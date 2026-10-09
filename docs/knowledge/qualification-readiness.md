@@ -173,7 +173,7 @@ diskutil apfs addVolume <container> APFS <name> -quota 10g
 
 from `diskutil(8)`. `-quota` limits that volume's file data. Place checkouts, slot, `disp_tmp` and captures on it, and force `TMPDIR`/`TMP`/`TEMP` there. Residual: other writers if the volume is not exclusive; clone/snapshot accounting; hardcoded `/tmp`; still no write-volume cap. `-reserve` guarantees space **to** this volume; it does not keep space free for the rest of the host.
 
-Nucleus's documented 2.3 GiB unique artifact sample for the planning+diagnostics pair does not include `disp_tmp` or two source checkouts. Preflight after the isolated cold run must measure the full covered set. If it exceeds 10 GiB, stop and report.
+Nucleus's documented 2.3 GiB unique artifact sample for the planning+diagnostics pair used the line-tables profile; it does not establish full-debug size and excludes `disp_tmp` and two source checkouts. Preflight after the isolated cold run must measure the full covered set. If it exceeds 10 GiB, stop and report.
 
 ### 20 GiB host free-space threshold — settled
 
@@ -468,14 +468,16 @@ failure.
 normally receive a new physical root per task. Because the complete ordered
 root map and its digest are compatibility inputs, adding a worktree changes
 the compiler flags and creates a cold partition for that map. Nucleus documents
-about 2.3 GiB of unique artifacts for the planning+diagnostics selector; use
-that as the expected storage scale for each retained cold map partition, not
-as a hard size guarantee or the whole disposable-footprint estimate. Until
-safe idle eviction, old partitions continue to occupy storage. For example,
-retaining both an old and an expanded root map costs roughly two selector
-artifact sets (about 4.6 GiB at that measured scale), plus checkouts, temporary
-output and captures. Evicting the old partition frees its space but discards
-its reuse value; if the old map is needed again it must be rebuilt.
+about 2.3 GiB of unique artifacts for the planning+diagnostics selector with
+the **line-tables profile**. This is a reference measurement only: the
+proposal requires full debug information, and its per-map storage cost is not
+measured. Do not use the line-tables figure as a full-debug estimate or
+capacity guarantee. Each changed map still needs a cold partition; the
+full-debug artifact and storage cost must be measured in a newly authorized
+pilot. Until safe idle eviction, old partitions continue to occupy storage.
+Evicting an old partition frees its measured space but discards its reuse
+value; if that map is needed again it must be rebuilt. These profile-specific
+partition costs are additional to checkouts, temporary output and captures.
 
 The stable checkout pool is a **Queue-owned prerequisite**, not an Oxide
 capability: Queue would need to keep a finite set of worktree paths and assign
@@ -598,6 +600,11 @@ build directory, and per-run private captures. The image's filesystem capacity
 is capped at 8 GiB. The separate 10 GiB ceiling counts the entire disposable
 footprint, including the image and any task files outside it; no data may spill
 outside that footprint. Enforce both limits and stop at the first reached.
+The fresh brief must count the sparse image's allocated backing bytes once,
+plus task-owned files outside the image, under the 10 GiB measurement method;
+it must separately measure in-image use against the 8 GiB capacity without
+double-counting the same bytes. If the selected host cannot bound and reconcile
+sparse backing allocation, refuse the pilot.
 Retain the monitored 20 GiB host free-space start/abort threshold. Allow 90
 minutes for the worker including setup and all five scenarios, then 30 minutes
 for exact-head independent review; no retry, scenario expansion or budget
