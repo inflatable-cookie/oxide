@@ -2,19 +2,19 @@
 
 ## Q-001 — What implementation shape best supports durable exclusive ownership?
 
-A central daemon hub is Tom’s preferred candidate to qualify. Compare it with the simplest alternative, resolve failure/restart semantics and consumer authority boundaries; final implementation selection is still open. Owner: [architecture](architecture.md).
+A per-user local daemon is the recommended hub for one durable lease ledger, shared consumer integration and bounded observations. The minimal per-invocation lock/journal alternative is compared in [architecture](architecture.md#minimum-safe-cross-worktree-reuse-design); it still needs process guardianship and conservative reconciliation. This remains a design recommendation, not a selected implementation. The selected host's proof that task descendants cannot outlive slot ownership, plus daemon failure/restart mechanics, remain open for qualification.
 
 ## Q-002 — What exact toolchain and checkout-path portability can be supported?
 
-Qualify build-dir support, generated code, proc macros, embedded paths, test executables and final artifact capture before choosing shared versus path-isolated partitions. No assumed MSRV. Owner: [architecture](architecture.md).
+Cargo 1.91 stabilizes `build.build-dir` and `CARGO_BUILD_BUILD_DIR`; this moves intermediates but does not prove cross-path reuse. The exact pinned Cargo/rustc and host are still pilot prerequisites. Qualify generated code, proc macros, embedded paths, test executables and separate final artifact capture before choosing shared versus path-isolated partitions. No assumed MSRV. See [Cargo's current capabilities](rust-dx-landscape.md) and [the protocol](architecture.md#minimum-safe-cross-worktree-reuse-design).
 
 ## Q-003 — What partitions, budgets and reconciliation proofs are sufficient?
 
-Resolve key derivation, capacity refusal, idle-only eviction, uncertain ownership and idempotent lost-reply handling. Owner: [architecture](architecture.md).
+The design recommends distinct compatibility-partition and per-run identities; durable idempotent acquire/reconcile/finalize; refusal for concurrent or uncertain claims; and proven-idle-only eviction. The pilot proposal uses a 10 GiB disposable cap and 20 GiB host free-space reserve, but read-only feasibility and enforceability remain prerequisites. Exact host locking/process-containment behavior and any later product budgets are unsettled. See [the ownership protocol](architecture.md#semantic-operations) and [budget proposal](architecture.md#budget-and-observations).
 
 ## Q-004 — What narrowly scoped pilot may be authorized?
 
-Candidate: Nucleus core-test Effigy selector at one fixed exact head and two disposable checkout paths, per-run artifacts/logs and one bounded exclusive intermediate slot. The bounded design-only task is approved; experimental execution is not authorized. Resolve selector, source pin, storage/write/time bounds, RustQuality profile/deviations and consumer coordination separately before execution. Owner: [vision](vision.md).
+Candidate: one native Nucleus core-test Effigy selector at one fixed exact head in two disposable checkout paths, with per-run artifacts/logs and one bounded exclusive intermediate slot. The design task does not authorize execution. The exact selector ID, commit/tree, installed pinned toolchain, paths, measurement method and enforceable cap/reserve need separate scoped approval. Resolve the RustQuality profile/deviations before Rust authoring, coordinate with the Nucleus owner to avoid compiler-wrapper duplication, then require independent exact-head review. See [pilot gates and protocol](architecture.md#proposed-bounded-qualification) and [authority](vision.md).
 
 ## Q-005 — What names are safe to publish?
 
@@ -26,7 +26,7 @@ For the first foothold, use one narrow native workflow and bounded qualification
 
 ## Q-007 — How should Oxide consume upstream caching and existing tools?
 
-The strategy is settled: reuse usable Cargo capabilities and fill current gaps without waiting indefinitely; see [vision](vision.md#relationship-with-cargo). Identify supported capability/version boundaries, keep policy independent of replaceable mechanisms, and define replacement/retirement criteria for each temporary mechanism. The accepted Cargo cross-workspace-cache goal is direction, not installed capability proof. Owner: [Rust DX landscape](rust-dx-landscape.md).
+The strategy is settled: use stable Cargo 1.91 build-dir redirection as the smallest mechanism to qualify while the accepted upstream cross-workspace cache goal is still experimental direction, not a stable capability guarantee. Keep policy independent of the mechanism. Replace it only after supported Cargo coverage and exact-workflow tests prove ownership, path correctness, lifecycle bounds and evidence preservation. See the [sourced capability and replacement criteria](rust-dx-landscape.md) and [architecture](architecture.md#exact-run-evidence-and-cargo-boundary).
 
 ## Q-008 — Which host/container division preserves required production parity?
 
