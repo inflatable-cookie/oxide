@@ -1,8 +1,9 @@
 # Project adoption and coordinated slot waiting
 
-Status: proposed design for a future Queue/Nucleus adapter. It defines no
-implemented Oxide command, API, configuration key, daemon deployment or consumer
-adoption. The storage rules remain in [architecture](../architecture.md),
+Status: proposed consumer design. Oxide now contains an unpublished Rust
+library adapter for task-owned fixtures. It defines no production Queue/Nucleus
+binding, consumer configuration key, daemon deployment or consumer adoption.
+The storage rules remain in [architecture](../architecture.md),
 product authority remains in [vision](../vision.md), and Q-010/Q-011 are the
 open questions this design answers in [questions](../questions.md).
 
@@ -195,8 +196,9 @@ reconciled before either path is chosen.
 
 ## Minimum adapter vocabulary
 
-These are semantic capabilities and result categories for a future adapter,
-not command names, current API strings or implemented states.
+These are semantic capabilities and result categories, not command names or
+wire states. The Rust fixture prototype covers the bounded subset described
+below; it does not provide a consumer integration.
 
 | Capability or result | Meaning |
 | --- | --- |
@@ -213,7 +215,34 @@ not command names, current API strings or implemented states.
 At minimum the adapter must be able to pass an authenticated consumer envelope,
 resolve or refuse an effective compatibility key, register and cancel a
 state-change wait, acquire exclusively with idempotent operation identity,
-retain independent run capture, and reconcile uncertainty. These are design
-requirements only. Implementation, a pilot, consumer adoption, host/service
-installation and numeric fairness or timeout policy require their own approved
-scope and review.
+retain independent run capture, and reconcile uncertainty. These remain the
+consumer-facing design requirements. The fixture prototype resolves explicitly
+provided toolchain, platform, profile/features, allowlisted configuration and
+environment values; it refuses incomplete inputs and Cargo older than 1.91,
+partitions by canonical checkout path, and passes per-invocation
+`CARGO_BUILD_BUILD_DIR` and `CARGO_TARGET_DIR` overrides to an injected host
+boundary. It does not scan or launch a real project.
+
+The current opt-in is an in-process `ProjectDescriptor` with one exact
+workflow/selector entry, passed with a `ProjectInvocation` to `ProjectAdapter`;
+there is no project-file format, CLI, or Cargo interception. Calls made outside
+that adapter, including direct Cargo invocations and undeclared selectors, are
+bypasses and carry no Oxide reuse or observation claim.
+
+The fixture flow waits without a lease, performs at most one readiness wake and
+recheck, accepts an injected consumer authorization, acquires exclusively, then
+submits a distinct host-run identity. Busy/full is returned to the fixture
+consumer before a command runner is invoked. A matching consumer capture receipt
+and injected fixture completion proof are required for idle finalization;
+unknown process lifetime or missing capture proof leaves the slot unavailable.
+Observations remain in an in-process 16 MiB ring with at most 12 events per run
+and 1 KiB per event. Records are keyed by consumer, run and attempt identity and retain
+workflow, selector, commit, source-tree digest and partition/configuration
+digests; unavailable write attribution is recorded explicitly.
+
+The injected authorization/host-run split is fixture scaffolding, not an
+existing authenticated Queue/Nucleus capability. Q-012 remains unresolved for
+real bindings. The prototype does not solve native process containment, cross-
+path correctness, a persistent observation service, a pilot, consumer adoption,
+host/service installation, or numeric fairness/timeout policy. Each remains
+separately gated and requires its own approved scope and review.
