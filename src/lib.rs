@@ -1,1 +1,7 @@
-//! Unpublished foundation crate for Oxide's storage work.
+//! Durable, bounded ownership for Oxide build intermediates.
+
+#[cfg(unix)]
+mod storage;
+
+#[cfg(unix)]
+pub use storage::*;

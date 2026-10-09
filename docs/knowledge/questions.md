@@ -2,7 +2,7 @@
 
 ## Q-001 — What implementation shape best supports durable exclusive ownership?
 
-A per-user local daemon is the recommended hub for one durable lease ledger, shared consumer integration and bounded observations. The minimal per-invocation lock/journal alternative is compared in [architecture](architecture.md#minimum-safe-cross-worktree-reuse-design); it still needs process guardianship and conservative reconciliation. This remains a design recommendation, not a selected implementation. The selected host's proof that task descendants cannot outlive slot ownership, plus daemon failure/restart mechanics, remain open for qualification.
+A per-user local daemon remains the recommended production hub for one durable lease ledger, shared consumer integration and bounded observations. The minimal per-invocation lock/journal alternative is compared in [architecture](architecture.md#minimum-safe-cross-worktree-reuse-design); it still needs process guardianship and conservative reconciliation. Queue authorized a bounded local prototype of the daemon candidate, described in [architecture](architecture.md#local-storage-prototype); that prototype does not select a production implementation. The selected host's proof that task descendants cannot outlive slot ownership, plus daemon failure/restart mechanics, remain open for qualification.
 
 The reviewed [macOS readiness findings](qualification-readiness.md#process-containment) refuse process scans as descendant-complete proof. A usable normal-completion mechanism is Q-013; no permanent-quarantine fallback has been accepted as the product design.
 

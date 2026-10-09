@@ -13,13 +13,15 @@ compiler requires deliberate compatibility validation and a revised policy.
 This minimum governs building Oxide itself; consumer project compilers remain
 independently resolved inputs to their build-storage identity.
 
-The unpublished root package uses Rust edition 2021 and has no dependencies or
-product behavior. Its internal name is `oxide-storage`; publication names remain
-subject to [Q-005](questions.md#q-005--what-names-are-safe-to-publish).
+The unpublished root package uses Rust edition 2021 and declares
+`rust-version = "1.97.1"`. Its internal name is `oxide-storage`; publication
+names remain subject to [Q-005](questions.md#q-005--what-names-are-safe-to-publish).
+It contains a Unix-only local storage prototype and pins `sha2` 0.10.9 for
+persisted lease-token hashes. This does not establish production host support.
 
 The reviewed design selects Cargo build-dir redirection as the smallest
 mechanism to qualify later. That setting is stable from Cargo 1.91; the pinned
-Cargo 1.97.1 supports it. This foundation does not configure shared storage or
+Cargo 1.97.1 supports it. The prototype does not configure Cargo storage or
 prove cross-checkout correctness. See [storage boundaries](architecture.md).
 
 Everyday Rust authoring follows the strict Northstar RustQuality profile at

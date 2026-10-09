@@ -1,6 +1,6 @@
 # Build storage boundaries
 
-These are design-only constraints agreed by Tom on 2026-10-09, not an implemented API. The design below recommends a per-user local daemon as the storage hub; it does not select an implementation, establish portability, or authorize a pilot.
+These are the production ownership constraints agreed by Tom on 2026-10-09. The local daemon candidate described below and in [the prototype boundary](#local-storage-prototype) implements only a bounded core; it does not establish production deployment, portability, process containment or pilot authority.
 
 ## Storage and ownership
 
@@ -78,6 +78,18 @@ Each attempt has a new attempt ID; retries of the same logical operation reuse i
 The ledger records the slot key, lease token hash, owner/run binding, acquire/finalize operation IDs, state, reserved/measured bytes and capture receipt reference. Durable transitions must be flushed before acknowledging them. The daemon serializes ledger mutation and atomically publishes completed metadata. A durable record is necessary but not sufficient: the selected process-control mechanism must ensure the slot remains unavailable while any launched task descendant may still write to it, even if the daemon or client disconnects.
 
 On daemon restart, every persisted `leased` record without a matching durable completion receipt becomes `uncertain`. The daemon queries the owning consumer for authenticated task/source/terminal/capture evidence and checks the guardian's process-containment record. PID plus start-time or a lock-file state may help locate a job, but absence alone proves nothing. If either authority is unavailable or a descendant may still exist, preserve the slot and refuse acquisition/eviction. Recovery may be retried with the same reconciliation ID; lost replies do not create new leases. Operator cleanup is outside this first protocol and must not be inferred from age.
+
+### Local storage prototype
+
+The unpublished `oxide-storage` crate contains a Unix-only daemon candidate with a versioned local request protocol and one serialized ledger writer. The endpoint is a Unix-domain socket beneath an existing canonical directory with private permissions; the socket is owner-only. A daemon-wide bound socket prevents a second live instance. Startup removes a stale socket only after a connection fails and the socket inode still matches. No service, launch agent or user installation is provided.
+
+The ledger is atomically replaced through a private temporary file, file sync and root-directory sync before an operation reply. A 256-bit random lease token is SHA-256 hashed in the ledger. Consumer credentials are verified at the adapter boundary and stripped before persistence. If an acquire reply is lost while the daemon remains alive, the same run-attempt request returns its original lease. After daemon restart, every active lease becomes `uncertain`; retry returns no slot path. A client that lost the token can settle an uncertain lease only with authenticated reconciliation evidence.
+
+Slots partition by project/component, workflow, Cargo and rustc provenance, host/target, profile, features, configuration and environment digests, and checkout-path identity. Source and run identity are recorded on the lease. An exclusive lease remains held until authenticated terminal, capture and descendant-containment evidence is accepted. PID absence, age, socket ownership and daemon restart never release a slot. Eviction first persists an `evicting` state and only removes a known owned slot whose ledger state is idle; interrupted eviction resumes only that recorded deletion. Unknown root entries, corrupt records, unsafe paths or unknown accounting fail closed.
+
+The prototype refuses a new attempt while any slot for its partition is leased or uncertain, even when the configured budget could hold another slot. A compatible partition permits sequential reuse only after authenticated settlement; it never permits parallel mutable sharing.
+
+This remains a scratch-state prototype. It requires injected consumer evidence verification and a free-space probe; no Queue/Nucleus authenticator or host probe is included. Its cap accounts for measured slot bytes and requested reservations, but there is no filesystem quota to constrain growth while a client writes. Consumer-owned checkout and capture roots are outside its accounting. It does not launch or contain build/test descendants, integrate Cargo, prove path portability, or qualify any host filesystem. Real managed builds and adoption remain blocked until those boundaries are implemented and qualified.
 
 ### Budget and observations
 
