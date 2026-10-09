@@ -6,6 +6,8 @@ Subsequent operator ruling, 2026-10-09: Tom approved a bounded documentation-onl
 
 Ownership: this file. Protocol semantics stay in [architecture](architecture.md). Scope and authorization stay in [vision](vision.md). Open product choices stay in [questions](questions.md).
 
+Subsequent supported-workflow ruling, 2026-10-09: Tom approved the narrower [cooperative foreground-workflow model](architecture.md#supported-writer-model) and a bounded native-fixture implementation/qualification task. The broad writer-model findings and pending-model asks below describe the reviewed design before that ruling; they do not override it. They remain evidence that arbitrary same-user write fencing is unqualified. The native completion mechanism still needs evidence and independent review under the approved limited contract. The ruling and task authorize no real Cargo/consumer pilot, installation or adoption; its exact bounds live in the approved Queue brief and [vision](vision.md#authority-boundaries).
+
 Inspection was read-only: committed Oxide, Nucleus and Queue documentation/config, installed toolchain metadata, Darwin headers and man pages, and `statfs`/`diskutil`/`quota` queries. This follow-up also reviewed Apple's public App Sandbox, Endpoint Security and System Extensions documentation and the XNU VFS implementation. No compilation, daemon, checkout, quota, volume, sandbox or service was created or installed.
 
 ## Observed facts versus proposed control
