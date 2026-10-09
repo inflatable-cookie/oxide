@@ -1021,11 +1021,12 @@ fn native_active_owner_refuses_competitors_then_allows_one_racing_winner() {
         )
     });
     let right_client = daemon.client.clone();
+    let right_gate = Arc::clone(&gate);
     let right = thread::spawn(move || {
         let mut adapter = ProjectAdapter::new(right_client);
         let mut consumer = right_consumer;
         let mut runner = native::NativeFixtureCommandRunner::healthy().expect("bounded runner");
-        gate.wait();
+        right_gate.wait();
         let result = adapter.execute(
             &right_invocation,
             &mut consumer,
