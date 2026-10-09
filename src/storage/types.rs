@@ -129,6 +129,7 @@ pub struct Inventory {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AcquireResult {
     pub lease_id: String,
+    pub slot_id: String,
     pub state: SlotState,
     /// Present only while the current daemon can safely grant the active lease.
     pub slot_path: Option<PathBuf>,
@@ -191,25 +192,98 @@ pub struct TerminalRecord {
 pub struct CaptureReceipt {
     pub reference: String,
     pub digest: String,
+    pub host_run_id: String,
+    pub run_id: String,
+    pub attempt_id: String,
     pub credential: Credential,
 }
 
-/// Process-containment evidence. PID absence is deliberately not release proof.
+/// One task-owned child process joined by the cooperative workflow boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessIdentityEvidence {
+    pub pid: u32,
+    /// A per-spawn identity echoed by the child before it can write.
+    pub start_identity: String,
+}
+
+/// Completion evidence for a registered cooperative foreground workflow.
+///
+/// The record is MAC-bound to the current lease token before it can release a
+/// slot. It proves only that the trusted workflow joined the listed fixture
+/// children and captured their bounded output; it is not an OS writer fence.
+#[derive(Clone, Eq, PartialEq)]
+pub struct CooperativeCompletionEvidence {
+    pub lease_id: String,
+    pub slot_id: String,
+    pub slot_path: String,
+    pub temp_dir: String,
+    pub capture_dir: String,
+    pub workflow: String,
+    pub workflow_definition_digest: String,
+    pub repository_head: String,
+    pub fixture_source_digest: String,
+    pub host_run_id: String,
+    pub run_id: String,
+    pub attempt_id: String,
+    pub processes: Vec<ProcessIdentityEvidence>,
+    pub free_space_samples: Vec<u64>,
+    pub exit_code: i32,
+    pub stdout_digest: String,
+    pub stderr_digest: String,
+    pub capture_reference: String,
+    pub capture_digest: String,
+    pub signature: String,
+}
+
+impl fmt::Debug for CooperativeCompletionEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CooperativeCompletionEvidence")
+            .field("lease_id", &self.lease_id)
+            .field("slot_id", &self.slot_id)
+            .field("slot_path", &self.slot_path)
+            .field("temp_dir", &self.temp_dir)
+            .field("capture_dir", &self.capture_dir)
+            .field("workflow", &self.workflow)
+            .field(
+                "workflow_definition_digest",
+                &self.workflow_definition_digest,
+            )
+            .field("repository_head", &self.repository_head)
+            .field("fixture_source_digest", &self.fixture_source_digest)
+            .field("host_run_id", &self.host_run_id)
+            .field("run_id", &self.run_id)
+            .field("attempt_id", &self.attempt_id)
+            .field("processes", &self.processes)
+            .field("free_space_samples", &self.free_space_samples)
+            .field("exit_code", &self.exit_code)
+            .field("stdout_digest", &self.stdout_digest)
+            .field("stderr_digest", &self.stderr_digest)
+            .field("capture_reference", &self.capture_reference)
+            .field("capture_digest", &self.capture_digest)
+            .field("signature", &"[redacted]")
+            .finish()
+    }
+}
+
+impl CooperativeCompletionEvidence {
+    pub(crate) fn sign(&mut self, token: &LeaseToken) {
+        self.signature = completion_mac(token.value(), self);
+    }
+
+    pub(crate) fn verify(&self, token: &LeaseToken) -> bool {
+        let expected = completion_mac(token.value(), self);
+        constant_time_eq(self.signature.as_bytes(), expected.as_bytes())
+    }
+}
+
+/// Process-lifetime evidence. Observations such as PID absence are not proof.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContainmentEvidence {
     Unknown,
-    Running {
-        pid: u32,
-        start_identity: String,
-    },
-    ProcessAbsent {
-        pid: u32,
-        start_identity: String,
-    },
-    DescendantsStopped {
-        guardian_reference: String,
-        credential: Credential,
-    },
+    Running { pid: u32, start_identity: String },
+    ProcessAbsent { pid: u32, start_identity: String },
+    CooperativeWorkflow(CooperativeCompletionEvidence),
 }
 
 /// Evidence presented for finalization or reconciliation.
@@ -282,3 +356,84 @@ impl fmt::Display for StorageError {
 }
 
 impl std::error::Error for StorageError {}
+
+fn completion_mac(token: &str, evidence: &CooperativeCompletionEvidence) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut key = [0_u8; 64];
+    let token_bytes = token.as_bytes();
+    if token_bytes.len() > key.len() {
+        let digest = Sha256::digest(token_bytes);
+        key[..digest.len()].copy_from_slice(&digest);
+    } else {
+        key[..token_bytes.len()].copy_from_slice(token_bytes);
+    }
+    let mut inner_pad = [0x36_u8; 64];
+    let mut outer_pad = [0x5c_u8; 64];
+    for (index, byte) in key.iter().enumerate() {
+        inner_pad[index] ^= byte;
+        outer_pad[index] ^= byte;
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    update_field(&mut inner, b"oxide-cooperative-completion-v1");
+    for value in [
+        evidence.lease_id.as_str(),
+        evidence.slot_id.as_str(),
+        evidence.slot_path.as_str(),
+        evidence.temp_dir.as_str(),
+        evidence.capture_dir.as_str(),
+        evidence.workflow.as_str(),
+        evidence.workflow_definition_digest.as_str(),
+        evidence.repository_head.as_str(),
+        evidence.fixture_source_digest.as_str(),
+        evidence.host_run_id.as_str(),
+        evidence.run_id.as_str(),
+        evidence.attempt_id.as_str(),
+    ] {
+        update_field(&mut inner, value.as_bytes());
+    }
+    inner.update((evidence.processes.len() as u64).to_le_bytes());
+    for process in &evidence.processes {
+        inner.update(process.pid.to_le_bytes());
+        update_field(&mut inner, process.start_identity.as_bytes());
+    }
+    inner.update((evidence.free_space_samples.len() as u64).to_le_bytes());
+    for sample in &evidence.free_space_samples {
+        inner.update(sample.to_le_bytes());
+    }
+    inner.update(evidence.exit_code.to_le_bytes());
+    for value in [
+        evidence.stdout_digest.as_str(),
+        evidence.stderr_digest.as_str(),
+        evidence.capture_reference.as_str(),
+        evidence.capture_digest.as_str(),
+    ] {
+        update_field(&mut inner, value.as_bytes());
+    }
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    format!("{:x}", outer.finalize())
+}
+
+fn update_field(hasher: &mut sha2::Sha256, bytes: &[u8]) {
+    use sha2::Digest;
+
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (*left ^ *right)
+        })
+        == 0
+}

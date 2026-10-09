@@ -1,4 +1,4 @@
-use super::codec::{decode_vec, encode_vec, Decode, Encode, Reader, Writer};
+use super::codec::{Decode, Encode, Reader, Writer, decode_vec, encode_vec};
 use super::transport;
 use super::types::*;
 use sha2::{Digest, Sha256};
@@ -9,12 +9,12 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 const LEDGER_MAGIC: &[u8; 8] = b"OXIDEST1";
-const LEDGER_VERSION: u32 = 1;
+const LEDGER_VERSION: u32 = 2;
 const MAX_LEDGER_BYTES: u64 = 64 * 1024 * 1024;
 const SOCKET_NAME: &str = "daemon.sock";
 const SLOTS_NAME: &str = "slots";
@@ -120,17 +120,19 @@ impl Daemon {
         let (accepted_sender, accepted_receiver) = mpsc::sync_channel(32);
         let accept_thread = std::thread::Builder::new()
             .name("oxide-storage-accept".to_owned())
-            .spawn(move || loop {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        if accepted_sender.send(Ok(stream)).is_err() {
+            .spawn(move || {
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            if accepted_sender.send(Ok(stream)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => {
+                            let _ = accepted_sender.send(Err(error));
                             break;
                         }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(error) => {
-                        let _ = accepted_sender.send(Err(error));
-                        break;
                     }
                 }
             })
@@ -669,6 +671,7 @@ impl Store {
         };
         Ok(AcquireResult {
             lease_id: lease.id.clone(),
+            slot_id: lease.slot_id.clone(),
             state,
             slot_path,
             token: self
@@ -776,7 +779,13 @@ impl Store {
             .capture
             .as_ref()
             .map(|capture| capture.digest.clone());
-        let proof_complete = release_proven(&evidence);
+        let expected_slot_path = self.slot_path(&slot_id)?;
+        let proof_complete = release_proven(
+            &evidence,
+            &lease,
+            token,
+            &expected_slot_path.to_string_lossy(),
+        );
         let mut new_state = SlotState::Uncertain;
         let measured = if proof_complete {
             let slot_path = self.slot_path(&slot_id)?;
@@ -1112,28 +1121,113 @@ fn persisted_evidence(evidence: &SettlementEvidence) -> SettlementEvidence {
     if let Some(capture) = evidence.capture.as_mut() {
         capture.credential = Credential::new("verified");
     }
-    if let ContainmentEvidence::DescendantsStopped { credential, .. } = &mut evidence.containment {
-        *credential = Credential::new("verified");
+    if let ContainmentEvidence::CooperativeWorkflow(completion) = &mut evidence.containment {
+        completion.signature = "verified".to_owned();
     }
     evidence
 }
 
-fn release_proven(evidence: &SettlementEvidence) -> bool {
+fn release_proven(
+    evidence: &SettlementEvidence,
+    lease: &Lease,
+    token: Option<&LeaseToken>,
+    expected_slot_path: &str,
+) -> bool {
     let terminal_matches = evidence
         .terminal
         .as_ref()
-        .map(|terminal| terminal.run_id == evidence.binding.run_id)
+        .map(|terminal| {
+            terminal.run_id == evidence.binding.run_id
+                && terminal.outcome != TerminalOutcome::Cancelled
+        })
         .unwrap_or(false);
     let capture_complete = evidence
         .capture
         .as_ref()
-        .map(|capture| !capture.reference.is_empty() && !capture.digest.is_empty())
+        .map(|capture| {
+            valid_id(&capture.reference)
+                && valid_digest(&capture.digest)
+                && valid_id(&capture.host_run_id)
+                && capture.run_id == evidence.binding.run_id
+                && capture.attempt_id == evidence.binding.attempt_id
+        })
         .unwrap_or(false);
-    let containment_complete = matches!(
-        evidence.containment,
-        ContainmentEvidence::DescendantsStopped { .. }
-    );
+    let containment_complete = match (&evidence.containment, token) {
+        (ContainmentEvidence::CooperativeWorkflow(completion), Some(token)) => {
+            let process_ids: std::collections::BTreeSet<_> = completion
+                .processes
+                .iter()
+                .map(|process| process.pid)
+                .collect();
+            completion.lease_id == lease.id
+                && completion.slot_id == lease.slot_id
+                && completion.slot_path == expected_slot_path
+                && !completion.temp_dir.is_empty()
+                && !completion.capture_dir.is_empty()
+                && Path::new(&completion.temp_dir).is_absolute()
+                && Path::new(&completion.capture_dir).is_absolute()
+                && completion.workflow == evidence.binding.workflow
+                && completion.host_run_id
+                    == evidence
+                        .capture
+                        .as_ref()
+                        .map_or("", |capture| capture.host_run_id.as_str())
+                && completion.run_id == evidence.binding.run_id
+                && completion.attempt_id == evidence.binding.attempt_id
+                && valid_id(&completion.host_run_id)
+                && !completion.workflow_definition_digest.is_empty()
+                && !completion.repository_head.is_empty()
+                && !completion.fixture_source_digest.is_empty()
+                && !completion.stdout_digest.is_empty()
+                && !completion.stderr_digest.is_empty()
+                && valid_id(&completion.capture_reference)
+                && completion.capture_reference
+                    == evidence
+                        .capture
+                        .as_ref()
+                        .map_or("", |capture| capture.reference.as_str())
+                && completion.capture_digest
+                    == evidence
+                        .capture
+                        .as_ref()
+                        .map_or("", |capture| capture.digest.as_str())
+                && !completion.processes.is_empty()
+                && completion.processes.len() <= 8
+                && process_ids.len() == completion.processes.len()
+                && !completion.free_space_samples.is_empty()
+                && completion.free_space_samples.len() <= 16
+                && completion
+                    .free_space_samples
+                    .iter()
+                    .all(|sample| *sample >= 20 * 1024 * 1024 * 1024)
+                && completion
+                    .processes
+                    .iter()
+                    .all(|process| process.pid > 0 && valid_digest(&process.start_identity))
+                && completion.exit_code >= 0
+                && evidence.terminal.as_ref().is_some_and(|terminal| {
+                    (completion.exit_code == 0 && terminal.outcome == TerminalOutcome::Passed)
+                        || (completion.exit_code > 0 && terminal.outcome == TerminalOutcome::Failed)
+                })
+                && valid_digest(&completion.workflow_definition_digest)
+                && valid_digest(&completion.repository_head)
+                && valid_digest(&completion.fixture_source_digest)
+                && valid_digest(&completion.stdout_digest)
+                && valid_digest(&completion.stderr_digest)
+                && completion.verify(token)
+        }
+        _ => false,
+    };
     terminal_matches && capture_complete && containment_complete
+}
+
+fn valid_digest(value: &str) -> bool {
+    let value = value.strip_prefix("sha256:").unwrap_or(value);
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && !value.as_bytes().contains(&0)
 }
 
 fn validate_root(path: &Path) -> Result<PathBuf, StorageError> {

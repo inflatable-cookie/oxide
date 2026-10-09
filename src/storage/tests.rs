@@ -1,10 +1,10 @@
 use super::*;
 use std::fs;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,11 @@ struct TaskRoot(PathBuf);
 
 impl TaskRoot {
     fn new() -> Self {
-        let parent = fs::canonicalize(std::env::temp_dir()).expect("canonical temp directory");
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let parent = base.join("storage-tests");
+        fs::create_dir_all(&parent).expect("create under task-owned scratch root");
         loop {
             let id = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
             let path = parent.join(format!("oxide-storage-test-{}-{}", std::process::id(), id));
@@ -63,8 +67,8 @@ impl EvidenceAuthority for TestAuthority {
                 .map(|capture| capture.credential.expose() == "capture-proof")
                 .unwrap_or(true)
             && match &evidence.containment {
-                ContainmentEvidence::DescendantsStopped { credential, .. } => {
-                    credential.expose() == "guardian-proof"
+                ContainmentEvidence::CooperativeWorkflow(completion) => {
+                    !completion.signature.is_empty()
                 }
                 _ => true,
             }
@@ -223,7 +227,52 @@ fn request(attempt: &str, acquire_id: &str, required_bytes: u64) -> AcquireReque
     }
 }
 
-fn complete_evidence(binding: &RunBinding) -> SettlementEvidence {
+fn complete_evidence(
+    binding: &RunBinding,
+    lease_id: &str,
+    slot_id: &str,
+    slot_path: &Path,
+    token: &LeaseToken,
+) -> SettlementEvidence {
+    let capture = CaptureReceipt {
+        reference: "task-capture/run-1".to_owned(),
+        digest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            .to_owned(),
+        host_run_id: "host-run-1".to_owned(),
+        run_id: binding.run_id.clone(),
+        attempt_id: binding.attempt_id.clone(),
+        credential: Credential::new("capture-proof"),
+    };
+    let mut completion = CooperativeCompletionEvidence {
+        lease_id: lease_id.to_owned(),
+        slot_id: slot_id.to_owned(),
+        slot_path: slot_path.to_string_lossy().into_owned(),
+        temp_dir: "/task/tmp".to_owned(),
+        capture_dir: "/task/capture".to_owned(),
+        workflow: binding.workflow.clone(),
+        workflow_definition_digest:
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        repository_head: "0".repeat(40),
+        fixture_source_digest:
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        host_run_id: capture.host_run_id.clone(),
+        run_id: binding.run_id.clone(),
+        attempt_id: binding.attempt_id.clone(),
+        processes: vec![ProcessIdentityEvidence {
+            pid: 1,
+            start_identity: format!("sha256:{}", "f".repeat(64)),
+        }],
+        free_space_samples: vec![20 * 1024 * 1024 * 1024],
+        exit_code: 1,
+        stdout_digest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            .to_owned(),
+        stderr_digest: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            .to_owned(),
+        capture_reference: capture.reference.clone(),
+        capture_digest: capture.digest.clone(),
+        signature: String::new(),
+    };
+    completion.sign(token);
     SettlementEvidence {
         binding: binding.clone(),
         consumer_credential: Credential::new("consumer-proof"),
@@ -232,15 +281,8 @@ fn complete_evidence(binding: &RunBinding) -> SettlementEvidence {
             outcome: TerminalOutcome::Failed,
             credential: Credential::new("terminal-proof"),
         }),
-        capture: Some(CaptureReceipt {
-            reference: "task-capture/run-1".to_owned(),
-            digest: "sha256:capture".to_owned(),
-            credential: Credential::new("capture-proof"),
-        }),
-        containment: ContainmentEvidence::DescendantsStopped {
-            guardian_reference: "guardian-receipt".to_owned(),
-            credential: Credential::new("guardian-proof"),
-        },
+        capture: Some(capture),
+        containment: ContainmentEvidence::CooperativeWorkflow(completion),
     }
 }
 
@@ -319,12 +361,16 @@ fn acquire_retry_reuses_lease_and_changed_identity_conflicts() {
     assert_eq!(retry, grant);
     let token = retry.token.as_ref().expect("active lease token");
     let ledger = fs::read(root.path().join("ledger.bin")).expect("read task ledger");
-    assert!(!ledger
-        .windows(token.value().len())
-        .any(|window| window == token.value().as_bytes()));
-    assert!(!ledger
-        .windows(b"admission-proof".len())
-        .any(|window| window == &b"admission-proof"[..]));
+    assert!(
+        !ledger
+            .windows(token.value().len())
+            .any(|window| window == token.value().as_bytes())
+    );
+    assert!(
+        !ledger
+            .windows(b"admission-proof".len())
+            .any(|window| window == &b"admission-proof"[..])
+    );
 
     let changed = request("attempt-a", "different-acquire", 64);
     assert_eq!(daemon.client.acquire(changed), Err(StorageError::Conflict));
@@ -370,11 +416,23 @@ fn process_restart_quarantines_until_authenticated_reconciliation() {
     assert_eq!(retry.state, SlotState::Uncertain);
     assert_eq!(retry.slot_path, None);
     assert_eq!(retry.token, None);
-    let evidence = complete_evidence(&request("attempt-restart", "unused", 64).envelope.binding);
+    let replayed_claim = request("attempt-restart", "unused", 64);
+    let binding = &replayed_claim.envelope.binding;
+    let evidence = SettlementEvidence {
+        binding: binding.clone(),
+        consumer_credential: Credential::new("consumer-proof"),
+        terminal: None,
+        capture: None,
+        containment: ContainmentEvidence::Unknown,
+    };
     let reconciled = recovered
         .reconcile(&grant.lease_id, None, "reconcile-restart", evidence)
         .expect("reconcile authenticated proof");
-    assert_eq!(reconciled.state, SlotState::Idle);
+    assert_eq!(reconciled.state, SlotState::Uncertain);
+    assert_eq!(
+        recovered.acquire(request("attempt-next", "acquire-next", 64)),
+        Err(StorageError::Refused(RefusalReason::LeaseUnavailable))
+    );
     drop(restarted);
 }
 
@@ -407,12 +465,18 @@ fn vanished_process_and_missing_proof_keep_storage_unavailable() {
     let daemon = RunningDaemon::start(root.path(), budget(128), Some(1024));
     let claim = request("attempt-uncertain", "acquire-uncertain", 64);
     let grant = daemon.client.acquire(claim.clone()).expect("acquire");
-    let mut evidence = complete_evidence(&claim.envelope.binding);
+    let token = grant.token.as_ref().expect("lease token");
+    let mut evidence = complete_evidence(
+        &claim.envelope.binding,
+        &grant.lease_id,
+        &grant.slot_id,
+        grant.slot_path.as_ref().expect("slot path"),
+        token,
+    );
     evidence.containment = ContainmentEvidence::ProcessAbsent {
         pid: 999_999,
         start_identity: "gone".to_owned(),
     };
-    let token = grant.token.as_ref().expect("lease token");
     let settled = daemon
         .client
         .finalize(&grant.lease_id, Some(token), "finalize-uncertain", evidence)
@@ -437,6 +501,37 @@ fn vanished_process_and_missing_proof_keep_storage_unavailable() {
 }
 
 #[test]
+fn mutated_cooperative_completion_cannot_release_a_slot() {
+    let root = TaskRoot::new();
+    let daemon = RunningDaemon::start(root.path(), budget(128), Some(1024));
+    let claim = request("attempt-mutated", "acquire-mutated", 64);
+    let grant = daemon.client.acquire(claim.clone()).expect("acquire");
+    let token = grant.token.as_ref().expect("lease token");
+    let mut evidence = complete_evidence(
+        &claim.envelope.binding,
+        &grant.lease_id,
+        &grant.slot_id,
+        grant.slot_path.as_ref().expect("slot path"),
+        token,
+    );
+    if let ContainmentEvidence::CooperativeWorkflow(completion) = &mut evidence.containment {
+        completion.repository_head = "1".repeat(40);
+    }
+    let receipt = daemon
+        .client
+        .finalize(&grant.lease_id, Some(token), "finalize-mutated", evidence)
+        .expect("record an unverifiable completion conservatively");
+    assert_eq!(receipt.state, SlotState::Uncertain);
+    assert_eq!(
+        daemon
+            .client
+            .evict("evict-mutated", 1)
+            .expect("eviction refusal"),
+        0
+    );
+}
+
+#[test]
 fn finalize_is_idempotent_and_only_idle_owned_slots_are_evicted() {
     let root = TaskRoot::new();
     let daemon = RunningDaemon::start(root.path(), budget(128), Some(1024));
@@ -455,7 +550,13 @@ fn finalize_is_idempotent_and_only_idle_owned_slots_are_evicted() {
         0
     );
 
-    let evidence = complete_evidence(&claim.envelope.binding);
+    let evidence = complete_evidence(
+        &claim.envelope.binding,
+        &grant.lease_id,
+        &grant.slot_id,
+        path,
+        grant.token.as_ref().expect("lease token"),
+    );
     let first = daemon
         .client
         .finalize(
@@ -483,9 +584,11 @@ fn finalize_is_idempotent_and_only_idle_owned_slots_are_evicted() {
         "capture-proof",
         "guardian-proof",
     ] {
-        assert!(!ledger
-            .windows(secret.len())
-            .any(|window| window == secret.as_bytes()));
+        assert!(
+            !ledger
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes())
+        );
     }
     let measured = daemon.client.inventory("idle").expect("inventory").slots[0]
         .measured_bytes
@@ -521,12 +624,14 @@ fn finalize_is_idempotent_and_only_idle_owned_slots_are_evicted() {
         fs::read(&sentinel).expect("outside sentinel remains"),
         b"outside the slot"
     );
-    assert!(daemon
-        .client
-        .inventory("after-evict")
-        .expect("inventory")
-        .slots
-        .is_empty());
+    assert!(
+        daemon
+            .client
+            .inventory("after-evict")
+            .expect("inventory")
+            .slots
+            .is_empty()
+    );
 }
 
 #[test]
@@ -539,12 +644,14 @@ fn unknown_free_space_fails_closed_before_a_slot_is_created() {
             .acquire(request("attempt-no-free", "acquire-no-free", 1)),
         Err(StorageError::Refused(RefusalReason::FreeSpaceUnavailable))
     );
-    assert!(daemon
-        .client
-        .inventory("unknown-free")
-        .expect("inventory")
-        .slots
-        .is_empty());
+    assert!(
+        daemon
+            .client
+            .inventory("unknown-free")
+            .expect("inventory")
+            .slots
+            .is_empty()
+    );
 }
 
 #[test]
