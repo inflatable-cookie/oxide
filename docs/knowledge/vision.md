@@ -52,6 +52,8 @@ Current authority covers project registration/claim, repository knowledge, read-
 
 The approved storage-core tranche may prototype the preferred daemon candidate in task-owned scratch state under independent review. Its ordinary local transport and ledger implementation choices can be resolved within the reviewed ownership design. This stages qualification rather than selecting a production deployment: real command process containment, cross-path correctness and adoption still require their own evidence and scoped authority. Unknown containment/capture state remains unavailable for reuse or eviction.
 
+Tom also approved bounded parallel documentation-only design of project adoption/coordinated waiting and pilot containment/capacity readiness on 2026-10-09. These briefs permit read-only source and primary-documentation inspection, owning knowledge edits and independent review. They grant no builds, live consumer changes, experiments, host installations or release changes.
+
 Hybrid dev/container/test profile design remains a separate Effigy plus Underlay bundle lane. Longhorn QA pilot phase 3 remains Longhorn-owned. Existing Nucleus workers are outside Oxide bootstrap scope; do not mutate or prompt them. The Nucleus compiler-wrapper lead `lead-1965` potentially duplicates this facility and must not run in parallel with Oxide; its disposition belongs to its owner.
 
 The org repository name was chosen by Tom. Future executable, crate and distribution names need review before publication because of the Oxide Computer Company naming collision; see [release](contracts/release.md).
