@@ -1,0 +1,219 @@
+# Project adoption and coordinated slot waiting
+
+Status: proposed design for a future Queue/Nucleus adapter. It defines no
+implemented Oxide command, API, configuration key, daemon deployment or consumer
+adoption. The storage rules remain in [architecture](../architecture.md),
+product authority remains in [vision](../vision.md), and Q-010/Q-011 are the
+open questions this design answers in [questions](../questions.md).
+
+## Recommendation
+
+Use a hybrid boundary: one explicit project-and-workflow opt-in, plus a
+consumer-owned adapter that invokes the project's existing Cargo command or
+Effigy selector. Queue or Nucleus supplies the admitted run identity and decides
+when the work may run. The adapter resolves the Rust inputs, acquires the
+compatible Oxide slot, and sets Cargo's per-invocation intermediate build
+directory. Cargo's normal `target` output and the consumer's captured run
+artifacts remain private to that checkout or run.
+
+Keep the opt-in in the consumer's existing project/workflow registration. It
+names the Rust workspace and the exact existing selectors allowed to use the
+facility. It is off by default. This is one control-plane registration per
+adopted project/workflow; it does not require changes to `Cargo.toml`,
+`.cargo/config.toml`, or an Effigy manifest. The owning consumer must choose the
+concrete field in its own integration brief; this document does not invent an
+Oxide config file or claim that such a field already exists.
+
+| Surface | Benefit | Limit | Recommendation |
+| --- | --- | --- | --- |
+| Cargo configuration alone | Familiar to every Cargo caller, including editors and test tools. | A static build-directory path cannot authenticate the run, coordinate admission, take an exclusive lease, or preserve per-run capture. A project or global setting that points at shared mutable storage would let direct callers bypass ownership. | Do not use as the integration by itself. Never point shared Cargo configuration at an Oxide slot. |
+| Explicit adapter alone | Carries consumer admission, run identity, cancellation and capture context. It can use Cargo's standard build-directory setting for one invocation. | Every adopted invocation must pass through the adapter; direct commands and editor actions otherwise bypass it. | Keep as the safety boundary, but pair it with a simple opt-in. |
+| Hybrid opt-in plus explicit adapter | Leaves familiar commands and selectors in place while making only declared workflows eligible for reuse. | Editor actions reuse storage only when the consumer can route those actions through the same adapter. | Recommended. |
+
+For a managed invocation, use Cargo's documented per-invocation build-directory
+mechanism where the pinned Cargo supports it. This relocates intermediates; it
+does not itself provide slot ownership or cross-path correctness. The candidate
+Cargo mechanism and its limits are described in the [Rust DX landscape](../rust-dx-landscape.md)
+and [storage architecture](../architecture.md#exact-run-evidence-and-cargo-boundary).
+Do not share `CARGO_TARGET_DIR`: it contains final outputs and cleanup scope.
+
+### Familiar commands and safe bypass
+
+- A worker still runs its usual `cargo check`, `cargo test`, or existing project
+  command. An Effigy-backed workflow keeps the same selector and lets Effigy
+  retain its language-neutral process and lifecycle role. Oxide adds no global
+  shell, `PATH`, Cargo, editor, or Effigy interception.
+- An editor or test-tool action is eligible only if Queue/Nucleus explicitly
+  routes it through the same adapter with a valid run envelope. An editor's
+  independent Cargo process remains an ordinary private build until it is
+  deliberately integrated. No IDE-specific sharing is implied.
+- An unopted project, an unlisted selector, or a direct command that cannot
+  present the required identity uses its existing private build directory.
+  If an opted-in invocation cannot contact Oxide or resolve a relevant input,
+  it may fall back to a private build only when consumer policy allows it;
+  otherwise it refuses before starting Cargo. Neither path claims a cache hit
+  or emits managed-reuse evidence.
+- Build reuse never skips the requested tests. Tests execute for the admitted
+  run, and logs, binaries, test output and receipts stay in the consumer-owned
+  capture area. The reusable slot is not the run's artifact store.
+
+## Identity and compatibility
+
+Keep the two identities from the storage architecture:
+
+- **Compatibility key:** stable project and component/workflow identity; exact
+  Cargo and rustc provenance; host and target; profile, features, effective
+  Cargo configuration and relevant compiler, linker, SDK and environment
+  inputs. Bind resolved values or stable digests, never secrets. Include the
+  checkout path until cross-path portability is proved. Unknown relevant inputs
+  mean private build or refusal, not a broader match.
+- **Run binding:** consumer, task, workspace, admitted run and attempt IDs when
+  present; exact source tree and submodules; compatibility-key digest; and the
+  admission reference. Source revision belongs to this run binding and Cargo's
+  own fingerprints still decide which build units need rebuilding.
+
+A pending request exists before an admitted run does. Its stable identity is
+`(consumer, project, workflow/selector, task, request_id)`. The consumer keeps
+that identity while the task waits. Once it admits an attempt, it adds the
+authenticated run and attempt IDs. Reconnecting or repeating the same operation
+reuses its operation ID and identical payload. A new attempt gets a new attempt
+ID and operation IDs; it never inherits an earlier lease. These identity tuples
+describe semantics, not existing wire fields.
+
+## Readiness, admission and acquire ordering
+
+Readiness is advisory and never reserves a slot. A compatible slot may become
+busy after a ready response. The smallest safe waiting contract is:
+
+1. Keep an ineligible task in Queue/Nucleus's own pending queue. Register one
+   cancellable storage wait using its stable request identity and compatibility
+   key. Registration does not create a run, start an agent, take an Oxide lease,
+   or consume a milestone QA slot.
+2. Oxide notifies compatible pending requests when the relevant slot state
+   changes. It does not order requests, admit work, choose an agent, reserve a
+   host resource, or decide retry priority. Queue/Nucleus applies its own
+   dependency, priority, fairness and resource rules when reconsidering the
+   task. The consumer's existing admission is authoritative.
+3. After normal consumer admission, the adapter sends one authenticated acquire
+   request bound to that run and attempt. Oxide durably records exclusive
+   ownership before returning a lease token. Only then may the adapter start
+   Cargo against the selected intermediate directory.
+4. Hold the lease through the command's descendants, required test execution,
+   and independent capture receipt. Finalize only after the consumer and process
+   guardian prove the run has stopped and its evidence is captured, following
+   the [storage recovery contract](../architecture.md#durable-ownership-and-recovery).
+
+The consumer must reconsider pending work on a readiness event, not poll or
+retry in a loop. Wakeups are hints and can be coalesced; consumers recheck the
+current state before admission. Oxide must not implement a second host scheduler
+or claim Queue/Nucleus fairness. Exact waiter fairness and operator-attention
+thresholds remain provisional; no numeric timeout or retry count is selected.
+
+If readiness races with another valid claimant, acquire returns `busy` and
+starts no build. The consumer owns recovery: release any capacity held only for
+that not-yet-started invocation, return the logical request to its own pending
+queue, and reconsider it after a newer readiness event. Do not wait while
+holding an execution slot, and do not automatically replay a lost or uncertain
+acquire. Reconcile the same acquire ID first. If the consumer's existing
+lifecycle cannot represent a not-started acquire refusal without falsifying a
+run outcome or changing frozen Nucleus Contract 010, stop before adapter
+implementation and ask the consumer owner for that narrow lifecycle mapping.
+
+This boundary preserves the existing ownership split: Queue/Nucleus control
+tasks, agents, QA slots and settlement; Oxide controls compatible Rust storage
+and execution behavior; Effigy remains language neutral. It aligns with Queue's
+private Cargo-output and worktree rules (Spec 028), Nucleus Core Contract 002,
+and frozen Host Run Scheduling Contract 010. None is amended here.
+
+## Refusal, cancellation and retry ownership
+
+- **Busy:** a compatible slot is currently leased. A registered request may
+  wait without acquiring it. A post-wakeup acquire refusal starts no command;
+  the consumer returns the request to its own queue and waits for a state
+  change.
+- **Full:** the configured cap/reserve is reached, unknown, or unenforceable,
+  or no compatible owned capacity can be made available safely. Refuse with
+  the measured/reserved state and owner-visible next step. Do not wait for a
+  configuration change, delete active state, or evict uncertain state.
+- **Uncertain or unreachable daemon:** report unavailable. Unknown lease state
+  stays unavailable and remains accounted. Do not start in the shared
+  directory, guess from age or PID absence, or retry a new acquire ID. A lost
+  reply is reconciled using the same operation ID.
+- **Cancellation while waiting:** Queue/Nucleus cancels its task/request and
+  removes the corresponding wait registration. Cancellation before acquire
+  releases no lease. Replayed cancellation is idempotent.
+- **Cancellation after acquire:** Queue/Nucleus owns the cancellation decision.
+  The adapter forwards it to the process guardian, captures available run
+  evidence, and finalizes only after descendants are proven stopped. A cancel
+  request, test result, daemon restart or lost response alone does not release
+  the slot. If acquire reply state is unknown at cancellation time, reconcile
+  that acquire ID; keep the slot unavailable until proof resolves it.
+
+The consumer owns retry and admission. The adapter may retry an identical
+operation only with the same ID and payload to resolve a lost response. It may
+not create a second build, invent a new attempt, or perform timer-based retries.
+After a settled refusal, a later consumer attempt uses a new attempt ID and a
+new acquire ID. Pending waits may remain visible without holding execution
+capacity until a compatible state change, explicit cancellation, or an
+owner-visible hold such as unresolved daemon recovery.
+
+## Example flows
+
+**Normal flow.** A project opts in one existing Effigy test selector. The
+consumer leaves its task pending while no compatible slot is ready. Oxide
+signals a readiness change; Queue/Nucleus applies its normal scheduling rules,
+admits the task and supplies the authenticated run envelope. The adapter
+resolves the effective key, acquires the lease, then invokes the same Effigy
+selector with Cargo's intermediate directory set for that lease. The selector
+runs tests, Queue/Nucleus captures its normal output and receipt, descendants
+stop, and the adapter finalizes. Per-run output is retained independently of
+the reusable intermediates.
+
+**Busy after wakeup.** Two pending tasks receive a readiness event. The
+consumer admits one and its acquire succeeds. If another admitted attempt
+reaches acquire and gets `busy`, it starts no Cargo process, releases any
+not-yet-used execution capacity, and returns to the consumer queue. It waits for
+a new state event; it does not spin or hold a QA slot.
+
+**Full capacity.** Preflight reports that the enforceable cap/reserve cannot
+admit the requested compatible storage. The adapter returns a full refusal
+with measured/reserved capacity and any blocking owner. The task remains under
+consumer control; no automatic cleanup, new budget or shared build is
+attempted.
+
+**Uncertain daemon.** The daemon restarts with a lease lacking complete
+process/capture proof. Readiness reports unavailable. Queue/Nucleus keeps the
+task pending with the reason visible. Oxide preserves the uncertain bytes and
+waits for authenticated reconciliation. Age, a missing PID or a new worker does
+not make the slot ready.
+
+**Cancellation.** A task cancelled before readiness removes its wait and never
+acquires. If cancellation arrives after acquire, the consumer stops the run
+through its normal process guardian; the adapter captures evidence and releases
+the lease only after shutdown and capture are proved. A lost acquire reply is
+reconciled before either path is chosen.
+
+## Minimum adapter vocabulary
+
+These are semantic capabilities and result categories for a future adapter,
+not command names, current API strings or implemented states.
+
+| Capability or result | Meaning |
+| --- | --- |
+| `opted_in` / `not_opted_in` | The exact project/workflow is declared eligible, or must use its private path. |
+| `ready` | A compatible slot was observed; this is advisory and grants no ownership. |
+| `wait_registered` / `wake` / `cancelled` | A cancellable request is waiting for a state change, was notified, or was withdrawn. |
+| `admitted` / `not_admitted` | The authenticated consumer has or has not authorized this run. Acquire requires `admitted`. |
+| `acquired` / `busy` | Durable exclusive lease granted, or no lease granted because another owner is active. |
+| `full` / `incompatible` / `input_unknown` | Safe bounded capacity, key compatibility, or a required input cannot be established. Refuse shared reuse. |
+| `daemon_unavailable` / `lease_uncertain` | Readiness or ownership cannot be proved. Fail closed; do not infer availability. |
+| `reconcile_required` / `finalized` | Resolve a prior operation by its stable ID, or confirm safe release after capture and process-stop proof. |
+| `private_build_allowed` / `private_build_refused` | Apply consumer policy when shared service or identity is unavailable; private execution makes no reuse claim. |
+
+At minimum the adapter must be able to pass an authenticated consumer envelope,
+resolve or refuse an effective compatibility key, register and cancel a
+state-change wait, acquire exclusively with idempotent operation identity,
+retain independent run capture, and reconcile uncertainty. These are design
+requirements only. Implementation, a pilot, consumer adoption, host/service
+installation and numeric fairness or timeout policy require their own approved
+scope and review.
