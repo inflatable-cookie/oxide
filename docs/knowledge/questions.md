@@ -35,3 +35,11 @@ Coordinate Rust-specific recommendations with Effigy's language-neutral executio
 ## Q-009 — Which alternative execution modes improve the daily loop?
 
 JIT, Cranelift and other code generation/execution solutions are confirmed research scope. Compare fast ahead-of-time compilation, JIT and hot reload by complete edit-to-feedback cost and supported semantics. Mechanisms, compatibility and validation mapping remain open. Owner: [Rust DX landscape](rust-dx-landscape.md); priority ruling: [vision](vision.md).
+
+## Q-010 — Which integration surface best preserves familiar development loops?
+
+The first audience and adoption preference are settled in [vision](vision.md#intended-experience): Tom's orchestrated Rust workflow first, broader Rust developers eventually, minimal project impact and tight integration where useful without breaking established tools. Determine Cargo integration versus a separate surface versus a hybrid, supported tooling interactions and the minimum project changes case by case. No command interception or consumer rollout is selected.
+
+## Q-011 — How should slot waiting coordinate with host admission?
+
+Tom accepts some waiting and queue reordering to reduce simultaneous builds; see [vision](vision.md#intended-experience). Determine pending-request identity, fairness, bounded wait/cancellation behavior and coordination with Queue/Nucleus admission so a storage wait does not unnecessarily occupy scarce execution capacity. Numeric limits and operator-attention thresholds remain open. Preserve conservative crash recovery and authoritative consumer scheduling.
