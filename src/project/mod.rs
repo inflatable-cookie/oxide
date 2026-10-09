@@ -711,8 +711,9 @@ impl<S: StorageOperations> ProjectAdapter<S> {
                         && ack.receipt.run_id == attempt.envelope.binding.run_id
                         && ack.receipt.attempt_id == attempt.envelope.binding.attempt_id
                         && valid_capture_receipt(&ack.receipt)
-                        && native_completion
-                            .is_some_and(|proof| proof.capture_digest == ack.receipt.digest) =>
+                        && native_completion.is_some_and(|proof| {
+                            proof.capture_digest() == ack.receipt.digest.as_str()
+                        }) =>
                 {
                     self.observations.event(
                         &attempt.envelope.binding.consumer,

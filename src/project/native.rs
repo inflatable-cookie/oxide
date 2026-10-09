@@ -128,7 +128,7 @@ impl NativeExecutionClaim {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeCompletionCertificate {
     claim: NativeExecutionClaim,
     repository_head: String,
@@ -145,6 +145,10 @@ pub(crate) struct NativeCompletionCertificate {
 }
 
 impl NativeCompletionCertificate {
+    pub(super) fn capture_digest(&self) -> &str {
+        &self.capture_digest
+    }
+
     pub(super) fn matches(
         &self,
         plan: &FixtureExecutionPlan,
@@ -413,7 +417,7 @@ impl FixtureCommandRunner for NativeFixtureCommandRunner {
                 .exists(),
         );
         check_fixture_budget(&self.task_root, &fixture_root, new_files, self.limits)?;
-        let _child_reservation =
+        let mut child_reservation =
             reserve_scenario_child(&fixture_root, self.limits.child_processes)?;
         let mut space = SpaceMonitor::new(self.task_root.clone());
         space.check()?;
@@ -962,7 +966,7 @@ pub(super) fn capture_receipt_digest(
 }
 
 fn read_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>, BoundaryFailure> {
-    let mut file = File::open(path).map_err(|_| BoundaryFailure::Unavailable)?;
+    let file = File::open(path).map_err(|_| BoundaryFailure::Unavailable)?;
     let mut bytes = Vec::new();
     file.take(maximum as u64 + 1)
         .read_to_end(&mut bytes)
