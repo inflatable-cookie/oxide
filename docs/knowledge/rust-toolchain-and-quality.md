@@ -8,13 +8,16 @@ The package does not declare `rust-version`, so no MSRV is claimed. The
 RustQuality profile stops version-sensitive work while that policy is
 unresolved.
 
-The unpublished root package uses Rust edition 2021 and has no dependencies or
-product behavior. Its internal name is `oxide-storage`; publication names remain
-subject to [Q-005](questions.md#q-005--what-names-are-safe-to-publish).
+The unpublished root package uses Rust edition 2021 and has no declared MSRV.
+Its internal name is `oxide-storage`; publication names remain subject to
+[Q-005](questions.md#q-005--what-names-are-safe-to-publish). It now contains a
+Unix-only local storage prototype and pins `sha2` 0.10.9 for persisted lease-token
+hashes. The local toolchain validates this code on Rust 1.97.1 only; it does not
+establish a minimum supported version or production host support.
 
 The reviewed design selects Cargo build-dir redirection as the smallest
 mechanism to qualify later. That setting is stable from Cargo 1.91; the pinned
-Cargo 1.97.1 supports it. This foundation does not configure shared storage or
+Cargo 1.97.1 supports it. The prototype does not configure Cargo storage or
 prove cross-checkout correctness. See [storage boundaries](architecture.md).
 
 Everyday Rust authoring follows the strict Northstar RustQuality profile at

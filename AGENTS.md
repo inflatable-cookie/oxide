@@ -18,7 +18,7 @@ When a change alters current truth, update its owning knowledge file in the same
 
 - `effigy rust:compile` checks the workspace and all targets with the committed lockfile.
 - `effigy rust:format` checks Rust formatting.
-- `effigy test rust` is the named Rust test suite for future repository tests. Do not add a `tasks.test` alias.
+- `effigy test rust` is the named Rust test suite. Do not add a `tasks.test` alias.
 - `effigy docs:check` runs the Northstar link and retired-concept checks plus `git diff --check HEAD`. The link check excludes `docs/knowledge/architecture.md`, whose references to optional sibling repositories are unavailable in a standalone checkout.
 
 There is no product QA selector yet. Use the focused selectors above; they do not replace milestone QA.
