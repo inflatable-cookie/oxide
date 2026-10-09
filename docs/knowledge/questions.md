@@ -38,8 +38,12 @@ JIT, Cranelift and other code generation/execution solutions are confirmed resea
 
 ## Q-010 — Which integration surface best preserves familiar development loops?
 
-The first audience and adoption preference are settled in [vision](vision.md#intended-experience): Tom's orchestrated Rust workflow first, broader Rust developers eventually, minimal project impact and tight integration where useful without breaking established tools. Determine Cargo integration versus a separate surface versus a hybrid, supported tooling interactions and the minimum project changes case by case. No command interception or consumer rollout is selected.
+Design answer: [project adoption](contracts/project-adoption.md#recommendation) recommends explicit project/workflow opt-in plus an adapter around familiar commands, with per-invocation Cargo settings and private final output. This is a proposed integration contract, not an implemented consumer registration or rollout. The concrete consumer binding remains Q-012.
 
 ## Q-011 — How should slot waiting coordinate with host admission?
 
-The ownership division is settled in [vision](vision.md#authority-boundaries); waiting tolerance lives in [intended experience](vision.md#intended-experience). Determine pending-request identity, storage-request fairness, bounded wait/cancellation behavior and coordination with Queue/Nucleus admission so a storage wait does not unnecessarily occupy scarce execution capacity. Numeric limits and operator-attention thresholds remain open. Preserve conservative crash recovery and authoritative consumer scheduling.
+Design answer: [project adoption](contracts/project-adoption.md#readiness-admission-and-acquire-ordering) defines non-reserving cancellable waiting, advisory readiness, authoritative consumer admission, exclusive acquire and consumer-owned recovery from a busy race. Consumer lifecycle mapping remains Q-012; numeric waiting/attention targets remain part of Q-006.
+
+## Q-012 — How does the consumer bind task admission, storage acquire and host-run scheduling?
+
+The proposed [adoption contract](contracts/project-adoption.md#readiness-admission-and-acquire-ordering) requires a consumer-approved mapping before real Queue/Nucleus adapter implementation. Frozen Contract010 admits and launches host runs together; it has no not-started storage-busy outcome. Establish authenticated task/attempt authorization for acquire, then the existing heavy-host-run submission, with exact identity, cancellation and capture binding. No invented host settlement, forged run token or execution slot held while waiting. Concrete consumer opt-in fields and compatibility-key availability after checkout preparation also need owner binding. Oxide's task-owned fixture prototype can exercise the semantic boundary without claiming this consumer mapping exists; consumer integration and real execution remain gated.
