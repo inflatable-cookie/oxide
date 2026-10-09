@@ -87,6 +87,8 @@ The ledger is atomically replaced through a private temporary file, file sync an
 
 Slots partition by project/component, workflow, Cargo and rustc provenance, host/target, profile, features, configuration and environment digests, and checkout-path identity. Source and run identity are recorded on the lease. An exclusive lease remains held until authenticated terminal, capture and descendant-containment evidence is accepted. PID absence, age, socket ownership and daemon restart never release a slot. Eviction first persists an `evicting` state and only removes a known owned slot whose ledger state is idle; interrupted eviction resumes only that recorded deletion. Unknown root entries, corrupt records, unsafe paths or unknown accounting fail closed.
 
+The prototype refuses a new attempt while any slot for its partition is leased or uncertain, even when the configured budget could hold another slot. A compatible partition permits sequential reuse only after authenticated settlement; it never permits parallel mutable sharing.
+
 This remains a scratch-state prototype. It requires injected consumer evidence verification and a free-space probe; no Queue/Nucleus authenticator or host probe is included. Its cap accounts for measured slot bytes and requested reservations, but there is no filesystem quota to constrain growth while a client writes. Consumer-owned checkout and capture roots are outside its accounting. It does not launch or contain build/test descendants, integrate Cargo, prove path portability, or qualify any host filesystem. Real managed builds and adoption remain blocked until those boundaries are implemented and qualified.
 
 ### Budget and observations

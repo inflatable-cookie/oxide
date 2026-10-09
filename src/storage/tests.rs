@@ -266,7 +266,7 @@ fn child_daemon_process() {
 #[test]
 fn competing_claims_never_share_a_mutable_slot() {
     let root = TaskRoot::new();
-    let daemon = RunningDaemon::start(root.path(), budget(64), Some(1024));
+    let daemon = RunningDaemon::start(root.path(), budget(128), Some(1024));
     let gate = Arc::new(Barrier::new(3));
     let claims = [
         request("attempt-a", "acquire-a", 64),
@@ -289,7 +289,15 @@ fn competing_claims_never_share_a_mutable_slot() {
         .map(|thread| thread.join().expect("claim thread joined"))
         .collect();
     assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| {
+                **result == Err(StorageError::Refused(RefusalReason::LeaseUnavailable))
+            })
+            .count(),
+        1
+    );
     assert_eq!(
         daemon
             .client
@@ -396,7 +404,7 @@ fn lost_acquire_reply_is_idempotent_and_does_not_start_a_second_lease() {
 #[test]
 fn vanished_process_and_missing_proof_keep_storage_unavailable() {
     let root = TaskRoot::new();
-    let daemon = RunningDaemon::start(root.path(), budget(64), Some(1024));
+    let daemon = RunningDaemon::start(root.path(), budget(128), Some(1024));
     let claim = request("attempt-uncertain", "acquire-uncertain", 64);
     let grant = daemon.client.acquire(claim.clone()).expect("acquire");
     let mut evidence = complete_evidence(&claim.envelope.binding);
@@ -424,7 +432,7 @@ fn vanished_process_and_missing_proof_keep_storage_unavailable() {
         daemon
             .client
             .acquire(request("attempt-other", "acquire-other", 1)),
-        Err(StorageError::Refused(RefusalReason::UnknownAccounting))
+        Err(StorageError::Refused(RefusalReason::LeaseUnavailable))
     );
 }
 

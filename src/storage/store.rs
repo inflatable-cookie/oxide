@@ -9,7 +9,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -116,21 +116,63 @@ impl Daemon {
             .listener
             .take()
             .ok_or(StorageError::Protocol("listener was already consumed"))?;
-        listener.set_nonblocking(true).map_err(io_error)?;
+        let socket_path = self.socket_path.clone();
+        let (accepted_sender, accepted_receiver) = mpsc::sync_channel(32);
+        let accept_thread = std::thread::Builder::new()
+            .name("oxide-storage-accept".to_owned())
+            .spawn(move || loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if accepted_sender.send(Ok(stream)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        let _ = accepted_sender.send(Err(error));
+                        break;
+                    }
+                }
+            })
+            .map_err(io_error)?;
+
+        let mut stopping = false;
+        let mut serving_error = None;
         loop {
             match shutdown.try_recv() {
-                Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    stopping = true;
+                    break;
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
-            match listener.accept() {
-                Ok((stream, _)) => {
+            match accepted_receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(Ok(stream)) => {
                     let _ = transport::serve_one(stream, &mut self.store);
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
+                Ok(Err(error)) => {
+                    serving_error = Some(io_error(error));
+                    break;
                 }
-                Err(error) => return Err(io_error(error)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    serving_error = Some(StorageError::Protocol("accept loop stopped"));
+                    break;
+                }
             }
+        }
+
+        drop(accepted_receiver);
+        if stopping {
+            // Wake the blocking accept call. The dropped receiver makes its
+            // next send fail, so this connection is never served as a request.
+            let _ = UnixStream::connect(socket_path);
+        }
+        if accept_thread.join().is_err() {
+            return Err(StorageError::Protocol("accept thread panicked"));
+        }
+        if let Some(error) = serving_error {
+            return Err(error);
         }
         Ok(())
     }
@@ -515,6 +557,12 @@ impl Store {
                 return Err(StorageError::Conflict);
             }
             return self.acquire_result(existing);
+        }
+
+        if self.ledger.slots.iter().any(|slot| {
+            slot.partition == request.envelope.partition && slot.state != InternalSlotState::Idle
+        }) {
+            return Err(StorageError::Refused(RefusalReason::LeaseUnavailable));
         }
 
         let matching = self
