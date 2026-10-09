@@ -148,10 +148,13 @@ busy/full refusal to the fixture consumer before any command runner is called.
 Task/attempt identity and host-run identity are separate types. This split is a
 fixture model only; it does not solve Q-012 or implement a Queue/Nucleus binding.
 
-Only injected fake/lightweight runners are in scope. A fixture completion proof
-can represent writers stopped by construction; it is not native process
-containment proof. The adapter requires a matching consumer capture receipt
-before finalizing to idle. Cancellation, failed capture, mismatched run identity,
+The unpublished implementation includes injected fake/lightweight runners and
+a fixed native test-fixture runner; it does not launch Cargo or establish a
+production workflow. An injected fixture completion proof cannot establish
+native completion. The native runner may mint its private completion
+certificate only for its owned child, exact attempt, slot and output bundle.
+The adapter still requires a matching consumer capture receipt before
+finalizing to idle. Cancellation, failed capture, mismatched run identity,
 daemon uncertainty or a lost finalization reply without a confirmed retry leave
 storage unavailable. It never starts a direct-Cargo fallback in managed state.
 

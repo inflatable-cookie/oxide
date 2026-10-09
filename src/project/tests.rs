@@ -19,11 +19,14 @@ struct FixtureRoot {
 
 impl FixtureRoot {
     fn new() -> Self {
-        Self::create("project-tests", false)
+        Self::create("p", false)
     }
 
     fn scenario(name: &str) -> Self {
-        let mut root = Self::create(&format!("scenarios/{}", name), true);
+        let scenario = name.split_once('-').map_or(name, |(number, _)| number);
+        assert_eq!(scenario.len(), 2, "scenario has a two-digit fixture ID");
+        assert!(scenario.bytes().all(|byte| byte.is_ascii_digit()));
+        let mut root = Self::create(&format!("s/{}", scenario), true);
         root.preserve = true;
         root
     }
@@ -33,7 +36,7 @@ impl FixtureRoot {
         fs::create_dir_all(&parent).expect("create under task-owned scratch root");
         loop {
             let id = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-            let path = parent.join(format!("ox-fixture-{}-{}", std::process::id(), id));
+            let path = parent.join(format!("f{:x}-{:x}", std::process::id(), id));
             match fs::create_dir(&path) {
                 Ok(()) => {
                     fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
@@ -47,6 +50,10 @@ impl FixtureRoot {
     }
 
     fn dir(&self, name: &str) -> PathBuf {
+        let name = match name {
+            "storage" => "s",
+            _ => name,
+        };
         let path = self.path.join(name);
         fs::create_dir(&path).expect("create isolated fixture directory");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
@@ -732,20 +739,44 @@ fn digest(value: &[u8]) -> String {
 fn assert_native_fixture_bounds(root: &FixtureRoot) {
     fn visit(
         path: &Path,
+        required: bool,
+        reject_symlinks: bool,
         files: &mut usize,
         bytes: &mut u64,
         largest: &mut u64,
         children: &mut usize,
     ) {
-        for entry in fs::read_dir(path).expect("read task-owned fixture root") {
-            let entry = entry.expect("read fixture entry");
-            let metadata = fs::symlink_metadata(entry.path()).expect("read fixture metadata");
-            assert!(
-                !metadata.file_type().is_symlink(),
-                "fixture contains no symlinks"
-            );
-            if metadata.is_dir() {
-                visit(&entry.path(), files, bytes, largest, children);
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("read task-owned fixture root: {}", error),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("read fixture entry: {}", error),
+            };
+            let metadata = match fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("read fixture metadata: {}", error),
+            };
+            if metadata.file_type().is_symlink() {
+                assert!(!reject_symlinks, "fixture contains no symlinks");
+                *files += 1;
+                *bytes = bytes.saturating_add(metadata.len());
+                *largest = (*largest).max(metadata.len());
+            } else if metadata.is_dir() {
+                visit(
+                    &entry.path(),
+                    false,
+                    reject_symlinks,
+                    files,
+                    bytes,
+                    largest,
+                    children,
+                );
             } else if metadata.is_file() {
                 *files += 1;
                 *bytes = bytes.saturating_add(metadata.len());
@@ -763,6 +794,8 @@ fn assert_native_fixture_bounds(root: &FixtureRoot) {
     let mut children = 0;
     visit(
         &root.path,
+        true,
+        true,
         &mut files,
         &mut bytes,
         &mut largest,
@@ -796,6 +829,8 @@ fn assert_native_fixture_bounds(root: &FixtureRoot) {
     let mut all_children = 0;
     visit(
         &task_root,
+        true,
+        false,
         &mut all_files,
         &mut all_bytes,
         &mut all_largest,
@@ -1235,13 +1270,13 @@ fn native_capture_binding_and_injected_completion_claims_fail_closed() {
     let root = FixtureRoot::scenario("05-capture-binding");
     let space = NativeScenarioSpace::new();
     space.sample(&root.path);
-    let daemon = RunningDaemon::start_with_probe(&root.dir("storage"), space.probe());
-    let mut adapter = ProjectAdapter::new(daemon.client.clone());
+    let injected_daemon = RunningDaemon::start_with_probe(&root.dir("i"), space.probe());
+    let mut injected_adapter = ProjectAdapter::new(injected_daemon.client.clone());
     let injected_invocation = fixture_invocation_named(&root, "injected");
     let mut injected_consumer = FixtureConsumer::new();
     let mut injected_runner = FixtureRunner::complete();
     injected_runner.issue_test_certificate = false;
-    let injected = adapter.execute(
+    let injected = injected_adapter.execute(
         &injected_invocation,
         &mut injected_consumer,
         &mut NoWait,
@@ -1252,10 +1287,17 @@ fn native_capture_binding_and_injected_completion_claims_fail_closed() {
     assert_eq!(injected_consumer.capture_calls, 0);
     assert_eq!(injected_runner.calls, 1);
     assert_eq!(
-        daemon.client.inventory("forged-proof").unwrap().slots[0].state,
+        injected_daemon
+            .client
+            .inventory("forged-proof")
+            .unwrap()
+            .slots[0]
+            .state,
         SlotState::Uncertain
     );
 
+    let native_daemon = RunningDaemon::start_with_probe(&root.dir("n"), space.probe());
+    let mut native_adapter = ProjectAdapter::new(native_daemon.client.clone());
     let native_invocation = fixture_invocation_named(&root, "bound-capture");
     let mut consumer = FixtureConsumer::new();
     consumer.attempt_id = "attempt-bound".to_owned();
@@ -1263,7 +1305,7 @@ fn native_capture_binding_and_injected_completion_claims_fail_closed() {
     consumer.host_run_id = "host-run-bound".to_owned();
     consumer.wrong_capture_attempt = true;
     let mut runner = native::NativeFixtureCommandRunner::healthy().expect("bounded runner");
-    let result = adapter.execute(
+    let result = native_adapter.execute(
         &native_invocation,
         &mut consumer,
         &mut NoWait,

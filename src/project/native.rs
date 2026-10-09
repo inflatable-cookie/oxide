@@ -843,11 +843,21 @@ fn wait_for_start_marker(
 ) -> Result<bool, BoundaryFailure> {
     let marker = control_dir.join("started");
     let deadline = Instant::now() + CHILD_WAIT_LIMIT;
+    let expected = format!("{}\n{}\n", expected_pid, expected_token);
     loop {
         if marker.is_file() {
-            let value = fs::read_to_string(marker).map_err(|_| BoundaryFailure::Unavailable)?;
-            let expected = format!("{}\n{}\n", expected_pid, expected_token);
-            return Ok(value == expected);
+            let value = fs::read_to_string(&marker).map_err(|_| BoundaryFailure::Unavailable)?;
+            if value == expected {
+                return Ok(true);
+            }
+            // The child creates this marker before writing its identity. A
+            // reader can observe that empty or partially written file, so
+            // wait for the exact marker instead of classifying that race as
+            // an identity mismatch. Any bytes outside the expected prefix
+            // remain a fail-closed mismatch.
+            if !expected.starts_with(&value) {
+                return Ok(false);
+            }
         }
         if child
             .try_wait()
@@ -1136,20 +1146,28 @@ fn fixture_root(task_root: &Path, capture_dir: &Path) -> Result<PathBuf, Boundar
         .strip_prefix(task_root)
         .map_err(|_| BoundaryFailure::Rejected)?;
     let mut components = relative.components();
-    if components.next().and_then(|part| part.as_os_str().to_str()) != Some("scenarios") {
+    if components.next().and_then(|part| part.as_os_str().to_str()) != Some("s") {
         return Err(BoundaryFailure::Rejected);
     }
     let scenario = components.next().ok_or(BoundaryFailure::Rejected)?;
     let fixture = components.next().ok_or(BoundaryFailure::Rejected)?;
-    if !fixture
-        .as_os_str()
-        .to_string_lossy()
-        .starts_with("ox-fixture-")
-    {
+    let scenario_name = scenario.as_os_str().to_string_lossy();
+    let fixture_name = fixture.as_os_str().to_string_lossy();
+    let valid_scenario =
+        scenario_name.len() == 2 && scenario_name.bytes().all(|byte| byte.is_ascii_digit());
+    let valid_fixture = fixture_name.strip_prefix('f').is_some_and(|identity| {
+        identity.split_once('-').is_some_and(|(pid, id)| {
+            !pid.is_empty()
+                && !id.is_empty()
+                && pid.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    });
+    if !valid_scenario || !valid_fixture {
         return Err(BoundaryFailure::Rejected);
     }
     let root = task_root
-        .join("scenarios")
+        .join("s")
         .join(scenario.as_os_str())
         .join(fixture.as_os_str());
     if !capture_dir.starts_with(&root)
@@ -1166,45 +1184,73 @@ struct TreeUsage {
     largest_file: u64,
 }
 
-fn tree_usage(root: &Path) -> Result<TreeUsage, BoundaryFailure> {
+fn tree_usage(root: &Path, account_sibling_links: bool) -> Result<TreeUsage, BoundaryFailure> {
     let mut usage = TreeUsage {
         files: 0,
         bytes: 0,
         largest_file: 0,
     };
-    for entry in fs::read_dir(root).map_err(|_| BoundaryFailure::Unavailable)? {
-        let path = entry.map_err(|_| BoundaryFailure::Unavailable)?.path();
-        let metadata = fs::symlink_metadata(&path).map_err(|_| BoundaryFailure::Unavailable)?;
-        if metadata.file_type().is_symlink() {
-            return Err(BoundaryFailure::Rejected);
+    fn visit(
+        root: &Path,
+        required: bool,
+        account_sibling_links: bool,
+        usage: &mut TreeUsage,
+    ) -> Result<(), BoundaryFailure> {
+        let entries = match fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if !required && error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(BoundaryFailure::Unavailable),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => return Err(BoundaryFailure::Unavailable),
+            };
+            let path = entry.path();
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => return Err(BoundaryFailure::Unavailable),
+            };
+            if metadata.file_type().is_symlink() {
+                if !account_sibling_links {
+                    return Err(BoundaryFailure::Rejected);
+                }
+                // The task-wide accounting walk can overlap isolated storage
+                // tests that deliberately create symlinks. Count the link's
+                // own directory entry without following it; the active
+                // scenario walk still rejects any link in its fixture tree.
+                usage.files = usage
+                    .files
+                    .checked_add(1)
+                    .ok_or(BoundaryFailure::Rejected)?;
+                usage.bytes = usage
+                    .bytes
+                    .checked_add(metadata.len())
+                    .ok_or(BoundaryFailure::Rejected)?;
+                usage.largest_file = usage.largest_file.max(metadata.len());
+                continue;
+            }
+            if metadata.is_dir() {
+                visit(&path, false, account_sibling_links, usage)?;
+            } else if metadata.is_file() {
+                usage.files = usage
+                    .files
+                    .checked_add(1)
+                    .ok_or(BoundaryFailure::Rejected)?;
+                usage.bytes = usage
+                    .bytes
+                    .checked_add(metadata.len())
+                    .ok_or(BoundaryFailure::Rejected)?;
+                usage.largest_file = usage.largest_file.max(metadata.len());
+            } else if !metadata.file_type().is_socket() {
+                return Err(BoundaryFailure::Rejected);
+            }
         }
-        if metadata.is_dir() {
-            let nested = tree_usage(&path)?;
-            usage.files = usage
-                .files
-                .checked_add(nested.files)
-                .ok_or(BoundaryFailure::Rejected)?;
-            usage.bytes = usage
-                .bytes
-                .checked_add(nested.bytes)
-                .ok_or(BoundaryFailure::Rejected)?;
-            usage.largest_file = usage.largest_file.max(nested.largest_file);
-        } else if metadata.is_file() {
-            usage.files = usage
-                .files
-                .checked_add(1)
-                .ok_or(BoundaryFailure::Rejected)?;
-            usage.bytes = usage
-                .bytes
-                .checked_add(metadata.len())
-                .ok_or(BoundaryFailure::Rejected)?;
-            usage.largest_file = usage.largest_file.max(metadata.len());
-        } else if metadata.file_type().is_socket() {
-            continue;
-        } else {
-            return Err(BoundaryFailure::Rejected);
-        }
+        Ok(())
     }
+    visit(root, true, account_sibling_links, &mut usage)?;
     Ok(usage)
 }
 
@@ -1214,8 +1260,8 @@ fn check_fixture_budget(
     new_files: usize,
     limits: NativeFixtureLimits,
 ) -> Result<(), BoundaryFailure> {
-    let scenario = tree_usage(fixture_root)?;
-    let task = tree_usage(task_root)?;
+    let scenario = tree_usage(fixture_root, false)?;
+    let task = tree_usage(task_root, true)?;
     if scenario
         .files
         .checked_add(new_files)

@@ -18,11 +18,11 @@ impl TaskRoot {
         let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
-        let parent = base.join("storage-tests");
+        let parent = base.join("t");
         fs::create_dir_all(&parent).expect("create under task-owned scratch root");
         loop {
             let id = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-            let path = parent.join(format!("oxide-storage-test-{}-{}", std::process::id(), id));
+            let path = parent.join(format!("d{:x}-{:x}", std::process::id(), id));
             match fs::create_dir(&path) {
                 Ok(()) => {
                     fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
