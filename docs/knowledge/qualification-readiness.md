@@ -69,7 +69,7 @@ Historical read-only readiness investigation (2026-10-09): committed Oxide, Nucl
 - Queue/Nucleus Contract 010 (Nucleus `docs/knowledge/contracts/010-host-run-scheduling.md`, Queue `server/process-group.ts`) launches a host run in a new process group, records pgid plus start identity, signals the group, records `setsid` escapees, and treats an empty group as host-process death, not container death. Frozen Contract 010 is unchanged by this design.
 - Nucleus observer docs (`experiments/recovery-core/OBSERVER.md`) state that cwd/open-file/`kill -0` scans cannot treat `Unknown` as empty, and that a process which changes cwd and drops worktree files disappears from that scan. Contract 002 forbids sharing mutable build directories and assigns shared Rust build/cache ownership to Oxide.
 
-**Proposed (not observed, not implemented):** signalling (not completeness), `disp_tmp` redirect, 10 GiB cap, path-omitting partition and six-scenario Cargo map. Those earlier proposals are not approved execution authority; the map is blocked until healthy release/reacquire is proven and may not use a still-held lease as a fallback. A cache hit is never validation success.
+**Earlier proposals (not observed, not implemented):** signalling (not completeness), `disp_tmp` redirect, 10 GiB cap, a path-omitting partition and a six-scenario Cargo map. They were not execution authority. The cooperative healthy-release boundary was later qualified for the fixed workflow and Cargo S1–S3; cross-path portability and invalidation remained unproved. A cache hit is never validation success.
 
 ## Process containment
 
@@ -173,7 +173,7 @@ diskutil apfs addVolume <container> APFS <name> -quota 10g
 
 from `diskutil(8)`. `-quota` limits that volume's file data. Place checkouts, slot, `disp_tmp` and captures on it, and force `TMPDIR`/`TMP`/`TEMP` there. Residual: other writers if the volume is not exclusive; clone/snapshot accounting; hardcoded `/tmp`; still no write-volume cap. `-reserve` guarantees space **to** this volume; it does not keep space free for the rest of the host.
 
-Nucleus's documented 2.3 GiB unique artifact sample for the planning+diagnostics pair does not include `disp_tmp` or two source checkouts. Preflight after the isolated cold run must measure the full covered set. If it exceeds 10 GiB, stop and report.
+Nucleus's documented 2.3 GiB unique artifact sample for the planning+diagnostics pair used the line-tables profile; it does not establish full-debug size and excludes `disp_tmp` and two source checkouts. Preflight after the isolated cold run must measure the full covered set. If it exceeds 10 GiB, stop and report.
 
 ### 20 GiB host free-space threshold — settled
 
@@ -196,7 +196,12 @@ Recorded for a later execution brief. **Not owner consent.** Source-owner coordi
 
 `CARGO_HOME` may stay the per-user download cache Queue already shares. That is not slot sharing.
 
-## Earlier experimental cross-path partition proposal (blocked; not authorized)
+## Earlier path-omitting partition proposal (superseded; not authorized)
+
+This proposal predates run 5 and omits checkout identity without normalizing
+compiler source names. The portability design below supersedes it as the next
+candidate. Its details remain here as rejected history, not current execution
+authority or a second proposed mechanism.
 
 Default compatibility key **includes checkout-path identity** (or Cargo's `{workspace-path-hash}` if redirection is ever left to Cargo). That default stays conservative.
 
@@ -336,10 +341,11 @@ pilot test. The suite needs `OXIDE_TASK_SCRATCH_ROOT`, `TMPDIR`, `TMP` and `TEMP
 to one fresh canonical directory. Without them, 27 reviewed fixture and storage tests
 fail on environment assertions.
 
-Not yet executed: the six-scenario Cargo pilot. The run was denied by the host
-auto-mode classifier, so no Cargo scenario ran and this section records no reuse,
-rebuild, path or benefit evidence. Preflight evidence is recorded above. The next
-step is an explicitly approved execution path for the ignored pilot driver.
+At this checkpoint, the six-scenario Cargo pilot had not executed: the run was
+denied by the host auto-mode classifier, so no Cargo scenario ran and this
+checkpoint recorded no reuse, rebuild, path or benefit evidence. Preflight
+evidence is recorded above. The later run-5 record below supersedes this
+pre-run disposition.
 
 ### Pilot execution record (2026-10-09, partial)
 
@@ -384,9 +390,241 @@ Production keys keep checkout identity, leaving the duplication problem unsolved
 
 Reviewer verdict subjects: cargo_completion, resource_bounds, cross_path_correctness, invalidation, evidence_binding and measured_benefit. The reviewer may return fail or insufficient where evidence is missing. Future portability remediation or a fresh experiment needs a separate bounded plan after review.
 
+## Portable source identity proposal (design only, 2026-10-09)
+
+### What the run-5 path result means
+
+The reviewed byte scan found rustc source-name strings for checkout A in the
+reused planning and build-diagnostics test binaries. Those strings are used by
+debug information and Rust source-location metadata, including panic locations.
+The scan did not show a B load path or rpath, and the reviewer found no
+CARGO_MANIFEST_DIR string in these two binaries. With identical source trees,
+the passing tests show that those tests executed; they do not show what a
+changed source, generated input, or runtime resource path would do.
+
+Keep these classes separate:
+
+- **Compiler source identity:** debug information, diagnostics, file!() and
+  panic-location paths. The last two are observable program values as well as
+  debugger metadata.
+- **Behavior-bearing paths:** CARGO_MANIFEST_DIR, OUT_DIR, paths used by
+  include!, build-script or proc-macro inputs and outputs, generated code,
+  and runtime resource lookup. Rustc path remapping does not rewrite arbitrary
+  environment strings or generated contents, and does not change which files
+  a build script or test opens.
+- **Debugger lookup:** a logical path in debug information is useful only if
+  the run can map it back to the exact source tree that owns the run receipt.
+  This lookup has not been implemented or qualified.
+
+The selected Nucleus tests do not cover every behavior-bearing path. Other
+Nucleus tests use env!("CARGO_MANIFEST_DIR"); the reviewed pilot did not run
+those tests or a changed-source control. Generated-code, proc-macro and
+path-sensitive runtime behavior therefore remain unqualified.
+
+### Two mechanisms
+
+| Mechanism | Shipped support and fingerprint behavior | Coverage and limit |
+| --- | --- | --- |
+| **Compiler path remapping with an explicit root map** | The installed pinned rustc 1.97.1 accepts stable --remap-path-prefix and --remap-path-scope options; the exact compiler source lists both as stable. The rustc book describes best-effort rewriting of compiler output, including debug information and macro expansions. Cargo 1.97.1 stores Rust flags in its freshness fingerprint and marks a unit dirty when the flag vector changes. Its source omits these flags from the unit filename hash when remapping is present, but that does not omit them from freshness checking. A map with different FROM roots on A and B therefore misses. The same complete, ordered map containing both pre-authorized roots can be supplied at both paths; a newly added root changes the flags and causes a safe miss. | Keeps full debug information and maps compiler source names to one logical prefix. The default scope also remaps macro paths: file!() and panic-location strings become logical paths. That behavior change needs an operator ruling. Remapping does not normalize CARGO_MANIFEST_DIR, build-script environment, arbitrary generated strings or runtime resource paths. Rust's documentation also warns that remapping is best effort and does not rewrite Apple linker OSO entries. No debugger source-map behavior is assumed. |
+| **Stable authorized compilation namespace** | Cargo 1.97.1 has no documented option that presents arbitrary physical worktrees as one stable filesystem source root. A namespace would need to present the authorized tree at the same path for Cargo, build scripts, rustc and test processes, then resolve that logical path to the current tree. | Could cover environment and runtime paths as well as compiler names if the namespace really preserves that view. A symlink or mount-based view, Cargo path canonicalization, process access and safe rebinding would need separate host support and qualification. That broader host/source-view contract and any installation are outside this task. It is not the first mechanism to pursue here. |
+
+Cargo's [build.rustflags reference](https://doc.rust-lang.org/cargo/reference/config.html#buildrustflags)
+documents the Cargo entry point for passing compiler options. Primary-source
+checks for the shipped behavior were the installed rustc
+--help -v, rustc 1.97.1 source at
+[the pinned compiler commit](https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/compiler/rustc_session/src/config.rs#L1866-L1881),
+and the [rustc path-remapping guide](https://doc.rust-lang.org/rustc/remap-source-paths.html).
+Cargo 1.97.1 source at
+[the pinned fingerprint implementation](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/compiler/fingerprint/mod.rs#L1092-L1101)
+checks changed Rust flags, while
+[unit metadata construction](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/compiler/build_runner/compilation_files.rs#L836-L876)
+explains why remap flags are treated specially for unit filenames. These are
+shipped mechanisms, not evidence that the proposed adapter or source map
+exists.
+
+### Recommendation and operator decision
+
+For the first narrow qualification, use rustc path remapping to a stable
+logical source prefix, with one fixed mapping set containing every authorized
+checkout root for that qualification. Register A and B before compiling at
+either path. Preserve all effective Rust flags and Cargo configuration when
+adding the map; if they cannot be resolved, refuse managed reuse. Bind the map
+version and full mapping-set digest into the Oxide compatibility identity;
+pass the same complete flag vector to both invocations. Never strip a root
+path or remap flag from identity to manufacture a hit. If the set changes,
+Cargo must see the changed flags and rebuild. This uses no source or build-tree
+copy. It can qualify reuse among a finite, pre-registered set of worktrees; it
+does not yet solve arbitrary newly created roots that arrive one at a time.
+
+The proposed logical root is a stable synthetic path per project/component.
+An exact-run receipt must map it to that run's authorized checkout and preserve
+the compile-origin tree, requested run tree, selector, toolchain/configuration,
+slot lease, binary digests and private capture digests. The source map is
+proposed; no Cargo or debugger integration is shipped. Keep full debug info.
+Do not use debuginfo=0, strip symbols, or remove path flags to hide the
+failure.
+
+**Registered-root cost in Queue's workflow:** disposable Queue worktrees
+normally receive a new physical root per task. Because the complete ordered
+root map and its digest are compatibility inputs, adding a worktree changes
+the compiler flags and creates a cold partition for that map. Nucleus documents
+about 2.3 GiB of unique artifacts for the planning+diagnostics selector with
+the **line-tables profile**. This is a reference measurement only: the
+proposal requires full debug information, and its per-map storage cost is not
+measured. Do not use the line-tables figure as a full-debug estimate or
+capacity guarantee. Each changed map still needs a cold partition; the
+full-debug artifact and storage cost must be measured in a newly authorized
+pilot. Until safe idle eviction, old partitions continue to occupy storage.
+Evicting an old partition frees its measured space but discards its reuse
+value; if that map is needed again it must be rebuilt. These profile-specific
+partition costs are additional to checkouts, temporary output and captures.
+
+The stable checkout pool is a **Queue-owned prerequisite**, not an Oxide
+capability: Queue would need to keep a finite set of worktree paths and assign
+future runs back to those registered roots. This workflow change needs Queue
+ownership and a separate Queue brief; Oxide cannot provide or assume it. Reuse
+can amortize registration and cold-build cost only when that pool is actually
+reused across tasks. A stream of one-use roots keeps creating partitions and
+can spend storage on old and new generations without reducing total work. No
+stable Queue checkout pool is established by this design. A fresh qualification
+must measure root-set reuse and partition occupancy. If Queue cannot maintain
+the pool, stop this candidate for its ad hoc worktrees, retain checkout-
+isolated partitions, and report that the dominant duplication problem remains
+unsolved. Do not grow the root map silently or claim arbitrary-root reuse.
+
+**Operator decision required:** accepting the logical prefix for compiler
+source names, file!() and panic locations would replace the original strict
+requirement that a B-run binary contain B-absolute paths and no A-absolute
+paths. This design does not make that change. Until Tom accepts or rejects
+that contract, the strict proof remains binding and no cross-path reuse claim
+may pass on logical paths alone. Behavior-bearing paths still need to resolve
+and behave against the exact requested tree; any stale A resource path,
+unresolved path class or missing source evidence fails closed. Production
+partitions remain checkout-isolated.
+
+The next brief must name the path gate before running. In **strict mode** (the
+default until an operator ruling changes it), pass only when every inspected
+reference to this project's source in the reused B artifacts contains B's
+exact absolute root and none contains A's root; third-party and toolchain paths
+are classified separately. The full-debug scan and exact B source lookup must
+be present, tests must execute at B, and the run receipt must bind the
+compile-origin tree, requested B tree, slot lease and artifact digest; private
+captures must bind to that B run. An observed A or other project-source root
+is a failure; a missing artifact, scan or binding is insufficient. The
+recommended fixed A+B remap emits a logical project path, so it cannot pass
+this strict predicate; unless a mechanism preserves B-absolute paths, no
+cross-path claim can pass strict mode.
+
+In **logical mode**, run only after Tom explicitly accepts the logical-path
+contract. Pass only when every inspected project-source reference in compiler
+source/debug fields contains the agreed logical prefix and neither physical
+root, the run-private mapping binds that prefix to B's exact tree and resolves
+every inspected source to the expected B file, and `file!()`/panic-location
+values match the accepted contract. If an Apple linker OSO entry is emitted,
+it must satisfy the selected gate too; the documented rustc remap does not
+rewrite it, so a physical A/B entry fails unless a separately supported,
+identity-bound treatment is approved. In either mode, a path-behavior
+evidence matrix must show that in-scope `CARGO_MANIFEST_DIR`, `include!`,
+build-script inputs and runtime resources resolve against B, while `OUT_DIR`,
+generated outputs and proc-macro inputs belong to the active leased generation
+and reflect B's exact source tree. No behavior-bearing path may resolve to
+stale A, and the selected tests must pass at B. An observed mismatch fails; a
+required but unobservable path class or missing evidence is insufficient and
+fails closed.
+A logical-path result does not claim interactive debugger integration; if
+that is part of the accepted contract, the pilot must stop until an exact-B
+debugger source lookup is available and qualified.
+
+### Bounded follow-up proposal (not authorized)
+
+One future Queue brief should implement and qualify the mechanism within the
+local Oxide adapter and driver; it must not wire a consumer or install a host
+service. Carry an explicit source-map policy and complete authorized-root map
+through compatibility identity and run receipts, fail closed at the selected
+portability gate, and give every disposable root its own identity. The current
+trial's constant disposable-root component must become a per-root stable ID
+bound to the declared root; containment validation alone cannot distinguish
+two roots. Preserve separate records for the tree that produced a slot
+artifact and the tree requested by a later run. Keep each final binary,
+stdout/stderr, test output, manifest and receipt in that run's private capture.
+The slot retains only reusable Cargo intermediates and their compile-origin
+evidence. Use the existing reviewed lease, resource, local receipt and
+cooperative completion machinery without widening it.
+
+The brief must enumerate the behavior-path classes in scope for its selector,
+identify the test or artifact evidence for each, and name any excluded class;
+an unlisted class is not covered. Keep the consumer-facing source-identity,
+miss and refusal semantics independent of rustc remapping and its flag/map
+encoding, so a later supported Cargo mechanism can replace it without changing
+Queue or Nucleus workflows.
+
+A fresh Queue brief could qualify five ordered scenarios. Begin with all three
+miss controls; do not begin the shared-slot pair unless each control passes:
+
+1. **Source miss:** build the exact approved baseline tree at A into a private
+   reference build directory and run tests; then apply one freshly approved
+   marker change at B, reuse that directory, and prove affected units rebuild
+   before running tests. Record both tree digests. Restore B only after the
+   run settles and evidence is captured, with fresh restore authority, then
+   verify B is exactly back at baseline.
+2. **Configuration miss:** prove effective-configuration key separation or
+   refusal without building.
+3. **Toolchain miss:** prove toolchain key separation or refusal without
+   building or installing a toolchain. Use already-installed 1.96.1 only if
+   fresh preflight confirms it.
+4. **Cold shared-slot run:** build the approved baseline at A in the exclusive
+   shared slot and run tests.
+5. **Different-path warm run:** run the same baseline at B in that slot, run
+   tests at B, and require zero appropriate rebuilds, the preselected strict
+   or operator-approved logical path gate, and exact-run captures.
+
+Before authorizing scenario 5, the brief must record the operator's path
+contract decision. The fixed A+B map emits logical paths, so if Tom declines
+that contract and no B-absolute-path-preserving mechanism is in scope, stop
+after the miss controls; do not run the cross-path pair or report portability.
+
+The complete A+B path map must be fixed before scenario 1 and remain identical
+for every compile. The source, selector, exact toolchains, paths, map and one
+marker patch require fresh source-owner and Queue approval. The candidate from
+005 is Nucleus commit bca75ed0143f96cd20b88ff72a421f1fb5f4ef19, tree
+67ecef91c907ca4085d94ea242b62f678c92993f, selector
+check:core:test -- -p nucleus-core --test planning --test build_diagnostics,
+Cargo 1.97.1 (c980f4866) and rustc 1.97.1 (8bab26f4f); re-pin and freeze them
+again at approval. The old pilot's execution authority, image, slot and time
+window do not carry forward. In particular, do not reuse or alter the 005
+image or its contents.
+
+Proposed fresh bounds are one new task-owned fixed 8 GiB APFS image, two
+independent disposable checkouts, one exclusive slot, one private reference
+build directory, and per-run private captures. The image's filesystem capacity
+is capped at 8 GiB. The separate 10 GiB ceiling counts the entire disposable
+footprint, including the image and any task files outside it; no data may spill
+outside that footprint. Enforce both limits and stop at the first reached.
+The fresh brief must count the sparse image's allocated backing bytes once,
+plus task-owned files outside the image, under the 10 GiB measurement method;
+it must separately measure in-image use against the 8 GiB capacity without
+double-counting the same bytes. If the selected host cannot bound and reconcile
+sparse backing allocation, refuse the pilot.
+Retain the monitored 20 GiB host free-space start/abort threshold. Allow 90
+minutes for the worker including setup and all five scenarios, then 30 minutes
+for exact-head independent review; no retry, scenario expansion or budget
+extension. Run tests on every scenario that builds. Stop at the first
+miss-control failure, path-gate failure, uncertain ownership/capture or
+resource threshold; preserve the slot and evidence. The independent reviewer
+inspects the receipts and replays at most one warm run and one meaningful miss
+within the 30-minute cap.
+
+This scope can qualify only the selected workflow and pre-registered roots.
+If the logical-path decision is declined, the strict A/B path requirement
+continues to fail. If the registered-root map cannot be held identical across
+the pair, if behavior-bearing paths cannot be shown correct, or if the
+workflow needs a stable filesystem namespace, stop and return that precise
+prerequisite rather than adopt path-isolated partitions as a solution to
+worktree duplication.
+
 ## Preserved real-build pilot outline (not authorized)
 
-This earlier outline remains a separate, unapproved real-build pilot. The six native fixture scenarios above are the current completion-boundary task; they do not authorize Cargo performance measurement or a consumer run. Any later pilot needs its own Queue brief, host/consumer scope, and independent review. Do not inherit execution authority from the fixture task.
+This earlier outline remains a separate, unapproved real-build pilot. The five proposed portability scenarios above are a separate design proposal; they do not authorize Cargo performance measurement or a consumer run. Any later pilot needs its own Queue brief, host/consumer scope, and independent review. Do not inherit execution authority from the fixture task.
 
 1. **Healthy release and reacquire:** one task-owned writer performs a bounded write, exits normally, and produces a capture receipt. The mechanism must prove no stale process or handle can mutate the slot; finalize durably; then a competing run reacquires and verifies the expected prior contents. Root exit or capture alone is an explicit negative control, not success.
 2. **Competing ownership:** while leased, concurrent second claimants are refused without changing slot bytes. After a proven healthy release, racing claimants yield exactly one owner, and the durable ledger matches the winner.
