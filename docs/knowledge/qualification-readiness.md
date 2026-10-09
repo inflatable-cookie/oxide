@@ -265,6 +265,121 @@ Minimum evidence is what can **falsify** ownership, reuse, path/proc-macro corre
 4. Exact-head path-correctness and generated-code/proc-macro checks before any cross-path reuse claim; failed portability means path-isolated partitions and lower expected benefit.
 5. Queue/Nucleus owner mapping for adapter identity, scheduling, cancellation, settlement and capture. Preserve frozen Contract010, Nucleus Contract002, and the existing pilot hold until that mapping is reviewed.
 
+## Standalone Cargo pilot attempt: preflight and storage (2026-10-09)
+
+Queue task 005 was dispatched under Tom's standalone Cargo pilot approval. This
+section records what ran before any Cargo scenario. No Cargo build, test run or
+slot lease was executed, so this section adds no reuse, rebuild, path or
+benefit evidence.
+
+Passed:
+
+- Source pin: `bca75ed0143f96cd20b88ff72a421f1fb5f4ef19` and tree
+  `67ecef91c907ca4085d94ea242b62f678c92993f` are present in the read-only
+  Nucleus object store. The pinned `effigy.toml` defines
+  `check:core:test` as `cargo test --offline {args}`.
+- Toolchain: `/Users/tom/.cargo/bin/cargo` and `rustc` report 1.97.1. The
+  rustup 1.96.1 install is present for the key-separation control.
+- Offline inputs: `cargo fetch --offline --locked` and
+  `cargo metadata --offline --locked` succeed in the disposable clone.
+- Storage: task root `/private/var/tmp/oxide-cargo-8e87a74d` was fresh, mode
+  0700. `hdiutil create -size 8g -type SPARSE -fs APFS` made
+  `pilot.sparseimage`. `hdiutil attach -nobrowse` mounted `disk5s1` at `m/`.
+  `diskutil` reported an APFS container of 8,380,178,432 bytes, about 7.8 GiB.
+  Every disposable path, including the two clones, lives on that container, so
+  the container's capacity bounds their writes. Shared `CARGO_HOME` is excluded
+  existing state. Overhead, snapshots and backing-file growth are not measured.
+- Clones: two `git clone --no-local` copies of the pinned commit, `m/a` and
+  `m/b`, each at the pinned tree with a clean status.
+- Host free space: about 752 GiB free on the boot volume (`df`) at setup. The
+  20 GiB monitored threshold was not reached.
+- Image lifecycle: the image was detached with ordinary `hdiutil detach` of its
+  recorded device. The task root and sparse file are retained for a continuation.
+
+Blocked before Cargo: the reviewed native completion path cannot yet qualify a
+real Cargo tree. Current limits, verified by reading `src/project/native.rs`:
+
+- `NativeCompletionCertificate::matches` accepts at most 16 free-space samples.
+  At the 30-second interval that covers about eight minutes, so a longer
+  build would be refused.
+- The fixture budget walk allows 16 files, 1 MiB per file and eight children.
+  Real Cargo output exceeds those bounds.
+- The start identity is a per-spawn value echoed by the child. Cargo and rustc
+  cannot echo an Oxide marker. An env-marker plus recorded process start
+  identity would be a different proof and needs a narrow ruling.
+
+Next gate: a ruling on the Cargo start-identity model and the sample/budget
+bounds, then a Cargo-specific executor with its own review. Scenario 1 starts
+only after that. The volume and enforceable cap are ready to use.
+
+## Standalone Cargo pilot: runner landed, execution not run (2026-10-09)
+
+Oxide now contains an experimental registered Cargo runner (`src/project/cargo.rs`)
+and an ignored standalone pilot driver (`src/project/tests/cargo_pilot.rs`). Both
+are unpublished and test-only in use. The runner launches the pinned Effigy
+selector in its own process group, binds a per-spawn start marker, samples host
+free space every 30 seconds, and issues a native completion certificate only after
+a normal exit with no leftover group members. Any other outcome returns an error,
+so the adapter keeps the lease uncertain.
+
+Two deliberate choices:
+
+- The storage completion bound of 16 free-space samples is unchanged. When full,
+  adjacent samples merge to their minimum. Every raw reading stayed at or above the
+  20 GiB threshold, or the run aborted.
+- Trial-only partition identity is `PathIdentity::DisposableRoot`. Checkouts under
+  one declared root share a key. Environment, toolchain and configuration digests
+  still separate partitions. The default remains `PathIdentity::Checkout`.
+
+Validation at this head: `effigy test rust` passed with 33 tests and 1 ignored
+pilot test. The suite needs `OXIDE_TASK_SCRATCH_ROOT`, `TMPDIR`, `TMP` and `TEMP` set
+to one fresh canonical directory. Without them, 27 reviewed fixture and storage tests
+fail on environment assertions.
+
+Not yet executed: the six-scenario Cargo pilot. The run was denied by the host
+auto-mode classifier, so no Cargo scenario ran and this section records no reuse,
+rebuild, path or benefit evidence. Preflight evidence is recorded above. The next
+step is an explicitly approved execution path for the ignored pilot driver.
+
+### Pilot execution record (2026-10-09, partial)
+
+Launched through the approved Effigy two-separator command after standing approval. Three attempts ran past the launch:
+
+- Run 2 stopped in scenario 1. The runner's 20 GiB check read the disposable APFS volume (about 7 GiB free), not host free space. No Cargo ran.
+- Run 3 stopped in scenario 1 with the same check. The stale per-run temp directory from run 2 blocked `create_dir`. No Cargo ran.
+- Run 4 completed scenario 1 with exit 0, against an empty build directory. Host free space was about 746 GiB. The reference took 129,943 ms wall time and rebuilt 47 units. It then stopped at the daemon bind: the storage root `m/storage` was never created.
+
+Scenarios 2 to 6 did not run. The session was at roughly 65 of 90 minutes, so a rerun was not taken. Scenario 1 is cold evidence only. Its build directory now exists, so any rerun would measure warm. No reuse, rebuild, path or benefit claim is made.
+
+### Pilot execution record, run 5 (2026-10-09, partial)
+
+Run 5 used the verified two-separator launch on a fresh `m/storage` root. Run 4's scenario-1 directories were moved aside, not deleted. Results from `evidence/events-run4.log` and `evidence/events.log`:
+
+- Scenario 1, cold reference, private build directory: exit 0. Wall time 94,323 ms. 47 units rebuilt.
+- Scenario 2, slot cold at checkout A: disposition Finished. Finalization Idle. Wall time 87,704 ms.
+- Scenario 3, warm at checkout B on the same slot: disposition Finished. Same slot. Same partition digest. Cargo reported 0 rebuilt units. Tests ran: 1 and 60 passed. Wall time 58,546 ms.
+- Path check on scenario-3 binaries in the slot's `debug/deps` (read-only byte scan): `planning-*` contains 484 occurrences of the checkout-A path and no checkout-B path. `build_diagnostics-*` contains 56 A-path occurrences and none for B. This is a stale-path result for cross-checkout reuse, which the brief treats as a path-correctness failure.
+
+The driver stopped at its path proof. It looked in `runs/s3/target/debug/deps`, but test binaries live under the slot's build directory. The driver never reached scenario 4. Scenarios 4 to 6 and the controls did not run. No reuse benefit is claimed. The result is a reduced-benefit finding, pending the planned independent review.
+
+### Disposition of the partial pilot (2026-10-09)
+
+This is an honest partial negative result for the standalone pilot. The original 90-minute experiment window expired before scenarios 4 to 6 and the in-session controls ran. No further Cargo scenario or reviewer replay is authorized under this disposition. The stale-path observation is not proof of wrong-source execution: a byte count of embedded paths can be debug metadata, and that distinction is left to independent review.
+
+Missing before any reuse claim:
+
+- Scenarios 4 to 6 and the concurrent-refusal, identity-replay, uncertainty and idle-eviction controls. Scenario 5's configuration key separation and scenario 6's toolchain separation were never recorded.
+- Source-content-miss evidence. The planned miss in checkout B never ran.
+- Whether the embedded checkout-A paths are behavior-bearing or only debug metadata. This needs a separate path-classification proof.
+- Completion coverage for the Cargo process tree. The runner records one process group leader and a per-spawn marker, not a full descendant census. Leftover members make the lease uncertain, but the process tree was not separately audited.
+- Write and performance attribution. Occupied bytes and elapsed times are single-run observations on a shared host. Storage deltas are not write volume or SSD lifetime.
+
+Artifact ownership: each run's captures, manifest, stdout/stderr digests and final binaries are kept under that run's own capture directory. Test binaries live under the slot's build directory.
+
+Production keys keep checkout identity. The trial-only key preserves safety but leaves the duplication problem unsolved for production.
+
+Reviewer verdict subjects: cargo_completion, resource_bounds, cross_path_correctness, invalidation, evidence_binding and measured_benefit. The reviewer may return fail or insufficient where evidence is missing. Future portability remediation or a fresh experiment needs a separate bounded plan after review.
+
 ## Preserved real-build pilot outline (not authorized)
 
 This earlier outline remains a separate, unapproved real-build pilot. The six native fixture scenarios above are the current completion-boundary task; they do not authorize Cargo performance measurement or a consumer run. Any later pilot needs its own Queue brief, host/consumer scope, and independent review. Do not inherit execution authority from the fixture task.
