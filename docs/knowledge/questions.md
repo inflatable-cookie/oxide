@@ -2,7 +2,7 @@
 
 ## Q-001 — What implementation shape best supports durable exclusive ownership?
 
-Compare daemon and non-daemon options, failure/restart semantics and consumer authority boundaries. A daemon is not selected. Owner: [architecture](architecture.md).
+A central daemon hub is Tom’s preferred candidate to qualify. Compare it with the simplest alternative, resolve failure/restart semantics and consumer authority boundaries; final implementation selection is still open. Owner: [architecture](architecture.md).
 
 ## Q-002 — What exact toolchain and checkout-path portability can be supported?
 
@@ -14,7 +14,7 @@ Resolve key derivation, capacity refusal, idle-only eviction, uncertain ownershi
 
 ## Q-004 — What narrowly scoped pilot may be authorized?
 
-Candidate: Nucleus core-test Effigy selector at one fixed exact head and two disposable checkout paths, per-run artifacts/logs and one bounded exclusive intermediate slot. Execution is not authorized. Resolve selector, source pin, storage/write/time bounds, RustQuality profile/deviations and consumer coordination separately before execution. Owner: [vision](vision.md).
+Candidate: Nucleus core-test Effigy selector at one fixed exact head and two disposable checkout paths, per-run artifacts/logs and one bounded exclusive intermediate slot. The bounded design-only task is approved; experimental execution is not authorized. Resolve selector, source pin, storage/write/time bounds, RustQuality profile/deviations and consumer coordination separately before execution. Owner: [vision](vision.md).
 
 ## Q-005 — What names are safe to publish?
 

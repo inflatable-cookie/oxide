@@ -28,6 +28,8 @@ Initial qualification should compare one isolated reference with cross-worktree 
 
 The target experience is aspirational, not a promise of compiler-speed parity with TypeScript or Go. Compiler/backend limitations may require upstream contributions. Prefer adopting upstream cache mechanisms over reproducing Cargo internals when they satisfy the need. Research evidence and limits live in [the Rust DX landscape](rust-dx-landscape.md); ordered outcomes and proposed work live in Queue.
 
+Tom's architecture direction, 2026-10-09: qualify a central daemon as the preferred hub for reusable storage and normalized measurement of real project workflows. Projects should opt into a defined workflow so observations can come from ordinary use, with future experiments integrated deliberately. This is design direction, not permission to install a daemon, change projects or run experiments. Compare the simplest viable daemon design with alternatives within the existing design time box. Storage correctness and immediate duplication relief remain first.
+
 ## Relationship with Cargo
 
 Tom's ruling, 2026-10-09: reuse work within Cargo wherever it is available and meets the need; that is the ideal long-term mechanism. Oxide must also fill practical gaps until Cargo catches up. An upstream initiative or roadmap is not a reason to defer relief for today's development problems indefinitely.
@@ -40,7 +42,7 @@ Tom's retained ruling, 2026-10-09: Effigy must remain language agnostic. Cargo/c
 
 Effigy owns language-neutral selector/process/env/lifecycle orchestration. Queue and Nucleus retain scheduler/admission authority, managed Git/source/task/workspace/run identity, authenticated settlement, source/evidence retention and artifact capture policy. Frozen Contract010 must not change.
 
-Current authority covers project registration/claim, repository knowledge, read-only research, planning and proposed briefs. Tom authorized the broader vision and research/plan on 2026-10-09. There is no experimental execution authority. Product implementation proceeds through explicitly approved Queue briefs and independent review.
+Current authority covers project registration/claim, repository knowledge, read-only research, planning and proposed briefs. Tom approved the bounded design-only Queue brief on 2026-10-09, including independent review and normal Queue delivery. Pilot execution and product implementation still require their own scoped approval. There is no experimental execution authority.
 
 Hybrid dev/container/test profile design remains a separate Effigy plus Underlay bundle lane. Longhorn QA pilot phase 3 remains Longhorn-owned. Existing Nucleus workers are outside Oxide bootstrap scope; do not mutate or prompt them. The Nucleus compiler-wrapper lead `lead-1965` potentially duplicates this facility and must not run in parallel with Oxide; its disposition belongs to its owner.
 

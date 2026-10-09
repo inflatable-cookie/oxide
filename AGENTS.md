@@ -10,7 +10,7 @@ Tom's scope and authority ruling lives in [vision](docs/knowledge/vision.md); st
 
 ## Guardrails
 
-Current authorization covers registration/claim, repository knowledge, read-only research, planning and proposed briefs. No builds, installs, cache cleanup, live changes, settings, scheduler or wire mutations, releases, tags, workflow changes, new workers or tasks. Do not prompt or mutate active Nucleus work. Resolve the repo-owned RustQuality profile/deviations before future Rust authoring; no assumed MSRV.
+Current authorization covers registration/claim, repository knowledge, read-only research, planning, proposed briefs and the explicitly approved bounded design-only Queue task with independent review. No builds, installs, cache cleanup, live changes, settings, scheduler or wire mutations, releases, tags, workflow changes, or other workers/tasks without scoped approval. Do not prompt or mutate active Nucleus work. Resolve the repo-owned RustQuality profile/deviations before future Rust authoring; no assumed MSRV.
 
 When a change alters current truth, update its owning knowledge file in the same PR. Record operator rulings before yielding.
 

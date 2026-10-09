@@ -16,6 +16,18 @@ Modern Cargo `build.build-dir` / `CARGO_BUILD_BUILD_DIR`, separate from target-d
 
 Nucleus Contract002 prohibits mutable target sharing. An exclusive-intermediate design requires narrow qualification before adoption and cannot weaken that contract. Frozen Contract010 remains unchanged. Queue/Nucleus own admission, source and run identities, authenticated settlement, retention and artifact capture; Oxide owns only its bounded storage semantics. See [scope](vision.md).
 
+## Preferred daemon hub to qualify
+
+Tom's direction, 2026-10-09: a central daemon could normalize project workflows, own reusable storage and provide a consistent place to measure real-world use. It is the preferred candidate for the bounded design task, not an implemented system or a final implementation choice.
+
+The design should define a minimal opt-in project/consumer adapter: resolve build identity, obtain scheduler admission where required, acquire a slot, execute the declared workflow, preserve/capture run outputs under consumer policy and finalize ownership with authenticated evidence. Every actor touching an adopted slot must follow the lease contract; direct Cargo access cannot silently bypass it. Commands outside the adapter have no claim to Oxide-managed coverage.
+
+The daemon owns the storage ledger and records observations keyed by project/component, source/run identity, resolved toolchain/configuration and backend. Observation is not authenticated run settlement or a validation verdict. Queue/Nucleus remain authoritative for admission, managed source/run identities, settlement and evidence/retention policy. Daemon failure/restart must reconcile durable leases conservatively; loss of connection cannot grant reuse. Consumer cancellation and process lifetime must have explicit owners.
+
+Start with bounded local events for acquisition/refusal, timing, rebuild/reuse observations, storage growth and finalization. Account for measurement overhead and unavailable write attribution. General tracing, dashboards and experiment scheduling are not requirements for first relief. Ordinary-use telemetry can reveal contention and trends after adoption; controlled qualification is still needed for cache correctness and failure cases. Future experiments are explicit opt-ins, use isolated declared resources and do not silently alter everyday flags or source.
+
+Keep storage/execution adapters replaceable and consumer-facing semantics stable as Cargo catches up. The design task must propose concrete daemon availability, project adoption and recovery behavior within its two-hour investigation bound; it does not install, execute or wire this design.
+
 ## Existing facilities and source context
 
 These sources inform qualification; they are not Oxide implementation or portability proof:
