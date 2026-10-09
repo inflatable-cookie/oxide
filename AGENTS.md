@@ -10,7 +10,7 @@ Tom's scope and authority ruling lives in [vision](docs/knowledge/vision.md); st
 
 ## Guardrails
 
-Tom authorized planning and queueing the next bounded tranche on 2026-10-09. Approved Queue briefs define each task’s authority, prerequisites and validation scope; dependency completion is not permission to bypass an explicit dispatch hold. Oxide-only implementation and its targeted repository validation must follow the independently reviewed design. Real-project qualification, consumer adoption and host installation remain separately gated. No live cache cleanup, settings/scheduler or consumer wire mutations, releases, tags or workflow changes without scoped approval. Do not prompt or mutate active Nucleus work. Resolve the repo-owned RustQuality profile/deviations before future Rust authoring; no assumed MSRV.
+Tom authorized planning and queueing the next bounded tranche on 2026-10-09. Approved Queue briefs define each task’s authority, prerequisites and validation scope; dependency completion is not permission to bypass an explicit dispatch hold. Oxide-only implementation and its targeted repository validation must follow the independently reviewed design. Real-project qualification, consumer adoption and host installation remain separately gated. No live cache cleanup, settings/scheduler or consumer wire mutations, releases, tags or workflow changes without scoped approval. Do not prompt or mutate active Nucleus work. Resolve the repo-owned RustQuality profile/deviations before future Rust authoring; use each package's declared `rust-version` and do not infer one where absent.
 
 When a change alters current truth, update its owning knowledge file in the same PR. Record operator rulings before yielding.
 
@@ -34,8 +34,9 @@ Scope: Rust source, Cargo manifests, build files, tests, and directly related
 documentation under this directory.
 
 Use Northstar's strict everyday-authoring route for ordinary Rust work. Resolve
-the repository-owned profile and deviations under `docs/knowledge/contracts/`; never
-assume a universal MSRV. Re-enter at task start and coherent batch closeout.
+the repository-owned profile and deviations under `docs/knowledge/contracts/`;
+use each package's declared `rust-version` and do not infer one where absent.
+Re-enter at task start and coherent batch closeout.
 Preserve unrelated work. A quality audit, no-slop pass, or audit-and-fix request
 is explicit audit intent; never route it through everyday authoring.
 <!-- northstar:rust-quality:end -->
