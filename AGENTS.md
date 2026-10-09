@@ -10,7 +10,7 @@ Tom's scope and authority ruling lives in [vision](docs/knowledge/vision.md); st
 
 ## Guardrails
 
-Current authorization covers registration/claim, repository knowledge, read-only research, planning, proposed briefs and the explicitly approved bounded design-only Queue task with independent review. No builds, installs, cache cleanup, live changes, settings, scheduler or wire mutations, releases, tags, workflow changes, or other workers/tasks without scoped approval. Do not prompt or mutate active Nucleus work. Resolve the repo-owned RustQuality profile/deviations before future Rust authoring; no assumed MSRV.
+Tom authorized planning and queueing the next bounded tranche on 2026-10-09. Approved Queue briefs define each task’s authority, prerequisites and validation scope; dependency completion is not permission to bypass an explicit dispatch hold. Oxide-only implementation and its targeted repository validation must follow the independently reviewed design. Real-project qualification, consumer adoption and host installation remain separately gated. No live cache cleanup, settings/scheduler or consumer wire mutations, releases, tags or workflow changes without scoped approval. Do not prompt or mutate active Nucleus work. Resolve the repo-owned RustQuality profile/deviations before future Rust authoring; no assumed MSRV.
 
 When a change alters current truth, update its owning knowledge file in the same PR. Record operator rulings before yielding.
 
