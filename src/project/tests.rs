@@ -18,11 +18,7 @@ impl FixtureRoot {
         let parent = fs::canonicalize(std::env::temp_dir()).expect("test TMPDIR exists");
         loop {
             let id = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
-            let path = parent.join(format!(
-                "oxide-project-fixture-{}-{}",
-                std::process::id(),
-                id
-            ));
+            let path = parent.join(format!("ox-fixture-{}-{}", std::process::id(), id));
             match fs::create_dir(&path) {
                 Ok(()) => {
                     fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
