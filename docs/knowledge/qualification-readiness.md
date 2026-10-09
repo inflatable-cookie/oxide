@@ -1,12 +1,12 @@
 # Qualification readiness: containment and capacity
 
-Design-only. This file answers the host/consumer gates that [architecture](architecture.md) left unproved: descendant containment after cancel/crash/lost reply/restart, and whether the proposed 10 GiB disposable cap and 20 GiB host free-space reserve can actually be enforced. It does not authorize a pilot, consumer adoption, or host installation. Saving or merging it grants none of those. Unmerged worker code is not an authority.
+Design-only. This file records the host/consumer gates that [architecture](architecture.md) left unproved: a usable healthy completion/fence, conservative cancel/crash/lost-reply/restart behavior, an enforceable 10 GiB disposable cap, and the monitored 20 GiB host free-space threshold. It does not authorize a pilot, consumer adoption, or host installation. Saving or merging it grants none of those. Unmerged worker code is not an authority.
 
 Subsequent operator ruling, 2026-10-09: Tom approved a bounded documentation-only completion/fencing follow-up and selected a monitored 20 GiB start/abort threshold. [Architecture](architecture.md#budget-and-observations) owns that current resource policy; the guarantee-versus-threshold asks below describe the original readiness disposition and are now answered. No permanent-quarantine or single-held-session fallback has been accepted, and no pilot execution is authorized. The enforced disposable-footprint cap and usable native completion proof remain gates.
 
 Ownership: this file. Protocol semantics stay in [architecture](architecture.md). Scope and authorization stay in [vision](vision.md). Open product choices stay in [questions](questions.md).
 
-Inspection was read-only: committed Oxide, Nucleus and Queue documentation/config, installed toolchain metadata, Darwin headers and man pages, and `statfs`/`diskutil`/`quota` queries. No compilation, daemon, checkout, quota, volume, sandbox or service was created.
+Inspection was read-only: committed Oxide, Nucleus and Queue documentation/config, installed toolchain metadata, Darwin headers and man pages, and `statfs`/`diskutil`/`quota` queries. This follow-up also reviewed Apple's public App Sandbox, Endpoint Security and System Extensions documentation and the XNU VFS implementation. No compilation, daemon, checkout, quota, volume, sandbox or service was created or installed.
 
 ## Observed facts versus proposed control
 
@@ -22,7 +22,7 @@ Inspection was read-only: committed Oxide, Nucleus and Queue documentation/confi
 - Queue/Nucleus Contract 010 (Nucleus `docs/knowledge/contracts/010-host-run-scheduling.md`, Queue `server/process-group.ts`) launches a host run in a new process group, records pgid plus start identity, signals the group, records `setsid` escapees, and treats an empty group as host-process death, not container death. Frozen Contract 010 is unchanged by this design.
 - Nucleus observer docs (`experiments/recovery-core/OBSERVER.md`) state that cwd/open-file/`kill -0` scans cannot treat `Unknown` as empty, and that a process which changes cwd and drops worktree files disappears from that scan. Contract 002 forbids sharing mutable build directories and assigns shared Rust build/cache ownership to Oxide.
 
-**Proposed (not observed, not implemented):** signalling (not completeness), `disp_tmp` redirect, 10 GiB accounting, experimental path-omitting partition, six-scenario map, and the blocked/unresolved disposition below. A cache hit is never validation success.
+**Proposed (not observed, not implemented):** signalling (not completeness), `disp_tmp` redirect, 10 GiB cap, path-omitting partition and six-scenario Cargo map. Those earlier proposals are not approved execution authority; the map is blocked until healthy release/reacquire is proven and may not use a still-held lease as a fallback. A cache hit is never validation success.
 
 ## Process containment
 
@@ -36,10 +36,39 @@ Inspection was read-only: committed Oxide, Nucleus and Queue documentation/confi
 | `kqueue` `NOTE_TRACK` | Follow forks automatically. | **Not supported** on this host. Darwin `sys/event.h`: no longer supported as of 10.5. Do not plan on it. |
 | `kqueue` `NOTE_EXIT`/`NOTE_FORK` on known PIDs | Events for PIDs already attached. `NOTE_FORK` does not reliably name every child. | Optional helper for the leader and already-known children. Not a tree proof. |
 | `proc_listchildpids` | Direct children of one PID, racy. | Optional helper. Not a tree proof. |
-| `sandbox-exec` / App Sandbox / Endpoint Security / VM | Kernel or framework confinement. | Deprecated, entitlement-heavy, or a different experiment. Out of this brief. |
+| `sandbox-exec` | Legacy sandbox profile launcher. | Deprecated by its man page; not a supported foundation. |
 | Linux cgroups | Kernel tree + resource control. | Not present on this macOS host. |
 
-**Signalling mechanism (not a completeness proof):** compose Contract 010's process-group and start-identity discipline with a slot-rooted file/cwd observer. Use it to deliver SIGTERM/SIGKILL to known members and to record what the host can see. It is the strongest user-space *control* this host offers without installing a service or changing frozen Contract 010. It does **not** enumerate every descendant.
+### Public macOS fencing candidates reviewed
+
+These are the two concrete public-API candidates examined for this follow-up. Neither currently proves that a healthy command has relinquished every way to write the reusable slot.
+
+| Candidate | Available mechanism and boundary | Why it does not establish safe release |
+| --- | --- | --- |
+| Inherited App Sandbox | A signed macOS app can launch child tools with sandbox inheritance. The child target uses `com.apple.security.app-sandbox` and `com.apple.security.inherit`; it inherits static sandbox rights, not rights granted dynamically after launch (such as PowerBox file access). | The static permission to write remains with any surviving child; parent exit does not revoke it. It does not account for an already-open or passed descriptor. Ordinary projects choose source paths at runtime, and Cargo build scripts, proc macros and tests execute project code; supporting those paths and tools would require compatibility work and a broad, fixed access policy. Repackaging/running the workflow inside an app sandbox changes the current command-line workflow. Static sandbox rights are therefore a research lead, not a completion proof. |
+| Endpoint Security system extension | Public ES APIs can authorize selected operations and report process, open, close, descriptor and write events. Apple documents a descendant-scoped client for a process subtree, but marks it preliminary/Beta; that client makes other processes invisible. The regular ES entitlement must be requested from Apple. The client is packaged as a system extension and activation may require user approval. | The documented file write event is `NOTIFY_WRITE`, not an authorization event; `AUTH_OPEN` authorizes opening a file, not later writes through an existing descriptor. Thus an open/inherited/mapped or transferred writer is not shown to be revocable at healthy completion. A descendant-scoped client also cannot account for an unrelated same-user process. Its entitlement, system-extension lifecycle, approval, event-loss handling and ongoing compatibility support add a substantial host service boundary. This candidate is not available under the current design-only authority and is not a proof as documented. |
+
+Apple's App Sandbox guide describes child inheritance and its static-rights limit ([App Sandbox inheritance](https://developer.apple.com/library/archive/documentation/Miscellaneous/Reference/EntitlementKeyReference/Chapters/EnablingAppSandbox.html)). Endpoint Security documents its authorization and notification event families, including `AUTH_OPEN` and `NOTIFY_WRITE` ([event types](https://developer.apple.com/documentation/endpointsecurity/es_event_type_t), [open authorization](https://developer.apple.com/documentation/endpointsecurity/es_event_type_auth_open), [write notification](https://developer.apple.com/documentation/endpointsecurity/es_event_type_notify_write)). Apple's descendant client covers the descendant subtree only and is marked preliminary ([`es_new_descendants_client`](https://developer.apple.com/documentation/endpointsecurity/es_new_descendants_client%28_%3A_%3A%29)). Its entitlement is requested from Apple ([Endpoint Security entitlement](https://developer.apple.com/documentation/BundleResources/Entitlements/com.apple.developer.endpoint-security.client)); Apple documents system-extension packaging and activation ([installing system extensions](https://developer.apple.com/documentation/systemextensions/installing-system-extensions-and-drivers?changes=_11), [activation request](https://developer.apple.com/documentation/systemextensions/ossystemextensionrequest/activationrequest%28forextensionwithidentifier%3Aqueue%3A%29?language=objc)).
+
+**Inference from the documented event boundary and XNU VFS implementation:** an authorization decision on `open` cannot, by itself, revoke write access already obtained through a file descriptor; [XNU routes `write(2)` through the existing file's write operation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/vfs/vfs_vnops.c). ES `NOTIFY_WRITE` reports that write, but does not authorize or deny it. The API/event documentation reviewed does not establish fencing for a writable mapping or a descriptor passed outside the monitored subtree. This is a gap in the reviewed public mechanisms, not a claim that no future macOS facility could provide a proof.
+
+### Writer model and completion proof
+
+The baseline threat model includes all four classes: cooperating Cargo/Effigy commands; accidental daemonization or inherited writers; arbitrary descendants that change process group, identity or working directory; and unrelated processes running as the same user. The latter three are possible writers, not accepted exclusions. A per-user file permission or Oxide lease does not prevent another process with that same user identity from opening the slot. A descendant may preserve write capability in an inherited descriptor even after the launcher exits. Queue/Nucleus admission and a successful consumer claim describe run authority; they do not fence storage writers.
+
+Ordinary adoption would need to state that every build, test, build script and proc-macro process that can touch the slot is launched under the adapter's ownership; no out-of-band same-user writer accesses it; and no descendant daemonizes, changes group/identity/cwd to evade supervision, retains a descriptor or writable mapping, or passes a slot handle past completion. Those are proposed workflow promises, not operator-approved policy. They are difficult to guarantee for arbitrary project code and do not become enforceable merely by documenting them. Treating any class above as out of scope requires Tom's separate ruling and a contract update before implementation or adoption.
+
+A healthy release needs all of the following, independently:
+
+1. The authenticated consumer terminal record and exact-run capture receipt/digests are durable and bound to the admitted run, source, selector and attempt.
+2. A supported guardian proves every process with slot write capability has ended, or an OS-enforced fence revokes every such capability, including inherited/open descriptors, writable mappings, descriptor transfer and path reopen.
+3. The daemon durably records `idle` before replying; a competing acquire remains refused until that commit.
+
+Root exit, zero exit status, consumer completion, capture completion, vanished PID, empty process group, quiet scans and a test verdict each prove less than this. The two public mechanisms above do not discharge item 2 under the baseline threat model. Therefore this task recommends **no healthy-release mechanism** on native macOS and does not recommend permanent quarantine as the product design.
+
+Interrupted, cancelled, restarted, daemon/client-crashed and lost-reply outcomes remain separate: persist `uncertain`, reserve the bytes, and refuse reuse and eviction. Reconciliation may preserve `uncertain`; neither a later clean scan nor an inferred terminal result converts it to `idle`. No contract relaxation is proposed.
+
+**Signalling mechanism (not a completeness proof):** compose Contract 010's process-group and start-identity discipline with a slot-rooted file/cwd observer. Use it to deliver SIGTERM/SIGKILL to known members and to record what the host can see. It is useful for diagnosis and best-effort cancellation. It does **not** enumerate every descendant or revoke a write capability.
 
 When the workflow is a Queue/Effigy-admitted host run, inherit that run's process group and start identity. Do not `setpgid` the Cargo/rustc tree out of the consumer group: that would look like an escape to Contract 010 and would change consumer process accounting. Oxide adds slot/checkout/capture/tmp path scans and extra escapee records; it does not replace the consumer supervisor.
 
@@ -49,7 +78,7 @@ When the workflow is a local adapter outside a consumer host run, the adapter cr
 
 ### Proof obligation
 
-Native macOS, with the APIs this brief may use, **cannot prove that every build/test descendant has ended**. `NOTE_TRACK` is unsupported. Process-group membership, start-identity environment, `proc_listchildpids`, `ps`, `lsof`, and cwd scans observe only processes they can still see. A descendant that leaves the group (`setsid` / new `posix_spawn` group), drops the identity variable, closes every slot/checkout/capture/tmp descriptor, `chdir`s away, and later reopens a remembered path is not in that set. The selected Nucleus planning+diagnostics selector also omits the observer tests that spawn extra process groups, so the candidate workflow does not even exercise the known extra-group case.
+For the public mechanisms reviewed here, **there is no proof that every writer has ended or lost write access**. `NOTE_TRACK` is unsupported. Process-group membership, start-identity environment, `proc_listchildpids`, `ps`, `lsof`, and cwd scans observe only processes they can still see. A descendant that leaves the group (`setsid` / new `posix_spawn` group), drops the identity variable, closes every slot/checkout/capture/tmp descriptor, `chdir`s away, and later reopens a remembered path is not in that set. The Endpoint Security descendant client is preliminary and excludes unrelated processes; its public write event is notification-only. The selected Nucleus planning+diagnostics selector also omits the observer tests that spawn extra process groups, so the candidate workflow does not even exercise the known extra-group case.
 
 Therefore the observational conjunction (empty pgid + recorded escapees dead + quiet `lsof`/cwd + capture receipt) is **not** a containment proof. Using it as a `reconcile` success predicate can pass while that descendant is still live. That predicate is refused.
 
@@ -58,13 +87,11 @@ Distinguish:
 - **Observation:** pid, pgid, lock file, `kill -0`, `ps`, `lsof`, unmount-busy. These locate some work and support signalling. Their absence is not idle and is not completeness.
 - **Containment proof:** a record that accounts for every descendant that could still write. This host has no supported mechanism that produces that record.
 
-**Release rule:** after any launch of Cargo/rustc/tests, and after cancellation, client crash, daemon crash, lost reply, or restart, the slot becomes or stays `uncertain` and remains **unavailable for reuse and eviction** for the rest of this protocol. There is no observational path to `idle`. Age, vanished PID, empty group, quiet scan, daemon restart, leader exit, or a test verdict never releases it. `reconcile` may confirm and persist `uncertain`; it must not transition to `idle` or `evictable`. Idempotent `(lease_id, reconcile_id)` still applies: identical evidence returns the same `uncertain` result; changed evidence is rejected.
+**Current release disposition:** an ordinary healthy run may become `idle` only after the three-part proof above. No mechanism in this review supplies that proof, so this design is blocked before a normal release/reacquire qualification can run. If execution is interrupted, cancelled, the client or daemon crashes/restarts, or a reply is lost, the slot becomes or stays `uncertain`, reserves its bytes, and is unavailable for reuse and eviction. There is no observational path from those unknown outcomes to `idle`. Age, vanished PID, empty group, quiet scan, daemon restart, leader exit, capture or a test verdict never releases it. `reconcile` may confirm and persist `uncertain`; it must not transition to `idle` or `evictable`. Idempotent `(lease_id, reconcile_id)` still applies: identical evidence returns the same `uncertain` result; changed evidence is rejected.
 
 Operator destruction of a quarantined tree or volume, without remounting that path for a new lease, stays outside this protocol as [architecture](architecture.md#durable-ownership-and-recovery) already states.
 
-**Pilot measurement without claiming completeness:** scenarios 2–4 may share one still-held exclusive lease (one `acquire`, cargo A then cargo B under that lease, `finalize` of the session still leaves the slot `uncertain` because descendants are unproven). That measures Cargo reuse under exclusive admission. It is not a descendant-complete release, not idle eviction, and not crash-recovery reuse. Concurrent second claimants are refused while `leased` or `uncertain`.
-
-Capture evidence remains required for consumer settlement and does not make the slot idle. Oxide does not mint that receipt.
+Capture evidence remains required for consumer settlement and does not make the slot idle. Oxide does not mint that receipt. A single-held-session Cargo measurement is not offered as a substitute for normal release/reacquire; it does not satisfy this task's outcome.
 
 ## Capacity
 
@@ -101,16 +128,11 @@ from `diskutil(8)`. `-quota` limits that volume's file data. Place checkouts, sl
 
 Nucleus's documented 2.3 GiB unique artifact sample for the planning+diagnostics pair does not include `disp_tmp` or two source checkouts. Preflight after the isolated cold run must measure the full covered set. If it exceeds 10 GiB, stop and report.
 
-### 20 GiB host free-space reserve — unresolved
+### 20 GiB host free-space threshold — settled
 
-This reserve is a property of the shared Data volume, not of the disposable trees. An exclusive `-quota 10g` volume does not enforce it. `-reserve` on that volume is the opposite polarity. Preflight `statfs` `f_bavail` and a periodic abort when `f_bavail` drops below 20 GiB are the same sampling the brief already calls insufficient: any other process can consume the reserve between samples, and this brief cannot stop those processes.
+Tom ruled on 2026-10-09 to use 20 GiB as a monitored start/abort threshold, not a guarantee against unrelated host writers. [Architecture](architecture.md#budget-and-observations) owns the policy: refuse to start if free space is below the threshold or cannot be measured; sample during execution, name the interval and abort behavior, and report a detected breach or unavailable reading. The protocol must record expected sampling overshoot and unrelated-writer races. This threshold does not enforce or replace the separate 10 GiB disposable-footprint cap, and does not authorize APFS volume creation.
 
-There is no supported, in-authority mechanism on this multi-writer laptop that **guarantees** 20 GiB remain free. Architecture's rule that an unenforceable bound means "do not start a build" therefore applies to a *guaranteed* 20 GiB reserve.
-
-This is not folded into the 10 GiB quota adjustment. It needs an explicit Tom decision before any execution brief:
-
-1. Treat 20 GiB as a heuristic start/abort threshold only (not a guarantee), and say so in the execution brief; or
-2. Keep the guarantee requirement, in which case the resource gate stays blocked on this host.
+The remaining resource gate is the enforced disposable-footprint cap: include both fixture/checkouts as applicable, slot, redirected temporary output and captures; demonstrate the cap for every covered path; do not claim that sampled accounting is a hard cap. A separately authorized APFS quota volume is one possible enforcement boundary, not authority granted here. If the cap is not enforceable for the selected setup, do not start.
 
 ## Candidate selector, head and toolchain
 
@@ -127,22 +149,24 @@ Recorded for a later execution brief. **Not owner consent.** Source-owner coordi
 
 `CARGO_HOME` may stay the per-user download cache Queue already shares. That is not slot sharing.
 
-## Experimental cross-path partition
+## Earlier experimental cross-path partition proposal (blocked; not authorized)
 
 Default compatibility key **includes checkout-path identity** (or Cargo's `{workspace-path-hash}` if redirection is ever left to Cargo). That default stays conservative.
 
-The **approved experimental variant** for this pilot only:
+The **previously proposed experimental variant** for a later pilot, pending the separate approvals below:
 
 - One exclusive slot, one compatibility key with checkout-path **omitted**, used by both disposable checkouts A and B.
 - Acquire records `partition_variant = experimental_cross_path` on the lease. A claimant without that variant, or with a different path-including key, is refused.
 - Adapter sets `CARGO_BUILD_BUILD_DIR` to that slot path for A and B. It does not use `{workspace-path-hash}` for this variant. `CARGO_TARGET_DIR` and capture remain per checkout/run.
-- Only scenarios 2, 3 and 4 (and the in-session failure proofs that reuse the slot) use this variant. Scenario 1 uses a private isolated build directory, not the slot. Scenarios 5 and 6 must change the key or be refused; they do not silently stay on the experimental key.
+- Each scenario that builds in the shared slot must acquire, execute/tests, prove healthy finalization to `idle`, and reacquire for the next scenario. Scenario 1 uses a private isolated build directory, not the slot. Scenarios 5 and 6 must change the key or be refused; they do not silently stay on the experimental key. No scenarios share a still-held lease.
+
+This path-omitting variant cannot run until Q-013 has a qualified healthy-release proof. Failure or uncertainty holds the slot; do not report a warm hit from a lease that was never safely released.
 
 If scenario 3's path/proc-macro/generated-code evidence fails, stop cross-path claims, keep the slot path-isolated, and report reduced benefit. Path isolation does not meet the cross-worktree objective. Do not expand the matrix to chase a hit.
 
 ## Six-scenario evidence map
 
-Stay inside six worker scenarios, 90 minutes worker, 30 minutes independent reviewer, and the 10 GiB occupied abort (including `disp_tmp`). Do not treat a 20 GiB free-space *guarantee* as in force. No automatic retries. Every scenario that actually builds runs the selected tests in the same lease. A cache hit cannot skip tests or mint a pass. Scenarios 2–4 share one still-held lease; they do not finalize to `idle` between them.
+This is a **prior evidence map only**, not an executable brief. Execution requires a separately approved release/reacquire mechanism, exact paths, an enforced 10 GiB disposable cap and the monitored 20 GiB start/abort policy. Stay inside six worker scenarios, 90 minutes worker, 30 minutes independent reviewer and no automatic retries. Every real build runs the selected tests in that run; a cache hit cannot skip tests or mint a pass. Scenarios 2–4 require normal healthy finalization and a fresh acquire between runs. Lost reply, cancel, crash or restart leaves the slot uncertain and stops the session.
 
 Minimum evidence is what can **falsify** ownership, reuse, path/proc-macro correctness, always-run tests, and exact-run binding. Timing and occupied bytes are recorded; they are not success.
 
@@ -158,9 +182,9 @@ Minimum evidence is what can **falsify** ownership, reuse, path/proc-macro corre
 **In-session proofs, not extra scenarios** (same 90-minute budget):
 
 - Concurrent second claimant refused while `leased` or `uncertain`; slot bytes unchanged.
-- Idempotent acquire/finalize after a deliberately dropped reply; the slot stays `uncertain` after launch, not `idle`.
+- Idempotent acquire/finalize after a deliberately dropped reply; because the outcome is unknown to the caller, the slot stays `uncertain` after launch and the session stops, not `idle`.
 - Daemon or client kill during an in-flight build; restart leaves the slot `uncertain` with **no** observational `reconcile` success path to `idle` or `evictable`. Empty pgid, quiet `lsof`, or vanished PID must not release it. That is the interruption proof this host can actually run.
-- Budget abort does not evict a launched slot. It refuses new acquire and turns the in-flight lease `uncertain`. Idle eviction after a Cargo/test launch is not in the proven set.
+- Budget abort does not evict a launched slot. It refuses new acquire and turns the in-flight lease `uncertain`. Eviction still requires a separately demonstrated `idle` proof; age, a healthy-looking scan or a prior build does not supply it.
 
 **Reviewer (30 minutes):** replay at most one warm (scenario 3) and one meaningful miss (4, 5 or 6), checking receipts, path strings, test execution, `disp_tmp` inclusion in occupied bytes, and that an interrupted run remains unavailable. Independent exact-head review of this design is separate and precedes any execution brief.
 
@@ -173,27 +197,38 @@ Minimum evidence is what can **falsify** ownership, reuse, path/proc-macro corre
 
 ## Disposition
 
-**Not proceed-to-execution.** Two gates stay unresolved until Tom rules. This file is still the documentation answer 001 lacked; saving or merging it grants no pilot, installation or adoption authority.
+**Blocked before qualification execution.** This design identifies no supported macOS mechanism that proves healthy release under the baseline writer model. This is not a recommendation to hold every healthy slot permanently; that would fail the required reusable workflow. It is also not authority to weaken unknown-outcome ownership. No experiment, service installation or consumer adoption is authorized by this disposition.
 
 | Gate | Status | Why |
 | --- | --- | --- |
-| Descendant-complete release after interruption (and after any Cargo/test launch) | **Blocked** on native macOS with supported APIs | Hidden identity-dropping/path-leaving descendants can evade group/identity/`lsof` scans, so those scans must not be a `reconcile` success predicate. Interrupted and post-launch slots stay `uncertain` and unavailable. The planning+diagnostics selector does not include observer orphan-group tests. |
-| 10 GiB disposable footprint | Protocol proposed, not yet authorized | Include `disp_tmp` via forced `TMPDIR`/`TMP`/`TEMP`. Accounting abort on Data; kernel cap only if a separately authorized `-quota 10g` volume holds checkouts, slot, `disp_tmp` and captures. Hardcoded `/tmp` remains a residual bypass. |
-| 20 GiB host free-space **guarantee** | **Unresolved / blocked as a guarantee** | Quota volumes do not enforce host free space. Sampling/preflight cannot. Needs Tom's choice below. |
+| Healthy normal release/reacquire | **Blocked** | App Sandbox's inherited static rights do not revoke a live child's access. Endpoint Security's documented write event is notification-only; its preliminary descendant client excludes other processes and cannot establish revocation of already-open handles. Neither covers the baseline writer classes with a reviewed proof. |
+| Interrupted/cancelled/crash/restart/lost reply | **Unavailable** | Keep the lease `uncertain`, reserve its bytes, refuse reuse/eviction. This remains the accepted conservative rule. |
+| Writer-model narrowing | **Needs separate Tom ruling** | A cooperative-only model would have to exclude daemonized descendants, retained/transferred handles and unrelated same-user writers. The current brief does not accept those exclusions, and documentation alone cannot enforce them. |
+| 10 GiB disposable footprint | **Still a prerequisite** | Include forced `TMPDIR`/`TMP`/`TEMP`, the slot, task-owned fixture trees and captures. Demonstrate an enforced cap; sampled accounting is not a hard cap. Do not create a volume without separate scoped approval. |
+| 20 GiB host free-space threshold | **Settled as monitored start/abort** | Follow [architecture](architecture.md#budget-and-observations). It is not a guarantee and does not remove the 10 GiB cap prerequisite. |
 
-**Smallest asks for Tom (do not start a build until answered):**
-
-1. Containment: accept permanent `uncertain` (unavailable) after launch/interrupt as the macOS protocol, and treat descendant-complete idle/eviction as out of this pilot; or keep completeness as a requirement, in which case qualification stays blocked until a kernel tree exists.
-2. Reserve: accept 20 GiB as a heuristic start/abort threshold only; or keep it as a guarantee, in which case the resource gate stays blocked on this shared Data volume.
-
-Cross-path Cargo measurement under one still-held lease can be scoped later only if (1) is the permanent-uncertain choice. It would not be a containment pass.
+**Exact next decision:** Tom must either keep arbitrary descendants, retained/passed write handles and unrelated same-user writers in scope, which requires a supported revocable-write-capability or complete process-lifetime proof before qualification; or separately approve a narrower cooperative writer model and its explicit adoption promises. In either case, the ruling is not itself a proof or implementation authorization. If the threat model stays broad and no supported primitive is identified, stop at this design disposition rather than test a permanent-held-session pilot.
 
 ### Missing prerequisites
 
 1. Independent exact-head review of this revision against the brief.
-2. Tom's two rulings above.
-3. Nucleus owner coordination: selector/args, frozen SHA, disposable-checkout permission, scenario-4 patch policy, and `lead-1965` disposition. No parallel compiler wrapper.
-4. Reviewed 003 storage-core and 004 adapter implementations to run against; this file does not wait on their merge, and they must not treat this text as execution authority.
-5. Separate execution brief only after (2): exact paths including `disp_tmp`, 10 GiB abort (and quota volume if chosen), 20 GiB policy as Tom ruled, partition variant flag, six-scenario script that never reconciles a launched slot to idle, crash proof that unavailable sticks, 90/30-minute hard stops.
+2. Tom's separate ruling on whether to narrow the baseline writer model; no promise is accepted by this document.
+3. If the broad model remains, identify a supported public mechanism that revokes or accounts for every write capability, including already-open handles, descendants and unrelated same-user writers. Any required Apple entitlement, application packaging, system-extension activation/approval or host change needs separate authority.
+4. Review the final mechanism against the compatible Cargo/Effigy workflow before writing an execution brief. Do not test a mechanism that still lacks the proof in this document.
+5. For any later fixture qualification: separate execution authority; a measured, enforced 10 GiB disposable cap; exact paths including `disp_tmp`; the monitored 20 GiB threshold and sampling/abort behavior; and an independent exact-head review. If it expands to a Nucleus selector, first obtain Nucleus owner coordination for selector/args, frozen SHA, disposable-checkout permission, scenario-4 patch policy and `lead-1965` disposition. No parallel compiler wrapper.
+6. Reviewed 003 storage-core and 004 adapter implementations are a later integration prerequisite, not permission to run this qualification.
 
-Queue/Nucleus keep admission, identity, settlement, retention and capture. Oxide owns how the slot is leased and why it stays unavailable when descendants cannot be proven.
+## Smallest next qualification brief (outline; not authorized)
+
+Prepare this only after the writer-model ruling and a mechanism has a credible public-API proof argument. The first qualification should target the completion/fence boundary with task-owned process fixtures in a fresh isolated scratch root; it is not a Cargo performance pilot or a consumer run. Keep the established cap of six scenarios, at most 90 minutes of worker execution and 30 minutes independent replay, with no retries or expansion. If required installation or entitlements are not separately authorized, stop before setup.
+
+1. **Healthy release and reacquire:** one task-owned writer performs a bounded write, exits normally, and produces a capture receipt. The mechanism must prove no stale process or handle can mutate the slot; finalize durably; then a competing run reacquires and verifies the expected prior contents. Root exit or capture alone is an explicit negative control, not success.
+2. **Competing ownership:** while leased, concurrent second claimants are refused without changing slot bytes. After a proven healthy release, racing claimants yield exactly one owner, and the durable ledger matches the winner.
+3. **Cancellation, crash and restart:** interrupt the writer; separately terminate the client and daemon at documented boundaries; restart and replay the same operation IDs. Each ambiguous result stays `uncertain`, retains its budget reservation and refuses both acquire and eviction.
+4. **Retained-handle and escaped-writer fixtures:** cover inherited and duplicated descriptors, writable mapping if supported, a child that changes group/identity/cwd, path reopen after apparent completion, descriptor transfer to an unrelated same-user process, and a separately started same-user writer. After healthy release, every stale write/reopen must be denied or isolated from the currently reusable generation. Any unexplained writer or unobservable handle fails the proof.
+5. **Capture binding:** bind the fixture source commit/tree, selector and arguments, exact toolchain, checkout/slot paths, consumer/run/attempt IDs and output digests. Preserve per-run stdout/stderr and receipt independently of the intermediate slot. Capture completion never substitutes for writer completion.
+6. **Review replay:** at most one healthy release/reacquire case and one retained-handle or interruption case, independently at the exact reviewed head. Reviewer challenges the release proof, event-loss/restart coverage and whether fixture behavior covers each claimed writer class.
+
+Use task-owned fixtures only; never link them to real Queue/Nucleus checkouts. Count the entire disposable footprint, including fixture roots, slot, forced `TMPDIR`/`TMP`/`TEMP` directory and captures, against an enforced 10 GiB cap. Require at least 20 GiB free at start, monitor at an interval no slower than one minute and at protocol boundaries, and abort/report if a reading is below 20 GiB or unavailable; record sampling overshoot and unrelated-writer races. Neither this outline nor the prior ruling authorizes volume creation, system-extension installation, entitlement requests, builds or execution.
+
+Queue/Nucleus keep admission, identity, settlement, retention and capture. Oxide owns slot leases and the proof that all writers have ended or been fenced; otherwise the slot stays unavailable.
