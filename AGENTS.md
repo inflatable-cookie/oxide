@@ -1,6 +1,6 @@
 # Oxide
 
-Oxide is a Rust-oriented development efficiency/DX project. Read [docs/README.md](docs/README.md), then the owning knowledge files before changing anything.
+Oxide aims to make Rust development easy and light, with ease of use as its primary product axis. Read [docs/README.md](docs/README.md), then the owning knowledge files before changing anything.
 
 ## Ownership and work
 
@@ -10,7 +10,7 @@ Tom's scope and authority ruling lives in [vision](docs/knowledge/vision.md); st
 
 ## Guardrails
 
-Current authorization covers registration/claim, knowledge bootstrap and a proposed design/qualification brief. No builds, installs, cache cleanup, live changes, settings, scheduler or wire mutations, releases, tags, workflow changes, new workers or tasks. Do not prompt or mutate active Nucleus work. Resolve the repo-owned RustQuality profile/deviations before future Rust authoring; no assumed MSRV.
+Current authorization covers registration/claim, repository knowledge, read-only research, planning and proposed briefs. No builds, installs, cache cleanup, live changes, settings, scheduler or wire mutations, releases, tags, workflow changes, new workers or tasks. Do not prompt or mutate active Nucleus work. Resolve the repo-owned RustQuality profile/deviations before future Rust authoring; no assumed MSRV.
 
 When a change alters current truth, update its owning knowledge file in the same PR. Record operator rulings before yielding.
 

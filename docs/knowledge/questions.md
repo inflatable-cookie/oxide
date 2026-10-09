@@ -19,3 +19,15 @@ Candidate: Nucleus core-test Effigy selector at one fixed exact head and two dis
 ## Q-005 — What names are safe to publish?
 
 Review executable/crate/distribution names against the existing Oxide Computer Company SDK/CLI before publication. Owner: [release](contracts/release.md).
+
+## Q-006 — What experience and budgets define light Rust development?
+
+Choose baseline projects and edit/check/test/worktree scenarios, then set acceptable disk footprint, write volume, feedback latency, memory and operator-effort targets. Tom's direction is confirmed; numeric targets are not. Owner: [vision](vision.md).
+
+## Q-007 — How should Oxide consume upstream caching and existing tools?
+
+Identify supported capability/version boundaries and keep policy independent of replaceable mechanisms. The accepted Cargo cross-workspace-cache goal is direction, not installed capability proof. Owner: [Rust DX landscape](rust-dx-landscape.md).
+
+## Q-008 — Which host/container division preserves required production parity?
+
+Coordinate Rust-specific recommendations with Effigy's language-neutral execution routes. Native feedback, Linux builds/tests and Colima storage need separate measurements and ownership. Owner: [vision](vision.md).

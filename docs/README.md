@@ -1,9 +1,10 @@
 # Oxide documentation
 
-Oxide is a separate Rust-oriented facility intended for reuse by Queue and Nucleus. Its initial boundary is bounded build storage; a daemon is a candidate architecture.
+Oxide aims to make Rust development easy and light: predictable storage, less build churn and a fast, understandable feedback loop. Bounded reusable build storage is its first foothold. Queue and Nucleus should consume the same reusable facility; a daemon is one candidate architecture.
 
 - [Vision and operator ruling](knowledge/vision.md)
 - [Storage invariants and authority boundaries](knowledge/architecture.md)
+- [Rust DX research landscape](knowledge/rust-dx-landscape.md)
 - [Open decisions](knowledge/questions.md)
 - [Knowledge map](knowledge/README.md)
 - [Release contract](knowledge/contracts/release.md)
