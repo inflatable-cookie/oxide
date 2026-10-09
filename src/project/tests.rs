@@ -6,7 +6,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -302,12 +302,10 @@ impl ProjectConsumerBoundary for FixtureConsumer {
         self.submit_calls += 1;
         assert_eq!(request.selector, "test:fixture");
         assert_eq!(request.workflow, "rust:test");
-        assert!(
-            request
-                .cargo_build_dir
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("slot-"))
-        );
+        assert!(request
+            .cargo_build_dir
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("slot-")));
         assert_ne!(request.cargo_build_dir, request.cargo_target_dir);
         assert_ne!(request.cargo_target_dir, request.capture_dir);
         let overrides = request.cargo_directory_overrides();
@@ -908,12 +906,10 @@ fn native_fixture_child_completion_releases_and_reuses_the_same_slot() {
         second_consumer.last_terminal_outcome,
         Some(TerminalOutcome::Passed)
     );
-    assert!(
-        adapter.observations()[1]
-            .events
-            .iter()
-            .any(|event| matches!(event.kind, ObservationKind::Acquired { reused: true, .. }))
-    );
+    assert!(adapter.observations()[1]
+        .events
+        .iter()
+        .any(|event| matches!(event.kind, ObservationKind::Acquired { reused: true, .. })));
     assert!(second_invocation.capture_dir.join("stdout.log").is_file());
     assert_eq!(second_runner.launched_children(), 1);
     write_free_space_record(&space, &root);
@@ -1385,29 +1381,21 @@ fn fixture_adapter_resolves_acquires_captures_and_finalizes() {
     assert_eq!(observations[0].selector, "test:fixture");
     assert_eq!(observations[0].commit, invocation.commit);
     assert_eq!(observations[0].backend, "cargo-build-dir");
-    assert!(
-        observations[0]
-            .events
-            .iter()
-            .any(|event| matches!(&event.kind, ObservationKind::CaptureCompleted { .. }))
-    );
-    assert!(
-        format!("{:?}", observations)
-            .find("admission-proof")
-            .is_none()
-    );
-    assert!(
-        format!("{:?}", observations)
-            .find("fixture-private-value")
-            .is_none()
-    );
+    assert!(observations[0]
+        .events
+        .iter()
+        .any(|event| matches!(&event.kind, ObservationKind::CaptureCompleted { .. })));
+    assert!(format!("{:?}", observations)
+        .find("admission-proof")
+        .is_none());
+    assert!(format!("{:?}", observations)
+        .find("fixture-private-value")
+        .is_none());
     assert!(observations[0].events.len() <= MAX_EVENTS_PER_RUN);
-    assert!(
-        observations[0]
-            .events
-            .iter()
-            .all(|event| format!("{:?}", event).len() <= MAX_EVENT_BYTES)
-    );
+    assert!(observations[0]
+        .events
+        .iter()
+        .all(|event| format!("{:?}", event).len() <= MAX_EVENT_BYTES));
 }
 
 #[test]
@@ -1634,12 +1622,10 @@ fn capture_failure_keeps_storage_unavailable() {
             .state,
         SlotState::Uncertain
     );
-    assert!(
-        adapter.observations()[0]
-            .events
-            .iter()
-            .any(|event| matches!(&event.kind, ObservationKind::CaptureUnavailable))
-    );
+    assert!(adapter.observations()[0]
+        .events
+        .iter()
+        .any(|event| matches!(&event.kind, ObservationKind::CaptureUnavailable)));
 }
 
 #[test]
@@ -1834,12 +1820,10 @@ fn pre_cancel_and_unsupported_cargo_do_not_acquire() {
         ExecutionDisposition::Refused(AdapterRefusal::UnsupportedToolchain)
     );
     assert_eq!(consumer.submit_calls, 0);
-    assert!(
-        daemon
-            .client
-            .inventory("no-old-cargo-slot")
-            .unwrap()
-            .slots
-            .is_empty()
-    );
+    assert!(daemon
+        .client
+        .inventory("no-old-cargo-slot")
+        .unwrap()
+        .slots
+        .is_empty());
 }

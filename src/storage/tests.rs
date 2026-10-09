@@ -1,10 +1,10 @@
 use super::*;
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::{mpsc, Arc, Barrier};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -361,16 +361,12 @@ fn acquire_retry_reuses_lease_and_changed_identity_conflicts() {
     assert_eq!(retry, grant);
     let token = retry.token.as_ref().expect("active lease token");
     let ledger = fs::read(root.path().join("ledger.bin")).expect("read task ledger");
-    assert!(
-        !ledger
-            .windows(token.value().len())
-            .any(|window| window == token.value().as_bytes())
-    );
-    assert!(
-        !ledger
-            .windows(b"admission-proof".len())
-            .any(|window| window == &b"admission-proof"[..])
-    );
+    assert!(!ledger
+        .windows(token.value().len())
+        .any(|window| window == token.value().as_bytes()));
+    assert!(!ledger
+        .windows(b"admission-proof".len())
+        .any(|window| window == &b"admission-proof"[..]));
 
     let changed = request("attempt-a", "different-acquire", 64);
     assert_eq!(daemon.client.acquire(changed), Err(StorageError::Conflict));
@@ -584,11 +580,9 @@ fn finalize_is_idempotent_and_only_idle_owned_slots_are_evicted() {
         "capture-proof",
         "guardian-proof",
     ] {
-        assert!(
-            !ledger
-                .windows(secret.len())
-                .any(|window| window == secret.as_bytes())
-        );
+        assert!(!ledger
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()));
     }
     let measured = daemon.client.inventory("idle").expect("inventory").slots[0]
         .measured_bytes
@@ -624,14 +618,12 @@ fn finalize_is_idempotent_and_only_idle_owned_slots_are_evicted() {
         fs::read(&sentinel).expect("outside sentinel remains"),
         b"outside the slot"
     );
-    assert!(
-        daemon
-            .client
-            .inventory("after-evict")
-            .expect("inventory")
-            .slots
-            .is_empty()
-    );
+    assert!(daemon
+        .client
+        .inventory("after-evict")
+        .expect("inventory")
+        .slots
+        .is_empty());
 }
 
 #[test]
@@ -644,14 +636,12 @@ fn unknown_free_space_fails_closed_before_a_slot_is_created() {
             .acquire(request("attempt-no-free", "acquire-no-free", 1)),
         Err(StorageError::Refused(RefusalReason::FreeSpaceUnavailable))
     );
-    assert!(
-        daemon
-            .client
-            .inventory("unknown-free")
-            .expect("inventory")
-            .slots
-            .is_empty()
-    );
+    assert!(daemon
+        .client
+        .inventory("unknown-free")
+        .expect("inventory")
+        .slots
+        .is_empty());
 }
 
 #[test]

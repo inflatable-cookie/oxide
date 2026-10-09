@@ -6,8 +6,8 @@ mod resolve;
 mod tests;
 
 pub use observations::{
-    MAX_EVENT_BYTES, MAX_EVENTS_PER_RUN, OBSERVATION_RING_BYTES, ObservationEvent, ObservationKind,
-    RunObservation, WriteAttribution,
+    ObservationEvent, ObservationKind, RunObservation, WriteAttribution, MAX_EVENTS_PER_RUN,
+    MAX_EVENT_BYTES, OBSERVATION_RING_BYTES,
 };
 pub use resolve::{
     EffectiveBuildInputs, EffectiveInputSet, EffectiveValue, ProjectDescriptor, ProjectInvocation,

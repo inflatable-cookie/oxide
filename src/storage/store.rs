@@ -1,4 +1,4 @@
-use super::codec::{Decode, Encode, Reader, Writer, decode_vec, encode_vec};
+use super::codec::{decode_vec, encode_vec, Decode, Encode, Reader, Writer};
 use super::transport;
 use super::types::*;
 use sha2::{Digest, Sha256};
@@ -9,8 +9,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 use std::time::Duration;
 
 const LEDGER_MAGIC: &[u8; 8] = b"OXIDEST1";
@@ -120,19 +120,17 @@ impl Daemon {
         let (accepted_sender, accepted_receiver) = mpsc::sync_channel(32);
         let accept_thread = std::thread::Builder::new()
             .name("oxide-storage-accept".to_owned())
-            .spawn(move || {
-                loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            if accepted_sender.send(Ok(stream)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(error) => {
-                            let _ = accepted_sender.send(Err(error));
+            .spawn(move || loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if accepted_sender.send(Ok(stream)).is_err() {
                             break;
                         }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        let _ = accepted_sender.send(Err(error));
+                        break;
                     }
                 }
             })
@@ -1210,7 +1208,7 @@ fn release_proven(
                         || (completion.exit_code > 0 && terminal.outcome == TerminalOutcome::Failed)
                 })
                 && valid_digest(&completion.workflow_definition_digest)
-                && valid_digest(&completion.repository_head)
+                && valid_repository_head(&completion.repository_head)
                 && valid_digest(&completion.fixture_source_digest)
                 && valid_digest(&completion.stdout_digest)
                 && valid_digest(&completion.stderr_digest)
@@ -1224,6 +1222,10 @@ fn release_proven(
 fn valid_digest(value: &str) -> bool {
     let value = value.strip_prefix("sha256:").unwrap_or(value);
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_repository_head(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn valid_id(value: &str) -> bool {
