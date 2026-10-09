@@ -1,0 +1,20 @@
+{
+  "deviations_file": "docs/knowledge/contracts/rust-quality-deviations.json",
+  "exclusions": {
+    "generated": [],
+    "vendored": []
+  },
+  "language": "rust",
+  "msrv": {
+    "cargo_manifests": [
+      "Cargo.toml"
+    ],
+    "source": "repository_policy",
+    "toolchain_policy_paths": [
+      "rust-toolchain.toml"
+    ],
+    "when_unresolved": "stop"
+  },
+  "profile": "strict",
+  "schema_version": "1.0.0"
+}

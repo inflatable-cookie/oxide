@@ -14,12 +14,28 @@ Tom authorized planning and queueing the next bounded tranche on 2026-10-09. App
 
 When a change alters current truth, update its owning knowledge file in the same PR. Record operator rulings before yielding.
 
+## Effigy command map
+
+- `effigy rust:compile` checks the workspace and all targets with the committed lockfile.
+- `effigy rust:format` checks Rust formatting.
+- `effigy test rust` is the named Rust test suite for future repository tests. Do not add a `tasks.test` alias.
+- `effigy docs:check` runs the Northstar link and retired-concept checks plus `git diff --check HEAD`. The link check excludes `docs/knowledge/architecture.md`, whose references to optional sibling repositories are unavailable in a standalone checkout.
+
+There is no product QA selector yet. Use the focused selectors above; they do not replace milestone QA.
+
 ## Documentation validation
 
-There is no product build or repository QA selector yet. Documentation-only bootstrap uses installed Northstar checks from this checkout:
+Use `effigy docs:check` for repository documentation changes. Check its exit code. These checks do not establish product validation success. Future implementation briefs must name targeted repository selectors and respect Queue's validation policy. Release rules live in [release](docs/knowledge/contracts/release.md).
 
-- `effigy skill run northstar/check-links`
-- `effigy skill run northstar/retired-concepts`
-- `git diff --check`
+<!-- northstar:rust-quality:start -->
+## Northstar Rust Quality
 
-Check exit codes. These checks do not establish product validation success. Future implementation briefs must name targeted repository selectors and respect Queue's validation policy. Release rules live in [release](docs/knowledge/contracts/release.md).
+Scope: Rust source, Cargo manifests, build files, tests, and directly related
+documentation under this directory.
+
+Use Northstar's strict everyday-authoring route for ordinary Rust work. Resolve
+the repository-owned profile and deviations under `docs/knowledge/contracts/`; never
+assume a universal MSRV. Re-enter at task start and coherent batch closeout.
+Preserve unrelated work. A quality audit, no-slop pass, or audit-and-fix request
+is explicit audit intent; never route it through everyday authoring.
+<!-- northstar:rust-quality:end -->
