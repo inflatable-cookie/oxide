@@ -98,6 +98,8 @@ An unknown, changing or path-sensitive input is not silently omitted to improve 
 
 Production keys remain checkout-isolated until different-path portability passes an operator-approved source-path contract. The [design-only portability proposal](qualification-readiness.md#portable-source-identity-proposal-design-only-2026-10-09) would qualify rustc path remapping for a finite set of roots registered before the first build. Its complete flag map is compatibility input: Cargo 1.97.1 checks Rust-flag changes for freshness, so a changed root set must miss. This remaps compiler source names only; it does not normalize manifest, generated or runtime paths. The original A/B absolute-path proof remains binding until the operator explicitly accepts logical source paths.
 
+Queue's ad hoc worktrees normally have unique roots, so adding each new root changes that map and starts a cold partition. Remapping can amortize only over a stable, repeatedly reused checkout pool; that pool is not established. If it cannot be kept stable, stop the remapping candidate for that workflow and state that worktree duplication remains unsolved. Reassess at each supported Cargo/rustc upgrade. Retire remapping only when shipped Cargo support and a fresh exact-path qualification pass the same full-debug/source-lookup, behavior-path, source/config/toolchain miss, exact-run receipt, ownership and bounded-capacity gates without a per-root map. A roadmap is not enough. The portability proposal records the strict/logical pass predicates and limits; logical paths still require an explicit operator decision.
+
 ### Semantic operations
 
 These operation names describe a future protocol, not an existing command or API.

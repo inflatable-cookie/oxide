@@ -464,6 +464,19 @@ proposed; no Cargo or debugger integration is shipped. Keep full debug info.
 Do not use debuginfo=0, strip symbols, or remove path flags to hide the
 failure.
 
+**Registered-root cost in Queue's workflow:** disposable Queue worktrees
+normally receive a new physical root per task. Because the complete ordered
+root map and its digest are compatibility inputs, adding a worktree changes
+the compiler flags and creates a cold partition for that map. Reuse can
+amortize that registration cost only when the same finite checkout pool is
+reused across repeated runs. A stream of one-use roots can keep resetting the
+map and erase the expected saving; no stable Queue checkout pool is established
+by this design. A fresh qualification must measure root-set reuse. If the
+workflow cannot keep a finite pool stable, stop this candidate for Queue's
+ad-hoc worktrees, retain checkout-isolated partitions, and report that the
+dominant duplication problem remains unsolved. Do not grow the root map
+silently or claim arbitrary-root reuse.
+
 **Operator decision required:** accepting the logical prefix for compiler
 source names, file!() and panic locations would replace the original strict
 requirement that a B-run binary contain B-absolute paths and no A-absolute
@@ -473,6 +486,39 @@ may pass on logical paths alone. Behavior-bearing paths still need to resolve
 and behave against the exact requested tree; any stale A resource path,
 unresolved path class or missing source evidence fails closed. Production
 partitions remain checkout-isolated.
+
+The next brief must name the path gate before running. In **strict mode** (the
+default until an operator ruling changes it), pass only when every inspected
+reference to this project's source in the reused B artifacts contains B's
+exact absolute root and none contains A's root; third-party and toolchain paths
+are classified separately. The full-debug scan and exact B source lookup must
+be present, tests must execute at B, and the run receipt must bind the
+compile-origin tree, requested B tree, slot lease and artifact digest; private
+captures must bind to that B run. An observed A or other project-source root
+is a failure; a missing artifact, scan or binding is insufficient. The
+recommended fixed A+B remap emits a logical project path, so it cannot pass
+this strict predicate; unless a mechanism preserves B-absolute paths, no
+cross-path claim can pass strict mode.
+
+In **logical mode**, run only after Tom explicitly accepts the logical-path
+contract. Pass only when every inspected project-source reference in compiler
+source/debug fields contains the agreed logical prefix and neither physical
+root, the run-private mapping binds that prefix to B's exact tree and resolves
+every inspected source to the expected B file, and `file!()`/panic-location
+values match the accepted contract. If an Apple linker OSO entry is emitted,
+it must satisfy the selected gate too; the documented rustc remap does not
+rewrite it, so a physical A/B entry fails unless a separately supported,
+identity-bound treatment is approved. In either mode, a path-behavior
+evidence matrix must show that in-scope `CARGO_MANIFEST_DIR`, `include!`,
+build-script inputs and runtime resources resolve against B, while `OUT_DIR`,
+generated outputs and proc-macro inputs belong to the active leased generation
+and reflect B's exact source tree. No behavior-bearing path may resolve to
+stale A, and the selected tests must pass at B. An observed mismatch fails; a
+required but unobservable path class or missing evidence is insufficient and
+fails closed.
+A logical-path result does not claim interactive debugger integration; if
+that is part of the accepted contract, the pilot must stop until an exact-B
+debugger source lookup is available and qualified.
 
 ### Bounded follow-up proposal (not authorized)
 
@@ -490,22 +536,30 @@ The slot retains only reusable Cargo intermediates and their compile-origin
 evidence. Use the existing reviewed lease, resource, local receipt and
 cooperative completion machinery without widening it.
 
-A fresh Queue brief could qualify the following six ordered scenarios:
+A fresh Queue brief could qualify five ordered scenarios. Begin with all three
+miss controls; do not begin the shared-slot pair unless each control passes:
 
-1. Build the exact approved tree at A into a private reference build directory
-   and run the selected tests.
-2. Apply the one freshly approved marker change at B, reuse that same private
-   reference directory, and prove affected units miss; run tests. Record the
-   changed tree separately from the baseline tree. Restore B only after the
-   run settles and its evidence is captured, and verify B's exact baseline tree
-   before the shared-slot pair; that restoration needs fresh authority too.
-3. Prove effective-configuration key separation or refusal without building.
-4. Prove toolchain key separation or refusal without building or installing a
-   toolchain. Use already-installed 1.96.1 only if fresh preflight confirms it.
-5. Build the approved baseline tree cold at A in the exclusive shared slot;
-   run tests.
-6. Run the same baseline tree warm at B in that slot; require zero appropriate
-   rebuilds, tests at B, the accepted path gate and exact-run captures.
+1. **Source miss:** build the exact approved baseline tree at A into a private
+   reference build directory and run tests; then apply one freshly approved
+   marker change at B, reuse that directory, and prove affected units rebuild
+   before running tests. Record both tree digests. Restore B only after the
+   run settles and evidence is captured, with fresh restore authority, then
+   verify B is exactly back at baseline.
+2. **Configuration miss:** prove effective-configuration key separation or
+   refusal without building.
+3. **Toolchain miss:** prove toolchain key separation or refusal without
+   building or installing a toolchain. Use already-installed 1.96.1 only if
+   fresh preflight confirms it.
+4. **Cold shared-slot run:** build the approved baseline at A in the exclusive
+   shared slot and run tests.
+5. **Different-path warm run:** run the same baseline at B in that slot, run
+   tests at B, and require zero appropriate rebuilds, the preselected strict
+   or operator-approved logical path gate, and exact-run captures.
+
+Before authorizing scenario 5, the brief must record the operator's path
+contract decision. The fixed A+B map emits logical paths, so if Tom declines
+that contract and no B-absolute-path-preserving mechanism is in scope, stop
+after the miss controls; do not run the cross-path pair or report portability.
 
 The complete A+B path map must be fixed before scenario 1 and remain identical
 for every compile. The source, selector, exact toolchains, paths, map and one
@@ -520,15 +574,18 @@ image or its contents.
 
 Proposed fresh bounds are one new task-owned fixed 8 GiB APFS image, two
 independent disposable checkouts, one exclusive slot, one private reference
-build directory, and per-run private captures. Count the entire disposable
-footprint against a 10 GiB ceiling and retain the monitored 20 GiB host free
-space start/abort threshold. Allow 90 minutes for the worker including setup
-and all six scenarios, then 30 minutes for exact-head independent review; no
-retry, scenario expansion or budget extension. Run tests on every scenario
-that builds. Stop at the first miss-control failure, path-gate failure,
-uncertain ownership/capture or resource threshold; preserve the slot and
-evidence. The independent reviewer inspects the receipts and replays at most
-one warm run and one meaningful miss within the 30-minute cap.
+build directory, and per-run private captures. The image's filesystem capacity
+is capped at 8 GiB. The separate 10 GiB ceiling counts the entire disposable
+footprint, including the image and any task files outside it; no data may spill
+outside that footprint. Enforce both limits and stop at the first reached.
+Retain the monitored 20 GiB host free-space start/abort threshold. Allow 90
+minutes for the worker including setup and all five scenarios, then 30 minutes
+for exact-head independent review; no retry, scenario expansion or budget
+extension. Run tests on every scenario that builds. Stop at the first
+miss-control failure, path-gate failure, uncertain ownership/capture or
+resource threshold; preserve the slot and evidence. The independent reviewer
+inspects the receipts and replays at most one warm run and one meaningful miss
+within the 30-minute cap.
 
 This scope can qualify only the selected workflow and pre-registered roots.
 If the logical-path decision is declined, the strict A/B path requirement
@@ -540,7 +597,7 @@ worktree duplication.
 
 ## Preserved real-build pilot outline (not authorized)
 
-This earlier outline remains a separate, unapproved real-build pilot. The six native fixture scenarios above are the current completion-boundary task; they do not authorize Cargo performance measurement or a consumer run. Any later pilot needs its own Queue brief, host/consumer scope, and independent review. Do not inherit execution authority from the fixture task.
+This earlier outline remains a separate, unapproved real-build pilot. The five proposed portability scenarios above are a separate design proposal; they do not authorize Cargo performance measurement or a consumer run. Any later pilot needs its own Queue brief, host/consumer scope, and independent review. Do not inherit execution authority from the fixture task.
 
 1. **Healthy release and reacquire:** one task-owned writer performs a bounded write, exits normally, and produces a capture receipt. The mechanism must prove no stale process or handle can mutate the slot; finalize durably; then a competing run reacquires and verifies the expected prior contents. Root exit or capture alone is an explicit negative control, not success.
 2. **Competing ownership:** while leased, concurrent second claimants are refused without changing slot bytes. After a proven healthy release, racing claimants yield exactly one owner, and the durable ledger matches the winner.
