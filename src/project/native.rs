@@ -288,6 +288,41 @@ pub(super) struct NativeChildStarted {
     pub start_identity: String,
 }
 
+/// Inputs supplied by the registered Cargo runner. The storage core still verifies them.
+pub(super) struct CargoCompletion {
+    pub claim: NativeExecutionClaim,
+    pub repository_head: String,
+    pub workflow_definition_digest: String,
+    pub fixture_source_digest: String,
+    pub process: ProcessIdentityEvidence,
+    pub free_space_samples: Vec<u64>,
+    pub exit_code: i32,
+    pub stdout_digest: String,
+    pub stderr_digest: String,
+    pub capture_digest: String,
+    pub output_references: Vec<String>,
+}
+
+impl NativeCompletionCertificate {
+    /// Issued only by the registered Cargo runner after a normal exit and complete capture.
+    pub(super) fn cargo(parts: CargoCompletion) -> Self {
+        Self {
+            claim: parts.claim,
+            repository_head: parts.repository_head,
+            workflow_definition_digest: parts.workflow_definition_digest,
+            fixture_source_digest: parts.fixture_source_digest,
+            process: parts.process,
+            free_space_samples: parts.free_space_samples,
+            exit_code: parts.exit_code,
+            stdout_digest: parts.stdout_digest,
+            stderr_digest: parts.stderr_digest,
+            capture_digest: parts.capture_digest,
+            output_references: parts.output_references,
+            native: true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ChildBehavior {
     Complete,

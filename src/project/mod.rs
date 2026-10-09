@@ -1,3 +1,4 @@
+mod cargo;
 mod native;
 mod observations;
 mod resolve;
@@ -10,8 +11,8 @@ pub use observations::{
     MAX_EVENT_BYTES, OBSERVATION_RING_BYTES,
 };
 pub use resolve::{
-    EffectiveBuildInputs, EffectiveInputSet, EffectiveValue, ProjectDescriptor, ProjectInvocation,
-    ToolchainInput, WorkflowOptIn,
+    EffectiveBuildInputs, EffectiveInputSet, EffectiveValue, PathIdentity, ProjectDescriptor,
+    ProjectInvocation, ToolchainInput, WorkflowOptIn,
 };
 
 use crate::storage::{

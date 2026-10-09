@@ -312,6 +312,35 @@ Next gate: a ruling on the Cargo start-identity model and the sample/budget
 bounds, then a Cargo-specific executor with its own review. Scenario 1 starts
 only after that. The volume and enforceable cap are ready to use.
 
+## Standalone Cargo pilot: runner landed, execution not run (2026-10-09)
+
+Oxide now contains an experimental registered Cargo runner (`src/project/cargo.rs`)
+and an ignored standalone pilot driver (`src/project/tests/cargo_pilot.rs`). Both
+are unpublished and test-only in use. The runner launches the pinned Effigy
+selector in its own process group, binds a per-spawn start marker, samples host
+free space every 30 seconds, and issues a native completion certificate only after
+a normal exit with no leftover group members. Any other outcome returns an error,
+so the adapter keeps the lease uncertain.
+
+Two deliberate choices:
+
+- The storage completion bound of 16 free-space samples is unchanged. When full,
+  adjacent samples merge to their minimum. Every raw reading stayed at or above the
+  20 GiB threshold, or the run aborted.
+- Trial-only partition identity is `PathIdentity::DisposableRoot`. Checkouts under
+  one declared root share a key. Environment, toolchain and configuration digests
+  still separate partitions. The default remains `PathIdentity::Checkout`.
+
+Validation at this head: `effigy test rust` passed with 33 tests and 1 ignored
+pilot test. The suite needs `OXIDE_TASK_SCRATCH_ROOT`, `TMPDIR`, `TMP` and `TEMP` set
+to one fresh canonical directory. Without them, 27 reviewed fixture and storage tests
+fail on environment assertions.
+
+Not yet executed: the six-scenario Cargo pilot. The run was denied by the host
+auto-mode classifier, so no Cargo scenario ran and this section records no reuse,
+rebuild, path or benefit evidence. Preflight evidence is recorded above. The next
+step is an explicitly approved execution path for the ignored pilot driver.
+
 ## Preserved real-build pilot outline (not authorized)
 
 This earlier outline remains a separate, unapproved real-build pilot. The six native fixture scenarios above are the current completion-boundary task; they do not authorize Cargo performance measurement or a consumer run. Any later pilot needs its own Queue brief, host/consumer scope, and independent review. Do not inherit execution authority from the fixture task.

@@ -10,6 +10,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+mod cargo_pilot;
+
 static NEXT_ROOT: AtomicUsize = AtomicUsize::new(1);
 
 struct FixtureRoot {
@@ -640,6 +642,7 @@ fn fixture_invocation_named(root: &FixtureRoot, name: &str) -> ProjectInvocation
                 required_slot_bytes: 64,
                 cargo_config_keys: vec!["build.rustflags".to_owned()],
                 environment_keys: vec!["RUSTFLAGS".to_owned(), "SDKROOT".to_owned()],
+                path_identity: PathIdentity::Checkout,
             }],
         },
         workflow: "rust:test".to_owned(),

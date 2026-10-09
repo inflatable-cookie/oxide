@@ -6,6 +6,16 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// How checkout identity enters the compatibility key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PathIdentity {
+    /// Default key: the canonical checkout path is part of identity.
+    Checkout,
+    /// Trial-only key: checkouts under one declared disposable root share a key.
+    /// Every other effective input still separates partitions.
+    DisposableRoot { root: PathBuf },
+}
+
 /// An opted-in workflow and the inputs it permits the adapter to resolve.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkflowOptIn {
@@ -16,6 +26,7 @@ pub struct WorkflowOptIn {
     pub required_slot_bytes: u64,
     pub cargo_config_keys: Vec<String>,
     pub environment_keys: Vec<String>,
+    pub path_identity: PathIdentity,
 }
 
 /// Minimal project declaration. Opt-in is exact to a workflow and selector.
@@ -208,10 +219,19 @@ fn resolve_selected(
     if paths_overlap(&target_dir, &capture_dir) {
         return Err(AdapterRefusal::AmbiguousInput);
     }
-    let path_identity = workspace_root
-        .to_str()
-        .ok_or(AdapterRefusal::UnsupportedInput)?
-        .to_owned();
+    let path_identity = match &workflow.path_identity {
+        PathIdentity::Checkout => workspace_root
+            .to_str()
+            .ok_or(AdapterRefusal::UnsupportedInput)?
+            .to_owned(),
+        PathIdentity::DisposableRoot { root } => {
+            let root = canonical_directory(root)?;
+            if workspace_root == root || !workspace_root.starts_with(&root) {
+                return Err(AdapterRefusal::UnsupportedInput);
+            }
+            "disposable-root".to_owned()
+        }
+    };
     let project_component = format!(
         "{}:{}",
         invocation.descriptor.project_id, invocation.descriptor.component_id
