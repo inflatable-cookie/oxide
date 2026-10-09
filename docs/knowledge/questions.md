@@ -31,3 +31,7 @@ Identify supported capability/version boundaries and keep policy independent of 
 ## Q-008 — Which host/container division preserves required production parity?
 
 Coordinate Rust-specific recommendations with Effigy's language-neutral execution routes. Native feedback, Linux builds/tests and Colima storage need separate measurements and ownership. Owner: [vision](vision.md).
+
+## Q-009 — Which alternative execution modes improve the daily loop?
+
+JIT, Cranelift and other code generation/execution solutions are confirmed research scope. Compare fast ahead-of-time compilation, JIT and hot reload by complete edit-to-feedback cost and supported semantics. Mechanisms, compatibility and validation mapping remain open. Owner: [Rust DX landscape](rust-dx-landscape.md); priority ruling: [vision](vision.md).
