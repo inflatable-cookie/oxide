@@ -265,6 +265,53 @@ Minimum evidence is what can **falsify** ownership, reuse, path/proc-macro corre
 4. Exact-head path-correctness and generated-code/proc-macro checks before any cross-path reuse claim; failed portability means path-isolated partitions and lower expected benefit.
 5. Queue/Nucleus owner mapping for adapter identity, scheduling, cancellation, settlement and capture. Preserve frozen Contract010, Nucleus Contract002, and the existing pilot hold until that mapping is reviewed.
 
+## Standalone Cargo pilot attempt: preflight and storage (2026-10-09)
+
+Queue task 005 was dispatched under Tom's standalone Cargo pilot approval. This
+section records what ran before any Cargo scenario. No Cargo build, test run or
+slot lease was executed, so this section adds no reuse, rebuild, path or
+benefit evidence.
+
+Passed:
+
+- Source pin: `bca75ed0143f96cd20b88ff72a421f1fb5f4ef19` and tree
+  `67ecef91c907ca4085d94ea242b62f678c92993f` are present in the read-only
+  Nucleus object store. The pinned `effigy.toml` defines
+  `check:core:test` as `cargo test --offline {args}`.
+- Toolchain: `/Users/tom/.cargo/bin/cargo` and `rustc` report 1.97.1. The
+  rustup 1.96.1 install is present for the key-separation control.
+- Offline inputs: `cargo fetch --offline --locked` and
+  `cargo metadata --offline --locked` succeed in the disposable clone.
+- Storage: task root `/private/var/tmp/oxide-cargo-8e87a74d` was fresh, mode
+  0700. `hdiutil create -size 8g -type SPARSE -fs APFS` made
+  `pilot.sparseimage`. `hdiutil attach -nobrowse` mounted `disk5s1` at `m/`.
+  `diskutil` reported an APFS container of 8,380,178,432 bytes, about 7.8 GiB.
+  Every disposable path, including the two clones, lives on that container, so
+  the container's capacity bounds their writes. Shared `CARGO_HOME` is excluded
+  existing state. Overhead, snapshots and backing-file growth are not measured.
+- Clones: two `git clone --no-local` copies of the pinned commit, `m/a` and
+  `m/b`, each at the pinned tree with a clean status.
+- Host free space: about 752 GiB free on the boot volume (`df`) at setup. The
+  20 GiB monitored threshold was not reached.
+- Image lifecycle: the image was detached with ordinary `hdiutil detach` of its
+  recorded device. The task root and sparse file are retained for a continuation.
+
+Blocked before Cargo: the reviewed native completion path cannot yet qualify a
+real Cargo tree. Current limits, verified by reading `src/project/native.rs`:
+
+- `NativeCompletionCertificate::matches` accepts at most 16 free-space samples.
+  At the 30-second interval that covers about eight minutes, so a longer
+  build would be refused.
+- The fixture budget walk allows 16 files, 1 MiB per file and eight children.
+  Real Cargo output exceeds those bounds.
+- The start identity is a per-spawn value echoed by the child. Cargo and rustc
+  cannot echo an Oxide marker. An env-marker plus recorded process start
+  identity would be a different proof and needs a narrow ruling.
+
+Next gate: a ruling on the Cargo start-identity model and the sample/budget
+bounds, then a Cargo-specific executor with its own review. Scenario 1 starts
+only after that. The volume and enforceable cap are ready to use.
+
 ## Preserved real-build pilot outline (not authorized)
 
 This earlier outline remains a separate, unapproved real-build pilot. The six native fixture scenarios above are the current completion-boundary task; they do not authorize Cargo performance measurement or a consumer run. Any later pilot needs its own Queue brief, host/consumer scope, and independent review. Do not inherit execution authority from the fixture task.
