@@ -509,6 +509,7 @@ fn decode_inventory(reader: &mut Reader<'_>) -> Result<Inventory, StorageError> 
 
 fn encode_acquire_result(writer: &mut Writer, result: &AcquireResult) -> Result<(), StorageError> {
     result.lease_id.encode(writer)?;
+    result.slot_id.encode(writer)?;
     result.state.encode(writer)?;
     match result.slot_path.as_ref() {
         Some(path) => {
@@ -530,6 +531,7 @@ fn encode_acquire_result(writer: &mut Writer, result: &AcquireResult) -> Result<
 
 fn decode_acquire_result(reader: &mut Reader<'_>) -> Result<AcquireResult, StorageError> {
     let lease_id = String::decode(reader)?;
+    let slot_id = String::decode(reader)?;
     let state = SlotState::decode(reader)?;
     let slot_path = match reader.u8()? {
         0 => None,
@@ -548,6 +550,7 @@ fn decode_acquire_result(reader: &mut Reader<'_>) -> Result<AcquireResult, Stora
     };
     Ok(AcquireResult {
         lease_id,
+        slot_id,
         state,
         slot_path,
         token,

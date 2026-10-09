@@ -48,7 +48,7 @@ Under a lease, the adapter sets `CARGO_BUILD_BUILD_DIR` to the selected Oxide in
 
 Effigy continues to launch the declared language-neutral selector and own selector/process/env lifecycle. The project adapter carries the Rust-specific identity and lease context. Queue/Nucleus (or the local developer) owns the cancellation decision; the adapter passes it to the process guardian. Before release, the completion boundary must establish writing completion within the supported workflow contract below, together with exact-run terminal and capture evidence. The daemon's service lifetime does not define the workflow's lifetime.
 
-**macOS completion gate:** the read-only [macOS readiness review](qualification-readiness.md#public-macos-fencing-candidates-reviewed) found no public mechanism proving release against arbitrary descendants, transferred handles and unrelated same-user writers. Tom subsequently approved the narrower supported workflow contract below. Its native completion boundary still requires implementation and independent qualification; the ruling alone does not make a real Cargo slot releasable. Interrupted, cancelled, crashed, restarted or lost-reply runs remain `uncertain`. No permanent-held-session design is accepted.
+**macOS completion gate:** the read-only [macOS readiness review](qualification-readiness.md#public-macos-fencing-candidates-reviewed) found no public mechanism proving release against arbitrary descendants, transferred handles and unrelated same-user writers. Tom subsequently approved the narrower supported workflow contract below. Oxide now has an unpublished native fixture boundary and six task-owned process scenarios for that contract; independent exact-head review is still required. This does not make a real Cargo slot releasable. Interrupted, cancelled, crashed, restarted or lost-reply runs remain `uncertain`. No permanent-held-session design is accepted.
 
 ### Supported writer model
 
@@ -57,6 +57,33 @@ Tom's ruling, 2026-10-09: initially support explicitly registered, trusted foreg
 Unrelated same-user processes and commands accessing managed storage outside the adapter are unsupported bypasses. Hidden violations of the workflow promise are not guaranteed detectable or fenced; this contract coordinates participating writers and supplies no OS security boundary against arbitrary same-user programs. Known leftover writers, unexpected process behavior, missing completion/capture evidence and ambiguous crash/cancel/restart/reply outcomes keep storage unavailable. Leader exit, PID absence, age and quiet scans alone do not establish completion.
 
 Healthy release requires completion evidence bound to the registered supported workflow and exact attempt, an authenticated terminal record, independently bound capture evidence and the durable idle transition. The native fixture task may qualify this limited boundary; actual Cargo/consumer workflow eligibility, cross-path reuse, resource enforcement and adoption remain separately gated.
+
+The native fixture boundary runs only a fixed test-harness entry point with an
+environment cleared and `TMPDIR`, `TMP` and `TEMP` forced under the fresh task
+scratch root. It holds the direct child handle, checks the child's PID and
+per-spawn marker, waits for normal exit, and bounds fixture children, files,
+file size and captured output before accepting completion. It records the
+repository head, fixture source/definition digests, lease and slot paths,
+host-run/run/attempt identities, process marker, exit result, free-space
+samples, and stdout/stderr/capture digests. The consumer capture receipt must
+match that exact run and local capture bundle; storage verifies a
+lease-token-bound completion MAC before making the durable transition to idle.
+The fixture protocol refuses an unknown free-space reading or less than 20 GiB,
+samples before and after work and during waits at 30-second intervals, and
+keeps its task-owned disposable footprint below 10 GiB. Those bounds cover the
+fixed fixture construction only; they do not impose a filesystem quota or cap
+arbitrary Cargo output.
+
+This evidence means the registered, trusted foreground fixture honored its
+promise to wait for its writing child and close its write handle before
+completion. It does not discover or fence an unregistered same-user writer,
+an undisclosed child, or a workflow that breaks the promise while hiding that
+departure. Such behavior is an unsupported bypass, not a passed negative
+control or an OS security boundary. A caller-supplied `FixtureCompletionProof`,
+leader exit, quiet scan or capture receipt alone cannot mint native completion.
+Cancellation, incomplete execution, missing/mismatched capture and ambiguous
+daemon/client outcomes remain unavailable even if a known fixture child is
+later reaped.
 
 The first-use path should be one explicit project/workflow opt-in, with the adapter resolving Cargo settings and toolchain identity instead of asking users to edit global Cargo configuration. Explain a valid miss by category (source, configuration, toolchain, path partition or unknown) and show the effective non-secret identity. Under pressure, explain measured/reserved bytes, the cap/reserve, the active or uncertain owner and the safe next action; never suggest deleting evidence or forcibly clearing an uncertain slot. Reconnect should retry the same operation identity and reconcile when proof is available. If proof is unavailable, report that the slot is being held and why, then fail closed. These are ease-of-use acceptance criteria, not new user-facing command names.
 
@@ -95,7 +122,7 @@ The unpublished `oxide-storage` crate contains a Unix-only daemon candidate with
 
 The ledger is atomically replaced through a private temporary file, file sync and root-directory sync before an operation reply. A 256-bit random lease token is SHA-256 hashed in the ledger. Consumer credentials are verified at the adapter boundary and stripped before persistence. If an acquire reply is lost while the daemon remains alive, the same run-attempt request returns its original lease. After daemon restart, every active lease becomes `uncertain`; retry returns no slot path. A client that lost the token can settle an uncertain lease only with authenticated reconciliation evidence.
 
-Slots partition by project/component, workflow, Cargo and rustc provenance, host/target, profile, features, configuration and environment digests, and checkout-path identity. Source and run identity are recorded on the lease. An exclusive lease remains held until authenticated terminal, capture and descendant-containment evidence is accepted. PID absence, age, socket ownership and daemon restart never release a slot. Eviction first persists an `evicting` state and only removes a known owned slot whose ledger state is idle; interrupted eviction resumes only that recorded deletion. Unknown root entries, corrupt records, unsafe paths or unknown accounting fail closed.
+Slots partition by project/component, workflow, Cargo and rustc provenance, host/target, profile, features, configuration and environment digests, and checkout-path identity. Source and run identity are recorded on the lease. An exclusive lease remains held until authenticated terminal, capture and completion evidence under the registered supported workflow is accepted. The current native fixture evidence applies only to its fixed cooperative child; it does not prove that arbitrary descendants or same-user writers ended. PID absence, age, socket ownership and daemon restart never release a slot. Eviction first persists an `evicting` state and only removes a known owned slot whose ledger state is idle; interrupted eviction resumes only that recorded deletion. Unknown root entries, corrupt records, unsafe paths or unknown accounting fail closed.
 
 The prototype refuses a new attempt while any slot for its partition is leased or uncertain, even when the configured budget could hold another slot. A compatible partition permits sequential reuse only after authenticated settlement; it never permits parallel mutable sharing.
 
@@ -121,10 +148,13 @@ busy/full refusal to the fixture consumer before any command runner is called.
 Task/attempt identity and host-run identity are separate types. This split is a
 fixture model only; it does not solve Q-012 or implement a Queue/Nucleus binding.
 
-Only injected fake/lightweight runners are in scope. A fixture completion proof
-can represent writers stopped by construction; it is not native process
-containment proof. The adapter requires a matching consumer capture receipt
-before finalizing to idle. Cancellation, failed capture, mismatched run identity,
+The unpublished implementation includes injected fake/lightweight runners and
+a fixed native test-fixture runner; it does not launch Cargo or establish a
+production workflow. An injected fixture completion proof cannot establish
+native completion. The native runner may mint its private completion
+certificate only for its owned child, exact attempt, slot and output bundle.
+The adapter still requires a matching consumer capture receipt before
+finalizing to idle. Cancellation, failed capture, mismatched run identity,
 daemon uncertainty or a lost finalization reply without a confirmed retry leave
 storage unavailable. It never starts a direct-Cargo fallback in managed state.
 

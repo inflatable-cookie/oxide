@@ -232,9 +232,21 @@ bypasses and carry no Oxide reuse or observation claim.
 The fixture flow waits without a lease, performs at most one readiness wake and
 recheck, accepts an injected consumer authorization, acquires exclusively, then
 submits a distinct host-run identity. Busy/full is returned to the fixture
-consumer before a command runner is invoked. A matching consumer capture receipt
-and injected fixture completion proof are required for idle finalization;
-unknown process lifetime or missing capture proof leaves the slot unavailable.
+consumer before a command runner is invoked. The fixed native fixture runner
+waits on its owned child handle and can mint the private completion certificate
+only for its exact lease, slot, host-run/run/attempt, process marker and output
+bundle. The consumer receipt must match that bundle before the storage core
+accepts the lease-token-bound evidence for idle finalization. A caller-supplied
+`FixtureCompletionProof`, leader exit or capture receipt alone is insufficient.
+The retained-writer, cancellation and mismatched-capture cases stay unavailable
+even if a known child is later reaped.
+
+This native boundary qualifies only the registered cooperative fixture
+contract: a trusted foreground workflow waits for writing children and closes
+its write handles before completion. Hidden process departures and unrelated
+same-user writers are unsupported bypasses and cannot be detected or fenced by
+this prototype. Its fixed fixture bounds and host free-space samples do not
+qualify arbitrary Cargo output or a production cap.
 Observations remain in an in-process 16 MiB ring with at most 12 events per run
 and 1 KiB per event. Records are keyed by consumer, run and attempt identity and retain
 workflow, selector, commit, source-tree digest and partition/configuration
@@ -242,7 +254,8 @@ digests; unavailable write attribution is recorded explicitly.
 
 The injected authorization/host-run split is fixture scaffolding, not an
 existing authenticated Queue/Nucleus capability. Q-012 remains unresolved for
-real bindings. The prototype does not solve native process containment, cross-
-path correctness, a persistent observation service, a pilot, consumer adoption,
-host/service installation, or numeric fairness/timeout policy. Each remains
-separately gated and requires its own approved scope and review.
+real bindings. The prototype does not solve arbitrary process containment,
+cross-path correctness, a persistent observation service, a real Cargo pilot,
+consumer adoption, host/service installation, or numeric fairness/timeout
+policy. Each remains separately gated and requires its own approved scope and
+review.

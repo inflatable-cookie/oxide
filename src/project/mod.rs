@@ -1,3 +1,4 @@
+mod native;
 mod observations;
 mod resolve;
 
@@ -167,6 +168,7 @@ impl HostRunRequest {
 pub struct FixtureExecutionPlan {
     pub host_run: HostRunIdentity,
     pub command: HostRunRequest,
+    pub(crate) claim: native::NativeExecutionClaim,
 }
 
 /// Non-verdict process completion status returned by the fixture runner.
@@ -174,6 +176,7 @@ pub struct FixtureExecutionPlan {
 pub enum FixtureCommandStatus {
     Exited(i32),
     Cancelled,
+    Incomplete,
 }
 
 /// Completion proof from controlled fixture construction, never native containment proof.
@@ -196,6 +199,32 @@ pub struct FixtureCommandOutput {
     pub reused_units: Option<u32>,
     pub rebuilt_units: Option<u32>,
     pub completion: FixtureCompletionProof,
+    pub(crate) native_completion: Option<native::NativeCompletionCertificate>,
+}
+
+impl FixtureCommandOutput {
+    /// Constructs output from an injected runner. Injected completion claims
+    /// remain untrusted and cannot release managed storage.
+    pub fn new(
+        status: FixtureCommandStatus,
+        output_references: Vec<String>,
+        compile_elapsed_ms: Option<u64>,
+        test_elapsed_ms: Option<u64>,
+        reused_units: Option<u32>,
+        rebuilt_units: Option<u32>,
+        completion: FixtureCompletionProof,
+    ) -> Self {
+        Self {
+            status,
+            output_references,
+            compile_elapsed_ms,
+            test_elapsed_ms,
+            reused_units,
+            rebuilt_units,
+            completion,
+            native_completion: None,
+        }
+    }
 }
 
 /// Consumer acknowledgement that binds output capture to one host run.
@@ -327,7 +356,7 @@ impl<S: StorageOperations> ProjectAdapter<S> {
     {
         let resolved = match resolve::resolve(invocation) {
             Resolution::NotOptedIn => {
-                return result(ExecutionDisposition::NotOptedIn, None, None, true)
+                return result(ExecutionDisposition::NotOptedIn, None, None, true);
             }
             Resolution::Refused(reason) => {
                 return result(
@@ -335,7 +364,7 @@ impl<S: StorageOperations> ProjectAdapter<S> {
                     None,
                     None,
                     invocation.private_fallback_allowed,
-                )
+                );
             }
             Resolution::Ready(resolved) => resolved,
         };
@@ -357,7 +386,7 @@ impl<S: StorageOperations> ProjectAdapter<S> {
                     None,
                     None,
                     fallback_allowed(invocation, reason),
-                )
+                );
             }
         };
         let readiness = if readiness == Readiness::Busy && invocation.wait_once {
@@ -372,7 +401,7 @@ impl<S: StorageOperations> ProjectAdapter<S> {
                             None,
                             None,
                             fallback_allowed(invocation, reason),
-                        )
+                        );
                     }
                 },
                 Ok(WaitSignal::Cancelled) => {
@@ -414,7 +443,7 @@ impl<S: StorageOperations> ProjectAdapter<S> {
                     None,
                     None,
                     false,
-                )
+                );
             }
         };
         if !valid_authorization(invocation, &resolved, &attempt) {
@@ -611,6 +640,16 @@ impl<S: StorageOperations> ProjectAdapter<S> {
         let plan = FixtureExecutionPlan {
             host_run: host_run.clone(),
             command: command.clone(),
+            claim: native::NativeExecutionClaim::new(
+                acquired.lease_id.clone(),
+                acquired.slot_id.clone(),
+                slot_path.clone(),
+                attempt.envelope.binding.clone(),
+                host_run.clone(),
+                resolved.workflow.workflow.clone(),
+                resolved.workflow.selector.clone(),
+                resolved.capture_dir.clone(),
+            ),
         };
         let started = Instant::now();
         let output = match runner.execute(&plan, cancellation) {
@@ -653,17 +692,28 @@ impl<S: StorageOperations> ProjectAdapter<S> {
                 rebuilt_units: output.rebuilt_units,
                 exit_code: match output.status {
                     FixtureCommandStatus::Exited(code) => Some(code),
-                    FixtureCommandStatus::Cancelled => None,
+                    FixtureCommandStatus::Cancelled | FixtureCommandStatus::Incomplete => None,
                 },
-                cancelled: output.status == FixtureCommandStatus::Cancelled,
+                cancelled: matches!(output.status, FixtureCommandStatus::Cancelled),
             },
         );
 
-        let capture = if matches!(&output.completion, FixtureCompletionProof::Stopped { .. }) {
+        let native_completion = output
+            .native_completion
+            .as_ref()
+            .filter(|completion| completion.matches(&plan, &output));
+        let capture = if native_completion.is_some() {
             let capture_started = Instant::now();
             match consumer.capture(&host_run, &output, &resolved.capture_dir) {
                 Ok(ack)
-                    if ack.host_run_id == host_run.id && valid_capture_receipt(&ack.receipt) =>
+                    if ack.host_run_id == host_run.id
+                        && ack.receipt.host_run_id == host_run.id
+                        && ack.receipt.run_id == attempt.envelope.binding.run_id
+                        && ack.receipt.attempt_id == attempt.envelope.binding.attempt_id
+                        && valid_capture_receipt(&ack.receipt)
+                        && native_completion.is_some_and(|proof| {
+                            proof.capture_digest() == ack.receipt.digest.as_str()
+                        }) =>
                 {
                     self.observations.event(
                         &attempt.envelope.binding.consumer,
@@ -703,6 +753,7 @@ impl<S: StorageOperations> ProjectAdapter<S> {
             consumer,
             Some(&host_run),
             Some(&output),
+            native_completion,
             capture,
         );
         let disposition = match &finalization {
@@ -804,7 +855,9 @@ impl<S: StorageOperations> ProjectAdapter<S> {
         host_run: Option<&HostRunIdentity>,
         output: Option<&FixtureCommandOutput>,
     ) -> Option<FinalizationReceipt> {
-        self.finalize_run(attempt, acquired, token, consumer, host_run, output, None)
+        self.finalize_run(
+            attempt, acquired, token, consumer, host_run, output, None, None,
+        )
     }
 
     fn finalize_run<C: ProjectConsumerBoundary>(
@@ -815,20 +868,27 @@ impl<S: StorageOperations> ProjectAdapter<S> {
         consumer: &mut C,
         host_run: Option<&HostRunIdentity>,
         output: Option<&FixtureCommandOutput>,
+        native_completion: Option<&native::NativeCompletionCertificate>,
         capture: Option<CaptureReceipt>,
     ) -> Option<FinalizationReceipt> {
         let terminal = consumer.terminal_record(attempt, host_run, output);
         let terminal = terminal.filter(|record| record.run_id == attempt.envelope.binding.run_id);
-        let containment = match output.map(|output| &output.completion) {
-            Some(FixtureCompletionProof::Stopped {
-                reference,
-                credential,
-            }) if valid_id(reference) => ContainmentEvidence::DescendantsStopped {
-                guardian_reference: reference.clone(),
-                credential: credential.clone(),
-            },
-            _ => ContainmentEvidence::Unknown,
-        };
+        let containment = match (native_completion, capture.as_ref()) {
+            (Some(completion), Some(capture)) => completion.settlement_evidence(
+                &acquired.lease_id,
+                &acquired.slot_id,
+                acquired
+                    .slot_path
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new("")),
+                host_run,
+                capture,
+                token,
+            ),
+            _ => None,
+        }
+        .map(ContainmentEvidence::CooperativeWorkflow)
+        .unwrap_or(ContainmentEvidence::Unknown);
         let evidence = SettlementEvidence {
             binding: attempt.envelope.binding.clone(),
             consumer_credential: consumer.settlement_credential(attempt),
@@ -1084,6 +1144,9 @@ fn valid_output(output: &FixtureCommandOutput) -> bool {
 fn valid_capture_receipt(receipt: &CaptureReceipt) -> bool {
     valid_id(&receipt.reference)
         && valid_digest(&receipt.digest)
+        && valid_id(&receipt.host_run_id)
+        && valid_id(&receipt.run_id)
+        && valid_id(&receipt.attempt_id)
         && !receipt.credential.expose().is_empty()
 }
 

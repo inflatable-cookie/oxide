@@ -323,6 +323,9 @@ impl Encode for CaptureReceipt {
     fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
         self.reference.encode(writer)?;
         self.digest.encode(writer)?;
+        self.host_run_id.encode(writer)?;
+        self.run_id.encode(writer)?;
+        self.attempt_id.encode(writer)?;
         self.credential.encode(writer)
     }
 }
@@ -332,7 +335,78 @@ impl Decode for CaptureReceipt {
         Ok(Self {
             reference: String::decode(reader)?,
             digest: String::decode(reader)?,
+            host_run_id: String::decode(reader)?,
+            run_id: String::decode(reader)?,
+            attempt_id: String::decode(reader)?,
             credential: Credential::decode(reader)?,
+        })
+    }
+}
+
+impl Encode for ProcessIdentityEvidence {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        writer.u32(self.pid);
+        self.start_identity.encode(writer)
+    }
+}
+
+impl Decode for ProcessIdentityEvidence {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        Ok(Self {
+            pid: reader.u32()?,
+            start_identity: String::decode(reader)?,
+        })
+    }
+}
+
+impl Encode for CooperativeCompletionEvidence {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        self.lease_id.encode(writer)?;
+        self.slot_id.encode(writer)?;
+        self.slot_path.encode(writer)?;
+        self.temp_dir.encode(writer)?;
+        self.capture_dir.encode(writer)?;
+        self.workflow.encode(writer)?;
+        self.workflow_definition_digest.encode(writer)?;
+        self.repository_head.encode(writer)?;
+        self.fixture_source_digest.encode(writer)?;
+        self.host_run_id.encode(writer)?;
+        self.run_id.encode(writer)?;
+        self.attempt_id.encode(writer)?;
+        encode_vec(writer, &self.processes)?;
+        encode_vec(writer, &self.free_space_samples)?;
+        writer.u32(self.exit_code as u32);
+        self.stdout_digest.encode(writer)?;
+        self.stderr_digest.encode(writer)?;
+        self.capture_reference.encode(writer)?;
+        self.capture_digest.encode(writer)?;
+        self.signature.encode(writer)
+    }
+}
+
+impl Decode for CooperativeCompletionEvidence {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        Ok(Self {
+            lease_id: String::decode(reader)?,
+            slot_id: String::decode(reader)?,
+            slot_path: String::decode(reader)?,
+            temp_dir: String::decode(reader)?,
+            capture_dir: String::decode(reader)?,
+            workflow: String::decode(reader)?,
+            workflow_definition_digest: String::decode(reader)?,
+            repository_head: String::decode(reader)?,
+            fixture_source_digest: String::decode(reader)?,
+            host_run_id: String::decode(reader)?,
+            run_id: String::decode(reader)?,
+            attempt_id: String::decode(reader)?,
+            processes: decode_vec(reader)?,
+            free_space_samples: decode_vec(reader)?,
+            exit_code: reader.u32()? as i32,
+            stdout_digest: String::decode(reader)?,
+            stderr_digest: String::decode(reader)?,
+            capture_reference: String::decode(reader)?,
+            capture_digest: String::decode(reader)?,
+            signature: String::decode(reader)?,
         })
     }
 }
@@ -357,13 +431,9 @@ impl Encode for ContainmentEvidence {
                 writer.u32(*pid);
                 start_identity.encode(writer)?;
             }
-            Self::DescendantsStopped {
-                guardian_reference,
-                credential,
-            } => {
+            Self::CooperativeWorkflow(completion) => {
                 writer.u8(3);
-                guardian_reference.encode(writer)?;
-                credential.encode(writer)?;
+                completion.encode(writer)?;
             }
         }
         Ok(())
@@ -382,10 +452,9 @@ impl Decode for ContainmentEvidence {
                 pid: reader.u32()?,
                 start_identity: String::decode(reader)?,
             }),
-            3 => Ok(Self::DescendantsStopped {
-                guardian_reference: String::decode(reader)?,
-                credential: Credential::decode(reader)?,
-            }),
+            3 => Ok(Self::CooperativeWorkflow(
+                CooperativeCompletionEvidence::decode(reader)?,
+            )),
             _ => Err(StorageError::Protocol("unknown containment evidence")),
         }
     }

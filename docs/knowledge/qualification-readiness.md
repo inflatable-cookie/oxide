@@ -1,14 +1,57 @@
 # Qualification readiness: containment and capacity
 
-Design-only. This file records the host/consumer gates that [architecture](architecture.md) left unproved: a usable healthy completion/fence, conservative cancel/crash/lost-reply/restart behavior, an enforceable 10 GiB disposable cap, and the monitored 20 GiB host free-space threshold. It does not authorize a pilot, consumer adoption, or host installation. Saving or merging it grants none of those. Unmerged worker code is not an authority.
+This file records the host/consumer gates that [architecture](architecture.md) left unproved. The approved cooperative foreground-workflow contract now has an unpublished native fixture implementation and six bounded process scenarios in the Oxide project adapter. Independent exact-head review of those scenarios is pending. This does not qualify a real Cargo workflow, cross-worktree reuse, consumer adoption or host installation.
 
-Subsequent operator ruling, 2026-10-09: Tom approved a bounded documentation-only completion/fencing follow-up and selected a monitored 20 GiB start/abort threshold. [Architecture](architecture.md#budget-and-observations) owns that current resource policy; the guarantee-versus-threshold asks below describe the original readiness disposition and are now answered. No permanent-quarantine or single-held-session fallback has been accepted, and no pilot execution is authorized. The enforced disposable-footprint cap and usable native completion proof remain gates.
+Subsequent operator ruling, 2026-10-09: Tom approved a bounded documentation-only completion/fencing follow-up and selected a monitored 20 GiB start/abort threshold. [Architecture](architecture.md#budget-and-observations) owns that current resource policy; the guarantee-versus-threshold asks below describe the original readiness disposition and are now answered. No permanent-quarantine or single-held-session fallback has been accepted, and no real-build pilot execution is authorized. Independent review remains pending for the native fixture proof; an enforced disposable cap for real Cargo remains a separate gate.
 
 Ownership: this file. Protocol semantics stay in [architecture](architecture.md). Scope and authorization stay in [vision](vision.md). Open product choices stay in [questions](questions.md).
 
-Subsequent supported-workflow ruling, 2026-10-09: Tom approved the narrower [cooperative foreground-workflow model](architecture.md#supported-writer-model) and a bounded native-fixture implementation/qualification task. The broad writer-model findings and pending-model asks below describe the reviewed design before that ruling; they do not override it. They remain evidence that arbitrary same-user write fencing is unqualified. The native completion mechanism still needs evidence and independent review under the approved limited contract. The ruling and task authorize no real Cargo/consumer pilot, installation or adoption; its exact bounds live in the approved Queue brief and [vision](vision.md#authority-boundaries).
+Subsequent supported-workflow ruling, 2026-10-09: Tom approved the narrower [cooperative foreground-workflow model](architecture.md#supported-writer-model) and its bounded native-fixture implementation/qualification. The broad writer-model findings below describe the earlier design and remain evidence that arbitrary same-user write fencing is unqualified. The fixture implementation now creates attempt-bound completion evidence from an owned native child and separately captured output. Its six scenarios cover healthy release/reacquire, active contention, cancellation/restart uncertainty, a retained writer, capture/attempt binding, and preflight refusal. Independent exact-head review must still decide whether those fixtures establish the limited contract. The ruling and task authorize no real Cargo/consumer pilot, installation or adoption; authority and bounds remain in [vision](vision.md#authority-boundaries) and the approved Queue brief.
 
-Inspection was read-only: committed Oxide, Nucleus and Queue documentation/config, installed toolchain metadata, Darwin headers and man pages, and `statfs`/`diskutil`/`quota` queries. This follow-up also reviewed Apple's public App Sandbox, Endpoint Security and System Extensions documentation and the XNU VFS implementation. No compilation, daemon, checkout, quota, volume, sandbox or service was created or installed.
+## Cooperative native fixture boundary
+
+The adapter's unpublished native runner starts only its fixed test-harness
+fixture entry point. It clears the child environment, forces `TMPDIR`, `TMP`
+and `TEMP` to the canonical task-owned scratch directory, and refuses paths
+that resolve through a symlink or escape that root. Each scenario is
+construction-bounded to at most eight owned children, sixteen regular files,
+one MiB per file, 64 KiB each for stdout/stderr, and 10 GiB total across the
+task-owned fixture, temporary and capture trees. The fixed child writes one
+bounded slot file; the parent bounds stream memory and drains the pipes. A
+pre-launch budget walk reserves the worst-case fixture output, while the
+scenario evidence walk records actual files and bytes. This fixture bound is
+not an enforceable quota for a real Cargo command and must not be generalized
+to arbitrary project output.
+
+Before each native child, after it, at lease/storage protocol boundaries, and
+at 30-second intervals while waiting, the fixture samples host free space.
+Unknown readings or less than 20 GiB refuse or abort before healthy completion;
+samples and exact temporary/capture paths are retained with the fixture. The
+readings describe the observed host state and cannot prevent a concurrent
+unrelated writer from reducing free space between samples.
+
+The direct child handle, PID and per-spawn marker are checked together. Normal
+exit, bounded output capture, the fixture source/definition digest and exact
+repository head are recorded. A consumer receipt is accepted only when its
+host-run, run and attempt IDs and digest match the native capture bundle. The
+storage core verifies the completion evidence against the active lease token,
+slot ID and exact slot path before it releases the slot. A terminal pass is
+not enough: the capture-mismatch case has a successful native child exit but
+keeps the slot uncertain. The retained-writer case returns incomplete execution
+and also keeps the slot uncertain, including after that known fixture child is
+later reaped.
+
+This mechanism relies on the approved workflow promise. It observes and joins
+the fixture child it launched; it does not enumerate arbitrary same-user
+processes or prove that an unregistered process could not write the slot.
+Daemonization, handle transfer, undisclosed background writers and direct
+access outside the adapter are unsupported bypasses and remain unprovable.
+There is no PID/age/quiet-scan release path. Cancellation, missing evidence,
+daemon/client restart and mismatched capture stay uncertain. Real Cargo,
+consumer lifecycle, path portability, host isolation, and production resource
+enforcement require separate gates.
+
+Historical read-only readiness investigation (2026-10-09): committed Oxide, Nucleus and Queue documentation/config, installed toolchain metadata, Darwin headers and man pages, and `statfs`/`diskutil`/`quota` queries. That investigation also reviewed Apple's public App Sandbox, Endpoint Security and System Extensions documentation and the XNU VFS implementation. It ran no compilation and created or installed no daemon, checkout, quota, volume, sandbox or service.
 
 ## Observed facts versus proposed control
 
@@ -199,30 +242,30 @@ Minimum evidence is what can **falsify** ownership, reuse, path/proc-macro corre
 
 ## Disposition
 
-**Blocked before qualification execution.** This design identifies no supported macOS mechanism that proves healthy release under the baseline writer model. This is not a recommendation to hold every healthy slot permanently; that would fail the required reusable workflow. It is also not authority to weaken unknown-outcome ownership. No experiment, service installation or consumer adoption is authorized by this disposition.
+**Historical broad-model disposition; real-build pilot remains held.** The earlier design identified no supported macOS mechanism that proves healthy release for arbitrary descendants, transferred handles and unrelated same-user writers. The later cooperative contract explicitly excludes those behaviors and has a native fixture implementation awaiting independent exact-head review. That limited work does not prove a general fence or authorize a real Cargo/consumer pilot. Unknown outcomes remain unavailable; no permanent-held-session design or host installation is authorized.
 
 | Gate | Status | Why |
 | --- | --- | --- |
-| Healthy normal release/reacquire | **Blocked** | App Sandbox's inherited static rights do not revoke a live child's access. Endpoint Security's documented write event is notification-only; its preliminary descendant client excludes other processes and cannot establish revocation of already-open handles. Neither covers the baseline writer classes with a reviewed proof. |
-| Interrupted/cancelled/crash/restart/lost reply | **Unavailable** | Keep the lease `uncertain`, reserve its bytes, refuse reuse/eviction. This remains the accepted conservative rule. |
-| Writer-model narrowing | **Needs separate Tom ruling** | A cooperative-only model would have to exclude daemonized descendants, retained/transferred handles and unrelated same-user writers. The current brief does not accept those exclusions, and documentation alone cannot enforce them. |
-| 10 GiB disposable footprint | **Still a prerequisite** | Include forced `TMPDIR`/`TMP`/`TEMP`, the slot, task-owned fixture trees and captures. Demonstrate an enforced cap; sampled accounting is not a hard cap. Do not create a volume without separate scoped approval. |
-| 20 GiB host free-space threshold | **Settled as monitored start/abort** | Follow [architecture](architecture.md#budget-and-observations). It is not a guarantee and does not remove the 10 GiB cap prerequisite. |
+| Cooperative fixture release/reacquire | **Implemented; independent verdict pending** | Six fixed native scenarios exercise owned-child completion, durable finalize/reuse and the supported uncertainty/refusal cases. The Queue reviewer must judge whether the evidence proves the limited contract at the exact PR head. |
+| Arbitrary same-user writer fencing | **Unsupported and unqualified** | App Sandbox's inherited static rights do not revoke a live child's access. Endpoint Security's documented write event is notification-only; neither reviewed candidate accounts for all writers under the historical broad model. |
+| Interrupted/cancelled/crash/restart/lost reply | **Unavailable** | Keep the lease `uncertain`, reserve its bytes, and refuse reuse/eviction. Reaping a known fixture process later does not retroactively settle an ambiguous lease. |
+| Fixture disposable footprint | **Bounded for fixed fixtures only** | Construction limits and path walks cover the task-owned fixtures, forced temporary directory, slot and captures. This does not provide a quota for arbitrary Cargo or production use. |
+| Real Cargo 10 GiB disposable footprint | **Still a prerequisite** | A real workflow needs separately qualified enforcement for its full output tree; sampled accounting is not a hard cap. No volume or host setup is authorized here. |
+| 20 GiB host free-space threshold | **Settled as monitored start/abort** | Follow [architecture](architecture.md#budget-and-observations). It is not a guarantee against unrelated host writers. |
 
-**Exact next decision:** Tom must either keep arbitrary descendants, retained/passed write handles and unrelated same-user writers in scope, which requires a supported revocable-write-capability or complete process-lifetime proof before qualification; or separately approve a narrower cooperative writer model and its explicit adoption promises. In either case, the ruling is not itself a proof or implementation authorization. If the threat model stays broad and no supported primitive is identified, stop at this design disposition rather than test a permanent-held-session pilot.
+**Next gate:** the independent reviewer supplies pass/fail/insufficient verdicts for the five Queue dimensions at the exact PR head. Even a pass qualifies only the fixed cooperative fixture boundary. A real Cargo pilot still needs separate authorization, an owner-selected exact workflow, exact-head and path-correctness checks, an enforceable full-footprint cap, and coordinated consumer lifecycle mapping.
 
 ### Missing prerequisites
 
 1. Independent exact-head review of this revision against the brief.
-2. Tom's separate ruling on whether to narrow the baseline writer model; no promise is accepted by this document.
-3. If the broad model remains, identify a supported public mechanism that revokes or accounts for every write capability, including already-open handles, descendants and unrelated same-user writers. Any required Apple entitlement, application packaging, system-extension activation/approval or host change needs separate authority.
-4. Review the final mechanism against the compatible Cargo/Effigy workflow before writing an execution brief. Do not test a mechanism that still lacks the proof in this document.
-5. For any later fixture qualification: separate execution authority; a measured, enforced 10 GiB disposable cap; exact paths including `disp_tmp`; the monitored 20 GiB threshold and sampling/abort behavior; and an independent exact-head review. If it expands to a Nucleus selector, first obtain Nucleus owner coordination for selector/args, frozen SHA, disposable-checkout permission, scenario-4 patch policy and `lead-1965` disposition. No parallel compiler wrapper.
-6. Reviewed 003 storage-core and 004 adapter implementations are a later integration prerequisite, not permission to run this qualification.
+2. A separate real-build qualification brief with explicit execution authority, a selected native Cargo/Effigy workflow and consumer-owner coordination. The six fixture scenarios in this task do not authorize it.
+3. An enforceable 10 GiB cap covering the real build slot, forced temporary output and consumer-owned capture paths, plus the settled monitored 20 GiB threshold. No volume or system extension is authorized.
+4. Exact-head path-correctness and generated-code/proc-macro checks before any cross-path reuse claim; failed portability means path-isolated partitions and lower expected benefit.
+5. Queue/Nucleus owner mapping for adapter identity, scheduling, cancellation, settlement and capture. Preserve frozen Contract010, Nucleus Contract002, and the existing pilot hold until that mapping is reviewed.
 
-## Smallest next qualification brief (outline; not authorized)
+## Preserved real-build pilot outline (not authorized)
 
-Prepare this only after the writer-model ruling and a mechanism has a credible public-API proof argument. The first qualification should target the completion/fence boundary with task-owned process fixtures in a fresh isolated scratch root; it is not a Cargo performance pilot or a consumer run. Keep the established cap of six scenarios, at most 90 minutes of worker execution and 30 minutes independent replay, with no retries or expansion. If required installation or entitlements are not separately authorized, stop before setup.
+This earlier outline remains a separate, unapproved real-build pilot. The six native fixture scenarios above are the current completion-boundary task; they do not authorize Cargo performance measurement or a consumer run. Any later pilot needs its own Queue brief, host/consumer scope, and independent review. Do not inherit execution authority from the fixture task.
 
 1. **Healthy release and reacquire:** one task-owned writer performs a bounded write, exits normally, and produces a capture receipt. The mechanism must prove no stale process or handle can mutate the slot; finalize durably; then a competing run reacquires and verifies the expected prior contents. Root exit or capture alone is an explicit negative control, not success.
 2. **Competing ownership:** while leased, concurrent second claimants are refused without changing slot bytes. After a proven healthy release, racing claimants yield exactly one owner, and the durable ledger matches the winner.
@@ -231,6 +274,6 @@ Prepare this only after the writer-model ruling and a mechanism has a credible p
 5. **Capture binding:** bind the fixture source commit/tree, selector and arguments, exact toolchain, checkout/slot paths, consumer/run/attempt IDs and output digests. Preserve per-run stdout/stderr and receipt independently of the intermediate slot. Capture completion never substitutes for writer completion.
 6. **Review replay:** at most one healthy release/reacquire case and one retained-handle or interruption case, independently at the exact reviewed head. Reviewer challenges the release proof, event-loss/restart coverage and whether fixture behavior covers each claimed writer class.
 
-Use task-owned fixtures only; never link them to real Queue/Nucleus checkouts. Count the entire disposable footprint, including fixture roots, slot, forced `TMPDIR`/`TMP`/`TEMP` directory and captures, against an enforced 10 GiB cap. Require at least 20 GiB free at start, monitor at an interval no slower than one minute and at protocol boundaries, and abort/report if a reading is below 20 GiB or unavailable; record sampling overshoot and unrelated-writer races. Neither this outline nor the prior ruling authorizes volume creation, system-extension installation, entitlement requests, builds or execution.
+For that separate pilot, count the entire disposable footprint, including fixture roots, slot, forced `TMPDIR`/`TMP`/`TEMP` directory and captures, against an enforceable 10 GiB cap. Require at least 20 GiB free at start, monitor at an interval no slower than one minute and at protocol boundaries, and abort/report if a reading is below 20 GiB or unavailable; record sampling overshoot and unrelated-writer races. Neither this outline nor the cooperative fixture task authorizes volume creation, system-extension installation, entitlement requests, consumer builds or pilot execution.
 
 Queue/Nucleus keep admission, identity, settlement, retention and capture. Oxide owns slot leases and the proof that all writers have ended or been fenced; otherwise the slot stays unavailable.
