@@ -42,4 +42,4 @@ The first audience and adoption preference are settled in [vision](vision.md#int
 
 ## Q-011 — How should slot waiting coordinate with host admission?
 
-Tom accepts some waiting and queue reordering to reduce simultaneous builds; see [vision](vision.md#intended-experience). Determine pending-request identity, fairness, bounded wait/cancellation behavior and coordination with Queue/Nucleus admission so a storage wait does not unnecessarily occupy scarce execution capacity. Numeric limits and operator-attention thresholds remain open. Preserve conservative crash recovery and authoritative consumer scheduling.
+The ownership division is settled in [vision](vision.md#authority-boundaries); waiting tolerance lives in [intended experience](vision.md#intended-experience). Determine pending-request identity, storage-request fairness, bounded wait/cancellation behavior and coordination with Queue/Nucleus admission so a storage wait does not unnecessarily occupy scarce execution capacity. Numeric limits and operator-attention thresholds remain open. Preserve conservative crash recovery and authoritative consumer scheduling.
