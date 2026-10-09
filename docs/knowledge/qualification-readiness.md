@@ -341,6 +341,16 @@ auto-mode classifier, so no Cargo scenario ran and this section records no reuse
 rebuild, path or benefit evidence. Preflight evidence is recorded above. The next
 step is an explicitly approved execution path for the ignored pilot driver.
 
+### Pilot execution record (2026-10-09, partial)
+
+Launched through the approved Effigy two-separator command after standing approval. Three attempts ran past the launch:
+
+- Run 2 stopped in scenario 1. The runner's 20 GiB check read the disposable APFS volume (about 7 GiB free), not host free space. No Cargo ran.
+- Run 3 stopped in scenario 1 with the same check. The stale per-run temp directory from run 2 blocked `create_dir`. No Cargo ran.
+- Run 4 completed scenario 1 with exit 0, against an empty build directory. Host free space was about 746 GiB. The reference took 129,943 ms wall time and rebuilt 47 units. It then stopped at the daemon bind: the storage root `m/storage` was never created.
+
+Scenarios 2 to 6 did not run. The session was at roughly 65 of 90 minutes, so a rerun was not taken. Scenario 1 is cold evidence only. Its build directory now exists, so any rerun would measure warm. No reuse, rebuild, path or benefit claim is made.
+
 ## Preserved real-build pilot outline (not authorized)
 
 This earlier outline remains a separate, unapproved real-build pilot. The six native fixture scenarios above are the current completion-boundary task; they do not authorize Cargo performance measurement or a consumer run. Any later pilot needs its own Queue brief, host/consumer scope, and independent review. Do not inherit execution authority from the fixture task.

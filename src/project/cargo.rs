@@ -41,20 +41,28 @@ const FORCED_ENVIRONMENT: [&str; 6] = [
 /// Runs one registered Cargo selector inside a disposable trial root.
 pub(super) struct CargoWorkflowRunner {
     trial_root: PathBuf,
+    host_probe: PathBuf,
     executable: PathBuf,
     executable_digest: String,
 }
 
 impl CargoWorkflowRunner {
     /// `trial_root` is the canonical disposable mount. `executable` is the absolute selector launcher.
-    pub(super) fn new(trial_root: PathBuf, executable: PathBuf) -> Result<Self, BoundaryFailure> {
+    /// `host_probe` is any path on the host volume whose free space gates each boundary.
+    pub(super) fn new(
+        trial_root: PathBuf,
+        host_probe: PathBuf,
+        executable: PathBuf,
+    ) -> Result<Self, BoundaryFailure> {
         let trial_root = canonical_directory(&trial_root)?;
+        let host_probe = canonical_directory(&host_probe)?;
         if !executable.is_absolute() || !executable.is_file() {
             return Err(BoundaryFailure::Rejected);
         }
         let bytes = fs::read(&executable).map_err(|_| BoundaryFailure::Unavailable)?;
         Ok(Self {
             trial_root,
+            host_probe,
             executable,
             executable_digest: digest_parts(&["launcher-v1", &hex_digest(&bytes)]),
         })
@@ -267,7 +275,7 @@ impl FixtureCommandRunner for CargoWorkflowRunner {
 
 impl CargoWorkflowRunner {
     fn free_bytes(&self) -> Result<u64, BoundaryFailure> {
-        let free = native::host_free_bytes(&self.trial_root)?;
+        let free = native::host_free_bytes(&self.host_probe)?;
         if free < REQUIRED_FREE_BYTES {
             return Err(BoundaryFailure::Rejected);
         }

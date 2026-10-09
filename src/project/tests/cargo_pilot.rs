@@ -38,9 +38,12 @@ const ENVIRONMENT_KEYS: [&str; 6] = [
 
 struct PilotSpace;
 
+/// Host free space gates the pilot. The disposable volume's own free space is reported separately.
+const HOST_PROBE: &str = "/private/var/tmp";
+
 impl FreeSpaceProbe for PilotSpace {
-    fn available_bytes(&self, root: &Path) -> Result<Option<u64>, StorageError> {
-        native::host_free_bytes(root)
+    fn available_bytes(&self, _root: &Path) -> Result<Option<u64>, StorageError> {
+        native::host_free_bytes(Path::new(HOST_PROBE))
             .map(Some)
             .map_err(|_| StorageError::Io("free-space probe unavailable".to_owned()))
     }
@@ -327,8 +330,8 @@ fn create_run_dirs(mount: &Path, run: &str) {
     fs::create_dir_all(runs.join("capture")).expect("capture dir");
 }
 
-fn free_gib(mount: &Path) -> u64 {
-    native::host_free_bytes(mount).expect("free space") / GIB
+fn free_gib(_mount: &Path) -> u64 {
+    native::host_free_bytes(Path::new(HOST_PROBE)).expect("free space") / GIB
 }
 
 fn evidence_root() -> PathBuf {
@@ -451,8 +454,12 @@ fn nucleus_cargo_pilot() {
     ));
 
     let env = environment(stable.channel, None);
-    let mut runner =
-        CargoWorkflowRunner::new(mount.clone(), PathBuf::from(EFFIGY)).expect("cargo runner");
+    let mut runner = CargoWorkflowRunner::new(
+        mount.clone(),
+        PathBuf::from(HOST_PROBE),
+        PathBuf::from(EFFIGY),
+    )
+    .expect("cargo runner");
 
     // Scenario 1: isolated cold reference, private build directory on the image.
     create_run_dirs(&mount, "s1");
