@@ -1,0 +1,15 @@
+[manifest]
+minimum_effigy_version = "0.14.0"
+
+[tasks]
+"rust:compile" = "cargo check --workspace --all-targets --locked"
+"rust:format" = "cargo fmt --all -- --check"
+"docs:check" = [
+  "effigy skill run northstar/check-links -- --frozen '^docs/knowledge/architecture[.]md$'",
+  "effigy skill run northstar/retired-concepts",
+  "git diff --check HEAD",
+]
+
+[test.suites.rust]
+run = "cargo test --workspace --all-targets --locked"
+default = false

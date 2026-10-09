@@ -5,6 +5,7 @@ Oxide aims to make Rust development easy and light: predictable storage, less bu
 - [Vision and operator ruling](knowledge/vision.md)
 - [Storage invariants and authority boundaries](knowledge/architecture.md)
 - [Rust DX research landscape](knowledge/rust-dx-landscape.md)
+- [Rust toolchain and quality](knowledge/rust-toolchain-and-quality.md)
 - [Open decisions](knowledge/questions.md)
 - [Knowledge map](knowledge/README.md)
 - [Release contract](knowledge/contracts/release.md)
