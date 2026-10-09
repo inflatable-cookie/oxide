@@ -22,7 +22,7 @@ Review executable/crate/distribution names against the existing Oxide Computer C
 
 ## Q-006 — What experience and budgets define light Rust development?
 
-Choose baseline projects and edit/check/test/worktree scenarios, then set acceptable disk footprint, write volume, feedback latency, memory and operator-effort targets. Tom's direction is confirmed; numeric targets are not. Owner: [vision](vision.md).
+For the first foothold, use one narrow native workflow and bounded qualification; broad baselines are not a prerequisite. Choose longer-term representative workflows and acceptable disk footprint, write volume, feedback latency, memory and operator-effort targets after first storage relief. Tom's direction is confirmed; numeric targets are not. Owner: [vision](vision.md).
 
 ## Q-007 — How should Oxide consume upstream caching and existing tools?
 

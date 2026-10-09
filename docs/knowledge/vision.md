@@ -22,6 +22,10 @@ Tom's additional ruling, 2026-10-09: the day-to-day development loop prioritizes
 
 Bounded reusable Rust build storage with correct concurrent ownership remains the first foothold. A daemon remains a candidate architecture to qualify. Investigate aggressively but adopt based on measured benefit and supported behavior. Compare elapsed feedback time, occupied space, actual disk writes, peak memory, contention and operator effort independently; reducing stored bytes can increase rebuild writes. Track benefits over sustained edit/worktree cycles, not just one warm build.
 
+Tom's priority ruling, 2026-10-09: independent worktrees duplicating compilation and storage are the dominant current problem. Treat that as settled direction; do not make relief depend on a broad measurement programme or re-proving the operator's diagnosis. Bound initial qualification to the minimum needed for safe reuse and a useful benefit decision. Other Rust DX work can take a more measured approach after this first problem is addressed.
+
+Initial qualification should compare one isolated reference with cross-worktree reuse for one narrow native workflow. Correct input invalidation, exclusive ownership, uncertain release and independent run artifacts remain mandatory. General diagnostics, sustained incremental studies, multiple project baselines, containers and JIT research are later work; none is a prerequisite for first storage relief. Execution bounds and experiment details belong in the Queue brief.
+
 The target experience is aspirational, not a promise of compiler-speed parity with TypeScript or Go. Compiler/backend limitations may require upstream contributions. Prefer adopting upstream cache mechanisms over reproducing Cargo internals when they satisfy the need. Research evidence and limits live in [the Rust DX landscape](rust-dx-landscape.md); ordered outcomes and proposed work live in Queue.
 
 ## Relationship with Cargo
