@@ -467,15 +467,28 @@ failure.
 **Registered-root cost in Queue's workflow:** disposable Queue worktrees
 normally receive a new physical root per task. Because the complete ordered
 root map and its digest are compatibility inputs, adding a worktree changes
-the compiler flags and creates a cold partition for that map. Reuse can
-amortize that registration cost only when the same finite checkout pool is
-reused across repeated runs. A stream of one-use roots can keep resetting the
-map and erase the expected saving; no stable Queue checkout pool is established
-by this design. A fresh qualification must measure root-set reuse. If the
-workflow cannot keep a finite pool stable, stop this candidate for Queue's
-ad-hoc worktrees, retain checkout-isolated partitions, and report that the
-dominant duplication problem remains unsolved. Do not grow the root map
-silently or claim arbitrary-root reuse.
+the compiler flags and creates a cold partition for that map. Nucleus documents
+about 2.3 GiB of unique artifacts for the planning+diagnostics selector; use
+that as the expected storage scale for each retained cold map partition, not
+as a hard size guarantee or the whole disposable-footprint estimate. Until
+safe idle eviction, old partitions continue to occupy storage. For example,
+retaining both an old and an expanded root map costs roughly two selector
+artifact sets (about 4.6 GiB at that measured scale), plus checkouts, temporary
+output and captures. Evicting the old partition frees its space but discards
+its reuse value; if the old map is needed again it must be rebuilt.
+
+The stable checkout pool is a **Queue-owned prerequisite**, not an Oxide
+capability: Queue would need to keep a finite set of worktree paths and assign
+future runs back to those registered roots. This workflow change needs Queue
+ownership and a separate Queue brief; Oxide cannot provide or assume it. Reuse
+can amortize registration and cold-build cost only when that pool is actually
+reused across tasks. A stream of one-use roots keeps creating partitions and
+can spend storage on old and new generations without reducing total work. No
+stable Queue checkout pool is established by this design. A fresh qualification
+must measure root-set reuse and partition occupancy. If Queue cannot maintain
+the pool, stop this candidate for its ad hoc worktrees, retain checkout-
+isolated partitions, and report that the dominant duplication problem remains
+unsolved. Do not grow the root map silently or claim arbitrary-root reuse.
 
 **Operator decision required:** accepting the logical prefix for compiler
 source names, file!() and panic locations would replace the original strict
@@ -535,6 +548,13 @@ stdout/stderr, test output, manifest and receipt in that run's private capture.
 The slot retains only reusable Cargo intermediates and their compile-origin
 evidence. Use the existing reviewed lease, resource, local receipt and
 cooperative completion machinery without widening it.
+
+The brief must enumerate the behavior-path classes in scope for its selector,
+identify the test or artifact evidence for each, and name any excluded class;
+an unlisted class is not covered. Keep the consumer-facing source-identity,
+miss and refusal semantics independent of rustc remapping and its flag/map
+encoding, so a later supported Cargo mechanism can replace it without changing
+Queue or Nucleus workflows.
 
 A fresh Queue brief could qualify five ordered scenarios. Begin with all three
 miss controls; do not begin the shared-slot pair unless each control passes:
