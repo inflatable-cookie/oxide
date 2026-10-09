@@ -18,15 +18,15 @@ Nucleus Contract002 prohibits mutable target sharing. An exclusive-intermediate 
 
 ## Preferred daemon hub to qualify
 
-Tom's direction, 2026-10-09: a central daemon could normalize project workflows, own reusable storage and provide a consistent place to measure real-world use. It is the preferred candidate for the bounded design task, not an implemented system or a final implementation choice.
+Tom's direction, 2026-10-09: a central daemon could normalize project workflows, own reusable storage and provide a consistent place to measure real-world use. It remains the preferred candidate, not a production deployment choice.
 
-The design should define a minimal opt-in project/consumer adapter: resolve build identity, obtain scheduler admission where required, acquire a slot, execute the declared workflow, preserve/capture run outputs under consumer policy and finalize ownership with authenticated evidence. Every actor touching an adopted slot must follow the lease contract; direct Cargo access cannot silently bypass it. Commands outside the adapter have no claim to Oxide-managed coverage.
+The consumer contract defines a minimal opt-in project adapter: resolve build identity, obtain consumer authorization, acquire a slot, execute the declared workflow, preserve/capture run outputs under consumer policy and finalize ownership with authenticated evidence. The Oxide crate now implements a fixture-only slice of that flow. Every actor touching an adopted slot must follow the lease contract; direct Cargo access cannot silently bypass it. Commands outside the adapter have no claim to Oxide-managed coverage.
 
-The daemon owns the storage ledger and records observations keyed by project/component, source/run identity, resolved toolchain/configuration and backend. Observation is not authenticated run settlement or a validation verdict. Queue/Nucleus remain authoritative for admission, managed source/run identities, settlement and evidence/retention policy. Daemon failure/restart must reconcile durable leases conservatively; loss of connection cannot grant reuse. Consumer cancellation and process lifetime must have explicit owners.
+The production candidate would own the storage ledger and observations keyed by project/component, source/run identity, resolved toolchain/configuration and backend. The current fixture adapter keeps a bounded in-process observation ring; it is not durable daemon telemetry. Observation is not authenticated run settlement or a validation verdict. Queue/Nucleus remain authoritative for admission, managed source/run identities, settlement and evidence/retention policy. Daemon failure/restart must reconcile durable leases conservatively; loss of connection cannot grant reuse. Consumer cancellation and process lifetime must have explicit owners.
 
 Start with bounded local events for acquisition/refusal, timing, rebuild/reuse observations, storage growth and finalization. Account for measurement overhead and unavailable write attribution. General tracing, dashboards and experiment scheduling are not requirements for first relief. Ordinary-use telemetry can reveal contention and trends after adoption; controlled qualification is still needed for cache correctness and failure cases. Future experiments are explicit opt-ins, use isolated declared resources and do not silently alter everyday flags or source.
 
-Keep storage/execution adapters replaceable and consumer-facing semantics stable as Cargo catches up. The design task must propose concrete daemon availability, project adoption and recovery behavior within its two-hour investigation bound; it does not install, execute or wire this design.
+Keep storage/execution adapters replaceable and consumer-facing semantics stable as Cargo catches up. The design task specified daemon availability, project adoption and recovery semantics; it did not install or wire a service.
 
 ## Minimum safe cross-worktree reuse design
 
@@ -44,7 +44,7 @@ Adoption is explicit per project and per declared workflow/selector. The adapter
 
 Queue/Nucleus admission happens before `acquire`. An admitted consumer passes an authenticated envelope containing its project, workflow, task/workspace/run/attempt identity, source tree and admission reference. For developer workflows without a scheduler, the adapter creates a local run identity but does not claim Queue/Nucleus authority. The daemon validates the envelope or a consumer-issued capability, binds it to the lease and returns an opaque lease token. It never creates or changes the consumer's identity.
 
-Under a lease, the adapter sets `CARGO_BUILD_BUILD_DIR` to the selected Oxide intermediate slot. It keeps `CARGO_TARGET_DIR` and captured outputs private to the checkout/run. The lease stays held from compile start through test completion and independent artifact/log/receipt capture. Direct Cargo access to the shared build directory is a bypass and is unsupported. An invocation that cannot reach the daemon may run only with a consumer-approved private isolated directory; otherwise it refuses. Private fallback and unmanaged commands make no Oxide reuse or observation claim.
+Under a lease, the adapter sets `CARGO_BUILD_BUILD_DIR` to the selected Oxide intermediate slot. It keeps `CARGO_TARGET_DIR` and captured outputs private to the checkout/run. The fixture prototype passes both Cargo directory overrides to an injected boundary but does not spawn Cargo. Direct Cargo access to the shared build directory is a bypass and is unsupported. An invocation that cannot reach the daemon may run only with a consumer-approved private isolated directory; otherwise it refuses. Private fallback and unmanaged commands make no Oxide reuse or observation claim.
 
 Effigy continues to launch the declared language-neutral selector and own selector/process/env lifecycle. The project adapter carries the Rust-specific identity and lease context. Queue/Nucleus (or the local developer) owns the cancellation decision; the adapter passes it to the process guardian, which must establish that every task descendant has stopped before the lease can be released. The daemon's service lifetime does not define the workflow's lifetime.
 
@@ -89,15 +89,51 @@ Slots partition by project/component, workflow, Cargo and rustc provenance, host
 
 The prototype refuses a new attempt while any slot for its partition is leased or uncertain, even when the configured budget could hold another slot. A compatible partition permits sequential reuse only after authenticated settlement; it never permits parallel mutable sharing.
 
-This remains a scratch-state prototype. It requires injected consumer evidence verification and a free-space probe; no Queue/Nucleus authenticator or host probe is included. Its cap accounts for measured slot bytes and requested reservations, but there is no filesystem quota to constrain growth while a client writes. Consumer-owned checkout and capture roots are outside its accounting. It does not launch or contain build/test descendants, integrate Cargo, prove path portability, or qualify any host filesystem. Real managed builds and adoption remain blocked until those boundaries are implemented and qualified.
+This remains a scratch-state prototype. It requires injected consumer evidence verification and a free-space probe; no Queue/Nucleus authenticator or host probe is included. Its cap accounts for measured slot bytes and requested reservations, but there is no filesystem quota to constrain growth while a client writes. Consumer-owned checkout and capture roots are outside its accounting. The storage core does not launch or contain build/test descendants, and the project adapter below does not spawn Cargo or prove path portability. No host filesystem is qualified. Real managed builds and adoption remain blocked.
+
+### Project adapter fixture prototype
+
+The Unix-only `ProjectAdapter` accepts an exact workflow/selector opt-in and
+explicit resolved inputs. It validates Cargo 1.91 or newer, tool executable
+digests, host/target, profile/features, complete allowlisted Cargo configuration
+and environment entries, source identity and canonical paths. It hashes config
+and environment values without logging them, and includes checkout-path identity
+in the partition. Unknown or ambiguous inputs fail closed. This is a validation
+boundary for injected fixture data, not an automatic Cargo/toolchain/config
+scanner.
+
+The adapter gives an injected host boundary `CARGO_BUILD_BUILD_DIR` for the
+exclusive slot and a separate `CARGO_TARGET_DIR` for private final outputs. A
+non-reserving inventory check may register one cancellable wait and consume one
+wake; it never polls or loops. Consumer authorization supplies the run envelope
+and acquire ID. The adapter acquires before host-run submission and reports a
+busy/full refusal to the fixture consumer before any command runner is called.
+Task/attempt identity and host-run identity are separate types. This split is a
+fixture model only; it does not solve Q-012 or implement a Queue/Nucleus binding.
+
+Only injected fake/lightweight runners are in scope. A fixture completion proof
+can represent writers stopped by construction; it is not native process
+containment proof. The adapter requires a matching consumer capture receipt
+before finalizing to idle. Cancellation, failed capture, mismatched run identity,
+daemon uncertainty or a lost finalization reply without a confirmed retry leave
+storage unavailable. It never starts a direct-Cargo fallback in managed state.
+
+The adapter holds at most 12 fixed-schema events per run, each at most 1 KiB,
+inside a 16 MiB in-process ring. It drops the oldest settled records first.
+Records are keyed by consumer, run and attempt identity and retain workflow, selector,
+commit, source-tree digest and partition/configuration digests. Events include
+bounded timing, reuse/rebuild summaries when supplied, storage bytes, capture
+references and finalization state. Write attribution is explicitly unavailable.
+The ring is not persisted, is not broad tracing, and does not issue QA verdicts
+or control consumer retention.
 
 ### Budget and observations
 
 Capacity covers the dedicated disposable footprint, including checkout roots, intermediates and pilot run captures. The proposed pilot ceiling is 10 GiB total and a 20 GiB host free-space reserve. Before execution, read-only preflight must establish the measurement method and demonstrate an enforceable cap/reserve for the selected host and filesystem. A preflight measurement without an enforcement mechanism is insufficient; if either bound is unknown or unenforceable, do not start a build. Capacity pressure produces an actionable refusal and inventory. Do not delete an active or uncertain slot or consumer-retained evidence to make room.
 
-Emit only bounded lifecycle observations: one normalized run record and at most 12 fixed-schema events per run, each capped at 1 KiB. Events cover request/result, compile completion, test completion, capture completion, finalization and any uncertainty/reconciliation transitions. Repeated identical RPCs update a retry counter rather than append an event. Record durations, reuse/rebuild summaries, occupied/reserved bytes and available write counters; omit raw environment values, secrets, compiler command lines and per-file traces. Cap the observation ring at 16 MiB and drop oldest settled observations first. Lease ledger and consumer run evidence are outside this ring and cannot be evicted by it. The daemon is not a general tracing service.
+The semantic ceiling is one normalized run record and at most 12 fixed-schema events per run, each capped at 1 KiB. Events cover request/result, compile completion, test completion, capture completion, finalization and any uncertainty/reconciliation transitions. Repeated identical RPCs update a retry counter rather than append an event. Record durations, reuse/rebuild summaries, occupied/reserved bytes and available write counters; omit raw environment values, secrets, compiler command lines and per-file traces. Cap the observation ring at 16 MiB and drop oldest settled observations first. Lease ledger and consumer run evidence are outside this ring and cannot be evicted by it. The daemon is not a general tracing service.
 
-Observations correlate through project/component ID, consumer run/attempt ID, source-tree digest, partition digest and event sequence. They explain storage behavior but are not authenticated settlement, a test verdict or a replacement for controlled correctness/failure qualification. If actual write attribution is unavailable, record it as unavailable; do not treat occupied-space deltas as disk-write counts or infer SSD lifetime.
+Observations correlate through project/component ID, consumer task/workspace/run/attempt ID, host-run ID when submitted, workflow/selector, exact commit/source-tree digest, partition/configuration digest and event sequence. They explain storage behavior but are not authenticated settlement, a test verdict or a replacement for controlled correctness/failure qualification. If actual write attribution is unavailable, record it as unavailable; do not treat occupied-space deltas as disk-write counts or infer SSD lifetime.
 
 ### Exact-run evidence and Cargo boundary
 
