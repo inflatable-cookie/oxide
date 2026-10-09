@@ -351,6 +351,17 @@ Launched through the approved Effigy two-separator command after standing approv
 
 Scenarios 2 to 6 did not run. The session was at roughly 65 of 90 minutes, so a rerun was not taken. Scenario 1 is cold evidence only. Its build directory now exists, so any rerun would measure warm. No reuse, rebuild, path or benefit claim is made.
 
+### Pilot execution record, run 5 (2026-10-09, partial)
+
+Run 5 used the verified two-separator launch on a fresh `m/storage` root. Run 4's scenario-1 directories were moved aside, not deleted. Results from `evidence/events-run4.log` and `evidence/events.log`:
+
+- Scenario 1, cold reference, private build directory: exit 0. Wall time 94,323 ms. 47 units rebuilt.
+- Scenario 2, slot cold at checkout A: disposition Finished. Finalization Idle. Wall time 87,704 ms.
+- Scenario 3, warm at checkout B on the same slot: disposition Finished. Same slot. Same partition digest. Cargo reported 0 rebuilt units. Tests ran: 1 and 60 passed. Wall time 58,546 ms.
+- Path check on scenario-3 binaries in the slot's `debug/deps` (read-only byte scan): `planning-*` contains 484 occurrences of the checkout-A path and no checkout-B path. `build_diagnostics-*` contains 56 A-path occurrences and none for B. This is a stale-path result for cross-checkout reuse, which the brief treats as a path-correctness failure.
+
+The driver stopped at its path proof. It looked in `runs/s3/target/debug/deps`, but test binaries live under the slot's build directory. The driver never reached scenario 4. Scenarios 4 to 6 and the controls did not run. No reuse benefit is claimed. The result is a reduced-benefit finding, pending the planned independent review.
+
 ## Preserved real-build pilot outline (not authorized)
 
 This earlier outline remains a separate, unapproved real-build pilot. The six native fixture scenarios above are the current completion-boundary task; they do not authorize Cargo performance measurement or a consumer run. Any later pilot needs its own Queue brief, host/consumer scope, and independent review. Do not inherit execution authority from the fixture task.
