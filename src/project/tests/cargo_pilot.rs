@@ -580,7 +580,8 @@ fn nucleus_cargo_pilot() {
     ));
     assert_eq!(result3.disposition, ExecutionDisposition::Finished);
     assert_eq!(slot_s2, slot_s3, "scenario 3 must reuse the released slot");
-    let s3_target = mount.join("runs/s3/target/debug/deps");
+    // Test binaries live under the slot build directory, not the final target directory.
+    let s3_target = slot_s3.join("debug/deps");
     let base_refs = count_in_binaries(
         &s3_target,
         &["planning-", "build_diagnostics-"],

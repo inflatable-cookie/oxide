@@ -362,6 +362,24 @@ Run 5 used the verified two-separator launch on a fresh `m/storage` root. Run 4'
 
 The driver stopped at its path proof. It looked in `runs/s3/target/debug/deps`, but test binaries live under the slot's build directory. The driver never reached scenario 4. Scenarios 4 to 6 and the controls did not run. No reuse benefit is claimed. The result is a reduced-benefit finding, pending the planned independent review.
 
+### Disposition of the partial pilot (2026-10-09)
+
+This is an honest partial negative result for the standalone pilot. The original 90-minute experiment window expired before scenarios 4 to 6 and the in-session controls ran. No further Cargo scenario or reviewer replay is authorized under this disposition. The stale-path observation is not proof of wrong-source execution: a byte count of embedded paths can be debug metadata, and that distinction is left to independent review.
+
+Missing before any reuse claim:
+
+- Scenarios 4 to 6 and the concurrent-refusal, identity-replay, uncertainty and idle-eviction controls. Scenario 5's configuration key separation and scenario 6's toolchain separation were never recorded.
+- Source-content-miss evidence. The planned miss in checkout B never ran.
+- Whether the embedded checkout-A paths are behavior-bearing or only debug metadata. This needs a separate path-classification proof.
+- Completion coverage for the Cargo process tree. The runner records one process group leader and a per-spawn marker, not a full descendant census. Leftover members make the lease uncertain, but the process tree was not separately audited.
+- Write and performance attribution. Occupied bytes and elapsed times are single-run observations on a shared host. Storage deltas are not write volume or SSD lifetime.
+
+Artifact ownership: each run's captures, manifest, stdout/stderr digests and final binaries are kept under that run's own capture directory. Test binaries live under the slot's build directory.
+
+Production keys keep checkout identity. The trial-only key preserves safety but leaves the duplication problem unsolved for production.
+
+Reviewer verdict subjects: cargo_completion, resource_bounds, cross_path_correctness, invalidation, evidence_binding and measured_benefit. The reviewer may return fail or insufficient where evidence is missing. Future portability remediation or a fresh experiment needs a separate bounded plan after review.
+
 ## Preserved real-build pilot outline (not authorized)
 
 This earlier outline remains a separate, unapproved real-build pilot. The six native fixture scenarios above are the current completion-boundary task; they do not authorize Cargo performance measurement or a consumer run. Any later pilot needs its own Queue brief, host/consumer scope, and independent review. Do not inherit execution authority from the fixture task.
