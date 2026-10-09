@@ -26,7 +26,7 @@ Choose baseline projects and edit/check/test/worktree scenarios, then set accept
 
 ## Q-007 — How should Oxide consume upstream caching and existing tools?
 
-Identify supported capability/version boundaries and keep policy independent of replaceable mechanisms. The accepted Cargo cross-workspace-cache goal is direction, not installed capability proof. Owner: [Rust DX landscape](rust-dx-landscape.md).
+The strategy is settled: reuse usable Cargo capabilities and fill current gaps without waiting indefinitely; see [vision](vision.md#relationship-with-cargo). Identify supported capability/version boundaries, keep policy independent of replaceable mechanisms, and define replacement/retirement criteria for each temporary mechanism. The accepted Cargo cross-workspace-cache goal is direction, not installed capability proof. Owner: [Rust DX landscape](rust-dx-landscape.md).
 
 ## Q-008 — Which host/container division preserves required production parity?
 
