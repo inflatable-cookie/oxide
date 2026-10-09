@@ -3,10 +3,15 @@
 The repository pins the already-installed Rust 1.97.1 toolchain in
 [`rust-toolchain.toml`](../../rust-toolchain.toml). The selected compiler is
 `rustc 1.97.1` and its matching Cargo is `cargo 1.97.1`; this is the local
-development and validation toolchain, not a minimum supported Rust version.
-The package does not declare `rust-version`, so no MSRV is claimed. The
-RustQuality profile stops version-sensitive work while that policy is
-unresolved.
+development and validation toolchain.
+
+Tom's ruling, 2026-10-09: Oxide's initial minimum supported Rust version is
+**1.97.1**. Package manifests must declare `rust-version = "1.97.1"`; the strict
+RustQuality policy remains in force with no unresolved-MSRV exception. The
+prototype's recorded checks exercised this compiler. Supporting an older
+compiler requires deliberate compatibility validation and a revised policy.
+This minimum governs building Oxide itself; consumer project compilers remain
+independently resolved inputs to their build-storage identity.
 
 The unpublished root package uses Rust edition 2021 and has no dependencies or
 product behavior. Its internal name is `oxide-storage`; publication names remain
