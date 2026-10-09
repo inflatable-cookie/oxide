@@ -14,7 +14,7 @@ Cargo 1.91 stabilizes `build.build-dir` and `CARGO_BUILD_BUILD_DIR`; this moves 
 
 The design recommends distinct compatibility-partition and per-run identities; durable idempotent acquire/reconcile/finalize; refusal for concurrent or uncertain claims; and proven-idle-only eviction. The pilot proposal uses a 10 GiB disposable cap and 20 GiB host free-space reserve, but read-only feasibility and enforceability remain prerequisites. Exact host locking/process-containment behavior and any later product budgets are unsettled. See [the ownership protocol](architecture.md#semantic-operations) and [budget proposal](architecture.md#budget-and-observations).
 
-Reviewed [capacity findings](qualification-readiness.md#temporary-output-must-be-in-the-10-gib-footprint) include temporary output in the disposable footprint and distinguish sampled aborts from kernel enforcement. The host reserve policy needs Tom's ruling in Q-014. Existing hard-bound prerequisites remain in force until explicitly changed.
+Reviewed [capacity findings](qualification-readiness.md#temporary-output-must-be-in-the-10-gib-footprint) include temporary output in the disposable footprint and distinguish sampled aborts from kernel enforcement. The host reserve policy is settled in Q-014. The separate enforced disposable-footprint cap remains a prerequisite.
 
 ## Q-004 — What narrowly scoped pilot may be authorized?
 
@@ -60,4 +60,4 @@ The reviewed [containment disposition](qualification-readiness.md#process-contai
 
 ## Q-014 — Is 20 GiB host free space a guarantee or a start/abort threshold?
 
-The reviewed [reserve findings](qualification-readiness.md#20-gib-host-free-space-reserve--unresolved) show that the proposed isolated-volume quota would not guarantee free space on the shared host. Tom must decide whether to retain the guarantee (execution remains blocked) or explicitly adopt a monitored start/abort threshold with its stated races. This decision would not authorize volume creation, weaken the separate disposable-footprint cap or release the pilot hold.
+Settled by Tom on 2026-10-09: use 20 GiB as a monitored start/abort threshold, not a guarantee against unrelated host writers. [Architecture](architecture.md#budget-and-observations) owns the policy and required execution-protocol details. Volume creation remains unauthorized; the separate enforced disposable-footprint cap and pilot hold remain in force.

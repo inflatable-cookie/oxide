@@ -2,6 +2,8 @@
 
 Design-only. This file answers the host/consumer gates that [architecture](architecture.md) left unproved: descendant containment after cancel/crash/lost reply/restart, and whether the proposed 10 GiB disposable cap and 20 GiB host free-space reserve can actually be enforced. It does not authorize a pilot, consumer adoption, or host installation. Saving or merging it grants none of those. Unmerged worker code is not an authority.
 
+Subsequent operator ruling, 2026-10-09: Tom approved a bounded documentation-only completion/fencing follow-up and selected a monitored 20 GiB start/abort threshold. [Architecture](architecture.md#budget-and-observations) owns that current resource policy; the guarantee-versus-threshold asks below describe the original readiness disposition and are now answered. No permanent-quarantine or single-held-session fallback has been accepted, and no pilot execution is authorized. The enforced disposable-footprint cap and usable native completion proof remain gates.
+
 Ownership: this file. Protocol semantics stay in [architecture](architecture.md). Scope and authorization stay in [vision](vision.md). Open product choices stay in [questions](questions.md).
 
 Inspection was read-only: committed Oxide, Nucleus and Queue documentation/config, installed toolchain metadata, Darwin headers and man pages, and `statfs`/`diskutil`/`quota` queries. No compilation, daemon, checkout, quota, volume, sandbox or service was created.
