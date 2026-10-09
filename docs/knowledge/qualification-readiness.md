@@ -20,7 +20,7 @@ Inspection was read-only: committed Oxide, Nucleus and Queue documentation/confi
 - Queue/Nucleus Contract 010 (Nucleus `docs/knowledge/contracts/010-host-run-scheduling.md`, Queue `server/process-group.ts`) launches a host run in a new process group, records pgid plus start identity, signals the group, records `setsid` escapees, and treats an empty group as host-process death, not container death. Frozen Contract 010 is unchanged by this design.
 - Nucleus observer docs (`experiments/recovery-core/OBSERVER.md`) state that cwd/open-file/`kill -0` scans cannot treat `Unknown` as empty, and that a process which changes cwd and drops worktree files disappears from that scan. Contract 002 forbids sharing mutable build directories and assigns shared Rust build/cache ownership to Oxide.
 
-**Proposed (not observed, not implemented):** the guardian, accounting cap, experimental path-omitting partition, and six-scenario evidence map below. A cache hit is never validation success.
+**Proposed (not observed, not implemented):** signalling (not completeness), `disp_tmp` redirect, 10 GiB accounting, experimental path-omitting partition, six-scenario map, and the blocked/unresolved disposition below. A cache hit is never validation success.
 
 ## Process containment
 
@@ -37,64 +37,78 @@ Inspection was read-only: committed Oxide, Nucleus and Queue documentation/confi
 | `sandbox-exec` / App Sandbox / Endpoint Security / VM | Kernel or framework confinement. | Deprecated, entitlement-heavy, or a different experiment. Out of this brief. |
 | Linux cgroups | Kernel tree + resource control. | Not present on this macOS host. |
 
-**Recommended supported mechanism:** compose Contract 010's process-group and start-identity discipline with a slot-rooted file/cwd observer. That is the strongest user-space control this host offers without installing a service, creating a volume, or changing frozen Contract 010.
+**Signalling mechanism (not a completeness proof):** compose Contract 010's process-group and start-identity discipline with a slot-rooted file/cwd observer. Use it to deliver SIGTERM/SIGKILL to known members and to record what the host can see. It is the strongest user-space *control* this host offers without installing a service or changing frozen Contract 010. It does **not** enumerate every descendant.
 
-When the workflow is a Queue/Effigy-admitted host run, inherit that run's process group and start identity. Do not `setpgid` the Cargo/rustc tree out of the consumer group: that would look like an escape to Contract 010 and would change consumer process accounting. Oxide adds slot/checkout/capture path scans and extra escapee records; it does not replace the consumer supervisor.
+When the workflow is a Queue/Effigy-admitted host run, inherit that run's process group and start identity. Do not `setpgid` the Cargo/rustc tree out of the consumer group: that would look like an escape to Contract 010 and would change consumer process accounting. Oxide adds slot/checkout/capture/tmp path scans and extra escapee records; it does not replace the consumer supervisor.
 
 When the workflow is a local adapter outside a consumer host run, the adapter creates the group with `POSIX_SPAWN_SETPGROUP`, records pgid plus start identity, and is the sole signalling owner.
 
-`sandbox-exec` is rejected. A new APFS volume is a capacity tool, not descendant containment.
+`sandbox-exec` is rejected. An APFS volume can fail an unmount while FDs are open; that is a current-open-file observation, not a process-tree proof, and it does not stop a later reopen-by-path after remount.
 
 ### Proof obligation
 
-After cancellation, client crash, daemon crash, lost reply, or restart, a slot stays `leased` or becomes `uncertain`. It becomes reusable or evictable only after **all** of the following authenticated records exist for that lease. Any missing, conflicting, or `Unknown` item keeps the slot uncertain. Age, vanished PID, empty group, daemon restart, or a test verdict never releases it.
+Native macOS, with the APIs this brief may use, **cannot prove that every build/test descendant has ended**. `NOTE_TRACK` is unsupported. Process-group membership, start-identity environment, `proc_listchildpids`, `ps`, `lsof`, and cwd scans observe only processes they can still see. A descendant that leaves the group (`setsid` / new `posix_spawn` group), drops the identity variable, closes every slot/checkout/capture/tmp descriptor, `chdir`s away, and later reopens a remembered path is not in that set. The selected Nucleus planning+diagnostics selector also omits the observer tests that spawn extra process groups, so the candidate workflow does not even exercise the known extra-group case.
 
-1. **Group emptiness.** `kill(-pgid, 0)` returned `ESRCH` for the recorded pgid, or every identity-matched member is proven dead by pid+start-identity. A failed or denied scan is `Unknown`, not empty.
-2. **Escapees dead.** Every process recorded as leaving the group, plus every process observed with cwd or an open file under the slot, checkout, or capture root and carrying the start identity (or otherwise attributable to the lease), is proven dead by pid+start-identity. `proc_listchildpids` and `ps` listings are discovery aids, not completeness proofs.
-3. **Slot quiet.** A same-UID `lsof`/cwd scan of the slot, both checkouts and the capture root is `Observed` and quiet, with the Nucleus observer write-exclusion premise recorded for other UIDs. `Unknown` keeps the slot uncertain.
-4. **Capture evidence.** The consumer's authenticated capture receipt (digests bound to run/source/selector/toolchain) is present, or capture is durably recorded as not started. Oxide does not mint that receipt. Missing capture with an ended process still leaves storage uncertain if the run executed.
-5. **Idempotent reconcile.** The same `(lease_id, reconcile_id)` with byte-identical evidence returns the same result. Changed evidence under that ID is rejected.
+Therefore the observational conjunction (empty pgid + recorded escapees dead + quiet `lsof`/cwd + capture receipt) is **not** a containment proof. Using it as a `reconcile` success predicate can pass while that descendant is still live. That predicate is refused.
 
 Distinguish:
 
-- **Observation:** pid, pgid, lock file, `kill -0`, `ps`, `lsof`. These locate work. Their absence is not idle.
-- **Containment proof:** the conjunction above, durable, fail-closed. macOS does not give this brief a kernel tree that cannot escape. Qualification therefore proves a fail-closed guardian, not cgroup-equivalent confinement.
+- **Observation:** pid, pgid, lock file, `kill -0`, `ps`, `lsof`, unmount-busy. These locate some work and support signalling. Their absence is not idle and is not completeness.
+- **Containment proof:** a record that accounts for every descendant that could still write. This host has no supported mechanism that produces that record.
 
-Residual hole (must be named in the execution brief): a process that leaves the group, drops the identity env, closes every slot FD, `chdir`s away, and later reopens the slot by path. rustc/Cargo do not typically `setsid`; Nucleus observer tests deliberately spawn other groups. Treat that class as `uncertain` if a cancellation or crash hits during those tests.
+**Release rule:** after any launch of Cargo/rustc/tests, and after cancellation, client crash, daemon crash, lost reply, or restart, the slot becomes or stays `uncertain` and remains **unavailable for reuse and eviction** for the rest of this protocol. There is no observational path to `idle`. Age, vanished PID, empty group, quiet scan, daemon restart, leader exit, or a test verdict never releases it. `reconcile` may confirm and persist `uncertain`; it must not transition to `idle` or `evictable`. Idempotent `(lease_id, reconcile_id)` still applies: identical evidence returns the same `uncertain` result; changed evidence is rejected.
 
-If a production descendant still writes after the guardian has claimed quiet, that is a blocking qualification failure, not a reason to weaken the proof.
+Operator destruction of a quarantined tree or volume, without remounting that path for a new lease, stays outside this protocol as [architecture](architecture.md#durable-ownership-and-recovery) already states.
+
+**Pilot measurement without claiming completeness:** scenarios 2–4 may share one still-held exclusive lease (one `acquire`, cargo A then cargo B under that lease, `finalize` of the session still leaves the slot `uncertain` because descendants are unproven). That measures Cargo reuse under exclusive admission. It is not a descendant-complete release, not idle eviction, and not crash-recovery reuse. Concurrent second claimants are refused while `leased` or `uncertain`.
+
+Capture evidence remains required for consumer settlement and does not make the slot idle. Oxide does not mint that receipt.
 
 ## Capacity
 
-The 10 GiB disposable footprint and 20 GiB host free-space reserve **cannot be kernel-enforced on the existing Data volume** under this brief's authority. Periodic sampling and preflight `statfs` are observations. Host concurrent writes (other Queue tasks, Time Machine, ordinary use) can invalidate a reserve between samples. `RLIMIT_FSIZE` does not cap a tree. User quotas are not enabled.
+The two numbers are different controls. Sampling and preflight `statfs` are observations. `RLIMIT_FSIZE` caps one file, not a tree. User quotas for uid 501 are none. Host concurrent writes (other Queue tasks, Time Machine, ordinary use) can consume Data free space at any time.
 
-### Proposed control (accounting, fail-closed)
+### Temporary output (must be in the 10 GiB footprint)
 
-Covered trees: disposable checkout A, disposable checkout B, the one exclusive intermediate slot, and that session's capture/log directories. Shared `CARGO_HOME` downloads and the operator's other checkouts are outside the 10 GiB cap and must not be deleted to make room.
+Cargo/rustc/cc and tests write intermediates under `CARGO_BUILD_BUILD_DIR`, finals under `CARGO_TARGET_DIR` (including `CARGO_TARGET_TMPDIR` for integration tests, documented in Cargo's environment-variable reference), and **OS temporary files** via `std::env::temp_dir()`, which on this host follows `TMPDIR` (typically a per-user directory under `/var/folders/…/T/`). Native tools may also read `TMP` and `TEMP`. Cargo's own config reference shows `[env] TMPDIR = { value = "…", force = true }` as the supported way to override that for processes Cargo launches.
 
-- **Occupied bytes:** walk those trees and sum unique `(device, inode)` using `st_blocks * 512`. File lengths and `du` without inode dedup over-count hard links. APFS compression, clone extents and snapshots can make this an upper or lower bound; record the method and that limitation. Unknown size is unknown, not zero.
-- **Host free space:** `statfs` `f_bavail * f_frsize` (or `f_bsize` if `f_frsize` is 0) on the Data volume that holds the trees. This is a snapshot.
-- **Acquire refusal.** Refuse if occupied + a declared per-scenario headroom would exceed 10 GiB, or if free space is below 20 GiB. Do not start a build when either bound is unknown.
-- **In-run abort.** Resample at acquire, compile end, test end, capture end, finalize, and on a bounded timer no slower than once per minute while leased. Crossing 10 GiB occupied or 20 GiB free-space aborts the workflow, leaves the slot `uncertain` until the containment proof, and reports. No automatic retry or expansion.
-- **Writes.** Occupied-space deltas are not SSD write counts. If `iostat` on the APFS physical store can be sampled around a scenario without extra tools, record the delta as an observation; otherwise record write attribution as unavailable. An APFS quota would still not cap write amplification.
+Without redirecting those temps into the disposable trees, they bypass both a sampled 10 GiB walk and an APFS volume that only holds checkouts, slot and captures.
 
-**Coverage:** only the named trees, only at sample instants. **Overhead:** tree walks of a few-GiB slot are expected to be seconds, not the dominant budget. **Residual races:** a compiler can write past 10 GiB between samples; any other process can consume the 20 GiB host reserve at any time; APFS metadata and snapshots outside the walk are uncounted.
+**Required redirect for any 10 GiB claim:** before spawning Effigy/Cargo, force `TMPDIR`, `TMP` and `TEMP` to one dedicated directory `disp_tmp` on the same filesystem as the slot (and on the quota volume if that volume exists). Covered trees for occupied-byte accounting then are: checkout A, checkout B, the exclusive slot, `disp_tmp`, and that session's capture/log directories. Shared `CARGO_HOME` downloads stay outside the cap and must not be deleted to make room.
 
-This is an honest abort policy, not a reserve guarantee.
+Residual bypasses after that redirect: a tool that hard-codes `/tmp` or `/private/tmp`, or that ignores `TMPDIR`; APFS metadata and snapshots outside the walk; writes between samples.
 
-### Smallest scoped adjustment if Tom needs a hard cap
+### 10 GiB disposable cap
 
-Separately authorize an exclusive APFS volume on the existing container:
+On the existing Data volume the cap is accounting plus abort, not kernel enforcement:
+
+- **Occupied bytes:** walk the covered trees, including `disp_tmp`, and sum unique `(device, inode)` using `st_blocks * 512`. File lengths and `du` without inode dedup over-count hard links. APFS compression, clone extents and snapshots can make this an upper or lower bound; record the method. Unknown size is unknown, not zero.
+- **Acquire refusal.** Refuse if occupied + declared per-scenario headroom would exceed 10 GiB, or if occupied is unknown.
+- **In-run abort.** Resample at acquire, compile end, test end, capture end, finalize, and on a bounded timer no slower than once per minute while leased. Crossing 10 GiB aborts, leaves the slot `uncertain` (unavailable), and reports. No automatic retry or expansion.
+- **Writes.** Occupied-space deltas are not SSD write counts. If `iostat` on the APFS physical store can be sampled around a scenario without extra tools, record the delta; otherwise record write attribution as unavailable. An APFS quota still would not cap write amplification.
+
+**Coverage:** the named trees including `disp_tmp`, at sample instants, plus whatever actually lands under the forced temp vars. **Overhead:** tree walks of a few-GiB slot are seconds. **Residual races:** a compiler can write past 10 GiB between samples; ignored-`TMPDIR` tools; concurrent writers on Data.
+
+**Smallest kernel adjustment for the 10 GiB cap only** (separate authority; this task must not create it):
 
 ```text
 diskutil apfs addVolume <container> APFS <name> -quota 10g
 ```
 
-from `diskutil(8)`. `-quota` limits that volume's file data. Put checkouts, slot and captures on it. `-reserve` guarantees space **to** the volume; it does not keep 20 GiB free for the rest of the host. Keep the 20 GiB host reserve as preflight-plus-abort on Data (`f_bavail ≥ 20 GiB` in addition to the empty quota volume). Residual: other writers to that volume if it is not exclusive; clone/snapshot accounting; still no write-volume cap; still no protection of Data against concurrent host processes.
+from `diskutil(8)`. `-quota` limits that volume's file data. Place checkouts, slot, `disp_tmp` and captures on it, and force `TMPDIR`/`TMP`/`TEMP` there. Residual: other writers if the volume is not exclusive; clone/snapshot accounting; hardcoded `/tmp`; still no write-volume cap. `-reserve` guarantees space **to** this volume; it does not keep space free for the rest of the host.
 
-Do not pretend the accounting control is that volume. This task must not create it.
+Nucleus's documented 2.3 GiB unique artifact sample for the planning+diagnostics pair does not include `disp_tmp` or two source checkouts. Preflight after the isolated cold run must measure the full covered set. If it exceeds 10 GiB, stop and report.
 
-Nucleus's documented 2.3 GiB unique artifact sample for the planning+diagnostics pair leaves room under 10 GiB for two source checkouts, private `CARGO_TARGET_DIR` finals, one shared slot and captures, if the selector stays that narrow. Full `qa:core:test` (`cargo test --workspace --offline`) is larger and may not fit; preflight must measure occupied after the isolated cold run before sharing the slot. If the cold run already exceeds the cap, stop and report; do not widen the cap inside the session.
+### 20 GiB host free-space reserve — unresolved
+
+This reserve is a property of the shared Data volume, not of the disposable trees. An exclusive `-quota 10g` volume does not enforce it. `-reserve` on that volume is the opposite polarity. Preflight `statfs` `f_bavail` and a periodic abort when `f_bavail` drops below 20 GiB are the same sampling the brief already calls insufficient: any other process can consume the reserve between samples, and this brief cannot stop those processes.
+
+There is no supported, in-authority mechanism on this multi-writer laptop that **guarantees** 20 GiB remain free. Architecture's rule that an unenforceable bound means "do not start a build" therefore applies to a *guaranteed* 20 GiB reserve.
+
+This is not folded into the 10 GiB quota adjustment. It needs an explicit Tom decision before any execution brief:
+
+1. Treat 20 GiB as a heuristic start/abort threshold only (not a guarantee), and say so in the execution brief; or
+2. Keep the guarantee requirement, in which case the resource gate stays blocked on this host.
 
 ## Candidate selector, head and toolchain
 
@@ -103,10 +117,10 @@ Recorded for a later execution brief. **Not owner consent.** Source-owner coordi
 | Item | Candidate | Prerequisites still missing |
 | --- | --- | --- |
 | Selector | Nucleus Effigy `check:core:test` with args `-p nucleus-core --test planning --test build_diagnostics` | Nucleus owner agreement that this exact selector/args may run in two disposable checkouts under Oxide's slot. |
-| Why this selector | Named in Nucleus `AGENTS.md` Validate examples. Already measured on this host (Nucleus `crates/README.md`). Exercises serde derive (proc macros), bundled rusqlite (native build script/C), 58 planning tests plus diagnostics, and source-line backtraces. Fits the six-scenario / 90-minute / 10 GiB bounds better than full `qa:core:test`. | If the owner instead requires `qa:core:test`, preflight the isolated cold occupied size and wall time; observer tests spawn extra process groups and are a containment stress, not a reason to skip the guardian. |
+| Why this selector | Named in Nucleus `AGENTS.md` Validate examples. Already measured on this host (Nucleus `crates/README.md`). Exercises serde derive (proc macros), bundled rusqlite (native build script/C), 58 planning tests plus diagnostics, and source-line backtraces. Fits the six-scenario / 90-minute / 10 GiB bounds better than full `qa:core:test`. | Omits observer orphan-group tests. That is a completeness gap, not a reason to prefer `qa:core:test`: extra groups still would not close the identity-dropping hole. |
 | Exact head | Inspection snapshot: Nucleus `bca75ed0143f96cd20b88ff72a421f1fb5f4ef19` (tree `67ecef91c907ca4085d94ea242b62f678c92993f`, 2026-10-09). Re-pin at execution approval; do not treat this SHA as still `main`. | Owner freeze of that SHA (or a later named SHA) for both disposable checkouts, matching lockfile, no extra patches except any invalidation patch the owner approves for scenario 4. |
 | Toolchain | Already-installed `rustc 1.97.1 (8bab26f4f)` / `cargo 1.97.1 (c980f4866)`, `RUSTUP_TOOLCHAIN=1.97.1`, host `aarch64-apple-darwin`. Pin in the disposable environment because Nucleus has no `rust-toolchain.toml`. | Confirm the same sysroot on both checkouts. Do not install. Scenario 6 may use already-installed `1.96.1` only as a key-separation/refusal probe, and may skip a second compiler build. |
-| Paths | Two disposable checkout directories and one slot directory, all on Data (or on the separately authorized quota volume). Private `CARGO_TARGET_DIR` per checkout/run. `CARGO_BUILD_BUILD_DIR` = the slot. | Exact absolute paths in the execution brief. No links into real Nucleus/Queue checkouts. |
+| Paths | Two disposable checkout directories, one slot directory, one `disp_tmp` directory, and per-run capture directories, all on Data (or on a separately authorized 10 GiB quota volume that holds **all** of these). Private `CARGO_TARGET_DIR` per checkout/run. `CARGO_BUILD_BUILD_DIR` = the slot. `TMPDIR`, `TMP` and `TEMP` forced to `disp_tmp`. | Exact absolute paths in the execution brief. No links into real Nucleus/Queue checkouts. |
 | Oxide authoring | Repository RustQuality profile is `strict` with empty deviations; Oxide pins 1.97.1. | Irrelevant to this docs task. Any later Rust in 003/004 follows that profile. The pilot compiles Nucleus, not Oxide. |
 
 `CARGO_HOME` may stay the per-user download cache Queue already shares. That is not slot sharing.
@@ -126,13 +140,13 @@ If scenario 3's path/proc-macro/generated-code evidence fails, stop cross-path c
 
 ## Six-scenario evidence map
 
-Stay inside six worker scenarios, 90 minutes worker, 30 minutes independent reviewer, 10 GiB occupied, 20 GiB free-space abort. No automatic retries. Every scenario that actually builds runs the selected tests in the same lease. A cache hit cannot skip tests or mint a pass.
+Stay inside six worker scenarios, 90 minutes worker, 30 minutes independent reviewer, and the 10 GiB occupied abort (including `disp_tmp`). Do not treat a 20 GiB free-space *guarantee* as in force. No automatic retries. Every scenario that actually builds runs the selected tests in the same lease. A cache hit cannot skip tests or mint a pass. Scenarios 2–4 share one still-held lease; they do not finalize to `idle` between them.
 
 Minimum evidence is what can **falsify** ownership, reuse, path/proc-macro correctness, always-run tests, and exact-run binding. Timing and occupied bytes are recorded; they are not success.
 
 | # | Scenario | What must be in the capture | Falsifier |
 | --- | --- | --- | --- |
-| 1 | Isolated cold reference, private build directory, checkout A | Wall time; occupied/reserved; write observation or `unavailable`; full test execution record; consumer receipt binding binaries/logs/receipts to SHA, tree, selector, toolchain 1.97.1, checkout A. Slot untouched. | Tests skipped; receipt missing or bound to the wrong source; slot written. |
+| 1 | Isolated cold reference, private build directory, checkout A | Wall time; occupied of covered trees including `disp_tmp`; write observation or `unavailable`; full test execution record; consumer receipt binding binaries/logs/receipts to SHA, tree, selector, toolchain 1.97.1, checkout A. Slot untouched. | Tests skipped; receipt missing or bound to the wrong source; slot written; temps left in the default `/var/folders` TMPDIR. |
 | 2 | Shared-slot cold at A, experimental variant | Same as 1, plus lease id, partition digest without path, `CARGO_BUILD_BUILD_DIR` = slot, Cargo rebuild/reuse summary. Tests executed. | Tests skipped; another claimant touched the slot; lease not durable before first rustc. |
 | 3 | Same-head warm at B, same slot | Tests executed at B. Cargo reuse/rebuild summary. **Path proof:** captured test output plus `strings` (or equivalent) of the executed `planning` and `build_diagnostics` binaries under B's `CARGO_TARGET_DIR`. Checkout B's absolute path must appear where those binaries embed paths; checkout A's absolute path must not. `build_diagnostics` passing on `build_diagnostics.rs:<line>` alone is not path proof (`CARGO_MANIFEST_DIR` is compile-time; A remaining on disk can hide stale reuse). Proc-macro/native: rusqlite bundled and serde derive units either rebuild for B or, if reused, still pass the path proof. Receipt bound to B's checkout identity and the same SHA/tree/toolchain. | Tests skipped; binaries executed from A; embedded A paths in B's run; tests pass against A's tree via baked `CARGO_MANIFEST_DIR`. That is failed portability, not a hit. |
 | 4 | Controlled tracked-source change in one disposable checkout | Owner-approved patch or a recorded content edit (not only `touch`) with new tree digest. Affected units rebuild. Tests executed on the new tree. Receipt bound to the new digest. Slot remains exclusive. | Tests skipped; receipt still names the old tree; rebuild of affected units not evidenced. **Needs owner-approved source change.** `touch`-only is weaker and does not prove content invalidation; use it only if the owner refuses a patch, and name the weaker claim. |
@@ -141,31 +155,43 @@ Minimum evidence is what can **falsify** ownership, reuse, path/proc-macro corre
 
 **In-session proofs, not extra scenarios** (same 90-minute budget):
 
-- Concurrent second claimant refused; slot bytes unchanged.
-- Idempotent acquire/finalize after a deliberately dropped reply.
-- Daemon or client kill during an in-flight build; restart keeps the slot `uncertain` until the containment proof; empty pgid alone does not release.
-- Budget abort evicts only a reconciled idle slot; active/uncertain remains.
+- Concurrent second claimant refused while `leased` or `uncertain`; slot bytes unchanged.
+- Idempotent acquire/finalize after a deliberately dropped reply; the slot stays `uncertain` after launch, not `idle`.
+- Daemon or client kill during an in-flight build; restart leaves the slot `uncertain` with **no** observational `reconcile` success path to `idle` or `evictable`. Empty pgid, quiet `lsof`, or vanished PID must not release it. That is the interruption proof this host can actually run.
+- Budget abort does not evict a launched slot. It refuses new acquire and turns the in-flight lease `uncertain`. Idle eviction after a Cargo/test launch is not in the proven set.
 
-**Reviewer (30 minutes):** replay at most one warm (scenario 3) and one meaningful miss (4, 5 or 6), checking receipts, path strings, test execution and the uncertain-after-crash record. Independent exact-head review of this design is separate and precedes any execution brief.
+**Reviewer (30 minutes):** replay at most one warm (scenario 3) and one meaningful miss (4, 5 or 6), checking receipts, path strings, test execution, `disp_tmp` inclusion in occupied bytes, and that an interrupted run remains unavailable. Independent exact-head review of this design is separate and precedes any execution brief.
 
 **Fixture / different-workflow cases** (do not expand the matrix):
 
 - Path-absolute assertion: committed `build_diagnostics` is insufficient; capture binary strings as above rather than adding a Nucleus test.
-- Observer orphan groups: present in full `qa:core:test`, not in the planning+diagnostics pair. If the owner requires `qa:core:test`, cancellation during those tests is the containment stress case; budget time for it by dropping a less informative scenario only with explicit execution-brief edit, not ad hoc.
+- Observer orphan groups: present in full `qa:core:test`, not in the planning+diagnostics pair. Switching to `qa:core:test` would exercise extra process groups and still would not close the identity-dropping/path-leaving hole. Do not expand the matrix to chase a completeness proof this host cannot give.
 - Generated code beyond serde/rusqlite: this selector does not exercise a workspace `build.rs` of Nucleus itself. That is a coverage limit, not a seventh scenario. Do not swap in another repo to chase proc-macro breadth.
+- Descendant-complete release: would need a kernel tree (cgroup, supported sandbox, or equivalent) or a fixture whose processes cannot `setsid`/drop identity/leave path — Cargo/rustc/tests are not that fixture. Not a sixth-scenario substitute.
 
 ## Disposition
 
-**Proceed to scoped execution approval**, with honest accounting limits, after the missing prerequisites below. Not blocked on macOS process APIs: the recommended guardian is supported and fail-closed. Blocked only if Tom requires a kernel-hard 10 GiB/20 GiB **guarantee**; then the smallest next ask is the exclusive APFS `-quota 10g` volume plus the still-racy 20 GiB Data preflight, under a new brief.
+**Not proceed-to-execution.** Two gates stay unresolved until Tom rules. This file is still the documentation answer 001 lacked; saving or merging it grants no pilot, installation or adoption authority.
 
-This is not a claim that the pilot ran, that reuse works, or that consumers may adopt.
+| Gate | Status | Why |
+| --- | --- | --- |
+| Descendant-complete release after interruption (and after any Cargo/test launch) | **Blocked** on native macOS with supported APIs | Hidden identity-dropping/path-leaving descendants can evade group/identity/`lsof` scans, so those scans must not be a `reconcile` success predicate. Interrupted and post-launch slots stay `uncertain` and unavailable. The planning+diagnostics selector does not include observer orphan-group tests. |
+| 10 GiB disposable footprint | Protocol proposed, not yet authorized | Include `disp_tmp` via forced `TMPDIR`/`TMP`/`TEMP`. Accounting abort on Data; kernel cap only if a separately authorized `-quota 10g` volume holds checkouts, slot, `disp_tmp` and captures. Hardcoded `/tmp` remains a residual bypass. |
+| 20 GiB host free-space **guarantee** | **Unresolved / blocked as a guarantee** | Quota volumes do not enforce host free space. Sampling/preflight cannot. Needs Tom's choice below. |
+
+**Smallest asks for Tom (do not start a build until answered):**
+
+1. Containment: accept permanent `uncertain` (unavailable) after launch/interrupt as the macOS protocol, and treat descendant-complete idle/eviction as out of this pilot; or keep completeness as a requirement, in which case qualification stays blocked until a kernel tree exists.
+2. Reserve: accept 20 GiB as a heuristic start/abort threshold only; or keep it as a guarantee, in which case the resource gate stays blocked on this shared Data volume.
+
+Cross-path Cargo measurement under one still-held lease can be scoped later only if (1) is the permanent-uncertain choice. It would not be a containment pass.
 
 ### Missing prerequisites
 
-1. Independent exact-head review of this file against the brief.
-2. Nucleus owner coordination: selector/args, frozen SHA, disposable-checkout permission, scenario-4 patch policy, and `lead-1965` disposition. No parallel compiler wrapper.
-3. Reviewed 003 storage-core and 004 adapter implementations to run against; this file does not wait on their merge, and they must not treat this text as execution authority.
-4. Separate execution brief: exact paths, cap/reserve abort policy, partition variant flag, six-scenario script, crash/concurrency proofs, 90/30-minute hard stops, and either accounting-only honesty or the APFS-volume adjustment.
-5. Preflight on the chosen trees immediately before execution: occupied method, free space ≥ 20 GiB, cold-run fit under 10 GiB. If unenforceable or already over, stop and report.
+1. Independent exact-head review of this revision against the brief.
+2. Tom's two rulings above.
+3. Nucleus owner coordination: selector/args, frozen SHA, disposable-checkout permission, scenario-4 patch policy, and `lead-1965` disposition. No parallel compiler wrapper.
+4. Reviewed 003 storage-core and 004 adapter implementations to run against; this file does not wait on their merge, and they must not treat this text as execution authority.
+5. Separate execution brief only after (2): exact paths including `disp_tmp`, 10 GiB abort (and quota volume if chosen), 20 GiB policy as Tom ruled, partition variant flag, six-scenario script that never reconciles a launched slot to idle, crash proof that unavailable sticks, 90/30-minute hard stops.
 
-Queue/Nucleus keep admission, identity, settlement, retention and capture. Oxide owns how the slot is leased, observed and fail-closed on this host.
+Queue/Nucleus keep admission, identity, settlement, retention and capture. Oxide owns how the slot is leased and why it stays unavailable when descendants cannot be proven.
