@@ -360,23 +360,27 @@ Run 5 used the verified two-separator launch on a fresh `m/storage` root. Run 4'
 - Scenario 3, warm at checkout B on the same slot: disposition Finished. Same slot. Same partition digest. Cargo reported 0 rebuilt units. Tests ran: 1 and 60 passed. Wall time 58,546 ms.
 - Path check on scenario-3 binaries in the slot's `debug/deps` (read-only byte scan): `planning-*` contains 484 occurrences of the checkout-A path and no checkout-B path. `build_diagnostics-*` contains 56 A-path occurrences and none for B. This is a stale-path result for cross-checkout reuse, which the brief treats as a path-correctness failure.
 
-The driver stopped at its path proof. It looked in `runs/s3/target/debug/deps`, but test binaries live under the slot's build directory. The driver never reached scenario 4. Scenarios 4 to 6 and the controls did not run. No reuse benefit is claimed. The result is a reduced-benefit finding, pending the planned independent review.
+The driver stopped at its path proof. It looked in `runs/s3/target/debug/deps`, but test binaries live under the slot's build directory. The driver never reached scenario 4. Scenarios 4 to 6 and the controls did not run. No qualified reuse benefit is claimed.
+
+Independent review at exact head `8e087796d29cbc7f201d31e3caf6e9ab7b9d84b2` accepted this partial negative qualification result; the [review receipt](https://github.com/inflatable-cookie/oxide/pull/9#issuecomment-6088502764) owns its verdicts and evidence. Cooperative Cargo completion, approved image/host-threshold bounds and local receipt binding passed for S1–S3. Cross-path correctness and adoption-grade measured benefit failed; invalidation was insufficient. The reviewer classified the embedded A strings as rustc source paths used for debug/panic metadata, with no `CARGO_MANIFEST_DIR` string or B load/rpath observed. This is not proof of wrong-source execution on identical trees, but it fails the approved strict path proof.
+
+The lookup fix was checked without another pilot run. It logs path counts and continues rather than refusing stale paths; any future qualification driver must enforce its agreed portability gate. The trial key also uses a constant `disposable-root` component after checking containment, so it does not distinguish independent disposable roots. Neither behavior is qualified for production. Default keys retain checkout identity.
 
 ### Disposition of the partial pilot (2026-10-09)
 
-This is an honest partial negative result for the standalone pilot. The original 90-minute experiment window expired before scenarios 4 to 6 and the in-session controls ran. No further Cargo scenario or reviewer replay is authorized under this disposition. The stale-path observation is not proof of wrong-source execution: a byte count of embedded paths can be debug metadata, and that distinction is left to independent review.
+This is an honest partial negative result for the standalone pilot. The original 90-minute experiment window expired before scenarios 4 to 6 and the in-session controls ran. No further Cargo scenario or reviewer replay is authorized under this disposition. The reviewer identified the observed A paths as debug/panic metadata; behavior-bearing paths in changed-source/generated-code cases remain unqualified.
 
 Missing before any reuse claim:
 
 - Scenarios 4 to 6 and the concurrent-refusal, identity-replay, uncertainty and idle-eviction controls. Scenario 5's configuration key separation and scenario 6's toolchain separation were never recorded.
 - Source-content-miss evidence. The planned miss in checkout B never ran.
-- Whether the embedded checkout-A paths are behavior-bearing or only debug metadata. This needs a separate path-classification proof.
+- Portable debug/panic source identity, plus behavior-bearing path correctness under a source change. Passing tests against identical trees does not qualify those cases.
 - Completion coverage for the Cargo process tree. The runner records one process group leader and a per-spawn marker, not a full descendant census. Leftover members make the lease uncertain, but the process tree was not separately audited.
 - Write and performance attribution. Occupied bytes and elapsed times are single-run observations on a shared host. Storage deltas are not write volume or SSD lifetime.
 
 Artifact ownership: each run's captures, manifest, stdout/stderr digests and final binaries are kept under that run's own capture directory. Test binaries live under the slot's build directory.
 
-Production keys keep checkout identity. The trial-only key preserves safety but leaves the duplication problem unsolved for production.
+Production keys keep checkout identity, leaving the duplication problem unsolved for production. The trial-only key has the independent-root limitation recorded above and is not a production safety guarantee.
 
 Reviewer verdict subjects: cargo_completion, resource_bounds, cross_path_correctness, invalidation, evidence_binding and measured_benefit. The reviewer may return fail or insufficient where evidence is missing. Future portability remediation or a fresh experiment needs a separate bounded plan after review.
 
