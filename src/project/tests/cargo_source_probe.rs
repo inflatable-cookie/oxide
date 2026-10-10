@@ -26,17 +26,23 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-const ROOT: &str = "/private/var/tmp/oxide-rust-probe-retry-20261010";
+#[allow(dead_code)]
+#[path = "../../../fixtures/cargo-source-map-probe/probe/build.rs"]
+mod owned_probe_build_script;
+
+const ROOT: &str = "/private/var/tmp/oxide-rust-probe-fixture-20261010";
 const WORKFLOW: &str = "oxide-cargo-source-map-probe";
 const SELECTOR: &str =
     "test --offline --locked --message-format=json-render-diagnostics -- --nocapture";
-const ROOT_ID: &str = "oxide-rust-probe-retry-20261010";
-const LOCAL_TASK_ID: &str = "oxide-local-probe-retry-20261010";
-const LOCAL_WORKSPACE_ID: &str = "oxide-local-probe-image-retry-20261010";
+const ROOT_ID: &str = "oxide-rust-probe-fixture-20261010";
+const LOCAL_TASK_ID: &str = "oxide-local-probe-fixture-20261010";
+const LOCAL_WORKSPACE_ID: &str = "oxide-local-probe-image-fixture-20261010";
 const LOGICAL_PREFIX: &str = "/oxide-source-map-probe";
 const MARKER_PATH: &str = "probe/marker.txt";
 const BASELINE_MARKER: &str = "baseline-marker\n";
 const CHANGED_MARKER: &str = "changed-marker\n";
+const FROZEN_FIXTURE_TREE_DIGEST: &str =
+    "sha256:09059f6e2df5022525ef60916178d84584a22e20b422c94950ddebd50bfa5a95";
 const GIB: u64 = 1024 * 1024 * 1024;
 const MAX_SESSION: Duration = Duration::from_secs(20 * 60);
 const MAX_INVOCATIONS: u32 = 4;
@@ -310,6 +316,15 @@ fn session_clock_persists_original_machine_timestamps() {
         body,
         "oxide-probe-session-clock-v1\nstart_utc=2026-10-10T13:00:00Z\ndeadline_utc=2026-10-10T13:20:00Z\nmax_session_secs=1200\ninvocation_count=0\nmax_invocations=4\n"
     );
+}
+
+#[test]
+fn source_probe_fixture_matches_the_frozen_tree() {
+    let fixture_source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/cargo-source-map-probe");
+    let frozen = freeze_fixture(&fixture_source).expect("freeze source-probe fixture");
+    assert_eq!(frozen.digest, FROZEN_FIXTURE_TREE_DIGEST);
+    verify_committed_fixture(&fixture_source, &frozen).expect("committed source-probe fixture");
 }
 
 #[test]
@@ -1943,7 +1958,7 @@ fn setup_image(image: &Path, mount: &Path, setup_temp: &Path) -> Result<(String,
             "-fs",
             "APFS",
             "-volname",
-            "oxide-rust-probe-retry",
+            "oxide-rust-probe-fixture",
             "-nospotlight",
             "-quiet",
         ])
