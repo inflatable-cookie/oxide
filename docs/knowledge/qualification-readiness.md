@@ -754,6 +754,8 @@ and new session clock; this window and image are closed. No adoption.
 
 #### Task 016 execution result (2026-10-10)
 
+Interpretation for the next qualification: the observed relative compiler names do not establish wrong-source execution or failure of cross-worktree reuse. The [rustc remapping guide](https://doc.rust-lang.org/rustc/remap-source-paths.html#relative-paths) explains that Cargo can supply relative source paths and recommends remapping both relative and absolute prefixes. Any relative mapping must be explicitly tied to the registered workspace/component and its compiler working directory, included in the complete ordered flag/map identity before compilation, and resolve to the exact requested source tree; do not merely rewrite captured values or accept arbitrary relative paths. Likewise, empty debug sections in a Mach-O executable alone do not prove that full debug information was disabled: [Cargo profiles](https://doc.rust-lang.org/cargo/reference/profiles.html#split-debuginfo) documents macOS's default `unpacked` debug layout. Qualification must inspect and independently preserve the actual debug companion/object evidence, bound to the exact executable, or qualify an explicit supported full-debug `packed` profile. This corrects the proof setup; it does not establish that the captured run had complete debug information or useful reuse.
+
 The owned fixture correction formats the build script's `PathBuf` observations
 through `Path::display()`, retaining one literal path per line. The exact
 `probe/build.rs` file is included as a module in the ordinary Rust test target,
