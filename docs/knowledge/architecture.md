@@ -20,6 +20,14 @@ Nucleus Contract002 prohibits mutable target sharing. An exclusive-intermediate 
 
 Tom's direction, 2026-10-09: a central daemon could normalize project workflows, own reusable storage and provide a consistent place to measure real-world use. It remains the preferred candidate, not a production deployment choice.
 
+The inactive `registered` library route adds versioned audited-input and literal
+argv seams, with separate trusted registration, immutable-input and execution/
+capture owners. No Nucleus issuer, scheduler implementation or eligible workflow
+is installed. Its independent authenticated map and pre-spawn barrier preserve
+the same strict-physical and success-only publication model; the
+[first Nucleus contract](contracts/nucleus-core-reuse.md#implemented-registered-library-boundary)
+owns supported classes, finite budgets and remaining activation gates.
+
 The consumer contract defines a minimal opt-in project adapter: resolve build identity, obtain consumer authorization, acquire a slot, execute the declared workflow, preserve/capture run outputs under consumer policy and finalize ownership with authenticated evidence. The Oxide crate now implements a fixture-only slice of that flow. Every actor touching an adopted slot must follow the lease contract; direct Cargo access cannot silently bypass it. Commands outside the adapter have no claim to Oxide-managed coverage.
 
 The production candidate would own the storage ledger and observations keyed by project/component, source/run identity, resolved toolchain/configuration and backend. The current fixture adapter keeps a bounded in-process observation ring; it is not durable daemon telemetry. Observation is not authenticated run settlement or a validation verdict. Queue/Nucleus remain authoritative for admission, managed source/run identities, settlement and evidence/retention policy. Daemon failure/restart must reconcile durable leases conservatively; loss of connection cannot grant reuse. Consumer cancellation and process lifetime must have explicit owners.

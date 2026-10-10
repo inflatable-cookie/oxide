@@ -2503,10 +2503,14 @@ without broadening its evidence or replaying its preserved resources.
 The [first Nucleus core-test reuse contract](contracts/nucleus-core-reuse.md)
 owns the proposed representative eligibility and consumer path/lifecycle design.
 Read-only inspection selects the existing planning/build_diagnostics workflow,
-with a separate full-debug qualification profile. The current nine-file/seven-unit
-collector does not admit its registry/proc-macro/native inputs. A versioned
-closed audited input boundary and consumer-owned physical root/retention/attempt
-receipts are required. Runtime unit/header/opaque-read coverage, native SDK/tool
+with a separate full-debug qualification profile. The unchanged nine-file/seven-unit fixture collector does not admit its
+registry/proc-macro/native inputs. The separate inactive registered library route
+implements bounded byte/association verification and explicit argv/receipt seams;
+[the contract](contracts/nucleus-core-reuse.md#implemented-registered-library-boundary)
+owns their semantics. A complete real audited input contract, accepted immutable
+issuers, pinned evidence decoder and authentic consumer physical-root/retention/
+attempt/test/debug receipts are still required. Synthetic code regressions do
+not establish those receipts or actual Nucleus eligibility. Runtime unit/header/opaque-read coverage, native SDK/tool
 integrity, owner consent, budget fit and real representative qualification remain
 open. Task 021's changed-task dependency retention is a positive tiny-fixture
 starting point; cross-root reuse, successful live recovery, consumer adoption,
