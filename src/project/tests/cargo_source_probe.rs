@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Sender};
@@ -237,13 +237,6 @@ fn oxide_cargo_source_map_probe() {
 
 fn run_probe() -> Result<(), String> {
     let session_clock = Instant::now();
-    let prior_elapsed = known_resume_elapsed()?;
-    let started = session_clock
-        .checked_sub(prior_elapsed)
-        .ok_or_else(|| "could not preserve the original session start".to_owned())?;
-    if started.elapsed() >= MAX_SESSION {
-        return Err("the original 60 minute session limit was reached".to_owned());
-    }
     let host_free = native::host_free_bytes(Path::new("/private/var/tmp"))
         .map_err(|_| "host free-space preflight unavailable".to_owned())?;
     if host_free < HOST_RESERVE {
@@ -255,17 +248,24 @@ fn run_probe() -> Result<(), String> {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/cargo-source-map-probe");
     let frozen = freeze_fixture(&fixture_source)?;
     verify_committed_fixture(&fixture_source, &frozen)?;
+    let prior_elapsed = known_resume_elapsed(&frozen)?;
+    let started = session_clock
+        .checked_sub(prior_elapsed)
+        .ok_or_else(|| "could not preserve the original session start".to_owned())?;
+    if started.elapsed() >= MAX_SESSION {
+        return Err("the original 60 minute session limit was reached".to_owned());
+    }
+    let resumed = prior_elapsed > Duration::ZERO;
     let scanner_identity = producer::scanner_identity()?;
     let image = PathBuf::from(ROOT).join("oxide-rust-probe.sparseimage");
     let mount = PathBuf::from(ROOT).join("m");
     let setup_temp = PathBuf::from(ROOT).join("setup-tmp");
-    let (attach, outside_directories) =
-        setup_image(&image, &mount, &setup_temp, prior_elapsed > Duration::ZERO)?;
+    let (attach, outside_directories) = setup_image(&image, &mount, &setup_temp, resumed)?;
     let evidence = mount.join("evidence");
-    fs::create_dir(&evidence).map_err(|error| error.to_string())?;
-    fs::create_dir(mount.join("tmp")).map_err(|error| error.to_string())?;
-    fs::create_dir(mount.join("home")).map_err(|error| error.to_string())?;
-    fs::create_dir(mount.join("cargo-home")).map_err(|error| error.to_string())?;
+    ensure_probe_directory(&evidence)?;
+    ensure_probe_directory(&mount.join("tmp"))?;
+    ensure_probe_directory(&mount.join("home"))?;
+    ensure_probe_directory(&mount.join("cargo-home"))?;
     let budget = ProbeBudget::new(
         mount.clone(),
         image.clone(),
@@ -277,7 +277,8 @@ fn run_probe() -> Result<(), String> {
     append_evidence(
         &mount,
         &format!(
-            "mount-preflight\tdevice={attach}\thost_free={}\timage_capacity={}\timage_used={}\timage_free={}\timage_allocated={}\toutside_allocated={}\n",
+            "mount-{}\tdevice={attach}\thost_free={}\timage_capacity={}\timage_used={}\timage_free={}\timage_allocated={}\toutside_allocated={}\n",
+            if resumed { "resume" } else { "preflight" },
             setup_sample.host_free,
             setup_sample.image_capacity,
             setup_sample.image_used,
@@ -286,20 +287,32 @@ fn run_probe() -> Result<(), String> {
             setup_sample.outside_allocated,
         ),
     )?;
-    append_evidence(
-        &mount,
-        &format!(
-            "session\tstart\t{}	fixture_tree={}\nscanner-provenance\n{}",
-            local_timestamp(),
-            frozen.digest,
-            scanner_identity
-        ),
-    )?;
+    if resumed {
+        append_evidence(
+            &mount,
+            &format!(
+                "session\tresume\t{}\tprior_elapsed_ms={}\tfixture_tree={}\n",
+                local_timestamp(),
+                prior_elapsed.as_millis(),
+                frozen.digest
+            ),
+        )?;
+    } else {
+        append_evidence(
+            &mount,
+            &format!(
+                "session\tstart\t{}\tfixture_tree={}\nscanner-provenance\n{}",
+                local_timestamp(),
+                frozen.digest,
+                scanner_identity
+            ),
+        )?;
+    }
 
     let a = mount.join("a");
     let b = mount.join("b");
-    write_frozen_fixture(&frozen, &a)?;
-    write_frozen_fixture(&frozen, &b)?;
+    prepare_fixture_root(&frozen, &a)?;
+    prepare_fixture_root(&frozen, &b)?;
     if producer::source_tree_digest(&a)? != frozen.digest
         || producer::source_tree_digest(&b)? != frozen.digest
         || producer::source_tree_digest(&fixture_source)? != frozen.digest
@@ -339,7 +352,11 @@ fn run_probe() -> Result<(), String> {
     let mut runner =
         CargoWorkflowRunner::new(mount.clone(), PathBuf::from("/private/var/tmp"), cargo)
             .map_err(|error| format!("could not create registered runner: {error:?}"))?;
-    let daemon = ProbeDaemon::start(&mount.join("storage"), Arc::clone(&budget));
+    let storage_root = mount.join("storage");
+    ensure_probe_directory(&storage_root)?;
+    fs::set_permissions(&storage_root, fs::Permissions::from_mode(0o700))
+        .map_err(|error| error.to_string())?;
+    let daemon = ProbeDaemon::start(&storage_root, Arc::clone(&budget));
     let client = daemon.client();
     let flags = remap_flags(&a, &b);
     let env = probe_environment(&mount, "1.97.1", &flags);
@@ -1577,6 +1594,49 @@ fn collect_fixture(
     Ok(())
 }
 
+fn ensure_probe_directory(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Err(format!("probe path is not a directory: {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(|error| error.to_string())?;
+        }
+        Err(error) => return Err(error.to_string()),
+    }
+    let canonical = fs::canonicalize(path).map_err(|error| error.to_string())?;
+    if canonical != path {
+        return Err(format!(
+            "probe directory is not canonical: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_fixture_root(frozen: &FrozenFixture, destination: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(destination) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return write_frozen_fixture(frozen, destination)
+        }
+        Err(error) => return Err(error.to_string()),
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            if producer::source_tree_digest(destination)? != frozen.digest {
+                return Err(format!(
+                    "prepared fixture tree changed at {}",
+                    destination.display()
+                ));
+            }
+        }
+        Ok(_) => {
+            return Err(format!(
+                "prepared fixture root is not a directory: {}",
+                destination.display()
+            ))
+        }
+    }
+    Ok(())
+}
+
 fn write_frozen_fixture(frozen: &FrozenFixture, destination: &Path) -> Result<(), String> {
     fs::create_dir(destination).map_err(|error| error.to_string())?;
     for (relative, bytes) in &frozen.files {
@@ -1595,7 +1655,7 @@ fn write_frozen_fixture(frozen: &FrozenFixture, destination: &Path) -> Result<()
     Ok(())
 }
 
-fn known_resume_elapsed() -> Result<Duration, String> {
+fn known_resume_elapsed(frozen: &FrozenFixture) -> Result<Duration, String> {
     let root = Path::new(ROOT);
     match fs::symlink_metadata(root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Duration::ZERO),
@@ -1633,6 +1693,7 @@ fn known_resume_elapsed() -> Result<Duration, String> {
         "attempt-1.txt".to_owned(),
         "attempt-2.txt".to_owned(),
         "attempt-3.txt".to_owned(),
+        "attempt-4.txt".to_owned(),
         "diskutil-attempt-3.plist".to_owned(),
         "hdiutil-image-map-attempt-3.txt".to_owned(),
         "imageinfo-after-attach-attempt-3.plist".to_owned(),
@@ -1663,10 +1724,12 @@ fn known_resume_elapsed() -> Result<Duration, String> {
         ("root", ROOT),
         ("image", "oxide-rust-probe.sparseimage"),
         ("image_virtual_capacity", "8589934592"),
-        ("attempt_count", "3"),
+        ("attempt_count", "4"),
         ("imageinfo_file", "imageinfo-after-attach-attempt-3.plist"),
+        ("mount_stage", "pre-daemon"),
+        ("fixture_tree_digest", frozen.digest.as_str()),
     ];
-    if fields.len() != 13
+    if fields.len() != 16
         || required
             .iter()
             .any(|(key, expected)| fields.get(*key).map(String::as_str) != Some(expected))
@@ -1679,13 +1742,12 @@ fn known_resume_elapsed() -> Result<Duration, String> {
     if !image_metadata.is_file() || image_metadata.file_type().is_symlink() {
         return Err("recorded sparse image is not a regular file".to_owned());
     }
-    let image_digest = digest_file_path(&image)?;
     let image_allocated_length = image_metadata.len().to_string();
     if fields.get("image_allocated_length").map(String::as_str)
         != Some(image_allocated_length.as_str())
-        || fields.get("image_digest") != Some(&image_digest)
+        || !is_sha256_digest(fields.get("image_digest_at_checkpoint"))
     {
-        return Err("recorded sparse image changed since setup attempt 1".to_owned());
+        return Err("recorded sparse image metadata differs from its checkpoint".to_owned());
     }
 
     let info_path = setup_temp.join(
@@ -1731,6 +1793,13 @@ fn known_resume_elapsed() -> Result<Duration, String> {
     {
         return Err("recorded third attempt lacks its setup failure evidence".to_owned());
     }
+    let fourth_attempt =
+        fs::read_to_string(setup_temp.join("attempt-4.txt")).map_err(|error| error.to_string())?;
+    if !fourth_attempt.contains("before any fixture Cargo invocation")
+        || !fourth_attempt.contains("bind task-owned probe daemon")
+    {
+        return Err("recorded fourth attempt lacks its setup failure evidence".to_owned());
+    }
 
     let attached = Command::new("/usr/bin/hdiutil")
         .arg("info")
@@ -1773,12 +1842,63 @@ fn known_resume_elapsed() -> Result<Duration, String> {
         return Err("recorded diskutil APFS identity evidence changed".to_owned());
     }
 
+    let expected_mount_entries = BTreeSet::from([
+        "a".to_owned(),
+        "b".to_owned(),
+        "cargo-home".to_owned(),
+        "evidence".to_owned(),
+        "home".to_owned(),
+        "tmp".to_owned(),
+    ]);
+    if directory_names(&mount)? != expected_mount_entries
+        || producer::source_tree_digest(&mount.join("a"))? != frozen.digest
+        || producer::source_tree_digest(&mount.join("b"))? != frozen.digest
+    {
+        return Err("prepared A/B roots do not match the recorded frozen fixture".to_owned());
+    }
+    for directory in ["tmp", "home", "cargo-home"] {
+        if !directory_names(&mount.join(directory))?.is_empty() {
+            return Err(format!("prepared {directory} directory is not empty"));
+        }
+    }
+    let evidence = mount.join("evidence");
+    if directory_names(&evidence)? != BTreeSet::from(["events.tsv".to_owned()]) {
+        return Err("pre-daemon evidence directory contains unknown files".to_owned());
+    }
+    let events = evidence.join("events.tsv");
+    let events_metadata = fs::symlink_metadata(&events).map_err(|error| error.to_string())?;
+    if !events_metadata.is_file() || events_metadata.file_type().is_symlink() {
+        return Err("pre-daemon event evidence is not a regular file".to_owned());
+    }
+    let events_digest = digest_file_path(&events)?;
+    if fields.get("events_digest") != Some(&events_digest) {
+        return Err("pre-daemon event evidence changed since its checkpoint".to_owned());
+    }
+    let event_text = fs::read_to_string(&events).map_err(|error| error.to_string())?;
+    if !event_text.contains("mount-preflight\t")
+        || !event_text.contains("session\tstart\t")
+        || !event_text.contains("scanner-provenance")
+        || !event_text.contains("toolchain\tbaseline\t")
+        || !event_text.contains("alternate\tchannel=1.96.1\t")
+        || !event_text.contains(&frozen.digest)
+    {
+        return Err("pre-daemon event evidence is incomplete".to_owned());
+    }
+
     let elapsed_ms = fields
         .get("prior_elapsed_ms")
         .ok_or_else(|| "probe resume marker lacks prior elapsed time".to_owned())?
         .parse::<u64>()
         .map_err(|error| error.to_string())?;
     Ok(Duration::from_millis(elapsed_ms))
+}
+
+fn is_sha256_digest(value: Option<&String>) -> bool {
+    value
+        .and_then(|value| value.strip_prefix("sha256:"))
+        .is_some_and(|value| {
+            value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
 }
 
 fn directory_names(directory: &Path) -> Result<BTreeSet<String>, String> {
