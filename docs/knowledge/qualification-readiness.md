@@ -635,6 +635,16 @@ companion digest. The exact bundle name is only a discovery rule and does not
 establish a match by itself. The hook remains a plain file, so its identity row
 alone does not authenticate the claimed observations.
 
+The v2 baseline selected Cargo's exact `probe-<hash>.dSYM`, captured its three
+regular files, and read the same dashed UUID and `arm64` architecture from the
+executable and DWARF payload. The companion scan found `__debug_info`,
+`__debug_line` and `__debug_abbrev`. However, `dwarfdump --debug-info` exceeded
+the producer's 1 MiB scanner-output bound; the capture records the bounded
+error and truncated output. The source extractor therefore did not complete,
+`debug-companion` remained `bound=false`, and no full-debug logical source
+lookup was established. This is the observed v2 layout and scanner limit, not
+evidence that the companion lacked debug information.
+
 **Trust boundary:** the hook is a plain file in the run's Cargo target
 directory. Its identity row is compared with the adapter's accepted policy,
 map, build identity, tree, lease and run IDs, then copied into the private
@@ -917,8 +927,66 @@ effective flags and checks those flags against the later mapped A resolution;
 an ordinary regression asserts the Cargo encoding matches the resolved vector.
 These code corrections do not change the original run's evidence or establish
 debug binding, full-debug source lookup, source invalidation or cross-path
-reuse. No new Cargo probe ran. Any further probe requires a new scoped Queue
-record and fresh resources.
+reuse. The later Queue-recorded v2 continuation result follows.
+
+#### Task 017 continuation session v2 execution result (2026-10-10)
+
+The continuation used the new root
+`/private/var/tmp/oxide-rust-probe-proof-613d9b91-v2`, session ID
+`oxide-probe-session-613d9b91-v2`, and the fixed clock recorded before setup:
+`2026-10-10T15:19:29Z`–`2026-10-10T15:39:29Z`, four fixture invocations.
+The independent committed fixture hash was
+`sha256:550e62cefc7f647fef97b12489fc2c1e1ba67fd56a7529401fce25c97b0ce2e9`.
+The first selector attempt stopped before image creation because the stored
+monotonic markers were increasing but their delta did not encode 20 minutes.
+The marker file was not edited and the window was not reset; the guard now
+reconstructs its monotonic timer from elapsed time in the unchanged UTC pair.
+The next exact ignored-selector run started at 15:31:45Z, within that original
+window, and used the committed head recorded by its run manifest,
+`534204882e12c2230f24360cab8b93a3635cdcf2`.
+
+Cold A was the only fixture Cargo/test invocation. Cargo 1.97.1 and rustc
+1.97.1 compiled six units, the fixture test exited 0 with `1 passed`, and its
+`file!()` and panic-location values were
+`/oxide-source-map-probe/probe/tests/probe.rs` and
+`/oxide-source-map-probe/probe/tests/probe.rs:54`. The manifest directory,
+include/build inputs, generated value, proc-macro input and runtime value all
+matched the baseline requested tree. The resolver-derived flag vector was used
+for the build. The run lease finalized `Idle`.
+
+The exact Cargo-reported test executable companion was selected. Its UUID
+`27877A8A-EA00-3288-BD92-070FE9878F6F` and `arm64` architecture matched the
+captured DWARF payload; all three required debug sections were present and the
+bundle file hashes were recorded. The 1 MiB `dwarfdump --debug-info` output
+bound stopped compile-unit/source-path extraction, leaving
+`scan_complete=false` and `bound=false`. No full-debug logical source lookup
+was captured. The probe stopped at this first baseline gate; source-change B,
+shared-slot cold A and warm B did not run. The original session allows no
+replay or root reset.
+
+The image has 8,380,178,432 bytes capacity, 36,184,064 bytes in use at stop,
+53,481,472 bytes allocated backing storage, and 20,480 bytes outside allocation.
+The minimum recorded host free space was 240,012,070,912 bytes, above the
+20 GiB threshold. Host samples were not maintained at 30-second intervals
+during setup, so the resource-bound observation is insufficient despite the
+observed free-space and allocation values. The session clock file also retains
+its raw monotonic marker delta of 1,200,000,000, while the UTC interval records
+the authorized 1,200 seconds; the implementation kept the original UTC
+deadline and reconstructed a monotonic timer without changing the file. These
+clock and sampling limitations are recorded rather than treated as passes.
+After the settled lease, the runner detached the image; it was reattached
+read-only at the same `m` path for inspection. The image and raw captures remain
+preserved. No previous session image or lease was touched.
+
+For v2, `relative_mapping` and `baseline_tests` are supported by the observed
+flag vector and passing cold-A test. `debug_capture_binding` and
+`baseline_path_proof` remain insufficient because DWARF source lookup did not
+complete. `session_clock` and `resource_bounds` remain insufficient for the
+recorded limitations. `source_invalidation`, `cross_path_correctness`, the
+full `ownership_capture` sequence and `reuse_result` were not reached. This
+run does not qualify cross-worktree reuse or useful storage reduction. A new
+scoped Queue record and fresh resources are required to raise the scanner
+output bound and repeat the complete proof.
 
 ### Bounded real-project follow-up (execution not authorized)
 
