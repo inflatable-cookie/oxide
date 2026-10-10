@@ -1418,6 +1418,291 @@ a successful compile, or a resource/clock gate miss. Uncertain ownership
 stays retained. This proof cannot claim everyday storage relief or
 cross-root usefulness.
 
+#### Task 019 useful bounded reuse across changing tasks (design only, 2026-10-10)
+
+Design-only. No compiler, fixture, image, slot, timestamp, fingerprint or
+consumer mutation. Investigation used the named repository knowledge, the
+reviewed PR18 diagnosis, pinned Cargo 1.97.1 (`c980f4866`) freshness already
+recorded in Task 018, Queue Spec 028 / `worktree-cleanup.ts`, and Nucleus
+Contract 002. This is not execution authority and does not replay the 018
+four-invocation proof.
+
+Tom's first foothold is duplicate dependency compilation and storage across
+successive agent tasks with changing source. Exact-root/exact-tree retry is a
+safety fallback; it does not satisfy useful reuse.
+
+##### Two candidates
+
+Start from existing strict-physical mode: the adapter already puts requested
+checkout-path identity in the compatibility partition, so two different
+physical roots cannot share a slot. Logical mapped partitions omit that root
+ID; Task 018 proved that sharing them lets Cargo 1.97.1 execute stale
+cross-root artifacts. Do not treat that mapped hit as storage relief.
+
+| Candidate | Mechanism in pinned 1.97.1 | Useful-reuse result |
+| --- | --- | --- |
+| **(a) Bounded consumer-owned physical path reuse** | Keep one exclusive Oxide `CARGO_BUILD_BUILD_DIR` slot per registered compile root. After ordinary consumer archive, a new task/workspace/run/attempt occupies that same physical worktree. Cargo relative fingerprints and `CARGO_MANIFEST_DIR` stay at that path, so unchanged registry/path-dep units can stay fresh while changed workspace units rebuild. Strict-physical partition matching already keys the slot on that path. | **Recommend.** Different-source tasks at a recycled root can retain unmodified dependency work. Store count equals the finite root pool, not the task count. |
+| **(b) Supported dependency-only reuse boundary** | A private task-sensitive output tree plus a shared compiled-dependency store. | **No usable supported mechanism.** Stop the survey. |
+
+Pinned Cargo 1.91+ `CARGO_BUILD_BUILD_DIR` relocates the whole intermediate
+tree. Its layout is internal and has no documented split that keeps registry
+or path-dep units while isolating workspace crates, build-script output,
+incremental state or test executables. [Automatic global caches](https://doc.rust-lang.org/cargo/reference/config.html#global-caches)
+cover registry/Git *sources*; Queue Spec 028 already shares those through
+`CARGO_HOME` and keeps compiled outputs checkout-local. The 2026
+cross-workspace cache goal is experimental/nightly, initially excludes build
+scripts and proc macros, and is not in 1.97.1. Unstable
+`checksum-freshness` does not replace build-script `RerunIfChanged` mtimes.
+`sccache` is already rejected. Copying `deps/` or reimplementing fingerprints
+is forbidden. A compiler wrapper is Nucleus lead-1965, out of scope.
+
+Candidate (b) therefore cannot be a next delivery on this toolchain. Reassess
+only when a *supported* Cargo release documents shared compiled units with
+build-script/proc-macro coverage and passes the same ownership, path,
+evidence and budget gates. A roadmap is not that release.
+
+##### Recommended next delivery: (a)
+
+Use strict-physical identity. One exclusive slot per stable compile root.
+Acquire matches `partition` (which already includes canonical checkout path /
+`requested_root_id`). Compute `source_tree_digest` from the requested tree
+*before* acquire and record it on the run binding; do **not** put it in the
+acquire match. A different tree at the same root reuses that idle slot. A
+different physical root is a different partition and a miss.
+
+Task 018's `partition + requested_root_id + source_tree_digest` match is the
+cross-root safety fallback. Shipping it as the useful-reuse admission would
+create a new full-debug slot per head and fail this task's useful_reuse gate.
+Keep it only as the documented fail-closed rule if logical mapped mode is
+used at all; it is not the foothold architecture.
+
+**How unmodified dependency work survives a different-source task.** Registry
+and git dependency sources live under shared `CARGO_HOME` (already Queue
+policy). Their compiled units live in the root's Oxide slot. A later task at
+the same physical path, with a different workspace tree, leaves those
+dependency sources and fingerprints unchanged, so Cargo can keep them fresh.
+Workspace units whose inputs actually changed rebuild. Behavior-bearing
+`CARGO_MANIFEST_DIR`, `include!`, build-script, `OUT_DIR`, generated,
+proc-macro and runtime paths still name that same physical root, so retained
+generated strings are not a cross-root lie. This is Cargo's in-origin
+invalidation, which Task 018 recorded as working at changed B.
+
+**Storage bound versus reduced writes.** The number of exclusive build stores
+is the number of registered roots (plus any private-fallback directories),
+independent of how many tasks have run. Concurrent mapped workspaces cannot
+exceed the pool. Occupied bytes are still the full-debug slot plus that
+root's checkout, redirected temps and per-run captures; that footprint is
+unmeasured. Reduced *writes* happen only for units Cargo keeps fresh; a
+recycled path whose workspace crates all change still rewrites those crates
+and still saves dependency work. Do not promise zero rebuilds at a different
+path, and do not promise zero rebuilds when every workspace file is rewritten
+with a new mtime.
+
+**What remains possible.**
+
+- Same root, same tree: warm retry (control; not useful_reuse).
+- Same root, different tree, ordinary git materialization: useful warm if
+  unchanged dependency units stay fresh and requested-tree behavior holds.
+- Different root, any tree: miss / private fallback (strict-physical).
+- Consumer cannot recycle paths: duplication unsolved; path-isolated
+  fallback preserves safety and does not satisfy the foothold.
+
+##### Fail-closed freshness and compiled-path correctness
+
+Graph and unit-invalidation authority stays with Cargo once a run is
+admitted to an existing slot. Oxide's job is to refuse execution when Cargo
+1.97.1 would treat changed inputs as fresh, and to keep exclusive
+compile-through-test-and-capture ownership.
+
+Pre-execution gates, in order, after durable acquire and before spawn:
+
+1. **Compatibility.** Toolchain, host/target, profile, features, effective
+   Cargo configuration and allowlisted environment must match the partition.
+   A change is a new partition or a refusal. Unknown relevant inputs refuse
+   managed reuse (`input_unknown`); they are not omitted to manufacture a
+   hit.
+2. **Root.** Canonical requested path must equal the slot's compile root.
+   Cross-root is a miss; never execute that slot.
+3. **Source-tree digest.** Freshly hashed from the requested tree before
+   acquire. Bind it to the run/attempt receipt. Same digest is a same-tree
+   retry candidate. Different digest is still the same slot.
+4. **Mtime-stale content (the Task 018 hole, now at one root).** Cargo
+   `find_stale_file` treats `path_mtime <= reference_mtime` as fresh, including
+   equals, and encoded dep-info drops `CARGO_MANIFEST_DIR`. A naive "any
+   source mtime is old" refuse would also reject ordinary `git checkout` /
+   `git reset --hard`, because unchanged files keep their old mtimes. That
+   would destroy useful reuse.
+5. **Supported gate for (4):** on successful finalize, persist a bounded
+   relative-path digest map of fingerprint-named workspace inputs and
+   declared behavior-path files (cap: 4096 files or 1 MiB, whichever first;
+   exceed → this slot cannot be reused). On a later different-digest acquire
+   of the same slot, for every stored path whose current mtime is `<=` that
+   fingerprint's reference mtime, the current file hash must equal the stored
+   hash. Mismatch or unreadable current file with a stored hash: refuse
+   *before* Cargo, release the lease without writing, keep the slot Idle with
+   its previous origin, category `source_stale`. Newer mtimes are left to
+   Cargo. Missing fingerprint/map files, unknown format, or an input class
+   the map does not cover: refuse (`input_unknown`), no execution. This is
+   Oxide-owned admission evidence, not a Cargo fingerprint edit, source
+   touch, or emitted-path rewrite.
+6. **Generated / proc-macro / build-script / native / external.** Declared
+   `rerun-if-changed` and rustc dep-info paths are in the map. Undeclared
+   env, network, or extra files the workflow may read are unknown inputs:
+   refuse managed reuse rather than guess. `cargo clean -p` is a supported
+   command and is *not* selected: its coverage of build-script output,
+   incremental files and fingerprints is unqualified, and a refuse/private
+   fallback is the fail-closed path.
+7. **Runtime resource paths.** Same physical root, so retained paths are
+   correct only if the new tree actually has those files. Content changes
+   with newer mtimes rebuild or are re-read at test time; content changes
+   with old mtimes hit gate 5.
+8. **Post-execution tests are not admission.** A failing test never
+   authorizes the slot as a hit. Always run the requested tests. Private
+   captures bind this attempt, source digest, root, lease and artifact
+   hashes.
+
+Uncertainty: the digest map covers only files Cargo named plus declared
+behavior paths. A build script that reads an undeclared file can still go
+stale; that is an unknown-input refusal, not a claimed hit. Equal-mtime
+same-content files are allowed (ordinary unchanged git files). Clock-step
+backwards on changed content is refused. Replacement criterion: retire the
+map when a supported Cargo release's checksum freshness covers both rustc
+dep-info *and* build-script `RerunIfChanged`, including synthesized
+`CARGO_MANIFEST_DIR`, on the pinned toolchain, and a fresh qualification
+passes the same gates.
+
+Do not touch all sources, edit Cargo internals, rewrite emitted values,
+ignore paths, or grow the root map.
+
+##### Physical path reuse and consumer identity
+
+A recycled path is still a new task, workspace, branch, run and attempt.
+Oxide never creates, resets, selects, retains or cleans source. There is no
+second compilation copy and no transfer of source ownership.
+
+Existing facts, not proposed APIs:
+
+- Queue Spec 028 shares `CARGO_HOME` downloads, keeps compiled outputs
+  checkout-local, and removes in-checkout `target` directories only after
+  closeout proofs. It skips a `target_directory` outside the worktree and
+  then blocks cleanup-complete. Point `CARGO_BUILD_BUILD_DIR` at the Oxide
+  slot *outside* the checkout and keep `CARGO_TARGET_DIR` private *inside*
+  the checkout: Spec 028 can delete per-run finals and will not discover the
+  Oxide slot as a target. That is an observed compatibility, not a Queue
+  change.
+- Nucleus Contract 002 keeps one workspace/branch/worktree identity per
+  task; "multi-task workspace reuse is not part of the initial model."
+  Failed or cancelled never-merged worktrees stay retained. Shared Git
+  objects do not authorize shared mutable build directories. Bounded
+  retention of regenerable build caches is in-contract, with Oxide named as
+  the shared Rust cache owner. Sequential exclusive *path* reuse after
+  ordinary archive is not an existing 002 API.
+- Lead `4468cf49-0f5e-4a84-a746-535969c26ddf` remains a proposal, not
+  owner-agreed API.
+
+Minimum *proposed* consumer-managed-Git/lifecycle changes, each needing its
+own owner approval:
+
+1. Finite registered pool of canonical task-worktree paths per opted-in
+   repository/workflow. Create a checkout only when a task takes that slot.
+2. Assign a path exclusively to one live workspace. Recycle it only after
+   ordinary archive, artifact preservation, and exact source retention prove
+   the path empty of that workspace. No live checkout reset.
+3. Materialize the new tree with ordinary git checkout / `reset --hard` /
+   linked-worktree create, so content that actually changed receives a
+   current mtime. Snapshot restores that preserve historical mtimes on
+   changed content are ineligible and must private-fallback.
+4. Dirty, unmerged, failed, cancelled or uncertain work keeps its path.
+   It cannot fill the pool. The request waits, or uses a private
+   checkout-isolated build with no reuse claim. Age alone does not recycle.
+5. Authenticated task/attempt envelope for Oxide acquire, plus a
+   pre-`host.run` return-to-pending on `busy`, as already proposed in
+   [project adoption](contracts/project-adoption.md#stable-source-path-lifecycle).
+   Frozen Contract 010 is unchanged. Q-012 remains open until Queue
+   managed-Git/worktree owners and Nucleus 002/010 owners approve those
+   bindings.
+
+Without (1)–(4), Oxide can still qualify same-root sequential reuse on a
+task-owned fixture path. Everyday Queue/Nucleus relief stays unclaimed.
+
+##### Smallest next implementation slice and bounded proof
+
+Oxide-only. Strict-physical. Existing fixture
+`fixtures/cargo-source-map-probe` at frozen T0
+`sha256:550e62cefc7f647fef97b12489fc2c1e1ba67fd56a7529401fce25c97b0ce2e9`
+and the already-observed marker-only T1
+`sha256:784b4c701a7b752a11e0b5b99e7fff36f796af643cd3e8514ae16147b237ee26`.
+No new fixture members. Retained dependency work is the unchanged
+`oxide-source-probe-macro` path-dep (and any registry units if present). If
+step 2 rebuilds that proc-macro, useful_reuse fails. Logical remap flags are
+out of this proof.
+
+Not authorized here. A later scoped Queue brief must name these resources
+before dispatch. Carry forward: one fresh fixed 8 GiB APFS sparse image at
+`/private/var/tmp/oxide-rust-probe-proof-019-reuse` (capacity
+8,380,178,432 bytes), 10 GiB disposable ceiling, monitored 20 GiB host
+free-space start/abort, exclusive compile-through-test-and-capture, per-run
+full-debug/test/evidence, driver-owned `Instant` from before setup with
+1,200,000 ms deadline, at most four compiler/test invocations, 20 minutes
+including setup plus 20 minutes independent review, independent sampling at
+protocol boundaries and on a 20-second timer with a completed-sample gap of
+at most 30 seconds covering setup, scanning and capture. Pin already-installed
+cargo 1.97.1 (`c980f4866`) / rustc 1.97.1 (`8bab26f4f`); selector
+`test --offline --locked --message-format=json-render-diagnostics -- --nocapture`;
+full-debug `packed` fixture profile. One physical root `R`. Distinct
+`(run_id, attempt_id)` per step. While a partition slot is leased or
+uncertain, a second claimant is refused without touching slot bytes. Do not
+attach, detach, mutate or author a v5 of any 005/014–018 image.
+
+Acquire under the useful-reuse rule: match `partition` (strict-physical root).
+Record slot id, requested tree digest, attempt identity, rebuilt-unit set,
+elapsed ms, slot bytes, image used/backing, outside allocation and sampled
+host free space. Full-debug companion binding and project-source lookup on
+every successful compile.
+
+1. **Cold T0 / attempt 1 at R.** New slot-1. Workspace units rebuild.
+   Tests and full-debug lookup pass at R. Persist the input-digest map.
+   Idle.
+2. **Useful warm T1 / attempt 2 at R.** Different tree, new task/run/attempt
+   identity, same physical path. Acquire must return slot-1. `oxide-source-probe-macro`
+   must be Cargo-fresh. Affected probe library/test/build-script units
+   rebuild as required for the marker change. Tests pass with T1 values.
+   `CARGO_MANIFEST_DIR` and generated/proc-macro/runtime paths name R, not a
+   previous sibling. Full-debug lookup of T1. Idle. This is the useful_reuse
+   observation; same-source retry cannot substitute for it.
+3. **Same-tree T1 retry / attempt 3 at R.** Acquire returns slot-1, zero
+   rebuilt units, hashes equal step 2. Control only.
+4. **Stale-mtime refusal, no compiler.** Restore T0 *content* for
+   `probe/marker.txt` while forcing its mtime `<=` slot-1's fingerprint
+   reference. Tree digest differs. Acquire may return slot-1; the freshness
+   gate must refuse before Cargo, leave slot-1 Idle with the T1 origin, and
+   start no compiler. This does not consume a compiler invocation.
+
+Success: (1) is cold; (2) retains the proc-macro and executes T1, not T0;
+(3) is a true same-tree warm hit; (4) never executes; exclusive second-claim
+refusal, clocks, samples and resource caps hold. Failure: a new slot for T1,
+proc-macro rebuilt at (2), execution of T1 artifacts at (4), any
+cross-root/logical-map hit, missing debug/behavior evidence on a successful
+compile, or a resource/clock miss. Uncertain ownership stays retained. This
+proof still cannot claim everyday Queue storage relief; that needs the
+consumer path pool.
+
+If a later dispatch needs consumer contact, a different mechanism, more than
+four compiles, or mutation of preserved probes, stop and obtain that ruling
+before launch. Standing Oxide-only authority in [vision](vision.md#authority-boundaries)
+covers an equivalent scoped brief for this slice; it does not cover consumer
+edits, installation, or adopting the architecture as production.
+
+##### Disposition
+
+Recommend candidate (a). Candidate (b) has no supported 1.97.1 mechanism.
+The next implementation is the Oxide freshness map plus the four-step
+same-root proof above. Consumer path-pool work stays a separate owner
+brief under Q-012. Production keys stay checkout-isolated until that proof
+and the consumer contract both pass. Path-isolated fallback remains the
+safe default for ad hoc unique worktrees and leaves the duplication
+problem unsolved.
+
 ### Bounded real-project follow-up (execution not authorized)
 
 The Oxide-only experimental implementation is present in the local adapter and

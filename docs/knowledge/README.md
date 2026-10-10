@@ -4,4 +4,4 @@
 
 [Project adoption](contracts/project-adoption.md) owns the proposed opt-in adapter and coordinated waiting contract, including consumer lifecycle gates. [Rust toolchain and quality](rust-toolchain-and-quality.md) owns the development compiler, initial minimum Rust version and quality-policy routing.
 
-[Qualification readiness](qualification-readiness.md) owns the reviewed macOS containment and capacity findings, proposed narrow selector and remaining execution prerequisites. Its design proposals do not grant experimental execution authority.
+[Qualification readiness](qualification-readiness.md) owns the reviewed macOS containment and capacity findings, proposed narrow selector, remaining execution prerequisites, and the Task 019 useful-reuse architecture (physical-root slot reuse versus a dependency-only boundary). Its design proposals do not grant experimental execution authority.
