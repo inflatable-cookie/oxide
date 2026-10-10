@@ -68,6 +68,37 @@ impl CargoWorkflowRunner {
             executable_digest: digest_parts(&["launcher-v1", &hex_digest(&bytes)]),
         })
     }
+
+    /// Caller/identity contract used before storage acquisition or child creation.
+    /// It does not create files, leases, or processes.
+    pub(super) fn validate_plan(
+        &self,
+        plan: &FixtureExecutionPlan,
+        cancellation: &dyn CancellationProbe,
+    ) -> Result<(), BoundaryFailure> {
+        let command = &plan.command;
+        let claim = &plan.claim;
+        if cancellation.is_cancelled() {
+            return Err(BoundaryFailure::Rejected);
+        }
+        if command.source_map.as_ref().is_some_and(|source_map| {
+            source_map.requested_tree_digest() != claim.binding.source_tree_digest
+                || !command
+                    .workspace_root
+                    .starts_with(source_map.requested_root())
+        }) {
+            return Err(BoundaryFailure::InvalidIdentity);
+        }
+        if !single_component(claim.binding.run_id.as_str())
+            || command.environment.iter().any(forces_environment)
+        {
+            return Err(BoundaryFailure::Rejected);
+        }
+        if command.selector.split_whitespace().next().is_none() {
+            return Err(BoundaryFailure::Rejected);
+        }
+        Ok(())
+    }
 }
 
 /// Free-space samples. When full, adjacent samples merge to their minimum.
@@ -96,6 +127,7 @@ impl FixtureCommandRunner for CargoWorkflowRunner {
         plan: &FixtureExecutionPlan,
         cancellation: &dyn CancellationProbe,
     ) -> Result<FixtureCommandOutput, BoundaryFailure> {
+        self.validate_plan(plan, cancellation)?;
         let command = &plan.command;
         let claim = &plan.claim;
         for path in [
@@ -107,21 +139,7 @@ impl FixtureCommandRunner for CargoWorkflowRunner {
         ] {
             inside_trial(&self.trial_root, path)?;
         }
-        if cancellation.is_cancelled() {
-            return Err(BoundaryFailure::Rejected);
-        }
-        if command.source_map.as_ref().is_some_and(|source_map| {
-            source_map.requested_tree_digest() != claim.binding.source_tree_digest
-                || !command
-                    .workspace_root
-                    .starts_with(source_map.requested_root())
-        }) {
-            return Err(BoundaryFailure::InvalidIdentity);
-        }
         let run_id = claim.binding.run_id.as_str();
-        if !single_component(run_id) || command.environment.iter().any(forces_environment) {
-            return Err(BoundaryFailure::Rejected);
-        }
         let arguments: Vec<&str> = command.selector.split_whitespace().collect();
         if arguments.is_empty() {
             return Err(BoundaryFailure::Rejected);
@@ -260,9 +278,7 @@ impl FixtureCommandRunner for CargoWorkflowRunner {
         } else {
             #[cfg(test)]
             {
-                if claim.binding.task_id == "6ca14e7a-2cf9-42d3-8f94-f45daad4b2dc"
-                    && command.workflow == "oxide-cargo-source-map-probe"
-                {
+                if is_source_map_probe(command) {
                     let encoded_flags = command
                         .environment
                         .iter()
@@ -318,10 +334,7 @@ impl FixtureCommandRunner for CargoWorkflowRunner {
             "manifest.txt".to_owned(),
         ];
         #[cfg(test)]
-        if command.source_map.is_none()
-            && claim.binding.task_id == "6ca14e7a-2cf9-42d3-8f94-f45daad4b2dc"
-            && command.workflow == "oxide-cargo-source-map-probe"
-        {
+        if command.source_map.is_none() && is_source_map_probe(command) {
             let encoded_flags = command
                 .environment
                 .iter()
@@ -455,6 +468,10 @@ impl CargoWorkflowRunner {
 
 fn forces_environment(value: &EffectiveValue) -> bool {
     FORCED_ENVIRONMENT.contains(&value.name.as_str())
+}
+
+fn is_source_map_probe(command: &super::HostRunRequest) -> bool {
+    command.workflow == "oxide-cargo-source-map-probe"
 }
 
 fn environment_digest(values: &[EffectiveValue]) -> String {

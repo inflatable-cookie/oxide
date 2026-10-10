@@ -15,8 +15,8 @@ use crate::storage::{
     SettlementEvidence, SlotState, StorageError, TerminalOutcome, TerminalRecord,
 };
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -26,24 +26,27 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-const ROOT: &str = "/private/var/tmp/oxide-rust-probe-20261010";
+const ROOT: &str = "/private/var/tmp/oxide-rust-probe-retry-20261010";
 const WORKFLOW: &str = "oxide-cargo-source-map-probe";
 const SELECTOR: &str =
     "test --offline --locked --message-format=json-render-diagnostics -- --nocapture";
-const ROOT_ID: &str = "oxide-rust-probe-20261010";
+const ROOT_ID: &str = "oxide-rust-probe-retry-20261010";
+const LOCAL_TASK_ID: &str = "oxide-local-probe-retry-20261010";
+const LOCAL_WORKSPACE_ID: &str = "oxide-local-probe-image-retry-20261010";
 const LOGICAL_PREFIX: &str = "/oxide-source-map-probe";
 const MARKER_PATH: &str = "probe/marker.txt";
 const BASELINE_MARKER: &str = "baseline-marker\n";
 const CHANGED_MARKER: &str = "changed-marker\n";
 const GIB: u64 = 1024 * 1024 * 1024;
-const MAX_SESSION: Duration = Duration::from_secs(60 * 60);
+const MAX_SESSION: Duration = Duration::from_secs(20 * 60);
+const MAX_INVOCATIONS: u32 = 4;
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 const HOST_RESERVE: u64 = 20 * GIB;
 const IMAGE_CAP: u64 = 8 * GIB;
 const DISPOSABLE_CAP: u64 = 10 * GIB;
 const SLOT_RESERVATION: u64 = GIB;
 
-const ENVIRONMENT_KEYS: [&str; 9] = [
+const ENVIRONMENT_KEYS: [&str; 8] = [
     "CARGO_BUILD_JOBS",
     "CARGO_ENCODED_RUSTFLAGS",
     "CARGO_HOME",
@@ -52,7 +55,6 @@ const ENVIRONMENT_KEYS: [&str; 9] = [
     "RUSTFLAGS",
     "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
-    "TMPDIR",
 ];
 
 struct FrozenFixture {
@@ -96,7 +98,7 @@ impl CancellationProbe for ProbeCancellation {
             return true;
         }
         if self.0.started.elapsed() >= MAX_SESSION {
-            let reason = "the 60 minute session limit was reached".to_owned();
+            let reason = "the 20 minute session limit was reached".to_owned();
             if let Ok(mut failure) = self.0.failure.lock() {
                 *failure = Some(reason.clone());
             }
@@ -163,7 +165,7 @@ impl ProbeBudget {
 
     fn read_sample(&self) -> Result<SpaceSample, String> {
         if self.started.elapsed() >= MAX_SESSION {
-            return Err("the 60 minute session limit was reached".to_owned());
+            return Err("the 20 minute session limit was reached".to_owned());
         }
         let host_free = native::host_free_bytes(Path::new("/private/var/tmp"))
             .map_err(|_| "host free-space observation unavailable".to_owned())?;
@@ -225,6 +227,92 @@ impl ProbeBudget {
 }
 
 #[test]
+fn probe_plan_passes_runner_validation_before_acquire_and_rejects_forced_overrides() {
+    let root = super::super::FixtureRoot::new();
+    let trial = root.dir("trial");
+    let workspace = trial.join("workspace");
+    let target = trial.join("target");
+    let capture = trial.join("capture");
+    let temp = trial.join("tmp");
+    let home = trial.join("home");
+    let cargo_home = trial.join("cargo-home");
+    for path in [&workspace, &target, &capture, &temp, &home, &cargo_home] {
+        fs::create_dir(path).expect("probe validation directory");
+    }
+    fs::write(workspace.join("Cargo.toml"), b"[workspace]\n").expect("workspace marker");
+    let flags = remap_flags(&workspace, &workspace);
+    let environment = probe_environment(&trial, "1.97.1", &flags);
+    let cargo = toolchain_binary("1.97.1", "cargo");
+    let runner = CargoWorkflowRunner::new(trial.clone(), PathBuf::from("/private/var/tmp"), cargo)
+        .expect("registered runner");
+    let tree = format!("sha256:{}", "a".repeat(64));
+    let binding = RunBinding {
+        consumer: "oxide-local-probe".to_owned(),
+        project: "oxide".to_owned(),
+        component: "cargo-source-map-probe".to_owned(),
+        workflow: WORKFLOW.to_owned(),
+        task_id: LOCAL_TASK_ID.to_owned(),
+        workspace_id: LOCAL_WORKSPACE_ID.to_owned(),
+        run_id: "run-launch-contract".to_owned(),
+        attempt_id: "attempt-1".to_owned(),
+        commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        source_tree_digest: tree,
+    };
+    let host = HostRunIdentity {
+        id: "host-launch-contract".to_owned(),
+    };
+    let plan = probe_execution_plan(
+        &host,
+        &workspace,
+        &target,
+        &target,
+        &capture,
+        &temp,
+        None,
+        &environment,
+        &binding,
+        "unacquired",
+        "unacquired",
+    );
+    runner
+        .validate_plan(&plan, &super::super::NeverCancelled)
+        .expect("valid probe plan must pass pre-launch validation");
+
+    let mut tmpdir_override = plan.clone();
+    tmpdir_override.command.environment.push(EffectiveValue {
+        name: "TMPDIR".to_owned(),
+        value: Some(temp.to_string_lossy().into_owned()),
+    });
+    assert_eq!(
+        runner.validate_plan(&tmpdir_override, &super::super::NeverCancelled),
+        Err(BoundaryFailure::Rejected)
+    );
+
+    let mut target_override = plan;
+    target_override.command.environment.push(EffectiveValue {
+        name: "CARGO_TARGET_DIR".to_owned(),
+        value: Some(target.to_string_lossy().into_owned()),
+    });
+    assert_eq!(
+        runner.validate_plan(&target_override, &super::super::NeverCancelled),
+        Err(BoundaryFailure::Rejected)
+    );
+}
+
+#[test]
+fn session_clock_persists_original_machine_timestamps() {
+    let root = super::super::FixtureRoot::new();
+    let setup_temp = root.dir("setup-tmp");
+    record_session_clock(&setup_temp, "2026-10-10T13:00:00Z", "2026-10-10T13:20:00Z")
+        .expect("session clock");
+    let body = fs::read_to_string(setup_temp.join("session-clock.txt")).expect("clock file");
+    assert_eq!(
+        body,
+        "oxide-probe-session-clock-v1\nstart_utc=2026-10-10T13:00:00Z\ndeadline_utc=2026-10-10T13:20:00Z\nmax_session_secs=1200\ninvocation_count=0\nmax_invocations=4\n"
+    );
+}
+
+#[test]
 #[ignore = "approved four-invocation Cargo evidence probe; run only with OXIDE_CARGO_SOURCE_PROBE_RUN=1"]
 fn oxide_cargo_source_map_probe() {
     if std::env::var("OXIDE_CARGO_SOURCE_PROBE_RUN").as_deref() != Ok("1") {
@@ -236,7 +324,20 @@ fn oxide_cargo_source_map_probe() {
 }
 
 fn run_probe() -> Result<(), String> {
-    let session_clock = Instant::now();
+    let started = Instant::now();
+    let start_utc = machine_utc()?;
+    let deadline_utc = machine_deadline_utc()?;
+    refuse_session_timeout(&started)?;
+    match fs::symlink_metadata(ROOT) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("could not inspect {ROOT}: {error}")),
+        Ok(_) => return Err(format!("refusing unknown existing state at {ROOT}")),
+    }
+    fs::create_dir(ROOT).map_err(|error| error.to_string())?;
+    let setup_temp = PathBuf::from(ROOT).join("setup-tmp");
+    fs::create_dir(&setup_temp).map_err(|error| error.to_string())?;
+    record_session_clock(&setup_temp, &start_utc, &deadline_utc)?;
+    refuse_session_timeout(&started)?;
     let host_free = native::host_free_bytes(Path::new("/private/var/tmp"))
         .map_err(|_| "host free-space preflight unavailable".to_owned())?;
     if host_free < HOST_RESERVE {
@@ -244,23 +345,18 @@ fn run_probe() -> Result<(), String> {
             "host free space below the 20 GiB start threshold: {host_free}"
         ));
     }
+    refuse_session_timeout(&started)?;
     let fixture_source =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/cargo-source-map-probe");
     let frozen = freeze_fixture(&fixture_source)?;
     verify_committed_fixture(&fixture_source, &frozen)?;
-    let prior_elapsed = known_resume_elapsed(&frozen)?;
-    let started = session_clock
-        .checked_sub(prior_elapsed)
-        .ok_or_else(|| "could not preserve the original session start".to_owned())?;
-    if started.elapsed() >= MAX_SESSION {
-        return Err("the original 60 minute session limit was reached".to_owned());
-    }
-    let resumed = prior_elapsed > Duration::ZERO;
+    refuse_session_timeout(&started)?;
     let scanner_identity = producer::scanner_identity()?;
+    refuse_session_timeout(&started)?;
     let image = PathBuf::from(ROOT).join("oxide-rust-probe.sparseimage");
     let mount = PathBuf::from(ROOT).join("m");
-    let setup_temp = PathBuf::from(ROOT).join("setup-tmp");
-    let (attach, outside_directories) = setup_image(&image, &mount, &setup_temp, resumed)?;
+    let (attach, outside_directories) = setup_image(&image, &mount, &setup_temp)?;
+    refuse_session_timeout(&started)?;
     let evidence = mount.join("evidence");
     ensure_probe_directory(&evidence)?;
     ensure_probe_directory(&mount.join("tmp"))?;
@@ -277,8 +373,7 @@ fn run_probe() -> Result<(), String> {
     append_evidence(
         &mount,
         &format!(
-            "mount-{}\tdevice={attach}\thost_free={}\timage_capacity={}\timage_used={}\timage_free={}\timage_allocated={}\toutside_allocated={}\n",
-            if resumed { "resume" } else { "preflight" },
+            "mount-preflight\tdevice={attach}\thost_free={}\timage_capacity={}\timage_used={}\timage_free={}\timage_allocated={}\toutside_allocated={}\n",
             setup_sample.host_free,
             setup_sample.image_capacity,
             setup_sample.image_used,
@@ -287,27 +382,15 @@ fn run_probe() -> Result<(), String> {
             setup_sample.outside_allocated,
         ),
     )?;
-    if resumed {
-        append_evidence(
-            &mount,
-            &format!(
-                "session\tresume\t{}\tprior_elapsed_ms={}\tfixture_tree={}\n",
-                local_timestamp(),
-                prior_elapsed.as_millis(),
-                frozen.digest
-            ),
-        )?;
-    } else {
-        append_evidence(
-            &mount,
-            &format!(
-                "session\tstart\t{}\tfixture_tree={}\nscanner-provenance\n{}",
-                local_timestamp(),
-                frozen.digest,
-                scanner_identity
-            ),
-        )?;
-    }
+    append_evidence(
+        &mount,
+        &format!(
+            "session\tstart\t{}\tfixture_tree={}\nscanner-provenance\n{}",
+            machine_utc()?,
+            frozen.digest,
+            scanner_identity
+        ),
+    )?;
 
     let a = mount.join("a");
     let b = mount.join("b");
@@ -361,6 +444,7 @@ fn run_probe() -> Result<(), String> {
     let flags = remap_flags(&a, &b);
     let env = probe_environment(&mount, "1.97.1", &flags);
     let preflight_partition = preflight_partition(&mount, &a, &b, &stable, &env, &flags)?;
+    let mut invocations = 0u32;
 
     let a_tree = producer::source_tree_digest(&a)?;
     let run1 = execute_owned(
@@ -374,6 +458,7 @@ fn run_probe() -> Result<(), String> {
         &a_tree,
         &env,
         "reference-a",
+        &mut invocations,
     )?;
     budget.sample()?;
     if !run1.settled_idle || run1.exit_code != Some(0) {
@@ -445,6 +530,7 @@ fn run_probe() -> Result<(), String> {
         &changed_tree,
         &env,
         "source-miss-b",
+        &mut invocations,
     )?;
     budget.sample()?;
     let stdout2 =
@@ -641,6 +727,7 @@ fn run_probe() -> Result<(), String> {
         &frozen.digest,
         &mapped_env,
         "shared-cold-a",
+        &mut invocations,
     )?;
     budget.sample()?;
     append_qualification(&mount, &run4, "shared-cold-a")?;
@@ -667,6 +754,7 @@ fn run_probe() -> Result<(), String> {
         &frozen.digest,
         &mapped_env,
         "warm-b",
+        &mut invocations,
     )?;
     budget.sample()?;
     append_qualification(&mount, &run5, "warm-b")?;
@@ -724,6 +812,47 @@ struct OwnedRun {
     preflight_scans_complete: bool,
 }
 
+fn probe_execution_plan(
+    host: &HostRunIdentity,
+    workspace: &Path,
+    cargo_build_dir: &Path,
+    cargo_target_dir: &Path,
+    capture_dir: &Path,
+    temp_dir: &Path,
+    source_map: Option<source_map::ResolvedSourceMap>,
+    environment: &[EffectiveValue],
+    binding: &RunBinding,
+    lease_id: &str,
+    slot_id: &str,
+) -> FixtureExecutionPlan {
+    FixtureExecutionPlan {
+        host_run: host.clone(),
+        command: HostRunRequest {
+            selector: SELECTOR.to_owned(),
+            workflow: WORKFLOW.to_owned(),
+            profile: "dev".to_owned(),
+            features: Vec::new(),
+            workspace_root: workspace.to_path_buf(),
+            cargo_build_dir: cargo_build_dir.to_path_buf(),
+            cargo_target_dir: cargo_target_dir.to_path_buf(),
+            capture_dir: capture_dir.to_path_buf(),
+            source_map,
+            environment: environment.to_vec(),
+        },
+        claim: native::NativeExecutionClaim {
+            lease_id: lease_id.to_owned(),
+            slot_id: slot_id.to_owned(),
+            slot_path: cargo_build_dir.to_path_buf(),
+            temp_dir: temp_dir.to_path_buf(),
+            capture_dir: capture_dir.to_path_buf(),
+            binding: binding.clone(),
+            host_run_id: host.id.clone(),
+            workflow: WORKFLOW.to_owned(),
+            selector: SELECTOR.to_owned(),
+        },
+    }
+}
+
 fn execute_owned(
     mount: &Path,
     client: &Client,
@@ -735,6 +864,7 @@ fn execute_owned(
     tree: &str,
     environment: &[EffectiveValue],
     run: &str,
+    invocations: &mut u32,
 ) -> Result<OwnedRun, String> {
     let run_root = mount.join("runs").join(run);
     let target_dir = run_root.join("target");
@@ -746,8 +876,8 @@ fn execute_owned(
         project: "oxide".to_owned(),
         component: "cargo-source-map-probe".to_owned(),
         workflow: WORKFLOW.to_owned(),
-        task_id: "6ca14e7a-2cf9-42d3-8f94-f45daad4b2dc".to_owned(),
-        workspace_id: "probe-image-20261010".to_owned(),
+        task_id: LOCAL_TASK_ID.to_owned(),
+        workspace_id: LOCAL_WORKSPACE_ID.to_owned(),
         run_id: format!("run-{run}"),
         attempt_id: "attempt-1".to_owned(),
         commit: git(
@@ -761,6 +891,28 @@ fn execute_owned(
     let host = HostRunIdentity {
         id: format!("host-{run}"),
     };
+    let temp_dir = mount.join("tmp");
+    let validation_plan = probe_execution_plan(
+        &host,
+        workspace,
+        &target_dir,
+        &target_dir,
+        &capture_dir,
+        &temp_dir,
+        map.clone(),
+        environment,
+        &binding,
+        "unacquired",
+        "unacquired",
+    );
+    runner
+        .validate_plan(&validation_plan, cancellation)
+        .map_err(|error| format!("{run} failed pre-launch validation: {error:?}"))?;
+    if *invocations >= MAX_INVOCATIONS {
+        return Err(format!(
+            "{run} refused: the four-invocation Cargo cap was already used"
+        ));
+    }
     let acquire = client
         .acquire(AcquireRequest {
             envelope: RunEnvelope {
@@ -776,34 +928,21 @@ fn execute_owned(
     let (Some(slot_path), Some(token)) = (acquire.slot_path.clone(), acquire.token.clone()) else {
         return Err(format!("{run} acquired no active lease path"));
     };
-    let temp_dir = mount.join("tmp");
-    let claim = native::NativeExecutionClaim {
-        lease_id: acquire.lease_id.clone(),
-        slot_id: acquire.slot_id.clone(),
-        slot_path: slot_path.clone(),
-        temp_dir: temp_dir.clone(),
-        capture_dir: capture_dir.clone(),
-        binding: binding.clone(),
-        host_run_id: host.id.clone(),
-        workflow: WORKFLOW.to_owned(),
-        selector: SELECTOR.to_owned(),
-    };
-    let plan = FixtureExecutionPlan {
-        host_run: host.clone(),
-        command: HostRunRequest {
-            selector: SELECTOR.to_owned(),
-            workflow: WORKFLOW.to_owned(),
-            profile: "dev".to_owned(),
-            features: Vec::new(),
-            workspace_root: workspace.to_path_buf(),
-            cargo_build_dir: slot_path.clone(),
-            cargo_target_dir: target_dir.clone(),
-            capture_dir: capture_dir.clone(),
-            source_map: map.clone(),
-            environment: environment.to_vec(),
-        },
-        claim,
-    };
+    let plan = probe_execution_plan(
+        &host,
+        workspace,
+        &slot_path,
+        &target_dir,
+        &capture_dir,
+        &temp_dir,
+        map.clone(),
+        environment,
+        &binding,
+        &acquire.lease_id,
+        &acquire.slot_id,
+    );
+    *invocations += 1;
+    append_evidence(mount, &format!("cargo-invocation\t{invocations}\t{run}\n"))?;
     let output = match runner.execute(&plan, cancellation) {
         Ok(output) => output,
         Err(error) => {
@@ -1053,10 +1192,6 @@ fn probe_environment(mount: &Path, channel: &str, flags: &[String]) -> Vec<Effec
         ("RUSTFLAGS", None),
         ("RUSTUP_HOME", Some(rustup_home)),
         ("RUSTUP_TOOLCHAIN", Some(channel.to_owned())),
-        (
-            "TMPDIR",
-            Some(mount.join("tmp").to_string_lossy().into_owned()),
-        ),
     ]
     .into_iter()
     .map(|(name, value)| EffectiveValue {
@@ -1180,8 +1315,8 @@ fn invocation(
         workflow: WORKFLOW.to_owned(),
         selector: SELECTOR.to_owned(),
         request_id: format!("request-{run}"),
-        task_id: "6ca14e7a-2cf9-42d3-8f94-f45daad4b2dc".to_owned(),
-        workspace_id: "probe-image-20261010".to_owned(),
+        task_id: LOCAL_TASK_ID.to_owned(),
+        workspace_id: LOCAL_WORKSPACE_ID.to_owned(),
         commit: git(
             Path::new(env!("CARGO_MANIFEST_DIR")),
             &["rev-parse", "HEAD"],
@@ -1498,7 +1633,7 @@ fn finish_if_idle(
             mount,
             &format!("probe-stop\t{reason}\tunsettled lease; image stays mounted\n"),
         )?;
-        return Ok(());
+        return Err(format!("{reason}; unsettled lease; image stays mounted"));
     }
     budget.sample()?;
     append_evidence(
@@ -1507,7 +1642,7 @@ fn finish_if_idle(
     )?;
     drop(daemon);
     detach_image(attach)?;
-    Ok(())
+    Err(format!("{reason}; all leases settled; image preserved"))
 }
 
 fn freeze_fixture(root: &Path) -> Result<FrozenFixture, String> {
@@ -1655,317 +1790,58 @@ fn write_frozen_fixture(frozen: &FrozenFixture, destination: &Path) -> Result<()
     Ok(())
 }
 
-fn known_resume_elapsed(frozen: &FrozenFixture) -> Result<Duration, String> {
-    let root = Path::new(ROOT);
-    match fs::symlink_metadata(root) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Duration::ZERO),
-        Err(error) => return Err(format!("could not inspect {ROOT}: {error}")),
-        Ok(metadata)
-            if metadata.is_dir()
-                && !metadata.file_type().is_symlink()
-                && fs::canonicalize(root).is_ok_and(|path| path == root) => {}
-        Ok(_) => return Err(format!("refusing unknown pre-existing state at {ROOT}")),
+fn refuse_session_timeout(started: &Instant) -> Result<(), String> {
+    if started.elapsed() >= MAX_SESSION {
+        Err("the 20 minute session limit was reached".to_owned())
+    } else {
+        Ok(())
     }
+}
 
-    let expected_root_entries = BTreeSet::from([
-        "m".to_owned(),
-        "oxide-rust-probe.sparseimage".to_owned(),
-        "setup-tmp".to_owned(),
-    ]);
-    if directory_names(root)? != expected_root_entries {
-        return Err(format!("refusing unknown pre-existing state at {ROOT}"));
-    }
-    let mount = root.join("m");
-    let setup_temp = root.join("setup-tmp");
-    for directory in [&mount, &setup_temp] {
-        let metadata = fs::symlink_metadata(directory).map_err(|error| error.to_string())?;
-        let canonical = fs::canonicalize(directory).map_err(|error| error.to_string())?;
-        if !metadata.is_dir()
-            || metadata.file_type().is_symlink()
-            || canonical.as_path() != directory
-        {
-            return Err(
-                "pre-existing probe directories are not owned canonical directories".to_owned(),
-            );
-        }
-    }
-    let expected_setup_entries = BTreeSet::from([
-        "attempt-1.txt".to_owned(),
-        "attempt-2.txt".to_owned(),
-        "attempt-3.txt".to_owned(),
-        "attempt-4.txt".to_owned(),
-        "attempt-5.txt".to_owned(),
-        "attempt-6.txt".to_owned(),
-        "diskutil-attempt-3.plist".to_owned(),
-        "hdiutil-image-map-attempt-3.txt".to_owned(),
-        "imageinfo-after-attach-attempt-3.plist".to_owned(),
-        "imageinfo-attempt-1.plist".to_owned(),
-        "imageinfo-before-attach.plist".to_owned(),
-        "imageinfo-resume-observation.plist".to_owned(),
-        "resume-state.txt".to_owned(),
-    ]);
-    if directory_names(&setup_temp)? != expected_setup_entries {
-        return Err("pre-existing probe setup contents are not the recorded task state".to_owned());
-    }
-
-    let state_path = setup_temp.join("resume-state.txt");
-    let state = fs::read_to_string(&state_path).map_err(|error| error.to_string())?;
-    let mut fields = BTreeMap::new();
-    let mut lines = state.lines();
-    if lines.next() != Some("oxide-rust-probe-resume-v1") {
-        return Err("probe resume marker has an unknown version".to_owned());
-    }
-    for line in lines {
-        let (key, value) = line
-            .split_once('=')
-            .ok_or_else(|| "probe resume marker is malformed".to_owned())?;
-        if fields.insert(key.to_owned(), value.to_owned()).is_some() {
-            return Err("probe resume marker repeats a field".to_owned());
-        }
-    }
-    let required = [
-        ("root", ROOT),
-        ("image", "oxide-rust-probe.sparseimage"),
-        ("image_virtual_capacity", "8589934592"),
-        ("attempt_count", "6"),
-        ("imageinfo_file", "imageinfo-after-attach-attempt-3.plist"),
-        ("mount_stage", "pre-daemon"),
-        ("fixture_tree_digest", frozen.digest.as_str()),
-    ];
-    if fields.len() != 16
-        || required
-            .iter()
-            .any(|(key, expected)| fields.get(*key).map(String::as_str) != Some(expected))
-    {
-        return Err("probe resume marker does not describe the approved image state".to_owned());
-    }
-
-    let image = root.join("oxide-rust-probe.sparseimage");
-    let image_metadata = fs::symlink_metadata(&image).map_err(|error| error.to_string())?;
-    if !image_metadata.is_file() || image_metadata.file_type().is_symlink() {
-        return Err("recorded sparse image is not a regular file".to_owned());
-    }
-    let checkpoint_length = fields
-        .get("image_allocated_length")
-        .ok_or_else(|| "probe checkpoint lacks its image file length".to_owned())?
-        .parse::<u64>()
-        .map_err(|error| error.to_string())?;
-    if image_metadata.len() > IMAGE_CAP
-        || checkpoint_length > IMAGE_CAP
-        || !is_sha256_digest(fields.get("image_digest_at_checkpoint"))
-    {
-        return Err("sparse image file length exceeded its approved capacity".to_owned());
-    }
-
-    let info_path = setup_temp.join(
-        fields
-            .get("imageinfo_file")
-            .ok_or_else(|| "probe resume marker lacks its hdiutil capture name".to_owned())?,
+fn record_session_clock(
+    setup_temp: &Path,
+    start_utc: &str,
+    deadline_utc: &str,
+) -> Result<(), String> {
+    let body = format!(
+        "oxide-probe-session-clock-v1\nstart_utc={start_utc}\ndeadline_utc={deadline_utc}\nmax_session_secs={}\ninvocation_count=0\nmax_invocations={MAX_INVOCATIONS}\n",
+        MAX_SESSION.as_secs(),
     );
-    let info_metadata = fs::symlink_metadata(&info_path).map_err(|error| error.to_string())?;
-    if !info_metadata.is_file() || info_metadata.file_type().is_symlink() {
-        return Err("recorded hdiutil image information is not a regular file".to_owned());
-    }
-    let info_bytes = fs::read(&info_path).map_err(|error| error.to_string())?;
-    let recorded_info_digest = hex_digest(&info_bytes);
-    let current_info = image_info(&image)?;
-    let resume_info_bytes = fs::read(setup_temp.join("imageinfo-resume-observation.plist"))
+    let path = setup_temp.join("session-clock.txt");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
         .map_err(|error| error.to_string())?;
-    if fields.get("imageinfo_digest") != Some(&recorded_info_digest)
-        || image_capacity(&info_path)? != IMAGE_CAP
-        || !is_sparse_apfs_info(&info_bytes)
-        || hex_digest(&resume_info_bytes)
-            != "sha256:8ea268debb6fdc282b314d67f4f54db481af3de2db4234abe83d90368a115131"
-        || image_capacity_from_bytes(&resume_info_bytes)? != IMAGE_CAP
-        || !is_sparse_apfs_info(&resume_info_bytes)
-        || image_capacity_from_bytes(&current_info)? != IMAGE_CAP
-        || !is_sparse_apfs_info(&current_info)
-    {
-        return Err(
-            "recorded hdiutil evidence does not prove the exact sparse APFS image".to_owned(),
-        );
-    }
-    let attempt =
-        fs::read_to_string(setup_temp.join("attempt-1.txt")).map_err(|error| error.to_string())?;
-    if !attempt.contains("Result: exit 101 before any fixture Cargo invocation")
-        || !attempt.contains("15732736")
-    {
-        return Err("recorded first attempt lacks its setup failure evidence".to_owned());
-    }
-    let second_attempt =
-        fs::read_to_string(setup_temp.join("attempt-2.txt")).map_err(|error| error.to_string())?;
-    if !second_attempt
-        .contains("stopped before image attach and before any fixture Cargo invocation")
-        || !second_attempt.contains("does not prove the exact sparse APFS image")
-    {
-        return Err("recorded second attempt lacks its setup failure evidence".to_owned());
-    }
-    let third_attempt =
-        fs::read_to_string(setup_temp.join("attempt-3.txt")).map_err(|error| error.to_string())?;
-    if !third_attempt.contains("before any fixture Cargo invocation or storage lease")
-        || !third_attempt.contains("mounted=/dev/disk7s1")
-    {
-        return Err("recorded third attempt lacks its setup failure evidence".to_owned());
-    }
-    let fourth_attempt =
-        fs::read_to_string(setup_temp.join("attempt-4.txt")).map_err(|error| error.to_string())?;
-    if !fourth_attempt.contains("before any fixture Cargo invocation")
-        || !fourth_attempt.contains("bind task-owned probe daemon")
-    {
-        return Err("recorded fourth attempt lacks its setup failure evidence".to_owned());
-    }
-    let fifth_attempt =
-        fs::read_to_string(setup_temp.join("attempt-5.txt")).map_err(|error| error.to_string())?;
-    if !fifth_attempt.contains("before any fixture Cargo invocation or lease")
-        || !fifth_attempt.contains("8589934592-byte sparse APFS virtual image")
-        || !fifth_attempt.contains(
-            "imageinfo-resume-observation.plist (sha256:8ea268debb6fdc282b314d67f4f54db481af3de2db4234abe83d90368a115131)",
-        )
-    {
-        return Err("recorded fifth attempt lacks its setup failure evidence".to_owned());
-    }
-    let sixth_attempt =
-        fs::read_to_string(setup_temp.join("attempt-6.txt")).map_err(|error| error.to_string())?;
-    if !sixth_attempt.contains("before any fixture Cargo invocation or storage lease")
-        || !sixth_attempt.contains("recorded fifth attempt lacks its setup failure evidence")
-    {
-        return Err("recorded sixth attempt lacks its setup failure evidence".to_owned());
-    }
+    file.write_all(body.as_bytes())
+        .map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())
+}
 
-    let attached = Command::new("/usr/bin/hdiutil")
-        .arg("info")
+fn machine_utc() -> Result<String, String> {
+    machine_date(&["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+}
+
+fn machine_deadline_utc() -> Result<String, String> {
+    machine_date(&["-u", "-v+20M", "+%Y-%m-%dT%H:%M:%SZ"])
+}
+
+fn machine_date(args: &[&str]) -> Result<String, String> {
+    let output = Command::new("/bin/date")
+        .args(args)
         .output()
         .map_err(|error| error.to_string())?;
-    if !attached.status.success() {
-        return Err("hdiutil attachment state is unknown".to_owned());
+    if !output.status.success() {
+        return Err(format!(
+            "machine clock unavailable: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
-    let attached_text = String::from_utf8_lossy(&attached.stdout);
-    let attached_block = image_info_block(&attached_text, &image)
-        .ok_or_else(|| "the recorded task image is not attached in hdiutil state".to_owned())?;
-    let recorded_block = fs::read_to_string(setup_temp.join("hdiutil-image-map-attempt-3.txt"))
-        .map_err(|error| error.to_string())?;
-    let recorded_map_digest = hex_digest(recorded_block.as_bytes());
-    let block_base_device = image_block_base_device(attached_block)
-        .ok_or_else(|| "recorded image has no base device mapping".to_owned())?;
-    let state_base_device = fields.get("attached_device").map(String::as_str);
-    if attached_block != recorded_block
-        || fields.get("attachment_map_digest") != Some(&recorded_map_digest)
-        || !image_block_has_mount(attached_block, &mount, &block_base_device)
-        || state_base_device != Some(block_base_device.as_str())
-    {
-        return Err(
-            "recorded hdiutil mapping does not bind this image to the approved mount".to_owned(),
-        );
+    let stamp = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if stamp.is_empty() {
+        return Err("machine clock returned an empty timestamp".to_owned());
     }
-    let (mounted_device, capacity, used, free) = df_space(&mount)?;
-    if fields.get("mounted_device").map(String::as_str) != Some(mounted_device.as_str())
-        || capacity == 0
-        || capacity > IMAGE_CAP
-        || used > IMAGE_CAP
-        || free > capacity
-    {
-        return Err("recorded APFS mount no longer has the expected bounded capacity".to_owned());
-    }
-    let diskutil_bytes =
-        fs::read(setup_temp.join("diskutil-attempt-3.plist")).map_err(|error| error.to_string())?;
-    let recorded_diskutil_digest = hex_digest(&diskutil_bytes);
-    if fields.get("diskutil_digest") != Some(&recorded_diskutil_digest) {
-        return Err("recorded diskutil APFS identity evidence changed".to_owned());
-    }
-
-    let expected_mount_entries = BTreeSet::from([
-        "a".to_owned(),
-        "b".to_owned(),
-        "cargo-home".to_owned(),
-        "evidence".to_owned(),
-        "home".to_owned(),
-        "tmp".to_owned(),
-    ]);
-    if directory_names(&mount)? != expected_mount_entries
-        || producer::source_tree_digest(&mount.join("a"))? != frozen.digest
-        || producer::source_tree_digest(&mount.join("b"))? != frozen.digest
-    {
-        return Err("prepared A/B roots do not match the recorded frozen fixture".to_owned());
-    }
-    for directory in ["tmp", "home", "cargo-home"] {
-        if !directory_names(&mount.join(directory))?.is_empty() {
-            return Err(format!("prepared {directory} directory is not empty"));
-        }
-    }
-    let evidence = mount.join("evidence");
-    if directory_names(&evidence)? != BTreeSet::from(["events.tsv".to_owned()]) {
-        return Err("pre-daemon evidence directory contains unknown files".to_owned());
-    }
-    let events = evidence.join("events.tsv");
-    let events_metadata = fs::symlink_metadata(&events).map_err(|error| error.to_string())?;
-    if !events_metadata.is_file() || events_metadata.file_type().is_symlink() {
-        return Err("pre-daemon event evidence is not a regular file".to_owned());
-    }
-    let events_digest = digest_file_path(&events)?;
-    if fields.get("events_digest") != Some(&events_digest) {
-        return Err("pre-daemon event evidence changed since its checkpoint".to_owned());
-    }
-    let event_text = fs::read_to_string(&events).map_err(|error| error.to_string())?;
-    if !event_text.contains("mount-preflight\t")
-        || !event_text.contains("session\tstart\t")
-        || !event_text.contains("scanner-provenance")
-        || !event_text.contains("toolchain\tbaseline\t")
-        || !event_text.contains("alternate\tchannel=1.96.1\t")
-        || !event_text.contains(&frozen.digest)
-    {
-        return Err("pre-daemon event evidence is incomplete".to_owned());
-    }
-
-    let elapsed_ms = fields
-        .get("prior_elapsed_ms")
-        .ok_or_else(|| "probe resume marker lacks prior elapsed time".to_owned())?
-        .parse::<u64>()
-        .map_err(|error| error.to_string())?;
-    Ok(Duration::from_millis(elapsed_ms))
-}
-
-fn is_sha256_digest(value: Option<&String>) -> bool {
-    value
-        .and_then(|value| value.strip_prefix("sha256:"))
-        .is_some_and(|value| {
-            value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-        })
-}
-
-fn directory_names(directory: &Path) -> Result<BTreeSet<String>, String> {
-    let mut names = BTreeSet::new();
-    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
-        if metadata.file_type().is_symlink() {
-            return Err(format!(
-                "symlink refused in bounded probe setup: {}",
-                entry.path().display()
-            ));
-        }
-        names.insert(
-            entry
-                .file_name()
-                .into_string()
-                .map_err(|_| "non-UTF-8 bounded probe path refused".to_owned())?,
-        );
-    }
-    Ok(names)
-}
-
-fn digest_file_path(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|error| error.to_string())?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0; 64 * 1024];
-    loop {
-        let count =
-            std::io::Read::read(&mut file, &mut buffer).map_err(|error| error.to_string())?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-    }
-    Ok(format!("sha256:{:x}", digest.finalize()))
+    Ok(stamp)
 }
 
 fn image_info(image: &Path) -> Result<Vec<u8>, String> {
@@ -1982,10 +1858,6 @@ fn image_info(image: &Path) -> Result<Vec<u8>, String> {
             String::from_utf8_lossy(&result.stderr)
         ))
     }
-}
-
-fn image_capacity(plist: &Path) -> Result<u64, String> {
-    image_capacity_from_bytes(&fs::read(plist).map_err(|error| error.to_string())?)
 }
 
 fn image_capacity_from_bytes(plist: &[u8]) -> Result<u64, String> {
@@ -2059,107 +1931,75 @@ fn image_block_has_mount(block: &str, mount: &Path, device: &str) -> bool {
         })
 }
 
-fn setup_image(
-    image: &Path,
-    mount: &Path,
-    setup_temp: &Path,
-    resume: bool,
-) -> Result<(String, u64), String> {
-    if !resume {
-        fs::create_dir(ROOT).map_err(|error| error.to_string())?;
-        fs::create_dir(mount).map_err(|error| error.to_string())?;
-        fs::create_dir(setup_temp).map_err(|error| error.to_string())?;
-        let created = Command::new("/usr/bin/hdiutil")
-            .args([
-                "create",
-                "-size",
-                "8g",
-                "-type",
-                "SPARSE",
-                "-fs",
-                "APFS",
-                "-volname",
-                "oxide-rust-probe",
-                "-nospotlight",
-                "-quiet",
-            ])
-            .arg(image)
-            .env("TMPDIR", setup_temp)
-            .env("TMP", setup_temp)
-            .env("TEMP", setup_temp)
-            .output()
-            .map_err(|error| error.to_string())?;
-        if !created.status.success() {
-            return Err(format!(
-                "hdiutil create failed: {}",
-                String::from_utf8_lossy(&created.stderr)
-            ));
-        }
+fn setup_image(image: &Path, mount: &Path, setup_temp: &Path) -> Result<(String, u64), String> {
+    fs::create_dir(mount).map_err(|error| error.to_string())?;
+    let created = Command::new("/usr/bin/hdiutil")
+        .args([
+            "create",
+            "-size",
+            "8g",
+            "-type",
+            "SPARSE",
+            "-fs",
+            "APFS",
+            "-volname",
+            "oxide-rust-probe-retry",
+            "-nospotlight",
+            "-quiet",
+        ])
+        .arg(image)
+        .env("TMPDIR", setup_temp)
+        .env("TMP", setup_temp)
+        .env("TEMP", setup_temp)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !created.status.success() {
+        return Err(format!(
+            "hdiutil create failed: {}",
+            String::from_utf8_lossy(&created.stderr)
+        ));
     }
     let info = image_info(image)?;
     let image_info_capture = setup_temp.join("imageinfo-before-attach.plist");
-    match fs::read(&image_info_capture) {
-        Ok(previous)
-            if resume
-                && image_capacity_from_bytes(&previous)? == IMAGE_CAP
-                && is_sparse_apfs_info(&previous) => {}
-        Ok(_) => return Err("pre-attach image information changed since setup".to_owned()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut info_file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&image_info_capture)
-                .map_err(|error| error.to_string())?;
-            info_file
-                .write_all(&info)
-                .map_err(|error| error.to_string())?;
-            info_file.sync_all().map_err(|error| error.to_string())?;
-        }
-        Err(error) => return Err(error.to_string()),
-    }
+    let mut info_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&image_info_capture)
+        .map_err(|error| error.to_string())?;
+    info_file
+        .write_all(&info)
+        .map_err(|error| error.to_string())?;
+    info_file.sync_all().map_err(|error| error.to_string())?;
     if image_capacity_from_bytes(&info)? != IMAGE_CAP || !is_sparse_apfs_info(&info) {
         return Err("hdiutil did not confirm the approved 8 GiB sparse APFS image".to_owned());
     }
     let outside_directories =
         allocated_blocks(Path::new(ROOT))?.saturating_add(allocated_blocks(mount)?);
-    let device = if resume {
-        let attached = Command::new("/usr/bin/hdiutil")
-            .arg("info")
-            .output()
-            .map_err(|error| error.to_string())?;
-        if !attached.status.success() {
-            return Err("hdiutil attachment state is unknown".to_owned());
-        }
-        image_info_block(&String::from_utf8_lossy(&attached.stdout), image)
-            .and_then(image_block_base_device)
-            .ok_or_else(|| "the recorded task image is no longer attached".to_owned())?
-    } else {
-        let attached = Command::new("/usr/bin/hdiutil")
-            .args(["attach", "-nobrowse", "-noverify", "-mountpoint"])
-            .arg(mount)
-            .arg(image)
-            .env("TMPDIR", setup_temp)
-            .env("TMP", setup_temp)
-            .env("TEMP", setup_temp)
-            .output()
-            .map_err(|error| error.to_string())?;
-        if !attached.status.success() {
-            return Err(format!(
-                "hdiutil attach failed: {}",
-                String::from_utf8_lossy(&attached.stderr)
-            ));
-        }
-        String::from_utf8_lossy(&attached.stdout)
-            .split_whitespace()
-            .find(|value| value.starts_with("/dev/disk"))
-            .ok_or_else(|| {
-                format!(
-                    "hdiutil attach did not identify its device: {}",
-                    String::from_utf8_lossy(&attached.stdout)
-                )
-            })?
-            .to_owned()
-    };
+    let attached = Command::new("/usr/bin/hdiutil")
+        .args(["attach", "-nobrowse", "-noverify", "-mountpoint"])
+        .arg(mount)
+        .arg(image)
+        .env("TMPDIR", setup_temp)
+        .env("TMP", setup_temp)
+        .env("TEMP", setup_temp)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !attached.status.success() {
+        return Err(format!(
+            "hdiutil attach failed: {}",
+            String::from_utf8_lossy(&attached.stderr)
+        ));
+    }
+    let device = String::from_utf8_lossy(&attached.stdout)
+        .split_whitespace()
+        .find(|value| value.starts_with("/dev/disk"))
+        .ok_or_else(|| {
+            format!(
+                "hdiutil attach did not identify its device: {}",
+                String::from_utf8_lossy(&attached.stdout)
+            )
+        })?
+        .to_owned();
     let canonical_mount = fs::canonicalize(mount).map_err(|error| error.to_string())?;
     if canonical_mount.as_path() != mount {
         return Err("mounted disposable volume is not at its canonical approved path".to_owned());
@@ -2280,17 +2120,6 @@ fn append_evidence(mount: &Path, line: &str) -> Result<(), String> {
     file.write_all(line.as_bytes())
         .map_err(|error| error.to_string())?;
     file.sync_data().map_err(|error| error.to_string())
-}
-
-fn local_timestamp() -> String {
-    let output = Command::new("/bin/date")
-        .arg("-u")
-        .arg("+%Y-%m-%dT%H:%M:%SZ")
-        .output();
-    output.map_or_else(
-        |_| "unknown-utc".to_owned(),
-        |output| String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-    )
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
