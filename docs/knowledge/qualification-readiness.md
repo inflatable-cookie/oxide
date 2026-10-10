@@ -2047,7 +2047,9 @@ configuration/environment identity stays partition-owned. Ancestor and user Carg
 configuration, new members, external reads, symlinks, directories, old-style
 scripts, overrides, rustdoc, unknown formats and unresolved classes refuse.
 There is no directory-coverage claim: a directory input refuses in this file-only
-slice. No dependency reuse benefit has yet been observed through this guard.
+slice. The [Task 021 v2 proof](#task-021-v2-same-root-execution-result-2026-10-10)
+observed dependency reuse across changed tasks at one physical root in this tiny
+fixture; consumer adoption and everyday storage relief remain unqualified.
 
 The integrity-checked map is capped at 4096 total input/reference entries and
 1 MiB of serialized evidence. Paths are at most 1024 bytes; discovery visits at
@@ -2087,8 +2089,14 @@ The ignored later proof is
 `project::tests::cargo_pilot::same_root_probe::same_root_cargo_freshness_owned_proof`
 in [`cargo_same_root.rs`](../../src/project/tests/cargo_same_root.rs).
 It requires `OXIDE_SAME_ROOT_PROOF_RUN=1`,
-`OXIDE_SAME_ROOT_PROOF_SCOPE=oxide-019-same-root-v1`, and a fresh separately scoped
-Queue execution record for `/private/var/tmp/oxide-rust-probe-proof-019-reuse`.
+`OXIDE_SAME_ROOT_PROOF_SCOPE=oxide-021-same-root-v2`, and a fresh separately scoped
+Queue execution record for `/private/var/tmp/oxide-rust-probe-proof-021-reuse-v2`.
+The Task 021 v2 driver creates its new daemon storage directory with mode 0700;
+it refuses existing paths rather than repairing permissions. Its ordinary
+`private_storage_setup_binds_daemon_without_repairing_existing_roots` regression
+uses that same setup helper, checks canonical/private identity and actual
+`Daemon::bind`, and leaves a deliberately exposed existing root unchanged.
+The v1 setup-blocker session below remains preserved and cannot be resumed.
 Run only that exact ignored test through `effigy test rust` with
 `--ignored --exact --test-threads=1` passed to the test runner. Ordinary validation
 leaves it ignored and creates no experimental root. The driver uses an original
@@ -2105,3 +2113,380 @@ invocations; the failed compile is the fourth. There is no fifth recovery
 compile, no live eviction and no successful recovery claim. The driver retains
 its new resources for inspection. This task grants no live execution, consumer
 adoption, everyday benefit claim or authority over any previous probe session.
+
+
+#### Task 021 same-root execution: setup blocker (2026-10-10)
+
+The single authorized `oxide-019-same-root-v1` launch stopped before baseline
+Cargo execution. This is a producer setup deficiency, not a negative reuse
+mechanism result. No dependency reuse, stale-input refusal or failed-build
+invalidation was observed. The session has ended; its unused invocation allowance
+cannot be resumed. Product code and frozen fixtures were unchanged. Author allocation began at
+`2026-10-10T19:08:26.100Z` (40-minute ceiling); preflight, live execution,
+read-only diagnosis and record preparation consumed under four minutes.
+Independent review has a separate 20-minute read-only allocation; no replay is
+authorized and no independent verdict is claimed by this author record.
+
+Producer: independently reviewed Task020 head
+`563cf7b3c2540e11dae64e0efad29d84624eebdb`, running at merged planning/implementation
+head `3e54aa194d9d45b10a4f2f9db86f8968219a527e` on the clean Queue task branch.
+There was no source/fixture difference from the reviewed head.
+`src/project/tests/cargo_same_root.rs` SHA-256:
+`fafc7ed9659d20f75b6400604a18234d5639fdcc3e6e77bcf1926dc1be5c45a0`.
+Read-only preflight recomputed T0
+`sha256:550e62cefc7f647fef97b12489fc2c1e1ba67fd56a7529401fce25c97b0ce2e9`
+and marker-only T1
+`sha256:784b4c701a7b752a11e0b5b99e7fff36f796af643cd3e8514ae16147b237ee26`.
+Installed Cargo was `1.97.1 (c980f4866 2026-06-30)` and rustc was
+`1.97.1 (8bab26f4f 2026-07-14)`, host `aarch64-apple-darwin`.
+Full packed debug remains the unchanged fixture profile; no executable or debug
+companion was produced by this session.
+
+Fresh root `/private/var/tmp/oxide-rust-probe-proof-019-reuse` was absent before
+launch. Outer scratch was `/private/tmp/oxide-021.YGlEjg`; all four outer scratch
+variables (`OXIDE_TASK_SCRATCH_ROOT`, `TMPDIR`, `TMP`, `TEMP`) named it. The verified
+Effigy forwarding form was `effigy test --plan rust -- -- --ignored --exact
+project::tests::cargo_pilot::same_root_probe::same_root_cargo_freshness_owned_proof
+--test-threads=1 --nocapture`. Its plan exited 0 and resolved exactly:
+
+```text
+cargo test --workspace --all-targets --locked -- --ignored --exact project::tests::cargo_pilot::same_root_probe::same_root_cargo_freshness_owned_proof --test-threads=1 --nocapture
+```
+
+The same forwarding vector launched once through `effigy test rust`, with
+`OXIDE_SAME_ROOT_PROOF_RUN=1` and
+`OXIDE_SAME_ROOT_PROOF_SCOPE=oxide-019-same-root-v1`. The outer harness compiled
+successfully in 4.57 seconds, then its one selected ignored proof failed in
+8.02 seconds. Cargo reported exit 101; Effigy/outer shell reported exit 1.
+The saved outer log is 2,396 bytes. No additional ordinary Rust validation or
+fixture smoke build ran; unchanged code retains Task020's accepted validation.
+The strict RustQuality everyday route resolved locally to package 0.2.0,
+repository profile `strict`, no deviations, package-declared MSRV 1.97.1.
+
+The driver recorded original live Instant origin before setup at
+`2026-10-10T19:09:22Z`, deadline `2026-10-10T19:29:22Z` (1,200,000 ms).
+Its last completed sample was `2026-10-10T19:09:30Z`, elapsed 7,999 ms.
+The preceding completed sample was elapsed 58 ms: gap 7,941 ms. The driver
+started its independent 20-second sampler; this entire setup attempt ended
+before the first periodic tick. The outer test's 8.02-second duration is not
+substituted for a missing final driver sample.
+
+| Observation (bytes) | First sample | Last completed sample |
+| --- | ---: | ---: |
+| Host available | 242,213,838,848 | 242,197,155,840 |
+| Image capacity | 0 (not created) | 8,380,178,432 |
+| Image used | 0 | 86,016 |
+| Image free | 0 | 8,353,710,080 |
+| Image allocated | 0 | 15,732,736 |
+| Outside allocated | 4,096 | 20,480 |
+
+The sampled disposable footprint reached 15,753,216 bytes, below 10 GiB;
+observed host free space remained above 20 GiB. The fixed sparse image/mount
+remain retained. These are sampled allocation/free-space observations, not
+SSD write counts; writes are unmeasured. No setup/capture after the last sample
+is presented as continuously measured resource success.
+
+The driver verified its internal Effigy `same-root:probe` plan (executed=false)
+for physical root `m/r` and the pinned Cargo binary with selector
+`test --offline --locked --lib --bins --tests --message-format=json-render-diagnostics -- --nocapture`.
+It then created `m/storage` via `ensure_probe_directory`, which checks directory
+and canonical-path identity but does not impose private permissions.
+Read-only inspection found mode **0755**. `Daemon::bind` correctly rejected it:
+`InvalidInput("storage root must be a private directory")`; the panic was at
+`src/project/tests/cargo_source_probe.rs:1410`. The storage validator requires
+`mode & 0o077 == 0`. This occurred before constructing the invocation counter,
+runner, acquiring any lease or entering the six-step loop. No host launch denial
+was observed; this was the actual storage guard refusing setup.
+
+| Required step | Observed result |
+| --- | --- |
+| Cold T0 | Not reached; no tests/source/debug baseline |
+| Changed-task warm T1 | Not reached; no fresh/rebuilt unit rows |
+| Same-tree T1 retry | Not reached |
+| Old-mtime T0 refusal | Not reached |
+| Syntax-error compiler call | Not reached |
+| Restored-source invalid-map refusal / grant=false inspection | Not reached |
+
+Actual fixture compiler/test calls: **0 of 4**. No slot, lease, authenticated
+no-spawn settlement, capture receipt, finalization or ownership uncertainty was
+created. Empty `m/evidence`, `m/runs` and `m/storage` remain inspectable. No source
+restoration, permission repair, retry, recovery, deletion, attach or detach was
+performed after the stop; all prior resources were left untouched.
+
+Raw evidence is retained under the new root's `setup-tmp/` and outer scratch.
+`/private/tmp/oxide-021.YGlEjg/evidence-inventory.json` records every retained
+regular session file and the outer logs, sizes, allocation and SHA-256 values;
+its SHA-256 is `aeda0125e083af5f805769535d24922365136d2d3db14f8b35b3826c2d449511`.
+Key raw hashes:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `setup-tmp/session-clock.txt` | `036cc35174b0c5dfcd9d21b065a4d1bf5f6f70ad09cd27a72279176bdf5bd50c` |
+| `setup-tmp/host-space-samples.tsv` | `4444adf7c6dd3d10f7bff5bdb74ce0bace5bf44d74488236f4bec8793ce45f94` |
+| `setup-tmp/effigy-launch-setup.json` | `62c1f80f9caea14d5428d206cfe19d52261b1513192bdbdace528d5b42d5a4fd` |
+| `oxide-rust-probe.sparseimage` (inspection snapshot) | `8314cc2faeaec0c6c41f9a9e9ba4e904b0e5c9bec4c4aa9a68df22a6dba18ce0` |
+| Outer `outer-plan.log` | `d21844d5beb1441104365657dddc816432f28a93d5cbce0ee38a3c0c2f2d4b2b` |
+| Outer `outer-run.log` | `58c678fcd82b9bf75f75c4dd0f6d3b422cfe80afb59e5f7fe4c00d29ac5da73a` |
+
+Author assessment pending independent exact-head inspection: `baseline`,
+`useful_reuse`, `admission_refusal` and `failed_map` are **insufficient** because
+none of their steps ran. `ownership_evidence` passes only evidence honesty and
+preservation: no ownership was granted and no release is claimed.
+`session_resources` is **insufficient** for full qualification, with the bounded
+setup observations above preserved. `disposition` passes as an explicit setup
+blocker. Mandatory baseline/resource pass gates are unmet; this cannot close as
+qualified reuse or a negative mechanism result.
+
+Smallest supported next action: a scoped Oxide-only correction establishing a
+private canonical new daemon storage directory, with regression coverage, then
+independent review and a fresh bounded Queue continuation. Do not patch or retry
+this ended session. Consumer path-pool/lifecycle coordination, successful live
+cold recovery, general Cargo input coverage, real-project qualification,
+adoption and everyday storage relief remain unestablished and separately gated.
+
+
+#### Task 021 v2 private-storage setup correction (2026-10-10)
+
+The v2 driver creates its new storage root via `DirBuilder::mode(0o700)` before
+the unchanged real daemon bind. Creation refuses an existing path, including a
+private root; no existing path's permissions are repaired. Canonical-path checks
+remain in force. The ordinary regression calls that same helper, leaves an
+existing mode-0755 directory exposed, asserts a newly created canonical mode-0700
+root, and binds the real daemon successfully. It creates no APFS image, runs no
+fixture Cargo command and accesses no preserved session root.
+
+The targeted Effigy regression passed (one test, 0.02 seconds) with all four
+scratch variables set to `/private/tmp/oxide-021-v2.vjsYE5` and live flags absent.
+`effigy rust:compile` exited 0 with existing dead-code warnings (124 warning
+records in the compact collector). `effigy rust:format` initially rejected one
+line wrap; after that formatting-only correction it exited 0. No full ordinary
+suite was repeated. RustQuality strict everyday authoring resolved locally with
+no deviations; RUST-READ-001 and RUST-ERR-001 apply. Recoverable helper errors
+propagate; test assertions express explicit regression invariants. Raw ordinary
+check records are retained in the task worktree's Git metadata under
+`northstar/rust-quality/closeouts/a32f85f4ec64e3e47f7cfcc1d0d9dea4c6b7ddc00b5c9dd9362988feb18d2664/`;
+compact summary and corrected format output are in the fresh scratch above.
+
+V2 is separate from the preserved v1 blocker. Its driver ROOT is
+`/private/var/tmp/oxide-rust-probe-proof-021-reuse-v2`, SCOPE is
+`oxide-021-same-root-v2`, and image label is `oxide-same-root-021-v2`.
+Preflight found the root absent and no applicable existing ancestor Cargo config.
+The future daemon socket path is 74 bytes, below the existing 100-byte limit.
+Source inspection confirmed the subsequent runner checks canonical mount/host
+paths, an existing absolute selector, contained output/temp directories and
+registered source identity. The frozen source, selector, packed debug profile,
+physical paths, original six-step sequence and all resource/ownership gates
+remain unchanged. Cargo/rustc 1.97.1 were already installed; nothing was installed.
+Author allocation began `2026-10-10T19:23:11.181Z`, with a 50-minute ceiling
+including correction, validation, the single live proof and closeout. The
+separate independent review allocation is 20 minutes, with retained live
+resources read-only. No review verdict is claimed by this author record.
+
+
+#### Task 021 v2 same-root execution result (2026-10-10)
+
+The corrected same-root fixture proof completed all six steps with exactly four
+compiler/test calls. Changed-task T1 reused slot-1, retained both proc-macro
+compiler artifacts and executed current generated/proc-macro/runtime values.
+Both stale-source and post-failure requests refused without calling Cargo and
+settled Idle. This is a positive tiny-fixture mechanism observation at one fixed
+physical root, pending independent exact-head review; it is not consumer adoption,
+cross-root reuse or meaningful everyday storage-relief qualification.
+
+**Producer and launch.** V2 ran from clean committed producer
+`52712f3c2de0b53e9884f56658413443cee4ce65`, preserving the v1 ancestor
+`81f92d33cb277bb9ba85fb8c6b618bd62dcf18bf` and reviewed Task020 ancestry.
+Only the new-owned storage setup helper, its regression and v2 constants changed
+Rust code. Driver SHA-256 was
+`bfef6c9cce65231379d5aa45d7801f3bcf207c43ba1c894e70b4e5507b935d71`.
+`prelaunch.json` in `/private/tmp/oxide-021-v2.vjsYE5` recorded that producer,
+passed regression/compile/format, root absence and freshly recomputed frozen
+T0/T1 before launch. The workspace fixtures match the reviewed Task020 files.
+T0 is `sha256:550e62cefc7f647fef97b12489fc2c1e1ba67fd56a7529401fce25c97b0ce2e9`;
+T1 is `sha256:784b4c701a7b752a11e0b5b99e7fff36f796af643cd3e8514ae16147b237ee26`.
+The declared failure overlay produced
+`sha256:77ec22a59ebf68d685f47480c521c7d35f716b6618f58514cf52fd5325d73c13`.
+
+Already-installed Cargo `1.97.1 (c980f4866 2026-06-30)` and rustc
+`1.97.1 (8bab26f4f 2026-07-14)` ran on `aarch64-apple-darwin`, with unchanged
+full packed debug and no remapping flags. New scope was
+`oxide-021-same-root-v2`; new root was
+`/private/var/tmp/oxide-rust-probe-proof-021-reuse-v2`; physical fixture root R was
+`m/r`, and image label was `oxide-same-root-021-v2`. The four outer scratch
+variables all named `/private/tmp/oxide-021-v2.vjsYE5`. The verified plan exited 0:
+
+```text
+effigy test --plan rust -- -- --ignored --exact project::tests::cargo_pilot::same_root_probe::same_root_cargo_freshness_owned_proof --test-threads=1 --nocapture
+```
+
+It resolved exactly to `cargo test --workspace --all-targets --locked --
+--ignored --exact` followed by that test name, `--test-threads=1 --nocapture`.
+The same vector launched once through `effigy test rust`, with
+`OXIDE_SAME_ROOT_PROOF_RUN=1` and `OXIDE_SAME_ROOT_PROOF_SCOPE=oxide-021-same-root-v2`.
+Outer Cargo/Effigy exited 0, one selected test passed in 61.12 seconds after
+3.94 seconds compiling the outer harness. Each internal Effigy plan in
+`setup-tmp/effigy-launch-*.json` binds the actual pinned Cargo path at R to:
+
+```text
+test --offline --locked --lib --bins --tests --message-format=json-render-diagnostics -- --nocapture
+```
+
+**Step results.** All claims used `slot-0000000000000001`, partition
+`sha256:70af3c280222e62d69968bb380e2b38cf3ca08150197ad8a6c92818b13236836`.
+Task/workspace/run/attempt IDs are independently suffixed by the six step labels,
+with `host-<label>` for each launched step. Requested tree is run identity, not a
+new slot key. `m/evidence/events.tsv` preserves every binding and observation.
+
+| Step | Fixture call count before → after | Result | Fresh / rebuilt artifact rows | Runner / WorkCompleted / capture ms |
+| --- | --- | --- | --- | --- |
+| `cold-t0`, T0 | 0 → 1 | Exit 0, Finished, Idle | 0 / 6 | 7,807 / 13,510 / 321 |
+| `warm-t1`, T1 | 1 → 2 | Exit 0, reused slot, Finished, Idle | 3 / 3 | 8,051 / 15,182 / 298 |
+| `retry-t1`, T1 | 2 → 3 | Exit 0, reused slot, Finished, Idle | 6 / 0 | 1,031 / 6,796 / 261 |
+| `stale-refusal`, old-mtime T0 | 3 → 3 | Refused(SourceStale), no-spawn Idle | No Cargo | No runner/capture; exact refusal duration not separately recorded |
+| `failed-compile`, T1 plus overlay | 3 → 4 | Effigy exit 1, completed failed build, Idle | 2 / 0 successfully emitted rows | 836 / 1,532 / 0 |
+| `post-failure-refusal`, restored old-mtime T0 | 4 → 4 | Refused(InputUnknown), no-spawn Idle | No Cargo | No runner/capture; exact refusal duration not separately recorded |
+
+Runner time is the complete Cargo-selector process, including tests where
+executed; it is the manifest's `elapsed_ms` / observation's `compile_elapsed_ms`,
+not isolated compilation time. Separate test elapsed is unavailable. Failed
+build's zero rebuilt rows means no successful rebuilt artifact was emitted,
+not that no compiler work happened: its stderr records Cargo exit 101 for the
+intentional unclosed delimiter. `Finished` there denotes known workflow
+completion/capture, not successful tests or valid reuse evidence.
+
+All six compiler-artifact shapes appear in cold/warm/retry JSON: build-script
+compiler; ordinary and test-profile proc-macro; ordinary and test-profile library;
+integration test. A build-script-executed row is separately emitted each time.
+Cold rebuilt all six. Warm retained the build-script compiler and both
+`oxide_source_probe_macro` rows as fresh, while both library rows and the
+integration test rebuilt. The generated build-script output carried changed T1
+values. Retry retained all six as fresh and still executed the integration test.
+Cold/warm/retry each report one passing integration test and zero-test library
+and proc-macro harnesses. This is no claim of a speedup: warm runner time exceeded
+cold runner time in this observation. No SSD writes or savings percentage were
+measured.
+
+**Source/debug and exact-run evidence.** Each successful run observed
+`manifest-directory=R/probe`; include, build and runtime input paths named
+`R/probe/marker.txt`. Generated paths were in the exclusively owned slot's
+`debug/build/oxide-source-probe-7399ffb9991ca881/out`, with `generated.rs` and
+`proc-macro-input.txt`. All five include/build/generated/proc-macro/runtime values
+were `baseline-marker` for cold and `changed-marker` for warm/retry.
+`file!()` emitted `probe/tests/probe.rs` and panic location
+`probe/tests/probe.rs:54`; both resolve physically against R, with no logical map.
+The registered runner verified generated input bytes against the requested marker.
+Tree identity was recomputed at resolve/admit/publication, and the immutable
+fixture plus recorded marker/overlay reconstructs each requested tree.
+
+Independent per-run captures under `m/runs/<label>/capture/` contain stdout,
+stderr, manifest, test executable, all three packed companion files (Info.plist,
+DWARF and relocation YAML), exact UUID outputs, required debug-section sizes,
+bounded project compile-unit context and line-table lookup, and scanner commands.
+`same-root-debug-binding.txt` records `lookup=true`, `bound=true` and actual R.
+The observed context names `probe/tests/probe.rs/@/...` with `DW_AT_comp_dir=R`;
+the line-table query resolves the actual project source at R. The full companion
+has nonempty `__debug_info`, `__debug_line`, `__debug_abbrev`; its DWARF file is
+5,722,788 bytes. The captured executable is 1,130,296 bytes. Companions are fully
+captured, not replaced with scanner excerpts.
+
+| Run | Executable SHA-256 | DWARF companion SHA-256 | Matching executable/companion UUID |
+| --- | --- | --- | --- |
+| Cold | `efb12b2b574a44896025265ddf6a751801ecd52e7cf72b90fc60638b1424282e` | `a4edc2a55d60e45f0d84f22f86d8a4d8f1174d4cc23d64b097b0132612d25fd2` | `D9FAF098-692A-3356-9949-7D6DB58FBC65` |
+| Warm | `9fadb22ca30a0d63549825dcd933884cd3988a427c7af69e0857e7df4095f0b8` | `bd6f1e8cb5e16f9ee19444b9f2023b164836bc8d80043406f0875308df3be81e` | `A39E5F80-F5D9-3ACC-8C49-6AB79352554B` |
+| Retry | `9fadb22ca30a0d63549825dcd933884cd3988a427c7af69e0857e7df4095f0b8` | `bd6f1e8cb5e16f9ee19444b9f2023b164836bc8d80043406f0875308df3be81e` | `A39E5F80-F5D9-3ACC-8C49-6AB79352554B` |
+
+Capture receipt digests in the confirmed Idle finalizations independently bind
+the complete capture bundle to each lease/run/attempt:
+
+| Run | Lease | Capture receipt SHA-256 |
+| --- | --- | --- |
+| Cold | `40f40985a7403046c2b1ea2d3ec11f2f` | `6b5aab7fe01d9fe830e2d31a854f3084108636eca300692ca7a5a867e0fba45e` |
+| Warm | `ff8249d6b9ecfef488ba2d00fd48e5bb` | `5c3cd8e4a2d0e87add5f3b5e52ede47608cceceba671f108cdef206de82c61da` |
+| Retry | `b756a46b9718df88e18e84cda6cf371c` | `ccdb4b67df18ee6a658db12ce0383808c3bb750edc238786cc847a0814a90ded` |
+| Failed build | `1831930fddbdacf7afa8f272b0f49f29` | `a2d7523257d3c574497562a1b1001a530825085932b55c1b4fd5d09e1180b7a1` |
+
+The driver's four concurrent second-claim checks each received LeaseUnavailable
+before the runner launched, while the primary lease covered compile/tests/capture.
+For stale and post-failure refusals, leases `807ccab1c289c40b2934f133d225f60e` and
+`e9d31082ada38fec39f84ff5293fed0b` settled via token-bound authenticated
+`acquire-<label>:no-spawn` finalizations, Idle with no capture digest. No capture
+or test success is invented for these attempts. The failed build left the durable
+`oxide-freshness-pending-v1` barrier; a prior map file remains but is ineligible.
+Source restoration happened only after confirmed Idle. Post-failure admission
+refused InputUnknown, and recovery inspection returned `Refuse` with `grant=false`,
+no deletion. No Uncertain ownership, fifth compiler call, recovery/rebind,
+eviction, detach or cleanup occurred. Old v1 and all previous sessions remain
+untouched. The new mounted image, source, ledger, barrier, slot and captures
+remain retained for read-only review.
+
+**Session/resources.** Original v2 live Instant began before setup at
+`2026-10-10T19:25:54Z`, UTC deadline `2026-10-10T19:45:54Z`, monotonic deadline
+1,200,000 ms. The final completed sample was elapsed 61,111 ms at
+`2026-10-10T19:26:55Z`. Eighteen raw samples cover setup, execution, scanning,
+capture and final proof; maximum completed-sample gap was 13,571 ms, below
+30 seconds. The independent 20-second sampler remained active during the loop.
+The clock's initial invocation_count=0 is an initial value; events.tsv records
+the actual final count of four.
+
+| Measured bytes | Observed value |
+| --- | ---: |
+| Fixed image capacity | 8,380,178,432 |
+| Peak/final image used | 48,619,520 |
+| Final image free | 8,305,180,672 |
+| Peak/final backing allocation | 80,744,448 |
+| Peak/final outside allocation | 45,056 |
+| Peak sampled disposable footprint | 80,789,504 |
+| Minimum sampled host free | 220,561,674,240 |
+
+The footprint remained below 10 GiB and monitored host space above 20 GiB.
+Every acquisition recorded a 1 GiB reservation/accounted-byte value; that is
+budget accounting, not measured slot use. Read-only retained-file inventory found
+26,681,540 logical / 27,525,120 allocated bytes of regular slot files after the
+intentional failure (directory metadata excluded). Per-step slot allocation and
+exact refusal duration are not separately emitted. All raw allocation/free-space
+samples remain in `setup-tmp/host-space-samples.tsv`; global host-space changes
+include other writers. Allocation deltas are not write volume; writes remain
+unmeasured. Sampling is the approved monitored threshold, not an OS writer fence.
+
+Author evidence preparation completed at `2026-10-10T19:30:09.607Z`, elapsed
+418.426 seconds from the original v2 author allocation start (50-minute limit).
+The live session was not reset. Final docs validation/publication follows within
+that same allocation; independent review has not been performed by this worker.
+
+**Raw evidence and disposition.** The frozen producer head and captured source
+values establish the source variants; the final restored R is T0 while the slot
+retains invalidated T1 work. Do not execute it or interpret its retained map as
+usable. `/private/tmp/oxide-021-v2.vjsYE5/evidence-inventory.json` lists SHA-256,
+logical sizes and allocated regular-file bytes for all retained session files,
+including the independent captures and initial outer/prelaunch/check records.
+Its SHA-256 is `a8d5af2f0402951ef7b070f37a88b178430c4e7092066f2f432ea9e79e77efdb`.
+
+| Raw artifact under v2 root | SHA-256 |
+| --- | --- |
+| `setup-tmp/session-clock.txt` | `4d47cb4ead5a81490b1fa52cc306e1f83d50c53fdff9b527a7e0e41ab5d20880` |
+| `setup-tmp/host-space-samples.tsv` | `8c925646b783951e44c6c95a7c409a857400742282711210db31806f56b0e0e0` |
+| `m/evidence/events.tsv` | `72d4b66a869b4b351d8a955751272cafc51e6b623c700c7729e37ec605d4dd95` |
+| `oxide-rust-probe.sparseimage` (inspection snapshot) | `7412412f3a8bc99c957f5742124add09850faf46682a15e9a31d619d75071f17` |
+| `m/runs/cold-t0/capture/manifest.txt` | `ed53ffde8d4193994d3d10c70e6fc78b7dc94231c522334916a00522c10dbf83` |
+| `m/runs/warm-t1/capture/manifest.txt` | `2f3c21e1e9fc74fc129bf96afa4cedebad001e9a9ffb42c9f8a2d1fbbd1c2ddc` |
+| `m/runs/retry-t1/capture/manifest.txt` | `e0067eb6e0eb5ac5f7c5e7d4bae6cf83cccaf94097aa5f5fa175fa1ff7fdac34` |
+| `m/runs/failed-compile/capture/manifest.txt` | `bb8ddfe3eded2c47fc5cda1f167176db961a958c0f798ef4e98bc459772fd95e` |
+
+Author assessment: all seven `baseline`, `useful_reuse`, `admission_refusal`,
+`failed_map`, `ownership_evidence`, `session_resources`, `disposition` have passing
+v2 observations described above. These are not independent review verdicts.
+[Review comment 6101277599](https://github.com/inflatable-cookie/oxide/pull/21#issuecomment-6101277599)
+recorded those same seven verdict IDs as insufficient at the v1-only head
+`81f92d33cb277bb9ba85fb8c6b618bd62dcf18bf`; this correction/evidence does not rewrite
+that review identity. Final independent review must inspect the corrected code,
+ordinary check results and retained v2 raw artifacts at the final PR head within
+its separate 20-minute allocation, without replaying Cargo.
+
+The smallest supported next action is independent exact-head qualification of
+this bounded fixture result, followed by separately scoped consumer source-pool
+and lifecycle design/coordination and representative workflow qualification.
+The finite physical path pool remains unimplemented. Production keys remain
+checkout-isolated. General Cargo input coverage, cross-root reuse, successful
+live cold recovery/rebind, real-project qualification, consumer adoption,
+everyday storage relief and SSD-write reduction remain unestablished. No broader
+measurement programme or consumer action is authorized by this result.
