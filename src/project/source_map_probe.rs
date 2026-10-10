@@ -1637,3 +1637,268 @@ fn collect_files(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) -> Res
     }
     Ok(())
 }
+
+#[cfg(test)]
+struct NeverCancelled;
+
+#[cfg(test)]
+impl super::CancellationProbe for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(test)]
+fn producer_scratch(name: &str) -> PathBuf {
+    let root = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = root.join(format!(
+        "producer-{}-{}-{}",
+        name,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&path).expect("producer scratch");
+    path
+}
+
+#[cfg(test)]
+fn sample_digest(label: &str) -> String {
+    hex_digest(label.as_bytes())
+}
+
+#[cfg(test)]
+fn sample_map(volume: &Path, workspace: &Path, tree: &str) -> super::source_map::ResolvedSourceMap {
+    use super::source_map::{
+        AuthorizedSourceRoot, KeyMissControl, MissControlEvidence, SourceMapPolicy,
+        SourceMissControl, SourcePathMode, ACCEPTED_LOGICAL_POLICY, SOURCE_MAP_VERSION,
+    };
+    let policy = SourceMapPolicy {
+        version: SOURCE_MAP_VERSION.to_owned(),
+        mode: SourcePathMode::ExperimentalLogical {
+            accepted_policy: ACCEPTED_LOGICAL_POLICY.to_owned(),
+            prefix: PathBuf::from("/oxide-source-map-probe"),
+        },
+        roots: vec![AuthorizedSourceRoot {
+            id: "a".to_owned(),
+            path: workspace.to_path_buf(),
+        }],
+        miss_controls: Some(MissControlEvidence {
+            source: Some(SourceMissControl {
+                before_tree_digest: sample_digest("tree-before"),
+                after_tree_digest: sample_digest("tree-after"),
+                partition_digest: sample_digest("partition"),
+                rebuilt_units: 1,
+            }),
+            configuration: Some(KeyMissControl {
+                before_input_digest: sample_digest("config-before"),
+                after_input_digest: sample_digest("config-after"),
+                before_partition_digest: sample_digest("config-part-before"),
+                after_partition_digest: sample_digest("config-part-after"),
+            }),
+            toolchain: Some(KeyMissControl {
+                before_input_digest: sample_digest("tool-before"),
+                after_input_digest: sample_digest("tool-after"),
+                before_partition_digest: sample_digest("tool-part-before"),
+                after_partition_digest: sample_digest("tool-part-after"),
+            }),
+        }),
+    };
+    super::source_map::resolve(
+        &policy,
+        volume,
+        workspace,
+        tree,
+        Some(&[] as &[String]),
+        true,
+    )
+    .expect("sample source map")
+}
+
+#[test]
+fn inspect_cargo_output_parses_artifacts_and_probe_rows() {
+    let stdout = concat!(
+        r#"{"reason":"compiler-artifact","manifest_path":"/private/var/tmp/a/probe/Cargo.toml","target":{"kind":["test"],"name":"probe"},"filenames":["/private/var/tmp/a/slot/probe-test"],"executable":"/private/var/tmp/a/slot/probe-test","fresh":false}"#,
+        "\n",
+        r#"{"reason":"compiler-artifact","manifest_path":"/private/var/tmp/a/probe/Cargo.toml","target":{"kind":["lib"],"name":"oxide_source_probe"},"filenames":["/private/var/tmp/a/slot/libprobe.rlib"],"executable":null,"fresh":true}"#,
+        "\n",
+        r#"{"reason":"build-script-executed","out_dir":"/private/var/tmp/a/slot/build/probe-out"}"#,
+        "\n",
+        "test probe::emits_observed_paths_and_values ... ok\n",
+        "OXIDE_PROBE\tfile-macro\t/oxide-source-map-probe/probe/tests/probe.rs\n",
+        "OXIDE_PROBE\tinclude-value\tbaseline-marker\n",
+    );
+    let summary = inspect_cargo_output(stdout.as_bytes());
+    assert_eq!(summary.rebuilt_units, 1);
+    assert_eq!(summary.rebuilt_targets, vec!["probe:test".to_owned()]);
+    assert_eq!(summary.artifacts.len(), 2);
+    assert_eq!(summary.artifacts[0].target_name, "probe");
+    assert!(!summary.artifacts[0].fresh);
+    assert_eq!(
+        summary.artifacts[0].executable.as_deref(),
+        Some(Path::new("/private/var/tmp/a/slot/probe-test"))
+    );
+    assert_eq!(
+        summary.build_script_dirs,
+        vec![PathBuf::from("/private/var/tmp/a/slot/build/probe-out")]
+    );
+    assert_eq!(
+        summary.probe_values.get("file-macro").map(String::as_str),
+        Some("/oxide-source-map-probe/probe/tests/probe.rs")
+    );
+    assert_eq!(
+        summary
+            .probe_values
+            .get("include-value")
+            .map(String::as_str),
+        Some("baseline-marker")
+    );
+}
+
+#[test]
+fn inspect_cargo_output_rejects_malformed_and_duplicate_probe_rows() {
+    let oversized = format!(
+        "{{\"reason\":\"compiler-artifact\"}}{}",
+        "x".repeat(MAX_CARGO_LINE_BYTES)
+    );
+    let stdout = format!(
+        "{{not-json\n\
+         {{\"reason\":\"compiler-artifact\",\"manifest_path\":\"/missing\"}}\n\
+         {oversized}\n\
+         OXIDE_PROBE\tfile-macro\t/oxide-source-map-probe/a.rs\n\
+         OXIDE_PROBE\tfile-macro\t/oxide-source-map-probe/b.rs\n"
+    );
+    let summary = inspect_cargo_output(stdout.as_bytes());
+    assert!(summary.artifacts.is_empty());
+    assert!(summary.probe_values.is_empty());
+    assert_eq!(summary.rebuilt_units, 0);
+}
+
+#[test]
+fn debug_and_oso_scanners_keep_mapped_paths_and_drop_foreign_ones() {
+    let scratch = producer_scratch("scanner");
+    let volume = scratch.join("volume");
+    let workspace = volume.join("a");
+    fs::create_dir_all(workspace.join("src")).expect("workspace");
+    fs::write(workspace.join("src/lib.rs"), b"pub fn probe() {}\n").expect("source");
+    let tree = tree_digest(&workspace).expect("tree");
+    let map = sample_map(&volume, &workspace, &tree);
+    let info = br#"
+0x0000000b: DW_TAG_compile_unit
+  DW_AT_comp_dir        ("/oxide-source-map-probe/a")
+  DW_AT_name            ("src/lib.rs")
+0x0000004a: DW_TAG_compile_unit
+  DW_AT_name            ("/oxide-source-map-probe/a/src/lib.rs")
+"#;
+    let lines = br#"
+The file name is "/oxide-source-map-probe/a/src/lib.rs"
+The file name is "/private/var/tmp/unrelated/src/lib.rs"
+"#;
+    let paths = debug_source_paths(info, lines, &map);
+    assert_eq!(
+        paths,
+        vec!["/oxide-source-map-probe/a/src/lib.rs".to_owned()]
+    );
+    let oso = br#"
+0000000000000000 - 00 0000    OSO /oxide-source-map-probe/a/target/debug/deps/probe.o
+0000000000000000 - 00 0000    OSO /private/var/tmp/other/probe.o
+0000000000000000 - 01 0001    FUN _probe
+"#;
+    let observed = oso_paths(oso)
+        .into_iter()
+        .filter(|path| {
+            Path::new(path).starts_with("/oxide-source-map-probe")
+                || map
+                    .authorized_roots()
+                    .iter()
+                    .any(|root| Path::new(path).starts_with(&root.path))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        observed,
+        vec!["/oxide-source-map-probe/a/target/debug/deps/probe.o".to_owned()]
+    );
+    let _ = fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn origin_ledger_records_rebuilt_units_and_preserves_fresh_matches() {
+    let scratch = producer_scratch("origins");
+    let volume = scratch.join("volume");
+    let workspace = volume.join("a");
+    let slot = scratch.join("slot");
+    let target = scratch.join("target");
+    let capture = scratch.join("capture");
+    fs::create_dir_all(workspace.join("src")).expect("workspace");
+    fs::create_dir_all(&slot).expect("slot");
+    fs::create_dir_all(&target).expect("target");
+    fs::create_dir_all(&capture).expect("capture");
+    fs::write(workspace.join("src/lib.rs"), b"pub fn probe() {}\n").expect("source");
+    let artifact = slot.join("probe-test");
+    fs::write(&artifact, b"fresh-artifact-bytes\n").expect("artifact");
+    let tree = tree_digest(&workspace).expect("tree");
+    let map = sample_map(&volume, &workspace, &tree);
+    let rebuilt = CargoArtifact {
+        unit_key: "a-Cargo.toml-probe-test".to_owned(),
+        manifest: workspace.join("Cargo.toml"),
+        target_name: "probe".to_owned(),
+        target_kinds: vec!["test".to_owned()],
+        fresh: false,
+        executable: Some(artifact.clone()),
+        filenames: vec![artifact.clone()],
+    };
+    let (origins, complete) = compile_origins(
+        &[rebuilt.clone()],
+        &map,
+        &workspace,
+        &slot,
+        &target,
+        &NeverCancelled,
+    )
+    .expect("rebuilt origin");
+    assert!(complete);
+    assert_eq!(origins.len(), 1);
+    assert_eq!(origins[0].root_id, "a");
+    assert_eq!(origins[0].tree_digest, tree);
+    let mut references = Vec::new();
+    preserve_origin_ledger(&slot, &capture, &mut references).expect("preserve");
+    assert_eq!(references, vec!["compile-origins.txt".to_owned()]);
+    let preserved = fs::read_to_string(capture.join("compile-origins.txt")).expect("capture");
+    assert!(preserved.starts_with("oxide-cargo-origin-ledger-v1\n"));
+    assert!(preserved.contains("unit\ta-Cargo.toml-probe-test\ta\t"));
+
+    let mut fresh = rebuilt;
+    fresh.fresh = true;
+    let (fresh_origins, fresh_complete) =
+        compile_origins(&[fresh], &map, &workspace, &slot, &target, &NeverCancelled)
+            .expect("fresh origin");
+    assert!(fresh_complete);
+    assert_eq!(fresh_origins[0].tree_digest, tree);
+
+    fs::write(slot.join(ORIGIN_FILE), b"not-a-ledger\n").expect("malformed ledger");
+    let error = match compile_origins(
+        &[CargoArtifact {
+            unit_key: "a-Cargo.toml-probe-test".to_owned(),
+            manifest: workspace.join("Cargo.toml"),
+            target_name: "probe".to_owned(),
+            target_kinds: vec!["test".to_owned()],
+            fresh: true,
+            executable: Some(artifact.clone()),
+            filenames: vec![artifact],
+        }],
+        &map,
+        &workspace,
+        &slot,
+        &target,
+        &NeverCancelled,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("malformed ledger"),
+    };
+    assert!(error.contains("unknown"));
+    let _ = fs::remove_dir_all(&scratch);
+}

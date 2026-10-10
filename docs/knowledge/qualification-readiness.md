@@ -575,12 +575,14 @@ captured binary data. It does not accept a caller's qualification verdict.
 The owned completion certificate must bind the same run, lease, capture paths,
 output references and log digests before the existing qualifier can pass.
 
-Task 014 adds a test-only producer in `src/project/source_map_probe.rs` and
+Task 014 added a test-only producer in `src/project/source_map_probe.rs` and
 `src/project/tests/cargo_source_probe.rs`. It reads Cargo JSON output, preserves
 compile-origin rows, scans emitted binaries with the installed Apple tools, and
 compares values printed by the executed fixture with independently hashed
-requested-tree files. This producer has not yet completed an owned Cargo run;
-the attempt and its limits are recorded below.
+requested-tree files. Task 015 repaired launch and ran one owned Cargo
+invocation against that producer; the fixture build script then failed, so
+the remaining sequence did not run. Both attempts and their limits are
+recorded below.
 
 The optional `CARGO_TARGET_DIR/source-map-observations-v1.txt` hook uses
 UTF-8, one tab-separated record per line, and the version header below. Paths
@@ -671,6 +673,77 @@ checkout-sensitive workspace units could be rebuilt while retaining reusable
 dependency work; no artifacts were produced to inspect. That alternative was
 not implemented. The producer code is present, but real reuse and storage
 benefit remain unqualified.
+
+#### Task 015 execution result (2026-10-10)
+
+Launch correction: `CargoWorkflowRunner::validate_plan` now runs the
+caller/identity contract before storage acquire or child creation.
+`probe_environment` no longer supplies `TMPDIR`; the runner still forces
+`TMPDIR`/`TMP`/`TEMP`, `CARGO_BUILD_BUILD_DIR`, `CARGO_TARGET_DIR` and
+`OXIDE_CARGO_START_MARKER`. The non-ignored regression
+`probe_plan_passes_runner_validation_before_acquire_and_rejects_forced_overrides`
+exercises that real `validate_plan` path and still rejects caller `TMPDIR`
+and `CARGO_TARGET_DIR` overrides. Probe identity is the workflow name
+`oxide-cargo-source-map-probe`, not a Queue task UUID. Producer parser,
+scanner and origin-ledger tests use representative Cargo JSON, malformed
+input and a preserved ledger on fresh artifacts; they do not invoke Cargo.
+
+Session clock, written with `create_new` before image attach:
+`/private/var/tmp/oxide-rust-probe-retry-20261010/setup-tmp/session-clock.txt`
+records `start_utc=2026-10-10T13:23:06Z`, `deadline_utc=2026-10-10T13:43:06Z`,
+`max_session_secs=1200`, `invocation_count=0`, `max_invocations=4`. One
+`Instant` bounded the live session. The 014 image and lease
+`e0bd67897ed0b10eeb4a880d73fcb938` were not touched. Local labels for this
+attempt were `oxide-local-probe-retry-20261010` /
+`oxide-local-probe-image-retry-20261010`.
+
+Observed fixture tree at A, B and the committed
+`fixtures/cargo-source-map-probe` was
+`sha256:2dd89eba1d35184d65283e0eb28c008791f7ccc022879c9af0b28fb780e14132`,
+matching the frozen declaration. Manifest `head=d58e22439a8de0e939d30af541efe57ed4c175cb`
+is the Oxide repository HEAD claimed for the local run; the fixture tree is
+not a git checkout, so that head is a declared label, not an observed
+fixture commit.
+
+One genuine owned Cargo invocation ran: `cargo-invocation	1	reference-a`,
+selector `test --offline --locked --message-format=json-render-diagnostics -- --nocapture`,
+pinned `cargo 1.97.1 (c980f4866 2026-06-30)` / `rustc 1.97.1 (8bab26f4f 2026-07-14)`,
+process 35989, elapsed 828 ms, exit 101. Lease
+`c9d13410ea6450abbadef700f70fe727` on `slot-0000000000000001` finalized
+`Uncertain` and remains held. Raw stdout/stderr, preflight observations,
+scanner captures and `evidence/events.tsv` are on the still-mounted image
+at `/private/var/tmp/oxide-rust-probe-retry-20261010`.
+
+Exact compile failure from `stderr.log`: `probe/build.rs:21` formats a
+`PathBuf` with `{input}` (`error[E0277]`: `PathBuf` doesn't implement
+`Display`). Cargo compiled `oxide-source-probe-macro` (two rebuilt
+proc-macro artifacts) and stopped the `oxide-source-probe` build script.
+Fixture tests did not execute. Preflight scanners ran on
+`liboxide_source_probe_macro-174fa59f4284649b.dylib` (`debuginfo: 0`);
+`llvm-dwarfdump --section-sizes` reported total debug size 0. Probe
+values `generated`, `proc_macro_input`, `file_macro` and `panic_location`
+were missing. `scan_complete=true` records that those bounded scanner
+commands finished, not that full-debug source lookup was present.
+
+Resource samples stayed inside bounds: host free 342718029824 bytes at
+mount preflight, APFS capacity 8380178432, in-image used 24576 then
+4820992, backing allocation 15732736 then 20975616, outside 12288.
+No 20 GiB host or 10 GiB disposable breach. Session elapsed 8696 ms at
+stop. Remaining three invocation slots were not used; the existing retry
+root forbids a second launch in this session.
+
+The ignored probe test returned `ok` because `finish_if_idle` returned
+`Ok` after preserving the uncertain lease. That helper now returns `Err`
+so a later stop cannot look like harness success. The recorded 015 run
+used the earlier helper; evidence, not the ignored-test status, is the
+result.
+
+Source invalidation, cross-path correctness and reuse were not reached.
+This does not show whether dependency-only reuse or a stable
+consumer-owned compilation path would help: the workspace crate never
+built. The committed fixture as frozen cannot compile under the pinned
+1.97.1 toolchain. A further attempt needs a new frozen tree, new root
+and new session clock; this window and image are closed. No adoption.
 
 ### Bounded real-project follow-up (execution not authorized)
 
