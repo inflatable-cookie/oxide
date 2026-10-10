@@ -18,7 +18,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     fs::write(&macro_input, value)?;
     fs::write(
         out_dir.join("producer-observation.txt"),
-        format!("{input}\n{generated}\n{macro_input}\n{out_dir}\n"),
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            input.display(),
+            generated.display(),
+            macro_input.display(),
+            out_dir.display(),
+        ),
     )?;
     println!("cargo:rerun-if-changed=marker.txt");
     Ok(())
