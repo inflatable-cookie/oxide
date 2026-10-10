@@ -17,6 +17,9 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::time::Instant;
 
+#[path = "cargo_source_probe.rs"]
+mod source_map_probe;
+
 const GIB: u64 = 1024 * 1024 * 1024;
 const WORKFLOW: &str = "nucleus-core-test";
 const SELECTOR: &str =

@@ -22,6 +22,8 @@ pub(super) const MAX_FIXTURE_CHILDREN: usize = 8;
 pub(super) const MAX_FIXTURE_FILES: usize = 16;
 pub(super) const MAX_FIXTURE_FILE_BYTES: u64 = 1024 * 1024;
 pub(super) const MAX_CAPTURE_STREAM_BYTES: usize = 64 * 1024;
+pub(super) const MAX_CARGO_CAPTURE_FILE_BYTES: usize = 512 * 1024 * 1024;
+const MAX_CARGO_CAPTURE_FILES: usize = 256;
 pub(super) const MAX_DISPOSABLE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 pub(super) const REQUIRED_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 const MINIMUM_FREE_BYTES: u64 = REQUIRED_FREE_BYTES;
@@ -142,6 +144,8 @@ pub(crate) struct NativeCompletionCertificate {
     stderr_digest: String,
     capture_digest: String,
     output_references: Vec<String>,
+    capture_max_files: usize,
+    capture_max_file_bytes: usize,
     native: bool,
 }
 
@@ -193,10 +197,15 @@ impl NativeCompletionCertificate {
             && valid_digest(&self.stdout_digest)
             && valid_digest(&self.stderr_digest)
             && valid_digest(&self.capture_digest)
-            && capture_bundle_digest(
+            && ((self.capture_max_files == MAX_FIXTURE_FILES
+                && self.capture_max_file_bytes == MAX_CAPTURE_STREAM_BYTES)
+                || (self.capture_max_files == MAX_CARGO_CAPTURE_FILES
+                    && self.capture_max_file_bytes == MAX_CARGO_CAPTURE_FILE_BYTES))
+            && capture_bundle_digest_with_limits(
                 &plan.command.capture_dir,
                 &output.output_references,
-                MAX_CAPTURE_STREAM_BYTES,
+                self.capture_max_files,
+                self.capture_max_file_bytes,
             )
             .is_ok_and(|digest| digest == self.capture_digest)
     }
@@ -267,9 +276,10 @@ impl NativeCompletionCertificate {
             .expect("fixture stdout capture");
         let stderr_digest = file_digest(&plan.command.capture_dir.join("stderr.log"))
             .expect("fixture stderr capture");
-        let capture_digest = capture_bundle_digest(
+        let capture_digest = capture_bundle_digest_with_limits(
             &plan.command.capture_dir,
             output_references,
+            MAX_FIXTURE_FILES,
             MAX_CAPTURE_STREAM_BYTES,
         )
         .expect("fixture capture bundle");
@@ -292,6 +302,8 @@ impl NativeCompletionCertificate {
             stderr_digest,
             capture_digest,
             output_references: output_references.to_vec(),
+            capture_max_files: MAX_FIXTURE_FILES,
+            capture_max_file_bytes: MAX_CAPTURE_STREAM_BYTES,
             native: false,
         }
     }
@@ -333,6 +345,8 @@ impl NativeCompletionCertificate {
             stderr_digest: parts.stderr_digest,
             capture_digest: parts.capture_digest,
             output_references: parts.output_references,
+            capture_max_files: MAX_CARGO_CAPTURE_FILES,
+            capture_max_file_bytes: MAX_CARGO_CAPTURE_FILE_BYTES,
             native: true,
         }
     }
@@ -692,9 +706,10 @@ impl FixtureCommandRunner for NativeFixtureCommandRunner {
             "stderr.log".to_owned(),
             "native-evidence.txt".to_owned(),
         ];
-        let capture_digest = capture_bundle_digest(
+        let capture_digest = capture_bundle_digest_with_limits(
             &plan.command.capture_dir,
             &output_references,
+            MAX_FIXTURE_FILES,
             MAX_CAPTURE_STREAM_BYTES,
         )?;
         let certificate = NativeCompletionCertificate {
@@ -709,6 +724,8 @@ impl FixtureCommandRunner for NativeFixtureCommandRunner {
             stderr_digest,
             capture_digest,
             output_references: output_references.clone(),
+            capture_max_files: MAX_FIXTURE_FILES,
+            capture_max_file_bytes: MAX_CAPTURE_STREAM_BYTES,
             native: true,
         };
         Ok(FixtureCommandOutput {
@@ -995,7 +1012,16 @@ fn capture_bundle_digest(
     references: &[String],
     per_file_limit: usize,
 ) -> Result<String, BoundaryFailure> {
-    if references.is_empty() || references.len() > MAX_FIXTURE_FILES {
+    capture_bundle_digest_with_limits(directory, references, MAX_FIXTURE_FILES, per_file_limit)
+}
+
+fn capture_bundle_digest_with_limits(
+    directory: &Path,
+    references: &[String],
+    max_files: usize,
+    per_file_limit: usize,
+) -> Result<String, BoundaryFailure> {
+    if references.is_empty() || references.len() > max_files {
         return Err(BoundaryFailure::Rejected);
     }
     let mut digest = Sha256::new();
@@ -1011,13 +1037,44 @@ fn capture_bundle_digest(
         {
             return Err(BoundaryFailure::Rejected);
         }
-        let bytes = read_bounded(&directory.join(relative), per_file_limit)?;
-        total = total.saturating_add(bytes.len() as u64);
-        if total > MAX_DISPOSABLE_BYTES {
+        let path = directory.join(relative);
+        let metadata = fs::symlink_metadata(&path).map_err(|_| BoundaryFailure::Unavailable)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(BoundaryFailure::Rejected);
         }
+        let canonical = fs::canonicalize(&path).map_err(|_| BoundaryFailure::Unavailable)?;
+        if canonical != path || !canonical.starts_with(directory) {
+            return Err(BoundaryFailure::Rejected);
+        }
+        let length = metadata.len();
+        if length > per_file_limit as u64 {
+            return Err(BoundaryFailure::Rejected);
+        }
+        total = total
+            .checked_add(length)
+            .filter(|total| *total <= MAX_DISPOSABLE_BYTES)
+            .ok_or(BoundaryFailure::Rejected)?;
         update_field(&mut digest, reference.as_bytes());
-        update_field(&mut digest, &bytes);
+        digest.update(length.to_le_bytes());
+        let mut file = File::open(&path).map_err(|_| BoundaryFailure::Unavailable)?;
+        let mut copied = 0_u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|_| BoundaryFailure::Unavailable)?;
+            if read == 0 {
+                break;
+            }
+            copied = copied
+                .checked_add(read as u64)
+                .filter(|copied| *copied <= length)
+                .ok_or(BoundaryFailure::Rejected)?;
+            digest.update(&buffer[..read]);
+        }
+        if copied != length {
+            return Err(BoundaryFailure::Unavailable);
+        }
     }
     Ok(format!("sha256:{:x}", digest.finalize()))
 }
@@ -1027,6 +1084,18 @@ pub(super) fn capture_receipt_digest(
     references: &[String],
 ) -> Result<String, BoundaryFailure> {
     capture_bundle_digest(directory, references, MAX_CAPTURE_STREAM_BYTES)
+}
+
+pub(super) fn cargo_capture_receipt_digest(
+    directory: &Path,
+    references: &[String],
+) -> Result<String, BoundaryFailure> {
+    capture_bundle_digest_with_limits(
+        directory,
+        references,
+        MAX_CARGO_CAPTURE_FILES,
+        MAX_CARGO_CAPTURE_FILE_BYTES,
+    )
 }
 
 fn read_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>, BoundaryFailure> {

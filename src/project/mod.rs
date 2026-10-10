@@ -3,6 +3,8 @@ mod native;
 mod observations;
 mod resolve;
 mod source_map;
+#[cfg(test)]
+mod source_map_probe;
 
 #[cfg(test)]
 mod tests;
