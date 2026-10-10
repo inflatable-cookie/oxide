@@ -31,10 +31,10 @@ Task 018 pinned the cause: logical mapped partitions omit requested root ID, so
 the allocator reused the idle control slot, and Cargo 1.97.1 treated relative
 `rerun-if-changed` / dep-info inputs as fresh because A's files were older than
 B's fingerprint anchors and encoded dep-info stores no `CARGO_MANIFEST_DIR`.
-The smallest fail-closed correction is pre-execution compile-origin admission
-(`requested_root_id` plus `source_tree_digest`); a mismatch must miss before
-those intermediates execute. Same-origin warm retry can remain; mapped A/B hits
-cannot. There is no qualified cross-path reuse or storage benefit. See
+The smallest fail-closed correction is pre-execution compile-origin admission:
+acquire matches `partition + requested_root_id + source_tree_digest`, and a
+mismatch creates a new slot or falls back rather than executing those
+intermediates. Same-origin warm retry can remain; mapped A/B hits cannot. There is no qualified cross-path reuse or storage benefit. See
 [v4 observations](qualification-readiness.md#task-017-continuation-session-v4-observations-2026-10-10)
 and [task 018](qualification-readiness.md#task-018-stale-source-diagnosis-and-proposed-compile-origin-admission-2026-10-10).
 

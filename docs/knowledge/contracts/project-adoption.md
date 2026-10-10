@@ -195,17 +195,19 @@ touches lifecycle seams:
    worktree at that path; it does not reset a live checkout or ask Oxide to
    retain source.
 
-For the minimum cross-root recurrence pair, pre-register roots `r0` and `r1`
-once. Task identity A builds source tree S at `r0` cold and records its
-task-specific capture. After A settles and its workspace is safely archived,
-distinct task identity B builds the same compatible S at `r1`; the complete
-map digest and Rust flags must match A, while exact receipts retain A and B
-independently. This is the first cross-root recurrence pair, not a benefit
-claim. A separate sequential allocator check must assign a freed path to a new
-workspace without changing the map. Follow with a changed-source build and
-separate configuration/toolchain miss controls; tests still run. If any root,
-flag or policy changes, record a cold partition instead of counting it as
-reuse.
+Under the proposed [compile-origin admission](../qualification-readiness.md#task-018-stale-source-diagnosis-and-proposed-compile-origin-admission-2026-10-10),
+the old minimum cross-root recurrence pair is a guaranteed miss. Pre-register
+roots `r0` and `r1` once so compiler flags stay identical, but task A building
+tree S at `r0` and distinct task B building the same S at `r1` do not share a
+slot: `requested_root_id` differs, so acquire creates a new slot or falls back.
+B must not execute A's intermediates and must not be counted as a warm hit.
+Recurrence under this correction is same-root plus same-tree retry, or a later
+consumer-owned stable path that reassigns the same `root_id` after ordinary
+archive. A sequential allocator check may still assign a freed path to a new
+workspace without changing the map; that is a consumer path-pool proof, not
+Oxide reuse. Follow with a changed-source miss and separate
+configuration/toolchain miss controls; tests still run. If any root, flag or
+policy changes, record a cold partition instead of counting it as reuse.
 
 The finite path count bounds concurrent workspaces eligible for this map,
 not the full-debug cache bytes; that footprint remains unmeasured. Count every
@@ -221,7 +223,10 @@ Before implementation, Tom must approve a new consumer integration brief
 that binds the finite root registration and workspace-path reuse to the
 Queue/Nucleus managed-Git/worktree owners, and identifies who implements the
 task-attempt authorization, acquire/cancel/reconcile receipt, exact dirty-source
-retention and archive gate. Queue host-run owners must confirm this ordering
+retention and archive gate. That brief must treat compile-origin admission as
+current Oxide mapped-reuse policy: a cross-root pair at `r0`/`r1` is refused as
+a hit until the consumer reuses the same `root_id` or Tom chooses a different
+mechanism. Queue host-run owners must confirm this ordering
 against frozen Contract 010; Nucleus owners must confirm the workspace and
 retention mapping against Contract 002 and the same frozen 010. The consumers
 must not be treated as interchangeable until Nucleus actually supports each
