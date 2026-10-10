@@ -195,19 +195,21 @@ touches lifecycle seams:
    worktree at that path; it does not reset a live checkout or ask Oxide to
    retain source.
 
-Under the proposed [compile-origin admission](../qualification-readiness.md#task-018-stale-source-diagnosis-and-proposed-compile-origin-admission-2026-10-10),
-the old minimum cross-root recurrence pair is a guaranteed miss. Pre-register
-roots `r0` and `r1` once so compiler flags stay identical, but task A building
-tree S at `r0` and distinct task B building the same S at `r1` do not share a
-slot: `requested_root_id` differs, so acquire creates a new slot or falls back.
-B must not execute A's intermediates and must not be counted as a warm hit.
-Recurrence under this correction is same-root plus same-tree retry, or a later
-consumer-owned stable path that reassigns the same `root_id` after ordinary
-archive. A sequential allocator check may still assign a freed path to a new
-workspace without changing the map; that is a consumer path-pool proof, not
-Oxide reuse. Follow with a changed-source miss and separate
-configuration/toolchain miss controls; tests still run. If any root, flag or
-policy changes, record a cold partition instead of counting it as reuse.
+Under [useful-reuse admission](../qualification-readiness.md#task-019-useful-bounded-reuse-across-changing-tasks-design-only-2026-10-10),
+strict-physical partitions already make a cross-root pair a miss: task A at
+`r0` and task B at `r1` never share a slot, even with identical trees. B must
+not execute A's intermediates and must not be counted as a warm hit. Useful
+recurrence is a later, distinct workspace that reoccupies the same physical
+root after ordinary archive, with a new task/run/attempt identity and
+possibly a different source tree. Oxide reuses that root's exclusive slot;
+Cargo keeps unmodified dependency work and rebuilds changed workspace units.
+Same-root plus same-tree retry is a control, not satisfaction of useful
+reuse. A sequential allocator check that assigns a freed path is the
+consumer path-pool prerequisite for everyday relief; the Oxide same-root
+proof can run on a fixture path without that pool. Follow with the
+mtime-stale content refusal and separate configuration/toolchain miss
+controls; tests still run. If any root, flag or policy changes, record a
+cold partition instead of counting it as reuse.
 
 The finite path count bounds concurrent workspaces eligible for this map,
 not the full-debug cache bytes; that footprint remains unmeasured. Count every
@@ -217,16 +219,25 @@ roots free, and retained failures can reduce usable pool capacity until normal
 consumer disposition. Never evict leased/uncertain cache state or delete
 task-owned source/evidence to make room. A task that cannot obtain a pool root
 uses its existing private path only if the consumer explicitly allows that
-fallback; it makes no remapping/reuse claim.
+fallback; it makes no remapping/reuse claim. Private fallback build storage
+needs separate consumer-approved count/byte limits and ordinary retention /
+cleanup; it is excluded from the Oxide pool-count independence claim and
+refuses when that bound cannot be established. An invalid Oxide reuse map
+alone does not make the root or storage unsafe to own: the [Task 019 cold
+recovery transition](../qualification-readiness.md#task-019-useful-bounded-reuse-across-changing-tasks-design-only-2026-10-10)
+requires proven Idle ownership, scoped whole-generation eviction authority,
+empty-successor proof and budget. Ownership uncertainty still preserves storage;
+Oxide recovery never deletes consumer source or independently owned evidence.
 
 Before implementation, Tom must approve a new consumer integration brief
 that binds the finite root registration and workspace-path reuse to the
 Queue/Nucleus managed-Git/worktree owners, and identifies who implements the
 task-attempt authorization, acquire/cancel/reconcile receipt, exact dirty-source
-retention and archive gate. That brief must treat compile-origin admission as
-current Oxide mapped-reuse policy: a cross-root pair at `r0`/`r1` is refused as
-a hit until the consumer reuses the same `root_id` or Tom chooses a different
-mechanism. Queue host-run owners must confirm this ordering
+retention and archive gate. That brief must treat useful-reuse admission as current Oxide policy: a
+cross-root pair at `r0`/`r1` is refused as a hit; everyday relief needs the
+same physical `root_id` after ordinary archive, or Tom chooses a different
+mechanism. Do not ship Task 018's origin+tree match as that policy: it only
+gives same-tree retry. Queue host-run owners must confirm this ordering
 against frozen Contract 010; Nucleus owners must confirm the workspace and
 retention mapping against Contract 002 and the same frozen 010. The consumers
 must not be treated as interchangeable until Nucleus actually supports each
