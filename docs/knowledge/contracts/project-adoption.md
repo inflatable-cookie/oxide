@@ -219,7 +219,15 @@ roots free, and retained failures can reduce usable pool capacity until normal
 consumer disposition. Never evict leased/uncertain cache state or delete
 task-owned source/evidence to make room. A task that cannot obtain a pool root
 uses its existing private path only if the consumer explicitly allows that
-fallback; it makes no remapping/reuse claim.
+fallback; it makes no remapping/reuse claim. Private fallback build storage
+needs separate consumer-approved count/byte limits and ordinary retention /
+cleanup; it is excluded from the Oxide pool-count independence claim and
+refuses when that bound cannot be established. An invalid Oxide reuse map
+alone does not make the root or storage unsafe to own: the [Task 019 cold
+recovery transition](../qualification-readiness.md#task-019-useful-bounded-reuse-across-changing-tasks-design-only-2026-10-10)
+requires proven Idle ownership, scoped whole-generation eviction authority,
+empty-successor proof and budget. Ownership uncertainty still preserves storage;
+Oxide recovery never deletes consumer source or independently owned evidence.
 
 Before implementation, Tom must approve a new consumer integration brief
 that binds the finite root registration and workspace-path reuse to the
