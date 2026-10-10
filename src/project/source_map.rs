@@ -1004,7 +1004,10 @@ fn parse_behavior_path_class(value: &str) -> Option<BehaviorPathClass> {
     }
 }
 
-fn resolve_observed_source_path(map: &ResolvedSourceMap, observed: &Path) -> Option<PathBuf> {
+pub(super) fn resolve_observed_source_path(
+    map: &ResolvedSourceMap,
+    observed: &Path,
+) -> Option<PathBuf> {
     if let Some(prefix) = &map.logical_prefix {
         let Some(relative) = observed.strip_prefix(prefix).ok() else {
             // Preserve a concrete but non-logical observation so qualification

@@ -2122,6 +2122,7 @@ enum SourceMapFixtureTamper {
     WrongLease,
     ChangedMap,
     PhysicalSourcePath,
+    RequestedPhysicalSourcePath,
 }
 
 struct SourceMapFixtureRunner {
@@ -2166,18 +2167,21 @@ impl FixtureCommandRunner for SourceMapFixtureRunner {
         fs::write(&binary, b"task-owned fixture binary\n")
             .map_err(|_| BoundaryFailure::Unavailable)?;
 
-        let observed_source = if matches!(self.tamper, SourceMapFixtureTamper::PhysicalSourcePath) {
-            map.authorized_roots()
+        let observed_source = match self.tamper {
+            SourceMapFixtureTamper::PhysicalSourcePath => map
+                .authorized_roots()
                 .iter()
                 .find(|root| root.id != map.requested_root_id())
                 .ok_or(BoundaryFailure::InvalidIdentity)?
                 .path
-                .join("src/lib.rs")
-        } else {
-            map.logical_prefix().map_or_else(
+                .join("src/lib.rs"),
+            SourceMapFixtureTamper::RequestedPhysicalSourcePath => {
+                requested_root.join("src/lib.rs")
+            }
+            _ => map.logical_prefix().map_or_else(
                 || requested_root.join("src/lib.rs"),
                 |prefix| prefix.join("src/lib.rs"),
-            )
+            ),
         };
         let binary_digest = digest(&fs::read(&binary).map_err(|_| BoundaryFailure::Unavailable)?);
         let origin = map
@@ -2287,7 +2291,8 @@ impl FixtureCommandRunner for SourceMapFixtureRunner {
         .map_err(|_| BoundaryFailure::InvalidIdentity)?;
         match self.tamper {
             SourceMapFixtureTamper::None | SourceMapFixtureTamper::MissingHook => {}
-            SourceMapFixtureTamper::PhysicalSourcePath => {}
+            SourceMapFixtureTamper::PhysicalSourcePath
+            | SourceMapFixtureTamper::RequestedPhysicalSourcePath => {}
             SourceMapFixtureTamper::BinaryAfterCollection => {
                 fs::write(capture.join("binary-0.bin"), b"changed after collection\n")
                     .map_err(|_| BoundaryFailure::Unavailable)?;
@@ -2655,11 +2660,17 @@ fn logical_qualifier_binds_the_exact_tree_lease_binaries_and_behavior_paths() {
         QualificationDisposition::Insufficient
     );
     let mut physical_source_path = evidence.clone();
-    let physical_source = fixture.checkout_a.join("src/lib.rs");
+    let physical_source = fixture.checkout_b.join("src/lib.rs");
+    let resolved_physical_source = source_map::resolve_observed_source_path(&map, &physical_source);
+    assert_eq!(
+        resolved_physical_source.as_ref(),
+        Some(&physical_source),
+        "the resolver preserves a concrete path outside the logical prefix"
+    );
     physical_source_path.binary_scans.as_mut().unwrap()[0].source_paths[0].observed =
         physical_source.clone();
     physical_source_path.binary_scans.as_mut().unwrap()[0].source_paths[0].resolved =
-        Some(physical_source);
+        resolved_physical_source;
     assert_eq!(
         source_map::qualify(&map, &receipt, &physical_source_path),
         QualificationDisposition::Fail
@@ -2770,6 +2781,11 @@ fn source_map_collector_completes_adapter_reacquire_and_rejects_bound_mismatches
         (3, SourceMapFixtureTamper::ChangedMap, false),
         (4, SourceMapFixtureTamper::MissingHook, false),
         (5, SourceMapFixtureTamper::PhysicalSourcePath, false),
+        (
+            6,
+            SourceMapFixtureTamper::RequestedPhysicalSourcePath,
+            false,
+        ),
     ] {
         let invocation = fixture.invocation(&fixture.checkout_b, &tree, policy.clone());
         let failure_storage = fixture.root.dir(&format!("failure-storage-{index}"));
@@ -2805,7 +2821,11 @@ fn source_map_collector_completes_adapter_reacquire_and_rejects_bound_mismatches
             assert!(report.contains("observation-hook"));
             assert!(report.contains("binary-artifacts"));
         }
-        if matches!(tamper, SourceMapFixtureTamper::PhysicalSourcePath) {
+        if matches!(
+            tamper,
+            SourceMapFixtureTamper::PhysicalSourcePath
+                | SourceMapFixtureTamper::RequestedPhysicalSourcePath
+        ) {
             assert!(!failure_adapter.observations()[0]
                 .events
                 .iter()
