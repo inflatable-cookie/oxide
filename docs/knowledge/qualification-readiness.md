@@ -688,13 +688,20 @@ and `CARGO_TARGET_DIR` overrides. Probe identity is the workflow name
 scanner and origin-ledger tests use representative Cargo JSON, malformed
 input and a preserved ledger on fresh artifacts; they do not invoke Cargo.
 
-Session clock, written with `create_new` before image attach:
+Session clock file, written with `create_new` after retry-root/`setup-tmp`
+creation and before image attach:
 `/private/var/tmp/oxide-rust-probe-retry-20261010/setup-tmp/session-clock.txt`
 records `start_utc=2026-10-10T13:23:06Z`, `deadline_utc=2026-10-10T13:43:06Z`,
-`max_session_secs=1200`, `invocation_count=0`, `max_invocations=4`. One
-`Instant` bounded the live session. The 014 image and lease
-`e0bd67897ed0b10eeb4a880d73fcb938` were not touched. Local labels for this
-attempt were `oxide-local-probe-retry-20261010` /
+`max_session_secs=1200`, `invocation_count=0`, `max_invocations=4`. Independent
+review 6098048774 failed `session_clock`: that run started `Instant` and
+stamped the file only after host free-space preflight, fixture freeze/verify
+and retry-root setup, so those steps sat outside the 20-minute monotonic
+window. The driver now captures `Instant` and machine start/deadline first,
+persists those original stamps as soon as `setup-tmp` exists, then runs host
+preflight and fixture freeze under the same Instant. The recorded 015 clock
+file and image are unchanged; this session is not replayed. The 014 image and
+lease `e0bd67897ed0b10eeb4a880d73fcb938` were not touched. Local labels for
+this attempt were `oxide-local-probe-retry-20261010` /
 `oxide-local-probe-image-retry-20261010`.
 
 Observed fixture tree at A, B and the committed

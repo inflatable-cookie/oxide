@@ -300,6 +300,19 @@ fn probe_plan_passes_runner_validation_before_acquire_and_rejects_forced_overrid
 }
 
 #[test]
+fn session_clock_persists_original_machine_timestamps() {
+    let root = super::super::FixtureRoot::new();
+    let setup_temp = root.dir("setup-tmp");
+    record_session_clock(&setup_temp, "2026-10-10T13:00:00Z", "2026-10-10T13:20:00Z")
+        .expect("session clock");
+    let body = fs::read_to_string(setup_temp.join("session-clock.txt")).expect("clock file");
+    assert_eq!(
+        body,
+        "oxide-probe-session-clock-v1\nstart_utc=2026-10-10T13:00:00Z\ndeadline_utc=2026-10-10T13:20:00Z\nmax_session_secs=1200\ninvocation_count=0\nmax_invocations=4\n"
+    );
+}
+
+#[test]
 #[ignore = "approved four-invocation Cargo evidence probe; run only with OXIDE_CARGO_SOURCE_PROBE_RUN=1"]
 fn oxide_cargo_source_map_probe() {
     if std::env::var("OXIDE_CARGO_SOURCE_PROBE_RUN").as_deref() != Ok("1") {
@@ -311,17 +324,10 @@ fn oxide_cargo_source_map_probe() {
 }
 
 fn run_probe() -> Result<(), String> {
-    let host_free = native::host_free_bytes(Path::new("/private/var/tmp"))
-        .map_err(|_| "host free-space preflight unavailable".to_owned())?;
-    if host_free < HOST_RESERVE {
-        return Err(format!(
-            "host free space below the 20 GiB start threshold: {host_free}"
-        ));
-    }
-    let fixture_source =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/cargo-source-map-probe");
-    let frozen = freeze_fixture(&fixture_source)?;
-    verify_committed_fixture(&fixture_source, &frozen)?;
+    let started = Instant::now();
+    let start_utc = machine_utc()?;
+    let deadline_utc = machine_deadline_utc()?;
+    refuse_session_timeout(&started)?;
     match fs::symlink_metadata(ROOT) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("could not inspect {ROOT}: {error}")),
@@ -330,12 +336,27 @@ fn run_probe() -> Result<(), String> {
     fs::create_dir(ROOT).map_err(|error| error.to_string())?;
     let setup_temp = PathBuf::from(ROOT).join("setup-tmp");
     fs::create_dir(&setup_temp).map_err(|error| error.to_string())?;
-    let started = Instant::now();
-    record_session_clock(&setup_temp, &started)?;
+    record_session_clock(&setup_temp, &start_utc, &deadline_utc)?;
+    refuse_session_timeout(&started)?;
+    let host_free = native::host_free_bytes(Path::new("/private/var/tmp"))
+        .map_err(|_| "host free-space preflight unavailable".to_owned())?;
+    if host_free < HOST_RESERVE {
+        return Err(format!(
+            "host free space below the 20 GiB start threshold: {host_free}"
+        ));
+    }
+    refuse_session_timeout(&started)?;
+    let fixture_source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/cargo-source-map-probe");
+    let frozen = freeze_fixture(&fixture_source)?;
+    verify_committed_fixture(&fixture_source, &frozen)?;
+    refuse_session_timeout(&started)?;
     let scanner_identity = producer::scanner_identity()?;
+    refuse_session_timeout(&started)?;
     let image = PathBuf::from(ROOT).join("oxide-rust-probe.sparseimage");
     let mount = PathBuf::from(ROOT).join("m");
     let (attach, outside_directories) = setup_image(&image, &mount, &setup_temp)?;
+    refuse_session_timeout(&started)?;
     let evidence = mount.join("evidence");
     ensure_probe_directory(&evidence)?;
     ensure_probe_directory(&mount.join("tmp"))?;
@@ -1769,12 +1790,19 @@ fn write_frozen_fixture(frozen: &FrozenFixture, destination: &Path) -> Result<()
     Ok(())
 }
 
-fn record_session_clock(setup_temp: &Path, started: &Instant) -> Result<(), String> {
-    let start_utc = machine_utc()?;
-    let deadline_utc = machine_deadline_utc()?;
+fn refuse_session_timeout(started: &Instant) -> Result<(), String> {
     if started.elapsed() >= MAX_SESSION {
-        return Err("the 20 minute session limit was reached before setup".to_owned());
+        Err("the 20 minute session limit was reached".to_owned())
+    } else {
+        Ok(())
     }
+}
+
+fn record_session_clock(
+    setup_temp: &Path,
+    start_utc: &str,
+    deadline_utc: &str,
+) -> Result<(), String> {
     let body = format!(
         "oxide-probe-session-clock-v1\nstart_utc={start_utc}\ndeadline_utc={deadline_utc}\nmax_session_secs={}\ninvocation_count=0\nmax_invocations={MAX_INVOCATIONS}\n",
         MAX_SESSION.as_secs(),
