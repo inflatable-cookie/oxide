@@ -514,7 +514,7 @@ storage-attempt ledger must persist authorization, acquire/submit intents and
 identities, busy/uncertain outcomes, cancellation and reconciliation. Existing
 operation journals and worker admission are patterns, not this API.
 
-Nucleus's [consumer boundary, Contract 011](https://github.com/inflatable-cookie/nucleus/blob/b4321e2fd729cd3329e7111a2eacbe1ec27d934e/docs/knowledge/contracts/011-oxide-consumer-boundary.md)
+Nucleus's [consumer boundary, Contract 011](https://github.com/inflatable-cookie/nucleus/blob/38c2a814c9bc62a62f1535b9089c3ee52c292e62/docs/knowledge/contracts/011-oxide-consumer-boundary.md)
 defines proposed version-1 consumer-local receipts for allocation, storage
 authorization, acquire, submission, capture, archive/recycle and no-spawn closure.
 They bind the task/run/root allocation epoch, requested source tree, workflow and
@@ -524,7 +524,14 @@ adapter behavior only; unconfigured production issuers refuse. Live binding
 requires an independently reviewed mapping to the actual Oxide API. Per-run head
 and tree binding must not make every source revision a new compatibility partition.
 Contract 011 describes the consumer-local mapping to the Rust library above;
-the TypeScript consumer seams do not supply an authenticated concrete Rust
+its reviewed dep-info mapping requires `LocalInput::DepInfo.unit` to match
+`UnitEvidence.id`. The unit is included in the semantic publication-map framing,
+while the version constants remain 1. A future binding must pin the reviewed
+implementation and refuse unqualified compatibility with maps published before
+that framing change. The existing TypeScript seams neither encode dep-info nor
+consume Oxide publication maps, so this change introduces no immediate TypeScript
+code incompatibility.
+The TypeScript consumer seams do not supply an authenticated concrete Rust
 embedding or transport. That binding is a separate implementation prerequisite,
 along with accepted owners and genuine input/completion evidence.
 
