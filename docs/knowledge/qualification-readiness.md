@@ -549,6 +549,72 @@ A logical-path result does not claim interactive debugger integration; if
 that is part of the accepted contract, the pilot must stop until an exact-B
 debugger source lookup is available and qualified.
 
+### Registered Cargo source-map evidence schema
+
+`src/project/source_map.rs` collects a run-private receipt from the resolved
+map, partition, run binding, lease, private capture and typed workflow
+observations. It computes binary and log digests from captured files, checks
+relative references and canonical containment, and writes
+`source-map-evidence.txt` with provenance, identity digests, observed classes,
+paths and missing classes. The report is capped at 64 KiB; a collection can
+name at most 128 binary artifacts, 256 combined observations, and 8 GiB of
+captured binary data. It does not accept a caller's qualification verdict.
+The owned completion certificate must bind the same run, lease, capture paths,
+output references and log digests before the existing qualifier can pass.
+
+The optional `CARGO_TARGET_DIR/source-map-observations-v1.txt` hook uses
+UTF-8, one tab-separated record per line, and the version header below. Paths
+are absolute observations except artifact paths, which are safe relative names
+under the declared slot or target root. The identity row binds the accepted
+policy, complete map, full build identity, requested tree and this exact run.
+The collector parses at most 64 KiB and 256 records.
+
+```text
+oxide-cargo-source-map-observations-v1
+identity <policy-digest> <map-digest> <build-identity-digest> <requested-tree-digest> <lease-id> <run-id> <attempt-id> <host-run-id>
+origin <authorized-root-id> <tree-digest>
+artifact <reference> <slot|target> <relative-path>
+scan <reference> <scanner-version> <binary-digest>
+section <reference> <debug-section>
+source <reference> <compiler-debug|file-macro|panic-location|apple-oso> <observed-path>
+behavior <class> <resolved-path> <source-tree-digest> <generation-lease-id|->
+apple-oso <not-emitted|observed>
+```
+
+Each line shown after the header is a tab-separated record. The collector
+resolves artifact paths under their declared roots, copies their bytes into
+the private capture with create-new semantics, and computes the captured
+digest itself. It derives full-debug completeness from the three required
+section records; no `complete` flag is accepted. Source and behavior paths are
+resolved against the requested tree and checked for canonical containment.
+The hook's scanner and workflow observations remain inputs from a registered
+producer, not a scanner implemented by `CargoWorkflowRunner`.
+
+| Required evidence | Observation required by the schema | Collector and current coverage |
+| --- | --- | --- |
+| Compile origins | For each origin, a registered build-unit hook reports an authorized root ID and that root's exact tree digest. | Receipt keeps origins separate from the requested tree and checks IDs/digest shape. The registered Cargo runner has no unit-origin hook; missing origins are recorded as insufficient. |
+| Binary artifacts and full-debug sections | The workflow reports a safe slot/target relative artifact path; a versioned scanner reports the artifact digest and individual `.debug_info`, `.debug_line`, `.debug_abbrev` section records. | Collector verifies the rooted artifact path, copies and hashes its bytes in private capture, and derives completeness from the three required section records. Artifact discovery and the real binary scanner are not implemented. |
+| Compiler debug paths | The binary scanner reports each source path from debug information. Logical names must resolve to the requested tree; physical paths must be exact and contained. | Resolver and qualifier implement safe lookup and reject symlink escapes. The registered workflow has no scanner hook. |
+| `file!()` values | A registered workflow probe reports the value observed from the executed binary as its own class. | Kept distinct from debug paths and checked against the exact requested tree. The Cargo workflow does not emit this probe. |
+| Panic locations | A registered workflow probe captures the executed panic location as its own class. | Kept distinct from debug and `file!()` paths. No registered panic-location hook is implemented. |
+| Apple OSO | The binary scanner reports either `not emitted` or each emitted OSO path. | `not emitted` is an explicit observation; emitted paths use the normal path check. No rewrite is applied. The real scanner hook is missing, so absence cannot be assumed. |
+| Manifest directory | An executed workflow observation reports the effective manifest directory and the source-tree identity it belongs to. | Qualifier requires a canonical directory inside the requested tree. No real workflow probe currently reports it. |
+| Include input | Compiler dependency observation reports the exact file consumed by `include!` or related source inclusion. | Qualifier requires a canonical file in the requested tree. Cargo dep-info integration is not implemented. |
+| Build-script input | Build-script observation reports each input actually consumed by the script. | Qualifier requires a canonical requested-tree file. Build-script input hooks are not implemented. |
+| `OUT_DIR` | Build-script execution observation reports the exact generated directory and active lease. | Qualifier requires a canonical directory inside the leased slot and the requested tree digest. Real Cargo hook is missing. |
+| Generated output | Build-script/compiler observation reports each generated file and its active lease. | Qualifier requires a canonical file inside the leased slot. Real Cargo hook is missing. |
+| Proc-macro input | Compiler/build-unit observation reports the actual proc-macro input and active generation. | Qualifier requires a canonical file inside the leased slot. Real Cargo hook is missing. |
+| Runtime resource | An executed test or application probe reports the file actually opened and its requested-tree identity. | Qualifier requires a canonical requested-tree file. No runtime resource hook is implemented. |
+
+The `CargoWorkflowRunner` currently has no producer for the optional hook. It
+collects its owned logs and run manifest, then records the missing classes in
+the private capture. It therefore finalizes mapped runs as `Uncertain`; the
+registered real Cargo path is not ready to qualify reuse. The positive
+end-to-end tests use explicit
+`task-owned-fixture` provenance and a test-only completion certificate. They
+exercise collection, qualification, capture, Idle and same-slot reacquire;
+they do not certify rustc portability, invalidation, daily reuse or savings.
+
 ### Bounded real-project follow-up (execution not authorized)
 
 The Oxide-only experimental implementation is present in the local adapter and

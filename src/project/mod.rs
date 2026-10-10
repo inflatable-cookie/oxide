@@ -16,11 +16,12 @@ pub use resolve::{
     ProjectInvocation, ToolchainInput, WorkflowOptIn,
 };
 pub use source_map::{
-    AuthorizedSourceRoot, BehaviorPathClass, BehaviorPathObservation, BinaryArtifactDigest,
-    BinarySourceScan, CompileOriginIdentity, KeyMissControl, MissControlEvidence,
-    PortabilityEvidence, QualificationDisposition, ResolvedSourceMap, SourceMapPolicy,
-    SourceMapRunReceipt, SourceMissControl, SourcePathClass, SourcePathMode, SourcePathObservation,
-    ACCEPTED_LOGICAL_POLICY, REQUIRED_BEHAVIOR_PATHS, SOURCE_MAP_VERSION, SOURCE_SCAN_VERSION,
+    AppleOsoObservation, AuthorizedSourceRoot, BehaviorPathClass, BehaviorPathObservation,
+    BinaryArtifactDigest, BinarySourceScan, CompileOriginIdentity, KeyMissControl,
+    MissControlEvidence, PortabilityEvidence, QualificationDisposition, ResolvedSourceMap,
+    SourceMapPolicy, SourceMapRunReceipt, SourceMissControl, SourcePathClass, SourcePathMode,
+    SourcePathObservation, ACCEPTED_LOGICAL_POLICY, REQUIRED_BEHAVIOR_PATHS, SOURCE_MAP_VERSION,
+    SOURCE_SCAN_VERSION,
 };
 
 use crate::storage::{
@@ -771,6 +772,8 @@ impl<S: StorageOperations> ProjectAdapter<S> {
             ) {
                 (Some(receipt), Some(evidence), Some(capture_receipt)) => {
                     receipt.slot_path == slot_path
+                        && native_completion
+                            .is_some_and(|completion| completion.binds_source_map_receipt(receipt))
                         && receipt.binds_run(
                             source_map,
                             &acquired.lease_id,

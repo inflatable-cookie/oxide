@@ -1,3 +1,4 @@
+use super::source_map::SourceMapRunReceipt;
 use super::{
     BoundaryFailure, CancellationProbe, FixtureCommandOutput, FixtureCommandRunner,
     FixtureCommandStatus, FixtureCompletionProof, FixtureExecutionPlan,
@@ -147,6 +148,20 @@ pub(crate) struct NativeCompletionCertificate {
 impl NativeCompletionCertificate {
     pub(super) fn capture_digest(&self) -> &str {
         &self.capture_digest
+    }
+
+    pub(super) fn binds_source_map_receipt(&self, receipt: &SourceMapRunReceipt) -> bool {
+        self.claim.lease_id == receipt.slot_lease_id
+            && self.claim.binding.run_id == receipt.run_id
+            && self.claim.binding.attempt_id == receipt.attempt_id
+            && self.claim.binding.source_tree_digest == receipt.requested_source_tree_digest
+            && self.claim.host_run_id == receipt.host_run_id
+            && self.claim.slot_path == receipt.slot_path
+            && self.claim.capture_dir == receipt.capture_dir
+            && self.output_references == receipt.output_references
+            && self.stdout_digest == receipt.stdout_digest
+            && self.stderr_digest == receipt.stderr_digest
+            && self.capture_digest == receipt.capture_digest
     }
 
     pub(super) fn matches(
