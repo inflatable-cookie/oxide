@@ -1631,6 +1631,7 @@ fn known_resume_elapsed() -> Result<Duration, String> {
     }
     let expected_setup_entries = BTreeSet::from([
         "attempt-1.txt".to_owned(),
+        "attempt-2.txt".to_owned(),
         "imageinfo-attempt-1.plist".to_owned(),
         "resume-state.txt".to_owned(),
     ]);
@@ -1659,7 +1660,7 @@ fn known_resume_elapsed() -> Result<Duration, String> {
         ("root", ROOT),
         ("image", "oxide-rust-probe.sparseimage"),
         ("image_virtual_capacity", "8589934592"),
-        ("attempt_count", "1"),
+        ("attempt_count", "2"),
     ];
     if fields.len() != 8
         || required
@@ -1694,7 +1695,7 @@ fn known_resume_elapsed() -> Result<Duration, String> {
         || image_info(&image)? != info_bytes
         || image_capacity(&info_path)? != IMAGE_CAP
         || !String::from_utf8_lossy(&info_bytes).contains("<string>sparse</string>")
-        || !String::from_utf8_lossy(&info_bytes).contains("<string>APFS</string>")
+        || !String::from_utf8_lossy(&info_bytes).contains("<key>APFS</key>")
     {
         return Err(
             "recorded hdiutil evidence does not prove the exact sparse APFS image".to_owned(),
@@ -1706,6 +1707,14 @@ fn known_resume_elapsed() -> Result<Duration, String> {
         || !attempt.contains("15732736")
     {
         return Err("recorded first attempt lacks its setup failure evidence".to_owned());
+    }
+    let second_attempt =
+        fs::read_to_string(setup_temp.join("attempt-2.txt")).map_err(|error| error.to_string())?;
+    if !second_attempt
+        .contains("stopped before image attach and before any fixture Cargo invocation")
+        || !second_attempt.contains("does not prove the exact sparse APFS image")
+    {
+        return Err("recorded second attempt lacks its setup failure evidence".to_owned());
     }
 
     let root_device = df_space(root)?.0;
@@ -1851,7 +1860,7 @@ fn setup_image(
     info_file.sync_all().map_err(|error| error.to_string())?;
     if image_capacity(&image_info_capture)? != IMAGE_CAP
         || !String::from_utf8_lossy(&info).contains("<string>sparse</string>")
-        || !String::from_utf8_lossy(&info).contains("<string>APFS</string>")
+        || !String::from_utf8_lossy(&info).contains("<key>APFS</key>")
     {
         return Err("hdiutil did not confirm the approved 8 GiB sparse APFS image".to_owned());
     }
