@@ -1552,20 +1552,61 @@ Pre-execution gates, in order, after durable acquire and before spawn:
    left to Cargo. Missing fingerprint/map files, unknown format, or an input
    class the map does not cover: refuse (`input_unknown`), no execution. Cap
    4096 files or 1 MiB, whichever first, applies to fingerprint-named
-   workspace inputs, declared behavior-path files, and the recursive
-   expansion of declared directories (a subset of tracked files plus any
-   untracked members of those directories). Nucleus currently has 1003
+   workspace inputs, declared behavior-path files, workspace identity
+   files (`Cargo.toml`, `Cargo.lock`, in-tree toolchain and `.cargo`
+   config), and the recursive expansion of declared directories (a
+   subset of tracked files plus any untracked members of those
+   directories). Nucleus currently has 1003
    tracked files (140 `.rs`) and Oxide 46 tracked: that cap is expected to
    bind for those fingerprint-named subsets; if a workspace or directory
-   expansion exceeds it, that slot cannot be reused. On successful
-   finalize: re-hash the requested tree. Persist the relative-path digest
-   map only if the tree digest equals `D_admit`; bind the stored map to
-   that admitted digest. File hashes are of that admitted tree. If the
-   tree changed during the lease, do not persist or replace the map; mark
-   the slot's map invalid so the next reuse is `input_unknown` until a
-   later compile with an unchanged tree produces a bound map. This is
-   Oxide-owned admission evidence, not a Cargo fingerprint edit, source
-   touch, or emitted-path rewrite.
+   expansion exceeds it, that slot cannot be reused.
+
+   Persist or replace the bound map only on successful
+   compile-through-test-and-capture finalize whose tree digest still
+   equals `D_admit`. File hashes are of that admitted tree. Any other
+   terminal outcome of a lease that spawned Cargo — compile error, crash,
+   cancel, missing capture, failed finalize, lease loss, or Uncertain —
+   must not persist or replace the map; mark it invalid so the next reuse
+   is `input_unknown` until a later successful compile-through-test-and-capture
+   with an unchanged tree produces a bound map. A tree change during the
+   lease is the same invalidation. Reconcile-to-Idle after Uncertain does
+   not restore the previous bound map; the map stays invalid and the next
+   reuse is `input_unknown`. A pre-spawn refusal does not spawn Cargo and
+   leaves the previous bound map and origin intact.
+
+   Cargo rewrites or truncates unit fingerprints when it starts a dirty
+   unit (`fingerprint/mod.rs` truncates the fingerprint file before
+   rebuild). After a failed A1 compile the on-disk reference mtime can be
+   `r1` while Oxide still holds map M0 bound to A0. A later mtime-preserving
+   restore of A0 then has hashes matching M0 and `mtime <= r1`, so the
+   hash gate would pass and Cargo would treat A1 artifacts as fresh.
+   Invalidating the map on non-success closes that hole.
+
+   This is Oxide-owned admission evidence, not a Cargo fingerprint edit,
+   source touch, or emitted-path rewrite.
+
+   **Workspace identity files.** Pinned Cargo `c980f4866`
+   `fingerprint/mod.rs` does not mtime path-package manifests or
+   lockfiles. Path-package freshness is rustc dep-info / rerun-if
+   (`CheckDepInfo` / `RerunIfChanged`). Manifest content reaches the
+   fingerprint only through hashed features, declared feature names,
+   `[lints]` (`lint_rustflags`), profile, `unit.target`, and dependency
+   package IDs in the unit graph. Put these small files in the digest
+   map when present, under the same cap. Per class:
+
+   | Class | Map | Named Cargo / Oxide hash | Remainder |
+   | --- | --- | --- | --- |
+   | Workspace and member `Cargo.toml` | Yes | Fingerprint hashes features, declared feature names, `lint_rustflags`, profile; edition and target live in `unit.target` | Fields those hashes omit (description, authors, unused keys) are covered by the map |
+   | Workspace `Cargo.lock` | Yes | Dep-unit fingerprints hash resolved dependency package IDs | Lockfile text that does not change resolved package IDs is covered by the map |
+   | `rust-toolchain` / `rust-toolchain.toml` in the requested tree | Yes, when present | Gate 1 partition and Cargo `rustc.verbose_version` hash the resolved toolchain | Comments or unused pins while an env override selects the same rustc: map covers file content; gate 1 covers resolved identity |
+   | `.cargo/config.toml` and `.cargo/config` in the requested tree | Yes, when present | Gate 1 partition hashes effective Cargo configuration | Comments or unused keys that do not change resolved config: map covers file content; gate 1 covers resolved identity |
+   | User/global Cargo config under `CARGO_HOME` | No (out of tree) | Gate 1 resolved configuration | Extra unresolved files are not a claimed hit |
+
+   Missing, extra, unreadable, or hash-mismatched identity files with
+   `mtime <=` the fingerprint reference: `source_stale`. Newer mtimes are
+   left to Cargo and gate 1. The first-slice fixture has workspace and
+   member `Cargo.toml` plus `Cargo.lock` and no toolchain or `.cargo`
+   config files; those present files go in the map.
 6. **Generated / proc-macro / build-script / native / external.** Declared
    `rerun-if-changed` and rustc dep-info paths are resolved, then admitted
    to the map or refused, before spawn on a later acquire and before
@@ -1631,20 +1672,22 @@ Pre-execution gates, in order, after durable acquire and before spawn:
    captures bind this attempt, source digest, root, lease and artifact
    hashes.
 
-Uncertainty: the digest map covers files Cargo named plus declared behavior
-paths, including the recursive expansion of declared directories, bound to
-the admitted pre-acquire tree digest, persisted only if that digest is
-unchanged at finalize. Equal-mtime same-content files are allowed
-(ordinary unchanged git files). Clock-step backwards on changed content is
-refused. Named dep-info/rerun-if paths outside the requested tree and the
-exclusive slot refuse. Residual: undeclared extra reads by a script that
-also emitted some rerun-if; a mid-lease edit that reverts before finalize
-(Cargo `invoked.timestamp` is Cargo's mid-build protection). Replacement
+Uncertainty: the digest map covers files Cargo named, declared behavior
+paths, recursive expansion of declared directories, and the workspace
+identity files in the table above, bound to the admitted pre-acquire tree
+digest, persisted only after successful compile-through-test-and-capture
+with that digest unchanged. A non-successful Cargo spawn invalidates the
+map. Equal-mtime same-content files are allowed (ordinary unchanged git
+files). Clock-step backwards on changed content is refused. Named
+dep-info/rerun-if paths outside the requested tree and the exclusive slot
+refuse. Residual: undeclared extra reads by a script that also emitted
+some rerun-if; a mid-lease edit that reverts before finalize (Cargo
+`invoked.timestamp` is Cargo's mid-build protection). Replacement
 criterion: retire the map when a supported Cargo release's checksum
 freshness covers both rustc dep-info *and* build-script `RerunIfChanged`,
-including synthesized `CARGO_MANIFEST_DIR` and recursive directory
-members, on the pinned toolchain, and a fresh qualification passes the
-same gates.
+including synthesized `CARGO_MANIFEST_DIR`, recursive directory members,
+and manifest/lockfile content, on the pinned toolchain, and a fresh
+qualification passes the same gates.
 
 Do not touch all sources, edit Cargo internals, rewrite emitted values,
 ignore paths, or grow the root map.
@@ -1761,15 +1804,29 @@ every successful compile.
    reference. Tree digest differs. Acquire may return slot-1; the freshness
    gate must refuse before Cargo, leave slot-1 Idle with the T1 origin, and
    start no compiler. This does not consume a compiler invocation.
+5. **Non-success then restore (compiler 4, then no compiler).** Re-materialize
+   T1 at R (ordinary git checkout so T1 files have current mtimes). Overlay a
+   syntax error on existing `probe/src/lib.rs`; no new fixture member.
+   Distinct attempt identity. Acquire returns slot-1. Spawn the compile; it
+   must fail before successful compile-through-test-and-capture finalize.
+   The bound map must be marked invalid. If the slot is Uncertain, stop:
+   map invalid and unavailable is the observation; do not restore or spawn
+   further. If Idle: restore T0 content for `probe/src/lib.rs` and
+   `probe/marker.txt` with mtimes `<=` that failed run's fingerprint
+   reference. Acquire may return slot-1; the gate must refuse
+   `input_unknown` before Cargo (invalid map), start no compiler, and
+   leave the map invalid.
 
 Success: (1) is cold; (2) retains the proc-macro and executes T1, not T0;
-(3) is a true same-tree warm hit; (4) never executes; exclusive second-claim
-refusal, clocks, samples and resource caps hold. Failure: a new slot for T1,
-proc-macro rebuilt at (2), execution of T1 artifacts at (4), any
-cross-root/logical-map hit, missing debug/behavior evidence on a successful
-compile, or a resource/clock miss. Uncertain ownership stays retained. This
-proof still cannot claim everyday Queue storage relief; that needs the
-consumer path pool.
+(3) is a true same-tree warm hit; (4) never executes; (5) never executes
+after the failed compile (invalid map, or Uncertain); exclusive
+second-claim refusal, clocks, samples and resource caps hold. Failure: a
+new slot for T1, proc-macro rebuilt at (2), execution of T1 artifacts at
+(4) or of A1 artifacts after (5)'s restore, any cross-root/logical-map
+hit, missing debug/behavior evidence on a successful compile, a bound map
+still valid after the failed compile, or a resource/clock miss. Uncertain
+ownership stays retained. This proof still cannot claim everyday Queue
+storage relief; that needs the consumer path pool.
 
 If a later dispatch needs consumer contact, a different mechanism, more than
 four compiles, or mutation of preserved probes, stop and obtain that ruling
@@ -1780,8 +1837,10 @@ edits, installation, or adopting the architecture as production.
 ##### Disposition
 
 Recommend candidate (a). Candidate (b) has no supported 1.97.1 mechanism.
-The next implementation is the Oxide freshness map plus the four-step
-same-root proof above. Consumer path-pool work stays a separate owner
+The next implementation is the Oxide freshness map plus the five-step
+same-root proof above (four compiler invocations plus one no-compiler
+refusal, with the fifth step using the remaining compiler for a
+non-success then restore). Consumer path-pool work stays a separate owner
 brief under Q-012. Production keys stay checkout-isolated until that proof
 and the consumer contract both pass. Path-isolated fallback remains the
 safe default for ad hoc unique worktrees and leaves the duplication
