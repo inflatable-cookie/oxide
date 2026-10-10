@@ -2344,7 +2344,7 @@ fn mapped_run_without_exact_run_receipt_keeps_its_slot_uncertain() {
             },
         ),
     );
-    let storage_root = fixture.root.dir("mapped-storage");
+    let storage_root = fixture.root.dir("storage");
     let daemon = RunningDaemon::start(&storage_root);
     let mut adapter = ProjectAdapter::new(daemon.client.clone());
     let mut consumer = FixtureConsumer::new();
