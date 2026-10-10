@@ -1695,6 +1695,7 @@ fn known_resume_elapsed(frozen: &FrozenFixture) -> Result<Duration, String> {
         "attempt-3.txt".to_owned(),
         "attempt-4.txt".to_owned(),
         "attempt-5.txt".to_owned(),
+        "attempt-6.txt".to_owned(),
         "diskutil-attempt-3.plist".to_owned(),
         "hdiutil-image-map-attempt-3.txt".to_owned(),
         "imageinfo-after-attach-attempt-3.plist".to_owned(),
@@ -1726,7 +1727,7 @@ fn known_resume_elapsed(frozen: &FrozenFixture) -> Result<Duration, String> {
         ("root", ROOT),
         ("image", "oxide-rust-probe.sparseimage"),
         ("image_virtual_capacity", "8589934592"),
-        ("attempt_count", "5"),
+        ("attempt_count", "6"),
         ("imageinfo_file", "imageinfo-after-attach-attempt-3.plist"),
         ("mount_stage", "pre-daemon"),
         ("fixture_tree_digest", frozen.digest.as_str()),
@@ -1818,10 +1819,17 @@ fn known_resume_elapsed(frozen: &FrozenFixture) -> Result<Duration, String> {
     if !fifth_attempt.contains("before any fixture Cargo invocation or lease")
         || !fifth_attempt.contains("8589934592-byte sparse APFS virtual image")
         || !fifth_attempt.contains(
-            "imageinfo-resume-observation.plist sha256:8ea268debb6fdc282b314d67f4f54db481af3de2db4234abe83d90368a115131",
+            "imageinfo-resume-observation.plist (sha256:8ea268debb6fdc282b314d67f4f54db481af3de2db4234abe83d90368a115131)",
         )
     {
         return Err("recorded fifth attempt lacks its setup failure evidence".to_owned());
+    }
+    let sixth_attempt =
+        fs::read_to_string(setup_temp.join("attempt-6.txt")).map_err(|error| error.to_string())?;
+    if !sixth_attempt.contains("before any fixture Cargo invocation or storage lease")
+        || !sixth_attempt.contains("recorded fifth attempt lacks its setup failure evidence")
+    {
+        return Err("recorded sixth attempt lacks its setup failure evidence".to_owned());
     }
 
     let attached = Command::new("/usr/bin/hdiutil")
