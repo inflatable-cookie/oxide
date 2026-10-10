@@ -1924,6 +1924,7 @@ impl SourceMapFixture {
                     path,
                 })
                 .collect(),
+            relative_prefixes: Vec::new(),
             miss_controls: Some(MissControlEvidence {
                 source: Some(SourceMissControl {
                     before_tree_digest: digest(b"tree-before"),
@@ -2487,6 +2488,102 @@ fn incomplete_miss_gate_refuses_before_a_shared_partition_is_resolved() {
     assert!(matches!(
         resolve::resolve(&unknown_flags),
         Resolution::Refused(AdapterRefusal::InputUnknown)
+    ));
+}
+
+#[test]
+fn relative_source_prefix_is_registered_ordered_and_keyed_by_workspace_context() {
+    let fixture = SourceMapFixture::new("14-relative-source-prefix");
+    for root in [&fixture.checkout_a, &fixture.checkout_b] {
+        fs::create_dir_all(root.join("probe/src")).unwrap();
+        fs::write(root.join("probe/Cargo.toml"), b"[package]\nname='probe'\n").unwrap();
+        fs::write(root.join("probe/src/lib.rs"), b"pub fn probe() {}\n").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/Cargo.toml"), b"[package]\nname='other'\n").unwrap();
+    }
+    let mode = SourcePathMode::ExperimentalLogical {
+        accepted_policy: ACCEPTED_LOGICAL_POLICY.to_owned(),
+        prefix: PathBuf::from("/oxide/fixture-component"),
+    };
+    let roots = vec![
+        ("root-a", fixture.checkout_a.clone()),
+        ("root-b", fixture.checkout_b.clone()),
+    ];
+    let mut policy = fixture.policy(roots.clone(), mode.clone());
+    policy.relative_prefixes.push(RelativeSourcePrefix {
+        root_ids: vec!["root-a".to_owned(), "root-b".to_owned()],
+        compiler_working_directory: PathBuf::from("."),
+        package_directory: PathBuf::from("probe"),
+        prefix: PathBuf::from("probe"),
+    });
+    let (resolved, map) =
+        fixture.resolved_map(&fixture.checkout_a, &digest(b"tree-a"), policy.clone());
+    assert_eq!(
+        map.effective_rustflags().last().map(String::as_str),
+        Some("--remap-path-prefix=probe=/oxide/fixture-component/probe")
+    );
+    assert_eq!(
+        map.effective_rustflags(),
+        [
+            "--cfg=fixture_flag".to_owned(),
+            format!(
+                "--remap-path-prefix={}=/oxide/fixture-component",
+                fixture.checkout_a.display()
+            ),
+            format!(
+                "--remap-path-prefix={}=/oxide/fixture-component",
+                fixture.checkout_b.display()
+            ),
+            "--remap-path-prefix=probe=/oxide/fixture-component/probe".to_owned(),
+        ]
+    );
+    let mut changed = policy.clone();
+    changed.relative_prefixes[0].package_directory = PathBuf::from("src");
+    changed.relative_prefixes[0].prefix = PathBuf::from("src");
+    let (changed_resolved, changed_map) =
+        fixture.resolved_map(&fixture.checkout_a, &digest(b"tree-a"), changed);
+    assert_ne!(map.map_digest(), changed_map.map_digest());
+    assert_ne!(map.policy_digest(), changed_map.policy_digest());
+    assert_ne!(
+        resolved.partition.path_identity,
+        changed_resolved.partition.path_identity
+    );
+
+    let mut traversing = policy.clone();
+    traversing.relative_prefixes[0].prefix = PathBuf::from("../probe");
+    assert!(matches!(
+        resolve::resolve(&fixture.invocation(&fixture.checkout_a, &digest(b"tree-a"), traversing)),
+        Resolution::Refused(AdapterRefusal::AmbiguousInput)
+            | Resolution::Refused(AdapterRefusal::UnsupportedInput)
+    ));
+    let mut unregistered = policy.clone();
+    unregistered.relative_prefixes[0].root_ids[0] = "unregistered".to_owned();
+    assert!(matches!(
+        resolve::resolve(&fixture.invocation(
+            &fixture.checkout_a,
+            &digest(b"tree-a"),
+            unregistered
+        )),
+        Resolution::Refused(AdapterRefusal::AmbiguousInput)
+    ));
+    let mut ambiguous = policy.clone();
+    ambiguous
+        .relative_prefixes
+        .push(ambiguous.relative_prefixes[0].clone());
+    assert!(matches!(
+        resolve::resolve(&fixture.invocation(&fixture.checkout_a, &digest(b"tree-a"), ambiguous)),
+        Resolution::Refused(AdapterRefusal::AmbiguousInput)
+    ));
+    let mut wrong_context = policy;
+    wrong_context.relative_prefixes[0].compiler_working_directory = PathBuf::from("probe");
+    assert!(matches!(
+        resolve::resolve(&fixture.invocation(
+            &fixture.checkout_a,
+            &digest(b"tree-a"),
+            wrong_context
+        )),
+        Resolution::Refused(AdapterRefusal::AmbiguousInput)
+            | Resolution::Refused(AdapterRefusal::UnsupportedInput)
     ));
 }
 

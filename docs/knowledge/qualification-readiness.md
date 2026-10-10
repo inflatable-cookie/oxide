@@ -584,6 +584,17 @@ invocation against that producer; the fixture build script then failed, so
 the remaining sequence did not run. Both attempts and their limits are
 recorded below.
 
+Task 017 adds an ordered `RelativeSourcePrefix` to the accepted logical map.
+Each prefix names its authorized roots, Cargo compiler working directory and
+package directory. The resolver checks normalized non-traversing paths, a
+canonical package manifest under every named root, and the requested root's
+actual workspace context. The complete ordered absolute-A, absolute-B and
+relative flag vector and relative context contribute to policy, map and build
+identity. Strict-physical mode rejects relative entries. The fixture declares
+explicit `dev` and `test` profiles with `debug=2`, `strip=none` and
+`split-debuginfo=packed`; these values are also part of effective environment
+identity.
+
 The optional `CARGO_TARGET_DIR/source-map-observations-v1.txt` hook uses
 UTF-8, one tab-separated record per line, and the version header below. Paths
 are absolute observations except artifact paths, which are safe relative names
@@ -598,7 +609,8 @@ origin <authorized-root-id> <tree-digest>
 artifact <reference> <slot|target> <relative-path>
 scan <reference> <scanner-version> <binary-digest>
 section <reference> <debug-section>
-source <reference> <compiler-debug|file-macro|panic-location|apple-oso> <observed-path>
+source <reference> <compiler-debug|file-macro|panic-location> <observed-path>
+oso-object <artifact-reference> <captured-nm-reference> <absolute-object-path>
 behavior <class> <resolved-path> <source-tree-digest> <generation-lease-id|->
 apple-oso <not-emitted|observed>
 ```
@@ -610,8 +622,52 @@ digest itself. It derives full-debug completeness from the three required
 section records; no `complete` flag is accepted. Source and behavior paths are
 resolved against the requested tree and checked for canonical containment.
 The task-owned producer writes this hook from its Cargo, scanner, and executed
-fixture observations. The hook remains a plain file, so its identity row alone
-does not authenticate the claimed observations.
+fixture observations. Apple `OSO` records are object/debug-artifact references,
+not compiler source paths: every extracted absolute path is tied to its scanned
+artifact and the captured raw `nm` output. The complete raw `nm` output remains
+in the private capture. For a Cargo-reported test executable, the producer
+selects its exact sibling `<executable-name>.dSYM` and captures every regular
+file in that bundle under a bounded private name manifest; unrelated sibling
+bundles do not make discovery ambiguous. It compares executable and
+DWARF-payload UUID/architecture sets, hashes both originals and captures, and
+checks the required DWARF sections before binding source-lookup evidence to the
+companion digest. The exact bundle name is only a discovery rule and does not
+establish a match by itself. The hook remains a plain file, so its identity row
+alone does not authenticate the claimed observations.
+
+The v2 baseline selected Cargo's exact `probe-<hash>.dSYM`, captured its three
+regular files, and read the same dashed UUID and `arm64` architecture from the
+executable and DWARF payload. The companion scan found `__debug_info`,
+`__debug_line` and `__debug_abbrev`. However, `dwarfdump --debug-info` exceeded
+the producer's 1 MiB scanner-output bound; the capture records the bounded
+error and truncated output. The source extractor therefore did not complete,
+`debug-companion` remained `bound=false`, and no full-debug logical source
+lookup was established. This is the observed v2 layout and scanner limit, not
+evidence that the companion lacked debug information.
+
+The bounded project-source scanner uses installed `dwarfdump --show-sources`
+and a selective logical-prefix `--name/--regex --show-parents` query instead of
+full dependency/type DWARF dumps. For the fixed fixture test, a named-function
+query selects the actual `DW_TAG_subprogram` and its declared project source,
+ignoring same-name namespaces. Its parent compilation unit supplies the exact
+`DW_AT_stmt_list` offset and logical working directory; a section-offset query
+then requires the project's file/directory entry and nonzero source-line rows.
+Missing, ambiguous, truncated or over-limit context fails closed. Raw outputs,
+tool hashes/versions and exact argument records remain separate from runtime
+paths and raw `nm` object references. UUID, original/captured hashes, full
+companion capture and nonzero required sections still bind this observation.
+This focused observation proves lookup of the required project source; it does
+not claim complete enumeration of dependency DWARF types or source files.
+
+The test-local v3 driver owns a single live `std::time::Instant` before any
+experimental setup. Its create-new clock records session identity, the elapsed
+millisecond origin and 1,200,000 ms deadline, original UTC audit stamps and zero
+of four invocations. No prestarted/resumable clock or UTC reconstruction is
+accepted. An independent 20-second timer and protocol boundaries sample host
+free space and disposable allocations during setup, scanner and capture waits.
+Samples retain UTC plus elapsed milliseconds in `setup-tmp/host-space-samples.tsv`;
+a completed-sample gap over 30 seconds or any observation/write failure latches
+a stop. Negative or uncertain paths preserve the new mount and image.
 
 **Trust boundary:** the hook is a plain file in the run's Cargo target
 directory. Its identity row is compared with the adapter's accepted policy,
@@ -622,9 +678,9 @@ source value, generated input or opened runtime resource was actually
 observed. Artifact bytes and stdout/stderr are independently copied and
 digested by the collector. The 014 producer binds its records to the owned
 command's start identity and raw outputs, while the driver independently checks
-the fixture values against requested-tree file digests. Those checks have not
-run end to end, so genuine, independently validated Cargo observations are
-still required before reuse can qualify.
+the fixture values against requested-tree file digests. Task 017 v4 observed these checks on baseline and changed-source runs, then
+stopped at a real stale-source failure in the shared slot. The complete reuse
+sequence has not qualified; independent exact-head review remains required.
 
 In logical mode, origins from other authorized roots and trees are accepted as declarations; the qualifier does not independently establish which source contents produced a reused unit. Real qualification therefore needs genuine compile-origin observations and the source-miss control, not merely authorized root IDs or a matching hook identity row.
 
@@ -635,7 +691,7 @@ In logical mode, origins from other authorized roots and trees are accepted as d
 | Compiler debug paths | Producer-declared source paths extracted from binary debug information. Logical names must resolve to a requested-tree file; physical paths must match the selected physical-path policy and be contained. | The resolver checks requested-tree containment and the producer extracts paths from debug information. No scanner result exists from 014. |
 | `file!()` values | Producer-declared values observed from the executed binary, kept as their own class. | The driver compares emitted values with independently hashed requested-tree files. The fixture binary did not run in 014. |
 | Panic locations | Producer-declared panic locations captured from the executed binary, kept as their own class. | The driver checks panic paths separately from debug and `file!()` paths. No panic output was produced in 014. |
-| Apple OSO | Producer-declared scanner result: `not emitted` or each emitted OSO path. | The producer records bounded `nm` output and classifies OSO paths. No binary scan was completed in 014. |
+| Apple OSO | Producer-declared scanner result: `not emitted` or `observed`, plus one `oso-object` row per absolute linker-object reference. | Raw `nm` output is privately captured. Each extracted object path is bound to an artifact and its raw `nm` capture; it is not admitted as a requested-tree compiler source path. Task 017 v4 preserved raw `nm` output and completely bound/scanned the baseline and changed-source test companions; no OSO entries were emitted in those captures. |
 | Manifest directory | Producer-declared effective manifest directory and requested-tree digest. | The producer records the active manifest from the owned command. No command executed in 014. |
 | Include input | Producer-declared exact file consumed by `include!` or related source inclusion. | The fixture emits and checks the included value against its requested-tree file. No fixture test ran in 014. |
 | Build-script input | Producer-declared inputs consumed by the build script. | The producer correlates Cargo build-script output with the fixture's requested input. No Cargo build-script event was observed in 014. |
@@ -814,6 +870,315 @@ reconciled, detached, cleared or replayed. The image and evidence remain at the
 path above. Any further attempt needs a new scoped Queue record and fresh
 resources. For ad hoc worktrees, checkout-isolated build directories remain
 the safe fallback; they do not establish cross-worktree storage relief.
+
+#### Task 017 execution result (2026-10-10)
+
+The implementation registers relative compiler prefix `probe` against roots
+`a` and `b`, with Cargo working directory `.` and package directory `probe`.
+The ordered flags recorded before compilation were the complete absolute A,
+absolute B, and relative `probe` mappings. The resolver regression checks exact
+flag order, path-context digest separation, and refusal for traversal,
+unregistered roots, duplicate prefixes and an incorrect workspace context.
+`effigy rust:compile` and `effigy rust:format` exited 0. The final ordinary
+`effigy test rust` run passed 52 tests with 0 failures and 2 ignored. The
+corrected committed fixture tree was
+`sha256:550e62cefc7f647fef97b12489fc2c1e1ba67fd56a7529401fce25c97b0ce2e9`;
+the run manifest bound repository head
+`08b4354d15cfe79f8e41385e9baa6d750992d5cf` and that fixture digest.
+
+The new bounded session used
+`/private/var/tmp/oxide-rust-probe-paths-20261010`, an 8 GiB sparse APFS image
+mounted at `m`. Its original monotonic window was
+`2026-10-10T14:32:00Z`–`2026-10-10T14:52:00Z`; the evidence records one of four
+allowed fixture Cargo invocations. The single `reference-a` command used Cargo
+`1.97.1 (c980f4866 2026-06-30)` and rustc
+`1.97.1 (8bab26f4f 2026-07-14)`, exited 0 after the fixture test passed, and
+rebuilt six units. Its run elapsed 4334 ms; the whole session stopped after
+14926 ms. The observed `file!()` value was
+`/oxide-source-map-probe/probe/tests/probe.rs`, and the panic location was
+`/oxide-source-map-probe/probe/tests/probe.rs:54`. The independently read
+baseline marker, generated output, proc-macro input and runtime value matched;
+the producer recorded `values_match=true`. These observations support the
+logical behavior-path result with the complete map present, but do not isolate
+the relative flag from the two absolute flags.
+
+The full-debug baseline gate did not qualify. Cargo reported the final `probe`
+test executable and a sibling `.dSYM` filename, but the scanner searched the
+executable directory, found multiple sibling `.dSYM` bundles, and stopped with
+`Cargo artifact has ambiguous sibling dSYM bundles`. It therefore did not
+inspect or capture the Cargo-reported companion, compare UUID/architecture
+sets, hash-bind the companion, or establish logical source lookup from the
+captured debug data. The raw executable scans, partial `dwarfdump`/`nm` outputs,
+preflight report, Cargo stdout/stderr, manifest and events remain in the image.
+`scan_complete=false` and `debug-companion ... bound=false` are the recorded
+outcome. This is a scanner setup blocker; it does not show that the compiler
+omitted full debug information or that the cache reused wrong sources.
+
+Lease `bcb8b00be80f5deb527a92b384033f52` finalized `Idle` after the baseline
+run. Because preflight scanning was incomplete, source invalidation, measured
+key controls, shared cold A and warm B did not run; no reuse or storage-benefit
+claim is supported. The preserved evidence records host free space no lower
+than 300283924480 bytes, APFS capacity 8380178432 bytes, mounted use 29020160
+bytes at stop, sparse backing allocation 46141440 bytes, and outside allocation
+12288 bytes. No 20 GiB host or 10 GiB disposable threshold was reached. Per-run
+write attribution was unavailable.
+
+The runner detached the image on this failed-but-idle path. The worker
+reattached the same image read-only to inspect the stored evidence and left it
+mounted; the backing image and captured files remain untouched. That negative
+path must preserve the mount in a future session. The fixed root is now
+occupied, the original session is closed, and no further fixture invocation
+or clock reset was made. No existing 005/014/015/016 image or lease was
+modified.
+
+Task 017 dispositions: `relative_mapping` passed for the observed logical
+`file!()` and panic paths with the complete flag vector; `baseline_tests`,
+`launch_contract`, `session_clock` and `resource_bounds` passed. The required
+`debug_capture_binding` and `baseline_path_proof` remain insufficient because
+the companion scanner stopped on ambiguity. `source_invalidation`,
+`cross_path_correctness`, `ownership_capture` for the full sequence and
+`reuse_result` remain insufficient or not reached. This task does not establish
+useful recurring-run reduction. Checkout-isolated storage remains the safe
+fallback until a separately scoped attempt can inspect the Cargo-reported
+debug companion and complete the source/reuse sequence.
+
+The exact-head review found two proof-setup defects. Debug discovery scanned
+all sibling `.dSYM` directories instead of selecting the Cargo-reported
+executable's exact `<name>.dSYM`; the implementation and ordinary regression
+now select that companion while ignoring unrelated siblings. The probe now
+derives `CARGO_ENCODED_RUSTFLAGS` from the resolved source map's ordered
+effective flags and checks those flags against the later mapped A resolution;
+an ordinary regression asserts the Cargo encoding matches the resolved vector.
+These code corrections do not change the original run's evidence or establish
+debug binding, full-debug source lookup, source invalidation or cross-path
+reuse. The later Queue-recorded v2 continuation result follows.
+
+#### Task 017 continuation session v2 execution result (2026-10-10)
+
+The continuation used the new root
+`/private/var/tmp/oxide-rust-probe-proof-613d9b91-v2`, session ID
+`oxide-probe-session-613d9b91-v2`, and the fixed clock recorded before setup:
+`2026-10-10T15:19:29Z`–`2026-10-10T15:39:29Z`, four fixture invocations.
+The independent committed fixture hash was
+`sha256:550e62cefc7f647fef97b12489fc2c1e1ba67fd56a7529401fce25c97b0ce2e9`.
+The first selector attempt stopped before image creation because the stored
+monotonic markers were increasing but their delta did not encode 20 minutes.
+The marker file was not edited and the window was not reset; the guard now
+reconstructs its monotonic timer from elapsed time in the unchanged UTC pair.
+The next exact ignored-selector run started at 15:31:45Z, within that original
+window, and used the committed head recorded by its run manifest,
+`534204882e12c2230f24360cab8b93a3635cdcf2`.
+
+Cold A was the only fixture Cargo/test invocation. Cargo 1.97.1 and rustc
+1.97.1 compiled six units, the fixture test exited 0 with `1 passed`, and its
+`file!()` and panic-location values were
+`/oxide-source-map-probe/probe/tests/probe.rs` and
+`/oxide-source-map-probe/probe/tests/probe.rs:54`. The manifest directory,
+include/build inputs, generated value, proc-macro input and runtime value all
+matched the baseline requested tree. The resolver-derived flag vector was used
+for the build. The run lease finalized `Idle`.
+
+The exact Cargo-reported test executable companion was selected. Its UUID
+`27877A8A-EA00-3288-BD92-070FE9878F6F` and `arm64` architecture matched the
+captured DWARF payload; all three required debug sections were present and the
+bundle file hashes were recorded. The 1 MiB `dwarfdump --debug-info` output
+bound stopped compile-unit/source-path extraction, leaving
+`scan_complete=false` and `bound=false`. No full-debug logical source lookup
+was captured. The probe stopped at this first baseline gate; source-change B,
+shared-slot cold A and warm B did not run. The original session allows no
+replay or root reset.
+
+The image has 8,380,178,432 bytes capacity, 36,184,064 bytes in use at stop,
+53,481,472 bytes allocated backing storage, and 20,480 bytes outside allocation.
+The minimum recorded host free space was 240,012,070,912 bytes, above the
+20 GiB threshold. Host samples were not maintained at 30-second intervals
+during setup, so the resource-bound observation is insufficient despite the
+observed free-space and allocation values. The session clock file also retains
+its raw monotonic marker delta of 1,200,000,000, while the UTC interval records
+the authorized 1,200 seconds; the implementation kept the original UTC
+deadline and reconstructed a monotonic timer without changing the file. These
+clock and sampling limitations are recorded rather than treated as passes.
+After the settled lease, the runner detached the image; it was reattached
+read-only at the same `m` path for inspection. The image and raw captures remain
+preserved. No previous session image or lease was touched.
+
+For v2, `relative_mapping` and `baseline_tests` are supported by the observed
+flag vector and passing cold-A test. `debug_capture_binding` and
+`baseline_path_proof` remain insufficient because DWARF source lookup did not
+complete. `session_clock` and `resource_bounds` remain insufficient for the
+recorded limitations. `source_invalidation`, `cross_path_correctness`, the
+full `ownership_capture` sequence and `reuse_result` were not reached. This
+run does not qualify cross-worktree reuse or useful storage reduction. The bounded scanner correction keeps the original output limit; any further
+execution uses a fresh scoped Queue session and resources.
+
+#### Task 017 continuation session v3 observations (2026-10-10)
+
+The bounded read-only tool preflight on v2's accessible companion retained
+147,604 bytes of new captures under
+`/private/tmp/oxide-017-v3-preflight.p2d_a0kf`. Every scanner exited 0 within
+10 seconds and below the unchanged 1 MiB command bound. The function query
+also emitted same-name namespaces; the parser selects the actual subprogram's
+CU offset instead. Raw function/parent context, selected line table, source
+list, section sizes, UUIDs, tool version, arguments and executable/companion
+hashes are recorded in the scratch manifest. These are authoring observations,
+not retrofitted v2 receipts.
+
+V3 ran the committed implementation at
+`35a476b8b5b57c1311ad3d8912e4de4ffa1bb67d` under the new root
+`/private/var/tmp/oxide-rust-probe-proof-613d9b91-v3`, session
+`oxide-probe-session-613d9b91-v3`. The actual full commit is also recorded in
+each run's private manifest. Its live `Instant` started before setup at UTC
+`2026-10-10T16:04:08Z`, with elapsed deadline 1,200,000 ms and UTC audit deadline
+`16:24:08Z`. The unchanged packed fixture digest was
+`sha256:550e62cefc7f647fef97b12489fc2c1e1ba67fd56a7529401fce25c97b0ce2e9`.
+The driver's frozen-tree/committed-source guards succeeded before Cargo. An
+additional independent Python prelaunch checksum attempt used string rather
+than path-component sorting and failed its digest assertion; the shell still
+launched Effigy. The corrected independent checker matched the digest after
+the run, so that extra check is post-run evidence, not a prelaunch attestation.
+
+Two of the four allowed fixture invocations ran, in order. Private cold A
+rebuilt six units, executed the fixture test with `1 passed`, and printed the
+accepted logical `file!()` and panic paths. Requested-tree values matched.
+The exact packed companion's arm64 UUID
+`48014E44-7CC2-38B9-9627-F66B88BCFE0E` matched its executable. Its independently
+captured DWARF payload digest was
+`sha256:9c3fb2b29441038d3d462bc6592f66238f37367c413ed242fbf4cd9543efd650`.
+The raw project-subprogram/CU context and its selected line table establish
+`probe/tests/probe.rs` under logical working directory
+`/oxide-source-map-probe`; the map resolves that to the frozen A source.
+All required sections were nonzero, and the complete private bundle manifest,
+UUID, original/capture hashes and source lookup produced `bound=true` and
+`scan_complete=true`. The baseline capture occupies 10,550,929 logical bytes.
+
+The changed B marker produced tree
+`sha256:784b4c701a7b752a11e0b5b99e7fff36f796af643cd3e8514ae16147b237ee26`.
+B rebuilt three affected library/test units, its fixture test passed, and all
+include/build/generated/proc-macro/runtime values were `changed-marker` at the
+requested B paths. Independent file-byte checks recorded `values_match=true`.
+Its test/companion UUID was `870AA164-EAF9-33FC-A4E0-1F6F54540EB5`; complete
+companion binding and source lookup also succeeded. The capture occupies
+10,550,742 logical bytes.
+
+The driver nevertheless stopped at the source control: it required the
+unchanged build-script *compiler artifact* to be non-fresh. Cargo reported that
+artifact `fresh=true`, plus `build-script-executed` and the expected newly
+changed generated/proc-macro bytes. That rejection is an overstrict harness
+predicate, not observed stale-source execution or cache unsuitability. The
+later correction requires an affected test rebuild, Cargo's bound output
+directory, changed generated/proc-macro values and the existing independent
+byte checks; an execution row alone cannot prove rerun because Cargo may emit
+cached build-script output. Ordinary coverage includes a fresh script binary
+with changed outputs, stale values, missing execution context and a wrong slot.
+The new predicate was not executed in v3; its failed receipt remains unchanged.
+
+Both leases finalized Idle. B was restored to the frozen tree only after its
+private capture and settlement. The driver ended at about 16,380 ms; shared
+cold A, warm B and cheap configuration/toolchain controls were not reached.
+UTC/elapsed host samples were at 45, 1,786, 2,074, 11,798, 16,223 and 16,357 ms,
+with a largest gap of 9,724 ms. The minimum sampled host free space was
+249,785,610,240 bytes. At stop, APFS capacity was 8,380,178,432 bytes, mounted
+use 48,685,056 bytes, sparse backing allocation 73,404,416 bytes and outside
+allocation 16,384 bytes. No threshold was reached; write attribution remains
+unavailable. The negative path preserved the image and mount. All earlier
+session resources and captures remain unchanged.
+
+The baseline tests and full-debug logical lookup are now observed, while
+source-control acceptance with the corrected predicate, the full ownership
+sequence and cross-path reuse remain unqualified. This is a stopped harness
+qualification, not a negative mechanism decision or useful storage-reduction
+claim. The ended live driver is not resumable; no clock reset, replay, third or
+fourth invocation, or v4 session was started. Further live execution requires a
+fresh scoped Queue session. The earlier
+[review](https://github.com/inflatable-cookie/oxide/pull/17#issuecomment-6098812074)
+applies to its recorded head; the changed producer and these observations still
+require independent exact-head review.
+
+#### Task 017 continuation session v4 observations (2026-10-10)
+
+The fresh Queue-recorded v4 session ran at committed producer head
+`e4daf01b7d7e5ba2a36148b9c0b0cb556f82a13a`, after strict RustQuality routing,
+covering ordinary checks and the exact ignored Effigy plan passed. Before
+launch, an independent Python hash used relative path-component ordering and
+little-endian length framing, checked every fixture byte against that committed
+head, and matched the frozen
+`sha256:550e62cefc7f647fef97b12489fc2c1e1ba67fd56a7529401fce25c97b0ce2e9`.
+The hash and plan were checked in separate successful steps before launch;
+there was no failed prerequisite followed by a compiler invocation. Authoring
+captures are at `/private/tmp/oxide-017-v4-validation.ejavfjg9`, including
+`verify-fixture.py`, `fixture-prelaunch.json`, `live-plan.txt`, `closeout.json`,
+`live-v4.log` and the read-only inspection `v4-inspection.json`.
+
+The driver owned one live `Instant` before setup. Session
+`oxide-probe-session-613d9b91-v4` began at `2026-10-10T16:22:40Z`, with the
+original audit deadline `16:42:40Z` and monotonic deadline 1,200,000 ms.
+The session root is `/private/var/tmp/oxide-rust-probe-proof-613d9b91-v4`;
+its image, mounted sources, slot and captures remain preserved. Earlier
+sessions were neither mutated nor reattached. Three of four fixture
+invocations ran; the ended driver cannot be resumed or supply another live
+invocation without clock reconstruction. No v5 session is authorized.
+
+| Ordered invocation | Actual observation | Settlement |
+| --- | --- | --- |
+| Private baseline A | Six units rebuilt; one fixture test passed; Cargo elapsed 2,884 ms. Logical `file!()` and panic paths, requested-tree behavior and full-debug project source lookup matched A. | Idle |
+| Changed B | Three affected library/test units rebuilt; one fixture test passed; Cargo elapsed 1,023 ms. The unchanged build-script binary was fresh, while independently changed source/tree, generated bytes and build/generated/proc-macro/runtime values matched B. | Idle; B then restored and checked against the frozen tree |
+| Requested shared cold A | The allocator reacquired the control slot, so this was actually warm reuse of changed-B intermediates. Zero units rebuilt; the test executed and failed; Cargo elapsed 207 ms, exit 101. | Uncertain; retained |
+| Warm B | Not invoked after the preceding semantic failure. | Not reached |
+
+For both successful runs, the exact packed `.dSYM` was completely privately
+captured, UUID/hash-bound and source-scanned with nonzero required sections.
+Baseline test UUID was `474982C8-990F-3333-BE90-6179C10116A3`, executable digest
+`sha256:1122543c74d89b173b9455c267e9f2a60c1e60badbb61fd3506f1b14273498cf`
+and debug-file digest
+`sha256:e7429757aa1b6e65ec5055d90e526b88870d8fefecc8df53d3463473a9d579eb`.
+Changed-B UUID was `2F149CFB-1B45-3D6C-8559-0FFBC95248FC`; its executable digest
+was `sha256:11e5d59e7217c115a49372cab08692a1ad5ed2435795cc311f5f88c4dd5e8322`
+and debug-file digest
+`sha256:44781aea50b1efa076c10c25b358e4bc1f6ae717f30cb148233be762a2e4e083`.
+Raw bindings, CU/working-directory/file/line queries, arguments and complete
+companions are under `m/runs/{reference-a,source-miss-b}/capture`. The source
+control and cheap configuration/toolchain key-separation controls passed their
+actual predicates. No extra fixture smoke compile was used.
+
+The third run is a concrete stale-source behavior failure after a qualified
+baseline, not a scanner or compile setup failure. Its Cargo rows claim A and
+`fresh=true` for all six units, but its privately captured executable and
+debug-file hashes equal changed B. The fixture assertion at logical
+`/oxide-source-map-probe/probe/tests/probe.rs:18` failed with runtime value
+`baseline-marker` and compiled expectation `changed-marker`. Both requested
+source markers are baseline bytes; retained generated output still names B
+and contains `BUILD_VALUE = "changed-marker"`. Raw stdout/stderr hashes match
+the private manifest. The test fails before emitting its normal observation
+rows, so the qualifier conservatively reports missing behavior/compile-origin
+evidence and Fail, and settlement becomes Uncertain. The image/slot must not
+be reused, evicted, detached or released on this result. No repair or replay
+was attempted after that predicate failed.
+
+This does not establish the intended separate cold-A/warm-B pair: its first
+shared invocation was already warm. It nevertheless demonstrates that this
+observed shared-target transition accepted stale changed-source artifacts.
+The candidate therefore has no qualified cross-path reuse or storage benefit.
+Any next mechanism decision must preserve requested-tree behavior and consider
+a narrower checkout-isolated boundary; an alternate mechanism is not
+implemented here. Production remains checkout-isolated, and consumer source
+path/lifecycle coordination and representative usefulness remain separate.
+
+The independent timer also sampled during the live session. Completed
+UTC/elapsed samples were at 59, 1,832, 2,102, 11,761, 16,008, 20,171 and
+23,025 ms; the largest gap was 9,659 ms. Minimum sampled host free space was
+240,210,411,520 bytes. Final sampled APFS capacity was 8,380,178,432 bytes,
+mounted use 67,846,144 bytes, backing allocation 88,084,480 bytes and outside
+allocation 16,384 bytes. No threshold was reached; write attribution is
+unavailable. The driver stopped in about 23 seconds without resetting its
+clock/count. No remaining-slot replay can run after its lifetime ended.
+
+Effigy `rust:compile` and `rust:format` completed successfully; `test rust`
+passed 61 ordinary tests with two live probes ignored. Compile retained the
+existing 125 library dead-code warnings. Owning-document validation uses
+`docs:check`. These are author observations pending independent exact-head
+review of the current producer and raw v4 captures; the earlier review
+[6098812074](https://github.com/inflatable-cookie/oxide/pull/17#issuecomment-6098812074)
+does not review these paths or provide current verdict credit.
 
 ### Bounded real-project follow-up (execution not authorized)
 
