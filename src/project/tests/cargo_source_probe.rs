@@ -15,8 +15,8 @@ use crate::storage::{
     SettlementEvidence, SlotState, StorageError, TerminalOutcome, TerminalRecord,
 };
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -236,15 +236,13 @@ fn oxide_cargo_source_map_probe() {
 }
 
 fn run_probe() -> Result<(), String> {
-    let started = Instant::now();
-    match fs::symlink_metadata(ROOT) {
-        Ok(_) => return Err(format!("refusing unknown pre-existing state at {ROOT}")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(format!(
-                "could not establish that {ROOT} is absent: {error}"
-            ))
-        }
+    let session_clock = Instant::now();
+    let prior_elapsed = known_resume_elapsed()?;
+    let started = session_clock
+        .checked_sub(prior_elapsed)
+        .ok_or_else(|| "could not preserve the original session start".to_owned())?;
+    if started.elapsed() >= MAX_SESSION {
+        return Err("the original 60 minute session limit was reached".to_owned());
     }
     let host_free = native::host_free_bytes(Path::new("/private/var/tmp"))
         .map_err(|_| "host free-space preflight unavailable".to_owned())?;
@@ -261,7 +259,8 @@ fn run_probe() -> Result<(), String> {
     let image = PathBuf::from(ROOT).join("oxide-rust-probe.sparseimage");
     let mount = PathBuf::from(ROOT).join("m");
     let setup_temp = PathBuf::from(ROOT).join("setup-tmp");
-    let (attach, outside_directories) = setup_image(&image, &mount, &setup_temp)?;
+    let (attach, outside_directories) =
+        setup_image(&image, &mount, &setup_temp, prior_elapsed > Duration::ZERO)?;
     let evidence = mount.join("evidence");
     fs::create_dir(&evidence).map_err(|error| error.to_string())?;
     fs::create_dir(mount.join("tmp")).map_err(|error| error.to_string())?;
@@ -1596,43 +1595,265 @@ fn write_frozen_fixture(frozen: &FrozenFixture, destination: &Path) -> Result<()
     Ok(())
 }
 
-fn setup_image(image: &Path, mount: &Path, setup_temp: &Path) -> Result<(String, u64), String> {
-    fs::create_dir(ROOT).map_err(|error| error.to_string())?;
-    fs::create_dir(mount).map_err(|error| error.to_string())?;
-    fs::create_dir(setup_temp).map_err(|error| error.to_string())?;
-    let created = Command::new("/usr/bin/hdiutil")
-        .args([
-            "create",
-            "-size",
-            "8g",
-            "-type",
-            "SPARSE",
-            "-fs",
-            "APFS",
-            "-volname",
-            "oxide-rust-probe",
-            "-nospotlight",
-            "-quiet",
-        ])
-        .arg(image)
-        .env("TMPDIR", setup_temp)
-        .env("TMP", setup_temp)
-        .env("TEMP", setup_temp)
+fn known_resume_elapsed() -> Result<Duration, String> {
+    let root = Path::new(ROOT);
+    match fs::symlink_metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Duration::ZERO),
+        Err(error) => return Err(format!("could not inspect {ROOT}: {error}")),
+        Ok(metadata)
+            if metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && fs::canonicalize(root).is_ok_and(|path| path == root) => {}
+        Ok(_) => return Err(format!("refusing unknown pre-existing state at {ROOT}")),
+    }
+
+    let expected_root_entries = BTreeSet::from([
+        "m".to_owned(),
+        "oxide-rust-probe.sparseimage".to_owned(),
+        "setup-tmp".to_owned(),
+    ]);
+    if directory_names(root)? != expected_root_entries {
+        return Err(format!("refusing unknown pre-existing state at {ROOT}"));
+    }
+    let mount = root.join("m");
+    let setup_temp = root.join("setup-tmp");
+    for directory in [&mount, &setup_temp] {
+        let metadata = fs::symlink_metadata(directory).map_err(|error| error.to_string())?;
+        let canonical = fs::canonicalize(directory).map_err(|error| error.to_string())?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || canonical.as_path() != directory
+        {
+            return Err(
+                "pre-existing probe directories are not owned canonical directories".to_owned(),
+            );
+        }
+    }
+    let expected_setup_entries = BTreeSet::from([
+        "attempt-1.txt".to_owned(),
+        "imageinfo-attempt-1.plist".to_owned(),
+        "resume-state.txt".to_owned(),
+    ]);
+    if directory_names(&setup_temp)? != expected_setup_entries
+        || !directory_names(&mount)?.is_empty()
+    {
+        return Err("pre-existing probe setup contents are not the recorded task state".to_owned());
+    }
+
+    let state_path = setup_temp.join("resume-state.txt");
+    let state = fs::read_to_string(&state_path).map_err(|error| error.to_string())?;
+    let mut fields = BTreeMap::new();
+    let mut lines = state.lines();
+    if lines.next() != Some("oxide-rust-probe-resume-v1") {
+        return Err("probe resume marker has an unknown version".to_owned());
+    }
+    for line in lines {
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| "probe resume marker is malformed".to_owned())?;
+        if fields.insert(key.to_owned(), value.to_owned()).is_some() {
+            return Err("probe resume marker repeats a field".to_owned());
+        }
+    }
+    let required = [
+        ("root", ROOT),
+        ("image", "oxide-rust-probe.sparseimage"),
+        ("image_virtual_capacity", "8589934592"),
+        ("attempt_count", "1"),
+    ];
+    if fields.len() != 8
+        || required
+            .iter()
+            .any(|(key, expected)| fields.get(*key).map(String::as_str) != Some(expected))
+    {
+        return Err("probe resume marker does not describe the approved image state".to_owned());
+    }
+
+    let image = root.join("oxide-rust-probe.sparseimage");
+    let image_metadata = fs::symlink_metadata(&image).map_err(|error| error.to_string())?;
+    if !image_metadata.is_file() || image_metadata.file_type().is_symlink() {
+        return Err("recorded sparse image is not a regular file".to_owned());
+    }
+    let image_digest = digest_file_path(&image)?;
+    let image_allocated_length = image_metadata.len().to_string();
+    if fields.get("image_allocated_length").map(String::as_str)
+        != Some(image_allocated_length.as_str())
+        || fields.get("image_digest") != Some(&image_digest)
+    {
+        return Err("recorded sparse image changed since setup attempt 1".to_owned());
+    }
+
+    let info_path = setup_temp.join("imageinfo-attempt-1.plist");
+    let info_metadata = fs::symlink_metadata(&info_path).map_err(|error| error.to_string())?;
+    if !info_metadata.is_file() || info_metadata.file_type().is_symlink() {
+        return Err("recorded hdiutil image information is not a regular file".to_owned());
+    }
+    let info_bytes = fs::read(&info_path).map_err(|error| error.to_string())?;
+    let recorded_info_digest = hex_digest(&info_bytes);
+    if fields.get("imageinfo_digest") != Some(&recorded_info_digest)
+        || image_info(&image)? != info_bytes
+        || image_capacity(&info_path)? != IMAGE_CAP
+        || !String::from_utf8_lossy(&info_bytes).contains("<string>sparse</string>")
+        || !String::from_utf8_lossy(&info_bytes).contains("<string>APFS</string>")
+    {
+        return Err(
+            "recorded hdiutil evidence does not prove the exact sparse APFS image".to_owned(),
+        );
+    }
+    let attempt =
+        fs::read_to_string(setup_temp.join("attempt-1.txt")).map_err(|error| error.to_string())?;
+    if !attempt.contains("Result: exit 101 before any fixture Cargo invocation")
+        || !attempt.contains("15732736")
+    {
+        return Err("recorded first attempt lacks its setup failure evidence".to_owned());
+    }
+
+    let root_device = df_space(root)?.0;
+    let mount_device = df_space(&mount)?.0;
+    if root_device != mount_device {
+        return Err("probe mount path is already mounted on a different device".to_owned());
+    }
+    let attached = Command::new("/usr/bin/hdiutil")
+        .arg("info")
         .output()
         .map_err(|error| error.to_string())?;
-    if !created.status.success() {
+    if !attached.status.success()
+        || String::from_utf8_lossy(&attached.stdout).contains(image.to_string_lossy().as_ref())
+    {
+        return Err("probe image is already attached or hdiutil state is unknown".to_owned());
+    }
+
+    let elapsed_ms = fields
+        .get("prior_elapsed_ms")
+        .ok_or_else(|| "probe resume marker lacks prior elapsed time".to_owned())?
+        .parse::<u64>()
+        .map_err(|error| error.to_string())?;
+    Ok(Duration::from_millis(elapsed_ms))
+}
+
+fn directory_names(directory: &Path) -> Result<BTreeSet<String>, String> {
+    let mut names = BTreeSet::new();
+    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "symlink refused in bounded probe setup: {}",
+                entry.path().display()
+            ));
+        }
+        names.insert(
+            entry
+                .file_name()
+                .into_string()
+                .map_err(|_| "non-UTF-8 bounded probe path refused".to_owned())?,
+        );
+    }
+    Ok(names)
+}
+
+fn digest_file_path(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let count =
+            std::io::Read::read(&mut file, &mut buffer).map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("sha256:{:x}", digest.finalize()))
+}
+
+fn image_info(image: &Path) -> Result<Vec<u8>, String> {
+    let result = Command::new("/usr/bin/hdiutil")
+        .args(["imageinfo", "-plist"])
+        .arg(image)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if result.status.success() {
+        Ok(result.stdout)
+    } else {
+        Err(format!(
+            "hdiutil imageinfo failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        ))
+    }
+}
+
+fn image_capacity(plist: &Path) -> Result<u64, String> {
+    let result = Command::new("/usr/bin/plutil")
+        .args(["-extract", "Size Information.Total Bytes", "raw", "-o", "-"])
+        .arg(plist)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !result.status.success() {
         return Err(format!(
-            "hdiutil create failed: {}",
-            String::from_utf8_lossy(&created.stderr)
+            "plutil could not read hdiutil virtual capacity: {}",
+            String::from_utf8_lossy(&result.stderr)
         ));
     }
-    let image_length = fs::metadata(image)
-        .map_err(|error| error.to_string())?
-        .len();
-    if image_length != IMAGE_CAP {
-        return Err(format!(
-            "sparse image length differs from the approved 8 GiB cap: {image_length}"
-        ));
+    String::from_utf8_lossy(&result.stdout)
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| error.to_string())
+}
+
+fn setup_image(
+    image: &Path,
+    mount: &Path,
+    setup_temp: &Path,
+    resume: bool,
+) -> Result<(String, u64), String> {
+    if !resume {
+        fs::create_dir(ROOT).map_err(|error| error.to_string())?;
+        fs::create_dir(mount).map_err(|error| error.to_string())?;
+        fs::create_dir(setup_temp).map_err(|error| error.to_string())?;
+        let created = Command::new("/usr/bin/hdiutil")
+            .args([
+                "create",
+                "-size",
+                "8g",
+                "-type",
+                "SPARSE",
+                "-fs",
+                "APFS",
+                "-volname",
+                "oxide-rust-probe",
+                "-nospotlight",
+                "-quiet",
+            ])
+            .arg(image)
+            .env("TMPDIR", setup_temp)
+            .env("TMP", setup_temp)
+            .env("TEMP", setup_temp)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !created.status.success() {
+            return Err(format!(
+                "hdiutil create failed: {}",
+                String::from_utf8_lossy(&created.stderr)
+            ));
+        }
+    }
+    let info = image_info(image)?;
+    let image_info_capture = setup_temp.join("imageinfo-before-attach.plist");
+    let mut info_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&image_info_capture)
+        .map_err(|error| error.to_string())?;
+    info_file
+        .write_all(&info)
+        .map_err(|error| error.to_string())?;
+    info_file.sync_all().map_err(|error| error.to_string())?;
+    if image_capacity(&image_info_capture)? != IMAGE_CAP
+        || !String::from_utf8_lossy(&info).contains("<string>sparse</string>")
+        || !String::from_utf8_lossy(&info).contains("<string>APFS</string>")
+    {
+        return Err("hdiutil did not confirm the approved 8 GiB sparse APFS image".to_owned());
     }
     let outside_directories =
         allocated_blocks(Path::new(ROOT))?.saturating_add(allocated_blocks(mount)?);
