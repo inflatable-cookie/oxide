@@ -1181,20 +1181,228 @@ complete ownership/capture sequence as insufficient. Effigy `rust:compile`,
 two live probes ignored. Compile retained 125 existing library dead-code
 warnings. These checks do not qualify shared reuse.
 
-Read-only inspection of the preserved v4 files identifies a freshness
-hypothesis for the next design: A's unchanged marker mtime is
-`1791649362229659522` ns, older than the changed-B build-script fingerprint
-mtime `1791649372393953572` ns. Its fingerprint records the relative
-`rerun-if-changed` input `marker.txt`; generated output still carries B's
-changed value. [Cargo's build-script change detection](https://doc.rust-lang.org/cargo/reference/build-scripts.html#rerun-if-changed)
-uses file mtimes. This is consistent with a cross-root freshness alias, but
-does not yet establish the complete causal chain on pinned Cargo 1.97.1.
-The [upstream checksum-freshness experiment](https://doc.rust-lang.org/cargo/reference/unstable.html#checksum-freshness)
-is unstable and still excludes build-script inputs from checksum checking;
-it is not a qualified drop-in fix. Diagnose source and build-input freshness
-alongside compiled behavior paths before selecting a corrective reuse
-boundary. Do not mutate retained fingerprints, touch consumer sources, or
-start another live probe to infer that diagnosis.
+Read-only inspection of the preserved v4 files recorded A's unchanged marker
+mtime `1791649362229659522` ns, older than the changed-B build-script
+fingerprint mtime `1791649372393953572` ns, with relative `rerun-if-changed`
+input `marker.txt` and generated output still carrying B's changed value.
+Task 018 pinned that chain against Cargo 1.97.1 (`c980f4866`) and the
+allocator/partition code; see
+[stale-source diagnosis](#task-018-stale-source-diagnosis-and-proposed-compile-origin-admission-2026-10-10).
+Do not mutate retained fingerprints, touch consumer sources, or start another
+live probe from these resources.
+
+#### Task 018 stale-source diagnosis and proposed compile-origin admission (2026-10-10)
+
+Design-only. No compiler, fixture, image, slot or timestamp mutation. Evidence
+is the preserved v4 root
+`/private/var/tmp/oxide-rust-probe-proof-613d9b91-v4`, author inspection
+`/private/tmp/oxide-017-v4-validation.ejavfjg9`, committed producer
+`src/project/resolve.rs` / `src/project/tests/cargo_source_probe.rs`, and
+pinned Cargo 1.97.1 (`c980f4866`) fingerprint sources. This is not a generic
+Cargo defect finding and does not claim that all cross-worktree reuse is
+impossible.
+
+##### Allocator, partition and compile-origin transition
+
+Logical mapped mode builds `path_identity` as
+`disposable-root:{id}:{root_digest}:{map_digest}` and omits the requested root
+ID (`source_scope` is empty unless strict-physical). A, B and requested-A
+therefore shared partition
+`sha256:6d5af6571b28e2085d984887f1f98133cf69fb6311bf55ddb03638acb0151951`.
+`execute_owned` acquires against that partition and sets the exclusive slot as
+the Cargo build directory. After Idle settlement, the allocator reuses the
+idle slot. Source-tree digest is recorded on the run binding and is not an
+acquire admission check against the slot's last compile origin.
+
+| Step | Requested root / tree | Slot | `slot_reused` | Cargo | Settlement |
+| --- | --- | --- | --- | --- | --- |
+| Private baseline A | `a` / `sha256:550e62ce…e2e9` | `slot-0000000000000001` | false | 6 rebuilt | Idle, lease `9be223bb…` |
+| Changed B | `b` / `sha256:784b4c70…ee26` | same | true | 3 rebuilt | Idle, lease `7c94a4d8…`; B then restored to `550e62ce…` |
+| Requested shared A | `a` / `sha256:550e62ce…e2e9` | same | true | 0 rebuilt, six `compiler-artifact` rows `fresh=true`, exit 101 | Uncertain, lease `ce5fc27e…`, retained |
+
+Step 3 was warm control-slot reuse because the mapped partition is the same
+for every authorized root and the previous lease was Idle. The intended
+separate cold-A/warm-B pair was not reached.
+
+Requested-A privately captured executable
+`sha256:11e5d59e7217c115a49372cab08692a1ad5ed2435795cc311f5f88c4dd5e8322` and
+debug-file `sha256:44781aea50b1efa076c10c25b358e4bc1f6ae717f30cb148233be762a2e4e083`
+equal changed B. The test panicked at logical
+`/oxide-source-map-probe/probe/tests/probe.rs:18` with runtime
+`baseline-marker` versus compiled `changed-marker`. Retained
+`debug/build/oxide-source-probe-6c594a47bb112b5d/out/generated.rs` still names
+B (`BUILD_INPUT_PATH=…/m/b/probe/marker.txt`, `BUILD_VALUE="changed-marker"`).
+Rustc dep-info still records
+`# env-dep:CARGO_MANIFEST_DIR=/private/var/tmp/oxide-rust-probe-proof-613d9b91-v4/m/b/probe`.
+
+##### Cargo 1.97.1 freshness inputs (proven)
+
+Pinned Cargo fingerprints in the retained slot:
+
+- Run-custom-build
+  `.fingerprint/oxide-source-probe-6c594a47bb112b5d/run-build-script-build-script-build.json`
+  (mtime `1791649372393953572` ns):
+  `local: [{RerunIfChanged: {output: "debug/build/oxide-source-probe-6c594a47bb112b5d/output", paths: ["marker.txt"]}}]`.
+  `output` mtime is `1791649372242345471` ns. A's `probe/marker.txt` mtime is
+  `1791649362229659522` ns, older than `output`, so `RerunIfChanged` is fresh.
+  Cargo `c980f4866` `find_stale_file` treats `path_mtime <= reference_mtime` as
+  fresh, so equal timestamps are also a hit. B's restored marker is
+  `1791649376357229122` ns, newer than `output`; a same-root request at B after
+  restore would have been dirty. The failure is the cross-root request whose
+  relative files are older or equal.
+- Library/test units use `CheckDepInfo` with `checksum: false`. Encoded
+  Cargo dep-info lists package-relative `marker.txt`, `src/lib.rs`,
+  `tests/probe.rs`, `build.rs` and slot-relative `generated.rs`, with
+  `nenv=0`. `translate_dep_info` in Cargo `c980f4866` drops rustc-synthesized
+  env vars such as `CARGO_MANIFEST_DIR` because they are assumed tracked
+  elsewhere. They are not.
+- Fingerprint `path` is the workspace-relative target src path. Cargo 1.97.1
+  fingerprints never hash absolute checkout paths so that renaming a project
+  directory can reuse artifacts
+  ([fingerprint module](https://github.com/rust-lang/cargo/blob/c980f4866/src/cargo/core/compiler/fingerprint/mod.rs)).
+
+Official [rerun-if-changed](https://doc.rust-lang.org/cargo/reference/build-scripts.html#rerun-if-changed)
+compares file mtimes to the last run. Unstable
+[checksum-freshness](https://doc.rust-lang.org/cargo/reference/unstable.html#checksum-freshness)
+needs nightly rustc, replaces rustc dep-info mtimes with checksums, and does
+not replace build-script `RerunIfChanged` mtime comparison. It is not a
+stable 1.97.1 fix.
+
+Cargo still did the right forward miss at B: newer relative `marker.txt`
+reran the script and rebuilt the three affected units. Relative fingerprints
+inside one package root remain useful. They do not bind compile origin across
+mapped roots.
+
+##### Proven causes versus remaining limits
+
+Proven:
+
+1. Oxide admitted an idle mapped slot across different compile-origin trees
+   and roots, then executed Cargo against those intermediates.
+2. Cargo 1.97.1 treated relative `marker.txt` and relative rustc inputs as
+   fresh because their mtimes were older than the B-written `output` /
+   dep-info anchors (`path_mtime <= reference_mtime`, so equals are fresh
+   too), and it stored no `CARGO_MANIFEST_DIR` in encoded dep-info.
+3. The executed test binary and generated/proc-macro/runtime values were B's.
+
+Not proven, and not claimed: that every cross-worktree reuse is impossible,
+that Cargo unit invalidation is generally broken, or that touching sources or
+editing fingerprints would be a supported fix.
+
+##### Smallest fail-closed pre-execution contract
+
+Compare two Oxide-only boundaries; do not adopt sccache, nightly checksum
+flags, source touching, fingerprint edits, or post-execution path checks as
+the admission gate.
+
+1. **Compile-origin admission (recommended).** After a successful
+   compile-through-capture, bind the idle slot to last compile origin:
+   `requested_root_id` plus `source_tree_digest`, inside the existing
+   compatibility partition. Acquire selects an Idle slot only when
+   `partition + requested_root_id + source_tree_digest` all match. It must
+   not pick a different-origin idle slot in that partition (today's
+   least-recently-used partition match in `store.rs` is the defect). No
+   origin match is a miss: create a new exclusive empty slot in the same
+   partition, or refuse mapped reuse and use a private checkout-isolated
+   fallback. Never execute the mismatched intermediates, never touch
+   sources, and never edit fingerprints. Same-origin retry remains a warm
+   candidate and still needs Cargo's unit fingerprints plus
+   full-debug/behavior checks. A later request for a retained prior origin
+   may warm-hit that prior slot; that is not a hit on the mismatched slot.
+   New origin slots and retained prior-origin idle slots both count against
+   the existing budget. `make_room` may evict other proven-idle slots only;
+   leased or uncertain state is never evicted, and budget exhaustion refuses
+   the new slot ([Budget](architecture.md#budget-and-observations),
+   [Q-003](questions.md#q-003--what-partitions-budgets-and-reconciliation-proofs-are-sufficient)).
+2. **Tree-digest-only admission.** Allow a different root when the tree
+   digest matches. That would admit same-content warm B, while retained
+   `generated.rs`, `CARGO_MANIFEST_DIR`, include and proc-macro paths still
+   name the previous root. The behavior-bearing path contract forbids it.
+
+Recommend (1). Retained benefit: true same-origin warm retry and exclusive
+ownership, with fail-closed source transitions. Cost: each distinct origin
+may occupy another full-debug slot until idle eviction; mapped A/B hits are
+refused, so ad hoc worktree duplication stays unsolved until a different
+mechanism exists. Production keys stay checkout-isolated. Logical
+compiler-name remapping may remain for debug/`file!()`/panic names; it is
+not a reuse ticket.
+
+Stable Cargo can keep relative unit invalidation inside one origin and can
+cold-partition on rustflag/map changes. It cannot see older or equal
+relative content at another package root, cannot treat synthesized
+`CARGO_MANIFEST_DIR` as a freshness input, and cannot make checksum-freshness
+a 1.97.1 build-script fix. Cross-root reuse therefore needs consumer-owned
+stable paths, a content-addressed mechanism, or an operator decision to stop
+remapping; those are outside this correction.
+
+##### Proposed follow-up proof (not authorized here)
+
+Fresh Queue session; no v4 attach, detach, replay or resource reuse.
+Implementation remains a later scoped brief.
+
+Envelope: 20 minutes including setup and the four compiler/test invocations,
+then 20 minutes independent review. One new task-owned 8 GiB APFS sparse
+image at `/private/var/tmp/oxide-rust-probe-proof-018-origin` (capacity
+8,380,178,432 bytes). Separate 10 GiB disposable ceiling over image,
+checkouts, slot, redirected TMPDIR/TMP/TEMP and captures. Monitored 20 GiB
+host free-space start/abort threshold. Driver-owned monotonic
+`std::time::Instant` from before setup, 1,200,000 ms deadline, max four
+Cargo invocations, independent sampling at protocol boundaries and on a
+20-second timer with a completed-sample gap of at most 30 seconds covering
+setup, scanning and capture. Pin already-installed cargo 1.97.1
+(`c980f4866`) and rustc 1.97.1 (`8bab26f4f`); selector
+`test --offline --locked --message-format=json-render-diagnostics -- --nocapture`;
+full-debug `packed` fixture profile; frozen fixture digest
+`sha256:550e62cefc7f647fef97b12489fc2c1e1ba67fd56a7529401fce25c97b0ce2e9`.
+While a partition slot is leased or uncertain, a second claimant is refused
+without touching slot bytes. Each run records rebuilt-unit counts, elapsed
+ms, slot measured bytes, image used/backing allocation, outside allocation
+and sampled host free space. Full-debug companion binding and project-source
+lookup run on every successful compile. Stop and retain on first uncertain
+lease, budget/host breach or missing evidence.
+
+Acquire under the proposed rule: match `partition + requested_root_id +
+source_tree_digest`. Record each acquire's slot id, origin and whether it
+was a new slot.
+
+1. Cold A at tree T0 / root A: new slot-1, bind origin A+T0, tests and
+   full-debug lookup pass, generated/proc-macro/runtime paths are A's, Idle.
+2. Warm A at T0 / root A: acquire must return slot-1, zero rebuilt units,
+   hashes and behavior match step 1.
+3. Changed B at tree T1 / root B: no origin match. Acquire must not return
+   slot-1. Create slot-2 if budget allows after `make_room` of other
+   proven-idle slots, else refuse mapped reuse (private fallback). B compiles
+   only on that clean miss path and matches B. Record whether slot-1 remained
+   Idle or was proven-idle-evicted. Leave root A at T0 with its original
+   older marker mtime. Do not set A's `probe/marker.txt` equal to slot-2's
+   `output` mtime: that timestamp is later than slot-1's `output`, so a
+   same-origin retry of slot-1 would rebuild and destroy the warm-hit check.
+4. Requested A at T0 / root A:
+   - If slot-1 is still Idle with origin A+T0, acquire must return slot-1
+     (same-origin warm hit, zero rebuilt units, hashes equal step 1, not
+     step 3).
+   - If slot-1 was proven-idle-evicted, this is a miss: new empty slot or
+     private fallback; Cargo may cold-compile T0. Acquire must not return
+     slot-2.
+   Older timestamps are v4 evidence. Equal timestamps do not get a fifth
+   compile or a same-root restore step. Acquire matches origin and tree
+   digest before Cargo, so `find_stale_file` treating
+   `path_mtime <= reference_mtime` as fresh cannot admit slot-2 for T0, and
+   a same-root changed-then-restored tree would miss on `source_tree_digest`
+   before execution. Origin/digest admission is the safety gate; this proof
+   does not show that Cargo itself rebuilds when mtimes are equal and
+   content differs.
+
+Success: (2) is a warm hit on slot-1; (3) never executes A's intermediates
+as B and never returns slot-1 for B; (4) never returns slot-2 or executes B
+artifacts; every successful compile has full-debug binding and
+generated/proc-macro/runtime paths for the requested origin; exclusive
+second-claim refusal holds; clocks, samples and resource caps hold.
+Failure: any acquire of a different-origin slot, any execution of stale
+artifacts, any origin-mismatch warm hit, missing debug/behavior evidence on
+a successful compile, or a resource/clock gate miss. Uncertain ownership
+stays retained. This proof cannot claim everyday storage relief or
+cross-root usefulness.
 
 ### Bounded real-project follow-up (execution not authorized)
 
