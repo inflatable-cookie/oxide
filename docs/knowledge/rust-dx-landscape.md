@@ -1,6 +1,6 @@
 # Rust development experience: research landscape
 
-Read-only research, checked 2026-10-09. This file owns findings and candidate remedies, not the project plan. [Vision](vision.md) owns the desired experience; Queue owns order, briefs and execution authority. No experiments have been run by Oxide. Tool availability and compatibility must be checked on selected pinned versions before adoption.
+Read-only research, checked 2026-10-09. This file owns findings and candidate remedies, not the project plan. [Vision](vision.md) owns the desired experience; Queue owns order, briefs and execution authority. Oxide has run bounded qualification work; [qualification readiness](qualification-readiness.md) records its scope and limits. Tool availability and compatibility must be checked on selected pinned versions before adoption.
 
 ## Evidence and implications
 
