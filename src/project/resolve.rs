@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 /// How checkout identity enters the compatibility key.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PathIdentity {
+    /// Fixed owned-fixture admission at one physical root; no logical remapping.
+    SameRootCargoFixture { id: String, root: PathBuf },
     /// Default key: the canonical checkout path is part of identity.
     Checkout,
     /// Trial-only identity. Without an explicit qualified map it remains
@@ -258,7 +260,31 @@ fn resolve_selected(
     if paths_overlap(&target_dir, &capture_dir) {
         return Err(AdapterRefusal::AmbiguousInput);
     }
+    let same_root = matches!(
+        workflow.path_identity,
+        PathIdentity::SameRootCargoFixture { .. }
+    );
+    let source_tree_digest = if same_root {
+        super::freshness::validate_workflow(invocation, &workflow)?;
+        super::freshness::requested_tree(&workspace_root)?
+    } else {
+        invocation.source_tree_digest.clone()
+    };
     let (path_identity, mut source_map) = match &workflow.path_identity {
+        PathIdentity::SameRootCargoFixture { id, root } => {
+            let root = canonical_directory(root)?;
+            if !workspace_root.starts_with(&root) || workspace_root == root {
+                return Err(AdapterRefusal::UnsupportedInput);
+            }
+            let identity = source_map::disposable_root_identity(id, &root)?;
+            (
+                format!(
+                    "same-root-fixture-v1:{identity}:{}",
+                    workspace_root.display()
+                ),
+                None,
+            )
+        }
         PathIdentity::Checkout => (
             workspace_root
                 .to_str()
@@ -333,7 +359,7 @@ fn resolve_selected(
         workflow,
         partition,
         commit: invocation.commit.clone(),
-        source_tree_digest: invocation.source_tree_digest.clone(),
+        source_tree_digest,
         workspace_root,
         target_dir,
         capture_dir,

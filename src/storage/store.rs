@@ -585,8 +585,34 @@ impl Store {
         };
         let reservation = measured.max(request.required_bytes);
         let growth = reservation.saturating_sub(measured);
-        self.make_room(growth, matching.as_deref())?;
-        self.require_free_space(growth, matching.as_deref())?;
+        if request
+            .envelope
+            .partition
+            .path_identity
+            .starts_with("same-root-fixture-v1:")
+        {
+            // First slice: one compatibility partition per registered root.
+            // An acquire never borrows authority for generation eviction.
+            if self.ledger.slots.iter().any(|slot| {
+                slot.partition
+                    .path_identity
+                    .starts_with("same-root-fixture-v1:")
+                    && slot.partition != request.envelope.partition
+            }) || self.accounted_bytes()?.saturating_add(growth) > self.ledger.budget.cap_bytes
+            {
+                return Err(StorageError::Refused(RefusalReason::BudgetExceeded));
+            }
+            let free = self
+                .free_space
+                .available_bytes(&self.root)?
+                .ok_or(StorageError::Refused(RefusalReason::FreeSpaceUnavailable))?;
+            if free < self.ledger.budget.free_reserve_bytes.saturating_add(growth) {
+                return Err(StorageError::Refused(RefusalReason::FreeSpaceReserve));
+            }
+        } else {
+            self.make_room(growth, matching.as_deref())?;
+            self.require_free_space(growth, matching.as_deref())?;
+        }
 
         let lease_id = random_hex(16)?;
         let token = random_hex(32)?;
@@ -858,6 +884,10 @@ impl Store {
                 .iter()
                 .filter(|slot| {
                     slot.state == InternalSlotState::Idle
+                        && !slot
+                            .partition
+                            .path_identity
+                            .starts_with("same-root-fixture-v1:")
                         && slot.lease_id.is_none()
                         && slot.measured_bytes.is_some()
                 })
@@ -875,7 +905,13 @@ impl Store {
 
     fn evict_slot(&mut self, id: &str) -> Result<u64, StorageError> {
         let slot = self.slot_by_id(id)?;
-        if slot.state != InternalSlotState::Idle || slot.lease_id.is_some() {
+        if slot
+            .partition
+            .path_identity
+            .starts_with("same-root-fixture-v1:")
+            || slot.state != InternalSlotState::Idle
+            || slot.lease_id.is_some()
+        {
             return Err(StorageError::Refused(RefusalReason::NoIdleStorage));
         }
         let bytes = slot
@@ -902,6 +938,10 @@ impl Store {
                 .iter()
                 .filter(|slot| {
                     slot.state == InternalSlotState::Idle
+                        && !slot
+                            .partition
+                            .path_identity
+                            .starts_with("same-root-fixture-v1:")
                         && slot.lease_id.is_none()
                         && slot.measured_bytes.is_some()
                         && Some(slot.id.as_str()) != protected
@@ -941,6 +981,10 @@ impl Store {
                 .iter()
                 .filter(|slot| {
                     slot.state == InternalSlotState::Idle
+                        && !slot
+                            .partition
+                            .path_identity
+                            .starts_with("same-root-fixture-v1:")
                         && slot.lease_id.is_none()
                         && slot.measured_bytes.is_some()
                         && Some(slot.id.as_str()) != protected
@@ -1131,6 +1175,16 @@ fn release_proven(
     token: Option<&LeaseToken>,
     expected_slot_path: &str,
 ) -> bool {
+    if let (ContainmentEvidence::NotSpawned(proof), Some(token)) = (&evidence.containment, token) {
+        return lease.status == LeaseStatus::Leased
+            && evidence.capture.is_none()
+            && proof.lease_id == lease.id
+            && proof.slot_id == lease.slot_id
+            && proof.slot_path == expected_slot_path
+            && proof.run_id == evidence.binding.run_id
+            && proof.attempt_id == evidence.binding.attempt_id
+            && proof.verify(token);
+    }
     let terminal_matches = evidence
         .terminal
         .as_ref()

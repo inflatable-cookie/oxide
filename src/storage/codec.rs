@@ -415,6 +415,19 @@ impl Encode for ContainmentEvidence {
     fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
         match self {
             Self::Unknown => writer.u8(0),
+            Self::NotSpawned(proof) => {
+                writer.u8(4);
+                for value in [
+                    &proof.lease_id,
+                    &proof.slot_id,
+                    &proof.slot_path,
+                    &proof.run_id,
+                    &proof.attempt_id,
+                    &proof.signature,
+                ] {
+                    writer.string(value)?;
+                }
+            }
             Self::Running {
                 pid,
                 start_identity,
@@ -444,6 +457,14 @@ impl Decode for ContainmentEvidence {
     fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
         match reader.u8()? {
             0 => Ok(Self::Unknown),
+            4 => Ok(Self::NotSpawned(NoSpawnEvidence {
+                lease_id: reader.string()?,
+                slot_id: reader.string()?,
+                slot_path: reader.string()?,
+                run_id: reader.string()?,
+                attempt_id: reader.string()?,
+                signature: reader.string()?,
+            })),
             1 => Ok(Self::Running {
                 pid: reader.u32()?,
                 start_identity: String::decode(reader)?,

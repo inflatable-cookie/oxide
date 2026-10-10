@@ -680,3 +680,125 @@ fn daemon_refuses_symlinked_roots_and_preserves_unknown_root_files() {
         b"preserve this task-owned sentinel"
     );
 }
+
+#[test]
+fn no_spawn_settlement_is_token_bound_and_cannot_reconcile_uncertain_ownership() {
+    let root = TaskRoot::new();
+    let daemon = RunningDaemon::start(root.path(), budget(128), Some(1024));
+    let request = request("no-spawn", "no-spawn-acquire", 64);
+    let acquired = daemon.client.acquire(request.clone()).unwrap();
+    let token = acquired.token.as_ref().unwrap();
+    let proof = NoSpawnEvidence::new(&acquired, &request.envelope.binding, token).unwrap();
+    let evidence = SettlementEvidence {
+        binding: request.envelope.binding.clone(),
+        consumer_credential: Credential::new("consumer-proof"),
+        terminal: None,
+        capture: None,
+        containment: ContainmentEvidence::NotSpawned(proof.clone()),
+    };
+    let idle = daemon
+        .client
+        .finalize(&acquired.lease_id, Some(token), "not-started", evidence)
+        .unwrap();
+    assert_eq!(idle.state, SlotState::Idle);
+    let mut next = request.clone();
+    next.acquire_id = "second-acquire".into();
+    next.envelope.binding.run_id = "second-run".into();
+    next.envelope.binding.attempt_id = "second-attempt".into();
+    let second = daemon.client.acquire(next.clone()).unwrap();
+    let forged = SettlementEvidence {
+        binding: next.envelope.binding.clone(),
+        consumer_credential: Credential::new("consumer-proof"),
+        terminal: None,
+        capture: None,
+        containment: ContainmentEvidence::NotSpawned(proof),
+    };
+    let uncertain = daemon
+        .client
+        .finalize(
+            &second.lease_id,
+            second.token.as_ref(),
+            "wrong-lease-proof",
+            forged,
+        )
+        .unwrap();
+    assert_eq!(uncertain.state, SlotState::Uncertain);
+    let new_proof = NoSpawnEvidence::new(
+        &second,
+        &next.envelope.binding,
+        second.token.as_ref().unwrap(),
+    )
+    .unwrap();
+    let evidence = SettlementEvidence {
+        binding: next.envelope.binding,
+        consumer_credential: Credential::new("consumer-proof"),
+        terminal: None,
+        capture: None,
+        containment: ContainmentEvidence::NotSpawned(new_proof),
+    };
+    assert_eq!(
+        daemon
+            .client
+            .reconcile(
+                &second.lease_id,
+                second.token.as_ref(),
+                "no-spawn-after-unknown",
+                evidence
+            )
+            .unwrap()
+            .state,
+        SlotState::Uncertain
+    );
+}
+
+#[test]
+fn same_root_acquire_retains_one_partition_and_never_evicts_without_recovery_policy() {
+    let root = TaskRoot::new();
+    let daemon = RunningDaemon::start(root.path(), budget(128), Some(1024));
+    let mut first = request("first", "first-acquire", 64);
+    first.envelope.partition.path_identity = "same-root-fixture-v1:root-r".into();
+    let acquired = daemon.client.acquire(first.clone()).unwrap();
+    let token = acquired.token.as_ref().unwrap();
+    fs::write(
+        acquired
+            .slot_path
+            .as_ref()
+            .unwrap()
+            .join("invalid-map-bytes"),
+        b"owned bytes",
+    )
+    .unwrap();
+    let proof = NoSpawnEvidence::new(&acquired, &first.envelope.binding, token).unwrap();
+    daemon
+        .client
+        .finalize(
+            &acquired.lease_id,
+            Some(token),
+            "first-idle",
+            SettlementEvidence {
+                binding: first.envelope.binding.clone(),
+                consumer_credential: Credential::new("consumer-proof"),
+                terminal: None,
+                capture: None,
+                containment: ContainmentEvidence::NotSpawned(proof),
+            },
+        )
+        .unwrap();
+    let mut next = request("next", "next-acquire", 64);
+    next.envelope.partition = first.envelope.partition;
+    next.envelope.partition.config_digest = "different-config".into();
+    assert_eq!(
+        daemon.client.acquire(next),
+        Err(StorageError::Refused(RefusalReason::BudgetExceeded))
+    );
+    let before = daemon.client.inventory("before-no-eviction").unwrap();
+    assert_eq!(daemon.client.evict("no-recovery-grant", 128), Ok(0));
+    assert_eq!(
+        daemon.client.inventory("after-no-eviction").unwrap().slots,
+        before.slots
+    );
+    assert_eq!(
+        fs::read(acquired.slot_path.unwrap().join("invalid-map-bytes")).unwrap(),
+        b"owned bytes"
+    );
+}

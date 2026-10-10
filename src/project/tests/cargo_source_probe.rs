@@ -71,13 +71,13 @@ const ENVIRONMENT_KEYS: [&str; 14] = [
     "RUSTUP_TOOLCHAIN",
 ];
 
-struct FrozenFixture {
+pub(super) struct FrozenFixture {
     files: BTreeMap<PathBuf, Vec<u8>>,
     digest: String,
 }
 
 #[derive(Clone)]
-struct SpaceSample {
+pub(super) struct SpaceSample {
     elapsed_ms: u128,
     host_free: u64,
     image_capacity: u64,
@@ -87,12 +87,12 @@ struct SpaceSample {
     outside_allocated: u64,
 }
 
-struct ProbeBudget {
+pub(super) struct ProbeBudget {
     mount: PathBuf,
     image: PathBuf,
     setup_temp: PathBuf,
-    mounted: AtomicBool,
-    outside_directories: AtomicU64,
+    pub(super) mounted: AtomicBool,
+    pub(super) outside_directories: AtomicU64,
     sample_lock: Mutex<()>,
     started: Instant,
     last_sample: Mutex<Instant>,
@@ -100,13 +100,13 @@ struct ProbeBudget {
     failure: Mutex<Option<String>>,
 }
 
-struct PeriodicSampler {
+pub(super) struct PeriodicSampler {
     stop: Sender<()>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl PeriodicSampler {
-    fn start(interval: Duration, mut sample: impl FnMut() + Send + 'static) -> Self {
+    pub(super) fn start(interval: Duration, mut sample: impl FnMut() + Send + 'static) -> Self {
         let (stop, receiver) = mpsc::channel();
         let thread = thread::spawn(move || {
             while matches!(
@@ -159,7 +159,7 @@ fn independent_sampler_runs_while_capture_blocks_over_a_sample_interval() {
     assert!(samples.iter().all(|elapsed| *elapsed < started.elapsed()));
 }
 
-struct ProbeCancellation(Arc<ProbeBudget>);
+pub(super) struct ProbeCancellation(pub(super) Arc<ProbeBudget>);
 
 impl CancellationProbe for ProbeCancellation {
     fn is_cancelled(&self) -> bool {
@@ -192,7 +192,12 @@ impl CancellationProbe for ProbeCancellation {
 }
 
 impl ProbeBudget {
-    fn new(mount: PathBuf, image: PathBuf, setup_temp: PathBuf, started: Instant) -> Arc<Self> {
+    pub(super) fn new(
+        mount: PathBuf,
+        image: PathBuf,
+        setup_temp: PathBuf,
+        started: Instant,
+    ) -> Arc<Self> {
         Arc::new(Self {
             mount,
             image,
@@ -207,7 +212,7 @@ impl ProbeBudget {
         })
     }
 
-    fn sample(&self) -> Result<SpaceSample, String> {
+    pub(super) fn sample(&self) -> Result<SpaceSample, String> {
         let _guard = self
             .sample_lock
             .lock()
@@ -439,8 +444,13 @@ fn probe_plan_passes_runner_validation_before_acquire_and_rejects_forced_overrid
 fn session_clock_persists_original_machine_timestamps() {
     let root = super::super::FixtureRoot::new();
     let setup_temp = root.dir("setup-tmp");
-    record_session_clock(&setup_temp, "2026-10-10T13:00:00Z", "2026-10-10T13:20:00Z")
-        .expect("session clock");
+    record_session_clock(
+        &setup_temp,
+        "2026-10-10T13:00:00Z",
+        "2026-10-10T13:20:00Z",
+        SESSION_ID,
+    )
+    .expect("session clock");
     let body = fs::read_to_string(setup_temp.join("session-clock.txt")).expect("clock file");
     assert!(body.contains("clock=std::time::Instant\n"));
     assert!(body.contains("start_elapsed_ms=0\ndeadline_elapsed_ms=1200000\n"));
@@ -462,9 +472,14 @@ fn live_session_deadline_uses_duration_scale_and_refuses_expired_elapsed() {
     assert!(refuse_session_timeout(&started).is_err());
     let root = super::super::FixtureRoot::new();
     let temp = root.dir("clock");
-    record_session_clock(&temp, "2026-10-10T13:00:00Z", "2026-10-10T13:20:00Z")
-        .expect("initial clock");
-    assert!(record_session_clock(&temp, "later", "later").is_err());
+    record_session_clock(
+        &temp,
+        "2026-10-10T13:00:00Z",
+        "2026-10-10T13:20:00Z",
+        SESSION_ID,
+    )
+    .expect("initial clock");
+    assert!(record_session_clock(&temp, "later", "later", SESSION_ID).is_err());
 }
 
 #[test]
@@ -501,7 +516,7 @@ fn run_probe() -> Result<(), String> {
         .map_err(|error| format!("refusing existing or unavailable v4 root: {error}"))?;
     let setup_temp = PathBuf::from(ROOT).join("setup-tmp");
     fs::create_dir(&setup_temp).map_err(|error| error.to_string())?;
-    record_session_clock(&setup_temp, &start_utc, &deadline_utc)?;
+    record_session_clock(&setup_temp, &start_utc, &deadline_utc, SESSION_ID)?;
     let image = PathBuf::from(ROOT).join("oxide-rust-probe.sparseimage");
     let mount = PathBuf::from(ROOT).join("m");
     let budget = ProbeBudget::new(mount.clone(), image.clone(), setup_temp.clone(), started);
@@ -526,7 +541,8 @@ fn run_probe() -> Result<(), String> {
     refuse_session_timeout(&started)?;
     let scanner_identity = producer::scanner_identity()?;
     refuse_session_timeout(&started)?;
-    let (attach, outside_directories) = setup_image(&image, &mount, &setup_temp)?;
+    let (attach, outside_directories) =
+        setup_image(&image, &mount, &setup_temp, "oxide-rust-probe-proof-v4")?;
     budget
         .outside_directories
         .store(outside_directories, Ordering::Release);
@@ -1372,14 +1388,14 @@ fn execute_owned(
     })
 }
 
-struct ProbeDaemon {
+pub(super) struct ProbeDaemon {
     socket: PathBuf,
     shutdown: Option<Sender<()>>,
     thread: Option<JoinHandle<Result<(), StorageError>>>,
 }
 
 impl ProbeDaemon {
-    fn start(root: &Path, free_space: Arc<ProbeBudget>) -> Self {
+    pub(super) fn start(root: &Path, free_space: Arc<ProbeBudget>) -> Self {
         let daemon = Daemon::bind(
             DaemonConfig {
                 root: root.to_path_buf(),
@@ -1402,7 +1418,7 @@ impl ProbeDaemon {
         }
     }
 
-    fn client(&self) -> Client {
+    pub(super) fn client(&self) -> Client {
         Client::new(self.socket.clone())
     }
 }
@@ -2011,7 +2027,7 @@ fn finish_if_idle(
     ))
 }
 
-fn freeze_fixture(root: &Path) -> Result<FrozenFixture, String> {
+pub(super) fn freeze_fixture(root: &Path) -> Result<FrozenFixture, String> {
     let mut files = BTreeMap::new();
     collect_fixture(root, root, &mut files)?;
     let mut digest = Sha256::new();
@@ -2028,7 +2044,7 @@ fn freeze_fixture(root: &Path) -> Result<FrozenFixture, String> {
     })
 }
 
-fn verify_committed_fixture(root: &Path, frozen: &FrozenFixture) -> Result<(), String> {
+pub(super) fn verify_committed_fixture(root: &Path, frozen: &FrozenFixture) -> Result<(), String> {
     let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let relative_root = Path::new("fixtures/cargo-source-map-probe");
     let tracked = git(
@@ -2095,7 +2111,7 @@ fn collect_fixture(
     Ok(())
 }
 
-fn ensure_probe_directory(path: &Path) -> Result<(), String> {
+pub(super) fn ensure_probe_directory(path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
         Ok(_) => return Err(format!("probe path is not a directory: {}", path.display())),
@@ -2114,7 +2130,10 @@ fn ensure_probe_directory(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn prepare_fixture_root(frozen: &FrozenFixture, destination: &Path) -> Result<(), String> {
+pub(super) fn prepare_fixture_root(
+    frozen: &FrozenFixture,
+    destination: &Path,
+) -> Result<(), String> {
     match fs::symlink_metadata(destination) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return write_frozen_fixture(frozen, destination)
@@ -2167,13 +2186,14 @@ fn session_remaining(elapsed: Duration) -> Result<Duration, String> {
         .ok_or_else(|| "the 20 minute session limit was reached".to_owned())
 }
 
-fn record_session_clock(
+pub(super) fn record_session_clock(
     setup_temp: &Path,
     start_utc: &str,
     deadline_utc: &str,
+    session_id: &str,
 ) -> Result<(), String> {
     let body = format!(
-        "oxide-probe-session-clock-v2\nsession_id={SESSION_ID}\nclock=std::time::Instant\norigin=driver-start-before-setup\nmonotonic_unit=milliseconds\nstart_elapsed_ms=0\ndeadline_elapsed_ms=1200000\nstart_utc={start_utc}\ndeadline_utc={deadline_utc}\nmax_session_secs={}\ninvocation_count=0\nmax_invocations={MAX_INVOCATIONS}\n",
+        "oxide-probe-session-clock-v2\nsession_id={session_id}\nclock=std::time::Instant\norigin=driver-start-before-setup\nmonotonic_unit=milliseconds\nstart_elapsed_ms=0\ndeadline_elapsed_ms=1200000\nstart_utc={start_utc}\ndeadline_utc={deadline_utc}\nmax_session_secs={}\ninvocation_count=0\nmax_invocations={MAX_INVOCATIONS}\n",
         MAX_SESSION.as_secs(),
     );
     let path = setup_temp.join("session-clock.txt");
@@ -2187,17 +2207,17 @@ fn record_session_clock(
     file.sync_all().map_err(|error| error.to_string())
 }
 
-fn machine_epoch_utc(stamp: &str) -> Result<u64, String> {
+pub(super) fn machine_epoch_utc(stamp: &str) -> Result<u64, String> {
     machine_date(&["-j", "-u", "-f", "%Y-%m-%dT%H:%M:%SZ", stamp, "+%s"])?
         .parse()
         .map_err(|_| "machine UTC timestamp could not be parsed".to_owned())
 }
 
-fn machine_utc() -> Result<String, String> {
+pub(super) fn machine_utc() -> Result<String, String> {
     machine_date(&["-u", "+%Y-%m-%dT%H:%M:%SZ"])
 }
 
-fn machine_date(args: &[&str]) -> Result<String, String> {
+pub(super) fn machine_date(args: &[&str]) -> Result<String, String> {
     let output = Command::new("/bin/date")
         .args(args)
         .output()
@@ -2302,7 +2322,12 @@ fn image_block_has_mount(block: &str, mount: &Path, device: &str) -> bool {
         })
 }
 
-fn setup_image(image: &Path, mount: &Path, setup_temp: &Path) -> Result<(String, u64), String> {
+pub(super) fn setup_image(
+    image: &Path,
+    mount: &Path,
+    setup_temp: &Path,
+    volume_name: &str,
+) -> Result<(String, u64), String> {
     fs::create_dir(mount).map_err(|error| error.to_string())?;
     let created = Command::new("/usr/bin/hdiutil")
         .args([
@@ -2314,7 +2339,7 @@ fn setup_image(image: &Path, mount: &Path, setup_temp: &Path) -> Result<(String,
             "-fs",
             "APFS",
             "-volname",
-            "oxide-rust-probe-proof-v4",
+            volume_name,
             "-nospotlight",
             "-quiet",
         ])
@@ -2467,7 +2492,7 @@ fn du_bytes(path: &Path) -> Result<u64, String> {
         .ok_or_else(|| "du allocated-size overflow".to_owned())
 }
 
-fn append_evidence(mount: &Path, line: &str) -> Result<(), String> {
+pub(super) fn append_evidence(mount: &Path, line: &str) -> Result<(), String> {
     let path = mount.join("evidence/events.tsv");
     let mut file = OpenOptions::new()
         .create(true)

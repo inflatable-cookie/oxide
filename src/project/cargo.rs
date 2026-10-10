@@ -78,6 +78,15 @@ impl CargoWorkflowRunner {
     ) -> Result<(), BoundaryFailure> {
         let command = &plan.command;
         let claim = &plan.claim;
+        if command.workflow == super::freshness::WORKFLOW
+            && (command.source_map.is_some()
+                || super::freshness::requested_tree(&command.workspace_root)
+                    .ok()
+                    .as_deref()
+                    != Some(claim.binding.source_tree_digest.as_str()))
+        {
+            return Err(BoundaryFailure::InvalidIdentity);
+        }
         if cancellation.is_cancelled() {
             return Err(BoundaryFailure::Rejected);
         }
@@ -417,6 +426,42 @@ impl FixtureCommandRunner for CargoWorkflowRunner {
         } else {
             None
         };
+        #[cfg(test)]
+        if command.workflow == super::freshness::WORKFLOW && exit_code == 0 {
+            let summary = super::source_map_probe::inspect_cargo_output(&stdout);
+            super::source_map_probe::verify_physical_behavior(
+                &command.workspace_root,
+                &command.cargo_build_dir,
+                &summary,
+            )
+            .map_err(|_| BoundaryFailure::InvalidIdentity)?;
+            let tests: Vec<_> = summary
+                .artifacts
+                .iter()
+                .filter(|artifact| {
+                    artifact.target_name == "probe"
+                        && artifact.target_kinds == ["test"]
+                        && artifact.manifest == command.workspace_root.join("probe/Cargo.toml")
+                })
+                .collect();
+            if tests.len() != 1 {
+                return Err(BoundaryFailure::InvalidIdentity);
+            }
+            let executable = tests[0]
+                .executable
+                .as_ref()
+                .ok_or(BoundaryFailure::InvalidIdentity)?;
+            inside_trial(&self.trial_root, executable)?;
+            super::source_map_probe::capture_physical_test_debug(
+                &command.workspace_root,
+                executable,
+                &command.capture_dir,
+                &mut output_references,
+                &claim.temp_dir,
+                cancellation,
+            )
+            .map_err(|_| BoundaryFailure::Unavailable)?;
+        }
         let capture_digest =
             native::cargo_capture_receipt_digest(&command.capture_dir, &output_references)?;
         let certificate = native::NativeCompletionCertificate::cargo(CargoCompletion {
@@ -484,11 +529,14 @@ fn environment_digest(values: &[EffectiveValue]) -> String {
     digest_parts(&borrowed)
 }
 
-fn source_digest() -> String {
+pub(super) fn source_digest() -> String {
     #[cfg(test)]
     let probe_source = include_str!("source_map_probe.rs");
     #[cfg(test)]
-    let driver_source = include_str!("tests/cargo_source_probe.rs");
+    let driver_source = concat!(
+        include_str!("tests/cargo_source_probe.rs"),
+        include_str!("tests/cargo_same_root.rs")
+    );
     #[cfg(test)]
     let native_source = include_str!("native.rs");
     #[cfg(test)]
@@ -508,6 +556,7 @@ fn source_digest() -> String {
     digest_parts(&[
         "cargo-runner-source-v4",
         include_str!("cargo.rs"),
+        include_str!("freshness.rs"),
         native_source,
         source_map_contract,
         resolver_source,

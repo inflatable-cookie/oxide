@@ -277,12 +277,93 @@ impl CooperativeCompletionEvidence {
     }
 }
 
+/// Proof scoped to an active lease whose command boundary was never called.
+/// Construction/signing is crate-private; external caller declarations cannot
+/// release a slot. Like cooperative completion, this assumes the trusted adapter.
+#[derive(Clone, Eq, PartialEq)]
+pub struct NoSpawnEvidence {
+    pub(crate) lease_id: String,
+    pub(crate) slot_id: String,
+    pub(crate) slot_path: String,
+    pub(crate) run_id: String,
+    pub(crate) attempt_id: String,
+    pub(crate) signature: String,
+}
+impl fmt::Debug for NoSpawnEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NoSpawnEvidence")
+            .field("lease_id", &self.lease_id)
+            .field("slot_id", &self.slot_id)
+            .field("run_id", &self.run_id)
+            .field("attempt_id", &self.attempt_id)
+            .finish_non_exhaustive()
+    }
+}
+impl NoSpawnEvidence {
+    pub(crate) fn new(
+        acquired: &AcquireResult,
+        binding: &RunBinding,
+        token: &LeaseToken,
+    ) -> Option<Self> {
+        let mut proof = Self {
+            lease_id: acquired.lease_id.clone(),
+            slot_id: acquired.slot_id.clone(),
+            slot_path: acquired.slot_path.as_ref()?.to_str()?.to_owned(),
+            run_id: binding.run_id.clone(),
+            attempt_id: binding.attempt_id.clone(),
+            signature: String::new(),
+        };
+        proof.signature = proof.mac(token);
+        Some(proof)
+    }
+    fn mac(&self, token: &LeaseToken) -> String {
+        use sha2::{Digest, Sha256};
+        let mut key = [0u8; 64];
+        let digest = Sha256::digest(token.value().as_bytes());
+        key[..32].copy_from_slice(&digest);
+        let mut inner_pad = [0x36u8; 64];
+        let mut outer_pad = [0x5cu8; 64];
+        for (index, byte) in key.iter().enumerate() {
+            inner_pad[index] ^= byte;
+            outer_pad[index] ^= byte;
+        }
+        let mut inner = Sha256::new();
+        inner.update(inner_pad);
+        for value in [
+            "oxide-no-spawn-v1",
+            &self.lease_id,
+            &self.slot_id,
+            &self.slot_path,
+            &self.run_id,
+            &self.attempt_id,
+        ] {
+            update_field(&mut inner, value.as_bytes());
+        }
+        let mut outer = Sha256::new();
+        outer.update(outer_pad);
+        outer.update(inner.finalize());
+        format!("{:x}", outer.finalize())
+    }
+    pub(crate) fn verify(&self, token: &LeaseToken) -> bool {
+        constant_time_eq(self.signature.as_bytes(), self.mac(token).as_bytes())
+    }
+}
+
 /// Process-lifetime evidence. Observations such as PID absence are not proof.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContainmentEvidence {
     Unknown,
-    Running { pid: u32, start_identity: String },
-    ProcessAbsent { pid: u32, start_identity: String },
+    /// Token-bound proof issued by the adapter before any runner is called.
+    NotSpawned(NoSpawnEvidence),
+    Running {
+        pid: u32,
+        start_identity: String,
+    },
+    ProcessAbsent {
+        pid: u32,
+        start_identity: String,
+    },
     CooperativeWorkflow(CooperativeCompletionEvidence),
 }
 
