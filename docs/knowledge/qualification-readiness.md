@@ -1297,7 +1297,8 @@ the admission gate.
 
 1. **Compile-origin admission (recommended).** After a successful
    compile-through-capture, bind the idle slot to last compile origin:
-   `requested_root_id` plus `source_tree_digest`, inside the existing
+   `requested_root_id` plus `source_tree_digest`, freshly computed from the
+   requested source before acquire, inside the existing
    compatibility partition. Acquire selects an Idle slot only when
    `partition + requested_root_id + source_tree_digest` all match. It must
    not pick a different-origin idle slot in that partition (today's
@@ -1326,6 +1327,19 @@ refused, so ad hoc worktree duplication stays unsolved until a different
 mechanism exists. Production keys stay checkout-isolated. Logical
 compiler-name remapping may remain for debug/`file!()`/panic names; it is
 not a reuse ticket.
+
+The existing strict-physical adapter mode is a simpler reference: it already
+puts requested-root identity in the compatibility partition. The proposed
+origin gate additionally binds exact source content before execution. Neither
+boundary shares compiled work between fresh physical worktree paths; under
+the proposed logical contract, the common partition contributes centralized
+budget accounting and logical compiler names, not cross-root warm hits.
+Implementing and proving that safeguard alone would not satisfy Tom's first
+foothold. A useful-reuse design must explain how changing tasks preserve
+dependency work and bound storage without accepting another root's compiled
+behavior paths or stale source inputs. Consumer-owned stable physical paths
+and a separately qualified dependency-reuse boundary remain design options,
+not selected implementations or permission to modify consumers.
 
 Stable Cargo can keep relative unit invalidation inside one origin and can
 cold-partition on rustflag/map changes. It cannot see older or equal
@@ -1388,8 +1402,8 @@ was a new slot.
    compile or a same-root restore step. Acquire matches origin and tree
    digest before Cargo, so `find_stale_file` treating
    `path_mtime <= reference_mtime` as fresh cannot admit slot-2 for T0, and
-   a same-root changed-then-restored tree would miss on `source_tree_digest`
-   before execution. Origin/digest admission is the safety gate; this proof
+   a same-root restore to T0 may hit only a retained T0-origin slot, never
+   the changed T1-origin slot. Origin/digest admission is the safety gate; this proof
    does not show that Cargo itself rebuilds when mtimes are equal and
    content differs.
 
