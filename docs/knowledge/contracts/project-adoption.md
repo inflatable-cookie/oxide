@@ -124,6 +124,9 @@ this transition and credential are not current APIs. Nucleus shadows Queue's
 host authority, so consumer capability cannot be inferred from a proposed
 integration. Real-workflow eligibility, source-pool/lifecycle implementation,
 qualification and adoption each retain their scoped owner gates.
+Before consumer implementation, Tom must approve its scoped integration brief
+and the affected owners must agree the narrow policy/lifecycle changes; the
+design and fixture result do not supply that authority.
 
 ## Readiness, admission and acquire ordering
 

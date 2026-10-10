@@ -85,7 +85,8 @@ settings, default features plus resolved per-package feature sets, lockfile and
 manifest identity, host/target, compiler/linker/SDK identities, effective Cargo
 configuration and environment. Direct declarations include path
 `nucleus-observer`, bundled `rusqlite = 0.40.2`, `schemars = 0.8.22`,
-`serde = 1.0.229` with derive/rc, and dev `quote = 1.0.47` / `syn = 2.0.119`
+`serde = 1.0.229` with derive/rc, `serde_json = 1.0.151`,
+`serde_yaml_ng = 0.10.0`, and dev `quote = 1.0.47` / `syn = 2.0.119`
 with full. Lock entries include `libsqlite3-sys = 0.38.2`, `cc = 1.4.7`,
 `proc-macro2 = 1.0.107`, `serde_derive = 1.0.229` (with `syn = 3.0.6`),
 `schemars_derive = 0.8.22` and `serde_derive_internals = 0.29.1`.
@@ -214,7 +215,11 @@ old map. A proven pre-spawn refusal preserves the previous valid map.
 ## Consumer-owned physical source pool
 
 Recommend one canonical physical task-root initially, with at most two compatible
-partitions at that root (ordinary test and full-debug). Root count R=1 and
+partitions at that root (ordinary test and full-debug). This first pilot serializes
+opted-in tasks for their whole root-allocation lifetime, including editing,
+review and closeout, not just their builds. It is not a production concurrency
+choice; the managed-Git/workspace owner must accept or change that tradeoff before
+activation. Root count R=1 and
 partition allowance P=2 bound retained intermediate generations to R×P=2,
 independent of tasks and source revisions. Exact paths are assigned by the
 consumer's managed-Git owner later; none is created/registered here. Recommend
@@ -288,9 +293,9 @@ These field groups describe proposals, not existing settings or wire APIs:
 
 | Owner | Proposed fields/receipt and approval subject |
 | --- | --- |
-| Nucleus managed-Git/workspace + Contract 002 owner / Tom | Opt-in workflow ID/version, canonical root pool and allocation epoch, R/P/count/byte caps; distinct workspace/branch at each reuse; source-preparation/archive/recycle intent and outcome; exact-source retention manifest and reconstruction/debug lookup receipt |
+| Nucleus managed-Git/workspace + Contract 002 owner / Tom | Opt-in workflow ID/version, canonical root pool and allocation epoch, R/P/count/byte caps; explicit acceptance or revision of R=1 task serialization; distinct workspace/branch at each reuse; source-preparation/archive/recycle intent and outcome; exact-source retention manifest and reconstruction/debug lookup receipt |
 | Consumer task/admission owner | Pending request ID; attempt authorization bound to task/workspace/branch/run/attempt/root epoch/source/partition; idempotent authorize/acquire/return-to-pending/cancel/reconcile operations and terminal no-spawn receipt |
-| Host-run owner under unchanged 010 | Genuine submit request ID/run ID/epoch/token and settlement envelope; adapter command/capture binding; confirmation that acquisition-before-submit works with real scheduler authority and nested Effigy execution |
+| Host-run owner under unchanged 010 | Genuine submit request ID/run ID/epoch/token and settlement envelope; adapter command/capture binding; confirmation that acquisition-before-submit works with real scheduler authority and nested Effigy execution; explicit acceptance or rejection of holding an Oxide lease while a submitted host run waits for capacity, including cancellation/deadline and reconciliation bounds |
 | Queue Spec 028 runtime maintainers / Tom | Optional shared intermediate directory outside task checkout, bounded retention and cleanup handoff; task-private target/final outputs unchanged. Existing outside-root cleanup refusal is preserved; never teach task cleanup to delete an Oxide slot |
 | Consumer evidence/retention owner | Private artifact/source/generated/dependency/debug capture, independently retained digest manifests, retention quotas/duration and archive acknowledgment; failure preserves occupancy |
 | Oxide registration/storage owner | Audited input-boundary version, compatibility digest, lease/generation and pending-map state; capacities, refusal evidence and optional separately granted whole-generation recovery |
@@ -304,6 +309,8 @@ and excludes shared build outputs; retaining Oxide intermediates outside the
 checkout needs its owner/Tom agreement. Object sharing alone grants neither
 root recycling nor compiler reuse. Current managed-Git/retention owners must
 implement these seams; this task does not amend their contracts or contact them.
+Consumer integration requires its own scoped operator-approved brief and owner
+agreement under [vision](../vision.md#authority-boundaries).
 
 ## Lifecycle with frozen Contract 010
 
@@ -318,6 +325,10 @@ implement these seams; this task does not amend their contracts or contact them.
 
 The inspected 010 lifecycle is `queued→admitted→running→settled`; its nonlaunched
 settlements apply only to actual submitted runs cancelled or capacity-timed-out.
+Pre-acquire readiness and pool waiting reserve no Oxide lease or host-run slot.
+The proposed post-acquire host-capacity wait is a separate, explicitly gated
+owner decision in the table above; it is not permission to hold leases while
+waiting indefinitely, and no timeout by itself proves release.
 Storage busy is **not** a host outcome. Current consumers do not expose the
 required authenticated task-attempt→Oxide acquire→return-to-pending transition.
 Their task/lifecycle owner must approve that narrow durable representation outside
