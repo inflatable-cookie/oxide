@@ -2,6 +2,7 @@ mod cargo;
 mod native;
 mod observations;
 mod resolve;
+mod source_map;
 
 #[cfg(test)]
 mod tests;
@@ -13,6 +14,13 @@ pub use observations::{
 pub use resolve::{
     EffectiveBuildInputs, EffectiveInputSet, EffectiveValue, PathIdentity, ProjectDescriptor,
     ProjectInvocation, ToolchainInput, WorkflowOptIn,
+};
+pub use source_map::{
+    AuthorizedSourceRoot, BehaviorPathClass, BehaviorPathObservation, BinaryArtifactDigest,
+    BinarySourceScan, CompileOriginIdentity, KeyMissControl, MissControlEvidence,
+    PortabilityEvidence, QualificationDisposition, ResolvedSourceMap, SourceMapPolicy,
+    SourceMapRunReceipt, SourceMissControl, SourcePathClass, SourcePathMode, SourcePathObservation,
+    ACCEPTED_LOGICAL_POLICY, REQUIRED_BEHAVIOR_PATHS, SOURCE_MAP_VERSION, SOURCE_SCAN_VERSION,
 };
 
 use crate::storage::{
@@ -144,6 +152,8 @@ pub struct HostRunRequest {
     pub cargo_build_dir: PathBuf,
     pub cargo_target_dir: PathBuf,
     pub capture_dir: PathBuf,
+    /// Explicit map and complete effective compiler flag vector, when selected.
+    pub source_map: Option<ResolvedSourceMap>,
     /// Complete allowlisted overrides; `None` means remove that inherited variable.
     pub environment: Vec<EffectiveValue>,
 }
@@ -200,6 +210,10 @@ pub struct FixtureCommandOutput {
     pub reused_units: Option<u32>,
     pub rebuilt_units: Option<u32>,
     pub completion: FixtureCompletionProof,
+    /// Exact-path evidence from the experimental local qualifier. Ordinary
+    /// injected runners cannot qualify mapped reuse by returning a status.
+    pub(crate) source_map_receipt: Option<SourceMapRunReceipt>,
+    pub(crate) portability_evidence: Option<PortabilityEvidence>,
     pub(crate) native_completion: Option<native::NativeCompletionCertificate>,
 }
 
@@ -223,6 +237,8 @@ impl FixtureCommandOutput {
             reused_units,
             rebuilt_units,
             completion,
+            source_map_receipt: None,
+            portability_evidence: None,
             native_completion: None,
         }
     }
@@ -747,6 +763,73 @@ impl<S: StorageOperations> ProjectAdapter<S> {
             );
             None
         };
+        if let Some(source_map) = resolved.source_map.as_ref() {
+            let qualified = match (
+                output.source_map_receipt.as_ref(),
+                output.portability_evidence.as_ref(),
+                capture.as_ref(),
+            ) {
+                (Some(receipt), Some(evidence), Some(capture_receipt)) => {
+                    receipt.slot_path == slot_path
+                        && receipt.binds_run(
+                            source_map,
+                            &acquired.lease_id,
+                            &attempt.envelope.binding,
+                            &host_run.id,
+                            &resolved.capture_dir,
+                            &capture_receipt.digest,
+                        )
+                        && source_map::qualify(source_map, receipt, evidence)
+                            == QualificationDisposition::Pass
+                }
+                _ => false,
+            };
+            if !qualified {
+                let finalization = self.finalize_incomplete(
+                    &attempt,
+                    &acquired,
+                    &token,
+                    consumer,
+                    Some(&host_run),
+                    None,
+                );
+                self.observations.event(
+                    &attempt.envelope.binding.consumer,
+                    &attempt.envelope.binding.run_id,
+                    &attempt.envelope.binding.attempt_id,
+                    Event::Uncertain {
+                        reason: "source-map-qualification-incomplete",
+                    },
+                );
+                return result(
+                    ExecutionDisposition::Uncertain,
+                    Some(host_run),
+                    finalization,
+                    false,
+                );
+            }
+            if let Some(receipt) = output.source_map_receipt.as_ref() {
+                self.observations.set_compile_origins(
+                    &attempt.envelope.binding.consumer,
+                    &attempt.envelope.binding.run_id,
+                    &attempt.envelope.binding.attempt_id,
+                    receipt
+                        .compile_origins
+                        .iter()
+                        .map(|origin| origin.tree_digest.clone())
+                        .collect(),
+                );
+                self.observations.event(
+                    &attempt.envelope.binding.consumer,
+                    &attempt.envelope.binding.run_id,
+                    &attempt.envelope.binding.attempt_id,
+                    Event::SourceMapQualified {
+                        receipt_digest: receipt.receipt_digest(),
+                        binary_set_digest: receipt.binary_set_digest(),
+                    },
+                );
+            }
+        }
         let finalization = self.finalize_run(
             &attempt,
             &acquired,
@@ -814,6 +897,15 @@ impl<S: StorageOperations> ProjectAdapter<S> {
             source_tree_digest: binding.source_tree_digest.clone(),
             partition_digest: partition_digest(&resolved.partition),
             config_digest: resolved.partition.config_digest.clone(),
+            source_map_policy_digest: resolved
+                .source_map
+                .as_ref()
+                .map(|source_map| source_map.policy_digest().to_owned()),
+            source_map_digest: resolved
+                .source_map
+                .as_ref()
+                .map(|source_map| source_map.map_digest().to_owned()),
+            compile_origin_tree_digests: Vec::new(),
             backend: OBSERVATION_BACKEND,
             events: Vec::new(),
             settled: false,
@@ -1101,6 +1193,7 @@ fn host_request(resolved: &ResolvedInvocation, slot_path: &Path) -> HostRunReque
         cargo_build_dir: slot_path.to_path_buf(),
         cargo_target_dir: resolved.target_dir.clone(),
         capture_dir: resolved.capture_dir.clone(),
+        source_map: resolved.source_map.clone(),
         environment: resolved.environment.clone(),
     }
 }

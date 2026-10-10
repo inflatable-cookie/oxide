@@ -109,6 +109,14 @@ impl FixtureCommandRunner for CargoWorkflowRunner {
         if cancellation.is_cancelled() {
             return Err(BoundaryFailure::Rejected);
         }
+        if command.source_map.as_ref().is_some_and(|source_map| {
+            source_map.requested_tree_digest() != claim.binding.source_tree_digest
+                || !command
+                    .workspace_root
+                    .starts_with(source_map.requested_root())
+        }) {
+            return Err(BoundaryFailure::InvalidIdentity);
+        }
         let run_id = claim.binding.run_id.as_str();
         if !single_component(run_id) || command.environment.iter().any(forces_environment) {
             return Err(BoundaryFailure::Rejected);
@@ -147,6 +155,13 @@ impl FixtureCommandRunner for CargoWorkflowRunner {
                 command
                     .environment
                     .iter()
+                    .filter(|value| {
+                        command.source_map.is_none()
+                            || !matches!(
+                                value.name.as_str(),
+                                "RUSTFLAGS" | "CARGO_ENCODED_RUSTFLAGS"
+                            )
+                    })
                     .filter_map(|value| Some((value.name.as_str(), value.value.as_deref()?))),
             )
             .env("TMPDIR", &temp)
@@ -159,6 +174,12 @@ impl FixtureCommandRunner for CargoWorkflowRunner {
             .stdout(File::create(command.capture_dir.join("stdout.log")).map_err(io_failure)?)
             .stderr(File::create(command.capture_dir.join("stderr.log")).map_err(io_failure)?)
             .process_group(0);
+        if let Some(source_map) = &command.source_map {
+            process.env(
+                "CARGO_ENCODED_RUSTFLAGS",
+                source_map.effective_rustflags().join("\u{1f}"),
+            );
+        }
         let started = Instant::now();
         let mut child = process.spawn().map_err(|_| BoundaryFailure::Unavailable)?;
         let pgid = child.id();
@@ -207,13 +228,26 @@ impl FixtureCommandRunner for CargoWorkflowRunner {
             .filter_map(|line| line.trim_start().strip_prefix("Compiling "))
             .collect();
         let environment_digest = environment_digest(&command.environment);
+        let source_map_manifest = command.source_map.as_ref().map_or_else(
+            || "source_map_policy=checkout-isolated\nsource_map_digest=none\n".to_owned(),
+            |map| {
+                format!(
+                    "source_map_policy={}\nsource_map_digest={}\nsource_root_id={}\nsource_tree={}\n",
+                    map.policy_digest(),
+                    map.map_digest(),
+                    map.requested_root_id(),
+                    claim.binding.source_tree_digest,
+                )
+            },
+        );
         let manifest = format!(
-            "oxide-cargo-workflow-v1\nhead={}\nsource={}\ndefinition={}\nlauncher={}\nenvironment={}\nrun={}\nattempt={}\nhost_run={}\nlease={}\nslot={}\nselector={}\nexit_code={}\nelapsed_ms={}\nfree_space_samples={}\nrebuilt_units={}\nrebuilt_names={}\nstdout={}\nstderr={}\n",
+            "oxide-cargo-workflow-v1\nhead={}\nsource={}\ndefinition={}\nlauncher={}\nenvironment={}\n{}run={}\nattempt={}\nhost_run={}\nlease={}\nslot={}\nselector={}\nexit_code={}\nelapsed_ms={}\nfree_space_samples={}\nrebuilt_units={}\nrebuilt_names={}\nstdout={}\nstderr={}\n",
             repository_head(&command.workspace_root)?,
             source_digest(),
             definition,
             self.executable_digest,
             environment_digest,
+            source_map_manifest,
             claim.binding.run_id,
             claim.binding.attempt_id,
             claim.host_run_id,

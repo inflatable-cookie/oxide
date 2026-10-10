@@ -677,6 +677,8 @@ fn fixture_invocation_named(root: &FixtureRoot, name: &str) -> ProjectInvocation
                     value: None,
                 },
             ]),
+            effective_rustflags: Some(Vec::new()),
+            full_debug: true,
         },
         target_dir: target,
         capture_dir: capture,
@@ -1871,4 +1873,609 @@ fn pre_cancel_and_unsupported_cargo_do_not_acquire() {
         .unwrap()
         .slots
         .is_empty());
+}
+
+struct SourceMapFixture {
+    root: FixtureRoot,
+    disposable: PathBuf,
+    checkout_a: PathBuf,
+    checkout_b: PathBuf,
+    checkout_c: PathBuf,
+    slot: PathBuf,
+    capture: PathBuf,
+}
+
+impl SourceMapFixture {
+    fn new(scenario: &str) -> Self {
+        let root = FixtureRoot::scenario(scenario);
+        let disposable = root.dir("source-map-volume");
+        let checkout_a = disposable.join("checkout-a");
+        let checkout_b = disposable.join("checkout-b");
+        let checkout_c = disposable.join("checkout-c");
+        let slot = disposable.join("slot");
+        let capture = root.dir("source-map-capture");
+        for checkout in [&checkout_a, &checkout_b, &checkout_c] {
+            fs::create_dir_all(checkout.join("src")).unwrap();
+            fs::create_dir_all(checkout.join("assets")).unwrap();
+            fs::write(checkout.join("src/lib.rs"), b"pub fn fixture() {}\n").unwrap();
+            fs::write(checkout.join("build.rs"), b"fn main() {}\n").unwrap();
+            fs::write(checkout.join("assets/data.txt"), b"fixture resource\n").unwrap();
+        }
+        fs::create_dir_all(&slot).unwrap();
+        Self {
+            root,
+            disposable,
+            checkout_a,
+            checkout_b,
+            checkout_c,
+            slot,
+            capture,
+        }
+    }
+
+    fn policy(&self, roots: Vec<(&str, PathBuf)>, mode: SourcePathMode) -> SourceMapPolicy {
+        SourceMapPolicy {
+            version: SOURCE_MAP_VERSION.to_owned(),
+            mode,
+            roots: roots
+                .into_iter()
+                .map(|(id, path)| AuthorizedSourceRoot {
+                    id: id.to_owned(),
+                    path,
+                })
+                .collect(),
+            miss_controls: Some(MissControlEvidence {
+                source: Some(SourceMissControl {
+                    before_tree_digest: digest(b"tree-before"),
+                    after_tree_digest: digest(b"tree-after"),
+                    partition_digest: digest(b"same-partition"),
+                    rebuilt_units: 1,
+                }),
+                configuration: Some(KeyMissControl {
+                    before_input_digest: digest(b"config-before"),
+                    after_input_digest: digest(b"config-after"),
+                    before_partition_digest: digest(b"partition-before"),
+                    after_partition_digest: digest(b"partition-after"),
+                }),
+                toolchain: Some(KeyMissControl {
+                    before_input_digest: digest(b"toolchain-before"),
+                    after_input_digest: digest(b"toolchain-after"),
+                    before_partition_digest: digest(b"toolchain-partition-before"),
+                    after_partition_digest: digest(b"toolchain-partition-after"),
+                }),
+            }),
+        }
+    }
+
+    fn invocation(
+        &self,
+        workspace: &Path,
+        tree_digest: &str,
+        policy: SourceMapPolicy,
+    ) -> ProjectInvocation {
+        let name = format!("source-map-{}", NEXT_ROOT.fetch_add(1, Ordering::Relaxed));
+        let mut invocation = fixture_invocation_named(&self.root, &name);
+        invocation.descriptor.workspace_root = workspace.to_path_buf();
+        invocation.source_tree_digest = tree_digest.to_owned();
+        invocation.inputs.effective_rustflags = Some(vec!["--cfg=fixture_flag".to_owned()]);
+        invocation.inputs.full_debug = true;
+        invocation.descriptor.workflows[0].path_identity = PathIdentity::DisposableRoot {
+            id: "fixture-volume".to_owned(),
+            root: self.disposable.clone(),
+            source_map: Some(policy),
+        };
+        invocation
+    }
+
+    fn resolved_map(
+        &self,
+        workspace: &Path,
+        tree_digest: &str,
+        policy: SourceMapPolicy,
+    ) -> (resolve::ResolvedInvocation, ResolvedSourceMap) {
+        let invocation = self.invocation(workspace, tree_digest, policy);
+        let resolved = match resolve::resolve(&invocation) {
+            Resolution::Ready(resolved) => resolved,
+            _ => panic!("fixture source map resolves"),
+        };
+        let source_map = resolved.source_map.clone().expect("explicit source map");
+        (resolved, source_map)
+    }
+
+    fn run_evidence(
+        &self,
+        map: &ResolvedSourceMap,
+        compile_origin: (&str, &str),
+    ) -> (SourceMapRunReceipt, PortabilityEvidence) {
+        fs::create_dir_all(self.slot.join("out")).unwrap();
+        fs::create_dir_all(self.slot.join("proc-macro")).unwrap();
+        fs::write(self.slot.join("out/generated.rs"), b"generated\n").unwrap();
+        fs::write(self.slot.join("proc-macro/input.rs"), b"macro input\n").unwrap();
+        fs::write(self.capture.join("test.bin"), b"fixture binary\n").unwrap();
+        fs::write(self.capture.join("stdout.log"), b"fixture run\n").unwrap();
+        let output_references = vec!["test.bin".to_owned(), "stdout.log".to_owned()];
+        let capture_digest = native::capture_receipt_digest(&self.capture, &output_references)
+            .expect("bounded fixture capture digest");
+        let binary_digest = digest(&fs::read(self.capture.join("test.bin")).unwrap());
+        let receipt = SourceMapRunReceipt {
+            policy_digest: map.policy_digest().to_owned(),
+            map_digest: map.map_digest().to_owned(),
+            authorized_roots: map.authorized_roots().to_vec(),
+            requested_root_id: map.requested_root_id().to_owned(),
+            requested_root: map.requested_root().to_path_buf(),
+            logical_prefix: map.logical_prefix().map(Path::to_path_buf),
+            requested_source_tree_digest: map.requested_tree_digest().to_owned(),
+            compile_origins: vec![CompileOriginIdentity {
+                root_id: compile_origin.0.to_owned(),
+                tree_digest: compile_origin.1.to_owned(),
+            }],
+            slot_lease_id: "lease-fixture".to_owned(),
+            run_id: "run-fixture".to_owned(),
+            attempt_id: "attempt-fixture".to_owned(),
+            host_run_id: "host-fixture".to_owned(),
+            slot_path: self.slot.clone(),
+            capture_dir: self.capture.clone(),
+            output_references,
+            binaries: vec![BinaryArtifactDigest {
+                reference: "test.bin".to_owned(),
+                digest: binary_digest,
+            }],
+            capture_digest,
+        };
+        let source_path = match map.logical_prefix() {
+            Some(prefix) => prefix.join("src/lib.rs"),
+            None => self.checkout_b.join("src/lib.rs"),
+        };
+        let source_paths = [
+            SourcePathClass::CompilerDebug,
+            SourcePathClass::FileMacro,
+            SourcePathClass::PanicLocation,
+        ]
+        .into_iter()
+        .map(|class| SourcePathObservation {
+            class,
+            observed: source_path.clone(),
+            resolved: Some(self.checkout_b.join("src/lib.rs")),
+        })
+        .collect();
+        let generation = "lease-fixture".to_owned();
+        let tree = map.requested_tree_digest().to_owned();
+        let behavior_paths = vec![
+            BehaviorPathObservation {
+                class: BehaviorPathClass::ManifestDirectory,
+                resolved: Some(self.checkout_b.clone()),
+                source_tree_digest: Some(tree.clone()),
+                generation_lease_id: None,
+            },
+            BehaviorPathObservation {
+                class: BehaviorPathClass::IncludeInput,
+                resolved: Some(self.checkout_b.join("src/lib.rs")),
+                source_tree_digest: Some(tree.clone()),
+                generation_lease_id: None,
+            },
+            BehaviorPathObservation {
+                class: BehaviorPathClass::BuildScriptInput,
+                resolved: Some(self.checkout_b.join("build.rs")),
+                source_tree_digest: Some(tree.clone()),
+                generation_lease_id: None,
+            },
+            BehaviorPathObservation {
+                class: BehaviorPathClass::OutDirectory,
+                resolved: Some(self.slot.join("out")),
+                source_tree_digest: Some(tree.clone()),
+                generation_lease_id: Some(generation.clone()),
+            },
+            BehaviorPathObservation {
+                class: BehaviorPathClass::GeneratedOutput,
+                resolved: Some(self.slot.join("out/generated.rs")),
+                source_tree_digest: Some(tree.clone()),
+                generation_lease_id: Some(generation.clone()),
+            },
+            BehaviorPathObservation {
+                class: BehaviorPathClass::ProcMacroInput,
+                resolved: Some(self.slot.join("proc-macro/input.rs")),
+                source_tree_digest: Some(tree.clone()),
+                generation_lease_id: Some(generation),
+            },
+            BehaviorPathObservation {
+                class: BehaviorPathClass::RuntimeResource,
+                resolved: Some(self.checkout_b.join("assets/data.txt")),
+                source_tree_digest: Some(tree),
+                generation_lease_id: None,
+            },
+        ];
+        let evidence = PortabilityEvidence {
+            binary_scans: Some(vec![BinarySourceScan {
+                reference: "test.bin".to_owned(),
+                binary_digest: receipt.binaries[0].digest.clone(),
+                scanner_version: SOURCE_SCAN_VERSION.to_owned(),
+                complete: true,
+                debug_sections: vec![
+                    ".debug_info".to_owned(),
+                    ".debug_line".to_owned(),
+                    ".debug_abbrev".to_owned(),
+                ],
+                source_paths,
+            }]),
+            behavior_paths: Some(behavior_paths),
+        };
+        (receipt, evidence)
+    }
+}
+
+#[test]
+fn finite_source_map_preserves_flags_and_separates_map_and_disposable_roots() {
+    let fixture = SourceMapFixture::new("07-source-map-partition");
+    let mode = SourcePathMode::ExperimentalLogical {
+        accepted_policy: ACCEPTED_LOGICAL_POLICY.to_owned(),
+        prefix: PathBuf::from("/oxide/fixture-component"),
+    };
+    let policy = fixture.policy(
+        vec![
+            ("root-a", fixture.checkout_a.clone()),
+            ("root-b", fixture.checkout_b.clone()),
+        ],
+        mode.clone(),
+    );
+    let (first, first_map) =
+        fixture.resolved_map(&fixture.checkout_a, &digest(b"tree-a"), policy.clone());
+    let (second, second_map) =
+        fixture.resolved_map(&fixture.checkout_b, &digest(b"tree-b"), policy);
+    assert_eq!(
+        first.partition.path_identity,
+        second.partition.path_identity
+    );
+    assert_eq!(first_map.map_digest(), second_map.map_digest());
+    let expected_flags = vec![
+        "--cfg=fixture_flag".to_owned(),
+        format!(
+            "--remap-path-prefix={}=/oxide/fixture-component",
+            fixture.checkout_a.display()
+        ),
+        format!(
+            "--remap-path-prefix={}=/oxide/fixture-component",
+            fixture.checkout_b.display()
+        ),
+    ];
+    assert_eq!(first_map.effective_rustflags(), expected_flags.as_slice());
+
+    let changed_policy = fixture.policy(
+        vec![
+            ("root-a", fixture.checkout_a.clone()),
+            ("root-b", fixture.checkout_b.clone()),
+            ("root-c", fixture.checkout_c.clone()),
+        ],
+        mode.clone(),
+    );
+    let (changed, _) =
+        fixture.resolved_map(&fixture.checkout_a, &digest(b"tree-a"), changed_policy);
+    assert_ne!(
+        first.partition.path_identity,
+        changed.partition.path_identity
+    );
+
+    let mut changed_flags = fixture.invocation(
+        &fixture.checkout_a,
+        &digest(b"tree-a"),
+        fixture.policy(
+            vec![
+                ("root-a", fixture.checkout_a.clone()),
+                ("root-b", fixture.checkout_b.clone()),
+            ],
+            mode.clone(),
+        ),
+    );
+    changed_flags.inputs.effective_rustflags = Some(vec!["--cfg=another_flag".to_owned()]);
+    let changed_flags = match resolve::resolve(&changed_flags) {
+        Resolution::Ready(resolved) => resolved,
+        _ => panic!("changed flags resolve to a separate partition"),
+    };
+    assert_ne!(
+        first.partition.path_identity,
+        changed_flags.partition.path_identity
+    );
+
+    let checkout_policy = || {
+        fixture.policy(
+            vec![
+                ("root-a", fixture.checkout_a.clone()),
+                ("root-b", fixture.checkout_b.clone()),
+            ],
+            SourcePathMode::StrictPhysical,
+        )
+    };
+    let mut isolated_a =
+        fixture.invocation(&fixture.checkout_a, &digest(b"tree-a"), checkout_policy());
+    isolated_a.descriptor.workflows[0].path_identity = PathIdentity::DisposableRoot {
+        id: "fixture-volume".to_owned(),
+        root: fixture.disposable.clone(),
+        source_map: None,
+    };
+    let mut isolated_b =
+        fixture.invocation(&fixture.checkout_b, &digest(b"tree-b"), checkout_policy());
+    isolated_b.descriptor.workflows[0].path_identity = PathIdentity::DisposableRoot {
+        id: "fixture-volume".to_owned(),
+        root: fixture.disposable.clone(),
+        source_map: None,
+    };
+    let isolated_a = match resolve::resolve(&isolated_a) {
+        Resolution::Ready(resolved) => resolved,
+        _ => panic!("unmapped checkout resolves with physical identity"),
+    };
+    let isolated_b = match resolve::resolve(&isolated_b) {
+        Resolution::Ready(resolved) => resolved,
+        _ => panic!("second unmapped checkout resolves with physical identity"),
+    };
+    assert_ne!(
+        isolated_a.partition.path_identity,
+        isolated_b.partition.path_identity
+    );
+
+    let other_disposable = fixture.root.dir("second-disposable-root");
+    let other_a = other_disposable.join("checkout-a");
+    let other_b = other_disposable.join("checkout-b");
+    fs::create_dir_all(&other_a).unwrap();
+    fs::create_dir_all(&other_b).unwrap();
+    let other_policy = fixture.policy(vec![("root-a", other_a.clone()), ("root-b", other_b)], mode);
+    let mut other_invocation =
+        fixture.invocation(&other_a, &digest(b"tree-a"), other_policy.clone());
+    other_invocation.descriptor.workflows[0].path_identity = PathIdentity::DisposableRoot {
+        id: "fixture-volume".to_owned(),
+        root: other_disposable,
+        source_map: Some(other_policy),
+    };
+    let other = match resolve::resolve(&other_invocation) {
+        Resolution::Ready(resolved) => resolved,
+        _ => panic!("second disposable root resolves"),
+    };
+    assert_ne!(first.partition.path_identity, other.partition.path_identity);
+}
+
+#[test]
+fn incomplete_miss_gate_refuses_before_a_shared_partition_is_resolved() {
+    let fixture = SourceMapFixture::new("08-source-map-miss-gate");
+    let mut policy = fixture.policy(
+        vec![
+            ("root-a", fixture.checkout_a.clone()),
+            ("root-b", fixture.checkout_b.clone()),
+        ],
+        SourcePathMode::StrictPhysical,
+    );
+    policy.miss_controls.as_mut().unwrap().toolchain = None;
+    let invocation = fixture.invocation(&fixture.checkout_a, &digest(b"tree-a"), policy);
+    assert!(matches!(
+        resolve::resolve(&invocation),
+        Resolution::Refused(AdapterRefusal::InputUnknown)
+    ));
+
+    let policy = fixture.policy(
+        vec![
+            ("root-a", fixture.checkout_a.clone()),
+            ("root-b", fixture.checkout_b.clone()),
+        ],
+        SourcePathMode::ExperimentalLogical {
+            accepted_policy: ACCEPTED_LOGICAL_POLICY.to_owned(),
+            prefix: PathBuf::from("/oxide/fixture-component"),
+        },
+    );
+    let mut unknown_flags = fixture.invocation(&fixture.checkout_a, &digest(b"tree-a"), policy);
+    unknown_flags.inputs.effective_rustflags = None;
+    assert!(matches!(
+        resolve::resolve(&unknown_flags),
+        Resolution::Refused(AdapterRefusal::InputUnknown)
+    ));
+}
+
+#[test]
+fn logical_policy_rejects_unaccepted_or_debug_stripping_inputs() {
+    let fixture = SourceMapFixture::new("09-logical-policy");
+    let policy = |accepted_policy: &str| {
+        fixture.policy(
+            vec![
+                ("root-a", fixture.checkout_a.clone()),
+                ("root-b", fixture.checkout_b.clone()),
+            ],
+            SourcePathMode::ExperimentalLogical {
+                accepted_policy: accepted_policy.to_owned(),
+                prefix: PathBuf::from("/oxide/fixture-component"),
+            },
+        )
+    };
+    let unaccepted = fixture.invocation(
+        &fixture.checkout_a,
+        &digest(b"tree-a"),
+        policy("unrecorded-policy"),
+    );
+    assert!(matches!(
+        resolve::resolve(&unaccepted),
+        Resolution::Refused(AdapterRefusal::UnsupportedInput)
+    ));
+
+    let root_prefix = fixture.invocation(
+        &fixture.checkout_a,
+        &digest(b"tree-a"),
+        fixture.policy(
+            vec![
+                ("root-a", fixture.checkout_a.clone()),
+                ("root-b", fixture.checkout_b.clone()),
+            ],
+            SourcePathMode::ExperimentalLogical {
+                accepted_policy: ACCEPTED_LOGICAL_POLICY.to_owned(),
+                prefix: PathBuf::from("/"),
+            },
+        ),
+    );
+    assert!(matches!(
+        resolve::resolve(&root_prefix),
+        Resolution::Refused(AdapterRefusal::UnsupportedInput)
+    ));
+
+    let mut stripped = fixture.invocation(
+        &fixture.checkout_a,
+        &digest(b"tree-a"),
+        policy(ACCEPTED_LOGICAL_POLICY),
+    );
+    stripped.inputs.effective_rustflags = Some(vec!["-Cdebuginfo=0".to_owned()]);
+    assert!(matches!(
+        resolve::resolve(&stripped),
+        Resolution::Refused(AdapterRefusal::UnsupportedInput)
+    ));
+    stripped.inputs.effective_rustflags = Some(vec!["--strip=symbols".to_owned()]);
+    assert!(matches!(
+        resolve::resolve(&stripped),
+        Resolution::Refused(AdapterRefusal::UnsupportedInput)
+    ));
+}
+
+#[test]
+fn mapped_run_without_exact_run_receipt_keeps_its_slot_uncertain() {
+    let fixture = SourceMapFixture::new("10-mapped-uncertain");
+    let invocation = fixture.invocation(
+        &fixture.checkout_b,
+        &digest(b"tree-b"),
+        fixture.policy(
+            vec![
+                ("root-a", fixture.checkout_a.clone()),
+                ("root-b", fixture.checkout_b.clone()),
+            ],
+            SourcePathMode::ExperimentalLogical {
+                accepted_policy: ACCEPTED_LOGICAL_POLICY.to_owned(),
+                prefix: PathBuf::from("/oxide/fixture-component"),
+            },
+        ),
+    );
+    let storage_root = fixture.root.dir("storage");
+    let daemon = RunningDaemon::start(&storage_root);
+    let mut adapter = ProjectAdapter::new(daemon.client.clone());
+    let mut consumer = FixtureConsumer::new();
+    let mut runner = FixtureRunner::complete();
+    let result = adapter.execute(
+        &invocation,
+        &mut consumer,
+        &mut NoWait,
+        &mut runner,
+        &NeverCancelled,
+    );
+    assert_eq!(result.disposition, ExecutionDisposition::Uncertain);
+    assert_eq!(
+        daemon
+            .client
+            .inventory("mapped-receipt-required")
+            .unwrap()
+            .slots[0]
+            .state,
+        SlotState::Uncertain
+    );
+    assert!(!adapter.observations()[0]
+        .events
+        .iter()
+        .any(|event| matches!(event.kind, ObservationKind::SourceMapQualified { .. })));
+}
+
+#[test]
+fn logical_qualifier_binds_the_exact_tree_lease_binaries_and_behavior_paths() {
+    let fixture = SourceMapFixture::new("11-logical-qualifier");
+    let policy = fixture.policy(
+        vec![
+            ("root-a", fixture.checkout_a.clone()),
+            ("root-b", fixture.checkout_b.clone()),
+        ],
+        SourcePathMode::ExperimentalLogical {
+            accepted_policy: ACCEPTED_LOGICAL_POLICY.to_owned(),
+            prefix: PathBuf::from("/oxide/fixture-component"),
+        },
+    );
+    let (resolved_b, map) =
+        fixture.resolved_map(&fixture.checkout_b, &digest(b"tree-b"), policy.clone());
+    let (resolved_a, _) = fixture.resolved_map(&fixture.checkout_a, &digest(b"tree-a"), policy);
+    assert_eq!(
+        resolved_a.partition.path_identity,
+        resolved_b.partition.path_identity
+    );
+    let (receipt, evidence) = fixture.run_evidence(&map, ("root-a", &digest(b"tree-a")));
+    assert_eq!(
+        source_map::qualify(&map, &receipt, &evidence),
+        QualificationDisposition::Pass
+    );
+
+    let mut stale_receipt = receipt.clone();
+    stale_receipt.requested_source_tree_digest = digest(b"other-tree");
+    assert_eq!(
+        source_map::qualify(&map, &stale_receipt, &evidence),
+        QualificationDisposition::Fail
+    );
+    let mut too_many_origins = receipt.clone();
+    too_many_origins.compile_origins =
+        vec![receipt.compile_origins[0].clone(); source_map::MAX_COMPILE_ORIGINS + 1];
+    assert_eq!(
+        source_map::qualify(&map, &too_many_origins, &evidence),
+        QualificationDisposition::Insufficient
+    );
+    let changed_map_policy = fixture.policy(
+        vec![
+            ("root-a", fixture.checkout_a.clone()),
+            ("root-b", fixture.checkout_b.clone()),
+            ("root-c", fixture.checkout_c.clone()),
+        ],
+        SourcePathMode::ExperimentalLogical {
+            accepted_policy: ACCEPTED_LOGICAL_POLICY.to_owned(),
+            prefix: PathBuf::from("/oxide/fixture-component"),
+        },
+    );
+    let (_, changed_map) =
+        fixture.resolved_map(&fixture.checkout_b, &digest(b"tree-b"), changed_map_policy);
+    assert_eq!(
+        source_map::qualify(&changed_map, &receipt, &evidence),
+        QualificationDisposition::Fail
+    );
+
+    let mut missing_resolution = evidence.clone();
+    missing_resolution.binary_scans.as_mut().unwrap()[0].source_paths[0].resolved = None;
+    assert_eq!(
+        source_map::qualify(&map, &receipt, &missing_resolution),
+        QualificationDisposition::Insufficient
+    );
+    let mut mismatched_binary = evidence.clone();
+    mismatched_binary.binary_scans.as_mut().unwrap()[0].binary_digest = digest(b"other binary");
+    assert_eq!(
+        source_map::qualify(&map, &receipt, &mismatched_binary),
+        QualificationDisposition::Fail
+    );
+    let mut incomplete_scan = evidence.clone();
+    incomplete_scan.binary_scans.as_mut().unwrap()[0].complete = false;
+    assert_eq!(
+        source_map::qualify(&map, &receipt, &incomplete_scan),
+        QualificationDisposition::Insufficient
+    );
+    let mut stale_behavior = evidence.clone();
+    stale_behavior.behavior_paths.as_mut().unwrap()[6].resolved =
+        Some(fixture.checkout_a.join("assets/data.txt"));
+    assert_eq!(
+        source_map::qualify(&map, &receipt, &stale_behavior),
+        QualificationDisposition::Fail
+    );
+    let mut wrong_artifact = receipt;
+    wrong_artifact.binaries[0].reference = "../outside.bin".to_owned();
+    assert_eq!(
+        source_map::qualify(&map, &wrong_artifact, &evidence),
+        QualificationDisposition::Fail
+    );
+}
+
+#[test]
+fn strict_physical_mode_rejects_compile_origin_paths_from_another_root() {
+    let fixture = SourceMapFixture::new("12-strict-physical");
+    let policy = fixture.policy(
+        vec![
+            ("root-a", fixture.checkout_a.clone()),
+            ("root-b", fixture.checkout_b.clone()),
+        ],
+        SourcePathMode::StrictPhysical,
+    );
+    let (_, map) = fixture.resolved_map(&fixture.checkout_b, &digest(b"tree-b"), policy);
+    let (receipt, evidence) = fixture.run_evidence(&map, ("root-a", &digest(b"tree-a")));
+    assert_eq!(
+        source_map::qualify(&map, &receipt, &evidence),
+        QualificationDisposition::Fail
+    );
 }

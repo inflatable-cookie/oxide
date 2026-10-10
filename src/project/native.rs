@@ -662,6 +662,8 @@ impl FixtureCommandRunner for NativeFixtureCommandRunner {
                 reused_units: None,
                 rebuilt_units: None,
                 completion: FixtureCompletionProof::Unknown,
+                source_map_receipt: None,
+                portability_evidence: None,
                 native_completion: None,
             });
         }
@@ -705,6 +707,8 @@ impl FixtureCommandRunner for NativeFixtureCommandRunner {
                 reference: format!("native:{}", plan.claim.host_run_id),
                 credential: Credential::new("native-fixture-runner"),
             },
+            source_map_receipt: None,
+            portability_evidence: None,
             native_completion: Some(certificate),
         })
     }

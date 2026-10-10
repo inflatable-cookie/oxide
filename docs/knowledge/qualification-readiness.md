@@ -456,13 +456,27 @@ Cargo must see the changed flags and rebuild. This uses no source or build-tree
 copy. It can qualify reuse among a finite, pre-registered set of worktrees; it
 does not yet solve arbitrary newly created roots that arrive one at a time.
 
-The proposed logical root is a stable synthetic path per project/component.
-An exact-run receipt must map it to that run's authorized checkout and preserve
-the compile-origin tree, requested run tree, selector, toolchain/configuration,
-slot lease, binary digests and private capture digests. The source map is
-proposed; no Cargo or debugger integration is shipped. Keep full debug info.
-Do not use debuginfo=0, strip symbols, or remove path flags to hide the
-failure.
+The experimental local adapter now resolves a finite ordered source-root map
+and carries its policy and map digests with the complete effective Rust-flag
+vector. Root IDs bind to canonical declared paths. Map or flag changes create a
+separate partition; a missing effective flag vector, full-debug intent, or any
+source/configuration/toolchain miss control refuses before a shared partition
+is resolved. Logical mode requires the recorded accepted policy ID. Strict
+physical mode keeps each requested root in its own partition.
+
+The run receipt records the complete ordered map, chosen root and logical
+prefix, compile-origin root/tree identities, requested source tree, slot lease,
+binary digests and capture digest. The qualifier keeps debug-information,
+compiler source, `file!()`, panic-location, and Apple OSO paths distinct from
+manifest, include, build-script, `OUT_DIR`, generated, proc-macro and runtime
+paths. Missing or unresolved evidence is insufficient; mismatches fail. This
+mapping does not prove behavior-path correctness or debugger integration.
+Small task-owned fixtures exercise these predicates only. The registered Cargo
+runner forwards the effective remap flags and records map digests, but does not
+provide the binary and path evidence required to qualify mapped reuse; such a
+run remains uncertain. No real Cargo portability result is established. Keep
+full debug info; do not use debuginfo=0, strip symbols, or remove path flags to
+hide a failure.
 
 **Registered-root cost in Queue's workflow:** disposable Queue worktrees
 normally receive a new physical root per task. Because the complete ordered
@@ -494,15 +508,15 @@ unsolved. Do not grow the root map silently or claim arbitrary-root reuse.
 
 **Operator ruling, 2026-10-10:** Tom accepted logical compiler source names,
 file!() and panic locations bound to each run's exact source tree, and the
-prepared Oxide-only experimental qualifier implementation. [Vision](vision.md#authority-boundaries)
+Oxide-only experimental qualifier implementation. [Vision](vision.md#authority-boundaries)
 owns the exact ruling and scope. This replaces the B-absolute-path requirement
 for explicitly selected experimental logical mode; it does not qualify reuse
-or authorize another real-project pilot. Behavior-bearing paths still need to resolve
-and behave against the exact requested tree; any stale A resource path,
+or authorize another real-project pilot. Behavior-bearing paths still need to
+resolve and behave against the exact requested tree; any stale A resource path,
 unresolved path class or missing source evidence fails closed. Production
 partitions remain checkout-isolated.
 
-The next brief must name the path gate before running. In **strict mode** (the
+A real-project brief must name the path gate before running. In **strict mode** (the
 physical-path policy retained as an explicit option), pass only when every inspected
 reference to this project's source in the reused B artifacts contains B's
 exact absolute root and none contains A's root; third-party and toolchain paths
@@ -535,22 +549,17 @@ A logical-path result does not claim interactive debugger integration; if
 that is part of the accepted contract, the pilot must stop until an exact-B
 debugger source lookup is available and qualified.
 
-### Bounded follow-up proposal (real-project execution not authorized)
+### Bounded real-project follow-up (execution not authorized)
 
-Tom approved the prepared Oxide-only experimental implementation brief with
-small fixture validation; the proposed real-project qualification below still
-needs its own execution scope. Implementation stays within the local Oxide
-adapter and driver; it must not wire a consumer or install a host service. Carry an explicit source-map policy and complete authorized-root map
-through compatibility identity and run receipts, fail closed at the selected
-portability gate, and give every disposable root its own identity. The current
-trial's constant disposable-root component must become a per-root stable ID
-bound to the declared root; containment validation alone cannot distinguish
-two roots. Preserve separate records for the tree that produced a slot
-artifact and the tree requested by a later run. Keep each final binary,
-stdout/stderr, test output, manifest and receipt in that run's private capture.
-The slot retains only reusable Cargo intermediates and their compile-origin
-evidence. Use the existing reviewed lease, resource, local receipt and
-cooperative completion machinery without widening it.
+The Oxide-only experimental implementation is present in the local adapter and
+qualifier, with small fixture coverage. It does not wire a consumer or install
+a host service. The proposed real-project qualification below still needs its
+own execution scope. A fresh pilot must preserve separate compile-origin and
+requested-tree records and keep each final binary, stdout/stderr, test output,
+manifest and receipt in that run's private capture. The slot retains only
+reusable Cargo intermediates and their compile-origin evidence. Use the
+existing reviewed lease, resource, local receipt and cooperative completion
+machinery without widening it.
 
 The brief must enumerate the behavior-path classes in scope for its selector,
 identify the test or artifact evidence for each, and name any excluded class;
