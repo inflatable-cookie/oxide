@@ -336,6 +336,16 @@ fn prestarted_session_reuses_recorded_deadline_and_rejects_unknown_root_entries(
         "session_id={SESSION_ID}\nstart_utc=2026-10-10T15:19:29Z\ndeadline_utc=2026-10-10T15:39:29Z\nstart_monotonic_ns={start_ns}\ndeadline_monotonic_ns={deadline_ns}\nmax_session_secs=1200\ninvocation_count=0\nmax_invocations=4\n"
     );
     fs::write(setup_temp.join("session-clock.txt"), &clock).expect("clock file");
+    fs::write(
+        setup_temp.join("fixture-source-hash.txt"),
+        format!("sha256:{FROZEN_FIXTURE_TREE_DIGEST}\n"),
+    )
+    .expect("fixture hash record");
+    fs::write(
+        setup_temp.join("host-space-samples.tsv"),
+        b"sample header\n",
+    )
+    .expect("host sample record");
 
     let (started, start_utc, deadline_utc) =
         load_recorded_session_at(&probe_root, &setup_temp, SESSION_ID, "2026-10-10T15:19:34Z")
@@ -2010,7 +2020,18 @@ fn load_recorded_session_at(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
     setup_entries.sort();
-    if setup_entries != ["session-clock.txt"] {
+    let allowed_setup_entries = [
+        "fixture-source-hash.txt",
+        "host-space-samples.tsv",
+        "session-clock.txt",
+    ];
+    if !setup_entries
+        .iter()
+        .any(|entry| entry == "session-clock.txt")
+        || setup_entries
+            .iter()
+            .any(|entry| !allowed_setup_entries.contains(&entry.as_str()))
+    {
         return Err(format!("refusing unknown setup state: {setup_entries:?}"));
     }
     let clock_path = setup_temp.join("session-clock.txt");
