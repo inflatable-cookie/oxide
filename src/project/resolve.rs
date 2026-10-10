@@ -1,3 +1,4 @@
+use super::source_map::{self, ResolvedSourceMap, SourceMapPolicy};
 use super::AdapterRefusal;
 use crate::storage::PartitionKey;
 use sha2::{Digest, Sha256};
@@ -11,9 +12,13 @@ use std::path::{Path, PathBuf};
 pub enum PathIdentity {
     /// Default key: the canonical checkout path is part of identity.
     Checkout,
-    /// Trial-only key: checkouts under one declared disposable root share a key.
-    /// Every other effective input still separates partitions.
-    DisposableRoot { root: PathBuf },
+    /// Trial-only identity. Without an explicit qualified map it remains
+    /// checkout-isolated inside the disposable root.
+    DisposableRoot {
+        id: String,
+        root: PathBuf,
+        source_map: Option<SourceMapPolicy>,
+    },
 }
 
 /// An opted-in workflow and the inputs it permits the adapter to resolve.
@@ -86,7 +91,7 @@ pub enum EffectiveInputSet {
 }
 
 /// Effective toolchain, platform, Cargo configuration, and environment inputs.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct EffectiveBuildInputs {
     pub cargo: ToolchainInput,
     pub rustc: ToolchainInput,
@@ -94,6 +99,30 @@ pub struct EffectiveBuildInputs {
     pub target: String,
     pub cargo_configuration: EffectiveInputSet,
     pub environment: EffectiveInputSet,
+    /// Complete compiler flags after Cargo configuration and environment
+    /// precedence have been resolved. `None` is insufficient for mapped use.
+    pub effective_rustflags: Option<Vec<String>>,
+    /// Effective profile configuration requested full debug information.
+    pub full_debug: bool,
+}
+
+impl fmt::Debug for EffectiveBuildInputs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EffectiveBuildInputs")
+            .field("cargo", &self.cargo)
+            .field("rustc", &self.rustc)
+            .field("host", &self.host)
+            .field("target", &self.target)
+            .field("cargo_configuration", &self.cargo_configuration)
+            .field("environment", &self.environment)
+            .field(
+                "effective_rustflags",
+                &self.effective_rustflags.as_ref().map(|_| "[redacted]"),
+            )
+            .field("full_debug", &self.full_debug)
+            .finish()
+    }
 }
 
 /// One invocation of an exactly declared project workflow.
@@ -127,6 +156,7 @@ pub(super) struct ResolvedInvocation {
     pub target_dir: PathBuf,
     pub capture_dir: PathBuf,
     pub environment: Vec<EffectiveValue>,
+    pub source_map: Option<ResolvedSourceMap>,
 }
 
 pub(super) enum Resolution {
@@ -210,7 +240,16 @@ fn resolve_selected(
         &workflow.environment_keys,
         true,
     )?;
-    let config_digest = digest_values(b"cargo-config-v1", &cargo_configuration);
+    let mut config_digest = digest_values(b"cargo-config-v1", &cargo_configuration);
+    if let Some(flags) = &invocation.inputs.effective_rustflags {
+        let borrowed: Vec<_> = flags.iter().map(String::as_str).collect();
+        let flags_digest = source_map::digest_fields(&borrowed);
+        config_digest = source_map::digest_fields(&[
+            "cargo-config-with-rustflags-v1",
+            config_digest.as_str(),
+            flags_digest.as_str(),
+        ]);
+    }
     let environment_digest = digest_values(b"build-environment-v1", &environment);
 
     let workspace_root = canonical_directory(&invocation.descriptor.workspace_root)?;
@@ -219,17 +258,55 @@ fn resolve_selected(
     if paths_overlap(&target_dir, &capture_dir) {
         return Err(AdapterRefusal::AmbiguousInput);
     }
-    let path_identity = match &workflow.path_identity {
-        PathIdentity::Checkout => workspace_root
-            .to_str()
-            .ok_or(AdapterRefusal::UnsupportedInput)?
-            .to_owned(),
-        PathIdentity::DisposableRoot { root } => {
+    let (path_identity, source_map) = match &workflow.path_identity {
+        PathIdentity::Checkout => (
+            workspace_root
+                .to_str()
+                .ok_or(AdapterRefusal::UnsupportedInput)?
+                .to_owned(),
+            None,
+        ),
+        PathIdentity::DisposableRoot {
+            id,
+            root,
+            source_map,
+        } => {
             let root = canonical_directory(root)?;
             if workspace_root == root || !workspace_root.starts_with(&root) {
                 return Err(AdapterRefusal::UnsupportedInput);
             }
-            "disposable-root".to_owned()
+            let root_digest = source_map::disposable_root_identity(id, &root)?;
+            match source_map {
+                Some(policy) => {
+                    let resolved_map = source_map::resolve(
+                        policy,
+                        &root,
+                        &workspace_root,
+                        &invocation.source_tree_digest,
+                        invocation.inputs.effective_rustflags.as_deref(),
+                        invocation.inputs.full_debug,
+                    )?;
+                    let source_scope = if resolved_map.is_strict_physical() {
+                        format!(":strict-root:{}", resolved_map.requested_root_id())
+                    } else {
+                        String::new()
+                    };
+                    let identity = format!(
+                        "disposable-root:{id}:{root_digest}:{}{source_scope}",
+                        resolved_map.map_digest(),
+                    );
+                    (identity, Some(resolved_map))
+                }
+                None => {
+                    let checkout = workspace_root
+                        .to_str()
+                        .ok_or(AdapterRefusal::UnsupportedInput)?;
+                    (
+                        format!("disposable-root:{id}:{root_digest}:checkout:{checkout}"),
+                        None,
+                    )
+                }
+            }
         }
     };
     let project_component = format!(
@@ -258,6 +335,7 @@ fn resolve_selected(
         target_dir,
         capture_dir,
         environment,
+        source_map,
     })
 }
 

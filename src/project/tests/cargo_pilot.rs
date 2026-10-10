@@ -285,7 +285,9 @@ fn invocation(
                 cargo_config_keys: Vec::new(),
                 environment_keys: ENVIRONMENT_KEYS.iter().map(|key| key.to_string()).collect(),
                 path_identity: PathIdentity::DisposableRoot {
+                    id: "pilot-image-oxide-005".to_owned(),
                     root: mount.to_path_buf(),
+                    source_map: None,
                 },
             }],
         },
@@ -303,6 +305,8 @@ fn invocation(
             target: "aarch64-apple-darwin".to_owned(),
             cargo_configuration: EffectiveInputSet::Complete(Vec::new()),
             environment: EffectiveInputSet::Complete(environment),
+            effective_rustflags: None,
+            full_debug: true,
         },
         target_dir: runs.join("target"),
         capture_dir: runs.join("capture"),
@@ -491,6 +495,7 @@ fn nucleus_cargo_pilot() {
             cargo_build_dir: s1.join("build"),
             cargo_target_dir: s1.join("target"),
             capture_dir: s1.join("capture"),
+            source_map: None,
             environment: env.clone(),
         },
         claim: native::NativeExecutionClaim::new(
