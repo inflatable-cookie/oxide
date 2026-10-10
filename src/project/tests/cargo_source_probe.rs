@@ -717,24 +717,24 @@ fn run_probe() -> Result<(), String> {
             && artifact.target_kinds.iter().any(|kind| kind == "test")
             && !artifact.fresh
     });
-    let rebuilt_build_script = summary2.artifacts.iter().any(|artifact| {
-        artifact.manifest.starts_with(&b)
-            && artifact
-                .target_kinds
-                .iter()
-                .any(|kind| kind == "custom-build")
-            && !artifact.fresh
-    });
+    let baseline_stdout =
+        fs::read(run1.capture_dir.join("stdout.log")).map_err(|error| error.to_string())?;
+    let baseline_summary = producer::inspect_cargo_output(&baseline_stdout);
+    // A resource marker invalidates the script's outputs, not its unchanged
+    // executable. Cargo's execution row alone can be cached; require changed
+    // generated/proc-macro values as well as the independent byte checks below.
+    let invalidated_build_output =
+        source_control_build_output_changed(&baseline_summary, &summary2, &control_slot);
     let source_miss_pass = run2.exit_code == Some(0)
         && rebuilt_probe
-        && rebuilt_build_script
+        && invalidated_build_output
         && run2.preflight_scans_complete
         && run2.probe_values_match;
     if !source_miss_pass {
         append_evidence(
             &mount,
             &format!(
-                "source-miss\tfail\trebuilt_probe={rebuilt_probe}\trebuilt_build_script={rebuilt_build_script}\texit={:?}\n",
+                "source-miss\tfail\trebuilt_probe={rebuilt_probe}\tinvalidated_build_output={invalidated_build_output}\texit={:?}\n",
                 run2.exit_code
             ),
         )?;
@@ -971,6 +971,84 @@ fn run_probe() -> Result<(), String> {
     detach_image(&attach)?;
     refuse_session_timeout(&started)?;
     Ok(())
+}
+
+fn source_control_build_output_changed(
+    baseline: &producer::CargoOutputSummary,
+    changed: &producer::CargoOutputSummary,
+    slot: &Path,
+) -> bool {
+    let before = &baseline.probe_values;
+    let after = &changed.probe_values;
+    if before.get("generated-value").map(String::as_str) != Some(BASELINE_MARKER.trim())
+        || after.get("generated-value").map(String::as_str) != Some(CHANGED_MARKER.trim())
+        || after.get("build-value") != after.get("generated-value")
+        || after.get("proc-macro-value") != after.get("generated-value")
+    {
+        return false;
+    }
+    let Some(output) = after.get("generated-output-path").map(Path::new) else {
+        return false;
+    };
+    let Some(input) = after.get("proc-macro-input-path").map(Path::new) else {
+        return false;
+    };
+    changed.build_script_dirs.iter().any(|directory| {
+        directory.starts_with(slot)
+            && output == directory.join("generated.rs")
+            && input == directory.join("proc-macro-input.txt")
+    })
+}
+
+#[test]
+fn source_marker_control_accepts_fresh_script_binary_only_with_changed_bound_outputs() {
+    let baseline =
+        producer::inspect_cargo_output(b"OXIDE_PROBE\tgenerated-value\tbaseline-marker\n");
+    // These are the actual v3 Cargo/output forms: the custom-build compiler
+    // artifact is fresh, while build-script-executed and new values are emitted.
+    let stdout = br#"{"reason":"compiler-artifact","manifest_path":"/owned/b/probe/Cargo.toml","target":{"name":"build-script-build","kind":["custom-build"]},"filenames":["/owned/slot/debug/build/script"],"executable":null,"fresh":true}
+{"reason":"build-script-executed","out_dir":"/owned/slot/debug/build/probe/out"}
+OXIDE_PROBE	build-value	changed-marker
+OXIDE_PROBE	generated-value	changed-marker
+OXIDE_PROBE	proc-macro-value	changed-marker
+OXIDE_PROBE	generated-output-path	/owned/slot/debug/build/probe/out/generated.rs
+OXIDE_PROBE	proc-macro-input-path	/owned/slot/debug/build/probe/out/proc-macro-input.txt
+"#;
+    let current = producer::inspect_cargo_output(stdout);
+    assert_eq!(current.artifacts.len(), 1);
+    assert!(current.artifacts.iter().all(|artifact| artifact.fresh));
+    assert!(source_control_build_output_changed(
+        &baseline,
+        &current,
+        Path::new("/owned/slot")
+    ));
+    let stale = producer::inspect_cargo_output(
+        &String::from_utf8_lossy(stdout)
+            .replace("changed-marker", "baseline-marker")
+            .into_bytes(),
+    );
+    assert!(!source_control_build_output_changed(
+        &baseline,
+        &stale,
+        Path::new("/owned/slot")
+    ));
+    let missing_row = producer::inspect_cargo_output(
+        &stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.starts_with(b"{\"reason\":\"build-script-executed"))
+            .flat_map(|line| line.iter().copied().chain(std::iter::once(b'\n')))
+            .collect::<Vec<_>>(),
+    );
+    assert!(!source_control_build_output_changed(
+        &baseline,
+        &missing_row,
+        Path::new("/owned/slot")
+    ));
+    assert!(!source_control_build_output_changed(
+        &baseline,
+        &current,
+        Path::new("/other/slot")
+    ));
 }
 
 struct OwnedRun {

@@ -1011,6 +1011,89 @@ full `ownership_capture` sequence and `reuse_result` were not reached. This
 run does not qualify cross-worktree reuse or useful storage reduction. The bounded scanner correction keeps the original output limit; any further
 execution uses a fresh scoped Queue session and resources.
 
+#### Task 017 continuation session v3 observations (2026-10-10)
+
+The bounded read-only tool preflight on v2's accessible companion retained
+147,604 bytes of new captures under
+`/private/tmp/oxide-017-v3-preflight.p2d_a0kf`. Every scanner exited 0 within
+10 seconds and below the unchanged 1 MiB command bound. The function query
+also emitted same-name namespaces; the parser selects the actual subprogram's
+CU offset instead. Raw function/parent context, selected line table, source
+list, section sizes, UUIDs, tool version, arguments and executable/companion
+hashes are recorded in the scratch manifest. These are authoring observations,
+not retrofitted v2 receipts.
+
+V3 ran the committed implementation at
+`35a476b8b5b57c1311ad3d8912e4de4ffa1bb67d` under the new root
+`/private/var/tmp/oxide-rust-probe-proof-613d9b91-v3`, session
+`oxide-probe-session-613d9b91-v3`. The actual full commit is also recorded in
+each run's private manifest. Its live `Instant` started before setup at UTC
+`2026-10-10T16:04:08Z`, with elapsed deadline 1,200,000 ms and UTC audit deadline
+`16:24:08Z`. The unchanged packed fixture digest was
+`sha256:550e62cefc7f647fef97b12489fc2c1e1ba67fd56a7529401fce25c97b0ce2e9`.
+The driver's frozen-tree/committed-source guards succeeded before Cargo. An
+additional independent Python prelaunch checksum attempt used string rather
+than path-component sorting and failed its digest assertion; the shell still
+launched Effigy. The corrected independent checker matched the digest after
+the run, so that extra check is post-run evidence, not a prelaunch attestation.
+
+Two of the four allowed fixture invocations ran, in order. Private cold A
+rebuilt six units, executed the fixture test with `1 passed`, and printed the
+accepted logical `file!()` and panic paths. Requested-tree values matched.
+The exact packed companion's arm64 UUID
+`48014E44-7CC2-38B9-9627-F66B88BCFE0E` matched its executable. Its independently
+captured DWARF payload digest was
+`sha256:9c3fb2b29441038d3d462bc6592f66238f37367c413ed242fbf4cd9543efd650`.
+The raw project-subprogram/CU context and its selected line table establish
+`probe/tests/probe.rs` under logical working directory
+`/oxide-source-map-probe`; the map resolves that to the frozen A source.
+All required sections were nonzero, and the complete private bundle manifest,
+UUID, original/capture hashes and source lookup produced `bound=true` and
+`scan_complete=true`. The baseline capture occupies 10,550,929 logical bytes.
+
+The changed B marker produced tree
+`sha256:784b4c701a7b752a11e0b5b99e7fff36f796af643cd3e8514ae16147b237ee26`.
+B rebuilt three affected library/test units, its fixture test passed, and all
+include/build/generated/proc-macro/runtime values were `changed-marker` at the
+requested B paths. Independent file-byte checks recorded `values_match=true`.
+Its test/companion UUID was `870AA164-EAF9-33FC-A4E0-1F6F54540EB5`; complete
+companion binding and source lookup also succeeded. The capture occupies
+10,550,742 logical bytes.
+
+The driver nevertheless stopped at the source control: it required the
+unchanged build-script *compiler artifact* to be non-fresh. Cargo reported that
+artifact `fresh=true`, plus `build-script-executed` and the expected newly
+changed generated/proc-macro bytes. That rejection is an overstrict harness
+predicate, not observed stale-source execution or cache unsuitability. The
+later correction requires an affected test rebuild, Cargo's bound output
+directory, changed generated/proc-macro values and the existing independent
+byte checks; an execution row alone cannot prove rerun because Cargo may emit
+cached build-script output. Ordinary coverage includes a fresh script binary
+with changed outputs, stale values, missing execution context and a wrong slot.
+The new predicate was not executed in v3; its failed receipt remains unchanged.
+
+Both leases finalized Idle. B was restored to the frozen tree only after its
+private capture and settlement. The driver ended at about 16,380 ms; shared
+cold A, warm B and cheap configuration/toolchain controls were not reached.
+UTC/elapsed host samples were at 45, 1,786, 2,074, 11,798, 16,223 and 16,357 ms,
+with a largest gap of 9,724 ms. The minimum sampled host free space was
+249,785,610,240 bytes. At stop, APFS capacity was 8,380,178,432 bytes, mounted
+use 48,685,056 bytes, sparse backing allocation 73,404,416 bytes and outside
+allocation 16,384 bytes. No threshold was reached; write attribution remains
+unavailable. The negative path preserved the image and mount. All earlier
+session resources and captures remain unchanged.
+
+The baseline tests and full-debug logical lookup are now observed, while
+source-control acceptance with the corrected predicate, the full ownership
+sequence and cross-path reuse remain unqualified. This is a stopped harness
+qualification, not a negative mechanism decision or useful storage-reduction
+claim. The ended live driver is not resumable; no clock reset, replay, third or
+fourth invocation, or v4 session was started. Further live execution requires a
+fresh scoped Queue session. The earlier
+[review](https://github.com/inflatable-cookie/oxide/pull/17#issuecomment-6098812074)
+applies to its recorded head; the changed producer and these observations still
+require independent exact-head review.
+
 ### Bounded real-project follow-up (execution not authorized)
 
 The Oxide-only experimental implementation is present in the local adapter and
