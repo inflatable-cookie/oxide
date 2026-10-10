@@ -2493,7 +2493,7 @@ fn incomplete_miss_gate_refuses_before_a_shared_partition_is_resolved() {
 
 #[test]
 fn relative_source_prefix_is_registered_ordered_and_keyed_by_workspace_context() {
-    let fixture = SourceMapFixture::new("relative-source-prefix");
+    let fixture = SourceMapFixture::new("14-relative-source-prefix");
     for root in [&fixture.checkout_a, &fixture.checkout_b] {
         fs::create_dir_all(root.join("probe/src")).unwrap();
         fs::write(root.join("probe/Cargo.toml"), b"[package]\nname='probe'\n").unwrap();
