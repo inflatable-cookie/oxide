@@ -84,168 +84,46 @@ describe semantics, not existing wire fields.
 
 ## Stable source-path lifecycle
 
-This is a proposed Queue/Nucleus integration contract, not a shipped API or an
-approval to change either consumer. Read-only inspection found that Queue
-currently creates task-specific checkout roots, shares Cargo downloads through
-`CARGO_HOME`, keeps build outputs private to each task, and cleans them only
-after closeout proofs (Queue Spec 028). Nucleus Contract 002 preserves one
-logical workspace and branch per task and retains failed or unpublished
-workspaces; successful archival removes the checkout after artifact
-preservation. Its managed-Git direction can share Git objects without sharing
-mutable worktrees. Contract 010 is frozen: Queue admits and launches host runs
-through one scheduler path; Nucleus shadows it and its current host service
-does not implement host-run scheduling. None of these contracts currently
-provides a reusable finite task-root pool, a task-attempt credential for Oxide
-acquisition, or a dirty-source snapshot receipt.
+Recommend a finite consumer-owned pool of physical task-worktree paths, each
+with a bounded strict-physical compatibility allowance. Distinct tasks reuse a
+path sequentially only after ordinary closeout/archive and independently retained
+exact source/artifact/debug evidence. Source tree is per-run identity, not a
+per-revision slot key. Cross-root reuse remains unqualified; no logical root
+remap is selected for this consumer route.
 
-Compare these two consumer-owned arrangements:
+The detailed first-workflow contract is owned by
+[first Nucleus core-test reuse](nucleus-core-reuse.md). It pins the inspected
+selector/source, identifies the fixture collector's missing third-party/native
+input coverage, and specifies proposed root allocation, source retention,
+authenticated attempt/host-run binding and recovery receipts. It is a design,
+not shipped fields, consumer consent or execution approval.
 
-| Arrangement | Recurrence and ownership | Cost or blocker | Decision |
-| --- | --- | --- | --- |
-| Finite pool of task-worktree paths | A Queue/Nucleus task workspace occupies one registered canonical path exclusively. After ordinary archive proves the workspace safe to remove, a later, distinct workspace may use that same path. Every root is part of one fixed complete map, so tasks assigned to different roots keep the same compiler flags. | Requires a bounded path allocator integrated with managed Git/worktree creation, workspace identity and archive. Failed, unmerged or uncertain work keeps its path and can exhaust the pool. Exact dirty/untracked source must remain reproducible before a path is recycled. | **Recommend for the next consumer design brief.** It reuses the actual task worktree and adds no second source copy. It remains unimplemented and unqualified. |
-| Explicit stable compilation-source view | The consumer materializes each authorized task source into a separate stable view and runs Cargo there while retaining the ordinary task checkout elsewhere. | No current Queue/Nucleus view or snapshot contract was found. Copying files increases source storage and requires dirty-source sync, generated-input handling, sibling-relative-path preservation and exact source return. A filesystem snapshot/reflink would need its own supported consumer contract. It is not a safe assumed fallback. | Defer unless the managed-Git/worktree owners identify an existing supported copy-on-write view that avoids full copies and proves exact source behavior. |
+Queue Spec 028 currently keeps build outputs local to each task and only shares
+Cargo downloads/Git objects. Nucleus Contract 002 keeps distinct task workspaces
+and branches, archives successful work after preservation, and retains failed /
+unmerged work. The narrow owner decisions are sequential physical path reuse
+after archive, bounded shared intermediates outside task checkout, independently
+retained exact dirty/generated/dependency source and debug evidence, and a durable
+task-attempt acquire/return-to-pending transition. Existing managed-Git and
+retention owners must supply those seams; Oxide does not manage Git, copy a
+second mutable compilation tree, or recycle a live checkout.
 
-The pool's stable identity is its fixed, ordered set of root IDs, canonical
-paths and logical compiler prefixes plus the remap policy. Register the whole
-set before mapped use. It is independent of each task's mutable source
-revision. Queue/Nucleus binds every build receipt to the task/workspace/run/
-attempt, assigned root, exact commit/tree and submodules, any permitted dirty
-source delta, root-set/policy digest, effective configuration/toolchain,
-Oxide lease, and independent capture receipt. A source revision change under
-the same roots does not change compiler flags; Cargo fingerprints and explicit
-source/configuration/toolchain miss controls must still work. Any changed root
-set or prefix changes the map and produces a cold partition. Never add a root
-to chase a hit or evict an old partition as if that were a recurrence.
+Root allocation lasts through the task's normal workspace lifetime; an Oxide
+lease lasts through one compile/test/capture only. Dirty, unpublished, retained,
+leased or uncertain tasks occupy their root. Pool exhaustion waits without an
+Oxide lease or host-run execution slot, or uses separately bounded consumer-
+authorized private fallback. No age/PID/reply-loss cleanup, implicit map growth
+or silent eviction is permitted. Invalid reuse evidence is distinct from unknown
+ownership: only an explicit proven-Idle whole-generation recovery grant may
+replace invalid owned storage. Ordinary acquire grants no deletion authority.
 
-The consumer's root reservation lasts for the task workspace's normal lifetime;
-the Oxide lease covers one compile/test/capture run only. Reacquire for each
-managed selector. Do not hold an Oxide cache lease while a task edits or waits.
-
-For each opted-in selector, the map must cover every relevant Rust source root,
-including any sibling checkout or generated source tree that affects the
-build. If the consumer cannot register and retain a stable path for a relevant
-root, that selector remains on its private path; the map must not omit the root
-to manufacture a hit.
-
-### Preparation through retained source
-
-The proposed consumer implementation is small in responsibility, though it
-touches lifecycle seams:
-
-1. **Prepare:** the opted-in Queue/Nucleus repository/workflow registration
-   names a finite set of stable task-worktree paths and the exact selectors
-   allowed to use mapped reuse. This is a proposal for a consumer-owned field,
-   not an existing setting. Resolve/canonicalize the complete map before the
-   first managed build. Include all relevant source roots for the selector.
-   Create a checkout only when a task actually takes that slot; do not
-   pre-clone or seed idle roots.
-2. **Authorize the request:** the consumer checks task dependencies, project
-   opt-in and exact selector eligibility under its normal rules, then keeps a
-   stable request identity while the work is pending. This is task-level
-   authorization, not worker/attempt admission or a host-run token.
-3. **Wait:** if no root is free or Oxide reports no compatible storage ready,
-   Queue/Nucleus keeps the request in its own pending lifecycle. Register a
-   cancellable wait by stable request ID and resume on a state-change hint; do
-   not poll, prepare a task checkout, start a worker/build, consume a host-run
-   execution slot or take an Oxide lease while waiting. A full/uncertain pool
-   holds the request visibly; it does not trigger automatic cloning, cleanup,
-   map growth or a private claim of reuse.
-4. **Admit attempt and acquire:** after a wake, normal consumer admission
-   authorizes the task attempt and assigns an available path to its own
-   workspace. The consumer records that source revision and sends Oxide a
-   task/attempt authorization that authenticates `(consumer, project,
-   workflow, task, workspace, run, attempt, root_id, root_set_digest)` plus
-   exact source evidence. This is a required proposed capability, not a
-   current Queue or Nucleus API, and is separate from `HOST_RUN_TOKEN`. The
-   adapter then sends one authenticated, idempotent acquire. If it races and
-   returns `busy`, submit no host run and start no command; the consumer must
-   release/park the authorized attempt and return the request to pending with
-   no execution slot held. This needed return transition is not established by
-   the inspected contracts. It uses no new `host.run` outcome or fabricated
-   `launched: false` settlement. If acquire succeeds, persist the durable
-   lease before continuing. An acquire timeout/lost reply reconciles the same
-   acquire ID; it never creates a second lease.
-5. **Existing host-run admission/launch:** only after successful acquire does
-   the adapter submit the already-supported heavy Effigy selector to the
-   current host-run scheduler. Contract 010 remains the only host admission,
-   launch, cancellation and process-settlement authority. It creates the real
-   host-run ID and supplies its genuine token to the launched process; Oxide
-   must not mint, forge or substitute `HOST_RUN_TOKEN`. If the existing
-   scheduler settles a queued pre-launch cancellation or capacity timeout,
-   use that authentic envelope to reconcile the exact lease. Do not add a
-   storage-busy settlement. While the scheduler queues after acquire, Oxide's
-   storage lease remains reserved, but no host CPU/memory execution slot has
-   been admitted.
-6. **Test, capture and settle:** run the requested selector and tests normally.
-   Queue/Nucleus owns the host-run terminal receipt, exact source identity,
-   captured logs/binaries/test evidence and retention. The adapter binds the
-   real host-run ID/epoch, lease, source/root-set digests and independent
-   capture-receipt digest into the Oxide run receipt. Finalize only after the
-   consumer's ordinary host-run/process proof and capture receipt agree.
-   Missing, mismatched or lost evidence leaves the Oxide slot `uncertain` and
-   unavailable; a cache hit never changes test settlement.
-7. **Retain and recycle source:** the consumer keeps the task's root assigned
-   through its normal workspace lifetime. Before archive/reuse it preserves
-   the exact run source and receipt outside that mutable checkout. A clean,
-   published head can use the consumer's normal closeout and artifact
-   preservation gates. Dirty/untracked source needs an exact retained delta
-   or remains private/held. Failed, unmerged, cancelled or uncertain
-   workspaces follow current retention rules and keep their path occupied.
-   Once ordinary archive is proved, Queue/Nucleus may recreate a new task
-   worktree at that path; it does not reset a live checkout or ask Oxide to
-   retain source.
-
-Under [useful-reuse admission](../qualification-readiness.md#task-019-useful-bounded-reuse-across-changing-tasks-design-only-2026-10-10),
-strict-physical partitions already make a cross-root pair a miss: task A at
-`r0` and task B at `r1` never share a slot, even with identical trees. B must
-not execute A's intermediates and must not be counted as a warm hit. Useful
-recurrence is a later, distinct workspace that reoccupies the same physical
-root after ordinary archive, with a new task/run/attempt identity and
-possibly a different source tree. Oxide reuses that root's exclusive slot;
-Cargo keeps unmodified dependency work and rebuilds changed workspace units.
-Same-root plus same-tree retry is a control, not satisfaction of useful
-reuse. A sequential allocator check that assigns a freed path is the
-consumer path-pool prerequisite for everyday relief; the Oxide same-root
-proof can run on a fixture path without that pool. Follow with the
-mtime-stale content refusal and separate configuration/toolchain miss
-controls; tests still run. If any root, flag or policy changes, record a
-cold partition instead of counting it as reuse.
-
-The finite path count bounds concurrent workspaces eligible for this map,
-not the full-debug cache bytes; that footprint remains unmeasured. Count every
-registered checkout, slot, redirected temporary file and retained run capture
-inside the applicable bounded-storage policy. The map does not make source
-roots free, and retained failures can reduce usable pool capacity until normal
-consumer disposition. Never evict leased/uncertain cache state or delete
-task-owned source/evidence to make room. A task that cannot obtain a pool root
-uses its existing private path only if the consumer explicitly allows that
-fallback; it makes no remapping/reuse claim. Private fallback build storage
-needs separate consumer-approved count/byte limits and ordinary retention /
-cleanup; it is excluded from the Oxide pool-count independence claim and
-refuses when that bound cannot be established. An invalid Oxide reuse map
-alone does not make the root or storage unsafe to own: the [Task 019 cold
-recovery transition](../qualification-readiness.md#task-019-useful-bounded-reuse-across-changing-tasks-design-only-2026-10-10)
-requires proven Idle ownership, scoped whole-generation eviction authority,
-empty-successor proof and budget. Ownership uncertainty still preserves storage;
-Oxide recovery never deletes consumer source or independently owned evidence.
-
-Before implementation, Tom must approve a new consumer integration brief
-that binds the finite root registration and workspace-path reuse to the
-Queue/Nucleus managed-Git/worktree owners, and identifies who implements the
-task-attempt authorization, acquire/cancel/reconcile receipt, exact dirty-source
-retention and archive gate. That brief must treat useful-reuse admission as current Oxide policy: a
-cross-root pair at `r0`/`r1` is refused as a hit; everyday relief needs the
-same physical `root_id` after ordinary archive, or Tom chooses a different
-mechanism. Do not ship Task 018's origin+tree match as that policy: it only
-gives same-tree retry. Queue host-run owners must confirm this ordering
-against frozen Contract 010; Nucleus owners must confirm the workspace and
-retention mapping against Contract 002 and the same frozen 010. The consumers
-must not be treated as interchangeable until Nucleus actually supports each
-required capability. Oxide implementation, real-project qualification and
-rollout each need their own approved scope. The next qualification must still
-measure full-debug bytes and preserve source/configuration/toolchain
-invalidation, behavior-bearing paths, independent artifacts and conservative
-uncertainty.
+Frozen Contract 010 stays unchanged. Readiness is advisory, consumer task-attempt
+authorization precedes acquire, and successful acquire precedes genuine host-run
+submission. Busy returns to consumer pending without a host run/token/settlement;
+this transition and credential are not current APIs. Nucleus shadows Queue's
+host authority, so consumer capability cannot be inferred from a proposed
+integration. Real-workflow eligibility, source-pool/lifecycle implementation,
+qualification and adoption each retain their scoped owner gates.
 
 ## Readiness, admission and acquire ordering
 
