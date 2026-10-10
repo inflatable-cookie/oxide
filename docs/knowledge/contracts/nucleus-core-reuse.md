@@ -1,7 +1,7 @@
 # First Nucleus core-test reuse contract
 
-Status: proposed, documentation-only. This contract defines eligibility and
-owner gates; it does not enable Nucleus, approve its source for execution, or
+Status: proposed consumer contract, with inactive library seams implemented.
+This contract defines eligibility and owner gates; it does not enable Nucleus, approve its source for execution, or
 claim real-project reuse. [Vision](../vision.md#authority-boundaries) owns
 authority; [architecture](../architecture.md) owns storage/lease invariants;
 [project adoption](project-adoption.md) owns the general adapter boundary.
@@ -15,6 +15,95 @@ merge was `df7f084f6e89481b4b0a1b414abc32f23728d922`. That evidence does not
 cover this workflow's third-party/native inputs, consumer authentication,
 root recycling, successful live cold recovery or everyday storage/write relief.
 Task 017's negative mapped-root evidence and unknown lease remain preserved.
+
+## Implemented registered library boundary
+
+`oxide_storage::registered` is a separate version-1 library route. It does not
+change the frozen nine-file/seven-unit fixture, the production adapter default,
+Cargo fingerprints, storage transport or Contract010. It has no registered
+Nucleus workflow, built-in trusted issuer, scheduler or consumer authentication.
+Installing a trusted owner is an embedding decision, never task configuration.
+There is no hardcoded project identity allowlist in this route.
+
+`RegistrationOwner` authenticates the exact attempt, current exclusive lease and
+physical allocation, clean committed source receipt, and separately audits the
+complete registration's supported behavior closure. Versioned source, dependency
+and effective-configuration contracts bind literal executable/argv/cwd/env,
+registered graph/units/packages/features (through the audited graph digest),
+toolchain/configuration/debug identities, root/partition/generation and declared
+source inventory. Each attempt retains distinct task/workspace/run/commit/source
+and allocation-epoch identity. The source content digest frames sorted UTF-8
+relative filenames and their SHA-256 digest strings with little-endian u64 byte
+lengths; it is not the Git tree object ID. The consumer owns Git cleanliness,
+complete behavior-file inventory and durable committed objects. Dirty source,
+submodules, LFS, new graphs, wrappers and opaque reads require refusal under this
+initial policy, not a caller assertion that they are safe.
+
+`InputEvidenceOwner` resolves only accepted issuer references. Registry receipts
+must bind the locked archive checksum, exact extracted file/directory inventory/content,
+canonical source root, provenance and immutable epoch. Tool/SDK receipts bind
+bounded reachable files and their provenance/no-replacement agreement. Oxide
+checks every listed digest, exact file membership, stable reads and physical
+file identity at admission/finalize. The launcher must itself occur in an
+accepted tool manifest. The issuer, rather than Oxide's byte checker, must prove
+archive-to-extraction correspondence and preserve the no-replacement agreement
+through the lease. A correct byte hash does not prove complete native/proc-macro
+behavior. The separate audited closure remains essential. There is no archive
+extractor, whole-host scanner or shipped native/SDK issuer here.
+
+The unit seam consumes owner-verified semantic evidence for pinned Cargo
+`c980f4866` [`LocalFingerprint`](https://github.com/rust-lang/cargo/blob/c980f4866/src/cargo/core/compiler/fingerprint/mod.rs).
+It supports multiple dep-info/script file and environment references, explicit
+presence/absence, finite directory membership including empty directories,
+audited immutable-registry `Precalculated`, and explicitly associated generated
+producer/native-tool inputs. Every declared source file needs a consuming
+anchor, and every consuming anchor is retained; changed content with old/equal
+mtime relative to any anchor refuses. Immutable changes always refuse regardless
+of mtime. `Precalculated` on mutable source, unknown units, unassociated generated
+inputs, unsupported semantic variants, symlink/escape/special-file paths and
+budget overflow refuse. Immutable directory rerun inputs are conservatively
+unsupported; their whole-package immutable inventory is verified independently.
+Rust dep-info supplies no inferred C/header coverage.
+
+These are typed library semantics, **not** a newly invented Cargo capture format.
+A real owner must supply an independently audited pinned decoder/graph receipt
+and associate actual evidence with the registered contract. No raw Nucleus
+fingerprint/unit/native observation was made. The smallest missing evidence is
+that decoder and complete real input audit, authentic immutable registry/native
+SDK manifests, and genuine consumer/scheduler/test/debug capture receipts. No
+mock owner or fixture completion can activate the default adapter.
+
+`ExecutionOwner` alone submits the approved foreground launch through the genuine
+scheduler and validates independently owned completion/test/artifact/debug capture
+and durable exact-lease Idle receipts. `CaptureInputs` binds that verification
+to the collected source/dependency/generated digests and map identity. The command builder clears inherited env,
+uses literal argv, and adds only the authenticated slot, private target and temp
+paths as per-run relocation fields. The behavior audit must approve those path
+relocations; behavior-bearing paths cannot silently become partition-independent.
+No host token or settlement is manufactured. Cooperative owners must wait for
+writing children and close handles; unrelated same-user writers remain an
+unsupported bypass. In-process owner implementations are trusted integration
+code, not a security sandbox for hostile implementations of these traits.
+
+The registered map has its own bounded versioned encoding and owner-authenticated
+seal. A durable pending barrier precedes scheduler submission. Complete successful
+capture and unchanged admitted source/tools produce a candidate; only confirmed
+authenticated Idle removes the barrier. Failed/partial success, capture failure,
+mutation, cancellation or lost replies leave it ineligible, including after
+reconciliation to Idle. An authenticated proof that submission/writing never
+started preserves the prior map. No public recovery/removal or ordinary-acquire
+eviction operation is added.
+
+The engineering ceilings below are enforced independently from fixture limits.
+Each admission/finalize has one source byte budget, one collection byte budget
+(shared by immutable manifests and unit inputs, with deduplicated reads) and at
+most one bounded map read. Metadata membership/stability checks are separately
+finite and may conservatively refuse below a byte ceiling. An unstable read or
+oversized file refuses rather than truncating. Evidence owners must use bounded
+pre-issued receipts or charge their own separately approved preparation; they
+must not hide host scans behind these seams. Ordinary synthetic regressions
+exercise these semantics in fresh owned scratch and claim no actual Cargo reuse,
+Nucleus eligibility, representative fit or independent qualification.
 
 ## Inspected workflow and identity
 
@@ -106,8 +195,9 @@ path-package census (core + observer) is 109 files / 3,075,303 bytes, largest
 
 A safe useful slice is possible on the reviewed strict-physical mechanism,
 conditional on a closed, independently audited workflow input contract. It is
-**not currently eligible**. Implement a separately versioned Nucleus workflow
-registration/collector; preserve the fixed fixture route and its controls.
+**not currently eligible**. The separately versioned registered library route above supplies the
+verification/runner seams; a real Nucleus registration and evidence owners remain
+required. Retain the proposed workflow scope; preserve the fixed fixture route and its controls.
 Do not substitute Nucleus constants into its nine-file/seven-unit allowlists.
 Cargo remains graph/freshness owner; Oxide reads evidence and refuses unsafe
 reuse, never computes or edits Cargo fingerprints.

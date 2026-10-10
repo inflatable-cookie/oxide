@@ -11,3 +11,7 @@ mod project;
 
 #[cfg(unix)]
 pub use project::*;
+
+/// Inactive-by-default registered workflow boundary; trusted owners are required.
+#[cfg(unix)]
+pub mod registered;
