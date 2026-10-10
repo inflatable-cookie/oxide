@@ -30,13 +30,14 @@ use std::time::{Duration, Instant};
 #[path = "../../../fixtures/cargo-source-map-probe/probe/build.rs"]
 mod owned_probe_build_script;
 
-const ROOT: &str = "/private/var/tmp/oxide-rust-probe-paths-20261010";
+const ROOT: &str = "/private/var/tmp/oxide-rust-probe-proof-613d9b91-v2";
+const SESSION_ID: &str = "oxide-probe-session-613d9b91-v2";
 const WORKFLOW: &str = "oxide-cargo-source-map-probe";
 const SELECTOR: &str =
     "test --offline --locked --message-format=json-render-diagnostics -- --nocapture";
-const ROOT_ID: &str = "oxide-rust-probe-paths-20261010";
-const LOCAL_TASK_ID: &str = "oxide-local-probe-paths-20261010";
-const LOCAL_WORKSPACE_ID: &str = "oxide-local-probe-image-paths-20261010";
+const ROOT_ID: &str = "oxide-rust-probe-proof-613d9b91-v2";
+const LOCAL_TASK_ID: &str = "oxide-local-probe-proof-613d9b91-v2";
+const LOCAL_WORKSPACE_ID: &str = "oxide-local-probe-image-proof-613d9b91-v2";
 const LOGICAL_PREFIX: &str = "/oxide-source-map-probe";
 const MARKER_PATH: &str = "probe/marker.txt";
 const BASELINE_MARKER: &str = "baseline-marker\n";
@@ -324,6 +325,37 @@ fn session_clock_persists_original_machine_timestamps() {
 }
 
 #[test]
+fn prestarted_session_reuses_recorded_deadline_and_rejects_unknown_root_entries() {
+    let root = super::super::FixtureRoot::new();
+    let probe_root = root.dir("prestarted-session");
+    let setup_temp = probe_root.join("setup-tmp");
+    fs::create_dir(&setup_temp).expect("setup temp");
+    let start_ns = 10_000_000_000u128;
+    let deadline_ns = start_ns + MAX_SESSION.as_nanos();
+    let clock = format!(
+        "session_id={SESSION_ID}\nstart_utc=2026-10-10T15:19:29Z\ndeadline_utc=2026-10-10T15:39:29Z\nstart_monotonic_ns={start_ns}\ndeadline_monotonic_ns={deadline_ns}\nmax_session_secs=1200\ninvocation_count=0\nmax_invocations=4\n"
+    );
+    fs::write(setup_temp.join("session-clock.txt"), &clock).expect("clock file");
+
+    let (started, start_utc, deadline_utc) =
+        load_recorded_session_at(&probe_root, &setup_temp, SESSION_ID, "2026-10-10T15:19:34Z")
+            .expect("prestarted clock");
+    assert_eq!(start_utc, "2026-10-10T15:19:29Z");
+    assert_eq!(deadline_utc, "2026-10-10T15:39:29Z");
+    assert!(started.elapsed() >= Duration::from_secs(5));
+    assert_eq!(
+        fs::read_to_string(setup_temp.join("session-clock.txt")).expect("clock remains original"),
+        clock
+    );
+
+    fs::write(probe_root.join("unexpected"), b"unknown").expect("unexpected root entry");
+    assert!(
+        load_recorded_session_at(&probe_root, &setup_temp, SESSION_ID, "2026-10-10T15:19:34Z",)
+            .is_err()
+    );
+}
+
+#[test]
 fn source_probe_fixture_matches_the_frozen_tree() {
     let fixture_source =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/cargo-source-map-probe");
@@ -344,19 +376,9 @@ fn oxide_cargo_source_map_probe() {
 }
 
 fn run_probe() -> Result<(), String> {
-    let started = Instant::now();
-    let start_utc = machine_utc()?;
-    let deadline_utc = machine_deadline_utc()?;
-    refuse_session_timeout(&started)?;
-    match fs::symlink_metadata(ROOT) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("could not inspect {ROOT}: {error}")),
-        Ok(_) => return Err(format!("refusing unknown existing state at {ROOT}")),
-    }
-    fs::create_dir(ROOT).map_err(|error| error.to_string())?;
     let setup_temp = PathBuf::from(ROOT).join("setup-tmp");
-    fs::create_dir(&setup_temp).map_err(|error| error.to_string())?;
-    record_session_clock(&setup_temp, &start_utc, &deadline_utc)?;
+    let (started, start_utc, deadline_utc) =
+        load_prestarted_session(Path::new(ROOT), &setup_temp, SESSION_ID)?;
     refuse_session_timeout(&started)?;
     let host_free = native::host_free_bytes(Path::new("/private/var/tmp"))
         .map_err(|_| "host free-space preflight unavailable".to_owned())?;
@@ -405,8 +427,9 @@ fn run_probe() -> Result<(), String> {
     append_evidence(
         &mount,
         &format!(
-            "session\tstart\t{}\tfixture_tree={}\nprofile\ttest/dev debug=2 strip=none split-debuginfo=packed\nscanner-provenance\n{}",
+            "session\tstart_utc={start_utc}\tdeadline_utc={deadline_utc}\tobserved_start_utc={}\telapsed_ms={}\tfixture_tree={}\nprofile\ttest/dev debug=2 strip=none split-debuginfo=packed\nscanner-provenance\n{}",
             machine_utc()?,
+            started.elapsed().as_millis(),
             frozen.digest,
             scanner_identity
         ),
@@ -1949,12 +1972,109 @@ fn record_session_clock(
     file.sync_all().map_err(|error| error.to_string())
 }
 
-fn machine_utc() -> Result<String, String> {
-    machine_date(&["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+fn load_prestarted_session(
+    root: &Path,
+    setup_temp: &Path,
+    expected_session_id: &str,
+) -> Result<(Instant, String, String), String> {
+    load_recorded_session_at(root, setup_temp, expected_session_id, &machine_utc()?)
 }
 
-fn machine_deadline_utc() -> Result<String, String> {
-    machine_date(&["-u", "-v+20M", "+%Y-%m-%dT%H:%M:%SZ"])
+fn load_recorded_session_at(
+    root: &Path,
+    setup_temp: &Path,
+    expected_session_id: &str,
+    now_utc: &str,
+) -> Result<(Instant, String, String), String> {
+    let root_metadata = fs::symlink_metadata(root).map_err(|error| error.to_string())?;
+    let setup_metadata = fs::symlink_metadata(setup_temp).map_err(|error| error.to_string())?;
+    if !root_metadata.file_type().is_dir() || !setup_metadata.file_type().is_dir() {
+        return Err(
+            "prestarted session root and setup directory must be real directories".to_owned(),
+        );
+    }
+    let mut root_entries = fs::read_dir(root)
+        .map_err(|error| error.to_string())?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    root_entries.sort();
+    if root_entries != ["setup-tmp"] {
+        return Err(format!(
+            "refusing unknown disposable-root state: {root_entries:?}"
+        ));
+    }
+    let mut setup_entries = fs::read_dir(setup_temp)
+        .map_err(|error| error.to_string())?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    setup_entries.sort();
+    if setup_entries != ["session-clock.txt"] {
+        return Err(format!("refusing unknown setup state: {setup_entries:?}"));
+    }
+    let clock_path = setup_temp.join("session-clock.txt");
+    if !fs::symlink_metadata(&clock_path)
+        .map_err(|error| error.to_string())?
+        .file_type()
+        .is_file()
+    {
+        return Err("recorded session clock must be a regular file".to_owned());
+    }
+    let clock = fs::read_to_string(&clock_path).map_err(|error| error.to_string())?;
+    let mut fields = BTreeMap::new();
+    for line in clock.lines() {
+        let (name, value) = line
+            .split_once('=')
+            .ok_or_else(|| "malformed recorded session clock".to_owned())?;
+        if fields.insert(name, value).is_some() {
+            return Err("duplicate recorded session clock field".to_owned());
+        }
+    }
+    let field = |name: &str| {
+        fields
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("recorded session clock omitted {name}"))
+    };
+    let session_id = field("session_id")?;
+    let start_utc = field("start_utc")?.to_owned();
+    let deadline_utc = field("deadline_utc")?.to_owned();
+    let start_monotonic_ns = field("start_monotonic_ns")?
+        .parse::<u128>()
+        .map_err(|_| "invalid monotonic start in recorded session clock")?;
+    let deadline_monotonic_ns = field("deadline_monotonic_ns")?
+        .parse::<u128>()
+        .map_err(|_| "invalid monotonic deadline in recorded session clock")?;
+    let start_epoch = machine_epoch_utc(&start_utc)?;
+    let deadline_epoch = machine_epoch_utc(&deadline_utc)?;
+    let now_epoch = machine_epoch_utc(now_utc)?;
+    if session_id != expected_session_id
+        || field("max_session_secs")? != MAX_SESSION.as_secs().to_string()
+        || field("invocation_count")? != "0"
+        || field("max_invocations")? != MAX_INVOCATIONS.to_string()
+        || deadline_monotonic_ns.checked_sub(start_monotonic_ns) != Some(MAX_SESSION.as_nanos())
+        || deadline_epoch.checked_sub(start_epoch) != Some(MAX_SESSION.as_secs())
+        || now_epoch < start_epoch
+        || now_epoch >= deadline_epoch
+    {
+        return Err("recorded session identity, cap or deadline is invalid or expired".to_owned());
+    }
+    let elapsed = Duration::from_secs(now_epoch - start_epoch);
+    let started = Instant::now()
+        .checked_sub(elapsed)
+        .ok_or_else(|| "recorded session start is outside the monotonic clock range".to_owned())?;
+    Ok((started, start_utc, deadline_utc))
+}
+
+fn machine_epoch_utc(stamp: &str) -> Result<u64, String> {
+    machine_date(&["-j", "-u", "-f", "%Y-%m-%dT%H:%M:%SZ", stamp, "+%s"])?
+        .parse()
+        .map_err(|_| "machine UTC timestamp could not be parsed".to_owned())
+}
+
+fn machine_utc() -> Result<String, String> {
+    machine_date(&["-u", "+%Y-%m-%dT%H:%M:%SZ"])
 }
 
 fn machine_date(args: &[&str]) -> Result<String, String> {
@@ -2074,7 +2194,7 @@ fn setup_image(image: &Path, mount: &Path, setup_temp: &Path) -> Result<(String,
             "-fs",
             "APFS",
             "-volname",
-            "oxide-rust-probe-paths",
+            "oxide-rust-probe-proof-v2",
             "-nospotlight",
             "-quiet",
         ])
