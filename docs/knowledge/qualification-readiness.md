@@ -2105,3 +2105,133 @@ invocations; the failed compile is the fourth. There is no fifth recovery
 compile, no live eviction and no successful recovery claim. The driver retains
 its new resources for inspection. This task grants no live execution, consumer
 adoption, everyday benefit claim or authority over any previous probe session.
+
+
+#### Task 021 same-root execution: setup blocker (2026-10-10)
+
+The single authorized `oxide-019-same-root-v1` launch stopped before baseline
+Cargo execution. This is a producer setup deficiency, not a negative reuse
+mechanism result. No dependency reuse, stale-input refusal or failed-build
+invalidation was observed. The session has ended; its unused invocation allowance
+cannot be resumed. Product code and frozen fixtures were unchanged. Author allocation began at
+`2026-10-10T19:08:26.100Z` (40-minute ceiling); preflight, live execution,
+read-only diagnosis and record preparation consumed under four minutes.
+Independent review has a separate 20-minute read-only allocation; no replay is
+authorized and no independent verdict is claimed by this author record.
+
+Producer: independently reviewed Task020 head
+`563cf7b3c2540e11dae64e0efad29d84624eebdb`, running at merged planning/implementation
+head `3e54aa194d9d45b10a4f2f9db86f8968219a527e` on the clean Queue task branch.
+There was no source/fixture difference from the reviewed head.
+`src/project/tests/cargo_same_root.rs` SHA-256:
+`fafc7ed9659d20f75b6400604a18234d5639fdcc3e6e77bcf1926dc1be5c45a0`.
+Read-only preflight recomputed T0
+`sha256:550e62cefc7f647fef97b12489fc2c1e1ba67fd56a7529401fce25c97b0ce2e9`
+and marker-only T1
+`sha256:784b4c701a7b752a11e0b5b99e7fff36f796af643cd3e8514ae16147b237ee26`.
+Installed Cargo was `1.97.1 (c980f4866 2026-06-30)` and rustc was
+`1.97.1 (8bab26f4f 2026-07-14)`, host `aarch64-apple-darwin`.
+Full packed debug remains the unchanged fixture profile; no executable or debug
+companion was produced by this session.
+
+Fresh root `/private/var/tmp/oxide-rust-probe-proof-019-reuse` was absent before
+launch. Outer scratch was `/private/tmp/oxide-021.YGlEjg`; all four outer scratch
+variables (`OXIDE_TASK_SCRATCH_ROOT`, `TMPDIR`, `TMP`, `TEMP`) named it. The verified
+Effigy forwarding form was `effigy test --plan rust -- -- --ignored --exact
+project::tests::cargo_pilot::same_root_probe::same_root_cargo_freshness_owned_proof
+--test-threads=1 --nocapture`. Its plan exited 0 and resolved exactly:
+
+```text
+cargo test --workspace --all-targets --locked -- --ignored --exact project::tests::cargo_pilot::same_root_probe::same_root_cargo_freshness_owned_proof --test-threads=1 --nocapture
+```
+
+The same forwarding vector launched once through `effigy test rust`, with
+`OXIDE_SAME_ROOT_PROOF_RUN=1` and
+`OXIDE_SAME_ROOT_PROOF_SCOPE=oxide-019-same-root-v1`. The outer harness compiled
+successfully in 4.57 seconds, then its one selected ignored proof failed in
+8.02 seconds. Cargo reported exit 101; Effigy/outer shell reported exit 1.
+The saved outer log is 2,396 bytes. No additional ordinary Rust validation or
+fixture smoke build ran; unchanged code retains Task020's accepted validation.
+The strict RustQuality everyday route resolved locally to package 0.2.0,
+repository profile `strict`, no deviations, package-declared MSRV 1.97.1.
+
+The driver recorded original live Instant origin before setup at
+`2026-10-10T19:09:22Z`, deadline `2026-10-10T19:29:22Z` (1,200,000 ms).
+Its last completed sample was `2026-10-10T19:09:30Z`, elapsed 7,999 ms.
+The preceding completed sample was elapsed 58 ms: gap 7,941 ms. The driver
+started its independent 20-second sampler; this entire setup attempt ended
+before the first periodic tick. The outer test's 8.02-second duration is not
+substituted for a missing final driver sample.
+
+| Observation (bytes) | First sample | Last completed sample |
+| --- | ---: | ---: |
+| Host available | 242,213,838,848 | 242,197,155,840 |
+| Image capacity | 0 (not created) | 8,380,178,432 |
+| Image used | 0 | 86,016 |
+| Image free | 0 | 8,353,710,080 |
+| Image allocated | 0 | 15,732,736 |
+| Outside allocated | 4,096 | 20,480 |
+
+The sampled disposable footprint reached 15,753,216 bytes, below 10 GiB;
+observed host free space remained above 20 GiB. The fixed sparse image/mount
+remain retained. These are sampled allocation/free-space observations, not
+SSD write counts; writes are unmeasured. No setup/capture after the last sample
+is presented as continuously measured resource success.
+
+The driver verified its internal Effigy `same-root:probe` plan (executed=false)
+for physical root `m/r` and the pinned Cargo binary with selector
+`test --offline --locked --lib --bins --tests --message-format=json-render-diagnostics -- --nocapture`.
+It then created `m/storage` via `ensure_probe_directory`, which checks directory
+and canonical-path identity but does not impose private permissions.
+Read-only inspection found mode **0755**. `Daemon::bind` correctly rejected it:
+`InvalidInput("storage root must be a private directory")`; the panic was at
+`src/project/tests/cargo_source_probe.rs:1410`. The storage validator requires
+`mode & 0o077 == 0`. This occurred before constructing the invocation counter,
+runner, acquiring any lease or entering the six-step loop. No host launch denial
+was observed; this was the actual storage guard refusing setup.
+
+| Required step | Observed result |
+| --- | --- |
+| Cold T0 | Not reached; no tests/source/debug baseline |
+| Changed-task warm T1 | Not reached; no fresh/rebuilt unit rows |
+| Same-tree T1 retry | Not reached |
+| Old-mtime T0 refusal | Not reached |
+| Syntax-error compiler call | Not reached |
+| Restored-source invalid-map refusal / grant=false inspection | Not reached |
+
+Actual fixture compiler/test calls: **0 of 4**. No slot, lease, authenticated
+no-spawn settlement, capture receipt, finalization or ownership uncertainty was
+created. Empty `m/evidence`, `m/runs` and `m/storage` remain inspectable. No source
+restoration, permission repair, retry, recovery, deletion, attach or detach was
+performed after the stop; all prior resources were left untouched.
+
+Raw evidence is retained under the new root's `setup-tmp/` and outer scratch.
+`/private/tmp/oxide-021.YGlEjg/evidence-inventory.json` records every retained
+regular session file and the outer logs, sizes, allocation and SHA-256 values;
+its SHA-256 is `aeda0125e083af5f805769535d24922365136d2d3db14f8b35b3826c2d449511`.
+Key raw hashes:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `setup-tmp/session-clock.txt` | `036cc35174b0c5dfcd9d21b065a4d1bf5f6f70ad09cd27a72279176bdf5bd50c` |
+| `setup-tmp/host-space-samples.tsv` | `4444adf7c6dd3d10f7bff5bdb74ce0bace5bf44d74488236f4bec8793ce45f94` |
+| `setup-tmp/effigy-launch-setup.json` | `62c1f80f9caea14d5428d206cfe19d52261b1513192bdbdace528d5b42d5a4fd` |
+| `oxide-rust-probe.sparseimage` (inspection snapshot) | `8314cc2faeaec0c6c41f9a9e9ba4e904b0e5c9bec4c4aa9a68df22a6dba18ce0` |
+| Outer `outer-plan.log` | `d21844d5beb1441104365657dddc816432f28a93d5cbce0ee38a3c0c2f2d4b2b` |
+| Outer `outer-run.log` | `58c678fcd82b9bf75f75c4dd0f6d3b422cfe80afb59e5f7fe4c00d29ac5da73a` |
+
+Author assessment pending independent exact-head inspection: `baseline`,
+`useful_reuse`, `admission_refusal` and `failed_map` are **insufficient** because
+none of their steps ran. `ownership_evidence` passes only evidence honesty and
+preservation: no ownership was granted and no release is claimed.
+`session_resources` is **insufficient** for full qualification, with the bounded
+setup observations above preserved. `disposition` passes as an explicit setup
+blocker. Mandatory baseline/resource pass gates are unmet; this cannot close as
+qualified reuse or a negative mechanism result.
+
+Smallest supported next action: a scoped Oxide-only correction establishing a
+private canonical new daemon storage directory, with regression coverage, then
+independent review and a fresh bounded Queue continuation. Do not patch or retry
+this ended session. Consumer path-pool/lifecycle coordination, successful live
+cold recovery, general Cargo input coverage, real-project qualification,
+adoption and everyday storage relief remain unestablished and separately gated.
