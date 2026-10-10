@@ -14,6 +14,8 @@ Tom authorized planning and queueing the next bounded tranche on 2026-10-09. App
 
 When a change alters current truth, update its owning knowledge file in the same PR. Record operator rulings before yielding.
 
+Tom's 2026-10-10 blanket approval in [vision](docs/knowledge/vision.md#authority-boundaries) gives standing authority for routine Oxide-only corrections and equivalent bounded retries toward the agreed Rust reuse proof. Use scoped Queue briefs and independent review; do not re-request permission solely for a correction or fresh equivalent session. Each session retains its recorded time/storage/invocation caps and conservative uncertainty rules. Material scope changes still need an operator ruling.
+
 ## Effigy command map
 
 - `effigy rust:compile` checks the workspace and all targets with the committed lockfile.
