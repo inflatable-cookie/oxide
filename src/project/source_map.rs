@@ -1142,7 +1142,7 @@ pub(super) fn collect(
         return Err(AdapterRefusal::InputUnknown);
     }
     let capture_digest =
-        crate::project::native::capture_receipt_digest(capture_dir, &output_references)
+        crate::project::native::cargo_capture_receipt_digest(capture_dir, &output_references)
             .map_err(|_| AdapterRefusal::InputUnknown)?;
     let receipt = SourceMapRunReceipt {
         policy_digest: map.policy_digest.clone(),
@@ -1840,7 +1840,8 @@ fn verify_capture(receipt: &SourceMapRunReceipt) -> Option<String> {
     {
         return None;
     }
-    crate::project::native::capture_receipt_digest(&capture_dir, &receipt.output_references).ok()
+    crate::project::native::cargo_capture_receipt_digest(&capture_dir, &receipt.output_references)
+        .ok()
 }
 
 fn safe_file_under(root: &Path, path: &Path) -> bool {
