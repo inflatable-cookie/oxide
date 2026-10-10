@@ -124,6 +124,23 @@ impl Fixture {
             source_files: files,
             immutable_receipts: set(&["registry-receipt", "tool-receipt"]),
             units: set(&["source-unit", "script-unit", "registry-unit"]),
+            unit_environment: BTreeMap::from([
+                (
+                    "source-unit".into(),
+                    BTreeMap::from([
+                        ("KNOWN".into(), Some("value with spaces".into())),
+                        ("CARGO_PKG_NAME".into(), Some("synthetic-core".into())),
+                    ]),
+                ),
+                (
+                    "script-unit".into(),
+                    BTreeMap::from([
+                        ("KNOWN".into(), Some("value with spaces".into())),
+                        ("ABSENT".into(), None),
+                    ]),
+                ),
+                ("registry-unit".into(), BTreeMap::new()),
+            ]),
             tests: set(&["planning", "build_diagnostics"]),
             limits: Limits::NUCLEUS,
         };
@@ -304,10 +321,10 @@ impl InputEvidenceOwner for Owners {
                         .iter()
                         .map(|path| source(path))
                         .collect(),
-                    environment: BTreeMap::from([(
-                        "KNOWN".into(),
-                        Some("value with spaces".into()),
-                    )]),
+                    environment: BTreeMap::from([
+                        ("KNOWN".into(), Some("value with spaces".into())),
+                        ("CARGO_PKG_NAME".into(), Some("synthetic-core".into())),
+                    ]),
                 }],
                 associations: vec![
                     Association {
@@ -770,4 +787,34 @@ fn added_empty_directories_and_identical_byte_replacement_refuse() {
     fs::write(f.base.join("replacement"), bytes).unwrap();
     fs::rename(f.base.join("replacement"), path).unwrap();
     assert_eq!(f.run(), Err(Refusal::ImmutableChanged));
+}
+
+#[test]
+fn cargo_generated_unit_environment_is_distinct_and_partition_bound() {
+    let mut f = Fixture::new();
+    f.warm();
+    assert!(!f
+        .registration
+        .argv
+        .environment
+        .contains_key("CARGO_PKG_NAME"));
+    f.registration
+        .unit_environment
+        .get_mut("source-unit")
+        .unwrap()
+        .insert("CARGO_PKG_NAME".into(), Some("other-package".into()));
+    assert_eq!(f.run(), Err(Refusal::Identity));
+    assert_eq!(f.owners.calls.load(Ordering::Relaxed), 1);
+    let mut f = Fixture::new();
+    f.warm();
+    f.registration
+        .unit_environment
+        .get_mut("script-unit")
+        .unwrap()
+        .remove("ABSENT");
+    assert_eq!(
+        f.run(),
+        Err(Refusal::Identity),
+        "undeclared absence is not coverage"
+    );
 }

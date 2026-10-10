@@ -31,7 +31,9 @@ complete registration's supported behavior closure. Versioned source, dependency
 and effective-configuration contracts bind literal executable/argv/cwd/env,
 registered graph/units/packages/features (through the audited graph digest),
 toolchain/configuration/debug identities, root/partition/generation and declared
-source inventory. Each attempt retains distinct task/workspace/run/commit/source
+source inventory. Effective Cargo-generated and external unit environment values
+have a separately audited per-unit map with explicit presence/absence; they are
+not injected into or inferred from the launcher environment. Each attempt retains distinct task/workspace/run/commit/source
 and allocation-epoch identity. The source content digest frames sorted UTF-8
 relative filenames and their SHA-256 digest strings with little-endian u64 byte
 lengths; it is not the Git tree object ID. The consumer owns Git cleanliness,

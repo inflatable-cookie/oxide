@@ -143,6 +143,9 @@ pub struct Registration {
     pub source_files: BTreeSet<String>,
     pub immutable_receipts: BTreeSet<String>,
     pub units: BTreeSet<String>,
+    /// Audited effective Cargo-generated and external environment per unit,
+    /// including deliberate absence. This is distinct from the launcher env.
+    pub unit_environment: BTreeMap<String, BTreeMap<String, Option<String>>>,
     pub tests: BTreeSet<String>,
     pub debug_policy_digest: String,
     pub limits: Limits,
@@ -662,6 +665,22 @@ fn identity(registration: &Registration, attempt: &Attempt) -> Result<String> {
         frame(&mut hash, key.as_bytes());
         frame(&mut hash, value.as_bytes());
     }
+    frame(&mut hash, b"unit-environment");
+    frame(
+        &mut hash,
+        &(registration.unit_environment.len() as u64).to_le_bytes(),
+    );
+    for (unit, values) in &registration.unit_environment {
+        frame(&mut hash, unit.as_bytes());
+        frame(&mut hash, &(values.len() as u64).to_le_bytes());
+        for (name, value) in values {
+            frame(&mut hash, name.as_bytes());
+            frame(&mut hash, &[u8::from(value.is_some())]);
+            if let Some(value) = value {
+                frame(&mut hash, value.as_bytes());
+            }
+        }
+    }
     for set in [
         &registration.source_files,
         &registration.immutable_receipts,
@@ -760,6 +779,33 @@ fn validate(registration: &Registration, attempt: &Attempt) -> Result<()> {
         canonical_dir(path)?;
         if path.as_os_str().len() > limits.path_bytes {
             return Err(Refusal::Budget);
+        }
+    }
+    if registration
+        .unit_environment
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        != registration.units
+    {
+        return Err(Refusal::Identity);
+    }
+    let mut env_entries = 0;
+    for values in registration.unit_environment.values() {
+        env_entries += values.len();
+        if env_entries > limits.associations {
+            return Err(Refusal::Budget);
+        }
+        for (name, value) in values {
+            if name.is_empty()
+                || name.len() > limits.path_bytes
+                || name.contains(['=', '\0'])
+                || value
+                    .as_ref()
+                    .is_some_and(|v| v.len() > limits.path_bytes || v.as_bytes().contains(&0))
+            {
+                return Err(Refusal::Unsupported);
+            }
         }
     }
     let roots = [
@@ -1026,7 +1072,7 @@ impl Runner<'_> {
                             collector.associate(input, BTreeSet::from([anchor.clone()]), false)?;
                         }
                         for (key, value) in environment {
-                            collector.environment(&key, value.as_deref())?;
+                            collector.environment(&unit.id, &key, value.as_deref())?;
                         }
                     }
                     LocalInput::RerunFiles { output, paths } => {
@@ -1039,7 +1085,7 @@ impl Runner<'_> {
                     }
                     LocalInput::RerunEnvironment { name, value } => {
                         frame(&mut collector.semantic, b"rerun-env");
-                        collector.environment(&name, value.as_deref())?;
+                        collector.environment(&unit.id, &name, value.as_deref())?;
                     }
                     LocalInput::Precalculated {
                         value,
@@ -1319,17 +1365,17 @@ impl Collector<'_> {
         }
         Ok(())
     }
-    fn environment(&mut self, key: &str, value: Option<&str>) -> Result<()> {
+    fn environment(&mut self, unit: &str, key: &str, value: Option<&str>) -> Result<()> {
         if key.is_empty()
             || key.len() > self.registration.limits.path_bytes
             || value.is_some_and(|v| v.len() > self.registration.limits.path_bytes)
             || self
                 .registration
-                .argv
-                .environment
-                .get(key)
-                .map(String::as_str)
-                != value
+                .unit_environment
+                .get(unit)
+                .and_then(|values| values.get(key))
+                .map(|expected| expected.as_deref())
+                != Some(value)
         {
             return Err(Refusal::Identity);
         }
