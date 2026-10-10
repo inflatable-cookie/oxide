@@ -128,6 +128,9 @@ impl Fixture {
                 (
                     "source-unit".into(),
                     BTreeMap::from([
+                        ("ABSENT".into(), None),
+                        ("EMPTY".into(), Some(String::new())),
+                        ("SET".into(), Some("yes".into())),
                         ("KNOWN".into(), Some("value with spaces".into())),
                         ("CARGO_PKG_NAME".into(), Some("synthetic-core".into())),
                     ]),
@@ -310,39 +313,74 @@ impl InputEvidenceOwner for Owners {
             .ok_or(Refusal::MissingAuthority)
     }
     fn units(&self, registration: &Registration, _: &Attempt) -> Result<Vec<UnitEvidence>> {
+        // This literal fixture is the hand-annotated Cargo v1 vector in
+        // dep_info.rs; the trusted synthetic owner supplies the exact mappings.
+        let decoded = dep_info::decode(dep_info::UPSTREAM_V1)?;
+        let package_input = source("src.rs");
+        let generated_input = InputPath {
+            root: InputRoot::Generated,
+            path: "generated.rs".into(),
+        };
+        let cargo_files = [
+            dep_info::RegisteredFile {
+                reference: dep_info::FileReference {
+                    tag: dep_info::PathTag::PackageRootRelative,
+                    path: "src/lib.rs".into(),
+                },
+                input: package_input.clone(),
+                association: Association {
+                    input: package_input.clone(),
+                    anchors: set(&["dep-info"]),
+                    producer: None,
+                    native_receipt: None,
+                },
+            },
+            dep_info::RegisteredFile {
+                reference: dep_info::FileReference {
+                    tag: dep_info::PathTag::BuildRootRelative,
+                    path: "build/out.rs".into(),
+                },
+                input: generated_input.clone(),
+                association: Association {
+                    input: generated_input,
+                    anchors: set(&["dep-info"]),
+                    producer: Some("script-unit".into()),
+                    native_receipt: None,
+                },
+            },
+            dep_info::RegisteredFile {
+                reference: dep_info::FileReference {
+                    tag: dep_info::PathTag::PackageRootRelative,
+                    path: "Cargo.toml".into(),
+                },
+                input: source("Cargo.toml"),
+                association: Association {
+                    input: source("Cargo.toml"),
+                    anchors: set(&["dep-info"]),
+                    producer: None,
+                    native_receipt: None,
+                },
+            },
+        ];
+        let decoded = decoded.into_registered(dep_info::TrustedContext {
+            unit: "source-unit",
+            anchor: "dep-info",
+            registered_units: &registration.units,
+            files: &cargo_files,
+        })?;
+        let mut source_associations = decoded.associations;
+        source_associations.push(Association {
+            input: source("src.rs"),
+            anchors: set(&["consumer-two"]),
+            producer: None,
+            native_receipt: None,
+        });
         let mut units = vec![
             UnitEvidence {
                 id: "source-unit".into(),
                 anchors: set(&["dep-info", "consumer-two"]),
-                locals: vec![LocalInput::DepInfo {
-                    anchor: "dep-info".into(),
-                    files: registration
-                        .source_files
-                        .iter()
-                        .map(|path| source(path))
-                        .collect(),
-                    environment: BTreeMap::from([
-                        ("KNOWN".into(), Some("value with spaces".into())),
-                        ("CARGO_PKG_NAME".into(), Some("synthetic-core".into())),
-                    ]),
-                }],
-                associations: vec![
-                    Association {
-                        input: source("src.rs"),
-                        anchors: set(&["consumer-two"]),
-                        producer: None,
-                        native_receipt: None,
-                    },
-                    Association {
-                        input: InputPath {
-                            root: InputRoot::Generated,
-                            path: "generated.rs".into(),
-                        },
-                        anchors: set(&["dep-info"]),
-                        producer: Some("script-unit".into()),
-                        native_receipt: None,
-                    },
-                ],
+                locals: vec![decoded.local],
+                associations: source_associations,
             },
             UnitEvidence {
                 id: "script-unit".into(),

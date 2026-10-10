@@ -2505,11 +2505,12 @@ owns the proposed representative eligibility and consumer path/lifecycle design.
 Read-only inspection selects the existing planning/build_diagnostics workflow,
 with a separate full-debug qualification profile. The unchanged nine-file/seven-unit fixture collector does not admit its
 registry/proc-macro/native inputs. The separate inactive registered library route
-implements bounded byte/association verification and explicit argv/receipt seams;
+implements bounded byte/association verification, a strict pinned Cargo
+`EncodedDepInfo` v1 decoder, and explicit argv/receipt seams;
 [the contract](contracts/nucleus-core-reuse.md#implemented-registered-library-boundary)
-owns their semantics. A complete real audited input contract, accepted immutable
-issuers, pinned evidence decoder and authentic consumer physical-root/retention/
-attempt/test/debug receipts are still required. Synthetic code regressions do
+owns their semantics. A complete real audited input contract, authenticated
+graph and remaining evidence decoding, accepted immutable issuers, and authentic
+consumer physical-root/retention/attempt/test/debug receipts are still required. Synthetic code regressions do
 not establish those receipts or actual Nucleus eligibility. Runtime unit/header/opaque-read coverage, native SDK/tool
 integrity, owner consent, budget fit and real representative qualification remain
 open. Task 021's changed-task dependency retention is a positive tiny-fixture

@@ -68,12 +68,36 @@ unsupported; their whole-package immutable inventory is verified independently.
 Rust dep-info supplies no inferred C/header coverage.
 
 These are typed library semantics, **not** a newly invented Cargo capture format.
-A real owner must supply an independently audited pinned decoder/graph receipt
-and associate actual evidence with the registered contract. No raw Nucleus
-fingerprint/unit/native observation was made. The smallest missing evidence is
-that decoder and complete real input audit, authentic immutable registry/native
-SDK manifests, and genuine consumer/scheduler/test/debug capture receipts. No
-mock owner or fixture completion can activate the default adapter.
+A bounded decoder for the exact Cargo
+[`EncodedDepInfo`](https://github.com/rust-lang/cargo/blob/c980f4866/src/cargo/core/compiler/fingerprint/dep_info.rs)
+v1 byte format now lives in `src/registered/dep_info.rs`. It accepts an explicit
+byte slice up to 16 MiB; file and environment counts are each capped at 32,768,
+and UTF-8 strings at 2,048 bytes, matching the registered file, association and
+path/value ceilings. It requires marker `01 00 00 00 ff`, version `01`,
+little-endian u32 counts/lengths, path tags 0 (package-root-relative) and 1
+(build-root-relative), and strict 0/1 presence markers. It retains path tags,
+file size/checksum text, and environment `None` versus `Some("")` versus a
+nonempty value. It refuses non-UTF-8 strings, invalid tags/markers/bools,
+truncation, trailing bytes, duplicate file references or environment keys,
+oversized counts/strings, and unsupported versions. The literal hand-annotated
+byte vector is a pinned-format test fixture, not compiler-run evidence.
+
+The conversion seam requires trusted owner context containing the authenticated
+unit and consuming anchor plus an exact mapping for every `(path tag, path)` to
+one registered `InputPath` and its association. Missing, duplicate or extra
+mappings, unsafe paths, and generated inputs without a registered producer
+refuse. The runner checks the converted unit against `UnitEvidence.id`; it keeps
+its existing source inventory, anchor, mtime, integrity and identity checks.
+Checksum-bearing files decode without loss but conversion refuses them because
+`LocalInput::DepInfo` does not represent checksum freshness; they are never
+downgraded to mtime evidence. The decoder does not resolve paths or inspect the
+filesystem, build a graph, infer native/generated producers, or authenticate an
+issuer. A real owner must still audit complete input behavior and supply actual
+associations. No raw Nucleus fingerprint/unit/native observation was made. The
+remaining evidence includes the complete real input audit, authentic immutable
+registry/native SDK manifests, and genuine consumer/scheduler/test/debug
+capture receipts. No mock owner or fixture completion can activate the default
+adapter.
 
 `ExecutionOwner` alone submits the approved foreground launch through the genuine
 scheduler and validates independently owned completion/test/artifact/debug capture
