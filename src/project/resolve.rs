@@ -258,7 +258,7 @@ fn resolve_selected(
     if paths_overlap(&target_dir, &capture_dir) {
         return Err(AdapterRefusal::AmbiguousInput);
     }
-    let (path_identity, source_map) = match &workflow.path_identity {
+    let (path_identity, mut source_map) = match &workflow.path_identity {
         PathIdentity::Checkout => (
             workspace_root
                 .to_str()
@@ -326,6 +326,9 @@ fn resolve_selected(
         environment_digest,
         path_identity,
     };
+    if let Some(source_map) = source_map.as_mut() {
+        source_map.bind_build_identity(&partition);
+    }
     Ok(ResolvedInvocation {
         workflow,
         partition,

@@ -9,6 +9,7 @@
 
 use super::native::{self, CargoCompletion};
 use super::resolve::EffectiveValue;
+use super::source_map;
 use super::{
     BoundaryFailure, CancellationProbe, FixtureCommandOutput, FixtureCommandRunner,
     FixtureCommandStatus, FixtureCompletionProof, FixtureExecutionPlan,
@@ -267,11 +268,45 @@ impl FixtureCommandRunner for CargoWorkflowRunner {
             manifest.as_bytes(),
         )
         .map_err(io_failure)?;
-        let output_references = vec![
+        let mut output_references = vec![
             "stdout.log".to_owned(),
             "stderr.log".to_owned(),
             "manifest.txt".to_owned(),
         ];
+        let source_map_evidence = if let Some(source_map) = &command.source_map {
+            let observations = source_map::read_registered_cargo_hook(
+                source_map::EvidenceProvenance::RegisteredCargoWorkflow,
+                source_map,
+                &claim.lease_id,
+                &claim.binding,
+                &claim.host_run_id,
+                &command.cargo_build_dir,
+                &command.cargo_target_dir,
+                &command.capture_dir,
+                &mut output_references,
+            );
+            Some(
+                source_map::collect(
+                    source_map,
+                    &claim.lease_id,
+                    &claim.binding,
+                    &claim.host_run_id,
+                    &command.cargo_build_dir,
+                    &command.cargo_target_dir,
+                    &command.capture_dir,
+                    &mut output_references,
+                    observations,
+                )
+                .map_err(|reason| match reason {
+                    super::AdapterRefusal::AmbiguousInput
+                    | super::AdapterRefusal::UnsupportedInput => BoundaryFailure::Rejected,
+                    super::AdapterRefusal::InputUnknown => BoundaryFailure::Unavailable,
+                    _ => BoundaryFailure::InvalidIdentity,
+                })?,
+            )
+        } else {
+            None
+        };
         let capture_digest =
             native::capture_receipt_digest(&command.capture_dir, &output_references)?;
         let certificate = native::NativeCompletionCertificate::cargo(CargoCompletion {
@@ -302,6 +337,10 @@ impl FixtureCommandRunner for CargoWorkflowRunner {
                 credential: Credential::new("cargo-runner-proof"),
             },
         );
+        if let Some(collected) = source_map_evidence {
+            output.source_map_receipt = Some(collected.receipt);
+            output.portability_evidence = Some(collected.evidence);
+        }
         output.native_completion = Some(certificate);
         Ok(output)
     }

@@ -1993,13 +1993,19 @@ impl SourceMapFixture {
         fs::write(self.slot.join("proc-macro/input.rs"), b"macro input\n").unwrap();
         fs::write(self.capture.join("test.bin"), b"fixture binary\n").unwrap();
         fs::write(self.capture.join("stdout.log"), b"fixture run\n").unwrap();
-        let output_references = vec!["test.bin".to_owned(), "stdout.log".to_owned()];
+        fs::write(self.capture.join("stderr.log"), b"fixture stderr\n").unwrap();
+        let output_references = vec![
+            "test.bin".to_owned(),
+            "stdout.log".to_owned(),
+            "stderr.log".to_owned(),
+        ];
         let capture_digest = native::capture_receipt_digest(&self.capture, &output_references)
             .expect("bounded fixture capture digest");
         let binary_digest = digest(&fs::read(self.capture.join("test.bin")).unwrap());
         let receipt = SourceMapRunReceipt {
             policy_digest: map.policy_digest().to_owned(),
             map_digest: map.map_digest().to_owned(),
+            build_identity_digest: map.build_identity_digest().to_owned(),
             authorized_roots: map.authorized_roots().to_vec(),
             requested_root_id: map.requested_root_id().to_owned(),
             requested_root: map.requested_root().to_path_buf(),
@@ -2020,6 +2026,8 @@ impl SourceMapFixture {
                 reference: "test.bin".to_owned(),
                 digest: binary_digest,
             }],
+            stdout_digest: digest(&fs::read(self.capture.join("stdout.log")).unwrap()),
+            stderr_digest: digest(&fs::read(self.capture.join("stderr.log")).unwrap()),
             capture_digest,
         };
         let source_path = match map.logical_prefix() {
@@ -2098,8 +2106,224 @@ impl SourceMapFixture {
                 source_paths,
             }]),
             behavior_paths: Some(behavior_paths),
+            apple_oso: Some(source_map::AppleOsoObservation::NotEmitted),
+            provenance: source_map::EvidenceProvenance::TaskOwnedFixture,
+            missing_classes: Vec::new(),
         };
         (receipt, evidence)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SourceMapFixtureTamper {
+    None,
+    MissingHook,
+    BinaryAfterCollection,
+    WrongLease,
+    ChangedMap,
+    PhysicalSourcePath,
+    RequestedPhysicalSourcePath,
+}
+
+struct SourceMapFixtureRunner {
+    tamper: SourceMapFixtureTamper,
+}
+
+impl FixtureCommandRunner for SourceMapFixtureRunner {
+    fn execute(
+        &mut self,
+        plan: &FixtureExecutionPlan,
+        _: &dyn CancellationProbe,
+    ) -> Result<FixtureCommandOutput, BoundaryFailure> {
+        let map = plan
+            .command
+            .source_map
+            .as_ref()
+            .ok_or(BoundaryFailure::InvalidIdentity)?;
+        let capture = &plan.command.capture_dir;
+        let slot = &plan.command.cargo_build_dir;
+        let requested_root = map.requested_root();
+        let generated = slot.join("out/generated.rs");
+        let proc_macro_input = slot.join("proc-macro/input.rs");
+        let target_dir = &plan.command.cargo_target_dir;
+        fs::create_dir_all(generated.parent().ok_or(BoundaryFailure::InvalidIdentity)?)
+            .map_err(|_| BoundaryFailure::Unavailable)?;
+        fs::create_dir_all(
+            proc_macro_input
+                .parent()
+                .ok_or(BoundaryFailure::InvalidIdentity)?,
+        )
+        .map_err(|_| BoundaryFailure::Unavailable)?;
+        fs::create_dir_all(target_dir).map_err(|_| BoundaryFailure::Unavailable)?;
+        fs::write(&generated, b"fixture generated output\n")
+            .map_err(|_| BoundaryFailure::Unavailable)?;
+        fs::write(&proc_macro_input, b"fixture proc-macro input\n")
+            .map_err(|_| BoundaryFailure::Unavailable)?;
+        fs::write(capture.join("stdout.log"), b"task-owned fixture stdout\n")
+            .map_err(|_| BoundaryFailure::Unavailable)?;
+        fs::write(capture.join("stderr.log"), b"task-owned fixture stderr\n")
+            .map_err(|_| BoundaryFailure::Unavailable)?;
+        let binary = target_dir.join("fixture.bin");
+        fs::write(&binary, b"task-owned fixture binary\n")
+            .map_err(|_| BoundaryFailure::Unavailable)?;
+
+        let observed_source = match self.tamper {
+            SourceMapFixtureTamper::PhysicalSourcePath => map
+                .authorized_roots()
+                .iter()
+                .find(|root| root.id != map.requested_root_id())
+                .ok_or(BoundaryFailure::InvalidIdentity)?
+                .path
+                .join("src/lib.rs"),
+            SourceMapFixtureTamper::RequestedPhysicalSourcePath => {
+                requested_root.join("src/lib.rs")
+            }
+            _ => map.logical_prefix().map_or_else(
+                || requested_root.join("src/lib.rs"),
+                |prefix| prefix.join("src/lib.rs"),
+            ),
+        };
+        let binary_digest = digest(&fs::read(&binary).map_err(|_| BoundaryFailure::Unavailable)?);
+        let origin = map
+            .authorized_roots()
+            .iter()
+            .find(|root| root.id != map.requested_root_id())
+            .ok_or(BoundaryFailure::InvalidIdentity)?;
+        let generated_tree = map.requested_tree_digest();
+        let behavior = [
+            ("manifest-directory", requested_root.to_path_buf(), "-"),
+            ("include-input", requested_root.join("src/lib.rs"), "-"),
+            ("build-script-input", requested_root.join("build.rs"), "-"),
+            (
+                "out-directory",
+                generated
+                    .parent()
+                    .ok_or(BoundaryFailure::InvalidIdentity)?
+                    .to_path_buf(),
+                plan.claim.lease_id.as_str(),
+            ),
+            (
+                "generated-output",
+                generated.clone(),
+                plan.claim.lease_id.as_str(),
+            ),
+            (
+                "proc-macro-input",
+                proc_macro_input,
+                plan.claim.lease_id.as_str(),
+            ),
+            (
+                "runtime-resource",
+                requested_root.join("assets/data.txt"),
+                "-",
+            ),
+        ];
+        let hook_path = target_dir.join("source-map-observations-v1.txt");
+        if matches!(self.tamper, SourceMapFixtureTamper::MissingHook) {
+            let _ = fs::remove_file(&hook_path);
+        } else {
+            let mut rows = vec![
+                "oxide-cargo-source-map-observations-v1".to_owned(),
+                format!(
+                    "identity\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    map.policy_digest(),
+                    map.map_digest(),
+                    map.build_identity_digest(),
+                    map.requested_tree_digest(),
+                    plan.claim.lease_id,
+                    plan.claim.binding.run_id,
+                    plan.claim.binding.attempt_id,
+                    plan.claim.host_run_id,
+                ),
+                format!(
+                    "origin\t{}\t{}",
+                    origin.id,
+                    digest(b"fixture-compile-origin")
+                ),
+                "artifact\tfixture-binary\ttarget\tfixture.bin".to_owned(),
+                format!(
+                    "scan\tfixture-binary\t{}\t{}",
+                    SOURCE_SCAN_VERSION, binary_digest
+                ),
+                "section\tfixture-binary\t.debug_info".to_owned(),
+                "section\tfixture-binary\t.debug_line".to_owned(),
+                "section\tfixture-binary\t.debug_abbrev".to_owned(),
+            ];
+            for class in ["compiler-debug", "file-macro", "panic-location"] {
+                rows.push(format!(
+                    "source\tfixture-binary\t{class}\t{}",
+                    observed_source.display()
+                ));
+            }
+            for (class, path, generation) in behavior {
+                rows.push(format!(
+                    "behavior\t{class}\t{}\t{generated_tree}\t{generation}",
+                    path.display()
+                ));
+            }
+            rows.push("apple-oso\tnot-emitted".to_owned());
+            fs::write(hook_path, format!("{}\n", rows.join("\n")))
+                .map_err(|_| BoundaryFailure::Unavailable)?;
+        }
+        let mut output_references = vec!["stdout.log".to_owned(), "stderr.log".to_owned()];
+        let observations = source_map::read_registered_cargo_hook(
+            source_map::EvidenceProvenance::TaskOwnedFixture,
+            map,
+            &plan.claim.lease_id,
+            &plan.claim.binding,
+            &plan.claim.host_run_id,
+            slot,
+            target_dir,
+            capture,
+            &mut output_references,
+        );
+        let mut collected = source_map::collect(
+            map,
+            &plan.claim.lease_id,
+            &plan.claim.binding,
+            &plan.claim.host_run_id,
+            slot,
+            &plan.command.cargo_target_dir,
+            capture,
+            &mut output_references,
+            observations,
+        )
+        .map_err(|_| BoundaryFailure::InvalidIdentity)?;
+        match self.tamper {
+            SourceMapFixtureTamper::None | SourceMapFixtureTamper::MissingHook => {}
+            SourceMapFixtureTamper::PhysicalSourcePath
+            | SourceMapFixtureTamper::RequestedPhysicalSourcePath => {}
+            SourceMapFixtureTamper::BinaryAfterCollection => {
+                fs::write(capture.join("binary-0.bin"), b"changed after collection\n")
+                    .map_err(|_| BoundaryFailure::Unavailable)?;
+            }
+            SourceMapFixtureTamper::WrongLease => {
+                collected.receipt.slot_lease_id = "wrong-lease".to_owned();
+            }
+            SourceMapFixtureTamper::ChangedMap => {
+                collected.receipt.map_digest = digest(b"changed-map");
+            }
+        }
+        let mut output = FixtureCommandOutput::new(
+            FixtureCommandStatus::Exited(0),
+            output_references.clone(),
+            Some(4),
+            Some(3),
+            Some(0),
+            Some(1),
+            FixtureCompletionProof::Stopped {
+                reference: format!("fixture-run-{}", plan.claim.binding.run_id),
+                credential: Credential::new("task-owned-fixture-runner"),
+            },
+        );
+        output.source_map_receipt = Some(collected.receipt);
+        output.portability_evidence = Some(collected.evidence);
+        output.native_completion = Some(native::NativeCompletionCertificate::for_test(
+            plan,
+            output.status,
+            &output_references,
+        ));
+        Ok(output)
     }
 }
 
@@ -2435,6 +2659,22 @@ fn logical_qualifier_binds_the_exact_tree_lease_binaries_and_behavior_paths() {
         source_map::qualify(&map, &receipt, &missing_resolution),
         QualificationDisposition::Insufficient
     );
+    let mut physical_source_path = evidence.clone();
+    let physical_source = fixture.checkout_b.join("src/lib.rs");
+    let resolved_physical_source = source_map::resolve_observed_source_path(&map, &physical_source);
+    assert_eq!(
+        resolved_physical_source.as_ref(),
+        Some(&physical_source),
+        "the resolver preserves a concrete path outside the logical prefix"
+    );
+    physical_source_path.binary_scans.as_mut().unwrap()[0].source_paths[0].observed =
+        physical_source.clone();
+    physical_source_path.binary_scans.as_mut().unwrap()[0].source_paths[0].resolved =
+        resolved_physical_source;
+    assert_eq!(
+        source_map::qualify(&map, &receipt, &physical_source_path),
+        QualificationDisposition::Fail
+    );
     let mut mismatched_binary = evidence.clone();
     mismatched_binary.binary_scans.as_mut().unwrap()[0].binary_digest = digest(b"other binary");
     assert_eq!(
@@ -2460,6 +2700,229 @@ fn logical_qualifier_binds_the_exact_tree_lease_binaries_and_behavior_paths() {
         source_map::qualify(&map, &wrong_artifact, &evidence),
         QualificationDisposition::Fail
     );
+}
+
+#[test]
+fn source_map_collector_completes_adapter_reacquire_and_rejects_bound_mismatches() {
+    let fixture = SourceMapFixture::new("13-source-map-adapter");
+    let tree = digest(b"tree-b");
+    let policy = fixture.policy(
+        vec![
+            ("root-a", fixture.checkout_a.clone()),
+            ("root-b", fixture.checkout_b.clone()),
+        ],
+        SourcePathMode::ExperimentalLogical {
+            accepted_policy: ACCEPTED_LOGICAL_POLICY.to_owned(),
+            prefix: PathBuf::from("/oxide/fixture-component"),
+        },
+    );
+    let invocation = fixture.invocation(&fixture.checkout_b, &tree, policy.clone());
+    let storage_root = fixture.root.dir("storage");
+    let daemon = RunningDaemon::start(&storage_root);
+    let mut adapter = ProjectAdapter::new(daemon.client.clone());
+    let mut consumer = FixtureConsumer::new();
+    consumer.run_id = "mapped-run-1".to_owned();
+    consumer.attempt_id = "mapped-attempt-1".to_owned();
+    consumer.host_run_id = "mapped-host-1".to_owned();
+    let mut runner = SourceMapFixtureRunner {
+        tamper: SourceMapFixtureTamper::None,
+    };
+    let first = adapter.execute(
+        &invocation,
+        &mut consumer,
+        &mut NoWait,
+        &mut runner,
+        &NeverCancelled,
+    );
+    assert_eq!(first.disposition, ExecutionDisposition::Finished);
+    assert_eq!(
+        first.finalization.as_ref().map(|receipt| receipt.state),
+        Some(SlotState::Idle)
+    );
+    let slot = daemon.client.inventory("mapped-first-idle").unwrap().slots[0].clone();
+    assert_eq!(slot.state, SlotState::Idle);
+    let evidence_report =
+        fs::read_to_string(invocation.capture_dir.join("source-map-evidence.txt"))
+            .expect("task-owned evidence capture");
+    assert!(evidence_report.contains("provenance=task-owned-fixture\n"));
+    assert!(evidence_report.contains("hook=observed\n"));
+    assert!(evidence_report.contains("binary=binary-0.bin|sha256:"));
+    assert!(evidence_report.contains("missing=none\n"));
+    assert!(adapter.observations()[0]
+        .events
+        .iter()
+        .any(|event| matches!(event.kind, ObservationKind::SourceMapQualified { .. })));
+
+    let second_invocation = fixture.invocation(&fixture.checkout_b, &tree, policy.clone());
+    let mut second_consumer = FixtureConsumer::new();
+    second_consumer.run_id = "mapped-run-2".to_owned();
+    second_consumer.attempt_id = "mapped-attempt-2".to_owned();
+    second_consumer.host_run_id = "mapped-host-2".to_owned();
+    let mut second_runner = SourceMapFixtureRunner {
+        tamper: SourceMapFixtureTamper::None,
+    };
+    let second = adapter.execute(
+        &second_invocation,
+        &mut second_consumer,
+        &mut NoWait,
+        &mut second_runner,
+        &NeverCancelled,
+    );
+    assert_eq!(second.disposition, ExecutionDisposition::Finished);
+    assert_eq!(
+        daemon.client.inventory("mapped-second-idle").unwrap().slots[0].slot_id,
+        slot.slot_id
+    );
+
+    for (index, tamper, wrong_capture) in [
+        (0, SourceMapFixtureTamper::None, true),
+        (1, SourceMapFixtureTamper::BinaryAfterCollection, false),
+        (2, SourceMapFixtureTamper::WrongLease, false),
+        (3, SourceMapFixtureTamper::ChangedMap, false),
+        (4, SourceMapFixtureTamper::MissingHook, false),
+        (5, SourceMapFixtureTamper::PhysicalSourcePath, false),
+        (
+            6,
+            SourceMapFixtureTamper::RequestedPhysicalSourcePath,
+            false,
+        ),
+    ] {
+        let invocation = fixture.invocation(&fixture.checkout_b, &tree, policy.clone());
+        let failure_storage = fixture.root.dir(&format!("failure-storage-{index}"));
+        let failure_daemon = RunningDaemon::start(&failure_storage);
+        let mut failure_adapter = ProjectAdapter::new(failure_daemon.client.clone());
+        let mut failure_consumer = FixtureConsumer::new();
+        failure_consumer.run_id = format!("mapped-failure-{index}");
+        failure_consumer.attempt_id = format!("mapped-failure-attempt-{index}");
+        failure_consumer.host_run_id = format!("mapped-failure-host-{index}");
+        failure_consumer.wrong_capture_digest = wrong_capture;
+        let mut failure_runner = SourceMapFixtureRunner { tamper };
+        let result = failure_adapter.execute(
+            &invocation,
+            &mut failure_consumer,
+            &mut NoWait,
+            &mut failure_runner,
+            &NeverCancelled,
+        );
+        assert_eq!(result.disposition, ExecutionDisposition::Uncertain);
+        assert_eq!(
+            failure_daemon
+                .client
+                .inventory(&format!("mapped-failure-inventory-{index}"))
+                .unwrap()
+                .slots[0]
+                .state,
+            SlotState::Uncertain
+        );
+        if matches!(tamper, SourceMapFixtureTamper::MissingHook) {
+            let report = fs::read_to_string(invocation.capture_dir.join("source-map-evidence.txt"))
+                .expect("bounded missing-hook evidence capture");
+            assert!(report.contains("hook=missing\n"));
+            assert!(report.contains("observation-hook"));
+            assert!(report.contains("binary-artifacts"));
+        }
+        if matches!(
+            tamper,
+            SourceMapFixtureTamper::PhysicalSourcePath
+                | SourceMapFixtureTamper::RequestedPhysicalSourcePath
+        ) {
+            assert!(!failure_adapter.observations()[0]
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, ObservationKind::SourceMapQualified { .. })));
+        }
+    }
+}
+
+#[test]
+fn mapped_source_map_run_with_retained_writer_keeps_slot_uncertain() {
+    let fixture = SourceMapFixture::new("15-source-map-retained-writer");
+    let space = NativeScenarioSpace::new();
+    space.sample(&fixture.root.path);
+    let policy = fixture.policy(
+        vec![
+            ("root-a", fixture.checkout_a.clone()),
+            ("root-b", fixture.checkout_b.clone()),
+        ],
+        SourcePathMode::ExperimentalLogical {
+            accepted_policy: ACCEPTED_LOGICAL_POLICY.to_owned(),
+            prefix: PathBuf::from("/oxide/fixture-component"),
+        },
+    );
+    let invocation = fixture.invocation(&fixture.checkout_b, &digest(b"tree-b"), policy.clone());
+    assert!(matches!(
+        resolve::resolve(&invocation),
+        Resolution::Ready(resolved) if resolved.source_map.is_some()
+    ));
+    let storage_root = fixture.root.dir("storage");
+    let daemon = RunningDaemon::start_with_probe(&storage_root, space.probe());
+    let (started_tx, started_rx) = mpsc::channel();
+    let mut runner = native::NativeFixtureCommandRunner::retain_writer(started_tx)
+        .expect("bounded retained-writer runner");
+    let mut adapter = ProjectAdapter::new(daemon.client.clone());
+    let mut consumer = FixtureConsumer::new();
+    consumer.run_id = "mapped-retained-run".to_owned();
+    consumer.attempt_id = "mapped-retained-attempt".to_owned();
+    consumer.host_run_id = "mapped-retained-host".to_owned();
+    let result = adapter.execute(
+        &invocation,
+        &mut consumer,
+        &mut NoWait,
+        &mut runner,
+        &NeverCancelled,
+    );
+    let started = started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("mapped fixture writer remains active");
+    assert!(started.pid > 0 && runner.has_retained_writer());
+    assert_eq!(result.disposition, ExecutionDisposition::Uncertain);
+    assert_eq!(consumer.last_terminal_outcome, None);
+    assert_eq!(consumer.capture_calls, 0);
+    assert!(invocation.capture_dir.join("writer-progress.txt").is_file());
+    let slot = daemon
+        .client
+        .inventory("mapped-retained-writer")
+        .unwrap()
+        .slots
+        .pop()
+        .expect("mapped uncertain slot remains reserved");
+    assert_eq!(slot.state, SlotState::Uncertain);
+
+    let next_invocation = fixture.invocation(&fixture.checkout_b, &digest(b"tree-b"), policy);
+    let mut next_consumer = FixtureConsumer::new();
+    next_consumer.run_id = "mapped-after-retained".to_owned();
+    next_consumer.attempt_id = "mapped-after-retained-attempt".to_owned();
+    next_consumer.host_run_id = "mapped-after-retained-host".to_owned();
+    let mut next_runner = native::NativeFixtureCommandRunner::healthy().expect("bounded runner");
+    let refused = adapter.execute(
+        &next_invocation,
+        &mut next_consumer,
+        &mut NoWait,
+        &mut next_runner,
+        &NeverCancelled,
+    );
+    assert_eq!(
+        refused.disposition,
+        ExecutionDisposition::Refused(AdapterRefusal::Busy)
+    );
+    assert_eq!(next_runner.launched_children(), 0);
+
+    runner
+        .release_and_reap_retained()
+        .expect("reap only the identified fixture writer");
+    let after_reap = daemon
+        .client
+        .inventory("mapped-retained-after-reap")
+        .unwrap();
+    assert_eq!(after_reap.slots[0].state, SlotState::Uncertain);
+    assert_eq!(
+        daemon
+            .client
+            .evict("mapped-no-uncertain-eviction", 1)
+            .unwrap(),
+        0
+    );
+    space.save(&fixture.root);
 }
 
 #[test]
