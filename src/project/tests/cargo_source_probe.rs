@@ -1632,12 +1632,15 @@ fn known_resume_elapsed() -> Result<Duration, String> {
     let expected_setup_entries = BTreeSet::from([
         "attempt-1.txt".to_owned(),
         "attempt-2.txt".to_owned(),
+        "attempt-3.txt".to_owned(),
+        "diskutil-attempt-3.plist".to_owned(),
+        "hdiutil-image-map-attempt-3.txt".to_owned(),
+        "imageinfo-after-attach-attempt-3.plist".to_owned(),
         "imageinfo-attempt-1.plist".to_owned(),
+        "imageinfo-before-attach.plist".to_owned(),
         "resume-state.txt".to_owned(),
     ]);
-    if directory_names(&setup_temp)? != expected_setup_entries
-        || !directory_names(&mount)?.is_empty()
-    {
+    if directory_names(&setup_temp)? != expected_setup_entries {
         return Err("pre-existing probe setup contents are not the recorded task state".to_owned());
     }
 
@@ -1660,9 +1663,10 @@ fn known_resume_elapsed() -> Result<Duration, String> {
         ("root", ROOT),
         ("image", "oxide-rust-probe.sparseimage"),
         ("image_virtual_capacity", "8589934592"),
-        ("attempt_count", "2"),
+        ("attempt_count", "3"),
+        ("imageinfo_file", "imageinfo-after-attach-attempt-3.plist"),
     ];
-    if fields.len() != 8
+    if fields.len() != 13
         || required
             .iter()
             .any(|(key, expected)| fields.get(*key).map(String::as_str) != Some(expected))
@@ -1684,7 +1688,11 @@ fn known_resume_elapsed() -> Result<Duration, String> {
         return Err("recorded sparse image changed since setup attempt 1".to_owned());
     }
 
-    let info_path = setup_temp.join("imageinfo-attempt-1.plist");
+    let info_path = setup_temp.join(
+        fields
+            .get("imageinfo_file")
+            .ok_or_else(|| "probe resume marker lacks its hdiutil capture name".to_owned())?,
+    );
     let info_metadata = fs::symlink_metadata(&info_path).map_err(|error| error.to_string())?;
     if !info_metadata.is_file() || info_metadata.file_type().is_symlink() {
         return Err("recorded hdiutil image information is not a regular file".to_owned());
@@ -1716,20 +1724,53 @@ fn known_resume_elapsed() -> Result<Duration, String> {
     {
         return Err("recorded second attempt lacks its setup failure evidence".to_owned());
     }
-
-    let root_device = df_space(root)?.0;
-    let mount_device = df_space(&mount)?.0;
-    if root_device != mount_device {
-        return Err("probe mount path is already mounted on a different device".to_owned());
+    let third_attempt =
+        fs::read_to_string(setup_temp.join("attempt-3.txt")).map_err(|error| error.to_string())?;
+    if !third_attempt.contains("before any fixture Cargo invocation or storage lease")
+        || !third_attempt.contains("mounted=/dev/disk7s1")
+    {
+        return Err("recorded third attempt lacks its setup failure evidence".to_owned());
     }
+
     let attached = Command::new("/usr/bin/hdiutil")
         .arg("info")
         .output()
         .map_err(|error| error.to_string())?;
-    if !attached.status.success()
-        || String::from_utf8_lossy(&attached.stdout).contains(image.to_string_lossy().as_ref())
+    if !attached.status.success() {
+        return Err("hdiutil attachment state is unknown".to_owned());
+    }
+    let attached_text = String::from_utf8_lossy(&attached.stdout);
+    let attached_block = image_info_block(&attached_text, &image)
+        .ok_or_else(|| "the recorded task image is not attached in hdiutil state".to_owned())?;
+    let recorded_block = fs::read_to_string(setup_temp.join("hdiutil-image-map-attempt-3.txt"))
+        .map_err(|error| error.to_string())?;
+    let recorded_map_digest = hex_digest(recorded_block.as_bytes());
+    let block_base_device = image_block_base_device(attached_block)
+        .ok_or_else(|| "recorded image has no base device mapping".to_owned())?;
+    let state_base_device = fields.get("attached_device").map(String::as_str);
+    if attached_block != recorded_block
+        || fields.get("attachment_map_digest") != Some(&recorded_map_digest)
+        || !image_block_has_mount(attached_block, &mount, &block_base_device)
+        || state_base_device != Some(block_base_device.as_str())
     {
-        return Err("probe image is already attached or hdiutil state is unknown".to_owned());
+        return Err(
+            "recorded hdiutil mapping does not bind this image to the approved mount".to_owned(),
+        );
+    }
+    let (mounted_device, capacity, used, free) = df_space(&mount)?;
+    if fields.get("mounted_device").map(String::as_str) != Some(mounted_device.as_str())
+        || capacity == 0
+        || capacity > IMAGE_CAP
+        || used > IMAGE_CAP
+        || free > capacity
+    {
+        return Err("recorded APFS mount no longer has the expected bounded capacity".to_owned());
+    }
+    let diskutil_bytes =
+        fs::read(setup_temp.join("diskutil-attempt-3.plist")).map_err(|error| error.to_string())?;
+    let recorded_diskutil_digest = hex_digest(&diskutil_bytes);
+    if fields.get("diskutil_digest") != Some(&recorded_diskutil_digest) {
+        return Err("recorded diskutil APFS identity evidence changed".to_owned());
     }
 
     let elapsed_ms = fields
@@ -1810,6 +1851,42 @@ fn image_capacity(plist: &Path) -> Result<u64, String> {
         .map_err(|error| error.to_string())
 }
 
+fn image_info_block<'a>(info: &'a str, image: &Path) -> Option<&'a str> {
+    let expected = image.to_str()?;
+    info.split("================================================")
+        .find(|block| {
+            block.lines().any(|line| {
+                line.split_once(':').is_some_and(|(key, value)| {
+                    key.trim() == "image-path" && value.trim() == expected
+                })
+            })
+        })
+}
+
+fn image_block_base_device(block: &str) -> Option<String> {
+    block.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let device = fields.next()?;
+        (device.starts_with("/dev/disk") && fields.next() == Some("GUID_partition_scheme"))
+            .then(|| device.to_owned())
+    })
+}
+
+fn image_block_has_mount(block: &str, mount: &Path, device: &str) -> bool {
+    let Some(mount) = mount.to_str() else {
+        return false;
+    };
+    image_block_base_device(block).as_deref() == Some(device)
+        && block.lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            let observed_device = fields.next();
+            let _filesystem = fields.next();
+            let mounted_path = fields.next_back();
+            observed_device.is_some_and(|observed| observed.starts_with("/dev/disk"))
+                && mounted_path == Some(mount)
+        })
+}
+
 fn setup_image(
     image: &Path,
     mount: &Path,
@@ -1849,15 +1926,22 @@ fn setup_image(
     }
     let info = image_info(image)?;
     let image_info_capture = setup_temp.join("imageinfo-before-attach.plist");
-    let mut info_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&image_info_capture)
-        .map_err(|error| error.to_string())?;
-    info_file
-        .write_all(&info)
-        .map_err(|error| error.to_string())?;
-    info_file.sync_all().map_err(|error| error.to_string())?;
+    match fs::read(&image_info_capture) {
+        Ok(previous) if resume && previous == info => {}
+        Ok(_) => return Err("pre-attach image information changed since setup".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut info_file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&image_info_capture)
+                .map_err(|error| error.to_string())?;
+            info_file
+                .write_all(&info)
+                .map_err(|error| error.to_string())?;
+            info_file.sync_all().map_err(|error| error.to_string())?;
+        }
+        Err(error) => return Err(error.to_string()),
+    }
     if image_capacity(&image_info_capture)? != IMAGE_CAP
         || !String::from_utf8_lossy(&info).contains("<string>sparse</string>")
         || !String::from_utf8_lossy(&info).contains("<key>APFS</key>")
@@ -1866,32 +1950,61 @@ fn setup_image(
     }
     let outside_directories =
         allocated_blocks(Path::new(ROOT))?.saturating_add(allocated_blocks(mount)?);
-    let attached = Command::new("/usr/bin/hdiutil")
-        .args(["attach", "-nobrowse", "-noverify", "-mountpoint"])
-        .arg(mount)
-        .arg(image)
-        .env("TMPDIR", setup_temp)
-        .env("TMP", setup_temp)
-        .env("TEMP", setup_temp)
-        .output()
-        .map_err(|error| error.to_string())?;
-    if !attached.status.success() {
-        return Err(format!(
-            "hdiutil attach failed: {}",
-            String::from_utf8_lossy(&attached.stderr)
-        ));
-    }
-    let output = String::from_utf8_lossy(&attached.stdout).into_owned();
-    let device = output
-        .split_whitespace()
-        .find(|value| value.starts_with("/dev/disk"))
-        .ok_or_else(|| format!("hdiutil attach did not identify its device: {output}"))?;
+    let device = if resume {
+        let attached = Command::new("/usr/bin/hdiutil")
+            .arg("info")
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !attached.status.success() {
+            return Err("hdiutil attachment state is unknown".to_owned());
+        }
+        image_info_block(&String::from_utf8_lossy(&attached.stdout), image)
+            .and_then(image_block_base_device)
+            .ok_or_else(|| "the recorded task image is no longer attached".to_owned())?
+    } else {
+        let attached = Command::new("/usr/bin/hdiutil")
+            .args(["attach", "-nobrowse", "-noverify", "-mountpoint"])
+            .arg(mount)
+            .arg(image)
+            .env("TMPDIR", setup_temp)
+            .env("TMP", setup_temp)
+            .env("TEMP", setup_temp)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !attached.status.success() {
+            return Err(format!(
+                "hdiutil attach failed: {}",
+                String::from_utf8_lossy(&attached.stderr)
+            ));
+        }
+        String::from_utf8_lossy(&attached.stdout)
+            .split_whitespace()
+            .find(|value| value.starts_with("/dev/disk"))
+            .ok_or_else(|| {
+                format!(
+                    "hdiutil attach did not identify its device: {}",
+                    String::from_utf8_lossy(&attached.stdout)
+                )
+            })?
+            .to_owned()
+    };
     let canonical_mount = fs::canonicalize(mount).map_err(|error| error.to_string())?;
     if canonical_mount.as_path() != mount {
         return Err("mounted disposable volume is not at its canonical approved path".to_owned());
     }
     let (mounted_device, capacity, used, free) = df_space(mount)?;
-    if !mounted_device.starts_with(device)
+    let attached = Command::new("/usr/bin/hdiutil")
+        .arg("info")
+        .output()
+        .map_err(|error| error.to_string())?;
+    let attached_text = String::from_utf8_lossy(&attached.stdout);
+    let image_block = if attached.status.success() {
+        image_info_block(&attached_text, image)
+    } else {
+        None
+    };
+    if !image_block.is_some_and(|block| image_block_has_mount(block, mount, &device))
+        || !mounted_device.starts_with("/dev/disk")
         || capacity == 0
         || capacity > IMAGE_CAP
         || used > IMAGE_CAP
