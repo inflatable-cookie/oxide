@@ -1172,13 +1172,29 @@ allocation 16,384 bytes. No threshold was reached; write attribution is
 unavailable. The driver stopped in about 23 seconds without resetting its
 clock/count. No remaining-slot replay can run after its lifetime ended.
 
-Effigy `rust:compile` and `rust:format` completed successfully; `test rust`
-passed 61 ordinary tests with two live probes ignored. Compile retained the
-existing 125 library dead-code warnings. Owning-document validation uses
-`docs:check`. These are author observations pending independent exact-head
-review of the current producer and raw v4 captures; the earlier review
-[6098812074](https://github.com/inflatable-cookie/oxide/pull/17#issuecomment-6098812074)
-does not review these paths or provide current verdict credit.
+The [independent exact-head review](https://github.com/inflatable-cookie/oxide/pull/17#issuecomment-6099729811)
+at `d8c2ded43197b7fefa4619f8f643fc134ce7d7bf` confirms the baseline mapping,
+debug binding/source lookup, launch, clock and resource gates. It records
+source invalidation, cross-path correctness and reuse as failures, and the
+complete ownership/capture sequence as insufficient. Effigy `rust:compile`,
+`rust:format` and `docs:check` passed; `test rust` passed 61 ordinary tests with
+two live probes ignored. Compile retained 125 existing library dead-code
+warnings. These checks do not qualify shared reuse.
+
+Read-only inspection of the preserved v4 files identifies a freshness
+hypothesis for the next design: A's unchanged marker mtime is
+`1791649362229659522` ns, older than the changed-B build-script fingerprint
+mtime `1791649372393953572` ns. Its fingerprint records the relative
+`rerun-if-changed` input `marker.txt`; generated output still carries B's
+changed value. [Cargo's build-script change detection](https://doc.rust-lang.org/cargo/reference/build-scripts.html#rerun-if-changed)
+uses file mtimes. This is consistent with a cross-root freshness alias, but
+does not yet establish the complete causal chain on pinned Cargo 1.97.1.
+The [upstream checksum-freshness experiment](https://doc.rust-lang.org/cargo/reference/unstable.html#checksum-freshness)
+is unstable and still excludes build-script inputs from checksum checking;
+it is not a qualified drop-in fix. Diagnose source and build-input freshness
+alongside compiled behavior paths before selecting a corrective reuse
+boundary. Do not mutate retained fingerprints, touch consumer sources, or
+start another live probe to infer that diagnosis.
 
 ### Bounded real-project follow-up (execution not authorized)
 
