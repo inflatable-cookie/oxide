@@ -1379,25 +1379,8 @@ fn debug_binding_matches(
     captured_companion_digest: &str,
     sections: &[&str],
 ) -> bool {
-    fn uuids(output: &[u8]) -> BTreeSet<(String, String)> {
-        String::from_utf8_lossy(output)
-            .lines()
-            .filter_map(|line| {
-                let fields: Vec<_> = line.split_whitespace().collect();
-                let ["UUID:", uuid, arch, ..] = fields.as_slice() else {
-                    return None;
-                };
-                let uuid = uuid.to_ascii_lowercase();
-                let arch = arch.trim_matches(['(', ')']).to_owned();
-                (uuid.len() == 32
-                    && uuid.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    && !arch.is_empty())
-                .then_some((uuid, arch))
-            })
-            .collect()
-    }
-    let executable_uuids = uuids(executable_uuid);
-    let companion_uuids = uuids(companion_uuid);
+    let executable_uuids = dwarfdump_uuids(executable_uuid);
+    let companion_uuids = dwarfdump_uuids(companion_uuid);
     !executable_uuids.is_empty()
         && executable_uuids == companion_uuids
         && valid_sha256(executable_digest)
@@ -1407,6 +1390,42 @@ fn debug_binding_matches(
         && [".debug_info", ".debug_line", ".debug_abbrev"]
             .iter()
             .all(|required| sections.contains(required))
+}
+
+fn dwarfdump_uuids(output: &[u8]) -> BTreeSet<(String, String)> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            let ["UUID:", uuid, arch, ..] = fields.as_slice() else {
+                return None;
+            };
+            let uuid = normalize_dwarfdump_uuid(uuid)?;
+            let arch = arch.trim_matches(['(', ')']).to_owned();
+            (!arch.is_empty()).then_some((uuid, arch))
+        })
+        .collect()
+}
+
+fn normalize_dwarfdump_uuid(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let canonical_dashed = bytes.len() == 36
+        && [8, 13, 18, 23].iter().all(|index| bytes[*index] == b'-')
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit());
+    let compact = if bytes.len() == 32 && bytes.iter().all(u8::is_ascii_hexdigit) {
+        value.to_owned()
+    } else if canonical_dashed {
+        value
+            .chars()
+            .filter(|character| *character != '-')
+            .collect()
+    } else {
+        return None;
+    };
+    Some(compact.to_ascii_lowercase())
 }
 
 fn compile_origins(
@@ -1780,25 +1799,130 @@ fn extract_debug_source_paths(info: &[u8], lines: &[u8]) -> BTreeSet<PathBuf> {
     let mut paths = BTreeSet::new();
     let mut comp_dir = None;
     let mut names = Vec::new();
+    let mut comp_dirs = BTreeSet::new();
     for line in String::from_utf8_lossy(info).lines() {
         if line.contains("DW_TAG_compile_unit") {
             flush_debug_names(&mut names, comp_dir.as_deref(), &mut paths);
             comp_dir = None;
         } else if line.contains("DW_AT_comp_dir") {
             comp_dir = quoted_value(line);
+            if let Some(directory) = comp_dir.as_deref() {
+                comp_dirs.insert(PathBuf::from(directory));
+            }
         } else if line.contains("DW_AT_name") {
-            if let Some(name) = quoted_value(line).filter(|name| name.ends_with(".rs")) {
+            if let Some(name) = quoted_value(line).filter(|name| dwarf_source_name(name).is_some())
+            {
                 names.push(name);
             }
         }
     }
     flush_debug_names(&mut names, comp_dir.as_deref(), &mut paths);
+    extract_debug_line_paths(lines, &comp_dirs, &mut paths);
+    paths
+}
+
+fn extract_debug_line_paths(
+    lines: &[u8],
+    comp_dirs: &BTreeSet<PathBuf>,
+    paths: &mut BTreeSet<PathBuf>,
+) {
+    let mut include_directories: BTreeMap<usize, PathBuf> = BTreeMap::new();
+    let mut file_entry: Option<(Option<String>, Option<usize>)> = None;
+    let default_comp_dir = if comp_dirs.len() == 1 {
+        comp_dirs.iter().next()
+    } else {
+        None
+    };
+
+    let flush_file_entry = |entry: &mut Option<(Option<String>, Option<usize>)>,
+                            include_directories: &BTreeMap<usize, PathBuf>,
+                            paths: &mut BTreeSet<PathBuf>| {
+        let Some((Some(name), directory_index)) = entry.take() else {
+            return;
+        };
+        let directory = match directory_index {
+            Some(0) | None => default_comp_dir.cloned(),
+            Some(index) => include_directories.get(&index).map(|directory| {
+                if directory.is_absolute() {
+                    directory.clone()
+                } else if let Some(comp_dir) = default_comp_dir {
+                    comp_dir.join(directory)
+                } else {
+                    directory.clone()
+                }
+            }),
+        };
+        insert_debug_source_path(&name, directory.as_ref(), paths);
+    };
+
     for line in String::from_utf8_lossy(lines).lines() {
-        if let Some(value) = quoted_value(line).filter(|value| value.ends_with(".rs")) {
-            paths.insert(PathBuf::from(value));
+        if let Some(index) = dwarfdump_table_index(line, "include_directories") {
+            if let Some(directory) = quoted_value(line) {
+                include_directories.insert(index, PathBuf::from(directory));
+            }
+            continue;
+        }
+        if dwarfdump_table_index(line, "file_names").is_some() {
+            flush_file_entry(&mut file_entry, &include_directories, paths);
+            file_entry = Some((None, None));
+            if let Some(name) =
+                quoted_value(line).filter(|value| dwarf_source_name(value).is_some())
+            {
+                if let Some((entry_name, _)) = file_entry.as_mut() {
+                    *entry_name = Some(name);
+                }
+            }
+            continue;
+        }
+        if let Some((name, directory_index)) = file_entry.as_mut() {
+            if line.contains("dir_index") {
+                *directory_index = line.split_once("dir_index").and_then(|(_, value)| {
+                    value.trim().trim_start_matches(':').trim().parse().ok()
+                });
+                continue;
+            }
+            if line.contains("name:") {
+                *name = quoted_value(line).filter(|value| dwarf_source_name(value).is_some());
+                continue;
+            }
+        }
+        if let Some(name) = quoted_value(line).filter(|value| dwarf_source_name(value).is_some()) {
+            insert_debug_source_path(&name, default_comp_dir, paths);
         }
     }
-    paths
+    flush_file_entry(&mut file_entry, &include_directories, paths);
+}
+
+fn dwarfdump_table_index(line: &str, table: &str) -> Option<usize> {
+    let start = line.find(table)? + table.len();
+    let suffix = &line[start..];
+    let open = suffix.find('[')? + 1;
+    let close = suffix[open..].find(']')? + open;
+    suffix[open..close].trim().parse().ok()
+}
+
+fn dwarf_source_name(value: &str) -> Option<&str> {
+    let value = value.split_once("/@/").map_or(value, |(path, _)| path);
+    value.ends_with(".rs").then_some(value)
+}
+
+fn insert_debug_source_path(
+    name: &str,
+    directory: Option<&PathBuf>,
+    paths: &mut BTreeSet<PathBuf>,
+) {
+    let Some(name) = dwarf_source_name(name) else {
+        return;
+    };
+    let path = PathBuf::from(name);
+    let path = if path.is_absolute() {
+        path
+    } else if let Some(directory) = directory {
+        directory.join(path)
+    } else {
+        return;
+    };
+    paths.insert(path);
 }
 
 fn section_output_has(output: &[u8], section: &str) -> bool {
@@ -1832,7 +1956,10 @@ fn flush_debug_names(
     paths: &mut BTreeSet<PathBuf>,
 ) {
     for name in names.drain(..) {
-        let path = PathBuf::from(&name);
+        let Some(name) = dwarf_source_name(&name) else {
+            continue;
+        };
+        let path = PathBuf::from(name);
         let path = if path.is_absolute() {
             path
         } else if let Some(comp_dir) = comp_dir {
@@ -2385,6 +2512,41 @@ The file name is "/private/var/tmp/unrelated/src/lib.rs"
 }
 
 #[test]
+fn debug_source_lookup_reads_real_cu_suffix_and_line_table_paths() {
+    let scratch = producer_scratch("debug-source-lookup");
+    let volume = scratch.join("volume");
+    let workspace = volume.join("a");
+    fs::create_dir_all(workspace.join("src")).expect("workspace");
+    fs::write(workspace.join("src/lib.rs"), b"pub fn probe() {}\n").expect("source");
+    let tree = tree_digest(&workspace).expect("tree");
+    let map = sample_map(&volume, &workspace, &tree);
+    let compile_unit = br#"
+0x0000000b: DW_TAG_compile_unit
+  DW_AT_comp_dir        ("/oxide-source-map-probe")
+  DW_AT_name            ("/oxide-source-map-probe/probe/tests/probe.rs/@/probe.abc123-cgu.0")
+"#;
+    let line_table_context = br#"
+0x0000000b: DW_TAG_compile_unit
+  DW_AT_comp_dir        ("/unrelated/compiler-working-directory")
+"#;
+    let lines = br#"
+include_directories[  1] = "/oxide-source-map-probe"
+file_names[  1]:
+           name: "probe/tests/probe.rs"
+      dir_index: 1
+"#;
+
+    assert_eq!(
+        debug_source_paths(compile_unit, b"", &map),
+        vec![EXPECTED_LOGICAL_TEST_SOURCE.to_owned()]
+    );
+    assert_eq!(
+        debug_source_paths(line_table_context, lines, &map),
+        vec![EXPECTED_LOGICAL_TEST_SOURCE.to_owned()]
+    );
+}
+
+#[test]
 fn origin_ledger_records_rebuilt_units_and_preserves_fresh_matches() {
     let scratch = producer_scratch("origins");
     let volume = scratch.join("volume");
@@ -2464,8 +2626,9 @@ fn origin_ledger_records_rebuilt_units_and_preserves_fresh_matches() {
 
 #[test]
 fn packed_debug_companion_requires_uuid_hash_and_complete_dwarf_binding() {
-    let executable_uuid = b"UUID: 0123456789abcdef0123456789abcdef (arm64) /capture/test\n";
-    let companion_uuid = b"UUID: 0123456789abcdef0123456789abcdef (arm64) /capture/test.dSYM\n";
+    let executable_uuid = b"UUID: 90E04BB7-FDFE-38EE-81DA-E85F04838CD6 (arm64) /capture/test\n";
+    let companion_uuid =
+        b"UUID: 90E04BB7-FDFE-38EE-81DA-E85F04838CD6 (arm64) /capture/test.dSYM/Contents/Resources/DWARF/test\n";
     let executable_digest = sample_digest("executable");
     let companion_digest = sample_digest("companion");
     let sections = [".debug_info", ".debug_line", ".debug_abbrev"];
@@ -2492,7 +2655,7 @@ fn packed_debug_companion_requires_uuid_hash_and_complete_dwarf_binding() {
     ));
     assert!(!debug_binding_matches(
         executable_uuid,
-        b"UUID: fedcba9876543210fedcba9876543210 (arm64) /capture/other.dSYM\n",
+        b"UUID: FEDCBA98-7654-3210-FEDC-BA9876543210 (arm64) /capture/other.dSYM\n",
         &executable_digest,
         &executable_digest,
         &companion_digest,

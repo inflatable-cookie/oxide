@@ -626,14 +626,14 @@ fixture observations. Apple `OSO` records are object/debug-artifact references,
 not compiler source paths: every extracted absolute path is tied to its scanned
 artifact and the captured raw `nm` output. The complete raw `nm` output remains
 in the private capture. For a Cargo-reported test executable, the producer
-captures every regular file in the discovered `.dSYM` bundle under a bounded
-private name manifest. It compares executable and DWARF-payload UUID/architecture
-sets, hashes both originals and captures, and checks the required DWARF
-sections before binding source-lookup evidence to the companion digest. An
-ambiguous set of sibling `.dSYM` directories stops capture as insufficient;
-directory naming alone does not establish a match. The hook remains a plain
-file, so its identity row alone
-does not authenticate the claimed observations.
+selects its exact sibling `<executable-name>.dSYM` and captures every regular
+file in that bundle under a bounded private name manifest; unrelated sibling
+bundles do not make discovery ambiguous. It compares executable and
+DWARF-payload UUID/architecture sets, hashes both originals and captures, and
+checks the required DWARF sections before binding source-lookup evidence to the
+companion digest. The exact bundle name is only a discovery rule and does not
+establish a match by itself. The hook remains a plain file, so its identity row
+alone does not authenticate the claimed observations.
 
 **Trust boundary:** the hook is a plain file in the run's Cargo target
 directory. Its identity row is compared with the adapter's accepted policy,
