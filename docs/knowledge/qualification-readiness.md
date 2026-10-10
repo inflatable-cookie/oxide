@@ -584,6 +584,17 @@ invocation against that producer; the fixture build script then failed, so
 the remaining sequence did not run. Both attempts and their limits are
 recorded below.
 
+Task 017 adds an ordered `RelativeSourcePrefix` to the accepted logical map.
+Each prefix names its authorized roots, Cargo compiler working directory and
+package directory. The resolver checks normalized non-traversing paths, a
+canonical package manifest under every named root, and the requested root's
+actual workspace context. The complete ordered absolute-A, absolute-B and
+relative flag vector and relative context contribute to policy, map and build
+identity. Strict-physical mode rejects relative entries. The fixture declares
+explicit `dev` and `test` profiles with `debug=2`, `strip=none` and
+`split-debuginfo=packed`; these values are also part of effective environment
+identity.
+
 The optional `CARGO_TARGET_DIR/source-map-observations-v1.txt` hook uses
 UTF-8, one tab-separated record per line, and the version header below. Paths
 are absolute observations except artifact paths, which are safe relative names
@@ -598,7 +609,8 @@ origin <authorized-root-id> <tree-digest>
 artifact <reference> <slot|target> <relative-path>
 scan <reference> <scanner-version> <binary-digest>
 section <reference> <debug-section>
-source <reference> <compiler-debug|file-macro|panic-location|apple-oso> <observed-path>
+source <reference> <compiler-debug|file-macro|panic-location> <observed-path>
+oso-object <artifact-reference> <captured-nm-reference> <absolute-object-path>
 behavior <class> <resolved-path> <source-tree-digest> <generation-lease-id|->
 apple-oso <not-emitted|observed>
 ```
@@ -610,7 +622,17 @@ digest itself. It derives full-debug completeness from the three required
 section records; no `complete` flag is accepted. Source and behavior paths are
 resolved against the requested tree and checked for canonical containment.
 The task-owned producer writes this hook from its Cargo, scanner, and executed
-fixture observations. The hook remains a plain file, so its identity row alone
+fixture observations. Apple `OSO` records are object/debug-artifact references,
+not compiler source paths: every extracted absolute path is tied to its scanned
+artifact and the captured raw `nm` output. The complete raw `nm` output remains
+in the private capture. For a Cargo-reported test executable, the producer
+captures every regular file in the discovered `.dSYM` bundle under a bounded
+private name manifest. It compares executable and DWARF-payload UUID/architecture
+sets, hashes both originals and captures, and checks the required DWARF
+sections before binding source-lookup evidence to the companion digest. An
+ambiguous set of sibling `.dSYM` directories stops capture as insufficient;
+directory naming alone does not establish a match. The hook remains a plain
+file, so its identity row alone
 does not authenticate the claimed observations.
 
 **Trust boundary:** the hook is a plain file in the run's Cargo target
@@ -635,7 +657,7 @@ In logical mode, origins from other authorized roots and trees are accepted as d
 | Compiler debug paths | Producer-declared source paths extracted from binary debug information. Logical names must resolve to a requested-tree file; physical paths must match the selected physical-path policy and be contained. | The resolver checks requested-tree containment and the producer extracts paths from debug information. No scanner result exists from 014. |
 | `file!()` values | Producer-declared values observed from the executed binary, kept as their own class. | The driver compares emitted values with independently hashed requested-tree files. The fixture binary did not run in 014. |
 | Panic locations | Producer-declared panic locations captured from the executed binary, kept as their own class. | The driver checks panic paths separately from debug and `file!()` paths. No panic output was produced in 014. |
-| Apple OSO | Producer-declared scanner result: `not emitted` or each emitted OSO path. | The producer records bounded `nm` output and classifies OSO paths. No binary scan was completed in 014. |
+| Apple OSO | Producer-declared scanner result: `not emitted` or `observed`, plus one `oso-object` row per absolute linker-object reference. | Raw `nm` output is privately captured. Each extracted object path is bound to an artifact and its raw `nm` capture; it is not admitted as a requested-tree compiler source path. Task 017's preflight preserved raw `nm` output but stopped before a complete test-companion scan. |
 | Manifest directory | Producer-declared effective manifest directory and requested-tree digest. | The producer records the active manifest from the owned command. No command executed in 014. |
 | Include input | Producer-declared exact file consumed by `include!` or related source inclusion. | The fixture emits and checks the included value against its requested-tree file. No fixture test ran in 014. |
 | Build-script input | Producer-declared inputs consumed by the build script. | The producer correlates Cargo build-script output with the fixture's requested input. No Cargo build-script event was observed in 014. |
@@ -814,6 +836,77 @@ reconciled, detached, cleared or replayed. The image and evidence remain at the
 path above. Any further attempt needs a new scoped Queue record and fresh
 resources. For ad hoc worktrees, checkout-isolated build directories remain
 the safe fallback; they do not establish cross-worktree storage relief.
+
+#### Task 017 execution result (2026-10-10)
+
+The implementation registers relative compiler prefix `probe` against roots
+`a` and `b`, with Cargo working directory `.` and package directory `probe`.
+The ordered flags recorded before compilation were the complete absolute A,
+absolute B, and relative `probe` mappings. The resolver regression checks exact
+flag order, path-context digest separation, and refusal for traversal,
+unregistered roots, duplicate prefixes and an incorrect workspace context.
+`effigy rust:compile` and `effigy rust:format` exited 0. The final ordinary
+`effigy test rust` run passed 52 tests with 0 failures and 2 ignored. The
+corrected committed fixture tree was
+`sha256:550e62cefc7f647fef97b12489fc2c1e1ba67fd56a7529401fce25c97b0ce2e9`;
+the run manifest bound repository head
+`08b4354d15cfe79f8e41385e9baa6d750992d5cf` and that fixture digest.
+
+The new bounded session used
+`/private/var/tmp/oxide-rust-probe-paths-20261010`, an 8 GiB sparse APFS image
+mounted at `m`. Its original monotonic window was
+`2026-10-10T14:32:00Z`–`2026-10-10T14:52:00Z`; the evidence records one of four
+allowed fixture Cargo invocations. The single `reference-a` command used Cargo
+`1.97.1 (c980f4866 2026-06-30)` and rustc
+`1.97.1 (8bab26f4f 2026-07-14)`, exited 0 after the fixture test passed, and
+rebuilt six units. Its run elapsed 4334 ms; the whole session stopped after
+14926 ms. The observed `file!()` value was
+`/oxide-source-map-probe/probe/tests/probe.rs`, and the panic location was
+`/oxide-source-map-probe/probe/tests/probe.rs:54`. The independently read
+baseline marker, generated output, proc-macro input and runtime value matched;
+the producer recorded `values_match=true`. These observations support the
+logical behavior-path result with the complete map present, but do not isolate
+the relative flag from the two absolute flags.
+
+The full-debug baseline gate did not qualify. Cargo reported the final `probe`
+test executable and a sibling `.dSYM` filename, but the scanner searched the
+executable directory, found multiple sibling `.dSYM` bundles, and stopped with
+`Cargo artifact has ambiguous sibling dSYM bundles`. It therefore did not
+inspect or capture the Cargo-reported companion, compare UUID/architecture
+sets, hash-bind the companion, or establish logical source lookup from the
+captured debug data. The raw executable scans, partial `dwarfdump`/`nm` outputs,
+preflight report, Cargo stdout/stderr, manifest and events remain in the image.
+`scan_complete=false` and `debug-companion ... bound=false` are the recorded
+outcome. This is a scanner setup blocker; it does not show that the compiler
+omitted full debug information or that the cache reused wrong sources.
+
+Lease `bcb8b00be80f5deb527a92b384033f52` finalized `Idle` after the baseline
+run. Because preflight scanning was incomplete, source invalidation, measured
+key controls, shared cold A and warm B did not run; no reuse or storage-benefit
+claim is supported. The preserved evidence records host free space no lower
+than 300283924480 bytes, APFS capacity 8380178432 bytes, mounted use 29020160
+bytes at stop, sparse backing allocation 46141440 bytes, and outside allocation
+12288 bytes. No 20 GiB host or 10 GiB disposable threshold was reached. Per-run
+write attribution was unavailable.
+
+The runner detached the image on this failed-but-idle path. The worker
+reattached the same image read-only to inspect the stored evidence and left it
+mounted; the backing image and captured files remain untouched. That negative
+path must preserve the mount in a future session. The fixed root is now
+occupied, the original session is closed, and no further fixture invocation
+or clock reset was made. No existing 005/014/015/016 image or lease was
+modified.
+
+Task 017 dispositions: `relative_mapping` passed for the observed logical
+`file!()` and panic paths with the complete flag vector; `baseline_tests`,
+`launch_contract`, `session_clock` and `resource_bounds` passed. The required
+`debug_capture_binding` and `baseline_path_proof` remain insufficient because
+the companion scanner stopped on ambiguity. `source_invalidation`,
+`cross_path_correctness`, `ownership_capture` for the full sequence and
+`reuse_result` remain insufficient or not reached. This task does not establish
+useful recurring-run reduction. Checkout-isolated storage remains the safe
+fallback until a separately scoped attempt can inspect the Cargo-reported
+debug companion and complete the source/reuse sequence.
 
 ### Bounded real-project follow-up (execution not authorized)
 
