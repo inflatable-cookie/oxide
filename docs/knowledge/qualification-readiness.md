@@ -1552,41 +1552,76 @@ Pre-execution gates, in order, after durable acquire and before spawn:
    left to Cargo. Missing fingerprint/map files, unknown format, or an input
    class the map does not cover: refuse (`input_unknown`), no execution. Cap
    4096 files or 1 MiB, whichever first, applies to fingerprint-named
-   workspace inputs and declared behavior-path files (a subset of tracked
-   files). Nucleus currently has 1003 tracked files (140 `.rs`) and Oxide
-   46 tracked: that cap is expected to bind for those fingerprint-named
-   subsets; if a workspace exceeds it, that slot cannot be reused. On
-   successful finalize: re-hash the requested tree. Persist the
-   relative-path digest map only if the tree digest equals `D_admit`; bind
-   the stored map to that admitted digest. File hashes are of that admitted
-   tree. If the tree changed during the lease, do not persist or replace
-   the map; mark the slot's map invalid so the next reuse is
-   `input_unknown` until a later compile with an unchanged tree produces a
-   bound map. This is Oxide-owned admission evidence, not a Cargo
-   fingerprint edit, source touch, or emitted-path rewrite.
+   workspace inputs, declared behavior-path files, and the recursive
+   expansion of declared directories (a subset of tracked files plus any
+   untracked members of those directories). Nucleus currently has 1003
+   tracked files (140 `.rs`) and Oxide 46 tracked: that cap is expected to
+   bind for those fingerprint-named subsets; if a workspace or directory
+   expansion exceeds it, that slot cannot be reused. On successful
+   finalize: re-hash the requested tree. Persist the relative-path digest
+   map only if the tree digest equals `D_admit`; bind the stored map to
+   that admitted digest. File hashes are of that admitted tree. If the
+   tree changed during the lease, do not persist or replace the map; mark
+   the slot's map invalid so the next reuse is `input_unknown` until a
+   later compile with an unchanged tree produces a bound map. This is
+   Oxide-owned admission evidence, not a Cargo fingerprint edit, source
+   touch, or emitted-path rewrite.
 6. **Generated / proc-macro / build-script / native / external.** Declared
-   `rerun-if-changed` and rustc dep-info paths are in the map. Detectable
-   unknown: after a successful compile, parse the slot's build-script
-   `output` (and fingerprint local entries). If any in-scope package's
-   `run-custom-build` unit has zero `rerun-if-changed` and zero
-   `rerun-if-env-changed` lines, do not persist a reuse map for that slot,
-   and the next acquire refuses managed reuse (`input_unknown`) before
-   spawn. Pinned Cargo `c980f4866`
+   `rerun-if-changed` and rustc dep-info paths are resolved, then admitted
+   to the map or refused, before spawn on a later acquire and before
+   persisting a map at finalize.
+
+   **Containment.** Each path is resolved to a canonical location against
+   the package root. If that location is outside both the requested
+   compile-root tree and the exclusive slot (`CARGO_BUILD_BUILD_DIR`,
+   including `OUT_DIR`): refuse (`input_unknown`). Do not omit the path
+   to manufacture a hit. Slot-owned generated files are in the map as
+   slot-relative entries; they are not requested-tree files. A symlink
+   whose follow escapes the requested tree and the slot is out-of-tree
+   and refuses.
+
+   **Directories.** Official
+   [rerun-if-changed](https://doc.rust-lang.org/cargo/reference/build-scripts.html#rerun-if-changed)
+   says a directory path is scanned recursively. Pinned Cargo `c980f4866`
+   `find_stale_file` calls
+   [`paths::mtime_recursive`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/crates/cargo-util/src/paths.rs)
+   (`WalkDir` with `follow_links`), which takes the max mtime of the
+   walk and does not hash members. Hashing only the directory path as
+   one map entry would miss a child whose content changed with
+   `mtime <=` the fingerprint reference — the Task 018 hole for
+   directory inputs. Required rule: expand a declared directory
+   recursively into per-file hashes under the same cap. Walk error,
+   unreadable member, or an expansion that would exceed the cap:
+   refuse (`input_unknown`); do not truncate the walk and do not skip
+   members the way Cargo's walker ignores permission errors. At a later
+   different-digest acquire, re-walk that directory: extra files,
+   missing files, or hash mismatch on any member whose current mtime is
+   `<=` the fingerprint reference → `source_stale` before Cargo.
+
+   **Detectable unknown.** After a successful compile, parse the slot's
+   build-script `output` (and fingerprint local entries). If any
+   in-scope package's `run-custom-build` unit has zero
+   `rerun-if-changed` and zero `rerun-if-env-changed` lines, do not
+   persist a reuse map for that slot, and the next acquire refuses
+   managed reuse (`input_unknown`) before spawn. Pinned Cargo
+   `c980f4866`
    [`fingerprint/mod.rs`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/compiler/fingerprint/mod.rs)
    treats that case as old-style: an mtime change of any package file
    reruns the script; otherwise the fingerprint only tracks the listed
    rerun-if items. Official
    [change-detection](https://doc.rust-lang.org/cargo/reference/build-scripts.html#change-detection)
    docs match. The first-slice fixture emits
-   `cargo:rerun-if-changed=marker.txt`, so it is eligible. Residual, not a
-   refusal: a script that declares some rerun-if items but also reads an
+   `cargo:rerun-if-changed=marker.txt` (a file, not a directory), so it
+   is eligible without directory expansion. Residual, not a refusal: a
+   script that declares some rerun-if items but also reads an
    undeclared file, env var, or network resource. Oxide cannot observe
-   those reads. First slice excludes such workflows. Later consumers admit
-   them only with explicit owner/Tom acceptance that undeclared reads are
-   out of coverage; they are not claimed hits and not `input_unknown`
-   refusals. `cargo clean -p` is a supported command and is *not* selected:
-   its coverage of build-script output, incremental files and fingerprints
-   is unqualified, and a refuse/private fallback is the fail-closed path.
+   those reads. First slice excludes such workflows. Later consumers
+   admit them only with explicit owner/Tom acceptance that undeclared
+   reads are out of coverage; they are not claimed hits and not
+   `input_unknown` refusals. `cargo clean -p` is a supported command
+   and is *not* selected: its coverage of build-script output,
+   incremental files and fingerprints is unqualified, and a
+   refuse/private fallback is the fail-closed path.
 7. **Runtime resource paths.** Same physical root, so retained paths are
    correct only if the new tree actually has those files. Content changes
    with newer mtimes rebuild or are re-read at test time; content changes
@@ -1597,16 +1632,19 @@ Pre-execution gates, in order, after durable acquire and before spawn:
    hashes.
 
 Uncertainty: the digest map covers files Cargo named plus declared behavior
-paths, bound to the admitted pre-acquire tree digest, persisted only if that
-digest is unchanged at finalize. Equal-mtime same-content files are allowed
+paths, including the recursive expansion of declared directories, bound to
+the admitted pre-acquire tree digest, persisted only if that digest is
+unchanged at finalize. Equal-mtime same-content files are allowed
 (ordinary unchanged git files). Clock-step backwards on changed content is
-refused. Residual: undeclared extra reads by a script that also emitted
-some rerun-if; a mid-lease edit that reverts before finalize (Cargo
-`invoked.timestamp` is Cargo's mid-build protection). Replacement
+refused. Named dep-info/rerun-if paths outside the requested tree and the
+exclusive slot refuse. Residual: undeclared extra reads by a script that
+also emitted some rerun-if; a mid-lease edit that reverts before finalize
+(Cargo `invoked.timestamp` is Cargo's mid-build protection). Replacement
 criterion: retire the map when a supported Cargo release's checksum
 freshness covers both rustc dep-info *and* build-script `RerunIfChanged`,
-including synthesized `CARGO_MANIFEST_DIR`, on the pinned toolchain, and a
-fresh qualification passes the same gates.
+including synthesized `CARGO_MANIFEST_DIR` and recursive directory
+members, on the pinned toolchain, and a fresh qualification passes the
+same gates.
 
 Do not touch all sources, edit Cargo internals, rewrite emitted values,
 ignore paths, or grow the root map.
@@ -1705,8 +1743,10 @@ every successful compile.
    Tests and full-debug lookup pass at R. Re-hash the tree at finalize;
    persist the input-digest map only if it still equals the admitted T0
    digest, and bind the map to that digest. Record presence of
-   `rerun-if-changed=marker.txt` in the slot build-script `output` as
-   eligibility evidence. Idle.
+   `rerun-if-changed=marker.txt` (a file) in the slot build-script
+   `output` as eligibility evidence, and that every named dep-info and
+   rerun-if path resolved inside the requested tree or the exclusive
+   slot. Idle.
 2. **Useful warm T1 / attempt 2 at R.** Different tree, new task/run/attempt
    identity, same physical path. Acquire must return slot-1. `oxide-source-probe-macro`
    must be Cargo-fresh. Affected probe library/test/build-script units
