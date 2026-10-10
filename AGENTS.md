@@ -25,6 +25,15 @@ Tom's 2026-10-10 blanket approval in [vision](docs/knowledge/vision.md#authority
 
 There is no product QA selector yet. Use the focused selectors above; they do not replace milestone QA.
 
+For Rust tests on macOS, set `OXIDE_TASK_SCRATCH_ROOT`, `TMPDIR`, `TMP` and `TEMP` to the same fresh canonical directory under `/private/tmp` before running the selector. The suite checks canonical paths and uses short socket paths; the default `/var/folders` temp directory does not satisfy that contract. For example:
+
+```sh
+oxide_validation_scratch=$(mktemp -d /private/tmp/oxide-validation.XXXXXX)
+OXIDE_TASK_SCRATCH_ROOT="$oxide_validation_scratch" TMPDIR="$oxide_validation_scratch" TMP="$oxide_validation_scratch" TEMP="$oxide_validation_scratch" effigy test rust
+```
+
+Ordinary validation leaves the environment-gated Cargo probes ignored. Their live execution uses the separately recorded Queue session scope.
+
 ## Documentation validation
 
 Use `effigy docs:check` for repository documentation changes. Check its exit code. These checks do not establish product validation success. Future implementation briefs must name targeted repository selectors and respect Queue's validation policy. Release rules live in [release](docs/knowledge/contracts/release.md).
