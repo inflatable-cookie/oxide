@@ -20,7 +20,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -1700,6 +1700,7 @@ fn known_resume_elapsed(frozen: &FrozenFixture) -> Result<Duration, String> {
         "imageinfo-after-attach-attempt-3.plist".to_owned(),
         "imageinfo-attempt-1.plist".to_owned(),
         "imageinfo-before-attach.plist".to_owned(),
+        "imageinfo-resume-observation.plist".to_owned(),
         "resume-state.txt".to_owned(),
     ]);
     if directory_names(&setup_temp)? != expected_setup_entries {
@@ -1766,11 +1767,18 @@ fn known_resume_elapsed(frozen: &FrozenFixture) -> Result<Duration, String> {
     }
     let info_bytes = fs::read(&info_path).map_err(|error| error.to_string())?;
     let recorded_info_digest = hex_digest(&info_bytes);
+    let current_info = image_info(&image)?;
+    let resume_info_bytes = fs::read(setup_temp.join("imageinfo-resume-observation.plist"))
+        .map_err(|error| error.to_string())?;
     if fields.get("imageinfo_digest") != Some(&recorded_info_digest)
-        || image_info(&image)? != info_bytes
         || image_capacity(&info_path)? != IMAGE_CAP
-        || !String::from_utf8_lossy(&info_bytes).contains("<string>sparse</string>")
-        || !String::from_utf8_lossy(&info_bytes).contains("<key>APFS</key>")
+        || !is_sparse_apfs_info(&info_bytes)
+        || hex_digest(&resume_info_bytes)
+            != "sha256:8ea268debb6fdc282b314d67f4f54db481af3de2db4234abe83d90368a115131"
+        || image_capacity_from_bytes(&resume_info_bytes)? != IMAGE_CAP
+        || !is_sparse_apfs_info(&resume_info_bytes)
+        || image_capacity_from_bytes(&current_info)? != IMAGE_CAP
+        || !is_sparse_apfs_info(&current_info)
     {
         return Err(
             "recorded hdiutil evidence does not prove the exact sparse APFS image".to_owned(),
@@ -1809,6 +1817,9 @@ fn known_resume_elapsed(frozen: &FrozenFixture) -> Result<Duration, String> {
         fs::read_to_string(setup_temp.join("attempt-5.txt")).map_err(|error| error.to_string())?;
     if !fifth_attempt.contains("before any fixture Cargo invocation or lease")
         || !fifth_attempt.contains("8589934592-byte sparse APFS virtual image")
+        || !fifth_attempt.contains(
+            "imageinfo-resume-observation.plist sha256:8ea268debb6fdc282b314d67f4f54db481af3de2db4234abe83d90368a115131",
+        )
     {
         return Err("recorded fifth attempt lacks its setup failure evidence".to_owned());
     }
@@ -1966,10 +1977,26 @@ fn image_info(image: &Path) -> Result<Vec<u8>, String> {
 }
 
 fn image_capacity(plist: &Path) -> Result<u64, String> {
-    let result = Command::new("/usr/bin/plutil")
+    image_capacity_from_bytes(&fs::read(plist).map_err(|error| error.to_string())?)
+}
+
+fn image_capacity_from_bytes(plist: &[u8]) -> Result<u64, String> {
+    let mut child = Command::new("/usr/bin/plutil")
         .args(["-extract", "Size Information.Total Bytes", "raw", "-o", "-"])
-        .arg(plist)
-        .output()
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "plutil stdin is unavailable".to_owned())?
+        .write_all(plist)
+        .map_err(|error| error.to_string())?;
+    let result = child
+        .wait_with_output()
         .map_err(|error| error.to_string())?;
     if !result.status.success() {
         return Err(format!(
@@ -1981,6 +2008,11 @@ fn image_capacity(plist: &Path) -> Result<u64, String> {
         .trim()
         .parse::<u64>()
         .map_err(|error| error.to_string())
+}
+
+fn is_sparse_apfs_info(info: &[u8]) -> bool {
+    let info = String::from_utf8_lossy(info);
+    info.contains("<string>sparse</string>") && info.contains("<key>APFS</key>")
 }
 
 fn image_info_block<'a>(info: &'a str, image: &Path) -> Option<&'a str> {
@@ -2059,7 +2091,10 @@ fn setup_image(
     let info = image_info(image)?;
     let image_info_capture = setup_temp.join("imageinfo-before-attach.plist");
     match fs::read(&image_info_capture) {
-        Ok(previous) if resume && previous == info => {}
+        Ok(previous)
+            if resume
+                && image_capacity_from_bytes(&previous)? == IMAGE_CAP
+                && is_sparse_apfs_info(&previous) => {}
         Ok(_) => return Err("pre-attach image information changed since setup".to_owned()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let mut info_file = OpenOptions::new()
@@ -2074,10 +2109,7 @@ fn setup_image(
         }
         Err(error) => return Err(error.to_string()),
     }
-    if image_capacity(&image_info_capture)? != IMAGE_CAP
-        || !String::from_utf8_lossy(&info).contains("<string>sparse</string>")
-        || !String::from_utf8_lossy(&info).contains("<key>APFS</key>")
-    {
+    if image_capacity_from_bytes(&info)? != IMAGE_CAP || !is_sparse_apfs_info(&info) {
         return Err("hdiutil did not confirm the approved 8 GiB sparse APFS image".to_owned());
     }
     let outside_directories =
