@@ -86,7 +86,22 @@ Design answer: [project adoption](contracts/project-adoption.md#readiness-admiss
 
 ## Q-012 — How does the consumer bind task admission, storage acquire and host-run scheduling?
 
-The proposed [stable source-path lifecycle](contracts/project-adoption.md#stable-source-path-lifecycle) recommends a bounded consumer-owned pool of task-worktree paths, but Queue/Nucleus currently have no such pool or Oxide task-attempt credential. Their managed-Git/worktree and lifecycle owners must approve concrete opt-in fields, canonical path assignment/recycling, exact dirty-source retention, and the authenticated task/workspace/run/attempt-to-root binding. The consumer must wait without an Oxide lease or host-run slot, then authorize acquire before host-run submission. An acquire `busy` response must return the authorized request to consumer-owned pending state without creating or settling a host run; read-only inspection found no current task-attempt-to-acquire/return transition, so that narrow lifecycle representation needs owner approval. After successful acquire the adapter submits through the existing heavy host-run scheduler, which alone issues its token and owns admission, launch, cancellation and settlement. Frozen Contract 010 stays unchanged; no host-run storage-busy settlement or forged token is proposed. Queue and Nucleus host-run/workspace owners must separately confirm the mapping against Queue's existing implementation and Nucleus Contracts 002/010. Fixture behavior and the standalone local pilot do not establish these APIs or real consumer portability. Adoption, real-project qualification and rollout remain gated. Task 017 v4 has baseline full-debug lookup and accepted source-control evidence, but shared reuse executed stale changed-source artifacts and retained an Uncertain lease. Task 018's origin+tree match refuses that class of hit and does not create a consumer path pool or qualify useful reuse. Task 019 recommends recycling the same physical root after ordinary archive so a new task can reuse that root's exclusive slot across source revisions; the path pool, dirty-source snapshot and task-attempt credential remain proposed owner work, not current APIs. Pointing `CARGO_BUILD_BUILD_DIR` at an Oxide slot outside the checkout also departs from Spec 028's rationale that Cargo build outputs stay local to each task checkout and needs Queue Spec 028 owner / Tom approval; it is not a Queue change in this task. Production keys stay checkout-isolated.
+Design answer and exact open owner gates live in the
+[first Nucleus core-test contract](contracts/nucleus-core-reuse.md), with general
+ordering in [project adoption](contracts/project-adoption.md#readiness-admission-and-acquire-ordering).
+Select the existing core planning/diagnostics test workflow and sequential
+strict-physical root reuse after ordinary archive. The reviewed positive Task 021
+fixture is the mechanism starting point, not Nucleus input eligibility or
+adoption evidence. Current consumers have no authenticated task-attempt Oxide
+credential/return-to-pending transition or finite source pool. Managed-Git,
+Contract 002/Spec 028, admission/host-run and evidence/retention owners must agree
+the proposed opt-in, allocation epochs, bounded retention, exact dirty/generated/
+dependency source and old-run full-debug lookup before root recycling. Frozen
+010 remains unchanged: storage busy creates no host run or settlement, and the
+current genuine scheduler alone issues host tokens. Third-party/native input
+audit, SDK/tool integrity, runtime unit coverage, representative useful relief
+and successful live recovery remain separate gates. No owner consent, execution,
+consumer implementation or everyday benefit is established by this design.
 
 ## Q-013 — How can a healthy macOS workflow safely return its slot for reuse?
 

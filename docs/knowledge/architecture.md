@@ -263,3 +263,14 @@ invented and it cannot reconcile an Uncertain lease. Consumer authentication
 remains required. This releases only a no-writer lease, not a successful test
 verdict. Ordinary process-absence claims remain insufficient. Frozen Nucleus
 Contract 010 and all consumer wire formats are unchanged.
+
+## Proposed first Nucleus workflow extension
+
+The [first Nucleus core-test contract](contracts/nucleus-core-reuse.md) selects
+one existing selector for a proposed versioned input collector and consumer-owned
+physical root pool. It keeps strict-physical per-root partitions, per-run source
+binding, exclusive compile/test/capture and the pending-map failure barrier.
+The implemented fixture remains fixed; registry/native/opaque input coverage,
+external immutable input receipts, consumer authentication and path/lifecycle
+fields described there are proposals, not current admission support.
+No production activation or cross-root reuse follows from this design.

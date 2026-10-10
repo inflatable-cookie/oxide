@@ -2290,7 +2290,7 @@ compiler/test calls. Changed-task T1 reused slot-1, retained both proc-macro
 compiler artifacts and executed current generated/proc-macro/runtime values.
 Both stale-source and post-failure requests refused without calling Cargo and
 settled Idle. This is a positive tiny-fixture mechanism observation at one fixed
-physical root, pending independent exact-head review; it is not consumer adoption,
+physical root, independently reviewed at the corrected exact head (see below); it is not consumer adoption,
 cross-root reuse or meaningful everyday storage-relief qualification.
 
 **Producer and launch.** V2 ran from clean committed producer
@@ -2490,3 +2490,24 @@ checkout-isolated. General Cargo input coverage, cross-root reuse, successful
 live cold recovery/rebind, real-project qualification, consumer adoption,
 everyday storage relief and SSD-write reduction remain unestablished. No broader
 measurement programme or consumer action is authorized by this result.
+
+### First Nucleus workflow eligibility disposition
+
+Independent Task 021 review at `faf1490484af174dcb5ec4e98b116c408d2680ca`
+passed the seven fixture gates
+([review](https://github.com/inflatable-cookie/oxide/pull/21#issuecomment-6101426638));
+the result merged as `df7f084f6e89481b4b0a1b414abc32f23728d922`.
+This resolves the pending fixture review described in the author record above,
+without broadening its evidence or replaying its preserved resources.
+
+The [first Nucleus core-test reuse contract](contracts/nucleus-core-reuse.md)
+owns the proposed representative eligibility and consumer path/lifecycle design.
+Read-only inspection selects the existing planning/build_diagnostics workflow,
+with a separate full-debug qualification profile. The current nine-file/seven-unit
+collector does not admit its registry/proc-macro/native inputs. A versioned
+closed audited input boundary and consumer-owned physical root/retention/attempt
+receipts are required. Runtime unit/header/opaque-read coverage, native SDK/tool
+integrity, owner consent, budget fit and real representative qualification remain
+open. Task 021's changed-task dependency retention is a positive tiny-fixture
+starting point; cross-root reuse, successful live recovery, consumer adoption,
+everyday relief and SSD-write reduction remain unestablished.
