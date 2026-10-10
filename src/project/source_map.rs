@@ -1006,13 +1006,17 @@ fn parse_behavior_path_class(value: &str) -> Option<BehaviorPathClass> {
 
 fn resolve_observed_source_path(map: &ResolvedSourceMap, observed: &Path) -> Option<PathBuf> {
     if let Some(prefix) = &map.logical_prefix {
-        let relative = observed.strip_prefix(prefix).ok()?;
+        let Some(relative) = observed.strip_prefix(prefix).ok() else {
+            // Preserve a concrete but non-logical observation so qualification
+            // classifies it as a path mismatch instead of missing evidence.
+            return Some(observed.to_path_buf());
+        };
         if relative.as_os_str().is_empty()
             || !relative
                 .components()
                 .all(|component| matches!(component, Component::Normal(_)))
         {
-            return None;
+            return Some(observed.to_path_buf());
         }
         Some(map.requested_root.join(relative))
     } else {

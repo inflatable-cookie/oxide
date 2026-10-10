@@ -2121,6 +2121,7 @@ enum SourceMapFixtureTamper {
     BinaryAfterCollection,
     WrongLease,
     ChangedMap,
+    PhysicalSourcePath,
 }
 
 struct SourceMapFixtureRunner {
@@ -2165,10 +2166,19 @@ impl FixtureCommandRunner for SourceMapFixtureRunner {
         fs::write(&binary, b"task-owned fixture binary\n")
             .map_err(|_| BoundaryFailure::Unavailable)?;
 
-        let observed_source = map.logical_prefix().map_or_else(
-            || requested_root.join("src/lib.rs"),
-            |prefix| prefix.join("src/lib.rs"),
-        );
+        let observed_source = if matches!(self.tamper, SourceMapFixtureTamper::PhysicalSourcePath) {
+            map.authorized_roots()
+                .iter()
+                .find(|root| root.id != map.requested_root_id())
+                .ok_or(BoundaryFailure::InvalidIdentity)?
+                .path
+                .join("src/lib.rs")
+        } else {
+            map.logical_prefix().map_or_else(
+                || requested_root.join("src/lib.rs"),
+                |prefix| prefix.join("src/lib.rs"),
+            )
+        };
         let binary_digest = digest(&fs::read(&binary).map_err(|_| BoundaryFailure::Unavailable)?);
         let origin = map
             .authorized_roots()
@@ -2277,6 +2287,7 @@ impl FixtureCommandRunner for SourceMapFixtureRunner {
         .map_err(|_| BoundaryFailure::InvalidIdentity)?;
         match self.tamper {
             SourceMapFixtureTamper::None | SourceMapFixtureTamper::MissingHook => {}
+            SourceMapFixtureTamper::PhysicalSourcePath => {}
             SourceMapFixtureTamper::BinaryAfterCollection => {
                 fs::write(capture.join("binary-0.bin"), b"changed after collection\n")
                     .map_err(|_| BoundaryFailure::Unavailable)?;
@@ -2643,6 +2654,16 @@ fn logical_qualifier_binds_the_exact_tree_lease_binaries_and_behavior_paths() {
         source_map::qualify(&map, &receipt, &missing_resolution),
         QualificationDisposition::Insufficient
     );
+    let mut physical_source_path = evidence.clone();
+    let physical_source = fixture.checkout_a.join("src/lib.rs");
+    physical_source_path.binary_scans.as_mut().unwrap()[0].source_paths[0].observed =
+        physical_source.clone();
+    physical_source_path.binary_scans.as_mut().unwrap()[0].source_paths[0].resolved =
+        Some(physical_source);
+    assert_eq!(
+        source_map::qualify(&map, &receipt, &physical_source_path),
+        QualificationDisposition::Fail
+    );
     let mut mismatched_binary = evidence.clone();
     mismatched_binary.binary_scans.as_mut().unwrap()[0].binary_digest = digest(b"other binary");
     assert_eq!(
@@ -2748,6 +2769,7 @@ fn source_map_collector_completes_adapter_reacquire_and_rejects_bound_mismatches
         (2, SourceMapFixtureTamper::WrongLease, false),
         (3, SourceMapFixtureTamper::ChangedMap, false),
         (4, SourceMapFixtureTamper::MissingHook, false),
+        (5, SourceMapFixtureTamper::PhysicalSourcePath, false),
     ] {
         let invocation = fixture.invocation(&fixture.checkout_b, &tree, policy.clone());
         let failure_storage = fixture.root.dir(&format!("failure-storage-{index}"));
@@ -2783,7 +2805,104 @@ fn source_map_collector_completes_adapter_reacquire_and_rejects_bound_mismatches
             assert!(report.contains("observation-hook"));
             assert!(report.contains("binary-artifacts"));
         }
+        if matches!(tamper, SourceMapFixtureTamper::PhysicalSourcePath) {
+            assert!(!failure_adapter.observations()[0]
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, ObservationKind::SourceMapQualified { .. })));
+        }
     }
+}
+
+#[test]
+fn mapped_source_map_run_with_retained_writer_keeps_slot_uncertain() {
+    let fixture = SourceMapFixture::new("15-source-map-retained-writer");
+    let space = NativeScenarioSpace::new();
+    space.sample(&fixture.root.path);
+    let policy = fixture.policy(
+        vec![
+            ("root-a", fixture.checkout_a.clone()),
+            ("root-b", fixture.checkout_b.clone()),
+        ],
+        SourcePathMode::ExperimentalLogical {
+            accepted_policy: ACCEPTED_LOGICAL_POLICY.to_owned(),
+            prefix: PathBuf::from("/oxide/fixture-component"),
+        },
+    );
+    let invocation = fixture.invocation(&fixture.checkout_b, &digest(b"tree-b"), policy.clone());
+    assert!(matches!(
+        resolve::resolve(&invocation),
+        Resolution::Ready(resolved) if resolved.source_map.is_some()
+    ));
+    let storage_root = fixture.root.dir("storage");
+    let daemon = RunningDaemon::start_with_probe(&storage_root, space.probe());
+    let (started_tx, started_rx) = mpsc::channel();
+    let mut runner = native::NativeFixtureCommandRunner::retain_writer(started_tx)
+        .expect("bounded retained-writer runner");
+    let mut adapter = ProjectAdapter::new(daemon.client.clone());
+    let mut consumer = FixtureConsumer::new();
+    consumer.run_id = "mapped-retained-run".to_owned();
+    consumer.attempt_id = "mapped-retained-attempt".to_owned();
+    consumer.host_run_id = "mapped-retained-host".to_owned();
+    let result = adapter.execute(
+        &invocation,
+        &mut consumer,
+        &mut NoWait,
+        &mut runner,
+        &NeverCancelled,
+    );
+    let started = started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("mapped fixture writer remains active");
+    assert!(started.pid > 0 && runner.has_retained_writer());
+    assert_eq!(result.disposition, ExecutionDisposition::Uncertain);
+    assert_eq!(consumer.last_terminal_outcome, None);
+    assert_eq!(consumer.capture_calls, 0);
+    assert!(invocation.capture_dir.join("writer-progress.txt").is_file());
+    let slot = daemon
+        .client
+        .inventory("mapped-retained-writer")
+        .unwrap()
+        .slots
+        .pop()
+        .expect("mapped uncertain slot remains reserved");
+    assert_eq!(slot.state, SlotState::Uncertain);
+
+    let next_invocation = fixture.invocation(&fixture.checkout_b, &digest(b"tree-b"), policy);
+    let mut next_consumer = FixtureConsumer::new();
+    next_consumer.run_id = "mapped-after-retained".to_owned();
+    next_consumer.attempt_id = "mapped-after-retained-attempt".to_owned();
+    next_consumer.host_run_id = "mapped-after-retained-host".to_owned();
+    let mut next_runner = native::NativeFixtureCommandRunner::healthy().expect("bounded runner");
+    let refused = adapter.execute(
+        &next_invocation,
+        &mut next_consumer,
+        &mut NoWait,
+        &mut next_runner,
+        &NeverCancelled,
+    );
+    assert_eq!(
+        refused.disposition,
+        ExecutionDisposition::Refused(AdapterRefusal::Busy)
+    );
+    assert_eq!(next_runner.launched_children(), 0);
+
+    runner
+        .release_and_reap_retained()
+        .expect("reap only the identified fixture writer");
+    let after_reap = daemon
+        .client
+        .inventory("mapped-retained-after-reap")
+        .unwrap();
+    assert_eq!(after_reap.slots[0].state, SlotState::Uncertain);
+    assert_eq!(
+        daemon
+            .client
+            .evict("mapped-no-uncertain-eviction", 1)
+            .unwrap(),
+        0
+    );
+    space.save(&fixture.root);
 }
 
 #[test]
