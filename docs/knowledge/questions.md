@@ -24,6 +24,8 @@ Tom approved the standalone oxide#005 trial on 2026-10-09 after independent nati
 
 [Qualification readiness](qualification-readiness.md#candidate-selector-head-and-toolchain) records a candidate selector and gates. Its earlier single-held-lease measurement proposal is superseded: it is neither an authorized experiment nor a substitute for normal release/reacquire. Merging design documentation does not authorize any build or pilot.
 
+Tom separately authorized one tiny Oxide-owned Rust probe on 2026-10-10 to observe actual source invalidation and cross-path behavior before another representative-project build. [Vision](vision.md#authority-boundaries) owns its fresh source, image and execution limits. Its evidence applies to that fixed probe only; consumer adoption and a new Nucleus qualification remain separate scopes.
+
 ## Q-005 — What names are safe to publish?
 
 Review executable/crate/distribution names against the existing Oxide Computer Company SDK/CLI before publication. Owner: [release](contracts/release.md).
