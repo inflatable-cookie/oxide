@@ -4,8 +4,9 @@ Status: proposed consumer design. Oxide now contains an unpublished Rust
 library adapter for task-owned fixtures. It defines no production Queue/Nucleus
 binding, consumer configuration key, daemon deployment or consumer adoption.
 The storage rules remain in [architecture](../architecture.md),
-product authority remains in [vision](../vision.md), and Q-010/Q-011 are the
-open questions this design answers in [questions](../questions.md).
+product authority remains in [vision](../vision.md), and Q-010/Q-011 hold the
+integration design answers. Q-012 remains open for the consumer-owned source
+path and task-attempt lifecycle gates described below.
 
 ## Recommendation
 
@@ -81,6 +82,155 @@ reuses its operation ID and identical payload. A new attempt gets a new attempt
 ID and operation IDs; it never inherits an earlier lease. These identity tuples
 describe semantics, not existing wire fields.
 
+## Stable source-path lifecycle
+
+This is a proposed Queue/Nucleus integration contract, not a shipped API or an
+approval to change either consumer. Read-only inspection found that Queue
+currently creates task-specific checkout roots, shares Cargo downloads through
+`CARGO_HOME`, keeps build outputs private to each task, and cleans them only
+after closeout proofs (Queue Spec 028). Nucleus Contract 002 preserves one
+logical workspace and branch per task and retains failed or unpublished
+workspaces; successful archival removes the checkout after artifact
+preservation. Its managed-Git direction can share Git objects without sharing
+mutable worktrees. Contract 010 is frozen: Queue admits and launches host runs
+through one scheduler path; Nucleus shadows it and its current host service
+does not implement host-run scheduling. None of these contracts currently
+provides a reusable finite task-root pool, a task-attempt credential for Oxide
+acquisition, or a dirty-source snapshot receipt.
+
+Compare these two consumer-owned arrangements:
+
+| Arrangement | Recurrence and ownership | Cost or blocker | Decision |
+| --- | --- | --- | --- |
+| Finite pool of task-worktree paths | A Queue/Nucleus task workspace occupies one registered canonical path exclusively. After ordinary archive proves the workspace safe to remove, a later, distinct workspace may use that same path. Every root is part of one fixed complete map, so tasks assigned to different roots keep the same compiler flags. | Requires a bounded path allocator integrated with managed Git/worktree creation, workspace identity and archive. Failed, unmerged or uncertain work keeps its path and can exhaust the pool. Exact dirty/untracked source must remain reproducible before a path is recycled. | **Recommend for the next consumer design brief.** It reuses the actual task worktree and adds no second source copy. It remains unimplemented and unqualified. |
+| Explicit stable compilation-source view | The consumer materializes each authorized task source into a separate stable view and runs Cargo there while retaining the ordinary task checkout elsewhere. | No current Queue/Nucleus view or snapshot contract was found. Copying files increases source storage and requires dirty-source sync, generated-input handling, sibling-relative-path preservation and exact source return. A filesystem snapshot/reflink would need its own supported consumer contract. It is not a safe assumed fallback. | Defer unless the managed-Git/worktree owners identify an existing supported copy-on-write view that avoids full copies and proves exact source behavior. |
+
+The pool's stable identity is its fixed, ordered set of root IDs, canonical
+paths and logical compiler prefixes plus the remap policy. Register the whole
+set before mapped use. It is independent of each task's mutable source
+revision. Queue/Nucleus binds every build receipt to the task/workspace/run/
+attempt, assigned root, exact commit/tree and submodules, any permitted dirty
+source delta, root-set/policy digest, effective configuration/toolchain,
+Oxide lease, and independent capture receipt. A source revision change under
+the same roots does not change compiler flags; Cargo fingerprints and explicit
+source/configuration/toolchain miss controls must still work. Any changed root
+set or prefix changes the map and produces a cold partition. Never add a root
+to chase a hit or evict an old partition as if that were a recurrence.
+
+The consumer's root reservation lasts for the task workspace's normal lifetime;
+the Oxide lease covers one compile/test/capture run only. Reacquire for each
+managed selector. Do not hold an Oxide cache lease while a task edits or waits.
+
+For each opted-in selector, the map must cover every relevant Rust source root,
+including any sibling checkout or generated source tree that affects the
+build. If the consumer cannot register and retain a stable path for a relevant
+root, that selector remains on its private path; the map must not omit the root
+to manufacture a hit.
+
+### Preparation through retained source
+
+The proposed consumer implementation is small in responsibility, though it
+touches lifecycle seams:
+
+1. **Prepare:** the opted-in Queue/Nucleus repository/workflow registration
+   names a finite set of stable task-worktree paths and the exact selectors
+   allowed to use mapped reuse. This is a proposal for a consumer-owned field,
+   not an existing setting. Resolve/canonicalize the complete map before the
+   first managed build. Include all relevant source roots for the selector.
+   Create a checkout only when a task actually takes that slot; do not
+   pre-clone or seed idle roots.
+2. **Authorize the request:** the consumer checks task dependencies, project
+   opt-in and exact selector eligibility under its normal rules, then keeps a
+   stable request identity while the work is pending. This is task-level
+   authorization, not worker/attempt admission or a host-run token.
+3. **Wait:** if no root is free or Oxide reports no compatible storage ready,
+   Queue/Nucleus keeps the request in its own pending lifecycle. Register a
+   cancellable wait by stable request ID and resume on a state-change hint; do
+   not poll, prepare a task checkout, start a worker/build, consume a host-run
+   execution slot or take an Oxide lease while waiting. A full/uncertain pool
+   holds the request visibly; it does not trigger automatic cloning, cleanup,
+   map growth or a private claim of reuse.
+4. **Admit attempt and acquire:** after a wake, normal consumer admission
+   authorizes the task attempt and assigns an available path to its own
+   workspace. The consumer records that source revision and sends Oxide a
+   task/attempt authorization that authenticates `(consumer, project,
+   workflow, task, workspace, run, attempt, root_id, root_set_digest)` plus
+   exact source evidence. This is a required proposed capability, not a
+   current Queue or Nucleus API, and is separate from `HOST_RUN_TOKEN`. The
+   adapter then sends one authenticated, idempotent acquire. If it races and
+   returns `busy`, submit no host run and start no command; the consumer must
+   release/park the authorized attempt and return the request to pending with
+   no execution slot held. This needed return transition is not established by
+   the inspected contracts. It uses no new `host.run` outcome or fabricated
+   `launched: false` settlement. If acquire succeeds, persist the durable
+   lease before continuing. An acquire timeout/lost reply reconciles the same
+   acquire ID; it never creates a second lease.
+5. **Existing host-run admission/launch:** only after successful acquire does
+   the adapter submit the already-supported heavy Effigy selector to the
+   current host-run scheduler. Contract 010 remains the only host admission,
+   launch, cancellation and process-settlement authority. It creates the real
+   host-run ID and supplies its genuine token to the launched process; Oxide
+   must not mint, forge or substitute `HOST_RUN_TOKEN`. If the existing
+   scheduler settles a queued pre-launch cancellation or capacity timeout,
+   use that authentic envelope to reconcile the exact lease. Do not add a
+   storage-busy settlement. While the scheduler queues after acquire, Oxide's
+   storage lease remains reserved, but no host CPU/memory execution slot has
+   been admitted.
+6. **Test, capture and settle:** run the requested selector and tests normally.
+   Queue/Nucleus owns the host-run terminal receipt, exact source identity,
+   captured logs/binaries/test evidence and retention. The adapter binds the
+   real host-run ID/epoch, lease, source/root-set digests and independent
+   capture-receipt digest into the Oxide run receipt. Finalize only after the
+   consumer's ordinary host-run/process proof and capture receipt agree.
+   Missing, mismatched or lost evidence leaves the Oxide slot `uncertain` and
+   unavailable; a cache hit never changes test settlement.
+7. **Retain and recycle source:** the consumer keeps the task's root assigned
+   through its normal workspace lifetime. Before archive/reuse it preserves
+   the exact run source and receipt outside that mutable checkout. A clean,
+   published head can use the consumer's normal closeout and artifact
+   preservation gates. Dirty/untracked source needs an exact retained delta
+   or remains private/held. Failed, unmerged, cancelled or uncertain
+   workspaces follow current retention rules and keep their path occupied.
+   Once ordinary archive is proved, Queue/Nucleus may recreate a new task
+   worktree at that path; it does not reset a live checkout or ask Oxide to
+   retain source.
+
+For the minimum cross-root recurrence pair, pre-register roots `r0` and `r1`
+once. Task identity A builds source tree S at `r0` cold and records its
+task-specific capture. After A settles and its workspace is safely archived,
+distinct task identity B builds the same compatible S at `r1`; the complete
+map digest and Rust flags must match A, while exact receipts retain A and B
+independently. This is the first cross-root recurrence pair, not a benefit
+claim. A separate sequential allocator check must assign a freed path to a new
+workspace without changing the map. Follow with a changed-source build and
+separate configuration/toolchain miss controls; tests still run. If any root,
+flag or policy changes, record a cold partition instead of counting it as
+reuse.
+
+The finite path count bounds concurrent workspaces eligible for this map,
+not the full-debug cache bytes; that footprint remains unmeasured. Count every
+registered checkout, slot, redirected temporary file and retained run capture
+inside the applicable bounded-storage policy. The map does not make source
+roots free, and retained failures can reduce usable pool capacity until normal
+consumer disposition. Never evict leased/uncertain cache state or delete
+task-owned source/evidence to make room. A task that cannot obtain a pool root
+uses its existing private path only if the consumer explicitly allows that
+fallback; it makes no remapping/reuse claim.
+
+Before implementation, Tom must approve a new consumer integration brief
+that binds the finite root registration and workspace-path reuse to the
+Queue/Nucleus managed-Git/worktree owners, and identifies who implements the
+task-attempt authorization, acquire/cancel/reconcile receipt, exact dirty-source
+retention and archive gate. Queue host-run owners must confirm this ordering
+against frozen Contract 010; Nucleus owners must confirm the workspace and
+retention mapping against Contract 002 and the same frozen 010. The consumers
+must not be treated as interchangeable until Nucleus actually supports each
+required capability. Oxide implementation, real-project qualification and
+rollout each need their own approved scope. The next qualification must still
+measure full-debug bytes and preserve source/configuration/toolchain
+invalidation, behavior-bearing paths, independent artifacts and conservative
+uncertainty.
+
 ## Readiness, admission and acquire ordering
 
 Readiness is advisory and never reserves a slot. A compatible slot may become
@@ -95,10 +245,14 @@ busy after a ready response. The smallest safe waiting contract is:
    host resource, or decide retry priority. Queue/Nucleus applies its own
    dependency, priority, fairness and resource rules when reconsidering the
    task. The consumer's existing admission is authoritative.
-3. After normal consumer admission, the adapter sends one authenticated acquire
-   request bound to that run and attempt. Oxide durably records exclusive
-   ownership before returning a lease token. Only then may the adapter start
-   Cargo against the selected intermediate directory.
+3. After normal Queue/Nucleus task-attempt authorization and source-root
+   assignment, but before submitting the heavy host run, the adapter sends one
+   authenticated acquire bound to that task attempt. Oxide durably records
+   exclusive ownership before returning a lease token. Only then may the
+   adapter submit the existing host-run request and start Cargo against the
+   selected intermediate directory. This separates task-attempt authorization
+   from Host Run admission; the consumer credential is a required proposal,
+   not a current API or a substitute for `HOST_RUN_TOKEN`.
 4. Hold the lease through the command's descendants, required test execution,
    and independent capture receipt. Finalize only after the consumer and process
    guardian prove the run has stopped and its evidence is captured, following
@@ -110,15 +264,18 @@ current state before admission. Oxide must not implement a second host scheduler
 or claim Queue/Nucleus fairness. Exact waiter fairness and operator-attention
 thresholds remain provisional; no numeric timeout or retry count is selected.
 
-If readiness races with another valid claimant, acquire returns `busy` and
-starts no build. The consumer owns recovery: release any capacity held only for
-that not-yet-started invocation, return the logical request to its own pending
-queue, and reconsider it after a newer readiness event. Do not wait while
-holding an execution slot, and do not automatically replay a lost or uncertain
-acquire. Reconcile the same acquire ID first. If the consumer's existing
-lifecycle cannot represent a not-started acquire refusal without falsifying a
-run outcome or changing frozen Nucleus Contract 010, stop before adapter
-implementation and ask the consumer owner for that narrow lifecycle mapping.
+If readiness races with another valid claimant, acquire returns `busy` before
+any host-run submission and starts no build. Queue/Nucleus must return that
+authorized request to its own pending lifecycle and reconsider it after a
+newer readiness event; it must not create a `host.run` record or translate
+`busy` into `cancelled`, `failed` or `capacity_timeout`. Read-only inspection
+did not find a current task-attempt-to-acquire/return transition for this case.
+Its exact consumer-owned representation is therefore a prerequisite, not an
+existing API. Do not wait while holding a host execution slot, and do not
+automatically replay a lost or uncertain acquire. Reconcile the same acquire
+ID first. If Queue/Nucleus cannot represent this pre-host-run wait/refusal
+without falsifying a run outcome or changing frozen Contract 010, stop before
+adapter implementation and obtain the narrow lifecycle ruling from its owner.
 
 This boundary preserves the existing ownership split: Queue/Nucleus control
 tasks, agents, QA slots and settlement; Oxide controls compatible Rust storage
@@ -129,9 +286,10 @@ and frozen Host Run Scheduling Contract 010. None is amended here.
 ## Refusal, cancellation and retry ownership
 
 - **Busy:** a compatible slot is currently leased. A registered request may
-  wait without acquiring it. A post-wakeup acquire refusal starts no command;
-  the consumer returns the request to its own queue and waits for a state
-  change.
+  wait without acquiring it. A post-wakeup acquire refusal happens before
+  `host.run` submission and starts no command. The consumer must return the
+  task request to its own pending lifecycle and wait for a state change; that
+  transition still needs owner approval and implementation.
 - **Full:** the configured cap/reserve is reached, unknown, or unenforceable,
   or no compatible owned capacity can be made available safely. Refuse with
   the measured/reserved state and owner-visible next step. Do not wait for a
@@ -144,11 +302,15 @@ and frozen Host Run Scheduling Contract 010. None is amended here.
   removes the corresponding wait registration. Cancellation before acquire
   releases no lease. Replayed cancellation is idempotent.
 - **Cancellation after acquire:** Queue/Nucleus owns the cancellation decision.
-  The adapter forwards it to the process guardian, captures available run
-  evidence, and finalizes only after descendants are proven stopped. A cancel
-  request, test result, daemon restart or lost response alone does not release
-  the slot. If acquire reply state is unknown at cancellation time, reconcile
-  that acquire ID; keep the slot unavailable until proof resolves it.
+  Before host-run submission, release is allowed only with authenticated
+  task-attempt cancellation evidence proving that no host run was submitted;
+  this consumer capability remains a prerequisite. After host-run submission,
+  use its genuine cancellation and settlement path. The adapter forwards
+  cancellation to the process guardian, captures available run evidence, and
+  finalizes only after descendants are proven stopped. A cancel request, test
+  result, daemon restart or lost response alone does not release the slot. If
+  acquire or host-run reply state is unknown at cancellation time, reconcile
+  the same operation ID; keep the slot unavailable until proof resolves it.
 
 The consumer owns retry and admission. The adapter may retry an identical
 operation only with the same ID and payload to resolve a lost response. It may
@@ -161,20 +323,24 @@ owner-visible hold such as unresolved daemon recovery.
 ## Example flows
 
 **Normal flow.** A project opts in one existing Effigy test selector. The
-consumer leaves its task pending while no compatible slot is ready. Oxide
-signals a readiness change; Queue/Nucleus applies its normal scheduling rules,
-admits the task and supplies the authenticated run envelope. The adapter
-resolves the effective key, acquires the lease, then invokes the same Effigy
-selector with Cargo's intermediate directory set for that lease. The selector
-runs tests, Queue/Nucleus captures its normal output and receipt, descendants
-stop, and the adapter finalizes. Per-run output is retained independently of
-the reusable intermediates.
+consumer leaves its task pending while no compatible root or Oxide slot is
+ready. Oxide signals a readiness change; Queue/Nucleus applies its normal
+scheduling rules, prepares the workspace and supplies the authenticated task
+attempt envelope proposed above. The adapter acquires the lease before
+submitting the existing heavy Effigy selector to the host-run scheduler. The
+scheduler issues its genuine host-run ID/token and launches the selector, which
+runs tests with Cargo's intermediate directory set for that lease. Queue/Nucleus
+captures its normal output and receipt, descendants stop, and the adapter
+finalizes. Per-run output is retained independently of the reusable
+intermediates.
 
 **Busy after wakeup.** Two pending tasks receive a readiness event. The
-consumer admits one and its acquire succeeds. If another admitted attempt
-reaches acquire and gets `busy`, it starts no Cargo process, releases any
-not-yet-used execution capacity, and returns to the consumer queue. It waits for
-a new state event; it does not spin or hold a QA slot.
+consumer authorizes one attempt and its acquire succeeds. If another
+authorized attempt reaches acquire and gets `busy`, it starts no Cargo process
+and submits no host run. Queue/Nucleus must return that request to pending
+without holding an execution slot, then reconsider it after a new state event.
+That return transition is a consumer integration prerequisite; it is not an
+existing host-run settlement. No retry loop is allowed.
 
 **Full capacity.** Preflight reports that the enforceable cap/reserve cannot
 admit the requested compatible storage. The adapter returns a full refusal
@@ -189,9 +355,11 @@ waits for authenticated reconciliation. Age, a missing PID or a new worker does
 not make the slot ready.
 
 **Cancellation.** A task cancelled before readiness removes its wait and never
-acquires. If cancellation arrives after acquire, the consumer stops the run
-through its normal process guardian; the adapter captures evidence and releases
-the lease only after shutdown and capture are proved. A lost acquire reply is
+acquires. If cancellation arrives after acquire but before host-run submission,
+the consumer must authenticate that no host run was submitted before the lease
+can be reconciled. After host-run submission, the consumer stops it through its
+normal process guardian; the adapter captures evidence and releases the lease
+only after shutdown and capture are proved. A lost acquire or host-run reply is
 reconciled before either path is chosen.
 
 ## Minimum adapter vocabulary
