@@ -1424,7 +1424,10 @@ Design-only. No compiler, fixture, image, slot, timestamp, fingerprint or
 consumer mutation. Investigation used the named repository knowledge, the
 reviewed PR18 diagnosis, pinned Cargo 1.97.1 (`c980f4866`) freshness already
 recorded in Task 018, Queue Spec 028 / `worktree-cleanup.ts`, and Nucleus
-Contract 002. This is not execution authority and does not replay the 018
+Contract 002. This correction also read pinned Cargo
+[`fingerprint/mod.rs`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/compiler/fingerprint/mod.rs)
+build-script handling and the [change-detection](https://doc.rust-lang.org/cargo/reference/build-scripts.html#change-detection)
+docs. This is not execution authority and does not replay the 018
 four-invocation proof.
 
 Tom's first foothold is duplicate dependency compilation and storage across
@@ -1441,20 +1444,26 @@ cross-root artifacts. Do not treat that mapped hit as storage relief.
 
 | Candidate | Mechanism in pinned 1.97.1 | Useful-reuse result |
 | --- | --- | --- |
-| **(a) Bounded consumer-owned physical path reuse** | Keep one exclusive Oxide `CARGO_BUILD_BUILD_DIR` slot per registered compile root. After ordinary consumer archive, a new task/workspace/run/attempt occupies that same physical worktree. Cargo relative fingerprints and `CARGO_MANIFEST_DIR` stay at that path, so unchanged registry/path-dep units can stay fresh while changed workspace units rebuild. Strict-physical partition matching already keys the slot on that path. | **Recommend.** Different-source tasks at a recycled root can retain unmodified dependency work. Store count equals the finite root pool, not the task count. |
+| **(a) Bounded consumer-owned physical path reuse** | Keep one exclusive Oxide `CARGO_BUILD_BUILD_DIR` slot per registered compile root. After ordinary consumer archive, a new task/workspace/run/attempt occupies that same physical worktree. Cargo relative fingerprints and `CARGO_MANIFEST_DIR` stay at that path, so unchanged registry/path-dep units can stay fresh while changed workspace units rebuild. Strict-physical partition matching already keys the slot on that path. | **Recommend.** Different-source tasks at a recycled root can retain unmodified dependency work. Store count is registered roots times active compatibility partitions, independent of task count. |
 | **(b) Supported dependency-only reuse boundary** | A private task-sensitive output tree plus a shared compiled-dependency store. | **No usable supported mechanism.** Stop the survey. |
 
-Pinned Cargo 1.91+ `CARGO_BUILD_BUILD_DIR` relocates the whole intermediate
-tree. Its layout is internal and has no documented split that keeps registry
-or path-dep units while isolating workspace crates, build-script output,
-incremental state or test executables. [Automatic global caches](https://doc.rust-lang.org/cargo/reference/config.html#global-caches)
+Pinned Cargo 1.97.1 documents `CARGO_BUILD_BUILD_DIR` in the
+[configuration reference](https://doc.rust-lang.org/stable/cargo/reference/config.html#buildbuild-dir).
+The [Cargo 1.91 changelog](https://doc.rust-lang.org/cargo/CHANGELOG.html)
+records the `build.build-dir` stabilization. The layout is internal and has
+no documented split that keeps registry or path-dep units while isolating
+workspace crates, build-script output, incremental state or test executables.
+[Automatic global caches](https://doc.rust-lang.org/cargo/reference/config.html#global-caches)
 cover registry/Git *sources*; Queue Spec 028 already shares those through
-`CARGO_HOME` and keeps compiled outputs checkout-local. The 2026
-cross-workspace cache goal is experimental/nightly, initially excludes build
-scripts and proc macros, and is not in 1.97.1. Unstable
-`checksum-freshness` does not replace build-script `RerunIfChanged` mtimes.
-`sccache` is already rejected. Copying `deps/` or reimplementing fingerprints
-is forbidden. A compiler wrapper is Nucleus lead-1965, out of scope.
+`CARGO_HOME` and keeps compiled outputs checkout-local. Candidate (b)
+rejection rests on that 1.97.1 internal-layout fact. The 2026
+cross-workspace cache goal is recorded in
+[the landscape](rust-dx-landscape.md) as experimental direction, not a
+supported 1.97.1 capability; this task did not re-fetch that goal page.
+Unstable `checksum-freshness` does not replace build-script
+`RerunIfChanged` mtimes. `sccache` is already rejected. Copying `deps/` or
+reimplementing fingerprints is forbidden. A compiler wrapper is Nucleus
+lead-1965, out of scope.
 
 Candidate (b) therefore cannot be a next delivery on this toolchain. Reassess
 only when a *supported* Cargo release documents shared compiled units with
@@ -1487,10 +1496,11 @@ proc-macro and runtime paths still name that same physical root, so retained
 generated strings are not a cross-root lie. This is Cargo's in-origin
 invalidation, which Task 018 recorded as working at changed B.
 
-**Storage bound versus reduced writes.** The number of exclusive build stores
-is the number of registered roots (plus any private-fallback directories),
-independent of how many tasks have run. Concurrent mapped workspaces cannot
-exceed the pool. Occupied bytes are still the full-debug slot plus that
+**Storage bound versus reduced writes.** Exclusive build-store count is
+registered roots times active compatibility partitions (profile, features,
+toolchain, configuration, environment), plus any private-fallback
+directories, independent of how many tasks have run. Concurrent mapped
+workspaces cannot exceed the pool. Occupied bytes are still the full-debug slot plus that
 root's checkout, redirected temps and per-run captures; that footprint is
 unmeasured. Reduced *writes* happen only for units Cargo keeps fresh; a
 recycled path whose workspace crates all change still rewrites those crates
@@ -1532,26 +1542,51 @@ Pre-execution gates, in order, after durable acquire and before spawn:
    source mtime is old" refuse would also reject ordinary `git checkout` /
    `git reset --hard`, because unchanged files keep their old mtimes. That
    would destroy useful reuse.
-5. **Supported gate for (4):** on successful finalize, persist a bounded
-   relative-path digest map of fingerprint-named workspace inputs and
-   declared behavior-path files (cap: 4096 files or 1 MiB, whichever first;
-   exceed → this slot cannot be reused). On a later different-digest acquire
-   of the same slot, for every stored path whose current mtime is `<=` that
-   fingerprint's reference mtime, the current file hash must equal the stored
-   hash. Mismatch or unreadable current file with a stored hash: refuse
-   *before* Cargo, release the lease without writing, keep the slot Idle with
-   its previous origin, category `source_stale`. Newer mtimes are left to
-   Cargo. Missing fingerprint/map files, unknown format, or an input class
-   the map does not cover: refuse (`input_unknown`), no execution. This is
-   Oxide-owned admission evidence, not a Cargo fingerprint edit, source
-   touch, or emitted-path rewrite.
+5. **Supported gate for (4):** at acquire, record admitted_tree_digest
+   `D_admit` from the requested tree (gate 3). On a later different-digest
+   acquire of the same slot, for every stored path whose current mtime is
+   `<=` that fingerprint's reference mtime, the current file hash must equal
+   the stored hash. Mismatch or unreadable current file with a stored hash:
+   refuse *before* Cargo, release the lease without writing, keep the slot
+   Idle with its previous origin, category `source_stale`. Newer mtimes are
+   left to Cargo. Missing fingerprint/map files, unknown format, or an input
+   class the map does not cover: refuse (`input_unknown`), no execution. Cap
+   4096 files or 1 MiB, whichever first, applies to fingerprint-named
+   workspace inputs and declared behavior-path files (a subset of tracked
+   files). Nucleus currently has 1003 tracked files (140 `.rs`) and Oxide
+   46 tracked: that cap is expected to bind for those fingerprint-named
+   subsets; if a workspace exceeds it, that slot cannot be reused. On
+   successful finalize: re-hash the requested tree. Persist the
+   relative-path digest map only if the tree digest equals `D_admit`; bind
+   the stored map to that admitted digest. File hashes are of that admitted
+   tree. If the tree changed during the lease, do not persist or replace
+   the map; mark the slot's map invalid so the next reuse is
+   `input_unknown` until a later compile with an unchanged tree produces a
+   bound map. This is Oxide-owned admission evidence, not a Cargo
+   fingerprint edit, source touch, or emitted-path rewrite.
 6. **Generated / proc-macro / build-script / native / external.** Declared
-   `rerun-if-changed` and rustc dep-info paths are in the map. Undeclared
-   env, network, or extra files the workflow may read are unknown inputs:
-   refuse managed reuse rather than guess. `cargo clean -p` is a supported
-   command and is *not* selected: its coverage of build-script output,
-   incremental files and fingerprints is unqualified, and a refuse/private
-   fallback is the fail-closed path.
+   `rerun-if-changed` and rustc dep-info paths are in the map. Detectable
+   unknown: after a successful compile, parse the slot's build-script
+   `output` (and fingerprint local entries). If any in-scope package's
+   `run-custom-build` unit has zero `rerun-if-changed` and zero
+   `rerun-if-env-changed` lines, do not persist a reuse map for that slot,
+   and the next acquire refuses managed reuse (`input_unknown`) before
+   spawn. Pinned Cargo `c980f4866`
+   [`fingerprint/mod.rs`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/compiler/fingerprint/mod.rs)
+   treats that case as old-style: an mtime change of any package file
+   reruns the script; otherwise the fingerprint only tracks the listed
+   rerun-if items. Official
+   [change-detection](https://doc.rust-lang.org/cargo/reference/build-scripts.html#change-detection)
+   docs match. The first-slice fixture emits
+   `cargo:rerun-if-changed=marker.txt`, so it is eligible. Residual, not a
+   refusal: a script that declares some rerun-if items but also reads an
+   undeclared file, env var, or network resource. Oxide cannot observe
+   those reads. First slice excludes such workflows. Later consumers admit
+   them only with explicit owner/Tom acceptance that undeclared reads are
+   out of coverage; they are not claimed hits and not `input_unknown`
+   refusals. `cargo clean -p` is a supported command and is *not* selected:
+   its coverage of build-script output, incremental files and fingerprints
+   is unqualified, and a refuse/private fallback is the fail-closed path.
 7. **Runtime resource paths.** Same physical root, so retained paths are
    correct only if the new tree actually has those files. Content changes
    with newer mtimes rebuild or are re-read at test time; content changes
@@ -1561,15 +1596,17 @@ Pre-execution gates, in order, after durable acquire and before spawn:
    captures bind this attempt, source digest, root, lease and artifact
    hashes.
 
-Uncertainty: the digest map covers only files Cargo named plus declared
-behavior paths. A build script that reads an undeclared file can still go
-stale; that is an unknown-input refusal, not a claimed hit. Equal-mtime
-same-content files are allowed (ordinary unchanged git files). Clock-step
-backwards on changed content is refused. Replacement criterion: retire the
-map when a supported Cargo release's checksum freshness covers both rustc
-dep-info *and* build-script `RerunIfChanged`, including synthesized
-`CARGO_MANIFEST_DIR`, on the pinned toolchain, and a fresh qualification
-passes the same gates.
+Uncertainty: the digest map covers files Cargo named plus declared behavior
+paths, bound to the admitted pre-acquire tree digest, persisted only if that
+digest is unchanged at finalize. Equal-mtime same-content files are allowed
+(ordinary unchanged git files). Clock-step backwards on changed content is
+refused. Residual: undeclared extra reads by a script that also emitted
+some rerun-if; a mid-lease edit that reverts before finalize (Cargo
+`invoked.timestamp` is Cargo's mid-build protection). Replacement
+criterion: retire the map when a supported Cargo release's checksum
+freshness covers both rustc dep-info *and* build-script `RerunIfChanged`,
+including synthesized `CARGO_MANIFEST_DIR`, on the pinned toolchain, and a
+fresh qualification passes the same gates.
 
 Do not touch all sources, edit Cargo internals, rewrite emitted values,
 ignore paths, or grow the root map.
@@ -1582,14 +1619,18 @@ second compilation copy and no transfer of source ownership.
 
 Existing facts, not proposed APIs:
 
-- Queue Spec 028 shares `CARGO_HOME` downloads, keeps compiled outputs
-  checkout-local, and removes in-checkout `target` directories only after
-  closeout proofs. It skips a `target_directory` outside the worktree and
-  then blocks cleanup-complete. Point `CARGO_BUILD_BUILD_DIR` at the Oxide
-  slot *outside* the checkout and keep `CARGO_TARGET_DIR` private *inside*
-  the checkout: Spec 028 can delete per-run finals and will not discover the
-  Oxide slot as a target. That is an observed compatibility, not a Queue
-  change.
+- By reading of Spec 028 and `worktree-cleanup.ts`: Queue Spec 028 shares
+  `CARGO_HOME` downloads, keeps compiled outputs checkout-local, and
+  removes in-checkout `target` directories only after closeout proofs. It
+  skips a `target_directory` outside the worktree and then blocks
+  cleanup-complete. Point `CARGO_BUILD_BUILD_DIR` at the Oxide slot
+  *outside* the checkout and keep `CARGO_TARGET_DIR` private *inside* the
+  checkout: Spec 028 can delete per-run finals and will not discover the
+  Oxide slot as a target. This design departs from Spec 028's rationale
+  that "Cargo build outputs stay local to each task checkout":
+  intermediates live in the Oxide slot outside the checkout; finals stay
+  checkout-local via `CARGO_TARGET_DIR`. That departure needs Queue Spec
+  028 owner / Tom approval. It is not a Queue change in this task.
 - Nucleus Contract 002 keeps one workspace/branch/worktree identity per
   task; "multi-task workspace reuse is not part of the initial model."
   Failed or cancelled never-merged worktrees stay retained. Shared Git
@@ -1661,8 +1702,11 @@ host free space. Full-debug companion binding and project-source lookup on
 every successful compile.
 
 1. **Cold T0 / attempt 1 at R.** New slot-1. Workspace units rebuild.
-   Tests and full-debug lookup pass at R. Persist the input-digest map.
-   Idle.
+   Tests and full-debug lookup pass at R. Re-hash the tree at finalize;
+   persist the input-digest map only if it still equals the admitted T0
+   digest, and bind the map to that digest. Record presence of
+   `rerun-if-changed=marker.txt` in the slot build-script `output` as
+   eligibility evidence. Idle.
 2. **Useful warm T1 / attempt 2 at R.** Different tree, new task/run/attempt
    identity, same physical path. Acquire must return slot-1. `oxide-source-probe-macro`
    must be Cargo-fresh. Affected probe library/test/build-script units
