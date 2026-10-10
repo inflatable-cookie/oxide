@@ -380,6 +380,57 @@ own bounded proof; Task 021 did not execute it.
 
 ## Eligibility and qualification gates
 
+### Consumer-owner assessment
+
+The existing Queue and Nucleus planners assessed this contract on 2026-10-10
+under the bounded coordination authority in
+[vision](../vision.md#authority-boundaries). Both recommend the narrow
+Nucleus-first pilot in principle, with Queue retaining host-run authority.
+Their recommendations grant no implementation, activation, storage allocation
+or policy-departure approval.
+
+Both recommend acquire before genuine host submission, with an explicit finite
+host-capacity wait while holding the acquired Oxide lease. Readiness and storage
+busy remain non-reserving. A submitted run's authenticated nonlaunched
+cancel/capacity-timeout settlement needs adapter no-writer proof before release;
+deadline expiry alone never releases ownership. The missing consumer-owned
+storage-attempt ledger must persist authorization, acquire/submit intents and
+identities, busy/uncertain outcomes, cancellation and reconciliation. Existing
+operation journals and worker admission are patterns, not this API.
+
+Nucleus's managed-Git direction is not yet a qualified physical-root pool.
+Placement still creates clones. Its current preservation hashes timelines and a
+Git bundle, and archive observes host workspace state; neither proves complete
+old-run source/generated/dependency/debug retrieval. Shared repository storage
+also requires replacing `bundle --all` with task-scoped refs/object pins so
+preservation cannot include unrelated tasks' unpublished refs. Extend those
+existing placement, integration-preparation, preservation and archive owners;
+Oxide must not become their Git manager. A durable capture/archive/recycle
+acknowledgment and verified old-run lookup are missing prerequisites.
+
+Nucleus recommends starting the pilot with clean committed source only;
+unsupported submodules/LFS refuse, and dirty/unmerged/failed/uncertain tasks
+retain root occupancy. Both owners treat R=1/P=2 as a conditional pilot proposal
+with whole-task serialization, not a production concurrency choice. More
+parallel tasks require an explicitly bounded R>1, one live task per root, and
+no cross-root hit assumption.
+
+Neither consumer has a general immutable registry/tool/SDK receipt issuer.
+They recommend that the registered-workflow qualification owner supply the
+audited input manifest and accepted issuer policy, with the installation owner
+supplying bounded provenance/content integrity and a cooperative no-replacement
+agreement for declared reachable inputs during the lease. Oxide verifies that
+contract at acquire/finalize. Missing native closure stays ineligible; this does
+not authorize broad host hashing or turn paths/versions into integrity proof.
+
+Both recommend private fallback and automatic recovery remain disabled for the
+first pilot. Intermediate limits remain Oxide-owned; source/private-output/temp/
+evidence budgets and retention remain consumer-owned. Proposed 8/16 GiB limits,
+aggregate capture-copy peaks, retention periods and queue deadlines still need
+their explicit scoped decisions before real execution. The owner responses and
+proposed delivery dependencies are recorded in Queue's coordination lead;
+they are not new shipped consumer capabilities.
+
 The smallest Oxide boundary is the versioned registered Nucleus collector/argv
 runner extension above, retaining strict physical partitions, the stale-content
 refusal and durable failure barrier. The consumer boundary is a narrow opt-in
