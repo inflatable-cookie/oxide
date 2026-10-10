@@ -1568,7 +1568,7 @@ Pre-execution gates, in order, after durable acquire and before spawn:
    Missing/invalid fingerprint/map files, unknown format, or uncovered input
    classes refuse reuse (`input_unknown`), with no execution of those bytes.
    Only the separate cold path below can proceed without an old map. Cap
-   4096 files or 1 MiB, whichever first, applies to fingerprint-named
+   4096 input/reference entries or 1 MiB of serialized evidence, whichever first, applies to fingerprint-named
    workspace inputs, declared behavior-path files, workspace identity
    files (`Cargo.toml`, `Cargo.lock`, in-tree toolchain and `.cargo`
    config), and the recursive expansion of declared directories (a
@@ -2017,3 +2017,91 @@ This earlier outline remains a separate, unapproved real-build pilot. The five p
 For that separate pilot, count the entire disposable footprint, including fixture roots, slot, forced `TMPDIR`/`TMP`/`TEMP` directory and captures, against an enforceable 10 GiB cap. Require at least 20 GiB free at start, monitor at an interval no slower than one minute and at protocol boundaries, and abort/report if a reading is below 20 GiB or unavailable; record sampling overshoot and unrelated-writer races. Neither this outline nor the cooperative fixture task authorizes volume creation, system-extension installation, entitlement requests, consumer builds or pilot execution.
 
 Queue/Nucleus keep admission, identity, settlement, retention and capture. Oxide owns slot leases and the proof that all writers have ended or been fenced; otherwise the slot stays unavailable.
+
+
+#### Same-root fixture freshness admission (opt-in implementation)
+
+`PathIdentity::SameRootCargoFixture` selects the fixed
+`oxide-cargo-same-root-fixture` workflow in
+[`freshness.rs`](../../src/project/freshness.rs). Production checkout isolation
+and mapped experimental qualification are unchanged. This slice admits only the
+frozen local fixture, baseline/changed marker contents, and the explicitly named
+syntax-error overlay for a later failed-build control. It recomputes the requested
+tree before authorization/acquire and again at admission and publication. The tree
+is run identity, not a slot key. One retained compatibility partition is allowed
+in this fixture store; a different root/configuration refuses rather than growing
+another generation or evicting. No private fallback is granted by this opt-in.
+The consumer path pool and general project input coverage remain unimplemented.
+
+The pinned Cargo 1.97.1 collector checks all seven allowed unit shapes,
+`CheckDepInfo` version-1 binary references, modern file-only `RerunIfChanged`
+output, unit/dependency metadata and short fingerprint integrity. No fingerprint
+is edited. Source and slot-generated inputs have separate path classes. The
+fixture's complete declared file/behavior boundary uses a conservative maximum
+of the real unit references, including the proc-macro's generated-file read;
+this can refuse changes that Cargo could otherwise rebuild safely. Manifests,
+workspace Cargo.lock and package-root Cargo.lock presence are inventoried: this
+fixture has only the workspace lockfile, so introducing a package lockfile is
+outside eligibility. Referenced manifest metadata env-deps stay Cargo-owned;
+configuration/environment identity stays partition-owned. Ancestor and user Cargo
+configuration, new members, external reads, symlinks, directories, old-style
+scripts, overrides, rustdoc, unknown formats and unresolved classes refuse.
+There is no directory-coverage claim: a directory input refuses in this file-only
+slice. No dependency reuse benefit has yet been observed through this guard.
+
+The integrity-checked map is capped at 4096 total input/reference entries and
+1 MiB of serialized evidence. Paths are at most 1024 bytes; discovery visits at
+most 4096 source entries, 16 fingerprint directories and eight entries per unit.
+Each file read is capped at 4 MiB and each collection/tree operation at 32 MiB
+of bytes read. An admission performs at most one tree operation, one map read
+(at most 1 MiB accepted) and one collection operation: at most 65 MiB accepted
+reads. Decoding rejects duplicate entries, dangling references, excessive counts,
+trailing bytes and checksum mismatch. These are tiny-fixture bounds, not an
+inference from Nucleus tracked-file counts.
+
+A durable, synced pending marker precedes the runner call. Partial successful
+units, failed compile/test/capture, lost replies, changed source and reconciliation
+to Idle leave eligibility invalid. A candidate is prepared only after verified
+registered Cargo completion and run-bound capture. Only confirmed Idle
+finalization with the admitted tree unchanged removes the marker; a crash between
+candidate preparation and finalize cannot resurrect old evidence. Before that
+marker exists, a guard refusal preserves the map and origin. The adapter can
+settle such a lease with its token-bound `NotSpawned` proof, independently of
+writer/test success. Caller status declarations and injected runner mocks cannot
+publish a genuine map. The cooperative trust boundary still excludes arbitrary
+same-user mutation of owned storage outside the registered workflow.
+
+Cold admission requires a newly acquired, actually empty generation plus the full
+fixture/root/config/source gates. Missing evidence on an existing generation is
+not emptiness. Recovery inspection requires proven Idle ownership, a known owned
+generation, invalid evidence, an explicit consumer-owned recovery policy grant
+and capacity. Uncertain/leased/unknown ownership refuses. The runtime has no
+destructive recovery entrypoint; ordinary acquire and generic eviction cannot
+replace this fixture generation. Ordinary regression tests replace only their
+newly created small owned test generation under an explicit test grant; their
+synthetic rebind is not live Cargo qualification. A later consumer recovery
+implementation must serialize whole-generation replacement within existing
+reservations, preserve source/private evidence and verify deletion/emptiness.
+
+The ignored later proof is
+`project::tests::cargo_pilot::same_root_probe::same_root_cargo_freshness_owned_proof`
+in [`cargo_same_root.rs`](../../src/project/tests/cargo_same_root.rs).
+It requires `OXIDE_SAME_ROOT_PROOF_RUN=1`,
+`OXIDE_SAME_ROOT_PROOF_SCOPE=oxide-019-same-root-v1`, and a fresh separately scoped
+Queue execution record for `/private/var/tmp/oxide-rust-probe-proof-019-reuse`.
+Run only that exact ignored test through `effigy test rust` with
+`--ignored --exact --test-threads=1` passed to the test runner. Ordinary validation
+leaves it ignored and creates no experimental root. The driver uses an original
+live Instant before setup, records its new UTC clock, enforces 20 minutes/four
+possible launches, validates the real Effigy selector plan before acquire, and
+uses the existing 20-second independent sampler with a 30-second completed-sample
+gap, fixed 8 GiB image, 10 GiB footprint and monitored 20 GiB host threshold.
+Successful runs capture actual registered-root DWARF lookup, complete packed
+companions/UUID binding and behavior paths; logical observations are never
+relabeled. The sequence is cold T0, different-task warm T1 retaining the
+proc-macro, same-tree retry, stale-mtime refusal, failed compile, and post-restore
+invalid-map refusal/recovery inspection. Refusal steps consume zero compiler
+invocations; the failed compile is the fourth. There is no fifth recovery
+compile, no live eviction and no successful recovery claim. The driver retains
+its new resources for inspection. This task grants no live execution, consumer
+adoption, everyday benefit claim or authority over any previous probe session.

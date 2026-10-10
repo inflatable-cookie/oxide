@@ -150,6 +150,13 @@ pub(crate) struct NativeCompletionCertificate {
 }
 
 impl NativeCompletionCertificate {
+    pub(super) fn is_registered_cargo(&self) -> bool {
+        self.native
+            && self.fixture_source_digest == super::cargo::source_digest()
+            && self.claim.workflow == super::freshness::WORKFLOW
+            && self.claim.selector == super::freshness::SELECTOR
+    }
+
     pub(super) fn capture_digest(&self) -> &str {
         &self.capture_digest
     }

@@ -1,4 +1,5 @@
 mod cargo;
+mod freshness;
 mod native;
 mod observations;
 mod resolve;
@@ -9,6 +10,7 @@ mod source_map_probe;
 #[cfg(test)]
 mod tests;
 
+pub use freshness::{recovery as inspect_cold_recovery, RecoveryDecision};
 pub use observations::{
     ObservationEvent, ObservationKind, RunObservation, WriteAttribution, MAX_EVENTS_PER_RUN,
     MAX_EVENT_BYTES, OBSERVATION_RING_BYTES,
@@ -47,6 +49,7 @@ pub enum AdapterRefusal {
     AmbiguousInput,
     UnsupportedInput,
     InputUnknown,
+    SourceStale,
     UnsupportedToolchain,
     Busy,
     Full,
@@ -374,6 +377,11 @@ impl<S: StorageOperations> ProjectAdapter<S> {
         W: StorageWaitBoundary,
         R: FixtureCommandRunner,
     {
+        let same_root_requested = invocation.descriptor.workflows.iter().any(|workflow| {
+            workflow.workflow == invocation.workflow
+                && workflow.selector == invocation.selector
+                && freshness::selected(workflow)
+        });
         let resolved = match resolve::resolve(invocation) {
             Resolution::NotOptedIn => {
                 return result(ExecutionDisposition::NotOptedIn, None, None, true);
@@ -383,7 +391,7 @@ impl<S: StorageOperations> ProjectAdapter<S> {
                     ExecutionDisposition::Refused(reason),
                     None,
                     None,
-                    invocation.private_fallback_allowed,
+                    invocation.private_fallback_allowed && !same_root_requested,
                 );
             }
             Resolution::Ready(resolved) => resolved,
@@ -626,6 +634,34 @@ impl<S: StorageOperations> ProjectAdapter<S> {
             return result(ExecutionDisposition::Uncertain, None, finalization, false);
         }
 
+        let same_root = freshness::selected(&resolved.workflow);
+        if same_root {
+            if let Err(reason) = freshness::admit(
+                &resolved.workspace_root,
+                &slot_path,
+                &resolved.partition,
+                &acquired.slot_id,
+                acquired.reused,
+                &resolved.source_tree_digest,
+            ) {
+                self.observations.event(
+                    &attempt.envelope.binding.consumer,
+                    &attempt.envelope.binding.run_id,
+                    &attempt.envelope.binding.attempt_id,
+                    Event::Refused {
+                        reason: refusal_label(reason),
+                    },
+                );
+                let finalization = self.finalize_no_spawn(&attempt, &acquired, &token, consumer);
+                consumer.on_storage_refusal(&attempt, reason);
+                return result(
+                    ExecutionDisposition::Refused(reason),
+                    None,
+                    finalization,
+                    false,
+                );
+            }
+        }
         let command = host_request(&resolved, &slot_path);
         let host_run = match consumer.submit_host_run(&attempt, &command) {
             Ok(host_run) if valid_host_run(&host_run, &attempt.envelope.binding) => host_run,
@@ -671,6 +707,15 @@ impl<S: StorageOperations> ProjectAdapter<S> {
                 resolved.capture_dir.clone(),
             ),
         };
+        if same_root && freshness::begin(&slot_path, &acquired.lease_id).is_err() {
+            let finalization = self.finalize_no_spawn(&attempt, &acquired, &token, consumer);
+            return result(
+                ExecutionDisposition::Refused(AdapterRefusal::InputUnknown),
+                Some(host_run),
+                finalization,
+                false,
+            );
+        }
         let started = Instant::now();
         let output = match runner.execute(&plan, cancellation) {
             Ok(output) if valid_output(&output) => output,
@@ -835,6 +880,11 @@ impl<S: StorageOperations> ProjectAdapter<S> {
                 );
             }
         }
+        let freshness_ready = same_root
+            && output.status == FixtureCommandStatus::Exited(0)
+            && native_completion.is_some_and(|proof| proof.is_registered_cargo())
+            && capture.is_some()
+            && freshness::prepare(&plan, &resolved.partition).is_ok();
         let finalization = self.finalize_run(
             &attempt,
             &acquired,
@@ -846,7 +896,16 @@ impl<S: StorageOperations> ProjectAdapter<S> {
             capture,
         );
         let disposition = match &finalization {
-            Some(receipt) if receipt.state == SlotState::Idle => ExecutionDisposition::Finished,
+            Some(receipt) if receipt.state == SlotState::Idle => {
+                if same_root
+                    && output.status == FixtureCommandStatus::Exited(0)
+                    && (!freshness_ready || freshness::publish(&plan).is_err())
+                {
+                    ExecutionDisposition::Uncertain
+                } else {
+                    ExecutionDisposition::Finished
+                }
+            }
             _ => ExecutionDisposition::Uncertain,
         };
         result(disposition, Some(host_run), finalization, false)
@@ -942,6 +1001,48 @@ impl<S: StorageOperations> ProjectAdapter<S> {
                 write_attribution: super::WriteAttribution::Unavailable,
             },
         );
+    }
+
+    fn finalize_no_spawn<C: ProjectConsumerBoundary>(
+        &mut self,
+        attempt: &AuthorizedAttempt,
+        acquired: &AcquireResult,
+        token: &LeaseToken,
+        consumer: &mut C,
+    ) -> Option<FinalizationReceipt> {
+        let proof =
+            crate::storage::NoSpawnEvidence::new(acquired, &attempt.envelope.binding, token)?;
+        let evidence = SettlementEvidence {
+            binding: attempt.envelope.binding.clone(),
+            consumer_credential: consumer.settlement_credential(attempt),
+            terminal: None,
+            capture: None,
+            containment: ContainmentEvidence::NotSpawned(proof),
+        };
+        let finalize_id = format!("{}:no-spawn", attempt.acquire_id);
+        // A lost finalize reply stays unavailable; same evidence can be retried
+        // by its owner. No writer/capture success is invented here.
+        let receipt = self
+            .storage
+            .finalize(&acquired.lease_id, Some(token), &finalize_id, evidence)
+            .ok()?;
+        self.observations.event(
+            &attempt.envelope.binding.consumer,
+            &attempt.envelope.binding.run_id,
+            &attempt.envelope.binding.attempt_id,
+            Event::Finalized {
+                operation_id: finalize_id,
+                state: receipt.state,
+            },
+        );
+        if receipt.state == SlotState::Idle {
+            self.observations.settle(
+                &attempt.envelope.binding.consumer,
+                &attempt.envelope.binding.run_id,
+                &attempt.envelope.binding.attempt_id,
+            );
+        }
+        Some(receipt)
     }
 
     fn finalize_incomplete<C: ProjectConsumerBoundary>(
@@ -1293,6 +1394,11 @@ fn partition_digest(partition: &PartitionKey) -> String {
 
 fn fallback_allowed(invocation: &ProjectInvocation, reason: AdapterRefusal) -> bool {
     invocation.private_fallback_allowed
+        && !invocation
+            .descriptor
+            .workflows
+            .iter()
+            .any(freshness::selected)
         && matches!(
             reason,
             AdapterRefusal::UnsupportedInput
@@ -1330,6 +1436,7 @@ fn refusal_label(reason: AdapterRefusal) -> &'static str {
     match reason {
         AdapterRefusal::AmbiguousInput => "ambiguous-input",
         AdapterRefusal::UnsupportedInput => "unsupported-input",
+        AdapterRefusal::SourceStale => "source-stale",
         AdapterRefusal::InputUnknown => "input-unknown",
         AdapterRefusal::UnsupportedToolchain => "unsupported-toolchain",
         AdapterRefusal::Busy => "busy",

@@ -17,6 +17,8 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::time::Instant;
 
+#[path = "cargo_same_root.rs"]
+mod same_root_probe;
 #[path = "cargo_source_probe.rs"]
 mod source_map_probe;
 

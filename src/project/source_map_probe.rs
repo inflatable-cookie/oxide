@@ -1399,7 +1399,7 @@ fn capture_test_source_context(
         temp_dir,
         cancellation,
     )?;
-    let offset = project_statement_offset(&info)?;
+    let offset = project_statement_offset_at(&info, Path::new(EXPECTED_LOGICAL_TEST_SOURCE))?;
     let argument = format!("--debug-line={offset}");
     let args = [argument.as_str(), path];
     let reference = format!("{name}-project-line.txt");
@@ -1412,7 +1412,12 @@ fn capture_test_source_context(
         temp_dir,
         cancellation,
     )?;
-    Ok(project_source_context_matches(&info, &lines))
+    Ok(project_source_context_matches_at(
+        &info,
+        &lines,
+        Path::new("/oxide-source-map-probe"),
+        Path::new(EXPECTED_LOGICAL_TEST_SOURCE),
+    ))
 }
 
 fn capture_scanner_output(
@@ -1453,7 +1458,7 @@ fn capture_scanner_command(
         format!("program={}\nprogram_sha256={}\nargs={args:?}\nmax_output_bytes={MAX_SCANNER_BYTES}\ntimeout_secs={}\n", program.display(), digest_file(&program)?, SCANNER_TIMEOUT.as_secs()).as_bytes())
 }
 
-fn project_statement_offset(info: &[u8]) -> Result<String, String> {
+fn project_statement_offset_at(info: &[u8], expected_source: &Path) -> Result<String, String> {
     let text = std::str::from_utf8(info).map_err(|_| "project DWARF context is not UTF-8")?;
     let mut current_offset = None;
     let mut subprogram = false;
@@ -1475,7 +1480,7 @@ fn project_statement_offset(info: &[u8]) -> Result<String, String> {
                 quoted_value(line).as_deref() == Some("emits_observed_paths_and_values");
         } else if named_function
             && line.contains("DW_AT_decl_file")
-            && quoted_value(line).as_deref() == Some(EXPECTED_LOGICAL_TEST_SOURCE)
+            && quoted_value(line).as_deref().map(Path::new) == Some(expected_source)
         {
             if let Some(offset) = current_offset {
                 offsets.insert(offset);
@@ -1495,10 +1500,15 @@ fn project_statement_offset(info: &[u8]) -> Result<String, String> {
     Ok((*offset).to_owned())
 }
 
-fn project_source_context_matches(info: &[u8], lines: &[u8]) -> bool {
+fn project_source_context_matches_at(
+    info: &[u8],
+    lines: &[u8],
+    expected_root: &Path,
+    expected_source: &Path,
+) -> bool {
     let paths = extract_debug_source_paths(info, b"");
     let mut line_paths = BTreeSet::new();
-    let context = BTreeSet::from([PathBuf::from("/oxide-source-map-probe")]);
+    let context = BTreeSet::from([expected_root.to_path_buf()]);
     extract_debug_line_paths(lines, &context, &mut line_paths);
     let directories = String::from_utf8_lossy(info)
         .lines()
@@ -1515,11 +1525,11 @@ fn project_source_context_matches(info: &[u8], lines: &[u8]) -> bool {
             expected_file = current_file;
         }
     }
-    project_statement_offset(info)
+    project_statement_offset_at(info, expected_source)
         .is_ok_and(|offset| text.contains(&format!("debug_line[{offset}]")))
-        && directories == BTreeSet::from(["/oxide-source-map-probe".to_owned()])
-        && paths.contains(Path::new(EXPECTED_LOGICAL_TEST_SOURCE))
-        && line_paths.contains(Path::new(EXPECTED_LOGICAL_TEST_SOURCE))
+        && directories == BTreeSet::from([expected_root.to_string_lossy().into_owned()])
+        && paths.contains(expected_source)
+        && line_paths.contains(expected_source)
         && expected_file.is_some_and(|file| {
             text.lines().any(|line| {
                 let fields: Vec<_> = line.split_whitespace().collect();
@@ -3014,21 +3024,51 @@ Address            Line   Column File   ISA Discriminator OpIndex Flags
 0x0000000100001000      9      0      5   0             0       0  is_stmt
 "#;
     assert_eq!(
-        project_statement_offset(info).expect("offset"),
+        project_statement_offset_at(info, Path::new(EXPECTED_LOGICAL_TEST_SOURCE)).expect("offset"),
         "0x000011fb"
     );
-    assert!(project_source_context_matches(info, lines));
-    assert!(!project_source_context_matches(info, b""));
-    assert!(!project_source_context_matches(b"", lines));
-    let wrong_source = String::from_utf8_lossy(lines).replace("probe/tests", "unrelated/tests");
-    assert!(!project_source_context_matches(
+    assert!(project_source_context_matches_at(
         info,
-        wrong_source.as_bytes()
+        lines,
+        Path::new("/oxide-source-map-probe"),
+        Path::new(EXPECTED_LOGICAL_TEST_SOURCE)
+    ));
+    assert!(!project_source_context_matches_at(
+        info,
+        b"",
+        Path::new("/oxide-source-map-probe"),
+        Path::new(EXPECTED_LOGICAL_TEST_SOURCE)
+    ));
+    assert!(!project_source_context_matches_at(
+        b"",
+        lines,
+        Path::new("/oxide-source-map-probe"),
+        Path::new(EXPECTED_LOGICAL_TEST_SOURCE)
+    ));
+    let wrong_source = String::from_utf8_lossy(lines).replace("probe/tests", "unrelated/tests");
+    assert!(!project_source_context_matches_at(
+        info,
+        wrong_source.as_bytes(),
+        Path::new("/oxide-source-map-probe"),
+        Path::new(EXPECTED_LOGICAL_TEST_SOURCE)
     ));
     let no_rows = String::from_utf8_lossy(lines).replace("0x0000000100001000", "absent");
-    assert!(!project_source_context_matches(info, no_rows.as_bytes()));
-    assert!(project_statement_offset(b"DW_AT_stmt_list (1200000000)").is_err());
-    assert!(project_statement_offset(b"DW_AT_stmt_list (0x1)\nDW_AT_stmt_list (0x2)").is_err());
+    assert!(!project_source_context_matches_at(
+        info,
+        no_rows.as_bytes(),
+        Path::new("/oxide-source-map-probe"),
+        Path::new(EXPECTED_LOGICAL_TEST_SOURCE)
+    ));
+    assert!(project_statement_offset_at(
+        b"DW_AT_stmt_list (1200000000)",
+        Path::new(EXPECTED_LOGICAL_TEST_SOURCE)
+    )
+    .is_err());
+    assert!(project_statement_offset_at(
+        b"DW_AT_stmt_list (0x1)\nDW_AT_stmt_list (0x2)",
+        Path::new(EXPECTED_LOGICAL_TEST_SOURCE)
+    )
+    .is_err());
     let sources = b"/oxide-source-map-probe/probe/tests/probe.rs\n/rustc/library/std/src/lib.rs\n";
     assert!(
         extract_debug_source_paths(b"", sources).contains(Path::new(EXPECTED_LOGICAL_TEST_SOURCE))
@@ -3074,4 +3114,168 @@ fn scanner_timeout_terminates_its_owned_process_without_waiting_for_output() {
         run_bounded_raw("/bin/sleep", &["11"], None, None).expect_err("scanner timeout");
     assert!(reason.contains("scanner timeout"));
     assert!(started.elapsed() < Duration::from_secs(11));
+}
+
+/// Physical lookup uses the registered root in actual DWARF observations. It
+/// never rewrites logical observations or changes the frozen fixture contract.
+pub(super) fn capture_physical_test_debug(
+    root: &Path,
+    executable: &Path,
+    capture_root: &Path,
+    references: &mut Vec<String>,
+    temp_dir: &Path,
+    cancellation: &dyn CancellationProbe,
+) -> Result<(), String> {
+    let bundle = discover_debug_bundle(executable)?
+        .ok_or("test executable omitted packed debug companion")?;
+    let name = "same-root-test";
+    let copy = capture_root.join("same-root-test-executable.bin");
+    copy_capture(
+        executable,
+        &copy,
+        fs::metadata(executable)
+            .map_err(|error| error.to_string())?
+            .len(),
+        cancellation,
+    )?;
+    references.push("same-root-test-executable.bin".to_owned());
+    let (_, companion_digest) =
+        capture_debug_bundle(&bundle, name, capture_root, references, cancellation)?;
+    let mut scan = |suffix: &str, args: &[&str]| -> Result<Vec<u8>, String> {
+        let reference = format!("{name}-{suffix}.txt");
+        capture_scanner_command(references, capture_root, &reference, "dwarfdump", args)?;
+        capture_scanner_output(
+            args,
+            &reference,
+            capture_root,
+            references,
+            temp_dir,
+            cancellation,
+        )
+    };
+    let executable_path = executable.to_str().ok_or("executable path not UTF-8")?;
+    let debug_path = bundle.dwarf_file.to_str().ok_or("debug path not UTF-8")?;
+    let executable_uuid = scan("executable-uuid", &["--uuid", executable_path])?;
+    let companion_uuid = scan("companion-uuid", &["--uuid", debug_path])?;
+    let sections = scan("sections", &["--show-section-sizes", debug_path])?;
+    let info = scan(
+        "project-context",
+        &[
+            "--name=emits_observed_paths_and_values",
+            "--show-parents",
+            debug_path,
+        ],
+    )?;
+    let expected_source = root.join("probe/tests/probe.rs");
+    let offset = project_statement_offset_at(&info, &expected_source)?;
+    let argument = format!("--debug-line={offset}");
+    let lines = scan("project-line", &[&argument, debug_path])?;
+    let required_sections: Vec<_> = [".debug_info", ".debug_line", ".debug_abbrev"]
+        .into_iter()
+        .filter(|section| section_output_has(&sections, section))
+        .collect();
+    if !project_source_context_matches_at(&info, &lines, root, &expected_source)
+        || !debug_binding_matches(
+            &executable_uuid,
+            &companion_uuid,
+            &digest_file(executable)?,
+            &digest_file(&copy)?,
+            &digest_file(&bundle.dwarf_file)?,
+            &companion_digest,
+            &required_sections,
+        )
+    {
+        return Err("physical source lookup or full companion binding failed".to_owned());
+    }
+    add_capture(references, capture_root, "same-root-debug-binding.txt", format!("oxide-physical-source-lookup-v1\nroot={}\nsource={}\nexecutable_sha256={}\ncompanion_sha256={}\nlookup=true\nbound=true\n", root.display(), expected_source.display(), digest_file(executable)?, companion_digest).as_bytes())
+}
+
+#[test]
+fn physical_source_lookup_is_bound_to_observed_registered_root() {
+    let root = Path::new("/private/tmp/owned-fixture/source");
+    let source = root.join("probe/tests/probe.rs");
+    let info = format!("DW_TAG_compile_unit\n DW_AT_name (\"{}/@/unit\")\n DW_AT_stmt_list (0x12)\n DW_AT_comp_dir (\"{}\")\nDW_TAG_subprogram\n DW_AT_name (\"emits_observed_paths_and_values\")\n DW_AT_decl_file (\"{}\")\n", source.display(), root.display(), source.display());
+    let lines = b"debug_line[0x12]\ninclude_directories[ 5] = \"probe/tests\"\nfile_names[ 5]:\n name: \"probe.rs\"\n dir_index: 5\n0x00001000 9 0 5 0 0 0 is_stmt\n";
+    assert!(project_source_context_matches_at(
+        info.as_bytes(),
+        lines,
+        root,
+        &source
+    ));
+    assert!(!project_source_context_matches_at(
+        info.as_bytes(),
+        lines,
+        Path::new("/other/root"),
+        &source
+    ));
+    assert!(!project_source_context_matches_at(
+        info.as_bytes(),
+        lines,
+        root,
+        Path::new(EXPECTED_LOGICAL_TEST_SOURCE)
+    ));
+}
+
+pub(super) fn verify_physical_behavior(
+    root: &Path,
+    slot: &Path,
+    summary: &CargoOutputSummary,
+) -> Result<(), String> {
+    let values = &summary.probe_values;
+    let marker =
+        fs::read_to_string(root.join("probe/marker.txt")).map_err(|error| error.to_string())?;
+    let marker = marker.trim();
+    let manifest = root.join("probe");
+    let input = manifest.join("marker.txt");
+    let out = PathBuf::from(
+        values
+            .get("out-directory")
+            .ok_or("OUT_DIR observation missing")?,
+    );
+    if !out.starts_with(slot) || fs::canonicalize(&out).map_err(|error| error.to_string())? != out {
+        return Err("observed OUT_DIR escaped the owned slot".into());
+    }
+    for (key, path) in [
+        ("manifest-directory", manifest),
+        ("include-input-path", input.clone()),
+        ("build-input-path", input.clone()),
+        ("runtime-resource-path", input),
+        ("generated-output-path", out.join("generated.rs")),
+        ("proc-macro-input-path", out.join("proc-macro-input.txt")),
+    ] {
+        if values.get(key) != Some(&path.to_string_lossy().into_owned()) || !path.exists() {
+            return Err(format!("physical behavior path mismatch: {key}"));
+        }
+    }
+    for key in [
+        "include-value",
+        "build-value",
+        "generated-value",
+        "proc-macro-value",
+        "runtime-value",
+    ] {
+        if values.get(key).map(String::as_str) != Some(marker) {
+            return Err(format!("requested source behavior mismatch: {key}"));
+        }
+    }
+    let expected = root.join("probe/tests/probe.rs");
+    for observed in [
+        values.get("file-macro").map(String::as_str),
+        values
+            .get("panic-location")
+            .and_then(|value| value.rsplit_once(':').map(|(path, _)| path)),
+    ] {
+        let observed = Path::new(observed.ok_or("file/panic observation absent")?);
+        if root.join(observed) != expected {
+            return Err(
+                "file/panic source does not resolve at the registered physical root".into(),
+            );
+        }
+    }
+    if fs::read(out.join("proc-macro-input.txt")).map_err(|error| error.to_string())?
+        != marker.as_bytes()
+    {
+        return Err("generated proc-macro input differs from requested marker".into());
+    }
+    Ok(())
 }

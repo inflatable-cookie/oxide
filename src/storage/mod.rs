@@ -1,4 +1,4 @@
-mod codec;
+pub(crate) mod codec;
 mod store;
 mod transport;
 mod types;
@@ -8,8 +8,9 @@ pub use transport::Client;
 pub use types::{
     AcquireRequest, AcquireResult, Budget, CaptureReceipt, ContainmentEvidence,
     CooperativeCompletionEvidence, Credential, FinalizationReceipt, Inventory, InventorySlot,
-    LeaseToken, PartitionKey, ProcessIdentityEvidence, ReconcileReceipt, RefusalReason, RunBinding,
-    RunEnvelope, SettlementEvidence, SlotState, StorageError, TerminalOutcome, TerminalRecord,
+    LeaseToken, NoSpawnEvidence, PartitionKey, ProcessIdentityEvidence, ReconcileReceipt,
+    RefusalReason, RunBinding, RunEnvelope, SettlementEvidence, SlotState, StorageError,
+    TerminalOutcome, TerminalRecord,
 };
 
 #[cfg(test)]
