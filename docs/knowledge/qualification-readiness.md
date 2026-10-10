@@ -617,6 +617,8 @@ path containment and lease relationships. A real producer and independent
 validation of its observations are still required before real Cargo evidence
 can qualify.
 
+In logical mode, origins from other authorized roots and trees are accepted as declarations; the qualifier does not independently establish which source contents produced a reused unit. Real qualification therefore needs genuine compile-origin observations and the source-miss control, not merely authorized root IDs or a matching hook identity row.
+
 | Required evidence | Observation required by the schema | Collector and current coverage |
 | --- | --- | --- |
 | Compile origins | Producer-declared build-unit origin root IDs and tree digests. | Receipt preserves each declaration separately from the requested tree; collector checks authorized IDs and digest syntax, but does not re-read the origin tree or attest which unit used it. No registered unit-origin producer exists, so missing origins are insufficient. |
