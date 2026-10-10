@@ -490,7 +490,7 @@ storage-attempt ledger must persist authorization, acquire/submit intents and
 identities, busy/uncertain outcomes, cancellation and reconciliation. Existing
 operation journals and worker admission are patterns, not this API.
 
-Nucleus's [consumer boundary, Contract 011](https://github.com/inflatable-cookie/nucleus/blob/6f2d2493d5a23f5ded58ed520c0cdb53ef93936f/docs/knowledge/contracts/011-oxide-consumer-boundary.md)
+Nucleus's [consumer boundary, Contract 011](https://github.com/inflatable-cookie/nucleus/blob/b4321e2fd729cd3329e7111a2eacbe1ec27d934e/docs/knowledge/contracts/011-oxide-consumer-boundary.md)
 defines proposed version-1 consumer-local receipts for allocation, storage
 authorization, acquire, submission, capture, archive/recycle and no-spawn closure.
 They bind the task/run/root allocation epoch, requested source tree, workflow and
@@ -499,6 +499,10 @@ consumer-owned fields, not shipped Oxide RPC names. Fixture verifiers establish
 adapter behavior only; unconfigured production issuers refuse. Live binding
 requires an independently reviewed mapping to the actual Oxide API. Per-run head
 and tree binding must not make every source revision a new compatibility partition.
+Contract 011 describes the consumer-local mapping to the Rust library above;
+the TypeScript consumer seams do not supply an authenticated concrete Rust
+embedding or transport. That binding is a separate implementation prerequisite,
+along with accepted owners and genuine input/completion evidence.
 
 Nucleus's managed-Git direction is not yet a qualified physical-root pool.
 Placement still creates clones. Its current preservation hashes timelines and a
