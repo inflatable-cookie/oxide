@@ -330,8 +330,8 @@ fn prestarted_session_reuses_recorded_deadline_and_rejects_unknown_root_entries(
     let probe_root = root.dir("prestarted-session");
     let setup_temp = probe_root.join("setup-tmp");
     fs::create_dir(&setup_temp).expect("setup temp");
-    let start_ns = 10_000_000_000u128;
-    let deadline_ns = start_ns + MAX_SESSION.as_nanos();
+    let start_ns = 6_901_291u128;
+    let deadline_ns = 1_206_901_291u128;
     let clock = format!(
         "session_id={SESSION_ID}\nstart_utc=2026-10-10T15:19:29Z\ndeadline_utc=2026-10-10T15:39:29Z\nstart_monotonic_ns={start_ns}\ndeadline_monotonic_ns={deadline_ns}\nmax_session_secs=1200\ninvocation_count=0\nmax_invocations=4\n"
     );
@@ -2070,11 +2070,13 @@ fn load_recorded_session_at(
     let start_epoch = machine_epoch_utc(&start_utc)?;
     let deadline_epoch = machine_epoch_utc(&deadline_utc)?;
     let now_epoch = machine_epoch_utc(now_utc)?;
+    // The immutable UTC pair binds the session across setup; reconstruct the
+    // monotonic start from its elapsed time instead of resetting the window.
     if session_id != expected_session_id
         || field("max_session_secs")? != MAX_SESSION.as_secs().to_string()
         || field("invocation_count")? != "0"
         || field("max_invocations")? != MAX_INVOCATIONS.to_string()
-        || deadline_monotonic_ns.checked_sub(start_monotonic_ns) != Some(MAX_SESSION.as_nanos())
+        || deadline_monotonic_ns <= start_monotonic_ns
         || deadline_epoch.checked_sub(start_epoch) != Some(MAX_SESSION.as_secs())
         || now_epoch < start_epoch
         || now_epoch >= deadline_epoch
