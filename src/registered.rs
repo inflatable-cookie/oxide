@@ -1,8 +1,9 @@
 //! Versioned, strict-physical input and execution seams for audited workflows.
 //!
 //! There is no built-in registration, authentication, immutable-evidence issuer,
-//! Cargo decoder or host scheduler. The embedding consumer installs trusted
-//! owners, independently of task data. Synthetic owners are only test evidence.
+//! or host scheduler. A bounded pinned Cargo dep-info decoder is available, but
+//! the embedding consumer installs trusted owners independently of task data.
+//! Synthetic owners are only test evidence.
 //! Cargo owns graph construction and freshness; this module never writes its
 //! fingerprints. The cooperative writer and immutable-owner promises are trust
 //! boundaries, not an OS fence against other same-user writers.
@@ -17,6 +18,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::UNIX_EPOCH;
+
+pub mod dep_info;
 
 pub const REGISTRATION_VERSION: u32 = 1;
 pub const SOURCE_VERSION: u32 = 1;
@@ -239,6 +242,7 @@ pub struct InputPath {
 #[derive(Clone, Debug)]
 pub enum LocalInput {
     DepInfo {
+        unit: String,
         anchor: String,
         files: Vec<InputPath>,
         environment: BTreeMap<String, Option<String>>,
@@ -1061,12 +1065,17 @@ impl Runner<'_> {
             for local in unit.locals {
                 match local {
                     LocalInput::DepInfo {
+                        unit: evidence_unit,
                         anchor,
                         files,
                         environment,
                     } => {
+                        if evidence_unit != unit.id {
+                            return Err(Refusal::Identity);
+                        }
                         collector.anchor(&unit.anchors, &anchor)?;
                         frame(&mut collector.semantic, b"dep-info");
+                        frame(&mut collector.semantic, evidence_unit.as_bytes());
                         frame(&mut collector.semantic, anchor.as_bytes());
                         for input in files {
                             collector.associate(input, BTreeSet::from([anchor.clone()]), false)?;
