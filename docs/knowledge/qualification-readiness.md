@@ -492,18 +492,18 @@ the pool, stop this candidate for its ad hoc worktrees, retain checkout-
 isolated partitions, and report that the dominant duplication problem remains
 unsolved. Do not grow the root map silently or claim arbitrary-root reuse.
 
-**Operator decision required:** accepting the logical prefix for compiler
-source names, file!() and panic locations would replace the original strict
-requirement that a B-run binary contain B-absolute paths and no A-absolute
-paths. This design does not make that change. Until Tom accepts or rejects
-that contract, the strict proof remains binding and no cross-path reuse claim
-may pass on logical paths alone. Behavior-bearing paths still need to resolve
+**Operator ruling, 2026-10-10:** Tom accepted logical compiler source names,
+file!() and panic locations bound to each run's exact source tree, and the
+prepared Oxide-only experimental qualifier implementation. [Vision](vision.md#authority-boundaries)
+owns the exact ruling and scope. This replaces the B-absolute-path requirement
+for explicitly selected experimental logical mode; it does not qualify reuse
+or authorize another real-project pilot. Behavior-bearing paths still need to resolve
 and behave against the exact requested tree; any stale A resource path,
 unresolved path class or missing source evidence fails closed. Production
 partitions remain checkout-isolated.
 
 The next brief must name the path gate before running. In **strict mode** (the
-default until an operator ruling changes it), pass only when every inspected
+physical-path policy retained as an explicit option), pass only when every inspected
 reference to this project's source in the reused B artifacts contains B's
 exact absolute root and none contains A's root; third-party and toolchain paths
 are classified separately. The full-debug scan and exact B source lookup must
@@ -515,8 +515,8 @@ recommended fixed A+B remap emits a logical project path, so it cannot pass
 this strict predicate; unless a mechanism preserves B-absolute paths, no
 cross-path claim can pass strict mode.
 
-In **logical mode**, run only after Tom explicitly accepts the logical-path
-contract. Pass only when every inspected project-source reference in compiler
+In **logical mode**, use Tom's accepted exact-run source-map contract.
+Real-project execution still needs its separately approved scope. Pass only when every inspected project-source reference in compiler
 source/debug fields contains the agreed logical prefix and neither physical
 root, the run-private mapping binds that prefix to B's exact tree and resolves
 every inspected source to the expected B file, and `file!()`/panic-location
@@ -535,11 +535,12 @@ A logical-path result does not claim interactive debugger integration; if
 that is part of the accepted contract, the pilot must stop until an exact-B
 debugger source lookup is available and qualified.
 
-### Bounded follow-up proposal (not authorized)
+### Bounded follow-up proposal (real-project execution not authorized)
 
-One future Queue brief should implement and qualify the mechanism within the
-local Oxide adapter and driver; it must not wire a consumer or install a host
-service. Carry an explicit source-map policy and complete authorized-root map
+Tom approved the prepared Oxide-only experimental implementation brief with
+small fixture validation; the proposed real-project qualification below still
+needs its own execution scope. Implementation stays within the local Oxide
+adapter and driver; it must not wire a consumer or install a host service. Carry an explicit source-map policy and complete authorized-root map
 through compatibility identity and run receipts, fail closed at the selected
 portability gate, and give every disposable root its own identity. The current
 trial's constant disposable-root component must become a per-root stable ID
@@ -578,8 +579,8 @@ miss controls; do not begin the shared-slot pair unless each control passes:
    tests at B, and require zero appropriate rebuilds, the preselected strict
    or operator-approved logical path gate, and exact-run captures.
 
-Before authorizing scenario 5, the brief must record the operator's path
-contract decision. The fixed A+B map emits logical paths, so if Tom declines
+Before authorizing scenario 5, the brief must record Tom's accepted logical
+path contract and exact qualification policy. The fixed A+B map emits logical paths, so if Tom declines
 that contract and no B-absolute-path-preserving mechanism is in scope, stop
 after the miss controls; do not run the cross-path pair or report portability.
 
