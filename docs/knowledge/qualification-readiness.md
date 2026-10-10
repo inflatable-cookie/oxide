@@ -752,6 +752,67 @@ built. The committed fixture as frozen cannot compile under the pinned
 1.97.1 toolchain. A further attempt needs a new frozen tree, new root
 and new session clock; this window and image are closed. No adoption.
 
+#### Task 016 execution result (2026-10-10)
+
+The owned fixture correction formats the build script's `PathBuf` observations
+through `Path::display()`, retaining one literal path per line. The exact
+`probe/build.rs` file is included as a module in the ordinary Rust test target,
+so `effigy rust:compile` and `effigy test rust` typecheck the implementation
+before the experiment. A non-ignored regression pins the corrected fixture
+tree at
+`sha256:09059f6e2df5022525ef60916178d84584a22e20b422c94950ddebd50bfa5a95`
+and verifies that it is committed. The proc macro, generated source, and test
+fixture had no other straightforward compile defects. `effigy rust:compile`
+and `effigy rust:format` exited 0; the final ordinary `effigy test rust` run
+passed 48 tests with 0 failures and 2 ignored. The ignored probe selector and
+its Effigy/Cargo separators were confirmed with `effigy test --plan` before
+launch.
+
+The fresh session used
+`/private/var/tmp/oxide-rust-probe-fixture-20261010`, a fixed 8 GiB sparse APFS
+image mounted at `m`. The recorded monotonic window was
+`2026-10-10T13:55:03Z`–`2026-10-10T14:15:03Z`. `events.tsv` records one
+`reference-a` invocation of
+`test --offline --locked --message-format=json-render-diagnostics -- --nocapture`
+with Cargo 1.97.1 / rustc 1.97.1. The source tree at A, B and the committed
+fixture matched the new frozen digest. Cargo exited 0 after executing the
+fixture test (`1 passed, 0 failed`); six units were rebuilt. The manifest's
+captured stdout/stderr digests and the three raw scanner-capture digests match
+independent SHA-256 recomputation.
+
+The emitted manifest, include, build-script input, generated output, proc-macro
+input and runtime-resource paths and values matched A and the baseline marker.
+With the complete ordered A+B remap flags present, however, `file!()` emitted
+`probe/tests/probe.rs` and the panic location emitted
+`probe/tests/probe.rs:54`, rather than the accepted logical path
+`/oxide-source-map-probe/probe/tests/probe.rs`. The verifier therefore recorded
+`values_match=false`. Separately, the final `probe` test executable had no
+debug sections: its captured `dwarfdump --section-sizes` output reports total
+size 0, and the captured debug-info/debug-line outputs contain only the Mach-O
+header. No `.dSYM`, `.dwo` or `.dwp` files were present in the image. This is
+missing required final-binary source-lookup evidence; `scan_complete=true`
+means only that the bounded scanner commands finished.
+
+Because the value gate failed, the local run could not settle lease
+`a77955e9b31cd97b1547d7a894ad8e17` on `slot-0000000000000001`. The fail-closed
+runner retained the uncertain lease and left the image mounted with all raw
+captures. The outer ignored-probe test exited 101 after this refusal, even
+though the owned Cargo test itself passed. Source invalidation, the shared-slot
+cold-A/warm-B pair, cross-path reuse and useful storage reduction were not
+reached. The observation is a concrete failure of the pre-registered logical
+path predicate plus insufficient final-binary debug evidence; it is not a
+positive reuse result.
+
+Resource observations remained within the session bounds: minimum sampled
+host free space was 321207545856 bytes; image capacity was 8380178432 bytes;
+final in-image use was 14618624 bytes; sparse backing allocation was
+31461376 bytes and bounded outside allocation was 12288 bytes. The run stopped
+at 27257 ms after 1 of 4 allowed probe invocations. No uncertain lease was
+reconciled, detached, cleared or replayed. The image and evidence remain at the
+path above. Any further attempt needs a new scoped Queue record and fresh
+resources. For ad hoc worktrees, checkout-isolated build directories remain
+the safe fallback; they do not establish cross-worktree storage relief.
+
 ### Bounded real-project follow-up (execution not authorized)
 
 The Oxide-only experimental implementation is present in the local adapter and
