@@ -1694,6 +1694,7 @@ fn known_resume_elapsed(frozen: &FrozenFixture) -> Result<Duration, String> {
         "attempt-2.txt".to_owned(),
         "attempt-3.txt".to_owned(),
         "attempt-4.txt".to_owned(),
+        "attempt-5.txt".to_owned(),
         "diskutil-attempt-3.plist".to_owned(),
         "hdiutil-image-map-attempt-3.txt".to_owned(),
         "imageinfo-after-attach-attempt-3.plist".to_owned(),
@@ -1724,7 +1725,7 @@ fn known_resume_elapsed(frozen: &FrozenFixture) -> Result<Duration, String> {
         ("root", ROOT),
         ("image", "oxide-rust-probe.sparseimage"),
         ("image_virtual_capacity", "8589934592"),
-        ("attempt_count", "4"),
+        ("attempt_count", "5"),
         ("imageinfo_file", "imageinfo-after-attach-attempt-3.plist"),
         ("mount_stage", "pre-daemon"),
         ("fixture_tree_digest", frozen.digest.as_str()),
@@ -1742,12 +1743,16 @@ fn known_resume_elapsed(frozen: &FrozenFixture) -> Result<Duration, String> {
     if !image_metadata.is_file() || image_metadata.file_type().is_symlink() {
         return Err("recorded sparse image is not a regular file".to_owned());
     }
-    let image_allocated_length = image_metadata.len().to_string();
-    if fields.get("image_allocated_length").map(String::as_str)
-        != Some(image_allocated_length.as_str())
+    let checkpoint_length = fields
+        .get("image_allocated_length")
+        .ok_or_else(|| "probe checkpoint lacks its image file length".to_owned())?
+        .parse::<u64>()
+        .map_err(|error| error.to_string())?;
+    if image_metadata.len() > IMAGE_CAP
+        || checkpoint_length > IMAGE_CAP
         || !is_sha256_digest(fields.get("image_digest_at_checkpoint"))
     {
-        return Err("recorded sparse image metadata differs from its checkpoint".to_owned());
+        return Err("sparse image file length exceeded its approved capacity".to_owned());
     }
 
     let info_path = setup_temp.join(
@@ -1799,6 +1804,13 @@ fn known_resume_elapsed(frozen: &FrozenFixture) -> Result<Duration, String> {
         || !fourth_attempt.contains("bind task-owned probe daemon")
     {
         return Err("recorded fourth attempt lacks its setup failure evidence".to_owned());
+    }
+    let fifth_attempt =
+        fs::read_to_string(setup_temp.join("attempt-5.txt")).map_err(|error| error.to_string())?;
+    if !fifth_attempt.contains("before any fixture Cargo invocation or lease")
+        || !fifth_attempt.contains("8589934592-byte sparse APFS virtual image")
+    {
+        return Err("recorded fifth attempt lacks its setup failure evidence".to_owned());
     }
 
     let attached = Command::new("/usr/bin/hdiutil")
