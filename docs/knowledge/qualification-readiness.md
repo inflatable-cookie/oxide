@@ -645,6 +645,30 @@ error and truncated output. The source extractor therefore did not complete,
 lookup was established. This is the observed v2 layout and scanner limit, not
 evidence that the companion lacked debug information.
 
+The bounded project-source scanner uses installed `dwarfdump --show-sources`
+and a selective logical-prefix `--name/--regex --show-parents` query instead of
+full dependency/type DWARF dumps. For the fixed fixture test, a named-function
+query selects the actual `DW_TAG_subprogram` and its declared project source,
+ignoring same-name namespaces. Its parent compilation unit supplies the exact
+`DW_AT_stmt_list` offset and logical working directory; a section-offset query
+then requires the project's file/directory entry and nonzero source-line rows.
+Missing, ambiguous, truncated or over-limit context fails closed. Raw outputs,
+tool hashes/versions and exact argument records remain separate from runtime
+paths and raw `nm` object references. UUID, original/captured hashes, full
+companion capture and nonzero required sections still bind this observation.
+This focused observation proves lookup of the required project source; it does
+not claim complete enumeration of dependency DWARF types or source files.
+
+The test-local v3 driver owns a single live `std::time::Instant` before any
+experimental setup. Its create-new clock records session identity, the elapsed
+millisecond origin and 1,200,000 ms deadline, original UTC audit stamps and zero
+of four invocations. No prestarted/resumable clock or UTC reconstruction is
+accepted. An independent 20-second timer and protocol boundaries sample host
+free space and disposable allocations during setup, scanner and capture waits.
+Samples retain UTC plus elapsed milliseconds in `setup-tmp/host-space-samples.tsv`;
+a completed-sample gap over 30 seconds or any observation/write failure latches
+a stop. Negative or uncertain paths preserve the new mount and image.
+
 **Trust boundary:** the hook is a plain file in the run's Cargo target
 directory. Its identity row is compared with the adapter's accepted policy,
 map, build identity, tree, lease and run IDs, then copied into the private
@@ -984,9 +1008,8 @@ flag vector and passing cold-A test. `debug_capture_binding` and
 complete. `session_clock` and `resource_bounds` remain insufficient for the
 recorded limitations. `source_invalidation`, `cross_path_correctness`, the
 full `ownership_capture` sequence and `reuse_result` were not reached. This
-run does not qualify cross-worktree reuse or useful storage reduction. A new
-scoped Queue record and fresh resources are required to raise the scanner
-output bound and repeat the complete proof.
+run does not qualify cross-worktree reuse or useful storage reduction. The bounded scanner correction keeps the original output limit; any further
+execution uses a fresh scoped Queue session and resources.
 
 ### Bounded real-project follow-up (execution not authorized)
 

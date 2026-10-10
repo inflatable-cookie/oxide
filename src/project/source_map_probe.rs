@@ -20,7 +20,7 @@ const MAX_DEBUG_BUNDLE_FILES: usize = 64;
 const MAX_DEBUG_BUNDLE_BYTES: u64 = 512 * 1024 * 1024;
 const ORIGIN_FILE: &str = "oxide-compile-origins-v1.txt";
 const EXPECTED_LOGICAL_TEST_SOURCE: &str = "/oxide-source-map-probe/probe/tests/probe.rs";
-const SCANNER_TIMEOUT: Duration = Duration::from_secs(60);
+const SCANNER_TIMEOUT: Duration = Duration::from_secs(10);
 const SCANNER_POLL: Duration = Duration::from_millis(20);
 
 pub(super) struct CargoOutputSummary {
@@ -328,12 +328,17 @@ pub(super) fn produce_preflight_observations(
             (
                 "dwarfdump",
                 "debug-info",
-                vec!["--debug-info", canonical.to_str().unwrap_or("")],
+                vec![
+                    "--name=^/oxide-source-map-probe/",
+                    "--regex",
+                    "--show-parents",
+                    canonical.to_str().unwrap_or(""),
+                ],
             ),
             (
                 "dwarfdump",
                 "debug-line",
-                vec!["--debug-line", canonical.to_str().unwrap_or("")],
+                vec!["--show-sources", canonical.to_str().unwrap_or("")],
             ),
             (
                 "dwarfdump",
@@ -347,6 +352,13 @@ pub(super) fn produce_preflight_observations(
             ),
         ] {
             let capture_name = format!("preflight-{index}-{suffix}.txt");
+            capture_scanner_command(
+                output_references,
+                capture_root,
+                &capture_name,
+                tool,
+                &arguments,
+            )?;
             match run_bounded_raw(tool, &arguments, Some(temp_dir), Some(cancellation)) {
                 Ok(bytes) => {
                     add_capture(output_references, capture_root, &capture_name, &bytes)?;
@@ -464,6 +476,20 @@ fn capture_preflight_debug_companion(
             return Ok(false);
         }
     };
+    capture_scanner_command(
+        output_references,
+        capture_root,
+        &format!("{name}-executable-uuid.txt"),
+        "dwarfdump",
+        &["--uuid", executable.to_str().unwrap_or("")],
+    )?;
+    capture_scanner_command(
+        output_references,
+        capture_root,
+        &format!("{name}-companion-uuid.txt"),
+        "dwarfdump",
+        &["--uuid", bundle.dwarf_file.to_str().unwrap_or("")],
+    )?;
     let executable_uuid = run_bounded_raw(
         "dwarfdump",
         &["--uuid", executable.to_str().unwrap_or("")],
@@ -548,11 +574,16 @@ fn capture_preflight_debug_companion(
         ),
         (
             "debug-info",
-            vec!["--debug-info", bundle.dwarf_file.to_str().unwrap_or("")],
+            vec![
+                "--name=^/oxide-source-map-probe/",
+                "--regex",
+                "--show-parents",
+                bundle.dwarf_file.to_str().unwrap_or(""),
+            ],
         ),
         (
             "debug-line",
-            vec!["--debug-line", bundle.dwarf_file.to_str().unwrap_or("")],
+            vec!["--show-sources", bundle.dwarf_file.to_str().unwrap_or("")],
         ),
         (
             "debug-abbrev",
@@ -560,6 +591,13 @@ fn capture_preflight_debug_companion(
         ),
     ] {
         let reference = format!("{name}-{suffix}.txt");
+        capture_scanner_command(
+            output_references,
+            capture_root,
+            &reference,
+            "dwarfdump",
+            &args,
+        )?;
         match run_bounded_raw("dwarfdump", &args, Some(temp_dir), Some(cancellation)) {
             Ok(bytes) => {
                 add_capture(output_references, capture_root, &reference, &bytes)?;
@@ -577,6 +615,25 @@ fn capture_preflight_debug_companion(
             }
         }
     }
+    let source_lookup_pass = match capture_test_source_context(
+        &bundle.dwarf_file,
+        name,
+        capture_root,
+        output_references,
+        temp_dir,
+        cancellation,
+    ) {
+        Ok(pass) => pass,
+        Err(error) => {
+            add_capture(
+                output_references,
+                capture_root,
+                &format!("{name}-source-context-error.txt"),
+                error.as_bytes(),
+            )?;
+            return Ok(false);
+        }
+    };
     let section_output = outputs
         .get("sections")
         .map(Vec::as_slice)
@@ -595,9 +652,10 @@ fn capture_preflight_debug_companion(
             .map(Vec::as_slice)
             .unwrap_or_default(),
     );
-    let source_lookup_pass = debug_sources
-        .iter()
-        .any(|path| path == Path::new(EXPECTED_LOGICAL_TEST_SOURCE));
+    let source_lookup_pass = source_lookup_pass
+        && debug_sources
+            .iter()
+            .any(|path| path == Path::new(EXPECTED_LOGICAL_TEST_SOURCE));
     let companion_digest = digest_file(&bundle.dwarf_file)?;
     let source_lookup = format!(
         "oxide-debug-source-lookup-v1\nexpected={EXPECTED_LOGICAL_TEST_SOURCE}\ndebug_file_sha256={companion_digest}\npass={source_lookup_pass}\n{}",
@@ -1038,6 +1096,20 @@ fn scan_artifacts(
         let mut captured_companion_digest = None;
         let mut bundle_manifest_digest = None;
         if let Some(bundle) = &bundle {
+            capture_scanner_command(
+                output_references,
+                capture_root,
+                &format!("{name}-executable-uuid.txt"),
+                "dwarfdump",
+                &["--uuid", path.to_str().unwrap_or("")],
+            )?;
+            capture_scanner_command(
+                output_references,
+                capture_root,
+                &format!("{name}-companion-uuid.txt"),
+                "dwarfdump",
+                &["--uuid", bundle.dwarf_file.to_str().unwrap_or("")],
+            )?;
             let executable_output = match run_bounded_raw(
                 "dwarfdump",
                 &["--uuid", path.to_str().unwrap_or("")],
@@ -1149,12 +1221,17 @@ fn scan_artifacts(
             (
                 "dwarfdump",
                 "debug-info",
-                vec!["--debug-info", debug_path.to_str().unwrap_or("")],
+                vec![
+                    "--name=^/oxide-source-map-probe/",
+                    "--regex",
+                    "--show-parents",
+                    debug_path.to_str().unwrap_or(""),
+                ],
             ),
             (
                 "dwarfdump",
                 "debug-line",
-                vec!["--debug-line", debug_path.to_str().unwrap_or("")],
+                vec!["--show-sources", debug_path.to_str().unwrap_or("")],
             ),
             (
                 "dwarfdump",
@@ -1164,6 +1241,13 @@ fn scan_artifacts(
             ("nm", "oso", vec!["-a", "-m", path.to_str().unwrap_or("")]),
         ] {
             let reference = format!("{name}-{suffix}.txt");
+            capture_scanner_command(
+                output_references,
+                capture_root,
+                &reference,
+                tool,
+                &arguments,
+            )?;
             match run_bounded_raw(tool, &arguments, Some(temp_dir), Some(cancellation)) {
                 Ok(output) => {
                     add_capture(output_references, capture_root, &reference, &output)?;
@@ -1184,6 +1268,31 @@ fn scan_artifacts(
         }
         if scanner_failed {
             break;
+        }
+        if *is_test {
+            match capture_test_source_context(
+                debug_path,
+                &name,
+                capture_root,
+                output_references,
+                temp_dir,
+                cancellation,
+            ) {
+                Ok(true) => {}
+                result => {
+                    add_capture(
+                        output_references,
+                        capture_root,
+                        &format!("{name}-source-context-error.txt"),
+                        format!(
+                            "required project source context was not established: {result:?}\n"
+                        )
+                        .as_bytes(),
+                    )?;
+                    scanner_failed = true;
+                    break;
+                }
+            }
         }
         let Some(section_sizes) = outputs.get("sections") else {
             scanner_failed = true;
@@ -1261,6 +1370,169 @@ fn scan_artifacts(
         let complete = !scanned.is_empty();
         Ok((scanned, complete))
     }
+}
+
+// The fixed fixture function selects its parent CU and that CU's exact line
+// table. These observations establish project source lookup, not a census of
+// dependency/type DWARF or linker object references.
+fn capture_test_source_context(
+    debug_path: &Path,
+    name: &str,
+    capture_root: &Path,
+    references: &mut Vec<String>,
+    temp_dir: &Path,
+    cancellation: &dyn CancellationProbe,
+) -> Result<bool, String> {
+    let path = debug_path.to_str().ok_or("debug path is not UTF-8")?;
+    let args = [
+        "--name=emits_observed_paths_and_values",
+        "--show-parents",
+        path,
+    ];
+    let reference = format!("{name}-project-context.txt");
+    capture_scanner_command(references, capture_root, &reference, "dwarfdump", &args)?;
+    let info = capture_scanner_output(
+        &args,
+        &reference,
+        capture_root,
+        references,
+        temp_dir,
+        cancellation,
+    )?;
+    let offset = project_statement_offset(&info)?;
+    let argument = format!("--debug-line={offset}");
+    let args = [argument.as_str(), path];
+    let reference = format!("{name}-project-line.txt");
+    capture_scanner_command(references, capture_root, &reference, "dwarfdump", &args)?;
+    let lines = capture_scanner_output(
+        &args,
+        &reference,
+        capture_root,
+        references,
+        temp_dir,
+        cancellation,
+    )?;
+    Ok(project_source_context_matches(&info, &lines))
+}
+
+fn capture_scanner_output(
+    args: &[&str],
+    reference: &str,
+    capture_root: &Path,
+    references: &mut Vec<String>,
+    temp_dir: &Path,
+    cancellation: &dyn CancellationProbe,
+) -> Result<Vec<u8>, String> {
+    match run_bounded_raw("dwarfdump", args, Some(temp_dir), Some(cancellation)) {
+        Ok(bytes) => {
+            add_capture(references, capture_root, reference, &bytes)?;
+            Ok(bytes)
+        }
+        Err((error, partial)) => {
+            add_capture(references, capture_root, reference, &partial)?;
+            add_capture(
+                references,
+                capture_root,
+                &format!("{reference}-error.txt"),
+                error.as_bytes(),
+            )?;
+            Err(error)
+        }
+    }
+}
+
+fn capture_scanner_command(
+    references: &mut Vec<String>,
+    capture_root: &Path,
+    reference: &str,
+    tool: &str,
+    args: &[&str],
+) -> Result<(), String> {
+    let program = find_program(tool).ok_or_else(|| format!("scanner unavailable: {tool}"))?;
+    add_capture(references, capture_root, &format!("{reference}-command.txt"),
+        format!("program={}\nprogram_sha256={}\nargs={args:?}\nmax_output_bytes={MAX_SCANNER_BYTES}\ntimeout_secs={}\n", program.display(), digest_file(&program)?, SCANNER_TIMEOUT.as_secs()).as_bytes())
+}
+
+fn project_statement_offset(info: &[u8]) -> Result<String, String> {
+    let text = std::str::from_utf8(info).map_err(|_| "project DWARF context is not UTF-8")?;
+    let mut current_offset = None;
+    let mut subprogram = false;
+    let mut named_function = false;
+    let mut offsets = BTreeSet::new();
+    for line in text.lines() {
+        if line.contains("DW_TAG_compile_unit") {
+            current_offset = None;
+        }
+        if line.contains("DW_TAG_") {
+            subprogram = line.contains("DW_TAG_subprogram");
+            named_function = false;
+        } else if line.contains("DW_AT_stmt_list") {
+            current_offset = line
+                .split_once('(')
+                .and_then(|(_, value)| value.strip_suffix(')'));
+        } else if subprogram && line.contains("DW_AT_name") {
+            named_function =
+                quoted_value(line).as_deref() == Some("emits_observed_paths_and_values");
+        } else if named_function
+            && line.contains("DW_AT_decl_file")
+            && quoted_value(line).as_deref() == Some(EXPECTED_LOGICAL_TEST_SOURCE)
+        {
+            if let Some(offset) = current_offset {
+                offsets.insert(offset);
+            }
+        }
+    }
+    if offsets.len() != 1 {
+        return Err("project function omitted or ambiguously bound its CU line table".to_owned());
+    }
+    let offset = offsets.iter().next().ok_or("project line offset absent")?;
+    if !offset
+        .strip_prefix("0x")
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err("project CU line-table offset is malformed".to_owned());
+    }
+    Ok((*offset).to_owned())
+}
+
+fn project_source_context_matches(info: &[u8], lines: &[u8]) -> bool {
+    let paths = extract_debug_source_paths(info, b"");
+    let mut line_paths = BTreeSet::new();
+    let context = BTreeSet::from([PathBuf::from("/oxide-source-map-probe")]);
+    extract_debug_line_paths(lines, &context, &mut line_paths);
+    let directories = String::from_utf8_lossy(info)
+        .lines()
+        .filter(|line| line.contains("DW_AT_comp_dir"))
+        .filter_map(quoted_value)
+        .collect::<BTreeSet<_>>();
+    let text = String::from_utf8_lossy(lines);
+    let mut expected_file = None;
+    let mut current_file = None;
+    for line in text.lines() {
+        if let Some(index) = dwarfdump_table_index(line, "file_names") {
+            current_file = Some(index);
+        } else if line.contains("name:") && quoted_value(line).as_deref() == Some("probe.rs") {
+            expected_file = current_file;
+        }
+    }
+    project_statement_offset(info)
+        .is_ok_and(|offset| text.contains(&format!("debug_line[{offset}]")))
+        && directories == BTreeSet::from(["/oxide-source-map-probe".to_owned()])
+        && paths.contains(Path::new(EXPECTED_LOGICAL_TEST_SOURCE))
+        && line_paths.contains(Path::new(EXPECTED_LOGICAL_TEST_SOURCE))
+        && expected_file.is_some_and(|file| {
+            text.lines().any(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                fields
+                    .first()
+                    .is_some_and(|address| address.starts_with("0x"))
+                    && fields
+                        .get(1)
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .is_some_and(|line| line > 0)
+                    && fields.get(3).and_then(|value| value.parse::<usize>().ok()) == Some(file)
+            })
+        })
 }
 
 fn discover_debug_bundle(executable: &Path) -> Result<Option<DebugBundle>, String> {
@@ -1856,6 +2128,9 @@ fn extract_debug_line_paths(
     };
 
     for line in String::from_utf8_lossy(lines).lines() {
+        if line.starts_with('/') && line.ends_with(".rs") {
+            insert_debug_source_path(line, None, paths);
+        }
         if let Some(index) = dwarfdump_table_index(line, "include_directories") {
             if let Some(directory) = quoted_value(line) {
                 include_directories.insert(index, PathBuf::from(directory));
@@ -2013,7 +2288,7 @@ fn find_program(name: &str) -> Option<PathBuf> {
         .and_then(|candidate| fs::canonicalize(candidate).ok())
 }
 
-fn run_bounded(program: &str, arguments: &[&str]) -> Result<Vec<u8>, String> {
+pub(super) fn run_bounded(program: &str, arguments: &[&str]) -> Result<Vec<u8>, String> {
     run_bounded_raw(program, arguments, None, None).map_err(|(reason, _)| reason)
 }
 
@@ -2028,7 +2303,7 @@ fn run_bounded_raw(
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     if let Some(temp_dir) = temp_dir {
         command
             .env("TMPDIR", temp_dir)
@@ -2041,99 +2316,92 @@ fn run_bounded_raw(
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| (format!("{program} has no stdout pipe"), Vec::new()))?;
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        let result = stdout
-            .take((MAX_SCANNER_BYTES + 1) as u64)
-            .read_to_end(&mut output);
-        let _ = sender.send((result, output));
-    });
+        .ok_or_else(|| ("scanner has no stdout pipe".to_owned(), Vec::new()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ("scanner has no stderr pipe".to_owned(), Vec::new()))?;
+    let (sender, receiver) = mpsc::channel();
+    let read = |mut pipe: Box<dyn Read + Send>, stream: usize, sender: mpsc::Sender<_>| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = pipe
+                .by_ref()
+                .take((MAX_SCANNER_BYTES + 1) as u64)
+                .read_to_end(&mut bytes);
+            let _ = sender.send((stream, result, bytes));
+        })
+    };
+    let stdout_reader = read(Box::new(stdout), 0, sender.clone());
+    let stderr_reader = read(Box::new(stderr), 1, sender);
     let started = Instant::now();
-    let mut read_result = None;
+    let mut streams = [None, None];
     let mut status = None;
+    let mut failure = None;
     loop {
-        if read_result.is_none() {
-            match receiver.try_recv() {
-                Ok(result) => read_result = Some(result),
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = reader.join();
-                    return Err((
-                        format!("{program} scanner output reader stopped unexpectedly"),
-                        Vec::new(),
-                    ));
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
+        while let Ok((stream, result, bytes)) = receiver.try_recv() {
+            if result.is_err() || bytes.len() > MAX_SCANNER_BYTES {
+                failure = Some(format!(
+                    "{program} output exceeded the bounded scanner limit or could not be read"
+                ));
             }
+            streams[stream] = Some(bytes);
         }
-        if status.is_none() {
-            match child.try_wait() {
-                Ok(Some(exit)) => status = Some(exit),
-                Ok(None) => {}
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = reader.join();
-                    return Err((error.to_string(), Vec::new()));
-                }
-            }
+        match child.try_wait() {
+            Ok(exit) => status = exit,
+            Err(error) => failure = Some(error.to_string()),
         }
-        if read_result.is_some() && status.is_some() {
+        if failure.is_some() || (status.is_some() && streams.iter().all(Option::is_some)) {
             break;
         }
         if cancellation.is_some_and(|probe| probe.is_cancelled()) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
-            let partial = read_result
-                .take()
-                .or_else(|| receiver.try_recv().ok())
-                .map_or_else(Vec::new, |(_, mut bytes)| {
-                    bytes.truncate(MAX_SCANNER_BYTES);
-                    bytes
-                });
-            return Err((
-                format!("{program} stopped at a resource or session bound"),
-                partial,
-            ));
+            failure = Some(format!("{program} stopped at a resource or session bound"));
+            break;
         }
         if started.elapsed() >= SCANNER_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = reader.join();
-            let partial = read_result
-                .take()
-                .or_else(|| receiver.try_recv().ok())
-                .map_or_else(Vec::new, |(_, mut bytes)| {
-                    bytes.truncate(MAX_SCANNER_BYTES);
-                    bytes
-                });
-            return Err((
-                format!("{program} exceeded the {SCANNER_TIMEOUT:?} scanner timeout"),
-                partial,
+            failure = Some(format!(
+                "{program} exceeded the {SCANNER_TIMEOUT:?} scanner timeout"
             ));
+            break;
         }
         thread::sleep(SCANNER_POLL);
     }
-    let (read_result, mut output) = read_result.expect("bounded scanner read result");
-    let _ = reader.join();
-    if read_result.is_err() || output.len() > MAX_SCANNER_BYTES {
+    if failure.is_some() {
         let _ = child.kill();
         let _ = child.wait();
-        output.truncate(MAX_SCANNER_BYTES);
-        return Err((
-            format!("{program} output exceeded the bounded scanner limit or could not be read"),
-            output,
+    }
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+    while let Ok((stream, _, bytes)) = receiver.try_recv() {
+        streams[stream] = Some(bytes);
+    }
+    let mut stdout = streams[0].take().unwrap_or_default();
+    let mut stderr = streams[1].take().unwrap_or_default();
+    stdout.truncate(MAX_SCANNER_BYTES);
+    stderr.truncate(MAX_SCANNER_BYTES);
+    if !stderr.is_empty() {
+        // Nonempty stderr is never silently discarded or used as source proof.
+        // Both raw streams are retained in this failed capture with a delimiter.
+        failure.get_or_insert_with(|| format!("{program} emitted scanner stderr"));
+        stdout.extend_from_slice(b"\noxide-scanner-raw-stderr\n");
+        stdout.extend_from_slice(&stderr);
+    }
+    if stdout.len() > MAX_SCANNER_BYTES {
+        stdout.truncate(MAX_SCANNER_BYTES);
+        failure = Some(format!(
+            "{program} combined stdout/stderr exceeded the bounded scanner limit"
         ));
     }
-    let status = status.expect("scanner process exit status");
-    if !status.success() {
-        return Err((format!("{program} exited with {status}"), output));
+    if let Some(reason) = failure {
+        return Err((reason, stdout));
     }
-    Ok(output)
+    if !status.is_some_and(|exit| exit.success()) {
+        return Err((
+            format!("{program} did not exit successfully: {status:?}"),
+            stdout,
+        ));
+    }
+    Ok(stdout)
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -2717,4 +2985,93 @@ fn packed_debug_companion_discovery_selects_only_the_cargo_artifact_bundle() {
     assert_eq!(discovered.path, bundle);
     assert_eq!(discovered.dwarf_file, dwarf.join("probe"));
     let _ = fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn focused_project_context_requires_its_exact_cu_line_table_and_source_rows() {
+    let info = br#"
+0x00002c32: DW_TAG_compile_unit
+  DW_AT_stmt_list (0x00000d80)
+  DW_AT_comp_dir ("/oxide-source-map-probe")
+0x00002dce: DW_TAG_namespace
+  DW_AT_name ("emits_observed_paths_and_values")
+0x00003736: DW_TAG_compile_unit
+  DW_AT_name ("/oxide-source-map-probe/probe/tests/probe.rs/@/4hfsfcd1wh6ck2mc9wtekwhxh")
+  DW_AT_stmt_list (0x000011fb)
+  DW_AT_comp_dir ("/oxide-source-map-probe")
+0x00004000: DW_TAG_subprogram
+  DW_AT_name ("emits_observed_paths_and_values")
+  DW_AT_decl_file ("/oxide-source-map-probe/probe/tests/probe.rs")
+"#;
+    let lines = br#"
+.debug_line contents:
+debug_line[0x000011fb]
+include_directories[  5] = "probe/tests"
+file_names[  5]:
+           name: "probe.rs"
+      dir_index: 5
+Address            Line   Column File   ISA Discriminator OpIndex Flags
+0x0000000100001000      9      0      5   0             0       0  is_stmt
+"#;
+    assert_eq!(
+        project_statement_offset(info).expect("offset"),
+        "0x000011fb"
+    );
+    assert!(project_source_context_matches(info, lines));
+    assert!(!project_source_context_matches(info, b""));
+    assert!(!project_source_context_matches(b"", lines));
+    let wrong_source = String::from_utf8_lossy(lines).replace("probe/tests", "unrelated/tests");
+    assert!(!project_source_context_matches(
+        info,
+        wrong_source.as_bytes()
+    ));
+    let no_rows = String::from_utf8_lossy(lines).replace("0x0000000100001000", "absent");
+    assert!(!project_source_context_matches(info, no_rows.as_bytes()));
+    assert!(project_statement_offset(b"DW_AT_stmt_list (1200000000)").is_err());
+    assert!(project_statement_offset(b"DW_AT_stmt_list (0x1)\nDW_AT_stmt_list (0x2)").is_err());
+    let sources = b"/oxide-source-map-probe/probe/tests/probe.rs\n/rustc/library/std/src/lib.rs\n";
+    assert!(
+        extract_debug_source_paths(b"", sources).contains(Path::new(EXPECTED_LOGICAL_TEST_SOURCE))
+    );
+}
+
+#[test]
+fn bounded_scanner_refuses_excess_output_and_preserves_stderr() {
+    let (error, bytes) =
+        run_bounded_raw("/usr/bin/yes", &["project"], None, None).expect_err("oversize scanner");
+    assert!(error.contains("bounded scanner limit"));
+    assert_eq!(bytes.len(), MAX_SCANNER_BYTES);
+    let (error, bytes) = run_bounded_raw("/bin/sh", &["-c", "printf raw-error >&2"], None, None)
+        .expect_err("scanner stderr");
+    assert!(error.contains("stderr"));
+    assert!(bytes.ends_with(b"raw-error"));
+}
+
+#[test]
+fn scanner_polls_cancellation_while_output_read_is_blocked() {
+    struct CancelAfterSamples(std::sync::atomic::AtomicUsize);
+    impl CancellationProbe for CancelAfterSamples {
+        fn is_cancelled(&self) -> bool {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 3
+        }
+    }
+    let cancellation = CancelAfterSamples(std::sync::atomic::AtomicUsize::new(0));
+    let (reason, _) = run_bounded_raw(
+        "/bin/sh",
+        &["-c", "sleep 0.2; printf source"],
+        None,
+        Some(&cancellation),
+    )
+    .expect_err("cancel scanner");
+    assert!(reason.contains("resource or session bound"));
+    assert!(cancellation.0.load(std::sync::atomic::Ordering::Relaxed) >= 4);
+}
+
+#[test]
+fn scanner_timeout_terminates_its_owned_process_without_waiting_for_output() {
+    let started = Instant::now();
+    let (reason, _) =
+        run_bounded_raw("/bin/sleep", &["11"], None, None).expect_err("scanner timeout");
+    assert!(reason.contains("scanner timeout"));
+    assert!(started.elapsed() < Duration::from_secs(11));
 }

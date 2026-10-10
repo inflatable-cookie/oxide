@@ -21,6 +21,7 @@ use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -30,14 +31,14 @@ use std::time::{Duration, Instant};
 #[path = "../../../fixtures/cargo-source-map-probe/probe/build.rs"]
 mod owned_probe_build_script;
 
-const ROOT: &str = "/private/var/tmp/oxide-rust-probe-proof-613d9b91-v2";
-const SESSION_ID: &str = "oxide-probe-session-613d9b91-v2";
+const ROOT: &str = "/private/var/tmp/oxide-rust-probe-proof-613d9b91-v3";
+const SESSION_ID: &str = "oxide-probe-session-613d9b91-v3";
 const WORKFLOW: &str = "oxide-cargo-source-map-probe";
 const SELECTOR: &str =
     "test --offline --locked --message-format=json-render-diagnostics -- --nocapture";
-const ROOT_ID: &str = "oxide-rust-probe-proof-613d9b91-v2";
-const LOCAL_TASK_ID: &str = "oxide-local-probe-proof-613d9b91-v2";
-const LOCAL_WORKSPACE_ID: &str = "oxide-local-probe-image-proof-613d9b91-v2";
+const ROOT_ID: &str = "oxide-rust-probe-proof-613d9b91-v3";
+const LOCAL_TASK_ID: &str = "oxide-local-probe-proof-613d9b91-v3";
+const LOCAL_WORKSPACE_ID: &str = "oxide-local-probe-image-proof-613d9b91-v3";
 const LOGICAL_PREFIX: &str = "/oxide-source-map-probe";
 const MARKER_PATH: &str = "probe/marker.txt";
 const BASELINE_MARKER: &str = "baseline-marker\n";
@@ -90,11 +91,72 @@ struct ProbeBudget {
     mount: PathBuf,
     image: PathBuf,
     setup_temp: PathBuf,
-    outside_directories: u64,
+    mounted: AtomicBool,
+    outside_directories: AtomicU64,
+    sample_lock: Mutex<()>,
     started: Instant,
     last_sample: Mutex<Instant>,
     samples: Mutex<Vec<SpaceSample>>,
     failure: Mutex<Option<String>>,
+}
+
+struct PeriodicSampler {
+    stop: Sender<()>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl PeriodicSampler {
+    fn start(interval: Duration, mut sample: impl FnMut() + Send + 'static) -> Self {
+        let (stop, receiver) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            while matches!(
+                receiver.recv_timeout(interval),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                sample();
+            }
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for PeriodicSampler {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[test]
+fn independent_sampler_runs_while_capture_blocks_over_a_sample_interval() {
+    let samples = Arc::new(Mutex::new(Vec::new()));
+    let collected = Arc::clone(&samples);
+    let started = Instant::now();
+    let monitor = PeriodicSampler::start(Duration::from_millis(20), move || {
+        collected
+            .lock()
+            .expect("test samples")
+            .push(started.elapsed());
+    });
+    // A bounded blocked helper models scanner/capture and setup waits without
+    // running Cargo. The production timer uses the same mechanism at 20s.
+    let output = Command::new("/bin/sh")
+        .args(["-c", "sleep 0.12; printf captured"])
+        .output()
+        .expect("bounded test helper");
+    assert!(output.status.success());
+    drop(monitor);
+    let samples = samples.lock().expect("test samples");
+    assert!(
+        samples.len() >= 2,
+        "independent timer stalled behind helper"
+    );
+    assert!(samples.iter().all(|elapsed| *elapsed < started.elapsed()));
 }
 
 struct ProbeCancellation(Arc<ProbeBudget>);
@@ -130,18 +192,14 @@ impl CancellationProbe for ProbeCancellation {
 }
 
 impl ProbeBudget {
-    fn new(
-        mount: PathBuf,
-        image: PathBuf,
-        setup_temp: PathBuf,
-        outside_directories: u64,
-        started: Instant,
-    ) -> Arc<Self> {
+    fn new(mount: PathBuf, image: PathBuf, setup_temp: PathBuf, started: Instant) -> Arc<Self> {
         Arc::new(Self {
             mount,
             image,
             setup_temp,
-            outside_directories,
+            mounted: AtomicBool::new(false),
+            outside_directories: AtomicU64::new(0),
+            sample_lock: Mutex::new(()),
             started,
             last_sample: Mutex::new(Instant::now() - SAMPLE_INTERVAL),
             samples: Mutex::new(Vec::new()),
@@ -150,7 +208,53 @@ impl ProbeBudget {
     }
 
     fn sample(&self) -> Result<SpaceSample, String> {
-        let result = self.read_sample();
+        let _guard = self
+            .sample_lock
+            .lock()
+            .map_err(|_| "sample serialization lock poisoned")?;
+        if let Some(reason) = self
+            .failure
+            .lock()
+            .map_err(|_| "budget failure lock poisoned")?
+            .as_ref()
+        {
+            return Err(reason.clone());
+        }
+        let gap = self
+            .last_sample
+            .lock()
+            .map_err(|_| "sample clock lock poisoned")?
+            .elapsed();
+        let result = if gap > SAMPLE_INTERVAL
+            && !self
+                .samples
+                .lock()
+                .map_err(|_| "samples lock poisoned")?
+                .is_empty()
+        {
+            Err(format!(
+                "host sampling cadence exceeded 30 seconds: {} ms",
+                gap.as_millis()
+            ))
+        } else {
+            self.read_sample()
+        };
+        let result = result.and_then(|sample| {
+            if self
+                .samples
+                .lock()
+                .map_err(|_| "samples lock poisoned")?
+                .last()
+                .is_some_and(|previous| {
+                    sample.elapsed_ms.saturating_sub(previous.elapsed_ms)
+                        > SAMPLE_INTERVAL.as_millis()
+                })
+            {
+                return Err("completed host samples exceeded 30-second cadence".to_owned());
+            }
+            self.write_sample(&sample)?;
+            Ok(sample)
+        });
         let mut last = self
             .last_sample
             .lock()
@@ -158,7 +262,6 @@ impl ProbeBudget {
         *last = Instant::now();
         match result {
             Ok(sample) => {
-                self.write_sample(&sample)?;
                 self.samples
                     .lock()
                     .map_err(|_| "budget samples lock poisoned")?
@@ -171,6 +274,13 @@ impl ProbeBudget {
                     .lock()
                     .map_err(|_| "budget failure lock poisoned")? = Some(error.clone());
                 let _ = append_evidence(&self.mount, &format!("resource-stop\t{error}\n"));
+                let _ = fs::write(
+                    self.setup_temp.join("resource-stop.txt"),
+                    format!(
+                        "elapsed_ms={}\n{error}\n",
+                        self.started.elapsed().as_millis()
+                    ),
+                );
                 Err(error)
             }
         }
@@ -185,32 +295,38 @@ impl ProbeBudget {
         if host_free < HOST_RESERVE {
             return Err(format!("host free space fell below 20 GiB: {host_free}"));
         }
-        let (_, image_capacity, image_used, image_free) = df_space(&self.mount)?;
+        let (image_capacity, image_used, image_free) = if self.mounted.load(Ordering::Acquire) {
+            let (_, capacity, used, free) = df_space(&self.mount)?;
+            (capacity, used, free)
+        } else {
+            (0, 0, 0)
+        };
         if image_capacity > IMAGE_CAP || image_used > IMAGE_CAP || image_free > image_capacity {
             return Err(format!(
                 "APFS volume exceeded or obscured its 8 GiB bound: capacity={image_capacity} used={image_used} free={image_free}"
             ));
         }
-        let image_allocated = du_bytes(&self.image)?;
-        let outside_allocated = self
-            .outside_directories
+        let image_allocated = if self.image.exists() {
+            du_bytes(&self.image)?
+        } else {
+            0
+        };
+        let root = self.image.parent().ok_or("image has no parent")?;
+        let outside_allocated = allocated_blocks(root)?
+            .max(self.outside_directories.load(Ordering::Acquire))
             .saturating_add(du_bytes(&self.setup_temp)?);
         let disposable = image_allocated.saturating_add(outside_allocated);
         if disposable > DISPOSABLE_CAP {
             return Err(format!("10 GiB disposable ceiling exceeded: {disposable}"));
         }
         let expected = ["m", "oxide-rust-probe.sparseimage", "setup-tmp"];
-        let mut names = fs::read_dir(ROOT)
+        let mut names = fs::read_dir(root)
             .map_err(|error| error.to_string())?
             .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
         names.sort();
-        if names
-            .iter()
-            .map(String::as_str)
-            .ne(expected.iter().copied())
-        {
+        if names.iter().any(|name| !expected.contains(&name.as_str())) {
             return Err(format!("unexpected disposable-root entries: {names:?}"));
         }
         Ok(SpaceSample {
@@ -226,7 +342,8 @@ impl ProbeBudget {
 
     fn write_sample(&self, sample: &SpaceSample) -> Result<(), String> {
         let line = format!(
-            "space\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "space\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            machine_utc()?,
             sample.elapsed_ms,
             sample.host_free,
             sample.image_capacity,
@@ -235,7 +352,14 @@ impl ProbeBudget {
             sample.image_allocated,
             sample.outside_allocated,
         );
-        append_evidence(&self.mount, &line)
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.setup_temp.join("host-space-samples.tsv"))
+            .map_err(|error| error.to_string())?;
+        file.write_all(line.as_bytes())
+            .map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())
     }
 }
 
@@ -318,51 +442,29 @@ fn session_clock_persists_original_machine_timestamps() {
     record_session_clock(&setup_temp, "2026-10-10T13:00:00Z", "2026-10-10T13:20:00Z")
         .expect("session clock");
     let body = fs::read_to_string(setup_temp.join("session-clock.txt")).expect("clock file");
-    assert_eq!(
-        body,
-        "oxide-probe-session-clock-v1\nstart_utc=2026-10-10T13:00:00Z\ndeadline_utc=2026-10-10T13:20:00Z\nmax_session_secs=1200\ninvocation_count=0\nmax_invocations=4\n"
-    );
+    assert!(body.contains("clock=std::time::Instant\n"));
+    assert!(body.contains("start_elapsed_ms=0\ndeadline_elapsed_ms=1200000\n"));
+    assert!(body.contains("start_utc=2026-10-10T13:00:00Z\ndeadline_utc=2026-10-10T13:20:00Z\n"));
+    assert!(body.contains("invocation_count=0\nmax_invocations=4\n"));
 }
 
 #[test]
-fn prestarted_session_reuses_recorded_deadline_and_rejects_unknown_root_entries() {
-    let root = super::super::FixtureRoot::new();
-    let probe_root = root.dir("prestarted-session");
-    let setup_temp = probe_root.join("setup-tmp");
-    fs::create_dir(&setup_temp).expect("setup temp");
-    let start_ns = 6_901_291u128;
-    let deadline_ns = 1_206_901_291u128;
-    let clock = format!(
-        "session_id={SESSION_ID}\nstart_utc=2026-10-10T15:19:29Z\ndeadline_utc=2026-10-10T15:39:29Z\nstart_monotonic_ns={start_ns}\ndeadline_monotonic_ns={deadline_ns}\nmax_session_secs=1200\ninvocation_count=0\nmax_invocations=4\n"
-    );
-    fs::write(setup_temp.join("session-clock.txt"), &clock).expect("clock file");
-    fs::write(
-        setup_temp.join("fixture-source-hash.txt"),
-        format!("sha256:{FROZEN_FIXTURE_TREE_DIGEST}\n"),
-    )
-    .expect("fixture hash record");
-    fs::write(
-        setup_temp.join("host-space-samples.tsv"),
-        b"sample header\n",
-    )
-    .expect("host sample record");
-
-    let (started, start_utc, deadline_utc) =
-        load_recorded_session_at(&probe_root, &setup_temp, SESSION_ID, "2026-10-10T15:19:34Z")
-            .expect("prestarted clock");
-    assert_eq!(start_utc, "2026-10-10T15:19:29Z");
-    assert_eq!(deadline_utc, "2026-10-10T15:39:29Z");
-    assert!(started.elapsed() >= Duration::from_secs(5));
+fn live_session_deadline_uses_duration_scale_and_refuses_expired_elapsed() {
     assert_eq!(
-        fs::read_to_string(setup_temp.join("session-clock.txt")).expect("clock remains original"),
-        clock
+        session_remaining(Duration::from_millis(5)),
+        Ok(Duration::from_millis(1_199_995))
     );
-
-    fs::write(probe_root.join("unexpected"), b"unknown").expect("unexpected root entry");
-    assert!(
-        load_recorded_session_at(&probe_root, &setup_temp, SESSION_ID, "2026-10-10T15:19:34Z",)
-            .is_err()
-    );
+    assert!(session_remaining(Duration::from_millis(1_200_000)).is_err());
+    assert!(session_remaining(Duration::from_secs(1_200_000)).is_err());
+    let started = Instant::now()
+        .checked_sub(MAX_SESSION)
+        .expect("test monotonic range");
+    assert!(refuse_session_timeout(&started).is_err());
+    let root = super::super::FixtureRoot::new();
+    let temp = root.dir("clock");
+    record_session_clock(&temp, "2026-10-10T13:00:00Z", "2026-10-10T13:20:00Z")
+        .expect("initial clock");
+    assert!(record_session_clock(&temp, "later", "later").is_err());
 }
 
 #[test]
@@ -386,9 +488,28 @@ fn oxide_cargo_source_map_probe() {
 }
 
 fn run_probe() -> Result<(), String> {
+    let started = Instant::now();
+    let start_utc = machine_utc()?;
+    let deadline_utc = machine_date(&[
+        "-u",
+        "-r",
+        &(machine_epoch_utc(&start_utc)? + MAX_SESSION.as_secs()).to_string(),
+        "+%Y-%m-%dT%H:%M:%SZ",
+    ])?;
+    // create_dir refuses any earlier session, including an empty retained root.
+    fs::create_dir(ROOT)
+        .map_err(|error| format!("refusing existing or unavailable v3 root: {error}"))?;
     let setup_temp = PathBuf::from(ROOT).join("setup-tmp");
-    let (started, start_utc, deadline_utc) =
-        load_prestarted_session(Path::new(ROOT), &setup_temp, SESSION_ID)?;
+    fs::create_dir(&setup_temp).map_err(|error| error.to_string())?;
+    record_session_clock(&setup_temp, &start_utc, &deadline_utc)?;
+    let image = PathBuf::from(ROOT).join("oxide-rust-probe.sparseimage");
+    let mount = PathBuf::from(ROOT).join("m");
+    let budget = ProbeBudget::new(mount.clone(), image.clone(), setup_temp.clone(), started);
+    budget.sample()?;
+    let monitor_budget = Arc::clone(&budget);
+    let monitor = PeriodicSampler::start(Duration::from_secs(20), move || {
+        let _ = monitor_budget.sample();
+    });
     refuse_session_timeout(&started)?;
     let host_free = native::host_free_bytes(Path::new("/private/var/tmp"))
         .map_err(|_| "host free-space preflight unavailable".to_owned())?;
@@ -405,22 +526,18 @@ fn run_probe() -> Result<(), String> {
     refuse_session_timeout(&started)?;
     let scanner_identity = producer::scanner_identity()?;
     refuse_session_timeout(&started)?;
-    let image = PathBuf::from(ROOT).join("oxide-rust-probe.sparseimage");
-    let mount = PathBuf::from(ROOT).join("m");
     let (attach, outside_directories) = setup_image(&image, &mount, &setup_temp)?;
+    budget
+        .outside_directories
+        .store(outside_directories, Ordering::Release);
+    budget.mounted.store(true, Ordering::Release);
     refuse_session_timeout(&started)?;
     let evidence = mount.join("evidence");
     ensure_probe_directory(&evidence)?;
     ensure_probe_directory(&mount.join("tmp"))?;
     ensure_probe_directory(&mount.join("home"))?;
     ensure_probe_directory(&mount.join("cargo-home"))?;
-    let budget = ProbeBudget::new(
-        mount.clone(),
-        image.clone(),
-        setup_temp,
-        outside_directories,
-        started,
-    );
+
     let setup_sample = budget.sample()?;
     append_evidence(
         &mount,
@@ -850,7 +967,9 @@ fn run_probe() -> Result<(), String> {
     )?;
     budget.sample()?;
     drop(daemon);
+    drop(monitor);
     detach_image(&attach)?;
+    refuse_session_timeout(&started)?;
     Ok(())
 }
 
@@ -1035,6 +1154,9 @@ fn execute_owned(
         &acquire.lease_id,
         &acquire.slot_id,
     );
+    if cancellation.is_cancelled() {
+        return Err("probe stopped before invocation at a resource/session bound".to_owned());
+    }
     *invocations += 1;
     append_evidence(mount, &format!("cargo-invocation\t{invocations}\t{run}\n"))?;
     let output = match runner.execute(&plan, cancellation) {
@@ -1805,8 +1927,10 @@ fn finish_if_idle(
         &format!("probe-stop\t{reason}\tall leases settled; preserving image\n"),
     )?;
     drop(daemon);
-    detach_image(attach)?;
-    Err(format!("{reason}; all leases settled; image preserved"))
+    let _ = attach;
+    Err(format!(
+        "{reason}; all leases settled; image and mount preserved"
+    ))
 }
 
 fn freeze_fixture(root: &Path) -> Result<FrozenFixture, String> {
@@ -1955,11 +2079,14 @@ fn write_frozen_fixture(frozen: &FrozenFixture, destination: &Path) -> Result<()
 }
 
 fn refuse_session_timeout(started: &Instant) -> Result<(), String> {
-    if started.elapsed() >= MAX_SESSION {
-        Err("the 20 minute session limit was reached".to_owned())
-    } else {
-        Ok(())
-    }
+    session_remaining(started.elapsed()).map(|_| ())
+}
+
+fn session_remaining(elapsed: Duration) -> Result<Duration, String> {
+    MAX_SESSION
+        .checked_sub(elapsed)
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "the 20 minute session limit was reached".to_owned())
 }
 
 fn record_session_clock(
@@ -1968,7 +2095,7 @@ fn record_session_clock(
     deadline_utc: &str,
 ) -> Result<(), String> {
     let body = format!(
-        "oxide-probe-session-clock-v1\nstart_utc={start_utc}\ndeadline_utc={deadline_utc}\nmax_session_secs={}\ninvocation_count=0\nmax_invocations={MAX_INVOCATIONS}\n",
+        "oxide-probe-session-clock-v2\nsession_id={SESSION_ID}\nclock=std::time::Instant\norigin=driver-start-before-setup\nmonotonic_unit=milliseconds\nstart_elapsed_ms=0\ndeadline_elapsed_ms=1200000\nstart_utc={start_utc}\ndeadline_utc={deadline_utc}\nmax_session_secs={}\ninvocation_count=0\nmax_invocations={MAX_INVOCATIONS}\n",
         MAX_SESSION.as_secs(),
     );
     let path = setup_temp.join("session-clock.txt");
@@ -1980,114 +2107,6 @@ fn record_session_clock(
     file.write_all(body.as_bytes())
         .map_err(|error| error.to_string())?;
     file.sync_all().map_err(|error| error.to_string())
-}
-
-fn load_prestarted_session(
-    root: &Path,
-    setup_temp: &Path,
-    expected_session_id: &str,
-) -> Result<(Instant, String, String), String> {
-    load_recorded_session_at(root, setup_temp, expected_session_id, &machine_utc()?)
-}
-
-fn load_recorded_session_at(
-    root: &Path,
-    setup_temp: &Path,
-    expected_session_id: &str,
-    now_utc: &str,
-) -> Result<(Instant, String, String), String> {
-    let root_metadata = fs::symlink_metadata(root).map_err(|error| error.to_string())?;
-    let setup_metadata = fs::symlink_metadata(setup_temp).map_err(|error| error.to_string())?;
-    if !root_metadata.file_type().is_dir() || !setup_metadata.file_type().is_dir() {
-        return Err(
-            "prestarted session root and setup directory must be real directories".to_owned(),
-        );
-    }
-    let mut root_entries = fs::read_dir(root)
-        .map_err(|error| error.to_string())?
-        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    root_entries.sort();
-    if root_entries != ["setup-tmp"] {
-        return Err(format!(
-            "refusing unknown disposable-root state: {root_entries:?}"
-        ));
-    }
-    let mut setup_entries = fs::read_dir(setup_temp)
-        .map_err(|error| error.to_string())?
-        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    setup_entries.sort();
-    let allowed_setup_entries = [
-        "fixture-source-hash.txt",
-        "host-space-samples.tsv",
-        "session-clock.txt",
-    ];
-    if !setup_entries
-        .iter()
-        .any(|entry| entry == "session-clock.txt")
-        || setup_entries
-            .iter()
-            .any(|entry| !allowed_setup_entries.contains(&entry.as_str()))
-    {
-        return Err(format!("refusing unknown setup state: {setup_entries:?}"));
-    }
-    let clock_path = setup_temp.join("session-clock.txt");
-    if !fs::symlink_metadata(&clock_path)
-        .map_err(|error| error.to_string())?
-        .file_type()
-        .is_file()
-    {
-        return Err("recorded session clock must be a regular file".to_owned());
-    }
-    let clock = fs::read_to_string(&clock_path).map_err(|error| error.to_string())?;
-    let mut fields = BTreeMap::new();
-    for line in clock.lines() {
-        let (name, value) = line
-            .split_once('=')
-            .ok_or_else(|| "malformed recorded session clock".to_owned())?;
-        if fields.insert(name, value).is_some() {
-            return Err("duplicate recorded session clock field".to_owned());
-        }
-    }
-    let field = |name: &str| {
-        fields
-            .get(name)
-            .copied()
-            .ok_or_else(|| format!("recorded session clock omitted {name}"))
-    };
-    let session_id = field("session_id")?;
-    let start_utc = field("start_utc")?.to_owned();
-    let deadline_utc = field("deadline_utc")?.to_owned();
-    let start_monotonic_ns = field("start_monotonic_ns")?
-        .parse::<u128>()
-        .map_err(|_| "invalid monotonic start in recorded session clock")?;
-    let deadline_monotonic_ns = field("deadline_monotonic_ns")?
-        .parse::<u128>()
-        .map_err(|_| "invalid monotonic deadline in recorded session clock")?;
-    let start_epoch = machine_epoch_utc(&start_utc)?;
-    let deadline_epoch = machine_epoch_utc(&deadline_utc)?;
-    let now_epoch = machine_epoch_utc(now_utc)?;
-    // The immutable UTC pair binds the session across setup; reconstruct the
-    // monotonic start from its elapsed time instead of resetting the window.
-    if session_id != expected_session_id
-        || field("max_session_secs")? != MAX_SESSION.as_secs().to_string()
-        || field("invocation_count")? != "0"
-        || field("max_invocations")? != MAX_INVOCATIONS.to_string()
-        || deadline_monotonic_ns <= start_monotonic_ns
-        || deadline_epoch.checked_sub(start_epoch) != Some(MAX_SESSION.as_secs())
-        || now_epoch < start_epoch
-        || now_epoch >= deadline_epoch
-    {
-        return Err("recorded session identity, cap or deadline is invalid or expired".to_owned());
-    }
-    let elapsed = Duration::from_secs(now_epoch - start_epoch);
-    let started = Instant::now()
-        .checked_sub(elapsed)
-        .ok_or_else(|| "recorded session start is outside the monotonic clock range".to_owned())?;
-    Ok((started, start_utc, deadline_utc))
 }
 
 fn machine_epoch_utc(stamp: &str) -> Result<u64, String> {
@@ -2217,7 +2236,7 @@ fn setup_image(image: &Path, mount: &Path, setup_temp: &Path) -> Result<(String,
             "-fs",
             "APFS",
             "-volname",
-            "oxide-rust-probe-proof-v2",
+            "oxide-rust-probe-proof-v3",
             "-nospotlight",
             "-quiet",
         ])
@@ -2328,18 +2347,11 @@ fn detach_image(device: &str) -> Result<(), String> {
 }
 
 fn df_space(path: &Path) -> Result<(String, u64, u64, u64), String> {
-    let output = Command::new("/bin/df")
-        .arg("-k")
-        .arg(path)
-        .output()
-        .map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        return Err(format!(
-            "df failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let output_text = String::from_utf8_lossy(&output.stdout);
+    let output = producer::run_bounded(
+        "/bin/df",
+        &["-k", path.to_str().ok_or("df path is not UTF-8")?],
+    )?;
+    let output_text = String::from_utf8_lossy(&output);
     let line = output_text
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -2362,18 +2374,11 @@ fn df_space(path: &Path) -> Result<(String, u64, u64, u64), String> {
 }
 
 fn du_bytes(path: &Path) -> Result<u64, String> {
-    let output = Command::new("/usr/bin/du")
-        .args(["-sk"])
-        .arg(path)
-        .output()
-        .map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        return Err(format!(
-            "du failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let blocks = String::from_utf8_lossy(&output.stdout)
+    let output = producer::run_bounded(
+        "/usr/bin/du",
+        &["-sk", path.to_str().ok_or("du path is not UTF-8")?],
+    )?;
+    let blocks = String::from_utf8_lossy(&output)
         .split_whitespace()
         .next()
         .ok_or_else(|| "du returned no allocated-size value".to_owned())?
