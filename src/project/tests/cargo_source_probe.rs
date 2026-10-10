@@ -31,14 +31,14 @@ use std::time::{Duration, Instant};
 #[path = "../../../fixtures/cargo-source-map-probe/probe/build.rs"]
 mod owned_probe_build_script;
 
-const ROOT: &str = "/private/var/tmp/oxide-rust-probe-proof-613d9b91-v3";
-const SESSION_ID: &str = "oxide-probe-session-613d9b91-v3";
+const ROOT: &str = "/private/var/tmp/oxide-rust-probe-proof-613d9b91-v4";
+const SESSION_ID: &str = "oxide-probe-session-613d9b91-v4";
 const WORKFLOW: &str = "oxide-cargo-source-map-probe";
 const SELECTOR: &str =
     "test --offline --locked --message-format=json-render-diagnostics -- --nocapture";
-const ROOT_ID: &str = "oxide-rust-probe-proof-613d9b91-v3";
-const LOCAL_TASK_ID: &str = "oxide-local-probe-proof-613d9b91-v3";
-const LOCAL_WORKSPACE_ID: &str = "oxide-local-probe-image-proof-613d9b91-v3";
+const ROOT_ID: &str = "oxide-rust-probe-proof-613d9b91-v4";
+const LOCAL_TASK_ID: &str = "oxide-local-probe-proof-613d9b91-v4";
+const LOCAL_WORKSPACE_ID: &str = "oxide-local-probe-image-proof-613d9b91-v4";
 const LOGICAL_PREFIX: &str = "/oxide-source-map-probe";
 const MARKER_PATH: &str = "probe/marker.txt";
 const BASELINE_MARKER: &str = "baseline-marker\n";
@@ -498,7 +498,7 @@ fn run_probe() -> Result<(), String> {
     ])?;
     // create_dir refuses any earlier session, including an empty retained root.
     fs::create_dir(ROOT)
-        .map_err(|error| format!("refusing existing or unavailable v3 root: {error}"))?;
+        .map_err(|error| format!("refusing existing or unavailable v4 root: {error}"))?;
     let setup_temp = PathBuf::from(ROOT).join("setup-tmp");
     fs::create_dir(&setup_temp).map_err(|error| error.to_string())?;
     record_session_clock(&setup_temp, &start_utc, &deadline_utc)?;
@@ -2314,7 +2314,7 @@ fn setup_image(image: &Path, mount: &Path, setup_temp: &Path) -> Result<(String,
             "-fs",
             "APFS",
             "-volname",
-            "oxide-rust-probe-proof-v3",
+            "oxide-rust-probe-proof-v4",
             "-nospotlight",
             "-quiet",
         ])
