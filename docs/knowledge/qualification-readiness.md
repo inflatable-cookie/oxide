@@ -908,6 +908,18 @@ useful recurring-run reduction. Checkout-isolated storage remains the safe
 fallback until a separately scoped attempt can inspect the Cargo-reported
 debug companion and complete the source/reuse sequence.
 
+The exact-head review found two proof-setup defects. Debug discovery scanned
+all sibling `.dSYM` directories instead of selecting the Cargo-reported
+executable's exact `<name>.dSYM`; the implementation and ordinary regression
+now select that companion while ignoring unrelated siblings. The probe now
+derives `CARGO_ENCODED_RUSTFLAGS` from the resolved source map's ordered
+effective flags and checks those flags against the later mapped A resolution;
+an ordinary regression asserts the Cargo encoding matches the resolved vector.
+These code corrections do not change the original run's evidence or establish
+debug binding, full-debug source lookup, source invalidation or cross-path
+reuse. No new Cargo probe ran. Any further probe requires a new scoped Queue
+record and fresh resources.
+
 ### Bounded real-project follow-up (execution not authorized)
 
 The Oxide-only experimental implementation is present in the local adapter and

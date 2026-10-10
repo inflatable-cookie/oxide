@@ -1267,25 +1267,20 @@ fn discover_debug_bundle(executable: &Path) -> Result<Option<DebugBundle>, Strin
     let parent = executable
         .parent()
         .ok_or_else(|| "Cargo artifact has no parent directory".to_owned())?;
-    let mut bundles = Vec::new();
-    for entry in fs::read_dir(parent).map_err(|error| error.to_string())? {
-        let path = entry.map_err(|error| error.to_string())?.path();
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "dSYM")
-            && fs::symlink_metadata(&path)
-                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-        {
-            bundles.push(path);
-        }
+    let mut bundle_name = executable
+        .file_name()
+        .ok_or_else(|| "Cargo artifact has no file name".to_owned())?
+        .to_os_string();
+    bundle_name.push(".dSYM");
+    let path = parent.join(bundle_name);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("Cargo artifact debug companion is not a real directory".to_owned());
     }
-    if bundles.is_empty() {
-        return Ok(None);
-    }
-    if bundles.len() != 1 {
-        return Err("Cargo artifact has ambiguous sibling dSYM bundles".to_owned());
-    }
-    let path = bundles.remove(0);
     if fs::canonicalize(&path).ok().as_deref() != Some(path.as_path()) {
         return Err("debug companion is not a canonical directory".to_owned());
     }
@@ -2534,28 +2529,29 @@ fn packed_debug_companion_requires_uuid_hash_and_complete_dwarf_binding() {
 }
 
 #[test]
-fn packed_debug_companion_discovery_reports_missing_and_ambiguous_bundles() {
+fn packed_debug_companion_discovery_selects_only_the_cargo_artifact_bundle() {
     let scratch = producer_scratch("debug-bundles");
     let target = scratch.join("target");
     fs::create_dir_all(&target).expect("target");
     let executable = target.join("probe-test");
     fs::write(&executable, b"test executable").expect("executable");
+
+    let unrelated = target.join("other.dSYM");
+    let unrelated_dwarf = unrelated.join("Contents/Resources/DWARF");
+    fs::create_dir_all(&unrelated_dwarf).expect("unrelated dwarf directory");
+    fs::write(unrelated_dwarf.join("other"), b"other payload").expect("unrelated payload");
     assert!(discover_debug_bundle(&executable)
-        .expect("no companion is a valid observation")
+        .expect("a sibling bundle is not the Cargo artifact companion")
         .is_none());
 
     let bundle = target.join("probe-test.dSYM");
     let dwarf = bundle.join("Contents/Resources/DWARF");
     fs::create_dir_all(&dwarf).expect("dwarf directory");
     fs::write(dwarf.join("probe"), b"debug payload").expect("debug payload");
-    assert!(discover_debug_bundle(&executable)
-        .expect("one companion")
-        .is_some());
-
-    let second = target.join("other.dSYM");
-    let second_dwarf = second.join("Contents/Resources/DWARF");
-    fs::create_dir_all(&second_dwarf).expect("second dwarf directory");
-    fs::write(second_dwarf.join("other"), b"other payload").expect("other payload");
-    assert!(discover_debug_bundle(&executable).is_err());
+    let discovered = discover_debug_bundle(&executable)
+        .expect("the exact-name companion is selected despite unrelated siblings")
+        .expect("the Cargo artifact companion exists");
+    assert_eq!(discovered.path, bundle);
+    assert_eq!(discovered.dwarf_file, dwarf.join("probe"));
     let _ = fs::remove_dir_all(&scratch);
 }

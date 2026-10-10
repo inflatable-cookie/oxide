@@ -252,8 +252,7 @@ fn probe_plan_passes_runner_validation_before_acquire_and_rejects_forced_overrid
         fs::create_dir(path).expect("probe validation directory");
     }
     fs::write(workspace.join("Cargo.toml"), b"[workspace]\n").expect("workspace marker");
-    let flags = remap_flags(&workspace, &workspace);
-    let environment = probe_environment(&trial, "1.97.1", &flags);
+    let environment = probe_environment(&trial, "1.97.1", None);
     let cargo = toolchain_binary("1.97.1", "cargo");
     let runner = CargoWorkflowRunner::new(trial.clone(), PathBuf::from("/private/var/tmp"), cargo)
         .expect("registered runner");
@@ -462,9 +461,8 @@ fn run_probe() -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let daemon = ProbeDaemon::start(&storage_root, Arc::clone(&budget));
     let client = daemon.client();
-    let flags = remap_flags(&a, &b);
-    let env = probe_environment(&mount, "1.97.1", &flags);
-    let preflight_partition = preflight_partition(&mount, &a, &b, &stable, &env, &flags)?;
+    let (preflight_partition, preflight_source_map) = preflight_partition(&mount, &a, &b, &stable)?;
+    let env = probe_environment(&mount, "1.97.1", Some(&preflight_source_map));
     let mut invocations = 0u32;
 
     let a_tree = producer::source_tree_digest(&a)?;
@@ -632,7 +630,7 @@ fn run_probe() -> Result<(), String> {
         &stable,
         &alternate,
         &env,
-        &flags,
+        &preflight_source_map,
     ) {
         Ok(controls) => controls,
         Err(error) => {
@@ -714,6 +712,9 @@ fn run_probe() -> Result<(), String> {
     let map_b = resolved_b
         .source_map
         .ok_or_else(|| "mapped B lost source map".to_owned())?;
+    if map_a.effective_rustflags() != preflight_source_map.effective_rustflags() {
+        return Err("preflight Cargo flags differ from the resolved mapped A flags".to_owned());
+    }
     if map_a.policy_digest() != map_b.policy_digest()
         || map_a.map_digest() != map_b.map_digest()
         || map_a.build_identity_digest() != map_b.build_identity_digest()
@@ -831,6 +832,45 @@ struct OwnedRun {
     qualification: Option<source_map::QualificationDisposition>,
     probe_values_match: bool,
     preflight_scans_complete: bool,
+}
+
+#[test]
+fn cargo_encoded_rustflags_follow_the_resolved_source_map_order() {
+    let root = super::super::FixtureRoot::new();
+    let disposable = root.dir("resolved-map-flags");
+    let a = disposable.join("a");
+    let b = disposable.join("b");
+    for workspace in [&a, &b] {
+        let package = workspace.join("probe");
+        fs::create_dir_all(&package).expect("workspace package directory");
+        fs::write(
+            package.join("Cargo.toml"),
+            b"[package]\nname = \"probe\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("package manifest");
+    }
+    let tree = format!("sha256:{}", "a".repeat(64));
+    let resolved = source_map::resolve(
+        &source_policy(&a, &b, identity_only_miss_controls_for_key_preview()),
+        &disposable,
+        &a,
+        &tree,
+        Some(&[]),
+        true,
+    )
+    .expect("registered source map resolves");
+
+    let environment = probe_environment(&disposable, "1.97.1", Some(&resolved));
+    let encoded = environment
+        .iter()
+        .find(|value| value.name == "CARGO_ENCODED_RUSTFLAGS")
+        .and_then(|value| value.value.as_deref())
+        .expect("the fixture passes an explicit Cargo rustflags value");
+    let cargo_flags = encoded
+        .split('\u{1f}')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(cargo_flags, resolved.effective_rustflags());
 }
 
 fn probe_execution_plan(
@@ -1189,7 +1229,11 @@ fn toolchain_binary(channel: &str, name: &str) -> PathBuf {
         .join(format!("{channel}-aarch64-apple-darwin/bin/{name}"))
 }
 
-fn probe_environment(mount: &Path, channel: &str, flags: &[String]) -> Vec<EffectiveValue> {
+fn probe_environment(
+    mount: &Path,
+    channel: &str,
+    resolved_source_map: Option<&source_map::ResolvedSourceMap>,
+) -> Vec<EffectiveValue> {
     let toolchain_bin = toolchain_binary(channel, "cargo")
         .parent()
         .expect("toolchain bin")
@@ -1203,7 +1247,9 @@ fn probe_environment(mount: &Path, channel: &str, flags: &[String]) -> Vec<Effec
             .into_owned()
     });
     let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", toolchain_bin.display());
-    let encoded = flags.join("\u{1f}");
+    let encoded = resolved_source_map
+        .map(|map| map.effective_rustflags().join("\u{1f}"))
+        .unwrap_or_default();
     [
         ("CARGO_BUILD_JOBS", None),
         ("CARGO_PROFILE_DEV_DEBUG", Some("2".to_owned())),
@@ -1234,36 +1280,44 @@ fn probe_environment(mount: &Path, channel: &str, flags: &[String]) -> Vec<Effec
     .collect()
 }
 
-fn remap_flags(a: &Path, b: &Path) -> Vec<String> {
-    let mut flags = [a, b]
-        .into_iter()
-        .map(|root| format!("--remap-path-prefix={}={LOGICAL_PREFIX}", root.display()))
-        .collect::<Vec<_>>();
-    flags.push(format!(
-        "--remap-path-prefix=probe={}/probe",
-        LOGICAL_PREFIX
-    ));
-    flags
-}
-
 fn preflight_partition(
     mount: &Path,
     a: &Path,
     b: &Path,
     tools: &Toolchain,
-    environment: &[EffectiveValue],
-    _flags: &[String],
-) -> Result<PartitionKey, String> {
+) -> Result<(PartitionKey, source_map::ResolvedSourceMap), String> {
     let zero_tree = format!("sha256:{}", "0".repeat(64));
-    let base = invocation(
+    let preview_environment = probe_environment(mount, &tools.channel, None);
+    let preview = invocation(
         mount,
         a,
         &zero_tree,
         tools,
-        environment,
-        // This resolver pass exists only to preview the eventual partition
-        // key before measured controls are available. These values are never
-        // emitted as control evidence or used to authorize a mapped run.
+        &preview_environment,
+        // This pass previews the eventual partition key before measured
+        // controls are available. Placeholder controls never leave this
+        // helper or count as evidence.
+        Some(source_policy(
+            a,
+            b,
+            identity_only_miss_controls_for_key_preview(),
+        )),
+        "preflight-map-preview",
+    )?;
+    let preview = match resolve::resolve(&preview) {
+        Resolution::Ready(resolved) => resolved,
+        _ => return Err("preflight input set did not resolve".to_owned()),
+    };
+    let preview_source_map = preview
+        .source_map
+        .ok_or_else(|| "preflight source map was not resolved".to_owned())?;
+    let environment = probe_environment(mount, &tools.channel, Some(&preview_source_map));
+    let final_invocation = invocation(
+        mount,
+        a,
+        &zero_tree,
+        tools,
+        &environment,
         Some(source_policy(
             a,
             b,
@@ -1271,11 +1325,19 @@ fn preflight_partition(
         )),
         "preflight-key",
     )?;
-    let partition = match resolve::resolve(&base) {
-        Resolution::Ready(resolved) => resolved.partition,
-        _ => return Err("preflight input set did not resolve".to_owned()),
+    let resolved = match resolve::resolve(&final_invocation) {
+        Resolution::Ready(resolved) => resolved,
+        _ => return Err("preflight input set with resolved flags did not resolve".to_owned()),
     };
-    Ok(partition)
+    let source_map = resolved
+        .source_map
+        .ok_or_else(|| "preflight source map with resolved flags was not returned".to_owned())?;
+    if source_map.effective_rustflags() != preview_source_map.effective_rustflags() {
+        return Err(
+            "preflight resolved source-map flags changed with Cargo environment".to_owned(),
+        );
+    }
+    Ok((resolved.partition, source_map))
 }
 
 fn identity_only_miss_controls_for_key_preview() -> source_map::MissControlEvidence {
@@ -1411,7 +1473,7 @@ fn key_controls(
     stable: &Toolchain,
     alternate: &Toolchain,
     environment: &[EffectiveValue],
-    flags: &[String],
+    resolved_source_map: &source_map::ResolvedSourceMap,
 ) -> Result<KeyControls, String> {
     let mut config_after = environment.to_vec();
     if let Some(value) = config_after
@@ -1459,7 +1521,7 @@ fn key_controls(
         None,
         "toolchain-before",
     )?;
-    let alternate_env = probe_environment(mount, "1.96.1", flags);
+    let alternate_env = probe_environment(mount, "1.96.1", Some(resolved_source_map));
     let alternate_invocation = invocation(
         mount,
         workspace,
@@ -1637,10 +1699,22 @@ fn verify_probe_values(
         && output.status == FixtureCommandStatus::Exited(0);
     let report = format!(
         "tree={source_tree}\texpected_tree={expected_tree}\tmarker={marker_digest}\ttest_source={test_source_digest}\tgenerated={}\tproc_macro_input={}\tfile_macro={}\tpanic_location={}\tvalues_match={values_match}\n",
-        generated_bytes.as_deref().map(hex_digest).unwrap_or_else(|| "missing".to_owned()),
-        macro_input_bytes.as_deref().map(hex_digest).unwrap_or_else(|| "missing".to_owned()),
-        values.get("file-macro").map(String::as_str).unwrap_or("missing"),
-        values.get("panic-location").map(String::as_str).unwrap_or("missing"),
+        generated_bytes
+            .as_deref()
+            .map(hex_digest)
+            .unwrap_or_else(|| "missing".to_owned()),
+        macro_input_bytes
+            .as_deref()
+            .map(hex_digest)
+            .unwrap_or_else(|| "missing".to_owned()),
+        values
+            .get("file-macro")
+            .map(String::as_str)
+            .unwrap_or("missing"),
+        values
+            .get("panic-location")
+            .map(String::as_str)
+            .unwrap_or("missing"),
     );
     Ok((values_match, report))
 }
