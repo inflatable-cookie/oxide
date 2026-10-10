@@ -678,9 +678,9 @@ source value, generated input or opened runtime resource was actually
 observed. Artifact bytes and stdout/stderr are independently copied and
 digested by the collector. The 014 producer binds its records to the owned
 command's start identity and raw outputs, while the driver independently checks
-the fixture values against requested-tree file digests. Those checks have not
-run end to end, so genuine, independently validated Cargo observations are
-still required before reuse can qualify.
+the fixture values against requested-tree file digests. Task 017 v4 observed these checks on baseline and changed-source runs, then
+stopped at a real stale-source failure in the shared slot. The complete reuse
+sequence has not qualified; independent exact-head review remains required.
 
 In logical mode, origins from other authorized roots and trees are accepted as declarations; the qualifier does not independently establish which source contents produced a reused unit. Real qualification therefore needs genuine compile-origin observations and the source-miss control, not merely authorized root IDs or a matching hook identity row.
 
@@ -691,7 +691,7 @@ In logical mode, origins from other authorized roots and trees are accepted as d
 | Compiler debug paths | Producer-declared source paths extracted from binary debug information. Logical names must resolve to a requested-tree file; physical paths must match the selected physical-path policy and be contained. | The resolver checks requested-tree containment and the producer extracts paths from debug information. No scanner result exists from 014. |
 | `file!()` values | Producer-declared values observed from the executed binary, kept as their own class. | The driver compares emitted values with independently hashed requested-tree files. The fixture binary did not run in 014. |
 | Panic locations | Producer-declared panic locations captured from the executed binary, kept as their own class. | The driver checks panic paths separately from debug and `file!()` paths. No panic output was produced in 014. |
-| Apple OSO | Producer-declared scanner result: `not emitted` or `observed`, plus one `oso-object` row per absolute linker-object reference. | Raw `nm` output is privately captured. Each extracted object path is bound to an artifact and its raw `nm` capture; it is not admitted as a requested-tree compiler source path. Task 017's preflight preserved raw `nm` output but stopped before a complete test-companion scan. |
+| Apple OSO | Producer-declared scanner result: `not emitted` or `observed`, plus one `oso-object` row per absolute linker-object reference. | Raw `nm` output is privately captured. Each extracted object path is bound to an artifact and its raw `nm` capture; it is not admitted as a requested-tree compiler source path. Task 017 v4 preserved raw `nm` output and completely bound/scanned the baseline and changed-source test companions; no OSO entries were emitted in those captures. |
 | Manifest directory | Producer-declared effective manifest directory and requested-tree digest. | The producer records the active manifest from the owned command. No command executed in 014. |
 | Include input | Producer-declared exact file consumed by `include!` or related source inclusion. | The fixture emits and checks the included value against its requested-tree file. No fixture test ran in 014. |
 | Build-script input | Producer-declared inputs consumed by the build script. | The producer correlates Cargo build-script output with the fixture's requested input. No Cargo build-script event was observed in 014. |
@@ -1093,6 +1093,92 @@ fresh scoped Queue session. The earlier
 [review](https://github.com/inflatable-cookie/oxide/pull/17#issuecomment-6098812074)
 applies to its recorded head; the changed producer and these observations still
 require independent exact-head review.
+
+#### Task 017 continuation session v4 observations (2026-10-10)
+
+The fresh Queue-recorded v4 session ran at committed producer head
+`e4daf01b7d7e5ba2a36148b9c0b0cb556f82a13a`, after strict RustQuality routing,
+covering ordinary checks and the exact ignored Effigy plan passed. Before
+launch, an independent Python hash used relative path-component ordering and
+little-endian length framing, checked every fixture byte against that committed
+head, and matched the frozen
+`sha256:550e62cefc7f647fef97b12489fc2c1e1ba67fd56a7529401fce25c97b0ce2e9`.
+The hash and plan were checked in separate successful steps before launch;
+there was no failed prerequisite followed by a compiler invocation. Authoring
+captures are at `/private/tmp/oxide-017-v4-validation.ejavfjg9`, including
+`verify-fixture.py`, `fixture-prelaunch.json`, `live-plan.txt`, `closeout.json`,
+`live-v4.log` and the read-only inspection `v4-inspection.json`.
+
+The driver owned one live `Instant` before setup. Session
+`oxide-probe-session-613d9b91-v4` began at `2026-10-10T16:22:40Z`, with the
+original audit deadline `16:42:40Z` and monotonic deadline 1,200,000 ms.
+The session root is `/private/var/tmp/oxide-rust-probe-proof-613d9b91-v4`;
+its image, mounted sources, slot and captures remain preserved. Earlier
+sessions were neither mutated nor reattached. Three of four fixture
+invocations ran; the ended driver cannot be resumed or supply another live
+invocation without clock reconstruction. No v5 session is authorized.
+
+| Ordered invocation | Actual observation | Settlement |
+| --- | --- | --- |
+| Private baseline A | Six units rebuilt; one fixture test passed; Cargo elapsed 2,884 ms. Logical `file!()` and panic paths, requested-tree behavior and full-debug project source lookup matched A. | Idle |
+| Changed B | Three affected library/test units rebuilt; one fixture test passed; Cargo elapsed 1,023 ms. The unchanged build-script binary was fresh, while independently changed source/tree, generated bytes and build/generated/proc-macro/runtime values matched B. | Idle; B then restored and checked against the frozen tree |
+| Requested shared cold A | The allocator reacquired the control slot, so this was actually warm reuse of changed-B intermediates. Zero units rebuilt; the test executed and failed; Cargo elapsed 207 ms, exit 101. | Uncertain; retained |
+| Warm B | Not invoked after the preceding semantic failure. | Not reached |
+
+For both successful runs, the exact packed `.dSYM` was completely privately
+captured, UUID/hash-bound and source-scanned with nonzero required sections.
+Baseline test UUID was `474982C8-990F-3333-BE90-6179C10116A3`, executable digest
+`sha256:1122543c74d89b173b9455c267e9f2a60c1e60badbb61fd3506f1b14273498cf`
+and debug-file digest
+`sha256:e7429757aa1b6e65ec5055d90e526b88870d8fefecc8df53d3463473a9d579eb`.
+Changed-B UUID was `2F149CFB-1B45-3D6C-8559-0FFBC95248FC`; its executable digest
+was `sha256:11e5d59e7217c115a49372cab08692a1ad5ed2435795cc311f5f88c4dd5e8322`
+and debug-file digest
+`sha256:44781aea50b1efa076c10c25b358e4bc1f6ae717f30cb148233be762a2e4e083`.
+Raw bindings, CU/working-directory/file/line queries, arguments and complete
+companions are under `m/runs/{reference-a,source-miss-b}/capture`. The source
+control and cheap configuration/toolchain key-separation controls passed their
+actual predicates. No extra fixture smoke compile was used.
+
+The third run is a concrete stale-source behavior failure after a qualified
+baseline, not a scanner or compile setup failure. Its Cargo rows claim A and
+`fresh=true` for all six units, but its privately captured executable and
+debug-file hashes equal changed B. The fixture assertion at logical
+`/oxide-source-map-probe/probe/tests/probe.rs:18` failed with runtime value
+`baseline-marker` and compiled expectation `changed-marker`. Both requested
+source markers are baseline bytes; retained generated output still names B
+and contains `BUILD_VALUE = "changed-marker"`. Raw stdout/stderr hashes match
+the private manifest. The test fails before emitting its normal observation
+rows, so the qualifier conservatively reports missing behavior/compile-origin
+evidence and Fail, and settlement becomes Uncertain. The image/slot must not
+be reused, evicted, detached or released on this result. No repair or replay
+was attempted after that predicate failed.
+
+This does not establish the intended separate cold-A/warm-B pair: its first
+shared invocation was already warm. It nevertheless demonstrates that this
+observed shared-target transition accepted stale changed-source artifacts.
+The candidate therefore has no qualified cross-path reuse or storage benefit.
+Any next mechanism decision must preserve requested-tree behavior and consider
+a narrower checkout-isolated boundary; an alternate mechanism is not
+implemented here. Production remains checkout-isolated, and consumer source
+path/lifecycle coordination and representative usefulness remain separate.
+
+The independent timer also sampled during the live session. Completed
+UTC/elapsed samples were at 59, 1,832, 2,102, 11,761, 16,008, 20,171 and
+23,025 ms; the largest gap was 9,659 ms. Minimum sampled host free space was
+240,210,411,520 bytes. Final sampled APFS capacity was 8,380,178,432 bytes,
+mounted use 67,846,144 bytes, backing allocation 88,084,480 bytes and outside
+allocation 16,384 bytes. No threshold was reached; write attribution is
+unavailable. The driver stopped in about 23 seconds without resetting its
+clock/count. No remaining-slot replay can run after its lifetime ended.
+
+Effigy `rust:compile` and `rust:format` completed successfully; `test rust`
+passed 61 ordinary tests with two live probes ignored. Compile retained the
+existing 125 library dead-code warnings. Owning-document validation uses
+`docs:check`. These are author observations pending independent exact-head
+review of the current producer and raw v4 captures; the earlier review
+[6098812074](https://github.com/inflatable-cookie/oxide/pull/17#issuecomment-6098812074)
+does not review these paths or provide current verdict credit.
 
 ### Bounded real-project follow-up (execution not authorized)
 
