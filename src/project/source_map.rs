@@ -15,6 +15,7 @@ pub const SOURCE_SCAN_VERSION: &str = "oxide-source-scan-v1";
 pub const ACCEPTED_LOGICAL_POLICY: &str = "b5ea13cd-4c03-4a18-8cc3-93baab1f2039:v2";
 pub(super) const MAX_COMPILE_ORIGINS: usize = 32;
 const MAX_SOURCE_MAP_BINARIES: usize = 128;
+const MAX_SOURCE_MAP_CAPTURE_REFERENCES: usize = 256;
 const MAX_SOURCE_MAP_CAPTURE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_SOURCE_MAP_OBSERVATIONS: usize = 256;
 const MAX_SOURCE_MAP_REPORT_BYTES: usize = 64 * 1024;
@@ -37,6 +38,29 @@ pub enum SourcePathMode {
 pub struct AuthorizedSourceRoot {
     pub id: String,
     pub path: PathBuf,
+}
+
+/// One registered relative compiler prefix and the workspace context that
+/// gives it meaning. The prefix must be the package directory below the
+/// compiler working directory for every named source root.
+#[derive(Clone, Eq, PartialEq)]
+pub struct RelativeSourcePrefix {
+    pub root_ids: Vec<String>,
+    pub compiler_working_directory: PathBuf,
+    pub package_directory: PathBuf,
+    pub prefix: PathBuf,
+}
+
+impl fmt::Debug for RelativeSourcePrefix {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RelativeSourcePrefix")
+            .field("root_ids", &self.root_ids)
+            .field("compiler_working_directory", &"[redacted]")
+            .field("package_directory", &"[redacted]")
+            .field("prefix", &"[redacted]")
+            .finish()
+    }
 }
 
 impl fmt::Debug for AuthorizedSourceRoot {
@@ -84,6 +108,9 @@ pub struct SourceMapPolicy {
     pub mode: SourcePathMode,
     /// Order is significant and is preserved in the remap flag vector.
     pub roots: Vec<AuthorizedSourceRoot>,
+    /// Ordered mappings for compiler inputs Cargo names relative to its
+    /// registered workspace working directory.
+    pub relative_prefixes: Vec<RelativeSourcePrefix>,
     pub miss_controls: Option<MissControlEvidence>,
 }
 
@@ -94,6 +121,7 @@ impl fmt::Debug for SourceMapPolicy {
             .field("version", &self.version)
             .field("mode", &self.mode)
             .field("root_count", &self.roots.len())
+            .field("relative_prefix_count", &self.relative_prefixes.len())
             .field("miss_controls_present", &self.miss_controls.is_some())
             .finish()
     }
@@ -259,7 +287,8 @@ pub(super) fn resolve(
         return Err(AdapterRefusal::UnsupportedInput);
     }
     let logical_prefix = match &policy.mode {
-        SourcePathMode::StrictPhysical => None,
+        SourcePathMode::StrictPhysical if policy.relative_prefixes.is_empty() => None,
+        SourcePathMode::StrictPhysical => return Err(AdapterRefusal::UnsupportedInput),
         SourcePathMode::ExperimentalLogical {
             accepted_policy,
             prefix,
@@ -273,19 +302,83 @@ pub(super) fn resolve(
                 let to = prefix.to_str().ok_or(AdapterRefusal::UnsupportedInput)?;
                 effective_rustflags.push(format!("--remap-path-prefix={from}={to}"));
             }
+            let mut relative_ids = BTreeSet::new();
+            let mut relative_prefixes: Vec<&Path> = Vec::new();
+            for relative in &policy.relative_prefixes {
+                if !valid_relative_prefix(&relative.prefix)
+                    || relative.package_directory != relative.prefix
+                    || relative.root_ids.is_empty()
+                    || relative
+                        .root_ids
+                        .iter()
+                        .any(|id| !ids.contains(id.as_str()) || !relative_ids.insert(id.as_str()))
+                {
+                    return Err(AdapterRefusal::AmbiguousInput);
+                }
+                if relative_prefixes.iter().any(|prefix| {
+                    prefix.starts_with(&relative.prefix) || relative.prefix.starts_with(prefix)
+                }) {
+                    return Err(AdapterRefusal::AmbiguousInput);
+                }
+                relative_prefixes.push(&relative.prefix);
+                let compiler_cwd = relative_directory(&relative.compiler_working_directory, true)?;
+                let package_dir = relative_directory(&relative.package_directory, false)?;
+                for root_id in &relative.root_ids {
+                    let root = roots
+                        .iter()
+                        .find(|root| root.id == *root_id)
+                        .ok_or(AdapterRefusal::UnsupportedInput)?;
+                    let cwd = canonical_context_dir(&root.path, &compiler_cwd)?;
+                    let package = canonical_context_dir(&cwd, &package_dir)?;
+                    let manifest = package.join("Cargo.toml");
+                    if fs::canonicalize(&manifest).ok().as_deref() != Some(manifest.as_path())
+                        || !manifest.is_file()
+                    {
+                        return Err(AdapterRefusal::UnsupportedInput);
+                    }
+                    if root_id == &requested.id && cwd != workspace_root {
+                        return Err(AdapterRefusal::AmbiguousInput);
+                    }
+                }
+                let from = relative
+                    .prefix
+                    .to_str()
+                    .ok_or(AdapterRefusal::UnsupportedInput)?;
+                let to = prefix
+                    .join(&relative.prefix)
+                    .to_str()
+                    .ok_or(AdapterRefusal::UnsupportedInput)?
+                    .to_owned();
+                effective_rustflags.push(format!("--remap-path-prefix={from}={to}"));
+            }
             Some(prefix)
         }
     };
-    let policy_digest = digest_fields(&[
-        "oxide-source-map-policy-v1",
-        policy.version.as_str(),
-        mode_name(&policy.mode),
-        mode_ruling(&policy.mode),
+    let mut policy_fields = vec![
+        "oxide-source-map-policy-v1".to_owned(),
+        policy.version.clone(),
+        mode_name(&policy.mode).to_owned(),
+        mode_ruling(&policy.mode).to_owned(),
         logical_prefix
             .as_ref()
             .and_then(|path| path.to_str())
-            .unwrap_or(""),
-    ]);
+            .unwrap_or("")
+            .to_owned(),
+    ];
+    for relative in &policy.relative_prefixes {
+        policy_fields.push("relative".to_owned());
+        policy_fields.push(relative.prefix.to_string_lossy().into_owned());
+        policy_fields.push(
+            relative
+                .compiler_working_directory
+                .to_string_lossy()
+                .into_owned(),
+        );
+        policy_fields.push(relative.package_directory.to_string_lossy().into_owned());
+        policy_fields.extend(relative.root_ids.iter().cloned());
+    }
+    let policy_borrowed: Vec<_> = policy_fields.iter().map(String::as_str).collect();
+    let policy_digest = digest_fields(&policy_borrowed);
     let mut map_fields = vec![policy_digest.clone()];
     for root in &roots {
         map_fields.push(root.id.clone());
@@ -295,6 +388,18 @@ pub(super) fn resolve(
                 .ok_or(AdapterRefusal::UnsupportedInput)?
                 .to_owned(),
         );
+    }
+    for relative in &policy.relative_prefixes {
+        map_fields.push("relative".to_owned());
+        map_fields.push(relative.prefix.to_string_lossy().into_owned());
+        map_fields.push(
+            relative
+                .compiler_working_directory
+                .to_string_lossy()
+                .into_owned(),
+        );
+        map_fields.push(relative.package_directory.to_string_lossy().into_owned());
+        map_fields.extend(relative.root_ids.iter().cloned());
     }
     map_fields.extend(effective_rustflags.iter().cloned());
     let borrowed: Vec<_> = map_fields.iter().map(String::as_str).collect();
@@ -314,6 +419,33 @@ pub(super) fn resolve(
         logical_prefix,
         effective_rustflags,
     })
+}
+
+fn valid_relative_prefix(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn relative_directory(path: &Path, allow_root: bool) -> Result<PathBuf, AdapterRefusal> {
+    if allow_root && path == Path::new(".") {
+        return Ok(PathBuf::new());
+    }
+    if !valid_relative_prefix(path) {
+        return Err(AdapterRefusal::UnsupportedInput);
+    }
+    Ok(path.to_path_buf())
+}
+
+fn canonical_context_dir(root: &Path, relative: &Path) -> Result<PathBuf, AdapterRefusal> {
+    let candidate = root.join(relative);
+    let canonical = canonical_dir(&candidate)?;
+    if canonical != candidate || !canonical.starts_with(root) {
+        return Err(AdapterRefusal::UnsupportedInput);
+    }
+    Ok(canonical)
 }
 
 fn validate_miss_controls(controls: Option<&MissControlEvidence>) -> Result<(), AdapterRefusal> {
@@ -434,7 +566,6 @@ pub enum SourcePathClass {
     CompilerDebug,
     FileMacro,
     PanicLocation,
-    AppleOso,
 }
 
 /// Behavior paths that a portability run must exercise and resolve.
@@ -811,6 +942,7 @@ pub(super) fn read_registered_cargo_hook(
         slot_path,
         target_dir,
         &bytes,
+        output_references,
         provenance,
     ) else {
         return invalid();
@@ -826,6 +958,7 @@ fn parse_registered_cargo_hook(
     slot_path: &Path,
     target_dir: &Path,
     bytes: &[u8],
+    capture_references: &[String],
     provenance: EvidenceProvenance,
 ) -> Option<SourceMapObservations> {
     let text = std::str::from_utf8(bytes).ok()?;
@@ -840,6 +973,7 @@ fn parse_registered_cargo_hook(
     let mut scans = BTreeMap::new();
     let mut behavior_paths = Vec::new();
     let mut apple_oso = None;
+    let mut oso_rows = 0usize;
     for (index, line) in lines.enumerate() {
         if index >= MAX_SOURCE_MAP_OBSERVATIONS || line.is_empty() || line.contains('\r') {
             return None;
@@ -911,6 +1045,17 @@ fn parse_registered_cargo_hook(
                     return None;
                 }
             }
+            ["oso-object", reference, capture_reference, path]
+                if safe_reference(reference)
+                    && artifacts.contains_key(*reference)
+                    && *capture_reference == format!("{reference}-oso.txt")
+                    && capture_references
+                        .iter()
+                        .any(|capture| capture == capture_reference)
+                    && Path::new(path).is_absolute() =>
+            {
+                oso_rows += 1;
+            }
             ["section", reference, section] => {
                 scans
                     .get_mut(*reference)?
@@ -958,6 +1103,7 @@ fn parse_registered_cargo_hook(
         || scans
             .keys()
             .any(|reference| !artifacts.contains_key(reference))
+        || matches!(&apple_oso, Some(AppleOsoObservation::Observed)) != (oso_rows > 0)
     {
         return None;
     }
@@ -986,7 +1132,6 @@ fn parse_source_path_class(value: &str) -> Option<SourcePathClass> {
         "compiler-debug" => Some(SourcePathClass::CompilerDebug),
         "file-macro" => Some(SourcePathClass::FileMacro),
         "panic-location" => Some(SourcePathClass::PanicLocation),
-        "apple-oso" => Some(SourcePathClass::AppleOso),
         _ => None,
     }
 }
@@ -1047,7 +1192,7 @@ pub(super) fn collect(
     mut observations: SourceMapObservations,
 ) -> Result<CollectedSourceMapEvidence, AdapterRefusal> {
     if map.build_identity_digest.is_empty()
-        || output_references.len() > MAX_SOURCE_MAP_BINARIES + 8
+        || output_references.len() > MAX_SOURCE_MAP_CAPTURE_REFERENCES
         || !output_references
             .iter()
             .any(|reference| reference == "stdout.log")
@@ -1547,7 +1692,6 @@ fn source_path_class_name(class: SourcePathClass) -> &'static str {
         SourcePathClass::CompilerDebug => "compiler-debug",
         SourcePathClass::FileMacro => "file-macro",
         SourcePathClass::PanicLocation => "panic-location",
-        SourcePathClass::AppleOso => "apple-oso",
     }
 }
 
@@ -1698,14 +1842,7 @@ pub(super) fn qualify(
             return QualificationDisposition::Fail;
         }
     }
-    let oso_paths = source_paths
-        .iter()
-        .any(|path| path.class == SourcePathClass::AppleOso);
     match &evidence.apple_oso {
-        Some(AppleOsoObservation::NotEmitted) if oso_paths => {
-            return QualificationDisposition::Fail;
-        }
-        Some(AppleOsoObservation::Observed) if !oso_paths => insufficient = true,
         None => insufficient = true,
         _ => {}
     }

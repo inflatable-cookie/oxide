@@ -20,10 +20,10 @@ pub use resolve::{
 pub use source_map::{
     AppleOsoObservation, AuthorizedSourceRoot, BehaviorPathClass, BehaviorPathObservation,
     BinaryArtifactDigest, BinarySourceScan, CompileOriginIdentity, KeyMissControl,
-    MissControlEvidence, PortabilityEvidence, QualificationDisposition, ResolvedSourceMap,
-    SourceMapPolicy, SourceMapRunReceipt, SourceMissControl, SourcePathClass, SourcePathMode,
-    SourcePathObservation, ACCEPTED_LOGICAL_POLICY, REQUIRED_BEHAVIOR_PATHS, SOURCE_MAP_VERSION,
-    SOURCE_SCAN_VERSION,
+    MissControlEvidence, PortabilityEvidence, QualificationDisposition, RelativeSourcePrefix,
+    ResolvedSourceMap, SourceMapPolicy, SourceMapRunReceipt, SourceMissControl, SourcePathClass,
+    SourcePathMode, SourcePathObservation, ACCEPTED_LOGICAL_POLICY, REQUIRED_BEHAVIOR_PATHS,
+    SOURCE_MAP_VERSION, SOURCE_SCAN_VERSION,
 };
 
 use crate::storage::{

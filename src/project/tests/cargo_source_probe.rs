@@ -30,19 +30,19 @@ use std::time::{Duration, Instant};
 #[path = "../../../fixtures/cargo-source-map-probe/probe/build.rs"]
 mod owned_probe_build_script;
 
-const ROOT: &str = "/private/var/tmp/oxide-rust-probe-fixture-20261010";
+const ROOT: &str = "/private/var/tmp/oxide-rust-probe-paths-20261010";
 const WORKFLOW: &str = "oxide-cargo-source-map-probe";
 const SELECTOR: &str =
     "test --offline --locked --message-format=json-render-diagnostics -- --nocapture";
-const ROOT_ID: &str = "oxide-rust-probe-fixture-20261010";
-const LOCAL_TASK_ID: &str = "oxide-local-probe-fixture-20261010";
-const LOCAL_WORKSPACE_ID: &str = "oxide-local-probe-image-fixture-20261010";
+const ROOT_ID: &str = "oxide-rust-probe-paths-20261010";
+const LOCAL_TASK_ID: &str = "oxide-local-probe-paths-20261010";
+const LOCAL_WORKSPACE_ID: &str = "oxide-local-probe-image-paths-20261010";
 const LOGICAL_PREFIX: &str = "/oxide-source-map-probe";
 const MARKER_PATH: &str = "probe/marker.txt";
 const BASELINE_MARKER: &str = "baseline-marker\n";
 const CHANGED_MARKER: &str = "changed-marker\n";
 const FROZEN_FIXTURE_TREE_DIGEST: &str =
-    "sha256:09059f6e2df5022525ef60916178d84584a22e20b422c94950ddebd50bfa5a95";
+    "sha256:550e62cefc7f647fef97b12489fc2c1e1ba67fd56a7529401fce25c97b0ce2e9";
 const GIB: u64 = 1024 * 1024 * 1024;
 const MAX_SESSION: Duration = Duration::from_secs(20 * 60);
 const MAX_INVOCATIONS: u32 = 4;
@@ -52,8 +52,14 @@ const IMAGE_CAP: u64 = 8 * GIB;
 const DISPOSABLE_CAP: u64 = 10 * GIB;
 const SLOT_RESERVATION: u64 = GIB;
 
-const ENVIRONMENT_KEYS: [&str; 8] = [
+const ENVIRONMENT_KEYS: [&str; 14] = [
     "CARGO_BUILD_JOBS",
+    "CARGO_PROFILE_DEV_DEBUG",
+    "CARGO_PROFILE_DEV_SPLIT_DEBUGINFO",
+    "CARGO_PROFILE_DEV_STRIP",
+    "CARGO_PROFILE_TEST_DEBUG",
+    "CARGO_PROFILE_TEST_SPLIT_DEBUGINFO",
+    "CARGO_PROFILE_TEST_STRIP",
     "CARGO_ENCODED_RUSTFLAGS",
     "CARGO_HOME",
     "HOME",
@@ -400,7 +406,7 @@ fn run_probe() -> Result<(), String> {
     append_evidence(
         &mount,
         &format!(
-            "session\tstart\t{}\tfixture_tree={}\nscanner-provenance\n{}",
+            "session\tstart\t{}\tfixture_tree={}\nprofile\ttest/dev debug=2 strip=none split-debuginfo=packed\nscanner-provenance\n{}",
             machine_utc()?,
             frozen.digest,
             scanner_identity
@@ -845,7 +851,7 @@ fn probe_execution_plan(
         command: HostRunRequest {
             selector: SELECTOR.to_owned(),
             workflow: WORKFLOW.to_owned(),
-            profile: "dev".to_owned(),
+            profile: "test".to_owned(),
             features: Vec::new(),
             workspace_root: workspace.to_path_buf(),
             cargo_build_dir: cargo_build_dir.to_path_buf(),
@@ -1200,6 +1206,18 @@ fn probe_environment(mount: &Path, channel: &str, flags: &[String]) -> Vec<Effec
     let encoded = flags.join("\u{1f}");
     [
         ("CARGO_BUILD_JOBS", None),
+        ("CARGO_PROFILE_DEV_DEBUG", Some("2".to_owned())),
+        (
+            "CARGO_PROFILE_DEV_SPLIT_DEBUGINFO",
+            Some("packed".to_owned()),
+        ),
+        ("CARGO_PROFILE_DEV_STRIP", Some("none".to_owned())),
+        ("CARGO_PROFILE_TEST_DEBUG", Some("2".to_owned())),
+        (
+            "CARGO_PROFILE_TEST_SPLIT_DEBUGINFO",
+            Some("packed".to_owned()),
+        ),
+        ("CARGO_PROFILE_TEST_STRIP", Some("none".to_owned())),
         ("CARGO_ENCODED_RUSTFLAGS", Some(encoded)),
         ("CARGO_HOME", Some(cargo_home)),
         ("HOME", Some(home)),
@@ -1217,10 +1235,15 @@ fn probe_environment(mount: &Path, channel: &str, flags: &[String]) -> Vec<Effec
 }
 
 fn remap_flags(a: &Path, b: &Path) -> Vec<String> {
-    [a, b]
+    let mut flags = [a, b]
         .into_iter()
         .map(|root| format!("--remap-path-prefix={}={LOGICAL_PREFIX}", root.display()))
-        .collect()
+        .collect::<Vec<_>>();
+    flags.push(format!(
+        "--remap-path-prefix=probe={}/probe",
+        LOGICAL_PREFIX
+    ));
+    flags
 }
 
 fn preflight_partition(
@@ -1229,7 +1252,7 @@ fn preflight_partition(
     b: &Path,
     tools: &Toolchain,
     environment: &[EffectiveValue],
-    flags: &[String],
+    _flags: &[String],
 ) -> Result<PartitionKey, String> {
     let zero_tree = format!("sha256:{}", "0".repeat(64));
     let base = invocation(
@@ -1238,32 +1261,45 @@ fn preflight_partition(
         &zero_tree,
         tools,
         environment,
-        None,
+        // This resolver pass exists only to preview the eventual partition
+        // key before measured controls are available. These values are never
+        // emitted as control evidence or used to authorize a mapped run.
+        Some(source_policy(
+            a,
+            b,
+            identity_only_miss_controls_for_key_preview(),
+        )),
         "preflight-key",
     )?;
-    let mut partition = match resolve::resolve(&base) {
+    let partition = match resolve::resolve(&base) {
         Resolution::Ready(resolved) => resolved.partition,
         _ => return Err("preflight input set did not resolve".to_owned()),
     };
-    let policy_digest = source_map::digest_fields(&[
-        "oxide-source-map-policy-v1",
-        source_map::SOURCE_MAP_VERSION,
-        "experimental-logical",
-        source_map::ACCEPTED_LOGICAL_POLICY,
-        LOGICAL_PREFIX,
-    ]);
-    let mut map_fields = vec![policy_digest];
-    map_fields.push("a".to_owned());
-    map_fields.push(a.to_string_lossy().into_owned());
-    map_fields.push("b".to_owned());
-    map_fields.push(b.to_string_lossy().into_owned());
-    map_fields.extend(flags.iter().cloned());
-    let borrowed: Vec<_> = map_fields.iter().map(String::as_str).collect();
-    let map_digest = source_map::digest_fields(&borrowed);
-    let disposable_digest = source_map::disposable_root_identity(ROOT_ID, mount)
-        .map_err(|error| format!("probe disposable root identity failed: {error:?}"))?;
-    partition.path_identity = format!("disposable-root:{ROOT_ID}:{disposable_digest}:{map_digest}");
     Ok(partition)
+}
+
+fn identity_only_miss_controls_for_key_preview() -> source_map::MissControlEvidence {
+    let digest = |value: &str| source_map::digest_fields(&["probe-control", value]);
+    source_map::MissControlEvidence {
+        source: Some(source_map::SourceMissControl {
+            before_tree_digest: digest("source-before"),
+            after_tree_digest: digest("source-after"),
+            partition_digest: digest("source-partition"),
+            rebuilt_units: 1,
+        }),
+        configuration: Some(source_map::KeyMissControl {
+            before_input_digest: digest("config-before"),
+            after_input_digest: digest("config-after"),
+            before_partition_digest: digest("config-partition-before"),
+            after_partition_digest: digest("config-partition-after"),
+        }),
+        toolchain: Some(source_map::KeyMissControl {
+            before_input_digest: digest("tool-before"),
+            after_input_digest: digest("tool-after"),
+            before_partition_digest: digest("tool-partition-before"),
+            after_partition_digest: digest("tool-partition-after"),
+        }),
+    }
 }
 
 fn source_policy(
@@ -1287,6 +1323,12 @@ fn source_policy(
                 path: b.to_path_buf(),
             },
         ],
+        relative_prefixes: vec![source_map::RelativeSourcePrefix {
+            root_ids: vec!["a".to_owned(), "b".to_owned()],
+            compiler_working_directory: PathBuf::from("."),
+            package_directory: PathBuf::from("probe"),
+            prefix: PathBuf::from("probe"),
+        }],
         miss_controls: Some(miss_controls),
     }
 }
@@ -1312,7 +1354,7 @@ fn invocation(
             workflows: vec![WorkflowOptIn {
                 workflow: WORKFLOW.to_owned(),
                 selector: SELECTOR.to_owned(),
-                profile: "dev".to_owned(),
+                profile: "test".to_owned(),
                 features: Vec::new(),
                 required_slot_bytes: SLOT_RESERVATION,
                 cargo_config_keys: Vec::new(),
@@ -1958,7 +2000,7 @@ fn setup_image(image: &Path, mount: &Path, setup_temp: &Path) -> Result<(String,
             "-fs",
             "APFS",
             "-volname",
-            "oxide-rust-probe-fixture",
+            "oxide-rust-probe-paths",
             "-nospotlight",
             "-quiet",
         ])

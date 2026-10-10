@@ -5,3 +5,13 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 rust-version = "1.97.1"
+
+[profile.dev]
+debug = 2
+strip = "none"
+split-debuginfo = "packed"
+
+[profile.test]
+debug = 2
+strip = "none"
+split-debuginfo = "packed"

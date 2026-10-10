@@ -16,7 +16,10 @@ use std::time::{Duration, Instant};
 const MAX_CARGO_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SCANNER_BYTES: usize = 1024 * 1024;
 const MAX_ARTIFACTS: usize = 16;
+const MAX_DEBUG_BUNDLE_FILES: usize = 64;
+const MAX_DEBUG_BUNDLE_BYTES: u64 = 512 * 1024 * 1024;
 const ORIGIN_FILE: &str = "oxide-compile-origins-v1.txt";
+const EXPECTED_LOGICAL_TEST_SOURCE: &str = "/oxide-source-map-probe/probe/tests/probe.rs";
 const SCANNER_TIMEOUT: Duration = Duration::from_secs(60);
 const SCANNER_POLL: Duration = Duration::from_millis(20);
 
@@ -373,6 +376,37 @@ pub(super) fn produce_preflight_observations(
             }
         }
     }
+    for artifact in &summary.artifacts {
+        if !artifact.target_kinds.iter().any(|kind| kind == "test") {
+            continue;
+        }
+        let Some(executable) = artifact.executable.as_deref() else {
+            scans_complete = false;
+            report.push_str("\ndebug-companion\tmissing-cargo-executable");
+            continue;
+        };
+        let Some(capture_index) = paths.iter().position(|(path, _)| path == executable) else {
+            scans_complete = false;
+            report.push_str("\ndebug-companion\tmissing-preflight-artifact-capture");
+            continue;
+        };
+        let bound = capture_preflight_debug_companion(
+            executable,
+            &capture_root.join(format!("preflight-raw-{capture_index}.bin")),
+            &format!("preflight-test-{capture_index}"),
+            capture_root,
+            output_references,
+            temp_dir,
+            cancellation,
+        )?;
+        if !bound {
+            scans_complete = false;
+        }
+        report.push_str(&format!(
+            "\ndebug-companion\t{}\tbound={bound}",
+            artifact.target_name
+        ));
+    }
     report.push_str(if scans_complete {
         "\nscan_complete=true\n"
     } else {
@@ -398,6 +432,216 @@ pub(super) fn produce_preflight_observations(
         "preflight-observations.txt",
         report.as_bytes(),
     )
+}
+
+fn capture_preflight_debug_companion(
+    executable: &Path,
+    executable_capture: &Path,
+    name: &str,
+    capture_root: &Path,
+    output_references: &mut Vec<String>,
+    temp_dir: &Path,
+    cancellation: &dyn CancellationProbe,
+) -> Result<bool, String> {
+    let bundle = match discover_debug_bundle(executable) {
+        Ok(Some(bundle)) => bundle,
+        Ok(None) => {
+            add_capture(
+                output_references,
+                capture_root,
+                &format!("{name}-debug-companion-missing.txt"),
+                b"no packed debug companion was discovered for the Cargo-reported test executable\n",
+            )?;
+            return Ok(false);
+        }
+        Err(error) => {
+            add_capture(
+                output_references,
+                capture_root,
+                &format!("{name}-debug-companion-discovery-error.txt"),
+                error.as_bytes(),
+            )?;
+            return Ok(false);
+        }
+    };
+    let executable_uuid = run_bounded_raw(
+        "dwarfdump",
+        &["--uuid", executable.to_str().unwrap_or("")],
+        Some(temp_dir),
+        Some(cancellation),
+    );
+    let companion_uuid = run_bounded_raw(
+        "dwarfdump",
+        &["--uuid", bundle.dwarf_file.to_str().unwrap_or("")],
+        Some(temp_dir),
+        Some(cancellation),
+    );
+    let executable_uuid = match executable_uuid {
+        Ok(bytes) => bytes,
+        Err((error, partial)) => {
+            add_capture(
+                output_references,
+                capture_root,
+                &format!("{name}-executable-uuid.txt"),
+                &partial,
+            )?;
+            add_capture(
+                output_references,
+                capture_root,
+                &format!("{name}-executable-uuid-error.txt"),
+                error.as_bytes(),
+            )?;
+            return Ok(false);
+        }
+    };
+    let companion_uuid = match companion_uuid {
+        Ok(bytes) => bytes,
+        Err((error, partial)) => {
+            add_capture(
+                output_references,
+                capture_root,
+                &format!("{name}-companion-uuid.txt"),
+                &partial,
+            )?;
+            add_capture(
+                output_references,
+                capture_root,
+                &format!("{name}-companion-uuid-error.txt"),
+                error.as_bytes(),
+            )?;
+            return Ok(false);
+        }
+    };
+    add_capture(
+        output_references,
+        capture_root,
+        &format!("{name}-executable-uuid.txt"),
+        &executable_uuid,
+    )?;
+    add_capture(
+        output_references,
+        capture_root,
+        &format!("{name}-companion-uuid.txt"),
+        &companion_uuid,
+    )?;
+    let (manifest, copied_digest) =
+        match capture_debug_bundle(&bundle, name, capture_root, output_references, cancellation) {
+            Ok(result) => result,
+            Err(error) => {
+                add_capture(
+                    output_references,
+                    capture_root,
+                    &format!("{name}-debug-bundle-capture-error.txt"),
+                    error.as_bytes(),
+                )?;
+                return Ok(false);
+            }
+        };
+    let mut outputs = BTreeMap::new();
+    for (suffix, args) in [
+        (
+            "sections",
+            vec![
+                "--show-section-sizes",
+                bundle.dwarf_file.to_str().unwrap_or(""),
+            ],
+        ),
+        (
+            "debug-info",
+            vec!["--debug-info", bundle.dwarf_file.to_str().unwrap_or("")],
+        ),
+        (
+            "debug-line",
+            vec!["--debug-line", bundle.dwarf_file.to_str().unwrap_or("")],
+        ),
+        (
+            "debug-abbrev",
+            vec!["--debug-abbrev", bundle.dwarf_file.to_str().unwrap_or("")],
+        ),
+    ] {
+        let reference = format!("{name}-{suffix}.txt");
+        match run_bounded_raw("dwarfdump", &args, Some(temp_dir), Some(cancellation)) {
+            Ok(bytes) => {
+                add_capture(output_references, capture_root, &reference, &bytes)?;
+                outputs.insert(suffix, bytes);
+            }
+            Err((error, partial)) => {
+                add_capture(output_references, capture_root, &reference, &partial)?;
+                add_capture(
+                    output_references,
+                    capture_root,
+                    &format!("{name}-{suffix}-error.txt"),
+                    error.as_bytes(),
+                )?;
+                return Ok(false);
+            }
+        }
+    }
+    let section_output = outputs
+        .get("sections")
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let sections: Vec<_> = [".debug_info", ".debug_line", ".debug_abbrev"]
+        .into_iter()
+        .filter(|section| section_output_has(section_output, section))
+        .collect();
+    let debug_sources = extract_debug_source_paths(
+        outputs
+            .get("debug-info")
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+        outputs
+            .get("debug-line")
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+    );
+    let source_lookup_pass = debug_sources
+        .iter()
+        .any(|path| path == Path::new(EXPECTED_LOGICAL_TEST_SOURCE));
+    let companion_digest = digest_file(&bundle.dwarf_file)?;
+    let source_lookup = format!(
+        "oxide-debug-source-lookup-v1\nexpected={EXPECTED_LOGICAL_TEST_SOURCE}\ndebug_file_sha256={companion_digest}\npass={source_lookup_pass}\n{}",
+        debug_sources
+            .iter()
+            .map(|path| format!("source\t{}\n", path.display()))
+            .collect::<String>()
+    );
+    add_capture(
+        output_references,
+        capture_root,
+        &format!("{name}-debug-source-lookup.txt"),
+        source_lookup.as_bytes(),
+    )?;
+    let executable_digest = digest_file(executable)?;
+    let bound = debug_binding_matches(
+        &executable_uuid,
+        &companion_uuid,
+        &executable_digest,
+        &digest_file(executable_capture)?,
+        &companion_digest,
+        &copied_digest,
+        &sections,
+    ) && source_lookup_pass;
+    let line_digest = outputs
+        .get("debug-line")
+        .map(|bytes| hex_digest(bytes))
+        .unwrap_or_else(|| "missing".to_owned());
+    add_capture(
+        output_references,
+        capture_root,
+        &format!("{name}-debug-binding.txt"),
+        format!(
+            "oxide-debug-companion-binding-v1\nexecutable={}\nexecutable_sha256={}\ndebug_file={}\ndebug_file_sha256={}\nbundle_manifest_sha256={}\nlayout=packed\ndebug_line_sha256={}\nbound={bound}\n",
+            executable.display(),
+            executable_digest,
+            bundle.dwarf_file.display(),
+            companion_digest,
+            hex_digest(&manifest),
+            line_digest,
+        )
+        .as_bytes(),
+    )?;
+    Ok(bound)
 }
 
 pub(super) fn produce_registered_observations(
@@ -620,7 +864,10 @@ pub(super) fn produce_registered_observations(
             ));
         }
         for path in &artifact.oso_paths {
-            rows.push(format!("source\t{}\tapple-oso\t{}", artifact.name, path));
+            rows.push(format!(
+                "oso-object\t{}\t{}-oso.txt\t{}",
+                artifact.name, artifact.name, path
+            ));
         }
     }
     if scans_complete {
@@ -661,6 +908,11 @@ struct ScannedArtifact {
     oso_paths: Vec<String>,
     oso_emitted: bool,
     is_test: bool,
+}
+
+struct DebugBundle {
+    path: PathBuf,
+    dwarf_file: PathBuf,
 }
 
 fn scan_artifacts(
@@ -745,32 +997,169 @@ fn scan_artifacts(
         let name = format!("probe-{index}");
         let copy_name = format!("raw-{name}.bin");
         copy_capture(path, &capture_root.join(&copy_name), bytes, cancellation)?;
+        if digest_file(path)? != digest || digest_file(&capture_root.join(&copy_name))? != digest {
+            scanner_failed = true;
+            break;
+        }
         if cancellation.is_cancelled() {
             return Err("binary scanner capture was cancelled by the resource guard".to_owned());
         }
         output_references.push(copy_name);
+
+        let bundle = match discover_debug_bundle(path) {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                add_capture(
+                    output_references,
+                    capture_root,
+                    &format!("{name}-debug-companion-discovery-error.txt"),
+                    error.as_bytes(),
+                )?;
+                scanner_failed = true;
+                break;
+            }
+        };
+        if bundle.is_none() && *is_test {
+            add_capture(
+                output_references,
+                capture_root,
+                &format!("{name}-debug-companion-missing.txt"),
+                b"packed debug companion was not discovered beside the Cargo-reported test executable\n",
+            )?;
+            scanner_failed = true;
+            break;
+        }
+        let debug_path = bundle
+            .as_ref()
+            .map(|bundle| bundle.dwarf_file.as_path())
+            .unwrap_or(path);
+        let mut executable_uuid = None;
+        let mut companion_uuid = None;
+        let mut captured_companion_digest = None;
+        let mut bundle_manifest_digest = None;
+        if let Some(bundle) = &bundle {
+            let executable_output = match run_bounded_raw(
+                "dwarfdump",
+                &["--uuid", path.to_str().unwrap_or("")],
+                Some(temp_dir),
+                Some(cancellation),
+            ) {
+                Ok(output) => output,
+                Err((reason, partial)) => {
+                    add_capture(
+                        output_references,
+                        capture_root,
+                        &format!("{name}-executable-uuid.txt"),
+                        &partial,
+                    )?;
+                    add_capture(
+                        output_references,
+                        capture_root,
+                        &format!("{name}-uuid-error.txt"),
+                        reason.as_bytes(),
+                    )?;
+                    scanner_failed = true;
+                    break;
+                }
+            };
+            let companion_output = match run_bounded_raw(
+                "dwarfdump",
+                &["--uuid", bundle.dwarf_file.to_str().unwrap_or("")],
+                Some(temp_dir),
+                Some(cancellation),
+            ) {
+                Ok(output) => output,
+                Err((reason, partial)) => {
+                    add_capture(
+                        output_references,
+                        capture_root,
+                        &format!("{name}-companion-uuid.txt"),
+                        &partial,
+                    )?;
+                    add_capture(
+                        output_references,
+                        capture_root,
+                        &format!("{name}-uuid-error.txt"),
+                        reason.as_bytes(),
+                    )?;
+                    scanner_failed = true;
+                    break;
+                }
+            };
+            add_capture(
+                output_references,
+                capture_root,
+                &format!("{name}-executable-uuid.txt"),
+                &executable_output,
+            )?;
+            add_capture(
+                output_references,
+                capture_root,
+                &format!("{name}-companion-uuid.txt"),
+                &companion_output,
+            )?;
+            let (bundle_manifest, captured_dwarf_digest) = match capture_debug_bundle(
+                bundle,
+                &name,
+                capture_root,
+                output_references,
+                cancellation,
+            ) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    add_capture(
+                        output_references,
+                        capture_root,
+                        &format!("{name}-debug-bundle-capture-error.txt"),
+                        error.as_bytes(),
+                    )?;
+                    scanner_failed = true;
+                    break;
+                }
+            };
+            let executable_digest = digest_file(path)?;
+            let companion_digest = digest_file(&bundle.dwarf_file)?;
+            captured_companion_digest = Some(captured_dwarf_digest);
+            bundle_manifest_digest = Some(hex_digest(&bundle_manifest));
+            executable_uuid = Some(executable_output);
+            companion_uuid = Some(companion_output);
+            add_capture(
+                output_references,
+                capture_root,
+                &format!("{name}-debug-binding.txt"),
+                format!(
+                    "oxide-debug-companion-binding-v1\nexecutable={}\nexecutable_sha256={}\ndebug_file={}\ndebug_file_sha256={}\nbundle_manifest_sha256={}\nlayout=packed\n",
+                    path.display(),
+                    executable_digest,
+                    bundle.dwarf_file.display(),
+                    companion_digest,
+                    hex_digest(&bundle_manifest),
+                )
+                .as_bytes(),
+            )?;
+        }
 
         let mut outputs = BTreeMap::new();
         for (tool, suffix, arguments) in [
             (
                 "dwarfdump",
                 "sections",
-                vec!["--show-section-sizes", path.to_str().unwrap_or("")],
+                vec!["--show-section-sizes", debug_path.to_str().unwrap_or("")],
             ),
             (
                 "dwarfdump",
                 "debug-info",
-                vec!["--debug-info", path.to_str().unwrap_or("")],
+                vec!["--debug-info", debug_path.to_str().unwrap_or("")],
             ),
             (
                 "dwarfdump",
                 "debug-line",
-                vec!["--debug-line", path.to_str().unwrap_or("")],
+                vec!["--debug-line", debug_path.to_str().unwrap_or("")],
             ),
             (
                 "dwarfdump",
                 "debug-abbrev",
-                vec!["--debug-abbrev", path.to_str().unwrap_or("")],
+                vec!["--debug-abbrev", debug_path.to_str().unwrap_or("")],
             ),
             ("nm", "oso", vec!["-a", "-m", path.to_str().unwrap_or("")]),
         ] {
@@ -819,31 +1208,35 @@ fn scan_artifacts(
 
         let sections = [".debug_info", ".debug_line", ".debug_abbrev"]
             .into_iter()
-            .filter(|section| {
-                let short = section.trim_start_matches('.');
-                let apple = format!("__{short}");
-                let output = String::from_utf8_lossy(section_sizes);
-                output.contains(section) || output.contains(&apple) || output.contains(short)
-            })
+            .filter(|section| section_output_has(section_sizes, section))
             .collect::<Vec<_>>();
         let mut source_paths = debug_source_paths(info, lines, map);
         source_paths.sort();
         source_paths.dedup();
+        if let (Some(executable_uuid), Some(companion_uuid)) =
+            (executable_uuid.as_deref(), companion_uuid.as_deref())
+        {
+            let executable_copy = capture_root.join(format!("raw-{name}.bin"));
+            let source_companion_digest = digest_file(debug_path)?;
+            let sections_ref: Vec<_> = sections.iter().map(|section| *section).collect();
+            if !debug_binding_matches(
+                executable_uuid,
+                companion_uuid,
+                &digest_file(path)?,
+                &digest_file(&executable_copy)?,
+                &source_companion_digest,
+                captured_companion_digest.as_deref().unwrap_or(""),
+                &sections_ref,
+            ) || bundle_manifest_digest.is_none()
+            {
+                scanner_failed = true;
+                break;
+            }
+        }
         let oso_emitted = String::from_utf8_lossy(oso)
             .lines()
             .any(|line| line.contains("OSO "));
-        let oso_paths = oso_paths(oso)
-            .into_iter()
-            .filter(|path| {
-                let observed = Path::new(path);
-                map.logical_prefix()
-                    .is_some_and(|prefix| observed.starts_with(prefix))
-                    || map
-                        .authorized_roots()
-                        .iter()
-                        .any(|root| observed.starts_with(&root.path))
-            })
-            .collect();
+        let oso_paths = oso_paths(oso);
         scanned.push(ScannedArtifact {
             name,
             root_kind,
@@ -868,6 +1261,157 @@ fn scan_artifacts(
         let complete = !scanned.is_empty();
         Ok((scanned, complete))
     }
+}
+
+fn discover_debug_bundle(executable: &Path) -> Result<Option<DebugBundle>, String> {
+    let parent = executable
+        .parent()
+        .ok_or_else(|| "Cargo artifact has no parent directory".to_owned())?;
+    let mut bundles = Vec::new();
+    for entry in fs::read_dir(parent).map_err(|error| error.to_string())? {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "dSYM")
+            && fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        {
+            bundles.push(path);
+        }
+    }
+    if bundles.is_empty() {
+        return Ok(None);
+    }
+    if bundles.len() != 1 {
+        return Err("Cargo artifact has ambiguous sibling dSYM bundles".to_owned());
+    }
+    let path = bundles.remove(0);
+    if fs::canonicalize(&path).ok().as_deref() != Some(path.as_path()) {
+        return Err("debug companion is not a canonical directory".to_owned());
+    }
+    let dwarf_dir = path.join("Contents/Resources/DWARF");
+    let mut dwarf_files = Vec::new();
+    for entry in fs::read_dir(&dwarf_dir).map_err(|error| error.to_string())? {
+        let file = entry.map_err(|error| error.to_string())?.path();
+        let metadata = fs::symlink_metadata(&file).map_err(|error| error.to_string())?;
+        if metadata.is_file() && !metadata.file_type().is_symlink() {
+            dwarf_files.push(file);
+        }
+    }
+    if dwarf_files.len() != 1 {
+        return Err("debug companion must contain exactly one DWARF payload".to_owned());
+    }
+    let dwarf_file = dwarf_files.remove(0);
+    if fs::canonicalize(&dwarf_file).ok().as_deref() != Some(dwarf_file.as_path()) {
+        return Err("debug payload is not a canonical file".to_owned());
+    }
+    Ok(Some(DebugBundle { path, dwarf_file }))
+}
+
+fn capture_debug_bundle(
+    bundle: &DebugBundle,
+    artifact_name: &str,
+    capture_root: &Path,
+    output_references: &mut Vec<String>,
+    cancellation: &dyn CancellationProbe,
+) -> Result<(Vec<u8>, String), String> {
+    let mut files = Vec::new();
+    collect_files(&bundle.path, &bundle.path, &mut files)?;
+    files.sort();
+    if files.is_empty() || files.len() > MAX_DEBUG_BUNDLE_FILES {
+        return Err("debug companion file count is outside its capture bound".to_owned());
+    }
+    let mut total_bytes = 0u64;
+    let mut dwarf_copy_digest = None;
+    let mut manifest = format!("oxide-debug-bundle-v1\nbundle={}\n", bundle.path.display());
+    for (index, relative) in files.iter().enumerate() {
+        let relative_text = relative
+            .to_str()
+            .ok_or_else(|| "debug companion path is not UTF-8".to_owned())?;
+        if relative_text.contains(['\t', '\r', '\n']) {
+            return Err("debug companion path contains a manifest delimiter".to_owned());
+        }
+        let source = bundle.path.join(relative);
+        let metadata = fs::symlink_metadata(&source).map_err(|error| error.to_string())?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err("debug companion contains a non-regular file".to_owned());
+        }
+        total_bytes = total_bytes
+            .checked_add(metadata.len())
+            .ok_or_else(|| "debug companion size overflowed".to_owned())?;
+        if total_bytes > MAX_DEBUG_BUNDLE_BYTES {
+            return Err("debug companion exceeds its private capture bound".to_owned());
+        }
+        let reference = format!("{artifact_name}-debug-{index:02}.bin");
+        copy_capture(
+            &source,
+            &capture_root.join(&reference),
+            metadata.len(),
+            cancellation,
+        )?;
+        let source_digest = digest_file(&source)?;
+        let copied_digest = digest_file(&capture_root.join(&reference))?;
+        if source_digest != copied_digest {
+            return Err("captured debug companion hash does not match its source".to_owned());
+        }
+        if source == bundle.dwarf_file {
+            dwarf_copy_digest = Some(copied_digest.clone());
+        }
+        manifest.push_str(&format!(
+            "file\t{relative_text}\t{reference}\t{source_digest}\n"
+        ));
+        output_references.push(reference);
+    }
+    let manifest_bytes = manifest.into_bytes();
+    add_capture(
+        output_references,
+        capture_root,
+        &format!("{artifact_name}-debug-companion.txt"),
+        &manifest_bytes,
+    )?;
+    Ok((
+        manifest_bytes,
+        dwarf_copy_digest.ok_or_else(|| "debug bundle omitted its DWARF payload".to_owned())?,
+    ))
+}
+
+fn debug_binding_matches(
+    executable_uuid: &[u8],
+    companion_uuid: &[u8],
+    executable_digest: &str,
+    captured_executable_digest: &str,
+    companion_digest: &str,
+    captured_companion_digest: &str,
+    sections: &[&str],
+) -> bool {
+    fn uuids(output: &[u8]) -> BTreeSet<(String, String)> {
+        String::from_utf8_lossy(output)
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                let ["UUID:", uuid, arch, ..] = fields.as_slice() else {
+                    return None;
+                };
+                let uuid = uuid.to_ascii_lowercase();
+                let arch = arch.trim_matches(['(', ')']).to_owned();
+                (uuid.len() == 32
+                    && uuid.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && !arch.is_empty())
+                .then_some((uuid, arch))
+            })
+            .collect()
+    }
+    let executable_uuids = uuids(executable_uuid);
+    let companion_uuids = uuids(companion_uuid);
+    !executable_uuids.is_empty()
+        && executable_uuids == companion_uuids
+        && valid_sha256(executable_digest)
+        && executable_digest == captured_executable_digest
+        && valid_sha256(companion_digest)
+        && companion_digest == captured_companion_digest
+        && [".debug_info", ".debug_line", ".debug_abbrev"]
+            .iter()
+            .all(|required| sections.contains(required))
 }
 
 fn compile_origins(
@@ -1223,12 +1767,27 @@ fn json_container_end(value: &str, open: u8, close: u8) -> Option<usize> {
 }
 
 fn debug_source_paths(info: &[u8], lines: &[u8], map: &ResolvedSourceMap) -> Vec<String> {
+    extract_debug_source_paths(info, lines)
+        .into_iter()
+        .filter(|path| {
+            map.logical_prefix()
+                .is_some_and(|prefix| path.starts_with(prefix))
+                || map
+                    .authorized_roots()
+                    .iter()
+                    .any(|root| path.starts_with(&root.path))
+        })
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn extract_debug_source_paths(info: &[u8], lines: &[u8]) -> BTreeSet<PathBuf> {
     let mut paths = BTreeSet::new();
     let mut comp_dir = None;
     let mut names = Vec::new();
     for line in String::from_utf8_lossy(info).lines() {
         if line.contains("DW_TAG_compile_unit") {
-            flush_debug_names(&mut names, comp_dir.as_deref(), map, &mut paths);
+            flush_debug_names(&mut names, comp_dir.as_deref(), &mut paths);
             comp_dir = None;
         } else if line.contains("DW_AT_comp_dir") {
             comp_dir = quoted_value(line);
@@ -1238,20 +1797,44 @@ fn debug_source_paths(info: &[u8], lines: &[u8], map: &ResolvedSourceMap) -> Vec
             }
         }
     }
-    flush_debug_names(&mut names, comp_dir.as_deref(), map, &mut paths);
+    flush_debug_names(&mut names, comp_dir.as_deref(), &mut paths);
     for line in String::from_utf8_lossy(lines).lines() {
         if let Some(value) = quoted_value(line).filter(|value| value.ends_with(".rs")) {
-            add_source_path(PathBuf::from(value), map, &mut paths);
+            paths.insert(PathBuf::from(value));
         }
     }
-    paths.into_iter().collect()
+    paths
+}
+
+fn section_output_has(output: &[u8], section: &str) -> bool {
+    let short = section.trim_start_matches('.');
+    let apple = format!("__{short}");
+    String::from_utf8_lossy(output).lines().any(|line| {
+        line.split_whitespace().any(|field| {
+            let field = field.trim_matches(|character: char| {
+                matches!(character, ':' | ',' | '(' | ')' | '[' | ']')
+            });
+            field == section || field == short || field == apple
+        })
+    })
+}
+
+#[test]
+fn debug_section_detection_requires_a_section_token() {
+    assert!(section_output_has(
+        b"__DWARF __debug_info 0x1234\n__DWARF __debug_line 0x2345\n__DWARF __debug_abbrev 0x3456\n",
+        ".debug_info"
+    ));
+    assert!(!section_output_has(
+        b"section name includes debug_info_extra 0x1234\n",
+        ".debug_info"
+    ));
 }
 
 fn flush_debug_names(
     names: &mut Vec<String>,
     comp_dir: Option<&str>,
-    map: &ResolvedSourceMap,
-    paths: &mut BTreeSet<String>,
+    paths: &mut BTreeSet<PathBuf>,
 ) {
     for name in names.drain(..) {
         let path = PathBuf::from(&name);
@@ -1262,21 +1845,7 @@ fn flush_debug_names(
         } else {
             continue;
         };
-        add_source_path(path, map, paths);
-    }
-}
-
-fn add_source_path(path: PathBuf, map: &ResolvedSourceMap, paths: &mut BTreeSet<String>) {
-    let candidate = path.to_string_lossy().into_owned();
-    if map
-        .logical_prefix()
-        .is_some_and(|prefix| Path::new(&candidate).starts_with(prefix))
-        || map
-            .authorized_roots()
-            .iter()
-            .any(|root| Path::new(&candidate).starts_with(&root.path))
-    {
-        paths.insert(candidate);
+        paths.insert(path);
     }
 }
 
@@ -1687,6 +2256,7 @@ fn sample_map(volume: &Path, workspace: &Path, tree: &str) -> super::source_map:
             id: "a".to_owned(),
             path: workspace.to_path_buf(),
         }],
+        relative_prefixes: Vec::new(),
         miss_controls: Some(MissControlEvidence {
             source: Some(SourceMissControl {
                 before_tree_digest: sample_digest("tree-before"),
@@ -1779,7 +2349,7 @@ fn inspect_cargo_output_rejects_malformed_and_duplicate_probe_rows() {
 }
 
 #[test]
-fn debug_and_oso_scanners_keep_mapped_paths_and_drop_foreign_ones() {
+fn debug_paths_are_mapped_while_raw_oso_objects_are_preserved() {
     let scratch = producer_scratch("scanner");
     let volume = scratch.join("volume");
     let workspace = volume.join("a");
@@ -1808,19 +2378,13 @@ The file name is "/private/var/tmp/unrelated/src/lib.rs"
 0000000000000000 - 00 0000    OSO /private/var/tmp/other/probe.o
 0000000000000000 - 01 0001    FUN _probe
 "#;
-    let observed = oso_paths(oso)
-        .into_iter()
-        .filter(|path| {
-            Path::new(path).starts_with("/oxide-source-map-probe")
-                || map
-                    .authorized_roots()
-                    .iter()
-                    .any(|root| Path::new(path).starts_with(&root.path))
-        })
-        .collect::<Vec<_>>();
+    let observed = oso_paths(oso);
     assert_eq!(
         observed,
-        vec!["/oxide-source-map-probe/a/target/debug/deps/probe.o".to_owned()]
+        vec![
+            "/oxide-source-map-probe/a/target/debug/deps/probe.o".to_owned(),
+            "/private/var/tmp/other/probe.o".to_owned(),
+        ]
     );
     let _ = fs::remove_dir_all(&scratch);
 }
@@ -1900,5 +2464,98 @@ fn origin_ledger_records_rebuilt_units_and_preserves_fresh_matches() {
         Ok(_) => panic!("malformed ledger"),
     };
     assert!(error.contains("unknown"));
+    let _ = fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn packed_debug_companion_requires_uuid_hash_and_complete_dwarf_binding() {
+    let executable_uuid = b"UUID: 0123456789abcdef0123456789abcdef (arm64) /capture/test\n";
+    let companion_uuid = b"UUID: 0123456789abcdef0123456789abcdef (arm64) /capture/test.dSYM\n";
+    let executable_digest = sample_digest("executable");
+    let companion_digest = sample_digest("companion");
+    let sections = [".debug_info", ".debug_line", ".debug_abbrev"];
+    let valid = || {
+        debug_binding_matches(
+            executable_uuid,
+            companion_uuid,
+            &executable_digest,
+            &executable_digest,
+            &companion_digest,
+            &companion_digest,
+            &sections,
+        )
+    };
+    assert!(valid());
+    assert!(!debug_binding_matches(
+        executable_uuid,
+        b"",
+        &executable_digest,
+        &executable_digest,
+        &companion_digest,
+        &companion_digest,
+        &sections,
+    ));
+    assert!(!debug_binding_matches(
+        executable_uuid,
+        b"UUID: fedcba9876543210fedcba9876543210 (arm64) /capture/other.dSYM\n",
+        &executable_digest,
+        &executable_digest,
+        &companion_digest,
+        &companion_digest,
+        &sections,
+    ));
+    assert!(!debug_binding_matches(
+        executable_uuid,
+        companion_uuid,
+        &executable_digest,
+        &sample_digest("tampered-executable"),
+        &companion_digest,
+        &companion_digest,
+        &sections,
+    ));
+    assert!(!debug_binding_matches(
+        executable_uuid,
+        companion_uuid,
+        &executable_digest,
+        &executable_digest,
+        &companion_digest,
+        &sample_digest("tampered-companion"),
+        &sections,
+    ));
+    assert!(!debug_binding_matches(
+        executable_uuid,
+        companion_uuid,
+        &executable_digest,
+        &executable_digest,
+        &companion_digest,
+        &companion_digest,
+        &[".debug_info", ".debug_line"],
+    ));
+}
+
+#[test]
+fn packed_debug_companion_discovery_reports_missing_and_ambiguous_bundles() {
+    let scratch = producer_scratch("debug-bundles");
+    let target = scratch.join("target");
+    fs::create_dir_all(&target).expect("target");
+    let executable = target.join("probe-test");
+    fs::write(&executable, b"test executable").expect("executable");
+    assert!(discover_debug_bundle(&executable)
+        .expect("no companion is a valid observation")
+        .is_none());
+
+    let bundle = target.join("probe-test.dSYM");
+    let dwarf = bundle.join("Contents/Resources/DWARF");
+    fs::create_dir_all(&dwarf).expect("dwarf directory");
+    fs::write(dwarf.join("probe"), b"debug payload").expect("debug payload");
+    assert!(discover_debug_bundle(&executable)
+        .expect("one companion")
+        .is_some());
+
+    let second = target.join("other.dSYM");
+    let second_dwarf = second.join("Contents/Resources/DWARF");
+    fs::create_dir_all(&second_dwarf).expect("second dwarf directory");
+    fs::write(second_dwarf.join("other"), b"other payload").expect("other payload");
+    assert!(discover_debug_bundle(&executable).is_err());
     let _ = fs::remove_dir_all(&scratch);
 }
