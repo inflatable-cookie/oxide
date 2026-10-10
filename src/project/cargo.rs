@@ -257,22 +257,31 @@ impl FixtureCommandRunner for CargoWorkflowRunner {
                 map.requested_root_id(),
                 claim.binding.source_tree_digest,
             )
-        } else if claim.binding.task_id == "6ca14e7a-2cf9-42d3-8f94-f45daad4b2dc"
-            && command.workflow == "oxide-cargo-source-map-probe"
-        {
-            let encoded_flags = command
-                .environment
-                .iter()
-                .find(|value| value.name == "CARGO_ENCODED_RUSTFLAGS")
-                .and_then(|value| value.value.as_deref())
-                .unwrap_or("");
-            format!(
-                "source_map_policy=unqualified-preflight\nsource_map_digest=unqualified\nsource_map_flags_digest={}\nsource_tree={}\n",
-                hex_digest(encoded_flags.as_bytes()),
-                claim.binding.source_tree_digest,
-            )
         } else {
-            "source_map_policy=checkout-isolated\nsource_map_digest=none\n".to_owned()
+            #[cfg(test)]
+            {
+                if claim.binding.task_id == "6ca14e7a-2cf9-42d3-8f94-f45daad4b2dc"
+                    && command.workflow == "oxide-cargo-source-map-probe"
+                {
+                    let encoded_flags = command
+                        .environment
+                        .iter()
+                        .find(|value| value.name == "CARGO_ENCODED_RUSTFLAGS")
+                        .and_then(|value| value.value.as_deref())
+                        .unwrap_or("");
+                    format!(
+                        "source_map_policy=unqualified-preflight\nsource_map_digest=unqualified\nsource_map_flags_digest={}\nsource_tree={}\n",
+                        hex_digest(encoded_flags.as_bytes()),
+                        claim.binding.source_tree_digest,
+                    )
+                } else {
+                    "source_map_policy=checkout-isolated\nsource_map_digest=none\n".to_owned()
+                }
+            }
+            #[cfg(not(test))]
+            {
+                "source_map_policy=checkout-isolated\nsource_map_digest=none\n".to_owned()
+            }
         };
         let manifest = format!(
             "oxide-cargo-workflow-v1\nhead={}\nsource={}\ndefinition={}\nlauncher={}\nenvironment={}\nprocess_start_identity={}\nstart_marker_digest={}\n{}run={}\nattempt={}\nhost_run={}\nlease={}\nslot={}\nselector={}\nexit_code={}\nelapsed_ms={}\nfree_space_samples={}\nrebuilt_units={}\nrebuilt_names={}\nstdout={}\nstderr={}\n",
