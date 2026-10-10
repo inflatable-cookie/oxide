@@ -11,12 +11,12 @@ use crate::storage::{
     TerminalRecord,
 };
 use std::fs::File;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 
-const ROOT: &str = "/private/var/tmp/oxide-rust-probe-proof-019-reuse";
-const SCOPE: &str = "oxide-019-same-root-v1";
+const ROOT: &str = "/private/var/tmp/oxide-rust-probe-proof-021-reuse-v2";
+const SCOPE: &str = "oxide-021-same-root-v2";
 const T0: &str = "sha256:550e62cefc7f647fef97b12489fc2c1e1ba67fd56a7529401fce25c97b0ce2e9";
 const T1: &str = "sha256:784b4c701a7b752a11e0b5b99e7fff36f796af643cd3e8514ae16147b237ee26";
 
@@ -250,7 +250,8 @@ fn run_proof(started: Instant) -> Result<(), String> {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/cargo-source-map-probe");
     let frozen = resources::freeze_fixture(&source)?;
     resources::verify_committed_fixture(&source, &frozen)?;
-    let (_device, outside) = resources::setup_image(&image, &mount, &setup, "oxide-same-root-019")?;
+    let (_device, outside) =
+        resources::setup_image(&image, &mount, &setup, "oxide-same-root-021-v2")?;
     budget.outside_directories.store(outside, Ordering::Release);
     budget.mounted.store(true, Ordering::Release);
     for name in ["evidence", "tmp", "home", "cargo-home", "runs", "launch"] {
@@ -337,7 +338,7 @@ fn run_proof(started: Instant) -> Result<(), String> {
     )?;
     budget.sample()?;
     let storage = mount.join("storage");
-    resources::ensure_probe_directory(&storage)?;
+    create_private_storage(&storage)?;
     let daemon = resources::ProbeDaemon::start(&storage, Arc::clone(&budget));
     let client = daemon.client();
     let acquired = Arc::new(Mutex::new(None));
@@ -535,6 +536,52 @@ fn run_proof(started: Instant) -> Result<(), String> {
     // The later session owns any ordinary detach decision. This implementation
     // driver leaves the new resources inspectable and never clears evidence.
     Ok(())
+}
+
+// Create only a new owned root; never repair permissions on an existing path.
+fn create_private_storage(root: &Path) -> Result<(), String> {
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root)
+        .map_err(|error| format!("create private probe storage: {error}"))?;
+    resources::ensure_probe_directory(root)
+}
+
+#[test]
+fn private_storage_setup_binds_daemon_without_repairing_existing_roots() {
+    let owner = super::super::FixtureRoot::new();
+    let parent = owner.dir("setup");
+    let exposed = parent.join("exposed");
+    resources::ensure_probe_directory(&exposed).unwrap();
+    // Model normal permissive directory creation without changing process umask.
+    fs::set_permissions(&exposed, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(create_private_storage(&exposed).is_err());
+    assert_eq!(
+        fs::metadata(&exposed).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+
+    let storage = parent.join("storage");
+    create_private_storage(&storage).unwrap();
+    assert_eq!(fs::canonicalize(&storage).unwrap(), storage);
+    assert_eq!(
+        fs::metadata(&storage).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let daemon = Daemon::bind(
+        DaemonConfig {
+            root: storage.clone(),
+            budget: Budget {
+                cap_bytes: GIB,
+                free_reserve_bytes: 0,
+            },
+        },
+        Arc::new(super::super::FixtureAuthority),
+        Arc::new(super::super::FixedFreeSpace(Some(10 * GIB))),
+    )
+    .expect("same live setup path supplies a private canonical root to the real bind");
+    assert_eq!(daemon.socket_path(), storage.join("daemon.sock"));
+    assert!(create_private_storage(&storage).is_err());
 }
 
 fn invocation(

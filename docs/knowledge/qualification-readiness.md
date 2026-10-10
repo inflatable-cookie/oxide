@@ -2087,8 +2087,14 @@ The ignored later proof is
 `project::tests::cargo_pilot::same_root_probe::same_root_cargo_freshness_owned_proof`
 in [`cargo_same_root.rs`](../../src/project/tests/cargo_same_root.rs).
 It requires `OXIDE_SAME_ROOT_PROOF_RUN=1`,
-`OXIDE_SAME_ROOT_PROOF_SCOPE=oxide-019-same-root-v1`, and a fresh separately scoped
-Queue execution record for `/private/var/tmp/oxide-rust-probe-proof-019-reuse`.
+`OXIDE_SAME_ROOT_PROOF_SCOPE=oxide-021-same-root-v2`, and a fresh separately scoped
+Queue execution record for `/private/var/tmp/oxide-rust-probe-proof-021-reuse-v2`.
+The Task 021 v2 driver creates its new daemon storage directory with mode 0700;
+it refuses existing paths rather than repairing permissions. Its ordinary
+`private_storage_setup_binds_daemon_without_repairing_existing_roots` regression
+uses that same setup helper, checks canonical/private identity and actual
+`Daemon::bind`, and leaves a deliberately exposed existing root unchanged.
+The v1 setup-blocker session below remains preserved and cannot be resumed.
 Run only that exact ignored test through `effigy test rust` with
 `--ignored --exact --test-threads=1` passed to the test runner. Ordinary validation
 leaves it ignored and creates no experimental root. The driver uses an original
@@ -2235,3 +2241,41 @@ independent review and a fresh bounded Queue continuation. Do not patch or retry
 this ended session. Consumer path-pool/lifecycle coordination, successful live
 cold recovery, general Cargo input coverage, real-project qualification,
 adoption and everyday storage relief remain unestablished and separately gated.
+
+
+#### Task 021 v2 private-storage setup correction (2026-10-10)
+
+The v2 driver creates its new storage root via `DirBuilder::mode(0o700)` before
+the unchanged real daemon bind. Creation refuses an existing path, including a
+private root; no existing path's permissions are repaired. Canonical-path checks
+remain in force. The ordinary regression calls that same helper, leaves an
+existing mode-0755 directory exposed, asserts a newly created canonical mode-0700
+root, and binds the real daemon successfully. It creates no APFS image, runs no
+fixture Cargo command and accesses no preserved session root.
+
+The targeted Effigy regression passed (one test, 0.02 seconds) with all four
+scratch variables set to `/private/tmp/oxide-021-v2.vjsYE5` and live flags absent.
+`effigy rust:compile` exited 0 with existing dead-code warnings (124 warning
+records in the compact collector). `effigy rust:format` initially rejected one
+line wrap; after that formatting-only correction it exited 0. No full ordinary
+suite was repeated. RustQuality strict everyday authoring resolved locally with
+no deviations; RUST-READ-001 and RUST-ERR-001 apply. Recoverable helper errors
+propagate; test assertions express explicit regression invariants. Raw ordinary
+check records are retained in the task worktree's Git metadata under
+`northstar/rust-quality/closeouts/a32f85f4ec64e3e47f7cfcc1d0d9dea4c6b7ddc00b5c9dd9362988feb18d2664/`;
+compact summary and corrected format output are in the fresh scratch above.
+
+V2 is separate from the preserved v1 blocker. Its driver ROOT is
+`/private/var/tmp/oxide-rust-probe-proof-021-reuse-v2`, SCOPE is
+`oxide-021-same-root-v2`, and image label is `oxide-same-root-021-v2`.
+Preflight found the root absent and no applicable existing ancestor Cargo config.
+The future daemon socket path is 74 bytes, below the existing 100-byte limit.
+Source inspection confirmed the subsequent runner checks canonical mount/host
+paths, an existing absolute selector, contained output/temp directories and
+registered source identity. The frozen source, selector, packed debug profile,
+physical paths, original six-step sequence and all resource/ownership gates
+remain unchanged. Cargo/rustc 1.97.1 were already installed; nothing was installed.
+Author allocation began `2026-10-10T19:23:11.181Z`, with a 50-minute ceiling
+including correction, validation, the single live proof and closeout. The
+separate independent review allocation is 20 minutes, with retained live
+resources read-only. No review verdict is claimed by this author record.
