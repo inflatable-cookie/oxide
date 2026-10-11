@@ -514,7 +514,7 @@ storage-attempt ledger must persist authorization, acquire/submit intents and
 identities, busy/uncertain outcomes, cancellation and reconciliation. Existing
 operation journals and worker admission are patterns, not this API.
 
-Nucleus's [consumer boundary, Contract 011](https://github.com/inflatable-cookie/nucleus/blob/38c2a814c9bc62a62f1535b9089c3ee52c292e62/docs/knowledge/contracts/011-oxide-consumer-boundary.md)
+Nucleus's [consumer boundary, Contract 011](https://github.com/inflatable-cookie/nucleus/blob/9a562d1492ddb1474ebb2ea503889ecc6b0845b1/docs/knowledge/contracts/011-oxide-consumer-boundary.md)
 defines proposed version-1 consumer-local receipts for allocation, storage
 authorization, acquire, submission, capture, archive/recycle and no-spawn closure.
 They bind the task/run/root allocation epoch, requested source tree, workflow and
@@ -535,15 +535,24 @@ The TypeScript consumer seams do not supply an authenticated concrete Rust
 embedding or transport. That binding is a separate implementation prerequisite,
 along with accepted owners and genuine input/completion evidence.
 
-Nucleus's managed-Git direction is not yet a qualified physical-root pool.
-Placement still creates clones. Its current preservation hashes timelines and a
-Git bundle, and archive observes host workspace state; neither proves complete
-old-run source/generated/dependency/debug retrieval. Shared repository storage
-also requires replacing `bundle --all` with task-scoped refs/object pins so
-preservation cannot include unrelated tasks' unpublished refs. Extend those
-existing placement, integration-preparation, preservation and archive owners;
-Oxide must not become their Git manager. A durable capture/archive/recycle
-acknowledgment and verified old-run lookup are missing prerequisites.
+Nucleus now has disabled consumer-local managed-Git/root-allocation,
+storage-attempt and bounded retention seams. Managed Git supplies task-scoped
+object pins and bundles. The retention fixture implements independently owned
+capture, archive/recycle acknowledgments and retained-byte lookup through its
+existing owners. Its local retained-source manifest digest differs from Oxide's
+framed source digest. Debug identities use `fixture-v1`; this does not establish
+real native debug-companion binding or old-run debugger lookup. Production
+placement remains fresh private clones, and production retention registration
+refuses. Accepted production issuers, authenticated Rust embedding and genuine
+execution/source/debug evidence remain prerequisites for a qualified physical
+root pool. Oxide must not become the consumer's Git or retention manager.
+
+The retention code received independent static exact-head review; missing
+dependencies prevented the reviewer from executing tests/typecheck. Covering
+checks on merged Nucleus main `9a562d1` subsequently passed: 234 tests, one
+existing Effigy-pin-dependent skip, typecheck and docs. Those are merged-head
+reconciliation results, not pre-merge executed reviewer evidence or live reuse
+qualification.
 
 Nucleus recommends starting the pilot with clean committed source only;
 unsupported submodules/LFS refuse, and dirty/unmerged/failed/uncertain tasks

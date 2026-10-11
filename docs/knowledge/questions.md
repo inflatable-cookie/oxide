@@ -92,8 +92,9 @@ ordering in [project adoption](contracts/project-adoption.md#readiness-admission
 Select the existing core planning/diagnostics test workflow and sequential
 strict-physical root reuse after ordinary archive. The reviewed positive Task 021
 fixture is the mechanism starting point, not Nucleus input eligibility or
-adoption evidence. Current consumers have no authenticated task-attempt Oxide
-credential/return-to-pending transition or finite source pool. Managed-Git,
+adoption evidence. Production consumers still lack an installed authenticated
+Oxide binding and qualified source pool; disabled consumer-local ownership,
+storage-attempt and retention fixtures are described in the owning contract. Managed-Git,
 Contract 002/Spec 028, admission/host-run and evidence/retention owners must agree
 the proposed opt-in, allocation epochs, bounded retention, exact dirty/generated/
 dependency source and old-run full-debug lookup before root recycling. Frozen
