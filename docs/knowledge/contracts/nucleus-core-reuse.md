@@ -957,11 +957,12 @@ Callable surface: `oxide-storage-runtime <canonical-bootstrap-file>`. It takes o
 non-secret path. Keys, budgets and roots come only from the bootstrap. No environment
 discovery, command-line secrets, install, service or default executable is supplied.
 
-Exit codes: `0` authenticated shutdown, `2` lifetime, control EOF or control refusal
-after durable state was left as it was, `3` abandoned blocked storage operation,
-`1` refusal before effects or any other failure. Exit `2` writes
-`private storage runtime stopped: <Stop>` to stderr. Exit `3` writes an abandonment
-line. No exit proves writer completion or Idle.
+Exit codes: `0` authenticated shutdown. `2` lifetime, control EOF or control refusal
+after readiness, with durable state left as it was. `3` abandoned blocked storage
+operation after readiness. `4` owner window ended before readiness; no ready frame was
+published. `1` refusal before effects, or any other failure. Exits `2` and `3` write
+`private storage runtime stopped: <Stop>` or an abandonment line to stderr. Exit `4`
+writes a startup-expired line. No exit proves writer completion or Idle.
 
 **Bootstrap** (version 1 JSON; unknown fields refuse; read with the oxide#029 protected-file
 rules: canonical, owner-only mode 0600, one link, no-follow, stable identity, at most
@@ -971,7 +972,7 @@ rules: canonical, owner-only mode 0600, one link, no-follow, stable identity, at
 | --- | --- |
 | `version`, `storage_protocol`, `control_protocol` | All `1`. Storage remains `OXSTOR01`, ledger version 3. |
 | `scope` | Owner-approved qualification scope, 1–4096 bytes. |
-| `expires_unix_seconds` | Owner's remaining window end, as WireU64. The window is counted from the entry instant, when `serve_bootstrap` starts reading the bootstrap. The effective window is `min(expires - entry, 2700 s - stop_grace)`. Startup time is inside the window. |
+| `expires_unix_seconds` | Owner's remaining window end, as WireU64. The window is counted from the entry instant, when `serve_bootstrap` is called and before the bootstrap is read. The effective window is `min(expires - entry, 2700 s - stop_grace - 2 s)`. Startup time is inside the window. |
 | `stop_grace_seconds` | WireU64, 1–10. Bounded wait after a stop before an in-flight storage operation is abandoned. Bound into `policy_digest`. |
 | `storage_root` | Absolute canonical owner-only (0700) directory. The daemon endpoint is `<root>/daemon.sock`. |
 | `budget` | `{cap_bytes > 0, free_reserve_bytes}` as WireU64. Explicit finite policy, not kernel enforcement, not aggregate footprint, not a host reserve. |
@@ -984,6 +985,21 @@ WireU64 means a safe JSON integer through 2^53-1 or canonical decimal text above
 that. Non-Rust producers must write exact integer digits or decimal text, never a
 JavaScript `Number`.
 
+**Process bound and startup supervision.** Before the bootstrap is read, the only bound is
+the process ceiling of 45 minutes from entry. That is a compile-time constant, not
+something read from the bootstrap. Reading the bootstrap is a bounded local file read that
+does not wait on a peer. Validation then shrinks the bound to the owner's window, with the
+startup-time rule above. A supervisor thread owns the bound. The startup worker sends it the
+window end once validated, and the serve-phase bound once ready is written. Every blocking
+step runs on the worker: the protected read, validation, marker write and sync, bootstrap
+unlink, control connect, `Daemon::bind` and the ready write. The worker checks the window
+before each step. If the bound passes while the worker is still blocked, the supervisor
+returns `StartupExpired` (exit 4) before readiness, or `Abandoned` (exit 3) after it. The
+binary returns from `main` and the process ends. Nothing is released, finalized or deleted.
+Readiness is written only while at least 1 second of owner window remains. A worker
+result that arrives after the bound is never observed. Process exit is not a writer
+completion or Idle proof.
+
 **Startup, before effects.** Read and validate the bootstrap. Validate the owned
 storage root, the pinned control identity, the budget and the window. Create the
 exclusive replay marker `runtime-<sha256 hex of the exact bootstrap bytes>`
@@ -994,11 +1010,14 @@ listener and recheck its identity. Call `Daemon::bind` with `QualificationAuthor
 It uses checked `f_bavail * f_frsize` and refuses unknown capacity or any other path.
 Install the instance, capture the storage endpoint and write ready. A failure after
 the control connection writes an authenticated `failed` frame when it can, with code
-`refused`, `storage`, `io` or `protocol`.
+`refused`, `storage`, `io`, `protocol` or `expired`. Its write is bounded by the 2-second
+exit tolerance. An expired window stops before the next effect. A marker that exists
+without a finished startup stays in place, so a later replay is refused.
 
 **Control frames.** Newline-delimited JSON. Each frame is at most 64 KiB. Reads total
-at most 256 KiB across the session. Each blocked read resumes after 30 seconds. Writes
-time out after 30 seconds. Unknown operations, unknown fields, bad MACs, oversize and
+at most 256 KiB across the session. Each blocked read resumes after 30 seconds. Every
+runtime write, including ready, the stopped ack and failure frames, times out after
+the 2-second exit tolerance. Unknown operations, unknown fields, bad MACs, oversize and
 truncated frames refuse. Control traffic never renews the lifetime.
 
 **Ready** (runtime to parent, one frame): `version`, `operation: "ready"`, `scope`,
@@ -1029,11 +1048,11 @@ the domain first. Keys are not interchangeable.
 | `oxide-runtime-failed-v1` | control | scope, bootstrap digest, code |
 | `oxide-admission-v1`, `oxide-settlement-v1`, `oxide-terminal-v1`, `oxide-capture-v1` | authority | unchanged 029 domains |
 
-**Lifetime and stop path.** The deadline is monotonic. It is set once at entry, before
-the bootstrap is read, from the same instant as the Unix timestamp used for the window. The
-storage daemon runs on its own thread. The first stop reason, from the control reader
-or the deadline supervisor, is forwarded to it. The main thread then waits at most
-`stop_grace_seconds` for storage to return. Then it runs the stop action for that reason:
+**Lifetime and stop path.** The deadline is monotonic. It is set once at entry, from the same
+instant as the Unix timestamp used for the window. After readiness the storage daemon runs
+on its own thread. The first stop reason, from the control reader or the deadline
+supervisor, is forwarded to it. The worker then waits at most `stop_grace_seconds` for
+storage to return. Then it runs the stop action for that reason:
 
 | Stop | Trigger | Exit | Ack | Durable state |
 | --- | --- | --- | --- | --- |
@@ -1042,6 +1061,7 @@ or the deadline supervisor, is forwarded to it. The main thread then waits at mo
 | `ControlClosed` | parent EOF | 2 | none | leases stay held |
 | `ControlRefused` | refused control frame | 2 | none | leases stay held |
 | `Abandoned` | storage still busy after the grace | 3 | none | last committed ledger; leases stay held |
+| `StartupExpired` | window ended before readiness | 4 | none | no ready; replay marker and partial state kept |
 
 `Abandoned` treats a blocked storage operation like a crash. The ledger commits by
 temp file, sync, rename and directory sync, so a restart sees the last committed state.

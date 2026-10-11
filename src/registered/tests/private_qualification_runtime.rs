@@ -670,6 +670,103 @@ fn private_qualification_runtime_blocked_storage_operation_is_abandoned_at_the_g
     fs::remove_dir_all(&base).unwrap();
 }
 
+/// Spawns one actual runtime child with a bootstrap whose window ends at `expires`. It does
+/// not wait for readiness. The caller decides what the child must or must not publish.
+fn spawn_unready(
+    base: &Path,
+    name: &str,
+    storage_root: &Path,
+    subjects: Vec<ApprovedSubject>,
+    expires: u64,
+) -> (ChildGuard, UnixListener, PathBuf, PathBuf) {
+    let control_dir = base.join(format!("ctl-{name}"));
+    private_dir(&control_dir);
+    let control = control_dir.join("p.sock");
+    let listener = UnixListener::bind(&control).unwrap();
+    fs::set_permissions(&control, fs::Permissions::from_mode(0o600)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let bootstrap = bootstrap_for(storage_root, &control, subjects, expires, DEFAULT_GRACE);
+    let file = base.join(format!("bootstrap-{name}.json"));
+    write_private(&file, &serde_json::to_vec(&bootstrap).unwrap());
+    let child = ChildGuard(Some(
+        Command::new(
+            std::env::var_os("OXIDE_STORAGE_RUNTIME").expect("Effigy compiled the runtime"),
+        )
+        .arg(&file)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap(),
+    ));
+    (child, listener, control_dir, file)
+}
+
+#[test]
+fn private_qualification_runtime_window_ending_at_setup_publishes_no_ready_and_exits_bounded() {
+    // A one-second window cannot leave the readiness margin once setup has run, so the child
+    // must exit before it publishes ready. Setup may also see the window spent before it starts.
+    let base = scratch("before-ready");
+    let storage_root = base.join("store");
+    private_dir(&storage_root);
+    let subjects = vec![approved(1)];
+    let (mut child, listener, _control_dir, _file) =
+        spawn_unready(&base, "before-ready", &storage_root, subjects, now() + 1);
+    let started = Instant::now();
+    let status = child.wait_exit(Duration::from_secs(10));
+    assert!(started.elapsed() < Duration::from_secs(10), "bounded exit");
+    assert!(
+        matches!(status.code(), Some(1) | Some(4)),
+        "refused or expired, never success: {status:?}"
+    );
+    // Any connection the child made carries no ready frame. The child closed it on exit.
+    if let Ok((mut stream, _)) = listener.accept() {
+        // The child has already exited, so the peer is closed and this read cannot block.
+        // Socket timeouts are not set here: macOS rejects them on a disconnected socket.
+        stream.set_nonblocking(false).unwrap();
+        let mut bytes = Vec::new();
+        let _ = stream.read_to_end(&mut bytes);
+        // Only an authenticated failure frame may appear here, never a ready frame.
+        for line in String::from_utf8_lossy(&bytes).lines() {
+            let frame: Value = serde_json::from_str(line).unwrap();
+            assert_ne!(
+                frame["operation"], "ready",
+                "no ready before readiness: {line}"
+            );
+            assert_eq!(frame["operation"], "failed", "only a failure frame: {line}");
+        }
+    }
+    assert!(
+        !storage_root.join("daemon.sock").exists(),
+        "no storage endpoint remains serving"
+    );
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn private_qualification_runtime_already_expired_bootstrap_is_retained_without_effects() {
+    // An expired window is refused before the replay marker and before the bootstrap is
+    // consumed, so the owner keeps the file and no startup effect exists.
+    let base = scratch("expired");
+    let storage_root = base.join("store");
+    private_dir(&storage_root);
+    let subjects = vec![approved(1)];
+    let (mut child, _listener, control_dir, file) =
+        spawn_unready(&base, "expired", &storage_root, subjects, now() - 10);
+    let status = child.wait_exit(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(1));
+    assert!(file.exists(), "expired bootstrap is retained for its owner");
+    let markers = fs::read_dir(&control_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("runtime-"))
+        .count();
+    assert_eq!(markers, 0, "no replay marker was created");
+    assert!(!storage_root.join("daemon.sock").exists());
+    fs::remove_dir_all(&base).unwrap();
+}
+
 #[test]
 fn private_qualification_runtime_bootstrap_substitution_and_replay_refuse_before_effects() {
     let base = scratch("refuse");

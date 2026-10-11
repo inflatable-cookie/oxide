@@ -1,7 +1,8 @@
 //! Unpublished private storage-runtime entry point, enabled only by private-qualification.
 //! Exit 0 is an authenticated shutdown. Exit 2 is lifetime or control loss, which
 //! preserves durable ownership state and never proves writer completion. Exit 3 is an
-//! abandoned blocked storage operation, handled like a crash.
+//! abandoned blocked storage operation, handled like a crash. Exit 4 is an owner window
+//! that ended before readiness; no ready frame was published.
 fn main() -> std::process::ExitCode {
     let mut args = std::env::args_os().skip(1);
     let Some(path) = args.next() else {
@@ -13,6 +14,10 @@ fn main() -> std::process::ExitCode {
     match oxide_storage::registered::storage_runtime::serve_bootstrap(std::path::Path::new(&path)) {
         Ok(oxide_storage::registered::storage_runtime::Stop::Shutdown(_)) => {
             std::process::ExitCode::SUCCESS
+        }
+        Ok(oxide_storage::registered::storage_runtime::Stop::StartupExpired) => {
+            eprintln!("private storage runtime startup expired before readiness");
+            std::process::ExitCode::from(4)
         }
         Ok(oxide_storage::registered::storage_runtime::Stop::Abandoned) => {
             eprintln!("private storage runtime abandoned a blocked storage operation");

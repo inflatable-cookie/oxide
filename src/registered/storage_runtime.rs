@@ -40,6 +40,11 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_LIFETIME: Duration = Duration::from_secs(45 * 60);
 /// Upper bound on the wait after a stop before an in-flight storage operation is abandoned.
 pub const MAX_STOP_GRACE: Duration = Duration::from_secs(10);
+/// Bounded tolerance for the owned child to finish writing and exit once its stop is decided.
+/// It also bounds every runtime control write, including failure frames.
+pub const EXIT_TOLERANCE: Duration = Duration::from_secs(2);
+/// Readiness is written only while at least this much of the owner window remains.
+const READY_MARGIN: Duration = Duration::from_secs(1);
 /// Per-frame bound for every control frame, including the ready frame.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Aggregate bound for all control bytes read by the runtime.
@@ -121,6 +126,9 @@ pub enum Stop {
     /// A storage operation was still running after the stop grace. The process exits
     /// like a crash: the ledger keeps its last committed state and leases stay held.
     Abandoned,
+    /// The owner window ended before readiness was written. No ready frame was published.
+    /// Any replay marker or partial state stays as it was.
+    StartupExpired,
 }
 
 /// Parent-side expectation. The owner derives every field from its own bootstrap.
@@ -309,7 +317,9 @@ struct Plan {
 
 /// Nonrenewable window measured from the entry instant and its Unix timestamp. The
 /// owner's remaining seconds are counted from entry, so startup time is inside the window.
-/// The ceiling leaves room for the stop grace. `None` means the window is already spent.
+/// The ceiling leaves room for the stop grace and the exit tolerance, so the serve-phase
+/// bound (window end plus grace plus tolerance) never passes the 45-minute ceiling.
+/// `None` means the window is already spent.
 fn session_window(
     entry: Instant,
     entry_unix: u64,
@@ -320,7 +330,7 @@ fn session_window(
     if remaining.is_zero() {
         return None;
     }
-    let lifetime = remaining.min(MAX_LIFETIME - stop_grace);
+    let lifetime = remaining.min(MAX_LIFETIME - stop_grace - EXIT_TOLERANCE);
     Some((entry + lifetime, entry_unix + lifetime.as_secs()))
 }
 
@@ -425,19 +435,85 @@ impl FreeSpaceProbe for OwnedRootFreeSpace {
 }
 
 /// Consumes one protected bootstrap and serves the actual daemon until stop.
-/// The replay marker is created exclusively before any storage effect. An
-/// existing marker refuses even when a copied bootstrap is presented again.
-/// Failures after the control connection send an authenticated `failed` frame.
+/// The whole process runs under one nonrenewable bound counted from entry. See
+/// `supervise_startup`. The replay marker is created exclusively before any storage
+/// effect, and an existing marker refuses even when a copied bootstrap is presented again.
+/// Failures after the control connection send an authenticated `failed` frame, bounded
+/// by `EXIT_TOLERANCE`.
 pub fn serve_bootstrap(path: &Path) -> Result<Stop, HostError> {
-    // The owner's window starts here, before the bootstrap is read. Reading, validation,
-    // connect and startup all draw from it.
     let entry = Instant::now();
     let entry_unix = unix_now()?;
+    let path = path.to_path_buf();
+    supervise_startup(entry, move |events| {
+        startup(&path, entry, entry_unix, events)
+    })
+}
+
+/// Progress from the startup worker to the process supervisor.
+enum Event {
+    /// The owner window end, known once the bootstrap has been validated.
+    Window(Instant),
+    /// Readiness was written. The bound moves to the serve phase.
+    Ready(Instant),
+    /// The worker has finished with this result.
+    Finished(Result<Stop, HostError>),
+}
+
+/// Runs the whole process from entry under one nonrenewable bound. Before the bootstrap
+/// is read, the only bound is the process ceiling from entry. Validation shrinks it to
+/// the owner's window. Readiness moves it to the serve-phase bound. A blocked worker is
+/// abandoned at that bound. Returning from here lets the binary exit, which ends any
+/// blocked thread without releasing, finalizing or deleting durable state.
+fn supervise_startup<F>(entry: Instant, body: F) -> Result<Stop, HostError>
+where
+    F: FnOnce(&mpsc::Sender<Event>) -> Result<Stop, HostError> + Send + 'static,
+{
+    let (events, received) = mpsc::channel::<Event>();
+    let worker_events = events.clone();
+    thread::Builder::new()
+        .name("oxide-storage-startup".to_owned())
+        .spawn(move || {
+            let result = body(&worker_events);
+            let _ = worker_events.send(Event::Finished(result));
+        })
+        .map_err(|_| HostError::Io)?;
+    drop(events);
+    let mut deadline = entry + MAX_LIFETIME;
+    let mut ready = false;
+    loop {
+        match received.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Event::Window(end)) => deadline = end,
+            Ok(Event::Ready(end)) => {
+                ready = true;
+                deadline = end;
+            }
+            Ok(Event::Finished(Err(HostError::Timeout))) if !ready => {
+                return Ok(Stop::StartupExpired)
+            }
+            Ok(Event::Finished(result)) => return result,
+            Err(mpsc::RecvTimeoutError::Timeout) if ready => return Ok(Stop::Abandoned),
+            Err(mpsc::RecvTimeoutError::Timeout) => return Ok(Stop::StartupExpired),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(HostError::Protocol),
+        }
+    }
+}
+
+/// Startup from the bootstrap to the connected serve loop. Each blocking step checks the
+/// window first, so an expired window stops before the next effect.
+fn startup(
+    path: &Path,
+    entry: Instant,
+    entry_unix: u64,
+    events: &mpsc::Sender<Event>,
+) -> Result<Stop, HostError> {
     let mut bytes = read_protected(path)?;
     let digest = bootstrap_digest(&bytes);
     let bootstrap: RuntimeBootstrap =
         serde_json::from_slice(&bytes).map_err(|_| HostError::Protocol)?;
     let (plan, socket) = bootstrap.validate(entry, entry_unix, &digest)?;
+    let window_end = plan.deadline;
+    let _ = events.send(Event::Window(window_end));
+    before(window_end)?;
     let marker = bootstrap
         .control
         .path
@@ -456,20 +532,23 @@ pub fn serve_bootstrap(path: &Path) -> Result<Stop, HostError> {
     fs::File::open(marker.parent().ok_or(HostError::Protocol)?)
         .and_then(|directory| directory.sync_all())
         .map_err(|_| HostError::Io)?;
+    before(window_end)?;
     fs::remove_file(path).map_err(|_| HostError::Io)?;
     bytes.fill(0);
+    before(window_end)?;
     let mut control = UnixStream::connect(&bootstrap.control.path).map_err(|_| HostError::Io)?;
     let current = Endpoint::capture(bootstrap.control.path.clone())?;
     if current.device != bootstrap.control.device.0 || current.inode != bootstrap.control.inode.0 {
         return Err(HostError::Protocol);
     }
-    match run(&bootstrap, plan, socket, &mut control) {
+    match run(&bootstrap, plan, socket, &mut control, events) {
         Ok(stop) => Ok(stop),
         Err(error) => {
             let code = match error {
                 HostError::OwnerRejected => "refused",
                 HostError::Storage => "storage",
-                HostError::Io | HostError::Timeout => "io",
+                HostError::Timeout => "expired",
+                HostError::Io => "io",
                 HostError::Protocol | HostError::RunnerRefused => "protocol",
             };
             if let Ok(frame) = failed_frame(&bootstrap, &digest, code) {
@@ -480,11 +559,26 @@ pub fn serve_bootstrap(path: &Path) -> Result<Stop, HostError> {
     }
 }
 
+/// Fails with `Timeout` once the window has ended.
+fn before(deadline: Instant) -> Result<(), HostError> {
+    if Instant::now() < deadline {
+        Ok(())
+    } else {
+        Err(HostError::Timeout)
+    }
+}
+
+/// Readiness needs at least `READY_MARGIN` of owner window left.
+fn ready_allowed(deadline: Instant) -> bool {
+    deadline.saturating_duration_since(Instant::now()) >= READY_MARGIN
+}
+
 fn run(
     bootstrap: &RuntimeBootstrap,
     plan: Plan,
     socket: PathBuf,
     control: &mut UnixStream,
+    events: &mpsc::Sender<Event>,
 ) -> Result<Stop, HostError> {
     let allowed = bootstrap
         .admissions
@@ -531,7 +625,14 @@ fn run(
         ],
     )?;
     frame["mac"] = json!(mac);
+    if !ready_allowed(plan.deadline) {
+        return Err(HostError::Timeout);
+    }
     write_frame(control, &frame)?;
+    // The serve-phase bound covers the stop grace and the bounded exit tolerance.
+    let _ = events.send(Event::Ready(
+        plan.deadline + plan.stop_grace + EXIT_TOLERANCE,
+    ));
 
     // The main thread is the single authority on stop. The first reason from the
     // control reader or the deadline supervisor is forwarded to the storage thread.
@@ -741,7 +842,7 @@ fn failed_frame(
 
 fn write_frame(stream: &mut UnixStream, value: &Value) -> Result<(), HostError> {
     stream
-        .set_write_timeout(Some(CONTROL_IO_TIMEOUT))
+        .set_write_timeout(Some(EXIT_TOLERANCE))
         .map_err(|_| HostError::Io)?;
     let mut bytes = serde_json::to_vec(value).map_err(|_| HostError::Protocol)?;
     if bytes.len() >= MAX_FRAME_BYTES {
@@ -821,7 +922,7 @@ mod tests {
         assert_eq!(expires, entry_unix + 10);
         // The 45-minute ceiling leaves room for the stop grace.
         let (capped, _) = session_window(entry, entry_unix, entry_unix + 100_000, grace).unwrap();
-        assert_eq!(capped, entry + MAX_LIFETIME - grace);
+        assert_eq!(capped, entry + MAX_LIFETIME - grace - EXIT_TOLERANCE);
         // An already spent window refuses.
         assert!(session_window(entry, entry_unix, entry_unix, grace).is_none());
         assert!(session_window(entry, entry_unix, entry_unix - 1, grace).is_none());
@@ -850,6 +951,48 @@ mod tests {
         assert!(!verify_stopped(
             &key, scope, &instance, &bootstrap, "stop-1", &missing
         ));
+    }
+
+    #[test]
+    fn private_qualification_runtime_blocked_startup_is_abandoned_at_the_owner_window() {
+        // A worker that blocks before readiness is abandoned at its window end, not after
+        // its own sleep. The worker's later result is never observed.
+        let entry = Instant::now();
+        let started = Instant::now();
+        let result = supervise_startup(entry, move |events| {
+            let _ = events.send(Event::Window(Instant::now() + Duration::from_millis(300)));
+            thread::sleep(Duration::from_secs(20));
+            Ok(Stop::Lifetime)
+        })
+        .unwrap();
+        assert_eq!(result, Stop::StartupExpired);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn private_qualification_runtime_ready_needs_the_margin_and_the_window_is_checked_before_effects(
+    ) {
+        let now = Instant::now();
+        assert!(!ready_allowed(now + Duration::from_millis(500)));
+        assert!(ready_allowed(now + Duration::from_secs(5)));
+        assert!(before(now + Duration::from_secs(5)).is_ok());
+        assert_eq!(
+            before(now - Duration::from_millis(1)),
+            Err(HostError::Timeout)
+        );
+    }
+
+    #[test]
+    fn private_qualification_runtime_worker_result_after_startup_expiry_is_not_observed() {
+        // A worker that finishes after the window does not turn an expiry into a success.
+        let entry = Instant::now();
+        let result = supervise_startup(entry, move |events| {
+            let _ = events.send(Event::Window(Instant::now() + Duration::from_millis(200)));
+            thread::sleep(Duration::from_millis(600));
+            Ok(Stop::Shutdown("late".into()))
+        })
+        .unwrap();
+        assert_eq!(result, Stop::StartupExpired);
     }
 
     /// The same bytes the Node verifier checks. Rust authenticates them through the production path.
