@@ -11,6 +11,8 @@ use super::{
     EVIDENCE_VERSION,
 };
 use flate2::bufread::GzDecoder;
+use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self as stdio, BufReader, Read};
@@ -265,6 +267,365 @@ fn verify_inner(
         directories,
         counters: *counters,
     })
+}
+
+/// Private streaming route for a locked registry container whose total decoded
+/// tar size may exceed the legacy per-container cap.
+///
+/// The legacy [`verify`] still refuses any container that reaches
+/// `Limits::file_bytes` decoded bytes. This route instead streams the gzip
+/// member and each tar member without materializing the whole decoded tar, so
+/// the aggregate decoded size may grow to the shared collection budget. The
+/// compressed archive, every archive member payload (including extension or
+/// metadata payloads) and every extracted regular file remain capped at
+/// `limits.file_bytes`; the collection budget, entry cap, path/depth limits and
+/// all membership/integrity/stability/link rules are unchanged and shared with
+/// the legacy route. The caller cannot raise any of those ceilings from task
+/// JSON: the ceilings are the compiled owner limits. Every consumed counter is
+/// returned on success and refusal. This is correspondence evidence only; it
+/// installs no issuer and proves no native or generated closure.
+pub fn stream_verify(
+    request: &Request<'_>,
+    limits: Limits,
+    counters: Counters,
+) -> Outcome<VerifiedCorrespondence> {
+    let mut counters = counters;
+    match stream_verify_inner(request, limits, &mut counters) {
+        Ok(value) => Outcome {
+            counters,
+            value: Ok(value),
+        },
+        Err(refusal) => Outcome {
+            counters,
+            value: Err(refusal),
+        },
+    }
+}
+
+fn stream_verify_inner(
+    request: &Request<'_>,
+    limits: Limits,
+    counters: &mut Counters,
+) -> Result<VerifiedCorrespondence> {
+    limits.validate()?;
+    if !valid_digest(request.locked_checksum) {
+        return Err(Refusal::Identity);
+    }
+    let archive = owned_file(request.archive, limits)?;
+    canonical_dir(request.extracted_root)?;
+    if request.extracted_root.as_os_str().len() > limits.path_bytes {
+        return Err(Refusal::Budget);
+    }
+    let extracted_root = request.extracted_root.to_owned();
+    let compressed = read_archive(&archive, limits, counters)?;
+    let locked_checksum = digest(&compressed);
+    if locked_checksum != request.locked_checksum {
+        return Err(Refusal::Integrity);
+    }
+    if compressed.len() < 2 || compressed[0] != 0x1f || compressed[1] != 0x8b {
+        return Err(Refusal::Unsupported);
+    }
+    let package = stream_tar_inventory(&compressed, limits, counters)?;
+    let name = extracted_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(Refusal::Identity)?;
+    if name != package.prefix {
+        return Err(Refusal::Identity);
+    }
+    let (files, directories) = extracted_inventory(&extracted_root, limits, counters)?;
+    for (path, expected) in &package.files {
+        match files.get(path) {
+            None => return Err(Refusal::Membership),
+            Some(found) if found != expected => return Err(Refusal::Integrity),
+            Some(_) => {}
+        }
+    }
+    for path in files.keys() {
+        if !package.files.contains_key(path) {
+            return Err(Refusal::Membership);
+        }
+    }
+    if directories != package.directories {
+        return Err(Refusal::Membership);
+    }
+    Ok(VerifiedCorrespondence {
+        package_prefix: package.prefix,
+        locked_checksum,
+        archive,
+        extracted_root,
+        files,
+        directories,
+        counters: *counters,
+    })
+}
+
+/// Marks a read that stopped because the shared collection budget ran out, so
+/// the tar reader's generic I/O error is classified as `Budget`, not
+/// `Integrity`.
+#[derive(Debug)]
+struct BudgetExceeded;
+impl std::fmt::Display for BudgetExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("shared collection budget exhausted")
+    }
+}
+impl std::error::Error for BudgetExceeded {}
+
+/// Charges every decoded byte against one shared counter cell. The reader
+/// never returns more than the remaining collection allowance, so a stream
+/// cannot read past the budget or speculate beyond it.
+struct Charged<'a, R> {
+    inner: R,
+    counters: &'a Cell<Counters>,
+    limits: Limits,
+}
+impl<R: Read> Read for Charged<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> stdio::Result<usize> {
+        let mut counters = self.counters.get();
+        let remaining = self
+            .limits
+            .collection_bytes
+            .checked_sub(counters.total())
+            .ok_or_else(|| stdio::Error::other(BudgetExceeded))?;
+        if remaining == 0 {
+            return Err(stdio::Error::other(BudgetExceeded));
+        }
+        let want = buf.len().min(remaining);
+        let read = self.inner.read(&mut buf[..want])?;
+        counters.decompressed_bytes += read;
+        self.counters.set(counters);
+        Ok(read)
+    }
+}
+
+fn classify_stream_error(error: &stdio::Error) -> Refusal {
+    if error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<BudgetExceeded>())
+    {
+        Refusal::Budget
+    } else {
+        Refusal::Integrity
+    }
+}
+
+fn charge_stream_entry(counters: &Cell<Counters>, limits: Limits) -> Result<()> {
+    let mut current = counters.get();
+    current.entries = current
+        .entries
+        .checked_add(1)
+        .filter(|value| *value <= limits.associations)
+        .ok_or(Refusal::Budget)?;
+    counters.set(current);
+    Ok(())
+}
+
+fn stream_tar_inventory(
+    compressed: &[u8],
+    limits: Limits,
+    counters: &mut Counters,
+) -> Result<Package> {
+    let cell = Cell::new(*counters);
+    let outcome = stream_tar_inventory_inner(compressed, limits, &cell);
+    *counters = cell.get();
+    outcome
+}
+
+fn stream_tar_inventory_inner(
+    compressed: &[u8],
+    limits: Limits,
+    counters: &Cell<Counters>,
+) -> Result<Package> {
+    let mut reader = BufReader::new(stdio::Cursor::new(compressed));
+    let mut prefix = None;
+    let mut files = BTreeMap::new();
+    let mut directories = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    {
+        let decoder = GzDecoder::new(&mut reader);
+        let charged = Charged {
+            inner: decoder,
+            counters,
+            limits,
+        };
+        let mut tar = tar::Archive::new(charged);
+        {
+            let entries = tar.entries().map_err(|e| classify_stream_error(&e))?;
+            // Raw iteration keeps the library from buffering GNU long-name,
+            // long-link or PAX extension payloads before this route can check
+            // them; those extension classes are refused explicitly below.
+            for entry in entries.raw(true) {
+                let mut entry = entry.map_err(|e| classify_stream_error(&e))?;
+                stream_member(
+                    &mut entry,
+                    limits,
+                    counters,
+                    &mut prefix,
+                    &mut files,
+                    &mut directories,
+                    &mut seen,
+                )?;
+            }
+        }
+        let mut charged = tar.into_inner();
+        drain_stream_tail(&mut charged)?;
+        drop(charged);
+    }
+    if !reader.buffer().is_empty() {
+        return Err(Refusal::Unsupported);
+    }
+    if reader.into_inner().position() as usize != compressed.len() {
+        return Err(Refusal::Unsupported);
+    }
+    let prefix = prefix.ok_or(Refusal::Unsupported)?;
+    if files.is_empty() {
+        return Err(Refusal::Unsupported);
+    }
+    if files.len().saturating_add(directories.len()) > limits.associations {
+        return Err(Refusal::Budget);
+    }
+    Ok(Package {
+        prefix,
+        files,
+        directories,
+    })
+}
+
+/// Charges the decoded output after the tar terminator and refuses smuggled
+/// non-zero trailing members. All bytes are charged through `Charged`, so a
+/// large tail exhausts the budget rather than being skipped for free.
+fn drain_stream_tail<R: Read>(charged: &mut Charged<'_, R>) -> Result<()> {
+    let mut buf = [0u8; 8192];
+    loop {
+        let read = charged
+            .read(&mut buf)
+            .map_err(|e| classify_stream_error(&e))?;
+        if read == 0 {
+            return Ok(());
+        }
+        if buf[..read].iter().any(|byte| *byte != 0) {
+            return Err(Refusal::Unsupported);
+        }
+    }
+}
+
+fn stream_member<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+    limits: Limits,
+    counters: &Cell<Counters>,
+    prefix: &mut Option<String>,
+    files: &mut BTreeMap<String, String>,
+    directories: &mut BTreeSet<String>,
+    seen: &mut BTreeSet<String>,
+) -> Result<()> {
+    charge_stream_entry(counters, limits)?;
+    let kind = entry.header().entry_type();
+    if kind.is_gnu_longname()
+        || kind.is_gnu_longlink()
+        || kind.is_pax_local_extensions()
+        || kind.is_pax_global_extensions()
+    {
+        // Refuse before the reader can buffer an unbounded extension payload.
+        return Err(Refusal::Unsupported);
+    }
+    if entry.header().as_ustar().is_none() && entry.header().as_gnu().is_none() {
+        return Err(Refusal::Unsupported);
+    }
+    let is_dir = matches!(kind, tar::EntryType::Directory);
+    let is_file = matches!(kind, tar::EntryType::Regular | tar::EntryType::Continuous);
+    if !is_dir && !is_file {
+        return Err(Refusal::Unsupported);
+    }
+    let path = entry.path().map_err(|_| Refusal::Unsupported)?;
+    let text = path.to_str().ok_or(Refusal::Unsupported)?;
+    let parts = parse_member(text, is_dir, limits)?;
+    let this_prefix = parts[0].clone();
+    match prefix {
+        None => *prefix = Some(this_prefix),
+        Some(expected) if *expected == this_prefix => {}
+        Some(_) => return Err(Refusal::Unsupported),
+    }
+    let relative = parts[1..].join("/");
+    if relative.is_empty() {
+        if !is_dir || !seen.insert(String::new()) {
+            return Err(Refusal::Unsupported);
+        }
+        return Ok(());
+    }
+    if is_sidecar(&relative) || !seen.insert(relative.clone()) {
+        return Err(Refusal::Unsupported);
+    }
+    if is_dir {
+        if files.contains_key(&relative) {
+            return Err(Refusal::Unsupported);
+        }
+        directories.insert(relative.clone());
+        stream_insert_parents(&relative, files, directories, limits, counters)?;
+    } else {
+        if directories.contains(&relative) {
+            return Err(Refusal::Unsupported);
+        }
+        let size = entry.size();
+        if size > limits.file_bytes as u64 {
+            // Declared size is checked before consuming the payload, so an
+            // oversized member never allocates or reads unbounded output.
+            return Err(Refusal::Budget);
+        }
+        let hash = stream_member_digest(entry, size)?;
+        files.insert(relative.clone(), hash);
+        stream_insert_parents(&relative, files, directories, limits, counters)?;
+    }
+    Ok(())
+}
+
+fn stream_member_digest<R: Read>(entry: &mut tar::Entry<'_, R>, size: u64) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut remaining = size;
+    let mut buf = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let want = (remaining as usize).min(buf.len());
+        let read = entry
+            .read(&mut buf[..want])
+            .map_err(|e| classify_stream_error(&e))?;
+        if read == 0 {
+            return Err(Refusal::Integrity);
+        }
+        hasher.update(&buf[..read]);
+        remaining -= read as u64;
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn stream_insert_parents(
+    file: &str,
+    files: &BTreeMap<String, String>,
+    directories: &mut BTreeSet<String>,
+    limits: Limits,
+    counters: &Cell<Counters>,
+) -> Result<()> {
+    let path = Path::new(file);
+    let mut prefix = PathBuf::new();
+    let mut first = true;
+    for component in path.components() {
+        let Component::Normal(part) = component else {
+            return Err(Refusal::Unsupported);
+        };
+        if first {
+            first = false;
+            prefix.push(part);
+            continue;
+        }
+        let name = prefix.to_str().ok_or(Refusal::Unsupported)?;
+        if files.contains_key(name) {
+            return Err(Refusal::Unsupported);
+        }
+        if directories.insert(name.to_owned()) {
+            charge_stream_entry(counters, limits)?;
+        }
+        prefix.push(part);
+    }
+    Ok(())
 }
 
 struct Package {
@@ -1677,5 +2038,255 @@ mod tests {
                 .unwrap_err(),
             Refusal::Unsupported
         );
+    }
+
+    fn once_stream(request: &Request<'_>, limits: Limits) -> Outcome<VerifiedCorrespondence> {
+        stream_verify(request, limits, Counters::default())
+    }
+
+    fn crate_bytes_with_trailing(prefix: &str, files: &[(&str, &[u8])], dirs: &[&str]) -> Vec<u8> {
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            append_dir(&mut builder, &format!("{prefix}/"));
+            for dir in dirs {
+                append_dir(&mut builder, &format!("{prefix}/{dir}"));
+            }
+            for (name, bytes) in files {
+                append_file(&mut builder, &format!("{prefix}/{name}"), bytes);
+            }
+            builder.finish().unwrap();
+        }
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            append_file(&mut builder, &format!("{prefix}/smuggled.rs"), b"smuggled");
+            builder.finish().unwrap();
+        }
+        gzip(&tar_buf)
+    }
+
+    #[test]
+    fn streaming_route_admits_a_container_over_a_small_container_cap() {
+        let scratch = Scratch::new();
+        let prefix = "pkg-1.0.0";
+        let payload = vec![0u8; 400 * 1024];
+        let files: &[(&str, &[u8])] = &[
+            ("a.bin", payload.as_slice()),
+            ("b.bin", payload.as_slice()),
+            ("c.bin", payload.as_slice()),
+            ("d.bin", payload.as_slice()),
+            ("e.bin", payload.as_slice()),
+        ];
+        let archive = scratch.path("stream.crate");
+        fs::write(&archive, crate_bytes(prefix, files, &[])).unwrap();
+        let extracted = scratch.path(prefix);
+        write_extracted(&extracted, files, &[]);
+        let archive = fs::canonicalize(archive).unwrap();
+        let extracted = fs::canonicalize(extracted).unwrap();
+        let checksum = digest(&fs::read(&archive).unwrap());
+        let mut limits = Limits::NUCLEUS;
+        limits.file_bytes = 512 * 1024;
+        limits.collection_bytes = 16 * 1024 * 1024;
+        let legacy = once(&ask(&archive, &extracted, &checksum), limits);
+        assert_eq!(legacy.value, Err(Refusal::Budget));
+        assert!(legacy.counters.decompressed_bytes <= limits.file_bytes);
+        let streamed = once_stream(&ask(&archive, &extracted, &checksum), limits);
+        let verified = streamed
+            .value
+            .expect("individually-small members stream inside the shared budget");
+        assert_eq!(verified.files().len(), 5);
+        assert!(verified.files().contains_key("a.bin"));
+        assert!(streamed.counters.decompressed_bytes > limits.file_bytes);
+        assert!(streamed.counters.archive_bytes <= limits.file_bytes);
+        assert!(streamed.counters.extracted_bytes > 0);
+    }
+
+    #[test]
+    fn streaming_route_refuses_an_oversized_member_before_reading_it() {
+        let scratch = Scratch::new();
+        let prefix = "pkg-1.0.0";
+        let big = vec![0u8; 256 * 1024];
+        let files: &[(&str, &[u8])] = &[("big.bin", big.as_slice())];
+        let (archive, checksum) = write_crate(&scratch, "oversize.crate", prefix, files, &[], None);
+        let extracted = scratch.path(prefix);
+        write_extracted(&extracted, files, &[]);
+        let extracted = fs::canonicalize(extracted).unwrap();
+        let mut limits = Limits::NUCLEUS;
+        limits.file_bytes = 64 * 1024;
+        let outcome = once_stream(&ask(&archive, &extracted, &checksum), limits);
+        assert_eq!(outcome.value, Err(Refusal::Budget));
+        assert!(outcome.counters.decompressed_bytes < limits.file_bytes);
+    }
+
+    #[test]
+    fn streaming_route_refuses_metadata_extension_payloads_before_reading() {
+        let scratch = Scratch::new();
+        let prefix = "pkg-1.0.0";
+        let (archive, checksum) = write_crate(
+            &scratch,
+            "longname.crate",
+            prefix,
+            &[("Cargo.toml", b"[package]\nname=\"pkg\"\n")],
+            &[],
+            Some(|builder| {
+                let payload = vec![b'x'; 256 * 1024];
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::GNULongName);
+                header.set_size(payload.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append(&header, payload.as_slice()).unwrap();
+            }),
+        );
+        let files: &[(&str, &[u8])] = &[("Cargo.toml", b"[package]\nname=\"pkg\"\n")];
+        let extracted = scratch.path(prefix);
+        write_extracted(&extracted, files, &[]);
+        let extracted = fs::canonicalize(extracted).unwrap();
+        let mut limits = Limits::NUCLEUS;
+        limits.file_bytes = 64 * 1024;
+        let outcome = once_stream(&ask(&archive, &extracted, &checksum), limits);
+        assert_eq!(outcome.value, Err(Refusal::Unsupported));
+        assert!(outcome.counters.decompressed_bytes < limits.file_bytes);
+    }
+
+    #[test]
+    fn streaming_route_refuses_a_smuggled_trailing_member() {
+        let scratch = Scratch::new();
+        let prefix = "pkg-1.0.0";
+        let files: &[(&str, &[u8])] = &[("Cargo.toml", b"[package]\nname=\"pkg\"\n")];
+        let archive = scratch.path("trailing-tar.crate");
+        fs::write(&archive, crate_bytes_with_trailing(prefix, files, &[])).unwrap();
+        let extracted = scratch.path(prefix);
+        write_extracted(&extracted, files, &[]);
+        let archive = fs::canonicalize(archive).unwrap();
+        let extracted = fs::canonicalize(extracted).unwrap();
+        let checksum = digest(&fs::read(&archive).unwrap());
+        let outcome = once_stream(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS);
+        assert_eq!(outcome.value, Err(Refusal::Unsupported));
+        assert!(outcome.counters.decompressed_bytes > 0);
+    }
+
+    #[test]
+    fn streaming_route_applies_path_link_and_duplicate_rules() {
+        let scratch = Scratch::new();
+        let (_archive, extracted, _checksum) = prepare(&scratch);
+        let (duplicate, duplicate_sum) = write_crate(
+            &scratch,
+            "stream-duplicate.crate",
+            "pkg-1.0.0",
+            &[("Cargo.toml", b"one")],
+            &[],
+            Some(|builder| {
+                append_file(builder, "pkg-1.0.0/Cargo.toml", b"two");
+            }),
+        );
+        assert_eq!(
+            once_stream(
+                &ask(&duplicate, &extracted, &duplicate_sum),
+                Limits::NUCLEUS
+            )
+            .value,
+            Err(Refusal::Unsupported)
+        );
+        let (sidecar, sidecar_sum) = write_crate(
+            &scratch,
+            "stream-sidecar.crate",
+            "pkg-1.0.0",
+            &[("Cargo.toml", b"x"), (CARGO_OK, b"ok")],
+            &[],
+            None,
+        );
+        assert_eq!(
+            once_stream(&ask(&sidecar, &extracted, &sidecar_sum), Limits::NUCLEUS).value,
+            Err(Refusal::Unsupported)
+        );
+        let (symlink_crate, symlink_sum) = write_crate(
+            &scratch,
+            "stream-symlink.crate",
+            "pkg-1.0.0",
+            &[("Cargo.toml", b"x")],
+            &[],
+            Some(|builder| {
+                let mut header = tar::Header::new_ustar();
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_path("pkg-1.0.0/link").unwrap();
+                header.set_link_name("Cargo.toml").unwrap();
+                header.set_size(0);
+                header.set_cksum();
+                builder.append(&header, stdio::empty()).unwrap();
+            }),
+        );
+        assert_eq!(
+            once_stream(
+                &ask(&symlink_crate, &extracted, &symlink_sum),
+                Limits::NUCLEUS
+            )
+            .value,
+            Err(Refusal::Unsupported)
+        );
+        let (prefix, files, dirs) = layout();
+        let v7 = scratch.path("stream-v7.crate");
+        fs::write(
+            &v7,
+            crate_bytes_with_header(prefix, &files, &dirs, tar::Header::new_old),
+        )
+        .unwrap();
+        let v7 = fs::canonicalize(v7).unwrap();
+        let v7_sum = digest(&fs::read(&v7).unwrap());
+        assert_eq!(
+            once_stream(&ask(&v7, &extracted, &v7_sum), Limits::NUCLEUS).value,
+            Err(Refusal::Unsupported)
+        );
+    }
+
+    #[test]
+    fn streaming_route_charges_counters_and_refuses_budget_and_integrity() {
+        let scratch = Scratch::new();
+        let (archive, extracted, checksum) = prepare(&scratch);
+        let request = ask(&archive, &extracted, &checksum);
+        let ok = once_stream(&request, Limits::NUCLEUS);
+        assert!(ok.value.is_ok());
+        let full = ok.counters;
+
+        let wrong = format!("sha256:{}", "ab".repeat(32));
+        let mismatch = once_stream(&ask(&archive, &extracted, &wrong), Limits::NUCLEUS);
+        assert_eq!(mismatch.value, Err(Refusal::Integrity));
+        assert_eq!(mismatch.counters.archive_bytes, full.archive_bytes);
+
+        let mut tight = Limits::NUCLEUS;
+        tight.collection_bytes = full.archive_bytes + full.decompressed_bytes / 2;
+        let refused = once_stream(&request, tight);
+        assert_eq!(refused.value, Err(Refusal::Budget));
+        assert!(refused.counters.total() <= tight.collection_bytes);
+        assert!(refused.counters.decompressed_bytes > 0);
+
+        let raw = fs::read(&archive).unwrap();
+        let truncated = scratch.path("stream-truncated.crate");
+        fs::write(&truncated, &raw[..raw.len() / 2]).unwrap();
+        let truncated = fs::canonicalize(truncated).unwrap();
+        let truncated_sum = digest(&fs::read(&truncated).unwrap());
+        assert!(matches!(
+            once_stream(
+                &ask(&truncated, &extracted, &truncated_sum),
+                Limits::NUCLEUS
+            )
+            .value,
+            Err(Refusal::Integrity | Refusal::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn streaming_and_legacy_share_one_counter_set() {
+        let scratch = Scratch::new();
+        let (archive, extracted, checksum) = prepare(&scratch);
+        let request = ask(&archive, &extracted, &checksum);
+        let legacy = verify(&request, Limits::NUCLEUS, Counters::default());
+        let after_legacy = legacy.counters;
+        assert!(legacy.value.is_ok());
+        let streamed = stream_verify(&request, Limits::NUCLEUS, after_legacy);
+        assert!(streamed.value.is_ok());
+        assert!(streamed.counters.archive_bytes >= after_legacy.archive_bytes * 2);
+        assert!(streamed.counters.decompressed_bytes > after_legacy.decompressed_bytes);
+        assert!(streamed.counters.extracted_bytes > after_legacy.extracted_bytes);
     }
 }
