@@ -971,7 +971,7 @@ rules: canonical, owner-only mode 0600, one link, no-follow, stable identity, at
 | --- | --- |
 | `version`, `storage_protocol`, `control_protocol` | All `1`. Storage remains `OXSTOR01`, ledger version 3. |
 | `scope` | Owner-approved qualification scope, 1–4096 bytes. |
-| `expires_unix_seconds` | Owner's remaining window, as WireU64. Must be in the future. Effective window is `min(expires - now, 2700 s - stop_grace)`. |
+| `expires_unix_seconds` | Owner's remaining window end, as WireU64. The window is counted from the entry instant, when `serve_bootstrap` starts reading the bootstrap. The effective window is `min(expires - entry, 2700 s - stop_grace)`. Startup time is inside the window. |
 | `stop_grace_seconds` | WireU64, 1–10. Bounded wait after a stop before an in-flight storage operation is abandoned. Bound into `policy_digest`. |
 | `storage_root` | Absolute canonical owner-only (0700) directory. The daemon endpoint is `<root>/daemon.sock`. |
 | `budget` | `{cap_bytes > 0, free_reserve_bytes}` as WireU64. Explicit finite policy, not kernel enforcement, not aggregate footprint, not a host reserve. |
@@ -1014,6 +1014,9 @@ metadata only. It grants no lease, token, admission or submission.
 **Shutdown and ack.** Parent to runtime: `{version: 1, operation: "shutdown", id, mac}`.
 `id` is 1–128 bytes of `[A-Za-z0-9_-]`. The runtime stops its daemon, then sends
 `{version: 1, operation: "stopped", id, mac}` only after an authenticated shutdown.
+The parent verifier (`verify_stopped`) requires exactly these four fields. An extra
+field refuses even when the MAC is valid. Frames the runtime reads also refuse
+unknown fields.
 
 **MAC domains.** Each uses HMAC-SHA256 through the 029 length-prefixed framing, with
 the domain first. Keys are not interchangeable.
@@ -1026,7 +1029,8 @@ the domain first. Keys are not interchangeable.
 | `oxide-runtime-failed-v1` | control | scope, bootstrap digest, code |
 | `oxide-admission-v1`, `oxide-settlement-v1`, `oxide-terminal-v1`, `oxide-capture-v1` | authority | unchanged 029 domains |
 
-**Lifetime and stop path.** The deadline is monotonic and set once at startup. The
+**Lifetime and stop path.** The deadline is monotonic. It is set once at entry, before
+the bootstrap is read, from the same instant as the Unix timestamp used for the window. The
 storage daemon runs on its own thread. The first stop reason, from the control reader
 or the deadline supervisor, is forwarded to it. The main thread then waits at most
 `stop_grace_seconds` for storage to return. Then it runs the stop action for that reason:

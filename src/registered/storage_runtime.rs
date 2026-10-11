@@ -262,7 +262,15 @@ pub fn verify_stopped(
     id: &str,
     frame: &Value,
 ) -> bool {
-    frame["version"] == PROTOCOL_VERSION
+    // Exactly the four ack fields. Any extra field refuses, matching the unknown-field contract.
+    let exact_fields = frame.as_object().is_some_and(|object| {
+        object.len() == 4
+            && ["version", "operation", "id", "mac"]
+                .iter()
+                .all(|key| object.contains_key(*key))
+    });
+    exact_fields
+        && frame["version"] == PROTOCOL_VERSION
         && frame["operation"] == "stopped"
         && frame["id"] == id
         && frame["mac"].as_str().is_some_and(|mac| {
@@ -299,8 +307,30 @@ struct Plan {
     expires_unix_seconds: u64,
 }
 
+/// Nonrenewable window measured from the entry instant and its Unix timestamp. The
+/// owner's remaining seconds are counted from entry, so startup time is inside the window.
+/// The ceiling leaves room for the stop grace. `None` means the window is already spent.
+fn session_window(
+    entry: Instant,
+    entry_unix: u64,
+    expires_unix: u64,
+    stop_grace: Duration,
+) -> Option<(Instant, u64)> {
+    let remaining = Duration::from_secs(expires_unix.checked_sub(entry_unix)?);
+    if remaining.is_zero() {
+        return None;
+    }
+    let lifetime = remaining.min(MAX_LIFETIME - stop_grace);
+    Some((entry + lifetime, entry_unix + lifetime.as_secs()))
+}
+
 impl RuntimeBootstrap {
-    fn validate(&self, now_unix: u64, digest: &str) -> Result<(Plan, PathBuf), HostError> {
+    fn validate(
+        &self,
+        entry: Instant,
+        entry_unix: u64,
+        digest: &str,
+    ) -> Result<(Plan, PathBuf), HostError> {
         if self.version != PROTOCOL_VERSION
             || self.storage_protocol != PROTOCOL_VERSION
             || self.control_protocol != PROTOCOL_VERSION
@@ -311,7 +341,7 @@ impl RuntimeBootstrap {
             || self.budget.cap_bytes.0 == 0
             || self.stop_grace_seconds.0 == 0
             || self.stop_grace_seconds.0 > MAX_STOP_GRACE.as_secs()
-            || self.expires_unix_seconds.0 <= now_unix
+            || self.expires_unix_seconds.0 <= entry_unix
             || self.authority_key_hex == self.control_key_hex
             || !self.storage_root.is_absolute()
         {
@@ -338,10 +368,10 @@ impl RuntimeBootstrap {
         if control.device != self.control.device.0 || control.inode != self.control.inode.0 {
             return Err(HostError::Protocol);
         }
-        let remaining = Duration::from_secs(self.expires_unix_seconds.0 - now_unix);
         let stop_grace = Duration::from_secs(self.stop_grace_seconds.0);
-        // The hard exit (stop plus grace) must also fit inside the nonrenewable ceiling.
-        let lifetime = remaining.min(MAX_LIFETIME - stop_grace);
+        let (deadline, expires_unix_seconds) =
+            session_window(entry, entry_unix, self.expires_unix_seconds.0, stop_grace)
+                .ok_or(HostError::Protocol)?;
         let plan = Plan {
             scope: self.scope.clone(),
             bootstrap_digest: digest.to_owned(),
@@ -354,9 +384,9 @@ impl RuntimeBootstrap {
             budget: self.budget,
             authority_key,
             control_key,
-            deadline: Instant::now() + lifetime,
+            deadline,
             stop_grace,
-            expires_unix_seconds: now_unix + lifetime.as_secs(),
+            expires_unix_seconds,
         };
         Ok((plan, self.storage_root.join(SOCKET_NAME)))
     }
@@ -399,12 +429,15 @@ impl FreeSpaceProbe for OwnedRootFreeSpace {
 /// existing marker refuses even when a copied bootstrap is presented again.
 /// Failures after the control connection send an authenticated `failed` frame.
 pub fn serve_bootstrap(path: &Path) -> Result<Stop, HostError> {
-    let now = unix_now()?;
+    // The owner's window starts here, before the bootstrap is read. Reading, validation,
+    // connect and startup all draw from it.
+    let entry = Instant::now();
+    let entry_unix = unix_now()?;
     let mut bytes = read_protected(path)?;
     let digest = bootstrap_digest(&bytes);
     let bootstrap: RuntimeBootstrap =
         serde_json::from_slice(&bytes).map_err(|_| HostError::Protocol)?;
-    let (plan, socket) = bootstrap.validate(now, &digest)?;
+    let (plan, socket) = bootstrap.validate(entry, entry_unix, &digest)?;
     let marker = bootstrap
         .control
         .path
@@ -773,6 +806,50 @@ mod tests {
     /// Drives the frame parser from in-memory bytes. Socket timeouts are not used here.
     fn run_reader(bytes: Vec<u8>) -> Stop {
         read_frames(BufReader::new(std::io::Cursor::new(bytes)), &context())
+    }
+
+    #[test]
+    fn private_qualification_runtime_window_is_counted_from_entry_not_after_startup() {
+        let grace = Duration::from_secs(2);
+        let entry = Instant::now() - Duration::from_secs(5);
+        let entry_unix = unix_now().unwrap() - 5;
+        let (deadline, expires) =
+            session_window(entry, entry_unix, entry_unix + 10, grace).unwrap();
+        // Five seconds of startup are inside the ten-second window, not added after it.
+        assert_eq!(deadline, entry + Duration::from_secs(10));
+        assert!(deadline < Instant::now() + Duration::from_secs(10));
+        assert_eq!(expires, entry_unix + 10);
+        // The 45-minute ceiling leaves room for the stop grace.
+        let (capped, _) = session_window(entry, entry_unix, entry_unix + 100_000, grace).unwrap();
+        assert_eq!(capped, entry + MAX_LIFETIME - grace);
+        // An already spent window refuses.
+        assert!(session_window(entry, entry_unix, entry_unix, grace).is_none());
+        assert!(session_window(entry, entry_unix, entry_unix - 1, grace).is_none());
+    }
+
+    #[test]
+    fn private_qualification_runtime_stopped_ack_refuses_unknown_fields() {
+        let key = MacKey::from_hex(&"5".repeat(64)).unwrap();
+        let scope = "unit-scope";
+        let instance = "a".repeat(64);
+        let bootstrap = digest_of(b"unit bootstrap");
+        let mac = key
+            .sign(STOPPED_DOMAIN, &[scope, &instance, &bootstrap, "stop-1"])
+            .unwrap();
+        let ack = json!({"version": 1, "operation": "stopped", "id": "stop-1", "mac": mac});
+        assert!(verify_stopped(
+            &key, scope, &instance, &bootstrap, "stop-1", &ack
+        ));
+        let mut extra = ack.clone();
+        extra["unauthenticated"] = json!(true);
+        assert!(!verify_stopped(
+            &key, scope, &instance, &bootstrap, "stop-1", &extra
+        ));
+        let mut missing = ack.clone();
+        missing.as_object_mut().unwrap().remove("id");
+        assert!(!verify_stopped(
+            &key, scope, &instance, &bootstrap, "stop-1", &missing
+        ));
     }
 
     /// The same bytes the Node verifier checks. Rust authenticates them through the production path.

@@ -232,7 +232,7 @@ impl Runtime {
         let bytes = serde_json::to_vec(&bootstrap).unwrap();
         let file = base.join(format!("bootstrap-{name}.json"));
         write_private(&file, &bytes);
-        let child = ChildGuard(Some(
+        let mut child = ChildGuard(Some(
             Command::new(
                 std::env::var_os("OXIDE_STORAGE_RUNTIME").expect("Effigy compiled the runtime"),
             )
@@ -250,7 +250,10 @@ impl Runtime {
             match listener.accept() {
                 Ok((stream, _)) => break stream,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "runtime did not connect");
+                    if Instant::now() >= deadline {
+                        let stderr = child.stderr_after_exit();
+                        panic!("runtime did not connect; child stderr: {stderr}");
+                    }
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 Err(error) => panic!("accept: {error}"),
@@ -648,7 +651,7 @@ fn private_qualification_runtime_blocked_storage_operation_is_abandoned_at_the_g
     let storage_root = base.join("store");
     private_dir(&storage_root);
     let subjects = vec![approved(1)];
-    let mut runtime = Runtime::start_with_grace(&base, "blocked", &storage_root, subjects, 2, 1);
+    let mut runtime = Runtime::start_with_grace(&base, "blocked", &storage_root, subjects, 3, 1);
     // A stalled client keeps the storage thread inside one request until its 5-second read timeout.
     let stalled = UnixStream::connect(&runtime.storage_socket).unwrap();
     let started = Instant::now();
