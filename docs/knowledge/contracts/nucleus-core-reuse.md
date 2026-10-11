@@ -461,11 +461,12 @@ no reuse, benefit or storage claim is made.
 
 ## Task 042 graph-route and installation-evidence design (design-only)
 
-Status: **proposed design, nothing shipped or approved.** Task 042 is the
-DOCS-ONLY follow-up to the Task 041 NO-GO. It read 14 pinned Cargo source files
-(523,608 bytes; the 041 digests match for every overlapping file), ran no Cargo,
-rustc, build script or tool, read no tool/SDK content and installed nothing. The
-record is [`cargo-graph-route-and-installation-evidence-042.json`](../evidence/cargo-graph-route-and-installation-evidence-042.json).
+Status: **proposed route, no producer or invocation approved.** Task 042 is the
+DOCS-ONLY follow-up to the Task 041 NO-GO. Its final source ledger has 15 pinned
+Cargo files (568,816 bytes; the 041 digests match for every overlapping file).
+Task 042 ran no Cargo, rustc, build script or tool, read no tool/SDK content and
+installed nothing. The record is
+[`cargo-graph-route-and-installation-evidence-042.json`](../evidence/cargo-graph-route-and-installation-evidence-042.json).
 
 ### Graph route: same pinned Cargo behind a development-channel gate
 
@@ -475,10 +476,11 @@ Recommended candidate **A**: the same Cargo 1.97.1 (`c980f48`) planner, run as
 only. It is an unstable bypass, never a stable or supported feature. Its
 planner runs the same code path as the ordinary build: `create_bcx` runs in
 both, and the emit at `cargo_compile/mod.rs:188-190` returns before compilation.
-Outside that path the gate changes two things. It accepts unstable manifest and
-`-Z`/`[unstable]` input, and it serializes three unit-graph dependency fields
-that stable never emits. The consumer preflight refuses the first. The value
-rule below handles the second.
+Task 042 initially summarized two differences: the gate accepts unstable
+manifest and `-Z`/`[unstable]` input, and it serializes three unit-graph
+dependency fields that stable never emits. A later planner whole-tree text
+search found additional channel-dependent sites, so this is not a complete
+equivalence inventory.
 
 The source gate, at this pin:
 
@@ -500,6 +502,24 @@ The source gate, at this pin:
   (`commands/test.rs:60`). It is gated by `fail_if_stable_opt`
   (`command_prelude.rs:823-825`). Removing the override makes the graph run fail
   closed, with Cargo's own nightly-only refusal.
+
+The planner completed the whole-tree text-search prerequisite against the
+pinned public Cargo source archive
+`https://codeload.github.com/rust-lang/cargo/tar.gz/c980f4866141969fab6254a680546a277789d6f0`
+(SHA-256 `74431490023e3fbcd6bb72abf09cf54b0339b850bc49e1b2446c88a1be54ea9b`,
+4,439,958 compressed bytes, 2,918 regular files, 17,626,902 expanded bytes).
+Every regular member was searched for `nightly_features_allowed` and
+`channel()`. Besides the sites traced above, the results and targeted source
+review found `-C` changing Cargo's working directory behind unstable options
+in `src/bin/cargo/cli.rs`, nightly `CARGO_COMPLETE` handling in
+`src/bin/cargo/main.rs`, version-5 lockfile acceptance behind
+`next-lockfile-bump` in `src/cargo/core/resolver/encode.rs`, and a changed
+`cargo-lint` warning in `src/cargo/util/toml/mod.rs`. Other hits include
+`src/cargo/core/compiler/custom_build.rs`, `src/cargo/ops/fix/mod.rs`, feature
+diagnostics and documentation links; unrelated asynchronous `channel()` hits
+were not gate evidence. The source search is textual provenance, not a proof
+that the graph route is behaviorally equivalent to an ordinary stable build,
+and it is not consent to invoke the unstable route.
 
 Alternatives, all rejected for now:
 
@@ -555,9 +575,89 @@ Binding and refusal, proposed:
 - The record is produced by the consumer's admitted host run and settled by the
   consumer owner. Oxide verifies bytes and binding. No issuer attestation exists.
 
-Caveat: the nightly-branch inventory covers the 14 fetched files only. A
-whole-tree grep of `nightly_features_allowed` and `channel()` is a precondition
-of any implementation brief.
+The whole-tree search is complete as a text inventory, but it is not a complete
+route audit or equivalence proof. Any future route brief still needs to account
+for the additional sites above, the exact invocation and consumer inputs, and
+the distinction between graph output and stable execution. It grants no route
+activation authority.
+
+### Task 043 pinned graph decoder and provenance verifier (parser only)
+
+The Oxide-only Rust API is
+`registered::cargo_unit_graph::{decode_unit_graph, verify_provenance,
+framed_source_content_digest}`. It is parsing groundwork; the proposed Cargo
+producer and any unstable graph invocation remain unimplemented and
+unauthorized.
+
+Its public signatures are:
+
+```rust
+pub fn decode_unit_graph(
+    bytes: &[u8],
+    registered_roots: &[&std::path::Path],
+    limits: CargoUnitGraphLimits,
+) -> Result<CargoUnitGraph, CargoUnitGraphRefusal>;
+
+pub fn verify_provenance(
+    graph_bytes: &[u8],
+    provenance_bytes: &[u8],
+    expected: &CargoUnitGraphBindings,
+    limits: CargoUnitGraphLimits,
+) -> Result<(), CargoUnitGraphRefusal>;
+
+pub fn framed_source_content_digest(
+    files: &std::collections::BTreeMap<String, String>,
+    limits: CargoUnitGraphLimits,
+) -> Result<String, CargoUnitGraphRefusal>;
+```
+
+`CargoUnitGraphBindings` and `CargoUnitGraphRunAccounting` are caller-built
+expected identities and are serializable for record construction; they do not
+implement `Deserialize`, so the untrusted record cannot supply the expected
+side through deserialization.
+
+`decode_unit_graph(bytes, registered_roots, limits)` accepts only the pinned
+Cargo 1.97.1/c980f48 unit-graph v1 shape. `registered_roots` are explicit
+lexical absolute roots supplied by the caller; no filesystem is inspected.
+The returned graph retains package IDs, target fields and source paths, the
+complete validated profile value, platform, mode, features, roots, and each
+edge's index, extern name and optional `public`/`noprelude`/`nounused` values.
+Duplicate JSON keys are rejected before map construction, as are unknown
+fields, malformed or trailing bytes, unsupported values and invalid indices.
+Omitted `is_std` is false; a true value refuses build-std. `noprelude` and
+`nounused` may be omitted or false; true refuses. `public` may be either bool
+or omitted and its presence/value remains in the edge. Every target `src_path`
+must be under one supplied root. The default and maximum limits are 8 MiB,
+256 units or roots, 32,768 dependency edges or provenance identity-map entries,
+2,048 path bytes and depth 32; callers may choose lower ceilings, including
+zero, never higher ones. Registered roots are also bounded by the unit limit.
+
+`verify_provenance(graph_bytes, provenance_bytes, expected, limits)` accepts
+the version-1 `oxide-cargo-unit-graph-provenance-v1` record only when its
+digest matches the exact graph bytes and its bindings equal the separate
+constructor-supplied `CargoUnitGraphBindings`. The record carries the pinned
+Cargo version/commit, rustc version, `rustc -vV` digest, host triple and
+tool-receipt identity digests; source Git commit/tree and separate framed
+source-content digest; unchanged lock digests; manifest/config-set,
+argv/selector/profile/features/target/environment digests; private path
+identity digests; and supplied task/workspace/run/attempt and clock/invocation
+accounting. `framed_source_content_digest(files, limits)` frames each sorted
+relative path and supplied `sha256:` file digest with an unsigned 64-bit
+little-endian byte length. It reads no source files and keeps this content
+identity distinct from Git commit/tree IDs. Identity fields contain digests or
+IDs, not environment values, credentials or private paths. The embedding must
+construct expected digests from its canonical inputs; this verifier compares
+them but does not compute argv, environment, configuration or path identities.
+The caller separately decodes graph bytes with `decode_unit_graph`; the
+provenance verifier itself checks exact-byte digest correspondence and does not
+decode the graph. It refuses missing or unknown fields, duplicate keys,
+pin/digest/lock/binding mismatch and invalid accounting.
+
+This verifies internal correspondence only. It does not authenticate genuine
+settlement, establish verified tool bytes, prove source completeness, audit
+native or proc-macro behavior, construct `TrustedCargoGraphContext`, or make a
+graph owner/issuer trusted. Nothing in this parser enables a producer, consumer
+execution, installation, trial, or reuse eligibility.
 
 ### Installation evidence for oversized tools
 

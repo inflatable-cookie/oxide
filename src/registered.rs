@@ -27,6 +27,7 @@ pub mod archive_acquisition;
 #[cfg(feature = "private-qualification")]
 pub mod audit_owner;
 pub mod cargo_freshness;
+pub mod cargo_unit_graph;
 pub mod dep_info;
 #[cfg(feature = "private-qualification")]
 pub mod graph_owner;
