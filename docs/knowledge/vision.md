@@ -138,3 +138,24 @@ activation, cleanup, release or Contract 010 change follows from this ruling.
 It grants no general admission/settings change; any consumer dispatch capacity
 must follow its owning recorded authority. Implementation or synthetic success
 cannot satisfy the real proof's gates, and trial success is not production rollout.
+
+Tom's further ruling, relayed by the Nucleus owner on 2026-10-11:
+"Sounds good - get this going, and the work you suggested in your previous
+response. You have blanket authority - keep all of this moving, make progress
+on your own." Progress the smaller ordinary-Cargo storage-first route alongside
+the bounded graph parser. Oxide owns the separately reviewed storage/execution
+route; Nucleus owns source/attempt binding, genuine existing Effigy/Contract010
+submission and settlement, retention and its private client. Start with one
+fresh qualification workspace and sequential same-root attempts, exclusive
+ownership, always-run selected tests, finite budgets and an accepted pinned
+installation epoch/no-replacement commitment. This is an explicit ordinary
+Cargo freshness policy, not a relaxation of the registered Runner or a claim
+of complete graph/tool-content proof. Unknown dependency macro, build-script
+or native inputs require a qualified invalidation boundary, whole uncertain
+partition rebuild, or refusal; cleaning local source outputs is insufficient.
+Checked Queue scopes and independent review precede implementation and use.
+The original total four-Cargo/45-minute proof remains unstarted until the joint
+checked packet fixes pins, numeric footprint, deadlines, capture/debug evidence
+and owner conditions. No production activation, general installation/config
+change, new scheduler or consumer admission change is implied. Do not ask again
+for routine bounded progress already covered by this ruling.
