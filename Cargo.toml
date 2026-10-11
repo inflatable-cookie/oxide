@@ -16,10 +16,17 @@ tar = "=0.4.46"
 
 [features]
 private-qualification = ["dep:hmac", "dep:libc"]
+# Unpublished test-only blocking points. Off by default; never selected by bootstrap, env or argv.
+private-qualification-fixture = ["private-qualification"]
 
 [[bin]]
 name = "oxide-qualified-runner"
 path = "src/bin/qualified_runner.rs"
+required-features = ["private-qualification"]
+
+[[bin]]
+name = "oxide-storage-runtime"
+path = "src/bin/storage_runtime.rs"
 required-features = ["private-qualification"]
 
 [lib]

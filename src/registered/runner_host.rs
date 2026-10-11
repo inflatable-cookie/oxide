@@ -2133,6 +2133,7 @@ mod tests {
             });
             serde_json::to_writer(&mut parent_stream, &response).unwrap();
             parent_stream.write_all(b"\n").unwrap();
+            parent_stream
         });
         let mut channel = Channel::new(host_stream).unwrap();
         let error = channel.exchange::<_, ()>(
@@ -2160,7 +2161,7 @@ mod tests {
             },
             &AcceptReceipts,
         );
-        parent.join().unwrap();
+        let _peer = parent.join().unwrap();
         assert!(matches!(error, Err(CallbackError::Protocol)));
     }
 
@@ -2236,6 +2237,7 @@ mod tests {
                 });
                 serde_json::to_writer(&mut parent_stream, &response).unwrap();
                 parent_stream.write_all(b"\n").unwrap();
+                parent_stream
             });
 
             let mut channel = Channel::new(host_stream).unwrap();
@@ -2247,7 +2249,7 @@ mod tests {
                 &partition,
                 &AcceptReceipts,
             );
-            parent.join().unwrap();
+            let _peer = parent.join().unwrap();
             assert!(matches!(error, Err(CallbackError::Protocol)));
         }
     }
@@ -2274,6 +2276,7 @@ mod tests {
             });
             serde_json::to_writer(&mut parent_stream, &response).unwrap();
             parent_stream.write_all(b"\n").unwrap();
+            parent_stream
         });
         let mut channel = Channel::new(host_stream).unwrap();
         let error = channel.exchange::<_, ()>(
@@ -2301,7 +2304,7 @@ mod tests {
             },
             &AcceptReceipts,
         );
-        parent.join().unwrap();
+        let _peer = parent.join().unwrap();
         assert!(matches!(error, Err(CallbackError::Protocol)));
         assert_eq!(
             IMPLEMENTATION_PIN,
@@ -2330,6 +2333,7 @@ mod tests {
             });
             serde_json::to_writer(&mut parent_stream, &response).unwrap();
             parent_stream.write_all(b"\n").unwrap();
+            parent_stream
         });
         let mut channel = Channel::new(host_stream).unwrap();
         let error = channel.exchange::<_, ()>(
@@ -2357,7 +2361,7 @@ mod tests {
             },
             &RejectReceipts,
         );
-        parent.join().unwrap();
+        let _peer = parent.join().unwrap();
         assert!(matches!(error, Err(CallbackError::Rejected)));
     }
 

@@ -1,0 +1,31 @@
+{
+  "description": "Independent ready-frame vector: oxide-runtime-ready-v1 MAC over scope, bootstrap, policy, instance and canonical body digest. Endpoint u64 values above 2^53-1 are canonical decimal text.",
+  "key_hex": "6666666666666666666666666666666666666666666666666666666666666666",
+  "scope": "synthetic-task033-ready-vector",
+  "bootstrap_digest": "sha256:d167a031e8103a8b09c5957f0ae5792d2525c8663ad129af28dd313083ba2cab",
+  "policy_digest": "sha256:116f8c9ec7c5184fb493891c0a46fbc5e83ba3631a008e741af18027b74747d9",
+  "storage_socket": "/vector/store/daemon.sock",
+  "body": {
+    "version": 1,
+    "operation": "ready",
+    "scope": "synthetic-task033-ready-vector",
+    "bootstrap_digest": "sha256:d167a031e8103a8b09c5957f0ae5792d2525c8663ad129af28dd313083ba2cab",
+    "policy_digest": "sha256:116f8c9ec7c5184fb493891c0a46fbc5e83ba3631a008e741af18027b74747d9",
+    "storage_instance_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "storage": {
+      "path": "/vector/store/daemon.sock",
+      "device": "18446744073709551615",
+      "inode": "9007199254740993"
+    },
+    "storage_protocol": 1,
+    "control_protocol": 1,
+    "budget": {
+      "cap_bytes": 16777216,
+      "free_reserve_bytes": 1048576
+    },
+    "expires_unix_seconds": 1900000000
+  },
+  "body_canonical_utf8": "{\"bootstrap_digest\":\"sha256:d167a031e8103a8b09c5957f0ae5792d2525c8663ad129af28dd313083ba2cab\",\"budget\":{\"cap_bytes\":16777216,\"free_reserve_bytes\":1048576},\"control_protocol\":1,\"expires_unix_seconds\":1900000000,\"operation\":\"ready\",\"policy_digest\":\"sha256:116f8c9ec7c5184fb493891c0a46fbc5e83ba3631a008e741af18027b74747d9\",\"scope\":\"synthetic-task033-ready-vector\",\"storage\":{\"device\":\"18446744073709551615\",\"inode\":\"9007199254740993\",\"path\":\"/vector/store/daemon.sock\"},\"storage_instance_id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"storage_protocol\":1,\"version\":1}",
+  "body_digest": "sha256:b5d232c15cb4800a3e609bf1afca9737eb2d6063c62101d1b0d64bb565656951",
+  "mac": "hmac-sha256-v1:af58191fb8b971b64a9fe2d9f187799814a1617de2c299138a7fd3cd24e723eb"
+}

@@ -29,6 +29,8 @@ pub mod graph_owner;
 #[cfg(feature = "private-qualification")]
 pub mod qualification;
 pub mod runner_host;
+#[cfg(feature = "private-qualification")]
+pub mod storage_runtime;
 
 pub const REGISTRATION_VERSION: u32 = 1;
 pub const SOURCE_VERSION: u32 = 1;
