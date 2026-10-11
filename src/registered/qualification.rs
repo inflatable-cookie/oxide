@@ -6,6 +6,11 @@ use super::runner_host::{
     canonical_json_bytes, HostError, OwnerReceiptVerifier, RunnerHost, Timing,
     MAX_QUALIFIED_SESSION,
 };
+
+pub use super::graph_owner::{
+    accept_graph_provision, issue_graph_provision, GraphOwnerAuthority, GraphProvision,
+    GRAPH_OWNER_ISSUER, GRAPH_OWNER_PROVISION_DOMAIN, GRAPH_OWNER_SCHEMA, GRAPH_OWNER_VERSION,
+};
 use crate::storage::{
     AcquireResult, ContainmentEvidence, EvidenceAuthority, RunEnvelope, SettlementEvidence,
     TerminalOutcome,
@@ -316,6 +321,11 @@ pub struct Bootstrap {
     pub roots: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<TimingAuthority>,
+    /// Absent keeps parent `input.units` in-memory fixture mode. Present installs
+    /// the synthetic Cargo reading owner; missing context then refuses rather
+    /// than falling back to a parent UnitEvidence array.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_owner: Option<GraphOwnerAuthority>,
 }
 
 /// Trusted, receipt-bound finite window for exactly one approved start digest.
@@ -413,6 +423,19 @@ pub(super) struct AttemptGrant {
     pub(super) timing: Timing,
 }
 impl AttemptGrant {
+    pub(super) fn graph_owner_runtime(
+        &self,
+    ) -> Result<Option<(MacKey, String, String)>, HostError> {
+        if self.bootstrap.graph_owner.is_none() {
+            return Ok(None);
+        }
+        Ok(Some((
+            MacKey::from_hex(&self.bootstrap.callback_key_hex)?,
+            self.bootstrap.scope.clone(),
+            self.bootstrap.start_digest.clone(),
+        )))
+    }
+
     pub(super) fn check_start(&self, start: &Value) -> Result<(), HostError> {
         let b = &self.bootstrap;
         b.validate()?;
@@ -525,6 +548,9 @@ pub fn serve_bootstrap(path: &Path) -> Result<(), HostError> {
         None => Timing::Version1,
         Some(authority) => authority.verify(&bootstrap, entry)?,
     };
+    if let Some(owner) = &bootstrap.graph_owner {
+        owner.verify(&bootstrap)?;
+    }
     let verifier = CallbackAuthenticator::new(
         MacKey::from_hex(&bootstrap.callback_key_hex)?,
         bootstrap.callback_context()?,
@@ -680,6 +706,7 @@ mod tests {
             storage: Endpoint::capture(root.join("storage.sock")).unwrap(),
             roots,
             timing: None,
+            graph_owner: None,
         };
         let grant = AttemptGrant {
             bootstrap: b,
@@ -720,6 +747,7 @@ mod tests {
             storage: endpoint("storage"),
             roots: Vec::new(),
             timing: None,
+            graph_owner: None,
         }
     }
 

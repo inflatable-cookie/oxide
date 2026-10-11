@@ -23,6 +23,8 @@ use std::time::UNIX_EPOCH;
 pub mod cargo_freshness;
 pub mod dep_info;
 #[cfg(feature = "private-qualification")]
+pub mod graph_owner;
+#[cfg(feature = "private-qualification")]
 pub mod qualification;
 pub mod runner_host;
 #[cfg(feature = "private-qualification")]
