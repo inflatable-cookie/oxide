@@ -842,13 +842,19 @@ fn replay_markers(dir: &Path) -> usize {
 fn private_qualification_runtime_actual_child_stall_before_bind_expires_without_ready() {
     // Controlled step: after control connect and endpoint capture, before Daemon::bind.
     let base = scratch("stall-bind");
+    // Leave the cold child enough time to validate its bootstrap and reach the FIFO; a
+    // shorter window can expire during process startup and exercise early refusal instead.
     let (mut child, listener, storage_root, file, bytes, control_dir) =
-        stalled_child(&base, "stall-bind", "before-bind", 3);
+        stalled_child(&base, "stall-bind", "before-bind", 8);
     let started = Instant::now();
     let status = child.wait_exit(Duration::from_secs(15));
     assert!(started.elapsed() < Duration::from_secs(10), "bounded exit");
-    assert_eq!(status.code(), Some(4), "expired before readiness");
     let stderr = child.stderr_after_exit();
+    assert_eq!(
+        status.code(),
+        Some(4),
+        "expired before readiness; child stderr: {stderr}"
+    );
     assert!(
         stderr.contains("fixture stall entered: before-bind"),
         "blocked phase entered: {stderr}"
