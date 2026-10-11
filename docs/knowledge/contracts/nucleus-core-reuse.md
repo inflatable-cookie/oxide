@@ -66,7 +66,10 @@ file/directory membership, including empty directories and parent directories
 implied by files or by nested empty directories. Duplicate tar members refuse,
 including a repeated prefix-only package-root directory header. Extracted
 directory membership is snapshotted before and after each directory walk;
-identity or membership change refuses as unstable. `VerifiedCorrespondence` is
+identity or membership change refuses as unstable. Each listing charges a child
+against the inventory cap before retaining its path; a directory that would
+exceed the cap refuses without materializing the remainder. The after-walk
+snapshot is capped at the before set plus one extra member. `VerifiedCorrespondence` is
 constructed only by `verify`; its fields are private. Conversion to
 `ImmutableManifest` is `VerifiedCorrespondence::into_registered` and requires
 `TrustedContext::new` with an already-accepted `InputEvidenceOwner`, that
@@ -82,8 +85,9 @@ Local Cargo sidecars `.cargo-ok` and `.cargo-checksum.json` may exist at the
 extracted package root. They are not archive members and are never read as
 attestations of archive contents. Those names inside the archive refuse.
 Nested copies, and any other extra extracted file, refuse; extra files are not
-skipped. Symlink, hardlink and special tar entries, extracted symlinks and
-special files, absolute/parent/escaping paths, `.`/`..` components, backslashes,
+skipped. Symlink, hardlink and special tar entries, extracted symlinks,
+extracted regular files with `nlink ≠ 1`, and extracted special files refuse.
+Absolute/parent/escaping paths, `.`/`..` components, backslashes,
 non-UTF-8 names, duplicate or file/directory collisions, unknown formats
 (including bare tar, extra gzip members and trailing compressed bytes),
 corrupt or truncated streams, and unstable reads refuse.

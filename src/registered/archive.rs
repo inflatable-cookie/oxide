@@ -479,13 +479,8 @@ fn walk(
         return Err(Refusal::Unsupported);
     }
     let before_id = dir_identity(&before)?;
-    let mut children = Vec::new();
-    for entry in fs::read_dir(dir).map_err(io)? {
-        children.push(entry.map_err(io)?.path());
-    }
-    children.sort();
+    let children = list_dir_charged(dir, limits, counters)?;
     for path in &children {
-        bump_entries(counters, limits)?;
         let metadata = fs::symlink_metadata(path).map_err(io)?;
         let name = path
             .strip_prefix(root)
@@ -500,6 +495,9 @@ fn walk(
             directories.insert(name.to_owned());
             walk(root, path, depth + 1, limits, counters, files, directories)?;
         } else if metadata.is_file() {
+            if metadata.nlink() != 1 {
+                return Err(Refusal::Unsupported);
+            }
             if is_sidecar(name) {
                 continue;
             }
@@ -512,15 +510,33 @@ fn walk(
     if dir_identity(&after)? != before_id {
         return Err(Refusal::Unstable);
     }
-    let mut after_children = Vec::new();
-    for entry in fs::read_dir(dir).map_err(io)? {
-        after_children.push(entry.map_err(io)?.path());
-    }
-    after_children.sort();
+    let after_children = list_dir_capped(dir, children.len().saturating_add(1))?;
     if after_children != children {
         return Err(Refusal::Unstable);
     }
     Ok(())
+}
+
+fn list_dir_charged(dir: &Path, limits: Limits, counters: &mut Counters) -> Result<Vec<PathBuf>> {
+    let mut children = Vec::new();
+    for entry in fs::read_dir(dir).map_err(io)? {
+        bump_entries(counters, limits)?;
+        children.push(entry.map_err(io)?.path());
+    }
+    children.sort();
+    Ok(children)
+}
+
+fn list_dir_capped(dir: &Path, max: usize) -> Result<Vec<PathBuf>> {
+    let mut children = Vec::new();
+    for entry in fs::read_dir(dir).map_err(io)? {
+        if children.len() >= max {
+            return Err(Refusal::Unstable);
+        }
+        children.push(entry.map_err(io)?.path());
+    }
+    children.sort();
+    Ok(children)
 }
 
 fn dir_identity(metadata: &fs::Metadata) -> Result<(u64, u64, u64, i64, i64, u64)> {
@@ -537,7 +553,7 @@ fn dir_identity(metadata: &fs::Metadata) -> Result<(u64, u64, u64, i64, i64, u64
 
 fn read_extracted(path: &Path, limits: Limits, counters: &mut Counters) -> Result<String> {
     let before = fs::symlink_metadata(path).map_err(io)?;
-    if !before.is_file() || before.file_type().is_symlink() {
+    if !before.is_file() || before.file_type().is_symlink() || before.nlink() != 1 {
         return Err(Refusal::Unsupported);
     }
     let limit = remaining(limits, counters)?.min(limits.file_bytes);
@@ -562,6 +578,7 @@ fn read_extracted(path: &Path, limits: Limits, counters: &mut Counters) -> Resul
         || before.len() != after.len()
         || before.ctime() != after.ctime()
         || before.ctime_nsec() != after.ctime_nsec()
+        || before.nlink() != after.nlink()
         || bytes.len() as u64 != after.len()
     {
         return Err(Refusal::Unstable);
@@ -1093,6 +1110,22 @@ mod tests {
             once(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS).value,
             Err(Refusal::Unsupported)
         );
+        fs::remove_file(extracted.join("socket")).unwrap();
+        fs::hard_link(extracted.join("Cargo.toml"), extracted.join("alias.rs")).unwrap();
+        assert_eq!(
+            once(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS).value,
+            Err(Refusal::Unsupported)
+        );
+        fs::remove_file(extracted.join("alias.rs")).unwrap();
+        fs::hard_link(
+            extracted.join("src/lib.rs"),
+            extracted.join("src/lib.rs.bak"),
+        )
+        .unwrap();
+        assert_eq!(
+            once(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS).value,
+            Err(Refusal::Unsupported)
+        );
     }
 
     #[test]
@@ -1123,6 +1156,20 @@ mod tests {
             Err(Refusal::Unsupported)
         );
         assert!(parse_member("pkg-1.0.0/src/lib.rs", false, limits).is_ok());
+    }
+
+    #[test]
+    fn directory_listing_refuses_before_collecting_past_the_entry_cap() {
+        let scratch = Scratch::new();
+        let (archive, extracted, checksum) = prepare(&scratch);
+        for index in 0..64 {
+            fs::write(extracted.join(format!("extra-{index}.rs")), b"x").unwrap();
+        }
+        let mut tight = Limits::NUCLEUS;
+        tight.associations = 8;
+        let refused = once(&ask(&archive, &extracted, &checksum), tight);
+        assert_eq!(refused.value, Err(Refusal::Budget));
+        assert_eq!(refused.counters.entries, 8);
     }
 
     #[test]
