@@ -8,6 +8,9 @@ the separate reusable-slot adoption design.
 Status: proposed consumer design. Oxide now contains an unpublished Rust
 library adapter for task-owned fixtures. It defines no production Queue/Nucleus
 binding, consumer configuration key, daemon deployment or consumer adoption.
+Nucleus has a disabled synthetic runner client; its
+[implemented boundary and evidence limits](nucleus-core-reuse.md#inactive-nucleus-client)
+remain separate from production adoption.
 The storage rules remain in [architecture](../architecture.md),
 product authority remains in [vision](../vision.md), and Q-010/Q-011 hold the
 integration design answers. Q-012 remains open for the consumer-owned source

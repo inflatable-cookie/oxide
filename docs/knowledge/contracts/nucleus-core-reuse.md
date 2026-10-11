@@ -511,7 +511,7 @@ Both recommend acquire before genuine host submission, with an explicit finite
 host-capacity wait while holding the acquired Oxide lease. Readiness and storage
 busy remain non-reserving. A submitted run's authenticated nonlaunched
 cancel/capacity-timeout settlement needs adapter no-writer proof before release;
-deadline expiry alone never releases ownership. The missing consumer-owned
+deadline expiry alone never releases ownership. The consumer-owned
 storage-attempt ledger must persist authorization, acquire/submit intents and
 identities, busy/uncertain outcomes, cancellation and reconciliation. Existing
 operation journals and worker admission are patterns, not this API.
@@ -533,9 +533,9 @@ implementation and refuse unqualified compatibility with maps published before
 that framing change. The existing TypeScript seams neither encode dep-info nor
 consume Oxide publication maps, so this change introduces no immediate TypeScript
 code incompatibility.
-The TypeScript consumer seams do not supply an authenticated concrete Rust
-embedding or transport. That binding is a separate implementation prerequisite,
-along with accepted owners and genuine input/completion evidence.
+The TypeScript consumer now supplies the disabled fixture transport described
+under [inactive Nucleus client](#inactive-nucleus-client). Production embedding,
+accepted owners and genuine input/completion evidence remain prerequisites.
 
 Nucleus now has disabled consumer-local managed-Git/root-allocation,
 storage-attempt and bounded retention seams. Managed Git supplies task-scoped
@@ -770,12 +770,11 @@ finalize ID, and evidence before any identical finalize replay. `Present Idle`
 is an observation of completion, `Absent` permits the exact retry, and
 uncertainty holds. The host never uses `Client::reconcile` as lookup.
 
-The actual Nucleus `StorageAttempt`/`Lease{id,generation}` surface is unchanged
-by this PR and does not yet carry the complete storage tuple or secret-preserving
-recovery binding. No old lease or publication-map format is upgraded here; a
-future consumer binding must version and authenticate the complete tuple and
-preserve the original accepted secret through its own approved secret handling,
-or hold. The private host and fixtures do not implement that consumer adapter.
+The Oxide host alone does not upgrade Nucleus's old lease or publication-map
+formats. The [inactive Nucleus client](#inactive-nucleus-client) binds the complete
+storage tuple and preserves original secret material only within its private
+session. Session or secret loss holds; it provides no durable secret recovery
+or production adapter.
 
 Each callback request binds the exact payload to the acquired slot ID,
 storage-instance ID, generation, reuse result, and complete partition key. Its
@@ -801,6 +800,43 @@ representative test/debug capture, workflow eligibility, or everyday storage
 savings claim is established. A real embedding still needs owner-selected
 issuers and verifier keys, complete input auditing, consumer capture and
 settlement evidence, and its own transport/process policy.
+
+### Inactive Nucleus client
+
+Nucleus source `03b8eb95dbaad63ca154e81049280069f66697ea` contains
+[`oxide-runner-transport.ts`](https://github.com/inflatable-cookie/nucleus/blob/03b8eb95dbaad63ca154e81049280069f66697ea/hosts/paseo/src/oxide-runner-transport.ts)
+and opt-in fixture hooks in its existing `StorageAttempt`. The client uses a
+synthetic child channel against the actual reviewed host schema; it does not
+launch the Rust host or supply an executable. It pins the Oxide bridge
+`24ad2848b1fb91760919b1693a143b5a35fec23c`, storage API
+`ae56f4ebcfae65730a9de3ce26fd5d21386cc3f2` and registered-map implementation
+`d9ff17988c7eaa5cf57747bc55bfe4f138692f15`.
+
+Before delivery, the attempt retains the redacted start intent, exact original
+body digest, acquire identity and reserved finalize ID. Trusted
+`registration.authenticate` binds the acquired attempt, lease and full
+instance/slot/generation tuple. The existing ledger persists acquired ownership
+before acknowledging that callback or permitting `execution.execute`. Execution
+uses the same durable submission identity and reviewed Effigy client; it adds
+no second host submission path. Capture and finalization barriers precede the
+corresponding replies. The client checks framed source-content correspondence
+separately from Git head/tree and the consumer's retained-source digest.
+
+Generation conversion refuses values outside the positive safe JavaScript
+integer range. Framing, callback authentication, bounds and redaction are checked.
+Original credentials and token material do not enter ordinary ledgers or logs.
+There is no standalone parent lookup or cancellation wire operation. Session
+loss or consumer reconciliation holds; the client never repeats `run` to imitate
+lookup or recover missing secret material. Production registration refuses.
+
+Independent exact-head review at
+`8d118b2a6fc2d4baf066ea8c7d779c2d36171960` executed the covering storage-attempt,
+runner-transport, validation-client and retention tests: 124 passed, zero failed,
+eight existing private-qualification skips. Documentation checks passed. The
+reviewer's piped typecheck lacked a captured exit status; owner reconciliation
+on source `03b8eb9` separately established typecheck exit 0. These are fixture
+and merged-head reconciliation results, not an actual cross-language host
+session, trusted production issuers, real Cargo execution or reuse qualification.
 
 ### Field correspondence
 
@@ -922,8 +958,8 @@ from UTF-8 byte order, so neither may feed Oxide.
 | `RegistrationOwner.authenticate` and `audit` | Nucleus managed-Git and root owner; audited-input owner | missing |
 | `InputEvidenceOwner.immutable`, `units`, `seal_map`, `verify_map` | installation registry and SDK owner; Cargo graph audit | decoder only; no issuer |
 | `ExecutionOwner.execute`, `verify_success`, `finalize_*` | Queue host authority (submission); Nucleus capture owner | TS fixture only |
-| Daemon `generation` and storage-instance identity in `AcquireResult`; epoch in admission | Oxide storage owner | API and versioned wire change implemented by oxide#027; Nucleus consumer binding remains absent |
-| Authenticated lookup-only acquire/finalize recovery | Oxide storage owner; Nucleus attempt owner | Oxide APIs implemented by oxide#027; Nucleus caller and attempt binding remain absent |
+| Daemon `generation` and storage-instance identity in `AcquireResult`; epoch in admission | Oxide storage owner | Oxide API implemented; Nucleus fixture client binds the complete tuple and checks safe conversion; production binding disabled |
+| Authenticated lookup-only acquire/finalize recovery | Oxide storage owner; Nucleus attempt owner | Oxide APIs implemented; private host uses them internally; Nucleus session-loss reconciliation holds and adds no lookup wire verb |
 | Oxide `EvidenceAuthority` implementation | Nucleus embedding, in process | missing |
 
 Smallest proposed issuer API, needing owner decision: Nucleus task admission signs a
@@ -950,13 +986,12 @@ slot gets the next durable ordinal. Ledger recreation creates a new instance
 identity, fencing previous maps and receipts even if the new ordinal repeats.
 The slot counter is not reset by eviction.
 
-Nucleus's reviewed mapping recommendation is still an owner requirement, not
-consumer code: place this decimal text in `Attempt.generation` unchanged, and
+Nucleus's fixture client implements its reviewed mapping: place this decimal
+text in `Attempt.generation` unchanged, and
 convert to the existing TypeScript numeric generation only after checking
 `1 <= value <= Number.MAX_SAFE_INTEGER`. Oxide rejects malformed, noncanonical
-and overflowing u64 values. Nucleus's checked conversion and identity binding
-have not been implemented in this task; production registration remains
-disabled.
+and overflowing u64 values. The client checks conversion and binds the full
+tuple; production registration remains disabled.
 
 `Client::lookup_acquire` takes the original authenticated `AcquireRequest` and
 returns `LookupResult<LeaseIdentity>`. `Client::lookup_finalize` takes the
