@@ -298,6 +298,17 @@ requires complete-root membership within the entry and 256 MiB collection caps
 (`src/registered.rs:990-1090`). The exact table and limits are in
 [`cargo-unit-graph-and-tool-fit-041.json`](../evidence/cargo-unit-graph-and-tool-fit-041.json).
 
+### Task 042 graph and installation design (proposed)
+
+Task 042 designs, but does not apply, two routes for the 041 blockers: a
+same-pinned-Cargo unit-graph gate and owner-installed immutable tool receipts
+with streaming complete-content verification. Neither changes the 16 MiB
+policy, the proposed owner packet, or any acquisition authority. The receipt
+term would add reads on top of the 520 MiB admission and finalize budget, and
+the owner must accept it. The design is in
+[Task 042](nucleus-core-reuse.md#task-042-graph-route-and-installation-evidence-design-design-only)
+and [`cargo-graph-route-and-installation-evidence-042.json`](../evidence/cargo-graph-route-and-installation-evidence-042.json).
+
 ## Acquisition handover
 
 The Git commit/tree are the only source-authenticated identities established
