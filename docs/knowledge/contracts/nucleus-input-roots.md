@@ -117,8 +117,10 @@ cumulative snapshot was 9,249 archive bytes, 44,032 decompressed bytes, 36,437
 extracted-file bytes, and 21 entries. Behavior triage read 840 bytes from that
 package's verified `Cargo.toml`; it found no build script, proc-macro entry,
 or native link declaration. Aggregate acquisition reads were 74,433,606 bytes,
-including 69,158 pinned source bytes, 40 configuration bytes observed across
-preflight/acquisition, and triage. Retained evidence is 171,140 bytes. The
+including 69,158 pinned source bytes: 48,600 bounded source bytes were read
+during preflight before the acquisition entry existed, and 20,558 were read by
+the entry itself. The total also includes 40 configuration bytes observed
+across preflight/acquisition and triage. Retained evidence is 171,140 bytes. The
 sampled free space stayed above the 20 GiB reserve; its delta is not an SSD
 write measurement.
 

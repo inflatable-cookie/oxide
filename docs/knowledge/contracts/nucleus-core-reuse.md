@@ -115,11 +115,14 @@ package root, host registry scan, per-call counter reset or automatic growth.
 Task 037 added a private, opt-in acquisition caller at
 `src/registered/archive_acquisition.rs` and
 `src/bin/registry_acquisition.rs`, selected by
-`effigy registry:acquire:nucleus`. The Rust entry accepts only the pinned
-commit/tree, five pinned source-leaf digests, exact lock digest and 58-package
-tuple inventory. It requires explicit `CARGO_HOME=/Users/tom/.cargo`, examines
-at most eight immediate namespace names per cache/source root, and tests only
-lock-derived archive and extracted-directory names. Canonical containment,
+`effigy registry:acquire:nucleus`. The Python caller hashes the five
+allowlisted source leaves read from the pinned Git blobs. The Rust entry
+requires the pinned commit/tree, the exact five-leaf name set with
+well-formed digests, the pinned `Cargo.lock` digest, and the pinned 58-package
+tuple inventory digest; it does not pin the other four leaf digests itself.
+It requires explicit `CARGO_HOME=/Users/tom/.cargo`, examines at most eight
+immediate namespace names per cache/source root, and tests only lock-derived
+archive and extracted-directory names. Canonical containment,
 unique candidates, metadata stability and one shared `archive::verify`
 counter set are enforced; the JSON output is capped at 8 MiB. It does not read
 registry index data, fall back to arbitrary paths, modify installed roots, call
