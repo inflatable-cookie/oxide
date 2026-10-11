@@ -1,7 +1,7 @@
 //! Bounded verifier for a locked Cargo registry archive versus its extraction.
 //!
-//! The supported form is a single-member gzip of a ustar/pax tar whose members
-//! share one canonical package prefix, matching a Cargo `.crate`. Verification
+//! The supported form is a single-member gzip of a ustar or legacy GNU tar
+//! whose members share one canonical package prefix, matching a Cargo `.crate`. Verification
 //! is read-only: it does not unpack, fetch, or scan a host registry. Matching
 //! bytes do not install an issuer or prove native/proc-macro closure.
 
@@ -296,6 +296,9 @@ fn read_archive(path: &Path, limits: Limits, counters: &mut Counters) -> Result<
     if !before.is_file() || before.file_type().is_symlink() {
         return Err(Refusal::Unsupported);
     }
+    if before.len() > limits.file_bytes as u64 {
+        return Err(Refusal::Budget);
+    }
     let limit = remaining(limits, counters)?;
     if before.len() > limit as u64 {
         return Err(Refusal::Budget);
@@ -339,7 +342,19 @@ fn decompress(compressed: &[u8], limits: Limits, counters: &mut Counters) -> Res
             if limit == 0 {
                 return Err(Refusal::Budget);
             }
-            let want = buf.len().min(limit);
+            if out.len() == limits.file_bytes {
+                let mut extra = [0u8; 1];
+                match decoder.read(&mut extra) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        counters.decompressed_bytes += n;
+                        return Err(Refusal::Budget);
+                    }
+                    Err(_) => return Err(Refusal::Integrity),
+                }
+            }
+            let package_remaining = limits.file_bytes.saturating_sub(out.len());
+            let want = buf.len().min(limit).min(package_remaining);
             match decoder.read(&mut buf[..want]) {
                 Ok(0) => break,
                 Ok(n) => {
@@ -371,7 +386,9 @@ fn tar_inventory(bytes: &[u8], limits: Limits, counters: &mut Counters) -> Resul
     for entry in archive.entries().map_err(|_| Refusal::Unsupported)? {
         bump_entries(counters, limits)?;
         let mut entry = entry.map_err(|_| Refusal::Integrity)?;
-        if entry.header().as_ustar().is_none() {
+        // Cargo registry archives use both POSIX ustar and legacy GNU headers.
+        // This format allowance does not relax the member checks below.
+        if entry.header().as_ustar().is_none() && entry.header().as_gnu().is_none() {
             return Err(Refusal::Unsupported);
         }
         let kind = entry.header().entry_type();
@@ -790,6 +807,15 @@ mod tests {
         dirs: &[&str],
         new_header: fn() -> tar::Header,
     ) -> Vec<u8> {
+        crate_bytes_with_header_and_extra(prefix, files, dirs, new_header, None)
+    }
+    fn crate_bytes_with_header_and_extra(
+        prefix: &str,
+        files: &[(&str, &[u8])],
+        dirs: &[&str],
+        new_header: fn() -> tar::Header,
+        extra: Option<fn(&mut tar::Builder<&mut Vec<u8>>)>,
+    ) -> Vec<u8> {
         let mut tar_buf = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut tar_buf);
@@ -799,6 +825,9 @@ mod tests {
             }
             for (name, bytes) in files {
                 append_file_header(&mut builder, &format!("{prefix}/{name}"), bytes, new_header);
+            }
+            if let Some(extra) = extra {
+                extra(&mut builder);
             }
             builder.finish().unwrap();
         }
@@ -1246,8 +1275,90 @@ mod tests {
         .unwrap();
         let gnu = fs::canonicalize(gnu_path).unwrap();
         let gnu_sum = digest(&fs::read(&gnu).unwrap());
+        let gnu_outcome = once(&ask(&gnu, &gnu_root, &gnu_sum), Limits::NUCLEUS);
+        let gnu_verified = gnu_outcome
+            .value
+            .expect("observed legacy GNU tar headers have exact correspondence");
+        assert_eq!(gnu_verified.files().len(), 2);
+        assert!(gnu_verified.directories().contains("src"));
         assert_eq!(
-            once(&ask(&gnu, &gnu_root, &gnu_sum), Limits::NUCLEUS).value,
+            once(
+                &ask(&gnu, &gnu_root, &format!("sha256:{}", "ab".repeat(32))),
+                Limits::NUCLEUS
+            )
+            .value,
+            Err(Refusal::Integrity)
+        );
+
+        let gnu_link = scratch.path("gnu-link.crate");
+        fs::write(
+            &gnu_link,
+            crate_bytes_with_header_and_extra(
+                prefix,
+                &files,
+                &dirs,
+                tar::Header::new_gnu,
+                Some(|builder| {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_entry_type(tar::EntryType::Symlink);
+                    header.set_path("pkg-1.0.0/link").unwrap();
+                    header.set_link_name("Cargo.toml").unwrap();
+                    header.set_size(0);
+                    header.set_cksum();
+                    builder.append(&header, stdio::empty()).unwrap();
+                }),
+            ),
+        )
+        .unwrap();
+        let gnu_link = fs::canonicalize(gnu_link).unwrap();
+        let gnu_link_sum = digest(&fs::read(&gnu_link).unwrap());
+        assert_eq!(
+            once(&ask(&gnu_link, &gnu_root, &gnu_link_sum), Limits::NUCLEUS).value,
+            Err(Refusal::Unsupported)
+        );
+
+        let gnu_duplicate = scratch.path("gnu-duplicate.crate");
+        fs::write(
+            &gnu_duplicate,
+            crate_bytes_with_header_and_extra(
+                prefix,
+                &[("Cargo.toml", b"first")],
+                &[],
+                tar::Header::new_gnu,
+                Some(|builder| {
+                    append_file_header(
+                        builder,
+                        "pkg-1.0.0/Cargo.toml",
+                        b"second",
+                        tar::Header::new_gnu,
+                    );
+                }),
+            ),
+        )
+        .unwrap();
+        let gnu_duplicate = fs::canonicalize(gnu_duplicate).unwrap();
+        let gnu_duplicate_sum = digest(&fs::read(&gnu_duplicate).unwrap());
+        assert_eq!(
+            once(
+                &ask(&gnu_duplicate, &gnu_root, &gnu_duplicate_sum),
+                Limits::NUCLEUS
+            )
+            .value,
+            Err(Refusal::Unsupported)
+        );
+
+        let mut gnu_trailing = fs::read(&gnu).unwrap();
+        gnu_trailing.extend_from_slice(&gzip(b"second-gzip-member"));
+        let gnu_trailing_path = scratch.path("gnu-trailing.crate");
+        fs::write(&gnu_trailing_path, &gnu_trailing).unwrap();
+        let gnu_trailing_path = fs::canonicalize(gnu_trailing_path).unwrap();
+        let gnu_trailing_sum = digest(&fs::read(&gnu_trailing_path).unwrap());
+        assert_eq!(
+            once(
+                &ask(&gnu_trailing_path, &gnu_root, &gnu_trailing_sum),
+                Limits::NUCLEUS
+            )
+            .value,
             Err(Refusal::Unsupported)
         );
     }
@@ -1355,6 +1466,22 @@ mod tests {
         assert!(counters.archive_bytes > 0);
         assert!(counters.decompressed_bytes > 0);
         assert!(counters.extracted_bytes > 0);
+
+        let mut compressed_cap = Limits::NUCLEUS;
+        compressed_cap.file_bytes = fs::metadata(&archive).unwrap().len() as usize - 1;
+        let compressed_refusal = verify(&request, compressed_cap, Counters::default());
+        assert_eq!(compressed_refusal.value, Err(Refusal::Budget));
+        assert_eq!(compressed_refusal.counters.archive_bytes, 0);
+
+        let mut decompressed_cap = Limits::NUCLEUS;
+        decompressed_cap.file_bytes = fs::metadata(&archive).unwrap().len() as usize + 1;
+        let decompressed_refusal = verify(&request, decompressed_cap, Counters::default());
+        assert_eq!(decompressed_refusal.value, Err(Refusal::Budget));
+        assert!(decompressed_refusal.counters.archive_bytes > 0);
+        assert!(decompressed_refusal.counters.decompressed_bytes > 0);
+        assert!(
+            decompressed_refusal.counters.decompressed_bytes <= decompressed_cap.file_bytes + 1
+        );
 
         let second = verify(&request, Limits::NUCLEUS, counters);
         assert!(second.value.is_ok());

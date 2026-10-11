@@ -29,6 +29,10 @@ EXPECTED_LEAVES = (
 MAX_SOURCE_LEAF = 256 * 1024
 MAX_SOURCE_TOTAL = 2 * 1024 * 1024
 MAX_CONFIG = 64 * 1024
+MAX_ARCHIVE_PHASE = 256 * 1024 * 1024
+MAX_DIAGNOSTIC_OUTPUT = 256 * 1024
+MAX_PACKAGE_INPUT = 16 * 1024 * 1024
+MAX_DIAGNOSTIC_HEADERS = 64
 MAX_TRIAGE_LEAVES = 128
 MAX_TRIAGE_LEAF = 256 * 1024
 MAX_TRIAGE_TOTAL = 16 * 1024 * 1024
@@ -79,7 +83,7 @@ def source_blobs():
         if found_path != path or mode != "100644" or object_type != "blob":
             raise RuntimeError(f"pinned source leaf is not a blob: {path}")
         size = int(run(["git", "-C", str(ROOT), "cat-file", "-s", object_id], limit=32))
-        if size > MAX_SOURCE_LEAF or total + size > MAX_SOURCE_TOTAL:
+        if size > MAX_SOURCE_LEAF or PREFLIGHT_SOURCE_BYTES + total + size > MAX_SOURCE_TOTAL:
             raise RuntimeError(f"pinned source leaf budget exceeded: {path}")
         raw = run(["git", "-C", str(ROOT), "cat-file", "blob", object_id], limit=MAX_SOURCE_LEAF)
         if len(raw) != size:
@@ -172,7 +176,7 @@ def read_configs():
                     else:
                         mappings.append({"table": f"source.{name}", "key": key, "value": "<omitted>"})
                         custom = True
-    if total > 2 * MAX_CONFIG:
+    if PREFLIGHT_CONFIG_BYTES + total > 2 * MAX_CONFIG:
         raise RuntimeError("Cargo config read budget exceeded")
     return observations, mappings, custom, total
 
@@ -415,9 +419,124 @@ def behavior_triage(report, reachable):
     }
 
 
+def diagnostic_receipt(registry):
+    path_text = os.environ.get("OXIDE_TASK038_DIAGNOSTICS_PATH")
+    expected_digest = os.environ.get("OXIDE_TASK038_DIAGNOSTICS_SHA256")
+    if not path_text or not expected_digest or not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+        raise RuntimeError("task 038 requires its bounded diagnostic receipt and SHA-256")
+    path = Path(path_text)
+    if not path.is_absolute() or path.name != "task038-archive-diagnostics.json":
+        raise RuntimeError("diagnostic receipt path is outside the task-owned shape")
+    before = os.lstat(path)
+    scratch_root = Path("/private/tmp").resolve(strict=True)
+    canonical = path.resolve(strict=True)
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_size > MAX_DIAGNOSTIC_OUTPUT
+        or not canonical.is_relative_to(scratch_root)
+        or canonical != path
+        or not path.parent.name.startswith("oxide-038-diag.")
+    ):
+        raise RuntimeError("diagnostic receipt type, location, or size refused")
+    raw = path.read_bytes()
+    after = os.lstat(path)
+    if file_identity(before) != file_identity(after) or len(raw) != before.st_size:
+        raise RuntimeError("diagnostic receipt changed while being read")
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != expected_digest:
+        raise RuntimeError("diagnostic receipt digest does not match the charged phase record")
+    diagnostic = json.loads(raw)
+    if diagnostic.get("schema") != "oxide.registry-archive-diagnostics.task038.v1":
+        raise RuntimeError("unsupported diagnostic receipt schema")
+    rows = diagnostic.get("packages")
+    by_name = {(item["name"], item["version"]): item for item in registry}
+    if not isinstance(rows, list) or {row.get("package", {}).get("name") for row in rows} != {"bitflags", "cc"}:
+        raise RuntimeError("diagnostic receipt does not cover the two observed refusal samples")
+    namespaces = {"index.crates.io-1949cf8c6b5b557f", "index.crates.io-6f17d22bba15001f"}
+    archive_bytes = decompressed_bytes = entries = 0
+    for row in rows:
+        package = row["package"]
+        locked = by_name.get((package.get("name"), package.get("version")))
+        if locked is None or any(package.get(key) != locked.get(key) for key in ("source", "checksum")):
+            raise RuntimeError("diagnostic sample differs from the pinned lock tuple")
+        namespace = row.get("recorded_namespace")
+        expected_path = Path(CARGO_HOME) / "registry/cache" / namespace / f"{package['name']}-{package['version']}.crate"
+        if namespace not in namespaces or row.get("archive") != str(expected_path):
+            raise RuntimeError("diagnostic archive is not a literal recorded registry candidate")
+        if (
+            row.get("metadata_before") != row.get("metadata_after")
+            or row.get("compressed_sha256") != package["checksum"]
+            or row.get("locked_checksum_match") is not True
+            or row.get("gzip_trailing_bytes") != 0
+            or row.get("all_described_headers_regular_octal_and_bounded_path") is not True
+        ):
+            raise RuntimeError("diagnostic archive identity or bounded header result refused")
+        compressed = row.get("compressed_bytes_read", MAX_PACKAGE_INPUT + 1)
+        decompressed = row.get("decompressed_bytes_read", MAX_PACKAGE_INPUT + 1)
+        headers = row.get("header_descriptions", [])
+        if compressed > MAX_PACKAGE_INPUT or decompressed > MAX_PACKAGE_INPUT or len(headers) > MAX_DIAGNOSTIC_HEADERS:
+            raise RuntimeError("diagnostic package input or header-description limit exceeded")
+        archive_bytes += compressed
+        decompressed_bytes += decompressed
+        entries += len(headers)
+    counters = {
+        "archive_bytes": archive_bytes,
+        "decompressed_bytes": decompressed_bytes,
+        "extracted_bytes": 0,
+        "entries": entries,
+    }
+    if diagnostic.get("phase_counters") != counters or diagnostic.get("candidate_path_metadata_observations") != 2:
+        raise RuntimeError("diagnostic phase counters do not match the bounded receipt contents")
+    if diagnostic.get("serde_pairing_observation", {}).get("complete_pair_count") != 1:
+        raise RuntimeError("recorded serde pairing observation is not unique")
+    return diagnostic, len(raw), digest, counters
+
+
+def package_counter_ledger(report):
+    previous = report["phase_start"]["counters"]
+    rows = []
+    for item in report["packages"]:
+        after = item["counters_after"]
+        delta = {key: after[key] - previous[key] for key in previous}
+        rows.append({
+            "package": f"{item['package']['name']} {item['package']['version']}",
+            "refusal": item["refusal"],
+            "before_cumulative": previous,
+            "package_delta": delta,
+            "after_cumulative": after,
+        })
+        previous = after
+    if previous != report["counters"]:
+        raise RuntimeError("per-package cumulative counters do not close to the phase total")
+    return rows
+
+
+def pairing_audit(report):
+    results = []
+    for item in report["packages"]:
+        archives = [c for c in item["candidates"] if c["kind"] == "archive" and c["state"] == "present"]
+        extractions = [c for c in item["candidates"] if c["kind"] == "extracted" and c["state"] == "present"]
+        pairs = [(a, s) for a in archives for s in extractions if a["namespace"] == s["namespace"]]
+        selected = next((pair for pair in pairs if pair[0]["path"] == item["archive"] and pair[1]["path"] == item["extracted_root"]), None)
+        results.append({
+            "package": f"{item['package']['name']} {item['package']['version']}",
+            "complete_pair_namespaces": sorted({a["namespace"] for a, _ in pairs}),
+            "selected_namespace": selected[0]["namespace"] if selected else None,
+            "selected_pair_is_unique": len(pairs) == 1 and selected is not None,
+            "unmatched_archive_namespaces": sorted({a["namespace"] for a in archives} - {a["namespace"] for a, _ in pairs}),
+            "refusal": item["refusal"],
+        })
+    serde = next(item for item in results if item["package"] == "serde 1.0.229")
+    serde["effective_cargo_selection"] = "not established by filesystem correspondence"
+    return results
+
+
 def main():
     if os.environ.get("CARGO_HOME") != CARGO_HOME:
         raise RuntimeError("explicit CARGO_HOME mismatch; stop for scope correction")
+    implementation_commit = run(["git", "rev-parse", "HEAD"], limit=128).decode().strip()
+    implementation_tree = run(["git", "rev-parse", "HEAD^{tree}"], limit=128).decode().strip()
     leaves, source_bytes = source_blobs()
     configs, mappings, custom_config, config_bytes = read_configs()
     if custom_config:
@@ -430,6 +549,7 @@ def main():
         raise RuntimeError("pinned Effigy workflow selector changed")
     registry, local = lock_inventory(leaves["Cargo.lock"]["raw"])
     reachable, unresolved_deps = locked_reachable(registry, local)
+    diagnostics, diagnostic_output_bytes, diagnostic_digest, phase_counters = diagnostic_receipt(registry)
     before_free = shutil.disk_usage(CARGO_HOME).free
     if before_free < RESERVE:
         raise RuntimeError("host free space is below the 20 GiB acquisition reserve")
@@ -438,8 +558,12 @@ def main():
         "leaves": {path: item["sha256"] for path, item in leaves.items()},
     }
     request = {
-        "schema": "oxide.registry-acquisition.request.v1",
+        "schema": "oxide.registry-acquisition.request.v2",
         "source": source_identity,
+        "phase_start": {
+            "counters": phase_counters,
+            "candidate_observations": diagnostics["candidate_path_metadata_observations"],
+        },
         "packages": [{key: item[key] for key in ("name", "version", "source", "checksum")} for item in registry],
     }
     binary = Path("target/debug/oxide-registry-acquisition")
@@ -451,8 +575,15 @@ def main():
     if len(result.stdout) > MAX_OUTPUT:
         raise RuntimeError("Oxide verifier report exceeds the 8 MiB output ceiling")
     report = json.loads(result.stdout)
-    if report.get("schema") != "oxide.registry-acquisition.v1" or report.get("refusal"):
+    if report.get("schema") != "oxide.registry-acquisition.v2" or report.get("refusal"):
         raise RuntimeError("Oxide verifier report refused output retention")
+    expected_packages = [(item["name"], item["version"], item["checksum"]) for item in registry]
+    observed_packages = [
+        (item["package"]["name"], item["package"]["version"], item["package"]["checksum"])
+        for item in report["packages"]
+    ]
+    if observed_packages != expected_packages or report["phase_start"]["counters"] != phase_counters:
+        raise RuntimeError("refreshed report differs from the pinned 58-package request or phase start")
     after_free = shutil.disk_usage(CARGO_HOME).free
     if after_free < RESERVE:
         raise RuntimeError("host free space fell below the 20 GiB acquisition reserve")
@@ -461,23 +592,57 @@ def main():
     if after_triage_free < RESERVE:
         raise RuntimeError("host free space fell below the 20 GiB reserve during triage")
     archive_reads = sum(report["counters"][key] for key in ("archive_bytes", "decompressed_bytes", "extracted_bytes"))
+    diagnostic_archive_reads = sum(phase_counters[key] for key in ("archive_bytes", "decompressed_bytes", "extracted_bytes"))
+    acquisition_archive_reads = archive_reads - diagnostic_archive_reads
     total_source_bytes = PREFLIGHT_SOURCE_BYTES + source_bytes
     total_config_bytes = PREFLIGHT_CONFIG_BYTES + config_bytes
-    total_reads = total_source_bytes + total_config_bytes + archive_reads + triage["bytes_read"]
-    if archive_reads > 256 * 1024 * 1024 or triage["bytes_read"] > MAX_TRIAGE_TOTAL or total_reads > 275 * 1024 * 1024:
+    total_reads = total_source_bytes + total_config_bytes + archive_reads + triage["bytes_read"] + diagnostic_output_bytes
+    if (
+        total_source_bytes > MAX_SOURCE_TOTAL
+        or total_config_bytes > 2 * MAX_CONFIG
+        or archive_reads > MAX_ARCHIVE_PHASE
+        or triage["bytes_read"] > MAX_TRIAGE_TOTAL
+        or report["candidate_observations"] > 512
+        or total_reads > 275 * 1024 * 1024
+    ):
         raise RuntimeError("aggregate acquisition read ceiling exceeded")
+    package_counters = package_counter_ledger(report)
+    pairings = pairing_audit(report)
+    pairing_failures = [
+        item["package"] for item in pairings
+        if next(package for package in report["packages"]
+                if f"{package['package']['name']} {package['package']['version']}" == item["package"])["status"] == "supported"
+        and not item["selected_pair_is_unique"]
+    ]
+    diagnostic_paths = {row["package"]["name"]: row for row in diagnostics["packages"]}
+    diagnostic_refresh_match = []
+    for name, diagnostic in diagnostic_paths.items():
+        refreshed = next(item for item in report["packages"] if item["package"]["name"] == name)
+        observed_archive_metadata = (refreshed.get("metadata_before") or [None])[0]
+        diagnostic_refresh_match.append({
+            "package": f"{name} {diagnostic['package']['version']}",
+            "same_recorded_archive_path": refreshed.get("archive") == diagnostic["archive"],
+            "same_lock_checksum": refreshed["package"]["checksum"] == diagnostic["package"]["checksum"],
+            "metadata_matches_diagnostic": observed_archive_metadata == diagnostic["metadata_before"],
+            "refresh_refusal": refreshed["refusal"],
+            "verification_detail": refreshed.get("verification_detail"),
+        })
     manifests = {
         key: manifest_summary(leaves[key]["raw"], key)
         for key in ("Cargo.toml", "crates/nucleus-core/Cargo.toml", "crates/nucleus-observer/Cargo.toml")
     }
     manifests["crates/nucleus-core/Cargo.toml"]["test_selector_dependencies"] = manifests["crates/nucleus-core/Cargo.toml"]["dependencies"]
     evidence = {
-        "schema": "oxide.nucleus-registry-acquisition.evidence.v1",
+        "schema": "oxide.nucleus-registry-acquisition.evidence.v2",
         "scope": {
             "origin": ORIGIN, "source_commit": COMMIT, "source_tree": TREE,
             "selector": ["effigy", "check:core:test", "--", "-p", "nucleus-core", "--test", "planning", "--test", "build_diagnostics"],
             "effective_command_from_pinned_effigy": ["cargo", "test", "--offline", "-p", "nucleus-core", "--test", "planning", "--test", "build_diagnostics"],
             "nucleus_cargo_invocations": 0,
+        },
+        "oxide_implementation": {
+            "commit": implementation_commit,
+            "tree": implementation_tree,
         },
         "source": {
             "identity_kind": "Git commit and tree plus per-leaf SHA-256; not Oxide framed source-content digest",
@@ -512,17 +677,37 @@ def main():
             "reserve_bytes": RESERVE,
             "note": "free-space deltas are not SSD writes",
         },
+        "archive_diagnostics": {
+            "receipt_sha256": diagnostic_digest,
+            "receipt_bytes_read": diagnostic_output_bytes,
+            "receipt": diagnostics,
+            "refresh_continuity": diagnostic_refresh_match,
+        },
         "archive_verification": report,
+        "pairing_audit": {
+            "packages": pairings,
+            "supported_packages_without_one_selected_complete_pair": pairing_failures,
+            "filesystem_observation_is_not_effective_cargo_registry_selection": True,
+        },
         "behavior_triage": triage,
         "read_ledger": {
             "source_bytes": total_source_bytes, "config_bytes": total_config_bytes,
             "source_bytes_in_acquisition_entry": source_bytes,
             "config_bytes_in_acquisition_entry": config_bytes,
             "archive_compressed_decompressed_and_extracted_bytes": archive_reads,
+            "diagnostic_archive_bytes": diagnostic_archive_reads,
+            "refreshed_58_package_archive_bytes": acquisition_archive_reads,
+            "diagnostic_output_bytes": diagnostic_output_bytes,
             "triage_bytes": triage["bytes_read"], "aggregate_bytes": total_reads,
             "candidate_path_metadata_observations": report["candidate_observations"],
+            "diagnostic_candidate_path_metadata_observations": diagnostics["candidate_path_metadata_observations"],
+            "refreshed_candidate_path_metadata_observations": report["acquisition_candidate_observations"],
+            "per_package_cumulative_counters_and_deltas": package_counters,
             "limits": {"source_total": MAX_SOURCE_TOTAL, "per_source_leaf": MAX_SOURCE_LEAF,
-                       "archive_decode_extract_total": 256 * 1024 * 1024,
+                       "archive_decode_extract_total": MAX_ARCHIVE_PHASE,
+                       "per_package_archive_or_tar_input": MAX_PACKAGE_INPUT,
+                       "diagnostic_output": MAX_DIAGNOSTIC_OUTPUT,
+                       "diagnostic_headers_per_package": MAX_DIAGNOSTIC_HEADERS,
                        "triage_total": MAX_TRIAGE_TOTAL, "per_triage_leaf": MAX_TRIAGE_LEAF,
                        "triage_leaves": MAX_TRIAGE_LEAVES, "candidate_observations": 512,
                        "retained_output": MAX_OUTPUT},
@@ -536,7 +721,7 @@ def main():
     output = json.dumps(evidence, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(output) > MAX_OUTPUT:
         raise RuntimeError("combined evidence exceeds the 8 MiB retained-output ceiling")
-    scratch = Path(tempfile.mkdtemp(prefix="oxide-registry-acquisition-037-", dir="/private/tmp"))
+    scratch = Path(tempfile.mkdtemp(prefix="oxide-registry-acquisition-038-", dir="/private/tmp"))
     if not scratch.resolve().is_relative_to(Path("/private/tmp").resolve()):
         raise RuntimeError("task scratch escaped /private/tmp")
     target = scratch / "nucleus-registry-acquisition.json"
@@ -550,6 +735,8 @@ def main():
         "supported": supported, "refused_or_unobserved": refused,
         "candidate_observations": report["candidate_observations"],
         "archive_counters": report["counters"], "triage_bytes": triage["bytes_read"],
+        "diagnostic_output_bytes": diagnostic_output_bytes,
+        "archive_reads_in_refresh": acquisition_archive_reads,
         "aggregate_bytes": total_reads,
     }, separators=(",", ":")))
 
