@@ -47,10 +47,19 @@ pub struct SourceIdentity {
     pub leaves: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhaseStart {
+    pub counters: CounterSnapshot,
+    pub candidate_observations: usize,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcquisitionRequest {
     pub schema: String,
     pub source: SourceIdentity,
+    pub phase_start: PhaseStart,
     pub packages: Vec<LockedPackage>,
 }
 
@@ -113,7 +122,8 @@ pub struct Candidate {
     pub canonical: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CounterSnapshot {
     pub archive_bytes: usize,
     pub decompressed_bytes: usize,
@@ -123,6 +133,17 @@ pub struct CounterSnapshot {
 
 impl From<Counters> for CounterSnapshot {
     fn from(c: Counters) -> Self {
+        Self {
+            archive_bytes: c.archive_bytes,
+            decompressed_bytes: c.decompressed_bytes,
+            extracted_bytes: c.extracted_bytes,
+            entries: c.entries,
+        }
+    }
+}
+
+impl From<CounterSnapshot> for Counters {
+    fn from(c: CounterSnapshot) -> Self {
         Self {
             archive_bytes: c.archive_bytes,
             decompressed_bytes: c.decompressed_bytes,
@@ -151,9 +172,11 @@ pub struct PackageOutcome {
 pub struct AcquisitionReport {
     pub schema: String,
     pub source: SourceIdentity,
+    pub phase_start: PhaseStart,
     pub cache: RootSnapshot,
     pub extracted: RootSnapshot,
     pub candidate_observations: usize,
+    pub acquisition_candidate_observations: usize,
     pub packages: Vec<PackageOutcome>,
     pub counters: CounterSnapshot,
 }
@@ -181,7 +204,7 @@ pub fn run<R: Read, W: Write>(input: R, mut output: W) -> Result<(), String> {
     let mut capped = Capped(Vec::new());
     if serde_json::to_writer(&mut capped, &report).is_err() {
         let small = serde_json::json!({
-            "schema": "oxide.registry-acquisition.v1",
+            "schema": "oxide.registry-acquisition.v2",
             "status": "refused",
             "refusal": "retained_output_exceeds_8_mib"
         });
@@ -209,7 +232,7 @@ impl Write for Capped {
 }
 
 fn acquire(request: AcquisitionRequest) -> Result<AcquisitionReport, String> {
-    if request.schema != "oxide.registry-acquisition.request.v1"
+    if request.schema != "oxide.registry-acquisition.request.v2"
         || request.source.commit != SOURCE_COMMIT
         || request.source.tree != SOURCE_TREE
         || request.source.lock_sha256 != LOCK_SHA256
@@ -217,6 +240,17 @@ fn acquire(request: AcquisitionRequest) -> Result<AcquisitionReport, String> {
         || request.packages.len() > MAX_PACKAGES
     {
         return Err("pinned request identity or package bound refused".into());
+    }
+    let starting = request.phase_start.counters;
+    let starting_total = starting
+        .archive_bytes
+        .saturating_add(starting.decompressed_bytes)
+        .saturating_add(starting.extracted_bytes);
+    if starting_total > Limits::NUCLEUS.collection_bytes
+        || starting.entries > Limits::NUCLEUS.associations
+        || request.phase_start.candidate_observations > MAX_CANDIDATES
+    {
+        return Err("phase starting counters exceed the acquisition bounds".into());
     }
     if request.source.leaves.len() != SOURCE_LEAVES.len()
         || SOURCE_LEAVES.iter().any(|leaf| {
@@ -359,15 +393,17 @@ fn acquire_roots(
     limits: Limits,
 ) -> Result<AcquisitionReport, String> {
     let mut report = AcquisitionReport {
-        schema: "oxide.registry-acquisition.v1".into(),
+        schema: "oxide.registry-acquisition.v2".into(),
         source: request.source,
+        phase_start: request.phase_start,
         cache: root_snapshot(&cache, Some(cache.before.clone())),
         extracted: root_snapshot(&extracted, Some(extracted.before.clone())),
-        candidate_observations: 0,
+        candidate_observations: request.phase_start.candidate_observations,
+        acquisition_candidate_observations: 0,
         packages: Vec::with_capacity(request.packages.len()),
-        counters: CounterSnapshot::default(),
+        counters: request.phase_start.counters,
     };
-    let mut counters = Counters::default();
+    let mut counters: Counters = request.phase_start.counters.into();
     let unsafe_namespace = cache
         .namespaces
         .iter()
@@ -430,6 +466,7 @@ fn acquire_roots(
                     break;
                 }
                 report.candidate_observations += 1;
+                report.acquisition_candidate_observations += 1;
                 let path = namespace_path.join(expected_name);
                 let observed = observe_candidate(kind, namespace, &root.canonical, &path);
                 match observed.state.as_str() {
@@ -463,12 +500,26 @@ fn acquire_roots(
             });
             continue;
         }
-        if archives.len() != 1 || sources.len() != 1 {
-            let reason = match (archives.is_empty(), sources.is_empty()) {
-                (true, true) => "missing_archive_and_extraction",
-                (true, false) => "missing_archive",
-                (false, true) => "missing_extraction",
-                (false, false) => "ambiguous_candidates",
+        let complete_pairs = archives
+            .iter()
+            .flat_map(|archive| {
+                sources
+                    .iter()
+                    .filter(move |source| archive.0 == source.0)
+                    .map(move |source| (archive.clone(), source.clone()))
+            })
+            .collect::<Vec<_>>();
+        if complete_pairs.len() != 1 {
+            let reason = if archives.is_empty() && sources.is_empty() {
+                "missing_archive_and_extraction"
+            } else if archives.is_empty() {
+                "missing_archive"
+            } else if sources.is_empty() {
+                "missing_extraction"
+            } else if complete_pairs.is_empty() {
+                "no_complete_namespace_pair"
+            } else {
+                "ambiguous_complete_pairs"
             };
             report.packages.push(PackageOutcome {
                 package,
@@ -485,24 +536,8 @@ fn acquire_roots(
             });
             continue;
         }
-        let (archive_namespace, archive_path, archive_meta) = archives.pop().unwrap();
-        let (source_namespace, source_path, source_meta) = sources.pop().unwrap();
-        if archive_namespace != source_namespace {
-            report.packages.push(PackageOutcome {
-                package,
-                candidates,
-                archive: Some(archive_path.to_string_lossy().into_owned()),
-                extracted_root: Some(source_path.to_string_lossy().into_owned()),
-                metadata_before: Some((archive_meta, source_meta)),
-                metadata_after: None,
-                status: "refused".into(),
-                refusal: Some("namespace_mismatch".into()),
-                files: BTreeMap::new(),
-                directories: BTreeSet::new(),
-                counters_after: counters.into(),
-            });
-            continue;
-        }
+        let ((_, archive_path, archive_meta), (_, source_path, source_meta)) =
+            complete_pairs.into_iter().next().unwrap();
         let outcome = archive::verify(
             &Request {
                 archive: &archive_path,
@@ -797,12 +832,106 @@ mod private_qualification_tests {
         let root = fixture_root("pair");
         let (locked, _, _) = fixture_package(&root, "fixture", "1.0.0");
         let (cache, src) = roots(&root);
+        let mut request = request(vec![locked]);
+        request.phase_start = PhaseStart {
+            counters: CounterSnapshot {
+                archive_bytes: 7,
+                decompressed_bytes: 11,
+                extracted_bytes: 13,
+                entries: 2,
+            },
+            candidate_observations: 5,
+        };
+        let report = super::acquire_roots(request, cache, src, Limits::NUCLEUS).unwrap();
+        assert_eq!(report.packages[0].status, "supported");
+        assert_eq!(report.packages[0].files.len(), 2);
+        assert!(report.counters.archive_bytes > 7);
+        assert!(report.counters.decompressed_bytes > 11);
+        assert!(report.counters.extracted_bytes > 13);
+        assert_eq!(report.candidate_observations, 7);
+        assert_eq!(report.acquisition_candidate_observations, 2);
+        assert_eq!(report.phase_start.candidate_observations, 5);
+    }
+
+    #[test]
+    fn private_qualification_registry_pair_ignores_unmatched_spare_archive() {
+        let root = fixture_root("spare-archive");
+        let (locked, archive, _) = fixture_package(&root, "fixture", "1.0.0");
+        let spare_namespace = root.join("cache/spare");
+        fs::create_dir_all(&spare_namespace).unwrap();
+        fs::copy(&archive, spare_namespace.join("fixture-1.0.0.crate")).unwrap();
+        let (cache, src) = roots(&root);
         let report =
             super::acquire_roots(request(vec![locked]), cache, src, Limits::NUCLEUS).unwrap();
         assert_eq!(report.packages[0].status, "supported");
-        assert_eq!(report.packages[0].files.len(), 2);
-        assert!(report.counters.archive_bytes > 0);
-        assert_eq!(report.candidate_observations, 2);
+        assert_eq!(report.packages[0].candidates.len(), 3);
+        assert_eq!(
+            report.packages[0]
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.kind == "archive" && candidate.state == "present")
+                .count(),
+            2
+        );
+        assert_eq!(
+            report.packages[0].archive.as_deref(),
+            Some(archive.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn private_qualification_registry_multiple_complete_pairs_refuse() {
+        let root = fixture_root("multiple-pairs");
+        let (locked, archive, extracted_root) = fixture_package(&root, "fixture", "1.0.0");
+        let namespace = "second";
+        let second_archive = root.join(format!("cache/{namespace}/fixture-1.0.0.crate"));
+        let second_root = root.join(format!("src/{namespace}/fixture-1.0.0"));
+        fs::create_dir_all(second_archive.parent().unwrap()).unwrap();
+        fs::create_dir_all(&second_root.join("src")).unwrap();
+        fs::copy(&archive, &second_archive).unwrap();
+        fs::copy(
+            extracted_root.join("Cargo.toml"),
+            second_root.join("Cargo.toml"),
+        )
+        .unwrap();
+        fs::copy(
+            extracted_root.join("src/lib.rs"),
+            second_root.join("src/lib.rs"),
+        )
+        .unwrap();
+        let (cache, src) = roots(&root);
+        let report =
+            super::acquire_roots(request(vec![locked]), cache, src, Limits::NUCLEUS).unwrap();
+        assert_eq!(report.packages[0].status, "refused");
+        assert_eq!(
+            report.packages[0].refusal.as_deref(),
+            Some("ambiguous_complete_pairs")
+        );
+        assert_eq!(report.packages[0].candidates.len(), 4);
+        assert!(report.packages[0].archive.is_none());
+        assert!(report.packages[0].extracted_root.is_none());
+    }
+
+    #[test]
+    fn private_qualification_registry_cross_namespace_candidates_do_not_pair() {
+        let root = fixture_root("cross-namespace");
+        let (locked, archive, extracted_root) = fixture_package(&root, "fixture", "1.0.0");
+        let archive_namespace = root.join("cache/archive-only");
+        let extraction_namespace = root.join("src/extraction-only");
+        fs::create_dir_all(&archive_namespace).unwrap();
+        fs::create_dir_all(&extraction_namespace).unwrap();
+        fs::rename(archive, archive_namespace.join("fixture-1.0.0.crate")).unwrap();
+        fs::rename(extracted_root, extraction_namespace.join("fixture-1.0.0")).unwrap();
+        let (cache, src) = roots(&root);
+        let report =
+            super::acquire_roots(request(vec![locked]), cache, src, Limits::NUCLEUS).unwrap();
+        assert_eq!(report.packages[0].status, "refused");
+        assert_eq!(
+            report.packages[0].refusal.as_deref(),
+            Some("no_complete_namespace_pair")
+        );
+        assert!(report.packages[0].archive.is_none());
+        assert!(report.packages[0].extracted_root.is_none());
     }
 
     #[test]
@@ -891,13 +1020,14 @@ mod private_qualification_tests {
 
     fn request(packages: Vec<LockedPackage>) -> AcquisitionRequest {
         AcquisitionRequest {
-            schema: "oxide.registry-acquisition.request.v1".into(),
+            schema: "oxide.registry-acquisition.request.v2".into(),
             source: SourceIdentity {
                 commit: SOURCE_COMMIT.into(),
                 tree: SOURCE_TREE.into(),
                 lock_sha256: LOCK_SHA256.into(),
                 leaves: BTreeMap::new(),
             },
+            phase_start: PhaseStart::default(),
             packages,
         }
     }

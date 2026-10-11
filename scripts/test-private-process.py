@@ -13,6 +13,20 @@ build = subprocess.run(
     stdout=subprocess.PIPE, text=True, timeout=300,
 )
 if build.returncode:
+    diagnostic_bytes = 0
+    for line in build.stdout.splitlines():
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        rendered = message.get("message", {}).get("rendered")
+        if message.get("reason") == "compiler-message" and rendered:
+            remaining = 64 * 1024 - diagnostic_bytes
+            if remaining <= 0:
+                break
+            output = rendered[:remaining]
+            sys.stderr.write(output)
+            diagnostic_bytes += len(output)
     sys.exit(build.returncode)
 executables = {}
 for line in build.stdout.splitlines():

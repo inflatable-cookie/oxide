@@ -58,9 +58,9 @@ archive extractor, whole-host scanner or shipped native/SDK issuer here.
 A bounded verifier in `src/registered/archive.rs` proves an explicitly supplied
 locked registry archive corresponds to an explicitly owned extracted package
 root. The supported form is a single-member gzip (magic `1f 8b`) of a
-ustar/pax tar whose members share one canonical package top-level prefix,
-matching a Cargo `.crate`. The extracted directory's last component must equal
-that prefix. The verifier enforces the locked SHA-256 of the compressed archive
+ustar/PAX or legacy GNU tar whose members share one canonical package
+top-level prefix, matching a Cargo `.crate`. The extracted directory's last
+component must equal that prefix. The verifier enforces the locked SHA-256 of the compressed archive
 bytes (`sha256:` plus 64 lowercase hex), exact file content digests, and exact
 file/directory membership, including empty directories and parent directories
 implied by files or by nested empty directories. Implied parents are inventory
@@ -94,14 +94,15 @@ sidecar-named files, refuse; extra files are not skipped. Symlink, hardlink and 
 extracted regular files with `nlink ≠ 1`, and extracted special files refuse.
 Absolute/parent/escaping paths, `.`/`..` components, backslashes,
 non-UTF-8 names, duplicate or file/directory collisions, unknown formats
-(including V7/old and GNU tar headers, bare tar, extra gzip members and trailing compressed bytes),
+(including V7/old headers, bare tar, extra gzip members and trailing compressed bytes),
 corrupt or truncated streams, and unstable reads refuse.
 
 Reads charge one shared preparation budget that is not reset per member, phase
 or package: compressed archive bytes, decompressed tar bytes, and extracted-file
-bytes. Archive and extracted-file reads request at most the remaining collection
-budget; decompression refuses when that remainder is zero instead of probing an
-uncharged extra output byte. Counters stay at or below the recorded ceiling.
+bytes. Compressed archives, each decompressed package tar, and each extracted
+file have a 16 MiB cap; the verifier refuses at the cap if it cannot establish
+EOF without another read. Archive and extracted-file reads also stay within the
+remaining collection budget. Counters stay at or below the recorded ceiling.
 `verify(request, limits, counters)` continues from the caller-supplied
 `Counters` and returns `Outcome` with the aggregate `Counters`
 (`archive_bytes`, `decompressed_bytes`, `extracted_bytes`, `entries`) and a
@@ -134,6 +135,46 @@ invoke Cargo. Task 037 observed one supported real correspondence and refused
 [`nucleus-input-roots.md`](nucleus-input-roots.md#task-037-lock-and-registry-correspondence-update)
 evidence update for exact outcomes and limits. This is not a complete registry
 receipt, behavior graph, immutability agreement, or Nucleus build qualification.
+
+## Task 038 archive-format and registry-pairing correction
+
+Task 038 retained the Task 037 report unchanged and corrected the two observed
+refusal classes. Bounded diagnostics found that `bitflags 2.13.2` and
+`cc 1.4.7` use legacy GNU tar headers (`ustar ` magic, ` \0` version); the old
+verifier rejected them at its `as_ustar()` gate before checking member types or
+paths. The verifier now accepts those headers while retaining checksum,
+single-gzip, entry type, path, duplicate, inventory and stability checks. The
+same-namespace pairing selects exactly one complete archive/extraction pair;
+an unmatched spare archive no longer creates ambiguity. Multiple or absent
+complete pairs still refuse. The serde observation selected the sole complete
+pair in `index.crates.io-1949cf8c6b5b557f`, while retaining the unmatched spare
+archive candidate from `index.crates.io-6f17d22bba15001f`.
+
+The initial 58-package attempt at `ee9f3319095632f4ed42d2f11608eb3cf18aecc1`
+verified 56 packages but read one overflow byte past the decompressed 16 MiB
+limit for each of `libsqlite3-sys 0.38.2` and `sqlite-wasm-rs 0.5.5`. Its exact
+receipt is preserved as the
+[initial attempt](../evidence/nucleus-registry-acquisition-038-initial-attempt.json).
+Follow-up commit `8bd9949623a06df63cadd9cb7ea3bdbcebe8a70a` fixed the cap check.
+A corrected 58-package attempt at
+`98629cfc05ece0cdc0fde3b562e3be48b9e8d3a0` carried forward the first attempt's
+counters and verified 56 packages. The same two packages refused at exactly
+16 MiB, before any tar entry or extracted-file read. The
+[final acquisition evidence](../evidence/nucleus-registry-acquisition-038.json)
+keeps its per-package deltas separate from cumulative counters and links the
+prior receipt by digest.
+
+Across diagnosis and both attempts, the phase ledger records 207,717,057
+compressed/decompressed/extracted archive bytes, 89,716 pinned-source bytes,
+60 allowlisted-config bytes, 600,545 behavior-triage bytes, 54,218 diagnostic
+receipt bytes, 662,827 bytes to carry the prior report, 466 candidate-path
+observations, and 209,124,423 aggregate bytes. Triage reached the shared cap of
+128 leaves in the first attempt and was not repeated. This remains filesystem
+correspondence only: it establishes neither effective Cargo source selection
+nor a registry issuer, complete behavior graph, native closure, immutability
+agreement, or Nucleus build qualification. Acquisition request/report schema
+v2 carries counters across the diagnostic and refresh phases; the corrective
+handover also preserves them across the bounded retry.
 
 The unit seam consumes owner-verified semantic evidence for pinned Cargo
 `c980f4866` [`LocalFingerprint`](https://github.com/rust-lang/cargo/blob/c980f4866/src/cargo/core/compiler/fingerprint/mod.rs).
