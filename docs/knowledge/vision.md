@@ -85,3 +85,29 @@ Tom approved the prepared Nucleus-first follow-up on 2026-10-10 with "Go for it"
 Tom's subsequent "Continue" on 2026-10-10 authorizes the prepared bounded coordination packet to the existing Nucleus and Queue planners (Queue decision `0df0f3b5-b80e-4166-aeb5-57f6a3db093d`). Oxide may send one planning packet and consolidate one response per owner concerning the first workflow's input evidence, finite persistent physical paths, task concurrency, source/debug retention and authenticated acquire/wait/settlement contract. This supersedes the no-owner-contact boundary for that discussion only. It grants no implementation-worker prompts or interruption, consumer task assignment or code/policy/settings changes, builds or experiments, installation or activation. Consumer implementation and representative real-workflow execution still require concrete scoped briefs and their owner/evidence prerequisites.
 
 Tom approved the prepared isolated implementation tranche on 2026-10-10 with "Approve" (Queue decision `0d65d2d2-7720-4b69-b78e-ac6475052496`). Authority covers Oxide's registered-input verification and explicit-argv runner, plus Nucleus-owned task-scoped source/debug retention and authenticated storage-attempt handling through its existing managed-Git, retention and admission owners. Oxide may relay the concrete consumer scope to the existing Nucleus planner, which owns its Queue briefs and dispatch; do not create a competing compiler or Git manager. Each separately reviewed scope has 90 minutes of author work and 30 minutes of independent exact-head review, with targeted ordinary repository validation and newly owned bounded fixtures. Code paths remain inactive by default. This supersedes the prior coordination-only limit for these implementation scopes; it does not authorize active-checkout conversion, live root allocation/recycling, representative Nucleus workflow experiments, installation, cleanup, settings/scheduler/wire changes or Contract 010 edits. Real use still requires the audited native-input/accepted-issuer contract, old-run source/debug retrieval proof, explicit Contract 002 pilot departure and finite storage/retention/waiting policy, followed by a separately scoped representative proof.
+
+Tom approved the isolated binding tranche on 2026-10-11 through Queue decision
+`6c303464-2250-4a3e-873e-80acb121d3f4` version 2: "Approve isolated binding
+tranche." It covers three sequential, independently reviewed scopes: Oxide's
+durable slot-generation API and authenticated lookup-only acquire/finalize
+recovery; its private framed Rust registered-runner bridge with an injected
+synthetic parent; then Nucleus's disabled synthetic `StorageTransport` client
+after the reviewed Oxide API and bridge merge and closeout. Each scope has
+90 minutes of author work and 30 minutes of independent exact-head review,
+targeted repository checks and fresh bounded fixtures. This narrowly permits
+the prototype storage-protocol and private bridge changes excluded previously.
+Generation remains bound to the authenticated storage instance and slot;
+lookup must not allocate, release, evict or grant writer access. Lost tokens and
+uncertain ownership hold. Nucleus owns its brief, dispatch and client code;
+Oxide may relay the approved packet and actual reviewed API. The Nucleus owner
+may temporarily set native admission to one solely for that client task after
+Oxide prerequisites, restoring zero after final closeout.
+
+The binding approval grants no production issuer or signing-key deployment,
+real Cargo/SDK/native-input scan or representative experiment, live root
+recycling, cache cleanup, installation, activation, release or Contract 010
+change. Production registration remains disabled. Genuine host submission
+uses the existing reviewed Effigy path; no second scheduler or manager is
+authorized. Real consumer eligibility, Contract 002 departure, budgets and
+source/debug evidence remain separate gates. Acow's cheaper-storage work
+continues independently.
