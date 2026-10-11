@@ -8,9 +8,9 @@ pub use transport::Client;
 pub use types::{
     AcquireRequest, AcquireResult, Budget, CaptureReceipt, ContainmentEvidence,
     CooperativeCompletionEvidence, Credential, FinalizationReceipt, Inventory, InventorySlot,
-    LeaseToken, NoSpawnEvidence, PartitionKey, ProcessIdentityEvidence, ReconcileReceipt,
-    RefusalReason, RunBinding, RunEnvelope, SettlementEvidence, SlotState, StorageError,
-    TerminalOutcome, TerminalRecord,
+    LeaseIdentity, LeaseToken, LookupResult, NoSpawnEvidence, PartitionKey,
+    ProcessIdentityEvidence, ReconcileReceipt, RefusalReason, RunBinding, RunEnvelope,
+    SettlementEvidence, SlotState, StorageError, TerminalOutcome, TerminalRecord,
 };
 
 #[cfg(test)]

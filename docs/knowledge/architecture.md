@@ -143,6 +143,29 @@ Each attempt has a new attempt ID; retries of the same logical operation reuse i
 
 The ledger records the slot key, lease token hash, owner/run binding, acquire/finalize operation IDs, state, reserved/measured bytes and capture receipt reference. Durable transitions must be flushed before acknowledging them. The daemon serializes ledger mutation and atomically publishes completed metadata. A durable record is necessary but not sufficient: storage stays unavailable while a participating writer may still write or the supported workflow's completion remains unknown, even if the daemon or client disconnects. This is subject to the supported writer model, not a universal same-user write fence.
 
+Each ledger also persists a random 256-bit `storage_instance_id`. A slot's
+`slot-<16 lowercase hex digits>` ID contains its positive monotonic ordinal;
+`AcquireResult.generation` exposes that ordinal as canonical positive u64
+decimal text and returns the instance ID beside `slot_id`. The pair remains
+stable across sequential leases and source revisions on the same slot. A new
+slot receives the next ordinal; ledger recreation receives a new instance ID,
+so old maps and receipts cannot bind to the recreated ledger by ordinal alone.
+The counter is never reset by slot eviction.
+
+The local ledger format is version 3. Version-2 ledgers are refused without
+migration or reinterpretation. The local socket protocol now prefixes each
+request and response with `OXSTOR01` and protocol version 1; unversioned or
+unsupported peers are refused before request dispatch. The changed
+`AcquireResult` encoding is therefore not decoded as an older result.
+
+`Client::lookup_acquire` authenticates the original admission envelope and
+checks the exact acquire body digest. `Client::lookup_finalize` authenticates
+the settlement evidence and checks the accepted operation's exact body digest.
+They return absent, present or uncertain results without changing the ledger.
+The lookup identity carries no slot path or lease token. An uncertain lease
+stays held, and lookup does not allocate, evict, settle or mint access. This is
+an Oxide API only; no Nucleus consumer binding is installed.
+
 On daemon restart, every persisted `leased` record without a matching durable completion receipt becomes `uncertain`. The daemon queries the owning consumer for authenticated task/source/terminal/capture evidence and checks the workflow completion record. PID plus start-time or a lock-file state may help locate a job, but absence alone proves nothing. If completion/capture authority is unavailable or a known/unexplained writer persists, preserve the slot and refuse acquisition/eviction. Recovery may be retried with the same reconciliation ID; lost replies do not create new leases. Operator cleanup is outside this first protocol and must not be inferred from age.
 
 ### Local storage prototype

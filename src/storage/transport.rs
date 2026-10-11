@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+const PROTOCOL_MAGIC: &[u8; 8] = b"OXSTOR01";
+const PROTOCOL_VERSION: u32 = 1;
 
 #[cfg(test)]
 pub(super) fn send_acquire_and_forget(
@@ -17,9 +19,38 @@ pub(super) fn send_acquire_and_forget(
 ) -> Result<(), StorageError> {
     let mut stream = UnixStream::connect(socket_path).map_err(io_error)?;
     let mut writer = Writer::new();
+    encode_protocol_header(&mut writer)?;
     Request::Acquire(request).encode(&mut writer)?;
     write_frame(&mut stream, writer.finish())?;
     stream.shutdown(std::net::Shutdown::Both).map_err(io_error)
+}
+
+#[cfg(test)]
+pub(super) fn send_legacy_acquire_and_forget(
+    socket_path: &std::path::Path,
+    request: AcquireRequest,
+) -> Result<(), StorageError> {
+    let mut stream = UnixStream::connect(socket_path).map_err(io_error)?;
+    let mut writer = Writer::new();
+    Request::Acquire(request).encode(&mut writer)?;
+    write_frame(&mut stream, writer.finish())?;
+    let _ = read_frame(&mut stream)?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn send_unsupported_version_acquire_and_forget(
+    socket_path: &std::path::Path,
+    request: AcquireRequest,
+) -> Result<(), StorageError> {
+    let mut stream = UnixStream::connect(socket_path).map_err(io_error)?;
+    let mut writer = Writer::new();
+    writer.bytes(PROTOCOL_MAGIC)?;
+    writer.u32(PROTOCOL_VERSION + 1);
+    Request::Acquire(request).encode(&mut writer)?;
+    write_frame(&mut stream, writer.finish())?;
+    let _ = read_frame(&mut stream)?;
+    Ok(())
 }
 
 /// Client for the private local daemon socket.
@@ -60,6 +91,17 @@ impl Client {
         }
     }
 
+    /// Looks up the exact admitted acquire request without granting storage access.
+    pub fn lookup_acquire(
+        &self,
+        request: AcquireRequest,
+    ) -> Result<LookupResult<LeaseIdentity>, StorageError> {
+        match self.call(Request::LookupAcquire(request))? {
+            Response::LookupAcquire(result) => result,
+            _ => Err(StorageError::Protocol("unexpected acquire lookup response")),
+        }
+    }
+
     /// Finalizes a lease after authenticated terminal, capture, and containment evidence.
     pub fn finalize(
         &self,
@@ -76,6 +118,25 @@ impl Client {
         })? {
             Response::Finalize(result) => result,
             _ => Err(StorageError::Protocol("unexpected finalize response")),
+        }
+    }
+
+    /// Looks up an authenticated finalize intent without repeating settlement.
+    pub fn lookup_finalize(
+        &self,
+        lease_id: &str,
+        finalize_id: &str,
+        evidence: SettlementEvidence,
+    ) -> Result<LookupResult<FinalizationReceipt>, StorageError> {
+        match self.call(Request::LookupFinalize {
+            lease_id: lease_id.to_owned(),
+            operation_id: finalize_id.to_owned(),
+            evidence,
+        })? {
+            Response::LookupFinalize(result) => result,
+            _ => Err(StorageError::Protocol(
+                "unexpected finalize lookup response",
+            )),
         }
     }
 
@@ -118,10 +179,12 @@ impl Client {
             .set_write_timeout(Some(Duration::from_secs(30)))
             .map_err(io_error)?;
         let mut writer = Writer::new();
+        encode_protocol_header(&mut writer)?;
         request.encode(&mut writer)?;
         write_frame(&mut stream, writer.finish())?;
         let bytes = read_frame(&mut stream)?;
         let mut reader = Reader::new(&bytes);
+        decode_protocol_header(&mut reader)?;
         let response = Response::decode(&mut reader)?;
         if !reader.done() {
             return Err(StorageError::Protocol("trailing response data"));
@@ -137,6 +200,7 @@ enum Request {
     Inventory(String),
     Budget(String),
     Acquire(AcquireRequest),
+    LookupAcquire(AcquireRequest),
     Finalize {
         lease_id: String,
         token: Option<LeaseToken>,
@@ -146,6 +210,11 @@ enum Request {
     Reconcile {
         lease_id: String,
         token: Option<LeaseToken>,
+        operation_id: String,
+        evidence: SettlementEvidence,
+    },
+    LookupFinalize {
+        lease_id: String,
         operation_id: String,
         evidence: SettlementEvidence,
     },
@@ -168,6 +237,10 @@ impl Encode for Request {
             }
             Self::Acquire(request) => {
                 writer.u8(3);
+                request.encode(writer)?;
+            }
+            Self::LookupAcquire(request) => {
+                writer.u8(7);
                 request.encode(writer)?;
             }
             Self::Finalize {
@@ -194,6 +267,16 @@ impl Encode for Request {
                 operation_id.encode(writer)?;
                 evidence.encode(writer)?;
             }
+            Self::LookupFinalize {
+                lease_id,
+                operation_id,
+                evidence,
+            } => {
+                writer.u8(8);
+                lease_id.encode(writer)?;
+                operation_id.encode(writer)?;
+                evidence.encode(writer)?;
+            }
             Self::Evict {
                 request_id,
                 target_bytes,
@@ -213,6 +296,7 @@ impl Decode for Request {
             1 => Ok(Self::Inventory(String::decode(reader)?)),
             2 => Ok(Self::Budget(String::decode(reader)?)),
             3 => Ok(Self::Acquire(AcquireRequest::decode(reader)?)),
+            7 => Ok(Self::LookupAcquire(AcquireRequest::decode(reader)?)),
             4 => Ok(Self::Finalize {
                 lease_id: String::decode(reader)?,
                 token: decode_token(reader)?,
@@ -222,6 +306,11 @@ impl Decode for Request {
             5 => Ok(Self::Reconcile {
                 lease_id: String::decode(reader)?,
                 token: decode_token(reader)?,
+                operation_id: String::decode(reader)?,
+                evidence: SettlementEvidence::decode(reader)?,
+            }),
+            8 => Ok(Self::LookupFinalize {
+                lease_id: String::decode(reader)?,
                 operation_id: String::decode(reader)?,
                 evidence: SettlementEvidence::decode(reader)?,
             }),
@@ -237,8 +326,10 @@ impl Decode for Request {
 enum Response {
     Inventory(Result<Inventory, StorageError>),
     Acquire(Result<AcquireResult, StorageError>),
+    LookupAcquire(Result<LookupResult<LeaseIdentity>, StorageError>),
     Finalize(Result<FinalizationReceipt, StorageError>),
     Reconcile(Result<ReconcileReceipt, StorageError>),
+    LookupFinalize(Result<LookupResult<FinalizationReceipt>, StorageError>),
     Evict(Result<u64, StorageError>),
     Error(StorageError),
 }
@@ -254,6 +345,10 @@ impl Encode for Response {
                 writer.u8(2);
                 encode_result(writer, result, encode_acquire_result)?;
             }
+            Self::LookupAcquire(result) => {
+                writer.u8(6);
+                encode_result(writer, result, encode_lease_lookup)?;
+            }
             Self::Finalize(result) => {
                 writer.u8(3);
                 encode_result(writer, result, encode_finalization)?;
@@ -262,12 +357,16 @@ impl Encode for Response {
                 writer.u8(4);
                 encode_result(writer, result, encode_reconcile)?;
             }
+            Self::LookupFinalize(result) => {
+                writer.u8(7);
+                encode_result(writer, result, encode_finalization_lookup)?;
+            }
             Self::Evict(result) => {
                 writer.u8(5);
                 encode_result(writer, result, |writer, value| value.encode(writer))?;
             }
             Self::Error(error) => {
-                writer.u8(6);
+                writer.u8(8);
                 encode_error(writer, error)?;
             }
         }
@@ -283,7 +382,15 @@ impl Decode for Response {
             3 => Ok(Self::Finalize(decode_result(reader, decode_finalization))),
             4 => Ok(Self::Reconcile(decode_result(reader, decode_reconcile))),
             5 => Ok(Self::Evict(decode_result(reader, u64::decode))),
-            6 => Ok(Self::Error(decode_error(reader)?)),
+            6 => Ok(Self::LookupAcquire(decode_result(
+                reader,
+                decode_lease_lookup,
+            ))),
+            7 => Ok(Self::LookupFinalize(decode_result(
+                reader,
+                decode_finalization_lookup,
+            ))),
+            8 => Ok(Self::Error(decode_error(reader)?)),
             _ => Err(StorageError::Protocol("unknown response")),
         }
     }
@@ -298,29 +405,20 @@ pub(crate) fn serve_one(mut stream: UnixStream, store: &mut Store) -> Result<(),
         .map_err(io_error)?;
     let request_bytes = match read_frame(&mut stream) {
         Ok(bytes) => bytes,
-        Err(error) => {
-            let mut writer = Writer::new();
-            Response::Error(error).encode(&mut writer)?;
-            return write_frame(&mut stream, writer.finish());
-        }
+        Err(error) => return write_response(&mut stream, Response::Error(error)),
     };
-    let request = {
+    let request = (|| {
         let mut reader = Reader::new(&request_bytes);
-        let request = Request::decode(&mut reader);
-        match request {
-            Ok(request) if reader.done() => request,
-            Ok(_) => {
-                let mut writer = Writer::new();
-                Response::Error(StorageError::Protocol("trailing request data"))
-                    .encode(&mut writer)?;
-                return write_frame(&mut stream, writer.finish());
-            }
-            Err(error) => {
-                let mut writer = Writer::new();
-                Response::Error(error).encode(&mut writer)?;
-                return write_frame(&mut stream, writer.finish());
-            }
+        decode_protocol_header(&mut reader)?;
+        let request = Request::decode(&mut reader)?;
+        if !reader.done() {
+            return Err(StorageError::Protocol("trailing request data"));
         }
+        Ok(request)
+    })();
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => return write_response(&mut stream, Response::Error(error)),
     };
     let response = match request {
         Request::Inventory(request_id) => {
@@ -338,6 +436,7 @@ pub(crate) fn serve_one(mut stream: UnixStream, store: &mut Store) -> Result<(),
             }
         }
         Request::Acquire(request) => Response::Acquire(store.acquire(request)),
+        Request::LookupAcquire(request) => Response::LookupAcquire(store.lookup_acquire(request)),
         Request::Finalize {
             lease_id,
             token,
@@ -352,6 +451,11 @@ pub(crate) fn serve_one(mut stream: UnixStream, store: &mut Store) -> Result<(),
         } => {
             Response::Reconcile(store.reconcile(&lease_id, token.as_ref(), &operation_id, evidence))
         }
+        Request::LookupFinalize {
+            lease_id,
+            operation_id,
+            evidence,
+        } => Response::LookupFinalize(store.lookup_finalize(&lease_id, &operation_id, evidence)),
         Request::Evict {
             request_id,
             target_bytes,
@@ -363,9 +467,29 @@ pub(crate) fn serve_one(mut stream: UnixStream, store: &mut Store) -> Result<(),
             }
         }
     };
+    write_response(&mut stream, response)
+}
+
+fn encode_protocol_header(writer: &mut Writer) -> Result<(), StorageError> {
+    writer.bytes(PROTOCOL_MAGIC)?;
+    writer.u32(PROTOCOL_VERSION);
+    Ok(())
+}
+
+fn decode_protocol_header(reader: &mut Reader<'_>) -> Result<(), StorageError> {
+    if reader.bytes()?.as_slice() != &PROTOCOL_MAGIC[..] || reader.u32()? != PROTOCOL_VERSION {
+        return Err(StorageError::Protocol(
+            "unsupported storage protocol version",
+        ));
+    }
+    Ok(())
+}
+
+fn write_response(stream: &mut UnixStream, response: Response) -> Result<(), StorageError> {
     let mut writer = Writer::new();
+    encode_protocol_header(&mut writer)?;
     response.encode(&mut writer)?;
-    write_frame(&mut stream, writer.finish())
+    write_frame(stream, writer.finish())
 }
 
 fn encode_result<T>(
@@ -508,8 +632,23 @@ fn decode_inventory(reader: &mut Reader<'_>) -> Result<Inventory, StorageError> 
 }
 
 fn encode_acquire_result(writer: &mut Writer, result: &AcquireResult) -> Result<(), StorageError> {
+    validate_storage_identity(
+        &result.slot_id,
+        &result.storage_instance_id,
+        &result.generation,
+    )?;
+    if (result.state == SlotState::Leased) != (result.slot_path.is_some() && result.token.is_some())
+        || (result.state != SlotState::Leased
+            && (result.slot_path.is_some() || result.token.is_some()))
+    {
+        return Err(StorageError::Protocol(
+            "acquire result access does not match lease state",
+        ));
+    }
     result.lease_id.encode(writer)?;
     result.slot_id.encode(writer)?;
+    result.storage_instance_id.encode(writer)?;
+    result.generation.encode(writer)?;
     result.state.encode(writer)?;
     match result.slot_path.as_ref() {
         Some(path) => {
@@ -532,6 +671,9 @@ fn encode_acquire_result(writer: &mut Writer, result: &AcquireResult) -> Result<
 fn decode_acquire_result(reader: &mut Reader<'_>) -> Result<AcquireResult, StorageError> {
     let lease_id = String::decode(reader)?;
     let slot_id = String::decode(reader)?;
+    let storage_instance_id = String::decode(reader)?;
+    let generation = String::decode(reader)?;
+    validate_storage_identity(&slot_id, &storage_instance_id, &generation)?;
     let state = SlotState::decode(reader)?;
     let slot_path = match reader.u8()? {
         0 => None,
@@ -548,14 +690,155 @@ fn decode_acquire_result(reader: &mut Reader<'_>) -> Result<AcquireResult, Stora
         1 => true,
         _ => return Err(StorageError::Protocol("invalid reused flag")),
     };
+    if (state == SlotState::Leased) != (slot_path.is_some() && token.is_some())
+        || (state != SlotState::Leased && (slot_path.is_some() || token.is_some()))
+    {
+        return Err(StorageError::Protocol(
+            "acquire result access does not match lease state",
+        ));
+    }
     Ok(AcquireResult {
         lease_id,
         slot_id,
+        storage_instance_id,
+        generation,
         state,
         slot_path,
         token,
         reused,
     })
+}
+
+fn encode_lookup_result<T>(
+    writer: &mut Writer,
+    result: &LookupResult<T>,
+    encode_value: impl Fn(&mut Writer, &T) -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    match result {
+        LookupResult::Absent => writer.u8(0),
+        LookupResult::Present(value) => {
+            writer.u8(1);
+            encode_value(writer, value)?;
+        }
+        LookupResult::Uncertain(None) => writer.u8(2),
+        LookupResult::Uncertain(Some(value)) => {
+            writer.u8(3);
+            encode_value(writer, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_lookup_result<T>(
+    reader: &mut Reader<'_>,
+    decode_value: impl Fn(&mut Reader<'_>) -> Result<T, StorageError>,
+) -> Result<LookupResult<T>, StorageError> {
+    match reader.u8()? {
+        0 => Ok(LookupResult::Absent),
+        1 => Ok(LookupResult::Present(decode_value(reader)?)),
+        2 => Ok(LookupResult::Uncertain(None)),
+        3 => Ok(LookupResult::Uncertain(Some(decode_value(reader)?))),
+        _ => Err(StorageError::Protocol("unknown lookup result")),
+    }
+}
+
+fn encode_lease_lookup(
+    writer: &mut Writer,
+    result: &LookupResult<LeaseIdentity>,
+) -> Result<(), StorageError> {
+    validate_lookup_identity_state(result)?;
+    encode_lookup_result(writer, result, |writer, identity| {
+        validate_storage_identity(
+            &identity.slot_id,
+            &identity.storage_instance_id,
+            &identity.generation,
+        )?;
+        identity.lease_id.encode(writer)?;
+        identity.slot_id.encode(writer)?;
+        identity.storage_instance_id.encode(writer)?;
+        identity.generation.encode(writer)?;
+        identity.state.encode(writer)
+    })
+}
+
+fn decode_lease_lookup(
+    reader: &mut Reader<'_>,
+) -> Result<LookupResult<LeaseIdentity>, StorageError> {
+    let result = decode_lookup_result(reader, |reader| {
+        let lease_id = String::decode(reader)?;
+        let slot_id = String::decode(reader)?;
+        let storage_instance_id = String::decode(reader)?;
+        let generation = String::decode(reader)?;
+        validate_storage_identity(&slot_id, &storage_instance_id, &generation)?;
+        Ok(LeaseIdentity {
+            lease_id,
+            slot_id,
+            storage_instance_id,
+            generation,
+            state: SlotState::decode(reader)?,
+        })
+    })?;
+    validate_lookup_identity_state(&result)?;
+    Ok(result)
+}
+
+fn validate_lookup_identity_state(
+    result: &LookupResult<LeaseIdentity>,
+) -> Result<(), StorageError> {
+    match result {
+        LookupResult::Absent => Ok(()),
+        LookupResult::Present(identity) if identity.state != SlotState::Uncertain => Ok(()),
+        LookupResult::Uncertain(Some(identity)) if identity.state == SlotState::Uncertain => Ok(()),
+        _ => Err(StorageError::Protocol(
+            "lookup result does not match lease state",
+        )),
+    }
+}
+
+fn validate_storage_identity(
+    slot_id: &str,
+    storage_instance_id: &str,
+    generation: &str,
+) -> Result<(), StorageError> {
+    if !valid_storage_instance_id(storage_instance_id) {
+        return Err(StorageError::Protocol("invalid storage instance identity"));
+    }
+    let ordinal = slot_ordinal(slot_id).ok_or(StorageError::Protocol("invalid slot identity"))?;
+    if parse_generation(generation)? != ordinal {
+        return Err(StorageError::Protocol(
+            "generation does not match slot identity",
+        ));
+    }
+    Ok(())
+}
+
+fn encode_finalization_lookup(
+    writer: &mut Writer,
+    result: &LookupResult<FinalizationReceipt>,
+) -> Result<(), StorageError> {
+    validate_finalize_lookup_state(result)?;
+    encode_lookup_result(writer, result, encode_finalization)
+}
+
+fn decode_finalization_lookup(
+    reader: &mut Reader<'_>,
+) -> Result<LookupResult<FinalizationReceipt>, StorageError> {
+    let result = decode_lookup_result(reader, decode_finalization)?;
+    validate_finalize_lookup_state(&result)?;
+    Ok(result)
+}
+
+fn validate_finalize_lookup_state(
+    result: &LookupResult<FinalizationReceipt>,
+) -> Result<(), StorageError> {
+    match result {
+        LookupResult::Absent | LookupResult::Uncertain(None) => Ok(()),
+        LookupResult::Present(receipt) if receipt.state == SlotState::Idle => Ok(()),
+        LookupResult::Uncertain(Some(receipt)) if receipt.state == SlotState::Uncertain => Ok(()),
+        _ => Err(StorageError::Protocol(
+            "finalize lookup result does not match operation state",
+        )),
+    }
 }
 
 fn encode_finalization(
@@ -675,4 +958,96 @@ fn write_frame(stream: &mut UnixStream, bytes: Vec<u8>) -> Result<(), StorageErr
 
 fn io_error(error: std::io::Error) -> StorageError {
     StorageError::Io(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_acquire_result() -> AcquireResult {
+        AcquireResult {
+            lease_id: "lease-1".to_owned(),
+            slot_id: "slot-ffffffffffffffff".to_owned(),
+            storage_instance_id: "a".repeat(64),
+            generation: u64::MAX.to_string(),
+            state: SlotState::Uncertain,
+            slot_path: None,
+            token: None,
+            reused: true,
+        }
+    }
+
+    fn raw_acquire_result(slot_id: &str, generation: &str) -> Vec<u8> {
+        let mut writer = Writer::new();
+        writer.string("lease-1").expect("encode lease");
+        writer.string(slot_id).expect("encode slot");
+        writer.string(&"a".repeat(64)).expect("encode instance");
+        writer.string(generation).expect("encode generation");
+        SlotState::Uncertain
+            .encode(&mut writer)
+            .expect("encode state");
+        writer.u8(0);
+        writer.u8(0);
+        writer.u8(1);
+        writer.finish()
+    }
+
+    #[test]
+    fn acquire_result_roundtrips_max_generation_and_rejects_noncanonical_values() {
+        let expected = valid_acquire_result();
+        let mut writer = Writer::new();
+        encode_acquire_result(&mut writer, &expected).expect("encode result");
+        let bytes = writer.finish();
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(
+            decode_acquire_result(&mut reader).expect("decode result"),
+            expected
+        );
+        assert!(reader.done());
+
+        for generation in ["0", "01", "+1", "18446744073709551616", "١"] {
+            let bytes = raw_acquire_result("slot-0000000000000001", generation);
+            assert!(decode_acquire_result(&mut Reader::new(&bytes)).is_err());
+        }
+        let mismatched = raw_acquire_result("slot-0000000000000001", "2");
+        assert!(decode_acquire_result(&mut Reader::new(&mismatched)).is_err());
+    }
+
+    #[test]
+    fn lookup_result_roundtrips_without_writer_access_fields() {
+        let expected = LookupResult::Uncertain(Some(LeaseIdentity {
+            lease_id: "lease-1".to_owned(),
+            slot_id: "slot-0000000000000001".to_owned(),
+            storage_instance_id: "b".repeat(64),
+            generation: "1".to_owned(),
+            state: SlotState::Uncertain,
+        }));
+        let mut writer = Writer::new();
+        encode_lease_lookup(&mut writer, &expected).expect("encode lookup");
+        let bytes = writer.finish();
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(
+            decode_lease_lookup(&mut reader).expect("decode lookup"),
+            expected
+        );
+        assert!(reader.done());
+    }
+
+    #[test]
+    fn protocol_header_rejects_legacy_and_unsupported_peers() {
+        let mut writer = Writer::new();
+        encode_protocol_header(&mut writer).expect("encode current header");
+        let bytes = writer.finish();
+        decode_protocol_header(&mut Reader::new(&bytes)).expect("decode current header");
+
+        let mut legacy = Writer::new();
+        legacy.u8(3);
+        legacy.u32(0);
+        assert!(decode_protocol_header(&mut Reader::new(&legacy.finish())).is_err());
+
+        let mut future = Writer::new();
+        future.bytes(PROTOCOL_MAGIC).expect("encode protocol magic");
+        future.u32(PROTOCOL_VERSION + 1);
+        assert!(decode_protocol_header(&mut Reader::new(&future.finish())).is_err());
+    }
 }
