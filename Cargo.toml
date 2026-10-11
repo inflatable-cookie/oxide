@@ -14,6 +14,8 @@ libc = { version = "=0.2.190", optional = true }
 
 [features]
 private-qualification = ["dep:hmac", "dep:libc"]
+# Unpublished test-only blocking points. Off by default; never selected by bootstrap, env or argv.
+private-qualification-fixture = ["private-qualification"]
 
 [[bin]]
 name = "oxide-qualified-runner"

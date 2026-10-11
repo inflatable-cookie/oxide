@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -764,6 +765,142 @@ fn private_qualification_runtime_already_expired_bootstrap_is_retained_without_e
         .count();
     assert_eq!(markers, 0, "no replay marker was created");
     assert!(!storage_root.join("daemon.sock").exists());
+    fs::remove_dir_all(&base).unwrap();
+}
+
+/// Spawns a child whose startup reaches the named controlled step and blocks there. The step
+/// is an owned FIFO in the owner's control directory. This test never opens it for writing,
+/// so the child blocks until the supervisor expires the window.
+#[cfg(feature = "private-qualification-fixture")]
+fn stalled_child(
+    base: &Path,
+    name: &str,
+    point: &str,
+    window: u64,
+) -> (ChildGuard, UnixListener, PathBuf, PathBuf, Vec<u8>, PathBuf) {
+    let storage_root = base.join(format!("store-{name}"));
+    private_dir(&storage_root);
+    let control_dir = base.join(format!("ctl-{name}"));
+    private_dir(&control_dir);
+    let control = control_dir.join("p.sock");
+    let listener = UnixListener::bind(&control).unwrap();
+    fs::set_permissions(&control, fs::Permissions::from_mode(0o600)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let fifo = control_dir.join(format!("fixture-stall-{point}"));
+    let fifo_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    // SAFETY: the path is a NUL-terminated string inside this test's private control directory.
+    let made = unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) };
+    assert_eq!(made, 0, "owned stall FIFO created");
+    let bootstrap = bootstrap_for(
+        &storage_root,
+        &control,
+        vec![approved(1)],
+        now() + window,
+        DEFAULT_GRACE,
+    );
+    let bytes = serde_json::to_vec(&bootstrap).unwrap();
+    let file = base.join(format!("bootstrap-{name}.json"));
+    write_private(&file, &bytes);
+    let child = ChildGuard(Some(
+        Command::new(
+            std::env::var_os("OXIDE_STORAGE_RUNTIME").expect("Effigy compiled the runtime"),
+        )
+        .arg(&file)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap(),
+    ));
+    (child, listener, storage_root, file, bytes, control_dir)
+}
+
+/// Bytes of the one connection the child made, after it has exited. The read cannot block.
+#[cfg(feature = "private-qualification-fixture")]
+fn drained_connection(listener: &UnixListener) -> Vec<u8> {
+    let Ok((mut stream, _)) = listener.accept() else {
+        return Vec::new();
+    };
+    stream.set_nonblocking(false).unwrap();
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).unwrap();
+    bytes
+}
+
+#[cfg(feature = "private-qualification-fixture")]
+fn replay_markers(dir: &Path) -> usize {
+    fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("runtime-"))
+        .count()
+}
+
+#[cfg(feature = "private-qualification-fixture")]
+#[test]
+fn private_qualification_runtime_actual_child_stall_before_bind_expires_without_ready() {
+    // Controlled step: after control connect and endpoint capture, before Daemon::bind.
+    let base = scratch("stall-bind");
+    let (mut child, listener, storage_root, file, bytes, control_dir) =
+        stalled_child(&base, "stall-bind", "before-bind", 3);
+    let started = Instant::now();
+    let status = child.wait_exit(Duration::from_secs(15));
+    assert!(started.elapsed() < Duration::from_secs(10), "bounded exit");
+    assert_eq!(status.code(), Some(4), "expired before readiness");
+    let stderr = child.stderr_after_exit();
+    assert!(
+        stderr.contains("fixture stall entered: before-bind"),
+        "blocked phase entered: {stderr}"
+    );
+    assert!(stderr.contains("startup expired"), "stderr: {stderr}");
+    // The child had connected before the stall. No ready frame, failure frame or serve followed.
+    assert!(
+        drained_connection(&listener).is_empty(),
+        "no late ready or serve"
+    );
+    assert!(!storage_root.join("daemon.sock").exists(), "bind never ran");
+    // Durable intent is the replay marker alone, and the bootstrap was consumed.
+    assert_eq!(replay_markers(&control_dir), 1);
+    assert!(!file.exists());
+    // Replay of the identical bytes is refused by the spent window and the marker, and the
+    // file is retained for its owner. No effect follows.
+    write_private(&file, &bytes);
+    assert!(serve_bootstrap(&file).is_err());
+    assert!(file.exists(), "refused bootstrap is retained");
+    assert!(!storage_root.join("daemon.sock").exists());
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[cfg(feature = "private-qualification-fixture")]
+#[test]
+fn private_qualification_runtime_actual_child_stall_before_ready_expires_without_ready() {
+    // Controlled step: after Daemon::bind and frame construction, before the ready write.
+    let base = scratch("stall-ready");
+    let (mut child, listener, storage_root, file, bytes, control_dir) =
+        stalled_child(&base, "stall-ready", "before-ready", 3);
+    let started = Instant::now();
+    let status = child.wait_exit(Duration::from_secs(15));
+    assert!(started.elapsed() < Duration::from_secs(10), "bounded exit");
+    assert_eq!(status.code(), Some(4), "expired before readiness");
+    let stderr = child.stderr_after_exit();
+    assert!(
+        stderr.contains("fixture stall entered: before-ready"),
+        "blocked phase entered: {stderr}"
+    );
+    // The stall ran after bind, so the endpoint file exists. Exit does not run the daemon's
+    // drop, so the stale endpoint remains. It was never served, and the next bind refuses it
+    // through the existing stale-socket check.
+    assert!(
+        drained_connection(&listener).is_empty(),
+        "no ready frame before expiry"
+    );
+    assert!(storage_root.join("daemon.sock").exists());
+    assert_eq!(replay_markers(&control_dir), 1);
+    assert!(!file.exists());
+    write_private(&file, &bytes);
+    assert!(serve_bootstrap(&file).is_err());
+    assert!(file.exists(), "refused bootstrap is retained");
     fs::remove_dir_all(&base).unwrap();
 }
 

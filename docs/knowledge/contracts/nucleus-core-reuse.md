@@ -1001,6 +1001,43 @@ Readiness is written only while at least 1 second of owner window remains. A wor
 result that arrives after the bound is never observed. Process exit is not a writer
 completion or Idle proof.
 
+**Supervisor rule.** Each event, such as a queued window, ready or finished notice, is
+applied only after the supervisor reads the current monotonic time. Before readiness, a
+late event expires the startup. A late ready never changes readiness or extends the bound.
+A worker that finishes after the bound before readiness is never a success. After
+readiness, a second ready is a protocol failure. The decision is a pure step function
+with unit tests for each ordering.
+
+**Deadline checks around setup.** The worker checks the window after the control connect
+and endpoint capture, before `Daemon::bind`, and again after bind. It checks before the
+ready write. The ready write is bounded by the owner window, not a fresh tolerance. Partial
+writes are re-armed with the remaining window, rounded to whole milliseconds with a
+one-millisecond minimum. The write must complete inside the window, and the window is
+checked again before the serve-phase bound is posted. A write that is still in progress
+when the window ends is not a readiness event.
+
+**What is guaranteed.** The runtime never posts readiness or starts serving after its
+window has ended. The transport cannot be unsent, so a frame whose write completes at the
+boundary may reach the parent. The parent therefore refuses a ready frame received at or
+after its `expires_unix_seconds`, which `verify_ready` enforces. A truncated or incomplete
+frame refuses. Not even a late authenticated frame can start serving, because the
+serving step is never entered after expiry. Blocking connect and `Daemon::bind` have no
+timeout of their own. Those steps are bounded by the supervisor, which exits the process at
+the window, not by the step returning.
+
+**Controlled pre-ready stall (unpublished test surface).** Feature
+`private-qualification-fixture` is unpublished and off by default. It compiles two
+blocking points. Each blocks on an owned FIFO that the trusted test creates in the owner's
+control directory. The points are `before-bind`, after connect and endpoint capture, and
+`before-ready`, after bind and frame construction. The bootstrap, environment and argv
+cannot select or disable them. Actual-child proof: a window of three seconds reaches the
+blocked step, the child exits 4 with `fixture stall entered: <point>` in stderr, and the
+connection receives no bytes. For `before-bind`, bind never ran and no endpoint exists. For
+`before-ready`, bind ran and the stale endpoint remains, because exit does not run the
+daemon's drop. The replay marker stays, and the bootstrap is consumed. Replay of the
+identical bytes is refused and the file is retained. The step expires by the window, not by
+the test's own timing.
+
 **Startup, before effects.** Read and validate the bootstrap. Validate the owned
 storage root, the pinned control identity, the budget and the window. Create the
 exclusive replay marker `runtime-<sha256 hex of the exact bootstrap bytes>`
@@ -1029,7 +1066,9 @@ with credentials excluded), `storage_instance_id` (64 lowercase hex), `storage`
 `expires_unix_seconds` (the effective deadline), then `mac`. Parent verification
 (`registered::storage_runtime::verify_ready`) checks the MAC, scope, digests, instance
 text, the exact endpoint path and device/inode captured on the parent side. Ready is
-metadata only. It grants no lease, token, admission or submission.
+metadata only. It grants no lease, token, admission or submission. The parent refuses a ready
+frame received at or after its `expires_unix_seconds`, and it still verifies the MAC over
+every field before it uses the identity.
 
 **Shutdown and ack.** Parent to runtime: `{version: 1, operation: "shutdown", id, mac}`.
 `id` is 1–128 bytes of `[A-Za-z0-9_-]`. The runtime stops its daemon, then sends

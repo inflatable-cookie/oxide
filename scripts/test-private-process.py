@@ -7,7 +7,7 @@ import sys
 subprocess.run(["node", "scripts/qualification-vectors.mjs"], check=True, timeout=30)
 
 build = subprocess.run(
-    ["cargo", "build", "--offline", "--locked", "--features", "private-qualification",
+    ["cargo", "build", "--offline", "--locked", "--features", "private-qualification-fixture",
      "--bin", "oxide-qualified-runner", "--bin", "oxide-storage-runtime", "--message-format=json"],
     stdout=subprocess.PIPE, text=True, timeout=300,
 )
@@ -29,7 +29,7 @@ environment = dict(
     OXIDE_STORAGE_RUNTIME=executables["oxide-storage-runtime"],
 )
 result = subprocess.run(
-    ["python3", "scripts/bounded-test.py", "cargo", "test", "--offline", "--locked", "--features", "private-qualification",
+    ["python3", "scripts/bounded-test.py", "cargo", "test", "--offline", "--locked", "--features", "private-qualification-fixture",
      "--lib", "private_qualification", "--", "--test-threads=1", "--nocapture"],
     env=environment, timeout=330,
 )

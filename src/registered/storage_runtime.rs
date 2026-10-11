@@ -27,7 +27,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::mem::MaybeUninit;
 use std::net::Shutdown;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
@@ -194,6 +194,10 @@ pub fn verify_ready(
     frame: &Value,
 ) -> Result<Ready, HostError> {
     let ready = verify_ready_frame(key, expectation, frame)?;
+    // A ready frame is accepted only while its window end has not passed on the parent side.
+    if unix_now()? >= ready.expires_unix_seconds {
+        return Err(HostError::OwnerRejected);
+    }
     let current = Endpoint::capture(ready.storage.path.clone())?;
     if current.device != ready.storage.device.0 || current.inode != ready.storage.inode.0 {
         return Err(HostError::OwnerRejected);
@@ -450,6 +454,7 @@ pub fn serve_bootstrap(path: &Path) -> Result<Stop, HostError> {
 }
 
 /// Progress from the startup worker to the process supervisor.
+#[derive(Debug)]
 enum Event {
     /// The owner window end, known once the bootstrap has been validated.
     Window(Instant),
@@ -457,6 +462,40 @@ enum Event {
     Ready(Instant),
     /// The worker has finished with this result.
     Finished(Result<Stop, HostError>),
+}
+
+/// The supervisor's decision for one event or timeout.
+#[derive(Debug)]
+enum Step {
+    Continue { deadline: Instant, ready: bool },
+    Done(Result<Stop, HostError>),
+}
+
+/// Applies one event. The current monotonic time is checked first. A queued event that
+/// arrives after the bound never changes readiness or extends the deadline, and a worker
+/// that finishes after the bound before readiness is never promoted to a result.
+fn step(deadline: Instant, ready: bool, event: Event, now: Instant) -> Step {
+    let expired = if ready {
+        Stop::Abandoned
+    } else {
+        Stop::StartupExpired
+    };
+    match event {
+        Event::Window(_) if now >= deadline => Step::Done(Ok(expired)),
+        Event::Window(end) => Step::Continue {
+            deadline: deadline.min(end),
+            ready,
+        },
+        Event::Ready(_) if now >= deadline => Step::Done(Ok(expired)),
+        Event::Ready(_) if ready => Step::Done(Err(HostError::Protocol)),
+        Event::Ready(end) => Step::Continue {
+            deadline: end,
+            ready: true,
+        },
+        Event::Finished(Err(HostError::Timeout)) if !ready => Step::Done(Ok(Stop::StartupExpired)),
+        Event::Finished(_) if !ready && now >= deadline => Step::Done(Ok(Stop::StartupExpired)),
+        Event::Finished(result) => Step::Done(result),
+    }
 }
 
 /// Runs the whole process from entry under one nonrenewable bound. Before the bootstrap
@@ -481,19 +520,24 @@ where
     let mut deadline = entry + MAX_LIFETIME;
     let mut ready = false;
     loop {
-        match received.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(Event::Window(end)) => deadline = end,
-            Ok(Event::Ready(end)) => {
-                ready = true;
-                deadline = end;
+        let next = match received.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(event) => step(deadline, ready, event, Instant::now()),
+            Err(mpsc::RecvTimeoutError::Timeout) => Step::Done(Ok(if ready {
+                Stop::Abandoned
+            } else {
+                Stop::StartupExpired
+            })),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Step::Done(Err(HostError::Protocol)),
+        };
+        match next {
+            Step::Continue {
+                deadline: next_deadline,
+                ready: next_ready,
+            } => {
+                deadline = next_deadline;
+                ready = next_ready;
             }
-            Ok(Event::Finished(Err(HostError::Timeout))) if !ready => {
-                return Ok(Stop::StartupExpired)
-            }
-            Ok(Event::Finished(result)) => return result,
-            Err(mpsc::RecvTimeoutError::Timeout) if ready => return Ok(Stop::Abandoned),
-            Err(mpsc::RecvTimeoutError::Timeout) => return Ok(Stop::StartupExpired),
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(HostError::Protocol),
+            Step::Done(result) => return result,
         }
     }
 }
@@ -541,6 +585,11 @@ fn startup(
     if current.device != bootstrap.control.device.0 || current.inode != bootstrap.control.inode.0 {
         return Err(HostError::Protocol);
     }
+    fixture_stall(
+        bootstrap.control.path.parent().ok_or(HostError::Protocol)?,
+        "before-bind",
+    );
+    before(window_end)?;
     match run(&bootstrap, plan, socket, &mut control, events) {
         Ok(stop) => Ok(stop),
         Err(error) => {
@@ -607,6 +656,7 @@ fn run(
         Arc::new(OwnedRootFreeSpace { root }),
     )
     .map_err(|_| HostError::Storage)?;
+    before(plan.deadline)?;
     let instance = daemon.storage_instance_id().to_owned();
     authority
         .install_instance(&instance)
@@ -625,10 +675,17 @@ fn run(
         ],
     )?;
     frame["mac"] = json!(mac);
+    fixture_stall(
+        bootstrap.control.path.parent().ok_or(HostError::Protocol)?,
+        "before-ready",
+    );
     if !ready_allowed(plan.deadline) {
         return Err(HostError::Timeout);
     }
-    write_frame(control, &frame)?;
+    // The write is bounded by the owner window, not by a fresh tolerance. A write that ends
+    // after the window is not a readiness event.
+    write_frame_until(control, &frame, plan.deadline)?;
+    before(plan.deadline)?;
     // The serve-phase bound covers the stop grace and the bounded exit tolerance.
     let _ = events.send(Event::Ready(
         plan.deadline + plan.stop_grace + EXIT_TOLERANCE,
@@ -840,6 +897,69 @@ fn failed_frame(
     )
 }
 
+/// Writes one whole frame, re-arming each partial write with the remaining window. A
+/// frame cannot be held past `until`, and the timeout is passed in whole milliseconds.
+fn write_frame_until(
+    stream: &mut UnixStream,
+    value: &Value,
+    until: Instant,
+) -> Result<(), HostError> {
+    let mut bytes = serde_json::to_vec(value).map_err(|_| HostError::Protocol)?;
+    if bytes.len() >= MAX_FRAME_BYTES {
+        return Err(HostError::Protocol);
+    }
+    bytes.push(b'\n');
+    let mut written = 0;
+    while written < bytes.len() {
+        let remaining = until
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(HostError::Timeout)?;
+        let millis = u64::try_from(remaining.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        stream
+            .set_write_timeout(Some(Duration::from_millis(millis)))
+            .map_err(|_| HostError::Io)?;
+        match stream.write(&bytes[written..]) {
+            Ok(0) => return Err(HostError::Io),
+            Ok(count) => written += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(HostError::Timeout)
+            }
+            Err(_) => return Err(HostError::Io),
+        }
+    }
+    Ok(())
+}
+
+/// Test-only blocking point. It is compiled only with `private-qualification-fixture`,
+/// which is unpublished and off by default. It blocks on an owned FIFO that the trusted
+/// test creates in the owner's control directory. The bootstrap, environment and argv
+/// cannot select or disable it. The test opens no writer, so the step blocks until the
+/// supervisor expires the window.
+#[cfg(feature = "private-qualification-fixture")]
+fn fixture_stall(control_dir: &Path, point: &str) {
+    let path = control_dir.join(format!("fixture-stall-{point}"));
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return;
+    };
+    if !metadata.file_type().is_fifo() {
+        return;
+    }
+    eprintln!("fixture stall entered: {point}");
+    let _ = OpenOptions::new().read(true).open(&path);
+}
+
+#[cfg(not(feature = "private-qualification-fixture"))]
+fn fixture_stall(_control_dir: &Path, _point: &str) {}
+
 fn write_frame(stream: &mut UnixStream, value: &Value) -> Result<(), HostError> {
     stream
         .set_write_timeout(Some(EXIT_TOLERANCE))
@@ -902,6 +1022,83 @@ mod tests {
         .to_string();
         frame.push('\n');
         frame.into_bytes()
+    }
+
+    #[test]
+    fn private_qualification_runtime_late_queued_events_never_move_readiness_or_extend() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let late = deadline + Duration::from_millis(1);
+        // A ready event that is processed after the bound is refused, not applied.
+        assert!(matches!(
+            step(
+                deadline,
+                false,
+                Event::Ready(late + Duration::from_secs(60)),
+                late
+            ),
+            Step::Done(Ok(Stop::StartupExpired))
+        ));
+        // A window event processed after the bound also expires instead of continuing.
+        assert!(matches!(
+            step(
+                deadline,
+                false,
+                Event::Window(late + Duration::from_secs(60)),
+                late
+            ),
+            Step::Done(Ok(Stop::StartupExpired))
+        ));
+        // A worker that finishes after the bound before readiness is never a success.
+        assert!(matches!(
+            step(
+                deadline,
+                false,
+                Event::Finished(Ok(Stop::Shutdown("x".into()))),
+                late
+            ),
+            Step::Done(Ok(Stop::StartupExpired))
+        ));
+        // Readiness in time moves the bound to the serve phase and never back.
+        let serve = deadline + Duration::from_secs(12);
+        match step(deadline, false, Event::Ready(serve), Instant::now()) {
+            Step::Continue {
+                deadline: next,
+                ready,
+            } => {
+                assert!(ready);
+                assert_eq!(next, serve);
+            }
+            other => panic!("ready in time must continue: {other:?}"),
+        }
+        // A second ready is a protocol failure, not an extension.
+        assert!(matches!(
+            step(
+                serve,
+                true,
+                Event::Ready(serve + Duration::from_secs(60)),
+                Instant::now()
+            ),
+            Step::Done(Err(HostError::Protocol))
+        ));
+    }
+
+    #[test]
+    fn private_qualification_runtime_bounded_ready_write_stops_at_the_owner_window() {
+        // A write that cannot finish inside the window fails with Timeout and never reports
+        // readiness. The peer never reads, so only the window can end the write.
+        let (mut writer, _peer) = UnixStream::pair().unwrap();
+        let big = serde_json::json!({"fill": "x".repeat(MAX_FRAME_BYTES - 64)});
+        let until = Instant::now() + Duration::from_millis(200);
+        let started = Instant::now();
+        let mut result = Ok(());
+        for _ in 0..64 {
+            result = write_frame_until(&mut writer, &big, until);
+            if result.is_err() {
+                break;
+            }
+        }
+        assert_eq!(result, Err(HostError::Timeout));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     /// Drives the frame parser from in-memory bytes. Socket timeouts are not used here.
