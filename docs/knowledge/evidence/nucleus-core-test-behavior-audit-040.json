@@ -856,7 +856,7 @@
     "path": "crates/nucleus-observer/src/lib.rs",
     "observations": [
      "Six JsonSchema/serde derives on report/status types (lines 26,32,51,67,75).",
-     "Uses `std::process::Command` for `/bin/ps`, `/usr/sbin/lsof`, `/bin/kill -0`, `/usr/bin/id`, `/bin/ls` (lines 162,240,464,476,546,567).",
+     "Uses `std::process::Command` for `/bin/ps`, `/usr/sbin/lsof`, `/bin/kill -0`, `/usr/bin/id`, `/bin/ls` (lines 162,240,464,476,546,567), with a PATH fallback to `lsof` at line 571.",
      "The selected planning/build_diagnostics tests do not call these observer entry points; the external process reads are compiled but not exercised by this workflow (no `observe(` reference in tests/planning.rs)."
     ]
    },
@@ -915,14 +915,14 @@
      "`build_bundled::main` copies `sqlite3/bindgen_bundled_version.rs` to `$OUT_DIR/bindgen.rs` (unless `buildtime_bindgen`), emits `cargo:include=<manifest>/sqlite3`, and declares `cargo:include`, `cargo:rerun-if-changed=sqlite3/sqlite3.c` and `cargo:rerun-if-changed=sqlite3/wasm32-wasi-vfs.c` (build.rs lines 147-149).",
      "It compiles `sqlite3/sqlite3.c` through `cc::Build` with fixed `-D` feature flags plus `-I <manifest>/sqlite3` (build.rs lines 150-186, `cfg.compile` at 334).",
      "Environment reads: `OUT_DIR` (70), `CARGO_CFG_WINDOWS` (41), `CARGO_CFG_TARGET_OS` (48), `CARGO_CFG_TARGET_ENV` (56), `TARGET`/`HOST` (180-181, 340), `CARGO_CFG_TARGET_FEATURE` (269); `rerun-if-env-changed` for `LIBSQLITE3_SYS_USE_PKG_CONFIG` (79), `SQLITE_MAX_VARIABLE_NUMBER` (309), `SQLITE_MAX_EXPR_DEPTH` (314), `SQLITE_MAX_COLUMN` (319), `LIBSQLITE3_FLAGS` (332).",
-     "The `bundled` path never calls pkg-config or vcpkg; those are used only by `build_linked` (`find_sqlite` at 450, pkg-config probes at 473/490, `try_vcpkg` at 511)."
+     "`main` routes to `build_linked::main` when `LIBSQLITE3_SYS_USE_PKG_CONFIG` is set to a value other than `0`, or the `loadable_extension` feature is on (build.rs:79-83), before the `bundled` branch at build.rs:97-106. `build_linked` reaches `find_sqlite` (build.rs:450), pkg-config probes (473/490) and `try_vcpkg` (511). The owning contract requires `LIBSQLITE3_SYS_USE_PKG_CONFIG` absent or `0` (nucleus-core-reuse.md:520), so its effective presence/value is a decisive unresolved input."
     ]
    },
    {
     "package": "cc 1.4.7",
     "path": "src/lib.rs, src/tool.rs, src/target/*.rs",
     "facts": [
-     "Resolves the compiler/archiver/linker with target-qualified precedence (`target_envs` at 4296, `getenv_with_target_prefixes` at 4314, `envflags` `CFLAGS`/`CXXFLAGS`/`ARFLAGS`) over target/unprefixed `CC`,`CFLAGS`,`AR`,`ARFLAGS`,`CXX`,`CXXFLAGS`,`NVCC`,`CXXSTDLIB`,`RUSTC_WRAPPER` (3544),`RUSTC_LINKER` (3939); reads `CARGO_CFG_TARGET_FEATURE` (2229,2532), `CARGO_ENCODED_RUSTFLAGS` (2781,3240), `CARGO_TRIM_PATHS_SCOPE/REMAP` (2801-2804), `OUT_DIR` (4230), `NUM_JOBS` (job_token.rs 236).",
+     "Resolves the compiler/archiver/linker with target-qualified precedence (`target_envs` at 4296, `getenv_with_target_prefixes` at 4314, `envflags` `CFLAGS`/`CXXFLAGS`/`ARFLAGS`) over target/unprefixed `CC`,`CFLAGS`,`AR`,`ARFLAGS`,`CXX`,`CXXFLAGS`,`NVCC`,`CXXSTDLIB`,`RUSTC_WRAPPER` (3544),`RUSTC_LINKER` (3939); reads `CARGO_CFG_TARGET_FEATURE` (2229,2532), `CARGO_ENCODED_RUSTFLAGS` (2781,3240), `CARGO_TRIM_PATHS_SCOPE/REMAP` (2801-2804), `OUT_DIR` (4233), `NUM_JOBS` (job_token.rs 236).",
      "Executes compilers/archivers/linkers and `rustc` (target/parser.rs 594-609, target/llvm.rs 279-296; command_helpers.rs `spawn` 496, `Command` at tool.rs 134/242/413).",
      "On Apple it consults `SDKROOT` (4373), falls back to `xcrun` (4405,4458), and adds the deployment-target flag (`MACOSX_DEPLOYMENT_TARGET` at 4530; target/apple.rs).",
      "It writes and compiles temporary flag-check translation units, falling back to a tempfile (lib.rs 1482/1503,1515-1540)."
@@ -932,7 +932,8 @@
     "package": "pkg-config 0.3.34 / vcpkg 0.2.15",
     "facts": [
      "Compiled as libsqlite3-sys build-dependencies: the pinned Cargo.lock lists `libsqlite3-sys` dependencies `[cc, pkg-config, vcpkg]`, consistent with its `default = [min_sqlite_version_3_34_1]` enabling `pkg-config` and `vcpkg`.",
-     "Neither is invoked by the `bundled` branch of build.rs. pkg-config would run a `pkg-config` process and read `PKG_CONFIG*`; vcpkg would read `VCPKG_ROOT`/`OUT_DIR` files. Their runtime reads are therefore not part of this workflow unless a non-bundled feature is selected."
+     "`build_bundled::main` does not call them. But `LIBSQLITE3_SYS_USE_PKG_CONFIG` present and not `0` (or feature `loadable_extension`) routes build.rs `main` to `build_linked` even with `bundled` enabled (build.rs:79-83), which executes pkg-config (473/490) and vcpkg (511). pkg-config would run a `pkg-config` process and read `PKG_CONFIG*`; vcpkg would read `VCPKG_ROOT`/`OUT_DIR`.",
+     "Effective presence/absence of `LIBSQLITE3_SYS_USE_PKG_CONFIG` is not resolved in this audit and is a decisive unresolved input, not an unreachable branch."
     ]
    }
   ],
@@ -1421,7 +1422,7 @@
   {
    "class": "Effective Cargo configuration and cc environment",
    "status": "refused",
-   "basis": "Requires owner-scoped resolution of the Cargo config hierarchy and target-prefixed CC/CFLAGS/AR/SDKROOT presence/absence."
+   "basis": "Requires owner-scoped resolution of the Cargo config hierarchy and target-prefixed CC/CFLAGS/AR/SDKROOT presence/absence; `LIBSQLITE3_SYS_USE_PKG_CONFIG` must be absent or `0`."
   },
   {
    "class": "Enabled semantic unit graph",
@@ -1462,11 +1463,16 @@
    "class": "Genuine run/debug evidence",
    "status": "refused",
    "basis": "No Nucleus run, test execution, full-debug capture or old-run source lookup exists for this workflow; the audit is pre-execution only."
+  },
+  {
+   "class": "LIBSQLITE3_SYS_USE_PKG_CONFIG effective presence/value",
+   "status": "unresolved",
+   "basis": "build.rs:79-83 routes to `build_linked` (which calls pkg-config and vcpkg) when this variable is present and not `0`, even with `bundled` on. The owning contract requires it absent or `0`. Effective presence was not resolved here."
   }
  ],
  "finite_acquisition_package": {
-  "name": "One read-only accepted native/tool input-closure receipt for the selected core-test workflow",
-  "rationale": "The behavior audit shows the registry/generated side is mechanically coverable, while native/tool/SDK, effective configuration, enabled graph and the accepted issuer are the blocking seams. This one package closes the largest independently reviewable gap without Cargo.",
+  "name": "One accepted native/tool input-closure package: a Cargo-free receipt plus a separately scoped Cargo-side graph observation",
+  "rationale": "The behavior audit shows the registry/generated side is mechanically coverable, while native/tool/SDK, effective configuration, enabled graph and the accepted issuer are the blocking seams. The package has two visibly separate parts: (a) a Cargo-free accepted native/tool/SDK/config receipt, and (b) a Cargo-side enabled-unit-graph observation. Only (a) is read-only and Cargo-free; (b) necessarily requires Cargo or an accepted equivalent owner observation.",
   "concrete_inputs": [
    "Reuse the retained Task039 libsqlite3-sys per-file manifest (26 files/4 directories) and the Task038 per-file records; no new registry-correspondence acquisition is needed.",
    "Native input enumeration for the bundled build: sqlite3/sqlite3.c (9,507,037), sqlite3/sqlite3.h (690,725), sqlite3/sqlite3ext.h (39,175), and the generated $OUT_DIR/bindgen.rs association; `sqlite3/wasm32-wasi-vfs.c` only if the wasm feature is enabled.",
@@ -1510,7 +1516,8 @@
     "task039_archive_bytes": 104097860,
     "task039_aggregate_bytes": 104730050,
     "note": "Separate Task038 and Task039 ledgers; Task039 did not replay the 58 packages."
-   }
+   },
+   "six_root_extracted_bytes_note": "These are on-disk totals including the six package-root .cargo-ok sidecars that the verifier inventory excludes; the declared verifier members are 1,022 entries."
   },
   "time_cost": "Bounded read-only preparation; no Cargo invocation. Author work for this audit is within one 90-minute allocation; independent review within one 30-minute allocation.",
   "fit_with_remaining_trial": "The read-only acquisition does not consume the four Cargo invocations. A fit or infeasibility assertion for the representative <=4-Cargo/45-minute trial is NOT made, because the actual enabled graph size is unavailable; the brief prohibits an assertion without actual size.",

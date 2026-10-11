@@ -339,11 +339,11 @@ Behavior findings. The selected `build_diagnostics` test is
 `include_bytes!/include_str!("fixtures/decision-self-relay-v1.json")`; at
 runtime it resolves and spawns `mktemp`, writes SQLite WAL stores under
 `std::env::temp_dir()`, and cleans them up. It does not exercise the
-`nucleus-observer` `/bin/ps`, `/usr/sbin/lsof`, `/bin/kill -0` or `/usr/bin/id`
-reads, which are compiled but unused here. `rusqlite` `bundled` reaches
-`libsqlite3-sys 0.38.2` `build_bundled::main`, which copies
-`sqlite3/bindgen_bundled_version.rs` to `$OUT_DIR/bindgen.rs`, includes the
-`sqlite3` directory, declares `sqlite3/sqlite3.c` and
+`nucleus-observer` `/bin/ps`, `/usr/sbin/lsof` (with a `lsof` PATH fallback),
+`/bin/kill -0` or `/usr/bin/id` reads, which are compiled but unused here.
+`rusqlite` `bundled` reaches `libsqlite3-sys 0.38.2` `build_bundled::main`,
+which copies `sqlite3/bindgen_bundled_version.rs` to `$OUT_DIR/bindgen.rs`,
+includes the `sqlite3` directory, declares `sqlite3/sqlite3.c` and
 `sqlite3/wasm32-wasi-vfs.c` as changed-file inputs, and compiles `sqlite3.c`
 through `cc::Build` with fixed flags. It reads `TARGET`, `HOST`, `OUT_DIR`,
 `CARGO_CFG_*`, `SQLITE_MAX_*`, `LIBSQLITE3_FLAGS` and
@@ -352,7 +352,12 @@ through `cc::Build` with fixed flags. It reads `TARGET`, `HOST`, `OUT_DIR`,
 `RUSTC_LINKER`, executes compiler/archiver/linker/`rustc` probes, consults
 `xcrun` on Apple and writes temporary flag-check units. `pkg-config` and `vcpkg`
 are in the lock's `libsqlite3-sys` dependency edges (its default
-`min_sqlite_version_3_34_1` feature) but are not executed by the bundled branch.
+`min_sqlite_version_3_34_1` feature). `build_bundled::main` does not call them,
+but `LIBSQLITE3_SYS_USE_PKG_CONFIG` present and not `0` (or feature
+`loadable_extension`) routes build.rs `main` to `build_linked` before the
+`bundled` branch (build.rs:79-83), which does call pkg-config and vcpkg. The
+owning contract requires that variable absent or `0`; its effective presence is
+a decisive unresolved input here, not an unreachable branch.
 `serde_derive 1.0.229` and `schemars_derive 0.8.22` are token-only within their
 own crates; the only compile-time environment use is `serde_derive`'s
 `env!("CARGO_PKG_VERSION_PATCH")`. `proc-macro2`, `quote`, `syn`, `serde_core`,
@@ -368,12 +373,13 @@ integrity; effective Cargo configuration and environment; the enabled semantic
 unit graph; registry installation provenance; a continuous no-replacement
 agreement; the native consuming associations; genuine run/debug evidence; or a
 real accepted graph/audit issuer, which remains synthetic-only under oxide#035.
-The one finite next acquisition package is a read-only accepted native/tool
-input-closure receipt (native C inputs, toolchain/SDK content identities,
-effective configuration inventory, enabled-graph observation, no-replacement
-and installation-provenance evidence, and the issuer ruling). The retained
-Task038/Task039 registry manifests are reused and are not re-acquired. Three
-owner rulings are still unrecorded: a qualification-only real verifier/issuer
+The one finite next acquisition package has two visibly separate parts: a
+Cargo-free accepted native/tool/SDK/config receipt (native C inputs,
+toolchain/SDK content identities, effective configuration inventory,
+no-replacement and installation-provenance evidence, and the issuer ruling),
+plus a separately scoped Cargo-side enabled-unit-graph observation. The
+retained Task038/Task039 registry manifests are reused and are not re-acquired.
+Three owner rulings are still unrecorded: a qualification-only real verifier/issuer
 to replace the synthetic-only oxide#035 policy; bounded tool/SDK read and
 content-integrity acquisition (this brief permits zero tool/SDK reads); and a
 Cargo-side or accepted-equivalent enabled-unit-graph observation. The actual
