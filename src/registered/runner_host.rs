@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fmt;
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -33,6 +33,10 @@ pub const MAX_AGGREGATE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_CALLBACKS: usize = 256;
 pub const CALLBACK_TIMEOUT: Duration = Duration::from_secs(30);
 pub const SESSION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Engineering ceiling for one private qualification session. It is not a
+/// measured workload duration; the owner supplies the remaining window.
+#[cfg(feature = "private-qualification")]
+pub(super) const MAX_QUALIFIED_SESSION: Duration = Duration::from_secs(45 * 60);
 const MAX_ID_BYTES: usize = 128;
 const MAX_RECEIPT_BYTES: usize = 4096;
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
@@ -280,11 +284,50 @@ impl fmt::Display for HostError {
 
 impl std::error::Error for HostError {}
 
+/// Finite execution timing for one attempt. `Version1` is the unchanged default.
+/// A qualified deadline is frozen once, at trusted bootstrap entry, and only
+/// shrinks: nothing read from the stream can renew it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "private-qualification"), allow(dead_code))]
+pub(super) enum Timing {
+    Version1,
+    Qualified {
+        callback: Duration,
+        session_deadline: Instant,
+    },
+}
+
+impl Timing {
+    /// Accepts only a finite, nonzero owner window that fits the engineering
+    /// ceiling. `entry` is the monotonic instant the bootstrap was accepted, so
+    /// startup and handshake time are charged to the same window.
+    #[cfg(feature = "private-qualification")]
+    pub(super) fn qualified(
+        entry: Instant,
+        callback: Duration,
+        remaining: Duration,
+    ) -> Result<Self, HostError> {
+        if callback.is_zero()
+            || remaining.is_zero()
+            || remaining > MAX_QUALIFIED_SESSION
+            || callback > remaining
+        {
+            return Err(HostError::Protocol);
+        }
+        let session_deadline = entry.checked_add(remaining).ok_or(HostError::Protocol)?;
+        Ok(Self::Qualified {
+            callback,
+            session_deadline,
+        })
+    }
+}
+
 /// Inactive host API. Construction does not spawn a process or register a
 /// workflow; the embedder must explicitly serve a private stream.
 pub struct RunnerHost {
     client: Client,
     verifier: Arc<dyn OwnerReceiptVerifier>,
+    timing: Timing,
     #[cfg(feature = "private-qualification")]
     qualification: Option<super::qualification::AttemptGrant>,
 }
@@ -308,6 +351,7 @@ impl RunnerHost {
         Self {
             client: Client::new(storage_socket),
             verifier,
+            timing: Timing::Version1,
             #[cfg(feature = "private-qualification")]
             qualification: None,
         }
@@ -315,13 +359,14 @@ impl RunnerHost {
 
     #[cfg(feature = "private-qualification")]
     pub(super) fn qualified(mut self, grant: super::qualification::AttemptGrant) -> Self {
+        self.timing = grant.timing;
         self.qualification = Some(grant);
         self
     }
 
     /// Serves one bounded request over an embedder-provided Unix stream.
     pub fn serve(&self, stream: UnixStream) -> Result<HostResult, HostError> {
-        let channel = Arc::new(Mutex::new(Channel::new(stream)?));
+        let channel = Arc::new(Mutex::new(Channel::with_timing(stream, self.timing)?));
         let frame: StartFrame = channel
             .lock()
             .map_err(|_| HostError::Protocol)?
@@ -615,34 +660,68 @@ impl From<LeaseIdentity> for StorageIdentity {
 
 struct Channel {
     reader: BufReader<UnixStream>,
-    writer: BufWriter<UnixStream>,
-    started: Instant,
+    writer: UnixStream,
+    callback: Duration,
+    session_deadline: Instant,
     callbacks: usize,
     aggregate_bytes: usize,
 }
 
 impl Channel {
+    #[cfg(test)]
     fn new(stream: UnixStream) -> Result<Self, HostError> {
-        stream
-            .set_read_timeout(Some(CALLBACK_TIMEOUT))
-            .map_err(|_| HostError::Io)?;
-        stream
-            .set_write_timeout(Some(CALLBACK_TIMEOUT))
-            .map_err(|_| HostError::Io)?;
+        Self::with_timing(stream, Timing::Version1)
+    }
+
+    fn with_timing(stream: UnixStream, timing: Timing) -> Result<Self, HostError> {
+        let (callback, session_deadline) = match timing {
+            Timing::Version1 => (CALLBACK_TIMEOUT, Instant::now() + SESSION_TIMEOUT),
+            Timing::Qualified {
+                callback,
+                session_deadline,
+            } => (callback, session_deadline),
+        };
         let writer = stream.try_clone().map_err(|_| HostError::Io)?;
         Ok(Self {
             reader: BufReader::new(stream),
-            writer: BufWriter::new(writer),
-            started: Instant::now(),
+            writer,
+            callback,
+            session_deadline,
             callbacks: 0,
             aggregate_bytes: 0,
         })
     }
 
-    fn read_frame<T: DeserializeOwned>(&mut self) -> Result<T, HostError> {
+    /// One frame or callback exchange shares a single ceiling: the callback
+    /// window from its start, clamped by the frozen session deadline.
+    fn operation_deadline(&self) -> Result<Instant, HostError> {
         self.check_time()?;
+        Ok((Instant::now() + self.callback).min(self.session_deadline))
+    }
+
+    fn remaining(&self, until: Instant) -> Result<Duration, HostError> {
+        self.check_time()?;
+        until
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(HostError::Timeout)
+    }
+
+    fn read_frame<T: DeserializeOwned>(&mut self) -> Result<T, HostError> {
+        let until = self.operation_deadline()?;
+        self.read_frame_until(until)
+    }
+
+    /// Each fill re-arms the socket with the remaining ceiling. Drip-fed bytes
+    /// cannot renew it, and a completed frame that arrives late is refused.
+    fn read_frame_until<T: DeserializeOwned>(&mut self, until: Instant) -> Result<T, HostError> {
         let mut bytes = Vec::new();
         loop {
+            let timeout = self.remaining(until)?;
+            self.reader
+                .get_ref()
+                .set_read_timeout(Some(timeout))
+                .map_err(|_| HostError::Io)?;
             let available = self.reader.fill_buf().map_err(|error| {
                 if matches!(
                     error.kind(),
@@ -675,19 +754,50 @@ impl Channel {
             return Err(HostError::Protocol);
         }
         self.charge(bytes.len() + 1)?;
+        self.remaining(until)?;
         serde_json::from_slice(&bytes).map_err(|_| HostError::Protocol)
     }
 
     fn write_frame<T: Serialize>(&mut self, value: &T) -> Result<(), HostError> {
-        self.check_time()?;
+        let until = self.operation_deadline()?;
+        self.write_frame_until(value, until)
+    }
+
+    /// Writes unbuffered so every partial write is re-armed with the remaining
+    /// ceiling; a peer that stops reading cannot hold the frame past it.
+    fn write_frame_until<T: Serialize>(
+        &mut self,
+        value: &T,
+        until: Instant,
+    ) -> Result<(), HostError> {
         let mut bytes = serde_json::to_vec(value).map_err(|_| HostError::Protocol)?;
         if bytes.len().saturating_add(1) > MAX_FRAME_BYTES {
             return Err(HostError::Protocol);
         }
         self.charge(bytes.len() + 1)?;
         bytes.push(b'\n');
-        self.writer.write_all(&bytes).map_err(|_| HostError::Io)?;
-        self.writer.flush().map_err(|_| HostError::Io)
+        let mut written = 0;
+        while written < bytes.len() {
+            let timeout = self.remaining(until)?;
+            self.writer
+                .set_write_timeout(Some(timeout))
+                .map_err(|_| HostError::Io)?;
+            match self.writer.write(&bytes[written..]) {
+                Ok(0) => return Err(HostError::Io),
+                Ok(count) => written += count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    return Err(HostError::Timeout);
+                }
+                Err(_) => return Err(HostError::Io),
+            }
+        }
+        Ok(())
     }
 
     fn exchange<T: Serialize, O: DeserializeOwned>(
@@ -716,19 +826,24 @@ impl Channel {
         let subject_digest =
             digest(&canonical_json_bytes(&subject).map_err(|_| CallbackError::Protocol)?);
         let policy_digest = callback_policy_digest(owner, registration)?;
-        self.write_frame(&CallbackRequest {
-            version: PROTOCOL_VERSION,
-            operation: "callback".to_owned(),
-            id: callback_id.clone(),
-            owner: owner.to_owned(),
-            subject_digest: subject_digest.clone(),
-            policy_digest: policy_digest.clone(),
-            storage: storage.clone(),
-            partition: partition.clone(),
-            payload,
-        })
+        let until = self.operation_deadline().map_err(CallbackError::from)?;
+        self.write_frame_until(
+            &CallbackRequest {
+                version: PROTOCOL_VERSION,
+                operation: "callback".to_owned(),
+                id: callback_id.clone(),
+                owner: owner.to_owned(),
+                subject_digest: subject_digest.clone(),
+                policy_digest: policy_digest.clone(),
+                storage: storage.clone(),
+                partition: partition.clone(),
+                payload,
+            },
+            until,
+        )
         .map_err(CallbackError::from)?;
-        let response: CallbackResponse = self.read_frame().map_err(CallbackError::from)?;
+        let response: CallbackResponse =
+            self.read_frame_until(until).map_err(CallbackError::from)?;
         if response.version != PROTOCOL_VERSION
             || response.operation != "callback_result"
             || response.id != callback_id
@@ -768,8 +883,10 @@ impl Channel {
         self.check_time()
     }
 
+    /// Expiry is checked before effects and after each blocked read or write.
+    /// The deadline is absolute and monotonic; there is no renewal path.
     fn check_time(&self) -> Result<(), HostError> {
-        if self.started.elapsed() > SESSION_TIMEOUT {
+        if Instant::now() >= self.session_deadline {
             Err(HostError::Timeout)
         } else {
             Ok(())
@@ -2022,7 +2139,7 @@ mod tests {
         let mut channel = Channel::new(stream).unwrap();
         channel.aggregate_bytes = MAX_AGGREGATE_BYTES;
         assert_eq!(channel.charge(1), Err(HostError::Protocol));
-        channel.started = Instant::now() - SESSION_TIMEOUT - Duration::from_millis(1);
+        channel.session_deadline = Instant::now() - Duration::from_millis(1);
         assert_eq!(channel.check_time(), Err(HostError::Timeout));
         channel.callbacks = MAX_CALLBACKS;
         assert!(matches!(
@@ -2052,6 +2169,196 @@ mod tests {
                 &AcceptReceipts,
             ),
             Err(CallbackError::Protocol)
+        ));
+    }
+
+    fn one_second() -> Duration {
+        Duration::from_secs(1)
+    }
+
+    #[test]
+    fn version1_defaults_are_unchanged_and_qualified_windows_are_bounded() {
+        assert_eq!(CALLBACK_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(SESSION_TIMEOUT, Duration::from_secs(5 * 60));
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let channel = Channel::new(stream).unwrap();
+        assert_eq!(channel.callback, CALLBACK_TIMEOUT);
+        assert!(channel.session_deadline > Instant::now() + SESSION_TIMEOUT - one_second());
+    }
+
+    #[cfg(feature = "private-qualification")]
+    #[test]
+    fn private_qualification_timing_constructor_bounds_finite_windows() {
+        let entry = Instant::now();
+        assert!(Timing::qualified(entry, Duration::ZERO, one_second()).is_err());
+        assert!(Timing::qualified(entry, one_second(), Duration::ZERO).is_err());
+        assert!(Timing::qualified(entry, 2 * one_second(), one_second()).is_err());
+        assert!(
+            Timing::qualified(entry, one_second(), MAX_QUALIFIED_SESSION + one_second()).is_err()
+        );
+        assert_eq!(
+            Timing::qualified(entry, one_second(), MAX_QUALIFIED_SESSION),
+            Ok(Timing::Qualified {
+                callback: one_second(),
+                session_deadline: entry + MAX_QUALIFIED_SESSION,
+            })
+        );
+    }
+
+    #[test]
+    fn session_deadline_clamps_a_longer_callback_window() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+        let mut channel = Channel::with_timing(
+            stream,
+            Timing::Qualified {
+                callback: Duration::from_secs(10),
+                session_deadline: Instant::now() + Duration::from_millis(300),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            channel.read_frame::<Value>(),
+            Err(HostError::Timeout),
+            "a silent peer must not hold past the frozen session"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn drip_fed_bytes_cannot_renew_the_callback_window() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let mut channel = Channel::with_timing(
+            stream,
+            Timing::Qualified {
+                callback: Duration::from_millis(300),
+                session_deadline: Instant::now() + Duration::from_secs(5),
+            },
+        )
+        .unwrap();
+        let writer = thread::spawn(move || {
+            for _ in 0..20 {
+                if peer.write_all(b"{").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let started = Instant::now();
+        assert_eq!(channel.read_frame::<Value>(), Err(HostError::Timeout));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(channel);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn late_completion_is_refused_and_prompt_completion_is_accepted() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let mut channel = Channel::with_timing(
+            stream,
+            Timing::Qualified {
+                callback: one_second(),
+                session_deadline: Instant::now() + Duration::from_secs(5),
+            },
+        )
+        .unwrap();
+        peer.write_all(b"{\"a\":1}\n").unwrap();
+        assert_eq!(
+            channel.read_frame::<Value>().unwrap(),
+            serde_json::json!({"a": 1})
+        );
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let mut channel = Channel::with_timing(
+            stream,
+            Timing::Qualified {
+                callback: Duration::from_millis(200),
+                session_deadline: Instant::now() + Duration::from_secs(5),
+            },
+        )
+        .unwrap();
+        let writer = thread::spawn(move || {
+            peer.write_all(b"{\"a\":").unwrap();
+            thread::sleep(Duration::from_millis(400));
+            let _ = peer.write_all(b"1}\n");
+        });
+        assert_eq!(channel.read_frame::<Value>(), Err(HostError::Timeout));
+        drop(channel);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn expired_session_refuses_before_any_write_or_read() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let mut channel = Channel::with_timing(
+            stream,
+            Timing::Qualified {
+                callback: one_second(),
+                session_deadline: Instant::now() - Duration::from_millis(1),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            channel.write_frame(&serde_json::json!({"x": 1})),
+            Err(HostError::Timeout)
+        );
+        assert_eq!(channel.read_frame::<Value>(), Err(HostError::Timeout));
+        peer.set_nonblocking(true).unwrap();
+        let mut byte = [0; 1];
+        assert_eq!(
+            std::io::Read::read(&mut peer, &mut byte)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn parent_channel_loss_after_callback_request_is_not_success() {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let mut channel = Channel::with_timing(
+            stream,
+            Timing::Qualified {
+                callback: one_second(),
+                session_deadline: Instant::now() + Duration::from_secs(5),
+            },
+        )
+        .unwrap();
+        let parent = thread::spawn(move || {
+            let mut reader = BufReader::new(peer);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+        });
+        let partition = crate::storage::PartitionKey {
+            project_component: "project:component".into(),
+            workflow: "workflow".into(),
+            cargo_provenance: "cargo".into(),
+            rustc_provenance: "rustc".into(),
+            host: "host".into(),
+            target: "target".into(),
+            profile: "profile".into(),
+            features: Vec::new(),
+            config_digest: digest(b"config"),
+            environment_digest: digest(b"env"),
+            path_identity: "path".into(),
+        };
+        let storage = StorageIdentity {
+            slot_id: "slot-0000000000000001".into(),
+            storage_instance_id: "a".repeat(64),
+            generation: "1".into(),
+            reused: Some(false),
+        };
+        let result = channel.exchange::<_, Value>(
+            "test.owner",
+            &serde_json::json!(null),
+            &registration(),
+            &storage,
+            &partition,
+            &AcceptReceipts,
+        );
+        parent.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(CallbackError::Host(HostError::Protocol))
         ));
     }
 }

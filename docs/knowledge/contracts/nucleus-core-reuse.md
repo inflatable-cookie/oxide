@@ -955,12 +955,77 @@ its current consumer brief does not authorize Rust harness implementation.
 
 Independent review of the actual process confirms that the unchanged
 30-second I/O and five-minute session limits do not establish a fit for genuine
-capacity wait plus compilation, tests and capture. A separately reviewed timing
-surface must bind explicit finite limits to the trusted attempt, enforce a
-nonrenewable deadline and preserve ownership on timeout or channel loss. It
-must not silently enlarge the existing protocol's defaults. This remains an
-implementation prerequisite, not authority to run the real workflow or change
-consumer admission.
+capacity wait plus compilation, tests and capture. oxide#032 supplies the
+explicit finite mechanism below. It binds limits to the trusted bootstrap,
+keeps a nonrenewable deadline and preserves ownership on timeout or channel
+loss. It does not enlarge version1 defaults and is not authority to run the
+real workflow or change consumer admission.
+
+#### Finite qualification timing (oxide#032)
+
+The bootstrap has an optional `timing` object. Absent means the unchanged
+version1 host defaults. Present means an explicit finite window, and every
+field is required and unknown fields refuse:
+
+| Field | Type and unit | Rule |
+| --- | --- | --- |
+| `policy` | string | Only `oxide-qualification-timing-v1` is supported. |
+| `callback_ms` | decimal u64 milliseconds | Greater than 0 and no greater than `remaining_ms`. Ceiling for one owner callback exchange, request write plus reply read. |
+| `remaining_ms` | decimal u64 milliseconds | Greater than 0 and no greater than 2,700,000 (45 minutes). The owner's remaining session window at issuance. |
+| `receipt` | `hmac-sha256-v1:<hex>` | HMAC-SHA256 with the bootstrap callback key over domain `oxide-qualification-timing-receipt-v1` and fields `scope`, `storage_instance_id`, `start_digest`, `policy`, `callback_ms`, `remaining_ms`. |
+
+Issuance is constructor-owned: `TimingAuthority::issue(&bootstrap, callback,
+remaining)` checks bounds before signing. Verification refuses before the
+bootstrap file is consumed, before connecting to the parent and before any
+acquire. Unsupported policy and contradictory or out-of-range bounds return
+`HostError::Protocol`. A receipt that does not verify for this exact bootstrap,
+including a forged, reminted or moved window, returns `HostError::OwnerRejected`.
+
+The session deadline is frozen once. `serve_bootstrap` takes a monotonic entry
+instant before it reads the file, and `entry + remaining_ms` is the deadline.
+Bootstrap reading, validation, connect and handshake all draw from that window.
+Wall-clock changes, stream traffic, partial frames, retries and reconnects
+cannot extend it. There is no keepalive or lifetime-extension path.
+
+Each callback exchange has one ceiling: the smaller of `now + callback_ms` at
+exchange start and the session deadline. Each frame read or write re-arms the
+socket with the remaining part of that ceiling. Drip-fed bytes cannot renew it.
+A complete frame that finishes after its ceiling is refused, not promoted. Expiry
+is checked before each write or read, and again after a blocked completion. The
+start-frame read is bounded the same way, so startup is charged to the session.
+
+On timeout or channel loss the host writes an `error` frame with `code:
+"timeout"` when the stream still accepts it. It never sends a result frame. It
+does not cancel the scheduler, finalize, publish a map, release a lease, remove
+markers or retry. Durable lease, root and map state stays as recorded, so the
+slot remains Leased or Uncertain. A replay from a fresh bootstrap for the same
+approved start refuses at the durable attempt marker before acquire.
+
+Version1 keeps its 30-second callback ceiling and five-minute session measured
+from channel creation. Its frames are now bounded in total as well, so the
+change tightens behavior and does not relax it. Bootstrap `expires_unix_seconds`
+remains a separate load-freshness check of at most 30 seconds. The execution
+window applies only after that check passes.
+
+Engineering ceilings are not measured workload timing. The 45-minute cap and
+any chosen `callback_ms` are bounds for the mechanism, not evidence that a Cargo
+build, test, capture or Nucleus workload fits. Qualification tests use short
+synthetic windows. An owner's `execution.execute` callback is the whole
+workflow receipt, so its `callback_ms` must cover that call. A smaller value
+times out and leaves uncertainty, which is the correct failure.
+
+Consumer handover after merge and closeout: the trusted launcher writes
+`timing` into the one-use bootstrap, issued for the exact start digest. An
+example owner-bound policy for a 45-minute remaining window with a 30-minute
+callback ceiling is:
+
+```json
+"timing": {"policy": "oxide-qualification-timing-v1", "callback_ms": 1800000, "remaining_ms": 2700000, "receipt": "hmac-sha256-v1:<issued-by-trusted-launcher>"}
+```
+
+Pins for the reviewed surface are `TIMING_POLICY_V1`, `TimingAuthority::issue`
+and `TimingAuthority` under the `private-qualification` feature. Nucleus must not
+prompt workers or change admission from this contract alone.
 
 ### Inactive Nucleus client
 
@@ -1021,9 +1086,10 @@ that callback closes this pre-submission seam.
 
 The host's 30-second stream timeout and five-minute session bound are not
 qualified for genuine capacity waiting, compilation, tests and capture.
-Qualification requires a reviewed finite timing mechanism or evidence that the
-actual workflow fits. Synthetic timing is insufficient; a timeout retains
-uncertainty rather than releasing ownership. No silent deadline increase or
+oxide#032 supplies the reviewed finite timing mechanism (see Finite qualification
+timing above). Evidence that the actual workflow fits is still required.
+Synthetic timing is insufficient; a timeout retains uncertainty rather than
+releasing ownership. No silent deadline increase or
 unsupervised keepalive follows from the integration approval.
 
 The pinned Cargo producer is now `registered::cargo_freshness::collect`, called

@@ -115,6 +115,7 @@ fn bootstrap(
             f.attempt.temp.clone(),
             f.attempt.capture.clone(),
         ],
+        timing: None,
     }
 }
 fn write_bootstrap(path: &Path, b: &Bootstrap) {
@@ -126,6 +127,42 @@ fn write_bootstrap(path: &Path, b: &Bootstrap) {
         .unwrap();
     serde_json::to_writer(&mut file, b).unwrap();
     file.sync_all().unwrap();
+}
+fn spawn_child(file: &Path) -> ChildGuard {
+    ChildGuard(
+        Command::new(
+            std::env::var_os("OXIDE_QUALIFICATION_CHILD").expect("Effigy compiled the child"),
+        )
+        .arg(file)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap(),
+    )
+}
+fn accept_child(listener: &UnixListener) -> UnixStream {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "child did not connect");
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("accept: {e}"),
+        }
+    };
+    stream.set_nonblocking(false).unwrap();
+    stream
+}
+fn read_frame_line(reader: &mut BufReader<UnixStream>) -> serde_json::Value {
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(!line.is_empty(), "host closed without a frame");
+    serde_json::from_str(&line).unwrap()
 }
 fn synthetic_settlement(
     launch: &Launch,
@@ -405,31 +442,8 @@ fn actual_child_cold_warm_and_interrupted_hold() {
         .unwrap();
         let file = f.base.join(format!("bootstrap-{scenario}.json"));
         write_bootstrap(&file, &b);
-        let child = ChildGuard(
-            Command::new(
-                std::env::var_os("OXIDE_QUALIFICATION_CHILD").expect("Effigy compiled the child"),
-            )
-            .arg(&file)
-            .env_clear()
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
-        );
-        listener.set_nonblocking(true).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "child did not connect");
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(e) => panic!("accept: {e}"),
-            }
-        };
-        stream.set_nonblocking(false).unwrap();
+        let child = spawn_child(&file);
+        let stream = accept_child(&listener);
         let (response, callbacks) =
             parent(stream, &f, &request, &auth, &authority, &map_key, interrupt);
         child.finish(scenario <= 2);
@@ -701,5 +715,182 @@ fn unsafe_malformed_expired_replaced_and_unapproved_bootstrap_refuse_before_effe
         .is_empty());
     drop(replacement);
     drop(listener);
+    guard.stop();
+}
+
+#[test]
+fn qualified_timing_refuses_unsupported_forged_or_moved_windows_before_connect() {
+    let mut f = Fixture::new();
+    f.attempt.binding.commit = "1".repeat(40);
+    f.attempt.allocation_epoch = "1".into();
+    let p = partition(&f);
+    let allowed = vec![envelope(&f, &p, 1), envelope(&f, &p, 2)];
+    let authority = QualificationAuthority::new(
+        MacKey::from_hex(STORAGE_KEY).unwrap(),
+        SCOPE.into(),
+        allowed.clone(),
+    )
+    .unwrap();
+    let instance = "a".repeat(64);
+    authority.install_instance(&instance).unwrap();
+    let storage = f.base.join("storage.sock");
+    let _storage = UnixListener::bind(&storage).unwrap();
+    fs::set_permissions(&storage, fs::Permissions::from_mode(0o600)).unwrap();
+    let parent_path = f.base.join("parent.sock");
+    let listener = UnixListener::bind(&parent_path).unwrap();
+    fs::set_permissions(&parent_path, fs::Permissions::from_mode(0o600)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let request = start(&f, &authority, allowed[0].clone(), 1);
+    let other_request = start(&f, &authority, allowed[1].clone(), 2);
+    let mut base = bootstrap(
+        &f,
+        &request,
+        storage.clone(),
+        &instance,
+        parent_path.clone(),
+    );
+    base.timing = Some(
+        TimingAuthority::issue(&base, Duration::from_secs(1), Duration::from_secs(2)).unwrap(),
+    );
+    let other = bootstrap(
+        &f,
+        &other_request,
+        storage.clone(),
+        &instance,
+        parent_path.clone(),
+    );
+    let reminted =
+        TimingAuthority::issue(&other, Duration::from_secs(1), Duration::from_secs(2)).unwrap();
+    let value = serde_json::to_value(&base).unwrap();
+    let mut variants = Vec::new();
+    let mut change = |edit: &dyn Fn(&mut serde_json::Value)| {
+        let mut changed = value.clone();
+        edit(&mut changed);
+        variants.push(changed);
+    };
+    change(&|v| v["timing"]["policy"] = serde_json::json!("oxide-qualification-timing-v0"));
+    change(&|v| v["timing"]["callback_ms"] = serde_json::json!(0));
+    change(&|v| v["timing"]["remaining_ms"] = serde_json::json!(2_700_001));
+    change(&|v| v["timing"]["remaining_ms"] = serde_json::json!(1_500));
+    change(&|v| v["timing"] = serde_json::to_value(&reminted).unwrap());
+    change(&|v| {
+        v["timing"].as_object_mut().unwrap().remove("receipt");
+    });
+    change(&|v| v["timing"]["unexpected"] = serde_json::json!(true));
+    change(&|v| v["timing"]["receipt"] = serde_json::json!("hmac-sha256-v1:00"));
+    for (n, changed) in variants.iter().enumerate() {
+        let file = f.base.join(format!("timing-{n}.json"));
+        let mut out = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&file)
+            .unwrap();
+        serde_json::to_writer(&mut out, changed).unwrap();
+        drop(out);
+        assert!(serve_bootstrap(&file).is_err(), "variant {n} must refuse");
+        assert!(file.exists(), "variant {n} must not consume the bootstrap");
+    }
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "refused timing never connects to the parent"
+    );
+}
+
+#[test]
+fn qualified_callback_timeout_after_acquire_holds_lease_and_refuses_replay() {
+    let started = Instant::now();
+    let mut f = Fixture::new();
+    f.attempt.binding.commit = "1".repeat(40);
+    f.attempt.allocation_epoch = "1".into();
+    let p = partition(&f);
+    f.attempt.partition = digest(&serde_json::to_vec(&p).unwrap());
+    let allowed = vec![envelope(&f, &p, 1)];
+    let authority = Arc::new(
+        QualificationAuthority::new(
+            MacKey::from_hex(STORAGE_KEY).unwrap(),
+            SCOPE.into(),
+            allowed.clone(),
+        )
+        .unwrap(),
+    );
+    let root = f.base.join("store");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let daemon = Daemon::bind(
+        DaemonConfig {
+            root,
+            budget: Budget {
+                cap_bytes: 16 * 1024 * 1024,
+                free_reserve_bytes: 0,
+            },
+        },
+        authority.clone(),
+        Arc::new(BridgeFreeSpace),
+    )
+    .unwrap();
+    let instance = daemon.storage_instance_id().to_owned();
+    authority.install_instance(&instance).unwrap();
+    let (socket, guard) = BridgeDaemon::start(daemon);
+    let client = Client::new(socket.clone());
+    let parent_path = f.base.join("parent.sock");
+    let listener = UnixListener::bind(&parent_path).unwrap();
+    fs::set_permissions(&parent_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // Synthetic 1s callback and 4s remaining window. The parent withholds the
+    // first owner reply after acquisition, so only the host timeout may follow.
+    let request = start(&f, &authority, allowed[0].clone(), 1);
+    let mut timed = bootstrap(&f, &request, socket.clone(), &instance, parent_path.clone());
+    timed.timing = Some(
+        TimingAuthority::issue(&timed, Duration::from_secs(1), Duration::from_secs(4)).unwrap(),
+    );
+    let file = f.base.join("bootstrap-timeout.json");
+    write_bootstrap(&file, &timed);
+    let child = spawn_child(&file);
+    let mut stream = accept_child(&listener);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    serde_json::to_writer(&mut stream, &request).unwrap();
+    stream.write_all(b"\n").unwrap();
+    let callback = read_frame_line(&mut reader);
+    assert_eq!(callback["owner"], "registration.authenticate");
+    let error = read_frame_line(&mut reader);
+    assert_eq!(error["operation"], "error");
+    assert_eq!(error["code"], "timeout");
+    assert!(error.get("result").is_none(), "no writer token or result");
+    child.finish(false);
+    assert!(!file.exists(), "bootstrap consumed before effects");
+    assert_eq!(
+        client.inventory("timeout").unwrap().slots[0].state,
+        SlotState::Leased
+    );
+
+    // A fresh bootstrap for the same approved start is refused before acquire.
+    let replay_file = f.base.join("bootstrap-replay.json");
+    let mut replay = bootstrap(&f, &request, socket.clone(), &instance, parent_path.clone());
+    replay.timing = Some(
+        TimingAuthority::issue(&replay, Duration::from_secs(1), Duration::from_secs(4)).unwrap(),
+    );
+    write_bootstrap(&replay_file, &replay);
+    let child = spawn_child(&replay_file);
+    let mut stream = accept_child(&listener);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    serde_json::to_writer(&mut stream, &request).unwrap();
+    stream.write_all(b"\n").unwrap();
+    let refusal = read_frame_line(&mut reader);
+    assert_eq!(refusal["operation"], "error");
+    assert_eq!(refusal["code"], "owner_rejected");
+    child.finish(false);
+    assert_eq!(
+        client.inventory("replay").unwrap().slots[0].state,
+        SlotState::Leased
+    );
+    assert!(started.elapsed() < Duration::from_secs(30));
     guard.stop();
 }
