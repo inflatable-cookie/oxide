@@ -49,11 +49,45 @@ canonical source root, provenance and immutable epoch. Tool/SDK receipts bind
 bounded reachable files and their provenance/no-replacement agreement. Oxide
 checks every listed digest, exact file membership, stable reads and physical
 file identity at admission/finalize. The launcher must itself occur in an
-accepted tool manifest. The issuer, rather than Oxide's byte checker, must prove
-archive-to-extraction correspondence and preserve the no-replacement agreement
-through the lease. A correct byte hash does not prove complete native/proc-macro
-behavior. The separate audited closure remains essential. There is no archive
-extractor, whole-host scanner or shipped native/SDK issuer here.
+accepted tool manifest. The accepted owner still preserves the no-replacement
+agreement through the lease. Verified archive/extraction bytes are not a trusted
+issuer, do not prove native/proc-macro/C/header closure, and do not qualify a
+Nucleus workflow. The separate audited closure remains essential. There is no
+archive extractor, whole-host scanner or shipped native/SDK issuer here.
+
+A bounded verifier in `src/registered/archive.rs` proves an explicitly supplied
+locked registry archive corresponds to an explicitly owned extracted package
+root. The supported form is a single-member gzip (magic `1f 8b`) of a
+ustar/pax tar whose members share one canonical package top-level prefix,
+matching a Cargo `.crate`. The extracted directory's last component must equal
+that prefix. The verifier enforces the locked SHA-256 of the compressed archive
+bytes (`sha256:` plus 64 lowercase hex), exact file content digests, and exact
+file/directory membership, including empty directories and parent directories
+implied by files. Conversion to `ImmutableManifest` is `VerifiedCorrespondence::into_registered`
+and requires `TrustedContext::new` constructed with an already-accepted
+`InputEvidenceOwner` plus that owner's issuer, source identity and epoch; it
+always yields `ImmutableClass::Registry` with `ArchiveEvidence` and never infers
+generated, native or proc-macro provenance.
+
+Local Cargo sidecars `.cargo-ok` and `.cargo-checksum.json` may exist at the
+extracted package root. They are not archive members and are never read as
+attestations of archive contents. Those names inside the archive refuse.
+Nested copies, and any other extra extracted file, refuse; extra files are not
+skipped. Symlink, hardlink and special tar entries, extracted symlinks and
+special files, absolute/parent/escaping paths, `.`/`..` components, backslashes,
+non-UTF-8 names, duplicate or file/directory collisions, unknown formats
+(including bare tar, extra gzip members and trailing compressed bytes),
+corrupt or truncated streams, and unstable reads refuse.
+
+Reads charge one shared preparation budget that is not reset per member or
+phase: compressed archive bytes, decompressed tar bytes, and extracted-file
+bytes. `verify` takes `Limits` and returns `Outcome` with `Counters`
+(`archive_bytes`, `decompressed_bytes`, `extracted_bytes`, `entries`) and a
+`Refusal` category on every attempt, including success. Nucleus engineering
+maxima are 256 MiB collection, 16 MiB per decoded or extracted file, 32,768
+inventory entries, 2,048-byte paths and depth 32; callers may pass lower
+bounds. There is no unpack/write into the package root, host registry scan,
+package-by-package budget reset or automatic growth.
 
 The unit seam consumes owner-verified semantic evidence for pinned Cargo
 `c980f4866` [`LocalFingerprint`](https://github.com/rust-lang/cargo/blob/c980f4866/src/cargo/core/compiler/fingerprint/mod.rs).
