@@ -1,0 +1,585 @@
+//! Private, explicitly installed qualification authentication and process bootstrap.
+//! No key is discovered from task data or the environment. Same-user bypasses
+//! remain outside the cooperative writer model.
+
+use super::runner_host::{canonical_json_bytes, HostError, OwnerReceiptVerifier, RunnerHost};
+use crate::storage::{
+    AcquireResult, ContainmentEvidence, EvidenceAuthority, RunEnvelope, SettlementEvidence,
+    TerminalOutcome,
+};
+use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const MAX_BOOTSTRAP_BYTES: u64 = 64 * 1024;
+const MAX_MAC_BYTES: usize = 1024 * 1024;
+const PIN: &str = "d9ff17988c7eaa5cf57747bc55bfe4f138692f15";
+
+/// Explicitly supplied 256-bit qualification key. Debug never exposes it.
+pub struct MacKey([u8; 32]);
+impl fmt::Debug for MacKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MacKey([redacted])")
+    }
+}
+impl MacKey {
+    pub fn from_hex(value: &str) -> Result<Self, HostError> {
+        Ok(Self(decode_hex(value).ok_or(HostError::Protocol)?))
+    }
+    /// HMAC-SHA256 over u32 big-endian length-prefixed UTF-8 fields.
+    /// The first field is the versioned domain. The remaining fields bind the
+    /// qualification context and the exact subject. All fields are bounded.
+    pub fn sign(&self, domain: &str, fields: &[&str]) -> Result<String, HostError> {
+        let bytes = mac_frame(domain, fields)?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.0).map_err(|_| HostError::Protocol)?;
+        mac.update(&bytes);
+        Ok(format!(
+            "hmac-sha256-v1:{}",
+            hex(&mac.finalize().into_bytes())
+        ))
+    }
+    pub fn verify(&self, domain: &str, fields: &[&str], receipt: &str) -> bool {
+        let Some(tag) = receipt.strip_prefix("hmac-sha256-v1:").and_then(decode_hex) else {
+            return false;
+        };
+        let Ok(bytes) = mac_frame(domain, fields) else {
+            return false;
+        };
+        let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(&self.0) else {
+            return false;
+        };
+        mac.update(&bytes);
+        mac.verify_slice(&tag).is_ok()
+    }
+}
+
+/// Cross-language receipt input encoding. No concatenation ambiguity or JSON
+/// number conversion is permitted in this layer.
+pub fn mac_frame(domain: &str, fields: &[&str]) -> Result<Vec<u8>, HostError> {
+    if domain.is_empty() || domain.len() > 128 || fields.len() > 16 {
+        return Err(HostError::Protocol);
+    }
+    let mut out = Vec::new();
+    for field in std::iter::once(domain).chain(fields.iter().copied()) {
+        if out.len().saturating_add(field.len()).saturating_add(4) > MAX_MAC_BYTES {
+            return Err(HostError::Protocol);
+        }
+        let length = u32::try_from(field.len()).map_err(|_| HostError::Protocol)?;
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(field.as_bytes());
+    }
+    Ok(out)
+}
+
+/// Existing host canonical JSON, shared with qualification subjects and vectors.
+pub fn canonical_digest(value: &Value) -> Result<String, HostError> {
+    let bytes = canonical_json_bytes(value).map_err(|_| HostError::Protocol)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(&bytes)))
+}
+
+/// Callback authentication is independent of daemon admission/settlement.
+#[derive(Debug)]
+pub struct CallbackAuthenticator {
+    key: MacKey,
+    context: String,
+}
+impl CallbackAuthenticator {
+    pub fn new(key: MacKey, context: String) -> Result<Self, HostError> {
+        if context.is_empty() || context.len() > 4096 {
+            return Err(HostError::Protocol);
+        }
+        Ok(Self { key, context })
+    }
+    pub fn receipt(
+        &self,
+        owner: &str,
+        id: &str,
+        subject: &str,
+        policy: &str,
+        result: &str,
+    ) -> Result<String, HostError> {
+        self.key.sign(
+            "oxide-owner-callback-v1",
+            &[&self.context, owner, id, subject, policy, result],
+        )
+    }
+}
+impl OwnerReceiptVerifier for CallbackAuthenticator {
+    fn verify(
+        &self,
+        owner: &str,
+        id: &str,
+        subject: &str,
+        policy: &str,
+        result: &str,
+        receipt: &str,
+    ) -> bool {
+        self.key.verify(
+            "oxide-owner-callback-v1",
+            &[&self.context, owner, id, subject, policy, result],
+            receipt,
+        )
+    }
+}
+
+/// Authenticates an exact set of embedder-approved admission envelopes. Install
+/// the daemon's durable instance once, before starting its serve loop. Keys and
+/// approved envelopes remain owner-side across sequential attempts.
+pub struct QualificationAuthority {
+    key: MacKey,
+    scope: String,
+    allowed: Vec<RunEnvelope>,
+    instance: Mutex<Option<String>>,
+}
+impl fmt::Debug for QualificationAuthority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("QualificationAuthority([installed])")
+    }
+}
+impl QualificationAuthority {
+    pub fn new(key: MacKey, scope: String, allowed: Vec<RunEnvelope>) -> Result<Self, HostError> {
+        if scope.is_empty() || scope.len() > 4096 || allowed.is_empty() || allowed.len() > 4 {
+            return Err(HostError::Protocol);
+        }
+        Ok(Self {
+            key,
+            scope,
+            allowed,
+            instance: Mutex::new(None),
+        })
+    }
+    pub fn install_instance(&self, instance: &str) -> Result<(), HostError> {
+        if decode_hex(instance).is_none() {
+            return Err(HostError::Protocol);
+        }
+        let mut installed = self.instance.lock().map_err(|_| HostError::Protocol)?;
+        if installed.as_ref().is_some_and(|old| old != instance) {
+            return Err(HostError::OwnerRejected);
+        }
+        *installed = Some(instance.to_owned());
+        Ok(())
+    }
+    pub fn receipt(&self, domain: &str, subject: &Value) -> Result<String, HostError> {
+        let instance = self.instance.lock().map_err(|_| HostError::Protocol)?;
+        let instance = instance.as_ref().ok_or(HostError::OwnerRejected)?;
+        self.key.sign(
+            domain,
+            &[&self.scope, instance, &canonical_digest(subject)?],
+        )
+    }
+    fn verifies(&self, domain: &str, subject: &Value, receipt: &str) -> bool {
+        let Ok(instance) = self.instance.lock() else {
+            return false;
+        };
+        let Some(instance) = instance.as_ref() else {
+            return false;
+        };
+        let Ok(digest) = canonical_digest(subject) else {
+            return false;
+        };
+        self.key
+            .verify(domain, &[&self.scope, instance, &digest], receipt)
+    }
+}
+impl EvidenceAuthority for QualificationAuthority {
+    fn verify_admission(&self, envelope: &RunEnvelope) -> bool {
+        let subject = admission_subject(envelope);
+        self.allowed
+            .iter()
+            .any(|allowed| admission_subject(allowed) == subject)
+            && self.verifies(
+                "oxide-admission-v1",
+                &subject,
+                envelope.admission_credential.expose(),
+            )
+    }
+    fn verify_settlement(&self, evidence: &SettlementEvidence) -> bool {
+        if !self
+            .allowed
+            .iter()
+            .any(|allowed| allowed.binding == evidence.binding)
+        {
+            return false;
+        }
+        let Some(subject) = settlement_subject(evidence) else {
+            return false;
+        };
+        self.verifies(
+            "oxide-settlement-v1",
+            &subject,
+            evidence.consumer_credential.expose(),
+        ) && evidence.terminal.as_ref().is_none_or(|terminal| {
+            self.verifies("oxide-terminal-v1", &subject, terminal.credential.expose())
+        }) && evidence.capture.as_ref().is_none_or(|capture| {
+            self.verifies("oxide-capture-v1", &subject, capture.credential.expose())
+        })
+    }
+}
+
+pub fn admission_subject(envelope: &RunEnvelope) -> Value {
+    json!({"binding": envelope.binding, "partition": envelope.partition, "admission_reference": envelope.admission_reference})
+}
+/// The complete accepted subject, excluding only authentication credentials and
+/// Rust's private token MAC. Unknown/running/absence evidence has no authority.
+pub fn settlement_subject(e: &SettlementEvidence) -> Option<Value> {
+    let containment = match &e.containment {
+        ContainmentEvidence::CooperativeWorkflow(c) => json!({
+            "kind":"cooperative", "lease_id":c.lease_id,"slot_id":c.slot_id,"slot_path":c.slot_path,
+            "temp_dir":c.temp_dir,"capture_dir":c.capture_dir,"workflow":c.workflow,
+            "workflow_definition_digest":c.workflow_definition_digest,"repository_head":c.repository_head,
+            "fixture_source_digest":c.fixture_source_digest,"host_run_id":c.host_run_id,
+            "run_id":c.run_id,"attempt_id":c.attempt_id,"processes":c.processes,
+            "free_space_samples":c.free_space_samples.iter().map(|v|super::runner_host::WireU64(*v)).collect::<Vec<_>>(),
+            "exit_code":c.exit_code,"stdout_digest":c.stdout_digest,"stderr_digest":c.stderr_digest,
+            "capture_reference":c.capture_reference,"capture_digest":c.capture_digest}),
+        ContainmentEvidence::NotSpawned(p) => json!({"kind":"not_spawned","lease_id":p.lease_id,
+            "slot_id":p.slot_id,"slot_path":p.slot_path,"run_id":p.run_id,"attempt_id":p.attempt_id}),
+        _ => return None,
+    };
+    let terminal = e.terminal.as_ref().map(|t| json!({"run_id":t.run_id,"outcome":match t.outcome {
+        TerminalOutcome::Passed => "passed", TerminalOutcome::Failed => "failed", TerminalOutcome::Cancelled => "cancelled" }}));
+    let capture = e.capture.as_ref().map(|c| {
+        json!({"reference":c.reference,"digest":c.digest,
+        "host_run_id":c.host_run_id,"run_id":c.run_id,"attempt_id":c.attempt_id})
+    });
+    Some(
+        json!({"binding":e.binding,"terminal":terminal,"capture":capture,"containment":containment}),
+    )
+}
+
+/// Public endpoint identity is pinned by the trusted embedder after binding.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Endpoint {
+    pub path: PathBuf,
+    pub device: u64,
+    pub inode: u64,
+}
+impl Endpoint {
+    pub fn capture(path: PathBuf) -> Result<Self, HostError> {
+        let m = fs::symlink_metadata(&path).map_err(|_| HostError::Io)?;
+        if !m.file_type().is_socket() || m.mode() & 0o7777 != 0o600 || m.uid() != owner_uid() {
+            return Err(HostError::Protocol);
+        }
+        private_directory(path.parent().ok_or(HostError::Protocol)?)?;
+        Ok(Self {
+            path,
+            device: m.dev(),
+            inode: m.ino(),
+        })
+    }
+    fn check(&self) -> Result<(), HostError> {
+        let current = Self::capture(self.path.clone())?;
+        if current.device != self.device || current.inode != self.inode {
+            return Err(HostError::Protocol);
+        }
+        Ok(())
+    }
+}
+
+/// One-use file schema. Only the trusted launcher creates this file; task data
+/// cannot choose endpoints, roots, keys, or an approved start digest.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Bootstrap {
+    pub version: u32,
+    pub host_protocol: u32,
+    pub storage_protocol: u32,
+    pub map_pin: String,
+    pub expires_unix_seconds: u64,
+    pub scope: String,
+    pub storage_instance_id: String,
+    pub start_digest: String,
+    pub callback_key_hex: String,
+    pub parent: Endpoint,
+    pub storage: Endpoint,
+    pub roots: Vec<PathBuf>,
+}
+impl fmt::Debug for Bootstrap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Bootstrap([private])")
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct AttemptGrant {
+    bootstrap: Bootstrap,
+}
+impl AttemptGrant {
+    pub(super) fn check_start(&self, start: &Value) -> Result<(), HostError> {
+        let b = &self.bootstrap;
+        b.validate()?;
+        if canonical_digest(start)? != b.start_digest {
+            return Err(HostError::OwnerRejected);
+        }
+        for version in [
+            "version",
+            "source_version",
+            "dependency_version",
+            "configuration_version",
+        ] {
+            if start["payload"]["registration"][version] != 1 {
+                return Err(HostError::Protocol);
+            }
+        }
+        for name in ["source_root", "target", "temp", "capture"] {
+            let path = PathBuf::from(
+                start["payload"]["attempt"][name]
+                    .as_str()
+                    .ok_or(HostError::Protocol)?,
+            );
+            if !b.roots.contains(&path) {
+                return Err(HostError::OwnerRejected);
+            }
+            owned_directory(&path)?;
+        }
+        // Durable one-use intent prevents a fresh process from blindly replaying
+        // an active or ended session. It records no credentials. Ambiguity holds.
+        let root = b.parent.path.parent().ok_or(HostError::Protocol)?;
+        let marker = root.join(format!("attempt-{}", &b.start_digest[7..]));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(marker)
+            .map_err(|_| HostError::OwnerRejected)?;
+        file.write_all(b"oxide-qualified-attempt-v1\n")
+            .map_err(|_| HostError::Io)?;
+        file.sync_all().map_err(|_| HostError::Io)?;
+        fs::File::open(root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| HostError::Io)?;
+        Ok(())
+    }
+    pub(super) fn check_acquired(&self, acquired: &AcquireResult) -> Result<(), HostError> {
+        if acquired.storage_instance_id != self.bootstrap.storage_instance_id {
+            return Err(HostError::OwnerRejected);
+        }
+        let path = acquired.slot_path.as_ref().ok_or(HostError::Storage)?;
+        let storage_root = self
+            .bootstrap
+            .storage
+            .path
+            .parent()
+            .ok_or(HostError::Protocol)?;
+        if path != &storage_root.join("slots").join(&acquired.slot_id) {
+            return Err(HostError::OwnerRejected);
+        }
+        Ok(())
+    }
+}
+impl Bootstrap {
+    pub fn callback_context(&self) -> Result<String, HostError> {
+        canonical_digest(
+            &json!({"scope":self.scope,"storage_instance_id":self.storage_instance_id,"start_digest":self.start_digest}),
+        )
+    }
+    fn validate(&self) -> Result<(), HostError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| HostError::Protocol)?
+            .as_secs();
+        if self.version != 1
+            || self.host_protocol != 1
+            || self.storage_protocol != 1
+            || self.map_pin != PIN
+            || self.expires_unix_seconds < now
+            || self.expires_unix_seconds > now.saturating_add(30)
+            || self.scope.is_empty()
+            || self.scope.len() > 4096
+            || self.roots.len() != 4
+            || decode_hex(&self.storage_instance_id).is_none()
+            || !valid_digest(&self.start_digest)
+        {
+            return Err(HostError::Protocol);
+        }
+        self.parent.check()?;
+        self.storage.check()?;
+        for root in &self.roots {
+            owned_directory(root)?;
+        }
+        Ok(())
+    }
+}
+
+/// Consumes and unlinks one private bootstrap, then connects to exactly one
+/// pinned parent stream. The daemon is owner-launched, using the real API and
+/// independently installed QualificationAuthority. No service is installed.
+pub fn serve_bootstrap(path: &Path) -> Result<(), HostError> {
+    private_directory(path.parent().ok_or(HostError::Protocol)?)?;
+    if fs::canonicalize(path).map_err(|_| HostError::Io)? != path {
+        return Err(HostError::Protocol);
+    }
+    let before = fs::symlink_metadata(path).map_err(|_| HostError::Io)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| HostError::Io)?;
+    let opened = file.metadata().map_err(|_| HostError::Io)?;
+    if !opened.is_file()
+        || opened.mode() & 0o7777 != 0o600
+        || opened.uid() != owner_uid()
+        || opened.nlink() != 1
+        || opened.len() == 0
+        || opened.len() > MAX_BOOTSTRAP_BYTES
+        || !same_file(&before, &opened)
+    {
+        return Err(HostError::Protocol);
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_BOOTSTRAP_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| HostError::Io)?;
+    let after = file.metadata().map_err(|_| HostError::Io)?;
+    let named = fs::symlink_metadata(path).map_err(|_| HostError::Io)?;
+    if !same_file(&opened, &after)
+        || !same_file(&after, &named)
+        || bytes.len() as u64 != opened.len()
+    {
+        return Err(HostError::Protocol);
+    }
+    let bootstrap: Bootstrap = serde_json::from_slice(&bytes).map_err(|_| HostError::Protocol)?;
+    bootstrap.validate()?;
+    let verifier = CallbackAuthenticator::new(
+        MacKey::from_hex(&bootstrap.callback_key_hex)?,
+        bootstrap.callback_context()?,
+    )?;
+    fs::remove_file(path).map_err(|_| HostError::Io)?;
+    // Disposal removes the owner-side file before any attempt effects. Memory
+    // is process-lifetime; no persistence, logs or secret recovery are provided.
+    bytes.fill(0);
+    drop(file);
+    let stream = UnixStream::connect(&bootstrap.parent.path).map_err(|_| HostError::Io)?;
+    bootstrap.parent.check()?;
+    RunnerHost::new(bootstrap.storage.path.clone(), Arc::new(verifier))
+        .qualified(AttemptGrant { bootstrap })
+        .serve(stream)
+        .map(|_| ())
+}
+fn owner_uid() -> u32 {
+    // SAFETY: geteuid takes no pointers or arguments and has no preconditions.
+    unsafe { libc::geteuid() }
+}
+fn private_directory(path: &Path) -> Result<(), HostError> {
+    owned_directory(path)?;
+    let m = fs::symlink_metadata(path).map_err(|_| HostError::Io)?;
+    if m.mode() & 0o7777 != 0o700 {
+        return Err(HostError::Protocol);
+    }
+    Ok(())
+}
+fn owned_directory(path: &Path) -> Result<(), HostError> {
+    let m = fs::symlink_metadata(path).map_err(|_| HostError::Io)?;
+    if !m.is_dir()
+        || m.uid() != owner_uid()
+        || m.mode() & 0o022 != 0
+        || fs::canonicalize(path).map_err(|_| HostError::Io)? != path
+    {
+        return Err(HostError::Protocol);
+    }
+    Ok(())
+}
+fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    a.dev() == b.dev()
+        && a.ino() == b.ino()
+        && a.len() == b.len()
+        && a.mode() == b.mode()
+        && a.uid() == b.uid()
+        && a.nlink() == b.nlink()
+        && a.mtime() == b.mtime()
+        && a.mtime_nsec() == b.mtime_nsec()
+        && a.ctime() == b.ctime()
+        && a.ctime_nsec() == b.ctime_nsec()
+}
+fn decode_hex(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    let mut key = [0; 32];
+    for (byte, pair) in key.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        let pair = std::str::from_utf8(pair).ok()?;
+        *byte = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some(key)
+}
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+fn valid_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").and_then(decode_hex).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn private_qualification_durable_marker_refuses_fresh_bootstrap_replay() {
+        let scratch = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT").expect("canonical task scratch");
+        let root = PathBuf::from(scratch).join("pure-replay-marker");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut roots = Vec::new();
+        for name in ["source", "target", "temp", "capture"] {
+            let path = root.join(name);
+            fs::create_dir(&path).unwrap();
+            roots.push(path);
+        }
+        let parent = UnixListener::bind(root.join("parent.sock")).unwrap();
+        let storage = UnixListener::bind(root.join("storage.sock")).unwrap();
+        for name in ["parent.sock", "storage.sock"] {
+            fs::set_permissions(root.join(name), fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let start = json!({"payload":{"registration":{"version":1,"source_version":1,"dependency_version":1,"configuration_version":1},
+            "attempt":{"source_root":roots[0],"target":roots[1],"temp":roots[2],"capture":roots[3]}}});
+        let b = Bootstrap {
+            version: 1,
+            host_protocol: 1,
+            storage_protocol: 1,
+            map_pin: PIN.into(),
+            expires_unix_seconds: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 30,
+            scope: "pure-marker".into(),
+            storage_instance_id: "a".repeat(64),
+            start_digest: canonical_digest(&start).unwrap(),
+            callback_key_hex: "b".repeat(64),
+            parent: Endpoint::capture(root.join("parent.sock")).unwrap(),
+            storage: Endpoint::capture(root.join("storage.sock")).unwrap(),
+            roots,
+        };
+        let grant = AttemptGrant { bootstrap: b };
+        grant.check_start(&start).unwrap();
+        assert_eq!(grant.check_start(&start), Err(HostError::OwnerRejected));
+        let mut changed = start.clone();
+        changed["payload"]["attempt"]["source_root"] = json!("changed");
+        assert_eq!(grant.check_start(&changed), Err(HostError::OwnerRejected));
+        let marker = root.join(format!("attempt-{}", &grant.bootstrap.start_digest[7..]));
+        assert_eq!(
+            fs::read_to_string(marker).unwrap(),
+            "oxide-qualified-attempt-v1\n"
+        );
+        drop(parent);
+        drop(storage);
+        fs::remove_dir_all(root).unwrap();
+    }
+}

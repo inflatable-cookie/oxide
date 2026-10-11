@@ -15,6 +15,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "private-qualification")]
+mod private_qualification;
 struct Fixture {
     base: PathBuf,
     registration: Registration,
