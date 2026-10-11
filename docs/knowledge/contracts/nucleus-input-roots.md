@@ -110,8 +110,11 @@ and the full package result are preserved in
 All package attempts shared one verifier counter set. It recorded 13,435,995
 compressed archive bytes, 60,891,136 decompressed bytes, 36,437 extracted-file
 bytes, and 54 entries (74,363,568 charged bytes total). The supported package
-alone contributed 304,106 archive bytes, 1,439,232 decompressed bytes, 36,437
-extracted bytes, and 27 entries. Behavior triage read 840 bytes from that
+attempt's cumulative counters were 304,106 archive bytes, 1,439,232
+decompressed bytes, 36,437 extracted-file bytes, and 27 entries; these include
+earlier refused attempts. The supported package's own delta from the preceding
+cumulative snapshot was 9,249 archive bytes, 44,032 decompressed bytes, 36,437
+extracted-file bytes, and 21 entries. Behavior triage read 840 bytes from that
 package's verified `Cargo.toml`; it found no build script, proc-macro entry,
 or native link declaration. Aggregate acquisition reads were 74,433,606 bytes,
 including 69,158 pinned source bytes, 40 configuration bytes observed across
