@@ -463,42 +463,61 @@ impl RunnerHost {
     }
 
     fn acquire(&self, request: &AcquireRequest) -> Result<AcquireDisposition, HostError> {
-        match self.client.acquire(request.clone()) {
-            Ok(result) => return acquired_or_hold(result),
-            Err(StorageError::Refused(
-                crate::storage::RefusalReason::LeaseUnavailable
-                | crate::storage::RefusalReason::BudgetExceeded
-                | crate::storage::RefusalReason::FreeSpaceReserve
-                | crate::storage::RefusalReason::FreeSpaceUnavailable,
-            )) => return Ok(AcquireDisposition::Pending),
-            Err(StorageError::Refused(crate::storage::RefusalReason::UnknownAccounting)) => {
-                return Ok(AcquireDisposition::Held(None));
-            }
-            Err(StorageError::Unauthorized | StorageError::Conflict) => {
-                return Err(HostError::Storage);
-            }
-            Err(_) => {}
-        }
+        acquire_with(
+            request,
+            |request| self.client.acquire(request),
+            |request| self.client.lookup_acquire(request),
+        )
+    }
+}
 
-        // A lost reply is resolved by the read-only API before any exact replay.
-        match self.client.lookup_acquire(request.clone()) {
-            Ok(LookupResult::Present(identity)) | Ok(LookupResult::Uncertain(Some(identity))) => {
-                return Ok(AcquireDisposition::Held(Some(identity)));
-            }
-            Ok(LookupResult::Uncertain(None)) => return Ok(AcquireDisposition::Held(None)),
-            Ok(LookupResult::Absent) => {}
-            Err(_) => return Ok(AcquireDisposition::Held(None)),
+/// Keep the original credential-bearing request in attempt memory. In
+/// particular, lookup is read-only and an Absent result permits only replay of
+/// this exact request; this function has no authority to mint credentials.
+fn acquire_with<A, L>(
+    request: &AcquireRequest,
+    mut acquire: A,
+    mut lookup: L,
+) -> Result<AcquireDisposition, HostError>
+where
+    A: FnMut(AcquireRequest) -> Result<AcquireResult, StorageError>,
+    L: FnMut(AcquireRequest) -> Result<LookupResult<LeaseIdentity>, StorageError>,
+{
+    match acquire(request.clone()) {
+        Ok(result) => return acquired_or_hold(result),
+        Err(StorageError::Refused(
+            crate::storage::RefusalReason::LeaseUnavailable
+            | crate::storage::RefusalReason::BudgetExceeded
+            | crate::storage::RefusalReason::FreeSpaceReserve
+            | crate::storage::RefusalReason::FreeSpaceUnavailable,
+        )) => return Ok(AcquireDisposition::Pending),
+        Err(StorageError::Refused(crate::storage::RefusalReason::UnknownAccounting)) => {
+            return Ok(AcquireDisposition::Held(None));
         }
-        match self.client.acquire(request.clone()) {
-            Ok(result) => acquired_or_hold(result),
-            Err(StorageError::Refused(
-                crate::storage::RefusalReason::LeaseUnavailable
-                | crate::storage::RefusalReason::BudgetExceeded
-                | crate::storage::RefusalReason::FreeSpaceReserve
-                | crate::storage::RefusalReason::FreeSpaceUnavailable,
-            )) => Ok(AcquireDisposition::Pending),
-            Err(_) => Ok(AcquireDisposition::Held(None)),
+        Err(StorageError::Unauthorized | StorageError::Conflict) => {
+            return Err(HostError::Storage);
         }
+        Err(_) => {}
+    }
+
+    // A lost reply is resolved by the read-only API before any exact replay.
+    match lookup(request.clone()) {
+        Ok(LookupResult::Present(identity)) | Ok(LookupResult::Uncertain(Some(identity))) => {
+            return Ok(AcquireDisposition::Held(Some(identity)));
+        }
+        Ok(LookupResult::Uncertain(None)) => return Ok(AcquireDisposition::Held(None)),
+        Ok(LookupResult::Absent) => {}
+        Err(_) => return Ok(AcquireDisposition::Held(None)),
+    }
+    match acquire(request.clone()) {
+        Ok(result) => acquired_or_hold(result),
+        Err(StorageError::Refused(
+            crate::storage::RefusalReason::LeaseUnavailable
+            | crate::storage::RefusalReason::BudgetExceeded
+            | crate::storage::RefusalReason::FreeSpaceReserve
+            | crate::storage::RefusalReason::FreeSpaceUnavailable,
+        )) => Ok(AcquireDisposition::Pending),
+        Err(_) => Ok(AcquireDisposition::Held(None)),
     }
 }
 
@@ -989,36 +1008,14 @@ impl ParentCallbacks {
 
     fn finalize(&self, evidence: SettlementEvidence) -> Result<FinalizationReceipt, Refusal> {
         let token = self.acquired.token.as_ref().ok_or(Refusal::Completion)?;
-        match self.request_finalize(token, evidence.clone()) {
-            Ok(receipt) if receipt.state == SlotState::Idle => Ok(receipt),
-            Ok(_) => Err(Refusal::Completion),
-            Err(()) => match self.client.lookup_finalize(
-                &self.acquired.lease_id,
-                &self.finalize_id,
-                evidence.clone(),
-            ) {
-                Ok(LookupResult::Present(receipt)) if receipt.state == SlotState::Idle => {
-                    Ok(receipt)
-                }
-                Ok(LookupResult::Absent) => match self.request_finalize(token, evidence.clone()) {
-                    Ok(receipt) if receipt.state == SlotState::Idle => Ok(receipt),
-                    Err(()) => match self.client.lookup_finalize(
-                        &self.acquired.lease_id,
-                        &self.finalize_id,
-                        evidence,
-                    ) {
-                        Ok(LookupResult::Present(receipt)) if receipt.state == SlotState::Idle => {
-                            Ok(receipt)
-                        }
-                        _ => Err(Refusal::Completion),
-                    },
-                    _ => Err(Refusal::Completion),
-                },
-                Ok(LookupResult::Uncertain(_)) | Ok(LookupResult::Present(_)) | Err(_) => {
-                    Err(Refusal::Completion)
-                }
+        finalize_with(
+            evidence,
+            |evidence| self.request_finalize(token, evidence),
+            |evidence| {
+                self.client
+                    .lookup_finalize(&self.acquired.lease_id, &self.finalize_id, evidence)
             },
-        }
+        )
     }
 
     fn request_finalize(
@@ -1034,6 +1031,40 @@ impl ParentCallbacks {
                 evidence,
             )
             .map_err(|_| ())
+    }
+}
+
+/// Resolve ambiguous settlement only through the authenticated lookup API.
+/// An Absent observation permits an exact evidence replay; it never settles by
+/// itself and there is deliberately no reconcile branch here.
+fn finalize_with<F, L>(
+    evidence: SettlementEvidence,
+    mut finalize: F,
+    mut lookup: L,
+) -> Result<FinalizationReceipt, Refusal>
+where
+    F: FnMut(SettlementEvidence) -> Result<FinalizationReceipt, ()>,
+    L: FnMut(SettlementEvidence) -> Result<LookupResult<FinalizationReceipt>, StorageError>,
+{
+    match finalize(evidence.clone()) {
+        Ok(receipt) if receipt.state == SlotState::Idle => Ok(receipt),
+        Ok(_) => Err(Refusal::Completion),
+        Err(()) => match lookup(evidence.clone()) {
+            Ok(LookupResult::Present(receipt)) if receipt.state == SlotState::Idle => Ok(receipt),
+            Ok(LookupResult::Absent) => match finalize(evidence.clone()) {
+                Ok(receipt) if receipt.state == SlotState::Idle => Ok(receipt),
+                Err(()) => match lookup(evidence) {
+                    Ok(LookupResult::Present(receipt)) if receipt.state == SlotState::Idle => {
+                        Ok(receipt)
+                    }
+                    _ => Err(Refusal::Completion),
+                },
+                _ => Err(Refusal::Completion),
+            },
+            Ok(LookupResult::Uncertain(_)) | Ok(LookupResult::Present(_)) | Err(_) => {
+                Err(Refusal::Completion)
+            }
+        },
     }
 }
 
@@ -1302,6 +1333,43 @@ mod tests {
         }
     }
 
+    fn acquire_request() -> AcquireRequest {
+        start_frame(PROTOCOL_VERSION, "run").payload.acquire.into()
+    }
+
+    fn test_lease_identity() -> LeaseIdentity {
+        LeaseIdentity {
+            lease_id: "lease-fixture".into(),
+            slot_id: "slot-0000000000000001".into(),
+            storage_instance_id: "a".repeat(64),
+            generation: "1".into(),
+            state: SlotState::Leased,
+        }
+    }
+
+    fn test_acquire_result(path: PathBuf) -> AcquireResult {
+        AcquireResult {
+            lease_id: "lease-fixture".into(),
+            slot_id: "slot-0000000000000001".into(),
+            storage_instance_id: "a".repeat(64),
+            generation: "1".into(),
+            state: SlotState::Leased,
+            slot_path: Some(path),
+            token: Some(LeaseToken::new("fixture-only-token".into())),
+            reused: false,
+        }
+    }
+
+    fn test_settlement_evidence() -> SettlementEvidence {
+        SettlementEvidence {
+            binding: acquire_request().envelope.binding,
+            consumer_credential: Credential::new("fixture-original-consumer-secret"),
+            terminal: None,
+            capture: None,
+            containment: ContainmentEvidence::Unknown,
+        }
+    }
+
     fn start_frame(version: u32, operation: &str) -> StartFrame {
         let binding = RunBinding {
             consumer: "consumer".into(),
@@ -1442,6 +1510,181 @@ mod tests {
     }
 
     #[test]
+    fn lost_acquire_uses_lookup_then_replays_the_exact_original_credential() {
+        let request = acquire_request();
+        let scratch = PathBuf::from(
+            std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+                .expect("Effigy supplies the canonical isolated scratch root"),
+        );
+        let slot = scratch.join(format!("runner-host-replay-{}", std::process::id()));
+        std::fs::create_dir(&slot).unwrap();
+        let mut acquire_calls = 0;
+        let observed = std::cell::RefCell::new(Vec::new());
+
+        let result = acquire_with(
+            &request,
+            |seen| {
+                observed.borrow_mut().push(("acquire", seen.clone()));
+                acquire_calls += 1;
+                if acquire_calls == 1 {
+                    Err(StorageError::Io("synthetic lost reply".into()))
+                } else {
+                    Ok(test_acquire_result(slot.clone()))
+                }
+            },
+            |seen| {
+                observed.borrow_mut().push(("lookup", seen.clone()));
+                Ok(LookupResult::Absent)
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(result, AcquireDisposition::Acquired(_)));
+        assert_eq!(
+            observed
+                .borrow()
+                .iter()
+                .map(|(operation, _)| *operation)
+                .collect::<Vec<_>>(),
+            ["acquire", "lookup", "acquire"]
+        );
+        assert!(observed.borrow().iter().all(|(_, seen)| seen == &request));
+        assert_eq!(request.envelope.admission_credential.expose(), "credential");
+        std::fs::remove_dir(slot).unwrap();
+    }
+
+    #[test]
+    fn lookup_present_leased_is_observation_only_and_unknown_accounting_holds() {
+        let request = acquire_request();
+        let operations = std::cell::RefCell::new(Vec::new());
+        let result = acquire_with(
+            &request,
+            |seen| {
+                assert_eq!(seen, request);
+                operations.borrow_mut().push("acquire");
+                Err(StorageError::Io("synthetic lost reply".into()))
+            },
+            |seen| {
+                assert_eq!(seen, request);
+                operations.borrow_mut().push("lookup");
+                Ok(LookupResult::Present(test_lease_identity()))
+            },
+        )
+        .unwrap();
+        let AcquireDisposition::Held(Some(identity)) = result else {
+            panic!("a lookup identity must remain held");
+        };
+        assert_eq!(identity, test_lease_identity());
+        assert_eq!(*operations.borrow(), ["acquire", "lookup"]);
+
+        operations.borrow_mut().clear();
+        let result = acquire_with(
+            &request,
+            |_| {
+                operations.borrow_mut().push("acquire");
+                Err(StorageError::Refused(
+                    crate::storage::RefusalReason::UnknownAccounting,
+                ))
+            },
+            |_| {
+                operations.borrow_mut().push("lookup");
+                Ok(LookupResult::Absent)
+            },
+        )
+        .unwrap();
+        assert!(matches!(result, AcquireDisposition::Held(None)));
+        assert_eq!(*operations.borrow(), ["acquire"]);
+    }
+
+    #[test]
+    fn missing_or_reminted_admission_secret_refuses_without_retry() {
+        let operations = std::cell::RefCell::new(Vec::new());
+        let mut missing = acquire_request();
+        missing.envelope.admission_credential = Credential::new("");
+        assert_eq!(
+            acquire_with(
+                &missing,
+                |_| {
+                    operations.borrow_mut().push("acquire");
+                    Err(StorageError::Unauthorized)
+                },
+                |_| {
+                    operations.borrow_mut().push("lookup");
+                    Ok(LookupResult::Absent)
+                },
+            )
+            .unwrap_err(),
+            HostError::Storage
+        );
+        assert_eq!(*operations.borrow(), ["acquire"]);
+
+        operations.borrow_mut().clear();
+        let original = acquire_request();
+        let mut reminted = original.clone();
+        reminted.envelope.admission_credential =
+            Credential::new("fixture-reminted-admission-secret");
+        assert_eq!(
+            acquire_with(
+                &reminted,
+                |seen| {
+                    operations.borrow_mut().push("acquire");
+                    assert_eq!(seen, reminted);
+                    assert_ne!(seen, original);
+                    Err(StorageError::Conflict)
+                },
+                |_| {
+                    operations.borrow_mut().push("lookup");
+                    Ok(LookupResult::Absent)
+                },
+            )
+            .unwrap_err(),
+            HostError::Storage
+        );
+        assert_eq!(*operations.borrow(), ["acquire"]);
+    }
+
+    #[test]
+    fn lost_finalize_uses_lookup_before_exact_evidence_replay() {
+        let evidence = test_settlement_evidence();
+        let expected = evidence.clone();
+        let receipt = FinalizationReceipt {
+            lease_id: "lease-fixture".into(),
+            finalize_id: "finalize-fixture".into(),
+            state: SlotState::Idle,
+            capture_digest: None,
+        };
+        let mut finalizes = 0;
+        let observed = std::cell::RefCell::new(Vec::new());
+        let result = finalize_with(
+            evidence,
+            |seen| {
+                observed.borrow_mut().push(("finalize", seen.clone()));
+                finalizes += 1;
+                if finalizes == 1 {
+                    Err(())
+                } else {
+                    Ok(receipt.clone())
+                }
+            },
+            |seen| {
+                observed.borrow_mut().push(("lookup", seen.clone()));
+                Ok(LookupResult::Absent)
+            },
+        )
+        .unwrap();
+        assert_eq!(result, receipt);
+        assert_eq!(
+            observed
+                .borrow()
+                .iter()
+                .map(|(operation, _)| *operation)
+                .collect::<Vec<_>>(),
+            ["finalize", "lookup", "finalize"]
+        );
+        assert!(observed.borrow().iter().all(|(_, seen)| seen == &expected));
+    }
+
+    #[test]
     fn unsupported_top_level_operation_and_version_refuse_before_acquire() {
         for frame in [
             start_frame(PROTOCOL_VERSION + 1, "run"),
@@ -1551,6 +1794,94 @@ mod tests {
         );
         parent.join().unwrap();
         assert!(matches!(error, Err(CallbackError::Protocol)));
+    }
+
+    #[test]
+    fn callback_binding_refuses_old_lease_shape_and_mismatched_tuple() {
+        let storage = StorageIdentity {
+            slot_id: "slot-0000000000000001".into(),
+            storage_instance_id: "a".repeat(64),
+            generation: "1".into(),
+            reused: Some(false),
+        };
+        let partition = crate::storage::PartitionKey {
+            project_component: "project:component".into(),
+            workflow: "workflow".into(),
+            cargo_provenance: "cargo".into(),
+            rustc_provenance: "rustc".into(),
+            host: "host".into(),
+            target: "target".into(),
+            profile: "profile".into(),
+            features: Vec::new(),
+            config_digest: digest(b"config"),
+            environment_digest: digest(b"env"),
+            path_identity: "path".into(),
+        };
+
+        for old_lease_shape in [false, true] {
+            let (host_stream, mut parent_stream) = UnixStream::pair().unwrap();
+            let parent_storage = serde_json::to_value(&storage).unwrap();
+            let parent_partition = serde_json::to_value(&partition).unwrap();
+            let parent = thread::spawn(move || {
+                let mut reader = BufReader::new(parent_stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["storage"]["slot_id"], parent_storage["slot_id"]);
+                assert_eq!(
+                    request["storage"]["storage_instance_id"],
+                    parent_storage["storage_instance_id"]
+                );
+                assert_eq!(
+                    request["storage"]["generation"],
+                    parent_storage["generation"]
+                );
+                assert_eq!(request["partition"], parent_partition);
+
+                let mut changed_storage = request["storage"].clone();
+                if old_lease_shape {
+                    changed_storage = serde_json::json!({
+                        "id": "legacy-lease-id",
+                        "generation": request["storage"]["generation"]
+                    });
+                } else {
+                    changed_storage["storage_instance_id"] = Value::String("b".repeat(64));
+                }
+                let changed_subject = serde_json::json!({
+                    "id": request["id"],
+                    "owner": request["owner"],
+                    "storage": changed_storage,
+                    "partition": request["partition"],
+                    "payload": request["payload"]
+                });
+                let result = Value::Null;
+                let response = serde_json::json!({
+                    "version": 1,
+                    "operation": "callback_result",
+                    "id": request["id"],
+                    "owner": request["owner"],
+                    "subject_digest": digest(&canonical_json_bytes(&changed_subject).unwrap()),
+                    "policy_digest": request["policy_digest"],
+                    "result_digest": digest(&canonical_json_bytes(&result).unwrap()),
+                    "receipt": "fixture-only-mismatched-binding",
+                    "result": result
+                });
+                serde_json::to_writer(&mut parent_stream, &response).unwrap();
+                parent_stream.write_all(b"\n").unwrap();
+            });
+
+            let mut channel = Channel::new(host_stream).unwrap();
+            let error = channel.exchange::<_, ()>(
+                "test.owner",
+                &serde_json::json!({"identity":"attempt"}),
+                &registration(),
+                &storage,
+                &partition,
+                &AcceptReceipts,
+            );
+            parent.join().unwrap();
+            assert!(matches!(error, Err(CallbackError::Protocol)));
+        }
     }
 
     #[test]

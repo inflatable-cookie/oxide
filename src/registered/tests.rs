@@ -1,5 +1,7 @@
 use super::*;
-use crate::registered::runner_host::{AttemptInput, HostResult, OwnerReceiptVerifier, RunnerHost};
+use crate::registered::runner_host::{
+    AttemptInput, HostError, HostResult, OwnerReceiptVerifier, RunnerHost,
+};
 use crate::storage::{
     AcquireRequest, Budget, Client, ContainmentEvidence, Credential, Daemon, DaemonConfig,
     EvidenceAuthority, FreeSpaceProbe, PartitionKey, RunEnvelope, SettlementEvidence, StorageError,
@@ -868,7 +870,10 @@ struct BridgeAuthority;
 impl EvidenceAuthority for BridgeAuthority {
     fn verify_admission(&self, envelope: &RunEnvelope) -> bool {
         envelope.admission_reference == "admission-ref"
-            && envelope.admission_credential.expose() == "admission-proof"
+            && matches!(
+                envelope.admission_credential.expose(),
+                "admission-proof" | "reminted-admission-proof"
+            )
     }
 
     fn verify_settlement(&self, evidence: &SettlementEvidence) -> bool {
@@ -1070,6 +1075,7 @@ fn inactive_runner_host_uses_the_durable_generation_api_and_verified_parent_call
     let storage_root = fixture.base.join("bridge-storage");
     fs::create_dir(&storage_root).unwrap();
     fs::set_permissions(&storage_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let ledger_path = storage_root.join("ledger.bin");
     let daemon = Daemon::bind(
         DaemonConfig {
             root: storage_root,
@@ -1105,6 +1111,36 @@ fn inactive_runner_host_uses_the_durable_generation_api_and_verified_parent_call
         admission_reference: "admission-ref".into(),
         admission_credential: Credential::new("admission-proof"),
     };
+    let acquire_request = AcquireRequest {
+        envelope: envelope.clone(),
+        acquire_id: "host-acquire-1".into(),
+        required_bytes: 64,
+    };
+    let storage_client = Client::new(socket.clone());
+    let original_grant = storage_client
+        .acquire(acquire_request.clone())
+        .expect("synthetic parent admitted the exact original request");
+    assert_eq!(
+        storage_client
+            .acquire(acquire_request.clone())
+            .expect("matching acquire replay returns the original lease"),
+        original_grant
+    );
+    let mut reminted_request = acquire_request.clone();
+    reminted_request.envelope.admission_credential = Credential::new("reminted-admission-proof");
+    assert_eq!(
+        storage_client.acquire(reminted_request),
+        Err(StorageError::Conflict),
+        "a valid replacement secret changes the exact persisted request body"
+    );
+    let mut missing_secret_request = acquire_request.clone();
+    missing_secret_request.envelope.admission_credential =
+        Credential::new("missing-original-secret");
+    assert_eq!(
+        storage_client.acquire(missing_secret_request),
+        Err(StorageError::Unauthorized),
+        "missing original credential refuses instead of being re-minted"
+    );
     let input = AttemptInput {
         binding: fixture.attempt.binding.clone(),
         root_id: fixture.attempt.root_id.clone(),
@@ -1125,13 +1161,30 @@ fn inactive_runner_host_uses_the_durable_generation_api_and_verified_parent_call
             "registration": &fixture.registration,
             "attempt": input,
             "acquire": {
-                "envelope": envelope,
-                "acquire_id": "host-acquire-1",
-                "required_bytes": 64
+                "envelope": &acquire_request.envelope,
+                "acquire_id": &acquire_request.acquire_id,
+                "required_bytes": acquire_request.required_bytes
             },
             "finalize_id": "host-finalize-1"
         }
     });
+    for replacement in ["reminted-admission-proof", "missing-original-secret"] {
+        let mut refused_request = request.clone();
+        refused_request["payload"]["acquire"]["envelope"]["admission_credential"] =
+            serde_json::Value::String(replacement.to_owned());
+        let (host_stream, parent_stream) = std::os::unix::net::UnixStream::pair().unwrap();
+        let refused_host = RunnerHost::new(socket.clone(), Arc::new(BridgeVerifier));
+        let refused_thread = thread::spawn(move || refused_host.serve(host_stream));
+        let (response, callbacks) =
+            bridge_parent(parent_stream, &fixture.owners, &partition, &refused_request);
+        assert_eq!(response["operation"], "error");
+        assert_eq!(response["code"], "storage_failure");
+        assert!(callbacks.is_empty(), "refused request cannot reach Runner");
+        assert_eq!(
+            refused_thread.join().unwrap().unwrap_err(),
+            HostError::Storage
+        );
+    }
     let (host_stream, parent_stream) = std::os::unix::net::UnixStream::pair().unwrap();
     let host = RunnerHost::new(socket, Arc::new(BridgeVerifier));
     let host_thread = thread::spawn(move || host.serve(host_stream));
@@ -1156,7 +1209,28 @@ fn inactive_runner_host_uses_the_durable_generation_api_and_verified_parent_call
     assert!(!has_token_field(&request));
     assert_eq!(callbacks.len(), 6);
     assert!(callbacks.iter().all(|frame| !has_token_field(frame)));
+    assert!(callbacks.iter().all(|frame| {
+        frame["storage"]["slot_id"] == storage.slot_id
+            && frame["storage"]["storage_instance_id"] == storage.storage_instance_id
+            && frame["storage"]["generation"] == storage.generation
+    }));
+    assert!(callbacks.iter().all(|frame| {
+        let subject = serde_json::json!({
+            "id": frame["id"],
+            "owner": frame["owner"],
+            "storage": frame["storage"],
+            "partition": frame["partition"],
+            "payload": frame["payload"]
+        });
+        frame["subject_digest"] == digest(&serde_json::to_vec(&subject).unwrap())
+    }));
     assert_eq!(fixture.owners.calls.load(Ordering::Relaxed), 1);
+    let ledger = fs::read(ledger_path).expect("read synthetic storage ledger");
+    for secret in ["admission-proof", "reminted-admission-proof"] {
+        assert!(!ledger
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()));
+    }
     assert!(!fixture
         .base
         .join("bridge-storage")

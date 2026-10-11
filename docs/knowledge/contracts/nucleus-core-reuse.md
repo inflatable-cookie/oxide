@@ -720,6 +720,61 @@ write, and five minutes per session. JSON u64 values use safe integers through
 digests use compact JSON with object keys sorted by UTF-8 byte order; they are
 separate from source, Git, and consumer-retention digests.
 
+The callable start schema is a single `run` frame with `version`, request `id`,
+and a payload containing `registration`, `attempt`, `acquire`, and `finalize_id`.
+`acquire` is the serialized Rust `AcquireRequest`: its envelope retains the exact
+`RunBinding`, complete partition, admission reference and credential bytes, plus
+`acquire_id` and `required_bytes`. The credential-bearing request is supplied at
+the private embedder boundary and stays in this host attempt's memory for lookup
+and any permitted retry. It is not copied to ordinary consumer or storage
+ledgers, logs, or error frames, and the host has no credential issuer or remint
+path. If that original credential payload is unavailable, recovery holds rather
+than manufacturing a replacement. A host restart does not preserve that secret
+in this library; an embedder without its original accepted secret must keep the
+attempt held.
+
+The callback request schema is `callback` with a monotone string `id`, owner,
+`subject_digest`, `policy_digest`, complete `storage` identity
+(`slot_id`, `storage_instance_id`, `generation`, and `reused`), full partition,
+and owner payload. The response must echo version, operation, callback ID, owner,
+subject and policy digests, then supply the result digest, receipt, and result.
+The exact subject digest covers the whole storage tuple and callback payload;
+receipt verification is against that digest and the installed policy. A legacy
+consumer `Lease{id,generation}` or a tuple with a different instance or slot
+cannot be interpreted as this binding and is refused. In particular, generation
+alone never identifies a storage instance.
+
+The delivered callback names are `registration.authenticate`,
+`registration.audit`, `input.immutable`, `input.units`, `input.seal_map`,
+`input.verify_map`, `execution.execute`, `execution.verify_success`, and one of
+`execution.finalize_idle` or `execution.finalize_not_spawned` when the existing
+Runner path reaches those operations. Replies are authenticated before their
+values reach Runner. The exact path-dependent order remains `Runner::run`'s
+existing order; this bridge does not change its map, input, or ownership rules.
+
+The storage ordering maps onto the existing `StorageAttempt` responsibility as
+follows, without changing its TypeScript interface: the consumer records acquire
+intent and passes the accepted original request to the host; Rust calls
+`Client::acquire`. Busy/capacity replies return pending before Runner, while
+unknown accounting holds. After an ambiguous acquire error Rust calls
+`Client::lookup_acquire` with the exact credential-bearing request. `Present`
+and `Uncertain` return a held observation containing the authenticated lookup
+identity, slot, storage-instance, generation, and state only; `LeaseIdentity` has no path
+or token and never authorizes Runner execution. Only `Absent` permits an exact
+replay of the original request. After Runner's authenticated parent callbacks,
+Rust finalizes with its in-memory token and exact settlement evidence. An
+ambiguous finalize uses `Client::lookup_finalize` with that same lease ID,
+finalize ID, and evidence before any identical finalize replay. `Present Idle`
+is an observation of completion, `Absent` permits the exact retry, and
+uncertainty holds. The host never uses `Client::reconcile` as lookup.
+
+The actual Nucleus `StorageAttempt`/`Lease{id,generation}` surface is unchanged
+by this PR and does not yet carry the complete storage tuple or secret-preserving
+recovery binding. No old lease or publication-map format is upgraded here; a
+future consumer binding must version and authenticate the complete tuple and
+preserve the original accepted secret through its own approved secret handling,
+or hold. The private host and fixtures do not implement that consumer adapter.
+
 Each callback request binds the exact payload to the acquired slot ID,
 storage-instance ID, generation, reuse result, and complete partition key. Its
 policy digest binds the full registration digest, graph/config/toolchain/debug
