@@ -63,11 +63,20 @@ matching a Cargo `.crate`. The extracted directory's last component must equal
 that prefix. The verifier enforces the locked SHA-256 of the compressed archive
 bytes (`sha256:` plus 64 lowercase hex), exact file content digests, and exact
 file/directory membership, including empty directories and parent directories
-implied by files. Conversion to `ImmutableManifest` is `VerifiedCorrespondence::into_registered`
-and requires `TrustedContext::new` constructed with an already-accepted
-`InputEvidenceOwner` plus that owner's issuer, source identity and epoch; it
-always yields `ImmutableClass::Registry` with `ArchiveEvidence` and never infers
-generated, native or proc-macro provenance.
+implied by files or by nested empty directories. Duplicate tar members refuse,
+including a repeated prefix-only package-root directory header. Extracted
+directory membership is snapshotted before and after each directory walk;
+identity or membership change refuses as unstable. `VerifiedCorrespondence` is
+constructed only by `verify`; its fields are private. Conversion to
+`ImmutableManifest` is `VerifiedCorrespondence::into_registered` and requires
+`TrustedContext::new` with an already-accepted `InputEvidenceOwner`, that
+owner's issuer, source identity and epoch, plus the receipt and `Attempt` the
+owner authenticates. Conversion calls `InputEvidenceOwner::immutable` and
+accepts the issued manifest only when it is `ImmutableClass::Registry` with
+`ArchiveEvidence` matching the verified checksum, paths and inventory. It does
+not mint an issuer from task strings and never infers generated, native or
+proc-macro provenance. An owner that returns `MissingAuthority` refuses
+conversion.
 
 Local Cargo sidecars `.cargo-ok` and `.cargo-checksum.json` may exist at the
 extracted package root. They are not archive members and are never read as
@@ -79,15 +88,17 @@ non-UTF-8 names, duplicate or file/directory collisions, unknown formats
 (including bare tar, extra gzip members and trailing compressed bytes),
 corrupt or truncated streams, and unstable reads refuse.
 
-Reads charge one shared preparation budget that is not reset per member or
-phase: compressed archive bytes, decompressed tar bytes, and extracted-file
-bytes. `verify` takes `Limits` and returns `Outcome` with `Counters`
+Reads charge one shared preparation budget that is not reset per member, phase
+or package: compressed archive bytes, decompressed tar bytes, and extracted-file
+bytes. `verify(request, limits, counters)` continues from the caller-supplied
+`Counters` and returns `Outcome` with the aggregate `Counters`
 (`archive_bytes`, `decompressed_bytes`, `extracted_bytes`, `entries`) and a
 `Refusal` category on every attempt, including success. Nucleus engineering
 maxima are 256 MiB collection, 16 MiB per decoded or extracted file, 32,768
 inventory entries, 2,048-byte paths and depth 32; callers may pass lower
-bounds. There is no unpack/write into the package root, host registry scan,
-package-by-package budget reset or automatic growth.
+bounds. The collection cap applies to the accumulated counters, so successive
+package verifies in one preparation share it. There is no unpack/write into the
+package root, host registry scan, per-call counter reset or automatic growth.
 
 The unit seam consumes owner-verified semantic evidence for pinned Cargo
 `c980f4866` [`LocalFingerprint`](https://github.com/rust-lang/cargo/blob/c980f4866/src/cargo/core/compiler/fingerprint/mod.rs).

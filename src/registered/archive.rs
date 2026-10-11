@@ -7,7 +7,7 @@
 
 use super::{
     canonical_dir, digest, io, receipt_bound, relative, stamp, valid_digest, ArchiveEvidence,
-    ImmutableClass, ImmutableManifest, InputEvidenceOwner, Limits, Refusal, Result,
+    Attempt, ImmutableClass, ImmutableManifest, InputEvidenceOwner, Limits, Refusal, Result,
     EVIDENCE_VERSION,
 };
 use flate2::bufread::GzDecoder;
@@ -56,6 +56,8 @@ pub struct TrustedContext<'a> {
     issuer: &'a str,
     source_identity: &'a str,
     epoch: &'a str,
+    receipt: &'a str,
+    attempt: &'a Attempt,
     limits: Limits,
 }
 impl std::fmt::Debug for TrustedContext<'_> {
@@ -64,52 +66,87 @@ impl std::fmt::Debug for TrustedContext<'_> {
             .field("issuer", &self.issuer)
             .field("source_identity", &self.source_identity)
             .field("epoch", &self.epoch)
+            .field("receipt", &self.receipt)
+            .field("attempt", &self.attempt.binding.run_id)
             .field("owner", &(self.owner as *const dyn InputEvidenceOwner))
             .finish()
     }
 }
 impl<'a> TrustedContext<'a> {
-    /// Build only from an already-accepted `InputEvidenceOwner`.
+    /// Build only from an already-accepted `InputEvidenceOwner` plus the
+    /// receipt and attempt that owner will authenticate. Strings are not an issuer.
     pub fn new(
         owner: &'a dyn InputEvidenceOwner,
         issuer: &'a str,
         source_identity: &'a str,
         epoch: &'a str,
+        receipt: &'a str,
+        attempt: &'a Attempt,
         limits: Limits,
     ) -> Result<Self> {
         limits.validate()?;
         receipt_bound(issuer, limits)?;
         receipt_bound(source_identity, limits)?;
         receipt_bound(epoch, limits)?;
+        receipt_bound(receipt, limits)?;
         Ok(Self {
             owner,
             issuer,
             source_identity,
             epoch,
+            receipt,
+            attempt,
             limits,
         })
     }
 }
 
+/// Produced only by `verify`. Fields stay private so callers cannot mint
+/// registry evidence from an unverified inventory.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedCorrespondence {
-    pub package_prefix: String,
-    pub locked_checksum: String,
-    pub archive: PathBuf,
-    pub extracted_root: PathBuf,
-    pub files: BTreeMap<String, String>,
-    pub directories: BTreeSet<String>,
-    pub counters: Counters,
+    package_prefix: String,
+    locked_checksum: String,
+    archive: PathBuf,
+    extracted_root: PathBuf,
+    files: BTreeMap<String, String>,
+    directories: BTreeSet<String>,
+    counters: Counters,
 }
 impl VerifiedCorrespondence {
-    /// Bind verified bytes into registered registry evidence. Does not infer
+    pub fn package_prefix(&self) -> &str {
+        &self.package_prefix
+    }
+    pub fn locked_checksum(&self) -> &str {
+        &self.locked_checksum
+    }
+    pub fn archive(&self) -> &Path {
+        &self.archive
+    }
+    pub fn extracted_root(&self) -> &Path {
+        &self.extracted_root
+    }
+    pub fn files(&self) -> &BTreeMap<String, String> {
+        &self.files
+    }
+    pub fn directories(&self) -> &BTreeSet<String> {
+        &self.directories
+    }
+    pub fn counters(&self) -> Counters {
+        self.counters
+    }
+
+    /// Bind verified bytes to an owner-issued Registry manifest. The owner must
+    /// accept the receipt; this conversion does not mint an issuer or infer
     /// native, generated or proc-macro provenance.
     pub fn into_registered(self, context: TrustedContext<'_>) -> Result<super::ImmutableManifest> {
         let TrustedContext {
-            owner: _,
+            owner,
             issuer,
             source_identity,
             epoch,
+            receipt,
+            attempt,
             limits,
         } = context;
         if self.files.is_empty()
@@ -130,26 +167,38 @@ impl VerifiedCorrespondence {
                 return Err(Refusal::Identity);
             }
         }
-        Ok(ImmutableManifest {
-            version: EVIDENCE_VERSION,
-            issuer: issuer.to_owned(),
-            source_identity: source_identity.to_owned(),
-            epoch: epoch.to_owned(),
-            class: ImmutableClass::Registry,
-            root: self.extracted_root,
-            files: self.files,
-            directories: self.directories,
-            archive: Some(ArchiveEvidence {
-                path: self.archive,
-                locked_checksum: self.locked_checksum,
-            }),
-        })
+        let issued = owner.immutable(receipt, attempt)?;
+        if issued.class != ImmutableClass::Registry {
+            return Err(Refusal::Unsupported);
+        }
+        if issued.version != EVIDENCE_VERSION
+            || issued.issuer != issuer
+            || issued.source_identity != source_identity
+            || issued.epoch != epoch
+            || issued.root != self.extracted_root
+            || issued.files != self.files
+            || issued.directories != self.directories
+        {
+            return Err(Refusal::Identity);
+        }
+        match &issued.archive {
+            Some(archive)
+                if archive.path == self.archive
+                    && archive.locked_checksum == self.locked_checksum => {}
+            _ => return Err(Refusal::Identity),
+        }
+        Ok(issued)
     }
 }
 
-/// Prove archive checksum and extraction membership/content. One shared budget.
-pub fn verify(request: &Request<'_>, limits: Limits) -> Outcome<VerifiedCorrespondence> {
-    let mut counters = Counters::default();
+/// Prove archive checksum and extraction membership/content. `counters` is the
+/// shared preparation budget so far; this call continues it and never resets.
+pub fn verify(
+    request: &Request<'_>,
+    limits: Limits,
+    counters: Counters,
+) -> Outcome<VerifiedCorrespondence> {
+    let mut counters = counters;
     match verify_inner(request, limits, &mut counters) {
         Ok(value) => Outcome {
             counters,
@@ -346,6 +395,9 @@ fn tar_inventory(bytes: &[u8], limits: Limits, counters: &mut Counters) -> Resul
             if !is_dir {
                 return Err(Refusal::Unsupported);
             }
+            if !seen.insert(String::new()) {
+                return Err(Refusal::Unsupported);
+            }
             continue;
         }
         if is_sidecar(&relative) {
@@ -358,7 +410,8 @@ fn tar_inventory(bytes: &[u8], limits: Limits, counters: &mut Counters) -> Resul
             if files.contains_key(&relative) {
                 return Err(Refusal::Unsupported);
             }
-            directories.insert(relative);
+            directories.insert(relative.clone());
+            insert_parents(&relative, &files, &mut directories)?;
         } else {
             if directories.contains(&relative) {
                 return Err(Refusal::Unsupported);
@@ -421,10 +474,19 @@ fn walk(
     if depth > limits.depth {
         return Err(Refusal::Budget);
     }
+    let before = fs::symlink_metadata(dir).map_err(io)?;
+    if !before.is_dir() || before.file_type().is_symlink() {
+        return Err(Refusal::Unsupported);
+    }
+    let before_id = dir_identity(&before)?;
+    let mut children = Vec::new();
     for entry in fs::read_dir(dir).map_err(io)? {
+        children.push(entry.map_err(io)?.path());
+    }
+    children.sort();
+    for path in &children {
         bump_entries(counters, limits)?;
-        let path = entry.map_err(io)?.path();
-        let metadata = fs::symlink_metadata(&path).map_err(io)?;
+        let metadata = fs::symlink_metadata(path).map_err(io)?;
         let name = path
             .strip_prefix(root)
             .map_err(io)?
@@ -436,17 +498,41 @@ fn walk(
         }
         if metadata.is_dir() {
             directories.insert(name.to_owned());
-            walk(root, &path, depth + 1, limits, counters, files, directories)?;
+            walk(root, path, depth + 1, limits, counters, files, directories)?;
         } else if metadata.is_file() {
             if is_sidecar(name) {
                 continue;
             }
-            files.insert(name.to_owned(), read_extracted(&path, limits, counters)?);
+            files.insert(name.to_owned(), read_extracted(path, limits, counters)?);
         } else {
             return Err(Refusal::Unsupported);
         }
     }
+    let after = fs::symlink_metadata(dir).map_err(io)?;
+    if dir_identity(&after)? != before_id {
+        return Err(Refusal::Unstable);
+    }
+    let mut after_children = Vec::new();
+    for entry in fs::read_dir(dir).map_err(io)? {
+        after_children.push(entry.map_err(io)?.path());
+    }
+    after_children.sort();
+    if after_children != children {
+        return Err(Refusal::Unstable);
+    }
     Ok(())
+}
+
+fn dir_identity(metadata: &fs::Metadata) -> Result<(u64, u64, u64, i64, i64, u64)> {
+    let (mtime, dev, ino) = stamp(metadata)?;
+    Ok((
+        mtime,
+        dev,
+        ino,
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+        metadata.nlink(),
+    ))
 }
 
 fn read_extracted(path: &Path, limits: Limits, counters: &mut Counters) -> Result<String> {
@@ -614,6 +700,28 @@ mod tests {
         }
     }
 
+    struct AcceptingOwner {
+        receipt: String,
+        manifest: ImmutableManifest,
+    }
+    impl InputEvidenceOwner for AcceptingOwner {
+        fn immutable(&self, receipt: &str, _: &Attempt) -> Result<ImmutableManifest> {
+            if receipt != self.receipt {
+                return Err(Refusal::MissingAuthority);
+            }
+            Ok(self.manifest.clone())
+        }
+        fn units(&self, _: &Registration, _: &Attempt) -> Result<Vec<UnitEvidence>> {
+            Err(Refusal::MissingAuthority)
+        }
+        fn seal_map(&self, _: &Attempt, _: &str) -> Result<String> {
+            Err(Refusal::MissingAuthority)
+        }
+        fn verify_map(&self, _: &Attempt, _: &str, _: &str) -> Result<()> {
+            Err(Refusal::MissingAuthority)
+        }
+    }
+
     fn crate_bytes(prefix: &str, files: &[(&str, &[u8])], dirs: &[&str]) -> Vec<u8> {
         crate_bytes_with(prefix, files, dirs, None)
     }
@@ -711,6 +819,54 @@ mod tests {
             locked_checksum: checksum,
         }
     }
+    fn once(request: &Request<'_>, limits: Limits) -> Outcome<VerifiedCorrespondence> {
+        verify(request, limits, Counters::default())
+    }
+    fn attempt(scratch: &Scratch) -> Attempt {
+        Attempt {
+            binding: crate::RunBinding {
+                consumer: "synthetic".into(),
+                project: "owned".into(),
+                component: "core".into(),
+                workflow: "archive".into(),
+                task_id: "task-1".into(),
+                workspace_id: "workspace-1".into(),
+                run_id: "run-1".into(),
+                attempt_id: "attempt-1".into(),
+                commit: "committed-1".into(),
+                source_tree_digest: format!("sha256:{}", "ab".repeat(32)),
+            },
+            root_id: "root-1".into(),
+            allocation_epoch: "epoch-1".into(),
+            branch: "task-branch-1".into(),
+            source_root: scratch.path("source"),
+            slot: scratch.path("slot"),
+            generation: "generation-1".into(),
+            partition: "partition-1".into(),
+            lease_id: "lease-1".into(),
+            target: scratch.path("target"),
+            temp: scratch.path("temp"),
+            capture: scratch.path("capture"),
+            authorization: "authenticated-attempt".into(),
+            reused: false,
+        }
+    }
+    fn issued(verified: &VerifiedCorrespondence, issuer: &str, epoch: &str) -> ImmutableManifest {
+        ImmutableManifest {
+            version: EVIDENCE_VERSION,
+            issuer: issuer.to_owned(),
+            source_identity: verified.package_prefix().to_owned(),
+            epoch: epoch.to_owned(),
+            class: ImmutableClass::Registry,
+            root: verified.extracted_root().to_owned(),
+            files: verified.files().clone(),
+            directories: verified.directories().clone(),
+            archive: Some(ArchiveEvidence {
+                path: verified.archive().to_owned(),
+                locked_checksum: verified.locked_checksum().to_owned(),
+            }),
+        }
+    }
     fn write_crate(
         scratch: &Scratch,
         name: &str,
@@ -736,39 +892,19 @@ mod tests {
             br#"{"package":"deadbeef","files":{"Cargo.toml":"nope"}}"#,
         )
         .unwrap();
-        let outcome = verify(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS);
+        let outcome = once(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS);
         let verified = outcome.value.expect("correspondence");
-        assert_eq!(verified.package_prefix, "pkg-1.0.0");
-        assert_eq!(verified.locked_checksum, checksum);
-        assert_eq!(verified.files.len(), 2);
-        assert!(verified.files.contains_key("Cargo.toml"));
-        assert!(verified.files.contains_key("src/lib.rs"));
-        assert!(verified.directories.contains("src"));
-        assert!(!verified.files.contains_key(CARGO_OK));
-        assert!(!verified.files.contains_key(CARGO_CHECKSUM_JSON));
+        assert_eq!(verified.package_prefix(), "pkg-1.0.0");
+        assert_eq!(verified.locked_checksum(), checksum);
+        assert_eq!(verified.files().len(), 2);
+        assert!(verified.files().contains_key("Cargo.toml"));
+        assert!(verified.files().contains_key("src/lib.rs"));
+        assert!(verified.directories().contains("src"));
+        assert!(!verified.files().contains_key(CARGO_OK));
+        assert!(!verified.files().contains_key(CARGO_CHECKSUM_JSON));
         assert!(outcome.counters.archive_bytes > 0);
         assert!(outcome.counters.decompressed_bytes > 0);
         assert!(outcome.counters.extracted_bytes > 0);
-        let manifest = verified
-            .into_registered(
-                TrustedContext::new(
-                    &StubOwner,
-                    "synthetic-owner",
-                    "pkg-1.0.0",
-                    "epoch-1",
-                    Limits::NUCLEUS,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        assert_eq!(manifest.class, ImmutableClass::Registry);
-        assert_eq!(manifest.root, extracted);
-        assert_eq!(manifest.archive.unwrap().locked_checksum, checksum);
-        assert!(manifest
-            .files
-            .get("src/lib.rs")
-            .unwrap()
-            .starts_with("sha256:"));
     }
 
     #[test]
@@ -776,7 +912,7 @@ mod tests {
         let scratch = Scratch::new();
         let (archive, extracted, checksum) = prepare(&scratch);
         assert_eq!(
-            verify(
+            once(
                 &ask(&archive, &extracted, "sha256:not-a-digest"),
                 Limits::NUCLEUS
             )
@@ -785,30 +921,30 @@ mod tests {
         );
         let wrong = format!("sha256:{}", "ab".repeat(32));
         assert_eq!(
-            verify(&ask(&archive, &extracted, &wrong), Limits::NUCLEUS).value,
+            once(&ask(&archive, &extracted, &wrong), Limits::NUCLEUS).value,
             Err(Refusal::Integrity)
         );
 
         fs::write(extracted.join("extra.rs"), b"extra").unwrap();
         assert_eq!(
-            verify(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS).value,
+            once(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS).value,
             Err(Refusal::Membership)
         );
         fs::remove_file(extracted.join("extra.rs")).unwrap();
         fs::remove_file(extracted.join("src/lib.rs")).unwrap();
         assert_eq!(
-            verify(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS).value,
+            once(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS).value,
             Err(Refusal::Membership)
         );
         fs::write(extracted.join("src/lib.rs"), b"changed").unwrap();
         assert_eq!(
-            verify(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS).value,
+            once(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS).value,
             Err(Refusal::Integrity)
         );
         fs::write(extracted.join("src/lib.rs"), b"pub fn n() -> u8 { 1 }\n").unwrap();
         fs::write(extracted.join("src/.cargo-ok"), b"nested sidecar is extra").unwrap();
         assert_eq!(
-            verify(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS).value,
+            once(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS).value,
             Err(Refusal::Membership)
         );
         fs::remove_file(extracted.join("src/.cargo-ok")).unwrap();
@@ -824,7 +960,7 @@ mod tests {
         );
         let other = fs::canonicalize(other).unwrap();
         assert_eq!(
-            verify(&ask(&archive, &other, &checksum), Limits::NUCLEUS).value,
+            once(&ask(&archive, &other, &checksum), Limits::NUCLEUS).value,
             Err(Refusal::Identity)
         );
 
@@ -840,7 +976,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            verify(
+            once(
                 &ask(&sidecar_archive, &extracted, &sidecar_sum),
                 Limits::NUCLEUS
             )
@@ -865,7 +1001,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            verify(&ask(&symlink_crate, &extracted, &sum), Limits::NUCLEUS).value,
+            once(&ask(&symlink_crate, &extracted, &sum), Limits::NUCLEUS).value,
             Err(Refusal::Unsupported)
         );
 
@@ -886,7 +1022,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            verify(&ask(&hardlink_crate, &extracted, &sum), Limits::NUCLEUS).value,
+            once(&ask(&hardlink_crate, &extracted, &sum), Limits::NUCLEUS).value,
             Err(Refusal::Unsupported)
         );
 
@@ -901,7 +1037,22 @@ mod tests {
             }),
         );
         assert_eq!(
-            verify(&ask(&duplicate, &extracted, &sum), Limits::NUCLEUS).value,
+            once(&ask(&duplicate, &extracted, &sum), Limits::NUCLEUS).value,
+            Err(Refusal::Unsupported)
+        );
+
+        let (dup_root, sum) = write_crate(
+            &scratch,
+            "dup-root.crate",
+            "pkg-1.0.0",
+            &[("Cargo.toml", b"x")],
+            &[],
+            Some(|builder| {
+                append_dir(builder, "pkg-1.0.0/");
+            }),
+        );
+        assert_eq!(
+            once(&ask(&dup_root, &extracted, &sum), Limits::NUCLEUS).value,
             Err(Refusal::Unsupported)
         );
 
@@ -916,14 +1067,14 @@ mod tests {
             }),
         );
         assert_eq!(
-            verify(&ask(&two_prefix, &extracted, &sum), Limits::NUCLEUS).value,
+            once(&ask(&two_prefix, &extracted, &sum), Limits::NUCLEUS).value,
             Err(Refusal::Unsupported)
         );
 
         fs::write(scratch.path("plain.tar"), b"not-gzip").unwrap();
         let plain = fs::canonicalize(scratch.path("plain.tar")).unwrap();
         assert_eq!(
-            verify(
+            once(
                 &ask(&plain, &extracted, &digest(&fs::read(&plain).unwrap())),
                 Limits::NUCLEUS
             )
@@ -933,13 +1084,13 @@ mod tests {
 
         symlink(extracted.join("Cargo.toml"), extracted.join("link.rs")).unwrap();
         assert_eq!(
-            verify(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS).value,
+            once(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS).value,
             Err(Refusal::Unsupported)
         );
         fs::remove_file(extracted.join("link.rs")).unwrap();
         UnixListener::bind(extracted.join("socket")).unwrap();
         assert_eq!(
-            verify(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS).value,
+            once(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS).value,
             Err(Refusal::Unsupported)
         );
     }
@@ -975,20 +1126,59 @@ mod tests {
     }
 
     #[test]
+    fn nested_empty_directories_record_implied_parents() {
+        let scratch = Scratch::new();
+        let prefix = "pkg-1.0.0";
+        let files = [("Cargo.toml", b"[package]\nname=\"pkg\"\n" as &[u8])];
+        let dirs = ["a/b"];
+        let archive = scratch.path("nested.crate");
+        fs::write(&archive, crate_bytes(prefix, &files, &dirs)).unwrap();
+        let extracted = scratch.path(prefix);
+        write_extracted(&extracted, &files, &dirs);
+        let archive = fs::canonicalize(archive).unwrap();
+        let extracted = fs::canonicalize(extracted).unwrap();
+        let checksum = digest(&fs::read(&archive).unwrap());
+        let verified = once(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS)
+            .value
+            .expect("nested empty dirs");
+        assert!(verified.directories().contains("a"));
+        assert!(verified.directories().contains("a/b"));
+        assert_eq!(verified.files().len(), 1);
+    }
+
+    #[test]
     fn shared_budget_counts_without_reset_and_refuses_bombs_and_truncation() {
         let scratch = Scratch::new();
         let (archive, extracted, checksum) = prepare(&scratch);
         let request = ask(&archive, &extracted, &checksum);
-        let ok = verify(&request, Limits::NUCLEUS);
+        let ok = verify(&request, Limits::NUCLEUS, Counters::default());
         let counters = ok.counters;
         assert!(ok.value.is_ok());
         assert!(counters.archive_bytes > 0);
         assert!(counters.decompressed_bytes > 0);
         assert!(counters.extracted_bytes > 0);
 
+        let second = verify(&request, Limits::NUCLEUS, counters);
+        assert!(second.value.is_ok());
+        assert_eq!(second.counters.archive_bytes, counters.archive_bytes * 2);
+        assert_eq!(
+            second.counters.decompressed_bytes,
+            counters.decompressed_bytes * 2
+        );
+        assert_eq!(
+            second.counters.extracted_bytes,
+            counters.extracted_bytes * 2
+        );
+
+        let mut exhausted = Limits::NUCLEUS;
+        exhausted.collection_bytes = counters.total();
+        let refused = verify(&request, exhausted, counters);
+        assert_eq!(refused.value, Err(Refusal::Budget));
+        assert_eq!(refused.counters, counters);
+
         let mut tight = Limits::NUCLEUS;
         tight.collection_bytes = counters.archive_bytes + counters.decompressed_bytes;
-        let refused = verify(&request, tight);
+        let refused = verify(&request, tight, Counters::default());
         assert_eq!(refused.value, Err(Refusal::Budget));
         assert_eq!(refused.counters.archive_bytes, counters.archive_bytes);
         assert_eq!(
@@ -999,7 +1189,7 @@ mod tests {
 
         let mut compressed_only = Limits::NUCLEUS;
         compressed_only.collection_bytes = counters.archive_bytes;
-        let refused = verify(&request, compressed_only);
+        let refused = verify(&request, compressed_only, Counters::default());
         assert_eq!(refused.value, Err(Refusal::Budget));
         assert_eq!(refused.counters.archive_bytes, counters.archive_bytes);
         assert_eq!(refused.counters.decompressed_bytes, 0);
@@ -1018,7 +1208,11 @@ mod tests {
         let bomb_sum = digest(&fs::read(&bomb_archive).unwrap());
         let mut bomb_limits = Limits::NUCLEUS;
         bomb_limits.collection_bytes = 512;
-        let bomb = verify(&ask(&bomb_archive, &bomb_root, &bomb_sum), bomb_limits);
+        let bomb = verify(
+            &ask(&bomb_archive, &bomb_root, &bomb_sum),
+            bomb_limits,
+            Counters::default(),
+        );
         assert_eq!(bomb.value, Err(Refusal::Budget));
         assert!(bomb.counters.total() <= 512);
         assert!(bomb_root.join("Cargo.toml").is_file());
@@ -1029,7 +1223,7 @@ mod tests {
         let truncated = fs::canonicalize(truncated).unwrap();
         let truncated_sum = digest(&fs::read(&truncated).unwrap());
         assert!(matches!(
-            verify(
+            once(
                 &ask(&truncated, &extracted, &truncated_sum),
                 Limits::NUCLEUS
             )
@@ -1044,13 +1238,13 @@ mod tests {
         let extra_gzip = fs::canonicalize(extra_gzip).unwrap();
         let extra_sum = digest(&fs::read(&extra_gzip).unwrap());
         assert_eq!(
-            verify(&ask(&extra_gzip, &extracted, &extra_sum), Limits::NUCLEUS).value,
+            once(&ask(&extra_gzip, &extracted, &extra_sum), Limits::NUCLEUS).value,
             Err(Refusal::Unsupported)
         );
 
         fs::write(extracted.join("src/lib.rs"), b"mutated-after-success").unwrap();
         assert_eq!(
-            verify(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS).value,
+            once(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS).value,
             Err(Refusal::Integrity)
         );
     }
@@ -1059,21 +1253,56 @@ mod tests {
     fn conversion_requires_accepted_owner_and_does_not_infer_native_closure() {
         let scratch = Scratch::new();
         let (archive, extracted, checksum) = prepare(&scratch);
-        let verified = verify(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS)
+        let verified = once(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS)
             .value
             .unwrap();
+        let attempt = attempt(&scratch);
         assert_eq!(
-            TrustedContext::new(&StubOwner, "", "pkg", "epoch", Limits::NUCLEUS).unwrap_err(),
+            TrustedContext::new(
+                &StubOwner,
+                "",
+                "pkg",
+                "epoch",
+                "registry-receipt",
+                &attempt,
+                Limits::NUCLEUS
+            )
+            .unwrap_err(),
             Refusal::Authentication
         );
+        assert_eq!(
+            verified
+                .clone()
+                .into_registered(
+                    TrustedContext::new(
+                        &StubOwner,
+                        "synthetic-owner",
+                        "pkg-1.0.0",
+                        "epoch-1",
+                        "registry-receipt",
+                        &attempt,
+                        Limits::NUCLEUS,
+                    )
+                    .unwrap(),
+                )
+                .unwrap_err(),
+            Refusal::MissingAuthority
+        );
+
+        let owner = AcceptingOwner {
+            receipt: "registry-receipt".into(),
+            manifest: issued(&verified, "synthetic-owner", "epoch-1"),
+        };
         let manifest = verified
             .clone()
             .into_registered(
                 TrustedContext::new(
-                    &StubOwner,
+                    &owner,
                     "synthetic-owner",
                     "pkg-1.0.0",
                     "epoch-1",
+                    "registry-receipt",
+                    &attempt,
                     Limits::NUCLEUS,
                 )
                 .unwrap(),
@@ -1086,5 +1315,29 @@ mod tests {
         assert!(manifest.directories.contains("src"));
         assert_eq!(manifest.files.len(), 2);
         assert!(format!("{manifest:?}").contains("Registry"));
+
+        let mut native = issued(&verified, "synthetic-owner", "epoch-1");
+        native.class = ImmutableClass::ToolSdk;
+        let native_owner = AcceptingOwner {
+            receipt: "registry-receipt".into(),
+            manifest: native,
+        };
+        assert_eq!(
+            verified
+                .into_registered(
+                    TrustedContext::new(
+                        &native_owner,
+                        "synthetic-owner",
+                        "pkg-1.0.0",
+                        "epoch-1",
+                        "registry-receipt",
+                        &attempt,
+                        Limits::NUCLEUS,
+                    )
+                    .unwrap(),
+                )
+                .unwrap_err(),
+            Refusal::Unsupported
+        );
     }
 }
