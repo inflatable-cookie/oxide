@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
 
@@ -11,7 +12,8 @@ pub struct Budget {
 }
 
 /// Inputs that must match before a slot can be reused.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PartitionKey {
     pub project_component: String,
     pub workflow: String,
@@ -27,7 +29,8 @@ pub struct PartitionKey {
 }
 
 /// Exact consumer and source identity for one admitted run attempt.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunBinding {
     pub consumer: String,
     pub project: String,
@@ -42,6 +45,7 @@ pub struct RunBinding {
 }
 
 /// Opaque credential data validated by the configured consumer authority.
+#[derive(Deserialize, Serialize)]
 pub struct Credential(String);
 
 impl Credential {
@@ -80,7 +84,8 @@ impl fmt::Debug for Credential {
 }
 
 /// Authenticated run envelope from Queue, Nucleus, or another consumer.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunEnvelope {
     pub binding: RunBinding,
     pub partition: PartitionKey,
@@ -227,7 +232,8 @@ pub struct CaptureReceipt {
 }
 
 /// One task-owned child process joined by the cooperative workflow boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessIdentityEvidence {
     pub pid: u32,
     /// A per-spawn identity echoed by the child before it can write.

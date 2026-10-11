@@ -10,6 +10,7 @@
 
 use crate::storage::codec::{Reader, Writer};
 use crate::RunBinding;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -20,6 +21,7 @@ use std::process::Command;
 use std::time::UNIX_EPOCH;
 
 pub mod dep_info;
+pub mod runner_host;
 
 pub const REGISTRATION_VERSION: u32 = 1;
 pub const SOURCE_VERSION: u32 = 1;
@@ -32,7 +34,8 @@ const PENDING: &str = "oxide-registered-pending-v1";
 const CANDIDATE: &str = "oxide-registered-candidate-v1";
 
 /// Engineering ceilings, not measured Nucleus fit. Fixture limits are separate.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     pub file_bytes: usize,
     pub source_bytes: usize,
@@ -109,7 +112,8 @@ fn valid_digest(value: &str) -> bool {
 }
 
 /// Literal launch identity. Only non-secret, audited environment values belong here.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Argv {
     pub executable: PathBuf,
     pub arguments: Vec<String>,
@@ -132,7 +136,8 @@ impl Argv {
 
 /// Registration authority must audit the entire value, including inventory and
 /// every supported script/macro/native behavior read. A digest alone is no audit.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Registration {
     pub version: u32,
     pub source_version: u32,
@@ -156,7 +161,8 @@ pub struct Registration {
 
 /// Supplied task configuration; it has no authority until the consumer verifies
 /// the lease, allocation epoch, clean committed source and exact run binding.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Attempt {
     pub binding: RunBinding,
     pub root_id: String,
@@ -174,7 +180,8 @@ pub struct Attempt {
     pub reused: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceEvidence {
     pub version: u32,
     pub commit: String,
@@ -197,12 +204,13 @@ pub trait RegistrationOwner: Send + Sync {
     fn audit(&self, registration: &Registration, source: &SourceEvidence) -> Result<()>;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ImmutableClass {
     Registry,
     ToolSdk,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArchiveEvidence {
     pub path: PathBuf,
     pub locked_checksum: String,
@@ -210,7 +218,8 @@ pub struct ArchiveEvidence {
 /// Obtained from the accepted issuer, never from a caller declaration. Issuer
 /// verifies archive-to-extraction provenance and no-replacement agreement for
 /// this lease; Oxide independently checks all listed bytes and exact membership.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImmutableManifest {
     pub version: u32,
     pub issuer: String,
@@ -224,13 +233,14 @@ pub struct ImmutableManifest {
     pub archive: Option<ArchiveEvidence>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub enum InputRoot {
     Source,
     Generated,
     Immutable(String),
 }
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct InputPath {
     pub root: InputRoot,
     pub path: String,
@@ -239,7 +249,8 @@ pub struct InputPath {
 /// Semantic variants from pinned Cargo c980f4866 LocalFingerprint. These are
 /// library seams, not a new Cargo capture wire format. The evidence owner must
 /// verify the real unit graph and decode the pinned evidence without truncation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub enum LocalInput {
     DepInfo {
         unit: String,
@@ -261,7 +272,8 @@ pub enum LocalInput {
     },
     Unsupported,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Association {
     pub input: InputPath,
     pub anchors: BTreeSet<String>,
@@ -270,7 +282,8 @@ pub struct Association {
     pub producer: Option<String>,
     pub native_receipt: Option<String>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnitEvidence {
     pub id: String,
     pub locals: Vec<LocalInput>,
@@ -289,7 +302,8 @@ pub trait InputEvidenceOwner: Send + Sync {
     fn verify_map(&self, attempt: &Attempt, map_digest: &str, seal: &str) -> Result<()>;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Launch {
     pub argv: Argv,
     pub binding: RunBinding,
@@ -305,7 +319,8 @@ pub struct Launch {
     pub temp: PathBuf,
     pub capture: PathBuf,
 }
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub enum ExecutionReceipt {
     /// Independently owned terminal/test/artifact/debug evidence reference.
     Completed(String),
@@ -314,7 +329,8 @@ pub enum ExecutionReceipt {
 }
 /// Exact verified input identities that independently retained capture must
 /// match, including generated bytes and dependency/tool source provenance.
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaptureInputs {
     pub source_tree: String,
     pub source_files: BTreeMap<String, String>,

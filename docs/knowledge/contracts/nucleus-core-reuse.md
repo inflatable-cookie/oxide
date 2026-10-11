@@ -1,6 +1,8 @@
 # First Nucleus core-test reuse contract
 
-Status: proposed consumer contract, with inactive library seams implemented.
+Status: proposed consumer contract, with inactive library seams and a private
+framed Rust runner host implemented. No accepted consumer owners or genuine
+consumer integration are installed.
 This contract defines eligibility and owner gates; it does not enable Nucleus, approve its source for execution, or
 claim real-project reuse. [Vision](../vision.md#authority-boundaries) owns
 authority; [architecture](../architecture.md) owns storage/lease invariants;
@@ -697,6 +699,51 @@ the map, input and seal checks, which duplicates the Oxide manager.
 Where a new local boundary is required: nothing in Oxide exposes `Runner` out of
 process today. The framed host above is that boundary. It is new, Oxide-owned and
 inactive until an embedder spawns it.
+
+### Inactive framed host (oxide#028)
+
+The callable library entry points are
+`registered::runner_host::RunnerHost::new` and
+`registered::runner_host::RunnerHost::serve`. Construction installs a Rust
+storage::Client and an embedder-provided OwnerReceiptVerifier; it does not
+spawn a process, register a workflow, install verifier material, or enable a
+default host. The embedder supplies one private Unix stream per attempt. No
+executable or distribution entry point is shipped.
+
+The private protocol is version-1 newline-delimited JSON. It refuses unknown
+operations or versions, unknown top-level fields, malformed/truncated frames,
+and callback replies that do not match the outstanding callback ID, owner,
+subject, policy, and result digest. Its fixed bounds are 8 MiB per frame,
+64 MiB total input/output, 256 owner callbacks, 30 seconds per stream read or
+write, and five minutes per session. JSON u64 values use safe integers through
+2^53-1 and canonical decimal strings above that. Callback subject and result
+digests use compact JSON with object keys sorted by UTF-8 byte order; they are
+separate from source, Git, and consumer-retention digests.
+
+Each callback request binds the exact payload to the acquired slot ID,
+storage-instance ID, generation, reuse result, and complete partition key. Its
+policy digest binds the full registration digest, graph/config/toolchain/debug
+identities, read limits, callback owner, and reviewed registered-map
+implementation pin d9ff17988c7eaa5cf57747bc55bfe4f138692f15. An installed
+verifier must authenticate the returned owner receipt over those digests and
+the result digest. A missing or false verifier result refuses the callback.
+Old map receipts without that pin do not verify. The host asks Runner::run
+only after acquire returns a leased result with a canonical generation, slot
+path, and token. Busy or capacity results return pending before Runner;
+uncertain or unknown accounting remains held. The host holds the lease token
+only in attempt memory and emits its SHA-256 digest, never token material.
+Ambiguous acquire and finalize errors use their exact lookup-only APIs before
+any identical replay; lookup results are never treated as settlement or as
+writer access. A lost token or uncertain result remains held; timeout, PID, or
+label evidence never releases it, and this host does not perform reconciliation.
+
+The test parent uses synthetic receipts and the actual oxide#027 storage
+generation and lookup APIs. It proves the private callback and ownership
+boundary only. No production issuer, real graph/registry/native closure,
+representative test/debug capture, workflow eligibility, or everyday storage
+savings claim is established. A real embedding still needs owner-selected
+issuers and verifier keys, complete input auditing, consumer capture and
+settlement evidence, and its own transport/process policy.
 
 ### Field correspondence
 
