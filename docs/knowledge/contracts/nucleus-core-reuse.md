@@ -192,6 +192,12 @@ Nucleus eligibility, representative fit or independent qualification.
 
 ## Inspected workflow and identity
 
+The bounded installed-root discovery for the exact candidate selector and
+pinned source object is recorded in [Nucleus input-root acquisition](nucleus-input-roots.md).
+It separates the authenticated Git object from the unaccepted Cargo, compiler,
+native-tool and SDK candidates; it does not establish acquisition readiness or
+an accepted production audit issuer.
+
 Read-only inspection on 2026-10-10 used these clean working trees (no porcelain
 status entries), without checkout, fetch, Cargo, selector execution or owner
 contact:
