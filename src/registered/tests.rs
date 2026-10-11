@@ -44,6 +44,7 @@ struct Owners {
     missing_issuer: bool,
     mutable_precalculated: bool,
     extra_env: bool,
+    cargo_context: Mutex<Option<cargo_freshness::TrustedCargoGraphContext>>,
 }
 fn set(values: &[&str]) -> BTreeSet<String> {
     values.iter().map(|s| (*s).to_owned()).collect()
@@ -228,6 +229,7 @@ impl Fixture {
             missing_issuer: false,
             mutable_precalculated: false,
             extra_env: false,
+            cargo_context: Mutex::new(None),
         };
         Self {
             base,
@@ -308,6 +310,428 @@ fn source(path: &str) -> InputPath {
     InputPath {
         root: InputRoot::Source,
         path: path.into(),
+    }
+}
+
+fn write_slot_file(slot: &Path, relative: &str, bytes: &[u8]) {
+    let path = slot.join(relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, bytes).unwrap();
+}
+
+fn observed_association(
+    input: InputPath,
+    anchors: &[&str],
+    producer: Option<&str>,
+    native_receipt: Option<&str>,
+) -> Association {
+    Association {
+        input,
+        anchors: set(anchors),
+        producer: producer.map(str::to_owned),
+        native_receipt: native_receipt.map(str::to_owned),
+    }
+}
+
+fn install_cargo_freshness(fixture: &Fixture) {
+    use cargo_freshness::{CargoDependency, CargoUnitContext, TrustedCargoGraphContext};
+
+    let slot = &fixture.attempt.slot;
+    write_slot_file(
+        slot,
+        "debug/.fingerprint/source-hash/lib-source.json",
+        include_bytes!("cargo_freshness/fixtures/check-dep-info-rerun-environment.json"),
+    );
+    write_slot_file(slot, "debug/deps/source.d", dep_info::UPSTREAM_V1);
+    write_slot_file(slot, "generated.rs", b"generated source");
+    write_slot_file(
+        slot,
+        "debug/.fingerprint/script-hash/run-build-script.json",
+        include_bytes!("cargo_freshness/fixtures/rerun-files.json"),
+    );
+    write_slot_file(
+        slot,
+        "debug/.fingerprint/script-hash/output",
+        b"build script output anchor",
+    );
+    write_slot_file(
+        slot,
+        "debug/.fingerprint/registry-hash/lib-registry.json",
+        include_bytes!("cargo_freshness/fixtures/precalculated.json"),
+    );
+
+    let dep_info_anchor = "debug/deps/source.d";
+    let package_file = |reference_path: &str, input_path: &str| dep_info::RegisteredFile {
+        reference: dep_info::FileReference {
+            tag: dep_info::PathTag::PackageRootRelative,
+            path: reference_path.into(),
+        },
+        input: source(input_path),
+        association: observed_association(source(input_path), &[dep_info_anchor], None, None),
+    };
+    let generated_input = InputPath {
+        root: InputRoot::Generated,
+        path: "generated.rs".into(),
+    };
+    let source_unit = CargoUnitContext {
+        package_root: fixture.attempt.source_root.clone(),
+        package_origin: InputRoot::Source,
+        fingerprint_directory: "debug/.fingerprint/source-hash".into(),
+        fingerprint_file: "lib-source.json".into(),
+        directory_entries: set(&["lib-source.json"]),
+        dep_info: BTreeMap::from([(
+            dep_info_anchor.into(),
+            vec![
+                package_file("src/lib.rs", "src.rs"),
+                dep_info::RegisteredFile {
+                    reference: dep_info::FileReference {
+                        tag: dep_info::PathTag::BuildRootRelative,
+                        path: "build/out.rs".into(),
+                    },
+                    input: generated_input.clone(),
+                    association: observed_association(
+                        generated_input,
+                        &[dep_info_anchor],
+                        Some("script-unit"),
+                        None,
+                    ),
+                },
+                package_file("Cargo.toml", "Cargo.toml"),
+            ],
+        )]),
+        rerun_files: BTreeMap::new(),
+        associations: Vec::new(),
+        dependencies: vec![CargoDependency {
+            package_id: 17,
+            name: "script-unit".into(),
+            public: false,
+            unit: "script-unit".into(),
+        }],
+        effective_environment: fixture.registration.unit_environment["source-unit"].clone(),
+        audited_precalculated_registry_receipt: None,
+        additional_anchors: BTreeSet::new(),
+    };
+
+    let output_anchor = "debug/.fingerprint/script-hash/output";
+    let script_unit = CargoUnitContext {
+        package_root: fixture.attempt.source_root.clone(),
+        package_origin: InputRoot::Source,
+        fingerprint_directory: "debug/.fingerprint/script-hash".into(),
+        fingerprint_file: "run-build-script.json".into(),
+        directory_entries: set(&["run-build-script.json", "output"]),
+        dep_info: BTreeMap::new(),
+        rerun_files: BTreeMap::from([
+            (
+                "build-input".into(),
+                observed_association(source("build-input"), &[output_anchor], None, None),
+            ),
+            (
+                "data".into(),
+                observed_association(source("data"), &[output_anchor], None, None),
+            ),
+        ]),
+        associations: vec![
+            observed_association(
+                InputPath {
+                    root: InputRoot::Immutable("registry-receipt".into()),
+                    path: "sqlite.c".into(),
+                },
+                &[output_anchor],
+                None,
+                Some("tool-receipt"),
+            ),
+            observed_association(
+                InputPath {
+                    root: InputRoot::Immutable("tool-receipt".into()),
+                    path: "header.h".into(),
+                },
+                &[output_anchor],
+                None,
+                Some("tool-receipt"),
+            ),
+        ],
+        dependencies: Vec::new(),
+        effective_environment: fixture.registration.unit_environment["script-unit"].clone(),
+        audited_precalculated_registry_receipt: None,
+        additional_anchors: BTreeSet::new(),
+    };
+
+    let registry = fixture.owners.manifests.get("registry-receipt").unwrap();
+    let registry_unit = CargoUnitContext {
+        package_root: registry.root.clone(),
+        package_origin: InputRoot::Immutable("registry-receipt".into()),
+        fingerprint_directory: "debug/.fingerprint/registry-hash".into(),
+        fingerprint_file: "lib-registry.json".into(),
+        directory_entries: set(&["lib-registry.json"]),
+        dep_info: BTreeMap::new(),
+        rerun_files: BTreeMap::new(),
+        associations: Vec::new(),
+        dependencies: Vec::new(),
+        effective_environment: fixture.registration.unit_environment["registry-unit"].clone(),
+        audited_precalculated_registry_receipt: Some("registry-receipt".into()),
+        additional_anchors: BTreeSet::new(),
+    };
+
+    let context = TrustedCargoGraphContext {
+        cargo_version: cargo_freshness::CARGO_VERSION.into(),
+        cargo_source_commit: cargo_freshness::CARGO_SOURCE_COMMIT.into(),
+        graph_digest: fixture.registration.graph_digest.clone(),
+        build_root: slot.clone(),
+        units: BTreeMap::from([
+            ("source-unit".into(), source_unit),
+            ("script-unit".into(), script_unit),
+            ("registry-unit".into(), registry_unit),
+        ]),
+    };
+    *fixture.owners.cargo_context.lock().unwrap() = Some(context);
+}
+
+fn collect_cargo_fixture(fixture: &Fixture) -> Result<Snapshot> {
+    let runner = Runner {
+        registration_owner: &fixture.owners,
+        input_owner: &fixture.owners,
+        execution_owner: &fixture.owners,
+    };
+    let inputs = runner.inputs(&fixture.registration, &fixture.attempt)?;
+    runner.collect(&fixture.registration, &fixture.attempt, inputs)
+}
+
+#[test]
+fn pinned_cargo_evidence_flows_through_registered_stale_gate() {
+    let mut fixture = Fixture::new();
+    install_cargo_freshness(&fixture);
+    let runner = Runner {
+        registration_owner: &fixture.owners,
+        input_owner: &fixture.owners,
+        execution_owner: &fixture.owners,
+    };
+    let mut producer_inputs = runner
+        .inputs(&fixture.registration, &fixture.attempt)
+        .unwrap();
+    let cargo_context = fixture.owners.cargo_context.lock().unwrap();
+    let unit_evidence = cargo_freshness::collect(
+        &fixture.registration,
+        &fixture.attempt,
+        &producer_inputs.manifests,
+        &mut producer_inputs.budget,
+        cargo_context.as_ref().unwrap(),
+    )
+    .unwrap();
+    let source_evidence = unit_evidence
+        .iter()
+        .find(|unit| unit.id == "source-unit")
+        .unwrap();
+    assert!(source_evidence.anchors.contains("debug/deps/source.d"));
+    assert!(source_evidence
+        .anchors
+        .contains("debug/.fingerprint/source-hash/lib-source.json"));
+    let LocalInput::DepInfo {
+        unit,
+        files,
+        environment,
+        ..
+    } = &source_evidence.locals[0]
+    else {
+        panic!("pinned CheckDepInfo must become registered dep-info evidence")
+    };
+    assert_eq!(unit, "source-unit");
+    assert_eq!(environment.get("ABSENT"), Some(&None));
+    assert_eq!(environment.get("EMPTY"), Some(&Some(String::new())));
+    assert!(files.contains(&InputPath {
+        root: InputRoot::Generated,
+        path: "generated.rs".into(),
+    }));
+    assert!(source_evidence.associations.iter().any(|association| {
+        association.input.root == InputRoot::Generated
+            && association.producer.as_deref() == Some("script-unit")
+    }));
+    assert!(source_evidence.locals.iter().any(|local| matches!(
+        local,
+        LocalInput::RerunEnvironment {
+            name,
+            value: None
+        } if name == "ABSENT"
+    )));
+    assert!(source_evidence.locals.iter().any(|local| matches!(
+        local,
+        LocalInput::RerunEnvironment {
+            name,
+            value: Some(value)
+        } if name == "EMPTY" && value.is_empty()
+    )));
+    let script_evidence = unit_evidence
+        .iter()
+        .find(|unit| unit.id == "script-unit")
+        .unwrap();
+    assert!(script_evidence.associations.iter().any(|association| {
+        association.input.path == "header.h"
+            && association.native_receipt.as_deref() == Some("tool-receipt")
+    }));
+    let registry_evidence = unit_evidence
+        .iter()
+        .find(|unit| unit.id == "registry-unit")
+        .unwrap();
+    assert!(matches!(
+        &registry_evidence.locals[..],
+        [LocalInput::Precalculated {
+            registry_receipt,
+            ..
+        }] if registry_receipt == "registry-receipt"
+    ));
+    drop(cargo_context);
+
+    let first = runner
+        .collect(
+            &fixture.registration,
+            &fixture.attempt,
+            runner
+                .inputs(&fixture.registration, &fixture.attempt)
+                .unwrap(),
+        )
+        .unwrap();
+
+    let dep_info_anchor = "debug/deps/source.d";
+    let anchor_mtime = first.anchors[dep_info_anchor].mtime;
+    assert!(first.inputs.contains_key(&InputPath {
+        root: InputRoot::Generated,
+        path: "generated.rs".into(),
+    }));
+    assert!(first.inputs.contains_key(&InputPath {
+        root: InputRoot::Immutable("registry-receipt".into()),
+        path: "sqlite.c".into(),
+    }));
+    assert!(first.inputs.contains_key(&InputPath {
+        root: InputRoot::Immutable("tool-receipt".into()),
+        path: "header.h".into(),
+    }));
+    assert!(first.directories.contains_key(&source("data")));
+    let semantics = &first.semantics;
+    assert!(!semantics.is_empty());
+
+    drop(runner);
+    fixture.changed_source(SystemTime::UNIX_EPOCH + Duration::from_nanos(anchor_mtime));
+    let runner = Runner {
+        registration_owner: &fixture.owners,
+        input_owner: &fixture.owners,
+        execution_owner: &fixture.owners,
+    };
+    let current = runner
+        .collect(
+            &fixture.registration,
+            &fixture.attempt,
+            runner
+                .inputs(&fixture.registration, &fixture.attempt)
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(admit(&first, &current), Err(Refusal::Stale));
+}
+
+#[test]
+fn checksum_and_mutable_precalculated_fingerprints_refuse() {
+    for (checksum, mutable_precalculated) in [(true, false), (false, true)] {
+        let fixture = Fixture::new();
+        install_cargo_freshness(&fixture);
+        if checksum {
+            let source_path = fixture
+                .attempt
+                .slot
+                .join("debug/.fingerprint/source-hash/lib-source.json");
+            let source_json = fs::read_to_string(&source_path).unwrap();
+            fs::write(
+                &source_path,
+                source_json.replace("\"checksum\": false", "\"checksum\": true"),
+            )
+            .unwrap();
+        }
+        if mutable_precalculated {
+            let mut context = fixture.owners.cargo_context.lock().unwrap();
+            let registry = context
+                .as_mut()
+                .unwrap()
+                .units
+                .get_mut("registry-unit")
+                .unwrap();
+            registry.package_root = fixture.attempt.source_root.clone();
+            registry.package_origin = InputRoot::Source;
+        }
+        let runner = Runner {
+            registration_owner: &fixture.owners,
+            input_owner: &fixture.owners,
+            execution_owner: &fixture.owners,
+        };
+        let result = runner.collect(
+            &fixture.registration,
+            &fixture.attempt,
+            runner
+                .inputs(&fixture.registration, &fixture.attempt)
+                .unwrap(),
+        );
+        assert_eq!(result, Err(Refusal::Unsupported));
+    }
+}
+
+#[test]
+fn cargo_collector_refuses_graph_mapping_and_inventory_gaps() {
+    for scenario in 0..7 {
+        let fixture = Fixture::new();
+        install_cargo_freshness(&fixture);
+        {
+            let mut context = fixture.owners.cargo_context.lock().unwrap();
+            let context = context.as_mut().unwrap();
+            match scenario {
+                0 => context.graph_digest = digest(b"different audited graph"),
+                1 => context
+                    .units
+                    .get_mut("source-unit")
+                    .unwrap()
+                    .dep_info
+                    .clear(),
+                2 => context
+                    .units
+                    .get_mut("source-unit")
+                    .unwrap()
+                    .dependencies
+                    .push(cargo_freshness::CargoDependency {
+                        package_id: 18,
+                        name: "extra-edge".into(),
+                        public: false,
+                        unit: "script-unit".into(),
+                    }),
+                3 => {
+                    let script = context.units.get_mut("script-unit").unwrap();
+                    script.associations.push(script.associations[0].clone());
+                }
+                4 => {
+                    context
+                        .units
+                        .get_mut("script-unit")
+                        .unwrap()
+                        .directory_entries
+                        .remove("output");
+                }
+                5 => {
+                    context
+                        .units
+                        .get_mut("source-unit")
+                        .unwrap()
+                        .fingerprint_file = "../outside.json".into();
+                }
+                6 => {
+                    let extra = context.units.remove("registry-unit").unwrap();
+                    context.units.insert("extra-unit".into(), extra);
+                }
+                _ => unreachable!(),
+            }
+        }
+        let expected = match scenario {
+            0 => Refusal::Identity,
+            1..=3 => Refusal::MissingAuthority,
+            4 => Refusal::Membership,
+            5 => Refusal::Unsupported,
+            _ => Refusal::Identity,
+        };
+        assert_eq!(collect_cargo_fixture(&fixture), Err(expected));
     }
 }
 impl InputEvidenceOwner for Owners {
@@ -446,6 +870,20 @@ impl InputEvidenceOwner for Owners {
             units[0].locals.push(LocalInput::Unsupported);
         }
         Ok(units)
+    }
+    fn units_with_budget(
+        &self,
+        registration: &Registration,
+        attempt: &Attempt,
+        manifests: &BTreeMap<String, ImmutableManifest>,
+        budget: &mut EvidenceReadBudget,
+    ) -> Result<Vec<UnitEvidence>> {
+        let context = self.cargo_context.lock().unwrap();
+        if let Some(context) = context.as_ref() {
+            cargo_freshness::collect(registration, attempt, manifests, budget, context)
+        } else {
+            self.units(registration, attempt)
+        }
     }
     fn seal_map(&self, _: &Attempt, map_digest: &str) -> Result<String> {
         let seal = format!("synthetic-seal-{map_digest}");
