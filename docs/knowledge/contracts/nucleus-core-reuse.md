@@ -940,27 +940,135 @@ service or production-readiness claim. Nucleus's existing client below is still
 inactive and unchanged; its owner receives this callable surface only through
 reviewed merge/closeout and separately scoped integration.
 
-#### Remaining runtime and timing seams
+#### Private storage-runtime process (oxide#033)
 
-The executable above connects to an existing storage socket. Its covering Rust
-test embedder constructs `Daemon::bind`, installs `QualificationAuthority` and
-binds the actual instance; that embedder is not a callable consumer runtime.
-Nucleus's TypeScript client has no reviewed way to start those Rust objects.
-Oxide must supply a private, unpublished storage-runtime process with trusted
-bootstrap, authenticated readiness and exact instance/endpoint identity,
-explicit finite authority and free-space policy, bounded lifetime and preserved
-uncertain leases. No runtime command or control schema is supplied by this
-requirement. Nucleus owns the eventual process/channel lifetime and integration;
-its current consumer brief does not authorize Rust harness implementation.
+The callable runtime is unpublished (`publish = false`) and behind feature
+`private-qualification`. Artifact `oxide-storage-runtime`, source
+`src/bin/storage_runtime.rs`, library `registered::storage_runtime`. Build with
+`effigy rust:private-compile`. The covering `effigy rust:private-process` builds it
+offline with the committed lockfile and passes its executable path as
+`OXIDE_STORAGE_RUNTIME`. The proof launches actual children, uses the real storage
+`Client` for cold publication, sequential same-slot reuse, unapproved admission and
+forged settlement refusal, control loss and lifetime expiry with restart, then
+authenticated shutdown. Its bootstrap, readiness and shutdown are constructed by the
+trusted parent in test code. The parent never constructs `Daemon` for these sessions.
 
-Independent review of the actual process confirms that the unchanged
-30-second I/O and five-minute session limits do not establish a fit for genuine
-capacity wait plus compilation, tests and capture. A separately reviewed timing
-surface must bind explicit finite limits to the trusted attempt, enforce a
-nonrenewable deadline and preserve ownership on timeout or channel loss. It
-must not silently enlarge the existing protocol's defaults. This remains an
-implementation prerequisite, not authority to run the real workflow or change
-consumer admission.
+Callable surface: `oxide-storage-runtime <canonical-bootstrap-file>`. It takes one
+non-secret path. Keys, budgets and roots come only from the bootstrap. No environment
+discovery, command-line secrets, install, service or default executable is supplied.
+
+Exit codes: `0` authenticated shutdown, `2` lifetime, control EOF or control refusal
+after durable state was left as it was, `1` refusal before effects or any other
+failure. Exit `2` writes `private storage runtime stopped: <Stop>` to stderr. Neither
+exit proves writer completion or Idle.
+
+**Bootstrap** (version 1 JSON; unknown fields refuse; read with the oxide#029 protected-file
+rules: canonical, owner-only mode 0600, one link, no-follow, stable identity, at most
+64 KiB):
+
+| Field | Meaning |
+| --- | --- |
+| `version`, `storage_protocol`, `control_protocol` | All `1`. Storage remains `OXSTOR01`, ledger version 3. |
+| `scope` | Owner-approved qualification scope, 1–4096 bytes. |
+| `expires_unix_seconds` | Owner's remaining window, as WireU64. Must be in the future. Effective lifetime is `min(expires - now, 2700 s)`. |
+| `storage_root` | Absolute canonical owner-only (0700) directory. The daemon endpoint is `<root>/daemon.sock`. |
+| `budget` | `{cap_bytes > 0, free_reserve_bytes}` as WireU64. Explicit finite policy, not kernel enforcement, not aggregate footprint, not a host reserve. |
+| `admissions` | 1–4 approved `{binding, partition, admission_reference}` subjects with no credentials. The owner mints credentials after readiness reports the instance. |
+| `authority_key_hex` | 64 lowercase hex. Admission and settlement authenticator for `QualificationAuthority`. |
+| `control_key_hex` | 64 lowercase hex. Readiness and shutdown authenticator, distinct from the authority key. |
+| `control` | `{path, device, inode}` for the pinned parent Unix listener: socket mode 0600, owner uid, private 0700 parent, parent is not the storage root. |
+
+WireU64 means a safe JSON integer through 2^53-1 or canonical decimal text above
+that. Non-Rust producers must write exact integer digits or decimal text, never a
+JavaScript `Number`.
+
+**Startup, before effects.** Read and validate the bootstrap. Validate the owned
+storage root, the pinned control identity, the budget and the window. Create the
+exclusive replay marker `runtime-<sha256 hex of the exact bootstrap bytes>`
+(mode 0600, synced) in the control parent. Existing markers refuse, and the file
+stays for the owner. Unlink the consumed bootstrap, then connect to the pinned control
+listener and recheck its identity. Call `Daemon::bind` with `QualificationAuthority` and
+`OwnedRootFreeSpace`. That probe calls statvfs on the one owned canonical root only.
+It uses checked `f_bavail * f_frsize` and refuses unknown capacity or any other path.
+Install the instance, capture the storage endpoint and write ready. A failure after
+the control connection writes an authenticated `failed` frame when it can, with code
+`refused`, `storage`, `io` or `protocol`.
+
+**Control frames.** Newline-delimited JSON. Each frame is at most 64 KiB. Reads total
+at most 256 KiB across the session. Each blocked read resumes after 30 seconds. Writes
+time out after 30 seconds. Unknown operations, unknown fields, bad MACs, oversize and
+truncated frames refuse. Control traffic never renews the lifetime.
+
+**Ready** (runtime to parent, one frame): `version`, `operation: "ready"`, `scope`,
+`bootstrap_digest` (`sha256:` of the exact bootstrap bytes), `policy_digest` (canonical
+digest of `{scope, storage_protocol, control_protocol, budget, admissions}` with
+credentials excluded), `storage_instance_id` (64 lowercase hex), `storage`
+(`{path, device, inode}`), `storage_protocol`, `control_protocol`, `budget`,
+`expires_unix_seconds` (the effective deadline), then `mac`. Parent verification
+(`registered::storage_runtime::verify_ready`) checks the MAC, scope, digests, instance
+text, the exact endpoint path and device/inode captured on the parent side. Ready is
+metadata only. It grants no lease, token, admission or submission.
+
+**Shutdown and ack.** Parent to runtime: `{version: 1, operation: "shutdown", id, mac}`.
+`id` is 1–128 bytes of `[A-Za-z0-9_-]`. The runtime stops its daemon, then sends
+`{version: 1, operation: "stopped", id, mac}` only after an authenticated shutdown.
+
+**MAC domains.** Each uses HMAC-SHA256 through the 029 length-prefixed framing, with
+the domain first. Keys are not interchangeable.
+
+| Domain | Key | Fields after the domain |
+| --- | --- | --- |
+| `oxide-runtime-ready-v1` | control | scope, bootstrap digest, policy digest, instance, canonical digest of the ready body without `mac` |
+| `oxide-runtime-shutdown-v1` | control | scope, instance, bootstrap digest, id |
+| `oxide-runtime-stopped-v1` | control | scope, instance, bootstrap digest, id |
+| `oxide-runtime-failed-v1` | control | scope, bootstrap digest, code |
+| `oxide-admission-v1`, `oxide-settlement-v1`, `oxide-terminal-v1`, `oxide-capture-v1` | authority | unchanged 029 domains |
+
+**Lifetime.** The deadline is monotonic and set once at startup. `Stop` values:
+
+| Stop | Trigger | Exit | Ack | Durable state |
+| --- | --- | --- | --- | --- |
+| `Shutdown(id)` | authenticated shutdown | 0 | `stopped` | unchanged |
+| `Lifetime` | effective window elapsed | 2 | none | leases stay held |
+| `ControlClosed` | parent EOF | 2 | none | leases stay held |
+| `ControlRefused` | refused control frame | 2 | none | leases stay held |
+
+A held lease restarts as `Uncertain` through the existing daemon recovery. A runtime
+that ends by exit, PID loss, deadline or EOF never releases a lease or makes a slot
+Idle. The runtime never deletes the bootstrap, replay marker, storage root, slots or
+ledger. It stops only its own daemon and never a scheduler's external workload.
+
+**Pins.** Map implementation `d9ff17988c7eaa5cf57747bc55bfe4f138692f15`. Rust
+`1.97.1`. Dependencies `hmac 0.12.1`, `sha2 0.10.9`, `libc 0.2.190`, `serde 1.0.229`,
+`serde_json 1.0.151`. Independent vector `fixtures/storage-runtime-ready-v1.json`.
+The Node check in `scripts/qualification-vectors.mjs` recomputes the MAC and refuses
+substitutions and forgeries. The Rust test runs the production verifier on the same
+bytes.
+
+**Timing.** The framed host keeps its 30-second I/O and five-minute session limits.
+This runtime does not change them. Real Cargo capacity wait, compilation, tests and
+capture still need the separately reviewed runner timing surface before a real
+workflow can run.
+
+**TypeScript owner sketch.** Illustrative only. The owner must verify every field
+before it uses the instance.
+
+```ts
+const child = spawn(artifactPath, [bootstrapPath], { env: {}, stdio: ['ignore', 'ignore', 'pipe'] });
+const ready = await readControlFrame(parentListener);       // newline JSON, <= 64 KiB
+const identity = verifyReady(ready, expectation, controlKey); // HMAC + exact endpoint; no lease implied
+// Mint admission credentials for identity.storage_instance_id with the authority key,
+// then connect the existing client to identity.storage.path. Keep device/inode as exact text.
+writeControlFrame(parentListener, shutdownFrame(id, identity, controlKey)); // expect stopped ack
+```
+
+**Known gap and not proven.** The storage client decodes `InvalidInput` and `Protocol`
+error payloads without consuming their strings, so a daemon error of those kinds reaches
+the caller as `trailing response data`. Both paths still fail closed. This is an existing
+codec defect, not fixed here. Also not supplied: a production issuer or installed
+authority, a persistent secret store, real Cargo input or debug capture, real footprint
+evidence, host installation or service, consumer adoption and any real storage saving.
+The runner timing work is a separate seam and is not changed here.
 
 ### Inactive Nucleus client
 

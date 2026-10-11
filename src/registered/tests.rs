@@ -17,6 +17,8 @@ use std::time::{Duration, SystemTime};
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "private-qualification")]
 mod private_qualification;
+#[cfg(feature = "private-qualification")]
+mod private_qualification_runtime;
 struct Fixture {
     base: PathBuf,
     registration: Registration,

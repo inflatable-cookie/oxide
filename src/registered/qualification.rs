@@ -25,6 +25,7 @@ const MAX_MAC_BYTES: usize = 1024 * 1024;
 const PIN: &str = "d9ff17988c7eaa5cf57747bc55bfe4f138692f15";
 
 /// Explicitly supplied 256-bit qualification key. Debug never exposes it.
+#[derive(Clone)]
 pub struct MacKey([u8; 32]);
 impl fmt::Debug for MacKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -415,6 +416,28 @@ impl Bootstrap {
 /// pinned parent stream. The daemon is owner-launched, using the real API and
 /// independently installed QualificationAuthority. No service is installed.
 pub fn serve_bootstrap(path: &Path) -> Result<(), HostError> {
+    let mut bytes = read_protected(path)?;
+    let bootstrap: Bootstrap = serde_json::from_slice(&bytes).map_err(|_| HostError::Protocol)?;
+    bootstrap.validate()?;
+    let verifier = CallbackAuthenticator::new(
+        MacKey::from_hex(&bootstrap.callback_key_hex)?,
+        bootstrap.callback_context()?,
+    )?;
+    fs::remove_file(path).map_err(|_| HostError::Io)?;
+    // Disposal removes the owner-side file before any attempt effects. Memory
+    // is process-lifetime; no persistence, logs or secret recovery are provided.
+    bytes.fill(0);
+    let stream = UnixStream::connect(&bootstrap.parent.path).map_err(|_| HostError::Io)?;
+    bootstrap.parent.check()?;
+    RunnerHost::new(bootstrap.storage.path.clone(), Arc::new(verifier))
+        .qualified(AttemptGrant { bootstrap })
+        .serve(stream)
+        .map(|_| ())
+}
+/// Reads one owner-only, single-link, bounded file without following links.
+/// The named and opened identities must agree before and after the read.
+/// The caller owns consumption and unlinking after its own validation.
+pub(super) fn read_protected(path: &Path) -> Result<Vec<u8>, HostError> {
     private_directory(path.parent().ok_or(HostError::Protocol)?)?;
     if fs::canonicalize(path).map_err(|_| HostError::Io)? != path {
         return Err(HostError::Protocol);
@@ -449,29 +472,13 @@ pub fn serve_bootstrap(path: &Path) -> Result<(), HostError> {
     {
         return Err(HostError::Protocol);
     }
-    let bootstrap: Bootstrap = serde_json::from_slice(&bytes).map_err(|_| HostError::Protocol)?;
-    bootstrap.validate()?;
-    let verifier = CallbackAuthenticator::new(
-        MacKey::from_hex(&bootstrap.callback_key_hex)?,
-        bootstrap.callback_context()?,
-    )?;
-    fs::remove_file(path).map_err(|_| HostError::Io)?;
-    // Disposal removes the owner-side file before any attempt effects. Memory
-    // is process-lifetime; no persistence, logs or secret recovery are provided.
-    bytes.fill(0);
-    drop(file);
-    let stream = UnixStream::connect(&bootstrap.parent.path).map_err(|_| HostError::Io)?;
-    bootstrap.parent.check()?;
-    RunnerHost::new(bootstrap.storage.path.clone(), Arc::new(verifier))
-        .qualified(AttemptGrant { bootstrap })
-        .serve(stream)
-        .map(|_| ())
+    Ok(bytes)
 }
-fn owner_uid() -> u32 {
+pub(super) fn owner_uid() -> u32 {
     // SAFETY: geteuid takes no pointers or arguments and has no preconditions.
     unsafe { libc::geteuid() }
 }
-fn private_directory(path: &Path) -> Result<(), HostError> {
+pub(super) fn private_directory(path: &Path) -> Result<(), HostError> {
     owned_directory(path)?;
     let m = fs::symlink_metadata(path).map_err(|_| HostError::Io)?;
     if m.mode() & 0o7777 != 0o700 {
@@ -479,7 +486,7 @@ fn private_directory(path: &Path) -> Result<(), HostError> {
     }
     Ok(())
 }
-fn owned_directory(path: &Path) -> Result<(), HostError> {
+pub(super) fn owned_directory(path: &Path) -> Result<(), HostError> {
     let m = fs::symlink_metadata(path).map_err(|_| HostError::Io)?;
     if !m.is_dir()
         || m.uid() != owner_uid()
@@ -502,7 +509,7 @@ fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
         && a.ctime() == b.ctime()
         && a.ctime_nsec() == b.ctime_nsec()
 }
-fn decode_hex(value: &str) -> Option<[u8; 32]> {
+pub(super) fn decode_hex(value: &str) -> Option<[u8; 32]> {
     if value.len() != 64
         || !value
             .bytes()
@@ -517,10 +524,10 @@ fn decode_hex(value: &str) -> Option<[u8; 32]> {
     }
     Some(key)
 }
-fn hex(bytes: &[u8]) -> String {
+pub(super) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
-fn valid_digest(value: &str) -> bool {
+pub(super) fn valid_digest(value: &str) -> bool {
     value.strip_prefix("sha256:").and_then(decode_hex).is_some()
 }
 

@@ -20,5 +20,10 @@ name = "oxide-qualified-runner"
 path = "src/bin/qualified_runner.rs"
 required-features = ["private-qualification"]
 
+[[bin]]
+name = "oxide-storage-runtime"
+path = "src/bin/storage_runtime.rs"
+required-features = ["private-qualification"]
+
 [lib]
 path = "src/lib.rs"
