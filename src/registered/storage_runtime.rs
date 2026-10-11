@@ -319,32 +319,47 @@ struct Plan {
     expires_unix_seconds: u64,
 }
 
-/// Nonrenewable window measured from the entry instant and its Unix timestamp. The
-/// owner's remaining seconds are counted from entry, so startup time is inside the window.
-/// The ceiling leaves room for the stop grace and the exit tolerance, so the serve-phase
-/// bound (window end plus grace plus tolerance) never passes the 45-minute ceiling.
-/// `None` means the window is already spent.
-fn session_window(
-    entry: Instant,
-    entry_unix: u64,
-    expires_unix: u64,
-    stop_grace: Duration,
-) -> Option<(Instant, u64)> {
-    let remaining = Duration::from_secs(expires_unix.checked_sub(entry_unix)?);
+/// Entry sample for the owner window: the monotonic instant and the wall clock, taken as a
+/// pair. The instant is sampled first, so any gap between the two shortens the window
+/// instead of extending it.
+#[derive(Clone, Copy, Debug)]
+struct Entry {
+    instant: Instant,
+    wall: Duration,
+}
+
+fn sample_entry() -> Result<Entry, HostError> {
+    let instant = Instant::now();
+    let wall = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| HostError::Protocol)?;
+    Ok(Entry { instant, wall })
+}
+
+/// Nonrenewable window from the entry sample, in exact arithmetic. The owner's end is
+/// compared with the full-precision entry wall clock, so no fractional second is dropped.
+/// The monotonic deadline is `entry.instant + lifetime`, and `lifetime` never exceeds
+/// `owner_end - entry.wall`, so the deadline never passes the owner's end. The ceiling
+/// leaves room for the stop grace and the exit tolerance. The published expiry is the whole
+/// second at or before `entry.wall + lifetime`. It is never later than the deadline, so the
+/// parent may refuse up to one second early and never late. `None` means the window is
+/// already spent or cannot be represented.
+fn session_window(entry: Entry, expires_unix: u64, stop_grace: Duration) -> Option<(Instant, u64)> {
+    let remaining = Duration::from_secs(expires_unix).checked_sub(entry.wall)?;
     if remaining.is_zero() {
         return None;
     }
-    let lifetime = remaining.min(MAX_LIFETIME - stop_grace - EXIT_TOLERANCE);
-    Some((entry + lifetime, entry_unix + lifetime.as_secs()))
+    let cap = MAX_LIFETIME
+        .checked_sub(stop_grace)?
+        .checked_sub(EXIT_TOLERANCE)?;
+    let lifetime = remaining.min(cap);
+    let deadline = entry.instant.checked_add(lifetime)?;
+    let published = entry.wall.checked_add(lifetime)?.as_secs();
+    Some((deadline, published))
 }
 
 impl RuntimeBootstrap {
-    fn validate(
-        &self,
-        entry: Instant,
-        entry_unix: u64,
-        digest: &str,
-    ) -> Result<(Plan, PathBuf), HostError> {
+    fn validate(&self, entry: Entry, digest: &str) -> Result<(Plan, PathBuf), HostError> {
         if self.version != PROTOCOL_VERSION
             || self.storage_protocol != PROTOCOL_VERSION
             || self.control_protocol != PROTOCOL_VERSION
@@ -355,7 +370,6 @@ impl RuntimeBootstrap {
             || self.budget.cap_bytes.0 == 0
             || self.stop_grace_seconds.0 == 0
             || self.stop_grace_seconds.0 > MAX_STOP_GRACE.as_secs()
-            || self.expires_unix_seconds.0 <= entry_unix
             || self.authority_key_hex == self.control_key_hex
             || !self.storage_root.is_absolute()
         {
@@ -384,7 +398,7 @@ impl RuntimeBootstrap {
         }
         let stop_grace = Duration::from_secs(self.stop_grace_seconds.0);
         let (deadline, expires_unix_seconds) =
-            session_window(entry, entry_unix, self.expires_unix_seconds.0, stop_grace)
+            session_window(entry, self.expires_unix_seconds.0, stop_grace)
                 .ok_or(HostError::Protocol)?;
         let plan = Plan {
             scope: self.scope.clone(),
@@ -445,12 +459,9 @@ impl FreeSpaceProbe for OwnedRootFreeSpace {
 /// Failures after the control connection send an authenticated `failed` frame, bounded
 /// by `EXIT_TOLERANCE`.
 pub fn serve_bootstrap(path: &Path) -> Result<Stop, HostError> {
-    let entry = Instant::now();
-    let entry_unix = unix_now()?;
+    let entry = sample_entry()?;
     let path = path.to_path_buf();
-    supervise_startup(entry, move |events| {
-        startup(&path, entry, entry_unix, events)
-    })
+    supervise_startup(entry.instant, move |events| startup(&path, entry, events))
 }
 
 /// Progress from the startup worker to the process supervisor.
@@ -544,17 +555,12 @@ where
 
 /// Startup from the bootstrap to the connected serve loop. Each blocking step checks the
 /// window first, so an expired window stops before the next effect.
-fn startup(
-    path: &Path,
-    entry: Instant,
-    entry_unix: u64,
-    events: &mpsc::Sender<Event>,
-) -> Result<Stop, HostError> {
+fn startup(path: &Path, entry: Entry, events: &mpsc::Sender<Event>) -> Result<Stop, HostError> {
     let mut bytes = read_protected(path)?;
     let digest = bootstrap_digest(&bytes);
     let bootstrap: RuntimeBootstrap =
         serde_json::from_slice(&bytes).map_err(|_| HostError::Protocol)?;
-    let (plan, socket) = bootstrap.validate(entry, entry_unix, &digest)?;
+    let (plan, socket) = bootstrap.validate(entry, &digest)?;
     let window_end = plan.deadline;
     let _ = events.send(Event::Window(window_end));
     before(window_end)?;
@@ -1106,23 +1112,61 @@ mod tests {
         read_frames(BufReader::new(std::io::Cursor::new(bytes)), &context())
     }
 
+    fn entry_at(instant: Instant, wall_millis: u64) -> Entry {
+        Entry {
+            instant,
+            wall: Duration::from_millis(wall_millis),
+        }
+    }
+
     #[test]
-    fn private_qualification_runtime_window_is_counted_from_entry_not_after_startup() {
+    fn private_qualification_runtime_fractional_entry_never_extends_the_owner_window() {
         let grace = Duration::from_secs(2);
-        let entry = Instant::now() - Duration::from_secs(5);
-        let entry_unix = unix_now().unwrap() - 5;
-        let (deadline, expires) =
-            session_window(entry, entry_unix, entry_unix + 10, grace).unwrap();
-        // Five seconds of startup are inside the ten-second window, not added after it.
-        assert_eq!(deadline, entry + Duration::from_secs(10));
-        assert!(deadline < Instant::now() + Duration::from_secs(10));
-        assert_eq!(expires, entry_unix + 10);
-        // The 45-minute ceiling leaves room for the stop grace.
-        let (capped, _) = session_window(entry, entry_unix, entry_unix + 100_000, grace).unwrap();
-        assert_eq!(capped, entry + MAX_LIFETIME - grace - EXIT_TOLERANCE);
-        // An already spent window refuses.
-        assert!(session_window(entry, entry_unix, entry_unix, grace).is_none());
-        assert!(session_window(entry, entry_unix, entry_unix - 1, grace).is_none());
+        let instant = Instant::now();
+        // Entry wall 199.8 against an owner end of 200 leaves 200 ms. The deadline is exact,
+        // not a whole second later, and the published expiry is the whole second not past it.
+        let (deadline, published) = session_window(entry_at(instant, 199_800), 200, grace).unwrap();
+        assert_eq!(deadline, instant + Duration::from_millis(200));
+        assert_eq!(published, 200);
+        // Subsecond entries and a 1 ms remainder never exceed the owner's remaining time.
+        let owner_end = Duration::from_secs(200);
+        for wall in [199_000_u64, 199_001, 199_500, 199_999] {
+            let entry = entry_at(instant, wall);
+            let (deadline, published) = session_window(entry, 200, grace).unwrap();
+            assert!(deadline <= instant + (owner_end - entry.wall));
+            assert!(published <= 200);
+            assert!(Duration::from_secs(published) <= entry.wall + (deadline - instant));
+        }
+        // A whole-second entry gets exactly the whole second that remains.
+        let (deadline, _) = session_window(entry_at(instant, 199_000), 200, grace).unwrap();
+        assert_eq!(deadline, instant + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn private_qualification_runtime_expired_and_unrepresentable_windows_refuse() {
+        let grace = Duration::from_secs(2);
+        let instant = Instant::now();
+        // At, just past and far past the owner's end are all spent.
+        assert!(session_window(entry_at(instant, 200_000), 200, grace).is_none());
+        assert!(session_window(entry_at(instant, 200_001), 200, grace).is_none());
+        assert!(session_window(entry_at(instant, 999_999_000), 200, grace).is_none());
+        // A zero expiry is spent at any entry.
+        assert!(session_window(entry_at(instant, 0), 0, grace).is_none());
+    }
+
+    #[test]
+    fn private_qualification_runtime_window_cap_and_overflow_stay_exact() {
+        let grace = Duration::from_secs(2);
+        let instant = Instant::now();
+        let cap = MAX_LIFETIME - grace - EXIT_TOLERANCE;
+        // A long owner window takes the cap exactly, measured from entry.
+        let entry = entry_at(instant, 1_000_000_000_000);
+        let (deadline, published) = session_window(entry, 1_000_000_100_000, grace).unwrap();
+        assert_eq!(deadline, instant + cap);
+        assert_eq!(published, 1_000_000_000 + cap.as_secs());
+        // The largest representable expiry takes the cap and does not overflow.
+        let (capped, _) = session_window(entry_at(instant, 1_000_000), u64::MAX, grace).unwrap();
+        assert_eq!(capped, instant + cap);
     }
 
     #[test]

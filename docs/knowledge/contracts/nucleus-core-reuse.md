@@ -973,7 +973,7 @@ rules: canonical, owner-only mode 0600, one link, no-follow, stable identity, at
 | --- | --- |
 | `version`, `storage_protocol`, `control_protocol` | All `1`. Storage remains `OXSTOR01`, ledger version 3. |
 | `scope` | Owner-approved qualification scope, 1–4096 bytes. |
-| `expires_unix_seconds` | Owner's remaining window end, as WireU64. The window is counted from the entry instant, when `serve_bootstrap` is called and before the bootstrap is read. The effective window is `min(expires - entry, 2700 s - stop_grace - 2 s)`. Startup time is inside the window. |
+| `expires_unix_seconds` | Owner's remaining window end, as WireU64. The window is counted from the entry sample, taken when `serve_bootstrap` is called and before the bootstrap is read. The entry monotonic instant and the full-precision wall clock are sampled as a pair, with the instant first. The lifetime is `min(expires - entry_wall, 2700 s - stop_grace - 2 s)`, in exact arithmetic. No fractional second is dropped. The monotonic deadline is `entry_instant + lifetime`, so it never passes the owner's end. The published expiry is the whole second at or before `entry_wall + lifetime`. It is never later than the deadline, so the parent may refuse up to one second early and never late. Startup time is inside the window. |
 | `stop_grace_seconds` | WireU64, 1–10. Bounded wait after a stop before an in-flight storage operation is abandoned. Bound into `policy_digest`. |
 | `storage_root` | Absolute canonical owner-only (0700) directory. The daemon endpoint is `<root>/daemon.sock`. |
 | `budget` | `{cap_bytes > 0, free_reserve_bytes}` as WireU64. Explicit finite policy, not kernel enforcement, not aggregate footprint, not a host reserve. |
@@ -1063,7 +1063,7 @@ truncated frames refuse. Control traffic never renews the lifetime.
 digest of `{scope, storage_protocol, control_protocol, budget, stop_grace_seconds, admissions}`
 with credentials excluded), `storage_instance_id` (64 lowercase hex), `storage`
 (`{path, device, inode}`), `storage_protocol`, `control_protocol`, `budget`,
-`expires_unix_seconds` (the effective deadline), then `mac`. Parent verification
+`expires_unix_seconds` (the whole second at or before the effective deadline), then `mac`. Parent verification
 (`registered::storage_runtime::verify_ready`) checks the MAC, scope, digests, instance
 text, the exact endpoint path and device/inode captured on the parent side. Ready is
 metadata only. It grants no lease, token, admission or submission. The parent refuses a ready
