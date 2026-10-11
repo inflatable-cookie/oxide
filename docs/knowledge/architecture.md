@@ -305,3 +305,7 @@ The implemented fixture remains fixed; registry/native/opaque input coverage,
 external immutable input receipts, consumer authentication and path/lifecycle
 fields described there are proposals, not current admission support.
 No production activation or cross-root reuse follows from this design.
+The separate proposed cooperative, graph-free same-root qualification route is
+defined in [ordinary-Cargo storage](contracts/ordinary-cargo-storage.md); it
+does not change the registered Runner's input requirements or authorize
+consumer activation.
