@@ -781,6 +781,12 @@ from UTF-8 byte order, so neither may feed Oxide.
 - Finalize uses the existing `operation_id`. A lost finalize reply goes through
   `reconcileFinalize` first, then the identical finalize ID, and only after verified
   absence.
+- The proposed bridge requires authenticated lookup-only acquire and finalize
+  recovery. Current `Client::acquire` may allocate when an attempt is absent, so
+  it cannot implement that lookup. Current `Client::reconcile` accepts settlement
+  evidence and may change lease state; it is not a read-only operation lookup.
+  A cancelled submission must not restart acquisition during recovery. Lost
+  tokens or uncertain ownership hold; a finalized replay grants no access.
 - Time, PID, filenames (`PENDING`, `CANDIDATE`), labels, SHA hashes and fixture booleans
   carry no authority. The durable pending barrier is ineligibility, not permission.
 - `NotSpawned` finalizes only with authentic no-writer evidence. Timeout, PID absence and
@@ -809,6 +815,7 @@ from UTF-8 byte order, so neither may feed Oxide.
 | `InputEvidenceOwner.immutable`, `units`, `seal_map`, `verify_map` | installation registry and SDK owner; Cargo graph audit | decoder only; no issuer |
 | `ExecutionOwner.execute`, `verify_success`, `finalize_*` | Queue host authority (submission); Nucleus capture owner | TS fixture only |
 | Daemon `generation` in `AcquireResult`; epoch in admission | Oxide storage owner | missing field, a daemon wire change |
+| Authenticated lookup-only acquire/finalize recovery | Oxide storage owner; Nucleus attempt owner | missing; acquire replay and settlement reconciliation are not lookup APIs |
 | Oxide `EvidenceAuthority` implementation | Nucleus embedding, in process | missing |
 
 Smallest proposed issuer API, needing owner decision: Nucleus task admission signs a
@@ -820,6 +827,17 @@ Concrete cross-language embedding is buildable and testable with a synthetic par
 Installed real authorities (issuers, registry/SDK receipts, complete Cargo graph and
 native closure, cooperative completion, full-debug retention) remain separate gates. No
 bridge or synthetic test supplies them.
+
+Nucleus's owner recommends using the durable ordinal behind `slot-<hex>` as
+intermediate generation identity: stable across leases and source revisions,
+changing only when replacement creates a new slot. Bind it to the authenticated
+storage instance and slot so ledger recreation cannot validate old receipts or
+seals. Expose positive `u64` as canonical decimal text; populate
+`Attempt.generation` exactly, and convert to the existing TypeScript numeric
+generation only after checking `1 <= value <= Number.MAX_SAFE_INTEGER`.
+Unsupported versions and missing or mismatched generation refuse. This is an
+owner mapping recommendation, not an implemented field or permission to change
+the daemon protocol.
 
 ### Gates still open
 
