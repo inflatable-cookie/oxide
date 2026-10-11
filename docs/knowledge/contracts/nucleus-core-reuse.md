@@ -391,6 +391,74 @@ one acquisition package named; ordinary fresh private validation is retained.
 This audit grants no real issuer, graph, native/tool receipt or consumer
 adoption.
 
+## Task 041 unit-graph and tool-size feasibility (read-only)
+
+Task 041 resolved the two feasibility questions Task 040 exposed: whether
+Cargo's own pinned planner can yield actual command-specific units without
+nightly or executing a build, and whether the explicitly named installed tools
+fit the unchanged 16 MiB/file evidence contract. It ran no Cargo, rustc,
+selector, script or tool, read no tool/SDK/rustlib content and installed
+nothing. It acquired sixteen pinned Cargo `c980f4866141969fab6254a680546a277789d6f0`
+source files (672,998 bytes) through `raw.githubusercontent.com` and made
+metadata-only `lstat`/`readlink` observations for the eight named paths. The
+full record, per-file source ledger and refusal notes are in
+[`cargo-unit-graph-and-tool-fit-041.json`](../evidence/cargo-unit-graph-and-tool-fit-041.json).
+
+Graph feasibility. The pinned planner does construct command-specific units:
+`compile_ws` -> `create_bcx` runs `RustcTargetData::new`, `ops::resolve_ws_with_opts`,
+`Profiles::new`, `UnitGenerator::generate_root_units`, `build_unit_dependencies`
+and `rebuild_unit_graph_shared` before `unit_graph::emit_serialized_unit_graph`
+writes units with package, target, profile, platform, mode, features and
+dependencies (`src/cargo/ops/cargo_compile/mod.rs:157-540`,
+`src/cargo/core/compiler/unit_graph.rs`). The emit returns before
+`BuildRunner::new` and the compiler queue, so nothing is built. But there is no
+supported stable CLI: `--unit-graph` is unstable
+(`src/cargo/util/command_prelude.rs:818-827`) and is gated by
+`fail_if_stable_opt("--unit-graph", 8002)`, whose non-nightly branch reports
+that the flag is only available on the nightly channel
+(`src/cargo/core/features.rs:1476-1505`; `nightly_features_allowed` comes from
+the channel at `src/cargo/util/context/mod.rs:397`, and `rust-toolchain.toml`
+pins stable `1.97.1`). The pinned reference documents the nightly invocation and
+states that `cargo metadata` fundamentally cannot represent command-specific or
+cross-dependency-kind features (`src/doc/src/reference/unstable.md:733-757`).
+The planner is also not non-executing: `TargetInfo::new` invokes
+`rustc --print=file-names/sysroot/split-debuginfo/crate-name/cfg`
+(`src/cargo/core/compiler/build_context/target_info.rs:168-221`), and
+`resolve_with_registry` can write `Cargo.lock` and `resolve_ws_with_opts` calls
+`pkg_set.download_accessible` (`src/cargo/ops/resolve.rs:274,370`). There is
+no public stable graph API; the only non-CLI route is a vendored/forked pinned
+Cargo library calling `create_bcx` + `emit_serialized_unit_graph`, a new
+mechanism against unstable internal APIs. A `UnitGraph` alone still supplies no
+audited behavior, consuming anchors, native associations, issuer or
+installation provenance. Verdict: **NO-GO** for a supported stable or truly
+nonexecuting producer under the unchanged constraints.
+
+Tool metadata fit. The required Rust toolchain `cargo` is 31,867,672 bytes
+(30.39 MiB) and the effective C/C++ driver `clang` is 124,676,976 bytes
+(118.90 MiB); `cc` is a single symlink to `clang`. Both exceed the unchanged
+16 MiB (`16,777,216`-byte) per-file bound before any content read. The Runner's
+`ImmutableClass::ToolSdk` path requires complete-root membership plus a
+whole-file digest under `Limits::file_bytes` and a shared 256 MiB collection
+(`src/registered.rs:62-74,554-573,638-683,990-1090`), so even a narrow-root
+receipt must still enumerate the whole toolchain root and stay within the
+entry and collection caps. `rustc` (412,504 B), `ar` (73,520 B), `ld`
+(2,749,664 B), `xcrun` (117,104 B) and `mktemp` (101,536 B) fit individually;
+no missing or unstable required file was observed. Verdict: **NO-GO** under the
+unchanged per-file bound; no stream, new class or cap raise is authorized here.
+
+Disposition. The two questions both resolve NO-GO under unchanged constraints,
+so the material mechanism-policy choice must be recorded rather than another
+wrapper: an explicitly different workflow/unstable route (consumer-side
+`--unit-graph` captured before the build), a pinned Cargo embedding/fork, or a
+new bounded ToolSdk policy for the oversized named binaries. The one concrete
+next mechanism proposal, for a separately scoped operator ruling only, is the
+explicitly different workflow/unstable route; it is viable only alongside a
+separate bounded ToolSdk policy ruling for `cargo`/`clang`, which is recorded
+as a required material choice rather than a second mechanism. None of these
+choices is applied or authorized by this feasibility PR. Eligibility stays
+**BLOCKED** as in Task 040; ordinary fresh private validation is retained and
+no reuse, benefit or storage claim is made.
+
 ## Inspected workflow and identity
 
 The bounded installed-root discovery for the exact candidate selector and
