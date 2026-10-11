@@ -144,6 +144,57 @@ registry issuer, no lease-time no-replacement guarantee, and no full package,
 graph, macro/build-script, native-tool, SDK, or hidden-read closure. It is
 partial correspondence evidence, not a build, test, reuse, or rollout result.
 
+## Task 038 archive-format and registry-pairing correction
+
+Task 038 retained the Task 037 evidence unchanged and added
+[`nucleus-registry-acquisition-038.json`](../evidence/nucleus-registry-acquisition-038.json).
+It also preserves the first, over-limit attempt at
+[`nucleus-registry-acquisition-038-initial-attempt.json`](../evidence/nucleus-registry-acquisition-038-initial-attempt.json).
+The bounded diagnostics tied `bitflags 2.13.2` and `cc 1.4.7` to their exact
+lock tuples, checksums and recorded archive paths. Both archives used legacy
+GNU tar headers (`ustar ` magic and ` \0` version); the previous verifier
+refused at `entry.header().as_ustar().is_none()` before checking member type or
+path. The diagnostics described at most 64 headers per package; bitflags
+reached that description cap, and cc had 28. Both selected archive candidates
+had stable metadata and matched their lock checksum. The diagnosis read
+153,835 compressed bytes, 740,864 decompressed bytes and 92 header descriptions.
+
+The verifier now admits those GNU headers through the existing tar reader and
+keeps the existing file, directory, path, duplicate, link, checksum, gzip,
+inventory, stability and budget checks. The refresh verified bitflags, cc and
+serde. For serde, two archive candidates and one extraction candidate produced
+one complete same-namespace pair in `index.crates.io-1949cf8c6b5b557f`; the
+spare archive in `index.crates.io-6f17d22bba15001f` had no extraction candidate
+there. The report preserves every candidate. This is filesystem correspondence
+only and does not establish effective Cargo registry selection or an accepted
+issuer.
+
+The initial full refresh covered all 58 lock tuples and verified 56. It refused
+`libsqlite3-sys 0.38.2` and `sqlite-wasm-rs 0.5.5` with `verifier_Budget`, but
+read 16,777,217 decompressed bytes for each due to a one-byte overflow probe.
+This attempt and its counters are preserved unchanged. Follow-up commit
+`8bd9949623a06df63cadd9cb7ea3bdbcebe8a70a` corrected the cap check. One
+corrected full refresh then ran at Oxide commit
+`98629cfc05ece0cdc0fde3b562e3be48b9e8d3a0` and again covered the same 58 lock
+tuples. It verified 56, including bitflags, cc and serde; the two budget
+refusals stopped at exactly 16,777,216 decompressed bytes, before any tar entry
+or extracted-file read. The corrected attempt carried forward the first
+attempt's archive counters and 234 candidate observations rather than resetting
+the phase.
+
+Across diagnosis and both full attempts, the ledger records 207,717,057
+compressed/decompressed/extracted archive bytes, 89,716 pinned-source bytes,
+60 allowlisted config bytes, 600,545 behavior-triage bytes, 54,218 diagnostic
+receipt bytes, and 662,827 bytes reading the prior acquisition receipt. The
+aggregate is 209,124,423 bytes with 466 candidate-path observations. The
+corrected full refresh added 103,411,178 archive bytes and 232 candidate
+observations. Its output is 611,520 bytes. Triage reached the 128-leaf cap in
+the initial attempt; it was not repeated, and the initial triage receipt remains
+preserved. All cumulative phase totals stayed within their aggregate ceilings.
+The evidence does not establish enabled units, native/SDK closure, an issuer,
+or a successful Nucleus workflow. No Nucleus Cargo command, package code,
+script, macro, helper, SDK content or toolchain content was read or run.
+
 ## Installed path observations
 
 The allowlisted path configuration observed was:
