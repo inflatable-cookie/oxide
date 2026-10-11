@@ -6,7 +6,7 @@
   "origin": "0b355fd4-4651-47e2-9d89-58e81519c9d5",
   "lane": "oxide-build-storage-qualification",
   "dispatch_authority": "queue/orchestrator",
-  "status": "source_bound_audit_complete"
+  "status": "author_complete_pending_review"
  },
  "authority": {
   "reads": [
@@ -727,8 +727,9 @@
     ]
    },
    "recorded_038_file_digest_matches": 65,
-   "recorded_digest_absent": 10,
-   "absent_digest_note": "The ten libsqlite3-sys-0.38.2 leaves have no retained per-file digest: Task038 refused this package at the decoded cap and Task039 retained only package counts. This is an observation gap, not a match."
+   "recorded_digest_absent": 0,
+   "recorded_039_file_digest_matches": 10,
+   "digest_binding_note": "All 75 read leaves bind by path to a retained per-file sha256: 65 to Task038 and the 10 libsqlite3-sys leaves to Task039. No observation gap remains for registry content correspondence."
   },
   "prior_receipt_and_report_reads": {
    "files": {
@@ -742,8 +743,11 @@
   "oxide_knowledge_reads_bytes": 459329,
   "candidate_observations": {
    "pinned_git_tree_entries": 1017,
-   "registry_directory_entries_approx": 2000,
-   "note": "metadata-only listings; no content read beyond the declared leaves"
+   "registry_root_filesystem_entries": 1028,
+   "registry_root_files": 962,
+   "registry_root_directories": 66,
+   "registry_verifier_declared_members": 1022,
+   "note": "Exact distinct entries. The 1,028 raw entries include six package-root .cargo-ok sidecars that the verifier inventory excludes, giving the 1,022 declared members. A small number of repeated metadata-only sizing listings were also performed but not separately retained."
   },
   "aggregate_read_bytes_estimate": 4085666,
   "report_output_bytes_ceiling": 8388608,
@@ -756,41 +760,81 @@
    "reserve_gib": 20,
    "below_reserve": false,
    "note": "Global free-space samples include other host writers. The delta is not an SSD-write or saving measurement."
+  },
+  "phase_exits": {
+   "git_ls_tree": {
+    "exit": 0
+   },
+   "git_cat_file_all_declared_leaves": {
+    "exit": 0
+   },
+   "registry_read_and_hash": {
+    "exit": 0
+   },
+   "prior_evidence_json_load": {
+    "exit": 0
+   },
+   "docs_check_effigy": {
+    "exit": 0
+   },
+   "refusals": 0
+  },
+  "phase_timing": {
+   "per_phase_wall_clock": "not separately instrumented; the audit ran as one bounded read-only author session within the 90-minute allocation",
+   "elapsed_ms": null,
+   "note": "No per-phase elapsed times were captured. Commands were sequential and returned exit 0; no read was retried or reset."
   }
  },
  "root_binding": {
   "method": "canonical realpath containment under the allowlisted index root; regular file, nlink==1, stable size/mtime/inode before and after read",
-  "libsqlite3-sys-0.38.2": {
-   "file_count": 26,
-   "dir_count": 4,
-   "evidence": "Task039 counts match; no per-file digest retained"
+  "per_root": {
+   "cc-1.4.7": {
+    "verifier": "Task038",
+    "file_count": 28,
+    "dir_count": 3
+   },
+   "pkg-config-0.3.34": {
+    "verifier": "Task038",
+    "file_count": 16,
+    "dir_count": 4
+   },
+   "vcpkg-0.2.15": {
+    "verifier": "Task038",
+    "file_count": 833,
+    "dir_count": 49
+   },
+   "serde_derive-1.0.229": {
+    "verifier": "Task038",
+    "file_count": 36,
+    "dir_count": 3
+   },
+   "schemars_derive-0.8.22": {
+    "verifier": "Task038",
+    "file_count": 17,
+    "dir_count": 3
+   },
+   "libsqlite3-sys-0.38.2": {
+    "verifier": "Task039",
+    "file_count": 26,
+    "dir_count": 4
+   }
   },
-  "cc-1.4.7": {
-   "file_count": 28,
-   "dir_count": 3,
-   "evidence": "Task038 counts match"
+  "read_leaf_binding": {
+   "task038_packages": [
+    "cc-1.4.7",
+    "pkg-config-0.3.34",
+    "vcpkg-0.2.15",
+    "serde_derive-1.0.229",
+    "schemars_derive-0.8.22"
+   ],
+   "task038_leaves_read": 65,
+   "task038_leaves_matching": 65,
+   "task039_package": "libsqlite3-sys-0.38.2",
+   "task039_leaves_read": 10,
+   "task039_leaves_matching": 10,
+   "task039_note": "The Task039 receipt retains 26 per-file sha256 records for libsqlite3-sys. All ten libsqlite3-sys leaves read here bind by path to those records exactly; no per-file digest is missing."
   },
-  "pkg-config-0.3.34": {
-   "file_count": 16,
-   "dir_count": 4,
-   "evidence": "Task038 counts match"
-  },
-  "vcpkg-0.2.15": {
-   "file_count": 833,
-   "dir_count": 49,
-   "evidence": "Task038 counts match"
-  },
-  "serde_derive-1.0.229": {
-   "file_count": 36,
-   "dir_count": 3,
-   "evidence": "Task038 counts match"
-  },
-  "schemars_derive-0.8.22": {
-   "file_count": 17,
-   "dir_count": 3,
-   "evidence": "Task038 counts match"
-  },
-  "conclusion": "All six extracted roots match committed Task038/Task039 package identities, checksums, counts and the pinned lock tuple. Sixty-five of the seventy-five read leaves also match a retained Task038 per-file SHA-256 exactly."
+  "conclusion": "All six extracted roots match committed Task038/Task039 package identities, checksums, counts and the pinned lock tuple. All 75 read leaves bind exactly to a retained per-file digest: 65 to Task038 and 10 to Task039."
  },
  "behavior_findings": {
   "compile_and_test_sources": [
@@ -856,9 +900,9 @@
    },
    {
     "name": "$OUT_DIR/bindgen.rs",
-    "producer": "libsqlite3-sys build.rs `copy_bindings(\"sqlite3\",\"bindgen_bundled_version\",$OUT_DIR/bindgen.rs)` (build.rs line 194-201)",
+    "producer": "libsqlite3-sys build.rs `copy_bindings(\"sqlite3\",\"bindgen_bundled_version\",$OUT_DIR/bindgen.rs)` at build.rs:75 (in_gecko branch) and build.rs:144 (bundled branch, inside the `cfg_select` beginning at build.rs:137)",
     "source_member": "sqlite3/bindgen_bundled_version.rs",
-    "consumer": "libsqlite3_sys `include!(concat!(env!(\"OUT_DIR\"), \"/bindgen.rs\"))` (src/lib.rs line 25)",
+    "consumer": "libsqlite3_sys `include!(concat!(env!(\"OUT_DIR\"), \"/bindgen.rs\"))` (src/lib.rs:25)",
     "kind": "generated Rust from an immutable registry package member"
    }
   ],
@@ -1345,9 +1389,9 @@
  },
  "decision_table": [
   {
-   "class": "Registry content correspondence (6 roots)",
+   "class": "Registry content correspondence (six permitted roots)",
    "status": "supported",
-   "basis": "Pinned lock checksums, Task038/Task039 counts, and 65 exact Task038 per-file SHA-256 matches on the leaves read here."
+   "basis": "Pinned lock checksums and committed verifier counts for all six roots; 65 read leaves bind by path to retained Task038 per-file SHA-256 records (cc, pkg-config, vcpkg, serde_derive, schemars_derive) and all 10 read libsqlite3-sys leaves bind to Task039 per-file SHA-256 records."
   },
   {
    "class": "Generated input association ($OUT_DIR/bindgen.rs)",
@@ -1360,9 +1404,9 @@
    "basis": "Pinned Cargo `EncodedDepInfo` v1 decoder and unit/anchor mapping already implemented in the registered boundary; not re-exercised for real Nucleus units."
   },
   {
-   "class": "libsqlite3-sys per-file correspondence receipt",
-   "status": "unresolved",
-   "basis": "Task039 retained counts only; the ten read libsqlite3-sys leaves have no prior per-file digest."
+   "class": "libsqlite3-sys per-file correspondence (Task039)",
+   "status": "supported",
+   "basis": "Task039 retains a 26-file/4-directory manifest with per-file SHA-256; the ten leaves read here match those records exactly. Only ten of the 26 were re-read in this audit; the verifier can re-read all 26."
   },
   {
    "class": "Native C/header closure (sqlite3.c, sqlite3.h, sqlite3ext.h)",
@@ -1398,13 +1442,33 @@
    "class": "Runtime process/temp inputs of the selected tests",
    "status": "observed",
    "basis": "`mktemp`, `std::env::temp_dir()`, SQLite WAL files, file cleanup; no network read."
+  },
+  {
+   "class": "Registry installation provenance",
+   "status": "unresolved",
+   "basis": "Cargo/rustc/xcrun identities appear in the pinned lock and prior config notes but were not verified here; no installation provenance receipt exists."
+  },
+  {
+   "class": "Continuous no-replacement agreement",
+   "status": "refused",
+   "basis": "No owner-supplied no-replacement agreement exists for registry or SDK roots across the lease; correspondence is a point-in-time observation only."
+  },
+  {
+   "class": "Native consuming associations",
+   "status": "refused",
+   "basis": "sqlite3.c and the SQLite headers are `cc` compile inputs in build_bundled but are not bound to an accepted native receipt or explicit generating association."
+  },
+  {
+   "class": "Genuine run/debug evidence",
+   "status": "refused",
+   "basis": "No Nucleus run, test execution, full-debug capture or old-run source lookup exists for this workflow; the audit is pre-execution only."
   }
  ],
  "finite_acquisition_package": {
   "name": "One read-only accepted native/tool input-closure receipt for the selected core-test workflow",
   "rationale": "The behavior audit shows the registry/generated side is mechanically coverable, while native/tool/SDK, effective configuration, enabled graph and the accepted issuer are the blocking seams. This one package closes the largest independently reviewable gap without Cargo.",
   "concrete_inputs": [
-   "Complete per-file correspondence manifest for libsqlite3-sys 0.38.2 (all 26 files, 4 directories) retained by the existing private streaming verifier, with the archive SHA-256 and lock checksum. No legacy `verify` call, no 58-package replay.",
+   "Reuse the retained Task039 libsqlite3-sys per-file manifest (26 files/4 directories) and the Task038 per-file records; no new registry-correspondence acquisition is needed.",
    "Native input enumeration for the bundled build: sqlite3/sqlite3.c (9,507,037), sqlite3/sqlite3.h (690,725), sqlite3/sqlite3ext.h (39,175), and the generated $OUT_DIR/bindgen.rs association; `sqlite3/wasm32-wasi-vfs.c` only if the wasm feature is enabled.",
    "Installed toolchain/SDK receipt: cargo 1.97.1/c980f4866, rustc 1.97.1/8bab26f4f, sysroot, clang/cc/ar/ld absolute identity+digest, SDK 27.0 header/framework roots, and a no-replacement agreement for the lease.",
    "Effective Cargo configuration/env inventory: config hierarchy resolution and explicit presence/absence for CC/CFLAGS/AR/ARFLAGS target variants, SDKROOT, DEVELOPER_DIR, MACOSX_DEPLOYMENT_TARGET, LIBSQLITE3_*, SQLITE_MAX_*, LIBSQLITE3_SYS_USE_PKG_CONFIG.",
@@ -1418,9 +1482,9 @@
    "Queue host authority: submission/settlement binding unchanged; no Contract010 change."
   ],
   "acquirable_without_cargo": [
-   "libsqlite3-sys per-file manifest and generated association",
-   "native input enumeration and digests",
-   "owner-declared tool/SDK and config/env inventories"
+   "Reuse the retained Task039 libsqlite3-sys per-file manifest and the Task038 per-file records (no new registry-correspondence acquisition)",
+   "Native input enumeration and digests",
+   "Owner-declared tool/SDK and config/env inventories"
   ],
   "requires_cargo_or_tool_sdk_scope": [
    "enabled semantic unit graph",
@@ -1438,23 +1502,34 @@
     "schemars_derive-0.8.22": 89207
    },
    "read_here_bytes": 1789111,
-   "prior_archive_bytes_charged_by_038_039": 207717057,
    "task_report_ceiling_bytes": 8388608,
-   "task_scratch_ceiling_bytes": 67108864
+   "task_scratch_ceiling_bytes": 67108864,
+   "prior_archive_bytes": {
+    "task038_archive_bytes": 207717057,
+    "task038_aggregate_bytes": 209124423,
+    "task039_archive_bytes": 104097860,
+    "task039_aggregate_bytes": 104730050,
+    "note": "Separate Task038 and Task039 ledgers; Task039 did not replay the 58 packages."
+   }
   },
   "time_cost": "Bounded read-only preparation; no Cargo invocation. Author work for this audit is within one 90-minute allocation; independent review within one 30-minute allocation.",
-  "fit_with_remaining_trial": "The read-only acquisition does not consume the four Cargo invocations. A fit or infeasibility assertion for the representative <=4-Cargo/45-minute trial is NOT made, because the actual enabled graph size is unavailable; the brief prohibits an assertion without actual size."
+  "fit_with_remaining_trial": "The read-only acquisition does not consume the four Cargo invocations. A fit or infeasibility assertion for the representative <=4-Cargo/45-minute trial is NOT made, because the actual enabled graph size is unavailable; the brief prohibits an assertion without actual size.",
+  "owner_rulings_needed": {
+   "real_verifier_issuer": "An operator/owner ruling is needed to replace the synthetic-only oxide#035 policy with an actual qualification-only real verifier/issuer. Not yet recorded.",
+   "bounded_tool_sdk_acquisition": "An operator ruling is needed to authorize bounded tool/SDK read and content-integrity acquisition; this brief sets ZERO tool/SDK reads, so no such ruling is recorded.",
+   "graph_observation": "An operator/owner ruling is needed to authorize a Cargo-side (or accepted equivalent) enabled-unit-graph observation for the exact selector; not yet recorded."
+  }
  },
  "disposition": {
   "eligibility": "BLOCKED",
-  "reason": "Actual enabled semantic unit graph, tool/SDK and native/header closure, effective configuration, retained libsqlite3-sys per-file correspondence, and an accepted real issuer are all unavailable.",
+  "reason": "Actual enabled semantic unit graph, tool/SDK and native/header closure, effective configuration, registry installation provenance/no-replacement, and an accepted real issuer are all unavailable. Registry per-file correspondence is retained (Task038/Task039) and is not a blocker.",
   "next_action": "Execute the one finite read-only acquisition package under owner-scoped briefs, then return a fresh scoped trial request. Ordinary fresh private validation is retained.",
   "stop": "STOP at this boundary; do not add a generic wrapper or authenticate an unaudited real graph."
  },
  "honest_scope": {
   "observed": [
    "Pinned source identity and lock",
-   "Registry root correspondence and per-file digests where retained",
+   "Registry root correspondence and per-file digests (65 Task038 + 10 Task039)",
    "Compile-time/generated input references",
    "Build-script and cc environment/process behaviour",
    "Token-only serde_derive/schemars_derive within their crates",
@@ -1465,9 +1540,11 @@
    "Native C/header closure",
    "Tool/SDK integrity",
    "Enabled unit graph",
-   "libsqlite3-sys per-file receipt",
    "Accepted real issuer",
-   "Effective Cargo configuration"
+   "Effective Cargo configuration",
+   "Continuous no-replacement agreement",
+   "Genuine run/debug evidence",
+   "Registry installation provenance"
   ],
   "not_claimed": [
    "Real issuer acceptance",

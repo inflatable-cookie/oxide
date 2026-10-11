@@ -326,10 +326,11 @@ Read boundary: fourteen pinned Nucleus Git-object leaves (365,037 bytes),
 seventy-five declared leaves from the six permitted extracted registry roots
 (1,789,111 bytes), and the existing contracts and prior receipts. Every root
 matched its committed Task038/Task039 name, version, checksum, file/directory
-count and pinned lock tuple; sixty-five leaves also matched a retained Task038
-per-file SHA-256 exactly. The ten read `libsqlite3-sys 0.38.2` leaves have no
-retained per-file digest (Task038 refused that package and Task039 kept counts
-only), which is an observation gap, not a match.
+count and pinned lock tuple. All 75 read leaves bind exactly to a retained
+per-file SHA-256: 65 to Task038 (`cc`, `pkg-config`, `vcpkg`, `serde_derive`,
+`schemars_derive`) and all ten `libsqlite3-sys 0.38.2` leaves to Task039, which
+retains a 26-file/4-directory manifest. Registry content correspondence is
+observed, not a gap.
 
 Behavior findings. The selected `build_diagnostics` test is
 `#[cfg(debug_assertions)]` and reads its own line-table/backtrace data.
@@ -358,19 +359,26 @@ own crates; the only compile-time environment use is `serde_derive`'s
 `serde_derive_internals` and `thiserror-impl` are outside the permitted roots,
 so the reported rustc probes/private-module behavior is not re-observed.
 
-Decision. The registered boundary covers the five Task038 per-file registry
-receipts, the `$OUT_DIR/bindgen.rs` generated-association, and the pinned
-dep-info mechanism. It cannot cover, and no accepted receipt exists for: the
-native C/header closure; `cc`/tool/SDK integrity; effective Cargo configuration
-and environment; the enabled semantic unit graph; the `libsqlite3-sys` per-file
-correspondence; or a real accepted graph/audit issuer, which remains
-synthetic-only under oxide#035. The one finite next acquisition package is a
-read-only accepted native/tool input-closure receipt (full `libsqlite3-sys`
-manifest, native C inputs, toolchain/SDK content identities, effective
-configuration inventory, enabled-graph observation, and the issuer ruling),
-acquirable without Cargo except the graph observation and tool/SDK content. The
-actual enabled graph size is unavailable, so no fit or infeasibility assertion
-is made for the remaining <=4 Cargo/45-minute trial.
+Decision. The registered boundary covers the six permitted roots' per-file
+registry receipts (Task038 for `cc`, `pkg-config`, `vcpkg`, `serde_derive` and
+`schemars_derive`; Task039 for `libsqlite3-sys`), the `$OUT_DIR/bindgen.rs`
+generated-association, and the pinned dep-info mechanism. It cannot cover, and
+no accepted receipt exists for: the native C/header closure; `cc`/tool/SDK
+integrity; effective Cargo configuration and environment; the enabled semantic
+unit graph; registry installation provenance; a continuous no-replacement
+agreement; the native consuming associations; genuine run/debug evidence; or a
+real accepted graph/audit issuer, which remains synthetic-only under oxide#035.
+The one finite next acquisition package is a read-only accepted native/tool
+input-closure receipt (native C inputs, toolchain/SDK content identities,
+effective configuration inventory, enabled-graph observation, no-replacement
+and installation-provenance evidence, and the issuer ruling). The retained
+Task038/Task039 registry manifests are reused and are not re-acquired. Three
+owner rulings are still unrecorded: a qualification-only real verifier/issuer
+to replace the synthetic-only oxide#035 policy; bounded tool/SDK read and
+content-integrity acquisition (this brief permits zero tool/SDK reads); and a
+Cargo-side or accepted-equivalent enabled-unit-graph observation. The actual
+enabled graph size is unavailable, so no fit or infeasibility assertion is made
+for the remaining <=4 Cargo/45-minute trial.
 
 Disposition: **BLOCKED for eligibility**, with the precise map above and the
 one acquisition package named; ordinary fresh private validation is retained.
