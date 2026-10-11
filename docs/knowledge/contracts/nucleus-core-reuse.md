@@ -975,7 +975,7 @@ field is required and unknown fields refuse:
 | `receipt` | `hmac-sha256-v1:<hex>` | HMAC-SHA256 with the bootstrap callback key over domain `oxide-qualification-timing-receipt-v1` and fields `scope`, `storage_instance_id`, `start_digest`, `policy`, `callback_ms`, `remaining_ms`. |
 
 Issuance is constructor-owned: `TimingAuthority::issue(&bootstrap, callback,
-remaining)` checks bounds before signing. Verification refuses before the
+remaining)` returns a signed policy only when its bounds pass. Verification refuses before the
 bootstrap file is consumed, before connecting to the parent and before any
 acquire. Unsupported policy and contradictory or out-of-range bounds return
 `HostError::Protocol`. A receipt that does not verify for this exact bootstrap,
