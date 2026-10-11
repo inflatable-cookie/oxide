@@ -30,7 +30,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -39,6 +38,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Nonrenewable monotonic ceiling. An owner window may be shorter, never longer.
 pub const MAX_LIFETIME: Duration = Duration::from_secs(45 * 60);
+/// Upper bound on the wait after a stop before an in-flight storage operation is abandoned.
+pub const MAX_STOP_GRACE: Duration = Duration::from_secs(10);
 /// Per-frame bound for every control frame, including the ready frame.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Aggregate bound for all control bytes read by the runtime.
@@ -65,6 +66,8 @@ pub struct RuntimeBootstrap {
     pub scope: String,
     /// Owner's remaining qualification window, as Unix seconds.
     pub expires_unix_seconds: WireU64,
+    /// Wait after a stop before an in-flight storage operation is abandoned. Bounded 1..=10.
+    pub stop_grace_seconds: WireU64,
     /// Canonical, owner-only storage root. The daemon socket is `daemon.sock` inside it.
     pub storage_root: PathBuf,
     pub budget: RuntimeBudget,
@@ -115,6 +118,9 @@ pub enum Stop {
     ControlClosed,
     /// A control frame failed bounds, authentication or protocol checks.
     ControlRefused,
+    /// A storage operation was still running after the stop grace. The process exits
+    /// like a crash: the ledger keeps its last committed state and leases stay held.
+    Abandoned,
 }
 
 /// Parent-side expectation. The owner derives every field from its own bootstrap.
@@ -159,6 +165,7 @@ pub fn bootstrap_digest(bytes: &[u8]) -> String {
 pub fn policy_digest(
     scope: &str,
     budget: &RuntimeBudget,
+    stop_grace_seconds: WireU64,
     admissions: &[ApprovedSubject],
 ) -> Result<String, HostError> {
     canonical_digest(&json!({
@@ -166,6 +173,7 @@ pub fn policy_digest(
         "storage_protocol": PROTOCOL_VERSION,
         "control_protocol": PROTOCOL_VERSION,
         "budget": serde_json::to_value(budget).map_err(|_| HostError::Protocol)?,
+        "stop_grace_seconds": serde_json::to_value(stop_grace_seconds).map_err(|_| HostError::Protocol)?,
         "admissions": serde_json::to_value(admissions).map_err(|_| HostError::Protocol)?,
     }))
 }
@@ -287,6 +295,7 @@ struct Plan {
     authority_key: MacKey,
     control_key: MacKey,
     deadline: Instant,
+    stop_grace: Duration,
     expires_unix_seconds: u64,
 }
 
@@ -300,6 +309,8 @@ impl RuntimeBootstrap {
             || self.admissions.is_empty()
             || self.admissions.len() > MAX_ADMISSIONS
             || self.budget.cap_bytes.0 == 0
+            || self.stop_grace_seconds.0 == 0
+            || self.stop_grace_seconds.0 > MAX_STOP_GRACE.as_secs()
             || self.expires_unix_seconds.0 <= now_unix
             || self.authority_key_hex == self.control_key_hex
             || !self.storage_root.is_absolute()
@@ -328,15 +339,23 @@ impl RuntimeBootstrap {
             return Err(HostError::Protocol);
         }
         let remaining = Duration::from_secs(self.expires_unix_seconds.0 - now_unix);
-        let lifetime = remaining.min(MAX_LIFETIME);
+        let stop_grace = Duration::from_secs(self.stop_grace_seconds.0);
+        // The hard exit (stop plus grace) must also fit inside the nonrenewable ceiling.
+        let lifetime = remaining.min(MAX_LIFETIME - stop_grace);
         let plan = Plan {
             scope: self.scope.clone(),
             bootstrap_digest: digest.to_owned(),
-            policy_digest: policy_digest(&self.scope, &self.budget, &self.admissions)?,
+            policy_digest: policy_digest(
+                &self.scope,
+                &self.budget,
+                self.stop_grace_seconds,
+                &self.admissions,
+            )?,
             budget: self.budget,
             authority_key,
             control_key,
             deadline: Instant::now() + lifetime,
+            stop_grace,
             expires_unix_seconds: now_unix + lifetime.as_secs(),
         };
         Ok((plan, self.storage_root.join(SOCKET_NAME)))
@@ -481,16 +500,16 @@ fn run(
     frame["mac"] = json!(mac);
     write_frame(control, &frame)?;
 
-    let (stop_sender, stop_receiver) = mpsc::channel::<()>();
+    // The main thread is the single authority on stop. The first reason from the
+    // control reader or the deadline supervisor is forwarded to the storage thread.
+    let (stop_sender, stop_receiver) = mpsc::channel::<Stop>();
     let (finished_sender, finished_receiver) = mpsc::channel::<()>();
-    let expired = Arc::new(AtomicBool::new(false));
     let supervisor = {
         let stop = stop_sender.clone();
-        let expired = expired.clone();
         let deadline = plan.deadline;
         thread::Builder::new()
             .name("oxide-storage-deadline".to_owned())
-            .spawn(move || supervise_deadline(&finished_receiver, deadline, &stop, &expired))
+            .spawn(move || supervise_deadline(&finished_receiver, deadline, &stop))
             .map_err(|_| HostError::Io)?
     };
     let reader_stream = control.try_clone().map_err(|_| HostError::Io)?;
@@ -500,32 +519,44 @@ fn run(
         instance: instance.clone(),
         bootstrap_digest: plan.bootstrap_digest.clone(),
     };
-    let reader = {
+    {
         let stop = stop_sender.clone();
         thread::Builder::new()
             .name("oxide-storage-control".to_owned())
             .spawn(move || {
-                let stop_reason = read_commands(reader_stream, &context);
-                let _ = stop.send(());
-                stop_reason
+                let reason = read_commands(reader_stream, &context);
+                let _ = stop.send(reason);
             })
-            .map_err(|_| HostError::Io)?
-    };
+            .map_err(|_| HostError::Io)?;
+    }
     drop(stop_sender);
 
-    let served = daemon.serve(stop_receiver);
-    // Wake a control read that is still blocked after storage stopped. The write side stays open
-    // so an authenticated shutdown acknowledgement can still be sent.
+    // Storage runs on its own thread so that no in-flight operation can delay the stop path.
+    let (daemon_sender, daemon_receiver) = mpsc::channel::<()>();
+    let (served_sender, served_receiver) = mpsc::channel::<Result<(), StorageError>>();
+    thread::Builder::new()
+        .name("oxide-storage-serve".to_owned())
+        .spawn(move || {
+            let _ = served_sender.send(daemon.serve(daemon_receiver));
+        })
+        .map_err(|_| HostError::Io)?;
+
+    let stop = stop_receiver.recv().map_err(|_| HostError::Protocol)?;
+    let _ = daemon_sender.send(());
+    match served_receiver.recv_timeout(plan.stop_grace) {
+        Ok(served) => served.map_err(|_| HostError::Storage)?,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // The blocked operation is abandoned with the process. Nothing here
+            // releases, finalizes or deletes durable state.
+            return Ok(Stop::Abandoned);
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => return Err(HostError::Storage),
+    }
+    // Storage has stopped. Wake a control read that may still be blocked; the write side
+    // stays open so an authenticated shutdown acknowledgement can still be sent.
     let _ = control.shutdown(Shutdown::Read);
-    let received = reader.join().map_err(|_| HostError::Protocol)?;
     drop(finished_sender);
     supervisor.join().map_err(|_| HostError::Protocol)?;
-    served.map_err(|_| HostError::Storage)?;
-    let stop = match received {
-        Stop::Shutdown(id) => Stop::Shutdown(id),
-        _ if expired.load(Ordering::SeqCst) => Stop::Lifetime,
-        other => other,
-    };
     if let Stop::Shutdown(id) = &stop {
         let ack = stopped_frame(&plan, &instance, id)?;
         write_frame(control, &ack)?;
@@ -533,18 +564,12 @@ fn run(
     Ok(stop)
 }
 
-/// Sends the single stop signal when the nonrenewable deadline passes before the
+/// Sends the single lifetime stop when the nonrenewable deadline passes before the
 /// storage session finishes. Control traffic never moves this deadline.
-fn supervise_deadline(
-    finished: &mpsc::Receiver<()>,
-    deadline: Instant,
-    stop: &mpsc::Sender<()>,
-    expired: &AtomicBool,
-) {
+fn supervise_deadline(finished: &mpsc::Receiver<()>, deadline: Instant, stop: &mpsc::Sender<Stop>) {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if let Err(mpsc::RecvTimeoutError::Timeout) = finished.recv_timeout(remaining) {
-        expired.store(true, Ordering::SeqCst);
-        let _ = stop.send(());
+        let _ = stop.send(Stop::Lifetime);
     }
 }
 
@@ -857,16 +882,13 @@ mod tests {
         assert_eq!(run_reader(partial), Stop::ControlRefused);
         // An elapsed deadline is reported by the supervisor, never by reading a frame.
         let (finished_sender, finished_receiver) = mpsc::channel::<()>();
-        let (stop_sender, stop_receiver) = mpsc::channel::<()>();
-        let expired = AtomicBool::new(false);
+        let (stop_sender, stop_receiver) = mpsc::channel::<Stop>();
         supervise_deadline(
             &finished_receiver,
             Instant::now() - Duration::from_secs(1),
             &stop_sender,
-            &expired,
         );
-        assert!(expired.load(Ordering::SeqCst));
-        assert!(stop_receiver.try_recv().is_ok());
+        assert_eq!(stop_receiver.try_recv(), Ok(Stop::Lifetime));
         drop(finished_sender);
     }
 

@@ -958,9 +958,10 @@ non-secret path. Keys, budgets and roots come only from the bootstrap. No enviro
 discovery, command-line secrets, install, service or default executable is supplied.
 
 Exit codes: `0` authenticated shutdown, `2` lifetime, control EOF or control refusal
-after durable state was left as it was, `1` refusal before effects or any other
-failure. Exit `2` writes `private storage runtime stopped: <Stop>` to stderr. Neither
-exit proves writer completion or Idle.
+after durable state was left as it was, `3` abandoned blocked storage operation,
+`1` refusal before effects or any other failure. Exit `2` writes
+`private storage runtime stopped: <Stop>` to stderr. Exit `3` writes an abandonment
+line. No exit proves writer completion or Idle.
 
 **Bootstrap** (version 1 JSON; unknown fields refuse; read with the oxide#029 protected-file
 rules: canonical, owner-only mode 0600, one link, no-follow, stable identity, at most
@@ -970,7 +971,8 @@ rules: canonical, owner-only mode 0600, one link, no-follow, stable identity, at
 | --- | --- |
 | `version`, `storage_protocol`, `control_protocol` | All `1`. Storage remains `OXSTOR01`, ledger version 3. |
 | `scope` | Owner-approved qualification scope, 1–4096 bytes. |
-| `expires_unix_seconds` | Owner's remaining window, as WireU64. Must be in the future. Effective lifetime is `min(expires - now, 2700 s)`. |
+| `expires_unix_seconds` | Owner's remaining window, as WireU64. Must be in the future. Effective window is `min(expires - now, 2700 s - stop_grace)`. |
+| `stop_grace_seconds` | WireU64, 1–10. Bounded wait after a stop before an in-flight storage operation is abandoned. Bound into `policy_digest`. |
 | `storage_root` | Absolute canonical owner-only (0700) directory. The daemon endpoint is `<root>/daemon.sock`. |
 | `budget` | `{cap_bytes > 0, free_reserve_bytes}` as WireU64. Explicit finite policy, not kernel enforcement, not aggregate footprint, not a host reserve. |
 | `admissions` | 1–4 approved `{binding, partition, admission_reference}` subjects with no credentials. The owner mints credentials after readiness reports the instance. |
@@ -1001,8 +1003,8 @@ truncated frames refuse. Control traffic never renews the lifetime.
 
 **Ready** (runtime to parent, one frame): `version`, `operation: "ready"`, `scope`,
 `bootstrap_digest` (`sha256:` of the exact bootstrap bytes), `policy_digest` (canonical
-digest of `{scope, storage_protocol, control_protocol, budget, admissions}` with
-credentials excluded), `storage_instance_id` (64 lowercase hex), `storage`
+digest of `{scope, storage_protocol, control_protocol, budget, stop_grace_seconds, admissions}`
+with credentials excluded), `storage_instance_id` (64 lowercase hex), `storage`
 (`{path, device, inode}`), `storage_protocol`, `control_protocol`, `budget`,
 `expires_unix_seconds` (the effective deadline), then `mac`. Parent verification
 (`registered::storage_runtime::verify_ready`) checks the MAC, scope, digests, instance
@@ -1024,18 +1026,28 @@ the domain first. Keys are not interchangeable.
 | `oxide-runtime-failed-v1` | control | scope, bootstrap digest, code |
 | `oxide-admission-v1`, `oxide-settlement-v1`, `oxide-terminal-v1`, `oxide-capture-v1` | authority | unchanged 029 domains |
 
-**Lifetime.** The deadline is monotonic and set once at startup. `Stop` values:
+**Lifetime and stop path.** The deadline is monotonic and set once at startup. The
+storage daemon runs on its own thread. The first stop reason, from the control reader
+or the deadline supervisor, is forwarded to it. The main thread then waits at most
+`stop_grace_seconds` for storage to return. Then it runs the stop action for that reason:
 
 | Stop | Trigger | Exit | Ack | Durable state |
 | --- | --- | --- | --- | --- |
-| `Shutdown(id)` | authenticated shutdown | 0 | `stopped` | unchanged |
+| `Shutdown(id)` | authenticated shutdown | 0 | `stopped` after storage returns | unchanged |
 | `Lifetime` | effective window elapsed | 2 | none | leases stay held |
 | `ControlClosed` | parent EOF | 2 | none | leases stay held |
 | `ControlRefused` | refused control frame | 2 | none | leases stay held |
+| `Abandoned` | storage still busy after the grace | 3 | none | last committed ledger; leases stay held |
+
+`Abandoned` treats a blocked storage operation like a crash. The ledger commits by
+temp file, sync, rename and directory sync, so a restart sees the last committed state.
+The process exit ends the blocked thread, and the stale endpoint file stays until the
+next bind removes it after a refused connect. The runtime does not wait for a stalled
+client's own 5-second read timeout.
 
 A held lease restarts as `Uncertain` through the existing daemon recovery. A runtime
-that ends by exit, PID loss, deadline or EOF never releases a lease or makes a slot
-Idle. The runtime never deletes the bootstrap, replay marker, storage root, slots or
+that ends by exit, PID loss, deadline, EOF or abandonment never releases a lease or
+makes a slot Idle. The runtime never deletes the bootstrap, replay marker, storage root, slots or
 ledger. It stops only its own daemon and never a scheduler's external workload.
 
 **Pins.** Map implementation `d9ff17988c7eaa5cf57747bc55bfe4f138692f15`. Rust

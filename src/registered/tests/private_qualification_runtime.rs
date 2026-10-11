@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -144,11 +144,14 @@ fn now() -> u64 {
         .as_secs()
 }
 
+const DEFAULT_GRACE: u64 = 2;
+
 fn bootstrap_for(
     storage_root: &Path,
     control: &Path,
     subjects: Vec<ApprovedSubject>,
     expires: u64,
+    grace: u64,
 ) -> RuntimeBootstrap {
     let endpoint = Endpoint::capture(control.to_path_buf()).unwrap();
     RuntimeBootstrap {
@@ -157,6 +160,7 @@ fn bootstrap_for(
         control_protocol: 1,
         scope: SCOPE.into(),
         expires_unix_seconds: serde_json::from_value(json!(expires)).unwrap(),
+        stop_grace_seconds: serde_json::from_value(json!(grace)).unwrap(),
         storage_root: storage_root.to_path_buf(),
         budget: budget(),
         admissions: subjects,
@@ -202,12 +206,29 @@ impl Runtime {
         subjects: Vec<ApprovedSubject>,
         window: u64,
     ) -> Self {
+        Self::start_with_grace(base, name, storage_root, subjects, window, DEFAULT_GRACE)
+    }
+
+    fn start_with_grace(
+        base: &Path,
+        name: &str,
+        storage_root: &Path,
+        subjects: Vec<ApprovedSubject>,
+        window: u64,
+        grace: u64,
+    ) -> Self {
         let control_dir = base.join(format!("ctl-{name}"));
         private_dir(&control_dir);
         let control = control_dir.join("p.sock");
         let listener = UnixListener::bind(&control).unwrap();
         fs::set_permissions(&control, fs::Permissions::from_mode(0o600)).unwrap();
-        let bootstrap = bootstrap_for(storage_root, &control, subjects.clone(), now() + window);
+        let bootstrap = bootstrap_for(
+            storage_root,
+            &control,
+            subjects.clone(),
+            now() + window,
+            grace,
+        );
         let bytes = serde_json::to_vec(&bootstrap).unwrap();
         let file = base.join(format!("bootstrap-{name}.json"));
         write_private(&file, &bytes);
@@ -244,7 +265,13 @@ impl Runtime {
         reader.read_line(&mut line).unwrap();
         let ready: Value = serde_json::from_str(&line).expect("ready frame");
         let bootstrap_digest = bootstrap_digest(&bytes);
-        let policy = policy_digest(SCOPE, &budget(), &subjects).unwrap();
+        let policy = policy_digest(
+            SCOPE,
+            &budget(),
+            serde_json::from_value(json!(grace)).unwrap(),
+            &subjects,
+        )
+        .unwrap();
         let storage_socket = storage_root.join("daemon.sock");
         let key = MacKey::from_hex(CONTROL_KEY).unwrap();
         let expectation = ReadyExpectation {
@@ -616,6 +643,31 @@ fn private_qualification_runtime_lifetime_expiry_is_nonrenewing_and_holds_state(
 }
 
 #[test]
+fn private_qualification_runtime_blocked_storage_operation_is_abandoned_at_the_grace() {
+    let base = scratch("blocked");
+    let storage_root = base.join("store");
+    private_dir(&storage_root);
+    let subjects = vec![approved(1)];
+    let mut runtime = Runtime::start_with_grace(&base, "blocked", &storage_root, subjects, 2, 1);
+    // A stalled client keeps the storage thread inside one request until its 5-second read timeout.
+    let stalled = UnixStream::connect(&runtime.storage_socket).unwrap();
+    let started = Instant::now();
+    let status = runtime.child.wait_exit(Duration::from_secs(10));
+    assert_eq!(
+        status.code(),
+        Some(3),
+        "lifetime plus grace, not the blocked read"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(runtime
+        .child
+        .stderr_after_exit()
+        .contains("abandoned a blocked storage operation"));
+    drop(stalled);
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
 fn private_qualification_runtime_bootstrap_substitution_and_replay_refuse_before_effects() {
     let base = scratch("refuse");
     let storage_root = base.join("store");
@@ -626,7 +678,13 @@ fn private_qualification_runtime_bootstrap_substitution_and_replay_refuse_before
     let _listener = UnixListener::bind(&control).unwrap();
     fs::set_permissions(&control, fs::Permissions::from_mode(0o600)).unwrap();
     let subjects = vec![approved(1)];
-    let valid = bootstrap_for(&storage_root, &control, subjects.clone(), now() + 60);
+    let valid = bootstrap_for(
+        &storage_root,
+        &control,
+        subjects.clone(),
+        now() + 60,
+        DEFAULT_GRACE,
+    );
     let no_effects = |root: &Path| {
         assert!(!root.join("daemon.sock").exists());
         assert!(!root.join("slots").exists());
@@ -688,7 +746,13 @@ fn private_qualification_runtime_bootstrap_substitution_and_replay_refuse_before
     let shared_socket = storage_root.join("p.sock");
     let _shared_listener = UnixListener::bind(&shared_socket).unwrap();
     fs::set_permissions(&shared_socket, fs::Permissions::from_mode(0o600)).unwrap();
-    let shared = bootstrap_for(&storage_root, &shared_socket, subjects.clone(), now() + 60);
+    let shared = bootstrap_for(
+        &storage_root,
+        &shared_socket,
+        subjects.clone(),
+        now() + 60,
+        DEFAULT_GRACE,
+    );
     let shared_file = base.join("shared.json");
     write_private(&shared_file, &serde_json::to_vec(&shared).unwrap());
     assert!(serve_bootstrap(&shared_file).is_err());
