@@ -138,28 +138,38 @@ The entry point does not accept a `Registration` or fabricate `UnitEvidence`.
 The host uses the existing client and lease semantics:
 
 1. Check the supported invocation shape and exact source/root bindings before
-   any writer starts. Persist a pending-use barrier for the acquired
-   generation before submission.
+   acquire or any writer starts. No generation-scoped barrier can be written
+   yet because no generation is known.
 2. Call `Client::acquire`. On ambiguous transport outcome, use
    `Client::lookup_acquire` with the exact original authenticated request.
    `Absent` permits only exact replay. Busy/capacity returns pending without a
    host run. `Uncertain`, unknown accounting, lost token, changed body, or
    inconclusive lookup holds storage and the consumer root.
-3. After a leased result with path, token, storage instance, slot and
-   generation, issue exactly one consumer `execution.execute` callback. No
-   host token or Cargo process exists for a busy attempt. Before callback,
-   bind the final acquired storage tuple, source/root/run identities, policy,
-   exact argv, cwd and full env-presence map into one launch digest; the
-   callback echoes that binding and cannot alter the command. It must record
-   the acquired tuple in the current `StorageAttempt`, then use the existing
-   Effigy 010 submission path and return the genuine scheduler run identity.
-4. Hold the lease over the complete Cargo process, all selected tests, and
+3. After a leased result with path, token, storage instance, slot, generation
+   and reuse result, durably write the pending-use barrier bound to that exact
+   lease/generation. Only then form the final launch digest from project, task,
+   workspace, branch, run, attempt, root ID and allocation epoch; source
+   commit/tree/content; policy and installation epoch; selector, argv, cwd,
+   canonical source/target/temp paths, complete environment-presence map; and
+   the acquired storage instance, slot, generation, lease, canonical slot
+   path, leased state and daemon-returned `reused` value. Do not include the
+   lease token; keep it in host memory and bind its digest only where the
+   existing protocol requires it. If the barrier cannot be written, do not
+   submit. Ask the consumer for authenticated no-spawn evidence; if it cannot
+   prove no writer, hold the lease and root.
+4. Send that immutable digest and command to exactly one
+   `ordinary_cargo.submit` callback. The callback must echo the digest, persist
+   the complete acquired tuple in the existing `StorageAttempt`, then call the
+   existing Effigy 010 submission path and return its genuine scheduler run
+   identity. No host token or Cargo process exists for a busy attempt, and the
+   callback cannot change the command after acquisition.
+5. Hold the lease over the complete Cargo process, all selected tests, and
    capture. The consumer returns its authenticated terminal and capture
    evidence, including the complete retained source/output/debug closure and
    full-debug lookup reference when required. Rust binds it to the acquired
    tuple and exact run/source attempt; Rust does not manufacture a successful
    test or capture record.
-5. Only after cooperative no-writer completion and complete capture may the
+6. Only after cooperative no-writer completion and complete capture may the
    host call `Client::finalize` with the existing authenticated settlement
    evidence. On a lost finalize reply, call `Client::lookup_finalize` with the
    same lease, operation ID, and evidence before any identical retry.
@@ -168,18 +178,31 @@ The host uses the existing client and lease semantics:
    recycle the consumer's physical root.
 
 The matching process schema should be one versioned
-`ordinary-cargo-attempt-v1` operation on a private attempt channel. It reuses
-the existing consumer callback meanings for `execution.execute`,
-`execution.verify_success`, `execution.finalize_idle`, and
-`execution.finalize_not_spawned`, with an ordinary-Cargo launch payload and
-the same installed verifier boundary. It does not call the registered Runner
-or its registration/input callbacks. Nucleus must install this exact operation
-in `oxide-runner-transport.ts` and `StorageAttempt`; current fixture hooks are
-not that installation. The Nucleus adapter must preserve original request
-digests and reserved operation IDs before delivery, persist acquired ownership
-before acknowledging it, and keep credentials/token material out of ordinary
-logs and ledgers. Effigy 010 remains the only host submission and settlement
-route.
+`ordinary-cargo-attempt-v1` operation on a private attempt channel, with three
+new callback messages that have no `Registration` argument:
+
+- `ordinary_cargo.submit(launch_digest, acquired_tuple, command)` returns the
+  genuine Effigy scheduler run identity and the echoed launch digest;
+- `ordinary_cargo.capture(run_identity, launch_digest, expected_outputs)`
+  returns the authenticated terminal, completion and complete capture claims
+  for that exact run and source; Rust verifies them against the acquired lease
+  before building existing settlement evidence;
+- `ordinary_cargo.not_submitted(launch_digest)` returns authenticated
+  no-writer evidence only when the consumer proves the Effigy submission never
+  began.
+
+These messages are deliberately separate from `ExecutionOwner`'s
+`execution.execute`, `execution.verify_success`, `execution.finalize_idle`,
+and `execution.finalize_not_spawned` methods: those callbacks are invoked by
+the registered Runner and their success-verification signature requires a
+`Registration`. The ordinary-Cargo route has no `Registration` and must not
+pretend it does. Nucleus must install this exact schema in
+`oxide-runner-transport.ts` and its existing `StorageAttempt`; current fixture
+hooks are not that installation. The Nucleus adapter must preserve original
+request digests and reserved operation IDs before delivery, persist acquired
+ownership before acknowledging it, and keep credentials/token material out of
+ordinary logs and ledgers. Effigy 010 remains the only host submission and
+settlement route.
 
 The callback contract must distinguish a normally completed test failure from
 lost or incomplete execution state. A completed failure may be settled only
@@ -279,27 +302,68 @@ The candidate workflow and toolchain from prior read-only inspection are
 Cargo `1.97.1 (c980f4866 2026-06-30)` / rustc
 `1.97.1 (8bab26f4f 2026-07-14)`, host = target
 `aarch64-apple-darwin`, no target override, wrapper, remapping, or alternate
-backend. The existing Effigy selector is the exact argv array:
+backend. The proof selector adds Cargo's structured output mode to the
+existing test invocation so reuse can be observed without resolving a graph.
+The candidate Effigy argv is:
 
 ```text
-["effigy", "check:core:test", "--", "-p", "nucleus-core", "--test", "planning", "--test", "build_diagnostics"]
+["effigy", "check:core:test", "--", "--message-format=json-render-diagnostics", "-p", "nucleus-core", "--test", "planning", "--test", "build_diagnostics"]
 ```
 
 At the inspected source, Effigy forwards this as
-`cargo test --offline -p nucleus-core --test planning --test
-build_diagnostics`; the ordinary profile inherits dev's line-tables debug
-setting. The full-debug control appends `--profile full-debug` after
-`build_diagnostics`, creating a separate compatibility partition. These
-candidate pins and selector must be reverified against the exact clean source
-in the joint packet. No `cargo metadata`, Cargo version command, graph probe,
-or unaccounted Cargo invocation is allowed in that proof.
+`cargo test --offline --message-format=json-render-diagnostics -p nucleus-core
+--test planning --test build_diagnostics`; the ordinary profile inherits
+dev's line-tables debug setting. The full-debug control appends
+`--profile full-debug` after `build_diagnostics`, creating a separate
+compatibility partition. This proof-only output argument must be accepted by
+the Effigy and Nucleus owners and pinned with the selector; if it cannot be
+passed through the reviewed 010 path, no warm-reuse proof runs.
+
+The bounded input-class scope is only this one locked `nucleus-core` workflow
+and its actual target/feature closure. Before launch, the Nucleus package and
+dependency owners must provide a finite table of every package, version,
+feature set, build script, proc macro, native helper, generated input/output,
+compiler/linker/SDK, and environment dependency that can affect this
+selector. Prior read-only inspection already identified candidate classes
+that the table must address: bundled native SQLite via
+`libsqlite3-sys 0.38.2` and `cc 1.4.7`; derive/proc-macro execution including
+`serde_derive 1.0.229`, `schemars_derive 0.8.22`, `proc-macro2 1.0.107`,
+`quote 1.0.47`, and locked `syn` versions; and any build scripts or generated
+files in the local `nucleus-core`/`nucleus-observer` packages. These are
+known candidates, not a complete active graph. Owners must classify the
+actual pinned workflow, state the Cargo freshness declaration for each
+behavioral input, and identify unsupported classes. A class without that
+owner-reviewed contract makes the partition cold-only; Cargo's artifact
+messages cannot qualify the input behavior themselves. As of this design,
+these Nucleus classes have no accepted owner qualification, so a real Nucleus
+warm-reuse proof is currently NO-GO. The bounded route may proceed to synthetic
+implementation; it may not enter the conditional warm sequence below until
+the class table is complete and accepted.
+
+For output observation, the consumer captures the bounded JSON event stream
+from each genuine Effigy run and parses only Cargo `compiler-artifact`
+records (`package_id`, target, profile and `fresh`) plus the matching command
+and run identity. This is observation of Cargo's reuse decision, not a graph
+resolver, input receipt, or acceptance proof. The preapproved class table
+names the expected package/target records. A cold-A event outside that table
+stops the sequence before any warm attempt. For B, the changed local target
+must report `fresh: false` and a predeclared unaffected target must report
+`fresh: true`; passing tests alone proves correctness, not reuse. The full-
+debug partition miss must report `fresh: false` for the comparable targets.
+Preserve the raw bounded event stream with the exact run and source record.
+
+These candidate pins, class table, output mode, and selectors must be
+reverified against the exact clean source in the joint packet. No
+`cargo metadata`, Cargo version command, graph probe, or unaccounted Cargo
+invocation is allowed in that proof.
 
 Owner commitments in that packet must include: Nucleus managed-Git/root
 allocation and source/archive/reconstruction; StorageAttempt and task
 admission; Queue host authority under frozen Contract 010; the existing Effigy
 submit, cancellation, settlement and process-completion path; capture and
 retention owners; the accepted cooperative Cargo/project behavior declaration
-and installation no-replacement owner; and the Oxide storage owner. They must
+and installation no-replacement owner; the Nucleus package/dependency owners
+for the complete class table above; and the Oxide storage owner. They must
 confirm one physical root, sequential leases, no cross-root reuse, busy before
 host submission, full capture before finalize, and old full-debug source
 lookup before changing the physical root's source bytes. They must also
@@ -329,25 +393,38 @@ about current Nucleus size:
   existing generation disabled. The one empty successor is only a clean new
   slot and never authorizes overwriting an old one;
 - at most four Cargo invocations and 45 minutes total from preparation through
-  source/debug lookup. Every invocation uses the exact selected test workflow;
-  there are no standalone Cargo metadata/version/probe calls, graph or nightly
-  gates, or extra retry. Stop before a new invocation at either cap.
+  source/debug lookup. Every invocation uses the exact selected test workflow
+  and JSON output mode; there are no standalone Cargo metadata/version/probe
+  calls, graph or nightly gates, or extra retry. Stop before a new invocation
+  at either cap.
 
-Candidate four-invocation sequence: (1) cold source A under the ordinary test
-profile; (2) changed source B under the same profile, with tests and Cargo
-freshness output demonstrating changed source invalidation and observed reuse
-of unaffected dependencies; (3) source B under full-debug as the whole
-partition miss, with tests and full-debug capture; (4) changed source C under
-that full-debug partition, with tests and a lookup proving source B's old
-full-debug artifacts and source paths still resolve to B's retained bytes.
-Each invocation gets a new authenticated run/attempt and one genuine Effigy
-submission. Cargo event evidence distinguishes reuse or a cold partition
-miss; exit status and passing tests alone do not. The exact A/B/C source pins
-and any bounded source changes must be named in the checked packet. If Cargo
-fails before executing tests, any test fails, evidence is incomplete, or
-reuse/miss evidence is ambiguous, stop the proof; preserve the image and
-records, mark the generation cold-only or held as uncertainty requires, and
-make no benefit claim.
+The current candidate Nucleus classes are not yet owner-qualified; therefore
+the warm-reuse sequence below is a conditional plan, not a launchable proof.
+If the class table is incomplete or lacks owner commitments, stop before
+Cargo. A separately approved cold-only storage proof may show bounded storage
+but cannot establish reuse or write reduction.
+
+After the class table and output mode are accepted, candidate sequence:
+(1) cold source A under the ordinary test profile; capture the event stream
+and require every observed target to match the owner-approved class table
+before proceeding. (2) Changed source B under the same profile; tests must
+run, the changed local target must be `fresh: false`, and at least one
+predeclared unaffected dependency target from the qualified class table must
+be `fresh: true`. (3) Source B under full-debug as the whole-partition miss;
+tests run and comparable targets must be `fresh: false`, with complete
+full-debug capture. (4) Changed source C under that full-debug partition;
+tests run, Cargo event records show changed-source invalidation plus
+predeclared unaffected reuse, then a lookup proves source B's old full-debug
+artifacts and paths still resolve to B's retained bytes. Each invocation gets
+a new authenticated run/attempt and one genuine Effigy submission. Cargo
+event evidence distinguishes reuse or a cold partition miss; exit status and
+passing tests alone do not. The exact A/B/C source pins and bounded changes
+must be named in the checked packet. If Cargo fails before executing tests,
+any test fails, an observed class is outside the approved table, required
+freshness events are missing, evidence is incomplete, or reuse/miss evidence
+is ambiguous, stop the proof; preserve the image and records, mark the
+generation cold-only or held as uncertainty requires, and make no benefit
+claim.
 
 Do not start if any owner has not committed to its boundary, if the complete
 source/tool/config/input boundary cannot be qualified, if exact pins or clean
