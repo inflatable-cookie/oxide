@@ -17,7 +17,7 @@ use std::io::{self as stdio, BufReader, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
-/// Local Cargo extraction metadata. Never archive members and never attestations.
+/// Package-root Cargo extraction metadata. Never archive members and never attestations.
 pub const CARGO_OK: &str = ".cargo-ok";
 pub const CARGO_CHECKSUM_JSON: &str = ".cargo-checksum.json";
 
@@ -963,6 +963,57 @@ mod tests {
         assert!(outcome.counters.archive_bytes > 0);
         assert!(outcome.counters.decompressed_bytes > 0);
         assert!(outcome.counters.extracted_bytes > 0);
+    }
+
+    #[test]
+    fn matching_nested_sidecar_named_files_are_ordinary_members() {
+        let scratch = Scratch::new();
+        let nested_ok: &[u8] = b"nested-ok-bytes";
+        let nested_sum: &[u8] = br#"{"files":{}}"#;
+        let files: &[(&str, &[u8])] = &[
+            ("Cargo.toml", b"[package]\nname=\"pkg\"\n"),
+            ("src/lib.rs", b"pub fn n() -> u8 { 1 }\n"),
+            ("src/.cargo-ok", nested_ok),
+            ("src/.cargo-checksum.json", nested_sum),
+        ];
+        let (archive, checksum) = write_crate(
+            &scratch,
+            "nested-sidecar.crate",
+            "pkg-1.0.0",
+            files,
+            &["src"],
+            None,
+        );
+        let extracted = scratch.path("pkg-1.0.0");
+        write_extracted(&extracted, files, &["src"]);
+        fs::write(extracted.join(CARGO_OK), b"root-ok").unwrap();
+        fs::write(extracted.join(CARGO_CHECKSUM_JSON), b"root-sum").unwrap();
+        let extracted = fs::canonicalize(&extracted).unwrap();
+        let verified = once(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS)
+            .value
+            .expect("matching nested sidecar names are ordinary members");
+        assert_eq!(verified.files().len(), 4);
+        assert_eq!(
+            verified.files().get("src/.cargo-ok"),
+            Some(&digest(nested_ok))
+        );
+        assert_eq!(
+            verified.files().get("src/.cargo-checksum.json"),
+            Some(&digest(nested_sum))
+        );
+        assert!(!verified.files().contains_key(CARGO_OK));
+        assert!(!verified.files().contains_key(CARGO_CHECKSUM_JSON));
+
+        fs::write(extracted.join("src/.cargo-ok"), b"different").unwrap();
+        assert_eq!(
+            once(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS).value,
+            Err(Refusal::Integrity)
+        );
+        fs::remove_file(extracted.join("src/.cargo-ok")).unwrap();
+        assert_eq!(
+            once(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS).value,
+            Err(Refusal::Membership)
+        );
     }
 
     #[test]

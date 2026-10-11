@@ -84,10 +84,13 @@ proc-macro provenance. An owner that returns `MissingAuthority` refuses
 conversion.
 
 Local Cargo sidecars `.cargo-ok` and `.cargo-checksum.json` may exist at the
-extracted package root. They are not archive members and are never read as
-attestations of archive contents. Those names inside the archive refuse.
-Nested copies, and any other extra extracted file, refuse; extra files are not
-skipped. Symlink, hardlink and special tar entries, extracted symlinks,
+extracted package root. They are excluded from archive evidence and never
+attest archive contents. Those exact root-relative names as archive members
+refuse. Nested paths that use the same file names (`src/.cargo-ok`,
+`src/.cargo-checksum.json`) are ordinary members: archive and extraction bytes
+and membership must match exactly, and matching files enter the verified
+inventory. Unmatched extra extracted files, including unmatched nested
+sidecar-named files, refuse; extra files are not skipped. Symlink, hardlink and special tar entries, extracted symlinks,
 extracted regular files with `nlink ≠ 1`, and extracted special files refuse.
 Absolute/parent/escaping paths, `.`/`..` components, backslashes,
 non-UTF-8 names, duplicate or file/directory collisions, unknown formats
