@@ -195,6 +195,26 @@ The evidence does not establish enabled units, native/SDK closure, an issuer,
 or a successful Nucleus workflow. No Nucleus Cargo command, package code,
 script, macro, helper, SDK content or toolchain content was read or run.
 
+## Task 039 streaming two-package update
+
+Task 039 left the Task 037 and Task 038 records unchanged and added
+[`nucleus-registry-acquisition-039.json`](../evidence/nucleus-registry-acquisition-039.json).
+The private schema-v3 streaming caller re-observed only the two pairs Task 038
+had refused at the 16 MiB decoded-container cap. Both `libsqlite3-sys 0.38.2`
+and `sqlite-wasm-rs 0.5.5` reached `supported` with exact archive/extraction
+correspondence: 26 files and 4 directories, and 77 files and 17 directories
+respectively, selected as the unique complete same-namespace pair. Their decoded
+containers are 21,646,848 and 24,785,920 bytes, above the legacy cap, while every
+member and extracted file stays below the 16 MiB member cap. The observation
+read 104,097,860 archive bytes (compressed, decoded and extracted) plus the
+611,520-byte Task 038 receipt, 104,730,050 aggregate, with 8 candidate-path
+observations and a 20,670-byte report. It called no legacy `verify`, replayed
+none of the other 56 packages, and read no package source, script, macro, native,
+SDK or toolchain content.
+Still not established: effective Cargo registry selection or configuration,
+enabled units, an accepted registry issuer or lease-time no-replacement
+agreement, and any Nucleus build, test or reuse result.
+
 ## Installed path observations
 
 The allowlisted path configuration observed was:
