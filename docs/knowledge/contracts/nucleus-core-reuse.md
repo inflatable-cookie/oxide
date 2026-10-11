@@ -758,9 +758,11 @@ intent and passes the accepted original request to the host; Rust calls
 `Client::acquire`. Busy/capacity replies return pending before Runner, while
 unknown accounting holds. After an ambiguous acquire error Rust calls
 `Client::lookup_acquire` with the exact credential-bearing request. `Present`
-and `Uncertain` return a held observation containing the authenticated lookup
-identity, slot, storage-instance, generation, and state only; `LeaseIdentity` has no path
-or token and never authorizes Runner execution. Only `Absent` permits an exact
+and `Uncertain` return a held observation. The wire `StorageIdentity` contains
+slot, storage-instance, generation and optional reuse information; it omits
+lease ID and state, so the consumer cannot distinguish Leased, Idle or Uncertain
+from that frame. The internal `LeaseIdentity` has no path or token and never
+authorizes Runner execution. Only `Absent` permits an exact
 replay of the original request. After Runner's authenticated parent callbacks,
 Rust finalizes with its in-memory token and exact settlement evidence. An
 ambiguous finalize uses `Client::lookup_finalize` with that same lease ID,
