@@ -313,6 +313,70 @@ registry selection, a registry issuer, enabled units, native/header/proc-macro
 or SDK closure, an immutability/no-replacement agreement, or a successful
 Nucleus workflow. The Task 037 and Task 038 reports remain unchanged.
 
+## Task 040 pre-execution behavior audit (read-only)
+
+Task 040 produced the first source-backed, pre-execution behavior audit of the
+pinned `check:core:test` workflow and one finite next acquisition package. It
+ran no Cargo, rustc, selector, script, macro or helper, read no tool/SDK/sysroot
+content and replayed no archive. The full record, per-leaf digests and ledgers
+are in
+[`nucleus-core-test-behavior-audit-040.json`](../evidence/nucleus-core-test-behavior-audit-040.json).
+
+Read boundary: fourteen pinned Nucleus Git-object leaves (365,037 bytes),
+seventy-five declared leaves from the six permitted extracted registry roots
+(1,789,111 bytes), and the existing contracts and prior receipts. Every root
+matched its committed Task038/Task039 name, version, checksum, file/directory
+count and pinned lock tuple; sixty-five leaves also matched a retained Task038
+per-file SHA-256 exactly. The ten read `libsqlite3-sys 0.38.2` leaves have no
+retained per-file digest (Task038 refused that package and Task039 kept counts
+only), which is an observation gap, not a match.
+
+Behavior findings. The selected `build_diagnostics` test is
+`#[cfg(debug_assertions)]` and reads its own line-table/backtrace data.
+`tests/planning.rs` has 50 tests and its compile-time inputs are
+`include_str!("../examples/portable-records.json")` and
+`include_bytes!/include_str!("fixtures/decision-self-relay-v1.json")`; at
+runtime it resolves and spawns `mktemp`, writes SQLite WAL stores under
+`std::env::temp_dir()`, and cleans them up. It does not exercise the
+`nucleus-observer` `/bin/ps`, `/usr/sbin/lsof`, `/bin/kill -0` or `/usr/bin/id`
+reads, which are compiled but unused here. `rusqlite` `bundled` reaches
+`libsqlite3-sys 0.38.2` `build_bundled::main`, which copies
+`sqlite3/bindgen_bundled_version.rs` to `$OUT_DIR/bindgen.rs`, includes the
+`sqlite3` directory, declares `sqlite3/sqlite3.c` and
+`sqlite3/wasm32-wasi-vfs.c` as changed-file inputs, and compiles `sqlite3.c`
+through `cc::Build` with fixed flags. It reads `TARGET`, `HOST`, `OUT_DIR`,
+`CARGO_CFG_*`, `SQLITE_MAX_*`, `LIBSQLITE3_FLAGS` and
+`LIBSQLITE3_SYS_USE_PKG_CONFIG`. `cc 1.4.7` resolves target-qualified
+`CC`/`CFLAGS`/`AR`/`ARFLAGS`/`CXX` variables, `SDKROOT`, `RUSTC_WRAPPER` and
+`RUSTC_LINKER`, executes compiler/archiver/linker/`rustc` probes, consults
+`xcrun` on Apple and writes temporary flag-check units. `pkg-config` and `vcpkg`
+are in the lock's `libsqlite3-sys` dependency edges (its default
+`min_sqlite_version_3_34_1` feature) but are not executed by the bundled branch.
+`serde_derive 1.0.229` and `schemars_derive 0.8.22` are token-only within their
+own crates; the only compile-time environment use is `serde_derive`'s
+`env!("CARGO_PKG_VERSION_PATCH")`. `proc-macro2`, `quote`, `syn`, `serde_core`,
+`serde_derive_internals` and `thiserror-impl` are outside the permitted roots,
+so the reported rustc probes/private-module behavior is not re-observed.
+
+Decision. The registered boundary covers the five Task038 per-file registry
+receipts, the `$OUT_DIR/bindgen.rs` generated-association, and the pinned
+dep-info mechanism. It cannot cover, and no accepted receipt exists for: the
+native C/header closure; `cc`/tool/SDK integrity; effective Cargo configuration
+and environment; the enabled semantic unit graph; the `libsqlite3-sys` per-file
+correspondence; or a real accepted graph/audit issuer, which remains
+synthetic-only under oxide#035. The one finite next acquisition package is a
+read-only accepted native/tool input-closure receipt (full `libsqlite3-sys`
+manifest, native C inputs, toolchain/SDK content identities, effective
+configuration inventory, enabled-graph observation, and the issuer ruling),
+acquirable without Cargo except the graph observation and tool/SDK content. The
+actual enabled graph size is unavailable, so no fit or infeasibility assertion
+is made for the remaining <=4 Cargo/45-minute trial.
+
+Disposition: **BLOCKED for eligibility**, with the precise map above and the
+one acquisition package named; ordinary fresh private validation is retained.
+This audit grants no real issuer, graph, native/tool receipt or consumer
+adoption.
+
 ## Inspected workflow and identity
 
 The bounded installed-root discovery for the exact candidate selector and
