@@ -181,6 +181,21 @@ impl DecodedDepInfo {
 /// current registered evidence refuses checksums because that model cannot
 /// preserve their freshness rule.
 pub fn decode(bytes: &[u8]) -> Result<DecodedDepInfo> {
+    decode_inner(bytes, None)
+}
+
+pub(super) fn decode_with_budget(
+    bytes: &[u8],
+    budget: &mut super::EvidenceReadBudget,
+) -> Result<DecodedDepInfo> {
+    budget.decoded(bytes.len().checked_mul(3).ok_or(Refusal::Budget)?)?;
+    decode_inner(bytes, Some(budget))
+}
+
+fn decode_inner(
+    bytes: &[u8],
+    mut budget: Option<&mut super::EvidenceReadBudget>,
+) -> Result<DecodedDepInfo> {
     if bytes.len() > MAX_ENCODED_BYTES {
         return Err(Refusal::Budget);
     }
@@ -190,6 +205,12 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedDepInfo> {
     }
 
     let file_count = reader.count(MAX_REFERENCES, 6)?;
+    if let Some(budget) = budget.as_deref_mut() {
+        let allocation = file_count
+            .checked_mul(std::mem::size_of::<File>() + 64)
+            .ok_or(Refusal::Budget)?;
+        budget.decoded(allocation)?;
+    }
     let mut files = Vec::with_capacity(file_count);
     let mut seen_files = BTreeSet::new();
     for _ in 0..file_count {
@@ -200,6 +221,15 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedDepInfo> {
         };
         let path = reader.string(MAX_STRING_BYTES)?;
         let reference = FileReference { tag, path };
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.decoded(
+                reference
+                    .path
+                    .len()
+                    .checked_add(std::mem::size_of::<FileReference>() + 64)
+                    .ok_or(Refusal::Budget)?,
+            )?;
+        }
         if !seen_files.insert(reference.clone()) {
             return Err(Refusal::Unsupported);
         }
@@ -217,6 +247,12 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedDepInfo> {
     }
 
     let env_count = reader.count(MAX_REFERENCES, 5)?;
+    if let Some(budget) = budget.as_deref_mut() {
+        let allocation = env_count
+            .checked_mul(std::mem::size_of::<(String, Option<String>)>() + 64)
+            .ok_or(Refusal::Budget)?;
+        budget.decoded(allocation)?;
+    }
     let mut environment = BTreeMap::new();
     for _ in 0..env_count {
         let key = reader.string(MAX_STRING_BYTES)?;

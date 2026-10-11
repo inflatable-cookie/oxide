@@ -672,7 +672,10 @@ consumer delivery scopes belong in Queue, not this knowledge contract.
 ## Proposed minimal Rust binding (inactive design)
 
 Status: proposal from read-only source inspection on 2026-10-11 (Task 026). It is
-not a shipped RPC, accepted issuer, live binding or evidence. Pins: Oxide main
+not a production RPC, accepted production issuer, live binding or real-workflow
+evidence. The private process/authentication seam is now supplied only by the
+[qualification surface](#private-authenticated-qualification-process-oxide029);
+consumer and production owner gates remain. Inspection pins: Oxide main
 `3c957a9`, Rust registered library at PR25 `57ee0cf` / merged `d9ff179`; Nucleus
 `9a562d1` ([Contract 011](https://github.com/inflatable-cookie/nucleus/blob/9a562d1492ddb1474ebb2ea503889ecc6b0845b1/docs/knowledge/contracts/011-oxide-consumer-boundary.md),
 `root-allocation.ts`, `managed-git.ts`, `storage-attempt.ts`, `oxide-retention.ts`,
@@ -750,9 +753,8 @@ Alternative, rejected: TS-only storage client plus direct Effigy invocation with
 `Runner`. That needs a TypeScript reimplementation of the binary daemon codec and of
 the map, input and seal checks, which duplicates the Oxide manager.
 
-Where a new local boundary is required: nothing in Oxide exposes `Runner` out of
-process today. The framed host above is that boundary. It is new, Oxide-owned and
-inactive until an embedder spawns it.
+The framed library host and private qualification process below supply this
+Oxide-owned boundary. It stays inactive until a trusted embedder launches it.
 
 ### Inactive framed host (oxide#028)
 
@@ -762,7 +764,8 @@ The callable library entry points are
 storage::Client and an embedder-provided OwnerReceiptVerifier; it does not
 spawn a process, register a workflow, install verifier material, or enable a
 default host. The embedder supplies one private Unix stream per attempt. No
-executable or distribution entry point is shipped.
+default executable or distribution entry point is shipped. The opt-in private
+qualification process is specified [below](#private-authenticated-qualification-process-oxide029).
 
 The private protocol is version-1 newline-delimited JSON. It refuses unknown
 operations or versions, unknown top-level fields, malformed/truncated frames,
@@ -855,6 +858,229 @@ savings claim is established. A real embedding still needs owner-selected
 issuers and verifier keys, complete input auditing, consumer capture and
 settlement evidence, and its own transport/process policy.
 
+### Private authenticated qualification process (oxide#029)
+
+Feature `private-qualification` adds the unpublished Unix executable
+`oxide-qualified-runner`; `publish = false` remains in force. Build/check with
+`effigy rust:private-compile`. The covering `effigy rust:private-process` builds
+the actual binary offline with the committed lockfile, resolves Cargo's emitted
+executable artifact path, checks independent Node authentication vectors, and
+runs only its named private fixtures. Its fixture build has a 300-second
+supervisor limit and test runner a 300-second process-group forced-exit limit; each of the
+three actual child sessions has a 30-second deadline and uses construction-bound
+small synthetic data below 16 MiB. Repository compilation is separate from
+those sessions. Standard compile, format, Rust suite and docs selectors still
+cover the default route. Live Cargo probes remain ignored.
+
+The exact callable surface is `<compiled-artifact> <canonical-bootstrap-file>`:
+one non-secret pathname argument; all attempt traffic uses the Unix stream,
+with no additional arguments, environment discovery, installation or service. A trusted qualification
+embedder creates a private mode-0700 bootstrap directory, the four canonical
+owned attempt directories, an owner-only mode-0600 parent Unix listener and a
+real `Daemon::bind` under a separate canonical mode-0700 storage root. The
+embedder installs `QualificationAuthority` as the daemon's `EvidenceAuthority`
+and its explicitly selected `FreeSpaceProbe`. Before serving, it calls
+`Daemon::storage_instance_id()` and `QualificationAuthority::install_instance`.
+The authority accepts at most four exact approved `RunEnvelope` subjects;
+changing the installed instance refuses. This non-secret getter does not mint
+admission, a lease, a signer or a new protocol operation. A trusted production
+issuer, persistent secret store and host free-space probe are not supplied.
+
+`registered::qualification::Bootstrap` is the version-1 JSON schema; unknown
+fields refuse. Its required fields are:
+
+| Field | Meaning |
+| --- | --- |
+| `version`, `host_protocol`, `storage_protocol` | All exactly `1`; storage stays `OXSTOR01`, ledger version 3. |
+| `map_pin` | Exactly `d9ff17988c7eaa5cf57747bc55bfe4f138692f15`. |
+| `expires_unix_seconds` | Current UTC seconds through at most 30 seconds ahead; checked at load and before acquire. |
+| `scope` | Owner-approved qualification scope, bounded to 4096 UTF-8 bytes. |
+| `storage_instance_id` | The actual daemon's 64 lowercase hex identity. |
+| `start_digest` | Canonical SHA-256 digest of the complete approved version-1 `run` frame, including binding, registration, partition, policies, original credentials and operation IDs. |
+| `callback_key_hex` | Owner-created cryptographically random 256-bit short-lived key, exactly 64 lowercase hex characters; private file only. |
+| `parent`, `storage` | Each `{path, device, inode}`, captured after binding via `Endpoint::capture`; canonical socket path, original exact unsigned-integer device/inode and mode 0600. A non-Rust bootstrap producer must preserve all integer digits without JavaScript Number rounding. |
+| `roots` | Four approved canonical owned directories containing `source_root`, `target`, `temp`, `capture`; group/other write permissions refuse. |
+
+The bootstrap must be a canonical, same-effective-user regular file, mode
+0600, one hard link, 1–65536 bytes. Open uses no-follow/nonblocking flags; the
+named and opened device/inode, size, mode, UID, link count and nanosecond
+mtime/ctime must agree before/after the bounded read. Endpoints and private
+parents are rechecked before effects; replaced, missing, unsafe or unapproved
+paths refuse. Supported registration/source/dependency/configuration versions
+are checked before acquire. Valid bootstrap is unlinked before connecting; raw
+read bytes are cleared and keys live only for this process. Rejected bootstrap
+is retained for its trusted owner to dispose of. Protected material never goes
+in command-line values, ambient environment, errors, logs or ordinary ledgers.
+The generic process error discloses no subject or secret. This supplies no
+secure memory erasure or fencing against a noncooperating same-user process.
+
+The child connects to that pinned parent listener and calls the actual
+`RunnerHost::serve` once. The parent sends the exact pinned `run` frame and
+answers the existing callbacks. Rust alone connects to the pinned storage
+endpoint, acquires/finalizes with the real client and retains the lease token.
+The acquired instance and canonical `root/slots/<slot_id>` path must match the
+bootstrap. The child issues no command, Cargo spawn, host submission, consumer
+lookup/cancel operation, reconciliation or invalid-generation deletion.
+Existing host limits, callback/result version 1, OXSTOR01 version 1 and the
+registered-map pin remain unchanged.
+
+Before acquire, the child durably creates an owner-only
+`attempt-<start_digest without sha256 prefix>` marker beside the parent endpoint,
+using exclusive create and file/directory sync. Existing, partial or uncertain
+markers refuse even when the bootstrap has been recreated. They contain only
+`oxide-qualified-attempt-v1` and no credentials. The owner must retain the
+marker directory throughout qualification and recovery; an ended/interrupted
+attempt cannot be launched afresh as lookup. Exact storage lookup/retry within
+the original host session remains unchanged. A changed original request
+refuses the pinned digest or daemon's exact-body identity checks. Markers are
+not removed automatically; owner disposal is outside an unknown lease's
+recovery. Channel loss leaves durable ownership held, and daemon restart makes
+an unsettled lease Uncertain. Missing original secrets, changed key/instance,
+reply loss, PID disappearance or elapsed time never release ownership.
+
+Authentication uses pinned RustCrypto `hmac` 0.12.1 with SHA-256 0.10.9,
+constant-time `verify_slice`, and 32-byte owner-supplied keys. Each receipt is
+`hmac-sha256-v1:<64 lowercase hex tag>`. The MAC input is a sequence of fields:
+first the domain, then the listed fields; each is UTF-8 prefixed by its **u32
+big-endian byte length**, with no delimiter or terminator. At most 16 subject
+fields and 1 MiB framed input are accepted. Canonical JSON and safe-u64/decimal
+text rules are those of the existing host, not Git or retention identity.
+
+| Domain | Fields after the domain |
+| --- | --- |
+| `oxide-owner-callback-v1` | callback context, owner, callback ID, exact subject digest, policy digest, result digest |
+| `oxide-admission-v1` | qualification scope, storage instance, canonical admission-subject digest |
+| `oxide-settlement-v1`, `oxide-terminal-v1`, `oxide-capture-v1` | qualification scope, storage instance, complete settlement-subject digest |
+
+Callback context is the canonical digest of
+`{scope, storage_instance_id, start_digest}`. Each callback already binds the
+complete slot/instance/generation tuple, partition and exact payload; its
+policy includes the registration and reviewed map pin. `CallbackAuthenticator`
+implements only `OwnerReceiptVerifier`. `QualificationAuthority` implements
+only daemon `EvidenceAuthority`, using a separately installed key. Admission
+subject is `{binding, partition, admission_reference}`. Settlement subject is
+`{binding, terminal, capture, containment}`, where terminal and capture contain
+all their non-credential fields and containment contains its kind plus every
+non-signature completion field (including lease, slot/path, process claims,
+free-space samples, output and capture digests). `settlement_subject` defines
+those exact JSON field names; unknown/running/process-absence containment has
+no authenticated subject. The consumer, terminal and capture credentials use
+separate domains over this same complete subject. Rust separately signs and
+checks the private lease-token completion MAC; a callback receipt cannot replace
+daemon settlement authentication. Parent settlement claims remain owner
+assertions under the cooperative writer model.
+
+The qualification input owner must keep a **separate map key and verification
+identity** across sequential attempts at the same storage instance. The tested
+map-seal domain is `oxide-map-v1`, with fields: scope, storage instance, slot ID,
+canonical generation, canonical partition digest, canonical registration digest,
+map-body digest. Attempt ID is deliberately outside this persistent seal;
+Runner independently verifies the original map and exact current input state.
+A per-attempt callback key/context may change without invalidating older map
+seals. Recreated storage, changed tuple/policy/body, reminted/missing map key or
+lost original verification identity refuses. No caller configuration installs a
+trusted owner; the embedder must install these boundaries explicitly.
+
+[Authentication vectors](../../../fixtures/qualification-auth-v1.json) and the
+[independent Node verifier](../../../scripts/qualification-vectors.mjs) pin
+UTF-8 length framing, canonical object-key ordering and receipt verification.
+The covering fixtures use actual compiled Rust children and real durable lease
+state for cold publication and sequential reuse, and interrupted-channel hold
+across daemon restart. A pure pre-acquire marker test rejects fresh-bootstrap
+replay and changed original requests without another host session. All registration, immutable,
+execution, process-completion, capture and test results are **synthetic**.
+There is no real Cargo execution, Nucleus benefit, production issuer, installed
+service or production-readiness claim. Nucleus's existing client below is still
+inactive and unchanged; its owner receives this callable surface only through
+reviewed merge/closeout and separately scoped integration.
+
+#### Remaining runtime and timing seams
+
+The executable above connects to an existing storage socket. Its covering Rust
+test embedder constructs `Daemon::bind`, installs `QualificationAuthority` and
+binds the actual instance; that embedder is not a callable consumer runtime.
+Nucleus's TypeScript client has no reviewed way to start those Rust objects.
+Oxide must supply a private, unpublished storage-runtime process with trusted
+bootstrap, authenticated readiness and exact instance/endpoint identity,
+explicit finite authority and free-space policy, bounded lifetime and preserved
+uncertain leases. No runtime command or control schema is supplied by this
+requirement. Nucleus owns the eventual process/channel lifetime and integration;
+its current consumer brief does not authorize Rust harness implementation.
+
+Independent review of the actual process confirms that the unchanged
+30-second I/O and five-minute session limits do not establish a fit for genuine
+capacity wait plus compilation, tests and capture. oxide#032 supplies the
+explicit finite mechanism below. It binds limits to the trusted bootstrap,
+keeps a nonrenewable deadline and preserves ownership on timeout or channel
+loss. It does not enlarge version1 defaults and is not authority to run the
+real workflow or change consumer admission.
+
+#### Finite qualification timing (oxide#032)
+
+The bootstrap has an optional `timing` object. Absent means the unchanged
+version1 host defaults. Present means an explicit finite window, and every
+field is required and unknown fields refuse:
+
+| Field | Type and unit | Rule |
+| --- | --- | --- |
+| `policy` | string | Only `oxide-qualification-timing-v1` is supported. |
+| `callback_ms` | decimal u64 milliseconds | Greater than 0 and no greater than `remaining_ms`. Ceiling for one owner callback exchange, request write plus reply read. |
+| `remaining_ms` | decimal u64 milliseconds | Greater than 0 and no greater than 2,700,000 (45 minutes). The owner's remaining session window at issuance. |
+| `receipt` | `hmac-sha256-v1:<hex>` | HMAC-SHA256 with the bootstrap callback key over domain `oxide-qualification-timing-receipt-v1` and fields `scope`, `storage_instance_id`, `start_digest`, `policy`, `callback_ms`, `remaining_ms`. |
+
+Issuance is constructor-owned: `TimingAuthority::issue(&bootstrap, callback,
+remaining)` returns a signed policy only when its bounds pass. Verification refuses before the
+bootstrap file is consumed, before connecting to the parent and before any
+acquire. Unsupported policy and contradictory or out-of-range bounds return
+`HostError::Protocol`. A receipt that does not verify for this exact bootstrap,
+including a forged, reminted or moved window, returns `HostError::OwnerRejected`.
+
+The session deadline is frozen once. `serve_bootstrap` takes a monotonic entry
+instant before it reads the file, and `entry + remaining_ms` is the deadline.
+Bootstrap reading, validation, connect and handshake all draw from that window.
+Wall-clock changes, stream traffic, partial frames, retries and reconnects
+cannot extend it. There is no keepalive or lifetime-extension path.
+
+Each callback exchange has one ceiling: the smaller of `now + callback_ms` at
+exchange start and the session deadline. Each frame read or write re-arms the
+socket with the remaining part of that ceiling. Drip-fed bytes cannot renew it.
+A complete frame that finishes after its ceiling is refused, not promoted. Expiry
+is checked before each write or read, and again after a blocked completion. The
+start-frame read is bounded the same way, so startup is charged to the session.
+
+On timeout or channel loss the host writes an `error` frame with `code:
+"timeout"` when the stream still accepts it. It never sends a result frame. It
+does not cancel the scheduler, finalize, publish a map, release a lease, remove
+markers or retry. Durable lease, root and map state stays as recorded, so the
+slot remains Leased or Uncertain. A replay from a fresh bootstrap for the same
+approved start refuses at the durable attempt marker before acquire.
+
+Version1 keeps its 30-second callback ceiling and five-minute session measured
+from channel creation. Its frames are now bounded in total as well, so the
+change tightens behavior and does not relax it. Bootstrap `expires_unix_seconds`
+remains a separate load-freshness check of at most 30 seconds. The execution
+window applies only after that check passes.
+
+Engineering ceilings are not measured workload timing. The 45-minute cap and
+any chosen `callback_ms` are bounds for the mechanism, not evidence that a Cargo
+build, test, capture or Nucleus workload fits. Qualification tests use short
+synthetic windows. An owner's `execution.execute` callback is the whole
+workflow receipt, so its `callback_ms` must cover that call. A smaller value
+times out and leaves uncertainty, which is the correct failure.
+
+Consumer handover after merge and closeout: the trusted launcher writes
+`timing` into the one-use bootstrap, issued for the exact start digest. An
+example owner-bound policy for a 45-minute remaining window with a 30-minute
+callback ceiling is:
+
+```json
+"timing": {"policy": "oxide-qualification-timing-v1", "callback_ms": 1800000, "remaining_ms": 2700000, "receipt": "hmac-sha256-v1:<issued-by-trusted-launcher>"}
+```
+
+Pins for the reviewed surface are `TIMING_POLICY_V1`, `TimingAuthority::issue`
+and `TimingAuthority` under the `private-qualification` feature. Nucleus must not
+prompt workers or change admission from this contract alone.
+
 ### Inactive Nucleus client
 
 Nucleus source `03b8eb95dbaad63ca154e81049280069f66697ea` contains
@@ -892,6 +1118,98 @@ on source `03b8eb9` separately established typecheck exit 0. These are fixture
 and merged-head reconciliation results, not an actual cross-language host
 session, trusted production issuers, real Cargo execution or reuse qualification.
 
+### Real-workflow binding requirements
+
+The fixture client is not the real-workflow owner adapter. Its source verifier
+allows 128 files, 64 KiB per file and 128 KiB total; those bounds do not cover
+the inspected Nucleus inputs. Qualification needs a finite, audited behavior
+inventory with actual counters. The complete clean Git head/tree identity stays
+distinct from the declared compiler-input digest. Omitting unrelated tracked
+files from that input inventory requires the accepted behavior audit, not a
+shortcut to make fixture limits pass. Every declared compiler input still needs
+its consuming anchors and retained bytes.
+
+The fixture's validation request fixes environment paths before acquisition,
+whereas the actual intermediate path arrives with the acquired attempt.
+The owner adapter must authenticate the acquired source/intermediate/target/temp
+binding and persist the final request before the existing submission path can
+start a writer. It must not guess a slot, allocate through a lookup, or mutate
+an already submitted request. The host's `registration.authenticate` callback
+provides the acquired attempt; a reviewed consumer binding must establish how
+that callback closes this pre-submission seam.
+
+The host's 30-second stream timeout and five-minute session bound are not
+qualified for genuine capacity waiting, compilation, tests and capture.
+oxide#032 supplies the reviewed finite timing mechanism (see Finite qualification
+timing above). Evidence that the actual workflow fits is still required.
+Synthetic timing is insufficient; a timeout retains uncertainty rather than
+releasing ownership. No silent deadline increase or
+unsupervised keepalive follows from the integration approval.
+
+The pinned Cargo producer is now `registered::cargo_freshness::collect`, called
+by an installed `InputEvidenceOwner::units_with_budget` with the runner's shared
+`EvidenceReadBudget`. It returns `Vec<UnitEvidence>` to the existing registered
+freshness checks; it adds no second guard or map version. The
+callable signature is
+`collect(&Registration, &Attempt, &BTreeMap<String, ImmutableManifest>,
+&mut EvidenceReadBudget, &TrustedCargoGraphContext) -> Result<Vec<UnitEvidence>>`.
+The `manifests` argument is the exact accepted receipt set already verified by
+`Runner.inputs`; the owner override receives that same set and budget from
+`Runner.collect`.
+The private host does not currently install that reading owner.
+`runner_host::ParentCallbacks` implements `units` as the authenticated
+`input.units` parent callback and inherits the in-memory `units_with_budget`
+default. It cannot turn precomputed parent JSON into proof that the Cargo
+collector ran with the shared budget. A private Rust reading-owner embedding
+must override `units_with_budget`, authenticate the graph-owner provenance,
+construct the trusted context and invoke the collector with those exact
+manifests and that operation budget. Nucleus's TypeScript client does not
+supply this Rust embedding or acquire Rust authoring authority from the gap.
+Its callable provisioning and refusal contract needs independent review;
+neither a trait nor format fixtures establish a real installed issuer.
+
+`TrustedCargoGraphContext` must be built by trusted embedding code after graph
+provenance and complete behavior audit. It binds the registered graph digest,
+exact semantic unit set, Cargo version/source revision, `Attempt.slot` build
+root, named package roots and per-unit environment. Each `CargoUnitContext`
+names one fingerprint directory/file and its complete directory-entry set,
+exact binary dep-info mappings, package-relative rerun mappings, graph edges,
+explicit generated/native/immutable associations and any audited registry-only
+`Precalculated` policy. Do not construct it from task labels or caller JSON.
+
+The accepted persisted formats are Cargo `Fingerprint` JSON and binary
+`EncodedDepInfo` v1 at commit `c980f4866141969fab6254a680546a277789d6f0`
+(Cargo version `1.97.1`). JSON is parsed with strict fields and bounded
+sequences. The collector reads explicitly named Cargo evidence files beneath
+the canonical build root; package and immutable inputs are associated here
+and read by the existing runner under the same operation budget. The collector
+supports `CheckDepInfo`, `RerunIfChanged`, `RerunIfEnvChanged` and
+`Precalculated`. Every path/tag is resolved through the exact owner mapping;
+package-root and build-root references remain distinct. It preserves absent
+environment values separately from empty strings and records the actual
+fingerprint, dep-info and rerun-output anchors. Duplicate or missing units,
+edges, references, consuming mappings and directory entries refuse, as do
+unknown fields/variants, duplicate JSON keys, unsafe or unstable files,
+checksum freshness, mutable `Precalculated` and unsupported policies.
+
+The collector shares the runner's 256 MiB operation budget, 16 MiB per-file
+limit, 256-unit and 32,768-association ceilings, 64-entry per-unit fingerprint
+inventory, 2,048-byte path and depth-32 limits. It charges evidence reads,
+decoded and copied allocations, and repeated directory membership reads. The
+existing map encoder enforces the 8 MiB persisted-map limit. The source-linked
+JSON records and binary vector are hand-annotated pinned-format fixtures, not
+output from an actual Cargo graph. They establish neither graph issuance nor an
+audited native closure, installed issuer, real registry/SDK scan, Nucleus reuse
+or consumer capture. The trusted owner must still authenticate the real graph,
+resolve every consuming reference and prove all native, proc-macro and SDK
+reads; archive agreement alone cannot prove that closure. Real full-debug capture
+and retrieval remain the consumer's separate obligation.
+
+Consumer implementation admission remains under the Nucleus owner. The earlier
+single-client capacity exception ended at closeout; the currently prepared
+real-workflow client has no new scoped capacity grant. This is separate from
+the approved integration implementation and its API/qualification gates.
+
 ### Field correspondence
 
 | Nucleus subject or receipt | Oxide field | Rule |
@@ -915,7 +1233,7 @@ session, trusted production issuers, real Cargo execution or reuse qualification
 | storage instance | `AcquireResult.storage_instance_id` | bind with `slot_id` and generation so ledger recreation cannot validate old maps or receipts |
 | acquire `token` | `AcquireResult.token` (`LeaseToken`) | host memory only; Nucleus stores a digest |
 | authorization | `Attempt.authorization`, `RunEnvelope.admission_reference` | Nucleus authorization receipt operation and payload digests |
-| admission credential | `RunEnvelope.admission_credential` | no accepted issuer exists (see owner table) |
+| admission credential | `RunEnvelope.admission_credential` | owner-installed private qualification MAC exists; no production consumer issuer (see owner table) |
 | `reused` | `AcquireResult.reused` → `Attempt.reused` | daemon value only |
 | required bytes | `AcquireRequest.required_bytes` | Nucleus policy byte bound |
 | `target`, `temp`, `capture` | `Attempt.target`, `temp`, `capture` | canonical private paths; `Runner` adds `CARGO_*`/`TMP*` env, which the audit must approve |
@@ -1007,10 +1325,10 @@ from UTF-8 byte order, so neither may feed Oxide.
 
 | Missing seam | Owner | Status |
 | --- | --- | --- |
-| Admission credential and `EvidenceAuthority::verify_admission` | Nucleus task admission and Queue host authority; Tom decides which signs | no issuer in source; the host calls the accepted verifier |
+| Admission credential and `EvidenceAuthority::verify_admission` | Nucleus task admission and Queue host authority; Tom decides which signs | private qualification authenticator only; no production consumer issuer |
 | Settlement and capture credentials (`SettlementEvidence.consumer_credential`, `TerminalRecord`, `CaptureReceipt`) | Queue scheduler envelope and Nucleus capture owner | no source |
 | `RegistrationOwner.authenticate` and `audit` | Nucleus managed-Git and root owner; audited-input owner | missing |
-| `InputEvidenceOwner.immutable`, `units`, `seal_map`, `verify_map` | installation registry and SDK owner; Cargo graph audit | decoder only; no issuer |
+| `InputEvidenceOwner.immutable`, `units`, `units_with_budget`, `seal_map`, `verify_map` | installation registry and SDK owner; Cargo graph audit | pinned bounded collector exists; no accepted production owner or issuer |
 | `ExecutionOwner.execute`, `verify_success`, `finalize_*` | Queue host authority (submission); Nucleus capture owner | TS fixture only |
 | Daemon `generation` and storage-instance identity in `AcquireResult`; epoch in admission | Oxide storage owner | Oxide API implemented; Nucleus fixture client binds the complete tuple and checks safe conversion; production binding disabled |
 | Authenticated lookup-only acquire/finalize recovery | Oxide storage owner; Nucleus attempt owner | Oxide APIs implemented; private host uses them internally; Nucleus session-loss reconciliation holds and adds no lookup wire verb |

@@ -107,6 +107,11 @@ impl Daemon {
         &self.socket_path
     }
 
+    /// Non-secret durable instance identity for trusted qualification bootstrap.
+    pub fn storage_instance_id(&self) -> &str {
+        &self.store.ledger.storage_instance_id
+    }
+
     /// Serves one request at a time until the owner signals shutdown.
     ///
     /// The serialized loop is the ledger's in-process single-writer boundary.
