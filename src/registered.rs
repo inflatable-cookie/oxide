@@ -20,6 +20,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::UNIX_EPOCH;
 
+pub mod cargo_freshness;
 pub mod dep_info;
 #[cfg(feature = "private-qualification")]
 pub mod qualification;
@@ -300,6 +301,18 @@ pub struct UnitEvidence {
 pub trait InputEvidenceOwner: Send + Sync {
     fn immutable(&self, receipt: &str, attempt: &Attempt) -> Result<ImmutableManifest>;
     fn units(&self, registration: &Registration, attempt: &Attempt) -> Result<Vec<UnitEvidence>>;
+    /// Collectors that read Cargo evidence override this method so reads and
+    /// decoded allocations share the runner's operation budget. The default is
+    /// for owners that return in-memory evidence and perform no producer reads.
+    fn units_with_budget(
+        &self,
+        registration: &Registration,
+        attempt: &Attempt,
+        _manifests: &BTreeMap<String, ImmutableManifest>,
+        _budget: &mut EvidenceReadBudget,
+    ) -> Result<Vec<UnitEvidence>> {
+        self.units(registration, attempt)
+    }
     fn seal_map(&self, attempt: &Attempt, map_digest: &str) -> Result<String>;
     fn verify_map(&self, attempt: &Attempt, map_digest: &str, seal: &str) -> Result<()>;
 }
@@ -407,14 +420,29 @@ struct Snapshot {
     immutable_members: BTreeMap<PathBuf, (u64, u64, BTreeSet<String>)>,
 }
 
-struct ReadBudget {
+/// Shared per-operation byte, allocation and directory-visit accounting.
+/// Only the registered runner constructs a budget for an admitted collection.
+pub struct EvidenceReadBudget {
     used: usize,
     maximum: usize,
     limits: Limits,
     files: BTreeMap<PathBuf, FileState>,
     visits: usize,
 }
-impl ReadBudget {
+// Keep cached absolute paths out of diagnostic formatting.
+impl std::fmt::Debug for EvidenceReadBudget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EvidenceReadBudget")
+            .field("used_bytes", &self.used)
+            .field("maximum_bytes", &self.maximum)
+            .field("cached_file_count", &self.files.len())
+            .field("directory_visits", &self.visits)
+            .finish_non_exhaustive()
+    }
+}
+type ReadBudget = EvidenceReadBudget;
+impl EvidenceReadBudget {
     fn new(maximum: usize, limits: Limits) -> Self {
         Self {
             used: 0,
@@ -456,6 +484,44 @@ impl ReadBudget {
             return Err(Refusal::Unstable);
         }
         Ok(bytes)
+    }
+    fn evidence_bytes(&mut self, path: &Path, maximum: usize) -> Result<Vec<u8>> {
+        let before = fs::symlink_metadata(path).map_err(io)?;
+        let bytes = self.bytes(path, maximum)?;
+        let after = fs::symlink_metadata(path).map_err(io)?;
+        if stamp(&before)? != stamp(&after)?
+            || before.ctime() != after.ctime()
+            || before.ctime_nsec() != after.ctime_nsec()
+        {
+            return Err(Refusal::Unstable);
+        }
+        let (mtime, device, inode) = stamp(&after)?;
+        let state = FileState {
+            digest: digest(&bytes),
+            mtime,
+            device,
+            inode,
+            length: after.len(),
+            ctime: after.ctime(),
+            ctime_nsec: after.ctime_nsec(),
+        };
+        if self
+            .files
+            .get(path)
+            .is_some_and(|existing| existing != &state)
+        {
+            return Err(Refusal::Unstable);
+        }
+        self.files.insert(path.to_owned(), state);
+        Ok(bytes)
+    }
+    fn decoded(&mut self, bytes: usize) -> Result<()> {
+        self.used = self
+            .used
+            .checked_add(bytes)
+            .filter(|used| *used <= self.maximum)
+            .ok_or(Refusal::Budget)?;
+        Ok(())
     }
     fn file(&mut self, path: &Path) -> Result<FileState> {
         if let Some(state) = self.files.get(path) {
@@ -1037,10 +1103,6 @@ impl Runner<'_> {
         inputs: Inputs,
     ) -> Result<Snapshot> {
         let limits = registration.limits;
-        let evidence = self.input_owner.units(registration, attempt)?;
-        if evidence.len() != registration.units.len() || evidence.len() > limits.units {
-            return Err(Refusal::Unsupported);
-        }
         let mut collector = Collector {
             registration,
             attempt,
@@ -1051,6 +1113,14 @@ impl Runner<'_> {
             semantic: Sha256::new(),
             generated: BTreeSet::new(),
         };
+        let evidence = {
+            let (manifests, budget) = (&collector.manifests, &mut collector.budget);
+            self.input_owner
+                .units_with_budget(registration, attempt, manifests, budget)?
+        };
+        if evidence.len() != registration.units.len() || evidence.len() > limits.units {
+            return Err(Refusal::Unsupported);
+        }
         // Immutable reads share the collection budget and deduplicated file states.
         let mut seen = BTreeSet::new();
         for unit in evidence {
@@ -1080,6 +1150,7 @@ impl Runner<'_> {
                     .file(&owned(&attempt.slot, anchor, limits)?)?;
                 collector.snapshot.anchors.insert(anchor.clone(), state);
             }
+            let mut local_inputs = BTreeMap::<InputPath, BTreeSet<String>>::new();
             for local in unit.locals {
                 match local {
                     LocalInput::DepInfo {
@@ -1096,7 +1167,17 @@ impl Runner<'_> {
                         frame(&mut collector.semantic, evidence_unit.as_bytes());
                         frame(&mut collector.semantic, anchor.as_bytes());
                         for input in files {
-                            collector.associate(input, BTreeSet::from([anchor.clone()]), false)?;
+                            collector.budget.decoded(
+                                input_path_allocation(&input)?
+                                    .checked_add(anchor.len() + std::mem::size_of::<String>() + 64)
+                                    .ok_or(Refusal::Budget)?,
+                            )?;
+                            let anchors = BTreeSet::from([anchor.clone()]);
+                            local_inputs
+                                .entry(input.clone())
+                                .or_default()
+                                .extend(anchors.iter().cloned());
+                            collector.associate(input, anchors, false)?;
                         }
                         for (key, value) in environment {
                             collector.environment(&unit.id, &key, value.as_deref())?;
@@ -1107,6 +1188,15 @@ impl Runner<'_> {
                         frame(&mut collector.semantic, b"rerun-files");
                         frame(&mut collector.semantic, output.as_bytes());
                         for input in paths {
+                            collector.budget.decoded(
+                                input_path_allocation(&input)?
+                                    .checked_add(output.len() + std::mem::size_of::<String>() + 64)
+                                    .ok_or(Refusal::Budget)?,
+                            )?;
+                            local_inputs
+                                .entry(input.clone())
+                                .or_default()
+                                .insert(output.clone());
                             collector.associate(input, BTreeSet::from([output.clone()]), true)?;
                         }
                     }
@@ -1173,7 +1263,30 @@ impl Runner<'_> {
                 if let Some(producer) = &association.producer {
                     frame(&mut collector.semantic, producer.as_bytes());
                 }
-                collector.associate(association.input, association.anchors, false)?;
+                let mut extra_anchors = BTreeSet::new();
+                if let Some(local) = local_inputs.get(&association.input) {
+                    for anchor in association.anchors.difference(local) {
+                        collector
+                            .budget
+                            .decoded(anchor.len() + std::mem::size_of::<String>() + 64)?;
+                        extra_anchors.insert(anchor.clone());
+                    }
+                } else {
+                    for anchor in &association.anchors {
+                        collector
+                            .budget
+                            .decoded(anchor.len() + std::mem::size_of::<String>() + 64)?;
+                        extra_anchors.insert(anchor.clone());
+                    }
+                }
+                if !extra_anchors.is_empty() {
+                    let directory = local_inputs.contains_key(&association.input)
+                        && collector
+                            .snapshot
+                            .directories
+                            .contains_key(&association.input);
+                    collector.associate(association.input, extra_anchors, directory)?;
+                }
             }
         }
         for name in &registration.source_files {
@@ -1315,6 +1428,18 @@ impl Runner<'_> {
             }
         }
     }
+}
+fn input_path_allocation(input: &InputPath) -> Result<usize> {
+    std::mem::size_of::<InputPath>()
+        .checked_add(input.path.len())
+        .and_then(|size| {
+            size.checked_add(match &input.root {
+                InputRoot::Immutable(receipt) => receipt.len(),
+                _ => 0,
+            })
+        })
+        .and_then(|size| size.checked_add(64))
+        .ok_or(Refusal::Budget)
 }
 fn receipt_bound(receipt: &str, limits: Limits) -> Result<()> {
     if receipt.is_empty() || receipt.len() > limits.path_bytes || receipt.as_bytes().contains(&0) {

@@ -1026,13 +1026,51 @@ actual workflow fits. Synthetic timing is insufficient; a timeout retains
 uncertainty rather than releasing ownership. No silent deadline increase or
 unsupervised keepalive follows from the integration approval.
 
-Cargo evidence collection must account for every accepted registered unit,
-its actual freshness anchors, dep-info, rerun files/environment, generated
-associations and supported immutable evidence. Cargo's pinned diagnostic
-fingerprint JSON is not a complete unit graph or an issuer. A collector needs
-accepted graph/path associations and must refuse absent or ambiguous coverage;
-registry archive agreement alone cannot prove macro, native or SDK reads.
-Real full-debug capture and retrieval remain the consumer's separate obligation.
+The pinned Cargo producer is now `registered::cargo_freshness::collect`, called
+by an installed `InputEvidenceOwner::units_with_budget` with the runner's shared
+`EvidenceReadBudget`. It returns `Vec<UnitEvidence>` to the existing registered
+freshness checks; it adds no second guard or map version. The
+callable signature is
+`collect(&Registration, &Attempt, &BTreeMap<String, ImmutableManifest>,
+&mut EvidenceReadBudget, &TrustedCargoGraphContext) -> Result<Vec<UnitEvidence>>`.
+The `manifests` argument is the exact accepted receipt set already verified by
+`Runner.inputs`; the owner override receives that same set and budget from
+`Runner.collect`.
+`TrustedCargoGraphContext` must be built by trusted embedding code after graph
+provenance and complete behavior audit. It binds the registered graph digest,
+exact semantic unit set, Cargo version/source revision, `Attempt.slot` build
+root, named package roots and per-unit environment. Each `CargoUnitContext`
+names one fingerprint directory/file and its complete directory-entry set,
+exact binary dep-info mappings, package-relative rerun mappings, graph edges,
+explicit generated/native/immutable associations and any audited registry-only
+`Precalculated` policy. Do not construct it from task labels or caller JSON.
+
+The accepted persisted formats are Cargo `Fingerprint` JSON and binary
+`EncodedDepInfo` v1 at commit `c980f4866141969fab6254a680546a277789d6f0`
+(Cargo version `1.97.1`). JSON is parsed with strict fields and bounded
+sequences; evidence is read only from explicitly named paths beneath the
+canonical build root, accepted package roots and immutable roots. The collector
+supports `CheckDepInfo`, `RerunIfChanged`, `RerunIfEnvChanged` and
+`Precalculated`. Every path/tag is resolved through the exact owner mapping;
+package-root and build-root references remain distinct. It preserves absent
+environment values separately from empty strings and records the actual
+fingerprint, dep-info and rerun-output anchors. Duplicate or missing units,
+edges, references, consuming mappings and directory entries refuse, as do
+unknown fields/variants, duplicate JSON keys, unsafe or unstable files,
+checksum freshness, mutable `Precalculated` and unsupported policies.
+
+The collector shares the runner's 256 MiB operation budget, 16 MiB per-file
+limit, 256-unit and 32,768-association ceilings, 64-entry per-unit fingerprint
+inventory, 2,048-byte path and depth-32 limits. It charges evidence reads,
+decoded and copied allocations, and repeated directory membership reads. The
+existing map encoder enforces the 8 MiB persisted-map limit. The source-linked
+JSON records and binary vector are hand-annotated pinned-format fixtures, not
+output from an actual Cargo graph. They establish neither graph issuance nor an
+audited native closure, installed issuer, real registry/SDK scan, Nucleus reuse
+or consumer capture. The trusted owner must still authenticate the real graph,
+resolve every consuming reference and prove all native, proc-macro and SDK
+reads; archive agreement alone cannot prove that closure. Real full-debug capture
+and retrieval remain the consumer's separate obligation.
 
 Consumer implementation admission remains under the Nucleus owner. The earlier
 single-client capacity exception ended at closeout; the currently prepared
@@ -1157,7 +1195,7 @@ from UTF-8 byte order, so neither may feed Oxide.
 | Admission credential and `EvidenceAuthority::verify_admission` | Nucleus task admission and Queue host authority; Tom decides which signs | private qualification authenticator only; no production consumer issuer |
 | Settlement and capture credentials (`SettlementEvidence.consumer_credential`, `TerminalRecord`, `CaptureReceipt`) | Queue scheduler envelope and Nucleus capture owner | no source |
 | `RegistrationOwner.authenticate` and `audit` | Nucleus managed-Git and root owner; audited-input owner | missing |
-| `InputEvidenceOwner.immutable`, `units`, `seal_map`, `verify_map` | installation registry and SDK owner; Cargo graph audit | decoder only; no issuer |
+| `InputEvidenceOwner.immutable`, `units`, `units_with_budget`, `seal_map`, `verify_map` | installation registry and SDK owner; Cargo graph audit | pinned bounded collector exists; no accepted production owner or issuer |
 | `ExecutionOwner.execute`, `verify_success`, `finalize_*` | Queue host authority (submission); Nucleus capture owner | TS fixture only |
 | Daemon `generation` and storage-instance identity in `AcquireResult`; epoch in admission | Oxide storage owner | Oxide API implemented; Nucleus fixture client binds the complete tuple and checks safe conversion; production binding disabled |
 | Authenticated lookup-only acquire/finalize recovery | Oxide storage owner; Nucleus attempt owner | Oxide APIs implemented; private host uses them internally; Nucleus session-loss reconciliation holds and adds no lookup wire verb |
