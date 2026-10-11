@@ -628,7 +628,7 @@ not a shipped RPC, accepted issuer, live binding or evidence. Pins: Oxide main
 | --- | --- | --- |
 | 1. Root and source | `ManagedGit` owned worktree and head pin; `RootAllocation` durable allocation via injected `RootVerifier` | Nucleus |
 | 2. Authorize, acquire intent | `StorageAuthority.authorize`, `StorageTransport.acquire` (TS semantic seam); ledger in `storage-attempt.ts` | Nucleus, seam pending |
-| 3. Acquire | Rust `storage::Client::acquire(AcquireRequest)` returns `AcquireResult { lease_id, slot_id, state, slot_path, token, reused }`. Busy is `StorageError::Refused(RefusalReason::{NoIdleStorage, BudgetExceeded, LeaseUnavailable, AlreadyRunning})` | Oxide daemon, Rust-only |
+| 3. Acquire | Rust `storage::Client::acquire(AcquireRequest)` returns `AcquireResult { lease_id, slot_id, state, slot_path, token, reused }` or a `StorageError` (classified below) | Oxide daemon, Rust-only |
 | 4. Host submission | `validation-client.ts` `runValidation` (reviewed, unchanged), then scheduler under 010 | Queue host authority |
 | 5. Registered admission and execution | `Runner::run(&Registration, &Attempt)`: `inputs` (authenticate, audit, source inventory), reuse check, pending barrier, `ExecutionOwner::execute` | Oxide library; no installed owners |
 | 6. Capture and finalize | `verify_success`, `seal_map`, `finalize_idle` or `finalize_not_spawned`; daemon `Client::finalize(lease_id, token, operation_id, SettlementEvidence)` | Oxide plus Nucleus capture owner |
@@ -638,6 +638,22 @@ Facts that drive the shape:
 
 - The daemon is reachable only through Rust `storage::Client` (binary codec over a
   Unix socket). TS has no codec and cannot construct daemon frames.
+- Acquire outcomes, from `store.rs` `acquire` and `acquire_result`:
+  - `Ok` with `SlotState::Leased` and a `slot_path`: acquired. Attempt receives it.
+  - `Ok` with `SlotState::Uncertain` and no `slot_path`: uncertain hold. The lease,
+    reservation and root stay occupied. No host run.
+  - `Ok` with `SlotState::Idle` (finalized lease replay): no access. Not busy; the
+    parent reconciles before any new attempt.
+  - `Refused(LeaseUnavailable)`: occupancy wait. The slot or lease is held. Storage
+    busy, pending, no host run.
+  - `Refused(BudgetExceeded | FreeSpaceReserve | FreeSpaceUnavailable)`: capacity
+    wait. Pending and non-reserving. The parent decides wait or refuse by policy.
+  - `Refused(UnknownAccounting)`: uncertain accounting. Hold, no automatic retry.
+  - `Unauthorized`: admission verifier refused. No lease, no spawn.
+  - `Conflict`: same `acquire_id` with a changed body. Refuse.
+  - `AlreadyRunning` comes only from `Daemon::bind` and stale-socket checks, never
+    from acquire. `NoIdleStorage` comes only from `evict_slot`. Ordinary acquire
+    never evicts, so neither is a busy outcome.
 - `NoSpawnEvidence` and `CooperativeCompletionEvidence` are signed with the
   daemon-issued `LeaseToken` through `pub(crate)` methods. Settlement can therefore
   only be built by the Rust side that holds the token from acquire.
@@ -664,8 +680,9 @@ spawned per attempt by the Nucleus adapter and driven over a private framed chan
 - `ExecutionOwner::execute` is the nested host submission. The parent persists its
   submission intent, calls reviewed `runValidation`, then returns `Completed` or
   `NotSpawned`. `Runner::run` itself does not change.
-- Ordering: parent persists acquire intent → host `acquire` → busy returns
-  `storage-pending` to the parent without calling `Runner::run` → acquired lease
+- Ordering: parent persists acquire intent → host `acquire` → `LeaseUnavailable` or a
+  capacity refusal returns `storage-pending` to the parent without calling `Runner::run`
+  (uncertain or unknown-accounting results hold instead) → acquired lease
   retained before host submission. A submitted run may hold the lease for the finite
   capacity wait that fits its queue deadline. Cancellation sends the fence first,
   then the host requests reconcile or finalize only with authentic proof.
