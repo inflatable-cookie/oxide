@@ -375,6 +375,9 @@ fn tar_inventory(bytes: &[u8], limits: Limits, counters: &mut Counters) -> Resul
     for entry in archive.entries().map_err(|_| Refusal::Unsupported)? {
         bump_entries(counters, limits)?;
         let mut entry = entry.map_err(|_| Refusal::Integrity)?;
+        if entry.header().as_ustar().is_none() {
+            return Err(Refusal::Unsupported);
+        }
         let kind = entry.header().entry_type();
         let is_dir = matches!(kind, tar::EntryType::Directory);
         let is_file = matches!(kind, tar::EntryType::Regular | tar::EntryType::Continuous);
@@ -411,7 +414,7 @@ fn tar_inventory(bytes: &[u8], limits: Limits, counters: &mut Counters) -> Resul
                 return Err(Refusal::Unsupported);
             }
             directories.insert(relative.clone());
-            insert_parents(&relative, &files, &mut directories)?;
+            insert_parents(&relative, &files, &mut directories, limits, counters)?;
         } else {
             if directories.contains(&relative) {
                 return Err(Refusal::Unsupported);
@@ -429,12 +432,15 @@ fn tar_inventory(bytes: &[u8], limits: Limits, counters: &mut Counters) -> Resul
                 return Err(Refusal::Integrity);
             }
             files.insert(relative.clone(), digest(&content));
-            insert_parents(&relative, &files, &mut directories)?;
+            insert_parents(&relative, &files, &mut directories, limits, counters)?;
         }
     }
     let prefix = prefix.ok_or(Refusal::Unsupported)?;
     if files.is_empty() {
         return Err(Refusal::Unsupported);
+    }
+    if files.len().saturating_add(directories.len()) > limits.associations {
+        return Err(Refusal::Budget);
     }
     Ok(Package {
         prefix,
@@ -637,6 +643,8 @@ fn insert_parents(
     file: &str,
     files: &BTreeMap<String, String>,
     directories: &mut BTreeSet<String>,
+    limits: Limits,
+    counters: &mut Counters,
 ) -> Result<()> {
     let path = Path::new(file);
     let mut prefix = PathBuf::new();
@@ -654,7 +662,9 @@ fn insert_parents(
         if files.contains_key(name) {
             return Err(Refusal::Unsupported);
         }
-        directories.insert(name.to_owned());
+        if directories.insert(name.to_owned()) {
+            bump_entries(counters, limits)?;
+        }
         prefix.push(part);
     }
     Ok(())
@@ -773,15 +783,50 @@ mod tests {
         out
     }
     fn append_dir(builder: &mut tar::Builder<&mut Vec<u8>>, name: &str) {
-        let mut header = tar::Header::new_ustar();
+        append_dir_header(builder, name, tar::Header::new_ustar);
+    }
+    fn append_file(builder: &mut tar::Builder<&mut Vec<u8>>, name: &str, bytes: &[u8]) {
+        append_file_header(builder, name, bytes, tar::Header::new_ustar);
+    }
+    fn crate_bytes_with_header(
+        prefix: &str,
+        files: &[(&str, &[u8])],
+        dirs: &[&str],
+        new_header: fn() -> tar::Header,
+    ) -> Vec<u8> {
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            append_dir_header(&mut builder, &format!("{prefix}/"), new_header);
+            for dir in dirs {
+                append_dir_header(&mut builder, &format!("{prefix}/{dir}"), new_header);
+            }
+            for (name, bytes) in files {
+                append_file_header(&mut builder, &format!("{prefix}/{name}"), bytes, new_header);
+            }
+            builder.finish().unwrap();
+        }
+        gzip(&tar_buf)
+    }
+    fn append_dir_header(
+        builder: &mut tar::Builder<&mut Vec<u8>>,
+        name: &str,
+        new_header: fn() -> tar::Header,
+    ) {
+        let mut header = new_header();
         header.set_entry_type(tar::EntryType::Directory);
         header.set_path(name).unwrap();
         header.set_size(0);
         header.set_cksum();
         builder.append(&header, stdio::empty()).unwrap();
     }
-    fn append_file(builder: &mut tar::Builder<&mut Vec<u8>>, name: &str, bytes: &[u8]) {
-        let mut header = tar::Header::new_ustar();
+    fn append_file_header(
+        builder: &mut tar::Builder<&mut Vec<u8>>,
+        name: &str,
+        bytes: &[u8],
+        new_header: fn() -> tar::Header,
+    ) {
+        let mut header = new_header();
         header.set_entry_type(tar::EntryType::Regular);
         header.set_path(name).unwrap();
         header.set_size(bytes.len() as u64);
@@ -1126,6 +1171,38 @@ mod tests {
             once(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS).value,
             Err(Refusal::Unsupported)
         );
+
+        let (prefix, files, dirs) = layout();
+        let v7_root = scratch.path("v7-extract").join(prefix);
+        write_extracted(&v7_root, &files, &dirs);
+        let v7_root = fs::canonicalize(v7_root).unwrap();
+        let v7_path = scratch.path("v7.crate");
+        fs::write(
+            &v7_path,
+            crate_bytes_with_header(prefix, &files, &dirs, tar::Header::new_old),
+        )
+        .unwrap();
+        let v7 = fs::canonicalize(v7_path).unwrap();
+        let v7_sum = digest(&fs::read(&v7).unwrap());
+        assert_eq!(
+            once(&ask(&v7, &v7_root, &v7_sum), Limits::NUCLEUS).value,
+            Err(Refusal::Unsupported)
+        );
+        let gnu_root = scratch.path("gnu-extract").join(prefix);
+        write_extracted(&gnu_root, &files, &dirs);
+        let gnu_root = fs::canonicalize(gnu_root).unwrap();
+        let gnu_path = scratch.path("gnu.crate");
+        fs::write(
+            &gnu_path,
+            crate_bytes_with_header(prefix, &files, &dirs, tar::Header::new_gnu),
+        )
+        .unwrap();
+        let gnu = fs::canonicalize(gnu_path).unwrap();
+        let gnu_sum = digest(&fs::read(&gnu).unwrap());
+        assert_eq!(
+            once(&ask(&gnu, &gnu_root, &gnu_sum), Limits::NUCLEUS).value,
+            Err(Refusal::Unsupported)
+        );
     }
 
     #[test]
@@ -1170,6 +1247,33 @@ mod tests {
         let refused = once(&ask(&archive, &extracted, &checksum), tight);
         assert_eq!(refused.value, Err(Refusal::Budget));
         assert_eq!(refused.counters.entries, 8);
+    }
+
+    #[test]
+    fn implied_parent_directories_charge_the_inventory_cap() {
+        let scratch = Scratch::new();
+        let prefix = "pkg-1.0.0";
+        let files = [("a/b/c/d/e.rs", b"fn e() {}\n" as &[u8])];
+        let archive = scratch.path("deep.crate");
+        fs::write(&archive, crate_bytes(prefix, &files, &[])).unwrap();
+        let extracted = scratch.path(prefix);
+        write_extracted(&extracted, &files, &[]);
+        let archive = fs::canonicalize(archive).unwrap();
+        let extracted = fs::canonicalize(extracted).unwrap();
+        let checksum = digest(&fs::read(&archive).unwrap());
+        let verified = once(&ask(&archive, &extracted, &checksum), Limits::NUCLEUS)
+            .value
+            .expect("implied parents");
+        assert!(verified.files().contains_key("a/b/c/d/e.rs"));
+        assert!(verified.directories().contains("a"));
+        assert!(verified.directories().contains("a/b"));
+        assert!(verified.directories().contains("a/b/c"));
+        assert!(verified.directories().contains("a/b/c/d"));
+        let mut tight = Limits::NUCLEUS;
+        tight.associations = 5;
+        let refused = once(&ask(&archive, &extracted, &checksum), tight);
+        assert_eq!(refused.value, Err(Refusal::Budget));
+        assert_eq!(refused.counters.entries, 5);
     }
 
     #[test]

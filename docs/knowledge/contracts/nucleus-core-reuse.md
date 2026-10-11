@@ -63,7 +63,9 @@ matching a Cargo `.crate`. The extracted directory's last component must equal
 that prefix. The verifier enforces the locked SHA-256 of the compressed archive
 bytes (`sha256:` plus 64 lowercase hex), exact file content digests, and exact
 file/directory membership, including empty directories and parent directories
-implied by files or by nested empty directories. Duplicate tar members refuse,
+implied by files or by nested empty directories. Implied parents are inventory
+members and charge the same 32,768-entry cap as tar headers and extracted
+listings. Duplicate tar members refuse,
 including a repeated prefix-only package-root directory header. Extracted
 directory membership is snapshotted before and after each directory walk;
 identity or membership change refuses as unstable. Each listing charges a child
@@ -89,7 +91,7 @@ skipped. Symlink, hardlink and special tar entries, extracted symlinks,
 extracted regular files with `nlink ≠ 1`, and extracted special files refuse.
 Absolute/parent/escaping paths, `.`/`..` components, backslashes,
 non-UTF-8 names, duplicate or file/directory collisions, unknown formats
-(including bare tar, extra gzip members and trailing compressed bytes),
+(including V7/old and GNU tar headers, bare tar, extra gzip members and trailing compressed bytes),
 corrupt or truncated streams, and unstable reads refuse.
 
 Reads charge one shared preparation budget that is not reset per member, phase
