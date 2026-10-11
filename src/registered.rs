@@ -1,8 +1,9 @@
 //! Versioned, strict-physical input and execution seams for audited workflows.
 //!
 //! There is no built-in registration, authentication, immutable-evidence issuer,
-//! or host scheduler. A bounded pinned Cargo dep-info decoder is available, but
-//! the embedding consumer installs trusted owners independently of task data.
+//! or host scheduler. A bounded pinned Cargo dep-info decoder and a locked
+//! registry-archive correspondence verifier are available, but the embedding
+//! consumer installs trusted owners independently of task data.
 //! Synthetic owners are only test evidence.
 //! Cargo owns graph construction and freshness; this module never writes its
 //! fingerprints. The cooperative writer and immutable-owner promises are trust
@@ -20,6 +21,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::UNIX_EPOCH;
 
+pub mod archive;
 pub mod cargo_freshness;
 pub mod dep_info;
 #[cfg(feature = "private-qualification")]
