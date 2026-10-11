@@ -42,6 +42,7 @@ RESERVE = 20 * 1024 * 1024 * 1024
 # callable entry was added. They are included in the task's aggregate ledger.
 PREFLIGHT_SOURCE_BYTES = 48600
 PREFLIGHT_CONFIG_BYTES = 20
+INITIAL_REFRESH_SHA256 = "8f8158e58972f6892b7dcd5711d1ea1ef4b3b07f065c2c15423ac9ef0e37b297"
 
 
 def run(argv, *, limit=None):
@@ -273,7 +274,7 @@ def checked_triage_read(package, relative, role, triage):
         if role not in found["roles"]:
             found["roles"].append(role)
         return triage["cache"][key]
-    if len(triage["leaves"]) >= MAX_TRIAGE_LEAVES or triage["bytes"] >= MAX_TRIAGE_TOTAL:
+    if triage["prior_leaves"] + len(triage["leaves"]) >= MAX_TRIAGE_LEAVES or triage["bytes"] >= MAX_TRIAGE_TOTAL:
         triage["truncated"] = True
         return None
     root = Path(package["extracted_root"])
@@ -293,7 +294,7 @@ def checked_triage_read(package, relative, role, triage):
     if not canonical.is_relative_to(root.resolve(strict=True)):
         triage["unresolved"].append({"package": package["package"]["name"], "path": relative, "reason": "escaped_root", "role": role})
         return None
-    if len(triage["leaves"]) >= MAX_TRIAGE_LEAVES or triage["bytes"] + before.st_size > MAX_TRIAGE_TOTAL:
+    if triage["prior_leaves"] + len(triage["leaves"]) >= MAX_TRIAGE_LEAVES or triage["bytes"] + before.st_size > MAX_TRIAGE_TOTAL:
         triage["truncated"] = True
         return None
     with path.open("rb") as stream:
@@ -314,8 +315,14 @@ def checked_triage_read(package, relative, role, triage):
     return raw
 
 
-def behavior_triage(report, reachable):
-    triage = {"leaves": [], "unresolved": [], "findings": [], "bytes": 0, "truncated": False, "by_key": {}, "cache": {}}
+def behavior_triage(report, reachable, previous=None):
+    previous_triage = previous["report"]["behavior_triage"] if previous else {}
+    triage = {
+        "leaves": [], "unresolved": [], "findings": [],
+        "bytes": previous_triage.get("bytes_read", 0),
+        "prior_leaves": previous_triage.get("leaves_read", 0),
+        "truncated": False, "by_key": {}, "cache": {},
+    }
     reachable_set = set(reachable)
     package_rows = []
     selected_names = []
@@ -409,7 +416,7 @@ def behavior_triage(report, reachable):
         "locked_packages_with_verified_manifests": package_rows,
         "reachable_locked_packages_observed": sorted(set(selected_names)),
         "bytes_read": triage["bytes"],
-        "leaves_read": len(triage["leaves"]),
+        "leaves_read": triage["prior_leaves"] + len(triage["leaves"]),
         "leaves": triage["leaves"],
         "source_backed_behavior_lines": triage["findings"],
         "unresolved_or_referenced_evidence": triage["unresolved"],
@@ -493,6 +500,79 @@ def diagnostic_receipt(registry):
     return diagnostic, len(raw), digest, counters
 
 
+def prior_acquisition_receipt(registry):
+    path_text = os.environ.get("OXIDE_TASK038_PRIOR_ACQUISITION_PATH")
+    expected_digest = os.environ.get("OXIDE_TASK038_PRIOR_ACQUISITION_SHA256")
+    if not path_text and not expected_digest:
+        return None
+    if not path_text or expected_digest != INITIAL_REFRESH_SHA256:
+        raise RuntimeError("corrective refresh requires the exact recorded initial receipt")
+    path = Path(path_text)
+    if not path.is_absolute() or path.name != "nucleus-registry-acquisition.json":
+        raise RuntimeError("prior acquisition receipt path is outside the task-owned shape")
+    before = os.lstat(path)
+    scratch_root = Path("/private/tmp").resolve(strict=True)
+    canonical = path.resolve(strict=True)
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_size > MAX_OUTPUT
+        or not canonical.is_relative_to(scratch_root)
+        or canonical != path
+        or not path.parent.name.startswith("oxide-registry-acquisition-038-")
+    ):
+        raise RuntimeError("prior receipt type, location, or size refused")
+    raw = path.read_bytes()
+    after = os.lstat(path)
+    if file_identity(before) != file_identity(after) or len(raw) != before.st_size:
+        raise RuntimeError("prior acquisition receipt changed while being read")
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != expected_digest:
+        raise RuntimeError("prior acquisition receipt digest does not match the recorded attempt")
+    receipt = json.loads(raw)
+    expected_packages = [(item["name"], item["version"], item["checksum"]) for item in registry]
+    source = receipt.get("source", {})
+    report = receipt.get("archive_verification", {})
+    observed_packages = [
+        (item.get("package", {}).get("name"), item.get("package", {}).get("version"), item.get("package", {}).get("checksum"))
+        for item in report.get("packages", [])
+    ]
+    ledger = receipt.get("read_ledger", {})
+    counters = report.get("counters", {})
+    if (
+        source.get("commit") != COMMIT
+        or source.get("tree") != TREE
+        or source.get("lock_sha256") != LOCK_SHA256
+        or receipt.get("oxide_implementation", {}).get("commit") != "ee9f3319095632f4ed42d2f11608eb3cf18aecc1"
+        or report.get("schema") != "oxide.registry-acquisition.v2"
+        or observed_packages != expected_packages
+        or set(counters) != {"archive_bytes", "decompressed_bytes", "extracted_bytes", "entries"}
+        or any(not isinstance(value, int) or value < 0 for value in counters.values())
+        or sum(counters[key] for key in ("archive_bytes", "decompressed_bytes", "extracted_bytes"))
+        != ledger.get("archive_compressed_decompressed_and_extracted_bytes")
+        or report.get("candidate_observations") != ledger.get("candidate_path_metadata_observations")
+        or ledger.get("aggregate_bytes") != sum(ledger.get(key, 0) for key in (
+            "source_bytes", "config_bytes", "archive_compressed_decompressed_and_extracted_bytes",
+            "diagnostic_output_bytes", "triage_bytes",
+        ))
+        or report.get("phase_start", {}).get("counters") != receipt.get("archive_diagnostics", {}).get("receipt", {}).get("phase_counters")
+    ):
+        raise RuntimeError("prior receipt does not match the recorded task 038 first refresh")
+    if (
+        sum(counters[key] for key in ("archive_bytes", "decompressed_bytes", "extracted_bytes")) > MAX_ARCHIVE_PHASE
+        or report.get("candidate_observations", MAX_OUTPUT) > 512
+        or ledger.get("aggregate_bytes", MAX_OUTPUT) > 275 * 1024 * 1024
+    ):
+        raise RuntimeError("prior receipt already exceeds a shared phase ceiling")
+    return {
+        "report": receipt,
+        "bytes_read": len(raw),
+        "sha256": digest,
+        "counters": counters,
+        "candidate_observations": report["candidate_observations"],
+    }
+
+
 def package_counter_ledger(report):
     previous = report["phase_start"]["counters"]
     rows = []
@@ -550,6 +630,9 @@ def main():
     registry, local = lock_inventory(leaves["Cargo.lock"]["raw"])
     reachable, unresolved_deps = locked_reachable(registry, local)
     diagnostics, diagnostic_output_bytes, diagnostic_digest, phase_counters = diagnostic_receipt(registry)
+    previous = prior_acquisition_receipt(registry)
+    starting_counters = previous["counters"] if previous else phase_counters
+    starting_candidates = previous["candidate_observations"] if previous else diagnostics["candidate_path_metadata_observations"]
     before_free = shutil.disk_usage(CARGO_HOME).free
     if before_free < RESERVE:
         raise RuntimeError("host free space is below the 20 GiB acquisition reserve")
@@ -561,8 +644,8 @@ def main():
         "schema": "oxide.registry-acquisition.request.v2",
         "source": source_identity,
         "phase_start": {
-            "counters": phase_counters,
-            "candidate_observations": diagnostics["candidate_path_metadata_observations"],
+            "counters": starting_counters,
+            "candidate_observations": starting_candidates,
         },
         "packages": [{key: item[key] for key in ("name", "version", "source", "checksum")} for item in registry],
     }
@@ -582,26 +665,49 @@ def main():
         (item["package"]["name"], item["package"]["version"], item["package"]["checksum"])
         for item in report["packages"]
     ]
-    if observed_packages != expected_packages or report["phase_start"]["counters"] != phase_counters:
+    if observed_packages != expected_packages or report["phase_start"]["counters"] != starting_counters:
         raise RuntimeError("refreshed report differs from the pinned 58-package request or phase start")
     after_free = shutil.disk_usage(CARGO_HOME).free
     if after_free < RESERVE:
         raise RuntimeError("host free space fell below the 20 GiB acquisition reserve")
-    triage = behavior_triage(report, reachable)
+    triage = behavior_triage(report, reachable, previous)
     after_triage_free = shutil.disk_usage(CARGO_HOME).free
     if after_triage_free < RESERVE:
         raise RuntimeError("host free space fell below the 20 GiB reserve during triage")
     archive_reads = sum(report["counters"][key] for key in ("archive_bytes", "decompressed_bytes", "extracted_bytes"))
-    diagnostic_archive_reads = sum(phase_counters[key] for key in ("archive_bytes", "decompressed_bytes", "extracted_bytes"))
+    current_phase_archive_reads = archive_reads - sum(starting_counters[key] for key in ("archive_bytes", "decompressed_bytes", "extracted_bytes"))
+    previous_ledger = previous["report"]["read_ledger"] if previous else {}
+    diagnostic_archive_reads = previous_ledger.get(
+        "diagnostic_archive_bytes",
+        sum(phase_counters[key] for key in ("archive_bytes", "decompressed_bytes", "extracted_bytes")),
+    )
     acquisition_archive_reads = archive_reads - diagnostic_archive_reads
-    total_source_bytes = PREFLIGHT_SOURCE_BYTES + source_bytes
-    total_config_bytes = PREFLIGHT_CONFIG_BYTES + config_bytes
-    total_reads = total_source_bytes + total_config_bytes + archive_reads + triage["bytes_read"] + diagnostic_output_bytes
+    previous_receipt_bytes = previous["bytes_read"] if previous else 0
+    total_source_bytes = previous_ledger.get("source_bytes", PREFLIGHT_SOURCE_BYTES) + source_bytes
+    total_config_bytes = previous_ledger.get("config_bytes", PREFLIGHT_CONFIG_BYTES) + config_bytes
+    total_diagnostic_output_bytes = previous_ledger.get("diagnostic_output_bytes", 0) + diagnostic_output_bytes
+    total_handover_receipt_bytes = previous_ledger.get("prior_acquisition_receipt_bytes_read", 0) + previous_receipt_bytes
+    previous_triage_bytes = previous_ledger.get("triage_bytes", 0)
+    latest_triage_bytes = triage["bytes_read"] - previous_triage_bytes
+    previous_triage_leaves = (
+        previous["report"]["behavior_triage"].get("leaves_read", 0) if previous else 0
+    )
+    latest_triage_leaves = triage["leaves_read"] - previous_triage_leaves
+    total_reads = (
+        total_source_bytes + total_config_bytes + archive_reads + triage["bytes_read"]
+        + total_diagnostic_output_bytes + total_handover_receipt_bytes
+    )
+    previous_refresh_archive_bytes = previous_ledger.get("refreshed_58_package_archive_bytes", 0)
+    latest_refresh_candidate_observations = report["acquisition_candidate_observations"]
+    total_refreshed_candidate_observations = previous_ledger.get(
+        "refreshed_candidate_path_metadata_observations", 0
+    ) + latest_refresh_candidate_observations
     if (
         total_source_bytes > MAX_SOURCE_TOTAL
         or total_config_bytes > 2 * MAX_CONFIG
         or archive_reads > MAX_ARCHIVE_PHASE
         or triage["bytes_read"] > MAX_TRIAGE_TOTAL
+        or triage["leaves_read"] > MAX_TRIAGE_LEAVES
         or report["candidate_observations"] > 512
         or total_reads > 275 * 1024 * 1024
     ):
@@ -681,6 +787,16 @@ def main():
             "receipt_sha256": diagnostic_digest,
             "receipt_bytes_read": diagnostic_output_bytes,
             "receipt": diagnostics,
+            "receipt_phase_already_charged": previous is not None,
+            "prior_acquisition_handover": None if previous is None else {
+                "receipt_git_path": "docs/knowledge/evidence/nucleus-registry-acquisition-038-initial-attempt.json",
+                "receipt_sha256": previous["sha256"],
+                "receipt_bytes_read": previous["bytes_read"],
+                "oxide_implementation": previous["report"]["oxide_implementation"],
+                "archive_counters": previous["counters"],
+                "candidate_path_metadata_observations": previous["candidate_observations"],
+                "aggregate_bytes": previous_ledger["aggregate_bytes"],
+            },
             "refresh_continuity": diagnostic_refresh_match,
         },
         "archive_verification": report,
@@ -697,11 +813,24 @@ def main():
             "archive_compressed_decompressed_and_extracted_bytes": archive_reads,
             "diagnostic_archive_bytes": diagnostic_archive_reads,
             "refreshed_58_package_archive_bytes": acquisition_archive_reads,
-            "diagnostic_output_bytes": diagnostic_output_bytes,
-            "triage_bytes": triage["bytes_read"], "aggregate_bytes": total_reads,
+            "previous_refresh_archive_bytes": previous_refresh_archive_bytes,
+            "latest_refresh_archive_bytes": current_phase_archive_reads,
+            "diagnostic_output_bytes": total_diagnostic_output_bytes,
+            "diagnostic_output_bytes_in_current_entry": diagnostic_output_bytes,
+            "prior_acquisition_receipt_bytes_read": total_handover_receipt_bytes,
+            "prior_acquisition_receipt_bytes_read_in_current_entry": previous_receipt_bytes,
+            "triage_bytes": triage["bytes_read"],
+            "triage_bytes_in_current_entry": latest_triage_bytes,
+            "aggregate_bytes": total_reads,
             "candidate_path_metadata_observations": report["candidate_observations"],
             "diagnostic_candidate_path_metadata_observations": diagnostics["candidate_path_metadata_observations"],
-            "refreshed_candidate_path_metadata_observations": report["acquisition_candidate_observations"],
+            "refreshed_candidate_path_metadata_observations": total_refreshed_candidate_observations,
+            "latest_refresh_candidate_path_metadata_observations": latest_refresh_candidate_observations,
+            "full_refresh_attempts": previous_ledger.get(
+                "full_refresh_attempts", 1 if previous else 0
+            ) + 1,
+            "triage_leaves_currently_read": triage["leaves_read"],
+            "triage_leaves_in_current_entry": latest_triage_leaves,
             "per_package_cumulative_counters_and_deltas": package_counters,
             "limits": {"source_total": MAX_SOURCE_TOTAL, "per_source_leaf": MAX_SOURCE_LEAF,
                        "archive_decode_extract_total": MAX_ARCHIVE_PHASE,
