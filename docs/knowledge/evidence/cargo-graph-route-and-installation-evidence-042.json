@@ -42,6 +42,24 @@
       }
     ]
   },
+  "planner_whole_tree_search": {
+    "provenance": "Completed planner prerequisite supplied to Task 043; distinct from Task 042's bounded raw-file reads.",
+    "source_archive": "https://codeload.github.com/rust-lang/cargo/tar.gz/c980f4866141969fab6254a680546a277789d6f0",
+    "sha256": "74431490023e3fbcd6bb72abf09cf54b0339b850bc49e1b2446c88a1be54ea9b",
+    "compressed_bytes": 4439958,
+    "regular_files": 2918,
+    "expanded_bytes": 17626902,
+    "searched_every_regular_member_for": ["nightly_features_allowed", "channel()"],
+    "additional_hits": [
+      "src/bin/cargo/cli.rs: -C changes the working directory behind unstable-options.",
+      "src/bin/cargo/main.rs: nightly enables CARGO_COMPLETE handling.",
+      "src/cargo/core/resolver/encode.rs: lockfile v5 is accepted only with next-lockfile-bump.",
+      "src/cargo/util/toml/mod.rs: cargo-lint warning behavior changes.",
+      "src/cargo/core/compiler/custom_build.rs and src/cargo/ops/fix/mod.rs: additional runtime hits requiring route review.",
+      "Feature diagnostics and documentation-link hits; unrelated asynchronous channel() hits are not runtime gate evidence."
+    ],
+    "interpretation": "This is a completed whole-tree text search and targeted source review, not a full invocation-equivalence proof, route approval, or consent to execute Cargo."
+  },
   "pinned_source_ledger": [
     {"path": "src/cargo/util/context/mod.rs", "bytes": 101269, "sha256": "5414a78a2859f4edd8f6995ccd56253341697c662408fedce01ac74905dfaf7d", "matches_041": true},
     {"path": "src/cargo/core/features.rs", "bytes": 64851, "sha256": "0f8af542f10fa318672a88203df79ba7a89e94b20b41b19491d36a3d89136252", "matches_041": true},
@@ -60,13 +78,13 @@
     {"path": "src/cargo/core/compiler/unit_dependencies.rs", "bytes": 45208, "sha256": "59ffc23fef8adc506b38eb0f6a7647983af31983e744dd82b6a07368123da04c", "matches_041": true, "note": "Added in the revision after review: source of public/noprelude/nounused values."}
   ],
   "graph_route": {
-    "verdict": "One candidate remains: same pinned Cargo 1.97.1 (c980f4866141969fab6254a680546a277789d6f0) planner behind an explicit, narrowly confined development-channel gate. Not approved. Stable/supported claim is refused. It is defensible only as an unstable bypass with exact-pin refusal and a complete nightly-branch inventory (see caveat).",
+    "verdict": "One proposed candidate remains: same pinned Cargo 1.97.1 (c980f4866141969fab6254a680546a277789d6f0) planner behind an explicit development-channel gate. Not approved. Stable/supported claim is refused. The whole-tree text inventory is complete but does not establish invocation equivalence or authorize the unstable route.",
     "candidates": [
       {
         "id": "A",
         "name": "Same pinned Cargo, development-channel gate",
         "status": "Preferred candidate; material ruling required",
-        "planner_identity": "Same code path: create_bcx runs for both graph and ordinary build, and the emit at cargo_compile/mod.rs:188-190 returns before compilation. Outside that path the gate changes two things: it accepts unstable manifest and -Z/[unstable] input, and it serializes public/noprelude/nounused, which stable never emits. The consumer preflight refuses the first; the value rule in unit_binding handles the second.",
+        "planner_identity": "Same code path: create_bcx runs for both graph and ordinary build, and the emit at cargo_compile/mod.rs:188-190 returns before compilation. Task 042's initial two-change summary was incomplete: whole-tree search found additional channel-dependent sites recorded in planner_whole_tree_search. Those sites still need route-specific preflight or audit; no equivalence is established.",
         "gate": {
           "channel_env": "__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS=nightly (preferred). Read only by Cargo (features.rs:1563-1566). Test-only, undocumented, unvalidated value.",
           "rejected_channel_env": "RUSTC_BOOTSTRAP=1 maps the Cargo channel to dev (features.rs:1570-1573) but is also read by rustc itself, enabling unstable rustc features in every probe and child rustc. Not acceptable as the gate.",
@@ -82,9 +100,11 @@
           "features.rs:439,610,625,764 feature-set plumbing and diagnostics text.",
           "features.rs:1529 fail_if_stable_command (new unstable subcommands).",
           "unit_graph.rs:115 public/noprelude/nounused serialized only when nightly_features_allowed (SerializedUnitDep lines 76-88). The values are computed regardless of channel: normal edges take resolve.is_public_dep with noprelude=false and nounused=false (unit_dependencies.rs:942-944). Only the std-root artificial edge sets all three true (unit_dependencies.rs:207-210), attached only when std_roots is non-empty (the build-std path; std_roots population not traced). Other UnitDep constructors not traced.",
-          "features.rs:1563 and 1570 channel() itself; features.rs cargo_docs_link only changes URLs."
+          "features.rs:1563 and 1570 channel() itself; features.rs cargo_docs_link only changes URLs.",
+          "Whole-tree search additionally found cli.rs -C working-directory changes, main.rs CARGO_COMPLETE handling, resolver/encode.rs lock-v5 gating, and util/toml/mod.rs cargo-lint warning behavior.",
+          "custom_build.rs, ops/fix/mod.rs, feature diagnostics/doc links and unrelated asynchronous channel() references were additional text hits; only the exact reviewed runtime sites count as gate effects."
         ],
-        "inventory_caveat": "Built from the 15 fetched files only. A complete grep of nightly_features_allowed and channel() across the whole pinned tree is a precondition of any implementation brief; it was not performed here.",
+        "inventory_caveat": "The 15-file Task 042 source ledger is separate from the completed planner whole-tree search. Search provenance is recorded at planner_whole_tree_search. Text-search completion is not full invocation-equivalence evidence and does not authorize route execution.",
         "rustc_probes": {
           "sites": [
             "target_info.rs:168-221 TargetInfo::new runs rustc --print=file-names/sysroot/split-debuginfo/crate-name/cfg per requested kind (RustcTargetData::new at cargo_compile/mod.rs:285 precedes units).",
@@ -109,7 +129,7 @@
           "source": "unit_graph.rs:53 VERSION=1; SerializedUnitGraph {version, units, roots}; SerializedUnit {pkg_id, target, profile, platform, mode, features, is_std, dependencies}.",
           "not_in_graph": "rustc version/host triple, cfg probe output, lock checksums, config inventory, env, build-script outputs, native/C/header closure, proc-macro helper executables, registry checksums."
         },
-        "behaviour_gap": "Manifest cargo-features and -Z/[unstable] accepted only under the gate, so a graph success does not imply ordinary stable success. The consumer must refuse any manifest cargo-features key, any [unstable] table, and any -Z in argv/config before the graph run. Serialized public/noprelude/nounused are accepted under the gate by the value rule in unit_binding, not refused."
+        "behaviour_gap": "Manifest cargo-features and -Z/[unstable] are accepted only under the gate, so graph success does not imply ordinary stable success. Consumer preflight must refuse those inputs and audit the additional -C, CARGO_COMPLETE, lock-v5/next-lockfile-bump and cargo-lint sites. Serialized public/noprelude/nounused are handled by the value rule in unit_binding. No full route equivalence is claimed."
       },
       {
         "id": "B",
@@ -277,11 +297,11 @@
   },
   "honest_scope": {
     "observed": [
-      "Pinned Cargo channel override, RUSTC_BOOTSTRAP mapping, nightly_features_allowed reach, unit-graph gate, [env] apply reach, rustc probe and rustc-info cache sites, lock and offline helpers, unit graph v1 schema.",
+      "Pinned Cargo channel override, RUSTC_BOOTSTRAP mapping, bounded 15-file Task 042 ledger, the separately supplied whole-tree planner text-search provenance, unit-graph gate, [env] apply reach, rustc probe and rustc-info cache sites, lock and offline helpers, unit graph v1 schema.",
       "Oxide in-repo registered.rs Limits, ImmutableClass, stability check and membership refusals."
     ],
     "unsupported": [
-      "Whole-tree nightly_features_allowed inventory (only 15 files read).",
+      "Full invocation equivalence across the additional nightly/channel sites and ordinary stable execution.",
       "Network enforcement point in the source layer.",
       "Real toolchain/Xcode closure, sizes or entry counts beyond 041's named-path metadata.",
       "Hash or copy throughput; any time claim.",
