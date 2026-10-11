@@ -1,5 +1,10 @@
 # Project adoption and coordinated slot waiting
 
+For project-owned component-lazy preparation, use the
+[optimization adoption policy](optimization-adoption.md). That improvement
+requires no shared slot or consumer lifecycle integration. This document owns
+the separate reusable-slot adoption design.
+
 Status: proposed consumer design. Oxide now contains an unpublished Rust
 library adapter for task-owned fixtures. It defines no production Queue/Nucleus
 binding, consumer configuration key, daemon deployment or consumer adoption.

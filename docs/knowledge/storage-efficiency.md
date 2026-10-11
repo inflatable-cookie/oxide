@@ -6,6 +6,9 @@ or authorize changes in the inspected projects.
 
 ## Component preparation
 
+The reusable project routing requirements live in the
+[optimization adoption policy](contracts/optimization-adoption.md#component-lazy-preparation).
+
 At Acowtancy commit `70b6d7c8c83a48a85abbbd24717ed8064898cf5a`,
 worktree setup no longer seeds host Rust targets. Supported host Rust selectors
 prepare only their declared Farmyard, Desktop or Silo component; composed
