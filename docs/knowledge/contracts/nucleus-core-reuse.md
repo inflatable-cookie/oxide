@@ -612,3 +612,217 @@ replay or a broad baseline programme. SSD writes remain a separate gate needing
 an attributable real write observable and separately approved measurement scope;
 allocation deltas/global free space do not measure writes. Qualification and
 consumer delivery scopes belong in Queue, not this knowledge contract.
+
+## Proposed minimal Rust binding (inactive design)
+
+Status: proposal from read-only source inspection on 2026-10-11 (Task 026). It is
+not a shipped RPC, accepted issuer, live binding or evidence. Pins: Oxide main
+`3c957a9`, Rust registered library at PR25 `57ee0cf` / merged `d9ff179`; Nucleus
+`9a562d1` ([Contract 011](https://github.com/inflatable-cookie/nucleus/blob/9a562d1492ddb1474ebb2ea503889ecc6b0845b1/docs/knowledge/contracts/011-oxide-consumer-boundary.md),
+`root-allocation.ts`, `managed-git.ts`, `storage-attempt.ts`, `oxide-retention.ts`,
+`validation-client.ts`). No build, test, scan or owner contact was made.
+
+### One attempt, traced through actual code
+
+| Step | Actual surface | Owner today |
+| --- | --- | --- |
+| 1. Root and source | `ManagedGit` owned worktree and head pin; `RootAllocation` durable allocation via injected `RootVerifier` | Nucleus |
+| 2. Authorize, acquire intent | `StorageAuthority.authorize`, `StorageTransport.acquire` (TS semantic seam); ledger in `storage-attempt.ts` | Nucleus, seam pending |
+| 3. Acquire | Rust `storage::Client::acquire(AcquireRequest)` returns `AcquireResult { lease_id, slot_id, state, slot_path, token, reused }` or a `StorageError` (classified below) | Oxide daemon, Rust-only |
+| 4. Host submission | `validation-client.ts` `runValidation` (reviewed, unchanged), then scheduler under 010 | Queue host authority |
+| 5. Registered admission and execution | `Runner::run(&Registration, &Attempt)`: `inputs` (authenticate, audit, source inventory), reuse check, pending barrier, `ExecutionOwner::execute` | Oxide library; no installed owners |
+| 6. Capture and finalize | `verify_success`, `seal_map`, `finalize_idle` or `finalize_not_spawned`; daemon `Client::finalize(lease_id, token, operation_id, SettlementEvidence)` | Oxide plus Nucleus capture owner |
+| 7. Archive and recycle | `OxideRetention.capture/archive/recycle`; `RootAllocation` seal. No Oxide call | Nucleus |
+
+Facts that drive the shape:
+
+- The daemon is reachable only through Rust `storage::Client` (binary codec over a
+  Unix socket). TS has no codec and cannot construct daemon frames.
+- Acquire outcomes, from `store.rs` `acquire` and `acquire_result`:
+  - `Ok` with `SlotState::Leased` and a `slot_path`: acquired. Attempt receives it.
+  - `Ok` with `SlotState::Uncertain` and no `slot_path`: uncertain hold. The lease,
+    reservation and root stay occupied. No host run.
+  - `Ok` with `SlotState::Idle` (finalized lease replay): no access. Not busy; the
+    parent reconciles before any new attempt.
+  - `Refused(LeaseUnavailable)`: occupancy wait. The slot or lease is held. Storage
+    busy, pending, no host run.
+  - `Refused(BudgetExceeded | FreeSpaceReserve | FreeSpaceUnavailable)`: capacity
+    wait. Pending and non-reserving. The parent decides wait or refuse by policy.
+  - `Refused(UnknownAccounting)`: uncertain accounting. Hold, no automatic retry.
+  - `Unauthorized`: admission verifier refused. No lease, no spawn.
+  - `Conflict`: same `acquire_id` with a changed body. Refuse.
+  - `AlreadyRunning` comes only from `Daemon::bind` and stale-socket checks, never
+    from acquire. `NoIdleStorage` comes only from `evict_slot`. Ordinary acquire
+    never evicts, so neither is a busy outcome.
+- `NoSpawnEvidence` and `CooperativeCompletionEvidence` are signed with the
+  daemon-issued `LeaseToken` through `pub(crate)` methods. Settlement can therefore
+  only be built by the Rust side that holds the token from acquire.
+- `Runner` has no daemon RPC. `Attempt` is caller data with no authority, and its
+  `reused` flag must come from the daemon, not from Nucleus.
+- `AcquireResult` has no `generation` and no allocation epoch. `RunEnvelope` has
+  no epoch field. Both must enter another way (see gaps).
+- `EvidenceAuthority::verify_admission` and `verify_settlement` return `bool`. An
+  implementation that does not authenticate through the accepted consumer verifier
+  must refuse. A boolean is not authority.
+
+### Chosen embedding
+
+Use a Rust **registered runner host** (proposed module `src/registered/runner_host.rs`),
+spawned per attempt by the Nucleus adapter and driven over a private framed channel
+(newline-delimited JSON, versioned, explicit frame cap, unknown op or version refuses):
+
+- The host owns every `storage::Client` call for acquire, finalize and reconcile.
+  It holds `LeaseToken` in memory for the attempt only. Nucleus stores only token digests.
+- `RegistrationOwner`, `InputEvidenceOwner` and `ExecutionOwner` are implemented as
+  parent callbacks over the same channel. Each returns an owner receipt that the Rust
+  side verifies against subject and policy digests before use. Verifier material is
+  installed at embedder construction, never from task JSON or environment.
+- `ExecutionOwner::execute` is the nested host submission. The parent persists its
+  submission intent, calls reviewed `runValidation`, then returns `Completed` or
+  `NotSpawned`. `Runner::run` itself does not change.
+- Ordering: parent persists acquire intent → host `acquire` → `LeaseUnavailable` or a
+  capacity refusal returns `storage-pending` to the parent without calling `Runner::run`
+  (uncertain or unknown-accounting results hold instead) → acquired lease
+  retained before host submission. A submitted run may hold the lease for the finite
+  capacity wait that fits its queue deadline. Cancellation sends the fence first,
+  then the host requests reconcile or finalize only with authentic proof.
+
+Alternative, rejected: TS-only storage client plus direct Effigy invocation without
+`Runner`. That needs a TypeScript reimplementation of the binary daemon codec and of
+the map, input and seal checks, which duplicates the Oxide manager.
+
+Where a new local boundary is required: nothing in Oxide exposes `Runner` out of
+process today. The framed host above is that boundary. It is new, Oxide-owned and
+inactive until an embedder spawns it.
+
+### Field correspondence
+
+| Nucleus subject or receipt | Oxide field | Rule |
+| --- | --- | --- |
+| `consumer` | `RunBinding.consumer` | exact string |
+| `project` | `RunBinding.project` | exact string |
+| `component` (explicit admitted registration) | `RunBinding.component`, `PartitionKey.project_component` | must match; registration name is proposed |
+| `workflowVersion` | `RunBinding.workflow`, `PartitionKey.workflow` | proposed canonical `<workflowId>@<version>`; not a current Nucleus string |
+| `task` | `RunBinding.task_id` | exact |
+| `workspace` | `RunBinding.workspace_id` | canonical workspace ID, not the branch name |
+| `branch` | `Attempt.branch`, `Launch.branch` | not in `RunBinding`; must not enter partition identity |
+| `run`, `attempt` | `RunBinding.run_id`, `RunBinding.attempt_id` | exact |
+| `head` | `RunBinding.commit`, `SourceEvidence.commit` | Git commit OID; must match exactly |
+| `tree` (Git tree OID) | none | Nucleus identity only; not Oxide's source digest |
+| source inventory | `RunBinding.source_tree_digest`, `SourceEvidence.tree_digest` | Oxide framed digest, defined below |
+| `rootId`, `rootPath` | `Attempt.root_id`, `Attempt.source_root` | canonical; `Attempt.slot` is the daemon `slot_path`, never `rootPath` |
+| `allocationEpoch` | `Attempt.allocation_epoch` | canonical decimal string; no daemon field, so the admission verifier must check it |
+| `partitionId` | `Attempt.partition` | digest of canonical `PartitionKey` (11 fields); no task, head, run or epoch inside |
+| lease ID | `AcquireResult.lease_id`, `Attempt.lease_id` | daemon string; Nucleus `Lease.id` must equal it |
+| `Lease.generation` | `Attempt.generation` | **no daemon source**; refuse acquired until the daemon returns it |
+| acquire `token` | `AcquireResult.token` (`LeaseToken`) | host memory only; Nucleus stores a digest |
+| authorization | `Attempt.authorization`, `RunEnvelope.admission_reference` | Nucleus authorization receipt operation and payload digests |
+| admission credential | `RunEnvelope.admission_credential` | no accepted issuer exists (see owner table) |
+| `reused` | `AcquireResult.reused` → `Attempt.reused` | daemon value only |
+| required bytes | `AcquireRequest.required_bytes` | Nucleus policy byte bound |
+| `target`, `temp`, `capture` | `Attempt.target`, `temp`, `capture` | canonical private paths; `Runner` adds `CARGO_*`/`TMP*` env, which the audit must approve |
+
+### Digest identities (all distinct)
+
+| Digest | Producer and encoding | Use |
+| --- | --- | --- |
+| `sourceManifestDigest` | Nucleus local manifest in `root-allocation.ts` and `storage-attempt.ts` | consumer identity only |
+| `retainedSourceDigest` | `oxide-retention.ts`: SHA-256 over JSON `{path, sha256, bytes, mode}` sorted by **`localeCompare`**, bare hex file digests, source and behavior classes only | consumer retention only; never forwarded as Oxide |
+| Git head / tree | 40 or 64 hex object IDs | Nucleus identity |
+| Oxide `tree_digest` | `sha256:` + hex of SHA-256 over, for each `(name, file)` in Rust `BTreeMap<String,String>` order (UTF-8 byte order), `frame(name)` then `frame(file)`. `frame(x)` = u64 little-endian byte length + bytes. `file` = `sha256:` + 64 lowercase hex of the file bytes | `RunBinding.source_tree_digest` |
+
+The file digest is the `sha256:`-prefixed string. Nucleus's bare-hex `sha256` must be
+prefixed before framing. Both `retainedSourceDigest` and JS default `.sort()` order differ
+from UTF-8 byte order, so neither may feed Oxide.
+
+### One bounded correspondence proof
+
+1. Clean committed tree only. `git status --porcelain=v1 -z --ignored --untracked-files=all`
+   is empty, with bounded output and no host scan. Submodules (mode 160000), LFS
+   attributes, symlinks (120000) and non-blob entries refuse.
+2. `git ls-tree -r -z --full-tree <head>` lists the set of regular blobs with modes
+   100644 or 100755 only. Each path must be valid UTF-8, contain no NUL, and have only
+   `Normal` components within the 2048-byte and depth-32 limits (`relative()` enforces these).
+3. Set equality: ls-tree paths = `Registration.source_files` = `SourceEvidence.files` keys.
+4. For each path, read the owned bytes (per-file 16 MiB, inventory 256 MiB). Recompute
+   the Git blob OID (`blob <len>\0` + bytes, SHA-1 or SHA-256 per repo) and require it to
+   equal the ls-tree OID. This is the **added** check, binding disk bytes to the committed
+   object. Oxide's existing check (`state.digest != expected`) only binds the SHA-256.
+5. Sort by UTF-8 bytes, build the framed digest, and compare with `RunBinding.source_tree_digest`.
+6. Modes are not in Oxide's digest. Nucleus records modes in its manifest and refuses any
+   mode other than 100644 or 100755.
+7. Integers. Byte counts and epochs cross JSON as safe integers only (≤ 2^53−1). Larger
+   values must be canonical decimal strings (no leading zero, `0` alone). Parse as `u64`
+   in Rust. Floats, negatives and non-canonical forms refuse.
+
+### Previous map provenance and PR25 framing
+
+- Reuse path: `verify_map(attempt, digest(encode(previous, "")), seal)`, then
+  `collect(current)`, then `admit(previous, current)`, which compares publication,
+  identity, tree, semantics, source and anchors. A passing previous map is provenance
+  only; `reused` is not authority.
+- PR25 (`57ee0cf`) changed the semantic digest. `frame(unit.id)` and, for
+  `LocalInput::DepInfo`, `frame("dep-info")`, `frame(evidence_unit)`, `frame(anchor)`
+  are now in the semantic framing, and `LocalInput::DepInfo` gained `unit` (checked
+  against `UnitEvidence.id`). `MAP_VERSION` and the map and pending/candidate prefixes
+  stayed `1`, so bytes alone do not distinguish old maps.
+- Binding rule: the Oxide implementation pin (`d9ff179`, or a later reviewed head) is
+  bound into the **owner seal**, which `seal_map` and `verify_map` already authenticate.
+  Verification refuses a seal that lacks the pin. Pre-PR25 maps are therefore refused
+  rather than converted. Admission's semantic mismatch is not relied on alone, because it
+  only catches units with dep-info.
+
+### Replay, lost reply and no-spawn
+
+- Acquire replays the same `acquire_id` with an identical body (Nucleus `bodyDigest`).
+  A changed body refuses. A lost acquire reply goes through `reconcileAcquire` first.
+- Finalize uses the existing `operation_id`. A lost finalize reply goes through
+  `reconcileFinalize` first, then the identical finalize ID, and only after verified
+  absence.
+- Time, PID, filenames (`PENDING`, `CANDIDATE`), labels, SHA hashes and fixture booleans
+  carry no authority. The durable pending barrier is ineligibility, not permission.
+- `NotSpawned` finalizes only with authentic no-writer evidence. Timeout, PID absence and
+  archive state never release a lease. Uncertain ownership holds the lease, reservation and
+  root.
+- Lease token material never appears in serialized frames, logs or the ledger (digest only).
+
+### Refusal rules
+
+- Any mismatch across `Attempt`, `RunBinding`, daemon results and Nucleus receipts refuses.
+- `acquired` without `slot_path`, `token` or `generation` refuses.
+- A map without the bound implementation pin refuses.
+- Non-UTF-8 paths, symlinks, submodules, LFS, modes other than 100644/100755, and unsafe
+  integers refuse.
+- A `reused` flag not returned by the daemon refuses.
+- Per-revision, task, branch and epoch identities never enter `PartitionKey` or `partitionId`.
+- Unknown op, version or frame size refuses. Contract 010 is unchanged.
+
+### Owner table and missing seams
+
+| Missing seam | Owner | Status |
+| --- | --- | --- |
+| Admission credential and `EvidenceAuthority::verify_admission` | Nucleus task admission and Queue host authority; Tom decides which signs | no issuer in source; the host calls the accepted verifier |
+| Settlement and capture credentials (`SettlementEvidence.consumer_credential`, `TerminalRecord`, `CaptureReceipt`) | Queue scheduler envelope and Nucleus capture owner | no source |
+| `RegistrationOwner.authenticate` and `audit` | Nucleus managed-Git and root owner; audited-input owner | missing |
+| `InputEvidenceOwner.immutable`, `units`, `seal_map`, `verify_map` | installation registry and SDK owner; Cargo graph audit | decoder only; no issuer |
+| `ExecutionOwner.execute`, `verify_success`, `finalize_*` | Queue host authority (submission); Nucleus capture owner | TS fixture only |
+| Daemon `generation` in `AcquireResult`; epoch in admission | Oxide storage owner | missing field, a daemon wire change |
+| Oxide `EvidenceAuthority` implementation | Nucleus embedding, in process | missing |
+
+Smallest proposed issuer API, needing owner decision: Nucleus task admission signs a
+`nucleus.storage.authorization` v1 receipt bound to the full subject. The Rust host
+verifies it against a verifier key installed at embedder construction. `verify_admission`
+returns true only on that verification. Credential material is never logged or persisted.
+
+Concrete cross-language embedding is buildable and testable with a synthetic parent.
+Installed real authorities (issuers, registry/SDK receipts, complete Cargo graph and
+native closure, cooperative completion, full-debug retention) remain separate gates. No
+bridge or synthetic test supplies them.
+
+### Gates still open
+
+Admission setting stays at 0. Real credentials and issuers need owner decisions. Real
+evidence needs a scoped audit: Cargo unit graph and proc-macro execution, bundled
+SQLite native inputs, SDK membership, and closure bytes against the 520 MiB accepted-read
+ceiling. No scan or Cargo invocation is authorized here. Numeric production budgets
+(8/16 GiB), Contract 002 departure and SSD-write measurement remain separate decisions.
