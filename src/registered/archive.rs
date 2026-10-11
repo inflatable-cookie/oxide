@@ -343,15 +343,9 @@ fn decompress(compressed: &[u8], limits: Limits, counters: &mut Counters) -> Res
                 return Err(Refusal::Budget);
             }
             if out.len() == limits.file_bytes {
-                let mut extra = [0u8; 1];
-                match decoder.read(&mut extra) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        counters.decompressed_bytes += n;
-                        return Err(Refusal::Budget);
-                    }
-                    Err(_) => return Err(Refusal::Integrity),
-                }
+                // Reaching the per-input cap without observing EOF refuses;
+                // never read an overflow probe beyond the charged limit.
+                return Err(Refusal::Budget);
             }
             let package_remaining = limits.file_bytes.saturating_sub(out.len());
             let want = buf.len().min(limit).min(package_remaining);
@@ -1478,9 +1472,9 @@ mod tests {
         let decompressed_refusal = verify(&request, decompressed_cap, Counters::default());
         assert_eq!(decompressed_refusal.value, Err(Refusal::Budget));
         assert!(decompressed_refusal.counters.archive_bytes > 0);
-        assert!(decompressed_refusal.counters.decompressed_bytes > 0);
-        assert!(
-            decompressed_refusal.counters.decompressed_bytes <= decompressed_cap.file_bytes + 1
+        assert_eq!(
+            decompressed_refusal.counters.decompressed_bytes,
+            decompressed_cap.file_bytes
         );
 
         let second = verify(&request, Limits::NUCLEUS, counters);
