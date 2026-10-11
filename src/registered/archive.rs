@@ -306,7 +306,7 @@ fn read_archive(path: &Path, limits: Limits, counters: &mut Counters) -> Result<
     }
     let mut bytes = Vec::new();
     (&mut file)
-        .take(limit as u64 + 1)
+        .take(limit as u64)
         .read_to_end(&mut bytes)
         .map_err(io)?;
     if bytes.len() > limit {
@@ -337,11 +337,7 @@ fn decompress(compressed: &[u8], limits: Limits, counters: &mut Counters) -> Res
         loop {
             let limit = remaining(limits, counters)?;
             if limit == 0 {
-                match decoder.read(&mut buf[..1]) {
-                    Ok(0) => break,
-                    Ok(_) => return Err(Refusal::Budget),
-                    Err(_) => return Err(Refusal::Integrity),
-                }
+                return Err(Refusal::Budget);
             }
             let want = buf.len().min(limit);
             match decoder.read(&mut buf[..want]) {
@@ -572,7 +568,7 @@ fn read_extracted(path: &Path, limits: Limits, counters: &mut Counters) -> Resul
     }
     let mut bytes = Vec::new();
     (&mut file)
-        .take(limit as u64 + 1)
+        .take(limit as u64)
         .read_to_end(&mut bytes)
         .map_err(io)?;
     if bytes.len() > limit {
@@ -1367,6 +1363,25 @@ mod tests {
         assert_eq!(bomb.value, Err(Refusal::Budget));
         assert!(bomb.counters.total() <= 512);
         assert!(bomb_root.join("Cargo.toml").is_file());
+
+        let mut exact_limits = Limits::NUCLEUS;
+        exact_limits.collection_bytes = counters.total();
+        let exact = verify(&request, exact_limits, Counters::default());
+        assert!(exact.value.is_ok());
+        assert_eq!(exact.counters.total(), counters.total());
+        let mut over_limits = Limits::NUCLEUS;
+        over_limits.collection_bytes = counters.total() - 1;
+        let over = verify(&request, over_limits, Counters::default());
+        assert_eq!(over.value, Err(Refusal::Budget));
+        assert!(over.counters.total() <= counters.total() - 1);
+        let mut decomp_over = Limits::NUCLEUS;
+        decomp_over.collection_bytes = counters.archive_bytes + counters.decompressed_bytes - 1;
+        let decomp = verify(&request, decomp_over, Counters::default());
+        assert_eq!(decomp.value, Err(Refusal::Budget));
+        assert_eq!(decomp.counters.archive_bytes, counters.archive_bytes);
+        assert!(decomp.counters.decompressed_bytes < counters.decompressed_bytes);
+        assert_eq!(decomp.counters.extracted_bytes, 0);
+        assert!(decomp.counters.total() <= decomp_over.collection_bytes);
 
         let raw = fs::read(&archive).unwrap();
         let truncated = scratch.path("truncated.crate");

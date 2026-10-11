@@ -96,7 +96,10 @@ corrupt or truncated streams, and unstable reads refuse.
 
 Reads charge one shared preparation budget that is not reset per member, phase
 or package: compressed archive bytes, decompressed tar bytes, and extracted-file
-bytes. `verify(request, limits, counters)` continues from the caller-supplied
+bytes. Archive and extracted-file reads request at most the remaining collection
+budget; decompression refuses when that remainder is zero instead of probing an
+uncharged extra output byte. Counters stay at or below the recorded ceiling.
+`verify(request, limits, counters)` continues from the caller-supplied
 `Counters` and returns `Outcome` with the aggregate `Counters`
 (`archive_bytes`, `decompressed_bytes`, `extracted_bytes`, `entries`) and a
 `Refusal` category on every attempt, including success. Nucleus engineering
