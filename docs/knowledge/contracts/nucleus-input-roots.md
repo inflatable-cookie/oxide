@@ -281,6 +281,23 @@ verified Cargo's version/source, selected compiler wrappers, effective native
 flags, or the contents and integrity of any installed root. Version/path and
 uid ownership do not prove closure, immutability, or no replacement.
 
+### Task 041 named-path size follow-up
+
+Task 041 added metadata-only `lstat`/`readlink` size/type/device/inode
+observations for the eight exact paths this contract names, without reading or
+hashing any content. `cargo` is 31,867,672 bytes (30.39 MiB) and `clang` is
+124,676,976 bytes (118.90 MiB); `cc` is a single relative symlink to `clang`.
+Both executables exceed the proposed 16 MiB
+(`16,777,216`-byte) per-file ceiling before any content read, so they cannot be
+represented by the unchanged whole-file `ToolSdk` receipt. The remaining named
+files fit individually: `rustc` 412,504 B, `ar` 73,520 B, `ld` 2,749,664 B,
+`xcrun` 117,104 B and `mktemp` 101,536 B. No required named path was missing,
+nonregular (beyond the resolved `cc` link) or unstable. Per-file size does not
+establish whole-root closure, and the Runner's `ToolSdk` path additionally
+requires complete-root membership within the entry and 256 MiB collection caps
+(`src/registered.rs:990-1090`). The exact table and limits are in
+[`cargo-unit-graph-and-tool-fit-041.json`](../evidence/cargo-unit-graph-and-tool-fit-041.json).
+
 ## Acquisition handover
 
 The Git commit/tree are the only source-authenticated identities established
@@ -324,6 +341,10 @@ the proposed ceilings in the [registered-input contract](nucleus-core-reuse.md#f
 16 MiB/file, 256 MiB/source inventory operation, 256 MiB/collection, and up to
 520 MiB of accepted reads for admission and independently for finalize. These
 are proposed limits, not measured closure sizes or an authorization to scan.
+Task 041 observed that the required `cargo` and `clang` executables already
+exceed the proposed 16 MiB/file ceiling, so the toolchain/Xcode receipts need an
+owner ruling on a bounded large-binary class or raised per-file ceiling before
+any acquisition packet can fit; that ruling is not applied here.
 
 The existing source/FINAL acquired request, StorageAttempt/Effigy 010 binding,
 cooperative capture, old-debug lookup, and scoped admission gates remain in
