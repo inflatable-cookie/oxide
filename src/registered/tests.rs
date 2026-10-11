@@ -318,7 +318,7 @@ impl RegistrationOwner for Owners {
             files,
         })
     }
-    fn audit(&self, registration: &Registration, _: &SourceEvidence) -> Result<()> {
+    fn audit(&self, registration: &Registration, _: &Attempt, _: &SourceEvidence) -> Result<()> {
         if registration.graph_digest != digest(b"known graph") {
             return Err(Refusal::Unsupported);
         }
@@ -1470,9 +1470,10 @@ fn bridge_parent(
             "registration.audit" => {
                 let registration: Registration =
                     serde_json::from_value(payload["registration"].clone()).unwrap();
+                let attempt: Attempt = serde_json::from_value(payload["attempt"].clone()).unwrap();
                 let source: SourceEvidence =
                     serde_json::from_value(payload["source"].clone()).unwrap();
-                owners.audit(&registration, &source).unwrap();
+                owners.audit(&registration, &attempt, &source).unwrap();
                 serde_json::Value::Null
             }
             "input.immutable" => {

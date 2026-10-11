@@ -126,6 +126,7 @@ fn bootstrap(
         ],
         timing: None,
         graph_owner: None,
+        audit_owner: None,
     }
 }
 
@@ -134,6 +135,16 @@ struct ReadingMode {
     start_digest: String,
     forged: bool,
     drop_dep_info: bool,
+    audit: AuditMode,
+    audit_authority: AuditOwnerAuthority,
+}
+
+/// Synthetic audit-record behaviour for a parent. Only `Valid` is an accepted record.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum AuditMode {
+    Valid,
+    Forged,
+    ChangedRegistration,
 }
 
 fn cargo_units(f: &Fixture) -> Vec<GraphUnitProvision> {
@@ -448,13 +459,40 @@ fn parent(
             )
             .unwrap(),
             "registration.audit" => {
-                f.owners
-                    .audit(
-                        &serde_json::from_value(payload["registration"].clone()).unwrap(),
-                        &serde_json::from_value(payload["source"].clone()).unwrap(),
-                    )
-                    .unwrap();
-                serde_json::Value::Null
+                let registration: Registration =
+                    serde_json::from_value(payload["registration"].clone()).unwrap();
+                let attempt: Attempt = serde_json::from_value(payload["attempt"].clone()).unwrap();
+                let source: SourceEvidence =
+                    serde_json::from_value(payload["source"].clone()).unwrap();
+                f.owners.audit(&registration, &attempt, &source).unwrap();
+                match reading {
+                    None => serde_json::Value::Null,
+                    Some(reading) => {
+                        let instance = frame["storage"]["storage_instance_id"].as_str().unwrap();
+                        let mut record = describe_audit_record(
+                            &reading.audit_authority,
+                            &registration,
+                            &attempt,
+                        )
+                        .unwrap();
+                        if reading.audit == AuditMode::ChangedRegistration {
+                            record.registration_digest = digest(b"changed registration");
+                        }
+                        let key = match reading.audit {
+                            AuditMode::Forged => MacKey::from_hex(STORAGE_KEY).unwrap(),
+                            _ => reading.key.clone(),
+                        };
+                        record.receipt = audit_record_receipt(
+                            &key,
+                            SCOPE,
+                            instance,
+                            &reading.start_digest,
+                            &record,
+                        )
+                        .unwrap();
+                        serde_json::to_value(&record).unwrap()
+                    }
+                }
             }
             "input.immutable" => serde_json::to_value(
                 f.owners
@@ -1442,8 +1480,30 @@ fn reading_bootstrap(
     parent: PathBuf,
 ) -> Bootstrap {
     let mut b = bootstrap(f, request, socket, instance, parent);
+    b.audit_owner = Some(AuditOwnerAuthority::issue(&b, AUDIT_OWNER, &audit_policy()).unwrap());
     b.graph_owner = Some(GraphOwnerAuthority::issue(&b).unwrap());
     b
+}
+
+const AUDIT_OWNER: &str = "synthetic-qualification-audit-owner";
+
+fn audit_policy() -> String {
+    digest(b"synthetic-audit-policy-v1")
+}
+
+fn reading_mode(b: &Bootstrap, key: MacKey, audit: AuditMode, forged: bool) -> ReadingMode {
+    ReadingMode {
+        key,
+        start_digest: b.start_digest.clone(),
+        forged,
+        drop_dep_info: false,
+        audit,
+        audit_authority: b.audit_owner.clone().unwrap(),
+    }
+}
+
+fn owner_index(callbacks: &[serde_json::Value], owner: &str) -> Option<usize> {
+    callbacks.iter().position(|c| c["owner"] == owner)
 }
 
 #[test]
@@ -1494,12 +1554,7 @@ fn actual_child_cargo_reading_owner_collects_then_refuses_stale_mapping() {
         let b = reading_bootstrap(&f, &request, socket.clone(), &instance, parent_path.clone());
         let auth =
             CallbackAuthenticator::new(owner_key.clone(), b.callback_context().unwrap()).unwrap();
-        let reading = ReadingMode {
-            key: owner_key.clone(),
-            start_digest: b.start_digest.clone(),
-            forged: false,
-            drop_dep_info: false,
-        };
+        let reading = reading_mode(&b, owner_key.clone(), AuditMode::Valid, false);
         if scenario == 3 {
             let slot = root.join("slots").join(previous.as_ref().unwrap());
             fs::write(slot.join("debug/deps/source.d"), b"stale-dep-info").unwrap();
@@ -1596,12 +1651,7 @@ fn actual_child_forged_graph_owner_holds_acquired_lease() {
     let owner_key = MacKey::from_hex(OWNER_KEY).unwrap();
     let auth =
         CallbackAuthenticator::new(owner_key.clone(), b.callback_context().unwrap()).unwrap();
-    let reading = ReadingMode {
-        key: owner_key,
-        start_digest: b.start_digest.clone(),
-        forged: true,
-        drop_dep_info: false,
-    };
+    let reading = reading_mode(&b, owner_key, AuditMode::Valid, true);
     let file = f.base.join("bootstrap-forged-graph.json");
     write_bootstrap(&file, &b);
     let child = spawn_child(&file);
@@ -1703,4 +1753,334 @@ fn graph_owner_issuance_vector_is_stable() {
         canonical_digest(&v["canonical_subject"]).unwrap(),
         v["canonical_digest"]
     );
+}
+
+#[test]
+fn audit_record_controls_refuse_forgery_drift_and_unknown_fields() {
+    let f = Fixture::new();
+    let storage = test_storage();
+    let key = MacKey::from_hex(OWNER_KEY).unwrap();
+    let start_digest = digest(b"synthetic-start");
+    let authority = AuditOwnerAuthority {
+        version: 1,
+        schema: "oxide-qualification-audit-record-v1".into(),
+        issuer: "synthetic-qualification".into(),
+        owner: AUDIT_OWNER.into(),
+        policy_digest: audit_policy(),
+        receipt: String::new(),
+    };
+    let runtime = AuditOwnerRuntime {
+        key: key.clone(),
+        scope: SCOPE.into(),
+        start_digest: start_digest.clone(),
+        authority: authority.clone(),
+    };
+    let sign = |mut record: AuditRecord, signer: &MacKey| {
+        record.receipt = audit_record_receipt(
+            signer,
+            SCOPE,
+            &storage.storage_instance_id,
+            &start_digest,
+            &record,
+        )
+        .unwrap();
+        record
+    };
+    let honest = describe_audit_record(&authority, &f.registration, &f.attempt).unwrap();
+    let verify = |record: &AuditRecord| {
+        verify_audit_record(record, &runtime, &storage, &f.registration, &f.attempt)
+    };
+    assert!(verify(&sign(honest.clone(), &key)).is_ok());
+
+    let forged = sign(honest.clone(), &MacKey::from_hex(STORAGE_KEY).unwrap());
+    assert!(matches!(verify(&forged), Err(Refusal::Authentication)));
+
+    let mut other_owner = honest.clone();
+    other_owner.owner = "unaccepted-owner".into();
+    assert!(matches!(
+        verify(&sign(other_owner, &key)),
+        Err(Refusal::Authentication)
+    ));
+
+    let mut other_policy = honest.clone();
+    other_policy.policy_digest = digest(b"unaccepted-policy");
+    assert!(matches!(
+        verify(&sign(other_policy, &key)),
+        Err(Refusal::Authentication)
+    ));
+
+    let mut extra_closure = honest.clone();
+    extra_closure
+        .closure_receipts
+        .insert("unlisted-native-receipt".into());
+    assert!(matches!(
+        verify(&sign(extra_closure, &key)),
+        Err(Refusal::Membership)
+    ));
+
+    let mut changed_unit = honest.clone();
+    changed_unit.registration_digest = digest(b"changed unit set");
+    assert!(matches!(
+        verify(&sign(changed_unit, &key)),
+        Err(Refusal::Identity)
+    ));
+
+    let mut changed_graph = honest.clone();
+    changed_graph.graph_digest = digest(b"changed graph");
+    assert!(matches!(
+        verify(&sign(changed_graph, &key)),
+        Err(Refusal::Identity)
+    ));
+
+    let mut moved = f.attempt.clone();
+    moved.slot = f.base.join("moved-slot");
+    assert!(matches!(
+        verify_audit_record(
+            &sign(honest.clone(), &key),
+            &runtime,
+            &storage,
+            &f.registration,
+            &moved
+        ),
+        Err(Refusal::Identity)
+    ));
+
+    let mut replayed_instance = test_storage();
+    replayed_instance.storage_instance_id = "bb".repeat(32);
+    assert!(matches!(
+        verify_audit_record(
+            &sign(honest.clone(), &key),
+            &runtime,
+            &replayed_instance,
+            &f.registration,
+            &f.attempt
+        ),
+        Err(Refusal::Authentication)
+    ));
+
+    let mut unknown = serde_json::to_value(sign(honest, &key)).unwrap();
+    unknown["unreviewed_closure"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<AuditRecord>(unknown).is_err());
+}
+
+#[test]
+fn audit_owner_install_refuses_forged_and_unknown_schema_before_connect() {
+    let mut f = Fixture::new();
+    f.attempt.binding.commit = "1".repeat(40);
+    f.attempt.allocation_epoch = "1".into();
+    let p = partition(&f);
+    let allowed = vec![envelope(&f, &p, 1)];
+    let authority = QualificationAuthority::new(
+        MacKey::from_hex(STORAGE_KEY).unwrap(),
+        SCOPE.into(),
+        allowed.clone(),
+    )
+    .unwrap();
+    let instance = "a".repeat(64);
+    authority.install_instance(&instance).unwrap();
+    let storage = f.base.join("storage.sock");
+    let _storage = UnixListener::bind(&storage).unwrap();
+    fs::set_permissions(&storage, fs::Permissions::from_mode(0o600)).unwrap();
+    let parent_path = f.base.join("parent.sock");
+    let listener = UnixListener::bind(&parent_path).unwrap();
+    fs::set_permissions(&parent_path, fs::Permissions::from_mode(0o600)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let request = start(&f, &authority, allowed[0].clone(), 1);
+    let b = bootstrap(
+        &f,
+        &request,
+        storage.clone(),
+        &instance,
+        parent_path.clone(),
+    );
+    let installed = AuditOwnerAuthority::issue(&b, AUDIT_OWNER, &audit_policy()).unwrap();
+    assert!(installed.verify(&b).is_ok());
+
+    let mut reminted = installed.clone();
+    reminted.owner = "reminted-owner".into();
+    assert!(matches!(reminted.verify(&b), Err(HostError::OwnerRejected)));
+
+    let mut unknown_schema = installed.clone();
+    unknown_schema.schema = "oxide-qualification-audit-record-v2".into();
+    assert!(matches!(
+        unknown_schema.verify(&b),
+        Err(HostError::Protocol)
+    ));
+
+    // Graph owner without audit provenance is refused before the bootstrap is consumed.
+    let mut unaudited = bootstrap(&f, &request, storage, &instance, parent_path);
+    unaudited.graph_owner = Some(GraphOwnerAuthority::issue(&unaudited).unwrap());
+    let file = f.base.join("bootstrap-unaudited-graph.json");
+    write_bootstrap(&file, &unaudited);
+    assert!(serve_bootstrap(&file).is_err());
+    assert!(file.exists());
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn actual_child_audit_record_gates_cold_and_reused_execution() {
+    let started = Instant::now();
+    let mut f = Fixture::new();
+    f.attempt.binding.commit = "1".repeat(40);
+    f.attempt.allocation_epoch = "1".into();
+    let p = partition(&f);
+    f.attempt.partition = digest(&serde_json::to_vec(&p).unwrap());
+    let allowed = (1..=3).map(|n| envelope(&f, &p, n)).collect::<Vec<_>>();
+    let authority = Arc::new(
+        QualificationAuthority::new(
+            MacKey::from_hex(STORAGE_KEY).unwrap(),
+            SCOPE.into(),
+            allowed.clone(),
+        )
+        .unwrap(),
+    );
+    let root = f.base.join("store");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let daemon = Daemon::bind(
+        DaemonConfig {
+            root: root.clone(),
+            budget: Budget {
+                cap_bytes: 16 * 1024 * 1024,
+                free_reserve_bytes: 0,
+            },
+        },
+        authority.clone(),
+        Arc::new(BridgeFreeSpace),
+    )
+    .unwrap();
+    let instance = daemon.storage_instance_id().to_owned();
+    authority.install_instance(&instance).unwrap();
+    let (socket, guard) = BridgeDaemon::start(daemon);
+    let client = Client::new(socket.clone());
+    let parent_path = f.base.join("parent.sock");
+    let listener = UnixListener::bind(&parent_path).unwrap();
+    fs::set_permissions(&parent_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let map_key = MacKey::from_hex(MAP_KEY).unwrap();
+    let owner_key = MacKey::from_hex(OWNER_KEY).unwrap();
+    // Cold valid, reused valid, then reused with a changed-registration record.
+    for (scenario, n, audit) in [
+        (1, 1, AuditMode::Valid),
+        (2, 2, AuditMode::Valid),
+        (3, 3, AuditMode::ChangedRegistration),
+    ] {
+        let scenario_started = Instant::now();
+        let request = start(&f, &authority, allowed[n - 1].clone(), n);
+        let b = reading_bootstrap(&f, &request, socket.clone(), &instance, parent_path.clone());
+        let auth =
+            CallbackAuthenticator::new(owner_key.clone(), b.callback_context().unwrap()).unwrap();
+        let reading = reading_mode(&b, owner_key.clone(), audit, false);
+        let file = f.base.join(format!("bootstrap-audit-{scenario}.json"));
+        write_bootstrap(&file, &b);
+        let child = spawn_child(&file);
+        let stream = accept_child(&listener);
+        let (response, callbacks) = parent(
+            stream,
+            &f,
+            &request,
+            &auth,
+            &authority,
+            &map_key,
+            false,
+            Some(&reading),
+        );
+        let audit_at = owner_index(&callbacks, "registration.audit").unwrap();
+        if scenario <= 2 {
+            child.finish(true);
+            assert_eq!(response["result"]["outcome"], "published");
+            let graph_at = owner_index(&callbacks, "input.graph_owner").unwrap();
+            let execute_at = owner_index(&callbacks, "execution.execute").unwrap();
+            assert!(audit_at < graph_at && graph_at < execute_at);
+            assert_eq!(
+                client.inventory("accepted").unwrap().slots[0].state,
+                SlotState::Idle
+            );
+        } else {
+            child.finish(false);
+            assert_eq!(response["operation"], "error");
+            assert!(owner_index(&callbacks, "input.graph_owner").is_none());
+            assert!(owner_index(&callbacks, "execution.execute").is_none());
+            assert_eq!(
+                client.inventory("refused").unwrap().slots[0].state,
+                SlotState::Leased
+            );
+        }
+        assert!(scenario_started.elapsed() < Duration::from_secs(30));
+        assert!(callbacks.iter().all(|c| !has_token_field(c)));
+    }
+    guard.stop();
+    assert!(started.elapsed() < Duration::from_secs(120));
+}
+
+#[test]
+fn actual_child_forged_audit_record_refuses_cold_before_execute() {
+    let mut f = Fixture::new();
+    f.attempt.binding.commit = "1".repeat(40);
+    f.attempt.allocation_epoch = "1".into();
+    let p = partition(&f);
+    f.attempt.partition = digest(&serde_json::to_vec(&p).unwrap());
+    let allowed = vec![envelope(&f, &p, 1)];
+    let authority = Arc::new(
+        QualificationAuthority::new(
+            MacKey::from_hex(STORAGE_KEY).unwrap(),
+            SCOPE.into(),
+            allowed.clone(),
+        )
+        .unwrap(),
+    );
+    let root = f.base.join("store");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let daemon = Daemon::bind(
+        DaemonConfig {
+            root,
+            budget: Budget {
+                cap_bytes: 16 * 1024 * 1024,
+                free_reserve_bytes: 0,
+            },
+        },
+        authority.clone(),
+        Arc::new(BridgeFreeSpace),
+    )
+    .unwrap();
+    let instance = daemon.storage_instance_id().to_owned();
+    authority.install_instance(&instance).unwrap();
+    let (socket, guard) = BridgeDaemon::start(daemon);
+    let client = Client::new(socket.clone());
+    let parent_path = f.base.join("parent.sock");
+    let listener = UnixListener::bind(&parent_path).unwrap();
+    fs::set_permissions(&parent_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let request = start(&f, &authority, allowed[0].clone(), 1);
+    let b = reading_bootstrap(&f, &request, socket.clone(), &instance, parent_path.clone());
+    let owner_key = MacKey::from_hex(OWNER_KEY).unwrap();
+    let auth =
+        CallbackAuthenticator::new(owner_key.clone(), b.callback_context().unwrap()).unwrap();
+    let reading = reading_mode(&b, owner_key, AuditMode::Forged, false);
+    let file = f.base.join("bootstrap-forged-audit.json");
+    write_bootstrap(&file, &b);
+    let child = spawn_child(&file);
+    let stream = accept_child(&listener);
+    let (response, callbacks) = parent(
+        stream,
+        &f,
+        &request,
+        &auth,
+        &authority,
+        &MacKey::from_hex(MAP_KEY).unwrap(),
+        false,
+        Some(&reading),
+    );
+    child.finish(false);
+    assert_eq!(response["operation"], "error");
+    assert!(owner_index(&callbacks, "registration.audit").is_some());
+    assert!(owner_index(&callbacks, "input.graph_owner").is_none());
+    assert!(owner_index(&callbacks, "execution.execute").is_none());
+    assert_eq!(
+        client.inventory("forged-audit").unwrap().slots[0].state,
+        SlotState::Leased
+    );
+    guard.stop();
 }

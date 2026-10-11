@@ -22,6 +22,8 @@ use std::process::Command;
 use std::time::UNIX_EPOCH;
 
 pub mod archive;
+#[cfg(feature = "private-qualification")]
+pub mod audit_owner;
 pub mod cargo_freshness;
 pub mod dep_info;
 #[cfg(feature = "private-qualification")]
@@ -210,7 +212,14 @@ pub trait RegistrationOwner: Send + Sync {
         registration: &Registration,
         attempt: &Attempt,
     ) -> Result<SourceEvidence>;
-    fn audit(&self, registration: &Registration, source: &SourceEvidence) -> Result<()>;
+    /// Runs before any graph acceptance or execution on both cold and reused paths.
+    /// Qualification owners verify the accepted record for this exact attempt here.
+    fn audit(
+        &self,
+        registration: &Registration,
+        attempt: &Attempt,
+        source: &SourceEvidence,
+    ) -> Result<()>;
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -318,6 +327,17 @@ pub trait InputEvidenceOwner: Send + Sync {
         _budget: &mut EvidenceReadBudget,
     ) -> Result<Vec<UnitEvidence>> {
         self.units(registration, attempt)
+    }
+    /// Pre-execution authorization that must not read post-execution observations.
+    /// Runs in `Runner.inputs` after the audit, on cold and reused attempts alike.
+    fn authorize(
+        &self,
+        _registration: &Registration,
+        _attempt: &Attempt,
+        _manifests: &BTreeMap<String, ImmutableManifest>,
+        _budget: &mut EvidenceReadBudget,
+    ) -> Result<()> {
+        Ok(())
     }
     fn seal_map(&self, attempt: &Attempt, map_digest: &str) -> Result<String>;
     fn verify_map(&self, attempt: &Attempt, map_digest: &str, seal: &str) -> Result<()>;
@@ -935,7 +955,8 @@ impl Runner<'_> {
         let source = self
             .registration_owner
             .authenticate(registration, attempt)?;
-        self.registration_owner.audit(registration, &source)?;
+        self.registration_owner
+            .audit(registration, attempt, &source)?;
         if source.version != SOURCE_VERSION
             || !source.clean_committed
             || source.submodules
@@ -1077,6 +1098,9 @@ impl Runner<'_> {
         if !executable_verified {
             return Err(Refusal::MissingAuthority);
         }
+        // Graph acceptance is pre-execution and reads no post-execution observation.
+        self.input_owner
+            .authorize(registration, attempt, &manifests, &mut budget)?;
         for (path, state) in &source_budget.files {
             stable_file(path, state)?;
         }
