@@ -1102,6 +1102,18 @@ callable signature is
 The `manifests` argument is the exact accepted receipt set already verified by
 `Runner.inputs`; the owner override receives that same set and budget from
 `Runner.collect`.
+The private host does not currently install that reading owner.
+`runner_host::ParentCallbacks` implements `units` as the authenticated
+`input.units` parent callback and inherits the in-memory `units_with_budget`
+default. It cannot turn precomputed parent JSON into proof that the Cargo
+collector ran with the shared budget. A private Rust reading-owner embedding
+must override `units_with_budget`, authenticate the graph-owner provenance,
+construct the trusted context and invoke the collector with those exact
+manifests and that operation budget. Nucleus's TypeScript client does not
+supply this Rust embedding or acquire Rust authoring authority from the gap.
+Its callable provisioning and refusal contract needs independent review;
+neither a trait nor format fixtures establish a real installed issuer.
+
 `TrustedCargoGraphContext` must be built by trusted embedding code after graph
 provenance and complete behavior audit. It binds the registered graph digest,
 exact semantic unit set, Cargo version/source revision, `Attempt.slot` build
