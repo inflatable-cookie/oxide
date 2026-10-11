@@ -838,6 +838,46 @@ on source `03b8eb9` separately established typecheck exit 0. These are fixture
 and merged-head reconciliation results, not an actual cross-language host
 session, trusted production issuers, real Cargo execution or reuse qualification.
 
+### Real-workflow binding requirements
+
+The fixture client is not the real-workflow owner adapter. Its source verifier
+allows 128 files, 64 KiB per file and 128 KiB total; those bounds do not cover
+the inspected Nucleus inputs. Qualification needs a finite, audited behavior
+inventory with actual counters. The complete clean Git head/tree identity stays
+distinct from the declared compiler-input digest. Omitting unrelated tracked
+files from that input inventory requires the accepted behavior audit, not a
+shortcut to make fixture limits pass. Every declared compiler input still needs
+its consuming anchors and retained bytes.
+
+The fixture's validation request fixes environment paths before acquisition,
+whereas the actual intermediate path arrives with the acquired attempt.
+The owner adapter must authenticate the acquired source/intermediate/target/temp
+binding and persist the final request before the existing submission path can
+start a writer. It must not guess a slot, allocate through a lookup, or mutate
+an already submitted request. The host's `registration.authenticate` callback
+provides the acquired attempt; a reviewed consumer binding must establish how
+that callback closes this pre-submission seam.
+
+The host's 30-second stream timeout and five-minute session bound are not
+qualified for genuine capacity waiting, compilation, tests and capture.
+Qualification requires a reviewed finite timing mechanism or evidence that the
+actual workflow fits. Synthetic timing is insufficient; a timeout retains
+uncertainty rather than releasing ownership. No silent deadline increase or
+unsupervised keepalive follows from the integration approval.
+
+Cargo evidence collection must account for every accepted registered unit,
+its actual freshness anchors, dep-info, rerun files/environment, generated
+associations and supported immutable evidence. Cargo's pinned diagnostic
+fingerprint JSON is not a complete unit graph or an issuer. A collector needs
+accepted graph/path associations and must refuse absent or ambiguous coverage;
+registry archive agreement alone cannot prove macro, native or SDK reads.
+Real full-debug capture and retrieval remain the consumer's separate obligation.
+
+Consumer implementation admission remains under the Nucleus owner. The earlier
+single-client capacity exception ended at closeout; the currently prepared
+real-workflow client has no new scoped capacity grant. This is separate from
+the approved integration implementation and its API/qualification gates.
+
 ### Field correspondence
 
 | Nucleus subject or receipt | Oxide field | Rule |
