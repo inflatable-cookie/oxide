@@ -577,6 +577,11 @@ impl RunnerHost {
                 }),
             None => None,
         };
+        #[cfg(feature = "private-qualification")]
+        let audit_owner = match &self.qualification {
+            Some(grant) => grant.audit_owner_runtime()?,
+            None => None,
+        };
         let parent = Arc::new(ParentCallbacks {
             channel,
             client: self.client.clone(),
@@ -590,6 +595,10 @@ impl RunnerHost {
             callback_failure: Mutex::new(None),
             #[cfg(feature = "private-qualification")]
             graph_owner,
+            #[cfg(feature = "private-qualification")]
+            audit_owner,
+            #[cfg(feature = "private-qualification")]
+            graph_context: Mutex::new(None),
         });
         let runner = Runner {
             registration_owner: parent.as_ref(),
@@ -1091,6 +1100,7 @@ struct RegistrationAuthPayload<'a> {
 #[derive(Serialize)]
 struct AuditPayload<'a> {
     registration: &'a Registration,
+    attempt: &'a Attempt,
     source: &'a SourceEvidence,
 }
 
@@ -1138,6 +1148,12 @@ struct ParentCallbacks {
     callback_failure: Mutex<Option<HostError>>,
     #[cfg(feature = "private-qualification")]
     graph_owner: Option<GraphOwnerRuntime>,
+    #[cfg(feature = "private-qualification")]
+    audit_owner: Option<super::audit_owner::AuditOwnerRuntime>,
+    /// Digest and context accepted before execution. Collect reuses this exact
+    /// context; a later provision with a different digest refuses.
+    #[cfg(feature = "private-qualification")]
+    graph_context: Mutex<Option<(String, super::cargo_freshness::TrustedCargoGraphContext)>>,
 }
 
 #[cfg(feature = "private-qualification")]
@@ -1332,11 +1348,36 @@ impl RegistrationOwner for ParentCallbacks {
         )
     }
 
-    fn audit(&self, registration: &Registration, source: &SourceEvidence) -> Result<(), Refusal> {
+    fn audit(
+        &self,
+        registration: &Registration,
+        attempt: &Attempt,
+        source: &SourceEvidence,
+    ) -> Result<(), Refusal> {
+        #[cfg(feature = "private-qualification")]
+        if let Some(runtime) = &self.audit_owner {
+            // The accepted record is required; a missing or null result refuses.
+            let record: super::audit_owner::AuditRecord = self.callback(
+                "registration.audit",
+                &AuditPayload {
+                    registration,
+                    attempt,
+                    source,
+                },
+            )?;
+            return super::audit_owner::verify_audit_record(
+                &record,
+                runtime,
+                &storage_identity(&self.acquired),
+                registration,
+                attempt,
+            );
+        }
         self.callback(
             "registration.audit",
             &AuditPayload {
                 registration,
+                attempt,
                 source,
             },
         )
@@ -1374,6 +1415,35 @@ impl InputEvidenceOwner for ParentCallbacks {
         budget: &mut super::EvidenceReadBudget,
     ) -> Result<Vec<UnitEvidence>, Refusal> {
         #[cfg(feature = "private-qualification")]
+        if self.graph_owner.is_some() {
+            // Collect reuses the context accepted before execution. It never
+            // requests a second provision, so post-execution data cannot redefine it.
+            let accepted = self
+                .graph_context
+                .lock()
+                .map_err(|_| Refusal::Authentication)?;
+            let (_, context) = accepted.as_ref().ok_or(Refusal::MissingAuthority)?;
+            return super::cargo_freshness::collect(
+                registration,
+                attempt,
+                manifests,
+                budget,
+                context,
+            );
+        }
+        self.units(registration, attempt)
+    }
+
+    // Inputs are used only by the private graph owner; the default build ignores them.
+    #[cfg_attr(not(feature = "private-qualification"), allow(unused_variables))]
+    fn authorize(
+        &self,
+        registration: &Registration,
+        attempt: &Attempt,
+        manifests: &std::collections::BTreeMap<String, ImmutableManifest>,
+        budget: &mut super::EvidenceReadBudget,
+    ) -> Result<(), Refusal> {
+        #[cfg(feature = "private-qualification")]
         if let Some(runtime) = &self.graph_owner {
             let provision: super::graph_owner::GraphProvision = self.callback(
                 "input.graph_owner",
@@ -1382,6 +1452,23 @@ impl InputEvidenceOwner for ParentCallbacks {
                     attempt,
                 },
             )?;
+            let digest = super::qualification::canonical_digest(
+                &serde_json::to_value(&provision).map_err(|_| Refusal::Unsupported)?,
+            )
+            .map_err(|_| Refusal::Unsupported)?;
+            let mut accepted = self
+                .graph_context
+                .lock()
+                .map_err(|_| Refusal::Authentication)?;
+            // Identical bytes, including the receipt, were already authenticated and
+            // charged; a changed provision after acceptance refuses.
+            if let Some((expected, _)) = accepted.as_ref() {
+                return if *expected == digest {
+                    Ok(())
+                } else {
+                    Err(Refusal::Identity)
+                };
+            }
             let context = super::graph_owner::accept_graph_provision(
                 provision,
                 registration,
@@ -1393,15 +1480,9 @@ impl InputEvidenceOwner for ParentCallbacks {
                 &runtime.start_digest,
                 &storage_identity(&self.acquired),
             )?;
-            return super::cargo_freshness::collect(
-                registration,
-                attempt,
-                manifests,
-                budget,
-                &context,
-            );
+            *accepted = Some((digest, context));
         }
-        self.units(registration, attempt)
+        Ok(())
     }
 
     fn seal_map(&self, attempt: &Attempt, map_digest: &str) -> Result<String, Refusal> {

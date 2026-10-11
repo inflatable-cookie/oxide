@@ -1462,6 +1462,50 @@ single-client capacity exception ended at closeout; the currently prepared
 real-workflow client has no new scoped capacity grant. This is separate from
 the approved integration implementation and its API/qualification gates.
 
+### Callable accepted audit record (oxide#035)
+
+Private qualification only. The bootstrap field `audit_owner` (absent keeps the
+previous synthetic-only behaviour) installs an accepted audit owner through
+`AuditOwnerAuthority::issue(&bootstrap, owner, policy_digest)`. Schema
+`oxide-qualification-audit-record-v1`, version `1`, issuer
+`synthetic-qualification`. Install receipt domain
+`oxide-qualification-audit-owner-install-v1` over `scope`,
+`storage_instance_id`, `start_digest`, schema, issuer, owner, policy digest and
+version. Unsupported schema, issuer or version is `HostError::Protocol`; a
+forged or reminted install is `OwnerRejected`. A `graph_owner` without
+`audit_owner` refuses before the one-use bootstrap is consumed. The owner
+identity and policy are embedder-installed; task JSON, labels and environment
+cannot name them.
+
+Order per acquired attempt, cold or reused: `registration.authenticate` →
+`registration.audit` (the record, verified by `verify_audit_record`) →
+`input.graph_owner` (`authorize`, a provision accepted before any file read) →
+[reused only: map verify and collect] → `execution.execute`. Post-execution
+`inputs` repeats the audit and requests the provision again; a changed digest
+refuses, and an identical provision is not charged again. Collect never requests
+a second provision; it uses the context accepted before execution, so
+post-execution observations cannot redefine the graph. A cold empty slot is
+authorized without requiring fingerprint, dep-info or rerun files to exist.
+
+The parent returns an untrusted `AuditRecord` (unknown fields refuse): owner,
+policy digest, registration ID, graph digest, `registration_digest`
+(canonical digest of the complete `Registration`), `attempt_digest` (canonical
+digest of the acquired `Attempt`, including source tree binding, slot,
+generation, lease and partition), `closure_receipts` and `receipt`. The receipt
+is HMAC over domain `oxide-qualification-audit-record-v1` and fields `scope`,
+`storage_instance_id`, `start_digest` and the canonical digest of the record
+body. `closure_receipts` must equal `Registration.immutable_receipts` exactly;
+there is no boolean closure-complete flag. Verification refuses owner or policy
+mismatch and forged receipts (`Authentication`), changed registration, graph or
+attempt identity (`Identity`), and closure drift (`Membership`). Moving to
+another storage instance refuses by receipt.
+
+Synthetic signing (`audit_record_receipt`, `describe_audit_record`) is test
+evidence under the fixture key. It is not the Nucleus closure audit, a native or
+SDK receipt, or an installed production issuer. The accepted owner, its policy
+and its independently reviewed audit record remain absent. Real behaviour
+audit evidence is still required before any real workflow may execute.
+
 ### Field correspondence
 
 | Nucleus subject or receipt | Oxide field | Rule |
@@ -1579,7 +1623,7 @@ from UTF-8 byte order, so neither may feed Oxide.
 | --- | --- | --- |
 | Admission credential and `EvidenceAuthority::verify_admission` | Nucleus task admission and Queue host authority; Tom decides which signs | private qualification authenticator only; no production consumer issuer |
 | Settlement and capture credentials (`SettlementEvidence.consumer_credential`, `TerminalRecord`, `CaptureReceipt`) | Queue scheduler envelope and Nucleus capture owner | no source |
-| `RegistrationOwner.authenticate` and `audit` | Nucleus managed-Git and root owner; audited-input owner | missing |
+| `RegistrationOwner.authenticate` and `audit` | Nucleus managed-Git and root owner; audited-input owner | private qualification verifies an installed synthetic audit record before graph acceptance and execution (oxide#035); no accepted production owner or real closure audit |
 | `InputEvidenceOwner.immutable`, `units`, `units_with_budget`, `seal_map`, `verify_map` | installation registry and SDK owner; Cargo graph audit | private synthetic reading owner installs `units_with_budget` → `collect`; no accepted production owner or issuer |
 | `ExecutionOwner.execute`, `verify_success`, `finalize_*` | Queue host authority (submission); Nucleus capture owner | TS fixture only |
 | Daemon `generation` and storage-instance identity in `AcquireResult`; epoch in admission | Oxide storage owner | Oxide API implemented; Nucleus fixture client binds the complete tuple and checks safe conversion; production binding disabled |

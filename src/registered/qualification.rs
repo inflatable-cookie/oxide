@@ -7,6 +7,10 @@ use super::runner_host::{
     MAX_QUALIFIED_SESSION,
 };
 
+pub use super::audit_owner::{
+    audit_record_receipt, describe_audit_record, verify_audit_record, AuditOwnerAuthority,
+    AuditOwnerRuntime, AuditRecord,
+};
 pub use super::graph_owner::{
     accept_graph_provision, issue_graph_provision, GraphOwnerAuthority, GraphProvision,
     GRAPH_OWNER_ISSUER, GRAPH_OWNER_PROVISION_DOMAIN, GRAPH_OWNER_SCHEMA, GRAPH_OWNER_VERSION,
@@ -326,6 +330,10 @@ pub struct Bootstrap {
     /// than falling back to a parent UnitEvidence array.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_owner: Option<GraphOwnerAuthority>,
+    /// Accepted audit owner for this bootstrap. Required with `graph_owner`; each
+    /// attempt's audit record is verified before graph acceptance or execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_owner: Option<AuditOwnerAuthority>,
 }
 
 /// Trusted, receipt-bound finite window for exactly one approved start digest.
@@ -434,6 +442,18 @@ impl AttemptGrant {
             self.bootstrap.scope.clone(),
             self.bootstrap.start_digest.clone(),
         )))
+    }
+
+    pub(super) fn audit_owner_runtime(&self) -> Result<Option<AuditOwnerRuntime>, HostError> {
+        let Some(authority) = &self.bootstrap.audit_owner else {
+            return Ok(None);
+        };
+        Ok(Some(AuditOwnerRuntime {
+            key: MacKey::from_hex(&self.bootstrap.callback_key_hex)?,
+            scope: self.bootstrap.scope.clone(),
+            start_digest: self.bootstrap.start_digest.clone(),
+            authority: authority.clone(),
+        }))
     }
 
     pub(super) fn check_start(&self, start: &Value) -> Result<(), HostError> {
@@ -548,6 +568,13 @@ pub fn serve_bootstrap(path: &Path) -> Result<(), HostError> {
         None => Timing::Version1,
         Some(authority) => authority.verify(&bootstrap, entry)?,
     };
+    // A graph owner without accepted audit provenance would reach execution unaudited.
+    if bootstrap.graph_owner.is_some() && bootstrap.audit_owner.is_none() {
+        return Err(HostError::Protocol);
+    }
+    if let Some(owner) = &bootstrap.audit_owner {
+        owner.verify(&bootstrap)?;
+    }
     if let Some(owner) = &bootstrap.graph_owner {
         owner.verify(&bootstrap)?;
     }
@@ -707,6 +734,7 @@ mod tests {
             roots,
             timing: None,
             graph_owner: None,
+            audit_owner: None,
         };
         let grant = AttemptGrant {
             bootstrap: b,
@@ -748,6 +776,7 @@ mod tests {
             roots: Vec::new(),
             timing: None,
             graph_owner: None,
+            audit_owner: None,
         }
     }
 
