@@ -1114,8 +1114,9 @@ explicit generated/native/immutable associations and any audited registry-only
 The accepted persisted formats are Cargo `Fingerprint` JSON and binary
 `EncodedDepInfo` v1 at commit `c980f4866141969fab6254a680546a277789d6f0`
 (Cargo version `1.97.1`). JSON is parsed with strict fields and bounded
-sequences; evidence is read only from explicitly named paths beneath the
-canonical build root, accepted package roots and immutable roots. The collector
+sequences. The collector reads explicitly named Cargo evidence files beneath
+the canonical build root; package and immutable inputs are associated here
+and read by the existing runner under the same operation budget. The collector
 supports `CheckDepInfo`, `RerunIfChanged`, `RerunIfEnvChanged` and
 `Precalculated`. Every path/tag is resolved through the exact owner mapping;
 package-root and build-root references remain distinct. It preserves absent
