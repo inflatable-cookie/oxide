@@ -10,7 +10,7 @@ use std::time::Duration;
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const PROTOCOL_MAGIC: &[u8; 8] = b"OXSTOR01";
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 
 #[cfg(test)]
 pub(super) fn send_acquire_and_forget(
@@ -23,6 +23,34 @@ pub(super) fn send_acquire_and_forget(
     Request::Acquire(request).encode(&mut writer)?;
     write_frame(&mut stream, writer.finish())?;
     stream.shutdown(std::net::Shutdown::Both).map_err(io_error)
+}
+
+#[cfg(test)]
+pub(super) fn send_ordinary_acquire_and_forget(
+    socket_path: &std::path::Path,
+    request: OrdinaryCargoRequest,
+) -> Result<(), StorageError> {
+    let mut stream = UnixStream::connect(socket_path).map_err(io_error)?;
+    let mut writer = Writer::new();
+    encode_protocol_header(&mut writer)?;
+    Request::AcquireOrdinaryCargo(request).encode(&mut writer)?;
+    write_frame(&mut stream, writer.finish())?;
+    let _discarded_response = read_frame(&mut stream)?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn send_ordinary_finalize_and_forget(
+    socket_path: &std::path::Path,
+    request: OrdinaryCargoFinalizeRequest,
+) -> Result<(), StorageError> {
+    let mut stream = UnixStream::connect(socket_path).map_err(io_error)?;
+    let mut writer = Writer::new();
+    encode_protocol_header(&mut writer)?;
+    Request::FinalizeOrdinaryCargo(request).encode(&mut writer)?;
+    write_frame(&mut stream, writer.finish())?;
+    let _discarded_response = read_frame(&mut stream)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -43,13 +71,15 @@ pub(super) fn send_unsupported_version_acquire_and_forget(
     socket_path: &std::path::Path,
     request: AcquireRequest,
 ) -> Result<(), StorageError> {
-    let mut stream = UnixStream::connect(socket_path).map_err(io_error)?;
-    let mut writer = Writer::new();
-    writer.bytes(PROTOCOL_MAGIC)?;
-    writer.u32(PROTOCOL_VERSION + 1);
-    Request::Acquire(request).encode(&mut writer)?;
-    write_frame(&mut stream, writer.finish())?;
-    let _ = read_frame(&mut stream)?;
+    for version in [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1] {
+        let mut stream = UnixStream::connect(socket_path).map_err(io_error)?;
+        let mut writer = Writer::new();
+        writer.bytes(PROTOCOL_MAGIC)?;
+        writer.u32(version);
+        Request::Acquire(request.clone()).encode(&mut writer)?;
+        write_frame(&mut stream, writer.finish())?;
+        let _ = read_frame(&mut stream)?;
+    }
     Ok(())
 }
 
@@ -102,6 +132,32 @@ impl Client {
         }
     }
 
+    /// Acquires or exactly replays one accepted ordinary-Cargo generation.
+    pub fn acquire_ordinary_cargo(
+        &self,
+        request: OrdinaryCargoRequest,
+    ) -> Result<OrdinaryCargoAcquireResult, StorageError> {
+        match self.call(Request::AcquireOrdinaryCargo(request))? {
+            Response::AcquireOrdinaryCargo(result) => result,
+            _ => Err(StorageError::Protocol(
+                "unexpected ordinary Cargo acquire response",
+            )),
+        }
+    }
+
+    /// Looks up the exact ordinary acquire without allocating or granting access.
+    pub fn lookup_ordinary_cargo(
+        &self,
+        request: OrdinaryCargoRequest,
+    ) -> Result<LookupResult<OrdinaryCargoLeaseIdentity>, StorageError> {
+        match self.call(Request::LookupOrdinaryCargo(request))? {
+            Response::LookupOrdinaryCargo(result) => result,
+            _ => Err(StorageError::Protocol(
+                "unexpected ordinary Cargo acquire lookup response",
+            )),
+        }
+    }
+
     /// Finalizes a lease after authenticated terminal, capture, and containment evidence.
     pub fn finalize(
         &self,
@@ -136,6 +192,33 @@ impl Client {
             Response::LookupFinalize(result) => result,
             _ => Err(StorageError::Protocol(
                 "unexpected finalize lookup response",
+            )),
+        }
+    }
+
+    /// Finalizes the exact ordinary request and records its reuse transition.
+    pub fn finalize_ordinary_cargo(
+        &self,
+        request: OrdinaryCargoFinalizeRequest,
+    ) -> Result<OrdinaryCargoFinalizationReceipt, StorageError> {
+        match self.call(Request::FinalizeOrdinaryCargo(request))? {
+            Response::FinalizeOrdinaryCargo(result) => result,
+            _ => Err(StorageError::Protocol(
+                "unexpected ordinary Cargo finalize response",
+            )),
+        }
+    }
+
+    /// Reads an exact ordinary finalize result without changing state or access.
+    pub fn lookup_finalize_ordinary_cargo(
+        &self,
+        mut request: OrdinaryCargoFinalizeRequest,
+    ) -> Result<LookupResult<OrdinaryCargoFinalizationReceipt>, StorageError> {
+        request.token = None;
+        match self.call(Request::LookupFinalizeOrdinaryCargo(request))? {
+            Response::LookupFinalizeOrdinaryCargo(result) => result,
+            _ => Err(StorageError::Protocol(
+                "unexpected ordinary Cargo finalize lookup response",
             )),
         }
     }
@@ -201,6 +284,8 @@ enum Request {
     Budget(String),
     Acquire(AcquireRequest),
     LookupAcquire(AcquireRequest),
+    AcquireOrdinaryCargo(OrdinaryCargoRequest),
+    LookupOrdinaryCargo(OrdinaryCargoRequest),
     Finalize {
         lease_id: String,
         token: Option<LeaseToken>,
@@ -218,6 +303,8 @@ enum Request {
         operation_id: String,
         evidence: SettlementEvidence,
     },
+    FinalizeOrdinaryCargo(OrdinaryCargoFinalizeRequest),
+    LookupFinalizeOrdinaryCargo(OrdinaryCargoFinalizeRequest),
     Evict {
         request_id: String,
         target_bytes: u64,
@@ -241,6 +328,22 @@ impl Encode for Request {
             }
             Self::LookupAcquire(request) => {
                 writer.u8(7);
+                request.encode(writer)?;
+            }
+            Self::AcquireOrdinaryCargo(request) => {
+                writer.u8(9);
+                request.encode(writer)?;
+            }
+            Self::LookupOrdinaryCargo(request) => {
+                writer.u8(10);
+                request.encode(writer)?;
+            }
+            Self::FinalizeOrdinaryCargo(request) => {
+                writer.u8(11);
+                request.encode(writer)?;
+            }
+            Self::LookupFinalizeOrdinaryCargo(request) => {
+                writer.u8(12);
                 request.encode(writer)?;
             }
             Self::Finalize {
@@ -297,6 +400,18 @@ impl Decode for Request {
             2 => Ok(Self::Budget(String::decode(reader)?)),
             3 => Ok(Self::Acquire(AcquireRequest::decode(reader)?)),
             7 => Ok(Self::LookupAcquire(AcquireRequest::decode(reader)?)),
+            9 => Ok(Self::AcquireOrdinaryCargo(OrdinaryCargoRequest::decode(
+                reader,
+            )?)),
+            10 => Ok(Self::LookupOrdinaryCargo(OrdinaryCargoRequest::decode(
+                reader,
+            )?)),
+            11 => Ok(Self::FinalizeOrdinaryCargo(
+                OrdinaryCargoFinalizeRequest::decode(reader)?,
+            )),
+            12 => Ok(Self::LookupFinalizeOrdinaryCargo(
+                OrdinaryCargoFinalizeRequest::decode(reader)?,
+            )),
             4 => Ok(Self::Finalize {
                 lease_id: String::decode(reader)?,
                 token: decode_token(reader)?,
@@ -327,9 +442,15 @@ enum Response {
     Inventory(Result<Inventory, StorageError>),
     Acquire(Result<AcquireResult, StorageError>),
     LookupAcquire(Result<LookupResult<LeaseIdentity>, StorageError>),
+    AcquireOrdinaryCargo(Result<OrdinaryCargoAcquireResult, StorageError>),
+    LookupOrdinaryCargo(Result<LookupResult<OrdinaryCargoLeaseIdentity>, StorageError>),
     Finalize(Result<FinalizationReceipt, StorageError>),
     Reconcile(Result<ReconcileReceipt, StorageError>),
     LookupFinalize(Result<LookupResult<FinalizationReceipt>, StorageError>),
+    FinalizeOrdinaryCargo(Result<OrdinaryCargoFinalizationReceipt, StorageError>),
+    LookupFinalizeOrdinaryCargo(
+        Result<LookupResult<OrdinaryCargoFinalizationReceipt>, StorageError>,
+    ),
     Evict(Result<u64, StorageError>),
     Error(StorageError),
 }
@@ -349,6 +470,14 @@ impl Encode for Response {
                 writer.u8(6);
                 encode_result(writer, result, encode_lease_lookup)?;
             }
+            Self::AcquireOrdinaryCargo(result) => {
+                writer.u8(9);
+                encode_result(writer, result, encode_ordinary_acquire_result)?;
+            }
+            Self::LookupOrdinaryCargo(result) => {
+                writer.u8(10);
+                encode_result(writer, result, encode_ordinary_lease_lookup)?;
+            }
             Self::Finalize(result) => {
                 writer.u8(3);
                 encode_result(writer, result, encode_finalization)?;
@@ -360,6 +489,14 @@ impl Encode for Response {
             Self::LookupFinalize(result) => {
                 writer.u8(7);
                 encode_result(writer, result, encode_finalization_lookup)?;
+            }
+            Self::FinalizeOrdinaryCargo(result) => {
+                writer.u8(11);
+                encode_result(writer, result, encode_ordinary_finalization)?;
+            }
+            Self::LookupFinalizeOrdinaryCargo(result) => {
+                writer.u8(12);
+                encode_result(writer, result, encode_ordinary_finalization_lookup)?;
             }
             Self::Evict(result) => {
                 writer.u8(5);
@@ -386,11 +523,27 @@ impl Decode for Response {
                 reader,
                 decode_lease_lookup,
             ))),
+            9 => Ok(Self::AcquireOrdinaryCargo(decode_result(
+                reader,
+                decode_ordinary_acquire_result,
+            ))),
+            10 => Ok(Self::LookupOrdinaryCargo(decode_result(
+                reader,
+                decode_ordinary_lease_lookup,
+            ))),
             7 => Ok(Self::LookupFinalize(decode_result(
                 reader,
                 decode_finalization_lookup,
             ))),
             8 => Ok(Self::Error(decode_error(reader)?)),
+            11 => Ok(Self::FinalizeOrdinaryCargo(decode_result(
+                reader,
+                decode_ordinary_finalization,
+            ))),
+            12 => Ok(Self::LookupFinalizeOrdinaryCargo(decode_result(
+                reader,
+                decode_ordinary_finalization_lookup,
+            ))),
             _ => Err(StorageError::Protocol("unknown response")),
         }
     }
@@ -437,6 +590,12 @@ pub(crate) fn serve_one(mut stream: UnixStream, store: &mut Store) -> Result<(),
         }
         Request::Acquire(request) => Response::Acquire(store.acquire(request)),
         Request::LookupAcquire(request) => Response::LookupAcquire(store.lookup_acquire(request)),
+        Request::AcquireOrdinaryCargo(request) => {
+            Response::AcquireOrdinaryCargo(store.acquire_ordinary_cargo(request))
+        }
+        Request::LookupOrdinaryCargo(request) => {
+            Response::LookupOrdinaryCargo(store.lookup_ordinary_cargo(request))
+        }
         Request::Finalize {
             lease_id,
             token,
@@ -456,6 +615,12 @@ pub(crate) fn serve_one(mut stream: UnixStream, store: &mut Store) -> Result<(),
             operation_id,
             evidence,
         } => Response::LookupFinalize(store.lookup_finalize(&lease_id, &operation_id, evidence)),
+        Request::FinalizeOrdinaryCargo(request) => {
+            Response::FinalizeOrdinaryCargo(store.finalize_ordinary_cargo(request))
+        }
+        Request::LookupFinalizeOrdinaryCargo(request) => {
+            Response::LookupFinalizeOrdinaryCargo(store.lookup_finalize_ordinary_cargo(request))
+        }
         Request::Evict {
             request_id,
             target_bytes,
@@ -546,6 +711,10 @@ fn encode_error(writer: &mut Writer, error: &StorageError) -> Result<(), Storage
                 RefusalReason::BudgetExceeded => 5,
                 RefusalReason::NoIdleStorage => 6,
                 RefusalReason::LeaseUnavailable => 7,
+                RefusalReason::OrdinaryCargoPending => 8,
+                RefusalReason::OrdinaryCargoColdOnly => 9,
+                RefusalReason::OrdinaryCargoPartitionLimit => 10,
+                RefusalReason::OrdinaryCargoIncompatible => 11,
             });
         }
     }
@@ -569,6 +738,14 @@ fn decode_error(reader: &mut Reader<'_>) -> Result<StorageError, StorageError> {
             5 => Ok(StorageError::Refused(RefusalReason::BudgetExceeded)),
             6 => Ok(StorageError::Refused(RefusalReason::NoIdleStorage)),
             7 => Ok(StorageError::Refused(RefusalReason::LeaseUnavailable)),
+            8 => Ok(StorageError::Refused(RefusalReason::OrdinaryCargoPending)),
+            9 => Ok(StorageError::Refused(RefusalReason::OrdinaryCargoColdOnly)),
+            10 => Ok(StorageError::Refused(
+                RefusalReason::OrdinaryCargoPartitionLimit,
+            )),
+            11 => Ok(StorageError::Refused(
+                RefusalReason::OrdinaryCargoIncompatible,
+            )),
             _ => Err(StorageError::Protocol("unknown refusal reason")),
         },
         _ => Err(StorageError::Protocol("unknown error response")),
@@ -593,6 +770,21 @@ fn encode_inventory(writer: &mut Writer, inventory: &Inventory) -> Result<(), St
             }
             None => writer.u8(0),
         }
+        match slot.cargo_reuse_state {
+            Some(state) => {
+                writer.u8(1);
+                state.encode(writer)?;
+            }
+            None => writer.u8(0),
+        }
+        encode_optional_ordinary_root(writer, slot.ordinary_root.as_ref())?;
+        match slot.ordinary_partition.as_ref() {
+            Some(partition) => {
+                writer.u8(1);
+                partition.encode(writer)?;
+            }
+            None => writer.u8(0),
+        }
     }
     Ok(())
 }
@@ -614,6 +806,17 @@ fn decode_inventory(reader: &mut Reader<'_>) -> Result<Inventory, StorageError> 
             1 => Some(RunBinding::decode(reader)?),
             _ => return Err(StorageError::Protocol("invalid owner field")),
         };
+        let cargo_reuse_state = match reader.u8()? {
+            0 => None,
+            1 => Some(CargoReuseState::decode(reader)?),
+            _ => return Err(StorageError::Protocol("invalid Cargo reuse state")),
+        };
+        let ordinary_root = decode_optional_ordinary_root(reader)?;
+        let ordinary_partition = match reader.u8()? {
+            0 => None,
+            1 => Some(OrdinaryCargoPartition::decode(reader)?),
+            _ => return Err(StorageError::Protocol("invalid ordinary Cargo partition")),
+        };
         slots.push(InventorySlot {
             slot_id,
             partition,
@@ -621,6 +824,9 @@ fn decode_inventory(reader: &mut Reader<'_>) -> Result<Inventory, StorageError> 
             measured_bytes,
             reserved_bytes,
             owner,
+            cargo_reuse_state,
+            ordinary_root,
+            ordinary_partition,
         });
     }
     Ok(Inventory {
@@ -629,6 +835,30 @@ fn decode_inventory(reader: &mut Reader<'_>) -> Result<Inventory, StorageError> 
         free_bytes,
         slots,
     })
+}
+
+fn encode_optional_ordinary_root(
+    writer: &mut Writer,
+    root: Option<&StrictPhysicalCargoRoot>,
+) -> Result<(), StorageError> {
+    match root {
+        Some(root) => {
+            writer.u8(1);
+            root.encode(writer)?;
+        }
+        None => writer.u8(0),
+    }
+    Ok(())
+}
+
+fn decode_optional_ordinary_root(
+    reader: &mut Reader<'_>,
+) -> Result<Option<StrictPhysicalCargoRoot>, StorageError> {
+    match reader.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(StrictPhysicalCargoRoot::decode(reader)?)),
+        _ => Err(StorageError::Protocol("invalid ordinary Cargo root")),
+    }
 }
 
 fn encode_acquire_result(writer: &mut Writer, result: &AcquireResult) -> Result<(), StorageError> {
@@ -707,6 +937,108 @@ fn decode_acquire_result(reader: &mut Reader<'_>) -> Result<AcquireResult, Stora
         token,
         reused,
     })
+}
+
+fn encode_ordinary_acquire_result(
+    writer: &mut Writer,
+    result: &OrdinaryCargoAcquireResult,
+) -> Result<(), StorageError> {
+    writer.u32(result.policy_version);
+    result.root.encode(writer)?;
+    result.partition.encode(writer)?;
+    result.reuse_state.encode(writer)?;
+    encode_acquire_result(writer, &result.lease)
+}
+
+fn decode_ordinary_acquire_result(
+    reader: &mut Reader<'_>,
+) -> Result<OrdinaryCargoAcquireResult, StorageError> {
+    Ok(OrdinaryCargoAcquireResult {
+        policy_version: reader.u32()?,
+        root: StrictPhysicalCargoRoot::decode(reader)?,
+        partition: OrdinaryCargoPartition::decode(reader)?,
+        reuse_state: CargoReuseState::decode(reader)?,
+        lease: decode_acquire_result(reader)?,
+    })
+}
+
+fn encode_ordinary_lease_lookup(
+    writer: &mut Writer,
+    result: &LookupResult<OrdinaryCargoLeaseIdentity>,
+) -> Result<(), StorageError> {
+    validate_ordinary_lease_lookup_state(result)?;
+    encode_lookup_result(writer, result, |writer, identity| {
+        writer.u32(identity.policy_version);
+        identity.root.encode(writer)?;
+        identity.partition.encode(writer)?;
+        identity.reuse_state.encode(writer)?;
+        encode_lease_identity(writer, &identity.lease)
+    })
+}
+
+fn decode_ordinary_lease_lookup(
+    reader: &mut Reader<'_>,
+) -> Result<LookupResult<OrdinaryCargoLeaseIdentity>, StorageError> {
+    let result = decode_lookup_result(reader, |reader| {
+        Ok(OrdinaryCargoLeaseIdentity {
+            policy_version: reader.u32()?,
+            root: StrictPhysicalCargoRoot::decode(reader)?,
+            partition: OrdinaryCargoPartition::decode(reader)?,
+            reuse_state: CargoReuseState::decode(reader)?,
+            lease: decode_lease_identity(reader)?,
+        })
+    })?;
+    validate_ordinary_lease_lookup_state(&result)?;
+    Ok(result)
+}
+
+fn encode_lease_identity(
+    writer: &mut Writer,
+    identity: &LeaseIdentity,
+) -> Result<(), StorageError> {
+    validate_storage_identity(
+        &identity.slot_id,
+        &identity.storage_instance_id,
+        &identity.generation,
+    )?;
+    identity.lease_id.encode(writer)?;
+    identity.slot_id.encode(writer)?;
+    identity.storage_instance_id.encode(writer)?;
+    identity.generation.encode(writer)?;
+    identity.state.encode(writer)
+}
+
+fn decode_lease_identity(reader: &mut Reader<'_>) -> Result<LeaseIdentity, StorageError> {
+    let lease_id = String::decode(reader)?;
+    let slot_id = String::decode(reader)?;
+    let storage_instance_id = String::decode(reader)?;
+    let generation = String::decode(reader)?;
+    validate_storage_identity(&slot_id, &storage_instance_id, &generation)?;
+    Ok(LeaseIdentity {
+        lease_id,
+        slot_id,
+        storage_instance_id,
+        generation,
+        state: SlotState::decode(reader)?,
+    })
+}
+
+fn validate_ordinary_lease_lookup_state(
+    result: &LookupResult<OrdinaryCargoLeaseIdentity>,
+) -> Result<(), StorageError> {
+    match result {
+        LookupResult::Absent => Ok(()),
+        LookupResult::Present(identity) if identity.lease.state != SlotState::Uncertain => Ok(()),
+        LookupResult::Uncertain(Some(identity))
+            if identity.lease.state == SlotState::Uncertain
+                && identity.reuse_state == CargoReuseState::Pending =>
+        {
+            Ok(())
+        }
+        _ => Err(StorageError::Protocol(
+            "ordinary Cargo lookup result does not match lease state",
+        )),
+    }
 }
 
 fn encode_lookup_result<T>(
@@ -858,6 +1190,68 @@ fn decode_finalization(reader: &mut Reader<'_>) -> Result<FinalizationReceipt, S
         state: SlotState::decode(reader)?,
         capture_digest: decode_optional_string(reader)?,
     })
+}
+
+fn encode_ordinary_finalization(
+    writer: &mut Writer,
+    receipt: &OrdinaryCargoFinalizationReceipt,
+) -> Result<(), StorageError> {
+    writer.u32(receipt.policy_version);
+    receipt.root.encode(writer)?;
+    receipt.partition.encode(writer)?;
+    receipt.reuse_state.encode(writer)?;
+    encode_finalization(writer, &receipt.finalization)
+}
+
+fn decode_ordinary_finalization(
+    reader: &mut Reader<'_>,
+) -> Result<OrdinaryCargoFinalizationReceipt, StorageError> {
+    Ok(OrdinaryCargoFinalizationReceipt {
+        policy_version: reader.u32()?,
+        root: StrictPhysicalCargoRoot::decode(reader)?,
+        partition: OrdinaryCargoPartition::decode(reader)?,
+        reuse_state: CargoReuseState::decode(reader)?,
+        finalization: decode_finalization(reader)?,
+    })
+}
+
+fn encode_ordinary_finalization_lookup(
+    writer: &mut Writer,
+    result: &LookupResult<OrdinaryCargoFinalizationReceipt>,
+) -> Result<(), StorageError> {
+    validate_ordinary_finalization_lookup_state(result)?;
+    encode_lookup_result(writer, result, encode_ordinary_finalization)
+}
+
+fn decode_ordinary_finalization_lookup(
+    reader: &mut Reader<'_>,
+) -> Result<LookupResult<OrdinaryCargoFinalizationReceipt>, StorageError> {
+    let result = decode_lookup_result(reader, decode_ordinary_finalization)?;
+    validate_ordinary_finalization_lookup_state(&result)?;
+    Ok(result)
+}
+
+fn validate_ordinary_finalization_lookup_state(
+    result: &LookupResult<OrdinaryCargoFinalizationReceipt>,
+) -> Result<(), StorageError> {
+    match result {
+        LookupResult::Absent | LookupResult::Uncertain(None) => Ok(()),
+        LookupResult::Present(receipt)
+            if receipt.finalization.state == SlotState::Idle
+                && receipt.reuse_state != CargoReuseState::Pending =>
+        {
+            Ok(())
+        }
+        LookupResult::Uncertain(Some(receipt))
+            if receipt.finalization.state == SlotState::Uncertain
+                && receipt.reuse_state == CargoReuseState::Pending =>
+        {
+            Ok(())
+        }
+        _ => Err(StorageError::Protocol(
+            "ordinary Cargo finalize lookup result does not match operation state",
+        )),
+    }
 }
 
 fn encode_reconcile(writer: &mut Writer, receipt: &ReconcileReceipt) -> Result<(), StorageError> {

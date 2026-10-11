@@ -1,11 +1,10 @@
 # Ordinary-Cargo same-root storage route
 
-Status: proposed qualification-only design, read-only source inspection on
-2026-10-11. This defines one graph-free route for a single fresh consumer-owned
-source workspace and sequential attempts at that same physical root. It is not
-an installed API, accepted Nucleus workflow, production input policy, or
-authorization to execute Cargo. The task-specific implementation and any later
-real proof need their own checked scopes.
+Status: the versioned Oxide storage API is implemented; the ordinary-Cargo
+execution route remains uninstalled and unqualified. This contract defines one
+graph-free route for a single consumer-owned source workspace and sequential
+attempts at that same physical root. It is not an accepted Nucleus workflow,
+production input policy, or authorization to execute Cargo.
 
 ## Decision and boundary
 
@@ -39,58 +38,133 @@ chain. Task 043's parser schema is not a dependency.
 
 ## What exists and what is missing
 
-Shipped Oxide storage APIs include `storage::Client::acquire`,
-`lookup_acquire`, `finalize`, and `lookup_finalize`, plus the durable
-`(storage_instance_id, slot_id, generation)` identity and lease token. Lookup
-methods are read-only: `Absent` permits only an exact replay of the original
-operation; `Present` and `Uncertain` grant neither a new attempt nor access to
-slot bytes. Acquire can allocate on a miss, so it never substitutes for lookup.
-The lease token remains in the Rust host process and does not enter Nucleus
-logs, frames, or ordinary ledger records.
+Shipped Oxide storage APIs include generic `storage::Client::acquire`,
+`lookup_acquire`, `finalize`, and `lookup_finalize`, plus the ordinary-Cargo
+methods documented below. Both routes use the durable
+`(storage_instance_id, slot_id, generation)` identity and opaque lease token.
+Lookup methods are read-only: `Absent` permits only an exact replay of the
+original operation; `Present` and `Uncertain` grant neither a new attempt nor
+access to slot bytes. The lease token remains in Rust host memory and is never
+persisted in the ledger.
 
-Those generic APIs do not implement this route's selection policy. Generic
-`Client::acquire` can return an idle slot as `reused=true`, and its capacity
-path can evict the oldest measured idle slot. The durable slot state records
-occupancy, not Cargo reuse eligibility, so it cannot distinguish a reusable
-generation from a failed/cold-only one or an in-flight pending generation.
-The current `same_root_fixture_v1` path identity is fixture-only and refuses a
-second partition under that root. None of those behaviors can be treated as
-ordinary-Cargo route support.
+Generic `Client::acquire` still returns a matching idle generic slot as
+`reused=true` and may evict an eligible generic idle slot for capacity. It does
+not implement ordinary-Cargo selection. Ordinary generations carry separate
+durable eligibility and are explicitly excluded from generic acquire,
+finalize/reconcile, and eviction. The current `same_root_fixture_v1` path
+identity remains fixture-only and retains its own one-partition rule.
 
-The proposed route therefore needs a narrow storage seam, not just a caller
-around generic acquire: a state-aware `Client::acquire_ordinary_cargo` (or an
-equivalent explicit policy input to acquire), and versioned reuse metadata in
-the existing durable ledger. The proposed `CargoReuseState` (`empty`,
-`pending`, `reusable`, `cold-only`) is per generation and remains separate from
-the existing slot occupancy states (`Idle`, `Leased`, `Uncertain`). Its
-selection policy must lease a compatible reusable generation only when its
-state is `reusable`; choose a clean, already-budgeted empty generation for
-cold work; return pending/refusal for `pending`, `Uncertain`, unknown, or
-incompatible state; and never return `cold-only` as warm. Capacity exhaustion
-returns refusal without calling the generic LRU eviction path. The route's
-proposed path identity is `StrictPhysicalCargoRoot`: canonical physical
-source-root path plus authenticated consumer root ID and allocation epoch,
-with a bounded partition key of `ordinary-test` or `full-debug`. This route
-may use only the owner's R×P=2 allowance: one generation per partition, with
-no spare successor and no implicit growth. It does not broaden
-`same_root_fixture_v1` or generic storage behavior.
+`Client::acquire_ordinary_cargo` supplies the required state-aware seam. It
+supports exactly the `ordinary-test` and `full-debug` labels, binds the
+canonical physical source root, consumer root ID, allocation epoch, policy and
+installation epochs, accepted input-boundary digest, and complete existing
+`PartitionKey`. Source commit/tree and task/workspace/run/attempt identities
+remain per-attempt fields and do not create more partitions. A compatible
+generation is warm only when its state is `reusable`; `empty` admits cold work;
+`pending`, `Uncertain`, unknown, incompatible, and `cold-only` states refuse.
+Admission never calls generic `make_room` or LRU eviction. Each accepted root
+allocation has at most one generation for each of the two labels.
 
-The durable barrier belongs in that versioned storage-ledger record, bound to
-`(storage_instance_id, slot_id, generation, lease_id)` and the original
-operation ID. The state-aware acquire transaction first selects and leases the
-exact generation, then commits its `pending` reuse state and lease together
-before returning the acquired tuple to the host. This ordering makes the
-barrier follow generation selection without exposing a callback window before
-the barrier exists. It is not a Nucleus-only flag or sidecar file. The shipped
-ledger has no such field today: the implementation must add an explicit
-compatible ledger version and refuse unknown versions rather than reinterpret
-old records. The pending marker also preserves the exact pre-acquire reuse
-state (`empty` or `reusable`). Authenticated finalize transitions the record
-to `reusable` only after successful tests and complete capture, or
-`cold-only` after an authenticated settled failure/invalidation. A positive
-authenticated no-spawn settlement restores that exact saved state and releases
-the lease without consuming another generation. An uncertain writer stays
-`pending`; lookup cannot clear it.
+The durable barrier belongs in the versioned storage-ledger record, bound to
+`(storage_instance_id, slot_id, generation, lease_id)` and the exact ordinary
+request. Acquire selects the generation and commits its `pending` state, lease,
+and saved prior state (`empty` or `reusable`) together before returning its
+path or token. Authenticated finalize makes a generation `reusable` only after
+successful tests and complete capture, or `cold-only` after an authenticated
+settled failure. Authenticated `NotSpawned` restores the saved state and
+releases occupancy without allocating another generation. An uncertain writer
+stays `pending`; lookup cannot clear it.
+
+## Shipped ordinary storage API
+
+The private local transport is `OXSTOR01` protocol version 2. The durable
+ledger keeps the `OXIDEST1` magic and uses version 4. Version-3 and other
+unsupported ledgers are refused without migration or mutation. Protocol
+version 1, unversioned frames, and unsupported peers are rejected before
+dispatch. Changing these request or response encodings requires another
+protocol version.
+
+`OrdinaryCargoRequest` carries an existing `AcquireRequest`, a
+`StrictPhysicalCargoRoot` (`source_root: PathBuf`, `consumer_root_id`, and
+`allocation_epoch`), one `OrdinaryCargoPartition` (`OrdinaryTest` or
+`FullDebug`), and `OrdinaryCargoAcceptance` (`policy_version == 1`,
+`installation_epoch`, `acceptance_reference`, SHA-256 `input_boundary_digest`,
+and an opaque credential). The source root must be an existing canonical
+absolute physical directory. The complete existing `PartitionKey` supplies
+the compatibility partition; the task/run/source identity remains bound in
+the request but is not a partition key.
+
+The client API is:
+
+```rust
+pub fn acquire_ordinary_cargo(
+    &self,
+    request: OrdinaryCargoRequest,
+) -> Result<OrdinaryCargoAcquireResult, StorageError>
+pub fn lookup_ordinary_cargo(
+    &self,
+    request: OrdinaryCargoRequest,
+) -> Result<LookupResult<OrdinaryCargoLeaseIdentity>, StorageError>
+pub fn finalize_ordinary_cargo(
+    &self,
+    request: OrdinaryCargoFinalizeRequest,
+) -> Result<OrdinaryCargoFinalizationReceipt, StorageError>
+pub fn lookup_finalize_ordinary_cargo(
+    &self,
+    request: OrdinaryCargoFinalizeRequest,
+) -> Result<LookupResult<OrdinaryCargoFinalizationReceipt>, StorageError>
+```
+
+Acquire responses include the policy version, root, partition, durable reuse
+state, and existing `AcquireResult`. Lookup returns only an access-free lease
+identity. Finalize repeats the exact ordinary request, lease ID, operation ID,
+and authenticated settlement evidence. The token is verified against the
+lease but excluded from the operation-identity digest; the digest binds every
+ordinary policy/root/epoch field and the evidence. Finalize lookup sends no
+token and returns no path or access. Exact replay returns the stored result; a
+changed request or evidence conflicts, and invalid credentials are
+unauthorized.
+
+`EvidenceAuthority::verify_ordinary_cargo_admission` and
+`verify_ordinary_cargo_settlement` authenticate the installed policy and
+accepted input boundary. Both have safe defaults that return `false`. A
+caller-provided flag or digest cannot install this trust. Existing admission
+and settlement verification also runs. Missing or unknown input-boundary
+acceptance refuses before a lease can become warm.
+
+`CargoReuseState::{Empty, Pending, Reusable, ColdOnly}` is separate from
+`SlotState::{Idle, Leased, Uncertain}`. The ledger stores root identity,
+partition label and compatibility key, policy/installation epochs,
+acceptance reference and input-boundary digest, saved pre-acquire state, and
+finalized transition. Credentials are redacted and lease tokens are stored
+only as hashes. Restart changes an active lease to `Uncertain` while retaining
+`Pending`.
+
+Admission uses checked arithmetic for measured and reserved bytes against the
+configured aggregate cap and free-space reserve. Unknown accounting or free
+space refuses. Explicit capacity results include
+`OrdinaryCargoPending`, `OrdinaryCargoColdOnly`,
+`OrdinaryCargoPartitionLimit`, and `OrdinaryCargoIncompatible`. There is one
+generation per root allocation and label, with no successor or implicit pool
+growth. Generic acquire rejects the reserved ordinary path identity; generic
+finalize/reconcile and lookups cannot operate on ordinary leases; generic
+eviction and `make_room` skip ordinary records.
+
+Synthetic socket fixtures cover cold and reusable no-spawn restoration,
+successful capture before reuse, settled failure and cold-only refusal,
+concurrent pending refusal, two-partition and checked budget bounds, exact
+lookup/replay and credential redaction, generic bypass/eviction refusal,
+uninstalled policy rejection, unsupported ledger/protocol versions, and
+restart uncertainty. They do not run Cargo or establish a real input
+boundary.
+
+This is the shipped storage seam only. `project::ordinary_cargo::run_attempt`,
+process execution, the ordinary-Cargo callback/client schema, Nucleus
+`StorageAttempt` integration, installation policy, accepted real inputs,
+full-debug/source retention lookup, and useful warm benefit remain
+unimplemented or unqualified. The next execution route must consume this API
+through the existing Nucleus `StorageAttempt` and Effigy Contract 010 path;
+this change does not activate or contact that consumer.
 
 The registered `RunnerHost` calls the graph-backed `Runner::run`. Its
 `ExecutionOwner` callbacks are behind registration, input audit, reuse checks,
@@ -180,8 +254,8 @@ ID. The embedder installs the verifier and callback dispatcher at construction;
 task JSON and environment cannot install trusted policy or issuer material.
 The entry point does not accept a `Registration` or fabricate `UnitEvidence`.
 
-The host uses the existing identity, lease, lookup, and finalize semantics,
-with the proposed state-aware acquire seam above (not generic
+The future host uses the existing identity, lease, lookup, and finalize
+semantics with the shipped ordinary-Cargo storage API above (not generic
 `Client::acquire`):
 
 1. Check the supported invocation shape and exact source/root bindings before
@@ -190,8 +264,8 @@ with the proposed state-aware acquire seam above (not generic
 2. Call `Client::acquire_ordinary_cargo` with the authenticated original
    request, `StrictPhysicalCargoRoot` identity, and validated partition. It
    applies the per-generation state policy above and never evicts. On an
-   ambiguous transport outcome, use `Client::lookup_acquire` with the exact
-   original authenticated request. `Absent` permits only exact replay.
+   ambiguous transport outcome, use `Client::lookup_ordinary_cargo` with the
+   exact original authenticated request. `Absent` permits only exact replay.
    Busy/capacity returns pending without a host run. `Uncertain`, unknown
    accounting, lost token, changed body, or inconclusive lookup holds storage
    and the consumer root.
@@ -223,15 +297,16 @@ with the proposed state-aware acquire seam above (not generic
    tuple and exact run/source attempt; Rust does not manufacture a successful
    test or capture record.
 6. For a started run, only after cooperative no-writer completion and complete
-   capture may the host call the proposed
-   `Client::finalize_ordinary_cargo` with authenticated terminal/capture
-   evidence. A proven no-submit result from `ordinary_cargo.not_submitted` uses
+   capture may the host call `Client::finalize_ordinary_cargo` with authenticated
+   terminal/capture evidence. A proven no-submit result from
+   `ordinary_cargo.not_submitted` uses
    the same operation with an authenticated `NotSpawned` settlement: it is
    accepted only when Effigy proves submission never began, and atomically
    restores the exact pre-acquire `empty` or `reusable` state saved in the
    pending marker before releasing the lease. No capture is fabricated and no
    bytes are cleared. On a lost finalize reply, call
-   `Client::lookup_finalize` with the same lease, operation ID, and exact
+   `Client::lookup_finalize_ordinary_cargo` with the original ordinary request,
+   same lease, operation ID, and exact
    evidence before any identical retry. `Present` observes the stored
    transition, `Absent` permits exact replay, and `Uncertain` keeps the lease
    held. A lost submit reply, cancellation, or ambiguous writer state is not
@@ -314,39 +389,25 @@ looked up independently of the current contents at the same physical path.
 Failure to retain or retrieve any required output leaves root recycling
 pending. This design itself never recycles the task root to another task.
 
-## Next checked implementation and owner handoff
+## Next implementation and owner handoff
 
-Define one Oxide-only implementation scope of at most 90 minutes authoring and
-30 minutes independent exact-head review. It must add the state-aware
-`acquire_ordinary_cargo` seam and compatible versioned per-generation reuse
-metadata in the existing storage ledger; it must not route this policy through
-generic `Client::acquire` or `make_room`. The scope includes the proposed
-`StrictPhysicalCargoRoot` path identity, support for exactly the bounded
-`ordinary-test` and `full-debug` partitions, atomic acquire-plus-pending-marker
-ordering, authenticated finalize state transitions, and refusal on unknown
-ledger versions. Keep all fixtures in fresh task-owned scratch. Synthetic
-fixtures must cover busy/no-spawn, exact lookup/replay, source/config/feature/
-tool/epoch/env invalidation, failed/partial builds, and capture-before-finalize;
-prove that a reusable idle generation is selected only when its reuse state
-permits it, `cold-only` is never returned as warm, and an idle generation is
-never evicted to admit another partition or generation. Exercise the one and
-two partition boundary, capacity refusal, pending/uncertain holds, and
-authenticated no-spawn finalize restoring a prior `empty` state followed by
-cold admission in the same partition without allocating another generation.
-Also prove `reusable` restoration, exact finalize lookup/replay, and that a
-settled failure stays cold-only and capacity-refuses when no owner-approved
-recovery exists. Unknown input must refuse warm use. This does not run or
-qualify a real Nucleus Cargo workflow, install an authority, or activate a
-consumer.
+The state-aware acquisition, per-generation reuse metadata, strict physical
+root identity, two-partition bound, authenticated transitions, lookup surfaces,
+and generic-operation protections described above are the shipped Oxide seam.
+The reviewed implementation must be handed to Nucleus by exact Oxide commit
+SHA after independent exact-head review. The packet names the API signatures
+above, binary ledger version 4, transport version 2, reuse-state meanings,
+redaction rules, and synthetic evidence. This seam defines no callback schema
+digest: the Nucleus-owned task must derive and review its
+`ordinary-cargo-attempt-v1` schema against these exact methods before any
+consumer implementation begins.
 
-After that API receives independent exact-head review, the handover packet to
-Nucleus must name the Oxide commit SHA, reviewed method/request/response
-signatures, callback schema digest, storage-ledger version and reuse-state
-definitions, the owner's R×P=2 / 8-GiB-per-generation / 16-GiB-total limits,
-no-successor/no-eviction/capacity-refusal semantics, redaction rules, and
-synthetic evidence. Nucleus owners
-must accept that exact packet before a separately scoped Nucleus-owned client
-task is dispatched; consumer work cannot start before this handover.
+The Nucleus owner must accept that exact handover before a separately scoped
+Nucleus-owned client task is dispatched. The next route remains bounded to one
+existing `StorageAttempt`/Effigy Contract 010 path and the reviewed root,
+partition, and storage limits. It does not install a new scheduler or storage
+codec, and it cannot activate a real Cargo workflow without the later joint
+proof packet below.
 
 That Nucleus task is bounded to at most 90 minutes authoring and 30 minutes
 independent exact-head review, one `ordinary-cargo-attempt-v1` adapter, one

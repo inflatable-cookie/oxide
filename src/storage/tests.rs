@@ -48,6 +48,19 @@ impl Drop for TaskRoot {
 
 struct TestAuthority;
 
+struct RejectingOrdinaryAuthority;
+
+impl EvidenceAuthority for RejectingOrdinaryAuthority {
+    fn verify_admission(&self, envelope: &RunEnvelope) -> bool {
+        envelope.admission_reference == "admission-ref"
+            && envelope.admission_credential.expose() == "admission-proof"
+    }
+
+    fn verify_settlement(&self, evidence: &SettlementEvidence) -> bool {
+        evidence.consumer_credential.expose() == "consumer-proof"
+    }
+}
+
 impl EvidenceAuthority for TestAuthority {
     fn verify_admission(&self, envelope: &RunEnvelope) -> bool {
         envelope.admission_reference == "admission-ref"
@@ -73,6 +86,25 @@ impl EvidenceAuthority for TestAuthority {
                 _ => true,
             }
     }
+
+    fn verify_ordinary_cargo_admission(&self, request: &OrdinaryCargoRequest) -> bool {
+        request.acceptance.policy_version == ORDINARY_CARGO_POLICY_VERSION
+            && request.acceptance.installation_epoch == "install-1"
+            && request.acceptance.acceptance_reference == "ordinary-acceptance"
+            && request.acceptance.input_boundary_digest == format!("sha256:{}", "a".repeat(64))
+            && request.acceptance.credential.expose() == "ordinary-proof"
+            && request.root.consumer_root_id == "consumer-root"
+    }
+
+    fn verify_ordinary_cargo_settlement(
+        &self,
+        request: &OrdinaryCargoRequest,
+        evidence: &SettlementEvidence,
+    ) -> bool {
+        self.verify_ordinary_cargo_admission(request)
+            && self.verify_settlement(evidence)
+            && evidence.binding == request.acquire.envelope.binding
+    }
 }
 
 struct FixedFreeSpace(Option<u64>);
@@ -85,6 +117,7 @@ impl FreeSpaceProbe for FixedFreeSpace {
 
 struct RunningDaemon {
     client: Client,
+    socket_path: PathBuf,
     shutdown: Option<mpsc::Sender<()>>,
     thread: Option<JoinHandle<Result<(), StorageError>>>,
 }
@@ -100,11 +133,13 @@ impl RunningDaemon {
             Arc::new(FixedFreeSpace(free_bytes)),
         )
         .expect("bind daemon");
-        let client = Client::new(daemon.socket_path().to_path_buf());
+        let socket_path = daemon.socket_path().to_path_buf();
+        let client = Client::new(socket_path.clone());
         let (shutdown, receiver) = mpsc::channel();
         let thread = thread::spawn(move || daemon.serve(receiver));
         Self {
             client,
+            socket_path,
             shutdown: Some(shutdown),
             thread: Some(thread),
         }
@@ -225,6 +260,51 @@ fn request(attempt: &str, acquire_id: &str, required_bytes: u64) -> AcquireReque
         acquire_id: acquire_id.to_owned(),
         required_bytes,
     }
+}
+
+fn ordinary_request(
+    source_root: &Path,
+    attempt: &str,
+    acquire_id: &str,
+    required_bytes: u64,
+    partition: OrdinaryCargoPartition,
+) -> OrdinaryCargoRequest {
+    let mut acquire = request(attempt, acquire_id, required_bytes);
+    acquire.envelope.partition.path_identity = "ordinary-cargo-storage-v1".to_owned();
+    OrdinaryCargoRequest {
+        acquire,
+        root: StrictPhysicalCargoRoot {
+            source_root: source_root.to_path_buf(),
+            consumer_root_id: "consumer-root".to_owned(),
+            allocation_epoch: "allocation-1".to_owned(),
+        },
+        partition,
+        acceptance: OrdinaryCargoAcceptance {
+            policy_version: ORDINARY_CARGO_POLICY_VERSION,
+            installation_epoch: "install-1".to_owned(),
+            acceptance_reference: "ordinary-acceptance".to_owned(),
+            input_boundary_digest: format!("sha256:{}", "a".repeat(64)),
+            credential: Credential::new("ordinary-proof"),
+        },
+    }
+}
+
+fn passing_evidence(
+    binding: &RunBinding,
+    lease_id: &str,
+    slot_id: &str,
+    slot_path: &Path,
+    token: &LeaseToken,
+) -> SettlementEvidence {
+    let mut evidence = complete_evidence(binding, lease_id, slot_id, slot_path, token);
+    if let Some(terminal) = evidence.terminal.as_mut() {
+        terminal.outcome = TerminalOutcome::Passed;
+    }
+    if let ContainmentEvidence::CooperativeWorkflow(completion) = &mut evidence.containment {
+        completion.exit_code = 0;
+        completion.sign(token);
+    }
+    evidence
 }
 
 fn complete_evidence(
@@ -699,12 +779,17 @@ fn unsupported_ledger_version_preserves_old_ledger_and_slot_evidence() {
         .expect("write bounded task-owned evidence fixture");
     daemon.stop();
 
+    let stale_temp = root.path().join("ledger.tmp-0123456789abcdef");
+    fs::write(&stale_temp, b"preserve with unsupported ledger")
+        .expect("write bounded task-owned ledger temp fixture");
+    fs::set_permissions(&stale_temp, fs::Permissions::from_mode(0o600))
+        .expect("make task-owned ledger temp private");
     let ledger_path = root.path().join("ledger.bin");
     let mut old_ledger = fs::read(&ledger_path).expect("read current ledger");
     let version = old_ledger
         .get_mut(12..16)
         .expect("ledger header contains version bytes");
-    version.copy_from_slice(&2_u32.to_le_bytes());
+    version.copy_from_slice(&3_u32.to_le_bytes());
     fs::write(&ledger_path, &old_ledger).expect("mark fixture with unsupported version");
     let result = Daemon::bind(
         DaemonConfig {
@@ -725,6 +810,10 @@ fn unsupported_ledger_version_preserves_old_ledger_and_slot_evidence() {
     assert_eq!(
         fs::read(&evidence_path).expect("old slot evidence remains"),
         b"preserve old evidence"
+    );
+    assert_eq!(
+        fs::read(&stale_temp).expect("unsupported ledger temp remains"),
+        b"preserve with unsupported ledger"
     );
 }
 
@@ -1207,5 +1296,787 @@ fn same_root_acquire_retains_one_partition_and_never_evicts_without_recovery_pol
     assert_eq!(
         fs::read(acquired.slot_path.unwrap().join("invalid-map-bytes")).unwrap(),
         b"owned bytes"
+    );
+}
+
+#[test]
+fn ordinary_cargo_no_spawn_restores_empty_then_reusable_state_on_one_generation() {
+    let storage = TaskRoot::new();
+    let source = TaskRoot::new();
+    let daemon = RunningDaemon::start(storage.path(), budget(256), Some(1024));
+    let first_request = ordinary_request(
+        source.path(),
+        "ordinary-first",
+        "ordinary-acquire-first",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let first = daemon
+        .client
+        .acquire_ordinary_cargo(first_request.clone())
+        .expect("authorized ordinary acquire");
+    assert!(!first.lease.reused);
+    assert_eq!(first.reuse_state, CargoReuseState::Pending);
+    let token = first.lease.token.as_ref().expect("active token");
+    let no_spawn =
+        NoSpawnEvidence::new(&first.lease, &first_request.acquire.envelope.binding, token)
+            .expect("no-spawn evidence");
+    let empty_restore = daemon
+        .client
+        .finalize_ordinary_cargo(OrdinaryCargoFinalizeRequest {
+            request: first_request.clone(),
+            lease_id: first.lease.lease_id.clone(),
+            token: Some(token.clone()),
+            finalize_id: "ordinary-no-spawn-first".to_owned(),
+            evidence: SettlementEvidence {
+                binding: first_request.acquire.envelope.binding.clone(),
+                consumer_credential: Credential::new("consumer-proof"),
+                terminal: None,
+                capture: None,
+                containment: ContainmentEvidence::NotSpawned(no_spawn),
+            },
+        })
+        .expect("restore empty state");
+    assert_eq!(empty_restore.reuse_state, CargoReuseState::Empty);
+    assert_eq!(empty_restore.finalization.state, SlotState::Idle);
+
+    let second_request = ordinary_request(
+        source.path(),
+        "ordinary-second",
+        "ordinary-acquire-second",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let second = daemon
+        .client
+        .acquire_ordinary_cargo(second_request.clone())
+        .expect("cold admit after no-spawn");
+    assert_eq!(second.lease.slot_id, first.lease.slot_id);
+    assert_eq!(second.lease.generation, first.lease.generation);
+    assert!(!second.lease.reused);
+
+    let token = second.lease.token.as_ref().expect("active token");
+    let passed = passing_evidence(
+        &second_request.acquire.envelope.binding,
+        &second.lease.lease_id,
+        &second.lease.slot_id,
+        second.lease.slot_path.as_ref().expect("slot path"),
+        token,
+    );
+    let reusable = daemon
+        .client
+        .finalize_ordinary_cargo(OrdinaryCargoFinalizeRequest {
+            request: second_request.clone(),
+            lease_id: second.lease.lease_id.clone(),
+            token: Some(token.clone()),
+            finalize_id: "ordinary-passed".to_owned(),
+            evidence: passed,
+        })
+        .expect("publish reusable state after complete capture");
+    assert_eq!(reusable.reuse_state, CargoReuseState::Reusable);
+
+    let compatibility_changes: [fn(&mut OrdinaryCargoRequest); 5] = [
+        |request| request.acquire.envelope.partition.config_digest = "sha256:other-config".into(),
+        |request| {
+            request.acquire.envelope.partition.features = vec!["default".into(), "extra".into()]
+        },
+        |request| request.acquire.envelope.partition.cargo_provenance = "cargo other".into(),
+        |request| request.acquire.envelope.partition.environment_digest = "sha256:other-env".into(),
+        |request| request.root.allocation_epoch = "allocation-2".into(),
+    ];
+    for (index, change) in compatibility_changes.into_iter().enumerate() {
+        let mut changed = ordinary_request(
+            source.path(),
+            &format!("ordinary-incompatible-{index}"),
+            &format!("ordinary-acquire-incompatible-{index}"),
+            64,
+            OrdinaryCargoPartition::OrdinaryTest,
+        );
+        change(&mut changed);
+        assert_eq!(
+            daemon.client.acquire_ordinary_cargo(changed),
+            Err(StorageError::Refused(
+                RefusalReason::OrdinaryCargoIncompatible
+            ))
+        );
+    }
+
+    let mut third_request = ordinary_request(
+        source.path(),
+        "ordinary-third",
+        "ordinary-acquire-third",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    third_request.acquire.envelope.binding.commit = "fedcba9876543210".to_owned();
+    third_request.acquire.envelope.binding.source_tree_digest =
+        "sha256:changed-source-tree".to_owned();
+    let third = daemon
+        .client
+        .acquire_ordinary_cargo(third_request.clone())
+        .expect("warm admit reusable generation");
+    assert_eq!(third.lease.slot_id, first.lease.slot_id);
+    assert!(third.lease.reused);
+
+    let token = third.lease.token.as_ref().expect("active token");
+    let no_spawn =
+        NoSpawnEvidence::new(&third.lease, &third_request.acquire.envelope.binding, token)
+            .expect("no-spawn evidence");
+    let reusable_restore = daemon
+        .client
+        .finalize_ordinary_cargo(OrdinaryCargoFinalizeRequest {
+            request: third_request.clone(),
+            lease_id: third.lease.lease_id.clone(),
+            token: Some(token.clone()),
+            finalize_id: "ordinary-no-spawn-reusable".to_owned(),
+            evidence: SettlementEvidence {
+                binding: third_request.acquire.envelope.binding.clone(),
+                consumer_credential: Credential::new("consumer-proof"),
+                terminal: None,
+                capture: None,
+                containment: ContainmentEvidence::NotSpawned(no_spawn),
+            },
+        })
+        .expect("restore reusable state");
+    assert_eq!(reusable_restore.reuse_state, CargoReuseState::Reusable);
+    let fourth_request = ordinary_request(
+        source.path(),
+        "ordinary-fourth",
+        "ordinary-acquire-fourth",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let fourth = daemon
+        .client
+        .acquire_ordinary_cargo(fourth_request)
+        .expect("warm admit after reusable no-spawn");
+    assert_eq!(fourth.lease.slot_id, first.lease.slot_id);
+    assert!(fourth.lease.reused);
+}
+
+#[test]
+fn ordinary_cargo_failure_stays_cold_and_capacity_never_evicts_or_grows() {
+    let storage = TaskRoot::new();
+    let source = TaskRoot::new();
+    let daemon = RunningDaemon::start(storage.path(), budget(256), Some(1024));
+    let first_request = ordinary_request(
+        source.path(),
+        "ordinary-failure",
+        "ordinary-acquire-failure",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let first = daemon
+        .client
+        .acquire_ordinary_cargo(first_request.clone())
+        .expect("cold acquire");
+    let token = first.lease.token.as_ref().expect("lease token");
+    let failed = complete_evidence(
+        &first_request.acquire.envelope.binding,
+        &first.lease.lease_id,
+        &first.lease.slot_id,
+        first.lease.slot_path.as_ref().expect("slot path"),
+        token,
+    );
+    let receipt = daemon
+        .client
+        .finalize_ordinary_cargo(OrdinaryCargoFinalizeRequest {
+            request: first_request.clone(),
+            lease_id: first.lease.lease_id.clone(),
+            token: Some(token.clone()),
+            finalize_id: "ordinary-failed-finalize".to_owned(),
+            evidence: failed,
+        })
+        .expect("settled failure becomes cold-only");
+    assert_eq!(receipt.reuse_state, CargoReuseState::ColdOnly);
+
+    let next = ordinary_request(
+        source.path(),
+        "ordinary-after-failure",
+        "ordinary-acquire-after-failure",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    assert_eq!(
+        daemon.client.acquire_ordinary_cargo(next),
+        Err(StorageError::Refused(RefusalReason::OrdinaryCargoColdOnly))
+    );
+    assert_eq!(daemon.client.evict("ordinary-evict", 256), Ok(0));
+
+    let full_debug = ordinary_request(
+        source.path(),
+        "ordinary-full-debug",
+        "ordinary-acquire-full-debug",
+        64,
+        OrdinaryCargoPartition::FullDebug,
+    );
+    let second = daemon
+        .client
+        .acquire_ordinary_cargo(full_debug)
+        .expect("second and final allowed partition");
+    assert_ne!(second.lease.slot_id, first.lease.slot_id);
+    let unsupported = ordinary_request(
+        source.path(),
+        "ordinary-third-partition",
+        "ordinary-acquire-third-partition",
+        1,
+        OrdinaryCargoPartition::Other("full-debug-plus-symbols".to_owned()),
+    );
+    assert_eq!(
+        daemon.client.acquire_ordinary_cargo(unsupported),
+        Err(StorageError::Refused(
+            RefusalReason::OrdinaryCargoPartitionLimit
+        ))
+    );
+    let inventory = daemon.client.inventory("ordinary-protected").unwrap();
+    assert_eq!(inventory.slots.len(), 2);
+    assert!(inventory
+        .slots
+        .iter()
+        .all(|slot| slot.cargo_reuse_state.is_some()));
+    assert!(first.lease.slot_path.unwrap().is_dir());
+}
+
+#[test]
+fn concurrent_ordinary_cargo_claims_commit_one_pending_barrier() {
+    let storage = TaskRoot::new();
+    let source = TaskRoot::new();
+    let daemon = RunningDaemon::start(storage.path(), budget(256), Some(1024));
+    let gate = Arc::new(Barrier::new(3));
+    let requests = [
+        ordinary_request(
+            source.path(),
+            "ordinary-race-a",
+            "ordinary-acquire-race-a",
+            64,
+            OrdinaryCargoPartition::OrdinaryTest,
+        ),
+        ordinary_request(
+            source.path(),
+            "ordinary-race-b",
+            "ordinary-acquire-race-b",
+            64,
+            OrdinaryCargoPartition::OrdinaryTest,
+        ),
+    ];
+    let threads: Vec<_> = requests
+        .into_iter()
+        .map(|request| {
+            let client = daemon.client.clone();
+            let gate = Arc::clone(&gate);
+            thread::spawn(move || {
+                gate.wait();
+                client.acquire_ordinary_cargo(request)
+            })
+        })
+        .collect();
+    gate.wait();
+    let results: Vec<_> = threads
+        .into_iter()
+        .map(|thread| thread.join().expect("ordinary acquire thread joined"))
+        .collect();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| {
+                **result == Err(StorageError::Refused(RefusalReason::OrdinaryCargoPending))
+            })
+            .count(),
+        1
+    );
+    let inventory = daemon.client.inventory("ordinary-race").unwrap();
+    assert_eq!(inventory.slots.len(), 1);
+    assert_eq!(
+        inventory.slots[0].cargo_reuse_state,
+        Some(CargoReuseState::Pending)
+    );
+    assert_eq!(inventory.slots[0].state, SlotState::Leased);
+}
+
+#[test]
+fn ordinary_cargo_authentication_exact_lookups_and_generic_bypass_are_closed() {
+    let storage = TaskRoot::new();
+    let source = TaskRoot::new();
+    let daemon = RunningDaemon::start(storage.path(), budget(256), Some(1024));
+    let request = ordinary_request(
+        source.path(),
+        "ordinary-lookup",
+        "ordinary-acquire-lookup",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let mut bad_credential = request.clone();
+    bad_credential.acceptance.credential = Credential::new("wrong-ordinary-proof");
+    assert_eq!(
+        daemon.client.acquire_ordinary_cargo(bad_credential),
+        Err(StorageError::Unauthorized)
+    );
+    let mut unknown_inputs = request.clone();
+    unknown_inputs.acceptance.input_boundary_digest = format!("sha256:{}", "b".repeat(64));
+    assert_eq!(
+        daemon.client.acquire_ordinary_cargo(unknown_inputs),
+        Err(StorageError::Unauthorized)
+    );
+
+    let acquired = daemon
+        .client
+        .acquire_ordinary_cargo(request.clone())
+        .expect("accepted acquire");
+    let ledger_with_lease = fs::read(storage.path().join("ledger.bin")).unwrap();
+    for secret in ["ordinary-proof", "admission-proof"] {
+        assert!(!ledger_with_lease
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()));
+    }
+    let before_lookup = fs::read(storage.path().join("ledger.bin")).unwrap();
+    let identity = daemon
+        .client
+        .lookup_ordinary_cargo(request.clone())
+        .expect("read-only exact lookup");
+    let LookupResult::Present(identity) = identity else {
+        panic!("active lease should be present");
+    };
+    assert_eq!(identity.lease.state, SlotState::Leased);
+    assert_eq!(identity.reuse_state, CargoReuseState::Pending);
+    assert_eq!(
+        fs::read(storage.path().join("ledger.bin")).unwrap(),
+        before_lookup
+    );
+    let mut changed_root = request.clone();
+    changed_root.root.allocation_epoch = "allocation-2".to_owned();
+    assert_eq!(
+        daemon.client.lookup_ordinary_cargo(changed_root.clone()),
+        Err(StorageError::Conflict)
+    );
+
+    let token = acquired.lease.token.as_ref().expect("lease token");
+    let passed = passing_evidence(
+        &request.acquire.envelope.binding,
+        &acquired.lease.lease_id,
+        &acquired.lease.slot_id,
+        acquired.lease.slot_path.as_ref().unwrap(),
+        token,
+    );
+    assert_eq!(
+        daemon.client.finalize(
+            &acquired.lease.lease_id,
+            Some(token),
+            "generic-ordinary-finalize-bypass",
+            passed.clone(),
+        ),
+        Err(StorageError::Conflict)
+    );
+    let finalize_request = OrdinaryCargoFinalizeRequest {
+        request: request.clone(),
+        lease_id: acquired.lease.lease_id.clone(),
+        token: Some(token.clone()),
+        finalize_id: "ordinary-finalize-lookup".to_owned(),
+        evidence: passed,
+    };
+    assert_eq!(
+        daemon
+            .client
+            .lookup_finalize_ordinary_cargo(finalize_request.clone())
+            .unwrap(),
+        LookupResult::Absent
+    );
+    let finalized = daemon
+        .client
+        .finalize_ordinary_cargo(finalize_request.clone())
+        .expect("ordinary finalize");
+    assert_eq!(finalized.reuse_state, CargoReuseState::Reusable);
+    let mut tokenless = finalize_request.clone();
+    tokenless.token = None;
+    assert_eq!(
+        daemon
+            .client
+            .lookup_finalize_ordinary_cargo(tokenless)
+            .unwrap(),
+        LookupResult::Present(finalized)
+    );
+    let mut changed_policy = finalize_request.clone();
+    changed_policy.request.root.allocation_epoch = "allocation-2".to_owned();
+    assert_eq!(
+        daemon.client.lookup_finalize_ordinary_cargo(changed_policy),
+        Err(StorageError::Conflict)
+    );
+    assert_eq!(
+        daemon.client.lookup_finalize(
+            &acquired.lease.lease_id,
+            "ordinary-finalize-lookup",
+            finalize_request.evidence.clone(),
+        ),
+        Err(StorageError::Conflict)
+    );
+    let replay = daemon
+        .client
+        .acquire_ordinary_cargo(request.clone())
+        .expect("finalized exact acquire replay");
+    assert_eq!(replay.lease.state, SlotState::Idle);
+    assert!(replay.lease.slot_path.is_none());
+    assert!(replay.lease.token.is_none());
+
+    let mut generic_collision = request.acquire.clone();
+    generic_collision.envelope.binding.attempt_id = "ordinary-generic-collision".to_owned();
+    generic_collision.envelope.binding.run_id = "run-ordinary-generic-collision".to_owned();
+    assert_eq!(
+        daemon.client.acquire(generic_collision),
+        Err(StorageError::Conflict)
+    );
+}
+
+#[test]
+fn ordinary_cargo_lost_acquire_and_finalize_replies_reconcile_exact_bodies() {
+    let storage = TaskRoot::new();
+    let source = TaskRoot::new();
+    let daemon = RunningDaemon::start(storage.path(), budget(256), Some(1024));
+    let request = ordinary_request(
+        source.path(),
+        "ordinary-lost-reply",
+        "ordinary-acquire-lost-reply",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    super::transport::send_ordinary_acquire_and_forget(
+        daemon.socket_path.as_path(),
+        request.clone(),
+    )
+    .expect("send acquire and discard response");
+    let lookup = daemon
+        .client
+        .lookup_ordinary_cargo(request.clone())
+        .unwrap();
+    assert!(
+        matches!(
+            lookup,
+            LookupResult::Present(OrdinaryCargoLeaseIdentity {
+                reuse_state: CargoReuseState::Pending,
+                lease: LeaseIdentity {
+                    state: SlotState::Leased,
+                    ..
+                },
+                ..
+            })
+        ),
+        "unexpected ordinary acquire lookup result: {lookup:?}"
+    );
+    let acquired = daemon
+        .client
+        .acquire_ordinary_cargo(request.clone())
+        .expect("exact acquire retry recovers active token");
+    let token = acquired.lease.token.as_ref().expect("recovered token");
+    let evidence = passing_evidence(
+        &request.acquire.envelope.binding,
+        &acquired.lease.lease_id,
+        &acquired.lease.slot_id,
+        acquired.lease.slot_path.as_ref().expect("recovered path"),
+        token,
+    );
+    let finalize_request = OrdinaryCargoFinalizeRequest {
+        request: request.clone(),
+        lease_id: acquired.lease.lease_id.clone(),
+        token: Some(token.clone()),
+        finalize_id: "ordinary-finalize-lost-reply".to_owned(),
+        evidence,
+    };
+    super::transport::send_ordinary_finalize_and_forget(
+        daemon.socket_path.as_path(),
+        finalize_request.clone(),
+    )
+    .expect("send finalize and discard response");
+    let mut tokenless = finalize_request;
+    tokenless.token = None;
+    let lookup = daemon
+        .client
+        .lookup_finalize_ordinary_cargo(tokenless)
+        .expect("read-only exact finalize lookup");
+    let LookupResult::Present(receipt) = lookup else {
+        panic!("durable finalize should be present");
+    };
+    assert_eq!(receipt.reuse_state, CargoReuseState::Reusable);
+    let replay = daemon.client.acquire_ordinary_cargo(request).unwrap();
+    assert!(replay.lease.token.is_none());
+    assert!(replay.lease.slot_path.is_none());
+}
+
+#[test]
+fn ordinary_cargo_bogus_capture_or_terminal_cannot_release_pending_state() {
+    let storage = TaskRoot::new();
+    let source = TaskRoot::new();
+    let daemon = RunningDaemon::start(storage.path(), budget(256), Some(1024));
+    let request = ordinary_request(
+        source.path(),
+        "ordinary-bogus-capture",
+        "ordinary-acquire-bogus-capture",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let acquired = daemon
+        .client
+        .acquire_ordinary_cargo(request.clone())
+        .unwrap();
+    let token = acquired.lease.token.as_ref().unwrap();
+    let mut bad_capture = complete_evidence(
+        &request.acquire.envelope.binding,
+        &acquired.lease.lease_id,
+        &acquired.lease.slot_id,
+        acquired.lease.slot_path.as_ref().unwrap(),
+        token,
+    );
+    bad_capture.capture.as_mut().unwrap().digest = "sha256:bad".to_owned();
+    let uncertain = daemon
+        .client
+        .finalize_ordinary_cargo(OrdinaryCargoFinalizeRequest {
+            request: request.clone(),
+            lease_id: acquired.lease.lease_id.clone(),
+            token: Some(token.clone()),
+            finalize_id: "ordinary-bad-capture-finalize".to_owned(),
+            evidence: bad_capture,
+        })
+        .unwrap();
+    assert_eq!(uncertain.finalization.state, SlotState::Uncertain);
+    assert_eq!(uncertain.reuse_state, CargoReuseState::Pending);
+
+    let no_spawn_storage = TaskRoot::new();
+    let no_spawn_daemon = RunningDaemon::start(no_spawn_storage.path(), budget(256), Some(1024));
+    let no_spawn_request = ordinary_request(
+        source.path(),
+        "ordinary-bogus-terminal",
+        "ordinary-acquire-bogus-terminal",
+        64,
+        OrdinaryCargoPartition::FullDebug,
+    );
+    let no_spawn = no_spawn_daemon
+        .client
+        .acquire_ordinary_cargo(no_spawn_request.clone())
+        .unwrap();
+    let token = no_spawn.lease.token.as_ref().unwrap();
+    let proof = NoSpawnEvidence::new(
+        &no_spawn.lease,
+        &no_spawn_request.acquire.envelope.binding,
+        token,
+    )
+    .unwrap();
+    let bogus = no_spawn_daemon
+        .client
+        .finalize_ordinary_cargo(OrdinaryCargoFinalizeRequest {
+            request: no_spawn_request.clone(),
+            lease_id: no_spawn.lease.lease_id.clone(),
+            token: Some(token.clone()),
+            finalize_id: "ordinary-bogus-terminal-finalize".to_owned(),
+            evidence: SettlementEvidence {
+                binding: no_spawn_request.acquire.envelope.binding.clone(),
+                consumer_credential: Credential::new("consumer-proof"),
+                terminal: Some(TerminalRecord {
+                    run_id: no_spawn_request.acquire.envelope.binding.run_id.clone(),
+                    outcome: TerminalOutcome::Failed,
+                    credential: Credential::new("terminal-proof"),
+                }),
+                capture: None,
+                containment: ContainmentEvidence::NotSpawned(proof),
+            },
+        })
+        .unwrap();
+    assert_eq!(bogus.finalization.state, SlotState::Uncertain);
+    assert_eq!(bogus.reuse_state, CargoReuseState::Pending);
+}
+
+#[test]
+fn ordinary_cargo_defaults_to_rejecting_uninstalled_policy() {
+    let storage = TaskRoot::new();
+    let source = TaskRoot::new();
+    let daemon = Daemon::bind(
+        DaemonConfig {
+            root: storage.path().to_path_buf(),
+            budget: budget(128),
+        },
+        Arc::new(RejectingOrdinaryAuthority),
+        Arc::new(FixedFreeSpace(Some(1024))),
+    )
+    .expect("bind daemon with safe default ordinary authority");
+    let client = Client::new(daemon.socket_path().to_path_buf());
+    let request = ordinary_request(
+        source.path(),
+        "ordinary-uninstalled",
+        "ordinary-acquire-uninstalled",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let (shutdown, receiver) = mpsc::channel();
+    let thread = thread::spawn(move || daemon.serve(receiver));
+    assert_eq!(
+        client.acquire_ordinary_cargo(request),
+        Err(StorageError::Unauthorized)
+    );
+    let inventory = client.inventory("ordinary-uninstalled").unwrap();
+    assert!(inventory.slots.is_empty());
+    shutdown.send(()).unwrap();
+    assert!(thread.join().unwrap().is_ok());
+}
+
+#[test]
+fn ordinary_cargo_restart_keeps_pending_generation_uncertain() {
+    let storage = TaskRoot::new();
+    let source = TaskRoot::new();
+    let mut daemon = RunningDaemon::start(storage.path(), budget(128), Some(1024));
+    let request = ordinary_request(
+        source.path(),
+        "ordinary-restart",
+        "ordinary-acquire-restart",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let acquired = daemon
+        .client
+        .acquire_ordinary_cargo(request.clone())
+        .expect("acquire before restart");
+    daemon.stop();
+    let restarted = RunningDaemon::start(storage.path(), budget(128), Some(1024));
+    let result = restarted
+        .client
+        .lookup_ordinary_cargo(request.clone())
+        .expect("lookup after restart");
+    let LookupResult::Uncertain(Some(identity)) = result else {
+        panic!("restart must retain uncertain ordinary ownership");
+    };
+    assert_eq!(identity.lease.state, SlotState::Uncertain);
+    assert_eq!(identity.reuse_state, CargoReuseState::Pending);
+    let retry = restarted
+        .client
+        .acquire_ordinary_cargo(request.clone())
+        .expect("same request returns uncertain identity");
+    assert_eq!(retry.lease.state, SlotState::Uncertain);
+    assert!(retry.lease.slot_path.is_none());
+    assert!(retry.lease.token.is_none());
+    let next = ordinary_request(
+        source.path(),
+        "ordinary-after-restart",
+        "ordinary-acquire-after-restart",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    assert_eq!(
+        restarted.client.acquire_ordinary_cargo(next),
+        Err(StorageError::Refused(RefusalReason::OrdinaryCargoPending))
+    );
+    assert_eq!(retry.lease.slot_id, acquired.lease.slot_id);
+}
+
+#[test]
+fn ordinary_cargo_uses_checked_budget_and_free_space_and_refuses_incompatible_epochs() {
+    let storage = TaskRoot::new();
+    let source = TaskRoot::new();
+    let daemon = RunningDaemon::start(storage.path(), budget(64), Some(1024));
+    let first_request = ordinary_request(
+        source.path(),
+        "ordinary-capacity-one",
+        "ordinary-acquire-capacity-one",
+        40,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let _first = daemon
+        .client
+        .acquire_ordinary_cargo(first_request.clone())
+        .expect("first generation within bound");
+    let second_partition = ordinary_request(
+        source.path(),
+        "ordinary-capacity-two",
+        "ordinary-acquire-capacity-two",
+        40,
+        OrdinaryCargoPartition::FullDebug,
+    );
+    assert_eq!(
+        daemon.client.acquire_ordinary_cargo(second_partition),
+        Err(StorageError::Refused(RefusalReason::BudgetExceeded))
+    );
+    assert_eq!(
+        daemon.client.inventory("capacity-one").unwrap().slots.len(),
+        1
+    );
+
+    let unknown_storage = TaskRoot::new();
+    let unknown_space = Daemon::bind(
+        DaemonConfig {
+            root: unknown_storage.path().to_path_buf(),
+            budget: budget(64),
+        },
+        Arc::new(TestAuthority),
+        Arc::new(FixedFreeSpace(None)),
+    )
+    .expect("bind unknown-space daemon");
+    let unknown_client = Client::new(unknown_space.socket_path().to_path_buf());
+    let (shutdown, receiver) = mpsc::channel();
+    let thread = thread::spawn(move || unknown_space.serve(receiver));
+    let unknown_request = ordinary_request(
+        source.path(),
+        "ordinary-unknown-space",
+        "ordinary-acquire-unknown-space",
+        1,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    assert_eq!(
+        unknown_client.acquire_ordinary_cargo(unknown_request),
+        Err(StorageError::Refused(RefusalReason::FreeSpaceUnavailable))
+    );
+    shutdown.send(()).unwrap();
+    assert!(thread.join().unwrap().is_ok());
+
+    let overflow_storage = TaskRoot::new();
+    let overflow = Daemon::bind(
+        DaemonConfig {
+            root: overflow_storage.path().to_path_buf(),
+            budget: Budget {
+                cap_bytes: 64,
+                free_reserve_bytes: u64::MAX,
+            },
+        },
+        Arc::new(TestAuthority),
+        Arc::new(FixedFreeSpace(Some(u64::MAX))),
+    )
+    .expect("bind overflow fixture daemon");
+    let overflow_client = Client::new(overflow.socket_path().to_path_buf());
+    let (shutdown, receiver) = mpsc::channel();
+    let thread = thread::spawn(move || overflow.serve(receiver));
+    let overflow_request = ordinary_request(
+        source.path(),
+        "ordinary-overflow",
+        "ordinary-acquire-overflow",
+        1,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    assert_eq!(
+        overflow_client.acquire_ordinary_cargo(overflow_request),
+        Err(StorageError::Refused(RefusalReason::FreeSpaceReserve))
+    );
+    shutdown.send(()).unwrap();
+    assert!(thread.join().unwrap().is_ok());
+
+    let epoch_storage = TaskRoot::new();
+    let epoch_daemon = RunningDaemon::start(epoch_storage.path(), budget(128), Some(1024));
+    let initial = ordinary_request(
+        source.path(),
+        "ordinary-epoch-one",
+        "ordinary-acquire-epoch-one",
+        1,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    epoch_daemon
+        .client
+        .acquire_ordinary_cargo(initial)
+        .expect("admit initial allocation");
+    let mut changed = ordinary_request(
+        source.path(),
+        "ordinary-epoch-two",
+        "ordinary-acquire-epoch-two",
+        1,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    changed.root.allocation_epoch = "allocation-2".to_owned();
+    assert_eq!(
+        epoch_daemon.client.acquire_ordinary_cargo(changed),
+        Err(StorageError::Refused(
+            RefusalReason::OrdinaryCargoIncompatible
+        ))
     );
 }

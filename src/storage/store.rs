@@ -14,10 +14,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const LEDGER_MAGIC: &[u8; 8] = b"OXIDEST1";
-const LEDGER_VERSION: u32 = 3;
+const LEDGER_VERSION: u32 = 4;
 const MAX_LEDGER_BYTES: u64 = 64 * 1024 * 1024;
 const SOCKET_NAME: &str = "daemon.sock";
 const SLOTS_NAME: &str = "slots";
+const ORDINARY_CARGO_PATH_IDENTITY: &str = "ordinary-cargo-storage-v1";
 
 /// Verifies the consumer's admission envelope and settlement evidence.
 ///
@@ -26,6 +27,22 @@ const SLOTS_NAME: &str = "slots";
 pub trait EvidenceAuthority: Send + Sync + 'static {
     fn verify_admission(&self, envelope: &RunEnvelope) -> bool;
     fn verify_settlement(&self, evidence: &SettlementEvidence) -> bool;
+
+    /// Verifies that this exact ordinary-Cargo policy and input boundary were
+    /// installed and accepted by the owning consumer. Safe default: refuse.
+    fn verify_ordinary_cargo_admission(&self, _request: &OrdinaryCargoRequest) -> bool {
+        false
+    }
+
+    /// Authenticates ordinary settlement against its original policy/root
+    /// request. Safe default: refuse.
+    fn verify_ordinary_cargo_settlement(
+        &self,
+        _request: &OrdinaryCargoRequest,
+        _evidence: &SettlementEvidence,
+    ) -> bool {
+        false
+    }
 }
 
 /// Supplies a host free-space observation. `None` means capacity is unknown.
@@ -215,6 +232,25 @@ struct Slot {
     reserved_bytes: u64,
     lease_id: Option<String>,
     last_used: u64,
+    ordinary_cargo: Option<OrdinaryCargoGeneration>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OrdinaryCargoGeneration {
+    root: StrictPhysicalCargoRoot,
+    partition: OrdinaryCargoPartition,
+    policy_version: u32,
+    installation_epoch: String,
+    acceptance_reference: String,
+    input_boundary_digest: String,
+    reuse_state: CargoReuseState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OrdinaryCargoLeaseRecord {
+    request: OrdinaryCargoRequest,
+    saved_reuse_state: CargoReuseState,
+    finalized_reuse_state: Option<CargoReuseState>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -226,6 +262,7 @@ struct Lease {
     request: AcquireRequest,
     status: LeaseStatus,
     reused: bool,
+    ordinary_cargo: Option<OrdinaryCargoLeaseRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -243,6 +280,7 @@ struct SettlementOperation {
     request_digest: String,
     state: SlotState,
     capture_digest: Option<String>,
+    cargo_reuse_state: Option<CargoReuseState>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -292,12 +330,12 @@ impl Store {
             return Err(StorageError::InvalidInput("budget cap must be positive"));
         }
         validate_root_entries(&root)?;
+        let ledger_path = root.join("ledger.bin");
+        let ledger = load_ledger(&ledger_path, budget)?;
         remove_stale_ledger_temps(&root)?;
         validate_root_entries(&root)?;
         let slots_root = root.join(SLOTS_NAME);
         ensure_private_directory(&slots_root)?;
-        let ledger_path = root.join("ledger.bin");
-        let ledger = load_ledger(&ledger_path, budget)?;
         let mut store = Self {
             root,
             slots_root,
@@ -323,6 +361,9 @@ impl Store {
             .map(|slot| slot.id.clone())
             .collect();
         for id in preparing {
+            if self.slot_by_id(&id)?.ordinary_cargo.is_some() {
+                return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+            }
             let path = self.slot_path(&id)?;
             if path_exists(&path)? {
                 remove_tree_owned(&self.slots_root, &path)?;
@@ -339,6 +380,9 @@ impl Store {
             .map(|slot| slot.id.clone())
             .collect();
         for id in evicting {
+            if self.slot_by_id(&id)?.ordinary_cargo.is_some() {
+                return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+            }
             let path = self.slot_path(&id)?;
             if path_exists(&path)? {
                 remove_tree_owned(&self.slots_root, &path)?;
@@ -420,6 +464,7 @@ impl Store {
         }
         let mut known = std::collections::BTreeSet::new();
         let mut largest_generation = 0_u64;
+        let mut ordinary_roots = Vec::<(StrictPhysicalCargoRoot, OrdinaryCargoPartition)>::new();
         for slot in &self.ledger.slots {
             if !valid_slot_id(&slot.id) || !known.insert(slot.id.as_str()) {
                 return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
@@ -451,6 +496,47 @@ impl Store {
                     }
                 }
                 _ => return Err(StorageError::Refused(RefusalReason::UnknownAccounting)),
+            }
+            if let Some(ordinary) = slot.ordinary_cargo.as_ref() {
+                if ordinary.policy_version != ORDINARY_CARGO_POLICY_VERSION
+                    || ordinary.root.source_root.as_os_str().is_empty()
+                    || !ordinary.root.source_root.is_absolute()
+                    || ordinary.root.consumer_root_id.is_empty()
+                    || ordinary.root.allocation_epoch.is_empty()
+                    || ordinary.installation_epoch.is_empty()
+                    || ordinary.acceptance_reference.is_empty()
+                    || !valid_digest(&ordinary.input_boundary_digest)
+                    || slot.partition.path_identity != ORDINARY_CARGO_PATH_IDENTITY
+                    || !matches!(
+                        &ordinary.partition,
+                        OrdinaryCargoPartition::OrdinaryTest | OrdinaryCargoPartition::FullDebug
+                    )
+                    || (matches!(
+                        slot.state,
+                        InternalSlotState::Leased | InternalSlotState::Uncertain
+                    ) != (ordinary.reuse_state == CargoReuseState::Pending))
+                    || (slot.state == InternalSlotState::Preparing
+                        && ordinary.reuse_state != CargoReuseState::Empty)
+                    || (slot.state == InternalSlotState::Evicting)
+                {
+                    return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+                }
+                for (root, partition) in &ordinary_roots {
+                    if root.source_root == ordinary.root.source_root && root != &ordinary.root {
+                        return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+                    }
+                    if root.consumer_root_id == ordinary.root.consumer_root_id
+                        && root != &ordinary.root
+                    {
+                        return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+                    }
+                    if same_ordinary_root_allocation(root, &ordinary.root)
+                        && partition == &ordinary.partition
+                    {
+                        return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+                    }
+                }
+                ordinary_roots.push((ordinary.root.clone(), ordinary.partition.clone()));
             }
         }
         let mut lease_ids = std::collections::BTreeSet::new();
@@ -484,6 +570,66 @@ impl Store {
                     return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
                 }
             }
+            match lease.ordinary_cargo.as_ref() {
+                Some(ordinary) => {
+                    let slot = self
+                        .ledger
+                        .slots
+                        .iter()
+                        .find(|slot| slot.id == lease.slot_id)
+                        .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+                    let generation = slot
+                        .ordinary_cargo
+                        .as_ref()
+                        .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+                    let active_owner = slot.lease_id.as_deref() == Some(lease.id.as_str());
+                    if lease.request
+                        != persisted_request(&normalized_ordinary_acquire(
+                            &ordinary.request.acquire,
+                        ))
+                        || ordinary.request.acquire.envelope.partition.path_identity
+                            != ORDINARY_CARGO_PATH_IDENTITY
+                        || slot.partition
+                            != normalized_ordinary_acquire(&ordinary.request.acquire)
+                                .envelope
+                                .partition
+                        || !valid_hash(&lease.request_digest)
+                        || generation.root != ordinary.request.root
+                        || generation.partition != ordinary.request.partition
+                        || generation.policy_version != ordinary.request.acceptance.policy_version
+                        || generation.installation_epoch
+                            != ordinary.request.acceptance.installation_epoch
+                        || generation.acceptance_reference
+                            != ordinary.request.acceptance.acceptance_reference
+                        || generation.input_boundary_digest
+                            != ordinary.request.acceptance.input_boundary_digest
+                        || (active_owner
+                            != matches!(lease.status, LeaseStatus::Leased | LeaseStatus::Uncertain))
+                        || (active_owner && generation.reuse_state != CargoReuseState::Pending)
+                        || (lease.status == LeaseStatus::Finalized
+                            && ordinary.finalized_reuse_state.is_none())
+                        || (lease.status != LeaseStatus::Finalized
+                            && ordinary.finalized_reuse_state.is_some())
+                        || !matches!(
+                            ordinary.saved_reuse_state,
+                            CargoReuseState::Empty | CargoReuseState::Reusable
+                        )
+                    {
+                        return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+                    }
+                }
+                None => {
+                    if self
+                        .ledger
+                        .slots
+                        .iter()
+                        .find(|slot| slot.id == lease.slot_id)
+                        .is_some_and(|slot| slot.ordinary_cargo.is_some())
+                    {
+                        return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+                    }
+                }
+            }
         }
         let mut operation_ids = std::collections::BTreeSet::new();
         for operation in &self.ledger.operations {
@@ -495,6 +641,25 @@ impl Store {
                     operation.operation_id.as_str(),
                 ))
             {
+                return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+            }
+            let lease = self
+                .ledger
+                .leases
+                .iter()
+                .find(|lease| lease.id == operation.lease_id)
+                .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+            let valid_cargo_state = match (
+                lease.ordinary_cargo.is_some(),
+                operation.state,
+                operation.cargo_reuse_state,
+            ) {
+                (true, SlotState::Idle, Some(_))
+                | (true, SlotState::Uncertain, None)
+                | (false, _, None) => true,
+                _ => false,
+            };
+            if !valid_cargo_state {
                 return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
             }
         }
@@ -552,6 +717,18 @@ impl Store {
                 measured_bytes: slot.measured_bytes,
                 reserved_bytes: slot.reserved_bytes,
                 owner,
+                cargo_reuse_state: slot
+                    .ordinary_cargo
+                    .as_ref()
+                    .map(|record| record.reuse_state),
+                ordinary_root: slot
+                    .ordinary_cargo
+                    .as_ref()
+                    .map(|record| record.root.clone()),
+                ordinary_partition: slot
+                    .ordinary_cargo
+                    .as_ref()
+                    .map(|record| record.partition.clone()),
             });
         }
         slots.sort_by(|left, right| left.slot_id.cmp(&right.slot_id));
@@ -570,6 +747,7 @@ impl Store {
     ) -> Result<AcquireResult, StorageError> {
         self.ensure_healthy()?;
         validate_request(&request)?;
+        reject_ordinary_path_identity(&request.envelope.partition.path_identity)?;
         request.envelope.partition.features.sort();
         request.envelope.partition.features.dedup();
 
@@ -603,6 +781,7 @@ impl Store {
             .iter()
             .filter(|slot| {
                 slot.state == InternalSlotState::Idle
+                    && slot.ordinary_cargo.is_none()
                     && slot.partition == request.envelope.partition
             })
             .min_by_key(|slot| slot.last_used)
@@ -667,6 +846,7 @@ impl Store {
                     reserved_bytes: 0,
                     lease_id: None,
                     last_used: self.take_sequence()?,
+                    ordinary_cargo: None,
                 };
                 self.ledger.slots.push(slot);
                 self.persist()?;
@@ -704,6 +884,7 @@ impl Store {
             request: persisted_request,
             status: LeaseStatus::Leased,
             reused,
+            ordinary_cargo: None,
         });
         self.persist()?;
         self.live_tokens.insert(lease_id.clone(), token);
@@ -715,12 +896,354 @@ impl Store {
         self.acquire_result(lease)
     }
 
+    pub(super) fn acquire_ordinary_cargo(
+        &mut self,
+        request: OrdinaryCargoRequest,
+    ) -> Result<OrdinaryCargoAcquireResult, StorageError> {
+        self.ensure_healthy()?;
+        validate_ordinary_request(&request)?;
+        validate_canonical_source_root(&request.root)?;
+        if !self.authority.verify_admission(&request.acquire.envelope)
+            || !self.authority.verify_ordinary_cargo_admission(&request)
+        {
+            return Err(StorageError::Unauthorized);
+        }
+        let request_digest = digest_encoded(&request)?;
+        let persisted_ordinary = persisted_ordinary_request(&request);
+        let acquire = normalized_ordinary_acquire(&request.acquire);
+        let persisted_acquire = persisted_request(&acquire);
+
+        if let Some(existing) = self.ledger.leases.iter().find(|lease| {
+            same_attempt(&lease.request, &request.acquire)
+                || lease.request.acquire_id == request.acquire.acquire_id
+                || lease.ordinary_cargo.as_ref().is_some_and(|ordinary| {
+                    ordinary.request.acquire.acquire_id == request.acquire.acquire_id
+                })
+        }) {
+            let Some(ordinary) = existing.ordinary_cargo.as_ref() else {
+                return Err(StorageError::Conflict);
+            };
+            if ordinary.request != persisted_ordinary || existing.request_digest != request_digest {
+                return Err(StorageError::Conflict);
+            }
+            return self.ordinary_acquire_result(existing);
+        }
+
+        if self.ledger.leases.iter().any(|lease| {
+            lease.request.acquire_id == request.acquire.acquire_id
+                || lease.ordinary_cargo.as_ref().is_some_and(|ordinary| {
+                    ordinary.request.acquire.acquire_id == request.acquire.acquire_id
+                })
+        }) {
+            return Err(StorageError::Conflict);
+        }
+
+        let root_slots: Vec<String> = self
+            .ledger
+            .slots
+            .iter()
+            .filter_map(|slot| {
+                slot.ordinary_cargo.as_ref().and_then(|ordinary| {
+                    (same_ordinary_root_allocation(&ordinary.root, &request.root)
+                        || ordinary.root.source_root == request.root.source_root
+                        || ordinary.root.consumer_root_id == request.root.consumer_root_id)
+                        .then(|| slot.id.clone())
+                })
+            })
+            .collect();
+        for id in &root_slots {
+            let slot = self.slot_by_id(id)?;
+            let ordinary = slot
+                .ordinary_cargo
+                .as_ref()
+                .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+            if ordinary.root != request.root {
+                return Err(StorageError::Refused(
+                    RefusalReason::OrdinaryCargoIncompatible,
+                ));
+            }
+        }
+
+        let matching = root_slots
+            .iter()
+            .find(|id| {
+                self.slot_by_id(id)
+                    .ok()
+                    .and_then(|slot| slot.ordinary_cargo.as_ref())
+                    .is_some_and(|ordinary| ordinary.partition == request.partition)
+            })
+            .cloned();
+
+        let (slot_id, saved_reuse_state, measured, reused) = if let Some(id) = matching {
+            let slot = self.slot_by_id(&id)?;
+            let ordinary = slot
+                .ordinary_cargo
+                .as_ref()
+                .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+            if slot.partition != acquire.envelope.partition
+                || ordinary.policy_version != request.acceptance.policy_version
+                || ordinary.installation_epoch != request.acceptance.installation_epoch
+                || ordinary.acceptance_reference != request.acceptance.acceptance_reference
+                || ordinary.input_boundary_digest != request.acceptance.input_boundary_digest
+            {
+                return Err(StorageError::Refused(
+                    RefusalReason::OrdinaryCargoIncompatible,
+                ));
+            }
+            match ordinary.reuse_state {
+                CargoReuseState::Pending => {
+                    return Err(StorageError::Refused(RefusalReason::OrdinaryCargoPending));
+                }
+                CargoReuseState::ColdOnly => {
+                    return Err(StorageError::Refused(RefusalReason::OrdinaryCargoColdOnly));
+                }
+                CargoReuseState::Empty | CargoReuseState::Reusable => {}
+            }
+            if slot.state != InternalSlotState::Idle || slot.lease_id.is_some() {
+                return Err(StorageError::Refused(RefusalReason::OrdinaryCargoPending));
+            }
+            let measured = slot
+                .measured_bytes
+                .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+            let previous = ordinary.reuse_state;
+            (
+                id,
+                previous,
+                measured,
+                previous == CargoReuseState::Reusable,
+            )
+        } else {
+            if root_slots.len() >= 2 {
+                return Err(StorageError::Refused(
+                    RefusalReason::OrdinaryCargoPartitionLimit,
+                ));
+            }
+            (String::new(), CargoReuseState::Empty, 0, false)
+        };
+
+        let reservation = measured.max(request.acquire.required_bytes);
+        let growth = reservation
+            .checked_sub(measured)
+            .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+        let total = self
+            .accounted_bytes()?
+            .checked_add(growth)
+            .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+        if total > self.ledger.budget.cap_bytes {
+            return Err(StorageError::Refused(RefusalReason::BudgetExceeded));
+        }
+        let free = self
+            .free_space
+            .available_bytes(&self.root)?
+            .ok_or(StorageError::Refused(RefusalReason::FreeSpaceUnavailable))?;
+        let required_free = self
+            .ledger
+            .budget
+            .free_reserve_bytes
+            .checked_add(growth)
+            .ok_or(StorageError::Refused(RefusalReason::FreeSpaceReserve))?;
+        if free < required_free {
+            return Err(StorageError::Refused(RefusalReason::FreeSpaceReserve));
+        }
+
+        let slot_id = if slot_id.is_empty() {
+            let id = format!("slot-{:016x}", self.ledger.next_slot);
+            self.ledger.next_slot = self
+                .ledger
+                .next_slot
+                .checked_add(1)
+                .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+            let ordinary = OrdinaryCargoGeneration {
+                root: request.root.clone(),
+                partition: request.partition.clone(),
+                policy_version: request.acceptance.policy_version,
+                installation_epoch: request.acceptance.installation_epoch.clone(),
+                acceptance_reference: request.acceptance.acceptance_reference.clone(),
+                input_boundary_digest: request.acceptance.input_boundary_digest.clone(),
+                reuse_state: CargoReuseState::Empty,
+            };
+            let last_used = self.take_sequence()?;
+            self.ledger.slots.push(Slot {
+                id: id.clone(),
+                partition: acquire.envelope.partition.clone(),
+                state: InternalSlotState::Preparing,
+                measured_bytes: Some(0),
+                reserved_bytes: 0,
+                lease_id: None,
+                last_used,
+                ordinary_cargo: Some(ordinary),
+            });
+            self.persist()?;
+            let path = self.slot_path(&id)?;
+            fs::create_dir(&path).map_err(|error| {
+                self.poisoned = true;
+                io_error(error)
+            })?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+                self.poisoned = true;
+                io_error(error)
+            })?;
+            File::open(&self.slots_root)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| {
+                    self.poisoned = true;
+                    io_error(error)
+                })?;
+            id
+        } else {
+            slot_id
+        };
+
+        let lease_id = random_hex(16)?;
+        let token = random_hex(32)?;
+        let token_hash = hash_token(&token);
+        let last_used = self.take_sequence()?;
+        let slot = self.slot_by_id_mut(&slot_id)?;
+        slot.state = InternalSlotState::Leased;
+        slot.measured_bytes = Some(measured);
+        slot.reserved_bytes = reservation;
+        slot.lease_id = Some(lease_id.clone());
+        slot.last_used = last_used;
+        let ordinary = slot
+            .ordinary_cargo
+            .as_mut()
+            .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+        ordinary.reuse_state = CargoReuseState::Pending;
+        self.ledger.leases.push(Lease {
+            id: lease_id.clone(),
+            token_hash,
+            slot_id,
+            request_digest,
+            request: persisted_acquire,
+            status: LeaseStatus::Leased,
+            reused,
+            ordinary_cargo: Some(OrdinaryCargoLeaseRecord {
+                request: persisted_ordinary,
+                saved_reuse_state,
+                finalized_reuse_state: None,
+            }),
+        });
+        self.persist()?;
+        self.live_tokens.insert(lease_id.clone(), token);
+        let lease = self
+            .ledger
+            .leases
+            .last()
+            .ok_or(StorageError::Protocol("ordinary lease was not recorded"))?;
+        self.ordinary_acquire_result(lease)
+    }
+
+    pub(super) fn lookup_ordinary_cargo(
+        &self,
+        request: OrdinaryCargoRequest,
+    ) -> Result<LookupResult<OrdinaryCargoLeaseIdentity>, StorageError> {
+        self.ensure_healthy()?;
+        validate_ordinary_request(&request)?;
+        validate_canonical_source_root(&request.root)?;
+        if !self.authority.verify_admission(&request.acquire.envelope)
+            || !self.authority.verify_ordinary_cargo_admission(&request)
+        {
+            return Err(StorageError::Unauthorized);
+        }
+        let request_digest = digest_encoded(&request)?;
+        let persisted = persisted_ordinary_request(&request);
+        let lease = match self.ledger.leases.iter().find(|lease| {
+            same_attempt(&lease.request, &request.acquire)
+                || lease.ordinary_cargo.as_ref().is_some_and(|ordinary| {
+                    ordinary.request.acquire.acquire_id == request.acquire.acquire_id
+                })
+        }) {
+            Some(lease) => lease,
+            None => {
+                if self
+                    .ledger
+                    .leases
+                    .iter()
+                    .any(|lease| lease.request.acquire_id == request.acquire.acquire_id)
+                {
+                    return Err(StorageError::Conflict);
+                }
+                return Ok(LookupResult::Absent);
+            }
+        };
+        let Some(ordinary) = lease.ordinary_cargo.as_ref() else {
+            return Err(StorageError::Conflict);
+        };
+        if ordinary.request != persisted || lease.request_digest != request_digest {
+            return Err(StorageError::Conflict);
+        }
+        let identity = self.ordinary_lease_identity(lease)?;
+        match lease.status {
+            LeaseStatus::Uncertain => Ok(LookupResult::Uncertain(Some(identity))),
+            LeaseStatus::Leased | LeaseStatus::Finalized => Ok(LookupResult::Present(identity)),
+        }
+    }
+
+    fn ordinary_acquire_result(
+        &self,
+        lease: &Lease,
+    ) -> Result<OrdinaryCargoAcquireResult, StorageError> {
+        let record = lease
+            .ordinary_cargo
+            .as_ref()
+            .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+        let slot = self.slot_by_id(&lease.slot_id)?;
+        let generation = slot
+            .ordinary_cargo
+            .as_ref()
+            .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+        let reuse_state = if lease.status == LeaseStatus::Finalized {
+            record
+                .finalized_reuse_state
+                .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?
+        } else {
+            generation.reuse_state
+        };
+        Ok(OrdinaryCargoAcquireResult {
+            policy_version: record.request.acceptance.policy_version,
+            root: record.request.root.clone(),
+            partition: record.request.partition.clone(),
+            reuse_state,
+            lease: self.acquire_result(lease)?,
+        })
+    }
+
+    fn ordinary_lease_identity(
+        &self,
+        lease: &Lease,
+    ) -> Result<OrdinaryCargoLeaseIdentity, StorageError> {
+        let record = lease
+            .ordinary_cargo
+            .as_ref()
+            .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+        let slot = self.slot_by_id(&lease.slot_id)?;
+        let generation = slot
+            .ordinary_cargo
+            .as_ref()
+            .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+        let reuse_state = if lease.status == LeaseStatus::Finalized {
+            record
+                .finalized_reuse_state
+                .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?
+        } else {
+            generation.reuse_state
+        };
+        Ok(OrdinaryCargoLeaseIdentity {
+            policy_version: record.request.acceptance.policy_version,
+            root: record.request.root.clone(),
+            partition: record.request.partition.clone(),
+            reuse_state,
+            lease: self.lease_identity(lease)?,
+        })
+    }
+
     pub(super) fn lookup_acquire(
         &self,
         mut request: AcquireRequest,
     ) -> Result<LookupResult<LeaseIdentity>, StorageError> {
         self.ensure_healthy()?;
         validate_request(&request)?;
+        reject_ordinary_path_identity(&request.envelope.partition.path_identity)?;
         request.envelope.partition.features.sort();
         request.envelope.partition.features.dedup();
         if !self.authority.verify_admission(&request.envelope) {
@@ -811,6 +1334,7 @@ impl Store {
             finalize_id,
             evidence,
             SettlementKind::Finalize,
+            None,
         )?;
         Ok(FinalizationReceipt {
             lease_id: operation.lease_id,
@@ -834,6 +1358,9 @@ impl Store {
         let Some(lease) = self.ledger.leases.iter().find(|lease| lease.id == lease_id) else {
             return Ok(LookupResult::Absent);
         };
+        if lease.ordinary_cargo.is_some() {
+            return Err(StorageError::Conflict);
+        }
         if evidence.binding != lease.request.envelope.binding {
             return Err(StorageError::Conflict);
         }
@@ -868,6 +1395,122 @@ impl Store {
         }
     }
 
+    pub(super) fn finalize_ordinary_cargo(
+        &mut self,
+        request: OrdinaryCargoFinalizeRequest,
+    ) -> Result<OrdinaryCargoFinalizationReceipt, StorageError> {
+        self.ensure_healthy()?;
+        validate_ordinary_finalize_request(&request)?;
+        validate_canonical_source_root(&request.request.root)?;
+        let operation = self.settle(
+            &request.lease_id,
+            request.token.as_ref(),
+            &request.finalize_id,
+            request.evidence,
+            SettlementKind::Finalize,
+            Some(&request.request),
+        )?;
+        let lease = self
+            .ledger
+            .leases
+            .iter()
+            .find(|lease| lease.id == operation.lease_id)
+            .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+        let ordinary = lease
+            .ordinary_cargo
+            .as_ref()
+            .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+        let reuse_state = operation_cargo_reuse_state(&operation)?;
+        Ok(OrdinaryCargoFinalizationReceipt {
+            policy_version: ordinary.request.acceptance.policy_version,
+            root: ordinary.request.root.clone(),
+            partition: ordinary.request.partition.clone(),
+            reuse_state,
+            finalization: FinalizationReceipt {
+                lease_id: operation.lease_id,
+                finalize_id: operation.operation_id,
+                state: operation.state,
+                capture_digest: operation.capture_digest,
+            },
+        })
+    }
+
+    pub(super) fn lookup_finalize_ordinary_cargo(
+        &self,
+        request: OrdinaryCargoFinalizeRequest,
+    ) -> Result<LookupResult<OrdinaryCargoFinalizationReceipt>, StorageError> {
+        self.ensure_healthy()?;
+        validate_ordinary_finalize_request(&request)?;
+        validate_canonical_source_root(&request.request.root)?;
+        if !self
+            .authority
+            .verify_admission(&request.request.acquire.envelope)
+            || !self
+                .authority
+                .verify_ordinary_cargo_admission(&request.request)
+            || !self.authority.verify_settlement(&request.evidence)
+            || !self
+                .authority
+                .verify_ordinary_cargo_settlement(&request.request, &request.evidence)
+        {
+            return Err(StorageError::Unauthorized);
+        }
+        let Some(lease) = self
+            .ledger
+            .leases
+            .iter()
+            .find(|lease| lease.id == request.lease_id)
+        else {
+            return Ok(LookupResult::Absent);
+        };
+        let Some(ordinary) = lease.ordinary_cargo.as_ref() else {
+            return Err(StorageError::Conflict);
+        };
+        if ordinary.request != persisted_ordinary_request(&request.request)
+            || lease.request_digest != digest_encoded(&request.request)?
+            || request.evidence.binding != lease.request.envelope.binding
+        {
+            return Err(StorageError::Conflict);
+        }
+        let request_digest =
+            ordinary_finalize_digest(&request.request, &request.finalize_id, &request.evidence)?;
+        let operation = self.ledger.operations.iter().find(|operation| {
+            operation.lease_id == request.lease_id
+                && operation.operation_id == request.finalize_id
+                && operation.kind == SettlementKind::Finalize
+        });
+        if let Some(operation) = operation {
+            if operation.request_digest != request_digest
+                || operation.evidence != persisted_evidence(&request.evidence)
+            {
+                return Err(StorageError::Conflict);
+            }
+            let reuse_state = operation_cargo_reuse_state(operation)?;
+            let receipt = OrdinaryCargoFinalizationReceipt {
+                policy_version: ordinary.request.acceptance.policy_version,
+                root: ordinary.request.root.clone(),
+                partition: ordinary.request.partition.clone(),
+                reuse_state,
+                finalization: FinalizationReceipt {
+                    lease_id: operation.lease_id.clone(),
+                    finalize_id: operation.operation_id.clone(),
+                    state: operation.state,
+                    capture_digest: operation.capture_digest.clone(),
+                },
+            };
+            return if operation.state == SlotState::Uncertain {
+                Ok(LookupResult::Uncertain(Some(receipt)))
+            } else {
+                Ok(LookupResult::Present(receipt))
+            };
+        }
+        if lease.status == LeaseStatus::Uncertain {
+            Ok(LookupResult::Uncertain(None))
+        } else {
+            Ok(LookupResult::Absent)
+        }
+    }
+
     pub(super) fn reconcile(
         &mut self,
         lease_id: &str,
@@ -875,12 +1518,21 @@ impl Store {
         reconcile_id: &str,
         evidence: SettlementEvidence,
     ) -> Result<ReconcileReceipt, StorageError> {
+        if self
+            .ledger
+            .leases
+            .iter()
+            .any(|lease| lease.id == lease_id && lease.ordinary_cargo.is_some())
+        {
+            return Err(StorageError::Conflict);
+        }
         let operation = self.settle(
             lease_id,
             token,
             reconcile_id,
             evidence,
             SettlementKind::Reconcile,
+            None,
         )?;
         Ok(ReconcileReceipt {
             lease_id: operation.lease_id,
@@ -896,6 +1548,7 @@ impl Store {
         operation_id: &str,
         evidence: SettlementEvidence,
         kind: SettlementKind,
+        ordinary_request: Option<&OrdinaryCargoRequest>,
     ) -> Result<SettlementOperation, StorageError> {
         self.ensure_healthy()?;
         validate_text(operation_id)?;
@@ -906,6 +1559,26 @@ impl Store {
             .find(|lease| lease.id == lease_id)
             .cloned()
             .ok_or(StorageError::Refused(RefusalReason::LeaseUnavailable))?;
+        match (&lease.ordinary_cargo, ordinary_request) {
+            (None, None) => {}
+            (Some(ordinary), Some(request))
+                if ordinary.request == persisted_ordinary_request(request)
+                    && lease.request
+                        == persisted_request(&normalized_ordinary_acquire(&request.acquire))
+                    && kind == SettlementKind::Finalize =>
+            {
+                validate_ordinary_request(request)?;
+                if !self.authority.verify_admission(&request.acquire.envelope)
+                    || !self.authority.verify_ordinary_cargo_admission(request)
+                    || !self
+                        .authority
+                        .verify_ordinary_cargo_settlement(request, &evidence)
+                {
+                    return Err(StorageError::Unauthorized);
+                }
+            }
+            _ => return Err(StorageError::Conflict),
+        }
         if evidence.binding != lease.request.envelope.binding {
             return Err(StorageError::Conflict);
         }
@@ -927,7 +1600,10 @@ impl Store {
         if !self.authority.verify_settlement(&evidence) {
             return Err(StorageError::Unauthorized);
         }
-        let request_digest = digest_encoded(&evidence)?;
+        let request_digest = match ordinary_request {
+            Some(request) => ordinary_finalize_digest(request, operation_id, &evidence)?,
+            None => digest_encoded(&evidence)?,
+        };
         let persisted_evidence = persisted_evidence(&evidence);
         if let Some(previous) = previous {
             if previous.evidence != persisted_evidence || previous.request_digest != request_digest
@@ -952,6 +1628,7 @@ impl Store {
             &expected_slot_path.to_string_lossy(),
         );
         let mut new_state = SlotState::Uncertain;
+        let mut cargo_reuse_state = None;
         let measured = if proof_complete {
             let slot_path = self.slot_path(&slot_id)?;
             measure_tree_owned(&self.slots_root, &slot_path).ok()
@@ -967,6 +1644,31 @@ impl Store {
                 slot.measured_bytes = Some(bytes);
                 slot.reserved_bytes = bytes;
                 slot.last_used = last_used;
+                if ordinary_request.is_some() {
+                    let reuse_state =
+                        if matches!(&evidence.containment, ContainmentEvidence::NotSpawned(_)) {
+                            lease
+                                .ordinary_cargo
+                                .as_ref()
+                                .map(|ordinary| ordinary.saved_reuse_state)
+                                .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?
+                        } else {
+                            match evidence.terminal.as_ref().map(|terminal| terminal.outcome) {
+                                Some(TerminalOutcome::Passed) => CargoReuseState::Reusable,
+                                Some(TerminalOutcome::Failed) => CargoReuseState::ColdOnly,
+                                _ => {
+                                    return Err(StorageError::Refused(
+                                        RefusalReason::UnknownAccounting,
+                                    ));
+                                }
+                            }
+                        };
+                    slot.ordinary_cargo
+                        .as_mut()
+                        .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?
+                        .reuse_state = reuse_state;
+                    cargo_reuse_state = Some(reuse_state);
+                }
             }
             new_state = SlotState::Idle;
             let stored = self
@@ -978,6 +1680,11 @@ impl Store {
                     "lease disappeared during settlement",
                 ))?;
             stored.status = LeaseStatus::Finalized;
+            if let (Some(reuse_state), Some(ordinary)) =
+                (cargo_reuse_state, stored.ordinary_cargo.as_mut())
+            {
+                ordinary.finalized_reuse_state = Some(reuse_state);
+            }
         } else {
             {
                 let slot = self.slot_by_id_mut(&slot_id)?;
@@ -1004,6 +1711,7 @@ impl Store {
             request_digest,
             state: new_state,
             capture_digest,
+            cargo_reuse_state,
         };
         self.ledger.operations.push(operation.clone());
         self.persist()?;
@@ -1026,6 +1734,7 @@ impl Store {
                 .iter()
                 .filter(|slot| {
                     slot.state == InternalSlotState::Idle
+                        && slot.ordinary_cargo.is_none()
                         && !slot
                             .partition
                             .path_identity
@@ -1051,6 +1760,7 @@ impl Store {
             .partition
             .path_identity
             .starts_with("same-root-fixture-v1:")
+            || slot.ordinary_cargo.is_some()
             || slot.state != InternalSlotState::Idle
             || slot.lease_id.is_some()
         {
@@ -1080,6 +1790,7 @@ impl Store {
                 .iter()
                 .filter(|slot| {
                     slot.state == InternalSlotState::Idle
+                        && slot.ordinary_cargo.is_none()
                         && !slot
                             .partition
                             .path_identity
@@ -1123,6 +1834,7 @@ impl Store {
                 .iter()
                 .filter(|slot| {
                     slot.state == InternalSlotState::Idle
+                        && slot.ordinary_cargo.is_none()
                         && !slot
                             .partition
                             .path_identity
@@ -1275,6 +1987,143 @@ fn validate_request(request: &AcquireRequest) -> Result<(), StorageError> {
     Ok(())
 }
 
+fn validate_ordinary_request(request: &OrdinaryCargoRequest) -> Result<(), StorageError> {
+    validate_request(&request.acquire)?;
+    if !matches!(
+        &request.partition,
+        OrdinaryCargoPartition::OrdinaryTest | OrdinaryCargoPartition::FullDebug
+    ) {
+        return Err(StorageError::Refused(
+            RefusalReason::OrdinaryCargoPartitionLimit,
+        ));
+    }
+    if request.acceptance.policy_version != ORDINARY_CARGO_POLICY_VERSION {
+        return Err(StorageError::InvalidInput(
+            "unsupported ordinary Cargo policy version",
+        ));
+    }
+    if request.acquire.envelope.partition.path_identity != ORDINARY_CARGO_PATH_IDENTITY {
+        return Err(StorageError::InvalidInput(
+            "ordinary Cargo path identity must use the versioned storage route",
+        ));
+    }
+    validate_text(&request.root.consumer_root_id)?;
+    validate_text(&request.root.allocation_epoch)?;
+    validate_text(&request.acceptance.installation_epoch)?;
+    validate_text(&request.acceptance.acceptance_reference)?;
+    validate_text(request.acceptance.credential.expose())?;
+    let mut features = std::collections::BTreeSet::new();
+    if request
+        .acquire
+        .envelope
+        .partition
+        .features
+        .iter()
+        .any(|feature| !features.insert(feature.as_str()))
+    {
+        return Err(StorageError::InvalidInput(
+            "ordinary Cargo partition contains duplicate features",
+        ));
+    }
+    if !valid_digest(&request.acceptance.input_boundary_digest) {
+        return Err(StorageError::InvalidInput(
+            "ordinary Cargo input boundary must be a SHA-256 digest",
+        ));
+    }
+    if !request.root.source_root.is_absolute() {
+        return Err(StorageError::InvalidInput(
+            "ordinary Cargo source root must be absolute",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ordinary_finalize_request(
+    request: &OrdinaryCargoFinalizeRequest,
+) -> Result<(), StorageError> {
+    validate_ordinary_request(&request.request)?;
+    validate_text(&request.lease_id)?;
+    validate_text(&request.finalize_id)?;
+    if request.evidence.binding != request.request.acquire.envelope.binding {
+        return Err(StorageError::Conflict);
+    }
+    if let Some(token) = request.token.as_ref() {
+        validate_text(token.value())?;
+    }
+    Ok(())
+}
+
+fn validate_canonical_source_root(root: &StrictPhysicalCargoRoot) -> Result<(), StorageError> {
+    let canonical = fs::canonicalize(&root.source_root).map_err(io_error)?;
+    if canonical != root.source_root {
+        return Err(StorageError::InvalidInput(
+            "ordinary Cargo source root must be the canonical physical path",
+        ));
+    }
+    let metadata = fs::symlink_metadata(&root.source_root).map_err(io_error)?;
+    if !metadata.file_type().is_dir() {
+        return Err(StorageError::InvalidInput(
+            "ordinary Cargo source root must be a directory",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_ordinary_path_identity(path_identity: &str) -> Result<(), StorageError> {
+    if path_identity == ORDINARY_CARGO_PATH_IDENTITY
+        || path_identity.starts_with("ordinary-cargo-storage-")
+    {
+        return Err(StorageError::Conflict);
+    }
+    Ok(())
+}
+
+fn same_ordinary_root_allocation(
+    left: &StrictPhysicalCargoRoot,
+    right: &StrictPhysicalCargoRoot,
+) -> bool {
+    left.source_root == right.source_root
+        && left.consumer_root_id == right.consumer_root_id
+        && left.allocation_epoch == right.allocation_epoch
+}
+
+fn persisted_ordinary_request(request: &OrdinaryCargoRequest) -> OrdinaryCargoRequest {
+    let mut request = request.clone();
+    request.acquire = persisted_request(&request.acquire);
+    request.acceptance.credential = Credential::new("verified");
+    request
+}
+
+fn normalized_ordinary_acquire(request: &AcquireRequest) -> AcquireRequest {
+    let mut request = request.clone();
+    request.envelope.partition.features.sort();
+    request.envelope.partition.features.dedup();
+    request.envelope.partition.path_identity = ORDINARY_CARGO_PATH_IDENTITY.to_owned();
+    request
+}
+
+fn ordinary_finalize_digest(
+    request: &OrdinaryCargoRequest,
+    finalize_id: &str,
+    evidence: &SettlementEvidence,
+) -> Result<String, StorageError> {
+    let mut writer = Writer::new();
+    request.encode(&mut writer)?;
+    finalize_id.to_owned().encode(&mut writer)?;
+    evidence.encode(&mut writer)?;
+    Ok(format!("{:x}", Sha256::digest(writer.finish())))
+}
+
+fn operation_cargo_reuse_state(
+    operation: &SettlementOperation,
+) -> Result<CargoReuseState, StorageError> {
+    match (operation.state, operation.cargo_reuse_state) {
+        (SlotState::Idle, Some(state)) => Ok(state),
+        (SlotState::Uncertain, None) => Ok(CargoReuseState::Pending),
+        _ => Err(StorageError::Refused(RefusalReason::UnknownAccounting)),
+    }
+}
+
 fn validate_text(value: &str) -> Result<(), StorageError> {
     if value.is_empty() || value.len() > 64 * 1024 || value.as_bytes().contains(&0) {
         return Err(StorageError::InvalidInput(
@@ -1320,6 +2169,7 @@ fn release_proven(
     if let (ContainmentEvidence::NotSpawned(proof), Some(token)) = (&evidence.containment, token) {
         return lease.status == LeaseStatus::Leased
             && evidence.capture.is_none()
+            && evidence.terminal.is_none()
             && proof.lease_id == lease.id
             && proof.slot_id == lease.slot_id
             && proof.slot_path == expected_slot_path
@@ -1758,6 +2608,64 @@ impl Decode for InternalSlotState {
     }
 }
 
+impl Encode for OrdinaryCargoGeneration {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        self.root.encode(writer)?;
+        self.partition.encode(writer)?;
+        writer.u32(self.policy_version);
+        self.installation_epoch.encode(writer)?;
+        self.acceptance_reference.encode(writer)?;
+        self.input_boundary_digest.encode(writer)?;
+        self.reuse_state.encode(writer)
+    }
+}
+
+impl Decode for OrdinaryCargoGeneration {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        Ok(Self {
+            root: StrictPhysicalCargoRoot::decode(reader)?,
+            partition: OrdinaryCargoPartition::decode(reader)?,
+            policy_version: reader.u32()?,
+            installation_epoch: String::decode(reader)?,
+            acceptance_reference: String::decode(reader)?,
+            input_boundary_digest: String::decode(reader)?,
+            reuse_state: CargoReuseState::decode(reader)?,
+        })
+    }
+}
+
+impl Encode for OrdinaryCargoLeaseRecord {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        self.request.encode(writer)?;
+        self.saved_reuse_state.encode(writer)?;
+        match self.finalized_reuse_state {
+            Some(state) => {
+                writer.u8(1);
+                state.encode(writer)?;
+            }
+            None => writer.u8(0),
+        }
+        Ok(())
+    }
+}
+
+impl Decode for OrdinaryCargoLeaseRecord {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        let request = OrdinaryCargoRequest::decode(reader)?;
+        let saved_reuse_state = CargoReuseState::decode(reader)?;
+        let finalized_reuse_state = match reader.u8()? {
+            0 => None,
+            1 => Some(CargoReuseState::decode(reader)?),
+            _ => return Err(StorageError::Protocol("invalid ordinary reuse state field")),
+        };
+        Ok(Self {
+            request,
+            saved_reuse_state,
+            finalized_reuse_state,
+        })
+    }
+}
+
 impl Encode for Slot {
     fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
         self.id.encode(writer)?;
@@ -1779,6 +2687,13 @@ impl Encode for Slot {
             None => writer.u8(0),
         }
         writer.u64(self.last_used);
+        match self.ordinary_cargo.as_ref() {
+            Some(ordinary) => {
+                writer.u8(1);
+                ordinary.encode(writer)?;
+            }
+            None => writer.u8(0),
+        }
         Ok(())
     }
 }
@@ -1799,6 +2714,12 @@ impl Decode for Slot {
             1 => Some(String::decode(reader)?),
             _ => return Err(StorageError::Protocol("invalid lease reference")),
         };
+        let last_used = reader.u64()?;
+        let ordinary_cargo = match reader.u8()? {
+            0 => None,
+            1 => Some(OrdinaryCargoGeneration::decode(reader)?),
+            _ => return Err(StorageError::Protocol("invalid ordinary Cargo slot record")),
+        };
         Ok(Self {
             id,
             partition,
@@ -1806,7 +2727,8 @@ impl Decode for Slot {
             measured_bytes,
             reserved_bytes,
             lease_id,
-            last_used: reader.u64()?,
+            last_used,
+            ordinary_cargo,
         })
     }
 }
@@ -1842,6 +2764,13 @@ impl Encode for Lease {
         self.request.encode(writer)?;
         self.status.encode(writer)?;
         writer.u8(u8::from(self.reused));
+        match self.ordinary_cargo.as_ref() {
+            Some(ordinary) => {
+                writer.u8(1);
+                ordinary.encode(writer)?;
+            }
+            None => writer.u8(0),
+        }
         Ok(())
     }
 }
@@ -1859,6 +2788,15 @@ impl Decode for Lease {
             1 => true,
             _ => return Err(StorageError::Protocol("invalid reused flag")),
         };
+        let ordinary_cargo = match reader.u8()? {
+            0 => None,
+            1 => Some(OrdinaryCargoLeaseRecord::decode(reader)?),
+            _ => {
+                return Err(StorageError::Protocol(
+                    "invalid ordinary Cargo lease record",
+                ))
+            }
+        };
         Ok(Self {
             id,
             token_hash,
@@ -1867,6 +2805,7 @@ impl Decode for Lease {
             request,
             status,
             reused,
+            ordinary_cargo,
         })
     }
 }
@@ -1928,6 +2867,13 @@ impl Encode for SettlementOperation {
             }
             None => writer.u8(0),
         }
+        match self.cargo_reuse_state {
+            Some(state) => {
+                writer.u8(1);
+                state.encode(writer)?;
+            }
+            None => writer.u8(0),
+        }
         Ok(())
     }
 }
@@ -1945,6 +2891,11 @@ impl Decode for SettlementOperation {
             1 => Some(String::decode(reader)?),
             _ => return Err(StorageError::Protocol("invalid capture digest")),
         };
+        let cargo_reuse_state = match reader.u8()? {
+            0 => None,
+            1 => Some(CargoReuseState::decode(reader)?),
+            _ => return Err(StorageError::Protocol("invalid Cargo reuse state field")),
+        };
         Ok(Self {
             lease_id,
             operation_id,
@@ -1953,6 +2904,7 @@ impl Decode for SettlementOperation {
             request_digest,
             state,
             capture_digest,
+            cargo_reuse_state,
         })
     }
 }

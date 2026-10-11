@@ -1,4 +1,6 @@
 use super::types::*;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::PathBuf;
 
 const MAX_STRING_BYTES: usize = 64 * 1024;
 const MAX_ITEMS: usize = 16 * 1024;
@@ -155,6 +157,18 @@ impl Decode for u64 {
     }
 }
 
+impl Encode for PathBuf {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        writer.bytes(self.as_os_str().as_bytes())
+    }
+}
+
+impl Decode for PathBuf {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(reader.bytes()?)))
+    }
+}
+
 impl Encode for PartitionKey {
     fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
         self.project_component.encode(writer)?;
@@ -275,6 +289,150 @@ impl Decode for AcquireRequest {
             envelope: RunEnvelope::decode(reader)?,
             acquire_id: String::decode(reader)?,
             required_bytes: u64::decode(reader)?,
+        })
+    }
+}
+
+impl Encode for OrdinaryCargoPartition {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        match self {
+            Self::OrdinaryTest => writer.u8(1),
+            Self::FullDebug => writer.u8(2),
+            Self::Other(value) => {
+                writer.u8(3);
+                value.encode(writer)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Decode for OrdinaryCargoPartition {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        match reader.u8()? {
+            1 => Ok(Self::OrdinaryTest),
+            2 => Ok(Self::FullDebug),
+            3 => Ok(Self::Other(String::decode(reader)?)),
+            _ => Err(StorageError::Protocol("unknown ordinary Cargo partition")),
+        }
+    }
+}
+
+impl Encode for StrictPhysicalCargoRoot {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        self.source_root.encode(writer)?;
+        self.consumer_root_id.encode(writer)?;
+        self.allocation_epoch.encode(writer)
+    }
+}
+
+impl Decode for StrictPhysicalCargoRoot {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        Ok(Self {
+            source_root: PathBuf::decode(reader)?,
+            consumer_root_id: String::decode(reader)?,
+            allocation_epoch: String::decode(reader)?,
+        })
+    }
+}
+
+impl Encode for OrdinaryCargoAcceptance {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        writer.u32(self.policy_version);
+        self.installation_epoch.encode(writer)?;
+        self.acceptance_reference.encode(writer)?;
+        self.input_boundary_digest.encode(writer)?;
+        self.credential.encode(writer)
+    }
+}
+
+impl Decode for OrdinaryCargoAcceptance {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        Ok(Self {
+            policy_version: reader.u32()?,
+            installation_epoch: String::decode(reader)?,
+            acceptance_reference: String::decode(reader)?,
+            input_boundary_digest: String::decode(reader)?,
+            credential: Credential::decode(reader)?,
+        })
+    }
+}
+
+impl Encode for OrdinaryCargoRequest {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        self.acquire.encode(writer)?;
+        self.root.encode(writer)?;
+        self.partition.encode(writer)?;
+        self.acceptance.encode(writer)
+    }
+}
+
+impl Decode for OrdinaryCargoRequest {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        Ok(Self {
+            acquire: AcquireRequest::decode(reader)?,
+            root: StrictPhysicalCargoRoot::decode(reader)?,
+            partition: OrdinaryCargoPartition::decode(reader)?,
+            acceptance: OrdinaryCargoAcceptance::decode(reader)?,
+        })
+    }
+}
+
+impl Encode for CargoReuseState {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        writer.u8(match self {
+            Self::Empty => 1,
+            Self::Pending => 2,
+            Self::Reusable => 3,
+            Self::ColdOnly => 4,
+        });
+        Ok(())
+    }
+}
+
+impl Decode for CargoReuseState {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        match reader.u8()? {
+            1 => Ok(Self::Empty),
+            2 => Ok(Self::Pending),
+            3 => Ok(Self::Reusable),
+            4 => Ok(Self::ColdOnly),
+            _ => Err(StorageError::Protocol("unknown Cargo reuse state")),
+        }
+    }
+}
+
+impl Encode for OrdinaryCargoFinalizeRequest {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        self.request.encode(writer)?;
+        self.lease_id.encode(writer)?;
+        match self.token.as_ref() {
+            Some(token) => {
+                writer.u8(1);
+                token.value().to_owned().encode(writer)?;
+            }
+            None => writer.u8(0),
+        }
+        self.finalize_id.encode(writer)?;
+        self.evidence.encode(writer)
+    }
+}
+
+impl Decode for OrdinaryCargoFinalizeRequest {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        let request = OrdinaryCargoRequest::decode(reader)?;
+        let lease_id = String::decode(reader)?;
+        let token = match reader.u8()? {
+            0 => None,
+            1 => Some(LeaseToken::new(String::decode(reader)?)),
+            _ => return Err(StorageError::Protocol("invalid lease token field")),
+        };
+        Ok(Self {
+            request,
+            lease_id,
+            token,
+            finalize_id: String::decode(reader)?,
+            evidence: SettlementEvidence::decode(reader)?,
         })
     }
 }

@@ -1426,6 +1426,12 @@ fn refusal_for_storage(error: &StorageError) -> AdapterRefusal {
         StorageError::Refused(crate::storage::RefusalReason::AlreadyRunning) => {
             AdapterRefusal::DaemonUnavailable
         }
+        StorageError::Refused(
+            crate::storage::RefusalReason::OrdinaryCargoPending
+            | crate::storage::RefusalReason::OrdinaryCargoColdOnly
+            | crate::storage::RefusalReason::OrdinaryCargoPartitionLimit
+            | crate::storage::RefusalReason::OrdinaryCargoIncompatible,
+        ) => AdapterRefusal::Busy,
         StorageError::InvalidInput(_) | StorageError::Conflict | StorageError::Unauthorized => {
             AdapterRefusal::AmbiguousInput
         }
