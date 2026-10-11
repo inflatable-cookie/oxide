@@ -652,8 +652,10 @@ Facts that drive the shape:
   - `Unauthorized`: admission verifier refused. No lease, no spawn.
   - `Conflict`: same `acquire_id` with a changed body. Refuse.
   - `AlreadyRunning` comes only from `Daemon::bind` and stale-socket checks, never
-    from acquire. `NoIdleStorage` comes only from `evict_slot`. Ordinary acquire
-    never evicts, so neither is a busy outcome.
+    from acquire. `NoIdleStorage` comes only from `evict_slot`; neither is an
+    acquire-busy outcome. Same-root fixture acquire never evicts. Other acquire
+    paths may evict eligible idle slots through `make_room` or
+    `require_free_space` to satisfy the existing budget and reserve policy.
 - `NoSpawnEvidence` and `CooperativeCompletionEvidence` are signed with the
   daemon-issued `LeaseToken` through `pub(crate)` methods. Settlement can therefore
   only be built by the Rust side that holds the token from acquire.
