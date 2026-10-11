@@ -2,7 +2,10 @@
 //! No key is discovered from task data or the environment. Same-user bypasses
 //! remain outside the cooperative writer model.
 
-use super::runner_host::{canonical_json_bytes, HostError, OwnerReceiptVerifier, RunnerHost};
+use super::runner_host::{
+    canonical_json_bytes, HostError, OwnerReceiptVerifier, RunnerHost, Timing,
+    MAX_QUALIFIED_SESSION,
+};
 use crate::storage::{
     AcquireResult, ContainmentEvidence, EvidenceAuthority, RunEnvelope, SettlementEvidence,
     TerminalOutcome,
@@ -18,11 +21,14 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_BOOTSTRAP_BYTES: u64 = 64 * 1024;
 const MAX_MAC_BYTES: usize = 1024 * 1024;
 const PIN: &str = "d9ff17988c7eaa5cf57747bc55bfe4f138692f15";
+/// Explicit, supported finite-timing policy. Any other identifier refuses.
+pub const TIMING_POLICY_V1: &str = "oxide-qualification-timing-v1";
+const TIMING_RECEIPT_DOMAIN: &str = "oxide-qualification-timing-receipt-v1";
 
 /// Explicitly supplied 256-bit qualification key. Debug never exposes it.
 #[derive(Clone)]
@@ -289,6 +295,10 @@ impl Endpoint {
 
 /// One-use file schema. Only the trusted launcher creates this file; task data
 /// cannot choose endpoints, roots, keys, or an approved start digest.
+///
+/// `expires_unix_seconds` is the short load freshness of this file. It is not
+/// the execution lifetime. An absent `timing` keeps the unchanged version1
+/// host defaults; a present one is an explicit, receipt-bound finite window.
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Bootstrap {
@@ -304,6 +314,92 @@ pub struct Bootstrap {
     pub parent: Endpoint,
     pub storage: Endpoint,
     pub roots: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<TimingAuthority>,
+}
+
+/// Trusted, receipt-bound finite window for exactly one approved start digest.
+/// Units are decimal milliseconds in JSON. `remaining_ms` is the owner's
+/// remaining window at issuance; it is not a renewable lifetime.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TimingAuthority {
+    pub policy: String,
+    pub callback_ms: u64,
+    pub remaining_ms: u64,
+    pub receipt: String,
+}
+
+impl TimingAuthority {
+    /// Constructor-owned issuance for one bootstrap. Bounds are checked before
+    /// signing with the bootstrap's trusted callback key.
+    pub fn issue(
+        bootstrap: &Bootstrap,
+        callback: Duration,
+        remaining: Duration,
+    ) -> Result<Self, HostError> {
+        let (callback_ms, remaining_ms) = (
+            u64::try_from(callback.as_millis()).map_err(|_| HostError::Protocol)?,
+            u64::try_from(remaining.as_millis()).map_err(|_| HostError::Protocol)?,
+        );
+        let policy = TIMING_POLICY_V1.to_owned();
+        let receipt = Self::receipt(bootstrap, &policy, callback_ms, remaining_ms)?;
+        let authority = Self {
+            policy,
+            callback_ms,
+            remaining_ms,
+            receipt,
+        };
+        authority.bounds()?;
+        Ok(authority)
+    }
+
+    fn receipt(
+        bootstrap: &Bootstrap,
+        policy: &str,
+        callback_ms: u64,
+        remaining_ms: u64,
+    ) -> Result<String, HostError> {
+        let callback = callback_ms.to_string();
+        let remaining = remaining_ms.to_string();
+        MacKey::from_hex(&bootstrap.callback_key_hex)?.sign(
+            TIMING_RECEIPT_DOMAIN,
+            &[
+                &bootstrap.scope,
+                &bootstrap.storage_instance_id,
+                &bootstrap.start_digest,
+                policy,
+                &callback,
+                &remaining,
+            ],
+        )
+    }
+
+    fn bounds(&self) -> Result<(Duration, Duration), HostError> {
+        if self.policy != TIMING_POLICY_V1
+            || self.callback_ms == 0
+            || self.remaining_ms == 0
+            || self.callback_ms > self.remaining_ms
+            || self.remaining_ms > MAX_QUALIFIED_SESSION.as_millis() as u64
+        {
+            return Err(HostError::Protocol);
+        }
+        Ok((
+            Duration::from_millis(self.callback_ms),
+            Duration::from_millis(self.remaining_ms),
+        ))
+    }
+
+    /// Unsupported or contradictory bounds are Protocol. A receipt that does not
+    /// verify for this exact bootstrap (forged, reminted or moved) is OwnerRejected.
+    fn verify(&self, bootstrap: &Bootstrap, entry: Instant) -> Result<Timing, HostError> {
+        let (callback, remaining) = self.bounds()?;
+        let expected = Self::receipt(bootstrap, &self.policy, self.callback_ms, self.remaining_ms)?;
+        if expected != self.receipt {
+            return Err(HostError::OwnerRejected);
+        }
+        Timing::qualified(entry, callback, remaining)
+    }
 }
 impl fmt::Debug for Bootstrap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -314,6 +410,7 @@ impl fmt::Debug for Bootstrap {
 #[derive(Debug)]
 pub(super) struct AttemptGrant {
     bootstrap: Bootstrap,
+    pub(super) timing: Timing,
 }
 impl AttemptGrant {
     pub(super) fn check_start(&self, start: &Value) -> Result<(), HostError> {
@@ -416,9 +513,18 @@ impl Bootstrap {
 /// pinned parent stream. The daemon is owner-launched, using the real API and
 /// independently installed QualificationAuthority. No service is installed.
 pub fn serve_bootstrap(path: &Path) -> Result<(), HostError> {
+    // Entry freezes the finite window: bootstrap read, validation, connect and
+    // handshake all draw from the owner's remaining allowance.
+    let entry = Instant::now();
     let mut bytes = read_protected(path)?;
     let bootstrap: Bootstrap = serde_json::from_slice(&bytes).map_err(|_| HostError::Protocol)?;
     bootstrap.validate()?;
+    // Absent timing is the unchanged version1 default; present timing must verify
+    // before the one-use file is consumed.
+    let timing = match &bootstrap.timing {
+        None => Timing::Version1,
+        Some(authority) => authority.verify(&bootstrap, entry)?,
+    };
     let verifier = CallbackAuthenticator::new(
         MacKey::from_hex(&bootstrap.callback_key_hex)?,
         bootstrap.callback_context()?,
@@ -430,7 +536,7 @@ pub fn serve_bootstrap(path: &Path) -> Result<(), HostError> {
     let stream = UnixStream::connect(&bootstrap.parent.path).map_err(|_| HostError::Io)?;
     bootstrap.parent.check()?;
     RunnerHost::new(bootstrap.storage.path.clone(), Arc::new(verifier))
-        .qualified(AttemptGrant { bootstrap })
+        .qualified(AttemptGrant { bootstrap, timing })
         .serve(stream)
         .map(|_| ())
 }
@@ -573,8 +679,12 @@ mod tests {
             parent: Endpoint::capture(root.join("parent.sock")).unwrap(),
             storage: Endpoint::capture(root.join("storage.sock")).unwrap(),
             roots,
+            timing: None,
         };
-        let grant = AttemptGrant { bootstrap: b };
+        let grant = AttemptGrant {
+            bootstrap: b,
+            timing: Timing::Version1,
+        };
         grant.check_start(&start).unwrap();
         assert_eq!(grant.check_start(&start), Err(HostError::OwnerRejected));
         let mut changed = start.clone();
@@ -588,5 +698,84 @@ mod tests {
         drop(parent);
         drop(storage);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn timing_bootstrap(start_digest: &str) -> Bootstrap {
+        let endpoint = |name: &str| Endpoint {
+            path: PathBuf::from(name),
+            device: 0,
+            inode: 0,
+        };
+        Bootstrap {
+            version: 1,
+            host_protocol: 1,
+            storage_protocol: 1,
+            map_pin: PIN.into(),
+            expires_unix_seconds: 0,
+            scope: "timing-scope".into(),
+            storage_instance_id: "a".repeat(64),
+            start_digest: start_digest.into(),
+            callback_key_hex: "c".repeat(64),
+            parent: endpoint("parent"),
+            storage: endpoint("storage"),
+            roots: Vec::new(),
+            timing: None,
+        }
+    }
+
+    #[test]
+    fn private_qualification_timing_authority_is_receipt_bound_and_bounded() {
+        let digest_one = format!("sha256:{}", "b".repeat(64));
+        let digest_two = format!("sha256:{}", "d".repeat(64));
+        let mut b = timing_bootstrap(&digest_one);
+        let other = timing_bootstrap(&digest_two);
+        let second = Duration::from_secs(1);
+        let issued = TimingAuthority::issue(&b, second, 4 * second).unwrap();
+        let other_issued = TimingAuthority::issue(&other, second, 4 * second).unwrap();
+        let entry = Instant::now();
+        assert_eq!(
+            issued.verify(&b, entry),
+            Ok(Timing::Qualified {
+                callback: second,
+                session_deadline: entry + 4 * second,
+            })
+        );
+        assert!(TimingAuthority::issue(&b, Duration::ZERO, second).is_err());
+        assert!(TimingAuthority::issue(&b, second, MAX_QUALIFIED_SESSION + second).is_err());
+
+        let mut unsupported = issued.clone();
+        unsupported.policy = "oxide-qualification-timing-v0".into();
+        assert_eq!(
+            unsupported.verify(&b, entry),
+            Err(HostError::Protocol),
+            "unknown policy identifiers refuse"
+        );
+        let mut zero = issued.clone();
+        zero.callback_ms = 0;
+        assert_eq!(zero.verify(&b, entry), Err(HostError::Protocol));
+        let mut contradictory = issued.clone();
+        contradictory.callback_ms = 5_000;
+        assert_eq!(contradictory.verify(&b, entry), Err(HostError::Protocol));
+        let mut over_ceiling = issued.clone();
+        over_ceiling.remaining_ms = MAX_QUALIFIED_SESSION.as_millis() as u64 + 1;
+        assert_eq!(over_ceiling.verify(&b, entry), Err(HostError::Protocol));
+        let mut widened = issued.clone();
+        widened.remaining_ms = 3_000;
+        assert_eq!(
+            widened.verify(&b, entry),
+            Err(HostError::OwnerRejected),
+            "changed bounds keep the old receipt and refuse"
+        );
+        assert_eq!(
+            other_issued.verify(&b, entry),
+            Err(HostError::OwnerRejected),
+            "a receipt minted for another start digest refuses"
+        );
+        b.start_digest = digest_two;
+        assert_eq!(
+            issued.verify(&b, entry),
+            Err(HostError::OwnerRejected),
+            "a moved bootstrap digest refuses"
+        );
     }
 }
