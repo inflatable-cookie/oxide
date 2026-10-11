@@ -31,6 +31,66 @@ const MAX_NAMESPACES: usize = 8;
 const MAX_CANDIDATES: usize = 512;
 const MAX_OUTPUT: usize = 8 * 1024 * 1024;
 
+/// Pinned per-leaf SHA-256 values for the five allowlisted source leaves. The
+/// streaming caller binds a request to these without re-reading Git; the legacy
+/// caller still hashes them from the pinned object.
+const PINNED_SOURCE_LEAVES: [(&str, &str); 5] = [
+    ("Cargo.lock", LOCK_SHA256),
+    (
+        "Cargo.toml",
+        "81f90a4e389cef850a26446900173d3bbe70ae6a31371abe5aae650a99ecca5a",
+    ),
+    (
+        "crates/nucleus-core/Cargo.toml",
+        "3d0e9fd5ead4e189ccb8d9dfd3e87254b46a84f8ca3e741d38e045a0da6c2e48",
+    ),
+    (
+        "crates/nucleus-observer/Cargo.toml",
+        "3bc428a6b5c2ede9f526e178f90d71da4f7a38222160514e7f6509ff8fa552a9",
+    ),
+    (
+        "effigy.toml",
+        "f666615645cb59f24fea78fbc7c1627e7d76cb647355dd791f1c57a2207ab8c2",
+    ),
+];
+
+/// The exact two registry tuples the streaming caller is allowed to observe.
+const STREAMING_PACKAGES: [(&str, &str, &str); 2] = [
+    (
+        "libsqlite3-sys",
+        "0.38.2",
+        "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8",
+    ),
+    (
+        "sqlite-wasm-rs",
+        "0.5.5",
+        "dc3efc0da82635d7e1ced0053bbbfa8c7ab9645d0bf36ceb4f7127bb85315d75",
+    ),
+];
+
+/// Selects the legacy capped verifier or the private streaming verifier. The
+/// route is fixed by the request schema and can never be raised by package or
+/// counter JSON.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Route {
+    Legacy,
+    Streaming,
+}
+impl Route {
+    fn schema(self) -> &'static str {
+        match self {
+            Route::Legacy => "oxide.registry-acquisition.v2",
+            Route::Streaming => "oxide.registry-acquisition.v3",
+        }
+    }
+    fn mode(self) -> Option<&'static str> {
+        match self {
+            Route::Legacy => None,
+            Route::Streaming => Some("streaming"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LockedPackage {
     pub name: String,
@@ -58,6 +118,18 @@ pub struct PhaseStart {
 #[serde(deny_unknown_fields)]
 pub struct AcquisitionRequest {
     pub schema: String,
+    pub source: SourceIdentity,
+    pub phase_start: PhaseStart,
+    pub packages: Vec<LockedPackage>,
+}
+
+/// Schema-v3 streaming request. The `mode` field and the exact two-package set
+/// distinguish it from the unchanged schema-v2 legacy request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamingAcquisitionRequest {
+    pub schema: String,
+    pub mode: String,
     pub source: SourceIdentity,
     pub phase_start: PhaseStart,
     pub packages: Vec<LockedPackage>,
@@ -171,6 +243,8 @@ pub struct PackageOutcome {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AcquisitionReport {
     pub schema: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     pub source: SourceIdentity,
     pub phase_start: PhaseStart,
     pub cache: RootSnapshot,
@@ -188,8 +262,28 @@ struct Root {
     namespaces: Vec<(String, PathBuf, String, Option<Metadata>)>,
 }
 
-/// Reads one request from stdin and emits a capped JSON acquisition report.
-pub fn run<R: Read, W: Write>(input: R, mut output: W) -> Result<(), String> {
+/// Reads one schema-v2 legacy request and emits a capped JSON report.
+pub fn run<R: Read, W: Write>(input: R, output: W) -> Result<(), String> {
+    let bytes = read_request(input)?;
+    let request: AcquisitionRequest =
+        serde_json::from_slice(&bytes).map_err(|e| format!("request JSON: {e}"))?;
+    emit(acquire(request)?, "oxide.registry-acquisition.v2", output)
+}
+
+/// Reads one schema-v3 streaming request and emits a capped JSON report. The
+/// route is opt-in and cannot be selected by a legacy request.
+pub fn run_streaming<R: Read, W: Write>(input: R, output: W) -> Result<(), String> {
+    let bytes = read_request(input)?;
+    let request: StreamingAcquisitionRequest =
+        serde_json::from_slice(&bytes).map_err(|e| format!("request JSON: {e}"))?;
+    emit(
+        acquire_streaming(request)?,
+        "oxide.registry-acquisition.v3",
+        output,
+    )
+}
+
+fn read_request<R: Read>(input: R) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     input
         .take((MAX_OUTPUT + 1) as u64)
@@ -198,13 +292,14 @@ pub fn run<R: Read, W: Write>(input: R, mut output: W) -> Result<(), String> {
     if bytes.len() > MAX_OUTPUT {
         return Err("request exceeds the 8 MiB output/input ceiling".into());
     }
-    let request: AcquisitionRequest =
-        serde_json::from_slice(&bytes).map_err(|e| format!("request JSON: {e}"))?;
-    let report = acquire(request)?;
+    Ok(bytes)
+}
+
+fn emit<W: Write>(report: AcquisitionReport, schema: &str, mut output: W) -> Result<(), String> {
     let mut capped = Capped(Vec::new());
     if serde_json::to_writer(&mut capped, &report).is_err() {
         let small = serde_json::json!({
-            "schema": "oxide.registry-acquisition.v2",
+            "schema": schema,
             "status": "refused",
             "refusal": "retained_output_exceeds_8_mib"
         });
@@ -304,6 +399,87 @@ fn acquire(request: AcquisitionRequest) -> Result<AcquisitionReport, String> {
     acquire_roots(request, cache, extracted, Limits::NUCLEUS)
 }
 
+/// Legacy-route wrapper kept for the unchanged schema-v2 entry and its tests.
+fn acquire_roots(
+    request: AcquisitionRequest,
+    cache: Root,
+    extracted: Root,
+    limits: Limits,
+) -> Result<AcquisitionReport, String> {
+    acquire_roots_route(
+        request.source,
+        request.phase_start,
+        request.packages,
+        cache,
+        extracted,
+        limits,
+        Route::Legacy,
+    )
+}
+
+/// Schema-v3 entry. It binds the pinned source leaves without re-reading Git and
+/// accepts only the exact two SQLite registry tuples before using the shared
+/// candidate discovery and the streaming verifier.
+fn acquire_streaming(request: StreamingAcquisitionRequest) -> Result<AcquisitionReport, String> {
+    if request.schema != "oxide.registry-acquisition.request.v3"
+        || request.mode != "streaming"
+        || request.source.commit != SOURCE_COMMIT
+        || request.source.tree != SOURCE_TREE
+        || request.source.lock_sha256 != LOCK_SHA256
+    {
+        return Err("streaming request identity or mode refused".into());
+    }
+    if request.source.leaves.len() != PINNED_SOURCE_LEAVES.len()
+        || PINNED_SOURCE_LEAVES.iter().any(|(leaf, digest)| {
+            request.source.leaves.get(*leaf).map(String::as_str) != Some(*digest)
+        })
+    {
+        return Err("streaming request pinned source leaf set refused".into());
+    }
+    let starting_total = request
+        .phase_start
+        .counters
+        .archive_bytes
+        .saturating_add(request.phase_start.counters.decompressed_bytes)
+        .saturating_add(request.phase_start.counters.extracted_bytes);
+    if starting_total > Limits::NUCLEUS.collection_bytes
+        || request.phase_start.counters.entries > Limits::NUCLEUS.associations
+        || request.phase_start.candidate_observations > MAX_CANDIDATES
+    {
+        return Err("phase starting counters exceed the acquisition bounds".into());
+    }
+    if request.packages.len() != STREAMING_PACKAGES.len()
+        || STREAMING_PACKAGES.iter().any(|(name, version, checksum)| {
+            !request.packages.iter().any(|package| {
+                package.name == *name
+                    && package.version == *version
+                    && package.checksum == *checksum
+                    && package.source == "registry+https://github.com/rust-lang/crates.io-index"
+            })
+        })
+    {
+        return Err("streaming request must carry exactly the two pinned SQLite tuples".into());
+    }
+    if std::env::var_os("CARGO_HOME").as_deref() != Some(std::ffi::OsStr::new(CARGO_HOME)) {
+        return Err("explicit CARGO_HOME does not match the pinned observation".into());
+    }
+    let home = fs::canonicalize(CARGO_HOME).map_err(|e| format!("CARGO_HOME: {e}"))?;
+    if home != Path::new(CARGO_HOME) {
+        return Err("canonical CARGO_HOME differs from the pinned root".into());
+    }
+    let cache = root(&home, &home.join("registry/cache"))?;
+    let extracted = root(&home, &home.join("registry/src"))?;
+    acquire_roots_route(
+        request.source,
+        request.phase_start,
+        request.packages,
+        cache,
+        extracted,
+        Limits::NUCLEUS,
+        Route::Streaming,
+    )
+}
+
 fn root(home: &Path, path: &Path) -> Result<Root, String> {
     let before =
         Metadata::read(path).map_err(|e| format!("root metadata {}: {e}", path.display()))?;
@@ -386,24 +562,28 @@ fn root_snapshot(root: &Root, after: Option<Metadata>) -> RootSnapshot {
     }
 }
 
-fn acquire_roots(
-    request: AcquisitionRequest,
+fn acquire_roots_route(
+    source: SourceIdentity,
+    phase_start: PhaseStart,
+    packages: Vec<LockedPackage>,
     cache: Root,
     extracted: Root,
     limits: Limits,
+    route: Route,
 ) -> Result<AcquisitionReport, String> {
     let mut report = AcquisitionReport {
-        schema: "oxide.registry-acquisition.v2".into(),
-        source: request.source,
-        phase_start: request.phase_start,
+        schema: route.schema().into(),
+        mode: route.mode().map(str::to_owned),
+        source,
+        phase_start,
         cache: root_snapshot(&cache, Some(cache.before.clone())),
         extracted: root_snapshot(&extracted, Some(extracted.before.clone())),
-        candidate_observations: request.phase_start.candidate_observations,
+        candidate_observations: phase_start.candidate_observations,
         acquisition_candidate_observations: 0,
-        packages: Vec::with_capacity(request.packages.len()),
-        counters: request.phase_start.counters,
+        packages: Vec::with_capacity(packages.len()),
+        counters: phase_start.counters,
     };
-    let mut counters: Counters = request.phase_start.counters.into();
+    let mut counters: Counters = phase_start.counters.into();
     let unsafe_namespace = cache
         .namespaces
         .iter()
@@ -415,7 +595,7 @@ fn acquire_roots(
         } else {
             "namespace_observation_limit_reached"
         };
-        for package in request.packages {
+        for package in packages {
             report.packages.push(empty_outcome(
                 package,
                 "not_observed",
@@ -427,7 +607,7 @@ fn acquire_roots(
         return Ok(report);
     }
     let mut capped = false;
-    for package in request.packages {
+    for package in packages {
         if capped {
             report.packages.push(empty_outcome(
                 package,
@@ -538,15 +718,15 @@ fn acquire_roots(
         }
         let ((_, archive_path, archive_meta), (_, source_path, source_meta)) =
             complete_pairs.into_iter().next().unwrap();
-        let outcome = archive::verify(
-            &Request {
-                archive: &archive_path,
-                extracted_root: &source_path,
-                locked_checksum: &format!("sha256:{}", package.checksum),
-            },
-            limits,
-            counters,
-        );
+        let request = Request {
+            archive: &archive_path,
+            extracted_root: &source_path,
+            locked_checksum: &format!("sha256:{}", package.checksum),
+        };
+        let outcome = match route {
+            Route::Legacy => archive::verify(&request, limits, counters),
+            Route::Streaming => archive::stream_verify(&request, limits, counters),
+        };
         counters = outcome.counters;
         let archive_after = Metadata::read(&archive_path).ok();
         let source_after = Metadata::read(&source_path).ok();
@@ -1030,5 +1210,104 @@ mod private_qualification_tests {
             phase_start: PhaseStart::default(),
             packages,
         }
+    }
+
+    fn streaming_request(mode: &str, packages: Vec<LockedPackage>) -> StreamingAcquisitionRequest {
+        let mut leaves = BTreeMap::new();
+        for (leaf, digest) in super::PINNED_SOURCE_LEAVES {
+            leaves.insert(leaf.to_owned(), digest.to_owned());
+        }
+        StreamingAcquisitionRequest {
+            schema: "oxide.registry-acquisition.request.v3".into(),
+            mode: mode.into(),
+            source: SourceIdentity {
+                commit: SOURCE_COMMIT.into(),
+                tree: SOURCE_TREE.into(),
+                lock_sha256: LOCK_SHA256.into(),
+                leaves,
+            },
+            phase_start: PhaseStart::default(),
+            packages,
+        }
+    }
+
+    fn streaming_packages() -> Vec<LockedPackage> {
+        super::STREAMING_PACKAGES
+            .iter()
+            .map(|(name, version, checksum)| package(name, version, checksum))
+            .collect()
+    }
+
+    fn run_streaming_error(request: &StreamingAcquisitionRequest) -> String {
+        let input = serde_json::to_vec(request).unwrap();
+        let mut output = Vec::new();
+        run_streaming(std::io::Cursor::new(input), &mut output)
+            .expect_err("invalid streaming requests must refuse")
+    }
+
+    #[test]
+    fn private_qualification_streaming_refuses_wrong_mode_and_package_set() {
+        assert!(
+            run_streaming_error(&streaming_request("legacy", streaming_packages()))
+                .contains("identity or mode")
+        );
+        let mut one = streaming_packages();
+        one.truncate(1);
+        assert!(run_streaming_error(&streaming_request("streaming", one))
+            .contains("two pinned SQLite tuples"));
+        let mut extra = streaming_packages();
+        extra.push(package("serde", "1.0.229", &"00".repeat(32)));
+        assert!(run_streaming_error(&streaming_request("streaming", extra))
+            .contains("two pinned SQLite tuples"));
+        // A schema-v2 legacy request cannot select the streaming route.
+        let legacy = serde_json::to_vec(&request(Vec::new())).unwrap();
+        assert!(run_streaming(std::io::Cursor::new(legacy), &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn private_qualification_streaming_route_admits_what_legacy_caps() {
+        let root = fixture_root("streaming-route");
+        let (locked, _, _) = fixture_package(&root, "fixture", "1.0.0");
+        let mut limits = Limits::NUCLEUS;
+        limits.file_bytes = 1024;
+        limits.collection_bytes = 64 * 1024;
+        let (cache, src) = roots(&root);
+        let legacy_report =
+            super::acquire_roots(request(vec![locked.clone()]), cache, src, limits).unwrap();
+        assert_eq!(legacy_report.schema, "oxide.registry-acquisition.v2");
+        assert!(legacy_report.mode.is_none());
+        assert_eq!(
+            legacy_report.packages[0].refusal.as_deref(),
+            Some("verifier_Budget")
+        );
+
+        let (cache, src) = roots(&root);
+        let request_v3 = super::StreamingAcquisitionRequest {
+            schema: "oxide.registry-acquisition.request.v3".into(),
+            mode: "streaming".into(),
+            source: SourceIdentity {
+                commit: SOURCE_COMMIT.into(),
+                tree: SOURCE_TREE.into(),
+                lock_sha256: LOCK_SHA256.into(),
+                leaves: BTreeMap::new(),
+            },
+            phase_start: PhaseStart::default(),
+            packages: vec![locked],
+        };
+        let streamed = super::acquire_roots_route(
+            request_v3.source,
+            request_v3.phase_start,
+            request_v3.packages,
+            cache,
+            src,
+            limits,
+            super::Route::Streaming,
+        )
+        .unwrap();
+        assert_eq!(streamed.schema, "oxide.registry-acquisition.v3");
+        assert_eq!(streamed.mode.as_deref(), Some("streaming"));
+        assert_eq!(streamed.packages[0].status, "supported");
+        assert_eq!(streamed.packages[0].files.len(), 2);
+        assert!(streamed.counters.decompressed_bytes > limits.file_bytes);
     }
 }

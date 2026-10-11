@@ -113,6 +113,24 @@ bounds. The collection cap applies to the accumulated counters, so successive
 package verifies in one preparation share it. There is no unpack/write into the
 package root, host registry scan, per-call counter reset or automatic growth.
 
+A distinct private streaming route, `archive::stream_verify`, exists for a
+locked container whose total decoded tar size genuinely exceeds 16 MiB while
+every individual archive member and extracted file stays at or below 16 MiB. It
+streams the single gzip member through a metered reader and raw tar entries, so
+the complete decoded tar is never materialized and no per-container cap applies;
+only the unchanged shared collection budget (256 MiB across compressed, decoded
+and extracted bytes) bounds the aggregate. The compressed archive, every archive
+member payload and every extracted file remain capped at 16 MiB, and each
+declared member size is checked before its payload is consumed. GNU long-name,
+long-link and PAX extension entries are refused before the tar reader can buffer
+an unbounded metadata payload. The gzip trailer, single-member and trailing-byte
+checks still run, and decoded bytes after the tar terminator are charged and must
+be NUL padding, so a smuggled trailing member refuses. Entry, path, depth,
+duplicate, collision, sidecar, link, hardlink, nlink, stability, membership,
+content and identity rules are shared with `verify`. Both routes consume one
+caller-supplied `Counters` and return every consumed counter on success and
+refusal. The schema-v2 `verify` container cap is unchanged.
+
 Task 037 added a private, opt-in acquisition caller at
 `src/registered/archive_acquisition.rs` and
 `src/bin/registry_acquisition.rs`, selected by
@@ -253,6 +271,47 @@ pre-issued receipts or charge their own separately approved preparation; they
 must not hide host scans behind these seams. Ordinary synthetic regressions
 exercise these semantics in fresh owned scratch and claim no actual Cargo reuse,
 Nucleus eligibility, representative fit or independent qualification.
+
+## Task 039 private streaming correspondence
+
+Task 039 added the distinct private schema-v3 streaming route
+`archive::stream_verify` and its opt-in caller
+`archive_acquisition::run_streaming` / `oxide-registry-acquisition --stream`,
+selected by `effigy registry:stream:nucleus`. It binds the same pinned source
+commit/tree/lock and the five recorded per-leaf digests as constants, accepts
+only the exact two SQLite registry tuples of Task 038, and reuses the shared
+candidate discovery, path safety, membership, integrity and counter logic. The
+schema-v2 legacy `verify` route, its 16 MiB decoded-container cap and the
+default callers are unchanged; caller or task JSON cannot raise the member,
+collection or entry ceilings. Existing map constants and the old receipts are
+not reinterpreted.
+
+The one bounded intended observation at implementation
+`d9983e750a04354d14744a18a9bbfda43da92b2e` (tree
+`2ab95ce285fe212eec18828bfd97c0f3f928ce8e`) applied the streaming route to both
+previously refused pairs. Both reached `supported`:
+
+| Package | Compressed | Decoded tar | Extracted | Entries | Files | Directories |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `libsqlite3-sys 0.38.2` | 5,361,739 | 21,646,848 | 21,624,199 | 61 | 26 | 4 |
+| `sqlite-wasm-rs 0.5.5` | 5,954,429 | 24,785,920 | 24,724,725 | 189 | 77 | 17 |
+
+Each decoded container exceeds the 16 MiB legacy cap while every member is well
+below the 16 MiB member cap. The phase used one shared counter set starting at
+zero: 11,316,168 compressed, 46,432,768 decoded, 46,348,924 extracted bytes and
+250 entries; 104,097,860 archive bytes total, 8 candidate-path observations and
+a 20,670-byte report. Adding the 611,520-byte Task 038 receipt read for
+continuity gives 104,730,050 aggregate bytes, within the 256 MiB owner-phase and
+260 MiB total-read ceilings, and the 20 GiB host reserve held. The full receipt
+is
+[`nucleus-registry-acquisition-039.json`](../evidence/nucleus-registry-acquisition-039.json).
+No legacy `verify` call ran and no 58-package replay, package script, macro,
+helper, Cargo, compiler, SDK or native content was read or executed.
+
+This is filesystem correspondence only. It does not establish effective Cargo
+registry selection, a registry issuer, enabled units, native/header/proc-macro
+or SDK closure, an immutability/no-replacement agreement, or a successful
+Nucleus workflow. The Task 037 and Task 038 reports remain unchanged.
 
 ## Inspected workflow and identity
 
