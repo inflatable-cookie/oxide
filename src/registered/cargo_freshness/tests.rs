@@ -64,6 +64,11 @@ fn rejects_unknown_fields_variants_duplicate_keys_and_truncated_json() {
         assert!(decode(value.as_bytes()).is_err());
     }
     assert!(decode(&CHECK_DEP_INFO[..CHECK_DEP_INFO.len() - 2]).is_err());
+
+    let missing_environment_value = String::from_utf8(RERUN_ENVIRONMENT.to_vec())
+        .unwrap()
+        .replace(", \"val\": null", "");
+    assert!(decode(missing_environment_value.as_bytes()).is_err());
 }
 
 #[test]

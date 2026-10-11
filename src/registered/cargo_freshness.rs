@@ -936,7 +936,17 @@ struct RerunIfChanged {
 #[serde(deny_unknown_fields)]
 struct RerunIfEnvChanged {
     var: String,
+    #[serde(deserialize_with = "deserialize_required_option")]
     val: Option<String>,
+}
+
+fn deserialize_required_option<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
 }
 
 fn deserialize_dependencies<'de, D>(
