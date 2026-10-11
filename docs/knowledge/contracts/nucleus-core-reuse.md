@@ -940,6 +940,28 @@ service or production-readiness claim. Nucleus's existing client below is still
 inactive and unchanged; its owner receives this callable surface only through
 reviewed merge/closeout and separately scoped integration.
 
+#### Remaining runtime and timing seams
+
+The executable above connects to an existing storage socket. Its covering Rust
+test embedder constructs `Daemon::bind`, installs `QualificationAuthority` and
+binds the actual instance; that embedder is not a callable consumer runtime.
+Nucleus's TypeScript client has no reviewed way to start those Rust objects.
+Oxide must supply a private, unpublished storage-runtime process with trusted
+bootstrap, authenticated readiness and exact instance/endpoint identity,
+explicit finite authority and free-space policy, bounded lifetime and preserved
+uncertain leases. No runtime command or control schema is supplied by this
+requirement. Nucleus owns the eventual process/channel lifetime and integration;
+its current consumer brief does not authorize Rust harness implementation.
+
+Independent review of the actual process confirms that the unchanged
+30-second I/O and five-minute session limits do not establish a fit for genuine
+capacity wait plus compilation, tests and capture. A separately reviewed timing
+surface must bind explicit finite limits to the trusted attempt, enforce a
+nonrenewable deadline and preserve ownership on timeout or channel loss. It
+must not silently enlarge the existing protocol's defaults. This remains an
+implementation prerequisite, not authority to run the real workflow or change
+consumer admission.
+
 ### Inactive Nucleus client
 
 Nucleus source `03b8eb95dbaad63ca154e81049280069f66697ea` contains
