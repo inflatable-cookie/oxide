@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
 
+pub const ORDINARY_CARGO_POLICY_VERSION: u32 = 1;
+
 /// Capacity limits for the Oxide-owned intermediate slots.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Budget {
@@ -102,6 +104,106 @@ pub struct AcquireRequest {
     pub required_bytes: u64,
 }
 
+/// The only compatibility partitions admitted by the ordinary-Cargo policy.
+/// `Other` keeps unsupported labels representable so the daemon can refuse
+/// them explicitly instead of silently creating another partition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OrdinaryCargoPartition {
+    OrdinaryTest,
+    FullDebug,
+    Other(String),
+}
+
+impl OrdinaryCargoPartition {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::OrdinaryTest => "ordinary-test",
+            Self::FullDebug => "full-debug",
+            Self::Other(value) => value,
+        }
+    }
+}
+
+/// Consumer-owned strict physical source-root allocation identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StrictPhysicalCargoRoot {
+    pub source_root: PathBuf,
+    pub consumer_root_id: String,
+    pub allocation_epoch: String,
+}
+
+/// Installed, owner-authenticated ordinary-Cargo acceptance.
+///
+/// The credential is verified by the configured owning boundary and is never
+/// persisted. A caller-provided digest alone cannot enable warm reuse.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrdinaryCargoAcceptance {
+    pub policy_version: u32,
+    pub installation_epoch: String,
+    pub acceptance_reference: String,
+    pub input_boundary_digest: String,
+    pub credential: Credential,
+}
+
+/// Exact authenticated request for one ordinary-Cargo generation lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrdinaryCargoRequest {
+    pub acquire: AcquireRequest,
+    pub root: StrictPhysicalCargoRoot,
+    pub partition: OrdinaryCargoPartition,
+    pub acceptance: OrdinaryCargoAcceptance,
+}
+
+/// Durable ordinary reuse eligibility, independent of slot occupancy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CargoReuseState {
+    Empty,
+    Pending,
+    Reusable,
+    ColdOnly,
+}
+
+/// Ordinary acquire result. Its embedded lease has no access after settlement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrdinaryCargoAcquireResult {
+    pub policy_version: u32,
+    pub root: StrictPhysicalCargoRoot,
+    pub partition: OrdinaryCargoPartition,
+    pub reuse_state: CargoReuseState,
+    pub lease: AcquireResult,
+}
+
+/// Access-free identity returned by ordinary acquire lookup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrdinaryCargoLeaseIdentity {
+    pub policy_version: u32,
+    pub root: StrictPhysicalCargoRoot,
+    pub partition: OrdinaryCargoPartition,
+    pub reuse_state: CargoReuseState,
+    pub lease: LeaseIdentity,
+}
+
+/// Exact ordinary finalization request. `request` repeats the original acquire
+/// body so policy, root and compatibility identity are checked on settlement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrdinaryCargoFinalizeRequest {
+    pub request: OrdinaryCargoRequest,
+    pub lease_id: String,
+    pub token: Option<LeaseToken>,
+    pub finalize_id: String,
+    pub evidence: SettlementEvidence,
+}
+
+/// Ordinary finalize result including the durable reuse transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrdinaryCargoFinalizationReceipt {
+    pub policy_version: u32,
+    pub root: StrictPhysicalCargoRoot,
+    pub partition: OrdinaryCargoPartition,
+    pub reuse_state: CargoReuseState,
+    pub finalization: FinalizationReceipt,
+}
+
 /// State of a slot in the durable ledger.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SlotState {
@@ -119,6 +221,9 @@ pub struct InventorySlot {
     pub measured_bytes: Option<u64>,
     pub reserved_bytes: u64,
     pub owner: Option<RunBinding>,
+    pub cargo_reuse_state: Option<CargoReuseState>,
+    pub ordinary_root: Option<StrictPhysicalCargoRoot>,
+    pub ordinary_partition: Option<OrdinaryCargoPartition>,
 }
 
 /// A read-only storage and capacity snapshot.
@@ -449,6 +554,10 @@ pub enum RefusalReason {
     BudgetExceeded,
     NoIdleStorage,
     LeaseUnavailable,
+    OrdinaryCargoPending,
+    OrdinaryCargoColdOnly,
+    OrdinaryCargoPartitionLimit,
+    OrdinaryCargoIncompatible,
 }
 
 impl fmt::Display for StorageError {

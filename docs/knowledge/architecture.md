@@ -152,11 +152,12 @@ slot receives the next ordinal; ledger recreation receives a new instance ID,
 so old maps and receipts cannot bind to the recreated ledger by ordinal alone.
 The counter is never reset by slot eviction.
 
-The local ledger format is version 3. Version-2 ledgers are refused without
-migration or reinterpretation. The local socket protocol now prefixes each
-request and response with `OXSTOR01` and protocol version 1; unversioned or
-unsupported peers are refused before request dispatch. The changed
-`AcquireResult` encoding is therefore not decoded as an older result.
+The local ledger format is version 4. Version-3 and other unsupported ledgers
+are refused without migration or reinterpretation. The local socket protocol
+prefixes each request and response with `OXSTOR01` and protocol version 2;
+unversioned or unsupported peers are refused before request dispatch. The
+ordinary-Cargo request/response shapes and inventory additions cannot be
+decoded by version-1 clients.
 
 `Client::lookup_acquire` authenticates the original admission envelope and
 checks the exact acquire body digest. `Client::lookup_finalize` authenticates
@@ -165,6 +166,16 @@ They return absent, present or uncertain results without changing the ledger.
 The lookup identity carries no slot path or lease token. An uncertain lease
 stays held, and lookup does not allocate, evict, settle or mint access. This is
 an Oxide API only; no Nucleus consumer binding is installed.
+
+The ordinary-Cargo storage seam uses a separate versioned API and durable
+per-generation `empty`, `pending`, `reusable`, or `cold-only` eligibility,
+independent of slot occupancy. Its configured authority hooks reject by
+default. It admits at most one `ordinary-test` and one `full-debug` generation
+for each authenticated strict physical root allocation, uses checked bounded
+capacity accounting, and never invokes generic eviction. Generic acquire,
+settlement, lookup, and eviction cannot operate on those protected records.
+This API does not execute Cargo or install a consumer workflow; its signatures
+and limits are owned by [ordinary-Cargo storage](contracts/ordinary-cargo-storage.md).
 
 On daemon restart, every persisted `leased` record without a matching durable completion receipt becomes `uncertain`. The daemon queries the owning consumer for authenticated task/source/terminal/capture evidence and checks the workflow completion record. PID plus start-time or a lock-file state may help locate a job, but absence alone proves nothing. If completion/capture authority is unavailable or a known/unexplained writer persists, preserve the slot and refuse acquisition/eviction. Recovery may be retried with the same reconciliation ID; lost replies do not create new leases. Operator cleanup is outside this first protocol and must not be inferred from age.
 
