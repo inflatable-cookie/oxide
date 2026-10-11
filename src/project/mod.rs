@@ -2,6 +2,8 @@ mod cargo;
 mod freshness;
 mod native;
 mod observations;
+#[cfg(feature = "private-qualification")]
+pub mod ordinary_cargo;
 mod resolve;
 mod source_map;
 #[cfg(test)]

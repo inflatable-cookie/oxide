@@ -21,21 +21,26 @@ use crate::storage::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::mem::MaybeUninit;
 use std::net::Shutdown;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+#[cfg(feature = "private-qualification-fixture")]
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Protocol version shared by bootstrap, readiness, control and storage policy.
+/// Version for bootstrap, readiness framing, and control commands.
 pub const PROTOCOL_VERSION: u32 = 1;
+/// Version spoken by the storage socket, independently versioned from control.
+pub const STORAGE_PROTOCOL_VERSION: u32 = crate::storage::STORAGE_PROTOCOL_VERSION;
 /// Nonrenewable monotonic ceiling. An owner window may be shorter, never longer.
 pub const MAX_LIFETIME: Duration = Duration::from_secs(45 * 60);
 /// Upper bound on the wait after a stop before an in-flight storage operation is abandoned.
@@ -78,6 +83,10 @@ pub struct RuntimeBootstrap {
     pub budget: RuntimeBudget,
     /// Exact approved subjects. Credentials are minted by the owner after readiness.
     pub admissions: Vec<ApprovedSubject>,
+    /// Exact ordinary-Cargo request digests admitted by the protected owner.
+    /// Absent or empty keeps the ordinary route disabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ordinary_cargo_request_digests: Vec<String>,
     /// Admission and settlement authenticator. Distinct from `control_key_hex`.
     pub authority_key_hex: String,
     /// Readiness and shutdown authenticator. Distinct purposes and domains.
@@ -175,14 +184,16 @@ pub fn policy_digest(
     budget: &RuntimeBudget,
     stop_grace_seconds: WireU64,
     admissions: &[ApprovedSubject],
+    ordinary_cargo_request_digests: &[String],
 ) -> Result<String, HostError> {
     canonical_digest(&json!({
         "scope": scope,
-        "storage_protocol": PROTOCOL_VERSION,
+        "storage_protocol": STORAGE_PROTOCOL_VERSION,
         "control_protocol": PROTOCOL_VERSION,
         "budget": serde_json::to_value(budget).map_err(|_| HostError::Protocol)?,
         "stop_grace_seconds": serde_json::to_value(stop_grace_seconds).map_err(|_| HostError::Protocol)?,
         "admissions": serde_json::to_value(admissions).map_err(|_| HostError::Protocol)?,
+        "ordinary_cargo_request_digests": ordinary_cargo_request_digests,
     }))
 }
 
@@ -223,7 +234,7 @@ pub fn verify_ready_frame(
         || ready.scope != expectation.scope
         || ready.bootstrap_digest != expectation.bootstrap_digest
         || ready.policy_digest != expectation.policy_digest
-        || ready.storage_protocol != PROTOCOL_VERSION
+        || ready.storage_protocol != STORAGE_PROTOCOL_VERSION
         || ready.control_protocol != PROTOCOL_VERSION
         || decode_hex(&ready.storage_instance_id).is_none()
         || ready.storage.path != expectation.storage_socket
@@ -312,6 +323,7 @@ struct Plan {
     bootstrap_digest: String,
     policy_digest: String,
     budget: RuntimeBudget,
+    ordinary_cargo_request_digests: Vec<String>,
     authority_key: MacKey,
     control_key: MacKey,
     deadline: Instant,
@@ -361,12 +373,23 @@ fn session_window(entry: Entry, expires_unix: u64, stop_grace: Duration) -> Opti
 impl RuntimeBootstrap {
     fn validate(&self, entry: Entry, digest: &str) -> Result<(Plan, PathBuf), HostError> {
         if self.version != PROTOCOL_VERSION
-            || self.storage_protocol != PROTOCOL_VERSION
+            || self.storage_protocol != STORAGE_PROTOCOL_VERSION
             || self.control_protocol != PROTOCOL_VERSION
             || self.scope.is_empty()
             || self.scope.len() > MAX_SCOPE_BYTES
             || self.admissions.is_empty()
             || self.admissions.len() > MAX_ADMISSIONS
+            || self.ordinary_cargo_request_digests.len() > MAX_ADMISSIONS
+            || self
+                .ordinary_cargo_request_digests
+                .iter()
+                .any(|digest| !valid_sha256_digest(digest))
+            || self
+                .ordinary_cargo_request_digests
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != self.ordinary_cargo_request_digests.len()
             || self.budget.cap_bytes.0 == 0
             || self.stop_grace_seconds.0 == 0
             || self.stop_grace_seconds.0 > MAX_STOP_GRACE.as_secs()
@@ -408,8 +431,10 @@ impl RuntimeBootstrap {
                 &self.budget,
                 self.stop_grace_seconds,
                 &self.admissions,
+                &self.ordinary_cargo_request_digests,
             )?,
             budget: self.budget,
+            ordinary_cargo_request_digests: self.ordinary_cargo_request_digests.clone(),
             authority_key,
             control_key,
             deadline,
@@ -418,6 +443,15 @@ impl RuntimeBootstrap {
         };
         Ok((plan, self.storage_root.join(SOCKET_NAME)))
     }
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 /// Statvfs-backed probe, limited to the one owned canonical storage root.
@@ -647,6 +681,11 @@ fn run(
         .collect();
     let authority = Arc::new(
         QualificationAuthority::new(plan.authority_key.clone(), plan.scope.clone(), allowed)
+            .and_then(|authority| {
+                authority.with_ordinary_cargo_request_digests(
+                    plan.ordinary_cargo_request_digests.clone(),
+                )
+            })
             .map_err(|_| HostError::Protocol)?,
     );
     let root = bootstrap.storage_root.clone();
@@ -875,7 +914,7 @@ fn ready_body(
             "device": WireU64(storage.device),
             "inode": WireU64(storage.inode),
         },
-        "storage_protocol": PROTOCOL_VERSION,
+        "storage_protocol": STORAGE_PROTOCOL_VERSION,
         "control_protocol": PROTOCOL_VERSION,
         "budget": plan.budget,
         "expires_unix_seconds": WireU64(plan.expires_unix_seconds),
@@ -989,6 +1028,43 @@ fn unix_now() -> Result<u64, HostError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_qualification_runtime_policy_digest_matches_storage_v2_vector() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../fixtures/storage-runtime-ready-v1.json"))
+                .unwrap();
+        let inputs = &fixture["policy_inputs"];
+        let budget: RuntimeBudget = serde_json::from_value(inputs["budget"].clone()).unwrap();
+        let grace: WireU64 = serde_json::from_value(inputs["stop_grace_seconds"].clone()).unwrap();
+        let admissions: Vec<ApprovedSubject> =
+            serde_json::from_value(inputs["admissions"].clone()).unwrap();
+        let ordinary: Vec<String> =
+            serde_json::from_value(inputs["ordinary_cargo_request_digests"].clone()).unwrap();
+        assert_eq!(
+            policy_digest(
+                inputs["scope"].as_str().unwrap(),
+                &budget,
+                grace,
+                &admissions,
+                &ordinary,
+            )
+            .unwrap(),
+            fixture["policy_digest"].as_str().unwrap()
+        );
+        let enabled = vec![format!("sha256:{}", "a".repeat(64))];
+        assert_ne!(
+            policy_digest(
+                inputs["scope"].as_str().unwrap(),
+                &budget,
+                grace,
+                &admissions,
+                &enabled,
+            )
+            .unwrap(),
+            fixture["policy_digest"].as_str().unwrap()
+        );
+    }
 
     #[test]
     fn private_qualification_runtime_wire_endpoint_keeps_u64_values_above_js_safe_range_exact() {

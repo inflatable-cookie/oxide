@@ -105,7 +105,7 @@ fn bootstrap(
     Bootstrap {
         version: 1,
         host_protocol: 1,
-        storage_protocol: 1,
+        storage_protocol: crate::storage::STORAGE_PROTOCOL_VERSION,
         map_pin: "d9ff17988c7eaa5cf57747bc55bfe4f138692f15".into(),
         expires_unix_seconds: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -926,7 +926,7 @@ fn unsafe_malformed_expired_replaced_and_unapproved_bootstrap_refuse_before_effe
     for (n, (field, wrong)) in [
         ("version", serde_json::json!(2)),
         ("host_protocol", serde_json::json!(2)),
-        ("storage_protocol", serde_json::json!(2)),
+        ("storage_protocol", serde_json::json!(1)),
         ("expires_unix_seconds", serde_json::json!(0)),
         ("callback_key_hex", serde_json::json!("malformed")),
         ("start_digest", serde_json::json!("malformed")),

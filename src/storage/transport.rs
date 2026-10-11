@@ -10,7 +10,8 @@ use std::time::Duration;
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const PROTOCOL_MAGIC: &[u8; 8] = b"OXSTOR01";
-const PROTOCOL_VERSION: u32 = 2;
+pub const STORAGE_PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = STORAGE_PROTOCOL_VERSION;
 
 #[cfg(test)]
 pub(super) fn send_acquire_and_forget(

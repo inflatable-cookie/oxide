@@ -11,6 +11,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 mod cargo_pilot;
+#[cfg(feature = "private-qualification")]
+mod private_ordinary_cargo_process;
 
 static NEXT_ROOT: AtomicUsize = AtomicUsize::new(1);
 

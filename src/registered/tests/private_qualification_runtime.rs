@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(feature = "private-qualification-fixture")]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -157,7 +158,7 @@ fn bootstrap_for(
     let endpoint = Endpoint::capture(control.to_path_buf()).unwrap();
     RuntimeBootstrap {
         version: 1,
-        storage_protocol: 1,
+        storage_protocol: super::super::storage_runtime::STORAGE_PROTOCOL_VERSION,
         control_protocol: 1,
         scope: SCOPE.into(),
         expires_unix_seconds: serde_json::from_value(json!(expires)).unwrap(),
@@ -165,6 +166,7 @@ fn bootstrap_for(
         storage_root: storage_root.to_path_buf(),
         budget: budget(),
         admissions: subjects,
+        ordinary_cargo_request_digests: Vec::new(),
         authority_key_hex: AUTHORITY_KEY.into(),
         control_key_hex: CONTROL_KEY.into(),
         control: RuntimeEndpoint {
@@ -274,6 +276,7 @@ impl Runtime {
             &budget(),
             serde_json::from_value(json!(grace)).unwrap(),
             &subjects,
+            &[],
         )
         .unwrap();
         let storage_socket = storage_root.join("daemon.sock");
