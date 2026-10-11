@@ -459,6 +459,202 @@ choices is applied or authorized by this feasibility PR. Eligibility stays
 **BLOCKED** as in Task 040; ordinary fresh private validation is retained and
 no reuse, benefit or storage claim is made.
 
+## Task 042 graph-route and installation-evidence design (design-only)
+
+Status: **proposed design, nothing shipped or approved.** Task 042 is the
+DOCS-ONLY follow-up to the Task 041 NO-GO. It read 14 pinned Cargo source files
+(523,608 bytes; the 041 digests match for every overlapping file), ran no Cargo,
+rustc, build script or tool, read no tool/SDK content and installed nothing. The
+record is [`cargo-graph-route-and-installation-evidence-042.json`](../evidence/cargo-graph-route-and-installation-evidence-042.json).
+
+### Graph route: same pinned Cargo behind a development-channel gate
+
+Recommended candidate **A**: the same Cargo 1.97.1 (`c980f48`) planner, run as
+`cargo build|test --unit-graph -Z unstable-options --frozen` with
+`__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS=nightly` in the graph process
+only. It is an unstable bypass, never a stable or supported feature. Its
+planner runs the same code path as the ordinary build: `create_bcx` runs in
+both, and the emit at `cargo_compile/mod.rs:188-190` returns before compilation.
+Outside that path the gate changes two things. It accepts unstable manifest and
+`-Z`/`[unstable]` input, and it serializes three unit-graph dependency fields
+that stable never emits. The consumer preflight refuses the first. The value
+rule below handles the second.
+
+The source gate, at this pin:
+
+- `features.rs:1563-1566` honours the override for any value. `RUSTC_BOOTSTRAP=1`
+  (`features.rs:1570-1573`) also maps to `dev`, but rustc reads it too, so it is
+  refused as the gate.
+- `context/mod.rs:397` sets `nightly_features_allowed` once. It also gates
+  `-Z` parsing (`:1155`, `features.rs:1244-1246`), the `[unstable]` table
+  (`context/mod.rs:1226`), unstable manifest `cargo-features` (`features.rs:681-684`),
+  and whether the unit-graph `public/noprelude/nounused` fields are serialized
+  (`unit_graph.rs:115`). Those fields are computed in `unit_dependencies.rs`
+  regardless of channel. Normal edges take `is_public_dep`, with `noprelude` and
+  `nounused` false (`:942-944`). Only the std-root artificial edge sets all three
+  true (`:207-210`), and it is attached only when `std_roots` is non-empty, which
+  is the build-std path. Other `UnitDep` constructors were not traced. So graph
+  success does not imply ordinary stable success, because of the manifest and
+  `-Z` input gates.
+- `--unit-graph` exists on `build` (`commands/build.rs:38`) and `test`
+  (`commands/test.rs:60`). It is gated by `fail_if_stable_opt`
+  (`command_prelude.rs:823-825`). Removing the override makes the graph run fail
+  closed, with Cargo's own nightly-only refusal.
+
+Alternatives, all rejected for now:
+
+- **B, separately pinned nightly capture.** Documented, but it is a different
+  Cargo and rustc from the ordinary 1.97.1 path, and planner equivalence is not
+  assumed. It needs a toolchain install that is not approved. Fallback only.
+- **C, vendored or forked library** (`create_bcx` + `emit_serialized_unit_graph`).
+  Internal unstable APIs, a larger maintenance surface, and it still runs probes.
+- **D, `cargo metadata`.** Cannot express command-specific features (041).
+- **E, no graph.** The current NO-GO disposition stays.
+
+Reach and side effects that the graph run cannot avoid:
+
+- **rustc probes.** `target_info.rs:168-221` runs `rustc --print=...` per kind,
+  and `util/rustc.rs:65-68` runs `rustc -vV`. The rustc-info cache goes to
+  `ws.build_dir()/.rustc_info.json` (`context/mod.rs:510-511`). Probes use the
+  consumer's rustc, so that rustc must be receipted and the build dir private.
+- **`[env]` config.** `core/compiler/mod.rs:2643-2655` applies `[env]` values to
+  rustc and probe processes, unless Cargo already set that key on the builder.
+  A config `RUSTC_BOOTSTRAP` therefore reaches rustc in ordinary runs. The
+  channel is read from the process env only, so `[env]` cannot flip the gate.
+- **Lock and network.** `ops/lockfile.rs:55-66` refuses lock writes under
+  `--locked`/`--frozen`. `--frozen` also sets `offline_flag`
+  (`context/mod.rs:1254-1262`). The enforcement point in the source layer was not
+  in the fetched set; prefer a private directory-vendored source so no network
+  source exists.
+- **No build.** `compile_ws` returns before `BuildRunner`. Build scripts, proc
+  macros, test binaries and crate compiles do not run. The graph JSON omits the
+  rustc version, cfg, lock checksums, config, env, build-script output, native
+  closure and proc-macro helpers.
+
+Binding and refusal, proposed:
+
+- Graph argv = ordinary argv + exactly `{--unit-graph, -Z, unstable-options, --frozen}`.
+  Graph env = ordinary env + exactly the override. Any other difference refuses.
+- A provenance record binds the Cargo and rustc receipts, `rustc -vV`, host
+  triple, Git tree, lock digest before and after (equal), manifest and config
+  file-set digests, env digest with secrets removed, private CARGO_HOME and
+  target/build dirs, argv, the selector/profile/feature inputs, the graph bytes
+  digest, and the clock/invocation accounting.
+- The decoder accepts only `version: 1` (`unit_graph.rs:53`). Unknown fields
+  refuse. Under the gate, `public`, `noprelude` and `nounused` are known v1
+  fields. Value rule: `noprelude` and `nounused` must be `false` or absent on
+  every edge, else refuse. A `true` value comes only from the std artificial
+  edge, which needs `-Z build-std` and is refused by the argv rule. `public` may
+  be either value and is part of the edge identity, so a change in it changes
+  the reuse key. Stable never emits these fields, and the ordinary path does not
+  produce a graph. Each target `src_path` must lie under a registered root. The
+  graph root set must equal the ordinary root selection.
+- Consumer rules, both runs: refuse any `[env]`, `--config env.*`, `RUSTC*`/
+  `build.rustc*` wrapper, `[unstable]` table, `-Z` outside the gate, or manifest
+  `cargo-features`.
+- The record is produced by the consumer's admitted host run and settled by the
+  consumer owner. Oxide verifies bytes and binding. No issuer attestation exists.
+
+Caveat: the nightly-branch inventory covers the 14 fetched files only. A
+whole-tree grep of `nightly_features_allowed` and `channel()` is a precondition
+of any implementation brief.
+
+### Installation evidence for oversized tools
+
+Recommended: **owner-installed immutable receipts (C)** plus **bounded streaming
+complete-content verification (B)**. Not a per-file cap raise (A). The budgets
+below are proposals. None is measured or ruled.
+
+- **B, streaming verification.** Hash each file in 1 MiB chunks. Resident memory
+  is the chunk plus the manifest. Refuse if dev/inode/size/mtime/ctime change
+  around the read, the same pattern as `src/registered.rs:559-573`. No sampled
+  digest, no split-file exemption, no size-only check.
+- **C, receipts.** The installation owner commits the root identity, an epoch
+  id, per-entry path/kind/size/mode (metadata only)/sha256 or link target/inode,
+  the declared required closure and an installer statement of the no-replacement
+  promise. The Nucleus owner accepts it under its acceptance conditions. Any
+  mismatch refuses and marks the epoch invalid; there is no auto re-accept. A
+  new toolchain or Xcode update starts a new epoch.
+- **Trust boundary.** Detection, not prevention. rustup and Xcode roots are
+  user-writable, so no OS immutability is assumed. Residual risk: same-UID
+  replacement between the last identity check and exec, the cooperative model
+  already recorded here. The receipt is an accepted commitment, not a signature.
+- **D, narrowed root.** Allowed only as a receipt over a named root with complete
+  membership and a declared closure. The sysroot/rustlib and SDK closure must be
+  included or justified. Partial closure with no declared root boundary is refused.
+- **Symlinks.** Record the link with its exact target string. Refuse absolute,
+  escaping, dangling and hard-linked entries, and special files. `cc -> clang`
+  is one clang read, not two.
+
+Proposed budgets, unruled and unmeasured:
+
+| Item | Proposal | Note |
+| --- | --- | --- |
+| Class | `InstalledToolReceipt`, constructor-installed and versioned | Not an existing class |
+| Per-file | 256 MiB, this class only | Covers cargo (30.39 MiB) and clang (118.90 MiB). The 16 MiB policy and `Limits::NUCLEUS` stay unchanged |
+| Chunk / manifest | 1 MiB / 8 MiB | |
+| Closure entries | 4096 per receipt | |
+| Root membership | 32,768 entries | Existing association cap |
+| Per phase | 1 GiB, after a measured inventory | |
+| Admission reads | 520 MiB existing, plus a separate tool term | The existing 520 MiB already fills source inventory, map and collection. Owner ruling, applied at finalize too |
+| Writes | 0 (verify in place) | A private copy needs its own write budget |
+
+Cost: admission and finalize each re-hash the closure. cargo + clang alone is
+156,544,648 bytes (149.28 MiB), so 298.56 MiB of reads per run before any SDK.
+Hash throughput is unmeasured. The 041 statement that the rustup and Xcode roots
+hold "far more than 32768 entries" was not enumerated in 041 or 042 and is still
+unverified.
+
+Owner commitments needed: the Rust toolchain owner supplies root identity,
+`rustc -vV`, cargo/rustc entries, sysroot closure, epoch and promise. The Xcode
+owner supplies the chosen clang/cc/ar/ld paths, the root membership, the SDK
+subset actually used, and the epoch and promise. The Nucleus owner supplies the
+class acceptance conditions and the tool-read admission and finalize term.
+
+Refusal: overflow, unreadable entry, identity change, unknown epoch, unsupported
+link or mismatch refuses before spawn. Unknown outcome retains bytes and holds
+ownership. Ordinary fresh private validation remains the fallback.
+
+### Finite delivery and cost
+
+Sequence, each step a separate Queue brief unless noted:
+
+1. **Oxide-only, owned fixtures, no host reads.** Unit-graph v1 decoder and
+   provenance binding verifier.
+2. **Oxide-only, owned fixtures.** `InstalledToolReceipt` schema, streaming
+   verifier, symlink and membership rules, identity checks, constructor budgets.
+   Synthetic files only.
+3. **Nucleus owner, not Oxide.** Accept or decline the receipt class, the tool
+   admission/finalize term, and epoch acceptance. Contract011 and NucleusContract002
+   departures need the owner's later agreement.
+4. **Material ruling plus a scoped host-read brief.** One bounded inventory of the
+   declared roots. This is the first measurement that can settle fit.
+5. **Material ruling.** Approve or refuse candidate A: env, flags, refusal set,
+   nightly-branch inventory, and a changed trial cap if needed.
+6. **Separate execution brief after 1-5.** One real graph plus receipt trial with
+   fresh caps. Not authorized here.
+
+Trial accounting: the graph call is one of the original 4 Cargo invocations and
+its full wall time counts against the 45-minute clock, including probes, resolution
+and any download. Probes are children of that invocation and must be reported
+under it. Receipt hashing is inside the attempt and must be inside the trial
+clock. A trial with a graph call leaves 3 Cargo invocations and the rest of the
+time for build and test. No extra graph, probe or metadata call is allowed beyond
+what the executing brief names.
+
+Burden and benefit: route A is moderate: version refusal, an unstable env that
+fails closed if removed, a nightly-branch re-audit on each Cargo upgrade, and a
+decoder. Receipts are moderate to high: re-acceptance on every Rust or Xcode
+update, and a full re-hash on each admission and finalize. The graph and
+receipts serve the stricter cross-root and unit-binding claim. They do not supply
+first storage relief. Same-root dependency reuse was shown by Task021 without a
+graph. Recommendation: do not start the trial until the owner path exists and
+Tom rules that the stricter claim is needed now.
+
+Design success establishes no eligibility, reuse, storage relief or permission
+to execute. Remaining gates: the real issuer, native/C and proc-macro closure,
+debug/capture, and resources.
+
 ## Inspected workflow and identity
 
 The bounded installed-root discovery for the exact candidate selector and
