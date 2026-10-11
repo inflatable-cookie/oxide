@@ -748,7 +748,8 @@ cannot be interpreted as this binding and is refused. In particular, generation
 alone never identifies a storage instance.
 
 The delivered callback names are `registration.authenticate`,
-`registration.audit`, `input.immutable`, `input.units`, `input.seal_map`,
+`registration.audit`, `input.immutable`, `input.units` (in-memory fixture mode)
+or `input.graph_owner` (collector mode; never both), `input.seal_map`,
 `input.verify_map`, `execution.execute`, `execution.verify_success`, and one of
 `execution.finalize_idle` or `execution.finalize_not_spawned` when the existing
 Runner path reaches those operations. Replies are authenticated before their
@@ -1102,17 +1103,16 @@ callable signature is
 The `manifests` argument is the exact accepted receipt set already verified by
 `Runner.inputs`; the owner override receives that same set and budget from
 `Runner.collect`.
-The private host does not currently install that reading owner.
-`runner_host::ParentCallbacks` implements `units` as the authenticated
-`input.units` parent callback and inherits the in-memory `units_with_budget`
-default. It cannot turn precomputed parent JSON into proof that the Cargo
-collector ran with the shared budget. A private Rust reading-owner embedding
-must override `units_with_budget`, authenticate the graph-owner provenance,
-construct the trusted context and invoke the collector with those exact
-manifests and that operation budget. Nucleus's TypeScript client does not
-supply this Rust embedding or acquire Rust authoring authority from the gap.
-Its callable provisioning and refusal contract needs independent review;
-neither a trait nor format fixtures establish a real installed issuer.
+
+The private compiled child installs that reading owner when bootstrap
+`graph_owner` is present. Absent `graph_owner` keeps the previous in-memory
+fixture mode: `ParentCallbacks::units` is the authenticated `input.units`
+callback and `units_with_budget` inherits that default. Collector mode never
+falls back to a parent-produced `UnitEvidence` array; `units` itself refuses
+`MissingAuthority`, and the child calls `input.graph_owner` then
+`cargo_freshness::collect`. Precomputed `input.units` success arrays are not
+collector proof. This is the synthetic qualification owner, not an accepted
+Nucleus graph, native closure, issuer, completion or debug proof.
 
 `TrustedCargoGraphContext` must be built by trusted embedding code after graph
 provenance and complete behavior audit. It binds the registered graph digest,
@@ -1122,6 +1122,62 @@ names one fingerprint directory/file and its complete directory-entry set,
 exact binary dep-info mappings, package-relative rerun mappings, graph edges,
 explicit generated/native/immutable associations and any audited registry-only
 `Precalculated` policy. Do not construct it from task labels or caller JSON.
+The type is not `Deserialize`; task JSON cannot assert trust.
+
+### Callable synthetic graph-owner provisioning
+
+This is the process API for an external parent that must not author a Rust
+harness. Schema `oxide-qualification-cargo-graph-v1`, version `1`, issuer
+`synthetic-qualification`. An incompatible schema, version or issuer refuses;
+unchanged `MAP_VERSION` / map pin `d9ff17988c7eaa5cf57747bc55bfe4f138692f15`
+do not imply provisioning compatibility.
+
+Bootstrap field `graph_owner` is optional. Issue it with
+`GraphOwnerAuthority::issue(&bootstrap)` using the bootstrap callback key over
+domain `oxide-qualification-graph-owner-install-v1` and fields
+`scope`, `storage_instance_id`, `start_digest`, schema, issuer, `"1"`.
+Unsupported schema/issuer/version is `HostError::Protocol`. A forged, moved or
+reminted installation receipt is `OwnerRejected`. Verification happens before
+the one-use bootstrap is consumed, so a refused owner never connects.
+
+After acquire, collector mode requests `input.graph_owner` with the Runner
+`registration` and acquired `attempt` (slot included). The parent returns
+untrusted `GraphProvision`: version, schema, issuer, Cargo `1.97.1` /
+`c980f4866141969fab6254a680546a277789d6f0`, graph digest, a unit vector, and
+`receipt`. Unknown fields refuse. Duplicate JSON object keys in that callback
+result refuse at frame parse, before `serde_json::Value` canonicalization or
+`GraphProvision` conversion; a collapsed Value must not be accepted as unique
+context fields. Duplicate unit IDs refuse. The provision
+must not name `build_root`; the Rust owner binds `TrustedCargoGraphContext.build_root`
+to `Attempt.slot` after acquire. Package roots must sit under the authenticated
+source root, acquired slot, or a Runner-verified immutable manifest root.
+
+Issue the provision with `issue_graph_provision` (same callback key) over
+domain `oxide-qualification-graph-owner-v1` and fields `scope`,
+`storage_instance_id`, `start_digest`, canonical digest of the subject
+`{body, source_root, root_id, run_id, attempt_id, build_root, storage_instance_id,
+slot_id, generation, scope, start_digest}` where `body` is the provision with
+an empty receipt. The cross-language vector is
+`fixtures/qualification-graph-owner-v1.json`. Forged, moved, replayed or
+slot/instance/generation-mismatched receipts refuse `Authentication` before
+collector file reads.
+
+Decode and copies charge the same `EvidenceReadBudget` as collector and Runner
+input reads (256 MiB aggregate, 16 MiB/file, 256 units, 32,768 associations,
+64 entries/unit, path 2048, depth 32, map 8 MiB). Oversize refuses without
+resetting counters. The collector then runs under that budget and the existing
+freshness/map/seal path. Post-execution fingerprint and anchor files are
+observations named by the preapproved semantic graph; they are not graph
+authority. On a cold empty slot, `Runner::run` still executes before the first
+collect; reuse collect (and therefore graph verification) happens before
+execute. Refusal uses existing host paths: no fabricated completion, release,
+or new replay token. Same-UID cooperative ownership and no-replacement remain
+the writer model.
+
+Pins: `GRAPH_OWNER_SCHEMA`, `GRAPH_OWNER_ISSUER`, `GRAPH_OWNER_VERSION`,
+`GRAPH_OWNER_PROVISION_DOMAIN`, `GraphOwnerAuthority::issue`,
+`issue_graph_provision`, `accept_graph_provision`. Nucleus must not prompt
+workers or change admission from this contract alone.
 
 The accepted persisted formats are Cargo `Fingerprint` JSON and binary
 `EncodedDepInfo` v1 at commit `c980f4866141969fab6254a680546a277789d6f0`
@@ -1274,7 +1330,7 @@ from UTF-8 byte order, so neither may feed Oxide.
 | Admission credential and `EvidenceAuthority::verify_admission` | Nucleus task admission and Queue host authority; Tom decides which signs | private qualification authenticator only; no production consumer issuer |
 | Settlement and capture credentials (`SettlementEvidence.consumer_credential`, `TerminalRecord`, `CaptureReceipt`) | Queue scheduler envelope and Nucleus capture owner | no source |
 | `RegistrationOwner.authenticate` and `audit` | Nucleus managed-Git and root owner; audited-input owner | missing |
-| `InputEvidenceOwner.immutable`, `units`, `units_with_budget`, `seal_map`, `verify_map` | installation registry and SDK owner; Cargo graph audit | pinned bounded collector exists; no accepted production owner or issuer |
+| `InputEvidenceOwner.immutable`, `units`, `units_with_budget`, `seal_map`, `verify_map` | installation registry and SDK owner; Cargo graph audit | private synthetic reading owner installs `units_with_budget` → `collect`; no accepted production owner or issuer |
 | `ExecutionOwner.execute`, `verify_success`, `finalize_*` | Queue host authority (submission); Nucleus capture owner | TS fixture only |
 | Daemon `generation` and storage-instance identity in `AcquireResult`; epoch in admission | Oxide storage owner | Oxide API implemented; Nucleus fixture client binds the complete tuple and checks safe conversion; production binding disabled |
 | Authenticated lookup-only acquire/finalize recovery | Oxide storage owner; Nucleus attempt owner | Oxide APIs implemented; private host uses them internally; Nucleus session-loss reconciliation holds and adds no lookup wire verb |

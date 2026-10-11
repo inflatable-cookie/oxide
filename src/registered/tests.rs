@@ -17,6 +17,21 @@ use std::time::{Duration, SystemTime};
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "private-qualification")]
 mod private_qualification;
+
+#[cfg(feature = "private-qualification")]
+fn evidence_budget(maximum: usize) -> EvidenceReadBudget {
+    EvidenceReadBudget::new(maximum, Limits::NUCLEUS)
+}
+
+#[cfg(feature = "private-qualification")]
+fn budget_used(budget: &EvidenceReadBudget) -> usize {
+    budget.used
+}
+
+#[cfg(feature = "private-qualification")]
+fn charge_budget(budget: &mut EvidenceReadBudget, bytes: usize) -> Result<()> {
+    budget.decoded(bytes)
+}
 struct Fixture {
     base: PathBuf,
     registration: Registration,
@@ -321,24 +336,7 @@ fn write_slot_file(slot: &Path, relative: &str, bytes: &[u8]) {
     fs::write(path, bytes).unwrap();
 }
 
-fn observed_association(
-    input: InputPath,
-    anchors: &[&str],
-    producer: Option<&str>,
-    native_receipt: Option<&str>,
-) -> Association {
-    Association {
-        input,
-        anchors: set(anchors),
-        producer: producer.map(str::to_owned),
-        native_receipt: native_receipt.map(str::to_owned),
-    }
-}
-
-fn install_cargo_freshness(fixture: &Fixture) {
-    use cargo_freshness::{CargoDependency, CargoUnitContext, TrustedCargoGraphContext};
-
-    let slot = &fixture.attempt.slot;
+fn write_cargo_slot_files(slot: &Path) {
     write_slot_file(
         slot,
         "debug/.fingerprint/source-hash/lib-source.json",
@@ -361,6 +359,27 @@ fn install_cargo_freshness(fixture: &Fixture) {
         "debug/.fingerprint/registry-hash/lib-registry.json",
         include_bytes!("cargo_freshness/fixtures/precalculated.json"),
     );
+}
+
+fn observed_association(
+    input: InputPath,
+    anchors: &[&str],
+    producer: Option<&str>,
+    native_receipt: Option<&str>,
+) -> Association {
+    Association {
+        input,
+        anchors: set(anchors),
+        producer: producer.map(str::to_owned),
+        native_receipt: native_receipt.map(str::to_owned),
+    }
+}
+
+fn install_cargo_freshness(fixture: &Fixture) {
+    use cargo_freshness::{CargoDependency, CargoUnitContext, TrustedCargoGraphContext};
+
+    let slot = &fixture.attempt.slot;
+    write_cargo_slot_files(slot);
 
     let dep_info_anchor = "debug/deps/source.d";
     let package_file = |reference_path: &str, input_path: &str| dep_info::RegisteredFile {
