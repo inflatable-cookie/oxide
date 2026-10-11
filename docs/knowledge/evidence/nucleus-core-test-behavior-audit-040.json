@@ -1,0 +1,1565 @@
+{
+ "schema": "oxide.nucleus-core-test-behavior-audit.v1",
+ "task": {
+  "queue_task": "oxide#040",
+  "title": "Audit the pinned workflow's build behavior and define one finite acquisition package",
+  "origin": "0b355fd4-4651-47e2-9d89-58e81519c9d5",
+  "lane": "oxide-build-storage-qualification",
+  "dispatch_authority": "queue/orchestrator",
+  "status": "author_complete_pending_review"
+ },
+ "authority": {
+  "reads": [
+   "pinned Nucleus Git object leaves (commit/tree objects, not mutable checkout)",
+   "six exact extracted registry roots under /Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f",
+   "existing Oxide contracts/source APIs/evidence"
+  ],
+  "prohibitions_honored": [
+   "no Nucleus Cargo/rustc/test/metadata/version query",
+   "no script/macro/helper execution",
+   "no tool/SDK/Rust sysroot content read",
+   "no archive re-verification",
+   "no network/service/issuer/key deployment",
+   "no slot/root allocation",
+   "no consumer settings/worker prompt",
+   "no cleanup",
+   "no Contract010 change",
+   "no new wrapper or graph authority"
+  ],
+  "note": "This is a new source audit record. No prior experiment clock or counter is reset."
+ },
+ "pinned_source": {
+  "repository": "inflatable-cookie/nucleus",
+  "local_repo": "/Users/tom/Dev/projects/nucleus",
+  "commit": "576ba7904d58e4bf829ddddda89a06833b8c5087",
+  "tree": "0aa379b840c2f8990adeecc1fc49d9e57ab5869b",
+  "lock_bytes": 14021,
+  "lock_sha256": "sha256:ab2ed097a6d9cc740cc738b32d1c361d99214b16f0dbdeacfeb061bc10d1d57d",
+  "selector": [
+   "effigy",
+   "check:core:test",
+   "--",
+   "-p",
+   "nucleus-core",
+   "--test",
+   "planning",
+   "--test",
+   "build_diagnostics"
+  ],
+  "effective_command_from_pinned_effigy": [
+   "cargo",
+   "test",
+   "--offline",
+   "-p",
+   "nucleus-core",
+   "--test",
+   "planning",
+   "--test",
+   "build_diagnostics"
+  ],
+  "no_locked_flag": true,
+  "no_toolchain_pin_or_msrv": true,
+  "nucleus_cargo_invocations": 0
+ },
+ "declared_read_plan": {
+  "shared_interpretation_budget": {
+   "max_leaves": 128,
+   "max_bytes": 16777216,
+   "per_leaf_bytes": 16777216,
+   "used_leaves": 89,
+   "used_bytes": 2154148
+  },
+  "shared_actual_read_ledger": {
+   "max_bytes": 33554432,
+   "max_observations": 32768,
+   "depth": 32,
+   "path_bytes": 2048
+  },
+  "declared_before_read": true,
+  "nucleus_paths": [
+   "Cargo.toml",
+   "Cargo.lock",
+   "effigy.toml",
+   "crates/nucleus-core/Cargo.toml",
+   "crates/nucleus-observer/Cargo.toml",
+   "crates/nucleus-core/src/lib.rs",
+   "crates/nucleus-core/src/sqlite.rs",
+   "crates/nucleus-core/tests/build_diagnostics.rs",
+   "crates/nucleus-core/tests/planning.rs",
+   "crates/nucleus-observer/src/lib.rs",
+   "crates/nucleus-core/examples/portable-records.json",
+   "crates/nucleus-core/tests/fixtures/decision-self-relay-v1.json",
+   "crates/nucleus-core/tests/support/legacy_journal.rs",
+   "crates/nucleus-core/tests/support/queued_cancellation.rs"
+  ],
+  "registry_roots": {
+   "libsqlite3-sys-0.38.2": [
+    "Cargo.toml",
+    "Cargo.toml.orig",
+    "build.rs",
+    "src/lib.rs",
+    "sqlite3/bindgen_bundled_version.rs",
+    "sqlite3/sqlite3.h",
+    "sqlite3/sqlite3ext.h",
+    "sqlite3/wasm32-wasi-vfs.c",
+    "wrapper.h",
+    "wrapper_ext.h"
+   ],
+   "cc-1.4.7": [
+    "Cargo.toml",
+    "Cargo.toml.orig",
+    "src/lib.rs",
+    "src/flags.rs",
+    "src/tool.rs",
+    "src/target.rs",
+    "src/target/apple.rs",
+    "src/target/generated.rs",
+    "src/target/llvm.rs",
+    "src/target/parser.rs",
+    "src/command_helpers.rs",
+    "src/detect_compiler_family.c",
+    "src/tempfile.rs",
+    "src/utilities.rs",
+    "src/parallel/mod.rs",
+    "src/parallel/command_runner.rs",
+    "src/parallel/job_token.rs",
+    "src/parallel/stderr.rs",
+    "src/parallel/async_executor.rs"
+   ],
+   "pkg-config-0.3.34": [
+    "Cargo.toml",
+    "Cargo.toml.orig",
+    "src/lib.rs"
+   ],
+   "vcpkg-0.2.15": [
+    "Cargo.toml",
+    "Cargo.toml.orig",
+    "src/lib.rs"
+   ],
+   "serde_derive-1.0.229": [
+    "Cargo.toml",
+    "src/bound.rs",
+    "src/de.rs",
+    "src/de/enum_.rs",
+    "src/de/enum_adjacently.rs",
+    "src/de/enum_externally.rs",
+    "src/de/enum_internally.rs",
+    "src/de/enum_untagged.rs",
+    "src/de/identifier.rs",
+    "src/de/struct_.rs",
+    "src/de/tuple.rs",
+    "src/de/unit.rs",
+    "src/deprecated.rs",
+    "src/dummy.rs",
+    "src/fragment.rs",
+    "src/internals/ast.rs",
+    "src/internals/attr.rs",
+    "src/internals/case.rs",
+    "src/internals/check.rs",
+    "src/internals/ctxt.rs",
+    "src/internals/mod.rs",
+    "src/internals/name.rs",
+    "src/internals/receiver.rs",
+    "src/internals/respan.rs",
+    "src/internals/symbol.rs",
+    "src/lib.rs",
+    "src/pretend.rs",
+    "src/ser.rs",
+    "src/this.rs"
+   ],
+   "schemars_derive-0.8.22": [
+    "Cargo.toml",
+    "src/ast/from_serde.rs",
+    "src/ast/mod.rs",
+    "src/attr/doc.rs",
+    "src/attr/mod.rs",
+    "src/attr/schemars_to_serde.rs",
+    "src/attr/validation.rs",
+    "src/lib.rs",
+    "src/metadata.rs",
+    "src/regex_syntax.rs",
+    "src/schema_exprs.rs"
+   ]
+  }
+ },
+ "phase_ledger": {
+  "nucleus_pinned_source": {
+   "leaves": 14,
+   "bytes": 365037,
+   "leaves_detail": [
+    {
+     "path": "Cargo.toml",
+     "bytes": 499,
+     "sha256": "sha256:81f90a4e389cef850a26446900173d3bbe70ae6a31371abe5aae650a99ecca5a"
+    },
+    {
+     "path": "Cargo.lock",
+     "bytes": 14021,
+     "sha256": "sha256:ab2ed097a6d9cc740cc738b32d1c361d99214b16f0dbdeacfeb061bc10d1d57d"
+    },
+    {
+     "path": "effigy.toml",
+     "bytes": 5408,
+     "sha256": "sha256:f666615645cb59f24fea78fbc7c1627e7d76cb647355dd791f1c57a2207ab8c2"
+    },
+    {
+     "path": "crates/nucleus-core/Cargo.toml",
+     "bytes": 450,
+     "sha256": "sha256:3d0e9fd5ead4e189ccb8d9dfd3e87254b46a84f8ca3e741d38e045a0da6c2e48"
+    },
+    {
+     "path": "crates/nucleus-observer/Cargo.toml",
+     "bytes": 180,
+     "sha256": "sha256:3bc428a6b5c2ede9f526e178f90d71da4f7a38222160514e7f6509ff8fa552a9"
+    },
+    {
+     "path": "crates/nucleus-core/src/lib.rs",
+     "bytes": 28735,
+     "sha256": "sha256:f2df1a349be93bedee2affb8a70d2e0f28231e7f1f4eeed8dd9fa0f7a9518e38"
+    },
+    {
+     "path": "crates/nucleus-core/src/sqlite.rs",
+     "bytes": 9775,
+     "sha256": "sha256:dc621c5e1ffe0431316cc3809b3c06aef06d51c9ceeddda32999ef22614f5a09"
+    },
+    {
+     "path": "crates/nucleus-core/tests/build_diagnostics.rs",
+     "bytes": 1022,
+     "sha256": "sha256:940051ade5b499a937bd953e7ccac03bca8b763cf47659e35455d24d9c2e2ab2"
+    },
+    {
+     "path": "crates/nucleus-core/tests/planning.rs",
+     "bytes": 212793,
+     "sha256": "sha256:b28f2a3cfcf1835725e305a6400f8fa4ce7c91586c6bfe7fa1c67c8436136c34"
+    },
+    {
+     "path": "crates/nucleus-observer/src/lib.rs",
+     "bytes": 22229,
+     "sha256": "sha256:b8fed04a62c8fb763704a2c090e16b4c9009ad970d57f13f164a54f35219c286"
+    },
+    {
+     "path": "crates/nucleus-core/examples/portable-records.json",
+     "bytes": 8250,
+     "sha256": "sha256:609f9ddf3ff85335032bda17ef4dfe2497662fdee3508656f2b9103d29ea8781"
+    },
+    {
+     "path": "crates/nucleus-core/tests/fixtures/decision-self-relay-v1.json",
+     "bytes": 34992,
+     "sha256": "sha256:c3c560fceaa97078e335348c4a47c77b1c6918aad72db8daeeff5b72cb7cf3c9"
+    },
+    {
+     "path": "crates/nucleus-core/tests/support/legacy_journal.rs",
+     "bytes": 891,
+     "sha256": "sha256:1c21d2d5c1df80159b3ab7e46cda156387c9d18bb4aa2719de71fa324d271e75"
+    },
+    {
+     "path": "crates/nucleus-core/tests/support/queued_cancellation.rs",
+     "bytes": 25792,
+     "sha256": "sha256:70cfa29f8d062e63f06f1fb5fb2d59a6c52dd82f18485883a5a5774d13f93dc4"
+    }
+   ]
+  },
+  "registry_source": {
+   "leaves": 75,
+   "bytes": 1789111,
+   "roots": {
+    "libsqlite3-sys-0.38.2": [
+     {
+      "path": "Cargo.toml",
+      "bytes": 2380,
+      "sha256": "sha256:ce2c66104c29834e8c5e875f765e2ddfc577b9366b1ccef80f3680c2039948b3",
+      "recorded_038_file_digest": "absent"
+     },
+     {
+      "path": "Cargo.toml.orig",
+      "bytes": 2084,
+      "sha256": "sha256:f7a4bf06e3f2b8ad8f1e559637b84c19fec5ad3daee05c42b75fb596c3c188e9",
+      "recorded_038_file_digest": "absent"
+     },
+     {
+      "path": "build.rs",
+      "bytes": 34354,
+      "sha256": "sha256:269acf1864de5046ac5b77814926d41fe24108b0d027f635812a1db3c965f81f",
+      "recorded_038_file_digest": "absent"
+     },
+     {
+      "path": "src/lib.rs",
+      "bytes": 826,
+      "sha256": "sha256:f61d8e306e11357479e20999f7b7adc5f3dbaea40cd17361853574001cf79360",
+      "recorded_038_file_digest": "absent"
+     },
+     {
+      "path": "sqlite3/bindgen_bundled_version.rs",
+      "bytes": 126484,
+      "sha256": "sha256:5b5a37a74dc728fb0bcd041867eb577c03c95e2fe46285262c589a3b1cd4bbac",
+      "recorded_038_file_digest": "absent"
+     },
+     {
+      "path": "sqlite3/sqlite3.h",
+      "bytes": 690725,
+      "sha256": "sha256:9e69a1353a4288450b0d5239ede11fc7f1f4c8e5eb07491fc8317eacb5b7de7e",
+      "recorded_038_file_digest": "absent"
+     },
+     {
+      "path": "sqlite3/sqlite3ext.h",
+      "bytes": 39175,
+      "sha256": "sha256:ac9645e5c9ff0cf176efdd6e75cb5e98f46295d38e02db5c4d208826a39ab4be",
+      "recorded_038_file_digest": "absent"
+     },
+     {
+      "path": "sqlite3/wasm32-wasi-vfs.c",
+      "bytes": 21443,
+      "sha256": "sha256:b95842044da2b8777876b7d3fef8c9711e8c201fb4a4255dbac98729a456bb5d",
+      "recorded_038_file_digest": "absent"
+     },
+     {
+      "path": "wrapper.h",
+      "bytes": 21,
+      "sha256": "sha256:b78f576f7eeabf316e183d476b0f16344b6897680b4df47628d3ce38c0aa979a",
+      "recorded_038_file_digest": "absent"
+     },
+     {
+      "path": "wrapper_ext.h",
+      "bytes": 25,
+      "sha256": "sha256:fa7a53fea99318ee29d75e6d5fab4d7ed26e9599803268e6a24396265f2a6f3a",
+      "recorded_038_file_digest": "absent"
+     }
+    ],
+    "cc-1.4.7": [
+     {
+      "path": "Cargo.toml",
+      "bytes": 1958,
+      "sha256": "sha256:bf2d33b8e7ecaa89b31e36694af88e5ccb99f2f6d46145686d99a7ee01f5bd17",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "Cargo.toml.orig",
+      "bytes": 2168,
+      "sha256": "sha256:3c02b673bda91a8fd75bd070afa76733ae42f85e1eca53cdce1341b2dfac2933",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/lib.rs",
+      "bytes": 199161,
+      "sha256": "sha256:c9ea78f993d939bd8be61f63060ce3b76c8f8c8a8def94448a968936b1038381",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/flags.rs",
+      "bytes": 24251,
+      "sha256": "sha256:1a80855f51db6808cdcb5c0e6bd1c0973e86463014082ef7ed1d0fbe7b89cf93",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/tool.rs",
+      "bytes": 22986,
+      "sha256": "sha256:434e52ad0a5f9ab4fbfce1575209f7b4328c3864f48caf3e4ea8d9b53e600638",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/target.rs",
+      "bytes": 1330,
+      "sha256": "sha256:a9d2d347a3a08015531f00b32bc8a7478f5636822cc8e0237ea9efa3f07d4cd4",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/target/apple.rs",
+      "bytes": 3159,
+      "sha256": "sha256:da9411b2c4db419e0fa39f765ee53b8665b3837fb39827679a53238734a4a1c1",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/target/generated.rs",
+      "bytes": 20097,
+      "sha256": "sha256:cd28e6738247eb1caa8954df1278f0d2fbf31d280a280c9afe8398e14855f1f1",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/target/llvm.rs",
+      "bytes": 10980,
+      "sha256": "sha256:525680a605fb57e038c3103d3efc9201c1af7b99162adf5dbc399da1d5007efe",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/target/parser.rs",
+      "bytes": 23353,
+      "sha256": "sha256:97bcc00afbdf178f2f8f5de9c38fedbe8124f55e5392e36e4d95521c645cbddb",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/command_helpers.rs",
+      "bytes": 20695,
+      "sha256": "sha256:bb31b1aa7ecf46d34a712271eff23e5719371d6814c046afc588aeca0cb6ca92",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/detect_compiler_family.c",
+      "bytes": 206,
+      "sha256": "sha256:97ca4b021495611e828becea6187add37414186a16dfedd26c2947cbce6e8b2f",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/tempfile.rs",
+      "bytes": 2409,
+      "sha256": "sha256:d0f2e7e67c880870b1056c3f6d6b5ac15a9af2333a77367b0c855c0fe6e6b155",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/utilities.rs",
+      "bytes": 4487,
+      "sha256": "sha256:64277b124e00765bb2690ad157da4d21dfefc9ea6a6a7ddce2fb2cd988e86ce2",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/parallel/mod.rs",
+      "bytes": 136,
+      "sha256": "sha256:bf156170790d40a76015a8c78cc2a391cbe1b60bb96c1fac1d047d26e342386a",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/parallel/command_runner.rs",
+      "bytes": 6107,
+      "sha256": "sha256:1d17d9a037de93b31cc7ee6a914a1e1f6c1ac156cf8619f0014dcbaca6a0b215",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/parallel/job_token.rs",
+      "bytes": 9559,
+      "sha256": "sha256:1aa1ecc639e09845eea0f1e11a76c39ad2604eaac3268059652f56add8890089",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/parallel/stderr.rs",
+      "bytes": 2796,
+      "sha256": "sha256:92a2e5332a36ddc9d2c31ec88993206ee6cb7fc2c42fe84c82879d2207757dcd",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/parallel/async_executor.rs",
+      "bytes": 3582,
+      "sha256": "sha256:4ce24435fff6b6555b43fee042c16bd65d4150d0346567f246b9190d85b45983",
+      "recorded_038_file_digest": "match"
+     }
+    ],
+    "pkg-config-0.3.34": [
+     {
+      "path": "Cargo.toml",
+      "bytes": 1119,
+      "sha256": "sha256:26612dc6bbb8c045f4c91f95fc026b926e9adb942655dddfd21ffecf2595b70b",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "Cargo.toml.orig",
+      "bytes": 452,
+      "sha256": "sha256:58fc0647cc0846241e187b8632332c6ae1e40a286bc629471a2c00cb04bbf7a5",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/lib.rs",
+      "bytes": 45904,
+      "sha256": "sha256:30aa8db7d5e696f19306731710161afa595bc6b22f76a014e40fbf1dac715b81",
+      "recorded_038_file_digest": "match"
+     }
+    ],
+    "vcpkg-0.2.15": [
+     {
+      "path": "Cargo.toml",
+      "bytes": 1100,
+      "sha256": "sha256:033f71986b9ec8b8d1fcef7fa8c2c02abafb5655e10b1bbe405b9465e80108b4",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "Cargo.toml.orig",
+      "bytes": 565,
+      "sha256": "sha256:6e0c0bbe553bf27610b9dee8ef3fc9d18c53371b0a2e1c67c92ab4c19a893a04",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/lib.rs",
+      "bytes": 73442,
+      "sha256": "sha256:e328540870c53574108da063a67e5ff10256b50a5b36063f0ae2f0bab51a9bc9",
+      "recorded_038_file_digest": "match"
+     }
+    ],
+    "serde_derive-1.0.229": [
+     {
+      "path": "Cargo.toml",
+      "bytes": 2094,
+      "sha256": "sha256:d2581160ffa61baa386f882e08b0db20051dc3c782a82268d6473998b61c926e",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/bound.rs",
+      "bytes": 15378,
+      "sha256": "sha256:7daa248b3b1121bba90c5a184bbd9b630d46bca4b4c1b5814df97f494bf1ee9e",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/de.rs",
+      "bytes": 34045,
+      "sha256": "sha256:a04fdb321ce47b479b42b2dd0ca1cfd57db88e06451d7dc95303c582fedc135c",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/de/enum_.rs",
+      "bytes": 3490,
+      "sha256": "sha256:5a099a25034e4f9364d421a53cfb4428ea8a94fd66515c66207bf8bfb7c4db4f",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/de/enum_adjacently.rs",
+      "bytes": 13795,
+      "sha256": "sha256:987d3a9fc7eda53776f0ccc3fbe64147ccfc8caf2ee202d3ad6432daf033a194",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/de/enum_externally.rs",
+      "bytes": 7158,
+      "sha256": "sha256:d001b7eab7f89165f29c7459a12c2baf4898c0ff456c219afabb5d19c20462e3",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/de/enum_internally.rs",
+      "bytes": 3511,
+      "sha256": "sha256:9d898dbc1c46262f695ef7ba1660b2af70de48e07bbac8f44b740326b7c5b303",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/de/enum_untagged.rs",
+      "bytes": 4858,
+      "sha256": "sha256:b66ad3cea36ee786d50270f6648f1075c1e615b5f04173b47f034a251df5220e",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/de/identifier.rs",
+      "bytes": 15852,
+      "sha256": "sha256:b653c26f4274e5c323e3f893c6f9a2b21bd5c873abdc2a801f0289a5e56a9f6c",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/de/struct_.rs",
+      "bytes": 24472,
+      "sha256": "sha256:7b26982ce59504a9bb5a18c3ab56eee2d75e70fd465774ff035d15c50452c118",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/de/tuple.rs",
+      "bytes": 9435,
+      "sha256": "sha256:5496ee711b935b17269960f4a0cfcb7d23de668db9489dfca7276ce1fcdf0f6f",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/de/unit.rs",
+      "bytes": 1916,
+      "sha256": "sha256:b792db7952fc2e4719fdce9552fe4ba1836086cc967ae9a5b919c28b30f2b4a0",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/deprecated.rs",
+      "bytes": 1633,
+      "sha256": "sha256:cff374e86ea5f134913a2a194a68d7c2510ffd5214956d10b9c496e90a20a952",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/dummy.rs",
+      "bytes": 751,
+      "sha256": "sha256:dce9d53f7f6efb41043d6dbd741e03e65fe0a56b2f739a041184036cd7491b16",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/fragment.rs",
+      "bytes": 2116,
+      "sha256": "sha256:6757cb4c3131d4300f093572efc273c4ab5a20e3e1efb54a311dcfa52d0bd6eb",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/internals/ast.rs",
+      "bytes": 6732,
+      "sha256": "sha256:bc6244a25f536cfee82f14a29df25b7e9bc299a639debe702b9bb060c1ac99fb",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/internals/attr.rs",
+      "bytes": 67345,
+      "sha256": "sha256:7abe82fde303a3c31f967c13e0ee1afe49ea584d882b9d2c32b067888e1c8225",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/internals/case.rs",
+      "bytes": 7121,
+      "sha256": "sha256:10c8dda2b32d8c6c6b63cf09cdc63d02375af7e95ecefe8fecb34f93b65191bb",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/internals/check.rs",
+      "bytes": 16744,
+      "sha256": "sha256:86ea817316638ec33f70ecdf9634a31c934fd3df84533e3e315816dc130f0bff",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/internals/ctxt.rs",
+      "bytes": 1982,
+      "sha256": "sha256:79c058495febd402facbfa24d8a82d0d53fd91a6497ad4e9595a4dcca2e0e0bc",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/internals/mod.rs",
+      "bytes": 395,
+      "sha256": "sha256:c1ece6bbce5a5e8a2bf5d6d9a29e85551258db9c610fab73ac19c6b7d8cf98fd",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/internals/name.rs",
+      "bytes": 2806,
+      "sha256": "sha256:9bc1553d7b493794cd436664ee6b43fccb914f271fa86705ae2937ae923a876f",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/internals/receiver.rs",
+      "bytes": 10540,
+      "sha256": "sha256:c75e0ba04602c5771d662004f32b82bf01e11c1905153ba4c073969788b75abe",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/internals/respan.rs",
+      "bytes": 451,
+      "sha256": "sha256:899753859c58ce5f532a3ec4584796a52f13ed5a0533191e48c953ba5c1b52ff",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/internals/symbol.rs",
+      "bytes": 2509,
+      "sha256": "sha256:d2590f1c8356d6a10923476b558c39a85b77392ba09c92fa97e05e2c403e73c7",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/lib.rs",
+      "bytes": 3642,
+      "sha256": "sha256:9c8efaaaad77caa41178ca4316bff1ccbb7a864673d88639d258b7c5619a4ad4",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/pretend.rs",
+      "bytes": 5852,
+      "sha256": "sha256:b3e4928f49b1f380c91afc575733586e5bced5d76f02847736c267c00872df91",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/ser.rs",
+      "bytes": 45068,
+      "sha256": "sha256:18b3a4d06cd721c402835b17f008a63fdbaad379734f0fd4132aa28d8ea5c1de",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/this.rs",
+      "bytes": 1007,
+      "sha256": "sha256:87818dc80cbb521b51938a653d09daf10aafc220bb10425948de82ad670fcb85",
+      "recorded_038_file_digest": "match"
+     }
+    ],
+    "schemars_derive-0.8.22": [
+     {
+      "path": "Cargo.toml",
+      "bytes": 1303,
+      "sha256": "sha256:eaa448939363def8789f965a7361ffaaecc6e4d7c31582affdc783f0bdd19f0c",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/ast/from_serde.rs",
+      "bytes": 2495,
+      "sha256": "sha256:cb2be4cce054510cdac468664508923f26b072f14514f016692fb49bb1af20fc",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/ast/mod.rs",
+      "bytes": 2094,
+      "sha256": "sha256:02c4f877e2c0c2cfd6cb744c5a01a9a5323e32d02906b6b634ef5fe28e7e6afd",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/attr/doc.rs",
+      "bytes": 2201,
+      "sha256": "sha256:1f33a9f80e044ebf36573cb40278fa23d2650ec39b539060d7dfe2226dcfef9f",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/attr/mod.rs",
+      "bytes": 10420,
+      "sha256": "sha256:5b522d956cca85777568a98fb5af52d82e9035f7b6b774907d1920f5229cebda",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/attr/schemars_to_serde.rs",
+      "bytes": 6130,
+      "sha256": "sha256:0554195ac3dfe202d163aba2d874cacba5ead04de61d2a6e78b6c39890151e99",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/attr/validation.rs",
+      "bytes": 21052,
+      "sha256": "sha256:688447f3a160faff9463ecfdb5a89696461ed24b44b7f3a015025374651a9a23",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/lib.rs",
+      "bytes": 7232,
+      "sha256": "sha256:aa0245fb6bde2ba985c25e40bea3f66366a1704b87433af53b9d4f8c6667f8a6",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/metadata.rs",
+      "bytes": 1960,
+      "sha256": "sha256:bcc88d9e7b8cf182211dea4a2717a25f6674f6753e959b91d3c791b7c5733acb",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/regex_syntax.rs",
+      "bytes": 1920,
+      "sha256": "sha256:ea417315dc653b10a03911cbc3a724fafa75d3ed6381b358e3bed8ed2b50ffea",
+      "recorded_038_file_digest": "match"
+     },
+     {
+      "path": "src/schema_exprs.rs",
+      "bytes": 20087,
+      "sha256": "sha256:bd349fb8db8462502c9b5aa68a3878fcb31acedf94b50dd10d0b6cd083bd0f21",
+      "recorded_038_file_digest": "match"
+     }
+    ]
+   },
+   "recorded_038_file_digest_matches": 65,
+   "recorded_digest_absent": 0,
+   "recorded_039_file_digest_matches": 10,
+   "digest_binding_note": "All 75 read leaves bind by path to a retained per-file sha256: 65 to Task038 and the 10 libsqlite3-sys leaves to Task039. No observation gap remains for registry content correspondence."
+  },
+  "prior_receipt_and_report_reads": {
+   "files": {
+    "docs/knowledge/evidence/nucleus-registry-acquisition-037.json": 171140,
+    "docs/knowledge/evidence/nucleus-registry-acquisition-038.json": 611520,
+    "docs/knowledge/evidence/nucleus-registry-acquisition-038-initial-attempt.json": 662827,
+    "docs/knowledge/evidence/nucleus-registry-acquisition-039.json": 26702
+   },
+   "bytes": 1472189
+  },
+  "oxide_knowledge_reads_bytes": 459329,
+  "candidate_observations": {
+   "pinned_git_tree_entries": 1017,
+   "registry_root_filesystem_entries": 1028,
+   "registry_root_files": 962,
+   "registry_root_directories": 66,
+   "registry_verifier_declared_members": 1022,
+   "note": "Exact distinct entries. The 1,028 raw entries include six package-root .cargo-ok sidecars that the verifier inventory excludes, giving the 1,022 declared members. A small number of repeated metadata-only sizing listings were also performed but not separately retained."
+  },
+  "aggregate_read_bytes_estimate": 4085666,
+  "report_output_bytes_ceiling": 8388608,
+  "scratch_bytes_ceiling": 67108864,
+  "host_free_space_below_20gib": false,
+  "note": "Free-space samples are capacity checks, not SSD-write or saving measurements.",
+  "host_free_space": {
+   "sample_start_kib": 1070926036,
+   "sample_end_kib": 1065053524,
+   "reserve_gib": 20,
+   "below_reserve": false,
+   "note": "Global free-space samples include other host writers. The delta is not an SSD-write or saving measurement."
+  },
+  "phase_exits": {
+   "git_ls_tree": {
+    "exit": 0
+   },
+   "git_cat_file_all_declared_leaves": {
+    "exit": 0
+   },
+   "registry_read_and_hash": {
+    "exit": 0
+   },
+   "prior_evidence_json_load": {
+    "exit": 0
+   },
+   "docs_check_effigy": {
+    "exit": 0
+   },
+   "refusals": 0
+  },
+  "phase_timing": {
+   "per_phase_wall_clock": "not separately instrumented; the audit ran as one bounded read-only author session within the 90-minute allocation",
+   "elapsed_ms": null,
+   "note": "No per-phase elapsed times were captured. Commands were sequential and returned exit 0; no read was retried or reset."
+  }
+ },
+ "root_binding": {
+  "method": "canonical realpath containment under the allowlisted index root; regular file, nlink==1, stable size/mtime/inode before and after read",
+  "per_root": {
+   "cc-1.4.7": {
+    "verifier": "Task038",
+    "file_count": 28,
+    "dir_count": 3
+   },
+   "pkg-config-0.3.34": {
+    "verifier": "Task038",
+    "file_count": 16,
+    "dir_count": 4
+   },
+   "vcpkg-0.2.15": {
+    "verifier": "Task038",
+    "file_count": 833,
+    "dir_count": 49
+   },
+   "serde_derive-1.0.229": {
+    "verifier": "Task038",
+    "file_count": 36,
+    "dir_count": 3
+   },
+   "schemars_derive-0.8.22": {
+    "verifier": "Task038",
+    "file_count": 17,
+    "dir_count": 3
+   },
+   "libsqlite3-sys-0.38.2": {
+    "verifier": "Task039",
+    "file_count": 26,
+    "dir_count": 4
+   }
+  },
+  "read_leaf_binding": {
+   "task038_packages": [
+    "cc-1.4.7",
+    "pkg-config-0.3.34",
+    "vcpkg-0.2.15",
+    "serde_derive-1.0.229",
+    "schemars_derive-0.8.22"
+   ],
+   "task038_leaves_read": 65,
+   "task038_leaves_matching": 65,
+   "task039_package": "libsqlite3-sys-0.38.2",
+   "task039_leaves_read": 10,
+   "task039_leaves_matching": 10,
+   "task039_note": "The Task039 receipt retains 26 per-file sha256 records for libsqlite3-sys. All ten libsqlite3-sys leaves read here bind by path to those records exactly; no per-file digest is missing."
+  },
+  "conclusion": "All six extracted roots match committed Task038/Task039 package identities, checksums, counts and the pinned lock tuple. All 75 read leaves bind exactly to a retained per-file digest: 65 to Task038 and 10 to Task039."
+ },
+ "behavior_findings": {
+  "compile_and_test_sources": [
+   {
+    "path": "crates/nucleus-core/src/lib.rs",
+    "observations": [
+     "Public types derive Serialize, Deserialize and schemars::JsonSchema (`use serde::{Deserialize, Serialize}` and `#[derive(..., schemars::JsonSchema)]` at e.g. lines 21, 43-51, 52-57, 58+).",
+     "Field attributes use `#[serde(deny_unknown_fields)]`, `#[serde(default)]`, `#[serde(with = \"crate::ingress::replay::map\")]` and matching `#[schemars(schema_with = ...)]` (lines 46,59,68,106,128,133,146-147,160-161,...). These are token-only derive inputs; no compile-time file reads."
+    ]
+   },
+   {
+    "path": "crates/nucleus-core/src/sqlite.rs",
+    "observations": [
+     "`#[derive(Serialize, Deserialize, schemars::JsonSchema)]` on `Seed` (line 7) with `#[serde(deny_unknown_fields)]` (line 8).",
+     "`connect` sets `journal_mode=WAL`, `synchronous=FULL`, `fullfsync`, `checkpoint_fullfsync`, `foreign_keys` (lines 30-43) via rusqlite; this is bundled native SQLite behaviour."
+    ]
+   },
+   {
+    "path": "crates/nucleus-observer/src/lib.rs",
+    "observations": [
+     "Six JsonSchema/serde derives on report/status types (lines 26,32,51,67,75).",
+     "Uses `std::process::Command` for `/bin/ps`, `/usr/sbin/lsof`, `/bin/kill -0`, `/usr/bin/id`, `/bin/ls` (lines 162,240,464,476,546,567), with a PATH fallback to `lsof` at line 571.",
+     "The selected planning/build_diagnostics tests do not call these observer entry points; the external process reads are compiled but not exercised by this workflow (no `observe(` reference in tests/planning.rs)."
+    ]
+   },
+   {
+    "path": "crates/nucleus-core/tests/build_diagnostics.rs",
+    "observations": [
+     "The single test is `#[cfg(debug_assertions)]` and asserts debug assertions, overflow checks and a source-line backtrace (`Backtrace::force_capture`).",
+     "It is enabled by the ordinary test profile (debug_assertions on) and is a real runtime read of the test binary's debug/line-table data."
+    ]
+   },
+   {
+    "path": "crates/nucleus-core/tests/planning.rs",
+    "observations": [
+     "50 #[test] functions; uses the `nucleus_core` library API plus `#[path = \"support/legacy_journal.rs\"]`.",
+     "Compile-time embedded inputs: `include_str!(\"../examples/portable-records.json\")` at lines 4001,4154,4650,4849,4961,4995,5029,5140,5209; `include_bytes!`/`include_str!(\"fixtures/decision-self-relay-v1.json\")` at lines 6403,6408.",
+     "Runtime external process: `std::process::Command::new(\"mktemp\")` with `.arg(\"-d\")` at lines 3993,4146,5201,5470,5565. This is a PATH-resolved host executable read.",
+     "Runtime temp path: `std::env::temp_dir()` (TMPDIR/TMP/TEMP) plus `std::process::id()` at lines 41-46 (helper `path()`).",
+     "Runtime file I/O: `rusqlite::Connection::open`, `std::fs::remove_file`, `std::fs::remove_dir_all` on test-created paths (lines 280-282,2840,2899,4138,4255,4651,...).",
+     "No network client dependency or socket read appears in the selected sources."
+    ]
+   },
+   {
+    "path": "crates/nucleus-core/tests/support/legacy_journal.rs",
+    "observations": [
+     "Pure JSON-reshaping helper; no I/O."
+    ]
+   }
+  ],
+  "embedded_and_generated_inputs": [
+   {
+    "name": "crates/nucleus-core/examples/portable-records.json",
+    "bytes": 8250,
+    "sha256": "sha256:609f9ddf3ff85335032bda17ef4dfe2497662fdee3508656f2b9103d29ea8781",
+    "kind": "source-tree include_str input"
+   },
+   {
+    "name": "crates/nucleus-core/tests/fixtures/decision-self-relay-v1.json",
+    "bytes": 34992,
+    "sha256": "sha256:c3c560fceaa97078e335348c4a47c77b1c6918aad72db8daeeff5b72cb7cf3c9",
+    "kind": "source-tree include_str/include_bytes input"
+   },
+   {
+    "name": "$OUT_DIR/bindgen.rs",
+    "producer": "libsqlite3-sys build.rs `copy_bindings(\"sqlite3\",\"bindgen_bundled_version\",$OUT_DIR/bindgen.rs)` at build.rs:75 (in_gecko branch) and build.rs:144 (bundled branch, inside the `cfg_select` beginning at build.rs:137)",
+    "source_member": "sqlite3/bindgen_bundled_version.rs",
+    "consumer": "libsqlite3_sys `include!(concat!(env!(\"OUT_DIR\"), \"/bindgen.rs\"))` (src/lib.rs:25)",
+    "kind": "generated Rust from an immutable registry package member"
+   }
+  ],
+  "native_chain": [
+   {
+    "package": "libsqlite3-sys 0.38.2",
+    "path": "build.rs",
+    "facts": [
+     "`main` reads `OUT_DIR`; for the `bundled` feature the selected branch is `build_bundled::main` (build.rs `main` lines 69-118, bundled branch at 106, `build_bundled` at 130).",
+     "`build_bundled::main` copies `sqlite3/bindgen_bundled_version.rs` to `$OUT_DIR/bindgen.rs` (unless `buildtime_bindgen`), emits `cargo:include=<manifest>/sqlite3`, and declares `cargo:include`, `cargo:rerun-if-changed=sqlite3/sqlite3.c` and `cargo:rerun-if-changed=sqlite3/wasm32-wasi-vfs.c` (build.rs lines 147-149).",
+     "It compiles `sqlite3/sqlite3.c` through `cc::Build` with fixed `-D` feature flags plus `-I <manifest>/sqlite3` (build.rs lines 150-186, `cfg.compile` at 334).",
+     "Environment reads: `OUT_DIR` (70), `CARGO_CFG_WINDOWS` (41), `CARGO_CFG_TARGET_OS` (48), `CARGO_CFG_TARGET_ENV` (56), `TARGET`/`HOST` (180-181, 340), `CARGO_CFG_TARGET_FEATURE` (269); `rerun-if-env-changed` for `LIBSQLITE3_SYS_USE_PKG_CONFIG` (79), `SQLITE_MAX_VARIABLE_NUMBER` (309), `SQLITE_MAX_EXPR_DEPTH` (314), `SQLITE_MAX_COLUMN` (319), `LIBSQLITE3_FLAGS` (332).",
+     "`main` routes to `build_linked::main` when `LIBSQLITE3_SYS_USE_PKG_CONFIG` is set to a value other than `0`, or the `loadable_extension` feature is on (build.rs:79-83), before the `bundled` branch at build.rs:97-106. `build_linked` reaches `find_sqlite` (build.rs:450), pkg-config probes (473/490) and `try_vcpkg` (511). The owning contract requires `LIBSQLITE3_SYS_USE_PKG_CONFIG` absent or `0` (nucleus-core-reuse.md:520), so its effective presence/value is a decisive unresolved input."
+    ]
+   },
+   {
+    "package": "cc 1.4.7",
+    "path": "src/lib.rs, src/tool.rs, src/target/*.rs",
+    "facts": [
+     "Resolves the compiler/archiver/linker with target-qualified precedence (`target_envs` at 4296, `getenv_with_target_prefixes` at 4314, `envflags` `CFLAGS`/`CXXFLAGS`/`ARFLAGS`) over target/unprefixed `CC`,`CFLAGS`,`AR`,`ARFLAGS`,`CXX`,`CXXFLAGS`,`NVCC`,`CXXSTDLIB`,`RUSTC_WRAPPER` (3544),`RUSTC_LINKER` (3939); reads `CARGO_CFG_TARGET_FEATURE` (2229,2532), `CARGO_ENCODED_RUSTFLAGS` (2781,3240), `CARGO_TRIM_PATHS_SCOPE/REMAP` (2801-2804), `OUT_DIR` (4233), `NUM_JOBS` (job_token.rs 236).",
+     "Executes compilers/archivers/linkers and `rustc` (target/parser.rs 594-609, target/llvm.rs 279-296; command_helpers.rs `spawn` 496, `Command` at tool.rs 134/242/413).",
+     "On Apple it consults `SDKROOT` (4373), falls back to `xcrun` (4405,4458), and adds the deployment-target flag (`MACOSX_DEPLOYMENT_TARGET` at 4530; target/apple.rs).",
+     "It writes and compiles temporary flag-check translation units, falling back to a tempfile (lib.rs 1482/1503,1515-1540)."
+    ]
+   },
+   {
+    "package": "pkg-config 0.3.34 / vcpkg 0.2.15",
+    "facts": [
+     "Compiled as libsqlite3-sys build-dependencies: the pinned Cargo.lock lists `libsqlite3-sys` dependencies `[cc, pkg-config, vcpkg]`, consistent with its `default = [min_sqlite_version_3_34_1]` enabling `pkg-config` and `vcpkg`.",
+     "`build_bundled::main` does not call them. But `LIBSQLITE3_SYS_USE_PKG_CONFIG` present and not `0` (or feature `loadable_extension`) routes build.rs `main` to `build_linked` even with `bundled` enabled (build.rs:79-83), which executes pkg-config (473/490) and vcpkg (511). pkg-config would run a `pkg-config` process and read `PKG_CONFIG*`; vcpkg would read `VCPKG_ROOT`/`OUT_DIR`.",
+     "Effective presence/absence of `LIBSQLITE3_SYS_USE_PKG_CONFIG` is not resolved in this audit and is a decisive unresolved input, not an unreachable branch."
+    ]
+   }
+  ],
+  "proc_macro_chains": [
+   {
+    "package": "serde_derive 1.0.229",
+    "facts": [
+     "Only compile-time environment use is `env!(\"CARGO_PKG_VERSION_PATCH\")` (src/lib.rs line 101); the macro emits a private module ident `__private<patch>`.",
+     "No `std::fs`, `std::process`, `env::var`, `include!` or `OUT_DIR` use anywhere under its 29 read leaves. Proc-macro behaviour is token-only within this crate."
+    ]
+   },
+   {
+    "package": "schemars_derive 0.8.22",
+    "facts": [
+     "No `std::fs`, `std::process`, `env::var`, `include_str!`, `OUT_DIR` or `option_env!` use under its 11 read leaves. Derive output is token-only; the `#[schemars(schema_with=...)]` paths are evaluated in the consuming crate, not read by the macro.",
+     "Dependencies per the pinned lock are `proc-macro2`, `quote`, `serde_derive_internals 0.29.1`, `syn 2.0.119`."
+    ]
+   },
+   {
+    "package": "unresolved helper chain",
+    "facts": [
+     "`proc-macro2 1.0.107`, `quote 1.0.47`, `syn 2.0.119`, `syn 3.0.6`, `serde_derive_internals 0.29.1`, `serde_core 1.0.229` and `thiserror-impl 2.0.21` are not among the six permit-ted roots.",
+     "The owning contract states proc-macro2 performs rustc compile probes under OUT_DIR and serde/serde_core write versioned private modules and query rustc; that behaviour was NOT re-observed here."
+    ]
+   }
+  ]
+ },
+ "graph_classification": {
+  "locked_registry_tuples": 58,
+  "locked_local_tuples": 4,
+  "manifest_reachable_candidates": {
+   "nucleus-core": [
+    "nucleus-observer (path)",
+    "rusqlite 0.40.2 [bundled]",
+    "schemars 0.8.22",
+    "serde 1.0.229 [derive,rc]",
+    "serde_json 1.0.151",
+    "serde_yaml_ng 0.10.0",
+    "sha2 0.10.9"
+   ],
+   "nucleus-core_dev": [
+    "quote 1.0.47",
+    "syn 2.0.119 [full]"
+   ],
+   "nucleus-observer": [
+    "serde 1.0.229 [derive]",
+    "schemars 0.8.22"
+   ]
+  },
+  "lock_edges_of_interest": {
+   "libsqlite3-sys 0.38.2": [
+    "cc",
+    "pkg-config",
+    "vcpkg"
+   ],
+   "rusqlite 0.40.2": [
+    "libsqlite3-sys",
+    "sqlite-wasm-rs",
+    "bitflags",
+    "fallible-iterator",
+    "fallible-streaming-iterator",
+    "hashlink",
+    "smallvec"
+   ],
+   "serde_derive 1.0.229": [
+    "proc-macro2",
+    "quote",
+    "syn 3.0.6"
+   ],
+   "schemars_derive 0.8.22": [
+    "proc-macro2",
+    "quote",
+    "serde_derive_internals",
+    "syn 2.0.119"
+   ],
+   "cc 1.4.7": [
+    "find-msvc-tools",
+    "shlex"
+   ]
+  },
+  "actual_enabled_semantic_unit_graph": "NOT ESTABLISHED. Cargo.lock edges, guessed cfg/features and manifest declarations do not establish the enabled unit graph. `pkg-config`/`vcpkg` edges strongly suggest the libsqlite3-sys default feature is enabled, but the bundled branch does not execute them. `sqlite-wasm-rs`, `js-sys` and `wasm-bindgen*` are lock candidates only and are not treated as enabled host units.",
+  "conservative_refusals": [
+   "rusqlite's own manifest is outside the permitted roots, so whether it disables libsqlite3-sys default features is unresolved.",
+   "No target/cfg resolution, feature unification or build-script output was observed."
+  ],
+  "locked_registry_inventory": [
+   {
+    "name": "bitflags",
+    "version": "2.13.2",
+    "checksum": "sha256:3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "block-buffer",
+    "version": "0.10.4",
+    "checksum": "sha256:3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "bumpalo",
+    "version": "3.20.3",
+    "checksum": "sha256:72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "cc",
+    "version": "1.4.7",
+    "checksum": "sha256:54413ede23c2daf518f35156dfde027feb2374004d63bd497f983c8db9c0e313",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "cfg-if",
+    "version": "1.0.5",
+    "checksum": "sha256:4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "cpufeatures",
+    "version": "0.2.17",
+    "checksum": "sha256:59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "crypto-common",
+    "version": "0.1.7",
+    "checksum": "sha256:78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "digest",
+    "version": "0.10.7",
+    "checksum": "sha256:9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "dyn-clone",
+    "version": "1.0.20",
+    "checksum": "sha256:d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "equivalent",
+    "version": "1.0.2",
+    "checksum": "sha256:877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "fallible-iterator",
+    "version": "0.3.0",
+    "checksum": "sha256:2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "fallible-streaming-iterator",
+    "version": "0.1.9",
+    "checksum": "sha256:7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "find-msvc-tools",
+    "version": "0.1.13",
+    "checksum": "sha256:ef25905e51abafe4dcea6c15fec58c57b601cdbd0ee53d22ea1d3016c587d39b",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "foldhash",
+    "version": "0.2.0",
+    "checksum": "sha256:77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "generic-array",
+    "version": "0.14.7",
+    "checksum": "sha256:85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "hashbrown",
+    "version": "0.16.1",
+    "checksum": "sha256:841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "hashbrown",
+    "version": "0.17.1",
+    "checksum": "sha256:ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "hashlink",
+    "version": "0.12.1",
+    "checksum": "sha256:32069d97bb81e38fa67eab65e3393bf804bb85969f2bc06bf13f64aef5aba248",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "indexmap",
+    "version": "2.14.2",
+    "checksum": "sha256:cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "itoa",
+    "version": "1.0.18",
+    "checksum": "sha256:8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "js-sys",
+    "version": "0.3.105",
+    "checksum": "sha256:ce57d20d1ea864ce2ac172ab472d409214f4fd359f0b2a2775abdf522e2af99e",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "libc",
+    "version": "0.2.189",
+    "checksum": "sha256:3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "libsqlite3-sys",
+    "version": "0.38.2",
+    "checksum": "sha256:f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "memchr",
+    "version": "2.8.3",
+    "checksum": "sha256:cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "once_cell",
+    "version": "1.21.4",
+    "checksum": "sha256:9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "pkg-config",
+    "version": "0.3.34",
+    "checksum": "sha256:f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "proc-macro2",
+    "version": "1.0.107",
+    "checksum": "sha256:985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "quote",
+    "version": "1.0.47",
+    "checksum": "sha256:1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "rsqlite-vfs",
+    "version": "0.1.1",
+    "checksum": "sha256:c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "rusqlite",
+    "version": "0.40.2",
+    "checksum": "sha256:23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "rustversion",
+    "version": "1.0.23",
+    "checksum": "sha256:cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "ryu",
+    "version": "1.0.23",
+    "checksum": "sha256:9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "schemars",
+    "version": "0.8.22",
+    "checksum": "sha256:3fbf2ae1b8bc8e02df939598064d22402220cd5bbcca1c76f7d6a310974d5615",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "schemars_derive",
+    "version": "0.8.22",
+    "checksum": "sha256:32e265784ad618884abaea0600a9adf15393368d840e0222d101a072f3f7534d",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "serde",
+    "version": "1.0.229",
+    "checksum": "sha256:4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "serde_core",
+    "version": "1.0.229",
+    "checksum": "sha256:67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "serde_derive",
+    "version": "1.0.229",
+    "checksum": "sha256:e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "serde_derive_internals",
+    "version": "0.29.1",
+    "checksum": "sha256:18d26a20a969b9e3fdf2fc2d9f21eda6c40e2de84c9408bb5d3b05d499aae711",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "serde_json",
+    "version": "1.0.151",
+    "checksum": "sha256:c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "serde_yaml_ng",
+    "version": "0.10.0",
+    "checksum": "sha256:7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "sha2",
+    "version": "0.10.9",
+    "checksum": "sha256:a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "shlex",
+    "version": "2.0.1",
+    "checksum": "sha256:f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "smallvec",
+    "version": "1.16.1",
+    "checksum": "sha256:ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "sqlite-wasm-rs",
+    "version": "0.5.5",
+    "checksum": "sha256:dc3efc0da82635d7e1ced0053bbbfa8c7ab9645d0bf36ceb4f7127bb85315d75",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "syn",
+    "version": "2.0.119",
+    "checksum": "sha256:872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "syn",
+    "version": "3.0.6",
+    "checksum": "sha256:8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "thiserror",
+    "version": "2.0.21",
+    "checksum": "sha256:09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "thiserror-impl",
+    "version": "2.0.21",
+    "checksum": "sha256:fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "typenum",
+    "version": "1.20.1",
+    "checksum": "sha256:b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "unicode-ident",
+    "version": "1.0.26",
+    "checksum": "sha256:d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "unsafe-libyaml",
+    "version": "0.2.11",
+    "checksum": "sha256:673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "vcpkg",
+    "version": "0.2.15",
+    "checksum": "sha256:accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "version_check",
+    "version": "0.9.5",
+    "checksum": "sha256:0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "wasm-bindgen",
+    "version": "0.2.128",
+    "checksum": "sha256:aecb87a33d3b0c5e3b7aa46336eaf486cffafbd281b195e4c8b80d50df2351bf",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "wasm-bindgen-macro",
+    "version": "0.2.128",
+    "checksum": "sha256:a690d511e3c1a8b3a55e33511e3c2c00c78415cd23650f32b808627f5696b9ed",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "wasm-bindgen-macro-support",
+    "version": "0.2.128",
+    "checksum": "sha256:411e4887f0071ef2d2164a9d5fdf2d20efbef78fccd3a78b0c10a1dc5295e48a",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "wasm-bindgen-shared",
+    "version": "0.2.128",
+    "checksum": "sha256:81941cd78d0c92026c33e5e01312845a4cb1e9af3407f9134b100dd03144103e",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   },
+   {
+    "name": "zmij",
+    "version": "1.0.23",
+    "checksum": "sha256:29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b",
+    "source": "registry+https://github.com/rust-lang/crates.io-index"
+   }
+  ],
+  "locked_local_inventory": [
+   {
+    "name": "nucleus-core",
+    "version": "0.1.0"
+   },
+   {
+    "name": "nucleus-observer",
+    "version": "0.1.0"
+   },
+   {
+    "name": "nucleus-protocol",
+    "version": "0.1.0"
+   },
+   {
+    "name": "nucleusd",
+    "version": "0.1.0"
+   }
+  ]
+ },
+ "decision_table": [
+  {
+   "class": "Registry content correspondence (six permitted roots)",
+   "status": "supported",
+   "basis": "Pinned lock checksums and committed verifier counts for all six roots; 65 read leaves bind by path to retained Task038 per-file SHA-256 records (cc, pkg-config, vcpkg, serde_derive, schemars_derive) and all 10 read libsqlite3-sys leaves bind to Task039 per-file SHA-256 records."
+  },
+  {
+   "class": "Generated input association ($OUT_DIR/bindgen.rs)",
+   "status": "supported",
+   "basis": "Producer is a byte copy of an immutable package member and the consumer is an explicit `include!`; the registered boundary represents exactly this association."
+  },
+  {
+   "class": "Rust unit freshness via dep-info",
+   "status": "supported (mechanism)",
+   "basis": "Pinned Cargo `EncodedDepInfo` v1 decoder and unit/anchor mapping already implemented in the registered boundary; not re-exercised for real Nucleus units."
+  },
+  {
+   "class": "libsqlite3-sys per-file correspondence (Task039)",
+   "status": "supported",
+   "basis": "Task039 retains a 26-file/4-directory manifest with per-file SHA-256; the ten leaves read here match those records exactly. Only ten of the 26 were re-read in this audit; the verifier can re-read all 26."
+  },
+  {
+   "class": "Native C/header closure (sqlite3.c, sqlite3.h, sqlite3ext.h)",
+   "status": "refused",
+   "basis": "The registered boundary does not infer C/header closure; no accepted native receipt exists. sqlite3.c is 9,507,037 bytes and was deliberately not interpreted."
+  },
+  {
+   "class": "cc tool execution, SDK/toolchain integrity",
+   "status": "refused",
+   "basis": "cc executes clang/ar/ld and consults SDKROOT/xcrun; tool/SDK content reads are outside this task and no accepted receipt exists."
+  },
+  {
+   "class": "Effective Cargo configuration and cc environment",
+   "status": "refused",
+   "basis": "Requires owner-scoped resolution of the Cargo config hierarchy and target-prefixed CC/CFLAGS/AR/SDKROOT presence/absence; `LIBSQLITE3_SYS_USE_PKG_CONFIG` must be absent or `0`."
+  },
+  {
+   "class": "Enabled semantic unit graph",
+   "status": "refused",
+   "basis": "Requires Cargo or an accepted equivalent graph observation; unavailable here."
+  },
+  {
+   "class": "Accepted real graph/audit issuer",
+   "status": "refused",
+   "basis": "oxide#035 authenticates only the synthetic qualification issuer."
+  },
+  {
+   "class": "proc-macro helper chain (proc-macro2/quote/syn/serde_core/serde_derive_internals)",
+   "status": "unresolved",
+   "basis": "Not among the permitted roots; behaviour (rustc probes / private modules) not re-observed."
+  },
+  {
+   "class": "Runtime process/temp inputs of the selected tests",
+   "status": "observed",
+   "basis": "`mktemp`, `std::env::temp_dir()`, SQLite WAL files, file cleanup; no network read."
+  },
+  {
+   "class": "Registry installation provenance",
+   "status": "unresolved",
+   "basis": "Cargo/rustc/xcrun identities appear in the pinned lock and prior config notes but were not verified here; no installation provenance receipt exists."
+  },
+  {
+   "class": "Continuous no-replacement agreement",
+   "status": "refused",
+   "basis": "No owner-supplied no-replacement agreement exists for registry or SDK roots across the lease; correspondence is a point-in-time observation only."
+  },
+  {
+   "class": "Native consuming associations",
+   "status": "refused",
+   "basis": "sqlite3.c and the SQLite headers are `cc` compile inputs in build_bundled but are not bound to an accepted native receipt or explicit generating association."
+  },
+  {
+   "class": "Genuine run/debug evidence",
+   "status": "refused",
+   "basis": "No Nucleus run, test execution, full-debug capture or old-run source lookup exists for this workflow; the audit is pre-execution only."
+  },
+  {
+   "class": "LIBSQLITE3_SYS_USE_PKG_CONFIG effective presence/value",
+   "status": "unresolved",
+   "basis": "build.rs:79-83 routes to `build_linked` (which calls pkg-config and vcpkg) when this variable is present and not `0`, even with `bundled` on. The owning contract requires it absent or `0`. Effective presence was not resolved here."
+  }
+ ],
+ "finite_acquisition_package": {
+  "name": "One accepted native/tool input-closure package: a Cargo-free receipt plus a separately scoped Cargo-side graph observation",
+  "rationale": "The behavior audit shows the registry/generated side is mechanically coverable, while native/tool/SDK, effective configuration, enabled graph and the accepted issuer are the blocking seams. The package has two visibly separate parts: (a) a Cargo-free accepted native/tool/SDK/config receipt, and (b) a Cargo-side enabled-unit-graph observation. Only (a) is read-only and Cargo-free; (b) necessarily requires Cargo or an accepted equivalent owner observation.",
+  "concrete_inputs": [
+   "Reuse the retained Task039 libsqlite3-sys per-file manifest (26 files/4 directories) and the Task038 per-file records; no new registry-correspondence acquisition is needed.",
+   "Native input enumeration for the bundled build: sqlite3/sqlite3.c (9,507,037), sqlite3/sqlite3.h (690,725), sqlite3/sqlite3ext.h (39,175), and the generated $OUT_DIR/bindgen.rs association; `sqlite3/wasm32-wasi-vfs.c` only if the wasm feature is enabled.",
+   "Installed toolchain/SDK receipt: cargo 1.97.1/c980f4866, rustc 1.97.1/8bab26f4f, sysroot, clang/cc/ar/ld absolute identity+digest, SDK 27.0 header/framework roots, and a no-replacement agreement for the lease.",
+   "Effective Cargo configuration/env inventory: config hierarchy resolution and explicit presence/absence for CC/CFLAGS/AR/ARFLAGS target variants, SDKROOT, DEVELOPER_DIR, MACOSX_DEPLOYMENT_TARGET, LIBSQLITE3_*, SQLITE_MAX_*, LIBSQLITE3_SYS_USE_PKG_CONFIG.",
+   "Enabled semantic unit graph observation for the exact selector (Cargo-side) or an accepted equivalent, plus a real `TrustedCargoGraphContext`.",
+   "Owner ruling permitting a qualification-only real verifier/issuer to replace the synthetic-only oxide#035 policy."
+  ],
+  "owner_installed_requirements": [
+   "Registry installation owner: bounded per-file content + canonical root + no-replacement.",
+   "Toolchain installation owner and Xcode/native-tool owner: identity/content receipts.",
+   "Nucleus graph/audited-input owner and task-admission owner: accepted graph/audit issuer and policy.",
+   "Queue host authority: submission/settlement binding unchanged; no Contract010 change."
+  ],
+  "acquirable_without_cargo": [
+   "Reuse the retained Task039 libsqlite3-sys per-file manifest and the Task038 per-file records (no new registry-correspondence acquisition)",
+   "Native input enumeration and digests",
+   "Owner-declared tool/SDK and config/env inventories"
+  ],
+  "requires_cargo_or_tool_sdk_scope": [
+   "enabled semantic unit graph",
+   "tool/SDK content integrity",
+   "effective configuration resolution",
+   "the representative cold/warm/changed-source trial"
+  ],
+  "read_and_footprint_costs": {
+   "six_root_extracted_bytes": {
+    "libsqlite3-sys-0.38.2": 21624206,
+    "cc-1.4.7": 420575,
+    "pkg-config-0.3.34": 77058,
+    "vcpkg-0.2.15": 2480887,
+    "serde_derive-1.0.229": 333938,
+    "schemars_derive-0.8.22": 89207
+   },
+   "read_here_bytes": 1789111,
+   "task_report_ceiling_bytes": 8388608,
+   "task_scratch_ceiling_bytes": 67108864,
+   "prior_archive_bytes": {
+    "task038_archive_bytes": 207717057,
+    "task038_aggregate_bytes": 209124423,
+    "task039_archive_bytes": 104097860,
+    "task039_aggregate_bytes": 104730050,
+    "note": "Separate Task038 and Task039 ledgers; Task039 did not replay the 58 packages."
+   },
+   "six_root_extracted_bytes_note": "These are on-disk totals including the six package-root .cargo-ok sidecars that the verifier inventory excludes; the declared verifier members are 1,022 entries."
+  },
+  "time_cost": "Bounded read-only preparation; no Cargo invocation. Author work for this audit is within one 90-minute allocation; independent review within one 30-minute allocation.",
+  "fit_with_remaining_trial": "The read-only acquisition does not consume the four Cargo invocations. A fit or infeasibility assertion for the representative <=4-Cargo/45-minute trial is NOT made, because the actual enabled graph size is unavailable; the brief prohibits an assertion without actual size.",
+  "owner_rulings_needed": {
+   "real_verifier_issuer": "An operator/owner ruling is needed to replace the synthetic-only oxide#035 policy with an actual qualification-only real verifier/issuer. Not yet recorded.",
+   "bounded_tool_sdk_acquisition": "An operator ruling is needed to authorize bounded tool/SDK read and content-integrity acquisition; this brief sets ZERO tool/SDK reads, so no such ruling is recorded.",
+   "graph_observation": "An operator/owner ruling is needed to authorize a Cargo-side (or accepted equivalent) enabled-unit-graph observation for the exact selector; not yet recorded."
+  }
+ },
+ "disposition": {
+  "eligibility": "BLOCKED",
+  "reason": "Actual enabled semantic unit graph, tool/SDK and native/header closure, effective configuration, registry installation provenance/no-replacement, and an accepted real issuer are all unavailable. Registry per-file correspondence is retained (Task038/Task039) and is not a blocker.",
+  "next_action": "Execute the one finite read-only acquisition package under owner-scoped briefs, then return a fresh scoped trial request. Ordinary fresh private validation is retained.",
+  "stop": "STOP at this boundary; do not add a generic wrapper or authenticate an unaudited real graph."
+ },
+ "honest_scope": {
+  "observed": [
+   "Pinned source identity and lock",
+   "Registry root correspondence and per-file digests (65 Task038 + 10 Task039)",
+   "Compile-time/generated input references",
+   "Build-script and cc environment/process behaviour",
+   "Token-only serde_derive/schemars_derive within their crates",
+   "Test runtime temp/process inputs"
+  ],
+  "independently_checked": "Nucleus/Queue retain their own review; this record has not yet had independent exact-head review.",
+  "unsupported": [
+   "Native C/header closure",
+   "Tool/SDK integrity",
+   "Enabled unit graph",
+   "Accepted real issuer",
+   "Effective Cargo configuration",
+   "Continuous no-replacement agreement",
+   "Genuine run/debug evidence",
+   "Registry installation provenance"
+  ],
+  "not_claimed": [
+   "Real issuer acceptance",
+   "Complete graph",
+   "Nucleus eligibility/reuse/storage-relief",
+   "Consumer/planning-owner consent",
+   "Successful live cold recovery",
+   "Everyday storage relief or SSD-write reduction"
+  ]
+ }
+}
