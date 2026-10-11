@@ -68,11 +68,12 @@ state is `reusable`; choose a clean, already-budgeted empty generation for
 cold work; return pending/refusal for `pending`, `Uncertain`, unknown, or
 incompatible state; and never return `cold-only` as warm. Capacity exhaustion
 returns refusal without calling the generic LRU eviction path. The route's
-proposed path identity is `StrictPhysicalCargoRoot`: canonical physical source
-root path plus authenticated consumer root ID and allocation epoch, with a
-bounded partition key of `ordinary-test` or `full-debug`. This route alone may
-admit those two partitions and its one pre-budgeted empty successor; it does
-not broaden `same_root_fixture_v1` or generic storage behavior.
+proposed path identity is `StrictPhysicalCargoRoot`: canonical physical
+source-root path plus authenticated consumer root ID and allocation epoch,
+with a bounded partition key of `ordinary-test` or `full-debug`. This route
+may use only the owner's R×P=2 allowance: one generation per partition, with
+no spare successor and no implicit growth. It does not broaden
+`same_root_fixture_v1` or generic storage behavior.
 
 The durable barrier belongs in that versioned storage-ledger record, bound to
 `(storage_instance_id, slot_id, generation, lease_id)` and the original
@@ -83,10 +84,13 @@ barrier follow generation selection without exposing a callback window before
 the barrier exists. It is not a Nucleus-only flag or sidecar file. The shipped
 ledger has no such field today: the implementation must add an explicit
 compatible ledger version and refuse unknown versions rather than reinterpret
-old records. Authenticated finalize transitions that same record to
-`reusable` only after successful tests and complete capture, or `cold-only`
-after an authenticated settled failure/invalidation. An uncertain writer
-stays `pending`; lookup cannot clear it.
+old records. The pending marker also preserves the exact pre-acquire reuse
+state (`empty` or `reusable`). Authenticated finalize transitions the record
+to `reusable` only after successful tests and complete capture, or
+`cold-only` after an authenticated settled failure/invalidation. A positive
+authenticated no-spawn settlement restores that exact saved state and releases
+the lease without consuming another generation. An uncertain writer stays
+`pending`; lookup cannot clear it.
 
 The registered `RunnerHost` calls the graph-backed `Runner::run`. Its
 `ExecutionOwner` callbacks are behind registration, input audit, reuse checks,
@@ -149,9 +153,10 @@ proc-macro, native-helper, and generated-output classes under those
 declarations. This is not a general threat-model claim or a new authenticity
 receipt. A missing class or unqualified input makes the whole affected
 compatibility partition cold-only; if Oxide cannot direct Cargo to an empty
-bounded successor without destroying retained or uncertain bytes, warm use is
-refused until an owner-authorized recovery path exists. Do not call cold-only
-storage a reuse benefit.
+generation already within the two-partition/two-generation allowance without
+destroying retained or uncertain bytes, cold execution is refused until an
+owner-authorized recovery path exists. Warm use is refused in either case. Do
+not call cold-only storage a reuse benefit.
 
 Cargo's ordinary freshness is separate from run validity. Every submitted
 attempt invokes the exact Effigy selector that includes the required tests;
@@ -201,8 +206,10 @@ with the proposed state-aware acquire seam above (not generic
    path, leased state and daemon-returned `reused` value. Do not include the
    lease token; keep it in host memory and bind its digest only where the
    existing protocol requires it. If the barrier is absent or does not match
-   the acquired tuple, do not submit. Ask the consumer for authenticated
-   no-spawn evidence; if it cannot prove no writer, hold the lease and root.
+   the acquired tuple, do not submit. A `NotSpawned` settlement is permitted
+   only if the authenticated acquire record still supplies the exact saved
+   pre-acquire state and the consumer proves no writer began; otherwise hold
+   the lease and root for recovery.
 4. Send that immutable digest and command to exactly one
    `ordinary_cargo.submit` callback. The callback must echo the digest, persist
    the complete acquired tuple in the existing `StorageAttempt`, then call the
@@ -215,13 +222,21 @@ with the proposed state-aware acquire seam above (not generic
    full-debug lookup reference when required. Rust binds it to the acquired
    tuple and exact run/source attempt; Rust does not manufacture a successful
    test or capture record.
-6. Only after cooperative no-writer completion and complete capture may the
-   host call `Client::finalize` with the existing authenticated settlement
-   evidence. On a lost finalize reply, call `Client::lookup_finalize` with the
-   same lease, operation ID, and evidence before any identical retry.
-   `Present` observes settlement, `Absent` permits exact replay, and
-   `Uncertain` keeps the lease held. Releasing the storage lease does not
-   recycle the consumer's physical root.
+6. For a started run, only after cooperative no-writer completion and complete
+   capture may the host call the proposed
+   `Client::finalize_ordinary_cargo` with authenticated terminal/capture
+   evidence. A proven no-submit result from `ordinary_cargo.not_submitted` uses
+   the same operation with an authenticated `NotSpawned` settlement: it is
+   accepted only when Effigy proves submission never began, and atomically
+   restores the exact pre-acquire `empty` or `reusable` state saved in the
+   pending marker before releasing the lease. No capture is fabricated and no
+   bytes are cleared. On a lost finalize reply, call
+   `Client::lookup_finalize` with the same lease, operation ID, and exact
+   evidence before any identical retry. `Present` observes the stored
+   transition, `Absent` permits exact replay, and `Uncertain` keeps the lease
+   held. A lost submit reply, cancellation, or ambiguous writer state is not
+   `NotSpawned` and leaves the marker pending until positive no-writer closure.
+   Releasing the storage lease does not recycle the consumer's physical root.
 
 The matching process schema should be one versioned
 `ordinary-cargo-attempt-v1` operation on a private attempt channel, with three
@@ -261,20 +276,21 @@ reply loss, or a file marker is not closure. Do not change the running clock,
 detach a writer, delete the generation, or silently retry with a new attempt.
 
 The durable pending barrier cannot be a permanent boolean that blocks every
-future cold attempt. Its states must distinguish `pending`, `reusable` after
-successful tests and complete capture, and `cold-only` after an authenticated
-settled failure or invalidation. An uncertain writer remains `pending` and
-unavailable. A cold-only generation is never served as warm: a separately
-authorized attempt may use an already-budgeted empty successor generation
-under the same compatibility partition, preserving the old generation. If no
-empty bounded successor exists, `acquire_ordinary_cargo` returns capacity
-pending/refusal until the consumer grants a specific recovery disposition.
-Neither that operation nor generic acquire may delete, rewrite, or evict
-shared, failed, retained, or uncertain generations for this route. A settled
-`cold-only` record releases the logical execution barrier while preserving
-the generation as ineligible, so it does not deadlock future admission when
-an empty successor is available. No implicit LRU eviction or cleanup is part
-of that recovery path.
+future cold attempt. Its states distinguish `pending`, `reusable` after
+successful tests and complete capture, `cold-only` after an authenticated
+settled failure or invalidation, and the saved pre-acquire `empty` or
+`reusable` state restored by authenticated `NotSpawned` finalization. An
+uncertain writer remains `pending` and unavailable. The no-spawn transition
+releases the barrier without spending another generation, so the exact same
+partition can admit its next cold attempt from `empty` or reuse attempt from
+`reusable`. A cold-only generation is never served as warm. A separately
+approved consumer recovery disposition is required before it can be retired
+or reset; neither ordinary acquire nor this task's real proof may delete,
+rewrite, or evict failed, retained, shared, or uncertain generations. Until
+that disposition exists, the state-aware acquire returns capacity
+pending/refusal when the two-generation owner cap provides no eligible
+generation. This is an explicit capacity stop with no active lease barrier,
+not silent pool growth or a claim that failed bytes became reusable.
 
 The existing registered host has a 30-second callback timeout and a
 five-minute session timeout; its 45-minute qualification ceiling is feature
@@ -314,16 +330,21 @@ tool/epoch/env invalidation, failed/partial builds, and capture-before-finalize;
 prove that a reusable idle generation is selected only when its reuse state
 permits it, `cold-only` is never returned as warm, and an idle generation is
 never evicted to admit another partition or generation. Exercise the one and
-two partition boundary, capacity refusal, pending/uncertain holds, and a
-bounded empty successor admitting cold work while preserving the prior
-generation. Unknown input must refuse warm use. This does not run or qualify a
-real Nucleus Cargo workflow, install an authority, or activate a consumer.
+two partition boundary, capacity refusal, pending/uncertain holds, and
+authenticated no-spawn finalize restoring a prior `empty` state followed by
+cold admission in the same partition without allocating another generation.
+Also prove `reusable` restoration, exact finalize lookup/replay, and that a
+settled failure stays cold-only and capacity-refuses when no owner-approved
+recovery exists. Unknown input must refuse warm use. This does not run or
+qualify a real Nucleus Cargo workflow, install an authority, or activate a
+consumer.
 
 After that API receives independent exact-head review, the handover packet to
 Nucleus must name the Oxide commit SHA, reviewed method/request/response
 signatures, callback schema digest, storage-ledger version and reuse-state
-definitions, two-partition and three-generation limits, no-eviction/capacity
-refusal semantics, redaction rules, and synthetic evidence. Nucleus owners
+definitions, the owner's R×P=2 / 8-GiB-per-generation / 16-GiB-total limits,
+no-successor/no-eviction/capacity-refusal semantics, redaction rules, and
+synthetic evidence. Nucleus owners
 must accept that exact packet before a separately scoped Nucleus-owned client
 task is dispatched; consumer work cannot start before this handover.
 
@@ -443,11 +464,17 @@ feature-scoped qualification timeout is not an automatic grant for this route.
 Proposed finite ceilings for that packet, not measured fit or an assumption
 about current Nucleus size:
 
-- one consumer-owned physical source root, at most two compatibility
-  partitions (ordinary test and full-debug), and at most three 8-GiB Oxide
-  generations total: one per partition plus one empty cold successor reserve;
-  24 GiB maximum intermediate storage, with no eviction or recovery deletion;
-- one fresh task-owned disposable APFS image capped at 32 GiB total allocated
+- one consumer-owned physical source root (R=1), at most two compatibility
+  partitions (P=2: ordinary test and full-debug), and at most two generations
+  total (R×P=2), one per partition, at 8 GiB each and 16 GiB maximum
+  intermediate storage. This follows the Nucleus owner recommendation and the
+  lane's one store per compatible partition; there is no third successor or
+  implicit growth. If a settled failure/invalidation leaves a partition
+  cold-only, stop that partition at capacity until a separately approved
+  consumer recovery disposition exists. A proven no-spawn attempt restores
+  its prior state and consumes no additional capacity. No eviction or recovery
+  deletion occurs in this proof;
+- one fresh task-owned disposable APFS image capped at 24 GiB total allocated
   footprint, including source, both private target/temp locations, all
   intermediates, live output/capture, and logs; all such writes stay inside
   that image;
@@ -455,12 +482,14 @@ about current Nucleus size:
   total, with at most 2 GiB per each of the four attempt records. Keep this
   outside the mutable root and image. No data is trimmed to make a later run
   fit;
-- 40 GiB maximum combined image plus retained evidence. Preserve the brief's
-  20-GiB host free-space reserve continuously, as a start/abort threshold, not
-  a guarantee against other host writers;
+- 32 GiB maximum combined footprint: the 24-GiB image cap plus the separate
+  8-GiB retained-evidence cap above. The 16-GiB Oxide intermediate limit is
+  inside the image and does not increase the owner's two-generation pool.
+  Preserve the brief's 20-GiB host free-space reserve continuously, as a
+  start/abort threshold, not a guarantee against other host writers;
 - no fallback root or alternate cache (0 bytes), and recovery/deletion of an
-  existing generation disabled. The one empty successor is only a clean new
-  slot and never authorizes overwriting an old one;
+  existing generation disabled for this proof. No unallocated successor is
+  assumed or used;
 - at most four Cargo invocations and 45 minutes total from preparation through
   source/debug lookup. Every invocation uses the exact selected test workflow
   and JSON output mode; there are no standalone Cargo metadata/version/probe
