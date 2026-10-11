@@ -628,7 +628,7 @@ not a shipped RPC, accepted issuer, live binding or evidence. Pins: Oxide main
 | --- | --- | --- |
 | 1. Root and source | `ManagedGit` owned worktree and head pin; `RootAllocation` durable allocation via injected `RootVerifier` | Nucleus |
 | 2. Authorize, acquire intent | `StorageAuthority.authorize`, `StorageTransport.acquire` (TS semantic seam); ledger in `storage-attempt.ts` | Nucleus, seam pending |
-| 3. Acquire | Rust `storage::Client::acquire(AcquireRequest)` returns `AcquireResult { lease_id, slot_id, state, slot_path, token, reused }` or a `StorageError` (classified below) | Oxide daemon, Rust-only |
+| 3. Acquire | Rust `storage::Client::acquire(AcquireRequest)` returns `AcquireResult { lease_id, slot_id, storage_instance_id, generation, state, slot_path, token, reused }` or a `StorageError` (classified below) | Oxide daemon, Rust-only |
 | 4. Host submission | `validation-client.ts` `runValidation` (reviewed, unchanged), then scheduler under 010 | Queue host authority |
 | 5. Registered admission and execution | `Runner::run(&Registration, &Attempt)`: `inputs` (authenticate, audit, source inventory), reuse check, pending barrier, `ExecutionOwner::execute` | Oxide library; no installed owners |
 | 6. Capture and finalize | `verify_success`, `seal_map`, `finalize_idle` or `finalize_not_spawned`; daemon `Client::finalize(lease_id, token, operation_id, SettlementEvidence)` | Oxide plus Nucleus capture owner |
@@ -661,8 +661,9 @@ Facts that drive the shape:
   only be built by the Rust side that holds the token from acquire.
 - `Runner` has no daemon RPC. `Attempt` is caller data with no authority, and its
   `reused` flag must come from the daemon, not from Nucleus.
-- `AcquireResult` has no `generation` and no allocation epoch. `RunEnvelope` has
-  no epoch field. Both must enter another way (see gaps).
+- `AcquireResult.generation` and `storage_instance_id` identify the durable slot
+  incarnation. It still has no allocation epoch. `RunEnvelope` has no epoch field;
+  the admission verifier must bind that consumer-owned identity.
 - `EvidenceAuthority::verify_admission` and `verify_settlement` return `bool`. An
   implementation that does not authenticate through the accepted consumer verifier
   must refuse. A boolean is not authority.
@@ -716,7 +717,8 @@ inactive until an embedder spawns it.
 | `allocationEpoch` | `Attempt.allocation_epoch` | canonical decimal string; no daemon field, so the admission verifier must check it |
 | `partitionId` | `Attempt.partition` | digest of canonical `PartitionKey` (11 fields); no task, head, run or epoch inside |
 | lease ID | `AcquireResult.lease_id`, `Attempt.lease_id` | daemon string; Nucleus `Lease.id` must equal it |
-| `Lease.generation` | `Attempt.generation` | **no daemon source**; refuse acquired until the daemon returns it |
+| `Lease.generation` | `AcquireResult.generation` → `Attempt.generation` | canonical positive u64 text; convert to the TypeScript safe number only after a checked range test |
+| storage instance | `AcquireResult.storage_instance_id` | bind with `slot_id` and generation so ledger recreation cannot validate old maps or receipts |
 | acquire `token` | `AcquireResult.token` (`LeaseToken`) | host memory only; Nucleus stores a digest |
 | authorization | `Attempt.authorization`, `RunEnvelope.admission_reference` | Nucleus authorization receipt operation and payload digests |
 | admission credential | `RunEnvelope.admission_credential` | no accepted issuer exists (see owner table) |
@@ -777,16 +779,18 @@ from UTF-8 byte order, so neither may feed Oxide.
 ### Replay, lost reply and no-spawn
 
 - Acquire replays the same `acquire_id` with an identical body (Nucleus `bodyDigest`).
-  A changed body refuses. A lost acquire reply goes through `reconcileAcquire` first.
-- Finalize uses the existing `operation_id`. A lost finalize reply goes through
-  `reconcileFinalize` first, then the identical finalize ID, and only after verified
-  absence.
-- The proposed bridge requires authenticated lookup-only acquire and finalize
-  recovery. Current `Client::acquire` may allocate when an attempt is absent, so
-  it cannot implement that lookup. Current `Client::reconcile` accepts settlement
-  evidence and may change lease state; it is not a read-only operation lookup.
-  A cancelled submission must not restart acquisition during recovery. Lost
-  tokens or uncertain ownership hold; a finalized replay grants no access.
+  A changed body refuses. After a lost acquire reply or cancellation, the caller
+  uses `Client::lookup_acquire` with the exact authenticated request before any
+  retry decision. `Present` or `Uncertain` never starts another acquire; `Absent`
+  is only a lookup result and does not reserve a slot.
+- Finalize uses the existing `operation_id`. After a lost finalize reply, the
+  caller uses `Client::lookup_finalize` with the original evidence and ID.
+  `Present` reflects the accepted operation without repeating settlement;
+  `Uncertain` keeps the lease held; `Absent` does not itself finalize.
+- These Oxide lookup APIs are implemented, while the proposed bridge and Nucleus
+  call flow remain absent. `Client::acquire` still allocates when an attempt is
+  absent, and `Client::reconcile` may change lease state; neither substitutes for
+  lookup. Lost tokens or uncertain ownership hold; a finalized replay grants no access.
 - Time, PID, filenames (`PENDING`, `CANDIDATE`), labels, SHA hashes and fixture booleans
   carry no authority. The durable pending barrier is ineligibility, not permission.
 - `NotSpawned` finalizes only with authentic no-writer evidence. Timeout, PID absence and
@@ -814,8 +818,8 @@ from UTF-8 byte order, so neither may feed Oxide.
 | `RegistrationOwner.authenticate` and `audit` | Nucleus managed-Git and root owner; audited-input owner | missing |
 | `InputEvidenceOwner.immutable`, `units`, `seal_map`, `verify_map` | installation registry and SDK owner; Cargo graph audit | decoder only; no issuer |
 | `ExecutionOwner.execute`, `verify_success`, `finalize_*` | Queue host authority (submission); Nucleus capture owner | TS fixture only |
-| Daemon `generation` in `AcquireResult`; epoch in admission | Oxide storage owner | missing field, a daemon wire change |
-| Authenticated lookup-only acquire/finalize recovery | Oxide storage owner; Nucleus attempt owner | missing; acquire replay and settlement reconciliation are not lookup APIs |
+| Daemon `generation` and storage-instance identity in `AcquireResult`; epoch in admission | Oxide storage owner | API and versioned wire change implemented by oxide#027; Nucleus consumer binding remains absent |
+| Authenticated lookup-only acquire/finalize recovery | Oxide storage owner; Nucleus attempt owner | Oxide APIs implemented by oxide#027; Nucleus caller and attempt binding remain absent |
 | Oxide `EvidenceAuthority` implementation | Nucleus embedding, in process | missing |
 
 Smallest proposed issuer API, needing owner decision: Nucleus task admission signs a
@@ -828,16 +832,59 @@ Installed real authorities (issuers, registry/SDK receipts, complete Cargo graph
 native closure, cooperative completion, full-debug retention) remain separate gates. No
 bridge or synthetic test supplies them.
 
-Nucleus's owner recommends using the durable ordinal behind `slot-<hex>` as
-intermediate generation identity: stable across leases and source revisions,
-changing only when replacement creates a new slot. Bind it to the authenticated
-storage instance and slot so ledger recreation cannot validate old receipts or
-seals. Expose positive `u64` as canonical decimal text; populate
-`Attempt.generation` exactly, and convert to the existing TypeScript numeric
-generation only after checking `1 <= value <= Number.MAX_SAFE_INTEGER`.
-Unsupported versions and missing or mismatched generation refuse. This is an
-owner mapping recommendation, not an implemented field or permission to change
-the daemon protocol.
+## Durable generation and lookup recovery (oxide#027)
+
+The approved Oxide API now adds `AcquireResult.storage_instance_id: String`
+and `AcquireResult.generation: String`. The generation is the durable ordinal
+already encoded by `slot-<16 lowercase hex digits>`, rendered as canonical
+positive u64 decimal text (`1` through `18446744073709551615`, with no sign,
+whitespace, or leading zero). The ledger persists a random 256-bit
+`storage_instance_id`; the returned identity is the tuple
+`(storage_instance_id, slot_id, generation)`. Generation stays stable over
+sequential leases and source revisions on one physical slot. A replacement
+slot gets the next durable ordinal. Ledger recreation creates a new instance
+identity, fencing previous maps and receipts even if the new ordinal repeats.
+The slot counter is not reset by eviction.
+
+Nucleus's reviewed mapping recommendation is still an owner requirement, not
+consumer code: place this decimal text in `Attempt.generation` unchanged, and
+convert to the existing TypeScript numeric generation only after checking
+`1 <= value <= Number.MAX_SAFE_INTEGER`. Oxide rejects malformed, noncanonical
+and overflowing u64 values. Nucleus's checked conversion and identity binding
+have not been implemented in this task; production registration remains
+disabled.
+
+`Client::lookup_acquire` takes the original authenticated `AcquireRequest` and
+returns `LookupResult<LeaseIdentity>`. `Client::lookup_finalize` takes the
+lease ID, original finalize ID and authenticated settlement evidence and
+returns `LookupResult<FinalizationReceipt>`. Exact request digests include
+credentials but only their digests are retained. Changed bodies refuse;
+invalid credentials fail authentication; a changed binding for a known lease
+conflicts. Results distinguish `Absent`, `Present`, and `Uncertain`. An
+uncertain finalize with no durable operation returns `Uncertain(None)`; an
+accepted uncertain operation includes its receipt. These read-only methods do
+not allocate, evict, settle, mint a token, or return a slot path. Normal
+`Client::acquire` still allocates on a miss and cannot replace lookup recovery.
+Lost tokens remain held, and a finalized replay grants no access.
+
+The local ledger format is version 3; version-2 data is refused without
+migration or reinterpretation. The framed local protocol is `OXSTOR01` plus
+version 1 on every request and response. Unversioned or unsupported peers are
+refused before dispatch, so they cannot receive a misleading acquire result
+or cause an allocation they cannot decode. No old retained root or uncertain
+resource is opened through a compatibility shim.
+
+| Source pin | Evidence used |
+| --- | --- |
+| Oxide base `c50af3874fdb90edaceecaaeb53fc256ff73afa7` | Approved implementation base; `AcquireResult` had no generation |
+| Oxide implementation `bf27ff748dc641c18126d2e698e37800d147856a` | Durable slot identity, authenticated lookup APIs, versioned protocol, and targeted regressions |
+| [Nucleus review `9a562d1492ddb1474ebb2ea503889ecc6b0845b1`](https://github.com/inflatable-cookie/nucleus/commit/9a562d1492ddb1474ebb2ea503889ecc6b0845b1) | Nucleus `Lease.generation` uses a positive safe JS number; registered `Attempt.generation` is text; owner-selected mapping |
+
+Oxide implementation sources are `src/storage/types.rs`,
+`src/storage/store.rs`, and `src/storage/transport.rs`; targeted regressions
+are in `src/storage/tests.rs` and the transport codec tests. No Nucleus source,
+SDK, issuer, service endpoint, or consumer configuration is changed by this
+PR.
 
 ### Gates still open
 
