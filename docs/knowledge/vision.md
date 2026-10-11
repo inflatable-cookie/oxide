@@ -111,3 +111,30 @@ uses the existing reviewed Effigy path; no second scheduler or manager is
 authorized. Real consumer eligibility, Contract 002 departure, budgets and
 source/debug evidence remain separate gates. Acow's cheaper-storage work
 continues independently.
+
+Tom approved the next representative-workflow step on 2026-10-11 with
+"Go for it" (Queue decision `81c05164-5914-4c10-b85a-e80084bb46f0` version 2):
+complete the actual private Rust host/Nucleus client path and trusted input,
+execution and capture evidence for the selected core-test workflow, then run
+one bounded cold, warm and changed-source qualification. Oxide may dispatch
+its implementation through checked Queue briefs and relay the consumer scope
+to Nucleus's existing owner, which owns its separate briefs and task controls.
+This permits a private, unpublished host entry point and owner-installed
+qualification authentication; it does not deploy a general production issuer
+or install a service. Implementation scopes retain 90-minute author and
+30-minute independent exact-head review budgets. Independent seams may proceed
+in parallel; no active consumer worker is prompted or interrupted.
+
+The representative proof requires its own checked execution brief after the
+real input/graph/tool/SDK, source identity, cooperative completion and full-debug
+retention gates pass. Record exact source/tool/selector pins and fresh resources
+before launch. Bound the proposed proof to at most four Cargo invocations and
+45 minutes of live work, with separately bounded read-only review. The existing
+registered read ceilings and conservative uncertainty rules remain in force;
+finite total-footprint enforcement, host reserve and consumer waiting/retention
+policy must be settled before that brief is admitted. No broad benchmark or
+host scan, old-resource reuse, active-checkout conversion, production root-pool
+activation, cleanup, release or Contract 010 change follows from this ruling.
+It grants no general admission/settings change; any consumer dispatch capacity
+must follow its owning recorded authority. Implementation or synthetic success
+cannot satisfy the real proof's gates, and trial success is not production rollout.
