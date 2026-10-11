@@ -20,9 +20,9 @@
     ],
     "budget": {
       "source_files_max": 32,
-      "source_files_used": 14,
+      "source_files_used": 15,
       "source_bytes_max": 4194304,
-      "source_bytes_used": 523608,
+      "source_bytes_used": 568816,
       "per_file_bytes_max": 262144,
       "largest_file_bytes": 101664,
       "http_404": 1
@@ -56,7 +56,8 @@
     {"path": "src/cargo/core/compiler/build_context/mod.rs", "bytes": 5827, "sha256": "c4ed7bc8a901fdb235dfd3ae3ad31b7679020cc02e9030b87b5716533786b21f", "matches_041": true},
     {"path": "src/cargo/core/package.rs", "bytes": 28671, "sha256": "23bd474eab2c5c76af6ffd2767b3245d671c3568b8bba321d9fbee511894d035", "matches_041": false},
     {"path": "src/bin/cargo/commands/test.rs", "bytes": 4457, "sha256": "fe1944aa2e06daadc06fbeb078484b1303e13bb2f31cf2be367a394761e1491d", "matches_041": false},
-    {"path": "src/bin/cargo/commands/build.rs", "bytes": 2708, "sha256": "10435788c80cc418639d2a649acc58efd1d3fb25818fefb9fc78b9d0a9c0bce2", "matches_041": true}
+    {"path": "src/bin/cargo/commands/build.rs", "bytes": 2708, "sha256": "10435788c80cc418639d2a649acc58efd1d3fb25818fefb9fc78b9d0a9c0bce2", "matches_041": true},
+    {"path": "src/cargo/core/compiler/unit_dependencies.rs", "bytes": 45208, "sha256": "59ffc23fef8adc506b38eb0f6a7647983af31983e744dd82b6a07368123da04c", "matches_041": true, "note": "Added in the revision after review: source of public/noprelude/nounused values."}
   ],
   "graph_route": {
     "verdict": "One candidate remains: same pinned Cargo 1.97.1 (c980f4866141969fab6254a680546a277789d6f0) planner behind an explicit, narrowly confined development-channel gate. Not approved. Stable/supported claim is refused. It is defensible only as an unstable bypass with exact-pin refusal and a complete nightly-branch inventory (see caveat).",
@@ -65,7 +66,7 @@
         "id": "A",
         "name": "Same pinned Cargo, development-channel gate",
         "status": "Preferred candidate; material ruling required",
-        "planner_identity": "Same code path by construction: create_bcx runs for both graph and ordinary build; the only divergence is the emit at cargo_compile/mod.rs:188-190 and the nightly_features_allowed branches listed below.",
+        "planner_identity": "Same code path: create_bcx runs for both graph and ordinary build, and the emit at cargo_compile/mod.rs:188-190 returns before compilation. Outside that path the gate changes two things: it accepts unstable manifest and -Z/[unstable] input, and it serializes public/noprelude/nounused, which stable never emits. The consumer preflight refuses the first; the value rule in unit_binding handles the second.",
         "gate": {
           "channel_env": "__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS=nightly (preferred). Read only by Cargo (features.rs:1563-1566). Test-only, undocumented, unvalidated value.",
           "rejected_channel_env": "RUSTC_BOOTSTRAP=1 maps the Cargo channel to dev (features.rs:1570-1573) but is also read by rustc itself, enabling unstable rustc features in every probe and child rustc. Not acceptable as the gate.",
@@ -80,10 +81,10 @@
           "features.rs:681-684 manifest cargo-features with Status::Unstable accepted only when nightly_features_allowed (manifest-level divergence from ordinary stable).",
           "features.rs:439,610,625,764 feature-set plumbing and diagnostics text.",
           "features.rs:1529 fail_if_stable_command (new unstable subcommands).",
-          "unit_graph.rs:115 public/noprelude/nounused populated only when nightly_features_allowed (SerializedUnitDep lines 76-88). Schema differs by channel.",
+          "unit_graph.rs:115 public/noprelude/nounused serialized only when nightly_features_allowed (SerializedUnitDep lines 76-88). The values are computed regardless of channel: normal edges take resolve.is_public_dep with noprelude=false and nounused=false (unit_dependencies.rs:942-944). Only the std-root artificial edge sets all three true (unit_dependencies.rs:207-210), attached only when std_roots is non-empty (the build-std path; std_roots population not traced). Other UnitDep constructors not traced.",
           "features.rs:1563 and 1570 channel() itself; features.rs cargo_docs_link only changes URLs."
         ],
-        "inventory_caveat": "Built from the 14 fetched files only. A complete grep of nightly_features_allowed and channel() across the whole pinned tree is a precondition of any implementation brief; it was not performed here.",
+        "inventory_caveat": "Built from the 15 fetched files only. A complete grep of nightly_features_allowed and channel() across the whole pinned tree is a precondition of any implementation brief; it was not performed here.",
         "rustc_probes": {
           "sites": [
             "target_info.rs:168-221 TargetInfo::new runs rustc --print=file-names/sysroot/split-debuginfo/crate-name/cfg per requested kind (RustcTargetData::new at cargo_compile/mod.rs:285 precedes units).",
@@ -108,7 +109,7 @@
           "source": "unit_graph.rs:53 VERSION=1; SerializedUnitGraph {version, units, roots}; SerializedUnit {pkg_id, target, profile, platform, mode, features, is_std, dependencies}.",
           "not_in_graph": "rustc version/host triple, cfg probe output, lock checksums, config inventory, env, build-script outputs, native/C/header closure, proc-macro helper executables, registry checksums."
         },
-        "behaviour_gap": "Manifest cargo-features and -Z/[unstable] accepted only under the gate. A graph success therefore does not imply ordinary stable success. The consumer must refuse any manifest cargo-features key, any [unstable] table, and any -Z in argv/config before the graph run, and must refuse graph output containing public/noprelude/nounused."
+        "behaviour_gap": "Manifest cargo-features and -Z/[unstable] accepted only under the gate, so a graph success does not imply ordinary stable success. The consumer must refuse any manifest cargo-features key, any [unstable] table, and any -Z in argv/config before the graph run. Serialized public/noprelude/nounused are accepted under the gate by the value rule in unit_binding, not refused."
       },
       {
         "id": "B",
@@ -147,14 +148,14 @@
         "argv digest, selected package/target/profile/feature inputs",
         "graph bytes digest, schema version, and clock/invocation accounting"
       ],
-      "unit_binding": "Decoder accepts only version=1 and refuses unknown fields. Each unit's target src_path must lie under a registered consumer root or refuse. The graph root set must equal the ordinary argv's root selection. Binding is to units for one argv; a changed selector, profile, feature, target or command needs a new graph.",
+      "unit_binding": "Decoder accepts only version=1 and refuses unknown fields. Under the gate, public/noprelude/nounused are known v1 fields. Value rule: noprelude and nounused must be false or absent on every edge (true comes only from the std artificial edge, which needs -Z build-std and is refused by argv); public may be either value and is part of the edge identity. Stable never emits these fields. Each unit's target src_path must lie under a registered consumer root or refuse. The graph root set must equal the ordinary argv's root selection. Binding is to units for one argv; a changed selector, profile, feature, target or command needs a new graph.",
       "authority": "The provenance record is produced by the consumer's admitted host run and settled by the consumer owner. Oxide verifies bytes and binding. No issuer attestation is created by this design."
     },
     "refusal_rules": [
       "Unsupported Cargo version/commit, or override env name absent at the pin: refuse.",
       "Any [env], --config env.*, RUSTC*/build.rustc* wrapper, [unstable] table, -Z outside the gate, or manifest cargo-features: refuse both graph and ordinary runs.",
       "Lock digest changes or lock missing under --frozen: refuse.",
-      "Graph JSON with unknown version, unknown field, public/noprelude/nounused, or absolute path outside registered roots: refuse.",
+      "Graph JSON with unknown version, unknown field, noprelude or nounused true on any edge, or an absolute path outside registered roots: refuse. public/noprelude/nounused present under the gate are not refusals by themselves.",
       "Any probe, wrapper or child not inside the receipted tool set: refuse."
     ]
   },
@@ -280,7 +281,7 @@
       "Oxide in-repo registered.rs Limits, ImmutableClass, stability check and membership refusals."
     ],
     "unsupported": [
-      "Whole-tree nightly_features_allowed inventory (only 14 files read).",
+      "Whole-tree nightly_features_allowed inventory (only 15 files read).",
       "Network enforcement point in the source layer.",
       "Real toolchain/Xcode closure, sizes or entry counts beyond 041's named-path metadata.",
       "Hash or copy throughput; any time claim.",

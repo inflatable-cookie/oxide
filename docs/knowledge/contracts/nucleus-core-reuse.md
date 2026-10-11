@@ -473,8 +473,12 @@ Recommended candidate **A**: the same Cargo 1.97.1 (`c980f48`) planner, run as
 `cargo build|test --unit-graph -Z unstable-options --frozen` with
 `__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS=nightly` in the graph process
 only. It is an unstable bypass, never a stable or supported feature. Its
-planner is the same code path as the ordinary build: `create_bcx` runs in both,
-and the only divergence is the emit at `cargo_compile/mod.rs:188-190`.
+planner runs the same code path as the ordinary build: `create_bcx` runs in
+both, and the emit at `cargo_compile/mod.rs:188-190` returns before compilation.
+Outside that path the gate changes two things. It accepts unstable manifest and
+`-Z`/`[unstable]` input, and it serializes three unit-graph dependency fields
+that stable never emits. The consumer preflight refuses the first. The value
+rule below handles the second.
 
 The source gate, at this pin:
 
@@ -484,8 +488,14 @@ The source gate, at this pin:
 - `context/mod.rs:397` sets `nightly_features_allowed` once. It also gates
   `-Z` parsing (`:1155`, `features.rs:1244-1246`), the `[unstable]` table
   (`context/mod.rs:1226`), unstable manifest `cargo-features` (`features.rs:681-684`),
-  and the unit-graph `public/noprelude/nounused` fields (`unit_graph.rs:115`).
-  So graph success does not imply ordinary stable success.
+  and whether the unit-graph `public/noprelude/nounused` fields are serialized
+  (`unit_graph.rs:115`). Those fields are computed in `unit_dependencies.rs`
+  regardless of channel. Normal edges take `is_public_dep`, with `noprelude` and
+  `nounused` false (`:942-944`). Only the std-root artificial edge sets all three
+  true (`:207-210`), and it is attached only when `std_roots` is non-empty, which
+  is the build-std path. Other `UnitDep` constructors were not traced. So graph
+  success does not imply ordinary stable success, because of the manifest and
+  `-Z` input gates.
 - `--unit-graph` exists on `build` (`commands/build.rs:38`) and `test`
   (`commands/test.rs:60`). It is gated by `fail_if_stable_opt`
   (`command_prelude.rs:823-825`). Removing the override makes the graph run fail
@@ -530,9 +540,15 @@ Binding and refusal, proposed:
   file-set digests, env digest with secrets removed, private CARGO_HOME and
   target/build dirs, argv, the selector/profile/feature inputs, the graph bytes
   digest, and the clock/invocation accounting.
-- The decoder accepts only `version: 1` (`unit_graph.rs:53`) and refuses unknown
-  fields and the nightly-only fields. Each target `src_path` must lie under a
-  registered root. The graph root set must equal the ordinary root selection.
+- The decoder accepts only `version: 1` (`unit_graph.rs:53`). Unknown fields
+  refuse. Under the gate, `public`, `noprelude` and `nounused` are known v1
+  fields. Value rule: `noprelude` and `nounused` must be `false` or absent on
+  every edge, else refuse. A `true` value comes only from the std artificial
+  edge, which needs `-Z build-std` and is refused by the argv rule. `public` may
+  be either value and is part of the edge identity, so a change in it changes
+  the reuse key. Stable never emits these fields, and the ordinary path does not
+  produce a graph. Each target `src_path` must lie under a registered root. The
+  graph root set must equal the ordinary root selection.
 - Consumer rules, both runs: refuse any `[env]`, `--config env.*`, `RUSTC*`/
   `build.rustc*` wrapper, `[unstable]` table, `-Z` outside the gate, or manifest
   `cargo-features`.
