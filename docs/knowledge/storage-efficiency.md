@@ -1,27 +1,45 @@
 # Storage-efficiency findings
 
-Read-only source review, 2026-10-10. This note records current behavior and
-evidence limits. It does not establish measured storage savings or authorize
-changes in the inspected projects.
+Source findings and bounded preparation evidence. This note records current
+behavior and evidence limits. It does not establish measured storage savings
+or authorize changes in the inspected projects.
 
 ## Component preparation
 
-At Acowtancy commit `5db16a550fc8bf572465be28d1dac11117fa7538`,
-`paseo.json` runs `effigy worktree:rust:seed` during every worktree setup,
-without a target filter. The seeder's defaults include
-`apps/farmyard/target`, `apps/bovine-desktop/src-tauri/target`, and
-`platform/silo/target`. Its `--path` argument already allows callers to choose
-specific target directories. It first tries `cp -c -R` and falls back to
+At Acowtancy commit `70b6d7c8c83a48a85abbbd24717ed8064898cf5a`,
+worktree setup no longer seeds host Rust targets. Supported host Rust selectors
+prepare only their declared Farmyard, Desktop or Silo component; composed
+selectors request an explicit union. JS/docs-only setup prepares none.
+`effigy worktree:rust:seed --component <name>` selects a component, repeated
+flags select a union, and unknown components refuse. Explicit `--path`
+selection remains available. An unfiltered direct seed command remains an
+operator opt-in for all three targets. Acow owns the
+[route inventory and preparation policy](https://github.com/acowtancy/acowtancy-v2/blob/70b6d7c8c83a48a85abbbd24717ed8064898cf5a/docs/knowledge/operations/267-qa-speed.md#shared-compile-cache).
+
+The copy mechanism first tries `cp -c -R` and falls back to
 `cp -R`; a Rust compiler mismatch uses a separate toolchain-keyed source
 target, built only when the primary checkout is clean. Cache readiness is
 published after the matching compiler and Cargo build are confirmed.
 
-The setup therefore prepares all three component targets before it knows which
-component a worktree will use. The path-selective mechanism exists, but setup
-does not use it. On APFS a clone can share file data until it diverges; the
-plain-copy fallback can retain a full copy. No allocated-byte comparison or
-per-component setup-latency measurement was made here, so this review cannot
-quantify the storage or time avoided by selecting fewer targets.
+The preceding source assessment at `5db16a550fc8bf572465be28d1dac11117fa7538`
+identified unconditional setup of all three targets. Component selection now
+avoids that unrelated preparation; it does not add a shared mutable compiler
+manager. Existing no-overwrite, primary-target, compiler-matching,
+dirty-primary, locking and readiness protections remain. Container target
+ownership is separate.
+
+Independent review at `91d6e4b2af18e977c8a323351004d67b799ec749`
+passed all five preparation, routing, protection, isolation and scope gates.
+The author and reviewer each ran 18 passing synthetic fixture tests in
+separate fresh roots. The reviewer also ran the focused seed compile/format
+and documentation checks; no real Cargo or rustc was invoked. Component-only
+and union fixtures leave unrelated destinations absent. These fixtures prove
+avoided unrelated preparation, not real component compilation or a complete
+milestone QA result.
+
+On APFS a clone can share file data until it diverges; the plain-copy fallback
+can retain a full copy. Allocated bytes, ordinary-use latency, write volume and
+SSD lifetime savings remain unmeasured. The evidence does not quantify them.
 
 Acowtancy's existing Rust profiles already distinguish ordinary and test
 work: Farmyard `dev` keeps incremental compilation and debug level 1, while
@@ -68,13 +86,15 @@ older or uncertain resources.
 
 ## Evidence limits
 
-The inspected source revisions are Acowtancy `5db16a550fc8bf572465be28d1dac11117fa7538`,
+The initial assessment inspected Acowtancy `5db16a550fc8bf572465be28d1dac11117fa7538`,
 Paseo Northstar Queue `7b9b840354a638a529ab023542903949b5b562ac`, and Nucleus
 `92dfb60cbae3b2eece70f03aa448e7b0cebc61d7`. Oxide's documentation base was
 `91343a280ba275079fc5f329bb3b07d419d9cdb9`.
 
-This assessment did not run builds, tests or Cargo metadata, inspect target
-trees, measure allocated storage or disk writes, or change consumer state.
+That read-only assessment did not run builds, tests or Cargo metadata, inspect
+target trees, measure allocated storage or disk writes, or change consumer
+state. The separately owned component-preparation evidence above uses small
+synthetic targets and applies to Acowtancy's host routes only.
 Apparent target size is not allocated storage. A smaller retained target is
 not proof of fewer SSD writes, and no SSD-life estimate follows from these
 findings.
