@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const LEDGER_MAGIC: &[u8; 8] = b"OXIDEST1";
-const LEDGER_VERSION: u32 = 2;
+const LEDGER_VERSION: u32 = 3;
 const MAX_LEDGER_BYTES: u64 = 64 * 1024 * 1024;
 const SOCKET_NAME: &str = "daemon.sock";
 const SLOTS_NAME: &str = "slots";
@@ -217,6 +217,7 @@ struct Lease {
     id: String,
     token_hash: String,
     slot_id: String,
+    request_digest: String,
     request: AcquireRequest,
     status: LeaseStatus,
     reused: bool,
@@ -234,6 +235,7 @@ struct SettlementOperation {
     operation_id: String,
     kind: SettlementKind,
     evidence: SettlementEvidence,
+    request_digest: String,
     state: SlotState,
     capture_digest: Option<String>,
 }
@@ -241,6 +243,7 @@ struct SettlementOperation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Ledger {
     budget: Budget,
+    storage_instance_id: String,
     next_slot: u64,
     next_sequence: u64,
     slots: Vec<Slot>,
@@ -249,15 +252,16 @@ struct Ledger {
 }
 
 impl Ledger {
-    fn empty(budget: Budget) -> Self {
-        Self {
+    fn empty(budget: Budget) -> Result<Self, StorageError> {
+        Ok(Self {
             budget,
+            storage_instance_id: random_hex(32)?,
             next_slot: 1,
             next_sequence: 1,
             slots: Vec::new(),
             leases: Vec::new(),
             operations: Vec::new(),
-        }
+        })
     }
 }
 
@@ -403,11 +407,22 @@ impl Store {
     }
 
     fn validate_slot_inventory(&self) -> Result<(), StorageError> {
+        if !valid_storage_instance_id(&self.ledger.storage_instance_id)
+            || self.ledger.next_slot == 0
+            || self.ledger.next_sequence == 0
+        {
+            return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+        }
         let mut known = std::collections::BTreeSet::new();
+        let mut largest_generation = 0_u64;
         for slot in &self.ledger.slots {
             if !valid_slot_id(&slot.id) || !known.insert(slot.id.as_str()) {
                 return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
             }
+            largest_generation = largest_generation.max(
+                parse_generation(&slot_generation(&slot.id)?)
+                    .map_err(|_| StorageError::Refused(RefusalReason::UnknownAccounting))?,
+            );
             match slot.state {
                 InternalSlotState::Idle if slot.lease_id.is_none() => {}
                 InternalSlotState::Uncertain => {
@@ -442,10 +457,15 @@ impl Store {
                     .token_hash
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit())
+                || !valid_hash(&lease.request_digest)
                 || !lease_ids.insert(lease.id.as_str())
             {
                 return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
             }
+            largest_generation = largest_generation.max(
+                parse_generation(&slot_generation(&lease.slot_id)?)
+                    .map_err(|_| StorageError::Refused(RefusalReason::UnknownAccounting))?,
+            );
             if lease.status == LeaseStatus::Uncertain {
                 let slot = self
                     .ledger
@@ -463,6 +483,7 @@ impl Store {
         let mut operation_ids = std::collections::BTreeSet::new();
         for operation in &self.ledger.operations {
             if !lease_ids.contains(operation.lease_id.as_str())
+                || !valid_hash(&operation.request_digest)
                 || !operation_ids.insert((
                     operation.lease_id.as_str(),
                     operation.kind,
@@ -471,6 +492,9 @@ impl Store {
             {
                 return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
             }
+        }
+        if self.ledger.next_slot <= largest_generation {
+            return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
         }
         for entry in fs::read_dir(&self.slots_root).map_err(io_error)? {
             let entry = entry.map_err(io_error)?;
@@ -547,13 +571,16 @@ impl Store {
         if !self.authority.verify_admission(&request.envelope) {
             return Err(StorageError::Unauthorized);
         }
+        let request_digest = digest_encoded(&request)?;
         if let Some(existing) = self
             .ledger
             .leases
             .iter()
             .find(|lease| same_attempt(&lease.request, &request))
         {
-            if existing.request != persisted_request(&request) {
+            if existing.request != persisted_request(&request)
+                || existing.request_digest != request_digest
+            {
                 return Err(StorageError::Conflict);
             }
             return self.acquire_result(existing);
@@ -668,6 +695,7 @@ impl Store {
             id: lease_id.clone(),
             token_hash,
             slot_id,
+            request_digest,
             request: persisted_request,
             status: LeaseStatus::Leased,
             reused,
@@ -680,6 +708,47 @@ impl Store {
             .last()
             .ok_or(StorageError::Protocol("new lease was not recorded"))?;
         self.acquire_result(lease)
+    }
+
+    pub(super) fn lookup_acquire(
+        &self,
+        mut request: AcquireRequest,
+    ) -> Result<LookupResult<LeaseIdentity>, StorageError> {
+        self.ensure_healthy()?;
+        validate_request(&request)?;
+        request.envelope.partition.features.sort();
+        request.envelope.partition.features.dedup();
+        if !self.authority.verify_admission(&request.envelope) {
+            return Err(StorageError::Unauthorized);
+        }
+        let request_digest = digest_encoded(&request)?;
+        let same_attempt = self
+            .ledger
+            .leases
+            .iter()
+            .find(|lease| same_attempt(&lease.request, &request));
+        let lease = match same_attempt {
+            Some(lease) => lease,
+            None => {
+                if self
+                    .ledger
+                    .leases
+                    .iter()
+                    .any(|lease| lease.request.acquire_id == request.acquire_id)
+                {
+                    return Err(StorageError::Conflict);
+                }
+                return Ok(LookupResult::Absent);
+            }
+        };
+        if lease.request != persisted_request(&request) || lease.request_digest != request_digest {
+            return Err(StorageError::Conflict);
+        }
+        let identity = self.lease_identity(lease)?;
+        match lease.status {
+            LeaseStatus::Uncertain => Ok(LookupResult::Uncertain(Some(identity))),
+            LeaseStatus::Leased | LeaseStatus::Finalized => Ok(LookupResult::Present(identity)),
+        }
     }
 
     fn acquire_result(&self, lease: &Lease) -> Result<AcquireResult, StorageError> {
@@ -696,6 +765,8 @@ impl Store {
         Ok(AcquireResult {
             lease_id: lease.id.clone(),
             slot_id: lease.slot_id.clone(),
+            storage_instance_id: self.ledger.storage_instance_id.clone(),
+            generation: slot_generation(&lease.slot_id)?,
             state,
             slot_path,
             token: self
@@ -704,6 +775,21 @@ impl Store {
                 .cloned()
                 .map(LeaseToken::new),
             reused: lease.reused,
+        })
+    }
+
+    fn lease_identity(&self, lease: &Lease) -> Result<LeaseIdentity, StorageError> {
+        let state = match lease.status {
+            LeaseStatus::Leased => SlotState::Leased,
+            LeaseStatus::Uncertain => SlotState::Uncertain,
+            LeaseStatus::Finalized => SlotState::Idle,
+        };
+        Ok(LeaseIdentity {
+            lease_id: lease.id.clone(),
+            slot_id: lease.slot_id.clone(),
+            storage_instance_id: self.ledger.storage_instance_id.clone(),
+            generation: slot_generation(&lease.slot_id)?,
+            state,
         })
     }
 
@@ -727,6 +813,54 @@ impl Store {
             state: operation.state,
             capture_digest: operation.capture_digest,
         })
+    }
+
+    pub(super) fn lookup_finalize(
+        &self,
+        lease_id: &str,
+        finalize_id: &str,
+        evidence: SettlementEvidence,
+    ) -> Result<LookupResult<FinalizationReceipt>, StorageError> {
+        self.ensure_healthy()?;
+        validate_text(finalize_id)?;
+        if !self.authority.verify_settlement(&evidence) {
+            return Err(StorageError::Unauthorized);
+        }
+        let Some(lease) = self.ledger.leases.iter().find(|lease| lease.id == lease_id) else {
+            return Ok(LookupResult::Absent);
+        };
+        if evidence.binding != lease.request.envelope.binding {
+            return Err(StorageError::Conflict);
+        }
+        let request_digest = digest_encoded(&evidence)?;
+        let operation = self.ledger.operations.iter().find(|operation| {
+            operation.lease_id == lease_id
+                && operation.operation_id == finalize_id
+                && operation.kind == SettlementKind::Finalize
+        });
+        if let Some(operation) = operation {
+            if operation.request_digest != request_digest
+                || operation.evidence != persisted_evidence(&evidence)
+            {
+                return Err(StorageError::Conflict);
+            }
+            let receipt = FinalizationReceipt {
+                lease_id: operation.lease_id.clone(),
+                finalize_id: operation.operation_id.clone(),
+                state: operation.state,
+                capture_digest: operation.capture_digest.clone(),
+            };
+            return if operation.state == SlotState::Uncertain {
+                Ok(LookupResult::Uncertain(Some(receipt)))
+            } else {
+                Ok(LookupResult::Present(receipt))
+            };
+        }
+        if lease.status == LeaseStatus::Uncertain {
+            Ok(LookupResult::Uncertain(None))
+        } else {
+            Ok(LookupResult::Absent)
+        }
     }
 
     pub(super) fn reconcile(
@@ -788,9 +922,11 @@ impl Store {
         if !self.authority.verify_settlement(&evidence) {
             return Err(StorageError::Unauthorized);
         }
+        let request_digest = digest_encoded(&evidence)?;
         let persisted_evidence = persisted_evidence(&evidence);
         if let Some(previous) = previous {
-            if previous.evidence != persisted_evidence {
+            if previous.evidence != persisted_evidence || previous.request_digest != request_digest
+            {
                 return Err(StorageError::Conflict);
             }
             return Ok(previous.clone());
@@ -860,6 +996,7 @@ impl Store {
             operation_id: operation_id.to_owned(),
             kind,
             evidence: persisted_evidence,
+            request_digest,
             state: new_state,
             capture_digest,
         };
@@ -1474,8 +1611,18 @@ fn random_hex(bytes: usize) -> Result<String, StorageError> {
 
 fn hash_token(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
-    let mut value = String::with_capacity(digest.len() * 2);
-    for byte in digest.iter() {
+    digest_hex(&digest)
+}
+
+fn digest_encoded<T: Encode>(value: &T) -> Result<String, StorageError> {
+    let mut writer = Writer::new();
+    value.encode(&mut writer)?;
+    Ok(digest_hex(&Sha256::digest(writer.finish())))
+}
+
+fn digest_hex(bytes: &[u8]) -> String {
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
         use std::fmt::Write as _;
         let _ = write!(&mut value, "{:02x}", byte);
     }
@@ -1483,9 +1630,20 @@ fn hash_token(token: &str) -> String {
 }
 
 fn valid_slot_id(id: &str) -> bool {
-    id.len() == 21
-        && id.starts_with("slot-")
-        && id[5..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    slot_ordinal(id).is_some()
+}
+
+fn slot_generation(slot_id: &str) -> Result<String, StorageError> {
+    let generation =
+        slot_ordinal(slot_id).ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+    Ok(generation.to_string())
+}
+
+fn valid_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn io_error(error: std::io::Error) -> StorageError {
@@ -1496,7 +1654,7 @@ fn load_ledger(path: &Path, budget: Budget) -> Result<Ledger, StorageError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Ledger::empty(budget));
+            return Ledger::empty(budget);
         }
         Err(error) => return Err(io_error(error)),
     };
@@ -1675,6 +1833,7 @@ impl Encode for Lease {
         self.id.encode(writer)?;
         self.token_hash.encode(writer)?;
         self.slot_id.encode(writer)?;
+        self.request_digest.encode(writer)?;
         self.request.encode(writer)?;
         self.status.encode(writer)?;
         writer.u8(u8::from(self.reused));
@@ -1687,6 +1846,7 @@ impl Decode for Lease {
         let id = String::decode(reader)?;
         let token_hash = String::decode(reader)?;
         let slot_id = String::decode(reader)?;
+        let request_digest = String::decode(reader)?;
         let request = AcquireRequest::decode(reader)?;
         let status = LeaseStatus::decode(reader)?;
         let reused = match reader.u8()? {
@@ -1698,6 +1858,7 @@ impl Decode for Lease {
             id,
             token_hash,
             slot_id,
+            request_digest,
             request,
             status,
             reused,
@@ -1753,6 +1914,7 @@ impl Encode for SettlementOperation {
         self.operation_id.encode(writer)?;
         self.kind.encode(writer)?;
         self.evidence.encode(writer)?;
+        self.request_digest.encode(writer)?;
         self.state.encode(writer)?;
         match self.capture_digest.as_ref() {
             Some(digest) => {
@@ -1771,6 +1933,7 @@ impl Decode for SettlementOperation {
         let operation_id = String::decode(reader)?;
         let kind = SettlementKind::decode(reader)?;
         let evidence = SettlementEvidence::decode(reader)?;
+        let request_digest = String::decode(reader)?;
         let state = SlotState::decode(reader)?;
         let capture_digest = match reader.u8()? {
             0 => None,
@@ -1782,6 +1945,7 @@ impl Decode for SettlementOperation {
             operation_id,
             kind,
             evidence,
+            request_digest,
             state,
             capture_digest,
         })
@@ -1791,6 +1955,7 @@ impl Decode for SettlementOperation {
 impl Encode for Ledger {
     fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
         self.budget.encode(writer)?;
+        self.storage_instance_id.encode(writer)?;
         writer.u64(self.next_slot);
         writer.u64(self.next_sequence);
         encode_vec(writer, &self.slots)?;
@@ -1803,6 +1968,7 @@ impl Decode for Ledger {
     fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
         Ok(Self {
             budget: Budget::decode(reader)?,
+            storage_instance_id: String::decode(reader)?,
             next_slot: reader.u64()?,
             next_sequence: reader.u64()?,
             slots: decode_vec(reader)?,

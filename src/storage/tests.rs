@@ -373,6 +373,362 @@ fn acquire_retry_reuses_lease_and_changed_identity_conflicts() {
 }
 
 #[test]
+fn acquire_lookup_is_authenticated_exact_and_read_only() {
+    let root = TaskRoot::new();
+    let daemon = RunningDaemon::start(root.path(), budget(128), Some(1024));
+    let claim = request("attempt-lookup", "acquire-lookup", 64);
+    let before_absent = fs::read(root.path().join("ledger.bin")).expect("read empty ledger");
+    assert_eq!(
+        daemon
+            .client
+            .lookup_acquire(request("attempt-cancelled", "acquire-cancelled", 64))
+            .expect("lookup absent attempt"),
+        LookupResult::Absent
+    );
+    assert_eq!(
+        fs::read(root.path().join("ledger.bin")).expect("ledger after absent lookup"),
+        before_absent
+    );
+    assert!(daemon
+        .client
+        .inventory("lookup-absent")
+        .expect("inventory")
+        .slots
+        .is_empty());
+
+    let grant = daemon.client.acquire(claim.clone()).expect("acquire");
+    let after_acquire = fs::read(root.path().join("ledger.bin")).expect("read acquired ledger");
+    let found = daemon
+        .client
+        .lookup_acquire(claim.clone())
+        .expect("lookup exact acquire");
+    assert_eq!(
+        found,
+        LookupResult::Present(LeaseIdentity {
+            lease_id: grant.lease_id.clone(),
+            slot_id: grant.slot_id.clone(),
+            storage_instance_id: grant.storage_instance_id.clone(),
+            generation: grant.generation.clone(),
+            state: SlotState::Leased,
+        })
+    );
+    assert_eq!(
+        fs::read(root.path().join("ledger.bin")).expect("ledger after present lookup"),
+        after_acquire
+    );
+
+    let mut changed_body = claim.clone();
+    changed_body.envelope.binding.source_tree_digest = "sha256:changed".to_owned();
+    assert_eq!(
+        daemon.client.lookup_acquire(changed_body),
+        Err(StorageError::Conflict)
+    );
+    let mut changed_subject = claim.clone();
+    changed_subject.envelope.binding.task_id = "different-task".to_owned();
+    assert_eq!(
+        daemon.client.lookup_acquire(changed_subject),
+        Err(StorageError::Conflict)
+    );
+    let mut changed_operation_subject = request("different-attempt", "acquire-lookup", 64);
+    changed_operation_subject.envelope.binding.consumer = "other-consumer".to_owned();
+    assert_eq!(
+        daemon.client.lookup_acquire(changed_operation_subject),
+        Err(StorageError::Conflict)
+    );
+    let mut changed_credential = claim;
+    changed_credential.envelope.admission_credential = Credential::new("wrong-credential");
+    assert_eq!(
+        daemon.client.lookup_acquire(changed_credential),
+        Err(StorageError::Unauthorized)
+    );
+    assert_eq!(
+        daemon
+            .client
+            .inventory("lookup-still-leased")
+            .expect("inventory after refusals")
+            .slots
+            .first()
+            .expect("active slot")
+            .state,
+        SlotState::Leased
+    );
+}
+
+#[test]
+fn finalize_lookup_reports_absence_and_exact_acceptance_without_effects() {
+    let root = TaskRoot::new();
+    let daemon = RunningDaemon::start(root.path(), budget(128), Some(1024));
+    let claim = request("attempt-finalize-lookup", "acquire-finalize-lookup", 64);
+    let grant = daemon.client.acquire(claim.clone()).expect("acquire");
+    let token = grant.token.as_ref().expect("lease token");
+    let evidence = complete_evidence(
+        &claim.envelope.binding,
+        &grant.lease_id,
+        &grant.slot_id,
+        grant.slot_path.as_ref().expect("slot path"),
+        token,
+    );
+
+    let before_absent = fs::read(root.path().join("ledger.bin")).expect("read leased ledger");
+    assert_eq!(
+        daemon
+            .client
+            .lookup_finalize(&grant.lease_id, "finalize-recover", evidence.clone())
+            .expect("lookup unaccepted finalize"),
+        LookupResult::Absent
+    );
+    assert_eq!(
+        fs::read(root.path().join("ledger.bin")).expect("ledger after absent finalize lookup"),
+        before_absent
+    );
+
+    let accepted = daemon
+        .client
+        .finalize(
+            &grant.lease_id,
+            Some(token),
+            "finalize-recover",
+            evidence.clone(),
+        )
+        .expect("finalize");
+    assert_eq!(accepted.state, SlotState::Idle);
+    let after_finalize = fs::read(root.path().join("ledger.bin")).expect("read finalized ledger");
+    assert_eq!(
+        daemon
+            .client
+            .lookup_finalize(&grant.lease_id, "finalize-recover", evidence.clone())
+            .expect("lookup accepted finalize"),
+        LookupResult::Present(accepted)
+    );
+    assert_eq!(
+        fs::read(root.path().join("ledger.bin")).expect("ledger after accepted lookup"),
+        after_finalize
+    );
+
+    let mut changed_body = evidence.clone();
+    if let Some(terminal) = changed_body.terminal.as_mut() {
+        terminal.outcome = TerminalOutcome::Passed;
+    }
+    assert_eq!(
+        daemon
+            .client
+            .lookup_finalize(&grant.lease_id, "finalize-recover", changed_body),
+        Err(StorageError::Conflict)
+    );
+    let mut changed_subject = evidence.clone();
+    changed_subject.binding.project = "other-project".to_owned();
+    assert_eq!(
+        daemon
+            .client
+            .lookup_finalize(&grant.lease_id, "finalize-recover", changed_subject),
+        Err(StorageError::Conflict)
+    );
+    let mut changed_credential = evidence;
+    changed_credential.consumer_credential = Credential::new("wrong-credential");
+    assert_eq!(
+        daemon
+            .client
+            .lookup_finalize(&grant.lease_id, "finalize-recover", changed_credential),
+        Err(StorageError::Unauthorized)
+    );
+}
+
+#[test]
+fn generation_tracks_slot_incarnations_and_is_fenced_by_storage_instance() {
+    let root = TaskRoot::new();
+    let mut daemon = RunningDaemon::start(root.path(), budget(128), Some(1024));
+    let first_claim = request("attempt-generation-1", "acquire-generation-1", 64);
+    let first = daemon
+        .client
+        .acquire(first_claim.clone())
+        .expect("first slot acquire");
+    assert_eq!(first.generation, "1");
+    assert_eq!(first.storage_instance_id.len(), 64);
+    let first_evidence = complete_evidence(
+        &first_claim.envelope.binding,
+        &first.lease_id,
+        &first.slot_id,
+        first.slot_path.as_ref().expect("first slot path"),
+        first.token.as_ref().expect("first token"),
+    );
+    daemon
+        .client
+        .finalize(
+            &first.lease_id,
+            first.token.as_ref(),
+            "finalize-generation-1",
+            first_evidence,
+        )
+        .expect("finalize first lease");
+
+    let mut second_claim = request("attempt-generation-2", "acquire-generation-2", 64);
+    second_claim.envelope.binding.source_tree_digest = "sha256:next-source-tree".to_owned();
+    let second = daemon
+        .client
+        .acquire(second_claim.clone())
+        .expect("reuse slot for next source revision");
+    assert_eq!(second.slot_id, first.slot_id);
+    assert_eq!(second.generation, first.generation);
+    assert_eq!(second.storage_instance_id, first.storage_instance_id);
+    let second_evidence = complete_evidence(
+        &second_claim.envelope.binding,
+        &second.lease_id,
+        &second.slot_id,
+        second.slot_path.as_ref().expect("second slot path"),
+        second.token.as_ref().expect("second token"),
+    );
+    daemon
+        .client
+        .finalize(
+            &second.lease_id,
+            second.token.as_ref(),
+            "finalize-generation-2",
+            second_evidence,
+        )
+        .expect("finalize second lease");
+    let finalized_replay = daemon
+        .client
+        .acquire(second_claim.clone())
+        .expect("acquire replay");
+    assert_eq!(finalized_replay.generation, "1");
+    assert_eq!(finalized_replay.state, SlotState::Idle);
+    assert_eq!(finalized_replay.slot_path, None);
+    assert_eq!(finalized_replay.token, None);
+    assert_eq!(
+        daemon
+            .client
+            .lookup_acquire(second_claim)
+            .expect("lookup finalized replay"),
+        LookupResult::Present(LeaseIdentity {
+            lease_id: second.lease_id.clone(),
+            slot_id: second.slot_id.clone(),
+            storage_instance_id: second.storage_instance_id.clone(),
+            generation: second.generation.clone(),
+            state: SlotState::Idle,
+        })
+    );
+    daemon
+        .client
+        .evict("evict-generation-1", 1)
+        .expect("evict old slot");
+
+    let third_claim = request("attempt-generation-3", "acquire-generation-3", 64);
+    let third = daemon
+        .client
+        .acquire(third_claim.clone())
+        .expect("allocate replacement slot");
+    assert_eq!(third.generation, "2");
+    assert_eq!(third.storage_instance_id, first.storage_instance_id);
+    let third_evidence = complete_evidence(
+        &third_claim.envelope.binding,
+        &third.lease_id,
+        &third.slot_id,
+        third.slot_path.as_ref().expect("third slot path"),
+        third.token.as_ref().expect("third token"),
+    );
+    daemon
+        .client
+        .finalize(
+            &third.lease_id,
+            third.token.as_ref(),
+            "finalize-generation-3",
+            third_evidence,
+        )
+        .expect("finalize replacement lease");
+    daemon
+        .client
+        .evict("evict-generation-2", 1)
+        .expect("evict replacement slot");
+    daemon.stop();
+
+    fs::remove_file(root.path().join("ledger.bin")).expect("recreate task-owned ledger fixture");
+    let recreated = RunningDaemon::start(root.path(), budget(128), Some(1024));
+    let fresh = recreated
+        .client
+        .acquire(request(
+            "attempt-generation-fresh",
+            "acquire-generation-fresh",
+            64,
+        ))
+        .expect("acquire under new storage instance");
+    assert_eq!(fresh.generation, "1");
+    assert_ne!(fresh.storage_instance_id, first.storage_instance_id);
+}
+
+#[test]
+fn unsupported_legacy_wire_request_is_rejected_before_acquire_effects() {
+    let root = TaskRoot::new();
+    let daemon = RunningDaemon::start(root.path(), budget(128), Some(1024));
+    let before = fs::read(root.path().join("ledger.bin")).expect("read empty ledger");
+    super::transport::send_legacy_acquire_and_forget(
+        &root.path().join("daemon.sock"),
+        request("attempt-legacy", "acquire-legacy", 64),
+    )
+    .expect("send legacy request to versioned endpoint");
+    super::transport::send_unsupported_version_acquire_and_forget(
+        &root.path().join("daemon.sock"),
+        request("attempt-future", "acquire-future", 64),
+    )
+    .expect("send unsupported version to current endpoint");
+    assert_eq!(
+        fs::read(root.path().join("ledger.bin")).expect("ledger after legacy request"),
+        before
+    );
+    assert!(daemon
+        .client
+        .inventory("legacy-refused")
+        .expect("inventory")
+        .slots
+        .is_empty());
+}
+
+#[test]
+fn unsupported_ledger_version_preserves_old_ledger_and_slot_evidence() {
+    let root = TaskRoot::new();
+    let mut daemon = RunningDaemon::start(root.path(), budget(128), Some(1024));
+    let grant = daemon
+        .client
+        .acquire(request("attempt-old-ledger", "acquire-old-ledger", 64))
+        .expect("acquire slot");
+    let evidence_path = grant
+        .slot_path
+        .as_ref()
+        .expect("slot path")
+        .join("retained-evidence.bin");
+    fs::write(&evidence_path, b"preserve old evidence")
+        .expect("write bounded task-owned evidence fixture");
+    daemon.stop();
+
+    let ledger_path = root.path().join("ledger.bin");
+    let mut old_ledger = fs::read(&ledger_path).expect("read current ledger");
+    let version = old_ledger
+        .get_mut(12..16)
+        .expect("ledger header contains version bytes");
+    version.copy_from_slice(&2_u32.to_le_bytes());
+    fs::write(&ledger_path, &old_ledger).expect("mark fixture with unsupported version");
+    let result = Daemon::bind(
+        DaemonConfig {
+            root: root.path().to_path_buf(),
+            budget: budget(128),
+        },
+        Arc::new(TestAuthority),
+        Arc::new(FixedFreeSpace(Some(1024))),
+    );
+    assert!(matches!(
+        result,
+        Err(StorageError::Refused(RefusalReason::UnknownAccounting))
+    ));
+    assert_eq!(
+        fs::read(&ledger_path).expect("old ledger remains"),
+        old_ledger
+    );
+    assert_eq!(
+        fs::read(&evidence_path).expect("old slot evidence remains"),
+        b"preserve old evidence"
+    );
+}
+
+#[test]
 fn a_second_daemon_cannot_bind_the_same_private_root() {
     let root = TaskRoot::new();
     let daemon = RunningDaemon::start(root.path(), budget(128), Some(1024));
@@ -407,11 +763,27 @@ fn process_restart_quarantines_until_authenticated_reconciliation() {
         .expect("recovered inventory");
     assert_eq!(inventory.slots[0].state, SlotState::Uncertain);
     assert_eq!(inventory.slots[0].measured_bytes, None);
-    let retry = recovered.acquire(claim).expect("replay after restart");
+    let retry = recovered
+        .acquire(claim.clone())
+        .expect("replay after restart");
     assert_eq!(retry.lease_id, grant.lease_id);
     assert_eq!(retry.state, SlotState::Uncertain);
     assert_eq!(retry.slot_path, None);
     assert_eq!(retry.token, None);
+    assert_eq!(retry.generation, grant.generation);
+    assert_eq!(retry.storage_instance_id, grant.storage_instance_id);
+    assert_eq!(
+        recovered
+            .lookup_acquire(claim)
+            .expect("lookup uncertain acquire"),
+        LookupResult::Uncertain(Some(LeaseIdentity {
+            lease_id: grant.lease_id.clone(),
+            slot_id: grant.slot_id.clone(),
+            storage_instance_id: grant.storage_instance_id.clone(),
+            generation: grant.generation.clone(),
+            state: SlotState::Uncertain,
+        }))
+    );
     let replayed_claim = request("attempt-restart", "unused", 64);
     let binding = &replayed_claim.envelope.binding;
     let evidence = SettlementEvidence {
@@ -421,10 +793,28 @@ fn process_restart_quarantines_until_authenticated_reconciliation() {
         capture: None,
         containment: ContainmentEvidence::Unknown,
     };
+    assert_eq!(
+        recovered
+            .lookup_finalize(&grant.lease_id, "finalize-not-recorded", evidence.clone())
+            .expect("lookup absent finalize on uncertain lease"),
+        LookupResult::Uncertain(None)
+    );
     let reconciled = recovered
         .reconcile(&grant.lease_id, None, "reconcile-restart", evidence)
         .expect("reconcile authenticated proof");
     assert_eq!(reconciled.state, SlotState::Uncertain);
+    assert_eq!(
+        recovered
+            .lookup_acquire(request("attempt-restart", "acquire-restart", 64))
+            .expect("lookup after uncertain reconciliation"),
+        LookupResult::Uncertain(Some(LeaseIdentity {
+            lease_id: grant.lease_id.clone(),
+            slot_id: grant.slot_id.clone(),
+            storage_instance_id: grant.storage_instance_id.clone(),
+            generation: grant.generation.clone(),
+            state: SlotState::Uncertain,
+        }))
+    );
     assert_eq!(
         recovered.acquire(request("attempt-next", "acquire-next", 64)),
         Err(StorageError::Refused(RefusalReason::LeaseUnavailable))
@@ -475,9 +865,26 @@ fn vanished_process_and_missing_proof_keep_storage_unavailable() {
     };
     let settled = daemon
         .client
-        .finalize(&grant.lease_id, Some(token), "finalize-uncertain", evidence)
+        .finalize(
+            &grant.lease_id,
+            Some(token),
+            "finalize-uncertain",
+            evidence.clone(),
+        )
         .expect("incomplete proof is recorded conservatively");
     assert_eq!(settled.state, SlotState::Uncertain);
+    let accepted_ledger = fs::read(root.path().join("ledger.bin")).expect("read uncertain ledger");
+    assert_eq!(
+        daemon
+            .client
+            .lookup_finalize(&grant.lease_id, "finalize-uncertain", evidence)
+            .expect("lookup accepted uncertain finalize"),
+        LookupResult::Uncertain(Some(settled))
+    );
+    assert_eq!(
+        fs::read(root.path().join("ledger.bin")).expect("ledger after uncertain lookup"),
+        accepted_ledger
+    );
     assert_eq!(
         daemon
             .client

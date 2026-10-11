@@ -130,12 +130,40 @@ pub struct Inventory {
 pub struct AcquireResult {
     pub lease_id: String,
     pub slot_id: String,
+    /// Durable random identity of the ledger instance that owns this slot.
+    pub storage_instance_id: String,
+    /// Slot ordinal as canonical positive u64 decimal text.
+    pub generation: String,
     pub state: SlotState,
     /// Present only while the current daemon can safely grant the active lease.
     pub slot_path: Option<PathBuf>,
     /// Required for later settlement operations; its debug output is redacted.
     pub token: Option<LeaseToken>,
     pub reused: bool,
+}
+
+/// Storage identity returned by a lookup-only acquire recovery request.
+///
+/// This deliberately contains no slot path or lease token and cannot grant
+/// writer access.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaseIdentity {
+    pub lease_id: String,
+    pub slot_id: String,
+    pub storage_instance_id: String,
+    /// Slot ordinal as canonical positive u64 decimal text.
+    pub generation: String,
+    pub state: SlotState,
+}
+
+/// Truthful result of an authenticated lookup that has no mutation authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LookupResult<T> {
+    Absent,
+    Present(T),
+    /// The current lease is uncertain; an optional value is present only when
+    /// the requested operation itself was durably accepted.
+    Uncertain(Option<T>),
 }
 
 /// Opaque token scoped to one persisted lease.
@@ -437,6 +465,47 @@ impl fmt::Display for StorageError {
 }
 
 impl std::error::Error for StorageError {}
+
+pub(crate) fn parse_generation(value: &str) -> Result<u64, StorageError> {
+    if value.is_empty()
+        || value.bytes().any(|byte| !byte.is_ascii_digit())
+        || value.starts_with('0')
+    {
+        return Err(StorageError::Protocol(
+            "generation is not canonical positive u64 decimal text",
+        ));
+    }
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| StorageError::Protocol("generation exceeds u64"))?;
+    if parsed.to_string() != value {
+        return Err(StorageError::Protocol(
+            "generation is not canonical positive u64 decimal text",
+        ));
+    }
+    Ok(parsed)
+}
+
+pub(crate) fn valid_storage_instance_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub(crate) fn slot_ordinal(value: &str) -> Option<u64> {
+    if value.len() != 21
+        || !value.starts_with("slot-")
+        || !value[5..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    u64::from_str_radix(&value[5..], 16)
+        .ok()
+        .filter(|ordinal| *ordinal > 0)
+}
 
 fn completion_mac(token: &str, evidence: &CooperativeCompletionEvidence) -> String {
     use sha2::{Digest, Sha256};
