@@ -1,9 +1,17 @@
 use super::*;
+use crate::registered::runner_host::{
+    AttemptInput, HostError, HostResult, OwnerReceiptVerifier, RunnerHost,
+};
+use crate::storage::{
+    AcquireRequest, Budget, Client, ContainmentEvidence, Credential, Daemon, DaemonConfig,
+    EvidenceAuthority, FreeSpaceProbe, PartitionKey, RunEnvelope, SettlementEvidence, StorageError,
+};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Mutex,
+    mpsc, Arc, Mutex,
 };
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -855,4 +863,479 @@ fn cargo_generated_unit_environment_is_distinct_and_partition_bound() {
         Err(Refusal::Identity),
         "undeclared absence is not coverage"
     );
+}
+
+struct BridgeAuthority;
+
+impl EvidenceAuthority for BridgeAuthority {
+    fn verify_admission(&self, envelope: &RunEnvelope) -> bool {
+        envelope.admission_reference == "admission-ref"
+            && matches!(
+                envelope.admission_credential.expose(),
+                "admission-proof" | "reminted-admission-proof"
+            )
+    }
+
+    fn verify_settlement(&self, evidence: &SettlementEvidence) -> bool {
+        evidence.consumer_credential.expose() == "consumer-proof"
+            && evidence.terminal.is_none()
+            && evidence.capture.is_none()
+            && matches!(&evidence.containment, ContainmentEvidence::NotSpawned(_))
+    }
+}
+
+struct BridgeFreeSpace;
+
+impl FreeSpaceProbe for BridgeFreeSpace {
+    fn available_bytes(&self, _: &Path) -> std::result::Result<Option<u64>, StorageError> {
+        Ok(Some(64 * 1024 * 1024 * 1024))
+    }
+}
+
+struct BridgeDaemon {
+    shutdown: Option<mpsc::Sender<()>>,
+    thread: Option<JoinHandle<std::result::Result<(), StorageError>>>,
+}
+
+impl BridgeDaemon {
+    fn start(daemon: Daemon) -> (PathBuf, Self) {
+        let socket = daemon.socket_path().to_path_buf();
+        let (shutdown, receiver) = mpsc::channel();
+        let thread = thread::spawn(move || daemon.serve(receiver));
+        (
+            socket,
+            Self {
+                shutdown: Some(shutdown),
+                thread: Some(thread),
+            },
+        )
+    }
+
+    fn stop(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            assert!(thread.join().expect("bridge daemon thread joined").is_ok());
+        }
+    }
+}
+
+impl Drop for BridgeDaemon {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct BridgeVerifier;
+
+impl OwnerReceiptVerifier for BridgeVerifier {
+    fn verify(
+        &self,
+        owner: &str,
+        callback_id: &str,
+        subject_digest: &str,
+        policy_digest: &str,
+        result_digest: &str,
+        receipt: &str,
+    ) -> bool {
+        receipt
+            == bridge_receipt(
+                owner,
+                callback_id,
+                subject_digest,
+                policy_digest,
+                result_digest,
+            )
+    }
+}
+
+fn bridge_receipt(
+    owner: &str,
+    callback_id: &str,
+    subject_digest: &str,
+    policy_digest: &str,
+    result_digest: &str,
+) -> String {
+    format!("fixture-v1:{owner}:{callback_id}:{subject_digest}:{policy_digest}:{result_digest}")
+}
+
+fn bridge_parent(
+    mut stream: std::os::unix::net::UnixStream,
+    owners: &Owners,
+    expected_partition: &PartitionKey,
+    start: &serde_json::Value,
+) -> (serde_json::Value, Vec<serde_json::Value>) {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut callbacks = Vec::new();
+    let mut line = String::new();
+    serde_json::to_writer(&mut stream, start).unwrap();
+    stream.write_all(b"\n").unwrap();
+    loop {
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(!line.is_empty(), "host closed before final response");
+        let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if frame["operation"] == "result" || frame["operation"] == "error" {
+            return (frame, callbacks);
+        }
+        assert_eq!(frame["operation"], "callback");
+        assert_eq!(
+            frame["partition"],
+            serde_json::to_value(expected_partition).unwrap()
+        );
+        let id = frame["id"].as_str().unwrap().to_owned();
+        assert_eq!(id.parse::<usize>().unwrap(), callbacks.len() + 1);
+        let owner = frame["owner"].as_str().unwrap().to_owned();
+        let payload = frame["payload"].clone();
+        let result = match owner.as_str() {
+            "registration.authenticate" => {
+                let registration: Registration =
+                    serde_json::from_value(payload["registration"].clone()).unwrap();
+                let attempt: Attempt = serde_json::from_value(payload["attempt"].clone()).unwrap();
+                assert_eq!(
+                    attempt.partition,
+                    digest(&serde_json::to_vec(expected_partition).unwrap())
+                );
+                serde_json::to_value(owners.authenticate(&registration, &attempt).unwrap()).unwrap()
+            }
+            "registration.audit" => {
+                let registration: Registration =
+                    serde_json::from_value(payload["registration"].clone()).unwrap();
+                let source: SourceEvidence =
+                    serde_json::from_value(payload["source"].clone()).unwrap();
+                owners.audit(&registration, &source).unwrap();
+                serde_json::Value::Null
+            }
+            "input.immutable" => {
+                let attempt: Attempt = serde_json::from_value(payload["attempt"].clone()).unwrap();
+                let receipt = payload["receipt"].as_str().unwrap();
+                serde_json::to_value(owners.immutable(receipt, &attempt).unwrap()).unwrap()
+            }
+            "input.units" => {
+                let registration: Registration =
+                    serde_json::from_value(payload["registration"].clone()).unwrap();
+                let attempt: Attempt = serde_json::from_value(payload["attempt"].clone()).unwrap();
+                serde_json::to_value(owners.units(&registration, &attempt).unwrap()).unwrap()
+            }
+            "execution.execute" => {
+                let launch: Launch = serde_json::from_value(payload["launch"].clone()).unwrap();
+                serde_json::to_value(owners.execute(&launch).unwrap()).unwrap()
+            }
+            "execution.finalize_not_spawned" => {
+                let launch: Launch = serde_json::from_value(payload["launch"].clone()).unwrap();
+                let receipt = payload["receipt"].as_str().unwrap();
+                owners.finalize_not_spawned(&launch, receipt).unwrap();
+                serde_json::json!({"consumer_credential":"consumer-proof"})
+            }
+            other => panic!("unexpected callback {other}"),
+        };
+        let result_digest = digest(&serde_json::to_vec(&result).unwrap());
+        let subject_digest = frame["subject_digest"].as_str().unwrap();
+        let policy_digest = frame["policy_digest"].as_str().unwrap();
+        let receipt = bridge_receipt(&owner, &id, subject_digest, policy_digest, &result_digest);
+        let response = serde_json::json!({
+            "version": 1,
+            "operation": "callback_result",
+            "id": id,
+            "owner": owner,
+            "subject_digest": subject_digest,
+            "policy_digest": policy_digest,
+            "result_digest": result_digest,
+            "receipt": receipt,
+            "result": result
+        });
+        serde_json::to_writer(&mut stream, &response).unwrap();
+        stream.write_all(b"\n").unwrap();
+        callbacks.push(frame);
+    }
+}
+
+fn has_token_field(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => object
+            .iter()
+            .any(|(key, value)| key == "token" || has_token_field(value)),
+        serde_json::Value::Array(values) => values.iter().any(has_token_field),
+        _ => false,
+    }
+}
+
+#[test]
+fn inactive_runner_host_uses_the_durable_generation_api_and_verified_parent_callbacks() {
+    let mut fixture = Fixture::new();
+    fixture.mode(Mode::NoSpawn);
+    let storage_root = fixture.base.join("bridge-storage");
+    fs::create_dir(&storage_root).unwrap();
+    fs::set_permissions(&storage_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let ledger_path = storage_root.join("ledger.bin");
+    let daemon = Daemon::bind(
+        DaemonConfig {
+            root: storage_root,
+            budget: Budget {
+                cap_bytes: 1024 * 1024,
+                free_reserve_bytes: 0,
+            },
+        },
+        Arc::new(BridgeAuthority),
+        Arc::new(BridgeFreeSpace),
+    )
+    .unwrap();
+    let (socket, daemon_guard) = BridgeDaemon::start(daemon);
+
+    let partition = PartitionKey {
+        project_component: "owned:core".into(),
+        workflow: fixture.registration.id.clone(),
+        cargo_provenance: "cargo-synthetic".into(),
+        rustc_provenance: "rustc-synthetic".into(),
+        host: "aarch64-apple-darwin".into(),
+        target: "aarch64-apple-darwin".into(),
+        profile: "full-debug".into(),
+        features: vec!["default".into()],
+        config_digest: digest(b"partition config"),
+        environment_digest: digest(b"partition env"),
+        path_identity: digest(b"physical path"),
+    };
+    fixture.attempt.partition = digest(&serde_json::to_vec(&partition).unwrap());
+    fixture.attempt.allocation_epoch = "1".into();
+    let envelope = RunEnvelope {
+        binding: fixture.attempt.binding.clone(),
+        partition: partition.clone(),
+        admission_reference: "admission-ref".into(),
+        admission_credential: Credential::new("admission-proof"),
+    };
+    let acquire_request = AcquireRequest {
+        envelope: envelope.clone(),
+        acquire_id: "host-acquire-1".into(),
+        required_bytes: 64,
+    };
+    let storage_client = Client::new(socket.clone());
+    let original_grant = storage_client
+        .acquire(acquire_request.clone())
+        .expect("synthetic parent admitted the exact original request");
+    assert_eq!(
+        storage_client
+            .acquire(acquire_request.clone())
+            .expect("matching acquire replay returns the original lease"),
+        original_grant
+    );
+    let mut reminted_request = acquire_request.clone();
+    reminted_request.envelope.admission_credential = Credential::new("reminted-admission-proof");
+    assert_eq!(
+        storage_client.acquire(reminted_request),
+        Err(StorageError::Conflict),
+        "a valid replacement secret changes the exact persisted request body"
+    );
+    let mut missing_secret_request = acquire_request.clone();
+    missing_secret_request.envelope.admission_credential =
+        Credential::new("missing-original-secret");
+    assert_eq!(
+        storage_client.acquire(missing_secret_request),
+        Err(StorageError::Unauthorized),
+        "missing original credential refuses instead of being re-minted"
+    );
+    let input = AttemptInput {
+        binding: fixture.attempt.binding.clone(),
+        root_id: fixture.attempt.root_id.clone(),
+        allocation_epoch: fixture.attempt.allocation_epoch.clone(),
+        branch: fixture.attempt.branch.clone(),
+        source_root: fixture.attempt.source_root.clone(),
+        partition: fixture.attempt.partition.clone(),
+        target: fixture.attempt.target.clone(),
+        temp: fixture.attempt.temp.clone(),
+        capture: fixture.attempt.capture.clone(),
+        authorization: fixture.attempt.authorization.clone(),
+    };
+    let request = serde_json::json!({
+        "version": 1,
+        "operation": "run",
+        "id": "host-run-1",
+        "payload": {
+            "registration": &fixture.registration,
+            "attempt": input,
+            "acquire": {
+                "envelope": &acquire_request.envelope,
+                "acquire_id": &acquire_request.acquire_id,
+                "required_bytes": acquire_request.required_bytes
+            },
+            "finalize_id": "host-finalize-1"
+        }
+    });
+    for replacement in ["reminted-admission-proof", "missing-original-secret"] {
+        let mut refused_request = request.clone();
+        refused_request["payload"]["acquire"]["envelope"]["admission_credential"] =
+            serde_json::Value::String(replacement.to_owned());
+        let (host_stream, parent_stream) = std::os::unix::net::UnixStream::pair().unwrap();
+        let refused_host = RunnerHost::new(socket.clone(), Arc::new(BridgeVerifier));
+        let refused_thread = thread::spawn(move || refused_host.serve(host_stream));
+        let (response, callbacks) =
+            bridge_parent(parent_stream, &fixture.owners, &partition, &refused_request);
+        assert_eq!(response["operation"], "error");
+        assert_eq!(response["code"], "storage_failure");
+        assert!(callbacks.is_empty(), "refused request cannot reach Runner");
+        assert_eq!(
+            refused_thread.join().unwrap().unwrap_err(),
+            HostError::Storage
+        );
+    }
+    let (host_stream, parent_stream) = std::os::unix::net::UnixStream::pair().unwrap();
+    let host = RunnerHost::new(socket, Arc::new(BridgeVerifier));
+    let host_thread = thread::spawn(move || host.serve(host_stream));
+    let (response, callbacks) = bridge_parent(parent_stream, &fixture.owners, &partition, &request);
+    let result: HostResult = serde_json::from_value(response["result"].clone()).unwrap();
+    let runner_result = host_thread.join().unwrap().unwrap();
+    daemon_guard.stop();
+
+    assert!(matches!(
+        runner_result.status,
+        super::runner_host::HostStatus::Finished
+    ));
+    assert_eq!(
+        result.outcome,
+        Some(super::runner_host::OutcomeName::NotSpawned)
+    );
+    let storage = result.storage.unwrap();
+    assert_eq!(storage.generation, "1");
+    assert_eq!(storage.reused, Some(false));
+    assert_eq!(storage.storage_instance_id.len(), 64);
+    assert!(result.token_digest.unwrap().starts_with("sha256:"));
+    assert!(!has_token_field(&request));
+    assert_eq!(callbacks.len(), 6);
+    assert!(callbacks.iter().all(|frame| !has_token_field(frame)));
+    assert!(callbacks.iter().all(|frame| {
+        frame["storage"]["slot_id"] == storage.slot_id
+            && frame["storage"]["storage_instance_id"] == storage.storage_instance_id
+            && frame["storage"]["generation"] == storage.generation
+    }));
+    assert!(callbacks.iter().all(|frame| {
+        let subject = serde_json::json!({
+            "id": frame["id"],
+            "owner": frame["owner"],
+            "storage": frame["storage"],
+            "partition": frame["partition"],
+            "payload": frame["payload"]
+        });
+        frame["subject_digest"] == digest(&serde_json::to_vec(&subject).unwrap())
+    }));
+    assert_eq!(fixture.owners.calls.load(Ordering::Relaxed), 1);
+    let ledger = fs::read(ledger_path).expect("read synthetic storage ledger");
+    for secret in ["admission-proof", "reminted-admission-proof"] {
+        assert!(!ledger
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()));
+    }
+    assert!(!fixture
+        .base
+        .join("bridge-storage")
+        .join("slots/slot-0000000000000001/PENDING")
+        .exists());
+}
+
+#[test]
+fn capacity_pending_returns_before_registered_runner_or_parent_callbacks() {
+    let mut fixture = Fixture::new();
+    let storage_root = fixture.base.join("pending-storage");
+    fs::create_dir(&storage_root).unwrap();
+    fs::set_permissions(&storage_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let daemon = Daemon::bind(
+        DaemonConfig {
+            root: storage_root,
+            budget: Budget {
+                cap_bytes: 64,
+                free_reserve_bytes: 0,
+            },
+        },
+        Arc::new(BridgeAuthority),
+        Arc::new(BridgeFreeSpace),
+    )
+    .unwrap();
+    let (socket, daemon_guard) = BridgeDaemon::start(daemon);
+    let client = Client::new(socket.clone());
+    let partition = PartitionKey {
+        project_component: "owned:core".into(),
+        workflow: fixture.registration.id.clone(),
+        cargo_provenance: "cargo-synthetic".into(),
+        rustc_provenance: "rustc-synthetic".into(),
+        host: "aarch64-apple-darwin".into(),
+        target: "aarch64-apple-darwin".into(),
+        profile: "full-debug".into(),
+        features: vec!["default".into()],
+        config_digest: digest(b"partition config"),
+        environment_digest: digest(b"partition env"),
+        path_identity: digest(b"physical path"),
+    };
+    fixture.attempt.partition = digest(&serde_json::to_vec(&partition).unwrap());
+    let first_request = AcquireRequest {
+        envelope: RunEnvelope {
+            binding: fixture.attempt.binding.clone(),
+            partition: partition.clone(),
+            admission_reference: "admission-ref".into(),
+            admission_credential: Credential::new("admission-proof"),
+        },
+        acquire_id: "occupying-acquire".into(),
+        required_bytes: 64,
+    };
+    let occupied = client.acquire(first_request).unwrap();
+    assert_eq!(occupied.generation, "1");
+
+    let mut binding = fixture.attempt.binding.clone();
+    binding.task_id = "next-task".into();
+    binding.run_id = "next-run".into();
+    binding.attempt_id = "next-attempt".into();
+    let attempt = AttemptInput {
+        binding: binding.clone(),
+        root_id: fixture.attempt.root_id.clone(),
+        allocation_epoch: "2".into(),
+        branch: "next-branch".into(),
+        source_root: fixture.attempt.source_root.clone(),
+        partition: fixture.attempt.partition.clone(),
+        target: fixture.attempt.target.clone(),
+        temp: fixture.attempt.temp.clone(),
+        capture: fixture.attempt.capture.clone(),
+        authorization: fixture.attempt.authorization.clone(),
+    };
+    let request = serde_json::json!({
+        "version": 1,
+        "operation": "run",
+        "id": "pending-run",
+        "payload": {
+            "registration": &fixture.registration,
+            "attempt": attempt,
+            "acquire": {
+                "envelope": RunEnvelope {
+                    binding,
+                    partition: partition.clone(),
+                    admission_reference: "admission-ref".into(),
+                    admission_credential: Credential::new("admission-proof")
+                },
+                "acquire_id": "pending-acquire",
+                "required_bytes": 64
+            },
+            "finalize_id": "pending-finalize"
+        }
+    });
+    let (host_stream, parent_stream) = std::os::unix::net::UnixStream::pair().unwrap();
+    let host = RunnerHost::new(socket, Arc::new(BridgeVerifier));
+    let host_thread = thread::spawn(move || host.serve(host_stream));
+    let (response, callbacks) = bridge_parent(parent_stream, &fixture.owners, &partition, &request);
+    let result: HostResult = serde_json::from_value(response["result"].clone()).unwrap();
+    let served = host_thread.join().unwrap().unwrap();
+    daemon_guard.stop();
+
+    assert!(matches!(
+        served.status,
+        super::runner_host::HostStatus::StoragePending
+    ));
+    assert!(result.storage.is_none());
+    assert!(result.token_digest.is_none());
+    assert!(result.outcome.is_none());
+    assert!(callbacks.is_empty());
+    assert_eq!(fixture.owners.calls.load(Ordering::Relaxed), 0);
 }
