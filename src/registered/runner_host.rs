@@ -16,7 +16,7 @@ use crate::storage::{
     LookupResult, NoSpawnEvidence, RunBinding, SettlementEvidence, SlotState, StorageError,
     TerminalOutcome, TerminalRecord,
 };
-use serde::de::DeserializeOwned;
+use serde::de::{self, DeserializeOwned, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -205,7 +205,94 @@ struct CallbackResponse {
     policy_digest: String,
     result_digest: String,
     receipt: String,
+    /// Parsed with duplicate-key refusal so typed owners see the wire keys.
+    #[serde(deserialize_with = "deserialize_strict_json_value")]
     result: Value,
+}
+
+/// `serde_json::Value` keeps the last duplicate object key. GraphProvision and
+/// other typed owners never see the collision if the callback result goes
+/// through Value first. This visitor refuses duplicates on the wire.
+struct StrictJsonValue(Value);
+
+fn deserialize_strict_json_value<'de, D>(deserializer: D) -> Result<Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    StrictJsonValue::deserialize(deserializer).map(|value| value.0)
+}
+
+impl<'de> Deserialize<'de> for StrictJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StrictJsonValueVisitor)
+    }
+}
+
+struct StrictJsonValueVisitor;
+
+impl<'de> Visitor<'de> for StrictJsonValueVisitor {
+    type Value = StrictJsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Number(
+            serde_json::Number::from_f64(value)
+                .ok_or_else(|| E::custom("non-finite JSON number"))?,
+        )))
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::String(value)))
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Null))
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Null))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(item) = access.next_element::<StrictJsonValue>()? {
+            items.push(item.0);
+        }
+        Ok(StrictJsonValue(Value::Array(items)))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+        let mut map = serde_json::Map::new();
+        while let Some((key, value)) = access.next_entry::<String, StrictJsonValue>()? {
+            if map.contains_key(&key) {
+                return Err(de::Error::custom(format!("duplicate JSON key `{key}`")));
+            }
+            map.insert(key, value.0);
+        }
+        Ok(StrictJsonValue(Value::Object(map)))
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1947,6 +2034,83 @@ mod tests {
         parent_stream.write_all(b"\n").unwrap();
         assert_eq!(worker.join().unwrap().unwrap_err(), HostError::Protocol);
     }
+
+    #[test]
+    fn callback_result_duplicate_json_keys_refuse_before_typed_conversion() {
+        for result_json in [
+            r#"{"schema":"oxide-qualification-cargo-graph-v1","schema":"oxide-qualification-cargo-graph-v1"}"#,
+            r#"{"units":[{"id":"source-unit","id":"source-unit"}]}"#,
+        ] {
+            let duplicate = format!(
+                r#"{{"version":1,"operation":"callback_result","id":"1","owner":"input.graph_owner","subject_digest":"sha256:{}","policy_digest":"sha256:{}","result_digest":"sha256:{}","receipt":"fixture","result":{}}}"#,
+                "aa".repeat(32),
+                "bb".repeat(32),
+                "cc".repeat(32),
+                result_json
+            );
+            assert!(
+                serde_json::from_str::<CallbackResponse>(&duplicate).is_err(),
+                "duplicate keys in {result_json}"
+            );
+            assert!(serde_json::from_str::<Value>(&duplicate).is_ok());
+
+            let (host_stream, mut parent_stream) = UnixStream::pair().unwrap();
+            let parent = thread::spawn({
+                let result_json = result_json.to_owned();
+                move || {
+                    let mut reader = BufReader::new(parent_stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let frame = format!(
+                        r#"{{"version":1,"operation":"callback_result","id":{},"owner":{},"subject_digest":{},"policy_digest":{},"result_digest":{},"receipt":"fixture","result":{}}}"#,
+                        serde_json::to_string(&request["id"]).unwrap(),
+                        serde_json::to_string(&request["owner"]).unwrap(),
+                        serde_json::to_string(&request["subject_digest"]).unwrap(),
+                        serde_json::to_string(&request["policy_digest"]).unwrap(),
+                        serde_json::to_string(&digest(b"unused")).unwrap(),
+                        result_json
+                    );
+                    parent_stream.write_all(frame.as_bytes()).unwrap();
+                    parent_stream.write_all(b"\n").unwrap();
+                }
+            });
+            let mut channel = Channel::new(host_stream).unwrap();
+            let error = channel.exchange::<_, GraphProvisionProbe>(
+                "input.graph_owner",
+                &serde_json::json!({"identity": "attempt"}),
+                &registration(),
+                &StorageIdentity {
+                    slot_id: "slot-0000000000000001".into(),
+                    storage_instance_id: "a".repeat(64),
+                    generation: "1".into(),
+                    reused: Some(false),
+                },
+                &crate::storage::PartitionKey {
+                    project_component: "project:component".into(),
+                    workflow: "workflow".into(),
+                    cargo_provenance: "cargo".into(),
+                    rustc_provenance: "rustc".into(),
+                    host: "host".into(),
+                    target: "target".into(),
+                    profile: "profile".into(),
+                    features: Vec::new(),
+                    config_digest: digest(b"config"),
+                    environment_digest: digest(b"env"),
+                    path_identity: "path".into(),
+                },
+                &AcceptReceipts,
+            );
+            parent.join().unwrap();
+            assert!(
+                matches!(error, Err(CallbackError::Host(HostError::Protocol))),
+                "wire duplicate keys in {result_json}: {error:?}"
+            );
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct GraphProvisionProbe {}
 
     #[test]
     fn callback_reply_must_match_the_exact_next_operation() {

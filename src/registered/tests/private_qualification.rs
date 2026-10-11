@@ -1322,6 +1322,11 @@ fn graph_owner_refuses_forged_mismatched_and_untrusted_fields() {
         .unwrap()
         .replacen('{', "{\"unexpected\":true,", 1);
     assert!(serde_json::from_str::<GraphProvision>(&extra_field).is_err());
+
+    let duplicate_key = serde_json::to_string(&issued_fixture_graph(&fixture, &key, &start_digest))
+        .unwrap()
+        .replacen("\"schema\":", "\"schema\":\"forged\",\"schema\":", 1);
+    assert!(serde_json::from_str::<GraphProvision>(&duplicate_key).is_err());
 }
 
 #[test]

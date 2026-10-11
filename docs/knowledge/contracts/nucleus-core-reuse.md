@@ -1144,7 +1144,10 @@ After acquire, collector mode requests `input.graph_owner` with the Runner
 `registration` and acquired `attempt` (slot included). The parent returns
 untrusted `GraphProvision`: version, schema, issuer, Cargo `1.97.1` /
 `c980f4866141969fab6254a680546a277789d6f0`, graph digest, a unit vector, and
-`receipt`. Unknown fields refuse. Duplicate unit IDs refuse. The provision
+`receipt`. Unknown fields refuse. Duplicate JSON object keys in that callback
+result refuse at frame parse, before `serde_json::Value` canonicalization or
+`GraphProvision` conversion; a collapsed Value must not be accepted as unique
+context fields. Duplicate unit IDs refuse. The provision
 must not name `build_root`; the Rust owner binds `TrustedCargoGraphContext.build_root`
 to `Attempt.slot` after acquire. Package roots must sit under the authenticated
 source root, acquired slot, or a Runner-verified immutable manifest root.
