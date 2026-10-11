@@ -6,6 +6,7 @@ minimum_effigy_version = "0.14.0"
 "rust:format" = "cargo fmt --all -- --check"
 "rust:private-compile" = "cargo check --workspace --all-targets --locked --features private-qualification"
 "rust:private-process" = "python3 scripts/test-private-process.py"
+"registry:acquire:nucleus" = "python3 scripts/acquire-nucleus-registry.py"
 "docs:check" = [
   "effigy skill run northstar/check-links -- --frozen '^docs/knowledge/architecture[.]md$'",
   "effigy skill run northstar/retired-concepts",

@@ -112,6 +112,26 @@ bounds. The collection cap applies to the accumulated counters, so successive
 package verifies in one preparation share it. There is no unpack/write into the
 package root, host registry scan, per-call counter reset or automatic growth.
 
+Task 037 added a private, opt-in acquisition caller at
+`src/registered/archive_acquisition.rs` and
+`src/bin/registry_acquisition.rs`, selected by
+`effigy registry:acquire:nucleus`. The Rust entry accepts only the pinned
+commit/tree, five pinned source-leaf digests, exact lock digest and 58-package
+tuple inventory. It requires explicit `CARGO_HOME=/Users/tom/.cargo`, examines
+at most eight immediate namespace names per cache/source root, and tests only
+lock-derived archive and extracted-directory names. Canonical containment,
+unique candidates, metadata stability and one shared `archive::verify`
+counter set are enforced; the JSON output is capped at 8 MiB. It does not read
+registry index data, fall back to arbitrary paths, modify installed roots, call
+`into_registered`, or issue registry authority. The Python entry reads only
+the pinned Nucleus Git blobs, the two allowed Cargo config files, and
+verified-package behavior leaves under the task's read limits; it does not
+invoke Cargo. Task 037 observed one supported real correspondence and refused
+57 of 58 locked registry packages. See the
+[`nucleus-input-roots.md`](nucleus-input-roots.md#task-037-lock-and-registry-correspondence-update)
+evidence update for exact outcomes and limits. This is not a complete registry
+receipt, behavior graph, immutability agreement, or Nucleus build qualification.
+
 The unit seam consumes owner-verified semantic evidence for pinned Cargo
 `c980f4866` [`LocalFingerprint`](https://github.com/rust-lang/cargo/blob/c980f4866/src/cargo/core/compiler/fingerprint/mod.rs).
 It supports multiple dep-info/script file and environment references, explicit
