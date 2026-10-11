@@ -285,6 +285,8 @@ impl std::error::Error for HostError {}
 pub struct RunnerHost {
     client: Client,
     verifier: Arc<dyn OwnerReceiptVerifier>,
+    #[cfg(feature = "private-qualification")]
+    qualification: Option<super::qualification::AttemptGrant>,
 }
 
 impl fmt::Debug for RunnerHost {
@@ -306,7 +308,15 @@ impl RunnerHost {
         Self {
             client: Client::new(storage_socket),
             verifier,
+            #[cfg(feature = "private-qualification")]
+            qualification: None,
         }
+    }
+
+    #[cfg(feature = "private-qualification")]
+    pub(super) fn qualified(mut self, grant: super::qualification::AttemptGrant) -> Self {
+        self.qualification = Some(grant);
+        self
     }
 
     /// Serves one bounded request over an embedder-provided Unix stream.
@@ -319,7 +329,16 @@ impl RunnerHost {
         if frame.version != PROTOCOL_VERSION || frame.operation != "run" || !valid_id(&frame.id) {
             return Err(HostError::Protocol);
         }
-        let result = self.run_request(frame.payload, channel.clone());
+        #[cfg(feature = "private-qualification")]
+        let preflight = match &self.qualification {
+            Some(grant) => {
+                grant.check_start(&serde_json::to_value(&frame).map_err(|_| HostError::Protocol)?)
+            }
+            None => Ok(()),
+        };
+        #[cfg(not(feature = "private-qualification"))]
+        let preflight = Ok(());
+        let result = preflight.and_then(|_| self.run_request(frame.payload, channel.clone()));
         match result {
             Ok(result) => {
                 channel
@@ -391,6 +410,10 @@ impl RunnerHost {
         };
         if !valid_acquired(&acquired) {
             return Err(HostError::Storage);
+        }
+        #[cfg(feature = "private-qualification")]
+        if let Some(grant) = &self.qualification {
+            grant.check_acquired(&acquired)?;
         }
         let token = acquired.token.as_ref().ok_or(HostError::Storage)?;
         let token_digest = digest(token.value().as_bytes());
@@ -822,7 +845,7 @@ fn callback_policy_digest(
         .map_err(|_| CallbackError::Protocol)
 }
 
-fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>, serde_json::Error> {
+pub(super) fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>, serde_json::Error> {
     fn sort_objects(value: &Value) -> Value {
         match value {
             Value::Object(fields) => {

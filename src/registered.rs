@@ -21,6 +21,8 @@ use std::process::Command;
 use std::time::UNIX_EPOCH;
 
 pub mod dep_info;
+#[cfg(feature = "private-qualification")]
+pub mod qualification;
 pub mod runner_host;
 
 pub const REGISTRATION_VERSION: u32 = 1;
