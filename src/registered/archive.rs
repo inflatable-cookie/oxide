@@ -2273,6 +2273,38 @@ mod tests {
             .value,
             Err(Refusal::Integrity | Refusal::Unsupported)
         ));
+
+        let mut trailing = raw.clone();
+        trailing.extend_from_slice(&gzip(b"second-gzip-member"));
+        let trailing_path = scratch.path("stream-trailing-gzip.crate");
+        fs::write(&trailing_path, &trailing).unwrap();
+        let trailing_path = fs::canonicalize(trailing_path).unwrap();
+        let trailing_sum = digest(&fs::read(&trailing_path).unwrap());
+        assert_eq!(
+            once_stream(
+                &ask(&trailing_path, &extracted, &trailing_sum),
+                Limits::NUCLEUS
+            )
+            .value,
+            Err(Refusal::Unsupported)
+        );
+
+        // A damaged gzip trailer (CRC/ISIZE) must fail the finish check.
+        let mut corrupt = raw.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xff;
+        let corrupt_path = scratch.path("stream-corrupt-trailer.crate");
+        fs::write(&corrupt_path, &corrupt).unwrap();
+        let corrupt_path = fs::canonicalize(corrupt_path).unwrap();
+        let corrupt_sum = digest(&fs::read(&corrupt_path).unwrap());
+        assert!(matches!(
+            once_stream(
+                &ask(&corrupt_path, &extracted, &corrupt_sum),
+                Limits::NUCLEUS
+            )
+            .value,
+            Err(Refusal::Integrity | Refusal::Unsupported)
+        ));
     }
 
     #[test]
