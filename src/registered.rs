@@ -23,6 +23,8 @@ use std::time::UNIX_EPOCH;
 
 pub mod archive;
 #[cfg(feature = "private-qualification")]
+pub mod archive_acquisition;
+#[cfg(feature = "private-qualification")]
 pub mod audit_owner;
 pub mod cargo_freshness;
 pub mod dep_info;

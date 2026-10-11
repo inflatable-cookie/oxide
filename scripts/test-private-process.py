@@ -8,7 +8,8 @@ subprocess.run(["node", "scripts/qualification-vectors.mjs"], check=True, timeou
 
 build = subprocess.run(
     ["cargo", "build", "--offline", "--locked", "--features", "private-qualification-fixture",
-     "--bin", "oxide-qualified-runner", "--bin", "oxide-storage-runtime", "--message-format=json"],
+     "--bin", "oxide-qualified-runner", "--bin", "oxide-storage-runtime",
+     "--bin", "oxide-registry-acquisition", "--message-format=json"],
     stdout=subprocess.PIPE, text=True, timeout=300,
 )
 if build.returncode:
@@ -17,10 +18,10 @@ executables = {}
 for line in build.stdout.splitlines():
     message = json.loads(line)
     if message.get("reason") == "compiler-artifact" and message["target"]["name"] in (
-        "oxide-qualified-runner", "oxide-storage-runtime"
+        "oxide-qualified-runner", "oxide-storage-runtime", "oxide-registry-acquisition"
     ):
         executables[message["target"]["name"]] = message.get("executable")
-for name in ("oxide-qualified-runner", "oxide-storage-runtime"):
+for name in ("oxide-qualified-runner", "oxide-storage-runtime", "oxide-registry-acquisition"):
     if not executables.get(name):
         raise RuntimeError(f"compiled artifact {name} was not reported")
 environment = dict(

@@ -62,6 +62,88 @@ toolchain pin or MSRV in the inspected workspace/package manifests. Oxide's
 repo-owned Rust authoring profile is `strict` with no deviations and an
 unresolved MSRV is a stop; this change authors documentation only.
 
+## Task 037 lock and registry correspondence update
+
+The preceding lock paragraph records the earlier Task 036 observation. For
+Task 037, the exact pinned `Cargo.lock` contents were read from the same
+committed Git object, parsed with the already-installed `pip._vendor.tomli`,
+and independently bound into the private Rust acquisition request. Its size
+is 14,021 bytes and SHA-256 is
+`ab2ed097a6d9cc740cc738b32d1c361d99214b16f0dbdeacfeb061bc10d1d57d`.
+The pinned source identity remains commit
+`576ba7904d58e4bf829ddddda89a06833b8c5087`, tree
+`0aa379b840c2f8990adeecc1fc49d9e57ab5869b`. Five allowlisted leaves were
+read; their individual sizes and digests are in the retained evidence file.
+The sorted locked registry tuple inventory (name, version, source, checksum)
+has digest
+`d34be11369c2dc97d43afca0a4211a287f5e841048187c4a386d0f19f2a29cc6`.
+There are 58 crates.io registry tuples and four local workspace tuples. The
+inventory is not an enabled-unit or complete feature graph.
+
+The only permitted Cargo configuration files were checked:
+`/Users/tom/.cargo/config` and
+`/Users/tom/.cargo/config.toml`. The former was absent; the latter contained
+20 bytes. No literal registry replacement or custom source mapping appeared
+there. `CARGO_HOME` was explicitly `/Users/tom/.cargo`, matching the pinned
+candidate root. Other configuration locations and environment overrides were
+not read, so effective Cargo configuration and registry identity remain
+unresolved.
+
+Discovery enumerated two immediate namespaces under each of
+`/Users/tom/.cargo/registry/cache` and
+`/Users/tom/.cargo/registry/src`; both roots were stable across the
+observation. All 58 locked packages received outcomes after 232 bounded
+candidate-path metadata observations: one supported correspondence, 24
+`ambiguous_candidates` refusals, and 33 exact
+`verifier_Unsupported` refusals. The verifier refusal class is retained as
+returned; no more specific unsupported-format cause is inferred. The one
+supported package was `fallible-streaming-iterator 0.1.9`, checksum
+`7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a`.
+Its archive and extracted root had unique canonical paths in namespace
+`index.crates.io-1949cf8c6b5b557f`. The existing
+`archive::verify(&Request, Limits, Counters)` implementation checked the
+archive checksum and exact extracted file/directory correspondence. The
+retained manifest lists eight files and two directories; before/after metadata
+and the full package result are preserved in
+[`nucleus-registry-acquisition-037.json`](../evidence/nucleus-registry-acquisition-037.json).
+
+All package attempts shared one verifier counter set. It recorded 13,435,995
+compressed archive bytes, 60,891,136 decompressed bytes, 36,437 extracted-file
+bytes, and 54 entries (74,363,568 charged bytes total). The supported package
+attempt's cumulative counters were 304,106 archive bytes, 1,439,232
+decompressed bytes, 36,437 extracted-file bytes, and 27 entries; these include
+earlier refused attempts. The supported package's own delta from the preceding
+cumulative snapshot was 9,249 archive bytes, 44,032 decompressed bytes, 36,437
+extracted-file bytes, and 21 entries. Behavior triage read 840 bytes from that
+package's verified `Cargo.toml`; it found no build script, proc-macro entry,
+or native link declaration. Aggregate acquisition reads were 74,433,606 bytes,
+including 69,158 pinned source bytes: 48,600 bounded source bytes were read
+during preflight before the acquisition entry existed, and 20,558 were read by
+the entry itself. The total also includes 40 configuration bytes observed
+across preflight/acquisition and triage. Retained evidence is 171,140 bytes. The
+sampled free space stayed above the 20 GiB reserve; its delta is not an SSD
+write measurement.
+
+Pinned manifests name `rusqlite = 0.40.2` with `bundled`, serde with
+`derive` (and `rc` in nucleus-core), and schemars; the lock inventory also
+contains candidate packages including `libsqlite3-sys 0.38.2`, `cc 1.4.7`,
+`pkg-config 0.3.34`, `vcpkg 0.2.15`, `serde_derive 1.0.229`,
+`schemars_derive 0.8.22`, `syn 2.0.119`, and `quote 1.0.47`. These
+manifest and lock references identify the next bounded behavior-audit
+candidates; they do not prove enabled units, feature selection, or that the
+refused packages are available for source inspection. No refused package
+sources were read, and no script, macro, helper, Cargo command, compiler, or
+SDK was executed or inspected.
+
+The opt-in private entry is
+`effigy registry:acquire:nucleus`. It reads only the pinned source leaves and
+allowlisted Cargo configuration, then invokes the feature-gated
+`oxide-registry-acquisition` binary, which delegates correspondence checks to
+the existing Rust archive verifier. This observation grants no installed
+registry issuer, no lease-time no-replacement guarantee, and no full package,
+graph, macro/build-script, native-tool, SDK, or hidden-read closure. It is
+partial correspondence evidence, not a build, test, reuse, or rollout result.
+
 ## Installed path observations
 
 The allowlisted path configuration observed was:

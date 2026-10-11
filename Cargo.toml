@@ -29,5 +29,10 @@ name = "oxide-storage-runtime"
 path = "src/bin/storage_runtime.rs"
 required-features = ["private-qualification"]
 
+[[bin]]
+name = "oxide-registry-acquisition"
+path = "src/bin/registry_acquisition.rs"
+required-features = ["private-qualification"]
+
 [lib]
 path = "src/lib.rs"
