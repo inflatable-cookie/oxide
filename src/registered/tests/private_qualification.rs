@@ -1,11 +1,20 @@
 //! Synthetic owner results, real compiled child and durable daemon. No Cargo
 //! workload, Nucleus workflow, or benefit qualification is performed.
 use super::*;
+use crate::registered::cargo_freshness;
+use crate::registered::graph_owner::{
+    accept_graph_provision, issue_graph_provision, DepInfoMapping, GraphEdgeProvision,
+    GraphOwnerAuthority, GraphProvision, GraphUnitProvision, RegisteredFileProvision, RerunMapping,
+    WirePathTag, GRAPH_OWNER_ISSUER, GRAPH_OWNER_PROVISION_DOMAIN, GRAPH_OWNER_SCHEMA,
+    GRAPH_OWNER_VERSION,
+};
 use crate::registered::qualification::*;
+use crate::registered::runner_host::StorageIdentity;
 use crate::storage::{
     CaptureReceipt, CooperativeCompletionEvidence, ProcessIdentityEvidence, SlotState,
     TerminalOutcome, TerminalRecord,
 };
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -116,8 +125,171 @@ fn bootstrap(
             f.attempt.capture.clone(),
         ],
         timing: None,
+        graph_owner: None,
     }
 }
+
+struct ReadingMode {
+    key: MacKey,
+    start_digest: String,
+    forged: bool,
+    drop_dep_info: bool,
+}
+
+fn cargo_units(f: &Fixture) -> Vec<GraphUnitProvision> {
+    let dep_info_anchor = "debug/deps/source.d";
+    let package_file = |reference_path: &str, input_path: &str| RegisteredFileProvision {
+        tag: WirePathTag::PackageRoot,
+        path: reference_path.into(),
+        input: source(input_path),
+        association: observed_association(source(input_path), &[dep_info_anchor], None, None),
+    };
+    let generated_input = InputPath {
+        root: InputRoot::Generated,
+        path: "generated.rs".into(),
+    };
+    let output_anchor = "debug/.fingerprint/script-hash/output";
+    let registry = f.owners.manifests.get("registry-receipt").unwrap();
+    vec![
+        GraphUnitProvision {
+            id: "source-unit".into(),
+            package_root: f.attempt.source_root.clone(),
+            package_origin: InputRoot::Source,
+            fingerprint_directory: "debug/.fingerprint/source-hash".into(),
+            fingerprint_file: "lib-source.json".into(),
+            directory_entries: set(&["lib-source.json"]),
+            dep_info: vec![DepInfoMapping {
+                path: dep_info_anchor.into(),
+                files: vec![
+                    package_file("src/lib.rs", "src.rs"),
+                    RegisteredFileProvision {
+                        tag: WirePathTag::BuildRoot,
+                        path: "build/out.rs".into(),
+                        input: generated_input.clone(),
+                        association: observed_association(
+                            generated_input,
+                            &[dep_info_anchor],
+                            Some("script-unit"),
+                            None,
+                        ),
+                    },
+                    package_file("Cargo.toml", "Cargo.toml"),
+                ],
+            }],
+            rerun_files: Vec::new(),
+            associations: Vec::new(),
+            dependencies: vec![GraphEdgeProvision {
+                package_id: 17,
+                name: "script-unit".into(),
+                public: false,
+                unit: "script-unit".into(),
+            }],
+            effective_environment: f.registration.unit_environment["source-unit"].clone(),
+            audited_precalculated_registry_receipt: None,
+            additional_anchors: BTreeSet::new(),
+        },
+        GraphUnitProvision {
+            id: "script-unit".into(),
+            package_root: f.attempt.source_root.clone(),
+            package_origin: InputRoot::Source,
+            fingerprint_directory: "debug/.fingerprint/script-hash".into(),
+            fingerprint_file: "run-build-script.json".into(),
+            directory_entries: set(&["run-build-script.json", "output"]),
+            dep_info: Vec::new(),
+            rerun_files: vec![
+                RerunMapping {
+                    path: "build-input".into(),
+                    association: observed_association(
+                        source("build-input"),
+                        &[output_anchor],
+                        None,
+                        None,
+                    ),
+                },
+                RerunMapping {
+                    path: "data".into(),
+                    association: observed_association(source("data"), &[output_anchor], None, None),
+                },
+            ],
+            associations: vec![
+                observed_association(
+                    InputPath {
+                        root: InputRoot::Immutable("registry-receipt".into()),
+                        path: "sqlite.c".into(),
+                    },
+                    &[output_anchor],
+                    None,
+                    Some("tool-receipt"),
+                ),
+                observed_association(
+                    InputPath {
+                        root: InputRoot::Immutable("tool-receipt".into()),
+                        path: "header.h".into(),
+                    },
+                    &[output_anchor],
+                    None,
+                    Some("tool-receipt"),
+                ),
+            ],
+            dependencies: Vec::new(),
+            effective_environment: f.registration.unit_environment["script-unit"].clone(),
+            audited_precalculated_registry_receipt: None,
+            additional_anchors: BTreeSet::new(),
+        },
+        GraphUnitProvision {
+            id: "registry-unit".into(),
+            package_root: registry.root.clone(),
+            package_origin: InputRoot::Immutable("registry-receipt".into()),
+            fingerprint_directory: "debug/.fingerprint/registry-hash".into(),
+            fingerprint_file: "lib-registry.json".into(),
+            directory_entries: set(&["lib-registry.json"]),
+            dep_info: Vec::new(),
+            rerun_files: Vec::new(),
+            associations: Vec::new(),
+            dependencies: Vec::new(),
+            effective_environment: f.registration.unit_environment["registry-unit"].clone(),
+            audited_precalculated_registry_receipt: Some("registry-receipt".into()),
+            additional_anchors: BTreeSet::new(),
+        },
+    ]
+}
+
+fn unsigned_graph(f: &Fixture) -> GraphProvision {
+    GraphProvision {
+        version: GRAPH_OWNER_VERSION,
+        schema: GRAPH_OWNER_SCHEMA.into(),
+        issuer: GRAPH_OWNER_ISSUER.into(),
+        cargo_version: cargo_freshness::CARGO_VERSION.into(),
+        cargo_source_commit: cargo_freshness::CARGO_SOURCE_COMMIT.into(),
+        graph_digest: f.registration.graph_digest.clone(),
+        units: cargo_units(f),
+        receipt: String::new(),
+    }
+}
+
+fn issue_for_attempt(
+    f: &Fixture,
+    key: &MacKey,
+    start_digest: &str,
+    attempt: &Attempt,
+    storage: &StorageIdentity,
+    mut provision: GraphProvision,
+) -> GraphProvision {
+    if provision.units.is_empty() {
+        provision.units = cargo_units(f);
+    }
+    issue_graph_provision(
+        key,
+        SCOPE,
+        &storage.storage_instance_id,
+        start_digest,
+        attempt,
+        storage,
+        provision,
+    )
+    .unwrap()
+}
+
 fn write_bootstrap(path: &Path, b: &Bootstrap) {
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -237,6 +409,7 @@ fn parent(
     authority: &QualificationAuthority,
     map_key: &MacKey,
     interrupt: bool,
+    reading: Option<&ReadingMode>,
 ) -> (serde_json::Value, Vec<serde_json::Value>) {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -292,21 +465,75 @@ fn parent(
                     .unwrap(),
             )
             .unwrap(),
-            "input.units" => serde_json::to_value(
-                f.owners
-                    .units(
-                        &serde_json::from_value(payload["registration"].clone()).unwrap(),
-                        &serde_json::from_value(payload["attempt"].clone()).unwrap(),
-                    )
-                    .unwrap(),
-            )
-            .unwrap(),
-            "execution.execute" => serde_json::to_value(
-                f.owners
-                    .execute(&serde_json::from_value(payload["launch"].clone()).unwrap())
-                    .unwrap(),
-            )
-            .unwrap(),
+            "input.units" => {
+                assert!(
+                    reading.is_none(),
+                    "collector mode must not fall back to parent UnitEvidence"
+                );
+                serde_json::to_value(
+                    f.owners
+                        .units(
+                            &serde_json::from_value(payload["registration"].clone()).unwrap(),
+                            &serde_json::from_value(payload["attempt"].clone()).unwrap(),
+                        )
+                        .unwrap(),
+                )
+                .unwrap()
+            }
+            "input.graph_owner" => {
+                let reading =
+                    reading.expect("graph owner callback requires installed reading mode");
+                let attempt: Attempt = serde_json::from_value(payload["attempt"].clone()).unwrap();
+                let storage = StorageIdentity {
+                    slot_id: frame["storage"]["slot_id"].as_str().unwrap().into(),
+                    storage_instance_id: frame["storage"]["storage_instance_id"]
+                        .as_str()
+                        .unwrap()
+                        .into(),
+                    generation: frame["storage"]["generation"].as_str().unwrap().into(),
+                    reused: frame["storage"]["reused"].as_bool(),
+                };
+                let mut provision = unsigned_graph(f);
+                if reading.drop_dep_info {
+                    provision.units[0].dep_info.clear();
+                }
+                let mut issued = issue_for_attempt(
+                    f,
+                    &reading.key,
+                    &reading.start_digest,
+                    &attempt,
+                    &storage,
+                    provision,
+                );
+                if reading.forged {
+                    issued.receipt = MacKey::from_hex(STORAGE_KEY)
+                        .unwrap()
+                        .sign(
+                            GRAPH_OWNER_PROVISION_DOMAIN,
+                            &[
+                                SCOPE,
+                                &storage.storage_instance_id,
+                                &reading.start_digest,
+                                "0",
+                            ],
+                        )
+                        .unwrap();
+                }
+                serde_json::to_value(&issued).unwrap()
+            }
+            "execution.execute" => {
+                let launch: Launch = serde_json::from_value(payload["launch"].clone()).unwrap();
+                if reading.is_some() {
+                    write_cargo_slot_files(&launch.slot);
+                    fs::write(launch.slot.join("generated.rs"), b"generated.rs").unwrap();
+                    serde_json::to_value(ExecutionReceipt::Completed(
+                        "synthetic-capture-receipt".into(),
+                    ))
+                    .unwrap()
+                } else {
+                    serde_json::to_value(f.owners.execute(&launch).unwrap()).unwrap()
+                }
+            }
             "execution.verify_success" => {
                 let launch: Launch = serde_json::from_value(payload["launch"].clone()).unwrap();
                 f.owners
@@ -444,8 +671,9 @@ fn actual_child_cold_warm_and_interrupted_hold() {
         write_bootstrap(&file, &b);
         let child = spawn_child(&file);
         let stream = accept_child(&listener);
-        let (response, callbacks) =
-            parent(stream, &f, &request, &auth, &authority, &map_key, interrupt);
+        let (response, callbacks) = parent(
+            stream, &f, &request, &auth, &authority, &map_key, interrupt, None,
+        );
         child.finish(scenario <= 2);
         assert!(!file.exists(), "bootstrap consumed before effects");
         if scenario <= 2 {
@@ -893,4 +1121,581 @@ fn qualified_callback_timeout_after_acquire_holds_lease_and_refuses_replay() {
     );
     assert!(started.elapsed() < Duration::from_secs(30));
     guard.stop();
+}
+
+fn test_storage() -> StorageIdentity {
+    StorageIdentity {
+        slot_id: "slot-0000000000000001".into(),
+        storage_instance_id: "aa".repeat(32),
+        generation: "1".into(),
+        reused: Some(false),
+    }
+}
+
+fn issued_fixture_graph(f: &Fixture, key: &MacKey, start_digest: &str) -> GraphProvision {
+    issue_for_attempt(
+        f,
+        key,
+        start_digest,
+        &f.attempt,
+        &test_storage(),
+        unsigned_graph(f),
+    )
+}
+
+#[test]
+fn graph_owner_accepts_synthetic_context_and_shares_one_budget() {
+    let fixture = Fixture::new();
+    install_cargo_freshness(&fixture);
+    let key = MacKey::from_hex(OWNER_KEY).unwrap();
+    let start_digest = format!("sha256:{}", "ab".repeat(32));
+    let provision = issued_fixture_graph(&fixture, &key, &start_digest);
+    let mut budget = evidence_budget(Limits::NUCLEUS.collection_bytes);
+    charge_budget(&mut budget, 1024).unwrap();
+    let used_before = budget_used(&budget);
+    let context = accept_graph_provision(
+        provision,
+        &fixture.registration,
+        &fixture.attempt,
+        &fixture.owners.manifests,
+        &mut budget,
+        &key,
+        SCOPE,
+        &start_digest,
+        &test_storage(),
+    )
+    .unwrap();
+    assert_eq!(context.build_root, fixture.attempt.slot);
+    assert_eq!(context.cargo_version, cargo_freshness::CARGO_VERSION);
+    let used_after_provision = budget_used(&budget);
+    assert!(
+        used_after_provision > used_before,
+        "provision decode charges the shared budget"
+    );
+    let units = cargo_freshness::collect(
+        &fixture.registration,
+        &fixture.attempt,
+        &fixture.owners.manifests,
+        &mut budget,
+        &context,
+    )
+    .unwrap();
+    assert_eq!(units.len(), 3);
+    assert!(budget_used(&budget) > used_after_provision);
+    let source = units.iter().find(|unit| unit.id == "source-unit").unwrap();
+    assert_eq!(
+        source.locals.iter().find_map(|local| match local {
+            LocalInput::RerunEnvironment { name, value } if name == "ABSENT" => Some(value),
+            _ => None,
+        }),
+        Some(&None)
+    );
+}
+
+#[test]
+fn graph_owner_refuses_forged_mismatched_and_untrusted_fields() {
+    let fixture = Fixture::new();
+    install_cargo_freshness(&fixture);
+    let key = MacKey::from_hex(OWNER_KEY).unwrap();
+    let start_digest = format!("sha256:{}", "cd".repeat(32));
+    let accept = |provision: GraphProvision, attempt: &Attempt, storage: &StorageIdentity| {
+        let mut budget = evidence_budget(Limits::NUCLEUS.collection_bytes);
+        accept_graph_provision(
+            provision,
+            &fixture.registration,
+            attempt,
+            &fixture.owners.manifests,
+            &mut budget,
+            &key,
+            SCOPE,
+            &start_digest,
+            storage,
+        )
+    };
+    let good = issued_fixture_graph(&fixture, &key, &start_digest);
+    assert!(accept(good.clone(), &fixture.attempt, &test_storage()).is_ok());
+
+    let mut unknown_issuer = good.clone();
+    unknown_issuer.issuer = "unknown-issuer".into();
+    unknown_issuer = issue_for_attempt(
+        &fixture,
+        &key,
+        &start_digest,
+        &fixture.attempt,
+        &test_storage(),
+        unknown_issuer,
+    );
+    assert_eq!(
+        accept(unknown_issuer, &fixture.attempt, &test_storage()).unwrap_err(),
+        Refusal::Identity
+    );
+
+    let mut wrong_pin = unsigned_graph(&fixture);
+    wrong_pin.cargo_version = "1.0.0".into();
+    let wrong_pin = issue_for_attempt(
+        &fixture,
+        &key,
+        &start_digest,
+        &fixture.attempt,
+        &test_storage(),
+        wrong_pin,
+    );
+    assert_eq!(
+        accept(wrong_pin, &fixture.attempt, &test_storage()).unwrap_err(),
+        Refusal::Identity
+    );
+
+    let mut wrong_graph = unsigned_graph(&fixture);
+    wrong_graph.graph_digest = digest(b"other graph");
+    let wrong_graph = issue_for_attempt(
+        &fixture,
+        &key,
+        &start_digest,
+        &fixture.attempt,
+        &test_storage(),
+        wrong_graph,
+    );
+    assert_eq!(
+        accept(wrong_graph, &fixture.attempt, &test_storage()).unwrap_err(),
+        Refusal::Identity
+    );
+
+    let mut duplicate = unsigned_graph(&fixture);
+    duplicate.units[2].id = duplicate.units[0].id.clone();
+    let duplicate = issue_for_attempt(
+        &fixture,
+        &key,
+        &start_digest,
+        &fixture.attempt,
+        &test_storage(),
+        duplicate,
+    );
+    assert_eq!(
+        accept(duplicate, &fixture.attempt, &test_storage()).unwrap_err(),
+        Refusal::Identity
+    );
+
+    let mut unsafe_path = unsigned_graph(&fixture);
+    unsafe_path.units[0].fingerprint_directory = "../outside".into();
+    let unsafe_path = issue_for_attempt(
+        &fixture,
+        &key,
+        &start_digest,
+        &fixture.attempt,
+        &test_storage(),
+        unsafe_path,
+    );
+    assert_eq!(
+        accept(unsafe_path, &fixture.attempt, &test_storage()).unwrap_err(),
+        Refusal::Unsupported
+    );
+
+    let mut forged = good.clone();
+    forged.receipt.push('0');
+    assert_eq!(
+        accept(forged, &fixture.attempt, &test_storage()).unwrap_err(),
+        Refusal::Authentication
+    );
+
+    let mut moved = fixture.attempt.clone();
+    moved.slot = fixture.base.join("capture");
+    assert_eq!(
+        accept(good.clone(), &moved, &test_storage()).unwrap_err(),
+        Refusal::Authentication
+    );
+
+    let mut replayed = fixture.attempt.clone();
+    replayed.binding.run_id.push('x');
+    assert_eq!(
+        accept(good.clone(), &replayed, &test_storage()).unwrap_err(),
+        Refusal::Authentication
+    );
+
+    let mut other_storage = test_storage();
+    other_storage.slot_id = "slot-0000000000000002".into();
+    assert_eq!(
+        accept(good, &fixture.attempt, &other_storage).unwrap_err(),
+        Refusal::Authentication
+    );
+
+    let extra_field = serde_json::to_string(&issued_fixture_graph(&fixture, &key, &start_digest))
+        .unwrap()
+        .replacen('{', "{\"unexpected\":true,", 1);
+    assert!(serde_json::from_str::<GraphProvision>(&extra_field).is_err());
+}
+
+#[test]
+fn graph_owner_shared_budget_cannot_reset_or_publish_after_exhaustion() {
+    let fixture = Fixture::new();
+    install_cargo_freshness(&fixture);
+    let key = MacKey::from_hex(OWNER_KEY).unwrap();
+    let start_digest = format!("sha256:{}", "ef".repeat(32));
+    let provision = issued_fixture_graph(&fixture, &key, &start_digest);
+    let mut budget = evidence_budget(16_384);
+    charge_budget(&mut budget, 16_000).unwrap();
+    let used = budget_used(&budget);
+    assert_eq!(
+        accept_graph_provision(
+            provision,
+            &fixture.registration,
+            &fixture.attempt,
+            &fixture.owners.manifests,
+            &mut budget,
+            &key,
+            SCOPE,
+            &start_digest,
+            &test_storage(),
+        )
+        .unwrap_err(),
+        Refusal::Budget
+    );
+    assert_eq!(budget_used(&budget), used);
+}
+
+#[test]
+fn graph_owner_missing_dep_info_and_rerun_mappings_refuse() {
+    let fixture = Fixture::new();
+    install_cargo_freshness(&fixture);
+    let key = MacKey::from_hex(OWNER_KEY).unwrap();
+    let start_digest = format!("sha256:{}", "11".repeat(32));
+    let mut missing_dep = unsigned_graph(&fixture);
+    missing_dep.units[0].dep_info.clear();
+    let missing_dep = issue_for_attempt(
+        &fixture,
+        &key,
+        &start_digest,
+        &fixture.attempt,
+        &test_storage(),
+        missing_dep,
+    );
+    let mut budget = evidence_budget(Limits::NUCLEUS.collection_bytes);
+    let context = accept_graph_provision(
+        missing_dep,
+        &fixture.registration,
+        &fixture.attempt,
+        &fixture.owners.manifests,
+        &mut budget,
+        &key,
+        SCOPE,
+        &start_digest,
+        &test_storage(),
+    )
+    .unwrap();
+    assert_eq!(
+        cargo_freshness::collect(
+            &fixture.registration,
+            &fixture.attempt,
+            &fixture.owners.manifests,
+            &mut budget,
+            &context,
+        )
+        .unwrap_err(),
+        Refusal::MissingAuthority
+    );
+
+    let mut missing_rerun = unsigned_graph(&fixture);
+    missing_rerun.units[1].rerun_files.clear();
+    let missing_rerun = issue_for_attempt(
+        &fixture,
+        &key,
+        &start_digest,
+        &fixture.attempt,
+        &test_storage(),
+        missing_rerun,
+    );
+    let mut budget = evidence_budget(Limits::NUCLEUS.collection_bytes);
+    let context = accept_graph_provision(
+        missing_rerun,
+        &fixture.registration,
+        &fixture.attempt,
+        &fixture.owners.manifests,
+        &mut budget,
+        &key,
+        SCOPE,
+        &start_digest,
+        &test_storage(),
+    )
+    .unwrap();
+    assert_eq!(
+        cargo_freshness::collect(
+            &fixture.registration,
+            &fixture.attempt,
+            &fixture.owners.manifests,
+            &mut budget,
+            &context,
+        )
+        .unwrap_err(),
+        Refusal::MissingAuthority
+    );
+}
+
+fn reading_bootstrap(
+    f: &Fixture,
+    request: &serde_json::Value,
+    socket: PathBuf,
+    instance: &str,
+    parent: PathBuf,
+) -> Bootstrap {
+    let mut b = bootstrap(f, request, socket, instance, parent);
+    b.graph_owner = Some(GraphOwnerAuthority::issue(&b).unwrap());
+    b
+}
+
+#[test]
+fn actual_child_cargo_reading_owner_collects_then_refuses_stale_mapping() {
+    let started = Instant::now();
+    let mut f = Fixture::new();
+    f.attempt.binding.commit = "1".repeat(40);
+    f.attempt.allocation_epoch = "1".into();
+    let p = partition(&f);
+    f.attempt.partition = digest(&serde_json::to_vec(&p).unwrap());
+    let allowed = (1..=3).map(|n| envelope(&f, &p, n)).collect::<Vec<_>>();
+    let authority = Arc::new(
+        QualificationAuthority::new(
+            MacKey::from_hex(STORAGE_KEY).unwrap(),
+            SCOPE.into(),
+            allowed.clone(),
+        )
+        .unwrap(),
+    );
+    let root = f.base.join("store");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let daemon = Daemon::bind(
+        DaemonConfig {
+            root: root.clone(),
+            budget: Budget {
+                cap_bytes: 16 * 1024 * 1024,
+                free_reserve_bytes: 0,
+            },
+        },
+        authority.clone(),
+        Arc::new(BridgeFreeSpace),
+    )
+    .unwrap();
+    let instance = daemon.storage_instance_id().to_owned();
+    authority.install_instance(&instance).unwrap();
+    let (socket, guard) = BridgeDaemon::start(daemon);
+    let client = Client::new(socket.clone());
+    let parent_path = f.base.join("parent.sock");
+    let listener = UnixListener::bind(&parent_path).unwrap();
+    fs::set_permissions(&parent_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let map_key = MacKey::from_hex(MAP_KEY).unwrap();
+    let owner_key = MacKey::from_hex(OWNER_KEY).unwrap();
+    let mut previous = None;
+    for (scenario, n) in [(1, 1), (2, 2), (3, 3)] {
+        let scenario_started = Instant::now();
+        let request = start(&f, &authority, allowed[n - 1].clone(), n);
+        let b = reading_bootstrap(&f, &request, socket.clone(), &instance, parent_path.clone());
+        let auth =
+            CallbackAuthenticator::new(owner_key.clone(), b.callback_context().unwrap()).unwrap();
+        let reading = ReadingMode {
+            key: owner_key.clone(),
+            start_digest: b.start_digest.clone(),
+            forged: false,
+            drop_dep_info: false,
+        };
+        if scenario == 3 {
+            let slot = root.join("slots").join(previous.as_ref().unwrap());
+            fs::write(slot.join("debug/deps/source.d"), b"stale-dep-info").unwrap();
+        }
+        let file = f.base.join(format!("bootstrap-reading-{scenario}.json"));
+        write_bootstrap(&file, &b);
+        let child = spawn_child(&file);
+        let stream = accept_child(&listener);
+        let (response, callbacks) = parent(
+            stream,
+            &f,
+            &request,
+            &auth,
+            &authority,
+            &map_key,
+            false,
+            Some(&reading),
+        );
+        if scenario <= 2 {
+            child.finish(true);
+            assert_eq!(response["result"]["status"], "finished");
+            assert_eq!(response["result"]["outcome"], "published");
+            assert!(callbacks.iter().any(|c| c["owner"] == "input.graph_owner"));
+            assert!(callbacks.iter().all(|c| c["owner"] != "input.units"));
+            previous = Some(
+                response["result"]["storage"]["slot_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+            assert_eq!(
+                client.inventory("reading").unwrap().slots[0].state,
+                SlotState::Idle
+            );
+        } else {
+            child.finish(false);
+            assert_eq!(response["operation"], "error");
+            assert_eq!(
+                response["result"].is_null() || response.get("result").is_none(),
+                true
+            );
+            assert_eq!(
+                client.inventory("stale").unwrap().slots[0].state,
+                SlotState::Leased
+            );
+        }
+        assert!(scenario_started.elapsed() < Duration::from_secs(30));
+        assert!(callbacks.iter().all(|c| !has_token_field(c)));
+    }
+    guard.stop();
+    assert!(started.elapsed() < Duration::from_secs(120));
+}
+
+#[test]
+fn actual_child_forged_graph_owner_holds_acquired_lease() {
+    let mut f = Fixture::new();
+    f.attempt.binding.commit = "1".repeat(40);
+    f.attempt.allocation_epoch = "1".into();
+    let p = partition(&f);
+    f.attempt.partition = digest(&serde_json::to_vec(&p).unwrap());
+    let allowed = vec![envelope(&f, &p, 1)];
+    let authority = Arc::new(
+        QualificationAuthority::new(
+            MacKey::from_hex(STORAGE_KEY).unwrap(),
+            SCOPE.into(),
+            allowed.clone(),
+        )
+        .unwrap(),
+    );
+    let root = f.base.join("store");
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let daemon = Daemon::bind(
+        DaemonConfig {
+            root,
+            budget: Budget {
+                cap_bytes: 16 * 1024 * 1024,
+                free_reserve_bytes: 0,
+            },
+        },
+        authority.clone(),
+        Arc::new(BridgeFreeSpace),
+    )
+    .unwrap();
+    let instance = daemon.storage_instance_id().to_owned();
+    authority.install_instance(&instance).unwrap();
+    let (socket, guard) = BridgeDaemon::start(daemon);
+    let client = Client::new(socket.clone());
+    let parent_path = f.base.join("parent.sock");
+    let listener = UnixListener::bind(&parent_path).unwrap();
+    fs::set_permissions(&parent_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let request = start(&f, &authority, allowed[0].clone(), 1);
+    let b = reading_bootstrap(&f, &request, socket.clone(), &instance, parent_path.clone());
+    let owner_key = MacKey::from_hex(OWNER_KEY).unwrap();
+    let auth =
+        CallbackAuthenticator::new(owner_key.clone(), b.callback_context().unwrap()).unwrap();
+    let reading = ReadingMode {
+        key: owner_key,
+        start_digest: b.start_digest.clone(),
+        forged: true,
+        drop_dep_info: false,
+    };
+    let file = f.base.join("bootstrap-forged-graph.json");
+    write_bootstrap(&file, &b);
+    let child = spawn_child(&file);
+    let stream = accept_child(&listener);
+    let (response, callbacks) = parent(
+        stream,
+        &f,
+        &request,
+        &auth,
+        &authority,
+        &MacKey::from_hex(MAP_KEY).unwrap(),
+        false,
+        Some(&reading),
+    );
+    child.finish(false);
+    assert_eq!(response["operation"], "error");
+    assert!(callbacks.iter().any(|c| c["owner"] == "input.graph_owner"));
+    assert!(callbacks.iter().all(|c| c["owner"] != "input.units"));
+    assert_eq!(
+        client.inventory("forged").unwrap().slots[0].state,
+        SlotState::Leased
+    );
+    // A second acquire_id for the still-held attempt cannot mint a new token.
+    assert_eq!(
+        client.acquire(AcquireRequest {
+            envelope: serde_json::from_value(
+                start(&f, &authority, allowed[0].clone(), 1)["payload"]["acquire"]["envelope"]
+                    .clone()
+            )
+            .unwrap(),
+            acquire_id: "acquire-forged-replay".into(),
+            required_bytes: 1024 * 1024
+        }),
+        Err(StorageError::Conflict)
+    );
+    guard.stop();
+}
+
+#[test]
+fn graph_owner_bootstrap_unknown_issuer_refuses_before_connect() {
+    let mut f = Fixture::new();
+    f.attempt.binding.commit = "1".repeat(40);
+    f.attempt.allocation_epoch = "1".into();
+    let p = partition(&f);
+    let allowed = vec![envelope(&f, &p, 1)];
+    let authority = QualificationAuthority::new(
+        MacKey::from_hex(STORAGE_KEY).unwrap(),
+        SCOPE.into(),
+        allowed.clone(),
+    )
+    .unwrap();
+    let instance = "a".repeat(64);
+    authority.install_instance(&instance).unwrap();
+    let storage = f.base.join("storage.sock");
+    let _storage = UnixListener::bind(&storage).unwrap();
+    fs::set_permissions(&storage, fs::Permissions::from_mode(0o600)).unwrap();
+    let parent_path = f.base.join("parent.sock");
+    let listener = UnixListener::bind(&parent_path).unwrap();
+    fs::set_permissions(&parent_path, fs::Permissions::from_mode(0o600)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let request = start(&f, &authority, allowed[0].clone(), 1);
+    let mut b = bootstrap(&f, &request, storage, &instance, parent_path);
+    b.graph_owner = Some(GraphOwnerAuthority::issue(&b).unwrap());
+    b.graph_owner.as_mut().unwrap().issuer = "production-issuer".into();
+    let file = f.base.join("bootstrap-unknown-issuer.json");
+    write_bootstrap(&file, &b);
+    assert!(serve_bootstrap(&file).is_err());
+    assert!(file.exists());
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn graph_owner_issuance_vector_is_stable() {
+    let v: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../fixtures/qualification-graph-owner-v1.json"
+    ))
+    .unwrap();
+    let key = MacKey::from_hex(v["key_hex"].as_str().unwrap()).unwrap();
+    let domain = v["domain"].as_str().unwrap();
+    let fields = v["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field.as_str().unwrap())
+        .collect::<Vec<_>>();
+    let bytes = mac_frame(domain, &fields).unwrap();
+    assert_eq!(
+        bytes.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        v["frame_hex"]
+    );
+    let receipt = key.sign(domain, &fields).unwrap();
+    assert_eq!(receipt, v["receipt"]);
+    assert!(key.verify(domain, &fields, &receipt));
+    assert_eq!(domain, GRAPH_OWNER_PROVISION_DOMAIN);
+    assert_eq!(
+        canonical_digest(&v["canonical_subject"]).unwrap(),
+        v["canonical_digest"]
+    );
 }

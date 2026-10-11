@@ -479,6 +479,17 @@ impl RunnerHost {
             authorization: payload.attempt.authorization,
             reused: acquired.reused,
         };
+        #[cfg(feature = "private-qualification")]
+        let graph_owner = match &self.qualification {
+            Some(grant) => grant
+                .graph_owner_runtime()?
+                .map(|(key, scope, start_digest)| GraphOwnerRuntime {
+                    key,
+                    scope,
+                    start_digest,
+                }),
+            None => None,
+        };
         let parent = Arc::new(ParentCallbacks {
             channel,
             client: self.client.clone(),
@@ -490,6 +501,8 @@ impl RunnerHost {
             settlement: Mutex::new(None),
             owner_rejected: Mutex::new(false),
             callback_failure: Mutex::new(None),
+            #[cfg(feature = "private-qualification")]
+            graph_owner,
         });
         let runner = Runner {
             registration_owner: parent.as_ref(),
@@ -1036,6 +1049,15 @@ struct ParentCallbacks {
     settlement: Mutex<Option<SettlementClaims>>,
     owner_rejected: Mutex<bool>,
     callback_failure: Mutex<Option<HostError>>,
+    #[cfg(feature = "private-qualification")]
+    graph_owner: Option<GraphOwnerRuntime>,
+}
+
+#[cfg(feature = "private-qualification")]
+struct GraphOwnerRuntime {
+    key: super::qualification::MacKey,
+    scope: String,
+    start_digest: String,
 }
 
 impl ParentCallbacks {
@@ -1244,6 +1266,10 @@ impl InputEvidenceOwner for ParentCallbacks {
         registration: &Registration,
         attempt: &Attempt,
     ) -> Result<Vec<UnitEvidence>, Refusal> {
+        #[cfg(feature = "private-qualification")]
+        if self.graph_owner.is_some() {
+            return Err(Refusal::MissingAuthority);
+        }
         self.callback(
             "input.units",
             &UnitsPayload {
@@ -1251,6 +1277,44 @@ impl InputEvidenceOwner for ParentCallbacks {
                 attempt,
             },
         )
+    }
+
+    fn units_with_budget(
+        &self,
+        registration: &Registration,
+        attempt: &Attempt,
+        manifests: &std::collections::BTreeMap<String, ImmutableManifest>,
+        budget: &mut super::EvidenceReadBudget,
+    ) -> Result<Vec<UnitEvidence>, Refusal> {
+        #[cfg(feature = "private-qualification")]
+        if let Some(runtime) = &self.graph_owner {
+            let provision: super::graph_owner::GraphProvision = self.callback(
+                "input.graph_owner",
+                &UnitsPayload {
+                    registration,
+                    attempt,
+                },
+            )?;
+            let context = super::graph_owner::accept_graph_provision(
+                provision,
+                registration,
+                attempt,
+                manifests,
+                budget,
+                &runtime.key,
+                &runtime.scope,
+                &runtime.start_digest,
+                &storage_identity(&self.acquired),
+            )?;
+            return super::cargo_freshness::collect(
+                registration,
+                attempt,
+                manifests,
+                budget,
+                &context,
+            );
+        }
+        self.units(registration, attempt)
     }
 
     fn seal_map(&self, attempt: &Attempt, map_digest: &str) -> Result<String, Refusal> {
