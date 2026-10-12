@@ -91,12 +91,15 @@ protocol version.
 `OrdinaryCargoRequest` carries an existing `AcquireRequest`, a
 `StrictPhysicalCargoRoot` (`source_root: PathBuf`, `consumer_root_id`, and
 `allocation_epoch`), one `OrdinaryCargoPartition` (`OrdinaryTest` or
-`FullDebug`), and `OrdinaryCargoAcceptance` (`policy_version == 1`,
+`FullDebug`), and `OrdinaryCargoAcceptance` (`policy_version == 1` or `2`,
 `installation_epoch`, `acceptance_reference`, SHA-256 `input_boundary_digest`,
-and an opaque credential). The source root must be an existing canonical
-absolute physical directory. The complete existing `PartitionKey` supplies
-the compatibility partition; the task/run/source identity remains bound in
-the request but is not a partition key.
+and an opaque credential). Version 1 keeps exact input-boundary digest reuse
+semantics. Version 2 uses the typed stable eligibility reference and separate
+attempt authentication described in [ordinary Cargo reuse identity](ordinary-cargo-reuse-identity.md).
+The source root must be an existing canonical absolute physical directory.
+The complete existing `PartitionKey` supplies the compatibility partition;
+the task/run/source identity remains bound in the request but is not a
+partition key.
 
 The client API is:
 
@@ -130,19 +133,26 @@ changed request or evidence conflicts, and invalid credentials are
 unauthorized.
 
 `EvidenceAuthority::verify_ordinary_cargo_admission` and
-`verify_ordinary_cargo_settlement` authenticate the installed policy and
-accepted input boundary. Both have safe defaults that return `false`. A
-caller-provided flag or digest cannot install this trust. Existing admission
-and settlement verification also runs. Missing or unknown input-boundary
-acceptance refuses before a lease can become warm.
+`verify_ordinary_cargo_settlement` authenticate each exact request and its
+accepted input boundary. Both have safe defaults that return `false`. Policy
+version 2 also requires
+`verify_ordinary_cargo_stable_reuse_policy`; its safe default is `false`, and
+it authenticates the installed stable eligibility independently. A
+caller-provided flag or digest cannot install this trust. Missing or unknown
+input-boundary acceptance refuses before a lease can become warm. Versioned
+generation comparison and per-attempt evidence are owned by the linked
+identity contract.
 
 `CargoReuseState::{Empty, Pending, Reusable, ColdOnly}` is separate from
 `SlotState::{Idle, Leased, Uncertain}`. The ledger stores root identity,
 partition label and compatibility key, policy/installation epochs,
 acceptance reference and input-boundary digest, saved pre-acquire state, and
-finalized transition. Credentials are redacted and lease tokens are stored
-only as hashes. Restart changes an active lease to `Uncertain` while retaining
-`Pending`.
+finalized transition. Version 1 compares the generation digest with each
+accepted attempt; version 2 preserves the generation's first-attempt digest
+while comparing the stable eligibility reference and checking each historical
+attempt against its own exact request. Credentials are redacted and lease
+tokens are stored only as hashes. Restart changes an active lease to
+`Uncertain` while retaining `Pending`.
 
 Admission uses checked arithmetic for measured and reserved bytes against the
 configured aggregate cap and free-space reserve. Unknown accounting or free
@@ -269,6 +279,11 @@ not-submitted and finalize IDs. The embedder installs the authenticator and
 process endpoints; task JSON and environment cannot install trusted policy or
 issuer material. The API does not accept a `Registration` or fabricate
 `UnitEvidence`.
+
+This current route remains on policy version 1. Storage policy version 2 is
+not enabled by the route until a separately scoped integration installs and
+authenticates its stable eligibility reference; see the
+[ordinary-Cargo reuse identity contract](ordinary-cargo-reuse-identity.md).
 
 The route uses the existing identity, lease, lookup, and finalize semantics
 with the shipped ordinary-Cargo storage API above (not generic

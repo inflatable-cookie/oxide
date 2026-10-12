@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
 
+/// Original exact-attempt ordinary-Cargo reuse policy semantics.
 pub const ORDINARY_CARGO_POLICY_VERSION: u32 = 1;
+/// Stable compatibility eligibility semantics for ordinary-Cargo policy v2.
+pub const ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION: u32 = 2;
 
 /// Capacity limits for the Oxide-owned intermediate slots.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,7 +138,10 @@ pub struct StrictPhysicalCargoRoot {
 /// Installed, owner-authenticated ordinary-Cargo acceptance.
 ///
 /// The credential is verified by the configured owning boundary and is never
-/// persisted. A caller-provided digest alone cannot enable warm reuse.
+/// persisted. Version 1 binds generation reuse to the exact input digest;
+/// version 2 uses a stable eligibility reference while each exact attempt is
+/// independently authenticated. A caller-provided digest alone cannot enable
+/// warm reuse.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OrdinaryCargoAcceptance {
     pub policy_version: u32,

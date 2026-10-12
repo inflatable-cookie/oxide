@@ -8,6 +8,9 @@ use std::sync::{mpsc, Arc, Barrier};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "private-qualification")]
+mod stable_reuse;
+
 static NEXT_ROOT: AtomicUsize = AtomicUsize::new(1);
 const TEST_DAEMON_ROOT: &str = "OXIDE_STORAGE_TEST_DAEMON_ROOT";
 
@@ -124,12 +127,21 @@ struct RunningDaemon {
 
 impl RunningDaemon {
     fn start(root: &Path, budget: Budget, free_bytes: Option<u64>) -> Self {
+        Self::start_with_authority(root, budget, free_bytes, Arc::new(TestAuthority))
+    }
+
+    fn start_with_authority(
+        root: &Path,
+        budget: Budget,
+        free_bytes: Option<u64>,
+        authority: Arc<dyn EvidenceAuthority>,
+    ) -> Self {
         let daemon = Daemon::bind(
             DaemonConfig {
                 root: root.to_path_buf(),
                 budget,
             },
-            Arc::new(TestAuthority),
+            authority,
             Arc::new(FixedFreeSpace(free_bytes)),
         )
         .expect("bind daemon");
