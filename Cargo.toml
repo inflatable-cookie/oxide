@@ -30,6 +30,11 @@ path = "src/bin/storage_runtime.rs"
 required-features = ["private-qualification"]
 
 [[bin]]
+name = "oxide-ordinary-cargo-attempt"
+path = "src/bin/ordinary_cargo_attempt.rs"
+required-features = ["private-qualification"]
+
+[[bin]]
 name = "oxide-registry-acquisition"
 path = "src/bin/registry_acquisition.rs"
 required-features = ["private-qualification"]

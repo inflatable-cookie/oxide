@@ -4,7 +4,7 @@ mod transport;
 mod types;
 
 pub use store::{Daemon, DaemonConfig, EvidenceAuthority, FreeSpaceProbe};
-pub use transport::Client;
+pub use transport::{Client, STORAGE_PROTOCOL_VERSION};
 pub use types::{
     AcquireRequest, AcquireResult, Budget, CaptureReceipt, CargoReuseState, ContainmentEvidence,
     CooperativeCompletionEvidence, Credential, FinalizationReceipt, Inventory, InventorySlot,

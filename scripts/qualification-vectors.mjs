@@ -31,6 +31,12 @@ const sortKeys = value => {
   return value;
 };
 const digestOf = text => 'sha256:' + createHash('sha256').update(text, 'utf8').digest('hex');
+const runtimePolicy = {
+  ...r.policy_inputs,
+  storage_protocol: 2,
+  control_protocol: 1,
+};
+assert.equal(digestOf(JSON.stringify(sortKeys(runtimePolicy))), r.policy_digest);
 const readyMac = (keyHex, fields) => {
   const bytes = Buffer.concat(['oxide-runtime-ready-v1', ...fields].flatMap(value => {
     const encoded = Buffer.from(value, 'utf8');
@@ -67,3 +73,27 @@ assert(!readyVerifies({ ...r.body, mac: r.mac }, { ...r, bootstrap_digest: diges
 assert(!readyVerifies({ ...r.body, mac: r.mac }, { ...r, policy_digest: digestOf('other policy') }), 'wrong policy must refuse');
 assert(!readyVerifies({ ...r.body, mac: r.mac }, { ...r, key_hex: '77'.repeat(32) }), 'wrong control key must refuse');
 console.log('Node/Rust storage-runtime ready vector authenticated; endpoint u64 text stays exact; substitutions and forgeries refuse');
+
+// Cross-language ordinary-Cargo request and installed receipt vectors.
+const ordinary = JSON.parse(readFileSync(new URL('../fixtures/ordinary-cargo-auth-v1.json', import.meta.url)));
+const ordinaryCanonical = JSON.stringify(sortKeys(ordinary.request_subject));
+assert.equal('sha256:' + createHash('sha256').update(ordinaryCanonical, 'utf8').digest('hex'), ordinary.request_digest);
+assert.equal(digestOf(JSON.stringify(sortKeys(ordinary.input_boundary_subject))), ordinary.input_boundary_digest);
+assert.equal(digestOf(JSON.stringify(sortKeys(ordinary.callback_context_subject))), ordinary.callback_context_digest);
+const ordinarySettlementCanonical = JSON.stringify(sortKeys(ordinary.settlement.subject));
+assert.equal(digestOf(ordinarySettlementCanonical), ordinary.settlement.subject_digest);
+assert.equal(ordinary.settlement.request_digest, ordinary.request_digest);
+const verifyMacVector = vector => {
+  const frame = Buffer.concat([vector.domain, ...vector.fields].flatMap(value => {
+    const encoded = Buffer.from(value, 'utf8');
+    const size = Buffer.alloc(4); size.writeUInt32BE(encoded.length);
+    return [size, encoded];
+  }));
+  assert.equal(frame.toString('hex'), vector.frame_hex);
+  const receipt = 'hmac-sha256-v1:' + createHmac('sha256', Buffer.from(vector.key_hex, 'hex')).update(frame).digest('hex');
+  assert.equal(receipt, vector.receipt);
+};
+for (const vector of [ordinary.admission, ordinary.callback, ordinary.settlement]) {
+  verifyMacVector(vector);
+}
+console.log('Node/Rust ordinary input/request/settlement/context digests and admission/settlement/callback HMAC vectors passed');

@@ -16,13 +16,14 @@ pub use super::graph_owner::{
     GRAPH_OWNER_ISSUER, GRAPH_OWNER_PROVISION_DOMAIN, GRAPH_OWNER_SCHEMA, GRAPH_OWNER_VERSION,
 };
 use crate::storage::{
-    AcquireResult, ContainmentEvidence, EvidenceAuthority, RunEnvelope, SettlementEvidence,
-    TerminalOutcome,
+    AcquireResult, ContainmentEvidence, EvidenceAuthority, OrdinaryCargoRequest, RunEnvelope,
+    SettlementEvidence, TerminalOutcome,
 };
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -154,6 +155,7 @@ pub struct QualificationAuthority {
     key: MacKey,
     scope: String,
     allowed: Vec<RunEnvelope>,
+    ordinary_request_digests: BTreeSet<String>,
     instance: Mutex<Option<String>>,
 }
 impl fmt::Debug for QualificationAuthority {
@@ -170,8 +172,24 @@ impl QualificationAuthority {
             key,
             scope,
             allowed,
+            ordinary_request_digests: BTreeSet::new(),
             instance: Mutex::new(None),
         })
+    }
+    /// Installs exact ordinary-Cargo request digests from protected owner policy.
+    /// An empty set keeps ordinary-Cargo issuance disabled.
+    pub fn with_ordinary_cargo_request_digests(
+        mut self,
+        digests: Vec<String>,
+    ) -> Result<Self, HostError> {
+        if digests.len() > 4
+            || digests.iter().any(|digest| !valid_digest(digest))
+            || digests.iter().collect::<BTreeSet<_>>().len() != digests.len()
+        {
+            return Err(HostError::Protocol);
+        }
+        self.ordinary_request_digests = digests.into_iter().collect();
+        Ok(self)
     }
     pub fn install_instance(&self, instance: &str) -> Result<(), HostError> {
         if decode_hex(instance).is_none() {
@@ -205,6 +223,27 @@ impl QualificationAuthority {
         self.key
             .verify(domain, &[&self.scope, instance, &digest], receipt)
     }
+
+    fn verify_ordinary_receipt(&self, domain: &str, subject: &Value, receipt: &str) -> bool {
+        let Ok(instance) = self.instance.lock() else {
+            return false;
+        };
+        let Some(instance) = instance.as_ref() else {
+            return false;
+        };
+        let Ok(digest) = canonical_digest(subject) else {
+            return false;
+        };
+        self.key
+            .verify(domain, &[&self.scope, instance, &digest], receipt)
+    }
+
+    fn verifies_admitted_ordinary_request(&self, request: &OrdinaryCargoRequest) -> Option<String> {
+        let digest = ordinary_cargo_request_digest(request).ok()?;
+        self.ordinary_request_digests
+            .contains(&digest)
+            .then_some(digest)
+    }
 }
 impl EvidenceAuthority for QualificationAuthority {
     fn verify_admission(&self, envelope: &RunEnvelope) -> bool {
@@ -232,13 +271,145 @@ impl EvidenceAuthority for QualificationAuthority {
         self.verifies(
             "oxide-settlement-v1",
             &subject,
-            evidence.consumer_credential.expose(),
+            &generic_receipt(evidence.consumer_credential.expose()),
         ) && evidence.terminal.as_ref().is_none_or(|terminal| {
-            self.verifies("oxide-terminal-v1", &subject, terminal.credential.expose())
+            self.verifies(
+                "oxide-terminal-v1",
+                &subject,
+                &generic_receipt(terminal.credential.expose()),
+            )
         }) && evidence.capture.as_ref().is_none_or(|capture| {
-            self.verifies("oxide-capture-v1", &subject, capture.credential.expose())
+            self.verifies(
+                "oxide-capture-v1",
+                &subject,
+                &generic_receipt(capture.credential.expose()),
+            )
         })
     }
+
+    fn verify_ordinary_cargo_admission(&self, request: &OrdinaryCargoRequest) -> bool {
+        let Some(digest) = self.verifies_admitted_ordinary_request(request) else {
+            return false;
+        };
+        let Ok(instance) = self.instance.lock() else {
+            return false;
+        };
+        let Some(instance) = instance.as_ref() else {
+            return false;
+        };
+        self.key.verify(
+            "oxide-ordinary-cargo-admission-v1",
+            &[&self.scope, instance, &digest],
+            request.acceptance.credential.expose(),
+        )
+    }
+
+    fn verify_ordinary_cargo_settlement(
+        &self,
+        request: &OrdinaryCargoRequest,
+        evidence: &SettlementEvidence,
+    ) -> bool {
+        let Some(request_digest) = self.verifies_admitted_ordinary_request(request) else {
+            return false;
+        };
+        if evidence.binding != request.acquire.envelope.binding {
+            return false;
+        }
+        let Some(subject) = ordinary_cargo_settlement_subject(&request_digest, evidence) else {
+            return false;
+        };
+        if !self.verify_settlement(evidence) {
+            return false;
+        }
+        let verifies = |credential: &str| {
+            self.verify_ordinary_receipt(
+                "oxide-ordinary-cargo-settlement-v1",
+                &subject,
+                &ordinary_receipt(credential),
+            )
+        };
+        verifies(evidence.consumer_credential.expose())
+            && evidence
+                .terminal
+                .as_ref()
+                .is_none_or(|terminal| verifies(terminal.credential.expose()))
+            && evidence
+                .capture
+                .as_ref()
+                .is_none_or(|capture| verifies(capture.credential.expose()))
+    }
+}
+
+/// Canonical digest of the complete ordinary request, excluding only its
+/// admission and acceptance credentials. Every u64 is represented as decimal
+/// text for lossless cross-language identity.
+pub fn ordinary_cargo_request_digest(request: &OrdinaryCargoRequest) -> Result<String, HostError> {
+    let source_root = request
+        .root
+        .source_root
+        .to_str()
+        .ok_or(HostError::Protocol)?;
+    canonical_digest(&json!({
+        "acquire": {
+            "envelope": admission_subject(&request.acquire.envelope),
+            "acquire_id": request.acquire.acquire_id,
+            "required_bytes": request.acquire.required_bytes.to_string(),
+        },
+        "root": {
+            "source_root": source_root,
+            "consumer_root_id": request.root.consumer_root_id,
+            "allocation_epoch": request.root.allocation_epoch,
+        },
+        "partition": request.partition.label(),
+        "acceptance": {
+            "policy_version": request.acceptance.policy_version,
+            "installation_epoch": request.acceptance.installation_epoch,
+            "acceptance_reference": request.acceptance.acceptance_reference,
+            "input_boundary_digest": request.acceptance.input_boundary_digest,
+        }
+    }))
+}
+
+/// The consumer receipt subject binds terminal, capture and containment
+/// evidence to the original ordinary-Cargo request.
+pub fn ordinary_cargo_settlement_subject(
+    request_digest: &str,
+    evidence: &SettlementEvidence,
+) -> Option<Value> {
+    Some(json!({
+        "ordinary_request_digest": request_digest,
+        "settlement": settlement_subject(evidence)?,
+    }))
+}
+
+/// Combine existing settlement authentication with its separate ordinary
+/// request-bound receipt while keeping the credential opaque in storage.
+pub fn bundle_ordinary_credentials(generic: &str, ordinary: &str) -> Option<String> {
+    let generic = generic
+        .strip_prefix("hmac-sha256-v1:")
+        .and_then(decode_hex)?;
+    let ordinary = ordinary
+        .strip_prefix("hmac-sha256-v1:")
+        .and_then(decode_hex)?;
+    Some(format!(
+        "hmac-bundle-v1:{}:{}",
+        hex(&generic),
+        hex(&ordinary)
+    ))
+}
+
+fn generic_receipt(value: &str) -> String {
+    value
+        .strip_prefix("hmac-bundle-v1:")
+        .and_then(|rest| rest.split_once(':').map(|(tag, _)| tag.to_owned()))
+        .map_or_else(|| value.to_owned(), |tag| format!("hmac-sha256-v1:{tag}"))
+}
+
+fn ordinary_receipt(value: &str) -> String {
+    value
+        .strip_prefix("hmac-bundle-v1:")
+        .and_then(|rest| rest.split_once(':').map(|(_, tag)| tag.to_owned()))
+        .map_or_else(String::new, |tag| format!("hmac-sha256-v1:{tag}"))
 }
 
 pub fn admission_subject(envelope: &RunEnvelope) -> Value {
@@ -531,7 +702,7 @@ impl Bootstrap {
             .as_secs();
         if self.version != 1
             || self.host_protocol != 1
-            || self.storage_protocol != 1
+            || self.storage_protocol != crate::storage::STORAGE_PROTOCOL_VERSION
             || self.map_pin != PIN
             || self.expires_unix_seconds < now
             || self.expires_unix_seconds > now.saturating_add(30)
@@ -596,7 +767,7 @@ pub fn serve_bootstrap(path: &Path) -> Result<(), HostError> {
 /// Reads one owner-only, single-link, bounded file without following links.
 /// The named and opened identities must agree before and after the read.
 /// The caller owns consumption and unlinking after its own validation.
-pub(super) fn read_protected(path: &Path) -> Result<Vec<u8>, HostError> {
+pub(crate) fn read_protected(path: &Path) -> Result<Vec<u8>, HostError> {
     private_directory(path.parent().ok_or(HostError::Protocol)?)?;
     if fs::canonicalize(path).map_err(|_| HostError::Io)? != path {
         return Err(HostError::Protocol);
@@ -633,11 +804,11 @@ pub(super) fn read_protected(path: &Path) -> Result<Vec<u8>, HostError> {
     }
     Ok(bytes)
 }
-pub(super) fn owner_uid() -> u32 {
+pub(crate) fn owner_uid() -> u32 {
     // SAFETY: geteuid takes no pointers or arguments and has no preconditions.
     unsafe { libc::geteuid() }
 }
-pub(super) fn private_directory(path: &Path) -> Result<(), HostError> {
+pub(crate) fn private_directory(path: &Path) -> Result<(), HostError> {
     owned_directory(path)?;
     let m = fs::symlink_metadata(path).map_err(|_| HostError::Io)?;
     if m.mode() & 0o7777 != 0o700 {
@@ -718,7 +889,7 @@ mod tests {
         let b = Bootstrap {
             version: 1,
             host_protocol: 1,
-            storage_protocol: 1,
+            storage_protocol: crate::storage::STORAGE_PROTOCOL_VERSION,
             map_pin: PIN.into(),
             expires_unix_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -764,7 +935,7 @@ mod tests {
         Bootstrap {
             version: 1,
             host_protocol: 1,
-            storage_protocol: 1,
+            storage_protocol: crate::storage::STORAGE_PROTOCOL_VERSION,
             map_pin: PIN.into(),
             expires_unix_seconds: 0,
             scope: "timing-scope".into(),

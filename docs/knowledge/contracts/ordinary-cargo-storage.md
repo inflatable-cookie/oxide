@@ -1,20 +1,24 @@
 # Ordinary-Cargo same-root storage route
 
-Status: the versioned Oxide storage API is implemented; the ordinary-Cargo
-execution route remains uninstalled and unqualified. This contract defines one
-graph-free route for a single consumer-owned source workspace and sequential
-attempts at that same physical root. It is not an accepted Nucleus workflow,
-production input policy, or authorization to execute Cargo.
+Status: the versioned Oxide storage API and one private qualification-only
+ordinary-Cargo attempt route are implemented. The route is inactive unless a
+trusted owner installs the protected authority and launches the private
+process. Synthetic route fixtures do not qualify real Cargo behavior, install
+policy, or authorize consumer activation. This contract defines one graph-free
+route for a single consumer-owned source workspace and sequential attempts at
+that same physical root.
 
 ## Decision and boundary
 
 Use ordinary Cargo as the freshness authority for one explicitly accepted,
 cooperative workflow. Keep the existing durable Oxide storage client and the
 consumer's current StorageAttempt, Effigy 010 submission, settlement, and
-retention owners. Add one qualification-only route that acquires storage before
-it asks the consumer to submit a host run. The route invokes the exact approved
-Cargo selector on the consumer's source root, with the acquired slot as Cargo's
-build directory, and always asks that selector to run its declared tests.
+retention owners. The qualification-only route acquires storage before it asks
+the consumer to submit a host run. It returns the exact approved selector,
+argv, source root, acquired slot as `CARGO_BUILD_BUILD_DIR`, and private
+per-attempt target/temp/capture paths to that consumer. It never starts Cargo;
+the consumer's existing Effigy 010 path remains the only host-submit path and
+must run the declared tests.
 
 The consumer gives this route one fresh physical root and owns its allocation
 for the whole task lifecycle. It may make sequential attempts there, with a new
@@ -36,7 +40,7 @@ existing full input boundary. This proposal creates no graph resolver, parser,
 compiler wrapper, scheduler, trusted issuer, or generic provenance wrapper
 chain. Task 043's parser schema is not a dependency.
 
-## What exists and what is missing
+## What exists and what remains unqualified
 
 Shipped Oxide storage APIs include generic `storage::Client::acquire`,
 `lookup_acquire`, `finalize`, and `lookup_finalize`, plus the ordinary-Cargo
@@ -158,13 +162,22 @@ uninstalled policy rejection, unsupported ledger/protocol versions, and
 restart uncertainty. They do not run Cargo or establish a real input
 boundary.
 
-This is the shipped storage seam only. `project::ordinary_cargo::run_attempt`,
-process execution, the ordinary-Cargo callback/client schema, Nucleus
-`StorageAttempt` integration, installation policy, accepted real inputs,
-full-debug/source retention lookup, and useful warm benefit remain
-unimplemented or unqualified. The next execution route must consume this API
-through the existing Nucleus `StorageAttempt` and Effigy Contract 010 path;
-this change does not activate or contact that consumer.
+The shipped private Rust route is available, in Unix builds with the
+`private-qualification` feature enabled, as
+`oxide_storage::ordinary_cargo::{OrdinaryCargoAttemptRunner,
+OrdinaryCargoAttemptBudget, OrdinaryCargoInvocation, run_attempt,
+serve_bootstrap}` and as the feature-gated unpublished
+`oxide-ordinary-cargo-attempt` binary. The binary accepts exactly one argument:
+the path to a protected, one-use bootstrap. Both entry points use the actual
+ordinary storage methods, validate the acquire reply against access-free lookup
+and durable inventory, then issue at most one submit callback. They do not
+execute Cargo or construct registered `Registration`/`UnitEvidence`.
+
+Oxide now defines the private callback schema below, but there is still no
+Nucleus `StorageAttempt` installation of it. Installation policy and accepted
+real input classes, real Effigy callback receipts, full-debug/source retention
+lookup, and useful warm benefit remain unqualified. This task does not activate
+or contact that consumer.
 
 The registered `RunnerHost` calls the graph-backed `Runner::run`. Its
 `ExecutionOwner` callbacks are behind registration, input audit, reuse checks,
@@ -178,9 +191,10 @@ Nucleus already has a durable `StorageAttempt` ledger and the reviewed
 `validation-client.ts` submission path. Its opt-in transport exercises a
 synthetic child channel; production registration remains disabled. There is no
 current Nucleus lookup wire operation for Oxide acquire/finalize recovery and
-no installed ordinary-Cargo callback schema. Do not have TypeScript implement
-the Oxide storage codec or settlement evidence, call `Runner` without its
-required evidence, or submit directly through a local native Cargo runner.
+the callback schema below is not installed in Nucleus. Do not have TypeScript
+implement the Oxide storage codec or settlement evidence, call `Runner`
+without its required evidence, or submit directly through a local native Cargo
+runner.
 
 ## Cargo freshness responsibility
 
@@ -240,22 +254,24 @@ passing test is not evidence that unknown inputs were fresh. Exact
 task/run/source provenance and the test result are retained independently
 from cache eligibility.
 
-## Minimal API and attempt lifecycle
+## Implemented API and attempt lifecycle
 
-The next Oxide implementation should add one inactive, qualification-only
-entry point, provisionally `project::ordinary_cargo::run_attempt`, behind the
-private qualification feature. It takes one existing `AcquireRequest` and one
-strictly bounded `OrdinaryCargoInvocation` containing the consumer-bound root
-and allocation epoch; project, task, workspace, branch, run and attempt IDs;
-source commit/tree/content digest; accepted workflow/policy version and
-installation epoch; selector and argv arrays; cwd; complete env map with
-presence/absence; private target/temp/capture paths; and a finalize operation
-ID. The embedder installs the verifier and callback dispatcher at construction;
-task JSON and environment cannot install trusted policy or issuer material.
-The entry point does not accept a `Registration` or fabricate `UnitEvidence`.
+The private Rust API is feature-gated by `private-qualification` and consists
+of `OrdinaryCargoAttemptRunner::new(Client, storage_root, parent_endpoint,
+CallbackAuthenticator, budget)`, `run_attempt(runner, invocation)`, and
+`serve_bootstrap(path)`. The bounded `OrdinaryCargoInvocation` contains the
+ordinary `AcquireRequest`; physical root and allocation epoch; project, task,
+workspace, branch, run and attempt IDs; commit/tree/content digests; accepted
+policy version, reference and installation epoch; selector and argv arrays;
+cwd; the complete environment map with explicit presence/absence; private
+target/temp/capture paths; expected output roles; and reserved submit, capture,
+not-submitted and finalize IDs. The embedder installs the authenticator and
+process endpoints; task JSON and environment cannot install trusted policy or
+issuer material. The API does not accept a `Registration` or fabricate
+`UnitEvidence`.
 
-The future host uses the existing identity, lease, lookup, and finalize
-semantics with the shipped ordinary-Cargo storage API above (not generic
+The route uses the existing identity, lease, lookup, and finalize semantics
+with the shipped ordinary-Cargo storage API above (not generic
 `Client::acquire`):
 
 1. Check the supported invocation shape and exact source/root bindings before
@@ -313,9 +329,9 @@ semantics with the shipped ordinary-Cargo storage API above (not generic
    `NotSpawned` and leaves the marker pending until positive no-writer closure.
    Releasing the storage lease does not recycle the consumer's physical root.
 
-The matching process schema should be one versioned
+The implemented private process schema is one versioned
 `ordinary-cargo-attempt-v1` operation on a private attempt channel, with three
-new callback messages that have no `Registration` argument:
+callback messages that have no `Registration` argument:
 
 - `ordinary_cargo.submit(launch_digest, acquired_tuple, command)` returns the
   genuine Effigy scheduler run identity and the echoed launch digest;
@@ -340,7 +356,7 @@ ownership before acknowledging it, and keep credentials/token material out of
 ordinary logs and ledgers. Effigy 010 remains the only host submission and
 settlement route.
 
-The callback contract must distinguish a normally completed test failure from
+The callback contract distinguishes a normally completed test failure from
 lost or incomplete execution state. A completed failure may be settled only
 with complete authenticated terminal/capture evidence; it makes the generation
 cold-only. A compile failure before tests is a failed invocation, never a
@@ -349,6 +365,8 @@ or unknown writer state holds the lease unless the existing process owner
 provides positive authenticated no-writer closure. PID disappearance, age,
 reply loss, or a file marker is not closure. Do not change the running clock,
 detach a writer, delete the generation, or silently retry with a new attempt.
+The compiled fixtures use synthetic receipts and do not prove genuine scheduler
+or retention provenance.
 
 The durable pending barrier cannot be a permanent boolean that blocks every
 future cold attempt. Its states distinguish `pending`, `reusable` after
@@ -389,18 +407,225 @@ looked up independently of the current contents at the same physical path.
 Failure to retain or retrieve any required output leaves root recycling
 pending. This design itself never recycles the task root to another task.
 
-## Next implementation and owner handoff
+## Private wire packet and consumer handoff
 
 The state-aware acquisition, per-generation reuse metadata, strict physical
 root identity, two-partition bound, authenticated transitions, lookup surfaces,
 and generic-operation protections described above are the shipped Oxide seam.
-The reviewed implementation must be handed to Nucleus by exact Oxide commit
-SHA after independent exact-head review. The packet names the API signatures
-above, binary ledger version 4, transport version 2, reuse-state meanings,
-redaction rules, and synthetic evidence. This seam defines no callback schema
-digest: the Nucleus-owned task must derive and review its
-`ordinary-cargo-attempt-v1` schema against these exact methods before any
-consumer implementation begins.
+The callable private route and this packet are pinned by the reviewed Oxide
+commit. Use this section with the Rust definitions and cross-language fixture
+`fixtures/ordinary-cargo-auth-v1.json`; do not infer a different wire shape.
+
+### Process bootstrap and version pins
+
+The unpublished binary `oxide-ordinary-cargo-attempt` is compiled only with
+`private-qualification`. Its sole argument is the protected bootstrap path. The
+process exits 0 for authenticated finalization, 2 when an acquired or uncertain
+lease stays held, and 1 for refusal or bootstrap/protocol failure before an
+acquire is durably established. Any post-acquire local, protocol, or callback
+error stays held; it is never reported as an unleased refusal. It writes no
+credentials to stdout or stderr. The bootstrap is a duplicate-key-rejecting JSON object with
+exactly these fields:
+`version` (1), `operation` (`ordinary-cargo-attempt-v1`), `scope`,
+`remaining_ms`, `callback_timeout_ms`, `storage`, `parent`,
+`callback_key_hex`, `callback_context`, and `invocation`. Endpoint objects
+contain `path`, `device`, and `inode`; device/inode and byte/duration quantities
+use lossless `WireU64` encoding (decimal strings for values outside JavaScript's
+safe integer range). The file is owner-only, regular, single-link and at most
+64 KiB; the canonical input-boundary JSON is at most 48 KiB. The file is
+consumed once; endpoint path/device/inode identities are rechecked. A durable
+private marker is synced before the bootstrap is removed.
+
+The `invocation` object contains exactly `acquire` (`envelope`, `acquire_id`,
+`required_bytes`), `root` (`source_root`, `consumer_root_id`, `allocation_epoch`),
+`partition` (`ordinary-test` or `full-debug`), `acceptance` (`policy_version`,
+`installation_epoch`, `acceptance_reference`, `input_boundary_digest`,
+`credential`), `branch_id`, `source_content_digest`, `selector`, `argv`,
+`cwd`, `environment`, `target_dir`, `temp_dir`, `capture_dir`,
+`expected_outputs`, and `operation_ids` (`submit`, `capture`, `not_submitted`,
+`finalize`). Environment values are strings or `null` for explicit absence.
+`expected_outputs` is a unique nonempty list selected from `source-archive`,
+`cargo-log`, `test-result`, `binary` and `full-debug`; captured role entries
+must match it exactly and total no more than 16 MiB.
+The owner computes the source-content digest from its accepted source
+inventory and binds it alongside the exact source commit/tree and command
+boundary; this route does not transfer or independently hash source bytes. Its
+framing is the same byte encoding as
+`oxide_storage::registered::cargo_unit_graph::framed_source_content_digest`, without invoking
+the registered Runner or its graph audit: the consumer's accepted source
+inventory maps each UTF-8 relative file path to `sha256:` plus the lowercase
+hex SHA-256 of that file's exact bytes. Sort entries by the UTF-8 path bytes.
+For each entry, append to one SHA-256 input stream the path byte length as an
+unsigned 64-bit little-endian integer, the path bytes, the digest-string byte
+length in the same format, then the ASCII digest string. The result is
+`sha256:` plus lowercase hex of that stream's SHA-256. There is no entry count,
+delimiter, terminator, absolute root path, or directory record in the stream;
+Git commit and tree IDs remain separate fields. The accepted input boundary
+owns the exact source inventory and completeness claim. The route receives
+this digest, validates its syntax, and binds it to the attempt; it does not
+read or hash source files.
+
+Attempt callback framing is a 4-byte big-endian length followed by UTF-8 JSON.
+The frame cap is 1 MiB, aggregate cap 16 MiB, and the route allows at most
+three exchanges. Unknown fields, duplicate JSON keys, malformed/trailing JSON,
+extra operations, and invalid version/method/type refuse. The route's
+`MAX_CAPTURE_BYTES` is 16 MiB. These private attempt limits are independent of
+the storage transport: `OXSTOR01` storage wire version is 2, durable
+`OXIDEST1` ledger version is 4. The private attempt operation, storage-runtime
+bootstrap schema/version, readiness schema/version and runtime control
+protocol are each version 1; the storage runtime bootstrap and readiness carry
+the independent `storage_protocol: 2` and `control_protocol: 1` fields. Its
+policy digest binds both wire versions and the exact ordinary-request digest
+allowlist. Old storage peers/ledgers refuse without reinterpretation or
+migration.
+
+### Canonical receipts and installed policy
+
+Canonical subjects use the existing Rust canonical JSON encoding (UTF-8,
+recursively sorted object keys, no lossy number conversion) and SHA-256 with a
+`sha256:` prefix. The ordinary request digest covers the existing admission
+subject and acquire ID, decimal-text `required_bytes`, source/root ID/allocation
+epoch, ordinary partition label, and the policy version, installation epoch,
+acceptance reference and input-boundary digest. Admission signs the fields
+`[scope, storage_instance_id, request_digest]` under
+`oxide-ordinary-cargo-admission-v1`; the existing generic admission credential
+is also required.
+
+The input-boundary subject has exactly `binding`, `root` (`source_root`,
+`root_id`, `allocation_epoch`), `ordinary_partition`, `cargo_partition`,
+decimal-text `required_bytes`, `branch_id`, `source_content_digest`,
+`policy_version`, `installation_epoch`, `acceptance_reference`, `selector`,
+`argv`, `cwd`, `environment`, `target_dir`, `temp_dir`, `capture_dir` and
+`expected_outputs`; its digest is canonical SHA-256. The ordinary request
+digest is the canonical digest of an object with
+`acquire` (`envelope` equal to the existing admission subject, `acquire_id`,
+decimal-text `required_bytes`), `root` (`source_root`, `consumer_root_id`,
+`allocation_epoch`), ordinary partition label, and `acceptance` (policy version,
+installation epoch, acceptance reference and input-boundary digest). The
+fixture pins both byte-level digests for representative values.
+
+The trusted runtime installs at most four exact ordinary request digests from
+the protected `RuntimeBootstrap.ordinary_cargo_request_digests` list. Missing
+or empty means ordinary issuance is disabled. The list participates in the
+runtime policy digest alongside scope, storage/control protocol versions,
+budget, stop grace and existing generic admission subjects. Generic
+`QualificationAuthority` continues to reject ordinary issuance by default.
+Only the protected owner may issue ordinary admission and settlement receipts;
+invocation JSON, argv, environment and parent task data cannot add accepted
+digests or keys.
+
+For ordinary settlement, canonicalize
+`{ordinary_request_digest, settlement: <existing settlement subject>}` and
+sign under `oxide-ordinary-cargo-settlement-v1` with fields
+`[scope, storage_instance_id, subject_digest]`. Each stored credential bundles
+the existing generic HMAC tag and ordinary HMAC tag as
+`hmac-bundle-v1:<generic-hex>:<ordinary-hex>`; the existing verifier checks
+both, while the ledger retains only redacted credentials. The lease token stays
+in Rust memory and is not included in callbacks, stdout, diagnostics, or the
+ledger. Credential-bearing bootstrap/storage/callback traffic is confined to
+the protected local process and owner-only sockets; credentials are not safe to
+copy to ordinary logs or ledgers.
+
+Callback context is the canonical digest of
+`{scope, operation: "ordinary-cargo-attempt-v1", request_digest,
+storage_protocol: 2}`. Each callback reply signs, under
+`oxide-owner-callback-v1`, the UTF-8 length-prefixed fields
+`[context, method, operation_id, launch_digest,
+"ordinary-cargo-attempt-v1", result_digest]`. `result_digest` is the canonical
+digest of `{method, id, launch_digest, acquired_digest, command_digest,
+payload}`. `MacKey` frames the domain and every UTF-8 field as a 4-byte
+big-endian byte length followed by the field bytes; tags are
+`hmac-sha256-v1:<lowercase-hex>`. The fixture contains request-digest,
+callback-context, ordinary-admission, ordinary-settlement and callback HMAC
+vectors checked by both Rust and Node.
+
+### Callback body and durable ordering
+
+Every callback request carries `version`, `operation`, `method`, reserved `id`,
+`launch_digest`, `acquired_digest`, `command_digest`, the complete acquired
+identity tuple, command, source/run identity, and expected output roles.
+The acquired tuple fields are `policy_version`, `installation_epoch`,
+`acceptance_reference`, `input_boundary_digest`, `source_root`, `root_id`,
+`allocation_epoch`, `partition`, `reuse_state`, `state`, `storage_instance_id`,
+`slot_id`, `generation`, `lease_id`, `slot_path` and `reused`; it also repeats
+consumer, project, component, workflow, `task_id`, `workspace_id`, `branch_id`,
+`run_id`, `attempt_id`, commit, source-tree/content digests and
+`cargo_partition`. Its digest is the canonical digest of that object. The
+command has exactly `selector`, `argv`,
+`cwd`, `environment`, `target_dir`, `temp_dir` and `capture_dir`; its digest is
+the canonical digest of that object. The launch digest is the canonical digest
+of `operation`, request digest, branch, source-content digest, those command
+fields, expected outputs, all reserved operation IDs and the acquired tuple.
+`environment` preserves all accepted entries and explicitly sets
+`CARGO_BUILD_BUILD_DIR` to the acquired slot, `CARGO_TARGET_DIR` to
+`target_dir`, and `TMPDIR`, `TMP` and `TEMP` to `temp_dir`.
+These digests are stable for one invocation and are not regenerated on replay.
+
+The callback `source` object contains `consumer`, `project`, `component`,
+`workflow`, `task_id`, `workspace_id`, `branch_id`, `run_id`, `attempt_id`,
+`commit`, `source_tree_digest` and `source_content_digest`. A full
+`run_identity` repeats those fields and adds `host_run_id`. All are exact
+strings; no identity is truncated or converted through a JavaScript number.
+`submit` replies with `status` (`started` or `not_started`) and an optional full
+run tuple. `capture` additionally carries `run_identity` and its reply payload
+contains `run`, `outcome` (`passed`, `failed`, `cancelled`),
+`terminal_credential`, `capture` (`reference`, `digest`, `host_run_id`, `run_id`,
+`attempt_id`, `credential`, `outputs` of `{role,digest,bytes}`), `completion`
+(`lease_id`, `slot_id`, `slot_path`, `temp_dir`, `capture_dir`, `workflow`,
+workflow-definition digest, repository head, fixture-source digest,
+`host_run_id`, `run_id`, `attempt_id`, process identities, free-space samples,
+exit code, stdout/stderr digests, capture reference/digest), and
+`settlement_credential`.
+`not_submitted` carries an explicit `no_submit_claim` and must return
+`status: not_submitted`, `submission_state: never_began`, `writer_state: none`,
+`closure_reference`, exact full `run`/source tuple and
+`settlement_credential`. Since no host run was submitted, `run.host_run_id`
+must be the empty string; the other run/source identity fields exactly repeat
+the invocation's consumer-owned tuple.
+The process checks callback id/method, all three digests, full source/run tuple,
+acquired lease/slot/path, terminal/exit code, capture completeness, output byte
+limit, and no-writer fields. HMAC validity alone is not proof of real Effigy
+completion or retention.
+
+The Oxide process performs acquire, access-free exact lookup, and inventory
+cross-check before it exposes the slot or emits `submit`. Busy/refusal creates
+no callback. Before acknowledging `submit`, the Nucleus adapter must persist
+the original credential-bearing acquire/finalize request identities, reserved
+operation IDs and full acquired tuple in its existing `StorageAttempt`; then it
+uses the existing `validation-client.ts` Effigy 010 host-submit path exactly
+once. After the genuine host run terminates, the existing retention owner must
+capture and durably retain exact source, Cargo/test output and required
+full-debug evidence before `capture` is acknowledged. Oxide validates and
+finalizes only after that callback. Nucleus must verify its genuine Effigy and
+retention evidence before issuing accepted receipts; fixtures cannot supply
+those receipts for actual host work.
+
+The route has no parent lookup or cancel callback. A lost submit/capture reply,
+process/session loss, timeout, cancellation, invalid callback, or unknown
+writer remains pending; it never infers no-spawn from age, PID exit or reply
+absence. An owner may use the storage API's access-free exact lookup during a
+separately implemented recovery flow, but this process does not provide that
+flow. Lost-session recovery is therefore hold-only at this seam.
+
+The process captures its monotonic start before protected bootstrap read and
+uses one nonrenewable `remaining_ms` window, bounded to 45 minutes. The
+owner-issued `callback_timeout_ms` is positive and no larger than the
+remaining window; each callback deadline is the earlier of that limit and the
+attempt deadline. No route setting comes from task arguments. Startup, storage
+operations, callback traffic and finalization share that deadline; storage
+transport retains its existing per-call timeout. Expiry returns held/unknown
+ownership and cannot synthesize no-spawn or finalize success. A consumer must
+prove that its real submit/process/capture work fits the owner-issued window
+before any real Cargo attempt is separately authorized.
+
+Synthetic compiled-process fixtures exercise pass/capture, settled failure,
+positive no-submit, timeout, lost reply, full-tuple mismatch, command/root/
+epoch/environment mutation, acquired-path substitution and secret redaction.
+They run at most six native child scenarios, each with a 30-second ceiling and
+an aggregate fixture bound below three minutes. These prove the Rust process
+and synthetic storage/callback protocol only; they do not establish genuine
+scheduler evidence, accepted installation policy, real input freshness,
+full-debug lookup, consumer adoption, storage relief or SSD writes.
 
 The Nucleus owner must accept that exact handover before a separately scoped
 Nucleus-owned client task is dispatched. The next route remains bounded to one
