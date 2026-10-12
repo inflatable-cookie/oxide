@@ -1,6 +1,7 @@
 use super::codec::{decode_vec, encode_vec, Decode, Encode, Reader, Writer};
 use super::transport;
 use super::types::*;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -31,6 +32,13 @@ pub trait EvidenceAuthority: Send + Sync + 'static {
     /// Verifies that this exact ordinary-Cargo policy and input boundary were
     /// installed and accepted by the owning consumer. Safe default: refuse.
     fn verify_ordinary_cargo_admission(&self, _request: &OrdinaryCargoRequest) -> bool {
+        false
+    }
+
+    /// Verifies that policy v2's stable compatibility and invalidation
+    /// declaration were installed by the accepting consumer. Safe default:
+    /// refuse. Exact per-attempt admission remains independently required.
+    fn verify_ordinary_cargo_stable_reuse_policy(&self, _request: &OrdinaryCargoRequest) -> bool {
         false
     }
 
@@ -242,6 +250,8 @@ struct OrdinaryCargoGeneration {
     policy_version: u32,
     installation_epoch: String,
     acceptance_reference: String,
+    // First accepted attempt boundary; v2 keeps it as evidence but compares
+    // later attempts by their stable eligibility reference.
     input_boundary_digest: String,
     reuse_state: CargoReuseState,
 }
@@ -498,7 +508,7 @@ impl Store {
                 _ => return Err(StorageError::Refused(RefusalReason::UnknownAccounting)),
             }
             if let Some(ordinary) = slot.ordinary_cargo.as_ref() {
-                if ordinary.policy_version != ORDINARY_CARGO_POLICY_VERSION
+                if !supported_ordinary_cargo_policy_version(ordinary.policy_version)
                     || ordinary.root.source_root.as_os_str().is_empty()
                     || !ordinary.root.source_root.is_absolute()
                     || ordinary.root.consumer_root_id.is_empty()
@@ -506,6 +516,7 @@ impl Store {
                     || ordinary.installation_epoch.is_empty()
                     || ordinary.acceptance_reference.is_empty()
                     || !valid_digest(&ordinary.input_boundary_digest)
+                    || !ordinary_generation_stable_reference_is_valid(ordinary, &slot.partition)
                     || slot.partition.path_identity != ORDINARY_CARGO_PATH_IDENTITY
                     || !matches!(
                         &ordinary.partition,
@@ -540,6 +551,7 @@ impl Store {
             }
         }
         let mut lease_ids = std::collections::BTreeSet::new();
+        let mut first_attempt_slots = std::collections::BTreeSet::new();
         for lease in &self.ledger.leases {
             if lease.id.len() != 32
                 || !lease.id.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -583,10 +595,11 @@ impl Store {
                         .as_ref()
                         .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
                     let active_owner = slot.lease_id.as_deref() == Some(lease.id.as_str());
-                    if lease.request
-                        != persisted_request(&normalized_ordinary_acquire(
-                            &ordinary.request.acquire,
-                        ))
+                    if validate_ordinary_request(&ordinary.request).is_err()
+                        || lease.request
+                            != persisted_request(&normalized_ordinary_acquire(
+                                &ordinary.request.acquire,
+                            ))
                         || ordinary.request.acquire.envelope.partition.path_identity
                             != ORDINARY_CARGO_PATH_IDENTITY
                         || slot.partition
@@ -594,15 +607,7 @@ impl Store {
                                 .envelope
                                 .partition
                         || !valid_hash(&lease.request_digest)
-                        || generation.root != ordinary.request.root
-                        || generation.partition != ordinary.request.partition
-                        || generation.policy_version != ordinary.request.acceptance.policy_version
-                        || generation.installation_epoch
-                            != ordinary.request.acceptance.installation_epoch
-                        || generation.acceptance_reference
-                            != ordinary.request.acceptance.acceptance_reference
-                        || generation.input_boundary_digest
-                            != ordinary.request.acceptance.input_boundary_digest
+                        || !ordinary_generation_matches_request(generation, &ordinary.request)
                         || (active_owner
                             != matches!(lease.status, LeaseStatus::Leased | LeaseStatus::Uncertain))
                         || (active_owner && generation.reuse_state != CargoReuseState::Pending)
@@ -617,6 +622,11 @@ impl Store {
                     {
                         return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
                     }
+                    if generation.input_boundary_digest
+                        == ordinary.request.acceptance.input_boundary_digest
+                    {
+                        first_attempt_slots.insert(lease.slot_id.as_str());
+                    }
                 }
                 None => {
                     if self
@@ -630,6 +640,13 @@ impl Store {
                     }
                 }
             }
+        }
+        if self.ledger.slots.iter().any(|slot| {
+            slot.ordinary_cargo.is_some()
+                && slot.state != InternalSlotState::Preparing
+                && !first_attempt_slots.contains(slot.id.as_str())
+        }) {
+            return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
         }
         let mut operation_ids = std::collections::BTreeSet::new();
         for operation in &self.ledger.operations {
@@ -903,9 +920,7 @@ impl Store {
         self.ensure_healthy()?;
         validate_ordinary_request(&request)?;
         validate_canonical_source_root(&request.root)?;
-        if !self.authority.verify_admission(&request.acquire.envelope)
-            || !self.authority.verify_ordinary_cargo_admission(&request)
-        {
+        if !self.ordinary_request_is_authorized(&request) {
             return Err(StorageError::Unauthorized);
         }
         let request_digest = digest_encoded(&request)?;
@@ -984,7 +999,8 @@ impl Store {
                 || ordinary.policy_version != request.acceptance.policy_version
                 || ordinary.installation_epoch != request.acceptance.installation_epoch
                 || ordinary.acceptance_reference != request.acceptance.acceptance_reference
-                || ordinary.input_boundary_digest != request.acceptance.input_boundary_digest
+                || (request.acceptance.policy_version == ORDINARY_CARGO_POLICY_VERSION
+                    && ordinary.input_boundary_digest != request.acceptance.input_boundary_digest)
             {
                 return Err(StorageError::Refused(
                     RefusalReason::OrdinaryCargoIncompatible,
@@ -1140,9 +1156,7 @@ impl Store {
         self.ensure_healthy()?;
         validate_ordinary_request(&request)?;
         validate_canonical_source_root(&request.root)?;
-        if !self.authority.verify_admission(&request.acquire.envelope)
-            || !self.authority.verify_ordinary_cargo_admission(&request)
-        {
+        if !self.ordinary_request_is_authorized(&request) {
             return Err(StorageError::Unauthorized);
         }
         let request_digest = digest_encoded(&request)?;
@@ -1442,12 +1456,7 @@ impl Store {
         self.ensure_healthy()?;
         validate_ordinary_finalize_request(&request)?;
         validate_canonical_source_root(&request.request.root)?;
-        if !self
-            .authority
-            .verify_admission(&request.request.acquire.envelope)
-            || !self
-                .authority
-                .verify_ordinary_cargo_admission(&request.request)
+        if !self.ordinary_request_is_authorized(&request.request)
             || !self.authority.verify_settlement(&request.evidence)
             || !self
                 .authority
@@ -1568,8 +1577,7 @@ impl Store {
                     && kind == SettlementKind::Finalize =>
             {
                 validate_ordinary_request(request)?;
-                if !self.authority.verify_admission(&request.acquire.envelope)
-                    || !self.authority.verify_ordinary_cargo_admission(request)
+                if !self.ordinary_request_is_authorized(request)
                     || !self
                         .authority
                         .verify_ordinary_cargo_settlement(request, &evidence)
@@ -1876,6 +1884,15 @@ impl Store {
         }
     }
 
+    fn ordinary_request_is_authorized(&self, request: &OrdinaryCargoRequest) -> bool {
+        self.authority.verify_admission(&request.acquire.envelope)
+            && self.authority.verify_ordinary_cargo_admission(request)
+            && (request.acceptance.policy_version != ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
+                || self
+                    .authority
+                    .verify_ordinary_cargo_stable_reuse_policy(request))
+    }
+
     fn slot_by_id(&self, id: &str) -> Result<&Slot, StorageError> {
         self.ledger
             .slots
@@ -1997,7 +2014,7 @@ fn validate_ordinary_request(request: &OrdinaryCargoRequest) -> Result<(), Stora
             RefusalReason::OrdinaryCargoPartitionLimit,
         ));
     }
-    if request.acceptance.policy_version != ORDINARY_CARGO_POLICY_VERSION {
+    if !supported_ordinary_cargo_policy_version(request.acceptance.policy_version) {
         return Err(StorageError::InvalidInput(
             "unsupported ordinary Cargo policy version",
         ));
@@ -2035,7 +2052,185 @@ fn validate_ordinary_request(request: &OrdinaryCargoRequest) -> Result<(), Stora
             "ordinary Cargo source root must be absolute",
         ));
     }
+    if request.acceptance.policy_version == ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
+        && !ordinary_request_stable_reference_is_valid(request)
+    {
+        return Err(StorageError::InvalidInput(
+            "ordinary Cargo stable reuse reference does not match its compatibility identity",
+        ));
+    }
     Ok(())
+}
+
+#[derive(Serialize)]
+struct StableReuseReferenceMaterial<'a> {
+    schema: &'static str,
+    policy_version: u32,
+    source_root_path_hex: String,
+    consumer_root_id: &'a str,
+    allocation_epoch: &'a str,
+    ordinary_partition: &'a str,
+    project_component: &'a str,
+    workflow: &'a str,
+    cargo_provenance: &'a str,
+    rustc_provenance: &'a str,
+    host: &'a str,
+    target: &'a str,
+    profile: &'a str,
+    features: Vec<&'a str>,
+    config_digest: &'a str,
+    environment_digest: &'a str,
+    path_identity: &'a str,
+    installation_epoch: &'a str,
+    qualified_invalidation_declaration_digest: &'a str,
+}
+
+/// Builds the typed v2 acceptance reference for an installed compatibility
+/// and invalidation policy. Storage recomputes this value and still requires
+/// the accepting authority to approve it.
+pub fn ordinary_cargo_stable_reuse_reference(
+    request: &OrdinaryCargoRequest,
+    qualified_invalidation_declaration_digest: &str,
+) -> Result<String, StorageError> {
+    if request.acceptance.policy_version != ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION {
+        return Err(StorageError::InvalidInput(
+            "stable reuse references require ordinary Cargo policy version 2",
+        ));
+    }
+    stable_reuse_reference_for_parts(
+        &request.root,
+        &request.acquire.envelope.partition,
+        &request.partition,
+        request.acceptance.policy_version,
+        &request.acceptance.installation_epoch,
+        qualified_invalidation_declaration_digest,
+    )
+}
+
+fn stable_reuse_reference_for_parts(
+    root: &StrictPhysicalCargoRoot,
+    cargo_partition: &PartitionKey,
+    ordinary_partition: &OrdinaryCargoPartition,
+    policy_version: u32,
+    installation_epoch: &str,
+    qualified_invalidation_declaration_digest: &str,
+) -> Result<String, StorageError> {
+    if policy_version != ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
+        || !canonical_sha256_digest(qualified_invalidation_declaration_digest)
+    {
+        return Err(StorageError::InvalidInput(
+            "stable reuse reference requires policy v2 and a canonical invalidation digest",
+        ));
+    }
+    let mut features: Vec<_> = cargo_partition
+        .features
+        .iter()
+        .map(String::as_str)
+        .collect();
+    features.sort_unstable();
+    let material = StableReuseReferenceMaterial {
+        schema: "oxide.ordinary-cargo.stable-reuse.v2",
+        policy_version,
+        source_root_path_hex: digest_hex(root.source_root.as_os_str().as_bytes()),
+        consumer_root_id: &root.consumer_root_id,
+        allocation_epoch: &root.allocation_epoch,
+        ordinary_partition: ordinary_partition.label(),
+        project_component: &cargo_partition.project_component,
+        workflow: &cargo_partition.workflow,
+        cargo_provenance: &cargo_partition.cargo_provenance,
+        rustc_provenance: &cargo_partition.rustc_provenance,
+        host: &cargo_partition.host,
+        target: &cargo_partition.target,
+        profile: &cargo_partition.profile,
+        features,
+        config_digest: &cargo_partition.config_digest,
+        environment_digest: &cargo_partition.environment_digest,
+        path_identity: &cargo_partition.path_identity,
+        installation_epoch,
+        qualified_invalidation_declaration_digest,
+    };
+    let encoded = serde_json::to_vec(&material)
+        .map_err(|_| StorageError::Protocol("stable reuse identity encoding failed"))?;
+    let compatibility_digest = format!("sha256:{}", digest_hex(&Sha256::digest(encoded)));
+    Ok(format!(
+        "oxide-ordinary-cargo-stable-eligibility-v2/{qualified_invalidation_declaration_digest}/{compatibility_digest}"
+    ))
+}
+
+fn ordinary_request_stable_reference_is_valid(request: &OrdinaryCargoRequest) -> bool {
+    let Some(invalidation_digest) =
+        invalidation_digest_from_stable_reference(&request.acceptance.acceptance_reference)
+    else {
+        return false;
+    };
+    ordinary_cargo_stable_reuse_reference(request, invalidation_digest)
+        .is_ok_and(|expected| expected == request.acceptance.acceptance_reference)
+}
+
+fn ordinary_generation_stable_reference_is_valid(
+    generation: &OrdinaryCargoGeneration,
+    cargo_partition: &PartitionKey,
+) -> bool {
+    match generation.policy_version {
+        ORDINARY_CARGO_POLICY_VERSION => true,
+        ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION => {
+            let Some(invalidation_digest) =
+                invalidation_digest_from_stable_reference(&generation.acceptance_reference)
+            else {
+                return false;
+            };
+            stable_reuse_reference_for_parts(
+                &generation.root,
+                cargo_partition,
+                &generation.partition,
+                generation.policy_version,
+                &generation.installation_epoch,
+                invalidation_digest,
+            )
+            .is_ok_and(|expected| expected == generation.acceptance_reference)
+        }
+        _ => false,
+    }
+}
+
+fn ordinary_generation_matches_request(
+    generation: &OrdinaryCargoGeneration,
+    request: &OrdinaryCargoRequest,
+) -> bool {
+    generation.root == request.root
+        && generation.partition == request.partition
+        && generation.policy_version == request.acceptance.policy_version
+        && generation.installation_epoch == request.acceptance.installation_epoch
+        && generation.acceptance_reference == request.acceptance.acceptance_reference
+        && (request.acceptance.policy_version == ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
+            || generation.input_boundary_digest == request.acceptance.input_boundary_digest)
+}
+
+fn supported_ordinary_cargo_policy_version(policy_version: u32) -> bool {
+    matches!(
+        policy_version,
+        ORDINARY_CARGO_POLICY_VERSION | ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
+    )
+}
+
+fn invalidation_digest_from_stable_reference(reference: &str) -> Option<&str> {
+    let identity = reference.strip_prefix("oxide-ordinary-cargo-stable-eligibility-v2/")?;
+    let (invalidation_digest, compatibility_digest) = identity.split_once('/')?;
+    if canonical_sha256_digest(invalidation_digest) && canonical_sha256_digest(compatibility_digest)
+    {
+        Some(invalidation_digest)
+    } else {
+        None
+    }
+}
+
+fn canonical_sha256_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
 }
 
 fn validate_ordinary_finalize_request(
