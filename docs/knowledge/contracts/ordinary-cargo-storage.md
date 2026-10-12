@@ -413,18 +413,26 @@ The state-aware acquisition, per-generation reuse metadata, strict physical
 root identity, two-partition bound, authenticated transitions, lookup surfaces,
 and generic-operation protections described above are the shipped Oxide seam.
 The callable private route and this packet are pinned by the reviewed Oxide
-commit. Use this section with the Rust definitions and cross-language fixture
+commit. Callable means the private qualification binary compiles and passes
+synthetic fixtures. It is not qualified: no real Cargo run, real input
+freshness, full-debug lookup, accepted installation policy, consumer adoption,
+storage relief, or SSD-write evidence exists yet. Use this section with the
+Rust definitions and cross-language fixture
 `fixtures/ordinary-cargo-auth-v1.json`; do not infer a different wire shape.
 
 ### Process bootstrap and version pins
 
 The unpublished binary `oxide-ordinary-cargo-attempt` is compiled only with
 `private-qualification`. Its sole argument is the protected bootstrap path. The
-process exits 0 for authenticated finalization, 2 when an acquired or uncertain
-lease stays held, and 1 for refusal or bootstrap/protocol failure before an
-acquire is durably established. Any post-acquire local, protocol, or callback
-error stays held; it is never reported as an unleased refusal. It writes no
-credentials to stdout or stderr. The bootstrap is a duplicate-key-rejecting JSON object with
+process exits 0 for authenticated finalization, 1 for a storage refusal or for
+bootstrap/input validation failure returned before any acquire call, and 2 for
+`Held`. `Held` is conservative uncertainty, not proof of ownership. It covers
+an acquired or uncertain lease, any post-acquire local, protocol, or callback
+error, and a deadline that expires before the acquire result is known. Exit 2
+can therefore occur with no lease. It is never reported as an unleased refusal.
+Process exit, a ready or stopped state, or PID exit alone implies neither
+ownership nor release; only authenticated storage or settlement evidence may
+change ownership. It writes no credentials to stdout or stderr. The bootstrap is a duplicate-key-rejecting JSON object with
 exactly these fields:
 `version` (1), `operation` (`ordinary-cargo-attempt-v1`), `scope`,
 `remaining_ms`, `callback_timeout_ms`, `storage`, `parent`,
@@ -446,16 +454,33 @@ The `invocation` object contains exactly `acquire` (`envelope`, `acquire_id`,
 `finalize`). Environment values are strings or `null` for explicit absence.
 `expected_outputs` is a unique nonempty list selected from `source-archive`,
 `cargo-log`, `test-result`, `binary` and `full-debug`; captured role entries
-must match it exactly and total no more than 16 MiB.
+must match it exactly and total no more than 16 MiB. That `MAX_CAPTURE_BYTES`
+route cap is the only implemented capture bound. The proposed 2 GiB per
+attempt-record retained-evidence figure in the Nucleus packet below is not
+implemented or checked here and does not establish fit. Neither value is
+widened by this contract.
 The owner computes the source-content digest from its accepted source
 inventory and binds it alongside the exact source commit/tree and command
 boundary; this route does not transfer or independently hash source bytes. Its
 framing is the same byte encoding as
 `oxide_storage::registered::cargo_unit_graph::framed_source_content_digest`, without invoking
 the registered Runner or its graph audit: the consumer's accepted source
-inventory maps each UTF-8 relative file path to `sha256:` plus the lowercase
-hex SHA-256 of that file's exact bytes. Sort entries by the UTF-8 path bytes.
-For each entry, append to one SHA-256 input stream the path byte length as an
+inventory maps each relative file path to `sha256:` plus the lowercase hex
+SHA-256 of that file's exact bytes. Path admissibility is enforced by the
+`framed_source_content_digest` helper before the route receives the digest, with
+the same rules as its `validate_relative_path`. A path is admissible only if it
+is a nonempty UTF-8 string with no NUL byte, does not start with `/`, and has no
+empty, `.`, or `..` component. Every component must be a normal name. Its UTF-8
+byte length must not exceed `path_bytes`, its component count must not exceed
+`depth`, and the owner-supplied entry count must not exceed `associations`.
+Each entry's framed bytes must fit `bytes`. Violations refuse as
+`InvalidSourcePath` or `BudgetExceeded`. Each digest must be `sha256:` followed
+by exactly 64 lowercase hex characters. The current defaults are 2048 path
+bytes, depth 32, 32768 entries, and 8 MiB framed bytes. The path rules are the
+input-boundary owner's precondition; the attempt route never sees paths and
+cannot check them. Sort entries by the UTF-8 path bytes, which is the order of
+Rust's `String` map keys; duplicate names are impossible in that map. For each
+entry, append to one SHA-256 input stream the path byte length as an
 unsigned 64-bit little-endian integer, the path bytes, the digest-string byte
 length in the same format, then the ASCII digest string. The result is
 `sha256:` plus lowercase hex of that stream's SHA-256. There is no entry count,
@@ -614,18 +639,47 @@ remaining window; each callback deadline is the earlier of that limit and the
 attempt deadline. No route setting comes from task arguments. Startup, storage
 operations, callback traffic and finalization share that deadline; storage
 transport retains its existing per-call timeout. Expiry returns held/unknown
-ownership and cannot synthesize no-spawn or finalize success. A consumer must
-prove that its real submit/process/capture work fits the owner-issued window
-before any real Cargo attempt is separately authorized.
+ownership and cannot synthesize no-spawn or finalize success. Expiry before
+the acquire result is known also returns exit 2 with no lease implied. A
+consumer must prove that its real submit/process/capture work fits the
+owner-issued window before any real Cargo attempt is separately authorized.
+
+Historical timing caveat: the reviewed fixtures moved from a 5-second callback
+window and 6-second withheld reply (aeb41c1) to a 15-second window and
+18-second withheld reply (665bbd4). The 25-second attempt window is unchanged.
+These are fixture settings, not a production ceiling or reliability fix. An
+independent aeb41c1 run held the pass case at Capture. Its cause is unresolved:
+no retained trace exists, and the historical load condition is unknown. Do
+not infer load reliability from later passing runs.
 
 Synthetic compiled-process fixtures exercise pass/capture, settled failure,
-positive no-submit, timeout, lost reply, full-tuple mismatch, command/root/
-epoch/environment mutation, acquired-path substitution and secret redaction.
-They run at most six native child scenarios, each with a 30-second ceiling and
-an aggregate fixture bound below three minutes. These prove the Rust process
-and synthetic storage/callback protocol only; they do not establish genuine
-scheduler evidence, accepted installation policy, real input freshness,
-full-debug lookup, consumer adoption, storage relief or SSD writes.
+positive no-submit, submit timeout, submit lost reply, full-tuple mismatch,
+and the three capture-path controls below, plus command/root/epoch/environment
+mutation, acquired-path substitution and secret redaction. They run nine
+native child scenarios, each with a 30-second ceiling. Each child gets a
+parent-side trace of phase labels, monotonic offsets, and bounded reasons,
+capped at 64 KiB per scenario. The trace never records frame bodies, keys, or
+environment values, and failures print it. The three capture-path cases are:
+
+- expiry: `CaptureDelayed` withholds a valid reply past the callback window.
+  The child must stay held at Capture, pending, with no release;
+- receipt/body correspondence: `CaptureMismatch` returns a validly signed reply
+  for a foreign operation ID. The child must refuse correspondence and hold;
+- channel loss: `CaptureLost` writes a partial frame and closes. The child must
+  hold at Capture.
+
+Output bounds are covered only by the in-process `MAX_CAPTURE_BYTES + 1`
+refusal control, not by a native child case. The child's exit line names only
+the phase. Distinguishing among the several `Held(Capture)` returns inside a
+single child needs a private diagnostic hook, which this fixture does not add.
+The parent trace separates timing expiry from delivered-but-refused replies.
+Capture-path timing is recorded in the trace. The on-time valid capture still
+finalizes.
+
+These prove the Rust process and synthetic storage/callback protocol only; they
+do not establish genuine scheduler evidence, accepted installation policy, real
+input freshness, full-debug lookup, consumer adoption, storage relief or SSD
+writes.
 
 The Nucleus owner must accept that exact handover before a separately scoped
 Nucleus-owned client task is dispatched. The next route remains bounded to one
