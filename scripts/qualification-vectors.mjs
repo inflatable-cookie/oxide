@@ -97,3 +97,113 @@ for (const vector of [ordinary.admission, ordinary.callback, ordinary.settlement
   verifyMacVector(vector);
 }
 console.log('Node/Rust ordinary input/request/settlement/context digests and admission/settlement/callback HMAC vectors passed');
+
+// Owner-issued artifact-budget route v2: stable eligibility is separate from
+// its exact attempt boundary and callback capture receipt.
+const ordinaryV2 = JSON.parse(readFileSync(new URL('../fixtures/ordinary-cargo-auth-v2.json', import.meta.url)));
+assert.equal(ordinaryV2.version, 2);
+assert.equal(ordinaryV2.operation, 'ordinary-cargo-attempt-v2');
+const budgetDigest = digestOf(JSON.stringify(sortKeys(ordinaryV2.capture_budget)));
+assert.equal(budgetDigest, ordinaryV2.capture_budget_digest);
+assert.equal(digestOf(JSON.stringify(sortKeys(ordinaryV2.input_boundary_subject))), ordinaryV2.input_boundary_digest);
+assert.equal(digestOf(JSON.stringify(sortKeys(ordinaryV2.request_subject))), ordinaryV2.request_digest);
+assert.equal(digestOf(JSON.stringify(sortKeys(ordinaryV2.callback_context_subject))), ordinaryV2.callback_context_digest);
+assert.equal(digestOf(JSON.stringify(sortKeys(ordinaryV2.bootstrap))), ordinaryV2.bootstrap_digest);
+
+const v2Input = ordinaryV2.bootstrap.invocation;
+const invalidation = ordinaryV2.stable_invalidation_digest;
+const stableMaterial = {
+  schema: 'oxide.ordinary-cargo.stable-reuse.v2',
+  policy_version: v2Input.acceptance.policy_version,
+  source_root_path_hex: Buffer.from(v2Input.root.source_root, 'utf8').toString('hex'),
+  consumer_root_id: v2Input.root.consumer_root_id,
+  allocation_epoch: v2Input.root.allocation_epoch,
+  ordinary_partition: v2Input.partition,
+  project_component: v2Input.acquire.envelope.partition.project_component,
+  workflow: v2Input.acquire.envelope.partition.workflow,
+  cargo_provenance: v2Input.acquire.envelope.partition.cargo_provenance,
+  rustc_provenance: v2Input.acquire.envelope.partition.rustc_provenance,
+  host: v2Input.acquire.envelope.partition.host,
+  target: v2Input.acquire.envelope.partition.target,
+  profile: v2Input.acquire.envelope.partition.profile,
+  features: [...v2Input.acquire.envelope.partition.features].sort(),
+  config_digest: v2Input.acquire.envelope.partition.config_digest,
+  environment_digest: v2Input.acquire.envelope.partition.environment_digest,
+  path_identity: v2Input.acquire.envelope.partition.path_identity,
+  installation_epoch: v2Input.acceptance.installation_epoch,
+  qualified_invalidation_declaration_digest: invalidation,
+};
+const compatibility = digestOf(JSON.stringify(stableMaterial));
+assert.equal(ordinaryV2.stable_reference,
+  `oxide-ordinary-cargo-stable-eligibility-v2/${invalidation}/${compatibility}`);
+
+const callbackRequest = ordinaryV2.callback_request;
+assert.equal(callbackRequest.version, 2);
+assert.equal(callbackRequest.operation, ordinaryV2.operation);
+assert.equal(callbackRequest.capture_budget_digest, budgetDigest);
+assert.equal(digestOf(JSON.stringify(sortKeys(callbackRequest.acquired))), callbackRequest.acquired_digest);
+assert.equal(digestOf(JSON.stringify(sortKeys(callbackRequest.command))), callbackRequest.command_digest);
+const launchSubject = {
+  operation: callbackRequest.operation,
+  request_digest: ordinaryV2.request_digest,
+  branch_id: callbackRequest.source.branch_id,
+  source_content_digest: callbackRequest.source.source_content_digest,
+  selector: callbackRequest.command.selector,
+  argv: callbackRequest.command.argv,
+  cwd: callbackRequest.command.cwd,
+  environment: callbackRequest.command.environment,
+  target_dir: callbackRequest.command.target_dir,
+  temp_dir: callbackRequest.command.temp_dir,
+  capture_dir: callbackRequest.command.capture_dir,
+  expected_outputs: callbackRequest.expected_outputs,
+  operation_ids: v2Input.operation_ids,
+  acquired: callbackRequest.acquired,
+  capture_budget: callbackRequest.capture_budget,
+  capture_budget_digest: callbackRequest.capture_budget_digest,
+};
+assert.equal(digestOf(JSON.stringify(sortKeys(launchSubject))), callbackRequest.launch_digest);
+assert.equal(callbackRequest.run_identity.run_id, v2Input.acquire.envelope.binding.run_id);
+assert.equal(ordinaryV2.callback_payload.capture.capture_budget_digest, budgetDigest);
+assert.equal(ordinaryV2.callback_payload.capture.outputs[0].bytes, 64);
+assert.equal(ordinaryV2.callback_reply.version, 2);
+assert.equal(ordinaryV2.callback_reply.receipt, ordinaryV2.callback.receipt);
+
+const verifyOrdinaryMac = vector => {
+  const frame = Buffer.concat([vector.domain, ...vector.fields].flatMap(value => {
+    const encoded = Buffer.from(value, 'utf8');
+    const size = Buffer.alloc(4); size.writeUInt32BE(encoded.length);
+    return [size, encoded];
+  }));
+  assert.equal(frame.toString('hex'), vector.frame_hex);
+  const tag = createHmac('sha256', Buffer.from(vector.key_hex, 'hex')).update(frame).digest();
+  assert.equal('hmac-sha256-v1:' + tag.toString('hex'), vector.receipt);
+};
+assert.equal(digestOf(JSON.stringify(sortKeys(ordinaryV2.callback_result_subject))), ordinaryV2.callback_result_digest);
+assert.equal(ordinaryV2.callback.result_digest, ordinaryV2.callback_result_digest);
+for (const vector of [ordinaryV2.admission, ordinaryV2.ordinary_admission, ordinaryV2.callback]) {
+  verifyOrdinaryMac(vector);
+}
+
+const bootstrapFields = Object.keys(ordinaryV2.bootstrap).sort();
+assert.deepEqual(bootstrapFields, [
+  'callback_context', 'callback_key_hex', 'callback_timeout_ms', 'capture_budget',
+  'invocation', 'operation', 'parent', 'remaining_ms', 'scope', 'storage', 'version',
+]);
+assert.deepEqual(Object.keys(ordinaryV2.bootstrap.invocation).sort(), [
+  'acceptance', 'acquire', 'argv', 'branch_id', 'capture_dir', 'cwd', 'environment',
+  'expected_outputs', 'operation_ids', 'partition', 'root', 'selector', 'source_content_digest',
+  'target_dir', 'temp_dir',
+]);
+assert.deepEqual(Object.keys(callbackRequest).sort(), [
+  'acquired', 'acquired_digest', 'capture_budget', 'capture_budget_digest', 'command',
+  'command_digest', 'expected_outputs', 'id', 'launch_digest', 'method', 'operation',
+  'run_identity', 'source', 'version',
+]);
+assert.equal(typeof ordinaryV2.capture_budget.total_bytes, 'number');
+assert.equal(typeof ordinaryV2.bootstrap.storage.device, 'string');
+assert.equal(BigInt(ordinaryV2.bootstrap.storage.device), 18446744073709551615n);
+assert.equal(typeof ordinaryV2.bootstrap.storage.inode, 'string');
+assert.equal(BigInt(ordinaryV2.bootstrap.storage.inode), 9007199254740993n);
+assert.equal(typeof ordinaryV2.bootstrap.parent.inode, 'number');
+assert.equal(JSON.stringify(ordinaryV2.bootstrap.storage.device), '"18446744073709551615"');
+console.log('Node/Rust ordinary artifact-budget v2 bootstrap, stable identity, exact boundary, callback schema and HMAC vectors passed');

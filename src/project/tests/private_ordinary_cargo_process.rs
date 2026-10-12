@@ -1,8 +1,12 @@
 use super::{task_scratch_root, FixedFreeSpace, FixtureRoot};
 use crate::project::ordinary_cargo::{
-    ordinary_cargo_callback_context, ordinary_cargo_input_boundary_digest,
-    validate_acquired_slot_path, validate_invocation, OrdinaryCargoInvocation,
-    OrdinaryCargoOperationIds, ORDINARY_CARGO_ATTEMPT_OPERATION, ORDINARY_CARGO_ATTEMPT_VERSION,
+    ordinary_cargo_callback_context, ordinary_cargo_callback_context_v2,
+    ordinary_cargo_capture_budget_digest, ordinary_cargo_input_boundary_digest,
+    ordinary_cargo_input_boundary_digest_with_capture_budget, validate_acquired_slot_path,
+    validate_invocation, validate_invocation_with_capture_budget, OrdinaryCargoCaptureBudget,
+    OrdinaryCargoInvocation, OrdinaryCargoOperationIds, ORDINARY_CARGO_ATTEMPT_OPERATION,
+    ORDINARY_CARGO_ATTEMPT_VERSION, ORDINARY_CARGO_CAPTURE_ATTEMPT_OPERATION,
+    ORDINARY_CARGO_CAPTURE_ATTEMPT_VERSION,
 };
 use crate::registered::qualification::{
     admission_subject, bundle_ordinary_credentials, canonical_digest,
@@ -11,12 +15,12 @@ use crate::registered::qualification::{
 };
 use crate::registered::runner_host::WireU64;
 use crate::storage::{
-    AcquireRequest, Budget, CaptureReceipt, CargoReuseState, Client, ContainmentEvidence,
-    CooperativeCompletionEvidence, Credential, Daemon, DaemonConfig, EvidenceAuthority,
-    FreeSpaceProbe, NoSpawnEvidence, OrdinaryCargoAcceptance, OrdinaryCargoPartition,
-    OrdinaryCargoRequest, PartitionKey, ProcessIdentityEvidence, RunBinding, RunEnvelope,
-    SettlementEvidence, SlotState, StorageError, StrictPhysicalCargoRoot, TerminalOutcome,
-    TerminalRecord,
+    ordinary_cargo_stable_reuse_reference, AcquireRequest, Budget, CaptureReceipt, CargoReuseState,
+    Client, ContainmentEvidence, CooperativeCompletionEvidence, Credential, Daemon, DaemonConfig,
+    EvidenceAuthority, FreeSpaceProbe, NoSpawnEvidence, OrdinaryCargoAcceptance,
+    OrdinaryCargoPartition, OrdinaryCargoRequest, PartitionKey, ProcessIdentityEvidence,
+    RunBinding, RunEnvelope, SettlementEvidence, SlotState, StorageError, StrictPhysicalCargoRoot,
+    TerminalOutcome, TerminalRecord,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -34,7 +38,6 @@ use std::time::{Duration, Instant};
 const SCOPE: &str = "synthetic-ordinary-cargo-scope";
 const STORAGE_KEY_HEX: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const CALLBACK_KEY_HEX: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-const CALLBACK_POLICY: &str = "ordinary-cargo-attempt-v1";
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const REMAINING_MS: u64 = 25_000;
 // Fixture window for each callback exchange, shared with the parent trace so
@@ -56,6 +59,7 @@ enum Scenario {
     CaptureDelayed,
     CaptureMismatch,
     CaptureLost,
+    BudgetReuse,
 }
 
 /// Parent-side scenario trace: fixed phase labels, monotonic offsets and
@@ -113,14 +117,18 @@ struct TestDaemon {
 
 impl TestDaemon {
     fn start(root: &Path, allowed: RunEnvelope, request_digest: String) -> Self {
+        Self::start_many(root, vec![allowed], vec![request_digest])
+    }
+
+    fn start_many(root: &Path, allowed: Vec<RunEnvelope>, request_digests: Vec<String>) -> Self {
         let authority = Arc::new(
             QualificationAuthority::new(
                 MacKey::from_hex(STORAGE_KEY_HEX).unwrap(),
                 SCOPE.into(),
-                vec![allowed],
+                allowed,
             )
             .unwrap()
-            .with_ordinary_cargo_request_digests(vec![request_digest])
+            .with_ordinary_cargo_request_digests(request_digests)
             .unwrap(),
         );
         let daemon = Daemon::bind(
@@ -334,17 +342,30 @@ fn invocation_json(invocation: &OrdinaryCargoInvocation) -> Value {
 
 fn create_bootstrap(
     case: &FixtureRoot,
+    name: &str,
     invocation: &OrdinaryCargoInvocation,
     storage: &Path,
     parent: &Path,
     request_digest: &str,
+    capture_budget: Option<&OrdinaryCargoCaptureBudget>,
 ) -> (PathBuf, String) {
     let storage_endpoint = Endpoint::capture(storage.to_path_buf()).unwrap();
     let parent_endpoint = Endpoint::capture(parent.to_path_buf()).unwrap();
-    let callback_context = ordinary_cargo_callback_context(SCOPE, request_digest).unwrap();
-    let bytes = serde_json::to_vec(&json!({
-        "version": ORDINARY_CARGO_ATTEMPT_VERSION,
-        "operation": ORDINARY_CARGO_ATTEMPT_OPERATION,
+    let (version, operation, callback_context) = match capture_budget {
+        Some(_) => (
+            ORDINARY_CARGO_CAPTURE_ATTEMPT_VERSION,
+            ORDINARY_CARGO_CAPTURE_ATTEMPT_OPERATION,
+            ordinary_cargo_callback_context_v2(SCOPE, request_digest).unwrap(),
+        ),
+        None => (
+            ORDINARY_CARGO_ATTEMPT_VERSION,
+            ORDINARY_CARGO_ATTEMPT_OPERATION,
+            ordinary_cargo_callback_context(SCOPE, request_digest).unwrap(),
+        ),
+    };
+    let mut bootstrap = json!({
+        "version": version,
+        "operation": operation,
         "scope": SCOPE,
         "remaining_ms": WireU64(REMAINING_MS),
         "callback_timeout_ms": WireU64(CALLBACK_TIMEOUT_MS),
@@ -353,9 +374,15 @@ fn create_bootstrap(
         "callback_key_hex": CALLBACK_KEY_HEX,
         "callback_context": callback_context,
         "invocation": invocation_json(invocation),
-    }))
-    .unwrap();
-    let path = case.path.join("callbacks").join("bootstrap.json");
+    });
+    if let Some(capture_budget) = capture_budget {
+        bootstrap["capture_budget"] = json!(capture_budget);
+    }
+    let bytes = serde_json::to_vec(&bootstrap).unwrap();
+    let path = case
+        .path
+        .join("callbacks")
+        .join(format!("bootstrap-{name}.json"));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -396,6 +423,8 @@ fn signed_callback_reply(request: &Value, payload: Value, context: &str) -> Valu
     let launch_digest = request["launch_digest"].as_str().unwrap();
     let acquired_digest = request["acquired_digest"].as_str().unwrap();
     let command_digest = request["command_digest"].as_str().unwrap();
+    let version = request["version"].as_u64().unwrap() as u32;
+    let operation = request["operation"].as_str().unwrap();
     let result_digest = canonical_digest(&json!({
         "method": method,
         "id": id,
@@ -411,10 +440,10 @@ fn signed_callback_reply(request: &Value, payload: Value, context: &str) -> Valu
     )
     .unwrap();
     let receipt = authenticator
-        .receipt(method, id, launch_digest, CALLBACK_POLICY, &result_digest)
+        .receipt(method, id, launch_digest, operation, &result_digest)
         .unwrap();
     json!({
-        "version": ORDINARY_CARGO_ATTEMPT_VERSION,
+        "version": version,
         "method": method,
         "id": id,
         "launch_digest": launch_digest,
@@ -521,6 +550,7 @@ fn uncredentialed_capture(
     let capture_digest = digest(b"synthetic retained output index");
     let exit_code = if failed { 1 } else { 0 };
     let outcome = if failed { "failed" } else { "passed" };
+    let large_synthetic_receipt = !callback_request["capture_budget"].is_null();
     let outputs: Vec<Value> = callback_request["expected_outputs"]
         .as_array()
         .unwrap()
@@ -529,23 +559,35 @@ fn uncredentialed_capture(
             json!({
                 "role": role,
                 "digest": digest(role.as_str().unwrap().as_bytes()),
-                "bytes": 64,
+                "bytes": if large_synthetic_receipt
+                    && role.as_str() == Some("binary")
+                {
+                    88_595_944
+                } else if large_synthetic_receipt {
+                    1_048_576
+                } else {
+                    64
+                },
             })
         })
         .collect();
+    let mut capture = json!({
+        "reference": reference,
+        "digest": capture_digest,
+        "host_run_id": run["host_run_id"],
+        "run_id": run["run_id"],
+        "attempt_id": run["attempt_id"],
+        "credential": "placeholder-capture",
+        "outputs": outputs,
+    });
+    if !callback_request["capture_budget_digest"].is_null() {
+        capture["capture_budget_digest"] = callback_request["capture_budget_digest"].clone();
+    }
     json!({
         "run": run,
         "outcome": outcome,
         "terminal_credential": "placeholder-terminal",
-        "capture": {
-            "reference": reference,
-            "digest": capture_digest,
-            "host_run_id": run["host_run_id"],
-            "run_id": run["run_id"],
-            "attempt_id": run["attempt_id"],
-            "credential": "placeholder-capture",
-            "outputs": outputs,
-        },
+        "capture": capture,
         "completion": {
             "lease_id": acquired["lease_id"],
             "slot_id": acquired["slot_id"],
@@ -864,10 +906,12 @@ fn one_scenario(
     fs::set_permissions(&callback_path, fs::Permissions::from_mode(0o600)).unwrap();
     let (bootstrap, context) = create_bootstrap(
         &case,
+        number,
         &invocation,
         &daemon.socket,
         &callback_path,
         &request_digest,
+        None,
     );
     let acquired = Arc::new(Mutex::new(None));
     let trace = Trace::new();
@@ -920,6 +964,194 @@ fn one_scenario(
         CargoReuseState::Pending => assert_eq!(slot.state, SlotState::Leased, "trace:\n{report}"),
         _ => assert_eq!(slot.state, SlotState::Idle, "trace:\n{report}"),
     }
+    daemon.stop();
+}
+
+fn capture_policy(total: u64, binary: u64, full_debug: u64) -> OrdinaryCargoCaptureBudget {
+    OrdinaryCargoCaptureBudget::new(
+        total,
+        BTreeMap::from([
+            ("source-archive".into(), 16 * 1024 * 1024),
+            ("cargo-log".into(), 16 * 1024 * 1024),
+            ("test-result".into(), 16 * 1024 * 1024),
+            ("binary".into(), binary),
+            ("full-debug".into(), full_debug),
+        ]),
+    )
+    .unwrap()
+}
+
+fn stable_budget_invocation(
+    mut invocation: OrdinaryCargoInvocation,
+    attempt: &str,
+    capture_budget: &OrdinaryCargoCaptureBudget,
+) -> OrdinaryCargoInvocation {
+    let binding = &mut invocation.request.acquire.envelope.binding;
+    binding.task_id = format!("synthetic-task-{attempt}");
+    binding.workspace_id = format!("synthetic-workspace-{attempt}");
+    binding.run_id = format!("synthetic-run-{attempt}");
+    binding.attempt_id = format!("synthetic-attempt-{attempt}");
+    binding.commit = if attempt == "budget-first" {
+        "a".repeat(40)
+    } else {
+        "b".repeat(40)
+    };
+    binding.source_tree_digest = digest(format!("source tree {attempt}").as_bytes());
+    invocation.request.acquire.envelope.admission_reference =
+        format!("synthetic-admission-{attempt}");
+    invocation.request.acquire.acquire_id = format!("synthetic-acquire-{attempt}");
+    invocation.request.acceptance.policy_version =
+        crate::storage::ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION;
+    invocation.request.acceptance.input_boundary_digest = digest(b"uninstalled placeholder");
+    invocation.request.acceptance.acceptance_reference = ordinary_cargo_stable_reuse_reference(
+        &invocation.request,
+        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    )
+    .unwrap();
+    invocation.branch_id = format!("synthetic-branch-{attempt}");
+    invocation.source_content_digest = digest(format!("source content {attempt}").as_bytes());
+    if attempt != "budget-first" {
+        invocation.target_dir =
+            PathBuf::from(invocation.target_dir.parent().unwrap()).join("target-budget-second");
+        invocation.temp_dir =
+            PathBuf::from(invocation.temp_dir.parent().unwrap()).join("temp-budget-second");
+        invocation.capture_dir =
+            PathBuf::from(invocation.capture_dir.parent().unwrap()).join("capture-budget-second");
+        for path in [
+            &invocation.target_dir,
+            &invocation.temp_dir,
+            &invocation.capture_dir,
+        ] {
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+    invocation.expected_outputs = vec![
+        "source-archive".into(),
+        "cargo-log".into(),
+        "test-result".into(),
+        "binary".into(),
+        "full-debug".into(),
+    ];
+    invocation.operation_ids = OrdinaryCargoOperationIds {
+        submit: format!("submit-{attempt}"),
+        capture: format!("capture-{attempt}"),
+        not_submitted: format!("not-submitted-{attempt}"),
+        finalize: format!("finalize-{attempt}"),
+    };
+    invocation.request.acceptance.input_boundary_digest =
+        ordinary_cargo_input_boundary_digest_with_capture_budget(&invocation, capture_budget)
+            .unwrap();
+    invocation
+}
+
+fn run_budget_attempt(
+    case: &FixtureRoot,
+    name: &str,
+    invocation: &mut OrdinaryCargoInvocation,
+    capture_budget: &OrdinaryCargoCaptureBudget,
+    daemon: &TestDaemon,
+) -> Value {
+    let request_digest = ordinary_cargo_request_digest(&invocation.request).unwrap();
+    install_request_credentials(invocation, &daemon.instance, &request_digest);
+    let callback_path = case
+        .path
+        .join("callbacks")
+        .join(format!("callback-{name}.sock"));
+    let listener = UnixListener::bind(&callback_path).unwrap();
+    fs::set_permissions(&callback_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let (bootstrap, context) = create_bootstrap(
+        case,
+        name,
+        invocation,
+        &daemon.socket,
+        &callback_path,
+        &request_digest,
+        Some(capture_budget),
+    );
+    let acquired = Arc::new(Mutex::new(None));
+    let trace = Trace::new();
+    trace.mark("scenario", name);
+    let callbacks = start_callback_server(
+        listener,
+        Scenario::BudgetReuse,
+        invocation.request.clone(),
+        daemon.instance.clone(),
+        context,
+        acquired.clone(),
+        trace.clone(),
+    );
+    run_child(&bootstrap, true, &trace);
+    callbacks.join().unwrap();
+    let report = trace.render();
+    let acquired = acquired
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| panic!("submit had acquired identity\ntrace:\n{report}"));
+    let expected_policy_digest = ordinary_cargo_capture_budget_digest(capture_budget).unwrap();
+    assert_eq!(acquired["capture_budget"], json!(capture_budget));
+    assert_eq!(
+        acquired["capture_budget_digest"],
+        json!(expected_policy_digest)
+    );
+    assert_eq!(
+        acquired["input_boundary_digest"],
+        json!(invocation.request.acceptance.input_boundary_digest)
+    );
+    acquired
+}
+
+#[test]
+fn version_two_capture_budget_reuses_stable_generation_with_new_exact_boundaries() {
+    let case = FixtureRoot::scenario("10-budget-stable-reuse");
+    let storage_root = case.dir("storage");
+    case.dir("callbacks");
+    let first_budget = capture_policy(512 * 1024 * 1024, 128 * 1024 * 1024, 256 * 1024 * 1024);
+    let second_budget = capture_policy(256 * 1024 * 1024, 96 * 1024 * 1024, 128 * 1024 * 1024);
+    let base = invocation(&case, "budget-first");
+    let mut first = stable_budget_invocation(base, "budget-first", &first_budget);
+    let mut second = stable_budget_invocation(first.clone(), "budget-second", &second_budget);
+    assert_eq!(
+        first.request.acceptance.acceptance_reference,
+        second.request.acceptance.acceptance_reference
+    );
+    assert_ne!(
+        first.request.acceptance.input_boundary_digest,
+        second.request.acceptance.input_boundary_digest
+    );
+    assert_ne!(first.target_dir, second.target_dir);
+    assert_ne!(first.temp_dir, second.temp_dir);
+    assert_ne!(first.capture_dir, second.capture_dir);
+    assert!(validate_invocation_with_capture_budget(&first, Some(&first_budget)).is_ok());
+    assert!(validate_invocation_with_capture_budget(&second, Some(&second_budget)).is_ok());
+
+    let first_request_digest = ordinary_cargo_request_digest(&first.request).unwrap();
+    let second_request_digest = ordinary_cargo_request_digest(&second.request).unwrap();
+    let mut daemon = TestDaemon::start_many(
+        &storage_root,
+        vec![
+            first.request.acquire.envelope.clone(),
+            second.request.acquire.envelope.clone(),
+        ],
+        vec![first_request_digest, second_request_digest],
+    );
+    let first_acquired = run_budget_attempt(&case, "first", &mut first, &first_budget, &daemon);
+    let second_acquired = run_budget_attempt(&case, "second", &mut second, &second_budget, &daemon);
+    assert_eq!(first_acquired["reused"], json!(false));
+    assert_eq!(second_acquired["reused"], json!(true));
+    assert_eq!(first_acquired["slot_id"], second_acquired["slot_id"]);
+    assert_eq!(first_acquired["generation"], second_acquired["generation"]);
+    assert_ne!(
+        first_acquired["input_boundary_digest"],
+        second_acquired["input_boundary_digest"]
+    );
+    let inventory = daemon.client.inventory("budget-reuse-result").unwrap();
+    assert_eq!(inventory.slots.len(), 1);
+    assert_eq!(
+        inventory.slots[0].cargo_reuse_state,
+        Some(CargoReuseState::Reusable)
+    );
     daemon.stop();
 }
 

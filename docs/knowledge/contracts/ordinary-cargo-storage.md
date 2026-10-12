@@ -172,11 +172,11 @@ uninstalled policy rejection, unsupported ledger/protocol versions, and
 restart uncertainty. They do not run Cargo or establish a real input
 boundary.
 
-The shipped private Rust route is available, in Unix builds with the
+The shipped private Rust routes are available, in Unix builds with the
 `private-qualification` feature enabled, as
 `oxide_storage::ordinary_cargo::{OrdinaryCargoAttemptRunner,
-OrdinaryCargoAttemptBudget, OrdinaryCargoInvocation, run_attempt,
-serve_bootstrap}` and as the feature-gated unpublished
+OrdinaryCargoAttemptBudget, OrdinaryCargoCaptureBudget, OrdinaryCargoInvocation,
+run_attempt, serve_bootstrap}` and as the feature-gated unpublished
 `oxide-ordinary-cargo-attempt` binary. The binary accepts exactly one argument:
 the path to a protected, one-use bootstrap. Both entry points use the actual
 ordinary storage methods, validate the acquire reply against access-free lookup
@@ -268,8 +268,9 @@ from cache eligibility.
 
 The private Rust API is feature-gated by `private-qualification` and consists
 of `OrdinaryCargoAttemptRunner::new(Client, storage_root, parent_endpoint,
-CallbackAuthenticator, budget)`, `run_attempt(runner, invocation)`, and
-`serve_bootstrap(path)`. The bounded `OrdinaryCargoInvocation` contains the
+CallbackAuthenticator, budget)`, `OrdinaryCargoAttemptRunner::new_with_capture_budget`,
+`run_attempt(runner, invocation)`, and `serve_bootstrap(path)`. The bounded
+`OrdinaryCargoInvocation` contains the
 ordinary `AcquireRequest`; physical root and allocation epoch; project, task,
 workspace, branch, run and attempt IDs; commit/tree/content digests; accepted
 policy version, reference and installation epoch; selector and argv arrays;
@@ -280,9 +281,13 @@ process endpoints; task JSON and environment cannot install trusted policy or
 issuer material. The API does not accept a `Registration` or fabricate
 `UnitEvidence`.
 
-This current route remains on policy version 1. Storage policy version 2 is
-not enabled by the route until a separately scoped integration installs and
-authenticates its stable eligibility reference; see the
+The original runner constructor remains version 1 and preserves its 16 MiB
+capture cap. Version 2 uses the storage API's stable eligibility reference
+while every exact source/run/command/output path and capture budget remains in
+that attempt's separately authenticated input boundary. A v2 request needs
+both the existing exact-request admission and the stable-policy verification;
+the protected owner's ordinary request digest allowlist contains the complete
+request digest, including its stable reference and exact boundary. See the
 [ordinary-Cargo reuse identity contract](ordinary-cargo-reuse-identity.md).
 
 The route uses the existing identity, lease, lookup, and finalize semantics
@@ -432,8 +437,10 @@ commit. Callable means the private qualification binary compiles and passes
 synthetic fixtures. It is not qualified: no real Cargo run, real input
 freshness, full-debug lookup, accepted installation policy, consumer adoption,
 storage relief, or SSD-write evidence exists yet. Use this section with the
-Rust definitions and cross-language fixture
-`fixtures/ordinary-cargo-auth-v1.json`; do not infer a different wire shape.
+Rust definitions and cross-language fixtures
+`fixtures/ordinary-cargo-auth-v1.json` and
+`fixtures/ordinary-cargo-auth-v2.json`; each route version has its own wire
+shape and authentication domain.
 
 ### Process bootstrap and version pins
 
@@ -448,16 +455,19 @@ can therefore occur with no lease. It is never reported as an unleased refusal.
 Process exit, a ready or stopped state, or PID exit alone implies neither
 ownership nor release; only authenticated storage or settlement evidence may
 change ownership. It writes no credentials to stdout or stderr. The bootstrap is a duplicate-key-rejecting JSON object with
-exactly these fields:
-`version` (1), `operation` (`ordinary-cargo-attempt-v1`), `scope`,
-`remaining_ms`, `callback_timeout_ms`, `storage`, `parent`,
-`callback_key_hex`, `callback_context`, and `invocation`. Endpoint objects
-contain `path`, `device`, and `inode`; device/inode and byte/duration quantities
-use lossless `WireU64` encoding (decimal strings for values outside JavaScript's
-safe integer range). The file is owner-only, regular, single-link and at most
-64 KiB; the canonical input-boundary JSON is at most 48 KiB. The file is
-consumed once; endpoint path/device/inode identities are rechecked. A durable
-private marker is synced before the bootstrap is removed.
+exactly these fields in version 1: `version` (1), `operation`
+(`ordinary-cargo-attempt-v1`), `scope`, `remaining_ms`,
+`callback_timeout_ms`, `storage`, `parent`, `callback_key_hex`,
+`callback_context`, and `invocation`. Version 2 uses operation
+`ordinary-cargo-attempt-v2` and adds the owner-issued `capture_budget` field at
+the bootstrap top level. A legacy bootstrap omits that field; explicit null is
+not treated as absence. Mixed or unsupported versions refuse. Endpoint
+objects contain `path`, `device`, and `inode`; device/inode and byte/duration
+quantities use lossless `WireU64` encoding (safe JSON integers as numbers and
+larger values as canonical decimal strings). The file is owner-only, regular,
+single-link and at most 64 KiB; the canonical input-boundary JSON is at most
+48 KiB. The file is consumed once; endpoint path/device/inode identities are
+rechecked. A durable private marker is synced before the bootstrap is removed.
 
 The `invocation` object contains exactly `acquire` (`envelope`, `acquire_id`,
 `required_bytes`), `root` (`source_root`, `consumer_root_id`, `allocation_epoch`),
@@ -468,12 +478,44 @@ The `invocation` object contains exactly `acquire` (`envelope`, `acquire_id`,
 `expected_outputs`, and `operation_ids` (`submit`, `capture`, `not_submitted`,
 `finalize`). Environment values are strings or `null` for explicit absence.
 `expected_outputs` is a unique nonempty list selected from `source-archive`,
-`cargo-log`, `test-result`, `binary` and `full-debug`; captured role entries
-must match it exactly and total no more than 16 MiB. That `MAX_CAPTURE_BYTES`
-route cap is the only implemented capture bound. The proposed 2 GiB per
-attempt-record retained-evidence figure in the Nucleus packet below is not
-implemented or checked here and does not establish fit. Neither value is
-widened by this contract.
+`cargo-log`, `test-result`, `binary` and `full-debug`. Version 1 captured role
+entries must match that list exactly and total no more than 16 MiB; its
+`MAX_CAPTURE_BYTES` cap and authentication semantics remain unchanged.
+
+Version 2 installs `OrdinaryCargoCaptureBudget { version, total_bytes,
+role_bytes }` in the protected bootstrap or trusted runner constructor. Its
+version is 1; `total_bytes` is positive and no greater than the 2 GiB
+per-attempt engineering maximum. `role_bytes` contains one positive finite
+ceiling for every predeclared expected role, with no extra role, wildcard, or
+unlimited entry. Every role ceiling is at most the total ceiling. Checked
+u64 accumulation rejects per-role or aggregate overflow. Captured entries must
+have unique roles matching the complete expected set and satisfy both their
+role ceilings and the aggregate ceiling before publication. A missing, extra,
+renamed, duplicate, mixed-version, changed, or over-budget receipt holds the
+acquired generation; it cannot make that generation reusable.
+
+The v2 policy is per-attempt input, not stable compatibility identity. Its
+version, aggregate ceiling and role ceilings are included in the exact
+input-boundary digest, exact owner-allowlisted request, acquired identity
+tuple, launch digest, callback request and capture-budget digest echoed in the
+authenticated capture reply. Finalize repeats the original request and its
+credentials. A changed budget requires a new signed boundary and owner
+allowlist entry. Stable reuse still uses the separate storage policy-v2
+reference, which excludes per-run capture paths and the budget.
+
+The 2 GiB value is only an engineering maximum, not a selected real-trial
+ceiling or evidence that artifacts fit. The observed planning binary size of
+88,595,944 bytes exceeds the unchanged v1 cap; the return did not include its
+source/path/hash, and full-debug, other binaries, source, copy overhead and
+aggregate retention remain unmeasured. The synthetic v2 fixture represents
+that size only as authenticated receipt metadata: no large or sparse file is
+created, read, hashed, copied or retained by the child. The proposed 2 GiB
+per-attempt-record retained-evidence figure in the Nucleus packet is not an
+installed allowance and does not establish fit. The child validates receipt
+fields only; Nucleus remains responsible for complete file enumeration,
+hashing, copy, custody and genuine evidence. The 1 MiB frame, 16 MiB aggregate
+callback traffic, three-exchange, 64 KiB bootstrap and 48 KiB boundary limits
+are unchanged.
 The owner computes the source-content digest from its accepted source
 inventory and binds it alongside the exact source commit/tree and command
 boundary; this route does not transfer or independently hash source bytes. Its
@@ -508,16 +550,19 @@ read or hash source files.
 Attempt callback framing is a 4-byte big-endian length followed by UTF-8 JSON.
 The frame cap is 1 MiB, aggregate cap 16 MiB, and the route allows at most
 three exchanges. Unknown fields, duplicate JSON keys, malformed/trailing JSON,
-extra operations, and invalid version/method/type refuse. The route's
-`MAX_CAPTURE_BYTES` is 16 MiB. These private attempt limits are independent of
-the storage transport: `OXSTOR01` storage wire version is 2, durable
-`OXIDEST1` ledger version is 4. The private attempt operation, storage-runtime
-bootstrap schema/version, readiness schema/version and runtime control
-protocol are each version 1; the storage runtime bootstrap and readiness carry
-the independent `storage_protocol: 2` and `control_protocol: 1` fields. Its
-policy digest binds both wire versions and the exact ordinary-request digest
-allowlist. Old storage peers/ledgers refuse without reinterpretation or
-migration.
+extra operations, and invalid version/method/type refuse. `MAX_CAPTURE_BYTES`
+remains 16 MiB for route version 1; route version 2 uses its owner-installed
+budget only for artifact receipt accounting. These private attempt limits are
+independent of the storage transport: `OXSTOR01` storage wire version is 2,
+and durable `OXIDEST1` ledger version is 4. Private attempt operations are
+explicitly versioned 1 and 2. The capture-budget schema, storage-runtime
+bootstrap, readiness schema, and runtime control protocol are version 1; the
+storage runtime bootstrap and readiness carry independent
+`storage_protocol: 2` and `control_protocol: 1` fields. The runtime policy
+digest still binds the wire versions and exact ordinary-request digest
+allowlist; the exact request digest includes the v2 stable reference and
+capture-budget input boundary. Old storage peers/ledgers refuse without
+reinterpretation or migration.
 
 ### Canonical receipts and installed policy
 
@@ -531,7 +576,7 @@ acceptance reference and input-boundary digest. Admission signs the fields
 `oxide-ordinary-cargo-admission-v1`; the existing generic admission credential
 is also required.
 
-The input-boundary subject has exactly `binding`, `root` (`source_root`,
+The version-1 input-boundary subject has exactly `binding`, `root` (`source_root`,
 `root_id`, `allocation_epoch`), `ordinary_partition`, `cargo_partition`,
 decimal-text `required_bytes`, `branch_id`, `source_content_digest`,
 `policy_version`, `installation_epoch`, `acceptance_reference`, `selector`,
@@ -542,7 +587,10 @@ digest is the canonical digest of an object with
 decimal-text `required_bytes`), `root` (`source_root`, `consumer_root_id`,
 `allocation_epoch`), ordinary partition label, and `acceptance` (policy version,
 installation epoch, acceptance reference and input-boundary digest). The
-fixture pins both byte-level digests for representative values.
+version-1 fixture pins both byte-level digests for representative values.
+Version 2 adds one `capture_budget` object to that boundary; its exact schema
+is `{version, total_bytes, role_bytes}`. The v2 fixture pins the changed
+boundary/request digests and does not reinterpret the v1 vector.
 
 The trusted runtime installs at most four exact ordinary request digests from
 the protected `RuntimeBootstrap.ordinary_cargo_request_digests` list. Missing
@@ -566,18 +614,21 @@ ledger. Credential-bearing bootstrap/storage/callback traffic is confined to
 the protected local process and owner-only sockets; credentials are not safe to
 copy to ordinary logs or ledgers.
 
-Callback context is the canonical digest of
+The version-1 callback context is the canonical digest of
 `{scope, operation: "ordinary-cargo-attempt-v1", request_digest,
-storage_protocol: 2}`. Each callback reply signs, under
+storage_protocol: 2}`. Version 2 uses the same fields with operation
+`ordinary-cargo-attempt-v2`. Each callback reply signs, under
 `oxide-owner-callback-v1`, the UTF-8 length-prefixed fields
-`[context, method, operation_id, launch_digest,
-"ordinary-cargo-attempt-v1", result_digest]`. `result_digest` is the canonical
+`[context, method, operation_id, launch_digest, route_operation,
+result_digest]`. `result_digest` is the canonical
 digest of `{method, id, launch_digest, acquired_digest, command_digest,
 payload}`. `MacKey` frames the domain and every UTF-8 field as a 4-byte
 big-endian byte length followed by the field bytes; tags are
-`hmac-sha256-v1:<lowercase-hex>`. The fixture contains request-digest,
-callback-context, ordinary-admission, ordinary-settlement and callback HMAC
-vectors checked by both Rust and Node.
+`hmac-sha256-v1:<lowercase-hex>`. Both fixtures contain the applicable
+request-digest, callback-context, ordinary-admission, ordinary-settlement and
+callback HMAC vectors checked by Rust and Node. The v1 vector remains a legacy
+control; the v2 vector also pins canonical decimal-string encoding for large
+`WireU64` values.
 
 ### Callback body and durable ordering
 
@@ -590,12 +641,16 @@ The acquired tuple fields are `policy_version`, `installation_epoch`,
 `slot_id`, `generation`, `lease_id`, `slot_path` and `reused`; it also repeats
 consumer, project, component, workflow, `task_id`, `workspace_id`, `branch_id`,
 `run_id`, `attempt_id`, commit, source-tree/content digests and
-`cargo_partition`. Its digest is the canonical digest of that object. The
+`cargo_partition`. Version 2 additionally carries the exact `capture_budget`
+and its `capture_budget_digest`; version 1 omits both fields. Its digest is the
+canonical digest of that object. The
 command has exactly `selector`, `argv`,
 `cwd`, `environment`, `target_dir`, `temp_dir` and `capture_dir`; its digest is
 the canonical digest of that object. The launch digest is the canonical digest
 of `operation`, request digest, branch, source-content digest, those command
 fields, expected outputs, all reserved operation IDs and the acquired tuple.
+Version 2 also includes `capture_budget` and `capture_budget_digest` in that
+launch subject.
 `environment` preserves all accepted entries and explicitly sets
 `CARGO_BUILD_BUILD_DIR` to the acquired slot, `CARGO_TARGET_DIR` to
 `target_dir`, and `TMPDIR`, `TMP` and `TEMP` to `temp_dir`.
@@ -610,7 +665,8 @@ strings; no identity is truncated or converted through a JavaScript number.
 run tuple. `capture` additionally carries `run_identity` and its reply payload
 contains `run`, `outcome` (`passed`, `failed`, `cancelled`),
 `terminal_credential`, `capture` (`reference`, `digest`, `host_run_id`, `run_id`,
-`attempt_id`, `credential`, `outputs` of `{role,digest,bytes}`), `completion`
+`attempt_id`, `credential`, `outputs` of `{role,digest,bytes}`; version 2 also
+echoes `capture_budget_digest`), `completion`
 (`lease_id`, `slot_id`, `slot_path`, `temp_dir`, `capture_dir`, `workflow`,
 workflow-definition digest, repository head, fixture-source digest,
 `host_run_id`, `run_id`, `attempt_id`, process identities, free-space samples,
@@ -623,9 +679,9 @@ exit code, stdout/stderr digests, capture reference/digest), and
 must be the empty string; the other run/source identity fields exactly repeat
 the invocation's consumer-owned tuple.
 The process checks callback id/method, all three digests, full source/run tuple,
-acquired lease/slot/path, terminal/exit code, capture completeness, output byte
-limit, and no-writer fields. HMAC validity alone is not proof of real Effigy
-completion or retention.
+acquired lease/slot/path, terminal/exit code, capture completeness, output
+limits (aggregate in v1; per-role and aggregate in v2), and no-writer fields.
+HMAC validity alone is not proof of real Effigy completion or retention.
 
 The Oxide process performs acquire, access-free exact lookup, and inventory
 cross-check before it exposes the slot or emits `submit`. Busy/refusal creates
@@ -670,11 +726,13 @@ not infer load reliability from later passing runs.
 Synthetic compiled-process fixtures exercise pass/capture, settled failure,
 positive no-submit, submit timeout, submit lost reply, full-tuple mismatch,
 and the three capture-path controls below, plus command/root/epoch/environment
-mutation, acquired-path substitution and secret redaction. They run nine
-native child scenarios, each with a 30-second ceiling. Each child gets a
-parent-side trace of phase labels, monotonic offsets, and bounded reasons,
-capped at 64 KiB per scenario. The trace never records frame bodies, keys, or
-environment values, and failures print it. The three capture-path cases are:
+mutation, acquired-path substitution and secret redaction. The legacy suite
+runs nine native child scenarios; the v2 control adds two child attempts
+against one storage generation. Each child has a 30-second ceiling. The
+parent-side trace for each child records phase labels, monotonic offsets, and
+bounded reasons, capped at 64 KiB per scenario. The trace never records frame
+bodies, keys, or environment values, and failures print it. The three legacy
+capture-path cases are:
 
 - expiry: `CaptureDelayed` withholds a valid reply past the callback window.
   The child must stay held at Capture, pending, with no release;
@@ -683,8 +741,16 @@ environment values, and failures print it. The three capture-path cases are:
 - channel loss: `CaptureLost` writes a partial frame and closes. The child must
   hold at Capture.
 
-Output bounds are covered only by the in-process `MAX_CAPTURE_BYTES + 1`
-refusal control, not by a native child case. The child's exit line names only
+The v2 control changes run/source identity and output paths between attempts,
+and signs a changed exact boundary and capture-budget digest while retaining
+the same stable eligibility reference. The second attempt reuses the same slot
+and generation. A binary receipt represents 88,595,944 bytes without creating
+or reading that file. Unit controls cover exact ceilings, one byte over,
+aggregate and per-role overflow, missing and extra roles, and legacy 16 MiB
+refusal; they do not establish actual artifact fit.
+
+Output refusal is covered by in-process v1 and v2 controls, not by an extra
+native refusal child. The child's exit line names only
 the phase. Distinguishing among the several `Held(Capture)` returns inside a
 single child needs a private diagnostic hook, which this fixture does not add.
 The parent trace separates timing expiry from delivered-but-refused replies.
@@ -696,15 +762,18 @@ do not establish genuine scheduler evidence, accepted installation policy, real
 input freshness, full-debug lookup, consumer adoption, storage relief or SSD
 writes.
 
-The Nucleus owner must accept that exact handover before a separately scoped
-Nucleus-owned client task is dispatched. The next route remains bounded to one
-existing `StorageAttempt`/Effigy Contract 010 path and the reviewed root,
+The Nucleus owner must accept this exact handover after the Oxide change has
+independent review, merge and Queue closeout, before a separately scoped
+Nucleus-owned client task is dispatched. The existing `Nucleus#175` pin stays
+on the older 046 route; this change does not amend or activate it. Later client follow-through
+uses the version-2 bootstrap, callback and exact input-boundary packet through
+one existing `StorageAttempt`/Effigy Contract 010 path and the reviewed root,
 partition, and storage limits. It does not install a new scheduler or storage
 codec, and it cannot activate a real Cargo workflow without the later joint
 proof packet below.
 
-That Nucleus task is bounded to at most 90 minutes authoring and 30 minutes
-independent exact-head review, one `ordinary-cargo-attempt-v1` adapter, one
+That future Nucleus task is bounded by its own approved brief, one
+`ordinary-cargo-attempt-v2` adapter with an owner-issued capture budget, one
 fresh consumer root, and the four-attempt/45-minute ceiling in the proof
 packet below. It may install the accepted callback schema only in the existing
 `StorageAttempt`, `oxide-runner-transport.ts`, and `validation-client.ts`
