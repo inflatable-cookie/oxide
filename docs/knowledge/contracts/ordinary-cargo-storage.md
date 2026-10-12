@@ -162,8 +162,9 @@ uninstalled policy rejection, unsupported ledger/protocol versions, and
 restart uncertainty. They do not run Cargo or establish a real input
 boundary.
 
-The shipped private Rust route is available as
-`project::ordinary_cargo::{OrdinaryCargoAttemptRunner,
+The shipped private Rust route is available, in Unix builds with the
+`private-qualification` feature enabled, as
+`oxide_storage::ordinary_cargo::{OrdinaryCargoAttemptRunner,
 OrdinaryCargoAttemptBudget, OrdinaryCargoInvocation, run_attempt,
 serve_bootstrap}` and as the feature-gated unpublished
 `oxide-ordinary-cargo-attempt` binary. The binary accepts exactly one argument:

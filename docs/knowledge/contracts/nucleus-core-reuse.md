@@ -1466,7 +1466,7 @@ fields refuse. Its required fields are:
 
 | Field | Meaning |
 | --- | --- |
-| `version`, `host_protocol`, `storage_protocol` | All exactly `1`; storage stays `OXSTOR01`, ledger version 3. |
+| `version`, `host_protocol`, `storage_protocol` | `version` and `host_protocol` are exactly `1`; `storage_protocol` is exactly `2`. The storage wire is `OXSTOR01` version 2 and the durable ledger is version 4. |
 | `map_pin` | Exactly `d9ff17988c7eaa5cf57747bc55bfe4f138692f15`. |
 | `expires_unix_seconds` | Current UTC seconds through at most 30 seconds ahead; checked at load and before acquire. |
 | `scope` | Owner-approved qualification scope, bounded to 4096 UTF-8 bytes. |
@@ -1496,7 +1496,7 @@ endpoint, acquires/finalizes with the real client and retains the lease token.
 The acquired instance and canonical `root/slots/<slot_id>` path must match the
 bootstrap. The child issues no command, Cargo spawn, host submission, consumer
 lookup/cancel operation, reconciliation or invalid-generation deletion.
-Existing host limits, callback/result version 1, OXSTOR01 version 1 and the
+Existing host limits and callback/result version 1, OXSTOR01 version 2 and the
 registered-map pin remain unchanged.
 
 Before acquire, the child durably creates an owner-only
@@ -1599,13 +1599,14 @@ rules: canonical, owner-only mode 0600, one link, no-follow, stable identity, at
 
 | Field | Meaning |
 | --- | --- |
-| `version`, `storage_protocol`, `control_protocol` | All `1`. Storage remains `OXSTOR01`, ledger version 3. |
+| `version`, `control_protocol`, `storage_protocol` | `version` and `control_protocol` are `1`; `storage_protocol` is `2`. Storage uses `OXSTOR01` version 2 and ledger version 4. |
 | `scope` | Owner-approved qualification scope, 1–4096 bytes. |
 | `expires_unix_seconds` | Owner's remaining window end, as WireU64. The window is counted from the entry sample, taken when `serve_bootstrap` is called and before the bootstrap is read. The entry monotonic instant and the full-precision wall clock are sampled as a pair, with the instant first. The lifetime is `min(expires - entry_wall, 2700 s - stop_grace - 2 s)`, in exact arithmetic. No fractional second is dropped. The monotonic deadline is `entry_instant + lifetime`, so it never passes the owner's end. The published expiry is the whole second at or before `entry_wall + lifetime`. It is never later than the deadline, so the parent may refuse up to one second early and never late. Startup time is inside the window. |
 | `stop_grace_seconds` | WireU64, 1–10. Bounded wait after a stop before an in-flight storage operation is abandoned. Bound into `policy_digest`. |
 | `storage_root` | Absolute canonical owner-only (0700) directory. The daemon endpoint is `<root>/daemon.sock`. |
 | `budget` | `{cap_bytes > 0, free_reserve_bytes}` as WireU64. Explicit finite policy, not kernel enforcement, not aggregate footprint, not a host reserve. |
 | `admissions` | 1–4 approved `{binding, partition, admission_reference}` subjects with no credentials. The owner mints credentials after readiness reports the instance. |
+| `ordinary_cargo_request_digests` | Optional list of at most four unique canonical SHA-256 digests for owner-approved ordinary-Cargo requests. Absent or empty keeps that route disabled. Included in the readiness policy digest. |
 | `authority_key_hex` | 64 lowercase hex. Admission and settlement authenticator for `QualificationAuthority`. |
 | `control_key_hex` | 64 lowercase hex. Readiness and shutdown authenticator, distinct from the authority key. |
 | `control` | `{path, device, inode}` for the pinned parent Unix listener: socket mode 0600, owner uid, private 0700 parent, parent is not the storage root. |
@@ -1688,7 +1689,7 @@ truncated frames refuse. Control traffic never renews the lifetime.
 
 **Ready** (runtime to parent, one frame): `version`, `operation: "ready"`, `scope`,
 `bootstrap_digest` (`sha256:` of the exact bootstrap bytes), `policy_digest` (canonical
-digest of `{scope, storage_protocol, control_protocol, budget, stop_grace_seconds, admissions}`
+digest of `{scope, storage_protocol, control_protocol, budget, stop_grace_seconds, admissions, ordinary_cargo_request_digests}`
 with credentials excluded), `storage_instance_id` (64 lowercase hex), `storage`
 (`{path, device, inode}`), `storage_protocol`, `control_protocol`, `budget`,
 `expires_unix_seconds` (the whole second at or before the effective deadline), then `mac`. Parent verification
@@ -2245,9 +2246,9 @@ not allocate, evict, settle, mint a token, or return a slot path. Normal
 `Client::acquire` still allocates on a miss and cannot replace lookup recovery.
 Lost tokens remain held, and a finalized replay grants no access.
 
-The local ledger format is version 3; version-2 data is refused without
-migration or reinterpretation. The framed local protocol is `OXSTOR01` plus
-version 1 on every request and response. Unversioned or unsupported peers are
+The local ledger format is version 4; version-3 and other unsupported data are
+refused without migration or reinterpretation. The framed local protocol is
+`OXSTOR01` plus version 2 on every request and response. Unversioned or unsupported peers are
 refused before dispatch, so they cannot receive a misleading acquire result
 or cause an allocation they cannot decode. No old retained root or uncertain
 resource is opened through a compatibility shim.
