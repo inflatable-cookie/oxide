@@ -36,6 +36,14 @@ const STORAGE_KEY_HEX: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const CALLBACK_KEY_HEX: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const CALLBACK_POLICY: &str = "ordinary-cargo-attempt-v1";
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+const REMAINING_MS: u64 = 25_000;
+// Fixture window for each callback exchange, shared with the parent trace so
+// deadline offsets are reported against the same value the child receives.
+const CALLBACK_TIMEOUT_MS: u64 = 15_000;
+// Withheld replies outlive one callback window by a fixed margin, so the child
+// has reached its deadline before any late reply is written.
+const WITHHELD_REPLY_MS: u64 = 18_000;
+const TRACE_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy)]
 enum Scenario {
@@ -45,6 +53,54 @@ enum Scenario {
     Timeout,
     LostReply,
     FullTupleChanged,
+    CaptureDelayed,
+    CaptureMismatch,
+    CaptureLost,
+}
+
+/// Parent-side scenario trace: fixed phase labels, monotonic offsets and
+/// bounded reasons. It never records frame bodies, keys or environment values.
+#[derive(Clone)]
+struct Trace(Arc<Mutex<TraceLog>>);
+
+struct TraceLog {
+    start: Instant,
+    lines: Vec<String>,
+    bytes: usize,
+    truncated: bool,
+}
+
+impl Trace {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(TraceLog {
+            start: Instant::now(),
+            lines: Vec::new(),
+            bytes: 0,
+            truncated: false,
+        })))
+    }
+
+    fn mark(&self, phase: &str, reason: &str) {
+        let mut log = self.0.lock().unwrap();
+        if log.truncated {
+            return;
+        }
+        let line = format!(
+            "{:>9.3}s {phase} {reason}",
+            log.start.elapsed().as_secs_f64()
+        );
+        if log.bytes + line.len() + 1 > TRACE_MAX_BYTES {
+            log.truncated = true;
+            log.lines.push("trace truncated at 64 KiB".into());
+            return;
+        }
+        log.bytes += line.len() + 1;
+        log.lines.push(line);
+    }
+
+    fn render(&self) -> String {
+        self.0.lock().unwrap().lines.join("\n")
+    }
 }
 
 struct TestDaemon {
@@ -290,8 +346,8 @@ fn create_bootstrap(
         "version": ORDINARY_CARGO_ATTEMPT_VERSION,
         "operation": ORDINARY_CARGO_ATTEMPT_OPERATION,
         "scope": SCOPE,
-        "remaining_ms": WireU64(25_000),
-        "callback_timeout_ms": WireU64(15_000),
+        "remaining_ms": WireU64(REMAINING_MS),
+        "callback_timeout_ms": WireU64(CALLBACK_TIMEOUT_MS),
         "storage": endpoint_json(&storage_endpoint),
         "parent": endpoint_json(&parent_endpoint),
         "callback_key_hex": CALLBACK_KEY_HEX,
@@ -616,21 +672,26 @@ fn start_callback_server(
     instance: String,
     context: String,
     acquired: Arc<Mutex<Option<Value>>>,
+    trace: Trace,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
+        trace.mark("callback_accepted", "");
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
         let submit = read_frame(&mut stream).unwrap();
         assert_eq!(submit["method"], "ordinary_cargo.submit");
+        trace.mark("submit_received", "");
         *acquired.lock().unwrap() = Some(submit["acquired"].clone());
         match scenario {
             Scenario::Timeout => {
-                thread::sleep(Duration::from_millis(18_000));
+                trace.mark("submit_withheld", "no reply inside callback window");
+                thread::sleep(Duration::from_millis(WITHHELD_REPLY_MS));
                 return;
             }
             Scenario::LostReply => {
+                trace.mark("submit_reply", "partial frame then close");
                 stream.write_all(&100u32.to_be_bytes()).unwrap();
                 stream.write_all(b"{}").unwrap();
                 return;
@@ -658,26 +719,70 @@ fn start_callback_server(
         let response =
             signed_callback_reply(&submit, json!({"status":"started","run":run}), &context);
         write_frame(&mut stream, &response).unwrap();
+        trace.mark("started_reply", "written");
         if matches!(scenario, Scenario::FullTupleChanged) {
             return;
         }
-        let capture = read_frame(&mut stream).unwrap();
+        let capture = match read_frame(&mut stream) {
+            Ok(frame) => frame,
+            Err(error) => {
+                trace.mark("capture_read", &format!("failed {:?}", error.kind()));
+                return;
+            }
+        };
         assert_eq!(capture["method"], "ordinary_cargo.capture");
-        let response = signed_callback_reply(
-            &capture,
-            capture_payload(
-                &capture,
-                &request,
-                &instance,
-                matches!(scenario, Scenario::Failed),
-            ),
-            &context,
+        trace.mark(
+            "capture_received",
+            &format!("callback window ends at +{CALLBACK_TIMEOUT_MS}ms (child send is earlier)"),
         );
-        write_frame(&mut stream, &response).unwrap();
+        let response = match scenario {
+            Scenario::CaptureLost => {
+                trace.mark("capture_reply", "partial frame then close");
+                stream.write_all(&100u32.to_be_bytes()).unwrap();
+                stream.write_all(b"{}").unwrap();
+                return;
+            }
+            Scenario::CaptureDelayed => {
+                thread::sleep(Duration::from_millis(WITHHELD_REPLY_MS));
+                trace.mark("capture_reply", "valid reply written after window");
+                signed_callback_reply(
+                    &capture,
+                    capture_payload(&capture, &request, &instance, false),
+                    &context,
+                )
+            }
+            Scenario::CaptureMismatch => {
+                // Authentic for a different operation: correspondence must refuse.
+                let mut foreign = capture.clone();
+                foreign["id"] = json!("synthetic-foreign-capture-operation");
+                trace.mark("capture_reply", "valid signature for foreign operation id");
+                signed_callback_reply(
+                    &foreign,
+                    capture_payload(&capture, &request, &instance, false),
+                    &context,
+                )
+            }
+            _ => {
+                trace.mark("capture_reply", "valid reply written inside window");
+                signed_callback_reply(
+                    &capture,
+                    capture_payload(
+                        &capture,
+                        &request,
+                        &instance,
+                        matches!(scenario, Scenario::Failed),
+                    ),
+                    &context,
+                )
+            }
+        };
+        if let Err(error) = write_frame(&mut stream, &response) {
+            trace.mark("capture_write", &format!("failed {:?}", error.kind()));
+        }
     })
 }
 
-fn run_child(bootstrap: &Path, expected_success: bool) {
+fn run_child(bootstrap: &Path, expected_success: bool, trace: &Trace) {
     let binary = std::env::var_os("OXIDE_ORDINARY_CARGO_ATTEMPT")
         .expect("Effigy compiled the private ordinary-Cargo process");
     let mut child = Command::new(binary)
@@ -688,6 +793,7 @@ fn run_child(bootstrap: &Path, expected_success: bool) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("start the compiled private route fixture");
+    trace.mark("child_spawned", "");
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -696,10 +802,15 @@ fn run_child(bootstrap: &Path, expected_success: bool) {
         if Instant::now() >= deadline {
             child.kill().unwrap();
             let _ = child.wait();
-            panic!("ordinary-Cargo child exceeded its 30-second scenario bound");
+            trace.mark("child_killed", "exceeded 30-second scenario bound");
+            panic!(
+                "ordinary-Cargo child exceeded its 30-second scenario bound\ntrace:\n{}",
+                trace.render()
+            );
         }
         thread::sleep(Duration::from_millis(10));
     };
+    trace.mark("child_exited", &format!("code {:?}", status.code()));
     let mut stdout = String::new();
     let mut stderr = String::new();
     child
@@ -718,7 +829,15 @@ fn run_child(bootstrap: &Path, expected_success: bool) {
     assert!(!stderr.contains(STORAGE_KEY_HEX));
     assert!(!stdout.contains(CALLBACK_KEY_HEX));
     assert!(!stderr.contains(CALLBACK_KEY_HEX));
-    assert_eq!(status.success(), expected_success, "child stderr: {stderr}");
+    // The binary prints only fixed category messages, so the first line is a
+    // bounded, nonsecret held/refused reason for the trace.
+    trace.mark("child_stderr", stderr.lines().next().unwrap_or("(empty)"));
+    assert_eq!(
+        status.success(),
+        expected_success,
+        "child stderr: {stderr}\ntrace:\n{}",
+        trace.render()
+    );
 }
 
 fn one_scenario(
@@ -751,6 +870,8 @@ fn one_scenario(
         &request_digest,
     );
     let acquired = Arc::new(Mutex::new(None));
+    let trace = Trace::new();
+    trace.mark("scenario", name);
     let callbacks = start_callback_server(
         listener,
         scenario,
@@ -758,15 +879,17 @@ fn one_scenario(
         daemon.instance.clone(),
         context,
         acquired.clone(),
+        trace.clone(),
     );
-    run_child(&bootstrap, expected_success);
+    run_child(&bootstrap, expected_success, &trace);
     callbacks.join().unwrap();
+    let report = trace.render();
 
     let tuple = acquired
         .lock()
         .unwrap()
         .clone()
-        .expect("submit had acquired identity");
+        .unwrap_or_else(|| panic!("submit had acquired identity\ntrace:\n{report}"));
     let lease = crate::storage::AcquireResult {
         lease_id: tuple["lease_id"].as_str().unwrap().into(),
         slot_id: tuple["slot_id"].as_str().unwrap().into(),
@@ -788,10 +911,14 @@ fn one_scenario(
         .iter()
         .find(|slot| slot.slot_id == lease.slot_id)
         .unwrap();
-    assert_eq!(slot.cargo_reuse_state, Some(expected_state));
+    assert_eq!(
+        slot.cargo_reuse_state,
+        Some(expected_state),
+        "trace:\n{report}"
+    );
     match expected_state {
-        CargoReuseState::Pending => assert_eq!(slot.state, SlotState::Leased),
-        _ => assert_eq!(slot.state, SlotState::Idle),
+        CargoReuseState::Pending => assert_eq!(slot.state, SlotState::Leased, "trace:\n{report}"),
+        _ => assert_eq!(slot.state, SlotState::Idle, "trace:\n{report}"),
     }
     daemon.stop();
 }
@@ -799,6 +926,12 @@ fn one_scenario(
 #[test]
 fn private_ordinary_cargo_compiled_process_lifecycle_and_controls() {
     assert!(task_scratch_root().is_absolute());
+    let bounded = Trace::new();
+    for _ in 0..10_000 {
+        bounded.mark("bound-control", "repeated bounded reason");
+    }
+    assert!(bounded.render().len() <= TRACE_MAX_BYTES + 64);
+    assert!(bounded.render().ends_with("trace truncated at 64 KiB"));
     let controls = FixtureRoot::scenario("00-controls");
     let mut invocation = invocation(&controls, "00");
     invocation.request.acceptance.input_boundary_digest =
@@ -873,6 +1006,27 @@ fn private_ordinary_cargo_compiled_process_lifecycle_and_controls() {
             "06-full-tuple",
             "06",
             Scenario::FullTupleChanged,
+            false,
+            CargoReuseState::Pending,
+        ),
+        (
+            "07-capture-delayed",
+            "07",
+            Scenario::CaptureDelayed,
+            false,
+            CargoReuseState::Pending,
+        ),
+        (
+            "08-capture-mismatch",
+            "08",
+            Scenario::CaptureMismatch,
+            false,
+            CargoReuseState::Pending,
+        ),
+        (
+            "09-capture-lost",
+            "09",
+            Scenario::CaptureLost,
             false,
             CargoReuseState::Pending,
         ),
