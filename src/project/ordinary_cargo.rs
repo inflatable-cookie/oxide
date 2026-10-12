@@ -448,7 +448,9 @@ pub fn run_attempt(
         Err(mpsc::RecvTimeoutError::Timeout) => {
             Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Uncertain))
         }
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(AttemptError::Protocol),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Uncertain))
+        }
     }
 }
 
@@ -485,15 +487,35 @@ fn run_attempt_inner(
         AcquireState::Refused => return Ok(OrdinaryCargoAttemptResult::Refused),
         AcquireState::Held => return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Acquire)),
     };
-    budget.check()?;
-    let command = command_for(&invocation, &acquired.lease)?;
-    let tuple = acquired_identity(storage_root, &invocation, &acquired)?;
-    let tuple_digest =
-        canonical_digest(&serde_json::to_value(&tuple).map_err(|_| AttemptError::Protocol)?)
-            .map_err(|_| AttemptError::Protocol)?;
-    let command_value = serde_json::to_value(&command).map_err(|_| AttemptError::Protocol)?;
-    let command_digest = canonical_digest(&command_value).map_err(|_| AttemptError::Protocol)?;
-    let launch_digest = canonical_digest(&json!({
+    // From here the acquire may be durable; local errors cannot release ownership.
+    if budget.check().is_err() {
+        return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit));
+    }
+    let command = match command_for(&invocation, &acquired.lease) {
+        Ok(command) => command,
+        Err(_) => return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit)),
+    };
+    let tuple = match acquired_identity(storage_root, &invocation, &acquired) {
+        Ok(tuple) => tuple,
+        Err(_) => return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit)),
+    };
+    let tuple_value = match serde_json::to_value(&tuple) {
+        Ok(value) => value,
+        Err(_) => return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit)),
+    };
+    let tuple_digest = match canonical_digest(&tuple_value) {
+        Ok(digest) => digest,
+        Err(_) => return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit)),
+    };
+    let command_value = match serde_json::to_value(&command) {
+        Ok(value) => value,
+        Err(_) => return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit)),
+    };
+    let command_digest = match canonical_digest(&command_value) {
+        Ok(digest) => digest,
+        Err(_) => return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit)),
+    };
+    let launch_digest = match canonical_digest(&json!({
         "operation": ORDINARY_CARGO_ATTEMPT_OPERATION,
         "request_digest": request_digest,
         "branch_id": invocation.branch_id,
@@ -508,8 +530,10 @@ fn run_attempt_inner(
         "expected_outputs": invocation.expected_outputs,
         "operation_ids": invocation.operation_ids,
         "acquired": tuple,
-    }))
-    .map_err(|_| AttemptError::Protocol)?;
+    })) {
+        Ok(digest) => digest,
+        Err(_) => return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit)),
+    };
     let submit_id = invocation.operation_ids.submit.clone();
     let submit_request = callback_request(
         "ordinary_cargo.submit",
@@ -521,7 +545,10 @@ fn run_attempt_inner(
         &command_digest,
         &invocation,
     );
-    let submit_deadline = budget.callback_deadline()?;
+    let submit_deadline = match budget.callback_deadline() {
+        Ok(deadline) => deadline,
+        Err(_) => return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit)),
+    };
     let submit_response = match callbacks.exchange(submit_request, submit_deadline) {
         Ok(value) => value,
         Err(CallbackFailure::Ambiguous) => {
@@ -548,8 +575,13 @@ fn run_attempt_inner(
     if Instant::now() >= submit_deadline {
         return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit));
     }
-    budget.check()?;
-    let submit_reply: CallbackReply = parse_callback_reply(submit_response)?;
+    if budget.check().is_err() {
+        return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit));
+    }
+    let submit_reply: CallbackReply = match parse_callback_reply(submit_response) {
+        Ok(reply) => reply,
+        Err(_) => return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit)),
+    };
     if !verify_callback(
         &submit_reply,
         "ordinary_cargo.submit",
@@ -588,7 +620,9 @@ fn run_attempt_inner(
             if !matches_run(&run, &invocation) {
                 return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit));
             }
-            budget.check()?;
+            if budget.check().is_err() {
+                return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Capture));
+            }
             let mut capture_request = callback_request(
                 "ordinary_cargo.capture",
                 &invocation.operation_ids.capture,
@@ -600,7 +634,10 @@ fn run_attempt_inner(
                 &invocation,
             );
             capture_request["run_identity"] = json!(run);
-            let capture_deadline = budget.callback_deadline()?;
+            let capture_deadline = match budget.callback_deadline() {
+                Ok(deadline) => deadline,
+                Err(_) => return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Capture)),
+            };
             let capture_response = match callbacks.exchange(capture_request, capture_deadline) {
                 Ok(value) => value,
                 Err(_) => return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Capture)),
@@ -608,8 +645,13 @@ fn run_attempt_inner(
             if Instant::now() >= capture_deadline {
                 return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Capture));
             }
-            budget.check()?;
-            let capture_reply: CallbackReply = parse_callback_reply(capture_response)?;
+            if budget.check().is_err() {
+                return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Capture));
+            }
+            let capture_reply: CallbackReply = match parse_callback_reply(capture_response) {
+                Ok(reply) => reply,
+                Err(_) => return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Capture)),
+            };
             if !verify_callback(
                 &capture_reply,
                 "ordinary_cargo.capture",
@@ -625,11 +667,13 @@ fn run_attempt_inner(
                 Ok(reply) => reply,
                 Err(_) => return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Capture)),
             };
-            let Some(evidence) =
-                capture_evidence(&invocation, &acquired.lease, &tuple, &run, captured)?
-            else {
-                return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Capture));
-            };
+            let evidence =
+                match capture_evidence(&invocation, &acquired.lease, &tuple, &run, captured) {
+                    Ok(Some(evidence)) => evidence,
+                    Ok(None) | Err(_) => {
+                        return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Capture));
+                    }
+                };
             finalize(client, invocation, acquired.lease, evidence, budget)
         }
         _ => Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit)),
@@ -1342,7 +1386,10 @@ fn finish_not_submitted(
         "submission_state": "never_began",
         "writer_state": "none",
     });
-    let callback_deadline = budget.callback_deadline()?;
+    let callback_deadline = match budget.callback_deadline() {
+        Ok(deadline) => deadline,
+        Err(_) => return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit)),
+    };
     let response = match callbacks.exchange(request, callback_deadline) {
         Ok(value) => value,
         Err(_) => return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit)),
@@ -1350,8 +1397,13 @@ fn finish_not_submitted(
     if Instant::now() >= callback_deadline {
         return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit));
     }
-    budget.check()?;
-    let reply: CallbackReply = parse_callback_reply(response)?;
+    if budget.check().is_err() {
+        return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit));
+    }
+    let reply: CallbackReply = match parse_callback_reply(response) {
+        Ok(reply) => reply,
+        Err(_) => return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit)),
+    };
     if !verify_callback(
         &reply,
         "ordinary_cargo.not_submitted",
@@ -1370,11 +1422,9 @@ fn finish_not_submitted(
     if !valid_not_submitted(&evidence_reply, &run_identity) {
         return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit));
     }
-    let token = acquired
-        .lease
-        .token
-        .as_ref()
-        .ok_or(AttemptError::Protocol)?;
+    let Some(token) = acquired.lease.token.as_ref() else {
+        return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit));
+    };
     let Some(not_spawned) = NoSpawnEvidence::new(&acquired.lease, binding, token) else {
         return Ok(OrdinaryCargoAttemptResult::Held(PendingPhase::Submit));
     };
@@ -1392,6 +1442,7 @@ fn valid_not_submitted(reply: &NotSubmittedReply, expected: &OrdinaryRunIdentity
     reply.status == "not_submitted"
         && reply.submission_state == "never_began"
         && reply.writer_state == "none"
+        && reply.run.host_run_id.is_empty()
         && valid_id(&reply.closure_reference)
         && reply.run == *expected
         && reply.settlement_credential.starts_with("hmac-bundle-v1:")
@@ -2505,7 +2556,8 @@ mod route_controls {
                 .is_none()
         );
 
-        let expected = run_identity(&invocation);
+        let mut expected = run_identity(&invocation);
+        expected.host_run_id.clear();
         let no_submit = NotSubmittedReply {
             status: "not_submitted".into(),
             submission_state: "never_began".into(),
@@ -2515,6 +2567,9 @@ mod route_controls {
             settlement_credential: "hmac-bundle-v1:synthetic".into(),
         };
         assert!(valid_not_submitted(&no_submit, &expected));
+        let mut started_host = no_submit.clone();
+        started_host.run.host_run_id = "synthetic-host-run".into();
+        assert!(!valid_not_submitted(&started_host, &expected));
         let mut changed_writer = no_submit.clone();
         changed_writer.writer_state = "unknown".into();
         assert!(!valid_not_submitted(&changed_writer, &expected));

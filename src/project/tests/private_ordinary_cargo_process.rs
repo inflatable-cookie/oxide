@@ -291,7 +291,7 @@ fn create_bootstrap(
         "operation": ORDINARY_CARGO_ATTEMPT_OPERATION,
         "scope": SCOPE,
         "remaining_ms": WireU64(25_000),
-        "callback_timeout_ms": WireU64(5000),
+        "callback_timeout_ms": WireU64(15_000),
         "storage": endpoint_json(&storage_endpoint),
         "parent": endpoint_json(&parent_endpoint),
         "callback_key_hex": CALLBACK_KEY_HEX,
@@ -627,7 +627,7 @@ fn start_callback_server(
         *acquired.lock().unwrap() = Some(submit["acquired"].clone());
         match scenario {
             Scenario::Timeout => {
-                thread::sleep(Duration::from_millis(6000));
+                thread::sleep(Duration::from_millis(18_000));
                 return;
             }
             Scenario::LostReply => {

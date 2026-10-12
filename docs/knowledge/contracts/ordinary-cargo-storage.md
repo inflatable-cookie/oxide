@@ -420,9 +420,11 @@ commit. Use this section with the Rust definitions and cross-language fixture
 
 The unpublished binary `oxide-ordinary-cargo-attempt` is compiled only with
 `private-qualification`. Its sole argument is the protected bootstrap path. The
-process exits 0 for authenticated finalization, 2 when ownership stays held,
-and 1 for refusal or bootstrap/protocol failure. It writes no credentials to
-stdout or stderr. The bootstrap is a duplicate-key-rejecting JSON object with
+process exits 0 for authenticated finalization, 2 when an acquired or uncertain
+lease stays held, and 1 for refusal or bootstrap/protocol failure before an
+acquire is durably established. Any post-acquire local, protocol, or callback
+error stays held; it is never reported as an unleased refusal. It writes no
+credentials to stdout or stderr. The bootstrap is a duplicate-key-rejecting JSON object with
 exactly these fields:
 `version` (1), `operation` (`ordinary-cargo-attempt-v1`), `scope`,
 `remaining_ms`, `callback_timeout_ms`, `storage`, `parent`,
@@ -445,9 +447,23 @@ The `invocation` object contains exactly `acquire` (`envelope`, `acquire_id`,
 `expected_outputs` is a unique nonempty list selected from `source-archive`,
 `cargo-log`, `test-result`, `binary` and `full-debug`; captured role entries
 must match it exactly and total no more than 16 MiB.
-The owner computes and binds the source-content digest with the exact source
-commit/tree and command boundary; this route does not transfer or independently
-hash source bytes.
+The owner computes the source-content digest from its accepted source
+inventory and binds it alongside the exact source commit/tree and command
+boundary; this route does not transfer or independently hash source bytes. Its
+framing is the same byte encoding as
+`oxide_storage::registered::cargo_unit_graph::framed_source_content_digest`, without invoking
+the registered Runner or its graph audit: the consumer's accepted source
+inventory maps each UTF-8 relative file path to `sha256:` plus the lowercase
+hex SHA-256 of that file's exact bytes. Sort entries by the UTF-8 path bytes.
+For each entry, append to one SHA-256 input stream the path byte length as an
+unsigned 64-bit little-endian integer, the path bytes, the digest-string byte
+length in the same format, then the ASCII digest string. The result is
+`sha256:` plus lowercase hex of that stream's SHA-256. There is no entry count,
+delimiter, terminator, absolute root path, or directory record in the stream;
+Git commit and tree IDs remain separate fields. The accepted input boundary
+owns the exact source inventory and completeness claim. The route receives
+this digest, validates its syntax, and binds it to the attempt; it does not
+read or hash source files.
 
 Attempt callback framing is a 4-byte big-endian length followed by UTF-8 JSON.
 The frame cap is 1 MiB, aggregate cap 16 MiB, and the route allows at most
@@ -563,7 +579,9 @@ exit code, stdout/stderr digests, capture reference/digest), and
 `not_submitted` carries an explicit `no_submit_claim` and must return
 `status: not_submitted`, `submission_state: never_began`, `writer_state: none`,
 `closure_reference`, exact full `run`/source tuple and
-`settlement_credential`.
+`settlement_credential`. Since no host run was submitted, `run.host_run_id`
+must be the empty string; the other run/source identity fields exactly repeat
+the invocation's consumer-owned tuple.
 The process checks callback id/method, all three digests, full source/run tuple,
 acquired lease/slot/path, terminal/exit code, capture completeness, output byte
 limit, and no-writer fields. HMAC validity alone is not proof of real Effigy
