@@ -18,8 +18,8 @@ fn main() -> ExitCode {
             eprintln!("ordinary-Cargo attempt refused before host submission");
             ExitCode::from(1)
         }
-        Ok(OrdinaryCargoAttemptResult::Held(_)) => {
-            eprintln!("ordinary-Cargo attempt ownership is held pending recovery");
+        Ok(OrdinaryCargoAttemptResult::Held(phase)) => {
+            eprintln!("ordinary-Cargo attempt ownership is held pending recovery ({phase:?})");
             ExitCode::from(2)
         }
         Err(_) => {
