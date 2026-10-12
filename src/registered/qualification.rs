@@ -16,8 +16,9 @@ pub use super::graph_owner::{
     GRAPH_OWNER_ISSUER, GRAPH_OWNER_PROVISION_DOMAIN, GRAPH_OWNER_SCHEMA, GRAPH_OWNER_VERSION,
 };
 use crate::storage::{
-    AcquireResult, ContainmentEvidence, EvidenceAuthority, OrdinaryCargoRequest, RunEnvelope,
-    SettlementEvidence, TerminalOutcome,
+    ordinary_cargo_stable_reuse_reference, AcquireResult, ContainmentEvidence, EvidenceAuthority,
+    OrdinaryCargoRequest, RunEnvelope, SettlementEvidence, TerminalOutcome,
+    ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION,
 };
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,7 @@ const PIN: &str = "d9ff17988c7eaa5cf57747bc55bfe4f138692f15";
 /// Explicit, supported finite-timing policy. Any other identifier refuses.
 pub const TIMING_POLICY_V1: &str = "oxide-qualification-timing-v1";
 const TIMING_RECEIPT_DOMAIN: &str = "oxide-qualification-timing-receipt-v1";
+const STABLE_REUSE_REFERENCE_PREFIX: &str = "oxide-ordinary-cargo-stable-eligibility-v2/";
 
 /// Explicitly supplied 256-bit qualification key. Debug never exposes it.
 #[derive(Clone)]
@@ -302,6 +304,28 @@ impl EvidenceAuthority for QualificationAuthority {
             &[&self.scope, instance, &digest],
             request.acceptance.credential.expose(),
         )
+    }
+
+    fn verify_ordinary_cargo_stable_reuse_policy(&self, request: &OrdinaryCargoRequest) -> bool {
+        if request.acceptance.policy_version != ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
+            || self.verifies_admitted_ordinary_request(request).is_none()
+        {
+            return false;
+        }
+        let Some(reference) = request
+            .acceptance
+            .acceptance_reference
+            .strip_prefix(STABLE_REUSE_REFERENCE_PREFIX)
+        else {
+            return false;
+        };
+        let Some((invalidation_digest, compatibility_digest)) = reference.split_once('/') else {
+            return false;
+        };
+        valid_digest(invalidation_digest)
+            && valid_digest(compatibility_digest)
+            && ordinary_cargo_stable_reuse_reference(request, invalidation_digest)
+                .is_ok_and(|expected| expected == request.acceptance.acceptance_reference)
     }
 
     fn verify_ordinary_cargo_settlement(

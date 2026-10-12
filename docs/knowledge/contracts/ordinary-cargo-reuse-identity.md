@@ -1,8 +1,9 @@
 # Ordinary-Cargo reuse identity
 
 This contract defines the versioned identity boundary for the ordinary-Cargo
-storage API. It supplements the [ordinary-Cargo storage contract](ordinary-cargo-storage.md)
-and does not change the private attempt route or qualify Cargo freshness.
+storage API and its private qualification route. It supplements the
+[ordinary-Cargo storage contract](ordinary-cargo-storage.md) and does not
+qualify Cargo freshness.
 
 ## Policy versions
 
@@ -95,10 +96,23 @@ without migration or mutation.
 
 ## Integration boundary and evidence limits
 
-The feature-gated private ordinary-Cargo route remains on its existing
-version-1 integration contract. It cannot use policy v2 until a separately
-scoped route integration installs and authenticates the stable reference and
-continues to bind the full exact invocation. This storage change does not
+The feature-gated private route keeps its version-1 contract and 16 MiB cap
+unchanged. Its separately versioned version-2 operation accepts storage policy
+v2 only with an owner-installed finite capture budget and an exact per-attempt
+input-boundary digest. The boundary includes the budget version, aggregate
+ceiling, exact role ceilings, full run/source/command identity, and output
+paths. Storage admission authenticates the complete ordinary request; the
+protected owner's existing exact-request digest allowlist therefore binds the
+stable reference and that attempt's capture policy together. The
+`QualificationAuthority` stable-policy check recomputes the reference and
+requires that exact request to be owner-allowlisted. Its helper and task data
+cannot install policy.
+
+The acquired tuple, launch digest, callback request, capture-budget digest,
+callback HMAC, and finalize request retain the same policy and exact attempt
+boundary. A budget change requires a new signed input boundary and exact
+request authorization. It cannot be substituted after acquire or replayed
+under a prior request. This route integration does not install it in Nucleus or
 establish an end-to-end consumer fix.
 
 The feature-scoped storage fixture calls the existing
