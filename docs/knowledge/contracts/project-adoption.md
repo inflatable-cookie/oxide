@@ -332,3 +332,34 @@ cross-path correctness, a persistent observation service, a real Cargo pilot,
 consumer adoption, host/service installation, or numeric fairness/timeout
 policy. Each remains separately gated and requires its own approved scope and
 review.
+
+
+## Current Nucleus integration boundary
+
+Nucleus intentionally removed its never-live disabled Oxide consumer code
+in the 2026-10-15 simplification reset. At reviewed owner inspection of
+Nucleus `15de6ac6b4f10bf4e17335fede01670ea2c5fb48`, there is **no current
+accepted Nucleus Oxide embedding or installed artifact/bootstrap pin**.
+Commit `443e56fe485ef132d67aa82097a624195adfea4f` removed
+`storage-attempt.ts`, `oxide-runner-transport.ts`, `oxide-retention.ts` and
+supporting tests; `189373b0c296bfc3a4c6d5e8629c6caaa4e55de8` later removed
+`validation-client.ts`. Nucleus Contract 011 marks its later implementation
+sections as historical. Earlier delivery receipts are not current APIs.
+
+Oxide's ordinary-Cargo v2 library/process and storage client remain upstream
+implementation references. They acquire storage and request consumer
+submit/capture/not-submitted callbacks; they do not execute Cargo or supply
+Nucleus authority. A future consumer integration must start from Oxide's
+actual reviewed handover and Nucleus's current owners, not restore the old
+fixture bridge as an activation shortcut.
+
+The retained ordinary authentication/readiness vectors and historical
+streaming/readback failure cases are reusable design/test material after
+remapping and review. The orphaned registered-runner child fixture is not an
+ordinary-Cargo v2 transport. Existing root-allocation/managed-Git fixtures
+have no production issuer binding; current source-commit/bundle preservation
+primitives do not provide native artifact capture. Genuine source/attempt,
+submission/settlement, independent native debug/source custody, installation
+acceptance and invalidation ownership therefore remain explicit integration
+work, separate from the size-bound storage core and from Nucleus's
+incremental-policy adoption.

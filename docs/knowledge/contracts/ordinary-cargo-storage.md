@@ -12,8 +12,9 @@ that same physical root.
 
 Use ordinary Cargo as the freshness authority for one explicitly accepted,
 cooperative workflow. Keep the existing durable Oxide storage client and the
-consumer's current StorageAttempt, Effigy 010 submission, settlement, and
-retention owners. The qualification-only route acquires storage before it asks
+consumer's own attempt ledger, Effigy 010 submission, settlement, and
+retention owners. These are required consumer responsibilities, not a claim
+that a current Nucleus adapter implements them. The qualification-only route acquires storage before it asks
 the consumer to submit a host run. It returns the exact approved selector,
 argv, source root, acquired slot as `CARGO_BUILD_BUILD_DIR`, and private
 per-attempt target/temp/capture paths to that consumer. It never starts Cargo;
@@ -183,8 +184,8 @@ ordinary storage methods, validate the acquire reply against access-free lookup
 and durable inventory, then issue at most one submit callback. They do not
 execute Cargo or construct registered `Registration`/`UnitEvidence`.
 
-Oxide now defines the private callback schema below, but there is still no
-Nucleus `StorageAttempt` installation of it. Installation policy and accepted
+Oxide defines the private callback schema below, but Nucleus has no current
+accepted implementation or installation of it. Installation policy and accepted
 real input classes, real Effigy callback receipts, full-debug/source retention
 lookup, and useful warm benefit remain unqualified. This task does not activate
 or contact that consumer.
@@ -197,14 +198,15 @@ qualification command and is not the genuine Effigy host path. The private
 qualified runner is not consumer or production authority. None of these
 surfaces is a ready-made ordinary-Cargo Nucleus route.
 
-Nucleus already has a durable `StorageAttempt` ledger and the reviewed
-`validation-client.ts` submission path. Its opt-in transport exercises a
-synthetic child channel; production registration remains disabled. There is no
-current Nucleus lookup wire operation for Oxide acquire/finalize recovery and
-the callback schema below is not installed in Nucleus. Do not have TypeScript
-implement the Oxide storage codec or settlement evidence, call `Runner`
-without its required evidence, or submit directly through a local native Cargo
-runner.
+Nucleus intentionally removed the earlier disabled `StorageAttempt`,
+transport, retention and validation-client implementations. Its historical
+fixture receipts do not establish a current callable adapter. The current
+[consumer boundary](project-adoption.md#current-nucleus-integration-boundary)
+owns that reset and the remaining integration responsibilities. A future
+adapter must use the current consumer's genuine submission/settlement and
+capture owners; do not have TypeScript duplicate the Oxide storage codec or
+settlement authority, call `Runner` without its required evidence, or submit
+through an unauthenticated local Cargo runner.
 
 ## Cargo freshness responsibility
 

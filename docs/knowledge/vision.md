@@ -227,3 +227,12 @@ another comparison-launcher or generic provenance-wrapper chain. The direct
 measurement exception stays specific to that experiment. Real consumer
 integration, the original representative trial, installation, default changes
 and cleanup of existing storage retain their separate boundaries.
+
+
+The Nucleus owner confirmed Tom's 2026-10-15 simplification reset: the earlier
+never-live Oxide consumer adapters were deliberately removed. Future Nucleus
+integration starts from Oxide's reviewed handover and current consumer owners;
+prior fixture receipts do not authorize restoration or activation. The current
+[consumer boundary](contracts/project-adoption.md#current-nucleus-integration-boundary)
+owns the source pins and evidence limits. This does not retire the upstream
+Oxide storage facility or undo Nucleus's independent incremental-policy adoption.
