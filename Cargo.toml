@@ -8,14 +8,14 @@ publish = false
 [dependencies]
 flate2 = "=1.1.10"
 hmac = { version = "=0.12.1", optional = true }
-libc = { version = "=0.2.190", optional = true }
+libc = "=0.2.190"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 sha2 = "=0.10.9"
 tar = "=0.4.46"
 
 [features]
-private-qualification = ["dep:hmac", "dep:libc"]
+private-qualification = ["dep:hmac"]
 # Unpublished test-only blocking points. Off by default; never selected by bootstrap, env or argv.
 private-qualification-fixture = ["private-qualification"]
 
@@ -38,6 +38,10 @@ required-features = ["private-qualification"]
 name = "oxide-registry-acquisition"
 path = "src/bin/registry_acquisition.rs"
 required-features = ["private-qualification"]
+
+[[bin]]
+name = "oxide-storage-inventory"
+path = "src/bin/storage_inventory.rs"
 
 [lib]
 path = "src/lib.rs"
