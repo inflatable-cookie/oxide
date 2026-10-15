@@ -9,6 +9,7 @@ minimum_effigy_version = "0.14.0"
 "rust:private-process" = "python3 scripts/test-private-process.py"
 "registry:acquire:nucleus" = "python3 scripts/acquire-nucleus-registry.py"
 "registry:stream:nucleus" = "python3 scripts/acquire-nucleus-registry-stream.py"
+"build-context:comparison:test" = "python3 scripts/test_build_context_comparison.py"
 "docs:check" = [
   "effigy skill run northstar/check-links -- --frozen '^docs/knowledge/architecture[.]md$'",
   "effigy skill run northstar/retired-concepts",

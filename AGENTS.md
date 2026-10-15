@@ -22,6 +22,7 @@ Tom's 2026-10-10 blanket approval in [vision](docs/knowledge/vision.md#authority
 - `effigy rust:format` checks Rust formatting.
 - `effigy test rust` is the named Rust test suite. Do not add a `tasks.test` alias.
 - `effigy docs:check` runs the Northstar link and retired-concept checks plus `git diff --check HEAD`. The link check excludes `docs/knowledge/architecture.md`, whose references to optional sibling repositories are unavailable in a standalone checkout.
+- `effigy build-context:comparison:test` runs synthetic fixtures for the private incremental comparison launcher. It never enters the live image or Cargo path.
 
 There is no product QA selector yet. Use the focused selectors above; they do not replace milestone QA.
 
