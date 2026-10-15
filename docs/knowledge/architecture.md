@@ -8,6 +8,8 @@ Persistent bounded cache slots partition by project/component identity, exact to
 
 Exact-run final binaries, logs, QA receipts and evidence remain independently owned and preserved. Cargo intermediates are internal and may contain test executables; separating output directories alone cannot prove isolation. Cache reuse never counts as validation success.
 
+Proposed: effective build context (incremental, debug, split-debuginfo) would be a partition input. Its lifetime and diagnostics rules are in the [build-context policy](contracts/build-context-policy.md); it is not active.
+
 Prepare only requested components lazily. No eager copying of all targets and no full-copy fallback. Evict idle slots only, within explicit budgets; occupied space and actual disk writes must be measured separately. Inventory/acquire/reconcile/finalize/budget describe interface semantics, not an existing CLI.
 
 ## Qualification boundaries
