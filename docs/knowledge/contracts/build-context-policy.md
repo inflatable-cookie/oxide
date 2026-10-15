@@ -182,7 +182,11 @@ After U, per mode:
 
 1. Rename `packages/` to `packages.oxide-moved` in the owned source clone. The test's read of that directory then fails at its `expect("packages directory")`.
 2. Run the built test binary directly from its path under `$OWNED/m/target-<mode>/debug/deps/packages-*` with `RUST_BACKTRACE=1 --exact committed_workflow_packages_parse`. Record the exit code and the panic output. Expected: panic, with a backtrace frame at `tests/packages.rs:<line>`.
-3. Restore by renaming back. Verify `git status --porcelain` is empty again.
+3. Restore by renaming `packages.oxide-moved` back to `packages/`.
+4. Restore the two edited tracked files to the pinned commit with `git -C <src> checkout -- crates/nucleus-core/src/lib.rs crates/nucleus-core/tests/packages.rs`. This removes the E1 and E2 comments. It changes file mtimes, but no further Cargo invocation runs in that clone after U, so it does not affect the measured runs.
+5. Verify `git -C <src> status --porcelain` is empty and `shasum -a 256 Cargo.lock` still matches the lock pin. Any remaining difference is recorded as a partial result. Do not repair it with another Cargo invocation.
+
+The clone's state is part of the evidence. It is not reused by any other measurement.
 
 This is a direct execution of an already-built test binary. It is not a Cargo or rustc invocation. It is counted separately in the evidence (at most one per mode). It is the only planned backtrace check. No panicking build is planned, and no extra Cargo build is added to obtain one.
 
