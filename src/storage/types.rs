@@ -169,6 +169,55 @@ pub enum CargoReuseState {
     ColdOnly,
 }
 
+/// Owner-authenticated acknowledgment that the exact source, artifact, and
+/// debug evidence for one retired generation remain retained independently
+/// of the deleted slot bytes.
+///
+/// The credential is verified by the configured owning boundary and is never
+/// persisted. A caller-provided reference alone cannot authorize retirement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrdinaryCargoRetention {
+    pub source_evidence_reference: String,
+    pub artifact_evidence_reference: String,
+    pub debug_evidence_reference: String,
+    pub credential: Credential,
+}
+
+/// Exact owner-authenticated request to retire one proven-idle ordinary
+/// generation. `request` repeats the original acquire body so stable root,
+/// partition, and policy identity are checked against the recorded
+/// generation; the request carries no slot path. `retire_id` is the
+/// idempotent operation identity: an exact replay returns the stored
+/// receipt, while the same ID with different data conflicts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrdinaryCargoRetireRequest {
+    pub request: OrdinaryCargoRequest,
+    pub slot_id: String,
+    pub storage_instance_id: String,
+    /// Slot ordinal as canonical positive u64 decimal text.
+    pub generation: String,
+    pub retire_id: String,
+    pub retention: OrdinaryCargoRetention,
+}
+
+/// Durable receipt for one retired ordinary generation. The tombstoned
+/// `(storage_instance_id, slot_id, generation)` triple can never admit a
+/// lease again; a replacement for the same root and partition always
+/// receives a new monotonic slot ordinal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrdinaryCargoRetirementReceipt {
+    pub policy_version: u32,
+    pub root: StrictPhysicalCargoRoot,
+    pub partition: OrdinaryCargoPartition,
+    pub slot_id: String,
+    pub storage_instance_id: String,
+    /// Slot ordinal as canonical positive u64 decimal text.
+    pub generation: String,
+    pub retire_id: String,
+    /// Proven idle state at retirement: `Reusable` or `ColdOnly`.
+    pub retired_reuse_state: CargoReuseState,
+}
+
 /// Ordinary acquire result. Its embedded lease has no access after settlement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OrdinaryCargoAcquireResult {
@@ -564,6 +613,13 @@ pub enum RefusalReason {
     OrdinaryCargoColdOnly,
     OrdinaryCargoPartitionLimit,
     OrdinaryCargoIncompatible,
+    /// A retirement intent is recorded for the named generation. Reuse and
+    /// replacement must wait for the durable tombstone receipt.
+    OrdinaryCargoRetiring,
+    /// The named generation was already retired. Only the original
+    /// `retire_id` receipt may be replayed; a new retirement of the same
+    /// scope is refused.
+    OrdinaryCargoRetired,
 }
 
 impl fmt::Display for StorageError {

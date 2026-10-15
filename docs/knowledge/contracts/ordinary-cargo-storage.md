@@ -83,10 +83,10 @@ stays `pending`; lookup cannot clear it.
 ## Shipped ordinary storage API
 
 The private local transport is `OXSTOR01` protocol version 2. The durable
-ledger keeps the `OXIDEST1` magic and uses version 5, which records the
-durable backend mode (budget-only directory or verified bounded payload).
-Version-4 and other unsupported ledgers are refused without migration or
-mutation. Protocol
+ledger keeps the `OXIDEST1` magic and uses version 6, which records the
+durable backend mode (budget-only directory or verified bounded payload)
+plus ordinary-retirement intents and tombstones. Version-5 and other
+unsupported ledgers are refused without migration or mutation. Protocol
 version 1, unversioned frames, and unsupported peers are rejected before
 dispatch. Changing these request or response encodings requires another
 protocol version.
@@ -123,7 +123,72 @@ pub fn lookup_finalize_ordinary_cargo(
     &self,
     request: OrdinaryCargoFinalizeRequest,
 ) -> Result<LookupResult<OrdinaryCargoFinalizationReceipt>, StorageError>
+/// Retires one proven-idle generation and publishes its tombstone receipt.
+pub fn retire_ordinary_cargo(
+    &self,
+    request: OrdinaryCargoRetireRequest,
+) -> Result<OrdinaryCargoRetirementReceipt, StorageError>
+/// Reads an exact retirement result without changing state or access.
+pub fn lookup_retire_ordinary_cargo(
+    &self,
+    request: OrdinaryCargoRetireRequest,
+) -> Result<LookupResult<OrdinaryCargoRetirementReceipt>, StorageError>
 ```
+
+## Retiring and replacing a proven-idle ordinary generation
+
+A `reusable` or `cold-only` generation that is proven idle and no longer
+needed for retained evidence can be retired by its owning consumer and
+replaced with a fresh-ordinal successor. Without this, a full or cold-only
+generation would permanently strand its root/partition allowance. This is
+lifecycle functionality over the existing store, not selective object GC:
+whole generations are deleted or nothing is, with no `.o` or
+incremental-session surgery, no implicit reuse-state toggle, and no
+automatic ordinary LRU eviction. Generic acquire, settlement, lookup, and
+eviction still cannot operate on ordinary records, and ordinary retirement
+cannot operate on generic slots.
+
+`OrdinaryCargoRetireRequest` repeats the original ordinary acquire body
+(exact stable root/partition/policy identity), the durable
+`(storage_instance_id, slot_id, generation)` triple, an idempotent
+`retire_id`, and an `OrdinaryCargoRetention` acknowledgment naming the
+independently retained source, artifact, and debug evidence. The request
+carries no slot path and no deletion capability derived from a
+caller-provided bool, byte count, age, idle PID, disk pressure, or
+inventory output. `EvidenceAuthority::verify_ordinary_cargo_retirement`
+authenticates the exact scope and the retention acknowledgment; its safe
+default returns `false`. This task's fixtures inject a clearly synthetic
+accepting authority; no production Nucleus receipt issuer is implemented.
+
+Retirement requires the recorded generation to match the request, an idle
+slot with no live, uncertain, or pending lease and no outstanding write
+grant, and a proven `reusable` or `cold-only` state. A leased, uncertain,
+pending, empty, generic, foreign, or already-retiring scope refuses; an
+unknown retention reference refuses the whole retirement. The intent and
+exact authorized scope persist before any payload byte is touched. An
+interrupted deletion resumes only that recorded scope on the next call or
+daemon restart: mount, backing, descendants, and metadata sync are
+rechecked, and anything unknown holds. Positive completion publishes the
+durable tombstone receipt before the root/partition may admit a
+replacement, which obeys the same enforced capacity and host reserve and
+receives a new monotonic slot ordinal bound to the storage instance. Old
+finalized acquire/finalize/retire replays stay access-free against the
+tombstone and cannot resurrect bytes. Retire and retire-lookup are
+`OXSTOR01` version-2 operation tags 13 and 14; peers predating retirement
+refuse them as unknown operations. New refusal codes
+`OrdinaryCargoRetiring` (code 12) and `OrdinaryCargoRetired` (code 13)
+decode as protocol refusals on older peers. Retired-generation receipts are
+finite control history (at most 64 recorded intents and tombstones per
+ledger); exhaustion refuses new retirements without trimming evidence,
+while old receipts still replay. Old executables and debug-referenced
+objects are never silently destroyed because a newer run succeeded.
+
+A future consumer handoff must supply, through its existing authenticated
+owners, the exact callable above with the original ordinary request body,
+the durable triple, a fresh `retire_id` per retirement, and the genuine
+source/artifact/debug retention acknowledgment from its retention owner.
+No consumer activation, scheduler/wire change, or installation is part of
+this seam.
 
 Acquire responses include the policy version, root, partition, durable reuse
 state, and existing `AcquireResult`. Lookup returns only an access-free lease
@@ -558,7 +623,7 @@ extra operations, and invalid version/method/type refuse. `MAX_CAPTURE_BYTES`
 remains 16 MiB for route version 1; route version 2 uses its owner-installed
 budget only for artifact receipt accounting. These private attempt limits are
 independent of the storage transport: `OXSTOR01` storage wire version is 2,
-and durable `OXIDEST1` ledger version is 5. Private attempt operations are
+and durable `OXIDEST1` ledger version is 6. Private attempt operations are
 explicitly versioned 1 and 2. The capture-budget schema, storage-runtime
 bootstrap, readiness schema, and runtime control protocol are version 1; the
 storage runtime bootstrap and readiness carry independent

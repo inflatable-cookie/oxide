@@ -43,14 +43,14 @@ slot directories; unknown entries refuse.
   provisioned or opened the backing and verified it can mint one, and caller
   JSON cannot upgrade a directory root to a hard-bound claim. Old
   directory-only roots remain explicitly budget-only.
-- The durable ledger is version 5 and records the backend mode: budget-only
+- The durable ledger is version 6 and records the backend mode: budget-only
   directory, or the bounded descriptor (backend tag, canonical payload root,
   recorded image identity, verified capacity). Restart refuses any mismatch
   between the configured backing and the recorded descriptor instead of
-  reinterpreting the store. Version-4 ledgers refuse without migration.
-- Finite control-history limits refuse new slots, leases, or settlement
-  records at exhaustion instead of pruning required evidence or growing the
-  ledger indefinitely; recorded ownership state is preserved.
+  reinterpreting the store. Version-5 ledgers refuse without migration.
+- Finite control-history limits refuse new slots, leases, settlement, or
+  retirement records at exhaustion instead of pruning required evidence or
+  growing the ledger indefinitely; recorded ownership state is preserved.
 - The protected runtime accepts an optional `bounded` bootstrap section
   (backend tag, image, receipt, mount point, nominal image bytes, ceiling).
   The ceiling must equal the bootstrap budget cap, so every bounded ceiling is

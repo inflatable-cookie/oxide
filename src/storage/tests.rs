@@ -96,7 +96,12 @@ impl EvidenceAuthority for TestAuthority {
             && request.acceptance.acceptance_reference == "ordinary-acceptance"
             && request.acceptance.input_boundary_digest == format!("sha256:{}", "a".repeat(64))
             && request.acceptance.credential.expose() == "ordinary-proof"
-            && request.root.consumer_root_id == "consumer-root"
+            // Two synthetic fixture allocations; any other root identity is
+            // uninstalled and refused. Retirement inherits this check.
+            && matches!(
+                request.root.consumer_root_id.as_str(),
+                "consumer-root" | "consumer-root-2"
+            )
     }
 
     fn verify_ordinary_cargo_settlement(
@@ -107,6 +112,18 @@ impl EvidenceAuthority for TestAuthority {
         self.verify_ordinary_cargo_admission(request)
             && self.verify_settlement(evidence)
             && evidence.binding == request.acquire.envelope.binding
+    }
+
+    /// Clearly synthetic retirement authority for fixtures: the exact
+    /// admitted ordinary request plus independently named retained
+    /// source/artifact/debug references. This does not implement a
+    /// production Nucleus receipt issuer.
+    fn verify_ordinary_cargo_retirement(&self, request: &OrdinaryCargoRetireRequest) -> bool {
+        self.verify_ordinary_cargo_admission(&request.request)
+            && request.retention.source_evidence_reference == "retained-source-v1"
+            && request.retention.artifact_evidence_reference == "retained-artifact-v1"
+            && request.retention.debug_evidence_reference == "retained-debug-v1"
+            && request.retention.credential.expose() == "retention-proof"
     }
 }
 
@@ -310,6 +327,80 @@ fn ordinary_request(
             credential: Credential::new("ordinary-proof"),
         },
     }
+}
+
+fn retention_grant() -> OrdinaryCargoRetention {
+    OrdinaryCargoRetention {
+        source_evidence_reference: "retained-source-v1".to_owned(),
+        artifact_evidence_reference: "retained-artifact-v1".to_owned(),
+        debug_evidence_reference: "retained-debug-v1".to_owned(),
+        credential: Credential::new("retention-proof"),
+    }
+}
+
+fn retire_request(
+    base: &OrdinaryCargoRequest,
+    slot_id: &str,
+    storage_instance_id: &str,
+    generation: &str,
+    retire_id: &str,
+) -> OrdinaryCargoRetireRequest {
+    OrdinaryCargoRetireRequest {
+        request: base.clone(),
+        slot_id: slot_id.to_owned(),
+        storage_instance_id: storage_instance_id.to_owned(),
+        generation: generation.to_owned(),
+        retire_id: retire_id.to_owned(),
+        retention: retention_grant(),
+    }
+}
+
+fn settle_reusable(
+    client: &Client,
+    request: &OrdinaryCargoRequest,
+    acquired: &OrdinaryCargoAcquireResult,
+    finalize_id: &str,
+) -> OrdinaryCargoFinalizationReceipt {
+    let token = acquired.lease.token.as_ref().expect("active lease token");
+    client
+        .finalize_ordinary_cargo(OrdinaryCargoFinalizeRequest {
+            request: request.clone(),
+            lease_id: acquired.lease.lease_id.clone(),
+            token: Some(token.clone()),
+            finalize_id: finalize_id.to_owned(),
+            evidence: passing_evidence(
+                &request.acquire.envelope.binding,
+                &acquired.lease.lease_id,
+                &acquired.lease.slot_id,
+                acquired.lease.slot_path.as_ref().expect("slot path"),
+                token,
+            ),
+        })
+        .expect("publish reusable generation after complete capture")
+}
+
+fn settle_cold_only(
+    client: &Client,
+    request: &OrdinaryCargoRequest,
+    acquired: &OrdinaryCargoAcquireResult,
+    finalize_id: &str,
+) -> OrdinaryCargoFinalizationReceipt {
+    let token = acquired.lease.token.as_ref().expect("active lease token");
+    client
+        .finalize_ordinary_cargo(OrdinaryCargoFinalizeRequest {
+            request: request.clone(),
+            lease_id: acquired.lease.lease_id.clone(),
+            token: Some(token.clone()),
+            finalize_id: finalize_id.to_owned(),
+            evidence: complete_evidence(
+                &request.acquire.envelope.binding,
+                &acquired.lease.lease_id,
+                &acquired.lease.slot_id,
+                acquired.lease.slot_path.as_ref().expect("slot path"),
+                token,
+            ),
+        })
+        .expect("settled failure becomes cold-only")
 }
 
 fn passing_evidence(
@@ -2425,4 +2516,1341 @@ fn bounded_full_payload_keeps_metadata_and_ownership_durable() {
     let measured = settled.slots[0].measured_bytes.expect("measured payload");
     assert_eq!(settled.accounted_bytes, Some(measured));
     assert!(measured >= 2 * 1024 * 1024 && measured <= 3 * 1024 * 1024);
+}
+
+#[test]
+fn ordinary_cargo_retire_reusable_idle_replaces_with_fresh_ordinal() {
+    let storage = TaskRoot::new();
+    let source = TaskRoot::new();
+    let daemon = RunningDaemon::start(storage.path(), budget(256), Some(1024));
+    let first_request = ordinary_request(
+        source.path(),
+        "ordinary-retire-reusable",
+        "ordinary-acquire-retire-reusable",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let acquired = daemon
+        .client
+        .acquire_ordinary_cargo(first_request.clone())
+        .expect("cold admit reusable candidate");
+    let slot_path = acquired.lease.slot_path.clone().expect("leased slot path");
+    // A small real payload proves deletion removes owned bytes only.
+    fs::write(slot_path.join("unit.rlib"), vec![7u8; 4096]).expect("write owned fixture payload");
+    let reusable = settle_reusable(
+        &daemon.client,
+        &first_request,
+        &acquired,
+        "ordinary-retire-reusable-finalize",
+    );
+    assert_eq!(reusable.reuse_state, CargoReuseState::Reusable);
+    let slot_id = acquired.lease.slot_id.clone();
+    let instance = acquired.lease.storage_instance_id.clone();
+    let generation = acquired.lease.generation.clone();
+    assert_eq!(generation, "1");
+
+    // Without the retention grant the whole retirement refuses and the
+    // proven-idle generation stays warm and reusable.
+    let mut denied = retire_request(&first_request, &slot_id, &instance, &generation, "retire-1");
+    denied.retention.credential = Credential::new("wrong-retention-proof");
+    assert_eq!(
+        daemon.client.retire_ordinary_cargo(denied),
+        Err(StorageError::Unauthorized)
+    );
+    let mut unknown_coverage =
+        retire_request(&first_request, &slot_id, &instance, &generation, "retire-1");
+    unknown_coverage.retention.debug_evidence_reference = String::new();
+    assert!(daemon
+        .client
+        .retire_ordinary_cargo(unknown_coverage)
+        .is_err());
+    let inventory = daemon.client.inventory("retire-denied").unwrap();
+    assert_eq!(inventory.slots.len(), 1);
+    assert_eq!(
+        inventory.slots[0].cargo_reuse_state,
+        Some(CargoReuseState::Reusable)
+    );
+    assert!(slot_path.is_dir());
+
+    // The authenticated retirement publishes the tombstone receipt before
+    // the root/partition may admit a replacement.
+    let receipt = daemon
+        .client
+        .retire_ordinary_cargo(retire_request(
+            &first_request,
+            &slot_id,
+            &instance,
+            &generation,
+            "retire-1",
+        ))
+        .expect("retire proven-idle reusable generation");
+    assert_eq!(receipt.slot_id, slot_id);
+    assert_eq!(receipt.storage_instance_id, instance);
+    assert_eq!(receipt.generation, generation);
+    assert_eq!(receipt.retire_id, "retire-1");
+    assert_eq!(receipt.retired_reuse_state, CargoReuseState::Reusable);
+    assert_eq!(receipt.root, first_request.root);
+    assert_eq!(receipt.partition, OrdinaryCargoPartition::OrdinaryTest);
+    assert!(!slot_path.exists());
+    let ledger = fs::read(storage.path().join("ledger.bin")).expect("read retired ledger");
+    for secret in ["retention-proof", "ordinary-proof", "admission-proof"] {
+        assert!(
+            !ledger
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()),
+            "retirement must not persist {secret}"
+        );
+    }
+    let inventory = daemon.client.inventory("retired").unwrap();
+    assert!(inventory.slots.is_empty());
+
+    // Old finalized acquire/finalize/retire replays stay access-free and
+    // cannot resurrect bytes.
+    let replay = daemon
+        .client
+        .acquire_ordinary_cargo(first_request.clone())
+        .expect("old exact acquire replay stays bound");
+    assert_eq!(replay.lease.lease_id, acquired.lease.lease_id);
+    assert_eq!(replay.lease.state, SlotState::Idle);
+    assert!(replay.lease.slot_path.is_none());
+    assert!(replay.lease.token.is_none());
+    // The slot directory is gone but the recorded path string is unchanged,
+    // so the exact original evidence still replays its finalize receipt.
+    let finalized_lookup = daemon
+        .client
+        .lookup_finalize_ordinary_cargo(OrdinaryCargoFinalizeRequest {
+            request: first_request.clone(),
+            lease_id: acquired.lease.lease_id.clone(),
+            token: None,
+            finalize_id: "ordinary-retire-reusable-finalize".to_owned(),
+            evidence: passing_evidence(
+                &first_request.acquire.envelope.binding,
+                &acquired.lease.lease_id,
+                &acquired.lease.slot_id,
+                &slot_path,
+                acquired.lease.token.as_ref().expect("original token"),
+            ),
+        })
+        .expect("old finalize lookup replays after retirement");
+    assert!(
+        matches!(finalized_lookup, LookupResult::Present(ref receipt) if receipt.reuse_state == CargoReuseState::Reusable),
+        "unexpected finalize replay: {finalized_lookup:?}"
+    );
+    assert_eq!(
+        daemon
+            .client
+            .lookup_retire_ordinary_cargo(retire_request(
+                &first_request,
+                &slot_id,
+                &instance,
+                &generation,
+                "retire-1",
+            ))
+            .expect("retire lookup replays the tombstone receipt"),
+        LookupResult::Present(receipt.clone())
+    );
+    assert_eq!(
+        daemon.client.retire_ordinary_cargo(retire_request(
+            &first_request,
+            &slot_id,
+            &instance,
+            &generation,
+            "retire-1",
+        )),
+        Ok(receipt.clone())
+    );
+
+    // A replacement for the same root and partition admits cold work with a
+    // new monotonic ordinal bound to the same storage instance.
+    let mut next_request = ordinary_request(
+        source.path(),
+        "ordinary-retire-replacement",
+        "ordinary-acquire-retire-replacement",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    next_request.acquire.envelope.binding.commit = "aaaaaaaa00000000".to_owned();
+    let replacement = daemon
+        .client
+        .acquire_ordinary_cargo(next_request.clone())
+        .expect("replacement admits cold work after receipt");
+    assert_ne!(replacement.lease.slot_id, slot_id);
+    assert_eq!(replacement.lease.generation, "2");
+    assert_eq!(replacement.lease.storage_instance_id, instance);
+    assert!(!replacement.lease.reused);
+    assert_eq!(replacement.reuse_state, CargoReuseState::Pending);
+
+    // The other label's generation is untouched by the retirement.
+    let debug_request = ordinary_request(
+        source.path(),
+        "ordinary-retire-debug",
+        "ordinary-acquire-retire-debug",
+        64,
+        OrdinaryCargoPartition::FullDebug,
+    );
+    let debug = daemon
+        .client
+        .acquire_ordinary_cargo(debug_request)
+        .expect("other label admits independently");
+    assert_eq!(debug.lease.generation, "3");
+}
+
+#[test]
+fn ordinary_cargo_retire_cold_only_needs_grant_then_admits_replacement() {
+    let storage = TaskRoot::new();
+    let source = TaskRoot::new();
+    let daemon = RunningDaemon::start(storage.path(), budget(256), Some(1024));
+    let first_request = ordinary_request(
+        source.path(),
+        "ordinary-retire-cold",
+        "ordinary-acquire-retire-cold",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let acquired = daemon
+        .client
+        .acquire_ordinary_cargo(first_request.clone())
+        .expect("cold admit");
+    let cold = settle_cold_only(
+        &daemon.client,
+        &first_request,
+        &acquired,
+        "ordinary-retire-cold-finalize",
+    );
+    assert_eq!(cold.reuse_state, CargoReuseState::ColdOnly);
+    let slot_id = acquired.lease.slot_id.clone();
+    let instance = acquired.lease.storage_instance_id.clone();
+    let generation = acquired.lease.generation.clone();
+
+    // Failure alone is not permission to retire: without the retention
+    // grant the cold-only generation is held as-is.
+    assert_eq!(
+        daemon.client.acquire_ordinary_cargo(ordinary_request(
+            source.path(),
+            "ordinary-retire-cold-retry",
+            "ordinary-acquire-retire-cold-retry",
+            64,
+            OrdinaryCargoPartition::OrdinaryTest,
+        )),
+        Err(StorageError::Refused(RefusalReason::OrdinaryCargoColdOnly))
+    );
+    let mut denied = retire_request(&first_request, &slot_id, &instance, &generation, "retire-1");
+    denied.retention.artifact_evidence_reference = "unretained".to_owned();
+    assert_eq!(
+        daemon.client.retire_ordinary_cargo(denied),
+        Err(StorageError::Unauthorized)
+    );
+
+    let receipt = daemon
+        .client
+        .retire_ordinary_cargo(retire_request(
+            &first_request,
+            &slot_id,
+            &instance,
+            &generation,
+            "retire-1",
+        ))
+        .expect("retire cold-only generation with retention grant");
+    assert_eq!(receipt.retired_reuse_state, CargoReuseState::ColdOnly);
+
+    // The retired cold-only pool no longer strands the root: a replacement
+    // admits cold work with a fresh ordinal instead of refusing cold-only.
+    let next_request = ordinary_request(
+        source.path(),
+        "ordinary-retire-cold-next",
+        "ordinary-acquire-retire-cold-next",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let replacement = daemon
+        .client
+        .acquire_ordinary_cargo(next_request)
+        .expect("replacement after cold-only retirement");
+    assert_ne!(replacement.lease.slot_id, slot_id);
+    assert_eq!(replacement.lease.generation, "2");
+    assert!(!replacement.lease.reused);
+}
+
+#[test]
+fn ordinary_cargo_retire_refuses_held_generic_and_foreign_scopes() {
+    let storage = TaskRoot::new();
+    let source = TaskRoot::new();
+    let other_source = TaskRoot::new();
+    let daemon = RunningDaemon::start(storage.path(), budget(512), Some(1024));
+
+    // A generic slot is acquired first: once an uncertain generation
+    // exists, global accounting is unknown and every admission refuses.
+    let generic = daemon
+        .client
+        .acquire(request(
+            "attempt-generic-retire",
+            "acquire-generic-retire",
+            64,
+        ))
+        .expect("generic acquire");
+
+    // A leased (pending) generation is held: no live, uncertain, or pending
+    // lease may be retired.
+    let pending_request = ordinary_request(
+        source.path(),
+        "ordinary-retire-pending",
+        "ordinary-acquire-retire-pending",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let pending = daemon
+        .client
+        .acquire_ordinary_cargo(pending_request.clone())
+        .expect("pending acquire");
+    let pending_retire = retire_request(
+        &pending_request,
+        &pending.lease.slot_id,
+        &pending.lease.storage_instance_id,
+        &pending.lease.generation,
+        "retire-pending",
+    );
+    assert_eq!(
+        daemon.client.retire_ordinary_cargo(pending_retire),
+        Err(StorageError::Refused(RefusalReason::LeaseUnavailable))
+    );
+
+    // An unproven empty generation is admitted before anything turns
+    // uncertain: unknown accounting would otherwise refuse all admission.
+    let empty_request = ordinary_request(
+        source.path(),
+        "ordinary-retire-empty",
+        "ordinary-acquire-retire-empty",
+        64,
+        OrdinaryCargoPartition::FullDebug,
+    );
+    let empty = daemon
+        .client
+        .acquire_ordinary_cargo(empty_request.clone())
+        .expect("empty candidate");
+    let empty_token = empty.lease.token.as_ref().expect("lease token");
+    let no_spawn = NoSpawnEvidence::new(
+        &empty.lease,
+        &empty_request.acquire.envelope.binding,
+        empty_token,
+    )
+    .expect("no-spawn proof");
+    daemon
+        .client
+        .finalize_ordinary_cargo(OrdinaryCargoFinalizeRequest {
+            request: empty_request.clone(),
+            lease_id: empty.lease.lease_id.clone(),
+            token: Some(empty_token.clone()),
+            finalize_id: "ordinary-retire-empty-finalize".to_owned(),
+            evidence: SettlementEvidence {
+                binding: empty_request.acquire.envelope.binding.clone(),
+                consumer_credential: Credential::new("consumer-proof"),
+                terminal: None,
+                capture: None,
+                containment: ContainmentEvidence::NotSpawned(no_spawn),
+            },
+        })
+        .expect("restore empty state");
+
+    // An uncertain generation is held as well.
+    let mut uncertain_request = ordinary_request(
+        other_source.path(),
+        "ordinary-retire-uncertain",
+        "ordinary-acquire-retire-uncertain",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    uncertain_request.root.consumer_root_id = "consumer-root-2".to_owned();
+    let uncertain = daemon
+        .client
+        .acquire_ordinary_cargo(uncertain_request.clone())
+        .expect("uncertain acquire");
+    let uncertain_token = uncertain.lease.token.as_ref().expect("lease token");
+    let mut bogus = complete_evidence(
+        &uncertain_request.acquire.envelope.binding,
+        &uncertain.lease.lease_id,
+        &uncertain.lease.slot_id,
+        uncertain.lease.slot_path.as_ref().expect("slot path"),
+        uncertain_token,
+    );
+    bogus.capture.as_mut().unwrap().digest = "sha256:bad".to_owned();
+    daemon
+        .client
+        .finalize_ordinary_cargo(OrdinaryCargoFinalizeRequest {
+            request: uncertain_request.clone(),
+            lease_id: uncertain.lease.lease_id.clone(),
+            token: Some(uncertain_token.clone()),
+            finalize_id: "ordinary-retire-uncertain-finalize".to_owned(),
+            evidence: bogus,
+        })
+        .expect("bogus capture stays uncertain");
+    assert_eq!(
+        daemon.client.retire_ordinary_cargo(retire_request(
+            &uncertain_request,
+            &uncertain.lease.slot_id,
+            &uncertain.lease.storage_instance_id,
+            &uncertain.lease.generation,
+            "retire-uncertain",
+        )),
+        Err(StorageError::Refused(RefusalReason::LeaseUnavailable))
+    );
+
+    // A generic slot is not an ordinary generation: the ordinary retire
+    // surface cannot operate on it.
+    assert_eq!(
+        daemon.client.retire_ordinary_cargo(retire_request(
+            &pending_request,
+            &generic.slot_id,
+            &generic.storage_instance_id,
+            &generic.generation,
+            "retire-generic",
+        )),
+        Err(StorageError::Conflict)
+    );
+
+    // Well-formed but foreign tuples refuse without effects.
+    let instance = pending.lease.storage_instance_id.clone();
+    let foreign_instance = retire_request(
+        &pending_request,
+        &pending.lease.slot_id,
+        &"c".repeat(64),
+        &pending.lease.generation,
+        "retire-foreign",
+    );
+    assert_eq!(
+        daemon.client.retire_ordinary_cargo(foreign_instance),
+        Err(StorageError::Conflict)
+    );
+    let wrong_generation = retire_request(
+        &pending_request,
+        &pending.lease.slot_id,
+        &instance,
+        "999",
+        "retire-wrong-generation",
+    );
+    assert_eq!(
+        daemon.client.retire_ordinary_cargo(wrong_generation),
+        Err(StorageError::Conflict)
+    );
+    let unknown_slot = retire_request(
+        &pending_request,
+        "slot-00000000000000ff",
+        &instance,
+        "255",
+        "retire-unknown",
+    );
+    assert_eq!(
+        daemon.client.retire_ordinary_cargo(unknown_slot),
+        Err(StorageError::Refused(RefusalReason::LeaseUnavailable))
+    );
+    assert_eq!(
+        daemon
+            .client
+            .retire_ordinary_cargo(OrdinaryCargoRetireRequest {
+                request: pending_request.clone(),
+                slot_id: "not-a-slot".to_owned(),
+                storage_instance_id: instance.clone(),
+                generation: "1".to_owned(),
+                retire_id: "retire-malformed".to_owned(),
+                retention: retention_grant(),
+            }),
+        // The wire keeps errors fixed-shape: the specific in-process
+        // reason stays server-side, the class crosses the socket.
+        Err(StorageError::InvalidInput("remote request was invalid"))
+    );
+
+    // A mismatched root allocation or epoch is incompatible, not a scope
+    // that may delete the recorded generation.
+    let mut moved_root = pending_request.clone();
+    moved_root.root.source_root = other_source.path().to_path_buf();
+    assert_eq!(
+        daemon
+            .client
+            .retire_ordinary_cargo(OrdinaryCargoRetireRequest {
+                request: moved_root,
+                slot_id: pending.lease.slot_id.clone(),
+                storage_instance_id: instance.clone(),
+                generation: pending.lease.generation.clone(),
+                retire_id: "retire-moved".to_owned(),
+                retention: retention_grant(),
+            }),
+        Err(StorageError::Refused(
+            RefusalReason::OrdinaryCargoIncompatible
+        ))
+    );
+
+    // An unproven empty generation is not proven idle and cannot retire.
+    assert_eq!(
+        daemon.client.retire_ordinary_cargo(retire_request(
+            &empty_request,
+            &empty.lease.slot_id,
+            &empty.lease.storage_instance_id,
+            &empty.lease.generation,
+            "retire-empty",
+        )),
+        Err(StorageError::Refused(
+            RefusalReason::OrdinaryCargoIncompatible
+        ))
+    );
+
+    // The pending lease still holds its own generation afterwards, and
+    // every other record is intact: generic, pending, uncertain, and empty.
+    let inventory = daemon.client.inventory("held").unwrap();
+    assert_eq!(inventory.slots.len(), 4);
+    assert!(inventory
+        .slots
+        .iter()
+        .any(|slot| slot.slot_id == pending.lease.slot_id && slot.state == SlotState::Leased));
+}
+
+#[test]
+fn ordinary_cargo_retire_replays_conflicts_and_marks_retired_scopes() {
+    let storage = TaskRoot::new();
+    let source = TaskRoot::new();
+    let other_source = TaskRoot::new();
+    let daemon = RunningDaemon::start(storage.path(), budget(512), Some(1024));
+    let first_request = ordinary_request(
+        source.path(),
+        "ordinary-retire-replay",
+        "ordinary-acquire-retire-replay",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let acquired = daemon
+        .client
+        .acquire_ordinary_cargo(first_request.clone())
+        .expect("retire candidate");
+    settle_reusable(
+        &daemon.client,
+        &first_request,
+        &acquired,
+        "ordinary-retire-replay-finalize",
+    );
+    let slot_id = acquired.lease.slot_id.clone();
+    let instance = acquired.lease.storage_instance_id.clone();
+    let generation = acquired.lease.generation.clone();
+    let exact = retire_request(&first_request, &slot_id, &instance, &generation, "retire-1");
+    let receipt = daemon
+        .client
+        .retire_ordinary_cargo(exact.clone())
+        .expect("retire with receipt");
+
+    // The same operation ID with changed data conflicts instead of
+    // replaying or deleting again. The changed reservation keeps the
+    // synthetic authority accepted so the conflict is exact, not denied.
+    let mut changed_body = exact.clone();
+    changed_body.request.acquire.required_bytes = 65;
+    assert_eq!(
+        daemon.client.retire_ordinary_cargo(changed_body.clone()),
+        Err(StorageError::Conflict)
+    );
+    assert_eq!(
+        daemon.client.lookup_retire_ordinary_cargo(changed_body),
+        Err(StorageError::Conflict)
+    );
+    // A new operation ID against the retired triple is explicitly refused
+    // as already retired; its lookup was never recorded.
+    let mut new_operation = exact.clone();
+    new_operation.retire_id = "retire-2".to_owned();
+    assert_eq!(
+        daemon.client.retire_ordinary_cargo(new_operation.clone()),
+        Err(StorageError::Refused(RefusalReason::OrdinaryCargoRetired))
+    );
+    assert_eq!(
+        daemon
+            .client
+            .lookup_retire_ordinary_cargo(new_operation)
+            .expect("unknown retire operation lookup"),
+        LookupResult::Absent
+    );
+    // A foreign generation naming the retired slot conflicts.
+    let mut wrong_generation = exact.clone();
+    wrong_generation.generation = "999".to_owned();
+    assert_eq!(
+        daemon.client.retire_ordinary_cargo(wrong_generation),
+        Err(StorageError::Conflict)
+    );
+    // The exact replay still returns the stored receipt without effects.
+    assert_eq!(
+        daemon.client.retire_ordinary_cargo(exact.clone()),
+        Ok(receipt.clone())
+    );
+    assert_eq!(
+        daemon
+            .client
+            .lookup_retire_ordinary_cargo(exact)
+            .expect("exact retire lookup"),
+        LookupResult::Present(receipt)
+    );
+
+    // An operation ID is ledger-scoped: reusing it for a different live
+    // generation conflicts instead of retiring the wrong bytes.
+    let mut second_request = ordinary_request(
+        other_source.path(),
+        "ordinary-retire-replay-second",
+        "ordinary-acquire-retire-replay-second",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    second_request.root.consumer_root_id = "consumer-root-2".to_owned();
+    let second = daemon
+        .client
+        .acquire_ordinary_cargo(second_request.clone())
+        .expect("second generation");
+    settle_reusable(
+        &daemon.client,
+        &second_request,
+        &second,
+        "ordinary-retire-replay-second-finalize",
+    );
+    assert_eq!(
+        daemon.client.retire_ordinary_cargo(retire_request(
+            &second_request,
+            &second.lease.slot_id,
+            &second.lease.storage_instance_id,
+            &second.lease.generation,
+            "retire-1",
+        )),
+        Err(StorageError::Conflict)
+    );
+    // The second generation is untouched and still reusable.
+    let inventory = daemon.client.inventory("replay").unwrap();
+    assert_eq!(inventory.slots.len(), 1);
+    assert_eq!(inventory.slots[0].slot_id, second.lease.slot_id);
+}
+
+#[test]
+fn ordinary_cargo_retire_lost_reply_reconciles_exact_body() {
+    let storage = TaskRoot::new();
+    let source = TaskRoot::new();
+    let daemon = RunningDaemon::start(storage.path(), budget(256), Some(1024));
+    let first_request = ordinary_request(
+        source.path(),
+        "ordinary-retire-lost",
+        "ordinary-acquire-retire-lost",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let acquired = daemon
+        .client
+        .acquire_ordinary_cargo(first_request.clone())
+        .expect("retire candidate");
+    fs::write(
+        acquired
+            .lease
+            .slot_path
+            .as_ref()
+            .expect("slot path")
+            .join("unit.rlib"),
+        vec![9u8; 2048],
+    )
+    .expect("write owned fixture payload");
+    settle_reusable(
+        &daemon.client,
+        &first_request,
+        &acquired,
+        "ordinary-retire-lost-finalize",
+    );
+    let exact = retire_request(
+        &first_request,
+        &acquired.lease.slot_id,
+        &acquired.lease.storage_instance_id,
+        &acquired.lease.generation,
+        "retire-lost",
+    );
+    // The effect commits even though this caller discards its reply.
+    super::transport::send_ordinary_retire_and_forget(daemon.socket_path.as_path(), exact.clone())
+        .expect("send retire and discard response");
+    let lookup = daemon
+        .client
+        .lookup_retire_ordinary_cargo(exact.clone())
+        .expect("lost retire reply reconciles");
+    let LookupResult::Present(receipt) = lookup else {
+        panic!("durable retirement should be present: {lookup:?}");
+    };
+    assert_eq!(receipt.retire_id, "retire-lost");
+    assert_eq!(receipt.retired_reuse_state, CargoReuseState::Reusable);
+    // The identical retry returns the stored receipt; replacement gets a
+    // fresh ordinal and never the deleted bytes.
+    assert_eq!(
+        daemon.client.retire_ordinary_cargo(exact),
+        Ok(receipt.clone())
+    );
+    assert!(!acquired
+        .lease
+        .slot_path
+        .as_ref()
+        .expect("recorded slot path")
+        .exists());
+    let next_request = ordinary_request(
+        source.path(),
+        "ordinary-retire-lost-next",
+        "ordinary-acquire-retire-lost-next",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let replacement = daemon
+        .client
+        .acquire_ordinary_cargo(next_request)
+        .expect("replacement after lost retire reply");
+    assert_eq!(replacement.lease.generation, "2");
+    assert_eq!(
+        replacement.lease.storage_instance_id,
+        receipt.storage_instance_id
+    );
+}
+
+#[test]
+fn ordinary_cargo_retire_crash_mid_deletion_resumes_recorded_scope() {
+    let root = TaskRoot::new();
+    let source = TaskRoot::new();
+    let mut child = ChildDaemon::start(root.path());
+    let client = Client::new(root.path().join("daemon.sock"));
+
+    // A sibling generation proves an interrupted deletion never touches
+    // another generation's bytes.
+    let sibling_request = ordinary_request(
+        source.path(),
+        "ordinary-retire-crash-sibling",
+        "ordinary-acquire-retire-crash-sibling",
+        64,
+        OrdinaryCargoPartition::FullDebug,
+    );
+    let sibling = client
+        .acquire_ordinary_cargo(sibling_request.clone())
+        .expect("sibling generation");
+    settle_reusable(
+        &client,
+        &sibling_request,
+        &sibling,
+        "crash-sibling-finalize",
+    );
+
+    let first_request = ordinary_request(
+        source.path(),
+        "ordinary-retire-crash",
+        "ordinary-acquire-retire-crash",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let acquired = client
+        .acquire_ordinary_cargo(first_request.clone())
+        .expect("crash retire candidate");
+    let slot_path = acquired.lease.slot_path.clone().expect("leased slot path");
+    // Many owned files widen the deletion window so the kill lands after
+    // the persisted intent; the total stays far below the 8 MiB bound.
+    for index in 0..300 {
+        fs::write(
+            slot_path.join(format!("object-{index:04}.o")),
+            vec![3u8; 4096],
+        )
+        .expect("write owned fixture objects");
+    }
+    settle_reusable(
+        &client,
+        &first_request,
+        &acquired,
+        "ordinary-retire-crash-finalize",
+    );
+    let exact = retire_request(
+        &first_request,
+        &acquired.lease.slot_id,
+        &acquired.lease.storage_instance_id,
+        &acquired.lease.generation,
+        "retire-crash",
+    );
+    let caller = client.clone();
+    let exact_for_thread = exact.clone();
+    let retiring = thread::spawn(move || caller.retire_ordinary_cargo(exact_for_thread));
+    thread::sleep(Duration::from_millis(2));
+    child.crash();
+    let _ = retiring.join().expect("retire thread joined");
+    drop(child);
+
+    // Startup recovery resumes only the recorded scope: the bytes are gone
+    // and the tombstone receipt is published, or nothing was recorded and
+    // the generation is intact. Either outcome is safe; none serves
+    // half-deleted bytes as reusable.
+    let _restarted = ChildDaemon::start(root.path());
+    let recovered = Client::new(root.path().join("daemon.sock"));
+    let lookup = recovered
+        .lookup_retire_ordinary_cargo(exact.clone())
+        .expect("retire lookup after crash");
+    match lookup {
+        LookupResult::Present(receipt) => {
+            assert_eq!(receipt.retire_id, "retire-crash");
+            assert_eq!(receipt.retired_reuse_state, CargoReuseState::Reusable);
+            assert!(!slot_path.exists());
+        }
+        LookupResult::Absent => {
+            assert!(slot_path.is_dir());
+            let replayed = recovered
+                .retire_ordinary_cargo(exact.clone())
+                .expect("exact retry after pre-intent crash");
+            assert_eq!(replayed.retire_id, "retire-crash");
+            assert!(!slot_path.exists());
+        }
+        LookupResult::Uncertain(_) => {
+            panic!("a recorded retire intent completes during recovery, never stays uncertain");
+        }
+    }
+    // The sibling generation survived the crash and the resumed deletion
+    // with its identity intact.
+    let sibling_inventory = recovered
+        .inventory("crash-sibling")
+        .expect("inventory after crash");
+    assert_eq!(sibling_inventory.slots.len(), 1);
+    assert_eq!(sibling_inventory.slots[0].slot_id, sibling.lease.slot_id);
+    assert_eq!(
+        sibling_inventory.slots[0].cargo_reuse_state,
+        Some(CargoReuseState::Reusable)
+    );
+    // Replacement admits cold work with a fresh ordinal, never the retired
+    // slot identity.
+    let next_request = ordinary_request(
+        source.path(),
+        "ordinary-retire-crash-next",
+        "ordinary-acquire-retire-crash-next",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let replacement = recovered
+        .acquire_ordinary_cargo(next_request)
+        .expect("replacement after crash recovery");
+    assert_ne!(replacement.lease.slot_id, acquired.lease.slot_id);
+    assert_eq!(replacement.lease.generation, "3");
+    assert!(!replacement.lease.reused);
+}
+
+#[test]
+fn ordinary_cargo_retirement_history_is_finite_and_replacement_obeys_budget() {
+    // The tombstone history is finite control history: filling it refuses
+    // the next retirement explicitly instead of trimming evidence, while
+    // old receipts still replay and the live generation stays usable.
+    let storage = TaskRoot::new();
+    let source = TaskRoot::new();
+    let daemon = RunningDaemon::start(storage.path(), budget(4096), Some(1024));
+    let base = ordinary_request(
+        source.path(),
+        "ordinary-retire-cycle",
+        "ordinary-acquire-retire-cycle",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    for cycle in 0..64 {
+        let mut attempt = base.clone();
+        attempt.acquire.envelope.binding.run_id = format!("run-retire-cycle-{cycle}");
+        attempt.acquire.envelope.binding.attempt_id = format!("attempt-retire-cycle-{cycle}");
+        attempt.acquire.acquire_id = format!("acquire-retire-cycle-{cycle}");
+        let acquired = daemon
+            .client
+            .acquire_ordinary_cargo(attempt.clone())
+            .unwrap_or_else(|error| panic!("cycle {cycle} admits replacement: {error:?}"));
+        // Every replacement is a fresh cold generation: retirement never
+        // recycles the retired slot identity.
+        assert!(!acquired.lease.reused);
+        let token = acquired.lease.token.as_ref().expect("cycle token");
+        daemon
+            .client
+            .finalize_ordinary_cargo(OrdinaryCargoFinalizeRequest {
+                request: attempt.clone(),
+                lease_id: acquired.lease.lease_id.clone(),
+                token: Some(token.clone()),
+                finalize_id: format!("finalize-retire-cycle-{cycle}"),
+                evidence: passing_evidence(
+                    &attempt.acquire.envelope.binding,
+                    &acquired.lease.lease_id,
+                    &acquired.lease.slot_id,
+                    acquired.lease.slot_path.as_ref().expect("cycle slot path"),
+                    token,
+                ),
+            })
+            .expect("cycle publishes reusable generation");
+        daemon
+            .client
+            .retire_ordinary_cargo(OrdinaryCargoRetireRequest {
+                request: attempt,
+                slot_id: acquired.lease.slot_id.clone(),
+                storage_instance_id: acquired.lease.storage_instance_id.clone(),
+                generation: acquired.lease.generation.clone(),
+                retire_id: format!("retire-cycle-{cycle}"),
+                retention: retention_grant(),
+            })
+            .unwrap_or_else(|error| panic!("cycle {cycle} retires: {error:?}"));
+    }
+    // One more live generation proves the pool is usable; its retirement
+    // then refuses on the finite history cap.
+    let mut last = base.clone();
+    last.acquire.envelope.binding.run_id = "run-retire-cycle-last".to_owned();
+    last.acquire.envelope.binding.attempt_id = "attempt-retire-cycle-last".to_owned();
+    last.acquire.acquire_id = "acquire-retire-cycle-last".to_owned();
+    let live = daemon
+        .client
+        .acquire_ordinary_cargo(last.clone())
+        .expect("live generation after full history");
+    settle_reusable(&daemon.client, &last, &live, "finalize-retire-cycle-last");
+    assert_eq!(
+        daemon.client.retire_ordinary_cargo(retire_request(
+            &last,
+            &live.lease.slot_id,
+            &live.lease.storage_instance_id,
+            &live.lease.generation,
+            "retire-cycle-overflow",
+        )),
+        Err(StorageError::Refused(RefusalReason::UnknownAccounting))
+    );
+    // The refused retirement recorded no intent: the live generation stays
+    // warm and reusable, and old receipts still replay.
+    let warm = daemon
+        .client
+        .acquire_ordinary_cargo({
+            let mut retry = base.clone();
+            retry.acquire.envelope.binding.run_id = "run-retire-cycle-warm".to_owned();
+            retry.acquire.envelope.binding.attempt_id = "attempt-retire-cycle-warm".to_owned();
+            retry.acquire.acquire_id = "acquire-retire-cycle-warm".to_owned();
+            retry
+        })
+        .expect("live generation still reusable after refused retirement");
+    assert!(warm.lease.reused);
+    assert_eq!(warm.lease.slot_id, live.lease.slot_id);
+
+    // Replacement under a full aggregate budget refuses instead of growing
+    // the pool, and under a tight host reserve instead of breaching it.
+    let capped_storage = TaskRoot::new();
+    let capped_source = TaskRoot::new();
+    let capped_other = TaskRoot::new();
+    let capped = RunningDaemon::start(capped_storage.path(), budget(128), Some(1024));
+    let capped_first = ordinary_request(
+        capped_source.path(),
+        "ordinary-retire-capped",
+        "ordinary-acquire-retire-capped",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let capped_acquired = capped
+        .client
+        .acquire_ordinary_cargo(capped_first.clone())
+        .expect("capped first generation");
+    settle_reusable(
+        &capped.client,
+        &capped_first,
+        &capped_acquired,
+        "capped-first-finalize",
+    );
+    let mut capped_second = ordinary_request(
+        capped_other.path(),
+        "ordinary-retire-capped-second",
+        "ordinary-acquire-retire-capped-second",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    capped_second.root.consumer_root_id = "consumer-root-2".to_owned();
+    let capped_second_acquired = capped
+        .client
+        .acquire_ordinary_cargo(capped_second.clone())
+        .expect("capped second generation fills the budget");
+    // Measured payload (not just the reservation) occupies the budget:
+    // finalize remeasures the slot directory.
+    fs::write(
+        capped_second_acquired
+            .lease
+            .slot_path
+            .as_ref()
+            .expect("capped slot path")
+            .join("unit.rlib"),
+        vec![5u8; 60],
+    )
+    .expect("write measured capped payload");
+    settle_reusable(
+        &capped.client,
+        &capped_second,
+        &capped_second_acquired,
+        "capped-second-finalize",
+    );
+    capped
+        .client
+        .retire_ordinary_cargo(retire_request(
+            &capped_first,
+            &capped_acquired.lease.slot_id,
+            &capped_acquired.lease.storage_instance_id,
+            &capped_acquired.lease.generation,
+            "retire-capped-first",
+        ))
+        .expect("retire frees exactly one reservation");
+    let mut oversized = ordinary_request(
+        capped_source.path(),
+        "ordinary-retire-capped-big",
+        "ordinary-acquire-retire-capped-big",
+        100,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    oversized.acquire.envelope.binding.run_id = "run-capped-big".to_owned();
+    oversized.acquire.envelope.binding.attempt_id = "attempt-capped-big".to_owned();
+    assert_eq!(
+        capped.client.acquire_ordinary_cargo(oversized),
+        Err(StorageError::Refused(RefusalReason::BudgetExceeded))
+    );
+    let mut fitting = ordinary_request(
+        capped_source.path(),
+        "ordinary-retire-capped-fit",
+        "ordinary-acquire-retire-capped-fit",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    fitting.acquire.envelope.binding.run_id = "run-capped-fit".to_owned();
+    fitting.acquire.envelope.binding.attempt_id = "attempt-capped-fit".to_owned();
+    let fitted = capped
+        .client
+        .acquire_ordinary_cargo(fitting)
+        .expect("fitting replacement admits after retirement");
+    assert_eq!(fitted.lease.generation, "3");
+
+    let tight_storage = TaskRoot::new();
+    let tight_source = TaskRoot::new();
+    let tight_other = TaskRoot::new();
+    let tight = RunningDaemon::start(tight_storage.path(), budget(10_000), Some(200));
+    let tight_first = ordinary_request(
+        tight_source.path(),
+        "ordinary-retire-tight",
+        "ordinary-acquire-retire-tight",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let tight_acquired = tight
+        .client
+        .acquire_ordinary_cargo(tight_first.clone())
+        .expect("tight first generation");
+    settle_reusable(
+        &tight.client,
+        &tight_first,
+        &tight_acquired,
+        "tight-first-finalize",
+    );
+    let mut tight_second = ordinary_request(
+        tight_other.path(),
+        "ordinary-retire-tight-second",
+        "ordinary-acquire-retire-tight-second",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    tight_second.root.consumer_root_id = "consumer-root-2".to_owned();
+    let tight_second_acquired = tight
+        .client
+        .acquire_ordinary_cargo(tight_second.clone())
+        .expect("tight second generation");
+    settle_reusable(
+        &tight.client,
+        &tight_second,
+        &tight_second_acquired,
+        "tight-second-finalize",
+    );
+    tight
+        .client
+        .retire_ordinary_cargo(retire_request(
+            &tight_first,
+            &tight_acquired.lease.slot_id,
+            &tight_acquired.lease.storage_instance_id,
+            &tight_acquired.lease.generation,
+            "retire-tight-first",
+        ))
+        .expect("tight retire frees one reservation");
+    let mut reserve_breaking = ordinary_request(
+        tight_source.path(),
+        "ordinary-retire-tight-big",
+        "ordinary-acquire-retire-tight-big",
+        200,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    reserve_breaking.acquire.envelope.binding.run_id = "run-tight-big".to_owned();
+    reserve_breaking.acquire.envelope.binding.attempt_id = "attempt-tight-big".to_owned();
+    assert_eq!(
+        tight.client.acquire_ordinary_cargo(reserve_breaking),
+        Err(StorageError::Refused(RefusalReason::FreeSpaceReserve))
+    );
+}
+
+#[test]
+fn retired_ledger_version_refuses_version_five_without_mutation() {
+    let root = TaskRoot::new();
+    let source = TaskRoot::new();
+    let mut daemon = RunningDaemon::start(root.path(), budget(256), Some(1024));
+    let first_request = ordinary_request(
+        source.path(),
+        "ordinary-ledger-version",
+        "ordinary-acquire-ledger-version",
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    let acquired = daemon
+        .client
+        .acquire_ordinary_cargo(first_request.clone())
+        .expect("version fixture acquire");
+    settle_reusable(
+        &daemon.client,
+        &first_request,
+        &acquired,
+        "ordinary-ledger-version-finalize",
+    );
+    daemon
+        .client
+        .retire_ordinary_cargo(retire_request(
+            &first_request,
+            &acquired.lease.slot_id,
+            &acquired.lease.storage_instance_id,
+            &acquired.lease.generation,
+            "retire-ledger-version",
+        ))
+        .expect("version fixture retire");
+    daemon.stop();
+
+    // A version-5 ledger predates retirement intents and tombstones. It is
+    // refused without migration or reinterpretation, byte-for-byte intact.
+    let ledger_path = root.path().join("ledger.bin");
+    let version_six = fs::read(&ledger_path).expect("read version-6 ledger");
+    let mut version_five = version_six.clone();
+    version_five
+        .get_mut(12..16)
+        .expect("ledger header contains version bytes")
+        .copy_from_slice(&5_u32.to_le_bytes());
+    fs::write(&ledger_path, &version_five).expect("mark fixture with version 5");
+    let result = Daemon::bind(
+        DaemonConfig {
+            root: root.path().to_path_buf(),
+            budget: budget(256),
+            backing: None,
+        },
+        Arc::new(TestAuthority),
+        Arc::new(FixedFreeSpace(Some(1024))),
+    );
+    assert!(matches!(
+        result,
+        Err(StorageError::Refused(RefusalReason::UnknownAccounting))
+    ));
+    assert_eq!(
+        fs::read(&ledger_path).expect("old ledger remains"),
+        version_five
+    );
+}
+
+const V2_INVALIDATION_DIGEST: &str =
+    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+/// Clearly synthetic v2 authority for retirement fixtures: the recomputed
+/// stable eligibility reference plus exact attempt authentication. This
+/// does not implement a production Nucleus receipt issuer.
+struct V2RetireAuthority;
+
+impl V2RetireAuthority {
+    fn stable_reference(request: &OrdinaryCargoRequest) -> Option<String> {
+        ordinary_cargo_stable_reuse_reference(request, V2_INVALIDATION_DIGEST).ok()
+    }
+
+    fn boundary_is_canonical(digest: &str) -> bool {
+        digest
+            .strip_prefix("sha256:")
+            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    }
+}
+
+impl EvidenceAuthority for V2RetireAuthority {
+    fn verify_admission(&self, envelope: &RunEnvelope) -> bool {
+        envelope.admission_reference == "admission-ref"
+            && envelope.admission_credential.expose() == "admission-proof"
+    }
+
+    fn verify_settlement(&self, evidence: &SettlementEvidence) -> bool {
+        evidence.consumer_credential.expose() == "consumer-proof"
+            && evidence
+                .terminal
+                .as_ref()
+                .map(|terminal| terminal.credential.expose() == "terminal-proof")
+                .unwrap_or(true)
+            && evidence
+                .capture
+                .as_ref()
+                .map(|capture| capture.credential.expose() == "capture-proof")
+                .unwrap_or(true)
+    }
+
+    fn verify_ordinary_cargo_admission(&self, request: &OrdinaryCargoRequest) -> bool {
+        request.acceptance.policy_version == ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
+            && request.acceptance.installation_epoch == "install-1"
+            && request.acceptance.credential.expose() == "ordinary-proof"
+            && request.root.consumer_root_id == "consumer-root"
+            && Self::boundary_is_canonical(&request.acceptance.input_boundary_digest)
+            && Self::stable_reference(request)
+                .is_some_and(|reference| reference == request.acceptance.acceptance_reference)
+    }
+
+    fn verify_ordinary_cargo_stable_reuse_policy(&self, request: &OrdinaryCargoRequest) -> bool {
+        request.acceptance.policy_version == ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
+            && Self::stable_reference(request)
+                .is_some_and(|reference| reference == request.acceptance.acceptance_reference)
+    }
+
+    fn verify_ordinary_cargo_settlement(
+        &self,
+        request: &OrdinaryCargoRequest,
+        evidence: &SettlementEvidence,
+    ) -> bool {
+        self.verify_ordinary_cargo_admission(request)
+            && self.verify_settlement(evidence)
+            && evidence.binding == request.acquire.envelope.binding
+    }
+
+    fn verify_ordinary_cargo_retirement(&self, request: &OrdinaryCargoRetireRequest) -> bool {
+        self.verify_ordinary_cargo_admission(&request.request)
+            && request.retention.source_evidence_reference == "retained-source-v2"
+            && request.retention.artifact_evidence_reference == "retained-artifact-v2"
+            && request.retention.debug_evidence_reference == "retained-debug-v2"
+            && request.retention.credential.expose() == "retention-proof-v2"
+    }
+}
+
+fn v2_request(
+    source: &Path,
+    attempt: &str,
+    acquire_id: &str,
+    boundary_mark: char,
+) -> OrdinaryCargoRequest {
+    let mut request = ordinary_request(
+        source,
+        attempt,
+        acquire_id,
+        64,
+        OrdinaryCargoPartition::OrdinaryTest,
+    );
+    request.acceptance.policy_version = ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION;
+    let reference = ordinary_cargo_stable_reuse_reference(&request, V2_INVALIDATION_DIGEST)
+        .expect("typed stable reuse reference");
+    request.acceptance.acceptance_reference = reference;
+    request.acceptance.input_boundary_digest =
+        format!("sha256:{}", boundary_mark.to_string().repeat(64));
+    request
+}
+
+fn v2_retire_request(
+    base: &OrdinaryCargoRequest,
+    slot_id: &str,
+    storage_instance_id: &str,
+    generation: &str,
+    retire_id: &str,
+) -> OrdinaryCargoRetireRequest {
+    OrdinaryCargoRetireRequest {
+        request: base.clone(),
+        slot_id: slot_id.to_owned(),
+        storage_instance_id: storage_instance_id.to_owned(),
+        generation: generation.to_owned(),
+        retire_id: retire_id.to_owned(),
+        retention: OrdinaryCargoRetention {
+            source_evidence_reference: "retained-source-v2".to_owned(),
+            artifact_evidence_reference: "retained-artifact-v2".to_owned(),
+            debug_evidence_reference: "retained-debug-v2".to_owned(),
+            credential: Credential::new("retention-proof-v2"),
+        },
+    }
+}
+
+#[test]
+fn ordinary_cargo_stable_v2_generation_retires_and_replacement_keeps_eligibility() {
+    let storage = TaskRoot::new();
+    let source = TaskRoot::new();
+    let mut daemon = RunningDaemon::start_with_authority(
+        storage.path(),
+        budget(256),
+        Some(1024),
+        Arc::new(V2RetireAuthority),
+    );
+    let first_request = v2_request(
+        source.path(),
+        "ordinary-v2-retire-first",
+        "ordinary-acquire-v2-retire-first",
+        'e',
+    );
+    let second_request = v2_request(
+        source.path(),
+        "ordinary-v2-retire-second",
+        "ordinary-acquire-v2-retire-second",
+        'f',
+    );
+    assert_eq!(
+        first_request.acceptance.acceptance_reference,
+        second_request.acceptance.acceptance_reference
+    );
+    assert_ne!(
+        first_request.acceptance.input_boundary_digest,
+        second_request.acceptance.input_boundary_digest
+    );
+    let first = daemon
+        .client
+        .acquire_ordinary_cargo(first_request.clone())
+        .expect("v2 cold admit");
+    settle_reusable(
+        &daemon.client,
+        &first_request,
+        &first,
+        "ordinary-v2-retire-first-finalize",
+    );
+    let slot_id = first.lease.slot_id.clone();
+    let instance = first.lease.storage_instance_id.clone();
+    let generation = first.lease.generation.clone();
+
+    let mut denied = v2_retire_request(
+        &first_request,
+        &slot_id,
+        &instance,
+        &generation,
+        "retire-v2-1",
+    );
+    denied.retention.credential = Credential::new("wrong-proof");
+    assert_eq!(
+        daemon.client.retire_ordinary_cargo(denied),
+        Err(StorageError::Unauthorized)
+    );
+    let exact = v2_retire_request(
+        &first_request,
+        &slot_id,
+        &instance,
+        &generation,
+        "retire-v2-1",
+    );
+    let receipt = daemon
+        .client
+        .retire_ordinary_cargo(exact.clone())
+        .expect("v2 retire with retention grant");
+    assert_eq!(receipt.retired_reuse_state, CargoReuseState::Reusable);
+
+    // The tombstoned v2 identity still replays access-free, and the next
+    // exact attempt under the same stable eligibility admits a fresh
+    // ordinal instead of reusing retired bytes.
+    let replay = daemon
+        .client
+        .acquire_ordinary_cargo(first_request.clone())
+        .expect("v2 old exact replay stays bound");
+    assert_eq!(replay.lease.state, SlotState::Idle);
+    assert!(replay.lease.slot_path.is_none());
+    assert!(replay.lease.token.is_none());
+    let replacement = daemon
+        .client
+        .acquire_ordinary_cargo(second_request.clone())
+        .expect("v2 replacement keeps stable eligibility");
+    assert_ne!(replacement.lease.slot_id, slot_id);
+    assert_ne!(replacement.lease.generation, generation);
+    assert!(!replacement.lease.reused);
+    daemon.stop();
+
+    // Restart reloads the v2 tombstone and recomputes its stable
+    // reference without reinterpretation.
+    let daemon = RunningDaemon::start_with_authority(
+        storage.path(),
+        budget(256),
+        Some(1024),
+        Arc::new(V2RetireAuthority),
+    );
+    assert_eq!(
+        daemon
+            .client
+            .lookup_retire_ordinary_cargo(exact)
+            .expect("v2 tombstone survives restart"),
+        LookupResult::Present(receipt)
+    );
 }

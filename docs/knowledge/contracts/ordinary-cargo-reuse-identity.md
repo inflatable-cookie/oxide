@@ -87,9 +87,11 @@ the existing success/failure/no-spawn transitions, fixed partition capacity,
 and no eviction. Restart, old exact lookup, exact replay and current finalize
 lookup retain their existing token and uncertainty rules.
 
-The storage request encoding and ledger record shape do not change. The
-transport protocol stays version 2; ledger version 5 now also records the
-durable backend mode, and version-4 ledgers refuse without migration. The
+The transport protocol stays version 2; ledger version 6 now also records
+the durable backend mode plus ordinary-retirement intents and tombstones,
+and version-5 ledgers refuse without migration. The storage request
+encoding gains the retire and retire-lookup operations (tags 13 and 14)
+with refusal codes 12 and 13; existing encodings are unchanged. The
 explicit per-record `policy_version` selects the semantics.
 Version 1 records retain their old checks. A v2 reference is strictly parsed,
 and any unsupported policy version or ledger/protocol version is refused
