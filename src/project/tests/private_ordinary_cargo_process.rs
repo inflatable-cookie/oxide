@@ -2056,6 +2056,36 @@ fn declared_workflow_front_end_plans_binds_and_reuses_across_handoff() {
     let _ = (first_digest, second_digest, successor_digest);
 }
 
+#[test]
+fn declared_workflow_cli_refuses_oversized_declaration_before_bootstrap() {
+    assert!(task_scratch_root().is_absolute());
+    let case = FixtureRoot::scenario("12-declared-oversize");
+    let declaration_path = case.path.join("too-large.json");
+    let payload = vec![b'y'; MAX_WORKFLOW_DECLARATION_BYTES + 1];
+    write_private_file(&declaration_path, &payload);
+    let bootstrap = case.path.join("missing-bootstrap.json");
+    let output = Command::new(declared_workflow_binary())
+        .arg("run")
+        .arg(&declaration_path)
+        .arg(&bootstrap)
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .expect("run declared-workflow oversize refusal");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stderr.contains("declaration-too-large"),
+        "oversize run must refuse at the declaration ceiling: {stderr}"
+    );
+    assert!(stderr.contains("65536 byte ceiling"));
+    assert!(!stderr.contains("bootstrap"));
+    assert!(!stderr.contains("acquire"));
+    assert!(!stderr.contains("yyyy"));
+    assert!(stdout.is_empty());
+}
+
 fn verify_declared_route(
     invocation: &OrdinaryCargoInvocation,
     capture_budget: &OrdinaryCargoCaptureBudget,

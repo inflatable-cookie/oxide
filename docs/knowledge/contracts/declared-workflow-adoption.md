@@ -72,9 +72,21 @@ identity. The committed example is
 
 Finite entry ceilings are enforced: declaration at most 64 KiB, rendered plan
 at most 64 KiB, at most 256 argv entries of at most 16 KiB each, at most 64
-environment names and at most 32 capture roles. Unknown fields, duplicate JSON
+environment names and at most 32 capture roles. The declaration ceiling is
+enforced **while reading** the caller-named file: at most 64 KiB + 1 bytes are
+allocated and copied, so a metadata size hint or a file that grows cannot
+cause unbounded allocation. `plan` and `run` share that reader. A FIFO,
+socket, device or directory is refused from `lstat` without opening it; a
+symlink is opened with `O_NONBLOCK` and accepted only when the opened
+descriptor is a regular file. Refusals are bounded and redacted: they do not
+dump file contents, secrets or large paths. Open and read are ordinary
+filesystem syscalls and are not a hard deadline against an uninterruptible
+kernel wait. This is explicit local file handling; Oxide does not walk
+directories or discover other host paths. Unknown fields, duplicate JSON
 keys, mixed versions, oversized values, path/symlink escape and ambiguous
-command forms all refuse before any effect.
+command forms all refuse before any effect. The library `WorkflowPlan::resolve`
+and `WorkflowPlan::render` byte interfaces are unchanged; render already
+budgets its truncation marker inside the 64 KiB plan ceiling.
 
 ## The read-only plan
 
@@ -165,12 +177,15 @@ storage.
 In Unix builds with the `private-qualification` feature:
 
 - library: `oxide_storage::WorkflowPlan`,
+  `oxide_storage::read_workflow_declaration`,
   `oxide_storage::ordinary_cargo::verify_declared_bootstrap` and
   `oxide_storage::ordinary_cargo::run_declared_attempt`;
 - CLI: the unpublished `oxide-declared-workflow` binary, with
   `oxide-declared-workflow plan <declaration>` (read-only, exit 0 or 1) and
   `oxide-declared-workflow run <declaration> <bootstrap>` (exit 0 finalized,
-  1 refused, 2 held, 3 process error).
+  1 refused, 2 held, 3 process error). Both commands read the declaration
+  through `read_workflow_declaration`, so an oversize or non-regular file
+  refuses before plan rendering or bootstrap consume.
 
 Some declaration validation and the whole plan surface are also available
 without the private feature through the same library types.

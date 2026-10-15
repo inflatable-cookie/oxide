@@ -115,9 +115,17 @@ Human output is concise: root, coverage, visited counts, a per-category table
 (files, directories, symlinks, other, logical bytes, allocated bytes), the
 by-name total, the global unique-inode union, hardlink overlap, the raw
 filesystem value, the dominant category, factual notes and the relevant policy
-pointers. `--json` emits the same report as bounded machine-readable JSON; a
-deliberately tiny `--max-output-bytes` returns a compact `truncated` object
-rather than invalid JSON.
+pointers. `--json` emits the same report as bounded machine-readable JSON.
+
+Rendered human and JSON bytes, including truncation markers, JSON fallback,
+escaping and path fields, stay at or below `max_output_bytes`. The 64-byte
+minimum is an exact ceiling: a tiny cap must not grow past 64 because a marker
+was appended after the cut. Truncation is character-boundary safe, always
+valid UTF-8, and JSON output is always syntactically valid. A deliberately
+tiny cap returns a small fixed `{"truncated":true,"partial":true}` object so a
+long root or note cannot blow the cap. Truncation is explicit; a truncated
+report never implies complete accounting. Exit 2 still applies when the
+output cap is reached.
 
 Exit codes:
 
@@ -171,7 +179,9 @@ and cover: known category grouping, a real hardlink across two categories with
 union and overlap accounting, a sparse file with apparent greater than
 allocated bytes, dangling and directory symlinks that are counted but never
 followed, an unreadable directory, entry and depth truncation, the cooperative
-deadline, bounded rendering, refused roots, invalid limits, concurrent
+deadline, bounded rendering (the 64-byte minimum including truncation
+markers and the JSON fallback), long or multibyte root/note fields remaining
+inside the cap with valid UTF-8/JSON, refused roots, invalid limits, concurrent
 mutation without panic, the measured filesystem value and the absence of
 stale or savings claims.
 
