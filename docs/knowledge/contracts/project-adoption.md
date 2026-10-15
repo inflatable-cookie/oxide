@@ -296,11 +296,15 @@ partitions by canonical checkout path, and passes per-invocation
 `CARGO_BUILD_BUILD_DIR` and `CARGO_TARGET_DIR` overrides to an injected host
 boundary. It does not scan or launch a real project.
 
-The current opt-in is an in-process `ProjectDescriptor` with one exact
-workflow/selector entry, passed with a `ProjectInvocation` to `ProjectAdapter`;
-there is no project-file format, CLI, or Cargo interception. Calls made outside
-that adapter, including direct Cargo invocations and undeclared selectors, are
-bypasses and carry no Oxide reuse or observation claim.
+The fixture opt-in described above is an in-process `ProjectDescriptor` with one
+exact workflow/selector entry, passed with a `ProjectInvocation` to
+`ProjectAdapter`; it has no project-file format, CLI or Cargo interception. The
+separate [declared workflow opt-in](declared-workflow-adoption.md) now adds one
+versioned declaration file, a read-only plan and an unpublished private
+`oxide-declared-workflow` CLI over the ordinary-Cargo route; it is a different,
+still unadopted surface that also scans nothing and launches no Cargo. Calls
+made outside an adapter, including direct Cargo invocations and undeclared
+selectors, are bypasses and carry no Oxide reuse or observation claim.
 
 The fixture flow waits without a lease, performs at most one readiness wake and
 recheck, accepts an injected consumer authorization, acquires exclusively, then

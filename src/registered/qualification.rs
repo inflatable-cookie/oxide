@@ -17,8 +17,9 @@ pub use super::graph_owner::{
 };
 use crate::storage::{
     ordinary_cargo_stable_reuse_reference, AcquireResult, ContainmentEvidence, EvidenceAuthority,
-    OrdinaryCargoRequest, RunEnvelope, SettlementEvidence, TerminalOutcome,
-    ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION,
+    OrdinaryCargoHandoffRequest, OrdinaryCargoRequest, RunEnvelope, SettlementEvidence,
+    TerminalOutcome, ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION,
+    ORDINARY_CARGO_HANDOFF_VERSION, ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION,
 };
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -40,7 +41,22 @@ const PIN: &str = "d9ff17988c7eaa5cf57747bc55bfe4f138692f15";
 /// Explicit, supported finite-timing policy. Any other identifier refuses.
 pub const TIMING_POLICY_V1: &str = "oxide-qualification-timing-v1";
 const TIMING_RECEIPT_DOMAIN: &str = "oxide-qualification-timing-receipt-v1";
-const STABLE_REUSE_REFERENCE_PREFIX: &str = "oxide-ordinary-cargo-stable-eligibility-v2/";
+const STABLE_REUSE_REFERENCE_PREFIXES: [&str; 2] = [
+    "oxide-ordinary-cargo-stable-eligibility-v2/",
+    "oxide-ordinary-cargo-stable-eligibility-v3/",
+];
+
+/// Extracts the invalidation declaration digest from either stable eligibility
+/// schema. The prefix is not accepted on its own: storage/policy recomputation
+/// still requires the prefix matching the request's policy version.
+fn stable_reference_invalidation_digest(request: &OrdinaryCargoRequest) -> Option<&str> {
+    let reference = STABLE_REUSE_REFERENCE_PREFIXES
+        .iter()
+        .find_map(|prefix| request.acceptance.acceptance_reference.strip_prefix(prefix))?;
+    let (invalidation_digest, compatibility_digest) = reference.split_once('/')?;
+    (valid_digest(invalidation_digest) && valid_digest(compatibility_digest))
+        .then_some(invalidation_digest)
+}
 
 /// Explicitly supplied 256-bit qualification key. Debug never exposes it.
 #[derive(Clone)]
@@ -158,6 +174,10 @@ pub struct QualificationAuthority {
     scope: String,
     allowed: Vec<RunEnvelope>,
     ordinary_request_digests: BTreeSet<String>,
+    /// Exact policy-3 declared-workflow request digests. Separate from the
+    /// policy-2 set so the older reference helper/config never grants the new
+    /// route; empty keeps the declared route default-refused.
+    declared_workflow_request_digests: BTreeSet<String>,
     instance: Mutex<Option<String>>,
 }
 impl fmt::Debug for QualificationAuthority {
@@ -175,6 +195,7 @@ impl QualificationAuthority {
             scope,
             allowed,
             ordinary_request_digests: BTreeSet::new(),
+            declared_workflow_request_digests: BTreeSet::new(),
             instance: Mutex::new(None),
         })
     }
@@ -191,6 +212,23 @@ impl QualificationAuthority {
             return Err(HostError::Protocol);
         }
         self.ordinary_request_digests = digests.into_iter().collect();
+        Ok(self)
+    }
+    /// Installs the exact declared-workflow (ordinary-Cargo policy 3) request
+    /// digests from protected owner policy. This is a distinct allowlist: the
+    /// policy-2 helper above does not grant policy 3, and an empty set leaves
+    /// the declared route refused.
+    pub fn with_declared_workflow_request_digests(
+        mut self,
+        digests: Vec<String>,
+    ) -> Result<Self, HostError> {
+        if digests.len() > 8
+            || digests.iter().any(|digest| !valid_digest(digest))
+            || digests.iter().collect::<BTreeSet<_>>().len() != digests.len()
+        {
+            return Err(HostError::Protocol);
+        }
+        self.declared_workflow_request_digests = digests.into_iter().collect();
         Ok(self)
     }
     pub fn install_instance(&self, instance: &str) -> Result<(), HostError> {
@@ -242,9 +280,13 @@ impl QualificationAuthority {
 
     fn verifies_admitted_ordinary_request(&self, request: &OrdinaryCargoRequest) -> Option<String> {
         let digest = ordinary_cargo_request_digest(request).ok()?;
-        self.ordinary_request_digests
-            .contains(&digest)
-            .then_some(digest)
+        let allowed = match request.acceptance.policy_version {
+            ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION => {
+                &self.declared_workflow_request_digests
+            }
+            _ => &self.ordinary_request_digests,
+        };
+        allowed.contains(&digest).then_some(digest)
     }
 }
 impl EvidenceAuthority for QualificationAuthority {
@@ -307,25 +349,68 @@ impl EvidenceAuthority for QualificationAuthority {
     }
 
     fn verify_ordinary_cargo_stable_reuse_policy(&self, request: &OrdinaryCargoRequest) -> bool {
-        if request.acceptance.policy_version != ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
-            || self.verifies_admitted_ordinary_request(request).is_none()
+        if !matches!(
+            request.acceptance.policy_version,
+            ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
+                | ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION
+        ) || self.verifies_admitted_ordinary_request(request).is_none()
         {
             return false;
         }
-        let Some(reference) = request
-            .acceptance
-            .acceptance_reference
-            .strip_prefix(STABLE_REUSE_REFERENCE_PREFIX)
+        let Some(invalidation_digest) = stable_reference_invalidation_digest(request) else {
+            return false;
+        };
+        ordinary_cargo_stable_reuse_reference(request, invalidation_digest)
+            .is_ok_and(|expected| expected == request.acceptance.acceptance_reference)
+    }
+
+    fn verify_ordinary_cargo_handoff(&self, request: &OrdinaryCargoHandoffRequest) -> bool {
+        if request.handoff_version != ORDINARY_CARGO_HANDOFF_VERSION
+            || !self.verify_ordinary_cargo_admission(&request.prior_request)
+            || !self.verify_ordinary_cargo_admission(&request.successor_request)
+            || !self.verify_ordinary_cargo_stable_reuse_policy(&request.prior_request)
+            || !self.verify_ordinary_cargo_stable_reuse_policy(&request.successor_request)
+        {
+            return false;
+        }
+        let retention = &request.retention;
+        if retention.source_evidence_reference.is_empty()
+            || retention.artifact_evidence_reference.is_empty()
+            || retention.debug_evidence_reference.is_empty()
+        {
+            return false;
+        }
+        let transition = &request.source_transition;
+        if !transition.mtime_qualified
+            || transition.transition_reference.is_empty()
+            || transition.qualified_input_classes.is_empty()
+            || request.prior_closure_reference.is_empty()
+            || request.successor_assignment_reference.is_empty()
+        {
+            return false;
+        }
+        let Some(invalidation_digest) =
+            stable_reference_invalidation_digest(&request.successor_request)
         else {
             return false;
         };
-        let Some((invalidation_digest, compatibility_digest)) = reference.split_once('/') else {
+        if transition.invalidation_declaration_digest != invalidation_digest {
+            return false;
+        }
+        let Ok(subject) = ordinary_cargo_handoff_subject(request) else {
             return false;
         };
-        valid_digest(invalidation_digest)
-            && valid_digest(compatibility_digest)
-            && ordinary_cargo_stable_reuse_reference(request, invalidation_digest)
-                .is_ok_and(|expected| expected == request.acceptance.acceptance_reference)
+        let Ok(instance) = self.instance.lock() else {
+            return false;
+        };
+        let Some(instance) = instance.as_ref() else {
+            return false;
+        };
+        self.key.verify(
+            "oxide-ordinary-cargo-handoff-v1",
+            &[&self.scope, instance, &subject],
+            request.credential.expose(),
+        )
     }
 
     fn verify_ordinary_cargo_settlement(
@@ -362,6 +447,45 @@ impl EvidenceAuthority for QualificationAuthority {
                 .as_ref()
                 .is_none_or(|capture| verifies(capture.credential.expose()))
     }
+}
+
+/// Canonical handoff authorization subject for the installed owner issuer. The
+/// credential is deliberately excluded; the subject binds both exact request
+/// bodies, the durable triple, the retention acknowledgment and the accepted
+/// source transition.
+pub fn ordinary_cargo_handoff_subject(
+    request: &OrdinaryCargoHandoffRequest,
+) -> Result<String, HostError> {
+    let retention = &request.retention;
+    let transition = &request.source_transition;
+    canonical_digest(&json!({
+        "prior_request_digest": ordinary_cargo_request_digest(&request.prior_request)?,
+        "successor_request_digest": ordinary_cargo_request_digest(&request.successor_request)?,
+        "slot_id": request.slot_id,
+        "storage_instance_id": request.storage_instance_id,
+        "generation": request.generation,
+        "handoff_id": request.handoff_id,
+        "handoff_version": request.handoff_version,
+        "retention": {
+            "source": retention.source_evidence_reference,
+            "artifact": retention.artifact_evidence_reference,
+            "debug": retention.debug_evidence_reference,
+        },
+        "transition": {
+            "prior_commit": transition.prior_commit,
+            "prior_tree_digest": transition.prior_tree_digest,
+            "prior_content_digest": transition.prior_content_digest,
+            "successor_commit": transition.successor_commit,
+            "successor_tree_digest": transition.successor_tree_digest,
+            "successor_content_digest": transition.successor_content_digest,
+            "transition_reference": transition.transition_reference,
+            "invalidation_declaration_digest": transition.invalidation_declaration_digest,
+            "mtime_qualified": transition.mtime_qualified,
+            "qualified_input_classes": transition.qualified_input_classes,
+        },
+        "prior_closure_reference": request.prior_closure_reference,
+        "successor_assignment_reference": request.successor_assignment_reference,
+    }))
 }
 
 /// Canonical digest of the complete ordinary request, excluding only its

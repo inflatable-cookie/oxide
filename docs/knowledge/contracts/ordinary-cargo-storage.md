@@ -279,10 +279,13 @@ request; handoff grants no writer access and runs no command.
 Retirement and replay after handoff work against the exact current
 allocation with old history intact. Handoff records are finite control
 history (at most 64 per ledger); exhaustion refuses new handoffs without
-trimming evidence while old receipts still replay. The existing private
-ordinary-Cargo v2 attempt process does not accept v3 semantics; the reviewed
-storage callable is the daemon/client above, and any route adaptation for a
-later front end remains separate work. Synthetic socket fixtures qualify
+trimming evidence while old receipts still replay. The private ordinary-Cargo
+attempt process now implements the reviewed policy-3 semantics under its own
+versioned route: `ordinary-cargo-attempt-v3`, bootstrap version 3, the
+`oxide-ordinary-cargo-input-boundary-v3` boundary subject and a separate
+callback-context domain, fronted by the [declared workflow opt-in](declared-workflow-adoption.md).
+The v1/v2 routes, digests, capture caps and fixtures are unchanged, and no
+record is relabelled across routes. Synthetic socket fixtures qualify
 storage semantics only; no consumer activation or Nucleus binding exists.
 
 The real consumer verifier must, before accepting this policy, prove prior
@@ -354,6 +357,22 @@ the path to a protected, one-use bootstrap. Both entry points use the actual
 ordinary storage methods, validate the acquire reply against access-free lookup
 and durable inventory, then issue at most one submit callback. They do not
 execute Cargo or construct registered `Registration`/`UnitEvidence`.
+
+Version 3 is the declared-workflow route over policy 3. It adds
+`OrdinaryCargoAttemptRunner::new_declared_workflow`,
+`validate_declared_invocation`, `ordinary_cargo_declared_input_boundary_digest`,
+`ordinary_cargo_callback_context_v3`, `verify_declared_bootstrap` and
+`run_declared_attempt`, and the unpublished `oxide-declared-workflow` binary
+(`plan` and `run`). Its bootstrap repeats the v2 shape plus one
+`declaration_digest` field; its input boundary repeats the v2 fields plus
+`boundary_version` and `declaration_digest`; its callback context uses the
+`ordinary-cargo-attempt-v3` operation domain. The installed
+`QualificationAuthority` keeps a separate declared-workflow request-digest
+allowlist, so the policy-2 ordinary helper does not grant policy 3 and an empty
+allowlist keeps the route refused. The versioned vectors are
+`fixtures/ordinary-cargo-auth-v3.json`; the v1 and v2 vectors stay stable. The
+front-end declaration, plan, binding rules and current limits are owned by the
+[declared workflow opt-in](declared-workflow-adoption.md).
 
 Oxide defines the private callback schema below, but Nucleus has no current
 accepted implementation or installation of it. Installation policy and accepted
@@ -611,9 +630,11 @@ synthetic fixtures. It is not qualified: no real Cargo run, real input
 freshness, full-debug lookup, accepted installation policy, consumer adoption,
 storage relief, or SSD-write evidence exists yet. Use this section with the
 Rust definitions and cross-language fixtures
-`fixtures/ordinary-cargo-auth-v1.json` and
-`fixtures/ordinary-cargo-auth-v2.json`; each route version has its own wire
-shape and authentication domain.
+`fixtures/ordinary-cargo-auth-v1.json`,
+`fixtures/ordinary-cargo-auth-v2.json` and
+`fixtures/ordinary-cargo-auth-v3.json`; each route version has its own wire
+shape and authentication domain, and the v1/v2 vectors stay byte-for-byte
+stable when a new route version is added.
 
 ### Process bootstrap and version pins
 
@@ -634,7 +655,11 @@ exactly these fields in version 1: `version` (1), `operation`
 `callback_context`, and `invocation`. Version 2 uses operation
 `ordinary-cargo-attempt-v2` and adds the owner-issued `capture_budget` field at
 the bootstrap top level. A legacy bootstrap omits that field; explicit null is
-not treated as absence. Mixed or unsupported versions refuse. Endpoint
+not treated as absence. Mixed or unsupported versions refuse. Route version 3
+uses operation `ordinary-cargo-attempt-v3` and adds one owner-issued
+`declaration_digest` field at the bootstrap top level; explicit `null` is again
+not absence, and a v3 bootstrap without it (or a v1/v2 bootstrap with it)
+refuses. Endpoint
 objects contain `path`, `device`, and `inode`; device/inode and byte/duration
 quantities use lossless `WireU64` encoding (safe JSON integers as numbers and
 larger values as canonical decimal strings). The file is owner-only, regular,
@@ -674,7 +699,12 @@ tuple, launch digest, callback request and capture-budget digest echoed in the
 authenticated capture reply. Finalize repeats the original request and its
 credentials. A changed budget requires a new signed boundary and owner
 allowlist entry. Stable reuse still uses the separate storage policy-v2
-reference, which excludes per-run capture paths and the budget.
+reference, which excludes per-run capture paths and the budget. Route version 3
+reuses those exact v2 field semantics under the policy-3 handoff-eligible
+reference, but adds `boundary_version:
+oxide-ordinary-cargo-input-boundary-v3` and the resolved `declaration_digest` to
+its boundary, so a v2 boundary, request digest, signature or callback context is
+never accepted as v3.
 
 The 2 GiB value is only an engineering maximum, not a selected real-trial
 ceiling or evidence that artifacts fit. The observed planning binary size of

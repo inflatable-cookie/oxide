@@ -1,26 +1,36 @@
 use super::{task_scratch_root, FixedFreeSpace, FixtureRoot};
 use crate::project::ordinary_cargo::{
     ordinary_cargo_callback_context, ordinary_cargo_callback_context_v2,
-    ordinary_cargo_capture_budget_digest, ordinary_cargo_input_boundary_digest,
-    ordinary_cargo_input_boundary_digest_with_capture_budget, validate_acquired_slot_path,
-    validate_invocation, validate_invocation_with_capture_budget, OrdinaryCargoCaptureBudget,
+    ordinary_cargo_callback_context_v3, ordinary_cargo_capture_budget_digest,
+    ordinary_cargo_declared_input_boundary_digest, ordinary_cargo_input_boundary_digest,
+    ordinary_cargo_input_boundary_digest_with_capture_budget, run_declared_attempt,
+    validate_acquired_slot_path, validate_invocation, validate_invocation_with_capture_budget,
+    verify_declared_bootstrap, DeclaredWorkflowError, OrdinaryCargoCaptureBudget,
     OrdinaryCargoInvocation, OrdinaryCargoOperationIds, ORDINARY_CARGO_ATTEMPT_OPERATION,
     ORDINARY_CARGO_ATTEMPT_VERSION, ORDINARY_CARGO_CAPTURE_ATTEMPT_OPERATION,
-    ORDINARY_CARGO_CAPTURE_ATTEMPT_VERSION,
+    ORDINARY_CARGO_CAPTURE_ATTEMPT_VERSION, ORDINARY_CARGO_DECLARED_ATTEMPT_OPERATION,
+    ORDINARY_CARGO_DECLARED_ATTEMPT_VERSION,
+};
+use crate::project::{
+    WorkflowPlan, MAX_WORKFLOW_DECLARATION_BYTES, MAX_WORKFLOW_PLAN_BYTES,
+    WORKFLOW_DECLARATION_FORMAT,
 };
 use crate::registered::qualification::{
     admission_subject, bundle_ordinary_credentials, canonical_digest,
-    ordinary_cargo_request_digest, ordinary_cargo_settlement_subject, settlement_subject,
-    CallbackAuthenticator, Endpoint, MacKey, QualificationAuthority,
+    ordinary_cargo_handoff_subject, ordinary_cargo_request_digest,
+    ordinary_cargo_settlement_subject, settlement_subject, CallbackAuthenticator, Endpoint, MacKey,
+    QualificationAuthority,
 };
 use crate::registered::runner_host::WireU64;
 use crate::storage::{
     ordinary_cargo_stable_reuse_reference, AcquireRequest, Budget, CaptureReceipt, CargoReuseState,
     Client, ContainmentEvidence, CooperativeCompletionEvidence, Credential, Daemon, DaemonConfig,
-    EvidenceAuthority, FreeSpaceProbe, NoSpawnEvidence, OrdinaryCargoAcceptance,
-    OrdinaryCargoPartition, OrdinaryCargoRequest, PartitionKey, ProcessIdentityEvidence,
+    EvidenceAuthority, FreeSpaceProbe, LookupResult, NoSpawnEvidence, OrdinaryCargoAcceptance,
+    OrdinaryCargoHandoffRequest, OrdinaryCargoPartition, OrdinaryCargoRequest,
+    OrdinaryCargoRetention, OrdinaryCargoSourceTransition, PartitionKey, ProcessIdentityEvidence,
     RunBinding, RunEnvelope, SettlementEvidence, SlotState, StorageError, StrictPhysicalCargoRoot,
-    TerminalOutcome, TerminalRecord,
+    TerminalOutcome, TerminalRecord, ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION,
+    ORDINARY_CARGO_HANDOFF_VERSION,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -119,6 +129,17 @@ impl TestDaemon {
     }
 
     fn start_many(root: &Path, allowed: Vec<RunEnvelope>, request_digests: Vec<String>) -> Self {
+        Self::start_policy(root, allowed, request_digests, Vec::new())
+    }
+
+    /// Install both the policy-2 ordinary digest allowlist and the separate
+    /// policy-3 declared-workflow allowlist used by the front end.
+    fn start_policy(
+        root: &Path,
+        allowed: Vec<RunEnvelope>,
+        request_digests: Vec<String>,
+        declared_digests: Vec<String>,
+    ) -> Self {
         let authority = Arc::new(
             QualificationAuthority::new(
                 MacKey::from_hex(STORAGE_KEY_HEX).unwrap(),
@@ -127,6 +148,8 @@ impl TestDaemon {
             )
             .unwrap()
             .with_ordinary_cargo_request_digests(request_digests)
+            .unwrap()
+            .with_declared_workflow_request_digests(declared_digests)
             .unwrap(),
         );
         let daemon = Daemon::bind(
@@ -1238,8 +1261,8 @@ fn version_two_capture_budget_reuses_stable_generation_with_new_exact_boundaries
     assert_ne!(first.target_dir, second.target_dir);
     assert_ne!(first.temp_dir, second.temp_dir);
     assert_ne!(first.capture_dir, second.capture_dir);
-    assert!(validate_invocation_with_capture_budget(&first, Some(&first_budget)).is_ok());
-    assert!(validate_invocation_with_capture_budget(&second, Some(&second_budget)).is_ok());
+    assert!(validate_invocation_with_capture_budget(&first, &first_budget).is_ok());
+    assert!(validate_invocation_with_capture_budget(&second, &second_budget).is_ok());
 
     let first_request_digest = ordinary_cargo_request_digest(&first.request).unwrap();
     let second_request_digest = ordinary_cargo_request_digest(&second.request).unwrap();
@@ -1388,4 +1411,680 @@ fn private_ordinary_cargo_compiled_process_lifecycle_and_controls() {
     for (name, number, scenario, success, state) in cases {
         one_scenario(name, number, scenario, success, state);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Declared-workflow front end over the same private ordinary-Cargo route.
+// ---------------------------------------------------------------------------
+
+const DECLARED_INVALIDATION_DIGEST: &str =
+    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+fn declared_capture_budget() -> OrdinaryCargoCaptureBudget {
+    // The synthetic capture receipt accounts 1 MiB for each non-binary role, so
+    // the declared finite ceilings must admit that bounded receipt.
+    OrdinaryCargoCaptureBudget::new(
+        4 * 1024 * 1024,
+        BTreeMap::from([("test-result".to_owned(), 2 * 1024 * 1024)]),
+    )
+    .unwrap()
+}
+
+/// The small reusable declaration a project would own. It carries no task,
+/// run, source identity, credential, endpoint, slot path or retention proof.
+fn declared_declaration_value(
+    project_root: &Path,
+    environment: &BTreeMap<String, Option<String>>,
+    capture_budget: &OrdinaryCargoCaptureBudget,
+) -> Value {
+    let mut names: Vec<String> = environment.keys().cloned().collect();
+    names.sort();
+    let roles: BTreeMap<String, u64> = capture_budget
+        .role_bytes
+        .iter()
+        .map(|(role, bytes)| (role.clone(), bytes.0))
+        .collect();
+    json!({
+        "format": WORKFLOW_DECLARATION_FORMAT,
+        "project": {
+            "root": project_root,
+            "consumer": "synthetic-consumer",
+            "project": "synthetic-project",
+            "component": "synthetic-component",
+            "workflow": "synthetic-ordinary-workflow",
+        },
+        "workspace": "source",
+        "workflow": {
+            "selector": "rust:test",
+            "argv": ["test", "--workspace", "--all-targets"],
+        },
+        "intent": {"profile": "dev", "incremental": true, "debug": "line-tables"},
+        "environment_names": names,
+        "limits": {
+            "storage_bytes": 1024,
+            "capture": {
+                "version": 1,
+                "total_bytes": capture_budget.total_bytes.0,
+                "role_bytes": roles,
+            },
+        },
+    })
+}
+
+/// Derive one exact owner-issued policy-3 attempt at the declared root from a
+/// single base fixture. Task/run/attempt and operation identities are new per
+/// attempt; the allocation epoch and stable owner root are explicit.
+fn declared_invocation(
+    base: &OrdinaryCargoInvocation,
+    number: &str,
+    allocation_epoch: &str,
+    declaration_digest: &str,
+    capture_budget: &OrdinaryCargoCaptureBudget,
+) -> OrdinaryCargoInvocation {
+    let mut invocation = base.clone();
+    let binding = &mut invocation.request.acquire.envelope.binding;
+    binding.task_id = format!("synthetic-task-{number}");
+    binding.workspace_id = format!("synthetic-workspace-{number}");
+    binding.run_id = format!("synthetic-run-{number}");
+    binding.attempt_id = format!("synthetic-attempt-{number}");
+    invocation.request.acquire.envelope.admission_reference =
+        format!("synthetic-admission-{number}");
+    invocation.request.acquire.acquire_id = format!("synthetic-acquire-{number}");
+    invocation.branch_id = format!("synthetic-branch-{number}");
+    invocation.source_content_digest =
+        digest(format!("synthetic source content {number}").as_bytes());
+    invocation.request.root.consumer_root_id = "synthetic-root".into();
+    invocation.request.root.allocation_epoch = allocation_epoch.to_owned();
+    invocation.request.acceptance.policy_version = ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION;
+    invocation.request.acceptance.installation_epoch = "synthetic-installation-epoch".into();
+    invocation.expected_outputs = capture_budget.role_bytes.keys().cloned().collect();
+    invocation.operation_ids = OrdinaryCargoOperationIds {
+        submit: format!("submit-{number}"),
+        capture: format!("capture-{number}"),
+        not_submitted: format!("not-submitted-{number}"),
+        finalize: format!("finalize-{number}"),
+    };
+    invocation.request.acceptance.acceptance_reference =
+        ordinary_cargo_stable_reuse_reference(&invocation.request, DECLARED_INVALIDATION_DIGEST)
+            .unwrap();
+    invocation.request.acceptance.input_boundary_digest =
+        ordinary_cargo_declared_input_boundary_digest(
+            &invocation,
+            capture_budget,
+            declaration_digest,
+        )
+        .unwrap();
+    invocation
+}
+
+/// Route version 3 bootstrap: same shape as v2 plus the exact declaration
+/// digest, under its own version/operation/callback-context subject.
+fn create_declared_bootstrap(
+    case: &FixtureRoot,
+    name: &str,
+    invocation: &OrdinaryCargoInvocation,
+    storage: &Path,
+    parent: &Path,
+    request_digest: &str,
+    capture_budget: &OrdinaryCargoCaptureBudget,
+    declaration_digest: &str,
+) -> (PathBuf, String) {
+    let storage_endpoint = Endpoint::capture(storage.to_path_buf()).unwrap();
+    let parent_endpoint = Endpoint::capture(parent.to_path_buf()).unwrap();
+    let context = ordinary_cargo_callback_context_v3(SCOPE, request_digest).unwrap();
+    let bootstrap = json!({
+        "version": ORDINARY_CARGO_DECLARED_ATTEMPT_VERSION,
+        "operation": ORDINARY_CARGO_DECLARED_ATTEMPT_OPERATION,
+        "scope": SCOPE,
+        "remaining_ms": WireU64(REMAINING_MS),
+        "callback_timeout_ms": WireU64(CALLBACK_TIMEOUT_MS),
+        "storage": endpoint_json(&storage_endpoint),
+        "parent": endpoint_json(&parent_endpoint),
+        "callback_key_hex": CALLBACK_KEY_HEX,
+        "callback_context": context,
+        "capture_budget": capture_budget,
+        "declaration_digest": declaration_digest,
+        "invocation": invocation_json(invocation),
+    });
+    let bytes = serde_json::to_vec(&bootstrap).unwrap();
+    let path = case
+        .path
+        .join("callbacks")
+        .join(format!("bootstrap-declared-{name}.json"));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    file.write_all(&bytes).unwrap();
+    file.sync_all().unwrap();
+    (path, context)
+}
+
+fn declared_workflow_binary() -> std::ffi::OsString {
+    std::env::var_os("OXIDE_DECLARED_WORKFLOW")
+        .expect("Effigy compiled the declared-workflow front end")
+}
+
+/// Run the declared front end's `plan` subcommand: read-only and exit-coded.
+fn run_declared_plan(declaration: &Path, trace: &Trace) -> (bool, String, String) {
+    let output = Command::new(declared_workflow_binary())
+        .arg("plan")
+        .arg(declaration)
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .expect("run declared-workflow plan");
+    trace.mark("plan_exited", &format!("code {:?}", output.status.code()));
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// Run the declared front end's `run` subcommand end to end.
+fn run_declared_child(
+    declaration: &Path,
+    bootstrap: &Path,
+    expected_success: bool,
+    trace: &Trace,
+) -> String {
+    let mut child = Command::new(declared_workflow_binary())
+        .arg("run")
+        .arg(declaration)
+        .arg(bootstrap)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the compiled declared-workflow fixture");
+    trace.mark("declared_child_spawned", "");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!(
+                "declared-workflow child exceeded its 30-second scenario bound\ntrace:\n{}",
+                trace.render()
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    trace.mark(
+        "declared_child_exited",
+        &format!("code {:?}", status.code()),
+    );
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(!stdout.contains(STORAGE_KEY_HEX));
+    assert!(!stderr.contains(STORAGE_KEY_HEX));
+    assert!(!stdout.contains(CALLBACK_KEY_HEX));
+    assert!(!stderr.contains(CALLBACK_KEY_HEX));
+    trace.mark(
+        "declared_child_stderr",
+        stderr.lines().next().unwrap_or("(empty)"),
+    );
+    assert_eq!(
+        status.success(),
+        expected_success,
+        "declared child stderr: {stderr}\ntrace:\n{}",
+        trace.render()
+    );
+    stderr
+}
+
+/// Drive one declared attempt through a fresh callback channel, exactly as the
+/// undeclared route does: acquire, one submit, complete capture, finalize.
+fn run_declared_case(
+    case: &FixtureRoot,
+    name: &str,
+    invocation: &mut OrdinaryCargoInvocation,
+    capture_budget: &OrdinaryCargoCaptureBudget,
+    declaration_path: &Path,
+    declaration_digest: &str,
+    daemon: &TestDaemon,
+    shared: &Trace,
+) -> Value {
+    let request_digest = ordinary_cargo_request_digest(&invocation.request).unwrap();
+    install_request_credentials(invocation, &daemon.instance, &request_digest);
+    let callback_path = case
+        .path
+        .join("callbacks")
+        .join(format!("callback-declared-{name}.sock"));
+    let listener = UnixListener::bind(&callback_path).unwrap();
+    fs::set_permissions(&callback_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let (bootstrap, context) = create_declared_bootstrap(
+        case,
+        name,
+        invocation,
+        &daemon.socket,
+        &callback_path,
+        &request_digest,
+        capture_budget,
+        declaration_digest,
+    );
+    let acquired = Arc::new(Mutex::new(None));
+    let trace = Trace::new();
+    trace.mark("scenario", name);
+    let callbacks = start_callback_server(
+        listener,
+        Scenario::Passed,
+        invocation.request.clone(),
+        daemon.instance.clone(),
+        context,
+        acquired.clone(),
+        trace.clone(),
+    );
+    run_declared_child(declaration_path, &bootstrap, true, &trace);
+    shared.mark("declared_child_exited", name);
+    callbacks.join().unwrap();
+    shared.mark("declared_callbacks_once", name);
+    let report = trace.render();
+    assert_trace_order(&report, "capture_reply_written", "callback_channel_closed");
+    assert_eq!(
+        report.matches("capture_received").count(),
+        1,
+        "one submit/capture exchange per attempt\ntrace:\n{report}"
+    );
+    let acquired = acquired
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| panic!("declared submit had acquired identity\ntrace:\n{report}"));
+    acquired
+}
+
+/// Explicit owner-authenticated handoff of one proven-idle reusable generation
+/// from the closed prior allocation to the assigned successor allocation at the
+/// same canonical physical root.
+fn declared_handoff(
+    prior: &OrdinaryCargoInvocation,
+    successor: &OrdinaryCargoInvocation,
+    acquired: &Value,
+    instance: &str,
+    handoff_id: &str,
+) -> OrdinaryCargoHandoffRequest {
+    let retention = OrdinaryCargoRetention {
+        source_evidence_reference: "synthetic-retained-source".into(),
+        artifact_evidence_reference: "synthetic-retained-artifact".into(),
+        debug_evidence_reference: "synthetic-retained-debug".into(),
+        credential: Credential::new("synthetic-retention-proof"),
+    };
+    let transition = OrdinaryCargoSourceTransition {
+        prior_commit: prior.request.acquire.envelope.binding.commit.clone(),
+        prior_tree_digest: prior
+            .request
+            .acquire
+            .envelope
+            .binding
+            .source_tree_digest
+            .clone(),
+        prior_content_digest: prior.source_content_digest.clone(),
+        successor_commit: successor.request.acquire.envelope.binding.commit.clone(),
+        successor_tree_digest: successor
+            .request
+            .acquire
+            .envelope
+            .binding
+            .source_tree_digest
+            .clone(),
+        successor_content_digest: successor.source_content_digest.clone(),
+        transition_reference: "synthetic-transition-reference".into(),
+        invalidation_declaration_digest: DECLARED_INVALIDATION_DIGEST.into(),
+        mtime_qualified: true,
+        qualified_input_classes: [
+            "manifest",
+            "lock",
+            "config",
+            "generated",
+            "build-script",
+            "proc-macro",
+            "native",
+            "dependency",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+    };
+    let mut request = OrdinaryCargoHandoffRequest {
+        prior_request: prior.request.clone(),
+        successor_request: successor.request.clone(),
+        slot_id: acquired["slot_id"].as_str().unwrap().into(),
+        storage_instance_id: instance.to_owned(),
+        generation: acquired["generation"].as_str().unwrap().into(),
+        handoff_id: handoff_id.into(),
+        handoff_version: ORDINARY_CARGO_HANDOFF_VERSION,
+        retention,
+        source_transition: transition,
+        prior_closure_reference: "synthetic-prior-closure".into(),
+        successor_assignment_reference: "synthetic-successor-assignment".into(),
+        credential: Credential::new("synthetic-handoff-placeholder"),
+    };
+    let subject = ordinary_cargo_handoff_subject(&request).unwrap();
+    request.credential = Credential::new(
+        MacKey::from_hex(STORAGE_KEY_HEX)
+            .unwrap()
+            .sign(
+                "oxide-ordinary-cargo-handoff-v1",
+                &[SCOPE, instance, &subject],
+            )
+            .unwrap(),
+    );
+    request
+}
+
+#[test]
+fn declared_workflow_front_end_plans_binds_and_reuses_across_handoff() {
+    assert!(task_scratch_root().is_absolute());
+    let case = FixtureRoot::scenario("11-declared-workflow");
+    case.dir("callbacks");
+    let storage_root = case.dir("storage");
+    let trace = Trace::new();
+    trace.mark("scenario", "declared-workflow");
+    let capture_budget = declared_capture_budget();
+    // The single base fixture creates and owns the declared workspace root.
+    let base = invocation(&case, "declared-a1");
+    let source = base.cwd.clone();
+    let declaration_value =
+        declared_declaration_value(&case.path, &base.environment, &capture_budget);
+    let declaration_bytes = serde_json::to_vec(&declaration_value).unwrap();
+    assert!(declaration_bytes.len() <= MAX_WORKFLOW_DECLARATION_BYTES);
+
+    // (1) Effective plan mode is read-only and creates nothing.
+    let entries_before = directory_entries(&case.path);
+    let plan = WorkflowPlan::resolve(&declaration_bytes).unwrap();
+    let rendered = plan.render();
+    assert!(rendered.len() <= MAX_WORKFLOW_PLAN_BYTES);
+    assert!(rendered.contains("partition: ordinary-test"));
+    assert!(rendered.contains("effects: none"));
+    assert!(rendered.contains("owner-grant-missing"));
+    assert_eq!(directory_entries(&case.path), entries_before);
+    assert_eq!(plan.source_root, source);
+    assert_eq!(plan.declaration_digest.len(), "sha256:".len() + 64);
+    let declaration_digest = plan.declaration_digest.clone();
+
+    // The same plan is reachable through the unpublished CLI entry point.
+    let declaration_path = case.path.join("callbacks").join("declaration.json");
+    write_private_file(&declaration_path, &declaration_bytes);
+    let (planned, stdout, stderr) = run_declared_plan(&declaration_path, &trace);
+    assert!(planned, "plan mode refused: {stderr}");
+    assert!(stdout.contains(&declaration_digest));
+    assert!(stdout.contains("effects: none"));
+    assert!(!stdout.contains("RUSTFLAGS="));
+
+    // (2) Three exact owner-issued attempts: two in allocation A, one in the
+    // handed-off allocation B at the same canonical root.
+    let mut first = declared_invocation(
+        &base,
+        "declared-a1",
+        "allocation-a",
+        &declaration_digest,
+        &capture_budget,
+    );
+    let mut second = declared_invocation(
+        &base,
+        "declared-a2",
+        "allocation-a",
+        &declaration_digest,
+        &capture_budget,
+    );
+    let mut successor = declared_invocation(
+        &base,
+        "declared-b1",
+        "allocation-b",
+        &declaration_digest,
+        &capture_budget,
+    );
+    assert_ne!(
+        first.request.acceptance.input_boundary_digest,
+        second.request.acceptance.input_boundary_digest
+    );
+    assert!(verify_declared_route(
+        &first,
+        &capture_budget,
+        &declaration_digest
+    ));
+    assert!(verify_declared_route(
+        &second,
+        &capture_budget,
+        &declaration_digest
+    ));
+    assert!(verify_declared_route(
+        &successor,
+        &capture_budget,
+        &declaration_digest
+    ));
+
+    let first_digest = ordinary_cargo_request_digest(&first.request).unwrap();
+    let second_digest = ordinary_cargo_request_digest(&second.request).unwrap();
+    let successor_digest = ordinary_cargo_request_digest(&successor.request).unwrap();
+    let mut daemon = TestDaemon::start_policy(
+        &storage_root,
+        vec![
+            first.request.acquire.envelope.clone(),
+            second.request.acquire.envelope.clone(),
+            successor.request.acquire.envelope.clone(),
+        ],
+        Vec::new(),
+        vec![
+            first_digest.clone(),
+            second_digest.clone(),
+            successor_digest.clone(),
+        ],
+    );
+
+    // A declaration whose resolved command differs cannot be bound to the
+    // owner-issued boundary, and the refusal happens before any acquire.
+    let mut drifted = declaration_value.clone();
+    drifted["workflow"]["argv"] = json!(["test", "--workspace", "--changed"]);
+    let drifted_bytes = serde_json::to_vec(&drifted).unwrap();
+    let drifted_path = case.path.join("callbacks").join("declaration-drifted.json");
+    write_private_file(&drifted_path, &drifted_bytes);
+    let callback_path = case
+        .path
+        .join("callbacks")
+        .join("callback-declared-refuse.sock");
+    let listener = UnixListener::bind(&callback_path).unwrap();
+    fs::set_permissions(&callback_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let (refuse_bootstrap, _) = create_declared_bootstrap(
+        &case,
+        "refuse",
+        &first,
+        &daemon.socket,
+        &callback_path,
+        &first_digest,
+        &capture_budget,
+        &declaration_digest,
+    );
+    assert!(matches!(
+        run_declared_attempt(&refuse_bootstrap, &drifted_bytes),
+        Err(DeclaredWorkflowError::Refusal(_))
+    ));
+    assert!(matches!(
+        verify_declared_bootstrap(&refuse_bootstrap, &plan),
+        Ok(_)
+    ));
+    drop(listener);
+    assert!(
+        daemon
+            .client
+            .inventory("declared-pre-acquire-refusal")
+            .unwrap()
+            .slots
+            .is_empty(),
+        "a drifted declaration must be refused before acquire"
+    );
+
+    // (3) First declared cold attempt at allocation A.
+    let first_attempt = run_declared_case(
+        &case,
+        "first",
+        &mut first,
+        &capture_budget,
+        &declaration_path,
+        &declaration_digest,
+        &daemon,
+        &trace,
+    );
+    assert_eq!(first_attempt["reused"], json!(false));
+    assert_eq!(first_attempt["policy_version"], json!(3));
+    assert_eq!(
+        first_attempt["input_boundary_digest"],
+        json!(first.request.acceptance.input_boundary_digest)
+    );
+    let slot_id = first_attempt["slot_id"].clone();
+    let generation = first_attempt["generation"].clone();
+    let instance = first_attempt["storage_instance_id"].clone();
+    let slot_path = PathBuf::from(first_attempt["slot_path"].as_str().unwrap());
+    fs::write(slot_path.join("payload.bin"), b"declared-ordinary-bytes").unwrap();
+
+    // (4) Repeat invocation at the same allocation reuses the same identity.
+    let second_attempt = run_declared_case(
+        &case,
+        "second",
+        &mut second,
+        &capture_budget,
+        &declaration_path,
+        &declaration_digest,
+        &daemon,
+        &trace,
+    );
+    assert_eq!(second_attempt["reused"], json!(true));
+    assert_eq!(second_attempt["slot_id"], slot_id);
+    assert_eq!(second_attempt["generation"], generation);
+    assert_eq!(second_attempt["storage_instance_id"], instance);
+    assert_ne!(
+        second_attempt["input_boundary_digest"],
+        first_attempt["input_boundary_digest"]
+    );
+
+    // (5) Explicit owner-authenticated handoff to the successor allocation.
+    // The owner has issued the successor attempt credentials before it asks for
+    // the handoff; the front end still acquires its own fresh lease later.
+    install_request_credentials(&mut successor, &daemon.instance, &successor_digest);
+    let handoff = declared_handoff(
+        &second,
+        &successor,
+        &second_attempt,
+        &daemon.instance,
+        "declared-handoff-a-b",
+    );
+    let receipt = daemon
+        .client
+        .handoff_ordinary_cargo(handoff.clone())
+        .expect("owner-authenticated handoff commits");
+    assert_eq!(receipt.slot_id, slot_id);
+    assert_eq!(receipt.generation, generation);
+    assert_eq!(receipt.storage_instance_id, instance);
+    assert_eq!(receipt.prior_root.allocation_epoch, "allocation-a");
+    assert_eq!(receipt.successor_root.allocation_epoch, "allocation-b");
+    assert_eq!(
+        fs::read(slot_path.join("payload.bin")).unwrap(),
+        b"declared-ordinary-bytes",
+        "handoff preserves the same storage bytes and identity"
+    );
+    // Default-deny: the same handoff with a forged credential is unauthorized.
+    let mut forged = handoff.clone();
+    forged.credential = Credential::new("synthetic-forged-handoff");
+    assert_eq!(
+        daemon.client.handoff_ordinary_cargo(forged),
+        Err(StorageError::Unauthorized)
+    );
+
+    // (6) Accepted successor-allocation invocation reuses the handed-off bytes.
+    let successor_attempt = run_declared_case(
+        &case,
+        "successor",
+        &mut successor,
+        &capture_budget,
+        &declaration_path,
+        &declaration_digest,
+        &daemon,
+        &trace,
+    );
+    assert_eq!(successor_attempt["reused"], json!(true));
+    assert_eq!(successor_attempt["slot_id"], slot_id);
+    assert_eq!(successor_attempt["generation"], generation);
+    assert_eq!(successor_attempt["storage_instance_id"], instance);
+    assert_eq!(successor_attempt["allocation_epoch"], json!("allocation-b"));
+    assert_eq!(
+        fs::read(slot_path.join("payload.bin")).unwrap(),
+        b"declared-ordinary-bytes"
+    );
+
+    // (7) Prior history stays access-free: lookup returns identity only, and an
+    // exact prior replay grants no path or token.
+    assert!(matches!(
+        daemon
+            .client
+            .lookup_ordinary_cargo(second.request.clone())
+            .unwrap(),
+        LookupResult::Present(_)
+    ));
+    let replay = daemon
+        .client
+        .acquire_ordinary_cargo(second.request.clone())
+        .expect("old exact replay");
+    assert_eq!(replay.lease.slot_id, slot_id);
+    assert!(replay.lease.slot_path.is_none());
+    assert!(replay.lease.token.is_none());
+
+    let report = trace.render();
+    assert_eq!(report.matches("declared_child_exited").count(), 3);
+    assert_eq!(report.matches("declared_callbacks_once").count(), 3);
+    assert_trace_order(&report, "plan_exited", "declared_child_exited");
+    daemon.stop();
+    let _ = (first_digest, second_digest, successor_digest);
+}
+
+fn verify_declared_route(
+    invocation: &OrdinaryCargoInvocation,
+    capture_budget: &OrdinaryCargoCaptureBudget,
+    declaration_digest: &str,
+) -> bool {
+    crate::project::ordinary_cargo::validate_declared_invocation(
+        invocation,
+        capture_budget,
+        declaration_digest,
+    )
+    .is_ok()
+}
+
+fn directory_entries(path: &Path) -> Vec<std::ffi::OsString> {
+    let mut entries: Vec<_> = fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    entries.sort();
+    entries
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap();
+    file.write_all(bytes).unwrap();
+    file.sync_all().unwrap();
 }

@@ -35,6 +35,11 @@ path = "src/bin/ordinary_cargo_attempt.rs"
 required-features = ["private-qualification"]
 
 [[bin]]
+name = "oxide-declared-workflow"
+path = "src/bin/declared_workflow.rs"
+required-features = ["private-qualification"]
+
+[[bin]]
 name = "oxide-registry-acquisition"
 path = "src/bin/registry_acquisition.rs"
 required-features = ["private-qualification"]

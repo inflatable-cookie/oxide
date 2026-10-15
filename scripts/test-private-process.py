@@ -10,6 +10,7 @@ build = subprocess.run(
     ["cargo", "build", "--offline", "--locked", "--features", "private-qualification-fixture",
      "--bin", "oxide-qualified-runner", "--bin", "oxide-storage-runtime",
      "--bin", "oxide-registry-acquisition", "--bin", "oxide-ordinary-cargo-attempt",
+     "--bin", "oxide-declared-workflow",
      "--message-format=json"],
     stdout=subprocess.PIPE, text=True, timeout=300,
 )
@@ -34,11 +35,11 @@ for line in build.stdout.splitlines():
     message = json.loads(line)
     if message.get("reason") == "compiler-artifact" and message["target"]["name"] in (
         "oxide-qualified-runner", "oxide-storage-runtime", "oxide-registry-acquisition",
-        "oxide-ordinary-cargo-attempt"
+        "oxide-ordinary-cargo-attempt", "oxide-declared-workflow"
     ):
         executables[message["target"]["name"]] = message.get("executable")
 for name in ("oxide-qualified-runner", "oxide-storage-runtime", "oxide-registry-acquisition",
-             "oxide-ordinary-cargo-attempt"):
+             "oxide-ordinary-cargo-attempt", "oxide-declared-workflow"):
     if not executables.get(name):
         raise RuntimeError(f"compiled artifact {name} was not reported")
 environment = dict(
@@ -46,6 +47,7 @@ environment = dict(
     OXIDE_QUALIFICATION_CHILD=executables["oxide-qualified-runner"],
     OXIDE_STORAGE_RUNTIME=executables["oxide-storage-runtime"],
     OXIDE_ORDINARY_CARGO_ATTEMPT=executables["oxide-ordinary-cargo-attempt"],
+    OXIDE_DECLARED_WORKFLOW=executables["oxide-declared-workflow"],
 )
 result = subprocess.run(
     ["python3", "scripts/bounded-test.py", "cargo", "test", "--offline", "--locked", "--features", "private-qualification-fixture",
