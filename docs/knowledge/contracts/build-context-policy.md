@@ -336,6 +336,22 @@ The launcher binds the 050 gaps: whole-session monotonic deadline, sibling backi
 
 Missing declared registry inputs, an unbindable named copy, or an unsupported Effigy inheritance seam is a refuse with that seam name. Do not invent unrestricted cache copy or bypass admission.
 
+### Attempt record (2026-10-15)
+
+One checked launch packet ran this recipe through the outer bootstrap on
+2026-10-15 (caller `oxide:planner:incremental-comparison:053`, request UUID
+`be2acbd8-7f3e-4488-b91d-6781ec0d6788`). The heavy host run was admitted and
+launched by Effigy, then settled `failed` after 629 ms: the inner comparison
+launcher failed before its own admission validation, with no Cargo or rustc
+invocation. The staged manifest's `run` array was executed by Effigy as a
+sequence of shell
+commands rather than as one argv vector, so the non-executable launcher script
+was executed directly (`Permission denied`, code 126). The recipe above stays
+frozen and unchanged; the comparison remains unqualified and needs a separately
+scoped producer correction. See
+[storage efficiency](../storage-efficiency.md#bounded-incremental-comparison-attempt-2026-10-15)
+and the [attempt evidence record](../evidence/build-context-comparison-053-attempt.json).
+
 ## Evidence limits for this design
 
 - The design rests on the supervisor's reported single-machine observations, a read-only inspection of three Nucleus commits and one stopgap, two pinned rustc source reads, and the installed Effigy source and contracts 010/049 for the heavy classification and token-root check. Its raw logs were not available.

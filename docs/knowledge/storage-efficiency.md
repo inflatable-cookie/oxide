@@ -99,7 +99,63 @@ Method and caveats:
 
 The proposed policy, frozen one-shot comparison, and private opt-in launcher
 are in the [build-context policy](contracts/build-context-policy.md). The
-comparison is not yet run.
+comparison remains unqualified.
+
+## Bounded incremental comparison attempt (2026-10-15)
+
+One checked launch packet (caller
+`oxide:planner:incremental-comparison:053`, request UUID
+`be2acbd8-7f3e-4488-b91d-6781ec0d6788`) submitted the frozen recipe through
+the private launcher's outer bootstrap on 2026-10-15. The reviewed launcher
+SHA256 `36e89aefbe6d4a69659f05f37f6963d583f5d0376fa8648a0b28929e2a4084a0`,
+registry-plan digest `ce5c0381…baa` and semantic request-body digest
+`c0427e75…401` all matched the brief before effects. The resource-plan names
+were unused, host free space was 1,169,873,059,840 bytes (about 1.06 TiB, above
+the 20 GiB reserve), and the Nucleus commit, tree and `Cargo.lock` pins resolved
+exactly.
+
+The forced read-only plan check returned `live_ready=true`. The outer bootstrap
+opened its single 1200 s session at `2026-10-15T14:00:14Z`, staged exactly
+`effigy.toml`, `resource-plan.json` and `binding.json` under the owned parent,
+and submitted the sole heavy selector. The heavy host run was admitted by Effigy
+(`admittedAt` `14:00:14.422Z`) and launched at `14:00:14.434Z`, then settled
+`failed` at `14:00:15.063Z` (`exitCode 1`, 629 ms, `escapedDescendants: []`). No
+capacity wait was needed (`position: null`).
+
+The heavy host run was admitted and launched, but the inner comparison launcher
+failed before its own admission validation (`verify_admission` /
+`validate_staged_session`): no Cargo or rustc invocation
+(`count_delivered=0`), no source clone, no APFS image and no measurement. The
+captured output was
+`sh: …/scripts/build_context_comparison.py: Permission denied` and
+`task command failed … (code=126)`.
+
+Observed cause: Effigy deserialises `[tasks.<name>.run]` through
+`ManifestManagedRun`, where a TOML array is a *sequence of separate shell
+commands*, not one argv vector. The staged manifest emitted
+`run = [python3, <launcher>, "--live", …]`, so Effigy ran `python3` with no
+arguments and then tried to execute the launcher script path directly. The
+repository records `scripts/build_context_comparison.py` as git mode `100644`
+(not executable) at the pinned base, so the direct exec failed with code 126.
+The 050/051 design note that the staged entry runs "through an absolute
+interpreter path" is not satisfied by an argv-shaped array.
+
+A second, inferred seam is recorded but was not reached: Effigy created
+`.effigy/{locks,runtime,reports}` inside the staged root during launch, while
+the admitted inner launcher requires exactly the three staged entries and would
+refuse `staged_session` on a fourth. It needs confirmation by the correction.
+
+Disposition: a bounded failure in the inner comparison launcher before its own
+admission validation, with a precise producer defect. It is not a qualified
+comparison, not shared warm reuse, not evidence about
+object deletion or production policy, and it produced no incremental-on/off
+timing, storage, allocation or write data. The frozen methodology is unchanged;
+the comparison stays unqualified and needs a separately scoped producer
+correction under standing authority before any fresh equivalent session. The
+staged root and the task control directory are retained read-only for review;
+nothing was deleted, detached or repaired. The exact receipts are in the
+[attempt evidence record](evidence/build-context-comparison-053-attempt.json).
+The original shared-reuse four-Cargo, 45-minute trial remains unstarted.
 
 ## Disposable output and retention
 
