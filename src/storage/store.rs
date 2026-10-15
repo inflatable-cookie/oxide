@@ -880,12 +880,14 @@ impl Store {
         {
             // First slice: one compatibility partition per registered root.
             // An acquire never borrows authority for generation eviction.
+            // Zero-growth reuse stays admissible over an OS-bound overhang.
             if self.ledger.slots.iter().any(|slot| {
                 slot.partition
                     .path_identity
                     .starts_with("same-root-fixture-v1:")
                     && slot.partition != request.envelope.partition
-            }) || self.accounted_bytes()?.saturating_add(growth) > self.ledger.budget.cap_bytes
+            }) || (growth > 0
+                && self.accounted_bytes()?.saturating_add(growth) > self.ledger.budget.cap_bytes)
             {
                 return Err(StorageError::Refused(RefusalReason::BudgetExceeded));
             }
@@ -1090,7 +1092,10 @@ impl Store {
             .accounted_bytes()?
             .checked_add(growth)
             .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
-        if total > self.ledger.budget.cap_bytes {
+        // See make_room: zero-growth reuse of a settled generation never
+        // expands the aggregate pool even when measured bytes outgrew the
+        // acquire-time reservation under the OS bound.
+        if growth > 0 && total > self.ledger.budget.cap_bytes {
             return Err(StorageError::Refused(RefusalReason::BudgetExceeded));
         }
         let free = self
@@ -1823,7 +1828,11 @@ impl Store {
 
     fn make_room(&mut self, growth: u64, protected: Option<&str>) -> Result<(), StorageError> {
         let mut accounted = self.accounted_bytes()?;
-        while accounted.saturating_add(growth) > self.ledger.budget.cap_bytes {
+        // Measured payload may legitimately exceed acquire-time reservations:
+        // the OS bound sits at the verified volume capacity, above the
+        // reservation ceiling. Zero-growth reuse never expands the pool, so
+        // only real growth evicts or refuses.
+        while growth > 0 && accounted.saturating_add(growth) > self.ledger.budget.cap_bytes {
             let candidate = self
                 .ledger
                 .slots
