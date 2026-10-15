@@ -184,3 +184,20 @@ Object age, filename, compiler session locks or process disappearance cannot
 authorize Oxide lease release or evidence removal. The original four-Cargo,
 45-minute reuse proof remains separate and is neither consumed nor reset by
 this comparison. Queue owns the scoped briefs, dispatch and independent review.
+
+
+Tom's direct-execution correction, relayed by the Nucleus Supervisor on
+2026-10-15: stop the incremental-comparison task-fixes-task chain. Once the
+existing bootstrap correction finishes, the Oxide planner should run the
+approved comparison directly in its own thread rather than dispatch another
+brief. This supersedes the checked-execution-brief and worker-dispatch
+requirement for this comparison only. A small disposable shell measurement
+script is permitted; no product implementation or general adoption follows.
+Keep the same ten-Cargo-call, twenty-minute total, 16 GiB fresh-owned limit,
+20 GiB raw host reserve, pinned Nucleus source, incremental on/off with
+unpacked line tables, cold/edit/unchanged sequence, executed tests and raw
+backtrace/output evidence. Preserve genuine Effigy host admission and all
+existing evidence; do not reset a live clock, change consumer defaults or
+inspect/delete old targets. Record actual limitations rather than building
+another measurement framework. Product changes still require ordinary
+independent exact-head review.
