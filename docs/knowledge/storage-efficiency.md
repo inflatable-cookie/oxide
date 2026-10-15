@@ -68,6 +68,36 @@ no source-backed case for another profile edit in this assessment. Disabling
 incremental output can increase rebuild work, and final target size alone
 would not establish reduced disk writes.
 
+## Incremental and debug storage measurements
+
+Supervisor-reported, single busy-machine observations on Darwin 25.6 with APFS,
+rustc 1.97.1 (`8bab26f4f`) and matching Cargo. Nucleus's dev profile is
+`line-tables-only` with the macOS default split-debuginfo mode (unpacked). The
+raw logs were not preserved, so these figures are attributed to the supervisor
+report and not re-observed here.
+
+| Mode (cold + two changed no-run builds) | Build time | Loose `deps` objects | Incremental state | Notes |
+| --- | --- | --- | --- | --- |
+| Incremental on, unpacked | 60 s + 38 s = 98 s | 12,303 | about 3 GB | Object set grows across builds. |
+| Incremental off, unpacked | 66 s + 107 s = 173 s | 408, unchanged after warm | none | Object set flat. |
+| Incremental off, packed | 82 s + 59 s = 141 s | zero loose | about 3 GB incremental and about 2x deps | Packed companion output adds bytes. |
+
+Method and caveats:
+
+- Compile-only no-run builds. No test execution is in these figures.
+- Off/packed file:line and LLDB behavior were not tested.
+- The 37.4 GB `deps` object figure in the source report is apparent size across
+  139,421 names. It is not proven stale or reclaimable. It may overlap the 38.4 GB
+  incremental figure through hardlinks and multiple variants.
+- Incremental off does not show lower cumulative writes. It removes retained
+  incremental state; changed-crate recompilation still writes objects.
+- Cache sharing does not prevent per-slot growth. Shared warm reuse is a separate
+  quantity from bounded growth and actual writes.
+
+The proposed policy and a frozen one-shot comparison are in the
+[build-context policy](contracts/build-context-policy.md). The comparison is
+not yet run.
+
 ## Disposable output and retention
 
 At Queue commit `7b9b840354a638a529ab023542903949b5b562ac`, Spec 028 keeps

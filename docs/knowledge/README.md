@@ -4,6 +4,8 @@
 
 [Storage-efficiency findings](storage-efficiency.md) records current component preparation, profile and disposable-output behavior across the inspected projects, with limits on what the source evidence establishes.
 
+[Build-context policy](contracts/build-context-policy.md) owns the proposed lifecycle-aware incremental/debug context semantics and the frozen one-shot comparison recipe. It is inert until its reviewed comparison and adoption.
+
 [Optimization adoption](contracts/optimization-adoption.md) owns the project adoption policy for component-lazy preparation and the distinction between lightweight improvements and reusable-slot integration.
 
 [Project adoption](contracts/project-adoption.md) owns the proposed opt-in adapter and coordinated waiting contract, including consumer lifecycle gates. [Rust toolchain and quality](rust-toolchain-and-quality.md) owns the development compiler, initial minimum Rust version and quality-policy routing.
