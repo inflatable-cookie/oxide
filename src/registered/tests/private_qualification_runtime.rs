@@ -167,6 +167,26 @@ fn bootstrap_for_bounded(
     grace: u64,
     bounded: Option<RuntimeBoundedStorage>,
 ) -> RuntimeBootstrap {
+    bootstrap_for_bounded_budget(
+        storage_root,
+        control,
+        subjects,
+        expires,
+        grace,
+        bounded,
+        budget(),
+    )
+}
+
+fn bootstrap_for_bounded_budget(
+    storage_root: &Path,
+    control: &Path,
+    subjects: Vec<ApprovedSubject>,
+    expires: u64,
+    grace: u64,
+    bounded: Option<RuntimeBoundedStorage>,
+    session_budget: RuntimeBudget,
+) -> RuntimeBootstrap {
     let endpoint = Endpoint::capture(control.to_path_buf()).unwrap();
     RuntimeBootstrap {
         version: 1,
@@ -176,7 +196,7 @@ fn bootstrap_for_bounded(
         expires_unix_seconds: serde_json::from_value(json!(expires)).unwrap(),
         stop_grace_seconds: serde_json::from_value(json!(grace)).unwrap(),
         storage_root: storage_root.to_path_buf(),
-        budget: budget(),
+        budget: session_budget,
         admissions: subjects,
         ordinary_cargo_request_digests: Vec::new(),
         bounded,
@@ -242,18 +262,41 @@ impl Runtime {
         grace: u64,
         bounded: Option<RuntimeBoundedStorage>,
     ) -> Self {
+        Self::start_bounded_budget(
+            base,
+            name,
+            storage_root,
+            subjects,
+            window,
+            grace,
+            bounded,
+            budget(),
+        )
+    }
+
+    fn start_bounded_budget(
+        base: &Path,
+        name: &str,
+        storage_root: &Path,
+        subjects: Vec<ApprovedSubject>,
+        window: u64,
+        grace: u64,
+        bounded: Option<RuntimeBoundedStorage>,
+        session_budget: RuntimeBudget,
+    ) -> Self {
         let control_dir = base.join(format!("ctl-{name}"));
         private_dir(&control_dir);
         let control = control_dir.join("p.sock");
         let listener = UnixListener::bind(&control).unwrap();
         fs::set_permissions(&control, fs::Permissions::from_mode(0o600)).unwrap();
-        let bootstrap = bootstrap_for_bounded(
+        let bootstrap = bootstrap_for_bounded_budget(
             storage_root,
             &control,
             subjects.clone(),
             now() + window,
             grace,
             bounded,
+            session_budget,
         );
         let bytes = serde_json::to_vec(&bootstrap).unwrap();
         let file = base.join(format!("bootstrap-{name}.json"));
@@ -296,7 +339,7 @@ impl Runtime {
         let bootstrap_digest = bootstrap_digest(&bytes);
         let policy = policy_digest(
             SCOPE,
-            &budget(),
+            &session_budget,
             serde_json::from_value(json!(grace)).unwrap(),
             &subjects,
             &[],
@@ -1103,9 +1146,13 @@ fn bounded_native_payload_filesystem_full_refuses_under_open_lease() {
         payload_ceiling_bytes: serde_json::from_value(json!(CEILING_BYTES)).unwrap(),
     };
     let subjects = vec![approved(1), approved(2)];
+    let native_budget = RuntimeBudget {
+        cap_bytes: serde_json::from_value(json!(CEILING_BYTES)).unwrap(),
+        free_reserve_bytes: serde_json::from_value(json!(1024 * 1024)).unwrap(),
+    };
 
     // Session one: provision (create + attach + capacity receipt) and serve.
-    let mut runtime = Runtime::start_bounded(
+    let mut runtime = Runtime::start_bounded_budget(
         &base,
         "native-one",
         &storage_root,
@@ -1113,6 +1160,7 @@ fn bounded_native_payload_filesystem_full_refuses_under_open_lease() {
         240,
         DEFAULT_GRACE,
         Some(bounded.clone()),
+        native_budget,
     );
     let client = runtime.client();
     let authority = runtime.authority();
@@ -1179,7 +1227,7 @@ fn bounded_native_payload_filesystem_full_refuses_under_open_lease() {
 
     // Session two: the same backing reopens from its capacity proof. The
     // settled generation and its measured bytes survive the daemon restart.
-    let mut reopened = Runtime::start_bounded(
+    let mut reopened = Runtime::start_bounded_budget(
         &base,
         "native-two",
         &storage_root,
@@ -1187,6 +1235,7 @@ fn bounded_native_payload_filesystem_full_refuses_under_open_lease() {
         240,
         DEFAULT_GRACE,
         Some(bounded.clone()),
+        native_budget,
     );
     let client = reopened.client();
     let authority = reopened.authority();
