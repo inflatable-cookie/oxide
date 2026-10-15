@@ -8,6 +8,8 @@ use std::sync::{mpsc, Arc, Barrier};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+mod handoff;
+
 #[cfg(feature = "private-qualification")]
 mod stable_reuse;
 

@@ -16,10 +16,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const LEDGER_MAGIC: &[u8; 8] = b"OXIDEST1";
-/// Version 6 adds durable ordinary-retirement intents and tombstones:
-/// version-5 ledgers predate owner-authenticated generation retirement and
-/// refuse without migration or reinterpretation.
-const LEDGER_VERSION: u32 = 6;
+/// Version 7 adds durable ordinary-handoff records: version-6 ledgers
+/// predate owner-authenticated cross-allocation handoff and refuse without
+/// migration or reinterpretation. Version 5 predates retirement likewise.
+const LEDGER_VERSION: u32 = 7;
 const MAX_LEDGER_BYTES: u64 = 64 * 1024 * 1024;
 const SOCKET_NAME: &str = "daemon.sock";
 pub(crate) const SLOTS_NAME: &str = "slots";
@@ -37,6 +37,11 @@ const MAX_LEDGER_OPERATIONS: usize = 16384;
 /// storage root (a new instance identity). In-flight intents recorded
 /// before exhaustion always run to completion.
 const MAX_LEDGER_RETIREMENTS: usize = 64;
+/// Handoff receipts are finite control history under the same policy as
+/// retirements: once the ledger holds this many recorded handoffs,
+/// further handoffs refuse without trimming evidence, while old receipts
+/// still replay exactly.
+const MAX_LEDGER_HANDOFFS: usize = 64;
 
 /// Durable backend mode of one store root. It is bound at daemon startup and
 /// recorded in the ledger; a restart with a different mode refuses.
@@ -89,6 +94,17 @@ pub trait EvidenceAuthority: Send + Sync + 'static {
     /// A task-provided flag, byte count, age, idle PID, disk pressure, or
     /// inventory output cannot grant this capability.
     fn verify_ordinary_cargo_retirement(&self, _request: &OrdinaryCargoRetireRequest) -> bool {
+        false
+    }
+
+    /// Authenticates one cross-allocation ordinary-generation handoff: the
+    /// exact prior generation tuple, prior allocation closure, independently
+    /// retained prior source/artifact/debug evidence, successor root
+    /// assignment/epoch/source/input identity, compatible full
+    /// partition/install/invalidation policy, and the qualified source
+    /// transition. Safe default: refuse. Neither task JSON nor a computed
+    /// digest grants this authority.
+    fn verify_ordinary_cargo_handoff(&self, _request: &OrdinaryCargoHandoffRequest) -> bool {
         false
     }
 }
@@ -351,6 +367,29 @@ struct OrdinaryCargoTombstone {
     retired_reuse_state: CargoReuseState,
 }
 
+/// Durable receipt of one committed cross-allocation handoff. The SAME slot
+/// identity and bytes are preserved; only allocation ownership moves. Old
+/// historical leases keep their own prior root/allocation/source request and
+/// validate against this record, never by overwriting them to match the
+/// successor generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OrdinaryCargoHandoffRecord {
+    prior_request: OrdinaryCargoRequest,
+    successor_request: OrdinaryCargoRequest,
+    retention: OrdinaryCargoRetention,
+    source_transition: OrdinaryCargoSourceTransition,
+    prior_closure_reference: String,
+    successor_assignment_reference: String,
+    slot_id: String,
+    storage_instance_id: String,
+    generation: String,
+    handoff_id: String,
+    handoff_version: u32,
+    request_digest: String,
+    reuse_state: CargoReuseState,
+    transition_reference: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Lease {
     id: String,
@@ -393,6 +432,7 @@ struct Ledger {
     operations: Vec<SettlementOperation>,
     retirements: Vec<OrdinaryCargoRetirementIntent>,
     tombstones: Vec<OrdinaryCargoTombstone>,
+    handoffs: Vec<OrdinaryCargoHandoffRecord>,
 }
 
 impl Ledger {
@@ -408,6 +448,7 @@ impl Ledger {
             operations: Vec::new(),
             retirements: Vec::new(),
             tombstones: Vec::new(),
+            handoffs: Vec::new(),
         })
     }
 }
@@ -814,7 +855,12 @@ impl Store {
                         if validate_ordinary_request(&ordinary.request).is_err()
                             || lease.status != LeaseStatus::Finalized
                             || ordinary.finalized_reuse_state != Some(tombstone.retired_reuse_state)
-                            || !ordinary_lease_matches_tombstone(&ordinary.request, tombstone)
+                            || (!ordinary_lease_matches_tombstone(&ordinary.request, tombstone)
+                                && !ordinary_lease_matches_handoff_history(
+                                    &self.ledger.handoffs,
+                                    &lease.slot_id,
+                                    &ordinary.request,
+                                ))
                         {
                             return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
                         }
@@ -839,7 +885,12 @@ impl Store {
                                 .envelope
                                 .partition
                         || !valid_hash(&lease.request_digest)
-                        || !ordinary_generation_matches_request(generation, &ordinary.request)
+                        || (!ordinary_generation_matches_request(generation, &ordinary.request)
+                            && !ordinary_lease_matches_handoff_history(
+                                &self.ledger.handoffs,
+                                &lease.slot_id,
+                                &ordinary.request,
+                            ))
                         || (active_owner
                             != matches!(lease.status, LeaseStatus::Leased | LeaseStatus::Uncertain))
                         || (active_owner && generation.reuse_state != CargoReuseState::Pending)
@@ -918,6 +969,28 @@ impl Store {
         // trimming, and no second intent or tombstone for one scope.
         if self.ledger.retirements.len() + self.ledger.tombstones.len() > MAX_LEDGER_RETIREMENTS {
             return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+        }
+        if self.ledger.handoffs.len() > MAX_LEDGER_HANDOFFS {
+            return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+        }
+        {
+            let mut handoff_ids = std::collections::BTreeSet::new();
+            let mut handoff_digests = std::collections::BTreeSet::new();
+            for record in &self.ledger.handoffs {
+                validate_handoff_record(record)
+                    .map_err(|_| StorageError::Refused(RefusalReason::UnknownAccounting))?;
+                if record.storage_instance_id != self.ledger.storage_instance_id
+                    || !handoff_ids.insert((record.slot_id.as_str(), record.handoff_id.as_str()))
+                    || !handoff_digests.insert(record.request_digest.as_str())
+                {
+                    return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+                }
+                largest_generation =
+                    largest_generation
+                        .max(parse_generation(&record.generation).map_err(|_| {
+                            StorageError::Refused(RefusalReason::UnknownAccounting)
+                        })?);
+            }
         }
         let mut retire_ids = std::collections::BTreeSet::new();
         for intent in &self.ledger.retirements {
@@ -2073,6 +2146,267 @@ impl Store {
         Ok(LookupResult::Absent)
     }
 
+    /// Hands one proven-idle reusable ordinary generation from a closed
+    /// prior allocation to an assigned successor allocation at the SAME
+    /// canonical physical source root. The SAME instance/slot/generation
+    /// identity and bytes are preserved; only allocation ownership moves.
+    /// The handoff grants no writer access, allocates no lease, and runs no
+    /// command: the successor must still acquire a fresh exclusive lease
+    /// with its own authenticated request.
+    pub(super) fn handoff_ordinary_cargo(
+        &mut self,
+        request: OrdinaryCargoHandoffRequest,
+    ) -> Result<OrdinaryCargoHandoffReceipt, StorageError> {
+        self.ensure_healthy()?;
+        validate_handoff_request(&request)?;
+        validate_canonical_source_root(&request.successor_request.root)?;
+        if request.prior_request.root.source_root != request.successor_request.root.source_root {
+            return Err(StorageError::Refused(
+                RefusalReason::OrdinaryCargoIncompatible,
+            ));
+        }
+        let request_digest = digest_encoded(&request)?;
+        let persisted = persisted_handoff_request(&request);
+        if let Some(record) = self
+            .ledger
+            .handoffs
+            .iter()
+            .find(|record| {
+                record.slot_id == request.slot_id
+                    && record.generation == request.generation
+                    && record.handoff_id == request.handoff_id
+            })
+            .cloned()
+        {
+            if !self.authority.verify_ordinary_cargo_handoff(&request) {
+                return Err(StorageError::Unauthorized);
+            }
+            let persisted_record = OrdinaryCargoHandoffRequest {
+                prior_request: record.prior_request.clone(),
+                successor_request: record.successor_request.clone(),
+                slot_id: record.slot_id.clone(),
+                storage_instance_id: record.storage_instance_id.clone(),
+                generation: record.generation.clone(),
+                handoff_id: record.handoff_id.clone(),
+                handoff_version: record.handoff_version,
+                retention: record.retention.clone(),
+                source_transition: record.source_transition.clone(),
+                prior_closure_reference: record.prior_closure_reference.clone(),
+                successor_assignment_reference: record.successor_assignment_reference.clone(),
+                credential: Credential::new("verified"),
+            };
+            if persisted_record != persisted || record.request_digest != request_digest {
+                return Err(StorageError::Conflict);
+            }
+            return Ok(handoff_receipt(&record));
+        }
+        if self.ledger.handoffs.iter().any(|record| {
+            record.handoff_id == request.handoff_id || record.request_digest == request_digest
+        }) {
+            return Err(StorageError::Conflict);
+        }
+        if self
+            .ledger
+            .tombstones
+            .iter()
+            .any(|tombstone| tombstone.slot_id == request.slot_id)
+        {
+            if !self.authority.verify_ordinary_cargo_handoff(&request) {
+                return Err(StorageError::Unauthorized);
+            }
+            return Err(StorageError::Refused(RefusalReason::OrdinaryCargoRetired));
+        }
+        if self
+            .ledger
+            .retirements
+            .iter()
+            .any(|intent| intent.slot_id == request.slot_id)
+        {
+            if !self.authority.verify_ordinary_cargo_handoff(&request) {
+                return Err(StorageError::Unauthorized);
+            }
+            return Err(StorageError::Refused(RefusalReason::OrdinaryCargoRetiring));
+        }
+        if request.storage_instance_id != self.ledger.storage_instance_id
+            || request.generation != slot_generation(&request.slot_id)?
+        {
+            return Err(StorageError::Conflict);
+        }
+        let slot = self
+            .ledger
+            .slots
+            .iter()
+            .find(|slot| slot.id == request.slot_id)
+            .cloned()
+            .ok_or(StorageError::Refused(RefusalReason::LeaseUnavailable))?;
+        let generation = slot.ordinary_cargo.clone().ok_or(StorageError::Conflict)?;
+        if generation.policy_version != ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION {
+            return Err(StorageError::Refused(
+                RefusalReason::OrdinaryCargoIncompatible,
+            ));
+        }
+        if request.prior_request.acceptance.policy_version
+            != ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION
+            || request.successor_request.acceptance.policy_version
+                != ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION
+        {
+            return Err(StorageError::Refused(
+                RefusalReason::OrdinaryCargoIncompatible,
+            ));
+        }
+        if !ordinary_generation_matches_request(&generation, &request.prior_request)
+            || slot.partition
+                != normalized_ordinary_acquire(&request.prior_request.acquire)
+                    .envelope
+                    .partition
+        {
+            return Err(StorageError::Refused(
+                RefusalReason::OrdinaryCargoIncompatible,
+            ));
+        }
+        if slot.state != InternalSlotState::Idle || slot.lease_id.is_some() {
+            return Err(StorageError::Refused(RefusalReason::LeaseUnavailable));
+        }
+        if self
+            .ledger
+            .leases
+            .iter()
+            .any(|lease| lease.slot_id == request.slot_id && lease.status != LeaseStatus::Finalized)
+        {
+            return Err(StorageError::Refused(RefusalReason::LeaseUnavailable));
+        }
+        match generation.reuse_state {
+            CargoReuseState::Reusable => {}
+            CargoReuseState::Pending => {
+                return Err(StorageError::Refused(RefusalReason::OrdinaryCargoPending));
+            }
+            CargoReuseState::ColdOnly => {
+                return Err(StorageError::Refused(RefusalReason::OrdinaryCargoColdOnly));
+            }
+            CargoReuseState::Empty => {
+                return Err(StorageError::Refused(
+                    RefusalReason::OrdinaryCargoIncompatible,
+                ));
+            }
+        }
+        if !handoff_requests_compatible(&request.prior_request, &request.successor_request) {
+            return Err(StorageError::Refused(
+                RefusalReason::OrdinaryCargoIncompatible,
+            ));
+        }
+        if slot.partition
+            != normalized_ordinary_acquire(&request.successor_request.acquire)
+                .envelope
+                .partition
+        {
+            return Err(StorageError::Refused(
+                RefusalReason::OrdinaryCargoIncompatible,
+            ));
+        }
+        if request.source_transition.invalidation_declaration_digest
+            != invalidation_digest_from_stable_reference(
+                &request.successor_request.acceptance.acceptance_reference,
+            )
+            .unwrap_or_default()
+        {
+            return Err(StorageError::Refused(
+                RefusalReason::OrdinaryCargoIncompatible,
+            ));
+        }
+        if !self.authority.verify_ordinary_cargo_handoff(&request) {
+            return Err(StorageError::Unauthorized);
+        }
+        if !self.ordinary_request_is_authorized(&request.successor_request) {
+            return Err(StorageError::Unauthorized);
+        }
+        if self.ledger.handoffs.len() >= MAX_LEDGER_HANDOFFS {
+            return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+        }
+        let reuse_state = generation.reuse_state;
+        let transition_reference = request.source_transition.transition_reference.clone();
+        {
+            let slot = self.slot_by_id_mut(&request.slot_id)?;
+            let ordinary = slot.ordinary_cargo.as_mut().ok_or(StorageError::Conflict)?;
+            ordinary.root = request.successor_request.root.clone();
+            ordinary.acceptance_reference = request
+                .successor_request
+                .acceptance
+                .acceptance_reference
+                .clone();
+        }
+        self.ledger.handoffs.push(OrdinaryCargoHandoffRecord {
+            prior_request: persisted.prior_request,
+            successor_request: persisted.successor_request,
+            retention: persisted.retention,
+            source_transition: persisted.source_transition,
+            prior_closure_reference: request.prior_closure_reference.clone(),
+            successor_assignment_reference: request.successor_assignment_reference.clone(),
+            slot_id: request.slot_id.clone(),
+            storage_instance_id: self.ledger.storage_instance_id.clone(),
+            generation: request.generation.clone(),
+            handoff_id: request.handoff_id.clone(),
+            handoff_version: request.handoff_version,
+            request_digest,
+            reuse_state,
+            transition_reference,
+        });
+        self.persist()?;
+        let record = self
+            .ledger
+            .handoffs
+            .iter()
+            .find(|record| {
+                record.slot_id == request.slot_id
+                    && record.generation == request.generation
+                    && record.handoff_id == request.handoff_id
+            })
+            .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+        Ok(handoff_receipt(record))
+    }
+
+    /// Reads an exact handoff result without changing state or access.
+    /// `Absent` was never recorded; `Present` replays the durable receipt.
+    pub(super) fn lookup_handoff_ordinary_cargo(
+        &self,
+        request: OrdinaryCargoHandoffRequest,
+    ) -> Result<LookupResult<OrdinaryCargoHandoffReceipt>, StorageError> {
+        self.ensure_healthy()?;
+        validate_handoff_request(&request)?;
+        validate_canonical_source_root(&request.successor_request.root)?;
+        if !self.authority.verify_ordinary_cargo_handoff(&request) {
+            return Err(StorageError::Unauthorized);
+        }
+        let request_digest = digest_encoded(&request)?;
+        let persisted = persisted_handoff_request(&request);
+        match self.ledger.handoffs.iter().find(|record| {
+            record.slot_id == request.slot_id
+                && record.generation == request.generation
+                && record.handoff_id == request.handoff_id
+        }) {
+            Some(record) => {
+                let persisted_record = OrdinaryCargoHandoffRequest {
+                    prior_request: record.prior_request.clone(),
+                    successor_request: record.successor_request.clone(),
+                    slot_id: record.slot_id.clone(),
+                    storage_instance_id: record.storage_instance_id.clone(),
+                    generation: record.generation.clone(),
+                    handoff_id: record.handoff_id.clone(),
+                    handoff_version: record.handoff_version,
+                    retention: record.retention.clone(),
+                    source_transition: record.source_transition.clone(),
+                    prior_closure_reference: record.prior_closure_reference.clone(),
+                    successor_assignment_reference: record.successor_assignment_reference.clone(),
+                    credential: Credential::new("verified"),
+                };
+                if persisted_record != persisted || record.request_digest != request_digest {
+                    return Err(StorageError::Conflict);
+                }
+                Ok(LookupResult::Present(handoff_receipt(record)))
+            }
+            None => Ok(LookupResult::Absent),
+        }
+    }
+
     pub(super) fn reconcile(
         &mut self,
         lease_id: &str,
@@ -2496,10 +2830,13 @@ impl Store {
     fn ordinary_request_is_authorized(&self, request: &OrdinaryCargoRequest) -> bool {
         self.authority.verify_admission(&request.acquire.envelope)
             && self.authority.verify_ordinary_cargo_admission(request)
-            && (request.acceptance.policy_version != ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
-                || self
-                    .authority
-                    .verify_ordinary_cargo_stable_reuse_policy(request))
+            && (!matches!(
+                request.acceptance.policy_version,
+                ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
+                    | ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION
+            ) || self
+                .authority
+                .verify_ordinary_cargo_stable_reuse_policy(request))
     }
 
     fn slot_by_id(&self, id: &str) -> Result<&Slot, StorageError> {
@@ -2661,8 +2998,10 @@ fn validate_ordinary_request(request: &OrdinaryCargoRequest) -> Result<(), Stora
             "ordinary Cargo source root must be absolute",
         ));
     }
-    if request.acceptance.policy_version == ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
-        && !ordinary_request_stable_reference_is_valid(request)
+    if matches!(
+        request.acceptance.policy_version,
+        ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION | ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION
+    ) && !ordinary_request_stable_reference_is_valid(request)
     {
         return Err(StorageError::InvalidInput(
             "ordinary Cargo stable reuse reference does not match its compatibility identity",
@@ -2694,16 +3033,21 @@ struct StableReuseReferenceMaterial<'a> {
     qualified_invalidation_declaration_digest: &'a str,
 }
 
-/// Builds the typed v2 acceptance reference for an installed compatibility
-/// and invalidation policy. Storage recomputes this value and still requires
-/// the accepting authority to approve it.
+/// Builds the typed stable acceptance reference for an installed
+/// compatibility and invalidation policy. Version 2 and handoff-eligible
+/// version 3 share field semantics; version 3 uses its own schema prefix so
+/// legacy records are never relabelled. Storage recomputes this value and
+/// still requires the accepting authority to approve it.
 pub fn ordinary_cargo_stable_reuse_reference(
     request: &OrdinaryCargoRequest,
     qualified_invalidation_declaration_digest: &str,
 ) -> Result<String, StorageError> {
-    if request.acceptance.policy_version != ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION {
+    if !matches!(
+        request.acceptance.policy_version,
+        ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION | ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION
+    ) {
         return Err(StorageError::InvalidInput(
-            "stable reuse references require ordinary Cargo policy version 2",
+            "stable reuse references require ordinary Cargo policy version 2 or 3",
         ));
     }
     stable_reuse_reference_for_parts(
@@ -2724,11 +3068,13 @@ fn stable_reuse_reference_for_parts(
     installation_epoch: &str,
     qualified_invalidation_declaration_digest: &str,
 ) -> Result<String, StorageError> {
-    if policy_version != ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
-        || !canonical_sha256_digest(qualified_invalidation_declaration_digest)
+    if !matches!(
+        policy_version,
+        ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION | ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION
+    ) || !canonical_sha256_digest(qualified_invalidation_declaration_digest)
     {
         return Err(StorageError::InvalidInput(
-            "stable reuse reference requires policy v2 and a canonical invalidation digest",
+            "stable reuse reference requires policy v2/v3 and a canonical invalidation digest",
         ));
     }
     let mut features: Vec<_> = cargo_partition
@@ -2737,8 +3083,23 @@ fn stable_reuse_reference_for_parts(
         .map(String::as_str)
         .collect();
     features.sort_unstable();
+    let (schema, prefix) = match policy_version {
+        ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION => (
+            "oxide.ordinary-cargo.stable-reuse.v2",
+            "oxide-ordinary-cargo-stable-eligibility-v2",
+        ),
+        ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION => (
+            "oxide.ordinary-cargo.stable-reuse.v3",
+            "oxide-ordinary-cargo-stable-eligibility-v3",
+        ),
+        _ => {
+            return Err(StorageError::InvalidInput(
+                "stable reuse reference requires policy v2/v3 and a canonical invalidation digest",
+            ));
+        }
+    };
     let material = StableReuseReferenceMaterial {
-        schema: "oxide.ordinary-cargo.stable-reuse.v2",
+        schema,
         policy_version,
         source_root_path_hex: digest_hex(root.source_root.as_os_str().as_bytes()),
         consumer_root_id: &root.consumer_root_id,
@@ -2762,7 +3123,7 @@ fn stable_reuse_reference_for_parts(
         .map_err(|_| StorageError::Protocol("stable reuse identity encoding failed"))?;
     let compatibility_digest = format!("sha256:{}", digest_hex(&Sha256::digest(encoded)));
     Ok(format!(
-        "oxide-ordinary-cargo-stable-eligibility-v2/{qualified_invalidation_declaration_digest}/{compatibility_digest}"
+        "{prefix}/{qualified_invalidation_declaration_digest}/{compatibility_digest}"
     ))
 }
 
@@ -2782,7 +3143,8 @@ fn ordinary_generation_stable_reference_is_valid(
 ) -> bool {
     match generation.policy_version {
         ORDINARY_CARGO_POLICY_VERSION => true,
-        ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION => {
+        ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
+        | ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION => {
             let Some(invalidation_digest) =
                 invalidation_digest_from_stable_reference(&generation.acceptance_reference)
             else {
@@ -2811,19 +3173,26 @@ fn ordinary_generation_matches_request(
         && generation.policy_version == request.acceptance.policy_version
         && generation.installation_epoch == request.acceptance.installation_epoch
         && generation.acceptance_reference == request.acceptance.acceptance_reference
-        && (request.acceptance.policy_version == ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
-            || generation.input_boundary_digest == request.acceptance.input_boundary_digest)
+        && (matches!(
+            request.acceptance.policy_version,
+            ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
+                | ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION
+        ) || generation.input_boundary_digest == request.acceptance.input_boundary_digest)
 }
 
 fn supported_ordinary_cargo_policy_version(policy_version: u32) -> bool {
     matches!(
         policy_version,
-        ORDINARY_CARGO_POLICY_VERSION | ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
+        ORDINARY_CARGO_POLICY_VERSION
+            | ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
+            | ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION
     )
 }
 
 fn invalidation_digest_from_stable_reference(reference: &str) -> Option<&str> {
-    let identity = reference.strip_prefix("oxide-ordinary-cargo-stable-eligibility-v2/")?;
+    let identity = reference
+        .strip_prefix("oxide-ordinary-cargo-stable-eligibility-v2/")
+        .or_else(|| reference.strip_prefix("oxide-ordinary-cargo-stable-eligibility-v3/"))?;
     let (invalidation_digest, compatibility_digest) = identity.split_once('/')?;
     if canonical_sha256_digest(invalidation_digest) && canonical_sha256_digest(compatibility_digest)
     {
@@ -2927,7 +3296,7 @@ fn retirement_receipt(tombstone: &OrdinaryCargoTombstone) -> OrdinaryCargoRetire
 /// A lease issued for a live generation stays consistent with its tombstone
 /// after retirement: same root allocation, partition, policy, installation,
 /// and acceptance. Version 1 additionally pins the exact input digest;
-/// version 2 pins the stable eligibility reference instead, while each
+/// versions 2 and 3 pin the stable eligibility reference instead, while each
 /// exact attempt remains bound by its own request digest.
 fn ordinary_lease_matches_tombstone(
     request: &OrdinaryCargoRequest,
@@ -2938,14 +3307,83 @@ fn ordinary_lease_matches_tombstone(
         && request.acceptance.policy_version == tombstone.policy_version
         && request.acceptance.installation_epoch == tombstone.installation_epoch
         && request.acceptance.acceptance_reference == tombstone.acceptance_reference
-        && (request.acceptance.policy_version == ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
-            || request.acceptance.input_boundary_digest == tombstone.input_boundary_digest)
+        && (matches!(
+            request.acceptance.policy_version,
+            ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
+                | ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION
+        ) || request.acceptance.input_boundary_digest == tombstone.input_boundary_digest)
+}
+
+/// A finalized pre-handoff lease keeps its own prior root/allocation/source
+/// request. It validates against the recorded handoff prior for its slot
+/// instead of being overwritten to match the successor generation.
+fn ordinary_lease_matches_handoff_history(
+    handoffs: &[OrdinaryCargoHandoffRecord],
+    slot_id: &str,
+    request: &OrdinaryCargoRequest,
+) -> bool {
+    handoffs.iter().any(|record| {
+        record.slot_id == slot_id && ordinary_handoff_prior_matches_request(record, request)
+    })
+}
+
+fn ordinary_handoff_prior_matches_request(
+    record: &OrdinaryCargoHandoffRecord,
+    request: &OrdinaryCargoRequest,
+) -> bool {
+    record.prior_request.root == request.root
+        && record.prior_request.partition == request.partition
+        && record.prior_request.acceptance.policy_version == request.acceptance.policy_version
+        && record.prior_request.acceptance.installation_epoch
+            == request.acceptance.installation_epoch
+        && record.prior_request.acceptance.acceptance_reference
+            == request.acceptance.acceptance_reference
+        && (matches!(
+            request.acceptance.policy_version,
+            ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
+                | ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION
+        ) || record.prior_request.acceptance.input_boundary_digest
+            == request.acceptance.input_boundary_digest)
+}
+
+fn validate_handoff_record(record: &OrdinaryCargoHandoffRecord) -> Result<(), StorageError> {
+    validate_ordinary_request(&record.prior_request)?;
+    validate_ordinary_request(&record.successor_request)?;
+    if record.handoff_version != ORDINARY_CARGO_HANDOFF_VERSION {
+        return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+    }
+    if !valid_slot_id(&record.slot_id)
+        || !valid_storage_instance_id(&record.storage_instance_id)
+        || parse_generation(&record.generation).is_err()
+        || record.generation != slot_generation(&record.slot_id)?
+    {
+        return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+    }
+    validate_text(&record.handoff_id)?;
+    validate_text(&record.prior_closure_reference)?;
+    validate_text(&record.successor_assignment_reference)?;
+    validate_retention(&record.retention)?;
+    validate_source_transition(&record.source_transition)?;
+    if !valid_hash(&record.request_digest) {
+        return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+    }
+    if !matches!(
+        record.reuse_state,
+        CargoReuseState::Reusable | CargoReuseState::ColdOnly
+    ) {
+        return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+    }
+    if !handoff_requests_compatible(&record.prior_request, &record.successor_request) {
+        return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+    }
+    Ok(())
 }
 
 fn tombstone_stable_reference_is_valid(tombstone: &OrdinaryCargoTombstone) -> bool {
     match tombstone.policy_version {
         ORDINARY_CARGO_POLICY_VERSION => true,
-        ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION => {
+        ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
+        | ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION => {
             let Some(invalidation_digest) =
                 invalidation_digest_from_stable_reference(&tombstone.acceptance_reference)
             else {
@@ -2994,6 +3432,218 @@ fn validate_retire_request(request: &OrdinaryCargoRetireRequest) -> Result<(), S
     }
     validate_text(&request.retire_id)?;
     validate_retention(&request.retention)
+}
+
+/// Required relevant input classes the handoff owner must qualify. Storage
+/// enforces presence; the installed authority verifies completeness for the
+/// real workflow.
+const HANDOFF_REQUIRED_INPUT_CLASSES: [&str; 8] = [
+    "manifest",
+    "lock",
+    "config",
+    "generated",
+    "build-script",
+    "proc-macro",
+    "native",
+    "dependency",
+];
+
+fn validate_source_transition(
+    transition: &OrdinaryCargoSourceTransition,
+) -> Result<(), StorageError> {
+    for value in [
+        transition.prior_commit.as_str(),
+        transition.prior_tree_digest.as_str(),
+        transition.prior_content_digest.as_str(),
+        transition.successor_commit.as_str(),
+        transition.successor_tree_digest.as_str(),
+        transition.successor_content_digest.as_str(),
+        transition.transition_reference.as_str(),
+        transition.invalidation_declaration_digest.as_str(),
+    ] {
+        validate_text(value)?;
+    }
+    for digest in [
+        &transition.prior_tree_digest,
+        &transition.prior_content_digest,
+        &transition.successor_tree_digest,
+        &transition.successor_content_digest,
+        &transition.invalidation_declaration_digest,
+    ] {
+        if !valid_digest(digest) {
+            return Err(StorageError::InvalidInput(
+                "ordinary Cargo handoff source digests must be SHA-256 digests",
+            ));
+        }
+    }
+    if transition.qualified_input_classes.is_empty()
+        || transition.qualified_input_classes.len() > 32
+    {
+        return Err(StorageError::InvalidInput(
+            "ordinary Cargo handoff must name its qualified input classes",
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for class in &transition.qualified_input_classes {
+        validate_text(class)?;
+        if !seen.insert(class.as_str()) {
+            return Err(StorageError::InvalidInput(
+                "ordinary Cargo handoff input classes must be unique",
+            ));
+        }
+    }
+    for required in HANDOFF_REQUIRED_INPUT_CLASSES {
+        if !seen.contains(required) {
+            return Err(StorageError::Refused(
+                RefusalReason::OrdinaryCargoIncompatible,
+            ));
+        }
+    }
+    if !transition.mtime_qualified {
+        return Err(StorageError::Refused(
+            RefusalReason::OrdinaryCargoIncompatible,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_handoff_request(request: &OrdinaryCargoHandoffRequest) -> Result<(), StorageError> {
+    validate_ordinary_request(&request.prior_request)?;
+    validate_ordinary_request(&request.successor_request)?;
+    if request.handoff_version != ORDINARY_CARGO_HANDOFF_VERSION {
+        return Err(StorageError::InvalidInput(
+            "unsupported ordinary Cargo handoff version",
+        ));
+    }
+    if !valid_slot_id(&request.slot_id) {
+        return Err(StorageError::InvalidInput(
+            "ordinary Cargo handoff needs a known slot identity",
+        ));
+    }
+    if !valid_storage_instance_id(&request.storage_instance_id) {
+        return Err(StorageError::InvalidInput(
+            "ordinary Cargo handoff needs a known storage instance",
+        ));
+    }
+    if parse_generation(&request.generation).is_err() {
+        return Err(StorageError::InvalidInput(
+            "ordinary Cargo handoff needs a canonical generation",
+        ));
+    }
+    validate_text(&request.handoff_id)?;
+    validate_text(&request.prior_closure_reference)?;
+    validate_text(&request.successor_assignment_reference)?;
+    validate_text(request.credential.expose())?;
+    validate_retention(&request.retention)?;
+    validate_source_transition(&request.source_transition)
+}
+
+/// Cross-allocation compatibility for one handoff: same canonical physical
+/// path, same stable owner root, different allocation epochs, same ordinary
+/// partition, same full compatibility partition, same installation epoch,
+/// same qualified invalidation declaration, and handoff-eligible policy on
+/// both sides. Task/workspace/run/attempt, source revision, command, and
+/// per-attempt input boundaries intentionally differ.
+fn handoff_requests_compatible(
+    prior: &OrdinaryCargoRequest,
+    successor: &OrdinaryCargoRequest,
+) -> bool {
+    if prior.acceptance.policy_version != ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION
+        || successor.acceptance.policy_version != ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION
+    {
+        return false;
+    }
+    if prior.root.source_root != successor.root.source_root
+        || prior.root.consumer_root_id != successor.root.consumer_root_id
+        || prior.root.allocation_epoch == successor.root.allocation_epoch
+    {
+        return false;
+    }
+    if prior.partition != successor.partition
+        || prior.acquire.envelope.partition != successor.acquire.envelope.partition
+        || prior.acceptance.installation_epoch != successor.acceptance.installation_epoch
+    {
+        return false;
+    }
+    let Some(prior_invalidation) =
+        invalidation_digest_from_stable_reference(&prior.acceptance.acceptance_reference)
+    else {
+        return false;
+    };
+    let Some(successor_invalidation) =
+        invalidation_digest_from_stable_reference(&successor.acceptance.acceptance_reference)
+    else {
+        return false;
+    };
+    if prior_invalidation != successor_invalidation {
+        return false;
+    }
+    // Both references already recomputed valid by the caller; compatibility
+    // additionally requires the same invalidation declaration and identical
+    // compatibility material modulo the allocation epoch.
+    stable_reuse_compatibility_without_epoch(prior)
+        == stable_reuse_compatibility_without_epoch(successor)
+}
+
+/// Compatibility material with the allocation epoch removed: used only to
+/// compare prior and successor handoff sides. The durable v2/v3 reference
+/// computation itself always keeps the epoch; this helper never persists.
+fn stable_reuse_compatibility_without_epoch(request: &OrdinaryCargoRequest) -> String {
+    let partition = &request.acquire.envelope.partition;
+    let mut features: Vec<_> = partition.features.iter().map(String::as_str).collect();
+    features.sort_unstable();
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{:?}|{}|{}|{}|{}|{}|{}",
+        hex_path(&request.root.source_root),
+        request.root.consumer_root_id,
+        request.partition.label(),
+        partition.project_component,
+        partition.workflow,
+        partition.cargo_provenance,
+        partition.rustc_provenance,
+        features,
+        partition.host,
+        partition.target,
+        partition.profile,
+        partition.config_digest,
+        partition.environment_digest,
+        request.acceptance.installation_epoch,
+    )
+}
+
+fn hex_path(path: &Path) -> String {
+    digest_hex(path.as_os_str().as_bytes())
+}
+
+fn persisted_source_transition(
+    transition: &OrdinaryCargoSourceTransition,
+) -> OrdinaryCargoSourceTransition {
+    transition.clone()
+}
+
+fn persisted_handoff_request(request: &OrdinaryCargoHandoffRequest) -> OrdinaryCargoHandoffRequest {
+    let mut request = request.clone();
+    request.prior_request = persisted_ordinary_request(&request.prior_request);
+    request.successor_request = persisted_ordinary_request(&request.successor_request);
+    request.retention = persisted_retention(&request.retention);
+    request.credential = Credential::new("verified");
+    request.source_transition = persisted_source_transition(&request.source_transition);
+    request
+}
+
+fn handoff_receipt(record: &OrdinaryCargoHandoffRecord) -> OrdinaryCargoHandoffReceipt {
+    OrdinaryCargoHandoffReceipt {
+        handoff_version: record.handoff_version,
+        prior_root: record.prior_request.root.clone(),
+        successor_root: record.successor_request.root.clone(),
+        partition: record.successor_request.partition.clone(),
+        slot_id: record.slot_id.clone(),
+        storage_instance_id: record.storage_instance_id.clone(),
+        generation: record.generation.clone(),
+        handoff_id: record.handoff_id.clone(),
+        reuse_state: record.reuse_state,
+        transition_reference: record.transition_reference.clone(),
+    }
 }
 
 fn normalized_ordinary_acquire(request: &AcquireRequest) -> AcquireRequest {
@@ -3591,6 +4241,46 @@ impl Decode for OrdinaryCargoTombstone {
     }
 }
 
+impl Encode for OrdinaryCargoHandoffRecord {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        self.prior_request.encode(writer)?;
+        self.successor_request.encode(writer)?;
+        self.retention.encode(writer)?;
+        self.source_transition.encode(writer)?;
+        self.prior_closure_reference.encode(writer)?;
+        self.successor_assignment_reference.encode(writer)?;
+        self.slot_id.encode(writer)?;
+        self.storage_instance_id.encode(writer)?;
+        self.generation.encode(writer)?;
+        self.handoff_id.encode(writer)?;
+        writer.u32(self.handoff_version);
+        self.request_digest.encode(writer)?;
+        self.reuse_state.encode(writer)?;
+        self.transition_reference.encode(writer)
+    }
+}
+
+impl Decode for OrdinaryCargoHandoffRecord {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        Ok(Self {
+            prior_request: OrdinaryCargoRequest::decode(reader)?,
+            successor_request: OrdinaryCargoRequest::decode(reader)?,
+            retention: OrdinaryCargoRetention::decode(reader)?,
+            source_transition: OrdinaryCargoSourceTransition::decode(reader)?,
+            prior_closure_reference: String::decode(reader)?,
+            successor_assignment_reference: String::decode(reader)?,
+            slot_id: String::decode(reader)?,
+            storage_instance_id: String::decode(reader)?,
+            generation: String::decode(reader)?,
+            handoff_id: String::decode(reader)?,
+            handoff_version: reader.u32()?,
+            request_digest: String::decode(reader)?,
+            reuse_state: CargoReuseState::decode(reader)?,
+            transition_reference: String::decode(reader)?,
+        })
+    }
+}
+
 impl Encode for OrdinaryCargoGeneration {
     fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
         self.root.encode(writer)?;
@@ -3926,7 +4616,8 @@ impl Encode for Ledger {
         encode_vec(writer, &self.leases)?;
         encode_vec(writer, &self.operations)?;
         encode_vec(writer, &self.retirements)?;
-        encode_vec(writer, &self.tombstones)
+        encode_vec(writer, &self.tombstones)?;
+        encode_vec(writer, &self.handoffs)
     }
 }
 
@@ -3943,6 +4634,7 @@ impl Decode for Ledger {
             operations: decode_vec(reader)?,
             retirements: decode_vec(reader)?,
             tombstones: decode_vec(reader)?,
+            handoffs: decode_vec(reader)?,
         })
     }
 }

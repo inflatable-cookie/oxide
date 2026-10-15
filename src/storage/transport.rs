@@ -69,6 +69,20 @@ pub(super) fn send_ordinary_finalize_and_forget(
 }
 
 #[cfg(test)]
+pub(super) fn send_ordinary_handoff_and_forget(
+    socket_path: &std::path::Path,
+    request: OrdinaryCargoHandoffRequest,
+) -> Result<(), StorageError> {
+    let mut stream = UnixStream::connect(socket_path).map_err(io_error)?;
+    let mut writer = Writer::new();
+    encode_protocol_header(&mut writer)?;
+    Request::HandoffOrdinaryCargo(request).encode(&mut writer)?;
+    write_frame(&mut stream, writer.finish())?;
+    let _discarded_response = read_frame(&mut stream)?;
+    Ok(())
+}
+
+#[cfg(test)]
 pub(super) fn send_legacy_acquire_and_forget(
     socket_path: &std::path::Path,
     request: AcquireRequest,
@@ -239,6 +253,38 @@ impl Client {
         }
     }
 
+    /// Hands one proven-idle reusable ordinary generation from a closed prior
+    /// allocation to an assigned successor allocation at the same canonical
+    /// physical source root. The same instance/slot/generation identity and
+    /// bytes are preserved. Grants no writer access and runs no command.
+    pub fn handoff_ordinary_cargo(
+        &self,
+        request: OrdinaryCargoHandoffRequest,
+    ) -> Result<OrdinaryCargoHandoffReceipt, StorageError> {
+        match self.call(Request::HandoffOrdinaryCargo(request))? {
+            Response::HandoffOrdinaryCargo(result) => result,
+            _ => Err(StorageError::Protocol(
+                "unexpected ordinary Cargo handoff response",
+            )),
+        }
+    }
+
+    /// Reads an exact handoff result without changing state or access.
+    /// `Absent` was never recorded; `Present` replays the durable receipt.
+    /// Lookup never allocates, returns no path or token, and grants no
+    /// writer access.
+    pub fn lookup_handoff_ordinary_cargo(
+        &self,
+        request: OrdinaryCargoHandoffRequest,
+    ) -> Result<LookupResult<OrdinaryCargoHandoffReceipt>, StorageError> {
+        match self.call(Request::LookupHandoffOrdinaryCargo(request))? {
+            Response::LookupHandoffOrdinaryCargo(result) => result,
+            _ => Err(StorageError::Protocol(
+                "unexpected ordinary Cargo handoff lookup response",
+            )),
+        }
+    }
+
     /// Reads an exact ordinary retirement result without changing state or
     /// access. `Absent` was never recorded; `Present` replays the durable
     /// tombstone receipt; `Uncertain(None)` reports a recorded intent whose
@@ -353,6 +399,8 @@ enum Request {
     LookupFinalizeOrdinaryCargo(OrdinaryCargoFinalizeRequest),
     RetireOrdinaryCargo(OrdinaryCargoRetireRequest),
     LookupRetireOrdinaryCargo(OrdinaryCargoRetireRequest),
+    HandoffOrdinaryCargo(OrdinaryCargoHandoffRequest),
+    LookupHandoffOrdinaryCargo(OrdinaryCargoHandoffRequest),
     Evict {
         request_id: String,
         target_bytes: u64,
@@ -400,6 +448,14 @@ impl Encode for Request {
             }
             Self::LookupRetireOrdinaryCargo(request) => {
                 writer.u8(14);
+                request.encode(writer)?;
+            }
+            Self::HandoffOrdinaryCargo(request) => {
+                writer.u8(15);
+                request.encode(writer)?;
+            }
+            Self::LookupHandoffOrdinaryCargo(request) => {
+                writer.u8(16);
                 request.encode(writer)?;
             }
             Self::Finalize {
@@ -474,6 +530,12 @@ impl Decode for Request {
             14 => Ok(Self::LookupRetireOrdinaryCargo(
                 OrdinaryCargoRetireRequest::decode(reader)?,
             )),
+            15 => Ok(Self::HandoffOrdinaryCargo(
+                OrdinaryCargoHandoffRequest::decode(reader)?,
+            )),
+            16 => Ok(Self::LookupHandoffOrdinaryCargo(
+                OrdinaryCargoHandoffRequest::decode(reader)?,
+            )),
             4 => Ok(Self::Finalize {
                 lease_id: String::decode(reader)?,
                 token: decode_token(reader)?,
@@ -515,6 +577,8 @@ enum Response {
     ),
     RetireOrdinaryCargo(Result<OrdinaryCargoRetirementReceipt, StorageError>),
     LookupRetireOrdinaryCargo(Result<LookupResult<OrdinaryCargoRetirementReceipt>, StorageError>),
+    HandoffOrdinaryCargo(Result<OrdinaryCargoHandoffReceipt, StorageError>),
+    LookupHandoffOrdinaryCargo(Result<LookupResult<OrdinaryCargoHandoffReceipt>, StorageError>),
     Evict(Result<u64, StorageError>),
     Error(StorageError),
 }
@@ -570,6 +634,14 @@ impl Encode for Response {
                 writer.u8(14);
                 encode_result(writer, result, encode_ordinary_retirement_lookup)?;
             }
+            Self::HandoffOrdinaryCargo(result) => {
+                writer.u8(15);
+                encode_result(writer, result, encode_ordinary_handoff)?;
+            }
+            Self::LookupHandoffOrdinaryCargo(result) => {
+                writer.u8(16);
+                encode_result(writer, result, encode_ordinary_handoff_lookup)?;
+            }
             Self::Evict(result) => {
                 writer.u8(5);
                 encode_result(writer, result, |writer, value| value.encode(writer))?;
@@ -623,6 +695,14 @@ impl Decode for Response {
             14 => Ok(Self::LookupRetireOrdinaryCargo(decode_result(
                 reader,
                 decode_ordinary_retirement_lookup,
+            ))),
+            15 => Ok(Self::HandoffOrdinaryCargo(decode_result(
+                reader,
+                decode_ordinary_handoff,
+            ))),
+            16 => Ok(Self::LookupHandoffOrdinaryCargo(decode_result(
+                reader,
+                decode_ordinary_handoff_lookup,
             ))),
             _ => Err(StorageError::Protocol("unknown response")),
         }
@@ -706,6 +786,12 @@ pub(crate) fn serve_one(mut stream: UnixStream, store: &mut Store) -> Result<(),
         }
         Request::LookupRetireOrdinaryCargo(request) => {
             Response::LookupRetireOrdinaryCargo(store.lookup_retire_ordinary_cargo(request))
+        }
+        Request::HandoffOrdinaryCargo(request) => {
+            Response::HandoffOrdinaryCargo(store.handoff_ordinary_cargo(request))
+        }
+        Request::LookupHandoffOrdinaryCargo(request) => {
+            Response::LookupHandoffOrdinaryCargo(store.lookup_handoff_ordinary_cargo(request))
         }
         Request::Evict {
             request_id,
@@ -1420,6 +1506,88 @@ fn validate_ordinary_retirement_lookup_state(
         LookupResult::Present(receipt) if valid_retirement_receipt(receipt) => Ok(()),
         _ => Err(StorageError::Protocol(
             "ordinary Cargo retire lookup result does not match operation state",
+        )),
+    }
+}
+
+fn encode_ordinary_handoff(
+    writer: &mut Writer,
+    receipt: &OrdinaryCargoHandoffReceipt,
+) -> Result<(), StorageError> {
+    writer.u32(receipt.handoff_version);
+    receipt.prior_root.encode(writer)?;
+    receipt.successor_root.encode(writer)?;
+    receipt.partition.encode(writer)?;
+    receipt.slot_id.encode(writer)?;
+    receipt.storage_instance_id.encode(writer)?;
+    receipt.generation.encode(writer)?;
+    receipt.handoff_id.encode(writer)?;
+    receipt.reuse_state.encode(writer)?;
+    receipt.transition_reference.encode(writer)
+}
+
+fn decode_ordinary_handoff(
+    reader: &mut Reader<'_>,
+) -> Result<OrdinaryCargoHandoffReceipt, StorageError> {
+    let receipt = OrdinaryCargoHandoffReceipt {
+        handoff_version: reader.u32()?,
+        prior_root: StrictPhysicalCargoRoot::decode(reader)?,
+        successor_root: StrictPhysicalCargoRoot::decode(reader)?,
+        partition: OrdinaryCargoPartition::decode(reader)?,
+        slot_id: String::decode(reader)?,
+        storage_instance_id: String::decode(reader)?,
+        generation: String::decode(reader)?,
+        handoff_id: String::decode(reader)?,
+        reuse_state: CargoReuseState::decode(reader)?,
+        transition_reference: String::decode(reader)?,
+    };
+    if receipt.handoff_version != ORDINARY_CARGO_HANDOFF_VERSION || !valid_handoff_receipt(&receipt)
+    {
+        return Err(StorageError::Protocol(
+            "ordinary Cargo handoff receipt is not canonical",
+        ));
+    }
+    Ok(receipt)
+}
+
+fn encode_ordinary_handoff_lookup(
+    writer: &mut Writer,
+    result: &LookupResult<OrdinaryCargoHandoffReceipt>,
+) -> Result<(), StorageError> {
+    validate_ordinary_handoff_lookup_state(result)?;
+    encode_lookup_result(writer, result, encode_ordinary_handoff)
+}
+
+fn decode_ordinary_handoff_lookup(
+    reader: &mut Reader<'_>,
+) -> Result<LookupResult<OrdinaryCargoHandoffReceipt>, StorageError> {
+    let result = decode_lookup_result(reader, decode_ordinary_handoff)?;
+    validate_ordinary_handoff_lookup_state(&result)?;
+    Ok(result)
+}
+
+fn valid_handoff_receipt(receipt: &OrdinaryCargoHandoffReceipt) -> bool {
+    matches!(
+        receipt.reuse_state,
+        CargoReuseState::Reusable | CargoReuseState::ColdOnly
+    ) && slot_ordinal(&receipt.slot_id)
+        .is_some_and(|ordinal| ordinal.to_string() == receipt.generation)
+        && valid_storage_instance_id(&receipt.storage_instance_id)
+        && !receipt.handoff_id.is_empty()
+        && !receipt.transition_reference.is_empty()
+        && receipt.prior_root.source_root == receipt.successor_root.source_root
+        && receipt.prior_root.consumer_root_id == receipt.successor_root.consumer_root_id
+        && receipt.prior_root.allocation_epoch != receipt.successor_root.allocation_epoch
+}
+
+fn validate_ordinary_handoff_lookup_state(
+    result: &LookupResult<OrdinaryCargoHandoffReceipt>,
+) -> Result<(), StorageError> {
+    match result {
+        LookupResult::Absent => Ok(()),
+        LookupResult::Present(receipt) if valid_handoff_receipt(receipt) => Ok(()),
+        _ => Err(StorageError::Protocol(
+            "ordinary Cargo handoff lookup result does not match operation state",
         )),
     }
 }

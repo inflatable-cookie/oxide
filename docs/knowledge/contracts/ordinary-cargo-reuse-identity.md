@@ -18,6 +18,15 @@ generation cannot be relabelled or upgraded by a v2 request; mismatched
 versions are incompatible. Unsupported policy versions and malformed v2
 references refuse.
 
+`ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION` is version 3. It admits
+and settles exactly like version 2 within one allocation epoch, and
+additionally opts its generation in to the explicit owner-authenticated
+cross-allocation handoff defined in the [ordinary-Cargo storage
+contract](ordinary-cargo-storage.md#handing-a-reusable-generation-across-task-allocations).
+Versions 1 and 2 are never relabelled, upgraded, or migrated to version 3;
+a handoff naming them refuses as incompatible. `ORDINARY_CARGO_HANDOFF_VERSION`
+is version 1 for the handoff request/receipt shape itself.
+
 ## Stable eligibility reference
 
 Version 2 uses the existing `OrdinaryCargoAcceptance.acceptance_reference`
@@ -87,15 +96,25 @@ the existing success/failure/no-spawn transitions, fixed partition capacity,
 and no eviction. Restart, old exact lookup, exact replay and current finalize
 lookup retain their existing token and uncertainty rules.
 
-The transport protocol stays version 2; ledger version 6 now also records
-the durable backend mode plus ordinary-retirement intents and tombstones,
-and version-5 ledgers refuse without migration. The storage request
-encoding gains the retire and retire-lookup operations (tags 13 and 14)
-with refusal codes 12 and 13; existing encodings are unchanged. The
-explicit per-record `policy_version` selects the semantics.
-Version 1 records retain their old checks. A v2 reference is strictly parsed,
-and any unsupported policy version or ledger/protocol version is refused
-without migration or mutation.
+The transport protocol stays version 2; ledger version 7 now also records
+ordinary-handoff receipts alongside the durable backend mode and
+ordinary-retirement intents and tombstones, and version-6 and older ledgers
+refuse without migration. The storage request encoding gains the retire and
+retire-lookup operations (tags 13 and 14) with refusal codes 12 and 13, plus
+the handoff and handoff-lookup operations (tags 15 and 16) with no new
+refusal codes; existing encodings are unchanged. The explicit per-record
+`policy_version` selects the semantics. Version 1 records retain their old
+checks. A v2/v3 reference is strictly parsed, the allocation epoch is never
+deleted from that computation, and any unsupported policy version or
+ledger/protocol version is refused without migration or mutation.
+
+Version 3 uses schema `oxide.ordinary-cargo.stable-reuse.v3` and prefix
+`oxide-ordinary-cargo-stable-eligibility-v3/` with the same bound fields as
+version 2, including the allocation epoch. Handoff compatibility compares the
+prior and successor sides field-by-field with only the allocation epoch
+allowed to differ; the durable references themselves always keep the epoch.
+Historical leases validate against their own recorded handoff prior, never
+by overwriting old records to match the successor generation.
 
 ## Integration boundary and evidence limits
 

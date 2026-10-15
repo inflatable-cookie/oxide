@@ -83,22 +83,27 @@ stays `pending`; lookup cannot clear it.
 ## Shipped ordinary storage API
 
 The private local transport is `OXSTOR01` protocol version 2. The durable
-ledger keeps the `OXIDEST1` magic and uses version 6, which records the
-durable backend mode (budget-only directory or verified bounded payload)
-plus ordinary-retirement intents and tombstones. Version-5 and other
-unsupported ledgers are refused without migration or mutation. Protocol
-version 1, unversioned frames, and unsupported peers are rejected before
-dispatch. Changing these request or response encodings requires another
-protocol version.
+ledger keeps the `OXIDEST1` magic and uses version 7, which records the
+durable backend mode (budget-only directory or verified bounded payload),
+ordinary-retirement intents and tombstones, plus ordinary-handoff records.
+Version-6 and older ledgers predate cross-allocation handoff and are refused
+without migration or mutation. Protocol version 1, unversioned frames, and
+unsupported peers are rejected before dispatch. Changing these request or
+response encodings requires another protocol version.
 
 `OrdinaryCargoRequest` carries an existing `AcquireRequest`, a
 `StrictPhysicalCargoRoot` (`source_root: PathBuf`, `consumer_root_id`, and
 `allocation_epoch`), one `OrdinaryCargoPartition` (`OrdinaryTest` or
-`FullDebug`), and `OrdinaryCargoAcceptance` (`policy_version == 1` or `2`,
-`installation_epoch`, `acceptance_reference`, SHA-256 `input_boundary_digest`,
-and an opaque credential). Version 1 keeps exact input-boundary digest reuse
-semantics. Version 2 uses the typed stable eligibility reference and separate
-attempt authentication described in [ordinary Cargo reuse identity](ordinary-cargo-reuse-identity.md).
+`FullDebug`), and `OrdinaryCargoAcceptance` (`policy_version == 1`, `2`, or
+`3`, `installation_epoch`, `acceptance_reference`, SHA-256
+`input_boundary_digest`, and an opaque credential). Version 1 keeps exact
+input-boundary digest reuse semantics. Version 2 uses the typed stable
+eligibility reference and separate attempt authentication described in
+[ordinary Cargo reuse identity](ordinary-cargo-reuse-identity.md). Version 3
+is handoff-eligible stable reuse: it admits and settles exactly like version
+2 within one allocation epoch and additionally opts its generation in to one
+explicit owner-authenticated cross-allocation handoff. Versions 1 and 2 are
+never relabelled or migrated; a handoff naming them refuses as incompatible.
 The source root must be an existing canonical absolute physical directory.
 The complete existing `PartitionKey` supplies the compatibility partition;
 the task/run/source identity remains bound in the request but is not a
@@ -133,7 +138,26 @@ pub fn lookup_retire_ordinary_cargo(
     &self,
     request: OrdinaryCargoRetireRequest,
 ) -> Result<LookupResult<OrdinaryCargoRetirementReceipt>, StorageError>
+/// Hands one proven-idle reusable generation from a closed prior
+/// allocation to an assigned successor allocation at the same canonical
+/// physical source root. Same identity and bytes are preserved; no lease,
+/// path, token, command, or Cargo execution is granted.
+pub fn handoff_ordinary_cargo(
+    &self,
+    request: OrdinaryCargoHandoffRequest,
+) -> Result<OrdinaryCargoHandoffReceipt, StorageError>
+/// Reads an exact handoff result without changing state or access.
+pub fn lookup_handoff_ordinary_cargo(
+    &self,
+    request: OrdinaryCargoHandoffRequest,
+) -> Result<LookupResult<OrdinaryCargoHandoffReceipt>, StorageError>
 ```
+
+Handoff and handoff-lookup are `OXSTOR01` version-2 operation tags 15 and
+16; peers predating handoff refuse them as unknown operations. No new
+refusal codes were added: incompatible, pending, cold-only, retiring,
+retired, lease-unavailable, unknown-accounting, unauthorized, and conflict
+cover every handoff refusal.
 
 ## Retiring and replacing a proven-idle ordinary generation
 
@@ -189,6 +213,86 @@ the durable triple, a fresh `retire_id` per retirement, and the genuine
 source/artifact/debug retention acknowledgment from its retention owner.
 No consumer activation, scheduler/wire change, or installation is part of
 this seam.
+
+## Handing a reusable generation across task allocations
+
+One explicit owner-authenticated handoff preserves a useful ordinary-Cargo
+intermediate generation across two fully closed/assigned task allocations at
+the SAME canonical physical source root. The prior allocation closes with all
+writers and grants positively settled; the successor allocation is assigned
+the same physical path and stable owner root (`source_root` plus
+`consumer_root_id`) under a new `allocation_epoch`. The SAME
+`(storage_instance_id, slot_id, generation)` identity and bytes are preserved
+when the accepted handoff commits; whole retirement/replacement remains the
+separate retirement operation with a new ordinal.
+
+`OrdinaryCargoHandoffRequest` carries the exact prior generation body, the
+successor allocation body, the durable triple, an idempotent `handoff_id`,
+`handoff_version == 1`, an `OrdinaryCargoRetention` acknowledgment for the
+independently retained prior source/artifact/debug evidence, an
+`OrdinaryCargoSourceTransition` binding the consumer-owned immutable source
+transition and current-source observation plus the accepted qualified
+complete invalidation policy, the prior-closure and successor-assignment
+references, and an opaque handoff credential. Neither task JSON nor a
+computed digest grants authority: `EvidenceAuthority::verify_ordinary_cargo_handoff`
+(default-denying) authenticates the exact prior tuple, closure, retention,
+successor identity, compatible full partition/install/invalidation policy,
+and qualified transition.
+
+Storage compatibility requires the same canonical physical path and stable
+owner root, different allocation epochs, the same ordinary partition and
+complete `PartitionKey`, the same installation epoch and qualified
+invalidation declaration, and handoff-eligible policy version 3 on the
+recorded generation and both request sides. The physical stable root must
+match; a different root, changed tool/config/environment/profile/features/
+installation, arbitrary same-path replacement, dirty/unknown source, leased/
+pending/uncertain/retiring/cold-only/foreign generation, unqualified or
+missing source transition, unknown relevant input, or insufficient retention
+refuses. Prior writers and grants must be positively closed; age, PID
+disappearance, and lost replies never suffice. Old v1/v2 generations refuse
+as incompatible rather than migrating.
+
+Source transition safety is an explicit authenticated prerequisite, distinct
+from storage compatibility. The owner must account for older/equal-mtime
+changed inputs after checkout replacement across manifests, lock/config,
+generated, build-script, proc-macro, native, and dependency classes; an
+installed authority cannot accept solely because paths or Git heads match.
+Missing, unqualified, or unknown-input transitions refuse warm handoff, with
+ordinary whole-generation retirement and cold admission available only under
+their existing separate grant. Oxide does not traverse arbitrary
+source/tool/SDK roots, alter source mtimes, execute Cargo, or claim that
+metadata fixtures qualify actual Cargo freshness.
+
+The handoff authorization and successor identity persist atomically before
+successor eligibility is published. Duplicate exact replay returns the stored
+receipt; the same operation id with changed body conflicts. Lookup is
+read-only and never allocates or returns a path or token; lost
+credentials/tokens hold. Crash, lost reply, and restart converge to one
+predecessor-to-successor transition without orphaning or dual ownership, and
+competing successor requests cannot both win: the winner replays while a
+stale predecessor refuses. Durable history validates each historical lease
+against its own root/allocation/source request via the recorded handoff,
+rather than overwriting old records. Old acquire/finalize/handoff retries
+stay access-free and cannot reacquire a writer or roll back. The successor
+must still acquire a fresh exclusive lease with its own authenticated
+request; handoff grants no writer access and runs no command.
+Retirement and replay after handoff work against the exact current
+allocation with old history intact. Handoff records are finite control
+history (at most 64 per ledger); exhaustion refuses new handoffs without
+trimming evidence while old receipts still replay. The existing private
+ordinary-Cargo v2 attempt process does not accept v3 semantics; the reviewed
+storage callable is the daemon/client above, and any route adaptation for a
+later front end remains separate work. Synthetic socket fixtures qualify
+storage semantics only; no consumer activation or Nucleus binding exists.
+
+The real consumer verifier must, before accepting this policy, prove prior
+allocation closure with positive writer/grant settlement, independent
+retention and retrievability of the exact prior source/artifact/debug
+closure (including full-debug lookup against retained old bytes), successor
+root assignment at the same canonical path, completeness of the accepted
+invalidation declaration for the pinned workflow and installation (including
+older/equal-mtime input coverage), and genuine Effigy submission/capture
+ownership for every successor attempt.
 
 Acquire responses include the policy version, root, partition, durable reuse
 state, and existing `AcquireResult`. Lookup returns only an access-free lease
