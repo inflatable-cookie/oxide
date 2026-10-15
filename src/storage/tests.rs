@@ -2153,7 +2153,7 @@ fn bounded_backing_binds_startup_ledger_and_refuses_mismatched_reopen() {
     let root = TaskRoot::new();
     let payload = TaskRoot::new();
     let identity = "a".repeat(16);
-    let daemon = start_bounded(root.path(), payload.path(), 128, &identity);
+    let mut daemon = start_bounded(root.path(), payload.path(), 128, &identity);
     let grant = daemon
         .client
         .acquire(request("bounded-bind", "bounded-bind-acquire", 64))
