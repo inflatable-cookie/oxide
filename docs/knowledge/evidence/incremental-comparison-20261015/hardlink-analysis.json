@@ -1,0 +1,18 @@
+{
+  "off": {
+    "cross_directory_shared_inodes": 0,
+    "shared_allocated_bytes": 0,
+    "directory_unique_allocated": {
+      "deps": 1345179648,
+      "incremental": 0
+    }
+  },
+  "on": {
+    "cross_directory_shared_inodes": 968,
+    "shared_allocated_bytes": 368418816,
+    "directory_unique_allocated": {
+      "deps": 1367965696,
+      "incremental": 1451450368
+    }
+  }
+}

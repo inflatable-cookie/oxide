@@ -1,0 +1,5 @@
+[manifest]
+minimum_effigy_version = "0.14.0"
+[tasks.comparison]
+admission = "heavy"
+run = "exec /Applications/Xcode.app/Contents/Developer/usr/bin/python3 /private/var/tmp/oxide-direct-incremental-20261015-4822cebb/measure.py"

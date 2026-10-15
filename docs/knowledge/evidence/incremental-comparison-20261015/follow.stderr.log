@@ -1,0 +1,68 @@
+image-create START
+image-create EXIT 0 1.277024042
+image-attach START
+image-attach EXIT 0 1.526108459
+clone START
+clone EXIT 0 2.820662375
+checkout START
+checkout EXIT 0 0.504833458
+tree START
+tree EXIT 0 0.263278833
+cargo-version START
+cargo-version EXIT 0 0.25497725
+rustc-version START
+rustc-version EXIT 0 0.264202167
+off-load START
+off-load EXIT 0 0.264783083
+off-C0 START
+off-C0 EXIT 0 55.801565375
+off-C0-du START
+off-C0-du EXIT 0 0.263661667
+off-E1 START
+off-E1 EXIT 0 37.129115208
+off-E1-du START
+off-E1-du EXIT 0 0.254265125
+off-E2 START
+off-E2 EXIT 0 3.06337775
+off-E2-du START
+off-E2-du EXIT 0 0.260529333
+off-U START
+off-U EXIT 0 0.262117875
+off-U-du START
+off-U-du EXIT 0 0.264243583
+off-backtrace START
+off-backtrace EXIT 101 0.259336
+off-restore START
+off-restore EXIT 0 0.766563083
+off-clean START
+off-clean EXIT 0 0.256621209
+on-load START
+on-load EXIT 0 0.257009209
+on-C0 START
+on-C0 EXIT 0 46.335661875
+on-C0-du START
+on-C0-du EXIT 0 0.259373042
+on-E1 START
+on-E1 EXIT 0 7.957243
+on-E1-du START
+on-E1-du EXIT 0 0.261645583
+on-E2 START
+on-E2 EXIT 0 0.775690083
+on-E2-du START
+on-E2-du EXIT 0 0.261947375
+on-U START
+on-U EXIT 0 0.262167417
+on-U-du START
+on-U-du EXIT 0 0.260896542
+on-backtrace START
+on-backtrace EXIT 101 0.265324
+on-restore START
+on-restore EXIT 0 0.258062833
+on-clean START
+on-clean EXIT 0 0.262084209
+{"outcome": "complete", "count": 10, "result": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/result.json", "error": null}
+
+╭─────────────────────────────────────────────────────────────────────╮
+│ EFFIGY  /private/var/tmp/oxide-direct-incremental-20261015-4822cebb │
+╰────────────────────────────────────────────── v0.14.1+local.e91cd4c ╯
+

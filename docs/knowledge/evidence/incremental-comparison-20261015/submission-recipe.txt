@@ -1,0 +1,22 @@
+import ctypes, hashlib, json, os, pathlib, shlex, shutil, sys, time
+
+packet = json.loads(pathlib.Path('/private/tmp/oxide-direct-prepared-packet.json').read_text())
+root = pathlib.Path(packet['root'])
+assert not root.exists(), 'fresh resource root already exists; stop without reusing it'
+lib=ctypes.CDLL('/usr/lib/libSystem.B.dylib');lib.mach_continuous_time.restype=ctypes.c_uint64
+class Scale(ctypes.Structure):
+    _fields_=[('numer',ctypes.c_uint32),('denom',ctypes.c_uint32)]
+scale=Scale();assert lib.mach_timebase_info(ctypes.byref(scale))==0
+start=lib.mach_continuous_time()*scale.numer//scale.denom
+packet.update(start_ns=start,deadline_ns=start+1_200_000_000_000,
+              clock='raw mach_continuous_time converted by mach_timebase_info, same boot',
+              utc_start=time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()))
+root.mkdir(mode=0o700);(root/'raw').mkdir()
+script=root/'measure.py';shutil.copyfile('/private/tmp/oxide-direct-comparison.py',script)
+packet['recipe_sha256']=hashlib.sha256(script.read_bytes()).hexdigest()
+(root/'packet.json').write_text(json.dumps(packet,indent=2)+'\n')
+command='exec '+shlex.join([sys.executable,str(script)])
+(root/'effigy.toml').write_text('[manifest]\nminimum_effigy_version = "0.14.0"\n[tasks.comparison]\nadmission = "heavy"\nrun = '+json.dumps(command)+'\n')
+os.chdir(root);os.environ['EFFIGY_CALLER']=packet['caller']
+print('START original deadline',packet['deadline_ns'],'root',root,flush=True)
+os.execvp('effigy',['effigy','--host-run-request-id',packet['request_id'],'comparison'])

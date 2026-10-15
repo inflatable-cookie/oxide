@@ -99,7 +99,103 @@ Method and caveats:
 
 The proposed policy, frozen one-shot comparison, and private opt-in launcher
 are in the [build-context policy](contracts/build-context-policy.md). The
-comparison remains unqualified.
+[direct comparison below](#direct-incremental-comparison-2026-10-15) measures
+the limited edit-loop tradeoff; production policy and shared reuse remain unqualified.
+
+## Direct incremental comparison (2026-10-15)
+
+The planner ran the approved comparison directly, following Tom's correction
+to the execution process in [vision](vision.md#authority-boundaries). One
+real Effigy heavy run settled passed, exit 0, with no escaped descendants:
+`a36ede60da7df4f274417117415517c934a50784b7d0227d3f6c0cabec27febb`,
+epoch 1, caller `oxide:planner:direct-incremental:20261015`, request
+`4822cebb-4d4f-4c9a-8a84-e9f85efcc985`.
+The original preparation-through-capture window was **165.2 seconds**,
+with eight executed positive test runs plus Cargo/rustc version probes
+(ten counted top-level commands; nine were Cargo). Both expected negative
+backtrace tests also ran, using the already-built executables.
+
+Both modes used Nucleus `fb2bd0449ede2d9d2089a47b0559182bd413b91f`, tree
+`b47caf2ffb7e4430fc5e78411a5b475203126194`, rustc/Cargo 1.97.1,
+line-tables-only debug and unpacked split debug info. The command was
+`effigy check:core:test -- -p nucleus-core --test packages -v -- --exact committed_workflow_packages_parse`.
+Each mode had a fresh private target inside the same fixed 15g APFS image.
+No existing target was scanned or changed. One source clone and contained
+Cargo source cache were used sequentially; both modes restored the source
+cleanly afterward. Exact setup, comments, environment handling and commands
+are retained with the evidence.
+
+Wall times below are `/usr/bin/time -l` real seconds, excluding the
+measurement controller's polling overhead:
+
+| Step | Incremental off | Incremental on |
+| --- | ---: | ---: |
+| Cold target | 55.72 s | 46.19 s |
+| Comment appended to library source | 36.99 s | 7.75 s |
+| Comment appended to selected test source | 3.00 s | 0.69 s |
+| Unchanged, test executed again | 0.09 s | 0.08 s |
+| Loose `deps/*.o`, cold → library edit → test edit → unchanged | 172 → 172 → 172 → 172 | 1,053 → 1,923 → 1,941 → 1,941 |
+| Whole-target allocated size (`du -sk`), cold → unchanged | 1.773 → 1.785 GiB | 2.307 → 2.787 GiB |
+| `deps` + `incremental` allocated union by unique inode, cold → unchanged | 1.269 → 1.282 GiB | 1.803 → 2.283 GiB |
+| Selected panic has a backtrace frame with file:line | yes | yes |
+
+Every positive invocation executed the selected test: eight passes, no
+failures. The unchanged runs compiled no `nucleus-core` unit. Captured rustc
+lines show line-tables-only/unpacked in both modes, with incremental state
+only in the on mode. The negative tests had the expected missing-packages
+panic and a real `tests/packages.rs:<line>` backtrace frame in **both** modes;
+the panic header alone was not counted.
+
+This supports a concrete tradeoff: in this short sequence, incremental made
+the library edit **4.77 times faster**, while the final whole target used
+about **1.00 GiB more allocated space**. Incremental off retained no
+`incremental/` state and its loose object count stayed flat. Incremental on
+added 888 loose objects across the two edits. This demonstrates growth in
+this sequence, not unbounded growth or proof that any object is stale.
+
+Hardlinks matter: a post-run scan found 968 shared inodes between the on
+mode's `deps` and `incremental`, representing 368,418,816 allocated bytes.
+The union row counts those once. Separate directory totals must not be added.
+Allocated observations can also differ between reads: the off-mode `deps`
+scan after settlement reported 1,345,179,648 allocated bytes, versus
+1,376,321,536 at the unchanged-step sample, with no further build. The cause
+was not investigated. These are timestamped filesystem observations, not
+physical reclaim estimates.
+
+The retained backing plus host-side files occupied about 4.28 GiB, excluding
+the mounted view to avoid counting the same storage twice. The image remained
+below its 14 GiB stop threshold; the 20 GiB raw host reserve was checked
+throughout. Raw logs total 274,340 bytes. The fresh root/image remain preserved
+at `/private/var/tmp/oxide-direct-incremental-20261015-4822cebb`; nothing was
+deleted or detached.
+
+Limits: this is one busy-machine run, off first. Extracted registry sources
+and OS caches were warmer for on. The cold-time difference cannot be isolated
+as an incremental effect. The edits were comments, so the result does not
+predict arbitrary behavior-changing edits. It is a narrower executed-test
+workflow than the supervisor's compile-only benchmark. No attributable SSD
+writes, SSD lifetime, LLDB/full-debug custody, long-run object liveness or
+cross-task shared-slot reuse was measured. The original four-Cargo,
+45-minute shared-reuse trial remains separate.
+
+**Recommendation:** retain lifecycle-aware policy as the direction. Iterative
+agent work can benefit from incremental just as interactive human work can;
+turning it off is a real speed/storage compromise. Keep the current consumer
+stopgaps until a separately reviewed adoption provides bounded owned storage.
+Qualify a hard per-slot budget and safe whole-idle-generation retirement;
+do not substitute selective `.o` deletion or silently flip incremental state
+inside a partition. Unchanged Cargo reuse remains useful in either mode.
+No more comparison-launcher work is needed to make this policy decision.
+
+Raw commands, logs, receipts, the disposable recipe and hashes are attached
+under [comparison evidence](evidence/incremental-comparison-20261015/summary.json).
+The [measurement recipe](evidence/incremental-comparison-20261015/measurement-recipe.txt),
+[raw library-edit logs](evidence/incremental-comparison-20261015/raw/off-E1.log),
+[matching on log](evidence/incremental-comparison-20261015/raw/on-E1.log),
+[off backtrace](evidence/incremental-comparison-20261015/raw/off-backtrace.log),
+[on backtrace](evidence/incremental-comparison-20261015/raw/on-backtrace.log) and
+[authenticated settlement](evidence/incremental-comparison-20261015/follow.json)
+make the result independently inspectable without another build.
 
 ## Bounded incremental comparison attempt (2026-10-15)
 
@@ -150,8 +246,9 @@ admission validation, with a precise producer defect. It is not a qualified
 comparison, not shared warm reuse, not evidence about
 object deletion or production policy, and it produced no incremental-on/off
 timing, storage, allocation or write data. The frozen methodology is unchanged;
-the comparison stays unqualified and needs a separately scoped producer
-correction under standing authority before any fresh equivalent session. The
+that failed attempt supplied no comparison evidence. The later bootstrap
+correction and direct measurement are distinct; the observations above do
+not turn this attempt into a successful run. The
 staged root and the task control directory are retained read-only for review;
 nothing was deleted, detached or repaired. The exact receipts are in the
 [attempt evidence record](evidence/build-context-comparison-053-attempt.json).

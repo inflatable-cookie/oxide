@@ -4,7 +4,7 @@
 
 [Storage-efficiency findings](storage-efficiency.md) records current component preparation, profile and disposable-output behavior across the inspected projects, with limits on what the source evidence establishes.
 
-[Build-context policy](contracts/build-context-policy.md) owns the proposed lifecycle-aware incremental/debug context semantics, the frozen one-shot comparison recipe, and the private opt-in launcher that enforces deadline and owned-footprint limits. Production policy stays inert. The live comparison is unqualified; one 2026-10-15 attempt launched a heavy host run whose inner comparison launcher failed before its own admission validation on a staged-manifest exec seam.
+[Build-context policy](contracts/build-context-policy.md) owns the proposed lifecycle-aware incremental/debug context semantics, the frozen one-shot comparison recipe, and the private opt-in launcher that enforces deadline and owned-footprint limits. Production policy stays inert. The [direct incremental comparison](storage-efficiency.md#direct-incremental-comparison-2026-10-15) supplies real timing, storage and selected backtrace evidence with raw output attached; production adoption and shared-slot reuse remain unqualified.
 
 [Optimization adoption](contracts/optimization-adoption.md) owns the project adoption policy for component-lazy preparation and the distinction between lightweight improvements and reusable-slot integration.
 

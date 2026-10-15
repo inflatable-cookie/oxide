@@ -1,0 +1,1140 @@
+{
+  "packet": {
+    "root": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb",
+    "request_id": "4822cebb-4d4f-4c9a-8a84-e9f85efcc985",
+    "caller": "oxide:planner:direct-incremental:20261015",
+    "source_repository": "/Users/tom/Dev/projects/nucleus",
+    "source_head": "fb2bd0449ede2d9d2089a47b0559182bd413b91f",
+    "source_tree": "b47caf2ffb7e4430fc5e78411a5b475203126194",
+    "lock_sha256": "ab2ed097a6d9cc740cc738b32d1c361d99214b16f0dbdeacfeb061bc10d1d57d",
+    "registry_inputs": [
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/bitflags-2.13.2.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/bitflags-2.13.2.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/block-buffer-0.10.4.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/block-buffer-0.10.4.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/bumpalo-3.20.3.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/bumpalo-3.20.3.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/cc-1.4.7.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/cc-1.4.7.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.5.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.5.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/cpufeatures-0.2.17.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/cpufeatures-0.2.17.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/crypto-common-0.1.7.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/crypto-common-0.1.7.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/digest-0.10.7.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/digest-0.10.7.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/dyn-clone-1.0.20.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/dyn-clone-1.0.20.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/equivalent-1.0.2.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/equivalent-1.0.2.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/fallible-iterator-0.3.0.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/fallible-iterator-0.3.0.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/fallible-streaming-iterator-0.1.9.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/fallible-streaming-iterator-0.1.9.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/find-msvc-tools-0.1.13.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/find-msvc-tools-0.1.13.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/foldhash-0.2.0.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/hashbrown-0.16.1.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/hashbrown-0.16.1.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/hashbrown-0.17.1.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/hashbrown-0.17.1.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/hashlink-0.12.1.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/hashlink-0.12.1.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/indexmap-2.14.2.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/indexmap-2.14.2.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/itoa-1.0.18.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/itoa-1.0.18.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/js-sys-0.3.105.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/js-sys-0.3.105.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/libc-0.2.189.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/libc-0.2.189.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/libsqlite3-sys-0.38.2.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/libsqlite3-sys-0.38.2.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/memchr-2.8.3.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/memchr-2.8.3.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/once_cell-1.21.4.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/once_cell-1.21.4.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/pkg-config-0.3.34.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/pkg-config-0.3.34.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/quote-1.0.47.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/quote-1.0.47.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/rsqlite-vfs-0.1.1.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/rsqlite-vfs-0.1.1.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/rusqlite-0.40.2.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/rusqlite-0.40.2.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/rustversion-1.0.23.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/rustversion-1.0.23.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/schemars-0.8.22.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/schemars-0.8.22.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/schemars_derive-0.8.22.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/schemars_derive-0.8.22.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/serde-1.0.229.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/serde-1.0.229.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/serde_derive-1.0.229.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/serde_derive-1.0.229.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/serde_derive_internals-0.29.1.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/serde_derive_internals-0.29.1.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/serde_yaml_ng-0.10.0.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/serde_yaml_ng-0.10.0.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/sha2-0.10.9.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/sha2-0.10.9.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/shlex-2.0.1.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/shlex-2.0.1.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/smallvec-1.16.1.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/smallvec-1.16.1.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/sqlite-wasm-rs-0.5.5.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/sqlite-wasm-rs-0.5.5.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/syn-2.0.119.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/syn-2.0.119.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/syn-3.0.6.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/syn-3.0.6.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.21.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.21.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/thiserror-impl-2.0.21.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/typenum-1.20.1.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/typenum-1.20.1.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.26.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.26.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/unsafe-libyaml-0.2.11.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/unsafe-libyaml-0.2.11.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/vcpkg-0.2.15.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/vcpkg-0.2.15.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/version_check-0.9.5.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/version_check-0.9.5.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-0.2.128.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-0.2.128.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-macro-0.2.128.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-macro-0.2.128.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-macro-support-0.2.128.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-macro-support-0.2.128.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-shared-0.2.128.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/wasm-bindgen-shared-0.2.128.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23.crate",
+        "rel": "registry/cache/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23.crate"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/2/cc",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/2/cc"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/3/r/ryu",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/3/r/ryu"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/3/s/syn",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/3/s/syn"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/3/s/syn",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/3/s/syn"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/bi/tf/bitflags",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/bi/tf/bitflags"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/bl/oc/block-buffer",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/bl/oc/block-buffer"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/bu/mp/bumpalo",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/bu/mp/bumpalo"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/cf/g-/cfg-if",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/cf/g-/cfg-if"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/cp/uf/cpufeatures",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/cp/uf/cpufeatures"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/cr/yp/crypto-common",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/cr/yp/crypto-common"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/di/ge/digest",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/di/ge/digest"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/dy/n-/dyn-clone",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/dy/n-/dyn-clone"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/eq/ui/equivalent",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/eq/ui/equivalent"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/fa/ll/fallible-iterator",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/fa/ll/fallible-iterator"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/fa/ll/fallible-streaming-iterator",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/fa/ll/fallible-streaming-iterator"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/fi/nd/find-msvc-tools",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/fi/nd/find-msvc-tools"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/fo/ld/foldhash",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/fo/ld/foldhash"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/ge/ne/generic-array",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/ge/ne/generic-array"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/ha/sh/hashbrown",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/ha/sh/hashbrown"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/ha/sh/hashbrown",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/ha/sh/hashbrown"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/ha/sh/hashlink",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/ha/sh/hashlink"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/in/de/indexmap",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/in/de/indexmap"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/it/oa/itoa",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/it/oa/itoa"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/js/-s/js-sys",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/js/-s/js-sys"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/li/bc/libc",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/li/bc/libc"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/li/bs/libsqlite3-sys",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/li/bs/libsqlite3-sys"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/me/mc/memchr",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/me/mc/memchr"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/on/ce/once_cell",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/on/ce/once_cell"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/pk/g-/pkg-config",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/pk/g-/pkg-config"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/pr/oc/proc-macro2",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/pr/oc/proc-macro2"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/qu/ot/quote",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/qu/ot/quote"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/rs/ql/rsqlite-vfs",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/rs/ql/rsqlite-vfs"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/ru/sq/rusqlite",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/ru/sq/rusqlite"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/ru/st/rustversion",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/ru/st/rustversion"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/sc/he/schemars",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/sc/he/schemars"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/sc/he/schemars_derive",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/sc/he/schemars_derive"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/se/rd/serde",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/se/rd/serde"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/se/rd/serde_core",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/se/rd/serde_core"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/se/rd/serde_derive",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/se/rd/serde_derive"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/se/rd/serde_derive_internals",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/se/rd/serde_derive_internals"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/se/rd/serde_json",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/se/rd/serde_json"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/se/rd/serde_yaml_ng",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/se/rd/serde_yaml_ng"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/sh/a2/sha2",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/sh/a2/sha2"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/sh/le/shlex",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/sh/le/shlex"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/sm/al/smallvec",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/sm/al/smallvec"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/sq/li/sqlite-wasm-rs",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/sq/li/sqlite-wasm-rs"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/th/is/thiserror",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/th/is/thiserror"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/th/is/thiserror-impl",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/th/is/thiserror-impl"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/ty/pe/typenum",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/ty/pe/typenum"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/un/ic/unicode-ident",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/un/ic/unicode-ident"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/un/sa/unsafe-libyaml",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/un/sa/unsafe-libyaml"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/vc/pk/vcpkg",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/vc/pk/vcpkg"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/ve/rs/version_check",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/ve/rs/version_check"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/wa/sm/wasm-bindgen",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/wa/sm/wasm-bindgen"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/wa/sm/wasm-bindgen-macro",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/wa/sm/wasm-bindgen-macro"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/wa/sm/wasm-bindgen-macro-support",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/wa/sm/wasm-bindgen-macro-support"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/wa/sm/wasm-bindgen-shared",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/wa/sm/wasm-bindgen-shared"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/zm/ij/zmij",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/zm/ij/zmij"
+      },
+      {
+        "src": "/Users/tom/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/config.json",
+        "rel": "registry/index/index.crates.io-1949cf8c6b5b557f/config.json"
+      }
+    ],
+    "start_ns": 26165096737041,
+    "deadline_ns": 27365096737041,
+    "clock": "raw mach_continuous_time converted by mach_timebase_info, same boot",
+    "utc_start": "2026-10-15T14:36:21Z",
+    "recipe_sha256": "eb219909d6cfda3e5e981791b919b9641d2da1998c775744bac3fac869740c2c"
+  },
+  "calls": [
+    {
+      "name": "image-create",
+      "argv": [
+        "/usr/bin/hdiutil",
+        "create",
+        "-size",
+        "15g",
+        "-type",
+        "SPARSE",
+        "-fs",
+        "APFS",
+        "-volname",
+        "OxideComparison",
+        "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/comparison.sparseimage"
+      ],
+      "counted": false,
+      "wall_seconds": 1.277024042,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/image-create.log",
+      "utc_end": "2026-10-15T14:36:24Z"
+    },
+    {
+      "name": "image-attach",
+      "argv": [
+        "/usr/bin/hdiutil",
+        "attach",
+        "-nobrowse",
+        "-mountpoint",
+        "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/m",
+        "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/comparison.sparseimage"
+      ],
+      "counted": false,
+      "wall_seconds": 1.526108459,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/image-attach.log",
+      "utc_end": "2026-10-15T14:36:25Z"
+    },
+    {
+      "name": "clone",
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--no-local",
+        "--no-checkout",
+        "/Users/tom/Dev/projects/nucleus",
+        "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/m/src"
+      ],
+      "counted": false,
+      "wall_seconds": 2.820662375,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/clone.log",
+      "utc_end": "2026-10-15T14:36:28Z"
+    },
+    {
+      "name": "checkout",
+      "argv": [
+        "/usr/bin/git",
+        "checkout",
+        "--detach",
+        "fb2bd0449ede2d9d2089a47b0559182bd413b91f"
+      ],
+      "counted": false,
+      "wall_seconds": 0.504833458,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/checkout.log",
+      "utc_end": "2026-10-15T14:36:29Z"
+    },
+    {
+      "name": "tree",
+      "argv": [
+        "/usr/bin/git",
+        "rev-parse",
+        "HEAD^{tree}"
+      ],
+      "counted": false,
+      "wall_seconds": 0.263278833,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/tree.log",
+      "utc_end": "2026-10-15T14:36:29Z"
+    },
+    {
+      "name": "cargo-version",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo",
+        "-vV"
+      ],
+      "counted": true,
+      "wall_seconds": 0.25497725,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/cargo-version.log",
+      "utc_end": "2026-10-15T14:36:29Z"
+    },
+    {
+      "name": "rustc-version",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc",
+        "-vV"
+      ],
+      "counted": true,
+      "wall_seconds": 0.264202167,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/rustc-version.log",
+      "utc_end": "2026-10-15T14:36:30Z"
+    },
+    {
+      "name": "off-load",
+      "argv": [
+        "/usr/bin/uptime"
+      ],
+      "counted": false,
+      "wall_seconds": 0.264783083,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/off-load.log",
+      "utc_end": "2026-10-15T14:36:30Z"
+    },
+    {
+      "name": "off-C0",
+      "argv": [
+        "/usr/bin/time",
+        "-l",
+        "effigy",
+        "check:core:test",
+        "--",
+        "-p",
+        "nucleus-core",
+        "--test",
+        "packages",
+        "-v",
+        "--",
+        "--exact",
+        "committed_workflow_packages_parse"
+      ],
+      "counted": true,
+      "wall_seconds": 55.801565375,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/off-C0.log",
+      "utc_end": "2026-10-15T14:37:26Z"
+    },
+    {
+      "name": "off-C0-du",
+      "argv": [
+        "/usr/bin/du",
+        "-sk",
+        "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/m/target-off"
+      ],
+      "counted": false,
+      "wall_seconds": 0.263661667,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/off-C0-du.log",
+      "utc_end": "2026-10-15T14:37:26Z"
+    },
+    {
+      "name": "off-E1",
+      "argv": [
+        "/usr/bin/time",
+        "-l",
+        "effigy",
+        "check:core:test",
+        "--",
+        "-p",
+        "nucleus-core",
+        "--test",
+        "packages",
+        "-v",
+        "--",
+        "--exact",
+        "committed_workflow_packages_parse"
+      ],
+      "counted": true,
+      "wall_seconds": 37.129115208,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/off-E1.log",
+      "utc_end": "2026-10-15T14:38:03Z"
+    },
+    {
+      "name": "off-E1-du",
+      "argv": [
+        "/usr/bin/du",
+        "-sk",
+        "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/m/target-off"
+      ],
+      "counted": false,
+      "wall_seconds": 0.254265125,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/off-E1-du.log",
+      "utc_end": "2026-10-15T14:38:03Z"
+    },
+    {
+      "name": "off-E2",
+      "argv": [
+        "/usr/bin/time",
+        "-l",
+        "effigy",
+        "check:core:test",
+        "--",
+        "-p",
+        "nucleus-core",
+        "--test",
+        "packages",
+        "-v",
+        "--",
+        "--exact",
+        "committed_workflow_packages_parse"
+      ],
+      "counted": true,
+      "wall_seconds": 3.06337775,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/off-E2.log",
+      "utc_end": "2026-10-15T14:38:06Z"
+    },
+    {
+      "name": "off-E2-du",
+      "argv": [
+        "/usr/bin/du",
+        "-sk",
+        "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/m/target-off"
+      ],
+      "counted": false,
+      "wall_seconds": 0.260529333,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/off-E2-du.log",
+      "utc_end": "2026-10-15T14:38:07Z"
+    },
+    {
+      "name": "off-U",
+      "argv": [
+        "/usr/bin/time",
+        "-l",
+        "effigy",
+        "check:core:test",
+        "--",
+        "-p",
+        "nucleus-core",
+        "--test",
+        "packages",
+        "-v",
+        "--",
+        "--exact",
+        "committed_workflow_packages_parse"
+      ],
+      "counted": true,
+      "wall_seconds": 0.262117875,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/off-U.log",
+      "utc_end": "2026-10-15T14:38:07Z"
+    },
+    {
+      "name": "off-U-du",
+      "argv": [
+        "/usr/bin/du",
+        "-sk",
+        "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/m/target-off"
+      ],
+      "counted": false,
+      "wall_seconds": 0.264243583,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/off-U-du.log",
+      "utc_end": "2026-10-15T14:38:07Z"
+    },
+    {
+      "name": "off-backtrace",
+      "argv": [
+        "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/m/target-off/debug/deps/packages-b0632fec35f2bd2f",
+        "--exact",
+        "committed_workflow_packages_parse"
+      ],
+      "counted": false,
+      "wall_seconds": 0.259336,
+      "exit": 101,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/off-backtrace.log",
+      "utc_end": "2026-10-15T14:38:08Z"
+    },
+    {
+      "name": "off-restore",
+      "argv": [
+        "/usr/bin/git",
+        "checkout",
+        "--",
+        "crates/nucleus-core/src/lib.rs",
+        "crates/nucleus-core/tests/packages.rs"
+      ],
+      "counted": false,
+      "wall_seconds": 0.766563083,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/off-restore.log",
+      "utc_end": "2026-10-15T14:38:08Z"
+    },
+    {
+      "name": "off-clean",
+      "argv": [
+        "/usr/bin/git",
+        "status",
+        "--porcelain"
+      ],
+      "counted": false,
+      "wall_seconds": 0.256621209,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/off-clean.log",
+      "utc_end": "2026-10-15T14:38:09Z"
+    },
+    {
+      "name": "on-load",
+      "argv": [
+        "/usr/bin/uptime"
+      ],
+      "counted": false,
+      "wall_seconds": 0.257009209,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/on-load.log",
+      "utc_end": "2026-10-15T14:38:09Z"
+    },
+    {
+      "name": "on-C0",
+      "argv": [
+        "/usr/bin/time",
+        "-l",
+        "effigy",
+        "check:core:test",
+        "--",
+        "-p",
+        "nucleus-core",
+        "--test",
+        "packages",
+        "-v",
+        "--",
+        "--exact",
+        "committed_workflow_packages_parse"
+      ],
+      "counted": true,
+      "wall_seconds": 46.335661875,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/on-C0.log",
+      "utc_end": "2026-10-15T14:38:55Z"
+    },
+    {
+      "name": "on-C0-du",
+      "argv": [
+        "/usr/bin/du",
+        "-sk",
+        "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/m/target-on"
+      ],
+      "counted": false,
+      "wall_seconds": 0.259373042,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/on-C0-du.log",
+      "utc_end": "2026-10-15T14:38:55Z"
+    },
+    {
+      "name": "on-E1",
+      "argv": [
+        "/usr/bin/time",
+        "-l",
+        "effigy",
+        "check:core:test",
+        "--",
+        "-p",
+        "nucleus-core",
+        "--test",
+        "packages",
+        "-v",
+        "--",
+        "--exact",
+        "committed_workflow_packages_parse"
+      ],
+      "counted": true,
+      "wall_seconds": 7.957243,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/on-E1.log",
+      "utc_end": "2026-10-15T14:39:03Z"
+    },
+    {
+      "name": "on-E1-du",
+      "argv": [
+        "/usr/bin/du",
+        "-sk",
+        "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/m/target-on"
+      ],
+      "counted": false,
+      "wall_seconds": 0.261645583,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/on-E1-du.log",
+      "utc_end": "2026-10-15T14:39:04Z"
+    },
+    {
+      "name": "on-E2",
+      "argv": [
+        "/usr/bin/time",
+        "-l",
+        "effigy",
+        "check:core:test",
+        "--",
+        "-p",
+        "nucleus-core",
+        "--test",
+        "packages",
+        "-v",
+        "--",
+        "--exact",
+        "committed_workflow_packages_parse"
+      ],
+      "counted": true,
+      "wall_seconds": 0.775690083,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/on-E2.log",
+      "utc_end": "2026-10-15T14:39:05Z"
+    },
+    {
+      "name": "on-E2-du",
+      "argv": [
+        "/usr/bin/du",
+        "-sk",
+        "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/m/target-on"
+      ],
+      "counted": false,
+      "wall_seconds": 0.261947375,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/on-E2-du.log",
+      "utc_end": "2026-10-15T14:39:05Z"
+    },
+    {
+      "name": "on-U",
+      "argv": [
+        "/usr/bin/time",
+        "-l",
+        "effigy",
+        "check:core:test",
+        "--",
+        "-p",
+        "nucleus-core",
+        "--test",
+        "packages",
+        "-v",
+        "--",
+        "--exact",
+        "committed_workflow_packages_parse"
+      ],
+      "counted": true,
+      "wall_seconds": 0.262167417,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/on-U.log",
+      "utc_end": "2026-10-15T14:39:05Z"
+    },
+    {
+      "name": "on-U-du",
+      "argv": [
+        "/usr/bin/du",
+        "-sk",
+        "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/m/target-on"
+      ],
+      "counted": false,
+      "wall_seconds": 0.260896542,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/on-U-du.log",
+      "utc_end": "2026-10-15T14:39:05Z"
+    },
+    {
+      "name": "on-backtrace",
+      "argv": [
+        "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/m/target-on/debug/deps/packages-f5fdc546a5d2e123",
+        "--exact",
+        "committed_workflow_packages_parse"
+      ],
+      "counted": false,
+      "wall_seconds": 0.265324,
+      "exit": 101,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/on-backtrace.log",
+      "utc_end": "2026-10-15T14:39:06Z"
+    },
+    {
+      "name": "on-restore",
+      "argv": [
+        "/usr/bin/git",
+        "checkout",
+        "--",
+        "crates/nucleus-core/src/lib.rs",
+        "crates/nucleus-core/tests/packages.rs"
+      ],
+      "counted": false,
+      "wall_seconds": 0.258062833,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/on-restore.log",
+      "utc_end": "2026-10-15T14:39:06Z"
+    },
+    {
+      "name": "on-clean",
+      "argv": [
+        "/usr/bin/git",
+        "status",
+        "--porcelain"
+      ],
+      "counted": false,
+      "wall_seconds": 0.262084209,
+      "exit": 0,
+      "log": "/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/raw/on-clean.log",
+      "utc_end": "2026-10-15T14:39:06Z"
+    }
+  ],
+  "measurements": [
+    {
+      "mode": "off",
+      "step": "C0",
+      "directories": {
+        "deps": {
+          "files": 344,
+          "objects": 172,
+          "apparent_bytes": 1344451471
+        },
+        "incremental": {
+          "files": 0,
+          "objects": 0,
+          "apparent_bytes": 0
+        }
+      },
+      "deps_incremental_unique_inode_allocated_bytes": 1362866176
+    },
+    {
+      "mode": "off",
+      "step": "E1",
+      "directories": {
+        "deps": {
+          "files": 344,
+          "objects": 172,
+          "apparent_bytes": 1344451481
+        },
+        "incremental": {
+          "files": 0,
+          "objects": 0,
+          "apparent_bytes": 0
+        }
+      },
+      "deps_incremental_unique_inode_allocated_bytes": 1376321536
+    },
+    {
+      "mode": "off",
+      "step": "E2",
+      "directories": {
+        "deps": {
+          "files": 344,
+          "objects": 172,
+          "apparent_bytes": 1344451481
+        },
+        "incremental": {
+          "files": 0,
+          "objects": 0,
+          "apparent_bytes": 0
+        }
+      },
+      "deps_incremental_unique_inode_allocated_bytes": 1376321536
+    },
+    {
+      "mode": "off",
+      "step": "U",
+      "directories": {
+        "deps": {
+          "files": 344,
+          "objects": 172,
+          "apparent_bytes": 1344451481
+        },
+        "incremental": {
+          "files": 0,
+          "objects": 0,
+          "apparent_bytes": 0
+        }
+      },
+      "deps_incremental_unique_inode_allocated_bytes": 1376321536
+    },
+    {
+      "mode": "on",
+      "step": "C0",
+      "directories": {
+        "deps": {
+          "files": 1225,
+          "objects": 1053,
+          "apparent_bytes": 1356273470
+        },
+        "incremental": {
+          "files": 1024,
+          "objects": 966,
+          "apparent_bytes": 920613043
+        }
+      },
+      "deps_incremental_unique_inode_allocated_bytes": 1935859712
+    },
+    {
+      "mode": "on",
+      "step": "E1",
+      "directories": {
+        "deps": {
+          "files": 2095,
+          "objects": 1923,
+          "apparent_bytes": 1669754422
+        },
+        "incremental": {
+          "files": 1947,
+          "objects": 1836,
+          "apparent_bytes": 1793065310
+        }
+      },
+      "deps_incremental_unique_inode_allocated_bytes": 2450989056
+    },
+    {
+      "mode": "on",
+      "step": "E2",
+      "directories": {
+        "deps": {
+          "files": 2113,
+          "objects": 1941,
+          "apparent_bytes": 1669832566
+        },
+        "incremental": {
+          "files": 1947,
+          "objects": 1836,
+          "apparent_bytes": 1793070479
+        }
+      },
+      "deps_incremental_unique_inode_allocated_bytes": 2450997248
+    },
+    {
+      "mode": "on",
+      "step": "U",
+      "directories": {
+        "deps": {
+          "files": 2113,
+          "objects": 1941,
+          "apparent_bytes": 1669832566
+        },
+        "incremental": {
+          "files": 1947,
+          "objects": 1836,
+          "apparent_bytes": 1793070479
+        }
+      },
+      "deps_incremental_unique_inode_allocated_bytes": 2450997248
+    }
+  ],
+  "outcome": "complete",
+  "writes": "unknown; occupancy and time -l block operations are not SSD writes",
+  "host_run_id": "a36ede60da7df4f274417117415517c934a50784b7d0227d3f6c0cabec27febb",
+  "inner_entry_ns": 26166597594833,
+  "registry_copied_bytes": 20371358,
+  "backtrace": {
+    "off": {
+      "frame_fileline": true,
+      "expected_panic": true
+    },
+    "on": {
+      "frame_fileline": true,
+      "expected_panic": true
+    }
+  },
+  "count_delivered": 10,
+  "end_ns": 26330277480375,
+  "total_seconds": 165.180746417
+}

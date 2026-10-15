@@ -105,7 +105,7 @@ Consequences:
 
 ## Comparison recipe (frozen methodology)
 
-This section defines one bounded comparison. It is authorized by the 2026-10-15 ruling in [vision](../vision.md#authority-boundaries). The execution brief pins it again before launch. This section does not run the comparison. It does not rerun the original four-Cargo, 45-minute reuse proof. Production policy stays proposed. Comparison status stays unrun, in Queue.
+This section defines one bounded comparison. It is authorized by the 2026-10-15 ruling in [vision](../vision.md#authority-boundaries). Normal execution is pinned before launch. Tom subsequently authorized direct planner execution for this comparison in [vision](../vision.md#authority-boundaries), superseding another execution brief. The [direct measurements](../storage-efficiency.md#direct-incremental-comparison-2026-10-15) record the resulting limited edit-loop evidence. This does not rerun the original four-Cargo, 45-minute reuse proof. Production policy stays proposed.
 
 ### Callable
 
@@ -334,7 +334,7 @@ Stop and report, without changing the design, if the execution brief cannot pin 
 
 ### Single named seam
 
-The launcher binds the 050 gaps: whole-session monotonic deadline, sibling backing file, 16 GiB owned total including overhead, admission-preserving environment, counted deliveries before spawn, declared registry inputs instead of a host `CARGO_HOME` walk, exact reported-executable location from both streams, backtrace frame vs panic header, post-restore porcelain/lock verification, live union accounting, and 15s cadence 14 GiB / 20 GiB peak sampling. The 051 follow-up binds five concrete integration defects: one explicit heavy staged entry with the submission cwd as the authenticated token root; caller/UUID/body/root binding persisted before delivery with authenticated-absence-only replay; a pure lock-to-archive/index registry plan over the canonical namespaces; positive per-measurement proofs on `target/debug/deps` and `target/debug/incremental`; and deadline-aware bounded stream reads. Live still needs a later checked execution brief, an unused planner-owned resource plan, and independent review. This PR does not run the comparison, create an image, or invoke real Cargo/rustc/Nucleus tests.
+The launcher binds the 050 gaps: whole-session monotonic deadline, sibling backing file, 16 GiB owned total including overhead, admission-preserving environment, counted deliveries before spawn, declared registry inputs instead of a host `CARGO_HOME` walk, exact reported-executable location from both streams, backtrace frame vs panic header, post-restore porcelain/lock verification, live union accounting, and 15s cadence 14 GiB / 20 GiB peak sampling. The 051 follow-up binds five concrete integration defects: one explicit heavy staged entry with the submission cwd as the authenticated token root; caller/UUID/body/root binding persisted before delivery with authenticated-absence-only replay; a pure lock-to-archive/index registry plan over the canonical namespaces; positive per-measurement proofs on `target/debug/deps` and `target/debug/incremental`; and deadline-aware bounded stream reads. Reusable-launcher use still needs an unused owned resource plan and its normal reviewed scope. Tom separately authorized direct planner execution of this comparison; its disposable recipe is evidence, not the product launcher or a production qualification.
 
 Missing declared registry inputs, an unbindable named copy, or an unsupported Effigy inheritance seam is a refuse with that seam name. Do not invent unrestricted cache copy or bypass admission.
 
@@ -349,8 +349,8 @@ invocation. The staged manifest's `run` array was executed by Effigy as a
 sequence of shell
 commands rather than as one argv vector, so the non-executable launcher script
 was executed directly (`Permission denied`, code 126). The recipe above stays
-frozen and unchanged; the comparison remains unqualified and needs a separately
-scoped producer correction. See
+frozen and unchanged. This attempt supplied no measurement; the correction
+and later direct observations are separate. See
 [storage efficiency](../storage-efficiency.md#bounded-incremental-comparison-attempt-2026-10-15)
 and the [attempt evidence record](../evidence/build-context-comparison-053-attempt.json).
 
@@ -394,11 +394,13 @@ The smoke is not a comparison result and no Cargo or rustc ran. Both the
 staged root and the smoke control directory are retained read-only for review;
 nothing was deleted, detached or repaired. Receipt:
 [smoke evidence record](../evidence/build-context-comparison-054-smoke.json).
-The comparison itself stays unqualified and needs its own separately pinned
-execution brief.
+The smoke supplies no timing/storage comparison. Tom later directed the
+planner to measure directly rather than dispatch another execution brief;
+[storage efficiency](../storage-efficiency.md#direct-incremental-comparison-2026-10-15)
+owns those observations.
 
 ## Evidence limits for this design
 
 - The design rests on the supervisor's reported single-machine observations, a read-only inspection of three Nucleus commits and one stopgap, two pinned rustc source reads, and the installed Effigy source and contracts 010/049 for the heavy classification and token-root check. Its raw logs were not available.
-- Synthetic fixtures cover launcher enforcement, staging, admission and submission with stub adapters. They are not a live comparison. No Cargo, rustc, Effigy-heavy, or `hdiutil create/attach` run supports a qualification result.
-- Reported timings (see [storage efficiency](../storage-efficiency.md#incremental-and-debug-storage-measurements)) are not reproduced.
+- Synthetic fixtures cover launcher enforcement, staging, admission and submission with stub adapters. They are not a live comparison. The genuine smoke proves bootstrap entry only. The separate direct run supplies narrow real edit-loop evidence, not production qualification.
+- The supervisor's larger compile-only timings are not reproduced. The direct executed-test workflow is narrower and uses comment-only edits, with retained raw output.

@@ -1,0 +1,78 @@
+
+╭───────────────────────────────────────────────────────────────────────────╮
+│ EFFIGY  /private/var/tmp/oxide-direct-incremental-20261015-4822cebb/m/src │
+╰──────────────────────────────────────────────────── v0.14.1+local.e91cd4c ╯
+
+       Fresh unicode-ident v1.0.26
+       Fresh version_check v0.9.5
+       Fresh shlex v2.0.1
+       Fresh typenum v1.20.1
+       Fresh find-msvc-tools v0.1.13
+       Fresh foldhash v0.2.0
+       Fresh itoa v1.0.18
+       Fresh vcpkg v0.2.15
+       Fresh pkg-config v0.3.34
+       Fresh memchr v2.8.3
+       Fresh equivalent v1.0.2
+       Fresh cc v1.4.7
+       Fresh hashbrown v0.17.1
+       Fresh dyn-clone v1.0.20
+       Fresh bitflags v2.13.2
+       Fresh ryu v1.0.23
+       Fresh unsafe-libyaml v0.2.11
+       Fresh fallible-streaming-iterator v0.1.9
+       Fresh cfg-if v1.0.5
+       Fresh fallible-iterator v0.3.0
+       Fresh serde_core v1.0.229
+       Fresh zmij v1.0.23
+       Fresh libc v0.2.189
+       Fresh hashlink v0.12.1
+       Fresh indexmap v2.14.2
+       Fresh smallvec v1.16.1
+       Fresh generic-array v0.14.7
+       Fresh serde_json v1.0.151
+       Fresh cpufeatures v0.2.17
+       Fresh syn v3.0.6
+       Fresh crypto-common v0.1.7
+       Fresh block-buffer v0.10.4
+       Fresh libsqlite3-sys v0.38.2
+       Fresh proc-macro2 v1.0.107
+       Fresh serde_derive v1.0.229
+       Fresh serde_derive_internals v0.29.1
+       Fresh digest v0.10.7
+       Fresh rusqlite v0.40.2
+       Fresh quote v1.0.47
+       Fresh serde v1.0.229
+       Fresh schemars_derive v0.8.22
+       Fresh sha2 v0.10.9
+       Fresh syn v2.0.119
+       Fresh schemars v0.8.22
+       Fresh serde_yaml_ng v0.10.0
+       Fresh nucleus-observer v0.1.0 (/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/m/src/crates/nucleus-observer)
+       Fresh nucleus-core v0.1.0 (/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/m/src/crates/nucleus-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running `/private/var/tmp/oxide-direct-incremental-20261015-4822cebb/m/target-off/debug/deps/packages-b0632fec35f2bd2f --exact committed_workflow_packages_parse`
+
+running 1 test
+test committed_workflow_packages_parse ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+        0.09 real         0.03 user         0.04 sys
+            43991040  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+                5966  page reclaims
+                  10  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   1  signals received
+                   4  voluntary context switches
+                 387  involuntary context switches
+           151471358  instructions retired
+            62793380  cycles elapsed
+             4882912  peak memory footprint
