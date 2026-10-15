@@ -31,7 +31,7 @@ use std::net::Shutdown;
 use std::os::unix::ffi::OsStrExt;
 #[cfg(feature = "private-qualification-fixture")]
 use std::os::unix::fs::FileTypeExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
