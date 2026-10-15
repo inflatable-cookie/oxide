@@ -87,13 +87,20 @@ def main() -> int:
         result = subprocess.run(
             ["python3", "scripts/bounded-test.py", "cargo", "test", "--offline", "--locked",
              "--features", "private-qualification", "--lib",
-             "private_qualification_runtime::bounded_native_payload_filesystem_full_refuses_under_open_lease",
+             "registered::tests::private_qualification_runtime::"
+             "bounded_native_payload_filesystem_full_refuses_under_open_lease",
              "--", "--exact", "--ignored", "--test-threads=1", "--nocapture"],
             cwd=os.getcwd(), env=environment, timeout=600,
+            stdout=subprocess.PIPE, stderr=None, text=True,
         )
+        sys.stdout.write(result.stdout)
         if result.returncode:
             print(f"native proof retained its owned scratch at {scratch}", file=sys.stderr)
             return result.returncode
+        if "test result: ok. 1 passed" not in result.stdout:
+            print("the native proof selector must run exactly one test", file=sys.stderr)
+            print(f"retained its owned scratch at {scratch}", file=sys.stderr)
+            return 1
         shutil.rmtree(scratch)
         print("native bounded proof passed; owned scratch removed")
         return 0
