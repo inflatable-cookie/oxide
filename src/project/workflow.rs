@@ -36,6 +36,12 @@ pub const MAX_WORKFLOW_ENVIRONMENT_NAMES: usize = 64;
 pub const MAX_WORKFLOW_CAPTURE_ROLES: usize = 32;
 /// The two compatibility partitions ordinary Cargo reuse supports.
 pub const SUPPORTED_WORKFLOW_PROFILES: [&str; 2] = ["dev", "full-debug"];
+/// Byte ceiling for one non-secret refusal detail, enforced as `<= 512` bytes
+/// on a character boundary.
+const REFUSAL_DETAIL_BYTES: usize = 512;
+/// Appended only when the rendered plan reaches the output ceiling, so a
+/// truncated plan is explicit and still fits `MAX_WORKFLOW_PLAN_BYTES`.
+const PLAN_TRUNCATION_MARKER: &str = "\n...(plan truncated at 64 KiB)\n";
 /// Per-role capture roles the ordinary route can account for.
 pub const SUPPORTED_CAPTURE_ROLES: [&str; 5] = [
     "source-archive",
@@ -55,11 +61,11 @@ pub struct WorkflowRefusal {
 
 impl WorkflowRefusal {
     fn new(code: &'static str, detail: impl Into<String>) -> Self {
-        let mut detail = detail.into();
-        if detail.len() > 512 {
-            detail.truncate(512);
+        let detail = detail.into();
+        Self {
+            code,
+            detail: bounded_prefix(&detail, REFUSAL_DETAIL_BYTES).to_owned(),
         }
-        Self { code, detail }
     }
 
     /// One bounded, non-secret refusal line.
@@ -362,10 +368,27 @@ impl WorkflowPlan {
         }
         out.push_str("effects: none (no storage acquire, daemon provisioning, directory creation, compiler execution, installation or host scan)\n");
         if out.len() > MAX_WORKFLOW_PLAN_BYTES {
-            out.truncate(MAX_WORKFLOW_PLAN_BYTES);
+            let body_budget = MAX_WORKFLOW_PLAN_BYTES - PLAN_TRUNCATION_MARKER.len();
+            let body = bounded_prefix(&out, body_budget).to_owned();
+            out = body;
+            out.push_str(PLAN_TRUNCATION_MARKER);
         }
+        debug_assert!(out.len() <= MAX_WORKFLOW_PLAN_BYTES);
         out
     }
+}
+
+/// Longest byte prefix of `value` that ends on a UTF-8 character boundary.
+/// Truncation is always bounded and never panics on in-bounds multi-byte input.
+fn bounded_prefix(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 fn unresolved_items() -> Vec<Unavailable> {
@@ -967,6 +990,90 @@ mod tests {
             .unwrap_err()
             .code,
             "project-root-not-directory"
+        );
+    }
+
+    #[test]
+    fn declared_workflow_bounds_multibyte_refusals_and_plan_output() {
+        // The byte-prefix helper is exhaustively boundary-safe for every ceiling.
+        for prefix in 0..4usize {
+            let value = format!("{}{}", "a".repeat(prefix), "€".repeat(8));
+            for ceiling in 0..=value.len() {
+                let bounded = bounded_prefix(&value, ceiling);
+                assert!(bounded.len() <= ceiling);
+                assert!(value.is_char_boundary(bounded.len()));
+            }
+        }
+
+        let (root, _) = fixture("bounds");
+        // A bounded refusal for an in-bounds declaration whose unknown field
+        // name is long and multi-byte must not panic.
+        let mut value: Value = serde_json::from_str(&declaration(&root.path)).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("é".repeat(400), serde_json::json!(1));
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(bytes.len() <= MAX_WORKFLOW_DECLARATION_BYTES);
+        let refusal = WorkflowPlan::resolve(&bytes).unwrap_err();
+        assert_eq!(refusal.code, "unknown-field");
+        assert!(refusal.detail.len() <= REFUSAL_DETAIL_BYTES);
+        assert!(!refusal.render().is_empty());
+
+        // An in-bounds declaration whose plan exceeds the output ceiling must
+        // truncate on a character boundary for every byte alignment.
+        let base = WorkflowPlan::resolve(declaration(&root.path).as_bytes()).unwrap();
+        for extra in 0..6usize {
+            let mut plan = base.clone();
+            plan.argv = vec![format!("{}{}", "a".repeat(extra), "€".repeat(22_000))];
+            let rendered = plan.render();
+            assert!(
+                rendered.len() <= MAX_WORKFLOW_PLAN_BYTES,
+                "plan output must stay within the ceiling (extra={extra})"
+            );
+            assert!(
+                rendered.contains("(plan truncated at 64 KiB)"),
+                "an over-ceiling plan must say it was truncated (extra={extra})"
+            );
+        }
+        // A normal plan is unaffected by the truncation path.
+        let rendered = base.render();
+        assert!(rendered.len() < MAX_WORKFLOW_PLAN_BYTES);
+        assert!(!rendered.contains("plan truncated"));
+        assert!(rendered.contains("effects: none"));
+
+        // The reviewer's exact shape: a declaration that is itself within the
+        // 64 KiB ceiling and whose plan output crosses it, for every byte
+        // alignment of a multi-byte argv run.
+        let mut over_ceiling = 0usize;
+        for extra in 0..6usize {
+            let mut value: Value = serde_json::from_str(&declaration(&root.path)).unwrap();
+            let chunks: Vec<String> = (0..5)
+                .map(|index| {
+                    let prefix = if index == 0 {
+                        "a".repeat(extra)
+                    } else {
+                        String::new()
+                    };
+                    format!("{prefix}{}", "€".repeat(4_300))
+                })
+                .collect();
+            value["workflow"]["argv"] = serde_json::json!(chunks);
+            let bytes = serde_json::to_vec(&value).unwrap();
+            assert!(bytes.len() <= MAX_WORKFLOW_DECLARATION_BYTES);
+            let plan = WorkflowPlan::resolve(&bytes).unwrap();
+            let rendered = plan.render();
+            assert!(
+                rendered.len() <= MAX_WORKFLOW_PLAN_BYTES,
+                "plan output must stay within the ceiling (extra={extra})"
+            );
+            if rendered.contains("(plan truncated at 64 KiB)") {
+                over_ceiling += 1;
+            }
+        }
+        assert!(
+            over_ceiling > 0,
+            "the over-ceiling render path must be exercised"
         );
     }
 
