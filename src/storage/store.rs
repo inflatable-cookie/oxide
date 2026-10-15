@@ -1079,7 +1079,6 @@ impl Store {
                     RefusalReason::OrdinaryCargoPartitionLimit,
                 ));
             }
-            self.require_ledger_capacity(true)?;
             (String::new(), CargoReuseState::Empty, 0, false)
         };
 
