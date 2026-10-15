@@ -1202,6 +1202,9 @@ fn bounded_native_payload_filesystem_full_refuses_under_open_lease() {
         "expected ENOSPC allocation refusal, got {os_refusal}"
     );
     assert!(written <= MAX_WRITER_BYTES);
+    // Close the writer before any settlement so the lease holds the payload,
+    // not an open fixture handle.
+    drop(payload);
     phase_left("filesystem-full-refusal");
 
     // Control-ledger durability while the payload is full: inventory is
