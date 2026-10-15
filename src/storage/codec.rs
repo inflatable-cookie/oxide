@@ -402,6 +402,78 @@ impl Decode for CargoReuseState {
     }
 }
 
+impl Encode for OrdinaryCargoRetention {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        self.source_evidence_reference.encode(writer)?;
+        self.artifact_evidence_reference.encode(writer)?;
+        self.debug_evidence_reference.encode(writer)?;
+        self.credential.encode(writer)
+    }
+}
+
+impl Decode for OrdinaryCargoRetention {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        Ok(Self {
+            source_evidence_reference: String::decode(reader)?,
+            artifact_evidence_reference: String::decode(reader)?,
+            debug_evidence_reference: String::decode(reader)?,
+            credential: Credential::decode(reader)?,
+        })
+    }
+}
+
+impl Encode for OrdinaryCargoRetireRequest {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        self.request.encode(writer)?;
+        self.slot_id.encode(writer)?;
+        self.storage_instance_id.encode(writer)?;
+        self.generation.encode(writer)?;
+        self.retire_id.encode(writer)?;
+        self.retention.encode(writer)
+    }
+}
+
+impl Decode for OrdinaryCargoRetireRequest {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        Ok(Self {
+            request: OrdinaryCargoRequest::decode(reader)?,
+            slot_id: String::decode(reader)?,
+            storage_instance_id: String::decode(reader)?,
+            generation: String::decode(reader)?,
+            retire_id: String::decode(reader)?,
+            retention: OrdinaryCargoRetention::decode(reader)?,
+        })
+    }
+}
+
+impl Encode for OrdinaryCargoRetirementReceipt {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        writer.u32(self.policy_version);
+        self.root.encode(writer)?;
+        self.partition.encode(writer)?;
+        self.slot_id.encode(writer)?;
+        self.storage_instance_id.encode(writer)?;
+        self.generation.encode(writer)?;
+        self.retire_id.encode(writer)?;
+        self.retired_reuse_state.encode(writer)
+    }
+}
+
+impl Decode for OrdinaryCargoRetirementReceipt {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        Ok(Self {
+            policy_version: reader.u32()?,
+            root: StrictPhysicalCargoRoot::decode(reader)?,
+            partition: OrdinaryCargoPartition::decode(reader)?,
+            slot_id: String::decode(reader)?,
+            storage_instance_id: String::decode(reader)?,
+            generation: String::decode(reader)?,
+            retire_id: String::decode(reader)?,
+            retired_reuse_state: CargoReuseState::decode(reader)?,
+        })
+    }
+}
+
 impl Encode for OrdinaryCargoFinalizeRequest {
     fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
         self.request.encode(writer)?;

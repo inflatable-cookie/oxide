@@ -16,9 +16,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const LEDGER_MAGIC: &[u8; 8] = b"OXIDEST1";
-/// Version 5 adds the durable backend record: version-4 ledgers predate the
-/// hard-bounded payload store and refuse without migration or reinterpretation.
-const LEDGER_VERSION: u32 = 5;
+/// Version 6 adds durable ordinary-retirement intents and tombstones:
+/// version-5 ledgers predate owner-authenticated generation retirement and
+/// refuse without migration or reinterpretation.
+const LEDGER_VERSION: u32 = 6;
 const MAX_LEDGER_BYTES: u64 = 64 * 1024 * 1024;
 const SOCKET_NAME: &str = "daemon.sock";
 pub(crate) const SLOTS_NAME: &str = "slots";
@@ -29,6 +30,13 @@ const ORDINARY_CARGO_PATH_IDENTITY: &str = "ordinary-cargo-storage-v1";
 const MAX_LEDGER_SLOTS: usize = 1024;
 const MAX_LEDGER_LEASES: usize = 4096;
 const MAX_LEDGER_OPERATIONS: usize = 16384;
+/// Retired-generation receipts are control history under the same finite
+/// policy. Retirement is exceptional owner-driven recovery, not routine
+/// turnover; once the ledger holds this many recorded intents and
+/// tombstones, further retirements refuse until the owner rotates the
+/// storage root (a new instance identity). In-flight intents recorded
+/// before exhaustion always run to completion.
+const MAX_LEDGER_RETIREMENTS: usize = 64;
 
 /// Durable backend mode of one store root. It is bound at daemon startup and
 /// recorded in the ledger; a restart with a different mode refuses.
@@ -71,6 +79,16 @@ pub trait EvidenceAuthority: Send + Sync + 'static {
         _request: &OrdinaryCargoRequest,
         _evidence: &SettlementEvidence,
     ) -> bool {
+        false
+    }
+
+    /// Authenticates retirement of one proven-idle ordinary generation:
+    /// the exact storage instance/slot/generation scope, its stable
+    /// root/partition/policy identity, and the independent
+    /// source/artifact/debug retention acknowledgment. Safe default: refuse.
+    /// A task-provided flag, byte count, age, idle PID, disk pressure, or
+    /// inventory output cannot grant this capability.
+    fn verify_ordinary_cargo_retirement(&self, _request: &OrdinaryCargoRetireRequest) -> bool {
         false
     }
 }
@@ -257,6 +275,10 @@ enum InternalSlotState {
     Leased,
     Uncertain,
     Evicting,
+    /// An owner-authenticated retirement intent is recorded. The bytes are
+    /// held for deletion under the recorded scope only; reuse and
+    /// replacement wait for the tombstone receipt.
+    Retiring,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -289,6 +311,44 @@ struct OrdinaryCargoLeaseRecord {
     request: OrdinaryCargoRequest,
     saved_reuse_state: CargoReuseState,
     finalized_reuse_state: Option<CargoReuseState>,
+}
+
+/// Durable record of an authorized ordinary-generation retirement before
+/// its receipt completes. The intent pins the exact owned scope; an
+/// interrupted deletion resumes only this recorded scope, never a newly
+/// supplied path. Credentials are redacted; exactness is proved by
+/// `request_digest` over the original credential-bearing request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OrdinaryCargoRetirementIntent {
+    request: OrdinaryCargoRequest,
+    retention: OrdinaryCargoRetention,
+    slot_id: String,
+    storage_instance_id: String,
+    generation: String,
+    retire_id: String,
+    request_digest: String,
+    retired_reuse_state: CargoReuseState,
+}
+
+/// Durable tombstone for one retired ordinary generation. The named
+/// `(storage_instance_id, slot_id, generation)` triple can never admit a
+/// lease again; old finalized acquire/finalize/retire replays stay
+/// access-free against this record and cannot resurrect bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OrdinaryCargoTombstone {
+    root: StrictPhysicalCargoRoot,
+    partition: OrdinaryCargoPartition,
+    cargo_partition: PartitionKey,
+    policy_version: u32,
+    installation_epoch: String,
+    acceptance_reference: String,
+    input_boundary_digest: String,
+    slot_id: String,
+    storage_instance_id: String,
+    generation: String,
+    retire_id: String,
+    request_digest: String,
+    retired_reuse_state: CargoReuseState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -331,6 +391,8 @@ struct Ledger {
     slots: Vec<Slot>,
     leases: Vec<Lease>,
     operations: Vec<SettlementOperation>,
+    retirements: Vec<OrdinaryCargoRetirementIntent>,
+    tombstones: Vec<OrdinaryCargoTombstone>,
 }
 
 impl Ledger {
@@ -344,6 +406,8 @@ impl Ledger {
             slots: Vec::new(),
             leases: Vec::new(),
             operations: Vec::new(),
+            retirements: Vec::new(),
+            tombstones: Vec::new(),
         })
     }
 }
@@ -445,6 +509,23 @@ impl Store {
             changed = true;
         }
 
+        // An interrupted retirement resumes only its recorded owned scope:
+        // the slot bytes are removed, the tombstone receipt is published,
+        // and the root/partition may then admit a fresh-ordinal replacement.
+        // Unknown mount/backing state or a failed metadata sync holds the
+        // whole recovery instead of half-completing it.
+        let retiring: Vec<String> = self
+            .ledger
+            .slots
+            .iter()
+            .filter(|slot| slot.state == InternalSlotState::Retiring)
+            .map(|slot| slot.id.clone())
+            .collect();
+        for id in retiring {
+            self.complete_recorded_retirement(&id)?;
+            changed = true;
+        }
+
         let active_ids: Vec<String> = self
             .ledger
             .leases
@@ -509,6 +590,77 @@ impl Store {
         Ok(())
     }
 
+    /// Completes one recorded ordinary retirement: removes the owned slot
+    /// bytes under the recorded scope only, publishes the durable tombstone
+    /// receipt, and frees the root/partition allowance for a fresh-ordinal
+    /// replacement. Used both by the live retire path and by startup
+    /// recovery after an interrupted deletion. The caller persists.
+    fn complete_recorded_retirement(&mut self, slot_id: &str) -> Result<(), StorageError> {
+        let intent = self
+            .ledger
+            .retirements
+            .iter()
+            .find(|intent| intent.slot_id == slot_id)
+            .cloned()
+            .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+        let slot = self.slot_by_id(slot_id)?;
+        let generation = slot
+            .ordinary_cargo
+            .as_ref()
+            .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+        if slot.state != InternalSlotState::Retiring
+            || slot.lease_id.is_some()
+            || intent.storage_instance_id != self.ledger.storage_instance_id
+            || intent.generation != slot_generation(slot_id)?
+            || !matches!(
+                generation.reuse_state,
+                CargoReuseState::Reusable | CargoReuseState::ColdOnly
+            )
+            || intent.retired_reuse_state != generation.reuse_state
+        {
+            return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+        }
+        // Mount/backing/descendant state is rechecked before touching
+        // payload bytes; anything unknown holds the whole recovery.
+        self.validate_root_inventory()?;
+        let path = self.slot_path(slot_id)?;
+        if path_exists(&path)? {
+            remove_tree_owned(&self.slots_root, &path).map_err(|error| {
+                self.poisoned = true;
+                error
+            })?;
+        }
+        let retiring = self.slot_by_id(slot_id)?;
+        let generation_record = retiring
+            .ordinary_cargo
+            .clone()
+            .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+        let cargo_partition = retiring.partition.clone();
+        self.ledger.slots.retain(|slot| slot.id != slot_id);
+        self.ledger
+            .retirements
+            .retain(|record| record.slot_id != slot_id);
+        // The tombstone history itself is finite; startup completion of an
+        // already-authorized intent is never the refusal point. New intents
+        // are gated before they are recorded.
+        self.ledger.tombstones.push(OrdinaryCargoTombstone {
+            root: generation_record.root,
+            partition: generation_record.partition,
+            cargo_partition,
+            policy_version: generation_record.policy_version,
+            installation_epoch: generation_record.installation_epoch,
+            acceptance_reference: generation_record.acceptance_reference,
+            input_boundary_digest: generation_record.input_boundary_digest,
+            slot_id: intent.slot_id,
+            storage_instance_id: intent.storage_instance_id,
+            generation: intent.generation,
+            retire_id: intent.retire_id,
+            request_digest: intent.request_digest,
+            retired_reuse_state: intent.retired_reuse_state,
+        });
+        Ok(())
+    }
+
     fn validate_slot_inventory(&self) -> Result<(), StorageError> {
         if !valid_storage_instance_id(&self.ledger.storage_instance_id)
             || self.ledger.next_slot == 0
@@ -546,6 +698,21 @@ impl Store {
                 }
                 InternalSlotState::Preparing | InternalSlotState::Evicting => {
                     if slot.lease_id.is_some() {
+                        return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+                    }
+                }
+                InternalSlotState::Retiring => {
+                    // Retirement holds no lease: the generation was proven
+                    // idle before its intent was recorded, and the intent
+                    // pins the only resumable scope.
+                    if slot.lease_id.is_some()
+                        || slot.ordinary_cargo.is_none()
+                        || !self
+                            .ledger
+                            .retirements
+                            .iter()
+                            .any(|intent| intent.slot_id == slot.id)
+                    {
                         return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
                     }
                 }
@@ -632,8 +799,29 @@ impl Store {
                         .ledger
                         .slots
                         .iter()
-                        .find(|slot| slot.id == lease.slot_id)
-                        .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+                        .find(|slot| slot.id == lease.slot_id);
+                    if slot.is_none() {
+                        // A retired generation keeps its finalized leases for
+                        // access-free replay only. The lease must be settled
+                        // and consistent with the tombstoned identity; it can
+                        // never grant access or resurrect bytes.
+                        let tombstone = self
+                            .ledger
+                            .tombstones
+                            .iter()
+                            .find(|tombstone| tombstone.slot_id == lease.slot_id)
+                            .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+                        if validate_ordinary_request(&ordinary.request).is_err()
+                            || lease.status != LeaseStatus::Finalized
+                            || ordinary.finalized_reuse_state != Some(tombstone.retired_reuse_state)
+                            || !ordinary_lease_matches_tombstone(&ordinary.request, tombstone)
+                        {
+                            return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+                        }
+                        continue;
+                    }
+                    let slot =
+                        slot.ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
                     let generation = slot
                         .ordinary_cargo
                         .as_ref()
@@ -724,6 +912,95 @@ impl Store {
                 return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
             }
         }
+        // Retirement intents pin exactly one live retiring slot each;
+        // tombstones pin retired triples that can never be re-admitted.
+        // Both stay within the finite control-history policy: no silent
+        // trimming, and no second intent or tombstone for one scope.
+        if self.ledger.retirements.len() + self.ledger.tombstones.len() > MAX_LEDGER_RETIREMENTS {
+            return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+        }
+        let mut retire_ids = std::collections::BTreeSet::new();
+        for intent in &self.ledger.retirements {
+            if validate_ordinary_request(&intent.request).is_err()
+                || validate_retention(&intent.retention).is_err()
+                || !valid_slot_id(&intent.slot_id)
+                || intent.storage_instance_id != self.ledger.storage_instance_id
+                || parse_generation(&intent.generation).is_err()
+                || intent.generation != slot_generation(&intent.slot_id)?
+                || !valid_hash(&intent.request_digest)
+                || !matches!(
+                    intent.retired_reuse_state,
+                    CargoReuseState::Reusable | CargoReuseState::ColdOnly
+                )
+                || !retire_ids.insert(intent.retire_id.as_str())
+            {
+                return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+            }
+            largest_generation = largest_generation.max(
+                parse_generation(&intent.generation)
+                    .map_err(|_| StorageError::Refused(RefusalReason::UnknownAccounting))?,
+            );
+            let slot = self
+                .ledger
+                .slots
+                .iter()
+                .find(|slot| slot.id == intent.slot_id)
+                .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+            let generation = slot
+                .ordinary_cargo
+                .as_ref()
+                .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+            if slot.state != InternalSlotState::Retiring
+                || slot.lease_id.is_some()
+                || !ordinary_generation_matches_request(generation, &intent.request)
+                || generation.reuse_state != intent.retired_reuse_state
+            {
+                return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+            }
+        }
+        for tombstone in &self.ledger.tombstones {
+            if !valid_slot_id(&tombstone.slot_id)
+                || tombstone.storage_instance_id != self.ledger.storage_instance_id
+                || parse_generation(&tombstone.generation).is_err()
+                || tombstone.generation != slot_generation(&tombstone.slot_id)?
+                || !valid_hash(&tombstone.request_digest)
+                || !supported_ordinary_cargo_policy_version(tombstone.policy_version)
+                || tombstone.root.source_root.as_os_str().is_empty()
+                || !tombstone.root.source_root.is_absolute()
+                || tombstone.root.consumer_root_id.is_empty()
+                || tombstone.root.allocation_epoch.is_empty()
+                || tombstone.installation_epoch.is_empty()
+                || tombstone.acceptance_reference.is_empty()
+                || !valid_digest(&tombstone.input_boundary_digest)
+                || tombstone.cargo_partition.path_identity != ORDINARY_CARGO_PATH_IDENTITY
+                || !matches!(
+                    &tombstone.partition,
+                    OrdinaryCargoPartition::OrdinaryTest | OrdinaryCargoPartition::FullDebug
+                )
+                || !matches!(
+                    tombstone.retired_reuse_state,
+                    CargoReuseState::Reusable | CargoReuseState::ColdOnly
+                )
+                || !tombstone_stable_reference_is_valid(tombstone)
+                || self
+                    .ledger
+                    .slots
+                    .iter()
+                    .any(|slot| slot.id == tombstone.slot_id)
+                || self
+                    .ledger
+                    .retirements
+                    .iter()
+                    .any(|intent| intent.slot_id == tombstone.slot_id)
+                || !retire_ids.insert(tombstone.retire_id.as_str())
+            {
+                return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+            }
+            largest_generation = largest_generation.max(
+                parse_generation(&tombstone.generation)
+                    .map_err(|_| StorageError::Refused(RefusalReason::UnknownAccounting))?,
+            );
+        }
         if self.ledger.next_slot <= largest_generation {
             return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
         }
@@ -765,7 +1042,8 @@ impl Store {
                 InternalSlotState::Leased => SlotState::Leased,
                 InternalSlotState::Uncertain
                 | InternalSlotState::Preparing
-                | InternalSlotState::Evicting => SlotState::Uncertain,
+                | InternalSlotState::Evicting
+                | InternalSlotState::Retiring => SlotState::Uncertain,
             };
             let owned = slot
                 .measured_bytes
@@ -1051,6 +1329,9 @@ impl Store {
                     RefusalReason::OrdinaryCargoIncompatible,
                 ));
             }
+            if slot.state == InternalSlotState::Retiring {
+                return Err(StorageError::Refused(RefusalReason::OrdinaryCargoRetiring));
+            }
             match ordinary.reuse_state {
                 CargoReuseState::Pending => {
                     return Err(StorageError::Refused(RefusalReason::OrdinaryCargoPending));
@@ -1226,6 +1507,52 @@ impl Store {
         }
     }
 
+    /// Resolves the durable reuse state for one ordinary lease without
+    /// granting access. A retired generation answers from its tombstone:
+    /// finalized replays stay access-free and can never resurrect bytes.
+    fn ordinary_durable_reuse_state(&self, lease: &Lease) -> Result<CargoReuseState, StorageError> {
+        let record = lease
+            .ordinary_cargo
+            .as_ref()
+            .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+        match self
+            .ledger
+            .slots
+            .iter()
+            .find(|slot| slot.id == lease.slot_id)
+        {
+            Some(slot) => {
+                let generation = slot
+                    .ordinary_cargo
+                    .as_ref()
+                    .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+                if lease.status == LeaseStatus::Finalized {
+                    record
+                        .finalized_reuse_state
+                        .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))
+                } else {
+                    Ok(generation.reuse_state)
+                }
+            }
+            None => {
+                let tombstone = self
+                    .ledger
+                    .tombstones
+                    .iter()
+                    .find(|tombstone| tombstone.slot_id == lease.slot_id)
+                    .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+                if tombstone.storage_instance_id != self.ledger.storage_instance_id
+                    || lease.status != LeaseStatus::Finalized
+                    || record.finalized_reuse_state != Some(tombstone.retired_reuse_state)
+                    || !ordinary_lease_matches_tombstone(&record.request, tombstone)
+                {
+                    return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+                }
+                Ok(tombstone.retired_reuse_state)
+            }
+        }
+    }
+
     fn ordinary_acquire_result(
         &self,
         lease: &Lease,
@@ -1234,18 +1561,7 @@ impl Store {
             .ordinary_cargo
             .as_ref()
             .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
-        let slot = self.slot_by_id(&lease.slot_id)?;
-        let generation = slot
-            .ordinary_cargo
-            .as_ref()
-            .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
-        let reuse_state = if lease.status == LeaseStatus::Finalized {
-            record
-                .finalized_reuse_state
-                .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?
-        } else {
-            generation.reuse_state
-        };
+        let reuse_state = self.ordinary_durable_reuse_state(lease)?;
         Ok(OrdinaryCargoAcquireResult {
             policy_version: record.request.acceptance.policy_version,
             root: record.request.root.clone(),
@@ -1263,18 +1579,7 @@ impl Store {
             .ordinary_cargo
             .as_ref()
             .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
-        let slot = self.slot_by_id(&lease.slot_id)?;
-        let generation = slot
-            .ordinary_cargo
-            .as_ref()
-            .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
-        let reuse_state = if lease.status == LeaseStatus::Finalized {
-            record
-                .finalized_reuse_state
-                .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?
-        } else {
-            generation.reuse_state
-        };
+        let reuse_state = self.ordinary_durable_reuse_state(lease)?;
         Ok(OrdinaryCargoLeaseIdentity {
             policy_version: record.request.acceptance.policy_version,
             root: record.request.root.clone(),
@@ -1551,6 +1856,221 @@ impl Store {
         } else {
             Ok(LookupResult::Absent)
         }
+    }
+
+    /// Retires one proven-idle ordinary generation and publishes its
+    /// durable tombstone receipt. The intent and exact authorized scope
+    /// persist before any payload byte is touched; an interrupted deletion
+    /// resumes only that recorded scope. Exactly one tombstone per slot
+    /// scope ever exists, and the root/partition may then admit a
+    /// replacement under enforced capacity with a new monotonic ordinal.
+    pub(super) fn retire_ordinary_cargo(
+        &mut self,
+        request: OrdinaryCargoRetireRequest,
+    ) -> Result<OrdinaryCargoRetirementReceipt, StorageError> {
+        self.ensure_healthy()?;
+        validate_retire_request(&request)?;
+        validate_canonical_source_root(&request.request.root)?;
+        let request_digest = digest_encoded(&request)?;
+
+        if let Some(tombstone) = self
+            .ledger
+            .tombstones
+            .iter()
+            .find(|tombstone| tombstone.slot_id == request.slot_id)
+        {
+            // Even idempotent replays authenticate: possession of the exact
+            // credential-bearing body is checked before any receipt,
+            // conflict, or retired refusal is reported.
+            if !self.authority.verify_ordinary_cargo_retirement(&request) {
+                return Err(StorageError::Unauthorized);
+            }
+            if tombstone.storage_instance_id != request.storage_instance_id
+                || tombstone.generation != request.generation
+            {
+                return Err(StorageError::Conflict);
+            }
+            if tombstone.retire_id == request.retire_id {
+                if tombstone.request_digest != request_digest {
+                    return Err(StorageError::Conflict);
+                }
+                return Ok(retirement_receipt(tombstone));
+            }
+            return Err(StorageError::Refused(RefusalReason::OrdinaryCargoRetired));
+        }
+
+        if let Some(intent) = self
+            .ledger
+            .retirements
+            .iter()
+            .find(|intent| intent.slot_id == request.slot_id)
+            .cloned()
+        {
+            if intent.storage_instance_id != request.storage_instance_id
+                || intent.generation != request.generation
+            {
+                return Err(StorageError::Conflict);
+            }
+            if intent.retire_id != request.retire_id || intent.request_digest != request_digest {
+                if intent.retire_id == request.retire_id {
+                    return Err(StorageError::Conflict);
+                }
+                return Err(StorageError::Refused(RefusalReason::OrdinaryCargoRetiring));
+            }
+            if !self.authority.verify_ordinary_cargo_retirement(&request) {
+                return Err(StorageError::Unauthorized);
+            }
+            self.complete_recorded_retirement(&request.slot_id)?;
+            self.persist()?;
+            let tombstone = self
+                .ledger
+                .tombstones
+                .iter()
+                .find(|tombstone| tombstone.slot_id == request.slot_id)
+                .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+            return Ok(retirement_receipt(tombstone));
+        }
+
+        if self.ledger.retirements.iter().any(|intent| {
+            intent.retire_id == request.retire_id || intent.request_digest == request_digest
+        }) || self.ledger.tombstones.iter().any(|tombstone| {
+            tombstone.retire_id == request.retire_id || tombstone.request_digest == request_digest
+        }) {
+            return Err(StorageError::Conflict);
+        }
+
+        let slot = self
+            .ledger
+            .slots
+            .iter()
+            .find(|slot| slot.id == request.slot_id)
+            .cloned()
+            .ok_or(StorageError::Refused(RefusalReason::LeaseUnavailable))?;
+        let generation = slot.ordinary_cargo.clone().ok_or(StorageError::Conflict)?;
+        if request.storage_instance_id != self.ledger.storage_instance_id
+            || request.generation != slot_generation(&request.slot_id)?
+        {
+            return Err(StorageError::Conflict);
+        }
+        if slot.partition
+            != normalized_ordinary_acquire(&request.request.acquire)
+                .envelope
+                .partition
+            || !ordinary_generation_matches_request(&generation, &request.request)
+        {
+            return Err(StorageError::Refused(
+                RefusalReason::OrdinaryCargoIncompatible,
+            ));
+        }
+        // Only proven-idle retained generations retire. A live, uncertain,
+        // or pending lease, or any outstanding ownership, holds the whole
+        // retirement first: failure or cold-only bytes are never a
+        // permission to retire, and success never waives the retention
+        // acknowledgment below.
+        if slot.state != InternalSlotState::Idle || slot.lease_id.is_some() {
+            return Err(StorageError::Refused(RefusalReason::LeaseUnavailable));
+        }
+        if self
+            .ledger
+            .leases
+            .iter()
+            .any(|lease| lease.slot_id == request.slot_id && lease.status != LeaseStatus::Finalized)
+        {
+            return Err(StorageError::Refused(RefusalReason::LeaseUnavailable));
+        }
+        let retired_reuse_state = match generation.reuse_state {
+            CargoReuseState::Reusable | CargoReuseState::ColdOnly => generation.reuse_state,
+            CargoReuseState::Pending => {
+                return Err(StorageError::Refused(RefusalReason::OrdinaryCargoPending));
+            }
+            CargoReuseState::Empty => {
+                return Err(StorageError::Refused(
+                    RefusalReason::OrdinaryCargoIncompatible,
+                ));
+            }
+        };
+        if !self.authority.verify_ordinary_cargo_retirement(&request) {
+            return Err(StorageError::Unauthorized);
+        }
+        if self.ledger.retirements.len() + self.ledger.tombstones.len() >= MAX_LEDGER_RETIREMENTS {
+            return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+        }
+
+        let persisted = persisted_retire_request(&request);
+        self.ledger.retirements.push(OrdinaryCargoRetirementIntent {
+            request: persisted.request,
+            retention: persisted.retention,
+            slot_id: request.slot_id.clone(),
+            storage_instance_id: self.ledger.storage_instance_id.clone(),
+            generation: request.generation.clone(),
+            retire_id: request.retire_id.clone(),
+            request_digest,
+            retired_reuse_state,
+        });
+        self.slot_by_id_mut(&request.slot_id)?.state = InternalSlotState::Retiring;
+        self.persist()?;
+        self.complete_recorded_retirement(&request.slot_id)?;
+        self.persist()?;
+        let tombstone = self
+            .ledger
+            .tombstones
+            .iter()
+            .find(|tombstone| tombstone.slot_id == request.slot_id)
+            .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?;
+        Ok(retirement_receipt(tombstone))
+    }
+
+    /// Reads an exact ordinary retirement result without changing state or
+    /// access. `Absent` names an operation that was never recorded;
+    /// `Present` replays the durable tombstone receipt; `Uncertain(None)`
+    /// reports a recorded intent whose deletion has not completed, in which
+    /// case only an exact retire retry may resume it.
+    pub(super) fn lookup_retire_ordinary_cargo(
+        &self,
+        request: OrdinaryCargoRetireRequest,
+    ) -> Result<LookupResult<OrdinaryCargoRetirementReceipt>, StorageError> {
+        self.ensure_healthy()?;
+        validate_retire_request(&request)?;
+        validate_canonical_source_root(&request.request.root)?;
+        if !self.authority.verify_ordinary_cargo_retirement(&request) {
+            return Err(StorageError::Unauthorized);
+        }
+        let request_digest = digest_encoded(&request)?;
+        if let Some(tombstone) = self
+            .ledger
+            .tombstones
+            .iter()
+            .find(|tombstone| tombstone.slot_id == request.slot_id)
+        {
+            if tombstone.storage_instance_id != request.storage_instance_id
+                || tombstone.generation != request.generation
+                || tombstone.retire_id != request.retire_id
+            {
+                return Ok(LookupResult::Absent);
+            }
+            if tombstone.request_digest != request_digest {
+                return Err(StorageError::Conflict);
+            }
+            return Ok(LookupResult::Present(retirement_receipt(tombstone)));
+        }
+        if let Some(intent) = self
+            .ledger
+            .retirements
+            .iter()
+            .find(|intent| intent.slot_id == request.slot_id)
+        {
+            if intent.storage_instance_id != request.storage_instance_id
+                || intent.generation != request.generation
+                || intent.retire_id != request.retire_id
+            {
+                return Ok(LookupResult::Absent);
+            }
+            if intent.request_digest != request_digest {
+                return Err(StorageError::Conflict);
+            }
+            return Ok(LookupResult::Uncertain(None));
+        }
+        Ok(LookupResult::Absent)
     }
 
     pub(super) fn reconcile(
@@ -2378,6 +2898,104 @@ fn persisted_ordinary_request(request: &OrdinaryCargoRequest) -> OrdinaryCargoRe
     request
 }
 
+fn persisted_retention(retention: &OrdinaryCargoRetention) -> OrdinaryCargoRetention {
+    let mut retention = retention.clone();
+    retention.credential = Credential::new("verified");
+    retention
+}
+
+fn persisted_retire_request(request: &OrdinaryCargoRetireRequest) -> OrdinaryCargoRetireRequest {
+    let mut request = request.clone();
+    request.request = persisted_ordinary_request(&request.request);
+    request.retention = persisted_retention(&request.retention);
+    request
+}
+
+fn retirement_receipt(tombstone: &OrdinaryCargoTombstone) -> OrdinaryCargoRetirementReceipt {
+    OrdinaryCargoRetirementReceipt {
+        policy_version: tombstone.policy_version,
+        root: tombstone.root.clone(),
+        partition: tombstone.partition.clone(),
+        slot_id: tombstone.slot_id.clone(),
+        storage_instance_id: tombstone.storage_instance_id.clone(),
+        generation: tombstone.generation.clone(),
+        retire_id: tombstone.retire_id.clone(),
+        retired_reuse_state: tombstone.retired_reuse_state,
+    }
+}
+
+/// A lease issued for a live generation stays consistent with its tombstone
+/// after retirement: same root allocation, partition, policy, installation,
+/// and acceptance. Version 1 additionally pins the exact input digest;
+/// version 2 pins the stable eligibility reference instead, while each
+/// exact attempt remains bound by its own request digest.
+fn ordinary_lease_matches_tombstone(
+    request: &OrdinaryCargoRequest,
+    tombstone: &OrdinaryCargoTombstone,
+) -> bool {
+    request.root == tombstone.root
+        && request.partition == tombstone.partition
+        && request.acceptance.policy_version == tombstone.policy_version
+        && request.acceptance.installation_epoch == tombstone.installation_epoch
+        && request.acceptance.acceptance_reference == tombstone.acceptance_reference
+        && (request.acceptance.policy_version == ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
+            || request.acceptance.input_boundary_digest == tombstone.input_boundary_digest)
+}
+
+fn tombstone_stable_reference_is_valid(tombstone: &OrdinaryCargoTombstone) -> bool {
+    match tombstone.policy_version {
+        ORDINARY_CARGO_POLICY_VERSION => true,
+        ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION => {
+            let Some(invalidation_digest) =
+                invalidation_digest_from_stable_reference(&tombstone.acceptance_reference)
+            else {
+                return false;
+            };
+            stable_reuse_reference_for_parts(
+                &tombstone.root,
+                &tombstone.cargo_partition,
+                &tombstone.partition,
+                tombstone.policy_version,
+                &tombstone.installation_epoch,
+                invalidation_digest,
+            )
+            .is_ok_and(|expected| expected == tombstone.acceptance_reference)
+        }
+        _ => false,
+    }
+}
+
+fn validate_retention(retention: &OrdinaryCargoRetention) -> Result<(), StorageError> {
+    // Retention coverage must name its evidence. An unknown, missing, or
+    // unbounded acknowledgment refuses the whole retirement; only the
+    // owning retention authority can supply an accepted one.
+    validate_text(&retention.source_evidence_reference)?;
+    validate_text(&retention.artifact_evidence_reference)?;
+    validate_text(&retention.debug_evidence_reference)?;
+    validate_text(retention.credential.expose())
+}
+
+fn validate_retire_request(request: &OrdinaryCargoRetireRequest) -> Result<(), StorageError> {
+    validate_ordinary_request(&request.request)?;
+    if !valid_slot_id(&request.slot_id) {
+        return Err(StorageError::InvalidInput(
+            "ordinary Cargo retirement needs a known slot identity",
+        ));
+    }
+    if !valid_storage_instance_id(&request.storage_instance_id) {
+        return Err(StorageError::InvalidInput(
+            "ordinary Cargo retirement needs a known storage instance",
+        ));
+    }
+    if parse_generation(&request.generation).is_err() {
+        return Err(StorageError::InvalidInput(
+            "ordinary Cargo retirement needs a canonical generation",
+        ));
+    }
+    validate_text(&request.retire_id)?;
+    validate_retention(&request.retention)
+}
+
 fn normalized_ordinary_acquire(request: &AcquireRequest) -> AcquireRequest {
     let mut request = request.clone();
     request.envelope.partition.features.sort();
@@ -2887,6 +3505,7 @@ impl Encode for InternalSlotState {
             Self::Leased => 2,
             Self::Uncertain => 3,
             Self::Evicting => 4,
+            Self::Retiring => 5,
         });
         Ok(())
     }
@@ -2900,8 +3519,75 @@ impl Decode for InternalSlotState {
             2 => Ok(Self::Leased),
             3 => Ok(Self::Uncertain),
             4 => Ok(Self::Evicting),
+            5 => Ok(Self::Retiring),
             _ => Err(StorageError::Protocol("unknown slot state")),
         }
+    }
+}
+
+impl Encode for OrdinaryCargoRetirementIntent {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        self.request.encode(writer)?;
+        self.retention.encode(writer)?;
+        self.slot_id.encode(writer)?;
+        self.storage_instance_id.encode(writer)?;
+        self.generation.encode(writer)?;
+        self.retire_id.encode(writer)?;
+        self.request_digest.encode(writer)?;
+        self.retired_reuse_state.encode(writer)
+    }
+}
+
+impl Decode for OrdinaryCargoRetirementIntent {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        Ok(Self {
+            request: OrdinaryCargoRequest::decode(reader)?,
+            retention: OrdinaryCargoRetention::decode(reader)?,
+            slot_id: String::decode(reader)?,
+            storage_instance_id: String::decode(reader)?,
+            generation: String::decode(reader)?,
+            retire_id: String::decode(reader)?,
+            request_digest: String::decode(reader)?,
+            retired_reuse_state: CargoReuseState::decode(reader)?,
+        })
+    }
+}
+
+impl Encode for OrdinaryCargoTombstone {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        self.root.encode(writer)?;
+        self.partition.encode(writer)?;
+        self.cargo_partition.encode(writer)?;
+        writer.u32(self.policy_version);
+        self.installation_epoch.encode(writer)?;
+        self.acceptance_reference.encode(writer)?;
+        self.input_boundary_digest.encode(writer)?;
+        self.slot_id.encode(writer)?;
+        self.storage_instance_id.encode(writer)?;
+        self.generation.encode(writer)?;
+        self.retire_id.encode(writer)?;
+        self.request_digest.encode(writer)?;
+        self.retired_reuse_state.encode(writer)
+    }
+}
+
+impl Decode for OrdinaryCargoTombstone {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        Ok(Self {
+            root: StrictPhysicalCargoRoot::decode(reader)?,
+            partition: OrdinaryCargoPartition::decode(reader)?,
+            cargo_partition: PartitionKey::decode(reader)?,
+            policy_version: reader.u32()?,
+            installation_epoch: String::decode(reader)?,
+            acceptance_reference: String::decode(reader)?,
+            input_boundary_digest: String::decode(reader)?,
+            slot_id: String::decode(reader)?,
+            storage_instance_id: String::decode(reader)?,
+            generation: String::decode(reader)?,
+            retire_id: String::decode(reader)?,
+            request_digest: String::decode(reader)?,
+            retired_reuse_state: CargoReuseState::decode(reader)?,
+        })
     }
 }
 
@@ -3238,7 +3924,9 @@ impl Encode for Ledger {
         writer.u64(self.next_sequence);
         encode_vec(writer, &self.slots)?;
         encode_vec(writer, &self.leases)?;
-        encode_vec(writer, &self.operations)
+        encode_vec(writer, &self.operations)?;
+        encode_vec(writer, &self.retirements)?;
+        encode_vec(writer, &self.tombstones)
     }
 }
 
@@ -3253,6 +3941,8 @@ impl Decode for Ledger {
             slots: decode_vec(reader)?,
             leases: decode_vec(reader)?,
             operations: decode_vec(reader)?,
+            retirements: decode_vec(reader)?,
+            tombstones: decode_vec(reader)?,
         })
     }
 }

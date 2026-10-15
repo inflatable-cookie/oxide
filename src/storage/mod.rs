@@ -14,10 +14,12 @@ pub use types::{
     CooperativeCompletionEvidence, Credential, FinalizationReceipt, Inventory, InventorySlot,
     LeaseIdentity, LeaseToken, LookupResult, NoSpawnEvidence, OrdinaryCargoAcceptance,
     OrdinaryCargoAcquireResult, OrdinaryCargoFinalizationReceipt, OrdinaryCargoFinalizeRequest,
-    OrdinaryCargoLeaseIdentity, OrdinaryCargoPartition, OrdinaryCargoRequest, PartitionKey,
-    ProcessIdentityEvidence, ReconcileReceipt, RefusalReason, RunBinding, RunEnvelope,
-    SettlementEvidence, SlotState, StorageError, StrictPhysicalCargoRoot, TerminalOutcome,
-    TerminalRecord, ORDINARY_CARGO_POLICY_VERSION, ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION,
+    OrdinaryCargoLeaseIdentity, OrdinaryCargoPartition, OrdinaryCargoRequest,
+    OrdinaryCargoRetention, OrdinaryCargoRetireRequest, OrdinaryCargoRetirementReceipt,
+    PartitionKey, ProcessIdentityEvidence, ReconcileReceipt, RefusalReason, RunBinding,
+    RunEnvelope, SettlementEvidence, SlotState, StorageError, StrictPhysicalCargoRoot,
+    TerminalOutcome, TerminalRecord, ORDINARY_CARGO_POLICY_VERSION,
+    ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION,
 };
 
 #[cfg(test)]

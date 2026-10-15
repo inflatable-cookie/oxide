@@ -41,6 +41,20 @@ pub(super) fn send_ordinary_acquire_and_forget(
 }
 
 #[cfg(test)]
+pub(super) fn send_ordinary_retire_and_forget(
+    socket_path: &std::path::Path,
+    request: OrdinaryCargoRetireRequest,
+) -> Result<(), StorageError> {
+    let mut stream = UnixStream::connect(socket_path).map_err(io_error)?;
+    let mut writer = Writer::new();
+    encode_protocol_header(&mut writer)?;
+    Request::RetireOrdinaryCargo(request).encode(&mut writer)?;
+    write_frame(&mut stream, writer.finish())?;
+    let _discarded_response = read_frame(&mut stream)?;
+    Ok(())
+}
+
+#[cfg(test)]
 pub(super) fn send_ordinary_finalize_and_forget(
     socket_path: &std::path::Path,
     request: OrdinaryCargoFinalizeRequest,
@@ -210,6 +224,37 @@ impl Client {
         }
     }
 
+    /// Retires one proven-idle ordinary generation and publishes its
+    /// durable tombstone receipt. The root/partition may then admit a
+    /// replacement with a new monotonic slot ordinal.
+    pub fn retire_ordinary_cargo(
+        &self,
+        request: OrdinaryCargoRetireRequest,
+    ) -> Result<OrdinaryCargoRetirementReceipt, StorageError> {
+        match self.call(Request::RetireOrdinaryCargo(request))? {
+            Response::RetireOrdinaryCargo(result) => result,
+            _ => Err(StorageError::Protocol(
+                "unexpected ordinary Cargo retire response",
+            )),
+        }
+    }
+
+    /// Reads an exact ordinary retirement result without changing state or
+    /// access. `Absent` was never recorded; `Present` replays the durable
+    /// tombstone receipt; `Uncertain(None)` reports a recorded intent whose
+    /// deletion has not completed.
+    pub fn lookup_retire_ordinary_cargo(
+        &self,
+        request: OrdinaryCargoRetireRequest,
+    ) -> Result<LookupResult<OrdinaryCargoRetirementReceipt>, StorageError> {
+        match self.call(Request::LookupRetireOrdinaryCargo(request))? {
+            Response::LookupRetireOrdinaryCargo(result) => result,
+            _ => Err(StorageError::Protocol(
+                "unexpected ordinary Cargo retire lookup response",
+            )),
+        }
+    }
+
     /// Reads an exact ordinary finalize result without changing state or access.
     pub fn lookup_finalize_ordinary_cargo(
         &self,
@@ -306,6 +351,8 @@ enum Request {
     },
     FinalizeOrdinaryCargo(OrdinaryCargoFinalizeRequest),
     LookupFinalizeOrdinaryCargo(OrdinaryCargoFinalizeRequest),
+    RetireOrdinaryCargo(OrdinaryCargoRetireRequest),
+    LookupRetireOrdinaryCargo(OrdinaryCargoRetireRequest),
     Evict {
         request_id: String,
         target_bytes: u64,
@@ -345,6 +392,14 @@ impl Encode for Request {
             }
             Self::LookupFinalizeOrdinaryCargo(request) => {
                 writer.u8(12);
+                request.encode(writer)?;
+            }
+            Self::RetireOrdinaryCargo(request) => {
+                writer.u8(13);
+                request.encode(writer)?;
+            }
+            Self::LookupRetireOrdinaryCargo(request) => {
+                writer.u8(14);
                 request.encode(writer)?;
             }
             Self::Finalize {
@@ -413,6 +468,12 @@ impl Decode for Request {
             12 => Ok(Self::LookupFinalizeOrdinaryCargo(
                 OrdinaryCargoFinalizeRequest::decode(reader)?,
             )),
+            13 => Ok(Self::RetireOrdinaryCargo(
+                OrdinaryCargoRetireRequest::decode(reader)?,
+            )),
+            14 => Ok(Self::LookupRetireOrdinaryCargo(
+                OrdinaryCargoRetireRequest::decode(reader)?,
+            )),
             4 => Ok(Self::Finalize {
                 lease_id: String::decode(reader)?,
                 token: decode_token(reader)?,
@@ -452,6 +513,8 @@ enum Response {
     LookupFinalizeOrdinaryCargo(
         Result<LookupResult<OrdinaryCargoFinalizationReceipt>, StorageError>,
     ),
+    RetireOrdinaryCargo(Result<OrdinaryCargoRetirementReceipt, StorageError>),
+    LookupRetireOrdinaryCargo(Result<LookupResult<OrdinaryCargoRetirementReceipt>, StorageError>),
     Evict(Result<u64, StorageError>),
     Error(StorageError),
 }
@@ -499,6 +562,14 @@ impl Encode for Response {
                 writer.u8(12);
                 encode_result(writer, result, encode_ordinary_finalization_lookup)?;
             }
+            Self::RetireOrdinaryCargo(result) => {
+                writer.u8(13);
+                encode_result(writer, result, encode_ordinary_retirement)?;
+            }
+            Self::LookupRetireOrdinaryCargo(result) => {
+                writer.u8(14);
+                encode_result(writer, result, encode_ordinary_retirement_lookup)?;
+            }
             Self::Evict(result) => {
                 writer.u8(5);
                 encode_result(writer, result, |writer, value| value.encode(writer))?;
@@ -544,6 +615,14 @@ impl Decode for Response {
             12 => Ok(Self::LookupFinalizeOrdinaryCargo(decode_result(
                 reader,
                 decode_ordinary_finalization_lookup,
+            ))),
+            13 => Ok(Self::RetireOrdinaryCargo(decode_result(
+                reader,
+                decode_ordinary_retirement,
+            ))),
+            14 => Ok(Self::LookupRetireOrdinaryCargo(decode_result(
+                reader,
+                decode_ordinary_retirement_lookup,
             ))),
             _ => Err(StorageError::Protocol("unknown response")),
         }
@@ -621,6 +700,12 @@ pub(crate) fn serve_one(mut stream: UnixStream, store: &mut Store) -> Result<(),
         }
         Request::LookupFinalizeOrdinaryCargo(request) => {
             Response::LookupFinalizeOrdinaryCargo(store.lookup_finalize_ordinary_cargo(request))
+        }
+        Request::RetireOrdinaryCargo(request) => {
+            Response::RetireOrdinaryCargo(store.retire_ordinary_cargo(request))
+        }
+        Request::LookupRetireOrdinaryCargo(request) => {
+            Response::LookupRetireOrdinaryCargo(store.lookup_retire_ordinary_cargo(request))
         }
         Request::Evict {
             request_id,
@@ -716,6 +801,8 @@ fn encode_error(writer: &mut Writer, error: &StorageError) -> Result<(), Storage
                 RefusalReason::OrdinaryCargoColdOnly => 9,
                 RefusalReason::OrdinaryCargoPartitionLimit => 10,
                 RefusalReason::OrdinaryCargoIncompatible => 11,
+                RefusalReason::OrdinaryCargoRetiring => 12,
+                RefusalReason::OrdinaryCargoRetired => 13,
             });
         }
     }
@@ -725,12 +812,20 @@ fn encode_error(writer: &mut Writer, error: &StorageError) -> Result<(), Storage
 fn decode_error(reader: &mut Reader<'_>) -> Result<StorageError, StorageError> {
     match reader.u8()? {
         1 => Ok(StorageError::Io(reader.string()?)),
-        2 => Ok(StorageError::InvalidInput("remote request was invalid")),
+        // The peer's detail string is consumed but never trusted: the
+        // local static message keeps error values fixed-shape.
+        2 => {
+            let _discarded_detail = reader.string()?;
+            Ok(StorageError::InvalidInput("remote request was invalid"))
+        }
         3 => Ok(StorageError::Conflict),
         4 => Ok(StorageError::Unauthorized),
-        5 => Ok(StorageError::Protocol(
-            "remote protocol rejected the request",
-        )),
+        5 => {
+            let _discarded_detail = reader.string()?;
+            Ok(StorageError::Protocol(
+                "remote protocol rejected the request",
+            ))
+        }
         6 => match reader.u8()? {
             1 => Ok(StorageError::Refused(RefusalReason::AlreadyRunning)),
             2 => Ok(StorageError::Refused(RefusalReason::UnknownAccounting)),
@@ -747,6 +842,8 @@ fn decode_error(reader: &mut Reader<'_>) -> Result<StorageError, StorageError> {
             11 => Ok(StorageError::Refused(
                 RefusalReason::OrdinaryCargoIncompatible,
             )),
+            12 => Ok(StorageError::Refused(RefusalReason::OrdinaryCargoRetiring)),
+            13 => Ok(StorageError::Refused(RefusalReason::OrdinaryCargoRetired)),
             _ => Err(StorageError::Protocol("unknown refusal reason")),
         },
         _ => Err(StorageError::Protocol("unknown error response")),
@@ -1251,6 +1348,78 @@ fn validate_ordinary_finalization_lookup_state(
         }
         _ => Err(StorageError::Protocol(
             "ordinary Cargo finalize lookup result does not match operation state",
+        )),
+    }
+}
+
+fn encode_ordinary_retirement(
+    writer: &mut Writer,
+    receipt: &OrdinaryCargoRetirementReceipt,
+) -> Result<(), StorageError> {
+    writer.u32(receipt.policy_version);
+    receipt.root.encode(writer)?;
+    receipt.partition.encode(writer)?;
+    receipt.slot_id.encode(writer)?;
+    receipt.storage_instance_id.encode(writer)?;
+    receipt.generation.encode(writer)?;
+    receipt.retire_id.encode(writer)?;
+    receipt.retired_reuse_state.encode(writer)
+}
+
+fn decode_ordinary_retirement(
+    reader: &mut Reader<'_>,
+) -> Result<OrdinaryCargoRetirementReceipt, StorageError> {
+    let receipt = OrdinaryCargoRetirementReceipt {
+        policy_version: reader.u32()?,
+        root: StrictPhysicalCargoRoot::decode(reader)?,
+        partition: OrdinaryCargoPartition::decode(reader)?,
+        slot_id: String::decode(reader)?,
+        storage_instance_id: String::decode(reader)?,
+        generation: String::decode(reader)?,
+        retire_id: String::decode(reader)?,
+        retired_reuse_state: CargoReuseState::decode(reader)?,
+    };
+    if !valid_retirement_receipt(&receipt) {
+        return Err(StorageError::Protocol(
+            "ordinary Cargo retirement receipt is not canonical",
+        ));
+    }
+    Ok(receipt)
+}
+
+fn encode_ordinary_retirement_lookup(
+    writer: &mut Writer,
+    result: &LookupResult<OrdinaryCargoRetirementReceipt>,
+) -> Result<(), StorageError> {
+    validate_ordinary_retirement_lookup_state(result)?;
+    encode_lookup_result(writer, result, encode_ordinary_retirement)
+}
+
+fn decode_ordinary_retirement_lookup(
+    reader: &mut Reader<'_>,
+) -> Result<LookupResult<OrdinaryCargoRetirementReceipt>, StorageError> {
+    let result = decode_lookup_result(reader, decode_ordinary_retirement)?;
+    validate_ordinary_retirement_lookup_state(&result)?;
+    Ok(result)
+}
+
+fn valid_retirement_receipt(receipt: &OrdinaryCargoRetirementReceipt) -> bool {
+    matches!(
+        receipt.retired_reuse_state,
+        CargoReuseState::Reusable | CargoReuseState::ColdOnly
+    ) && slot_ordinal(&receipt.slot_id)
+        .is_some_and(|ordinal| ordinal.to_string() == receipt.generation)
+        && valid_storage_instance_id(&receipt.storage_instance_id)
+}
+
+fn validate_ordinary_retirement_lookup_state(
+    result: &LookupResult<OrdinaryCargoRetirementReceipt>,
+) -> Result<(), StorageError> {
+    match result {
+        LookupResult::Absent | LookupResult::Uncertain(None) => Ok(()),
+        LookupResult::Present(receipt) if valid_retirement_receipt(receipt) => Ok(()),
+        _ => Err(StorageError::Protocol(
+            "ordinary Cargo retire lookup result does not match operation state",
         )),
     }
 }
