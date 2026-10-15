@@ -1,0 +1,31 @@
+{
+  "format": "oxide-workflow-declaration-v1",
+  "project": {
+    "root": "/absolute/path/to/project",
+    "consumer": "nucleus",
+    "project": "nucleus-core",
+    "component": "nucleus-core",
+    "workflow": "core-test"
+  },
+  "workspace": "workspace",
+  "workflow": {
+    "selector": "check:core:test",
+    "argv": ["check:core:test", "--", "--message-format=json-render-diagnostics"]
+  },
+  "intent": {
+    "profile": "dev",
+    "incremental": true,
+    "debug": "line-tables"
+  },
+  "environment_names": ["CARGO_HOME", "RUSTFLAGS"],
+  "limits": {
+    "storage_bytes": 1073741824,
+    "capture": {
+      "version": 1,
+      "total_bytes": 268435456,
+      "role_bytes": {
+        "test-result": 268435456
+      }
+    }
+  }
+}

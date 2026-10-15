@@ -207,3 +207,92 @@ assert.equal(BigInt(ordinaryV2.bootstrap.storage.inode), 9007199254740993n);
 assert.equal(typeof ordinaryV2.bootstrap.parent.inode, 'number');
 assert.equal(JSON.stringify(ordinaryV2.bootstrap.storage.device), '"18446744073709551615"');
 console.log('Node/Rust ordinary artifact-budget v2 bootstrap, stable identity, exact boundary, callback schema and HMAC vectors passed');
+
+// Declared-workflow route v3: its own versioned boundary/context subject over
+// the handoff-eligible policy-3 stable eligibility reference. Legacy v1/v2
+// vectors above stay byte-for-byte unchanged.
+const ordinaryV3 = JSON.parse(readFileSync(new URL('../fixtures/ordinary-cargo-auth-v3.json', import.meta.url)));
+assert.equal(ordinaryV3.version, 3);
+assert.equal(ordinaryV3.operation, 'ordinary-cargo-attempt-v3');
+assert.equal(ordinaryV3.storage_protocol, 2);
+const v3BudgetDigest = digestOf(JSON.stringify(sortKeys(ordinaryV3.capture_budget)));
+assert.equal(v3BudgetDigest, ordinaryV3.capture_budget_digest);
+const v3Input = ordinaryV3.bootstrap.invocation;
+const v3Invalidation = ordinaryV3.stable_invalidation_digest;
+const v3StableMaterial = {
+  schema: 'oxide.ordinary-cargo.stable-reuse.v3',
+  policy_version: v3Input.acceptance.policy_version,
+  source_root_path_hex: Buffer.from(v3Input.root.source_root, 'utf8').toString('hex'),
+  consumer_root_id: v3Input.root.consumer_root_id,
+  allocation_epoch: v3Input.root.allocation_epoch,
+  ordinary_partition: v3Input.partition,
+  project_component: v3Input.acquire.envelope.partition.project_component,
+  workflow: v3Input.acquire.envelope.partition.workflow,
+  cargo_provenance: v3Input.acquire.envelope.partition.cargo_provenance,
+  rustc_provenance: v3Input.acquire.envelope.partition.rustc_provenance,
+  host: v3Input.acquire.envelope.partition.host,
+  target: v3Input.acquire.envelope.partition.target,
+  profile: v3Input.acquire.envelope.partition.profile,
+  features: [...v3Input.acquire.envelope.partition.features].sort(),
+  config_digest: v3Input.acquire.envelope.partition.config_digest,
+  environment_digest: v3Input.acquire.envelope.partition.environment_digest,
+  path_identity: v3Input.acquire.envelope.partition.path_identity,
+  installation_epoch: v3Input.acceptance.installation_epoch,
+  qualified_invalidation_declaration_digest: v3Invalidation,
+};
+// The stable eligibility material serializes in the Rust struct field order,
+// not sorted key order; reproduce that exact encoding.
+assert.equal(ordinaryV3.stable_reference,
+  `oxide-ordinary-cargo-stable-eligibility-v3/${v3Invalidation}/${digestOf(JSON.stringify(v3StableMaterial))}`);
+assert.equal(ordinaryV3.input_boundary_subject.boundary_version, 'oxide-ordinary-cargo-input-boundary-v3');
+assert.equal(ordinaryV3.input_boundary_subject.declaration_digest, ordinaryV3.declaration_digest);
+assert.equal(digestOf(JSON.stringify(sortKeys(ordinaryV3.input_boundary_subject))), ordinaryV3.input_boundary_digest);
+assert.equal(digestOf(JSON.stringify(sortKeys(ordinaryV3.request_subject))), ordinaryV3.request_digest);
+assert.equal(digestOf(JSON.stringify(sortKeys(ordinaryV3.callback_context_subject))), ordinaryV3.callback_context_digest);
+assert.equal(ordinaryV3.callback_context_subject.operation, 'ordinary-cargo-attempt-v3');
+assert.equal(digestOf(JSON.stringify(sortKeys(ordinaryV3.bootstrap))), ordinaryV3.bootstrap_digest);
+assert.equal(ordinaryV3.bootstrap.declaration_digest, ordinaryV3.declaration_digest);
+assert.equal(ordinaryV3.bootstrap.version, 3);
+
+const v3CallbackRequest = ordinaryV3.callback_request;
+assert.equal(v3CallbackRequest.version, 3);
+assert.equal(v3CallbackRequest.operation, 'ordinary-cargo-attempt-v3');
+assert.equal(v3CallbackRequest.capture_budget_digest, v3BudgetDigest);
+assert.equal(digestOf(JSON.stringify(sortKeys(v3CallbackRequest.acquired))), v3CallbackRequest.acquired_digest);
+assert.equal(digestOf(JSON.stringify(sortKeys(v3CallbackRequest.command))), v3CallbackRequest.command_digest);
+const v3LaunchSubject = {
+  operation: v3CallbackRequest.operation,
+  request_digest: ordinaryV3.request_digest,
+  branch_id: v3CallbackRequest.source.branch_id,
+  source_content_digest: v3CallbackRequest.source.source_content_digest,
+  selector: v3CallbackRequest.command.selector,
+  argv: v3CallbackRequest.command.argv,
+  cwd: v3CallbackRequest.command.cwd,
+  environment: v3CallbackRequest.command.environment,
+  target_dir: v3CallbackRequest.command.target_dir,
+  temp_dir: v3CallbackRequest.command.temp_dir,
+  capture_dir: v3CallbackRequest.command.capture_dir,
+  expected_outputs: v3CallbackRequest.expected_outputs,
+  operation_ids: v3Input.operation_ids,
+  acquired: v3CallbackRequest.acquired,
+  capture_budget: v3CallbackRequest.capture_budget,
+  capture_budget_digest: v3CallbackRequest.capture_budget_digest,
+};
+assert.equal(digestOf(JSON.stringify(sortKeys(v3LaunchSubject))), v3CallbackRequest.launch_digest);
+assert.equal(digestOf(JSON.stringify(sortKeys(ordinaryV3.callback_result_subject))), ordinaryV3.callback_result_digest);
+assert.equal(ordinaryV3.callback_reply.version, 3);
+assert.equal(ordinaryV3.callback_reply.receipt, ordinaryV3.callback.receipt);
+for (const vector of [ordinaryV3.admission, ordinaryV3.ordinary_admission, ordinaryV3.callback]) {
+  verifyOrdinaryMac(vector);
+}
+assert.deepEqual(Object.keys(ordinaryV3.bootstrap).sort(), [
+  'callback_context', 'callback_key_hex', 'callback_timeout_ms', 'capture_budget',
+  'declaration_digest', 'invocation', 'operation', 'parent', 'remaining_ms', 'scope',
+  'storage', 'version',
+]);
+// A v2 signature/boundary is never reinterpreted as v3: the v2 vector keeps its
+// own prefix and has no declaration digest or boundary version.
+assert.ok(!('declaration_digest' in ordinaryV2.input_boundary_subject));
+assert.ok(!('boundary_version' in ordinaryV2.input_boundary_subject));
+assert.notEqual(ordinaryV2.operation, ordinaryV3.operation);
+console.log('Node/Rust declared-workflow v3 bootstrap, versioned boundary/context subject, exact digests and HMAC vectors passed');

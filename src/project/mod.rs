@@ -8,6 +8,7 @@ mod resolve;
 mod source_map;
 #[cfg(test)]
 mod source_map_probe;
+mod workflow;
 
 #[cfg(test)]
 mod tests;
@@ -28,6 +29,12 @@ pub use source_map::{
     ResolvedSourceMap, SourceMapPolicy, SourceMapRunReceipt, SourceMissControl, SourcePathClass,
     SourcePathMode, SourcePathObservation, ACCEPTED_LOGICAL_POLICY, REQUIRED_BEHAVIOR_PATHS,
     SOURCE_MAP_VERSION, SOURCE_SCAN_VERSION,
+};
+pub use workflow::{
+    CaptureLimits, ObservedWorkflow, Unavailable, WorkflowPlan, WorkflowRefusal,
+    MAX_WORKFLOW_ARGV_BYTES, MAX_WORKFLOW_ARGV_ENTRIES, MAX_WORKFLOW_CAPTURE_ROLES,
+    MAX_WORKFLOW_DECLARATION_BYTES, MAX_WORKFLOW_ENVIRONMENT_NAMES, MAX_WORKFLOW_PLAN_BYTES,
+    SUPPORTED_CAPTURE_ROLES, SUPPORTED_WORKFLOW_PROFILES, WORKFLOW_DECLARATION_FORMAT,
 };
 
 use crate::storage::{

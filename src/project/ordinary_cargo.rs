@@ -17,7 +17,6 @@ use crate::storage::{
     OrdinaryCargoFinalizeRequest as StorageOrdinaryCargoFinalizeRequest, OrdinaryCargoPartition,
     OrdinaryCargoRequest, PartitionKey, ProcessIdentityEvidence, RunEnvelope, SettlementEvidence,
     SlotState, StorageError, TerminalOutcome, TerminalRecord,
-    ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION,
 };
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -37,6 +36,13 @@ pub const ORDINARY_CARGO_ATTEMPT_VERSION: u32 = 1;
 pub const ORDINARY_CARGO_ATTEMPT_OPERATION: &str = "ordinary-cargo-attempt-v1";
 pub const ORDINARY_CARGO_CAPTURE_ATTEMPT_VERSION: u32 = 2;
 pub const ORDINARY_CARGO_CAPTURE_ATTEMPT_OPERATION: &str = "ordinary-cargo-attempt-v2";
+/// Declared-workflow route: policy 3 under its own versioned operation,
+/// bootstrap, input-boundary subject and callback context. It admits and
+/// settles exactly like version 2 within one allocation epoch and additionally
+/// opts its generation in to one owner-authenticated cross-allocation handoff.
+pub const ORDINARY_CARGO_DECLARED_ATTEMPT_VERSION: u32 = 3;
+pub const ORDINARY_CARGO_DECLARED_ATTEMPT_OPERATION: &str = "ordinary-cargo-attempt-v3";
+pub const ORDINARY_CARGO_DECLARED_BOUNDARY_VERSION: &str = "oxide-ordinary-cargo-input-boundary-v3";
 pub const ORDINARY_CARGO_CAPTURE_BUDGET_VERSION: u32 = 1;
 pub const MAX_ORDINARY_CARGO_CAPTURE_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_ATTEMPT_LIFETIME: Duration = Duration::from_secs(45 * 60);
@@ -44,7 +50,10 @@ pub const MAX_ATTEMPT_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_ATTEMPT_AGGREGATE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CAPTURE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_INVOCATION_BYTES: usize = 48 * 1024;
-const STABLE_REUSE_REFERENCE_PREFIX: &str = "oxide-ordinary-cargo-stable-eligibility-v2/";
+const STABLE_REUSE_REFERENCE_PREFIXES: [&str; 2] = [
+    "oxide-ordinary-cargo-stable-eligibility-v2/",
+    "oxide-ordinary-cargo-stable-eligibility-v3/",
+];
 const RESERVED_ENVIRONMENT: [&str; 5] = [
     "CARGO_BUILD_BUILD_DIR",
     "CARGO_TARGET_DIR",
@@ -52,6 +61,77 @@ const RESERVED_ENVIRONMENT: [&str; 5] = [
     "TMP",
     "TEMP",
 ];
+
+/// Explicit route installed by the trusted owner. Each route owns its version,
+/// operation domain, input-boundary subject, callback context and accepted
+/// storage policy version; a record is never relabelled or migrated between
+/// routes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OrdinaryCargoRoute {
+    /// Version 1: exact per-attempt digest and the legacy 16 MiB capture cap.
+    Exact,
+    /// Version 2: owner-issued capture budget over policy 2.
+    CaptureBudget(OrdinaryCargoCaptureBudget),
+    /// Version 3: declared-workflow front end over policy 3.
+    Declared {
+        capture_budget: OrdinaryCargoCaptureBudget,
+        declaration_digest: String,
+    },
+}
+
+impl OrdinaryCargoRoute {
+    fn capture_budget(&self) -> Option<&OrdinaryCargoCaptureBudget> {
+        match self {
+            Self::Exact => None,
+            Self::CaptureBudget(budget)
+            | Self::Declared {
+                capture_budget: budget,
+                ..
+            } => Some(budget),
+        }
+    }
+
+    fn declaration_digest(&self) -> Option<&str> {
+        match self {
+            Self::Declared {
+                declaration_digest, ..
+            } => Some(declaration_digest),
+            _ => None,
+        }
+    }
+
+    fn version(&self) -> u32 {
+        match self {
+            Self::Exact => ORDINARY_CARGO_ATTEMPT_VERSION,
+            Self::CaptureBudget(_) => ORDINARY_CARGO_CAPTURE_ATTEMPT_VERSION,
+            Self::Declared { .. } => ORDINARY_CARGO_DECLARED_ATTEMPT_VERSION,
+        }
+    }
+
+    fn operation(&self) -> &'static str {
+        match self {
+            Self::Exact => ORDINARY_CARGO_ATTEMPT_OPERATION,
+            Self::CaptureBudget(_) => ORDINARY_CARGO_CAPTURE_ATTEMPT_OPERATION,
+            Self::Declared { .. } => ORDINARY_CARGO_DECLARED_ATTEMPT_OPERATION,
+        }
+    }
+
+    fn policy_version(&self) -> u32 {
+        match self {
+            Self::Exact => crate::storage::ORDINARY_CARGO_POLICY_VERSION,
+            Self::CaptureBudget(_) => crate::storage::ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION,
+            Self::Declared { .. } => crate::storage::ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION,
+        }
+    }
+
+    fn callback_context(&self, scope: &str, request_digest: &str) -> Result<String, AttemptError> {
+        match self {
+            Self::Exact => ordinary_cargo_callback_context(scope, request_digest),
+            Self::CaptureBudget(_) => ordinary_cargo_callback_context_v2(scope, request_digest),
+            Self::Declared { .. } => ordinary_cargo_callback_context_v3(scope, request_digest),
+        }
+    }
+}
 
 /// Reserved operation identities for submit, capture, no-submit, and finalize.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -284,7 +364,7 @@ pub struct OrdinaryCargoAttemptRunner {
     callbacks: Box<dyn OrdinaryCargoCallbacks>,
     callback_authenticator: CallbackAuthenticator,
     budget: OrdinaryCargoAttemptBudget,
-    capture_budget: Option<OrdinaryCargoCaptureBudget>,
+    route: OrdinaryCargoRoute,
 }
 
 impl fmt::Debug for OrdinaryCargoAttemptRunner {
@@ -311,7 +391,7 @@ impl OrdinaryCargoAttemptRunner {
             parent_endpoint,
             callback_authenticator,
             budget,
-            None,
+            OrdinaryCargoRoute::Exact,
         )
     }
 
@@ -331,7 +411,35 @@ impl OrdinaryCargoAttemptRunner {
             parent_endpoint,
             callback_authenticator,
             budget,
-            Some(capture_budget),
+            OrdinaryCargoRoute::CaptureBudget(capture_budget),
+        )
+    }
+
+    /// Install the declared-workflow route: an owner-issued capture budget over
+    /// policy 3, bound to the exact declaration digest that was resolved.
+    pub fn new_declared_workflow(
+        client: Client,
+        storage_root: PathBuf,
+        parent_endpoint: Endpoint,
+        callback_authenticator: CallbackAuthenticator,
+        budget: OrdinaryCargoAttemptBudget,
+        capture_budget: OrdinaryCargoCaptureBudget,
+        declaration_digest: String,
+    ) -> Result<Self, AttemptError> {
+        capture_budget.validate(None)?;
+        if !valid_digest(&declaration_digest) {
+            return Err(AttemptError::InvalidInput);
+        }
+        Self::new_inner(
+            client,
+            storage_root,
+            parent_endpoint,
+            callback_authenticator,
+            budget,
+            OrdinaryCargoRoute::Declared {
+                capture_budget,
+                declaration_digest,
+            },
         )
     }
 
@@ -341,7 +449,7 @@ impl OrdinaryCargoAttemptRunner {
         parent_endpoint: Endpoint,
         callback_authenticator: CallbackAuthenticator,
         budget: OrdinaryCargoAttemptBudget,
-        capture_budget: Option<OrdinaryCargoCaptureBudget>,
+        route: OrdinaryCargoRoute,
     ) -> Result<Self, AttemptError> {
         validate_private_directory(&storage_root)?;
         let callback_root = parent_endpoint
@@ -361,7 +469,7 @@ impl OrdinaryCargoAttemptRunner {
             callbacks: Box::new(UnixCallbacks::new(parent_endpoint)),
             callback_authenticator,
             budget,
-            capture_budget,
+            route,
         })
     }
 }
@@ -571,8 +679,9 @@ fn run_attempt_inner(
     let callbacks = runner.callbacks.as_mut();
     let callback_authenticator = &runner.callback_authenticator;
     let budget = runner.budget;
-    let capture_budget = runner.capture_budget.as_ref();
-    let (route_version, route_operation) = attempt_route(capture_budget);
+    let route = &runner.route;
+    let capture_budget = route.capture_budget();
+    let (route_version, route_operation) = (route.version(), route.operation());
     budget.check()?;
     validate_private_directory(storage_root)?;
     if paths_overlap(storage_root, callback_root)
@@ -581,7 +690,7 @@ fn run_attempt_inner(
     {
         return Err(AttemptError::InvalidInput);
     }
-    let request_digest = validate_invocation_with_capture_budget(&invocation, capture_budget)?;
+    let request_digest = validate_invocation_for_route(&invocation, route)?;
     let capture_budget_digest = capture_budget
         .map(ordinary_cargo_capture_budget_digest)
         .transpose()?;
@@ -953,23 +1062,48 @@ fn verify_acquire_barrier(
 pub(super) fn validate_invocation(
     invocation: &OrdinaryCargoInvocation,
 ) -> Result<String, AttemptError> {
-    validate_invocation_with_capture_budget(invocation, None)
+    validate_invocation_for_route(invocation, &OrdinaryCargoRoute::Exact)
 }
 
 /// Validate an exact request against the budget installed by the trusted owner.
 pub fn validate_invocation_with_capture_budget(
     invocation: &OrdinaryCargoInvocation,
-    capture_budget: Option<&OrdinaryCargoCaptureBudget>,
+    capture_budget: &OrdinaryCargoCaptureBudget,
 ) -> Result<String, AttemptError> {
+    validate_invocation_for_route(
+        invocation,
+        &OrdinaryCargoRoute::CaptureBudget(capture_budget.clone()),
+    )
+}
+
+/// Validate an exact request against the declared-workflow route and the exact
+/// declaration digest the owner bound into its input boundary.
+pub fn validate_declared_invocation(
+    invocation: &OrdinaryCargoInvocation,
+    capture_budget: &OrdinaryCargoCaptureBudget,
+    declaration_digest: &str,
+) -> Result<String, AttemptError> {
+    validate_invocation_for_route(
+        invocation,
+        &OrdinaryCargoRoute::Declared {
+            capture_budget: capture_budget.clone(),
+            declaration_digest: declaration_digest.to_owned(),
+        },
+    )
+}
+
+fn validate_invocation_for_route(
+    invocation: &OrdinaryCargoInvocation,
+    route: &OrdinaryCargoRoute,
+) -> Result<String, AttemptError> {
+    let capture_budget = route.capture_budget();
     let binding = &invocation.request.acquire.envelope.binding;
-    let route_matches_policy = match capture_budget {
-        None => invocation.request.acceptance.policy_version == 1,
-        Some(_) => {
-            invocation.request.acceptance.policy_version
-                == ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION
-        }
-    };
+    let route_matches_policy =
+        invocation.request.acceptance.policy_version == route.policy_version();
     if !route_matches_policy
+        || route
+            .declaration_digest()
+            .is_some_and(|digest| !valid_digest(digest))
         || invocation.request.acquire.envelope.partition.path_identity
             != "ordinary-cargo-storage-v1"
         || invocation.request.root.source_root != invocation.cwd
@@ -1112,16 +1246,12 @@ pub fn validate_invocation_with_capture_budget(
     let digest =
         crate::registered::qualification::ordinary_cargo_request_digest(&invocation.request)
             .map_err(|_| AttemptError::InvalidInput)?;
-    let boundary = match capture_budget {
-        Some(capture_budget) => {
-            ordinary_cargo_input_boundary_digest_with_capture_budget(invocation, capture_budget)?
-        }
-        None => ordinary_cargo_input_boundary_digest(invocation)?,
-    };
+    let boundary = ordinary_cargo_input_boundary_digest_for_route(invocation, route)?;
     if boundary != invocation.request.acceptance.input_boundary_digest {
         return Err(AttemptError::InvalidInput);
     }
-    let encoded_boundary = ordinary_cargo_input_boundary(invocation, capture_budget)?;
+    let encoded_boundary =
+        ordinary_cargo_input_boundary(invocation, capture_budget, route.declaration_digest())?;
     if serde_json::to_vec(&encoded_boundary)
         .map_err(|_| AttemptError::InvalidInput)?
         .len()
@@ -1137,7 +1267,7 @@ pub fn validate_invocation_with_capture_budget(
 pub fn ordinary_cargo_input_boundary_digest(
     invocation: &OrdinaryCargoInvocation,
 ) -> Result<String, AttemptError> {
-    let boundary = ordinary_cargo_input_boundary(invocation, None)?;
+    let boundary = ordinary_cargo_input_boundary(invocation, None, None)?;
     canonical_digest(&boundary).map_err(|_| AttemptError::InvalidInput)
 }
 
@@ -1147,8 +1277,45 @@ pub fn ordinary_cargo_input_boundary_digest_with_capture_budget(
     capture_budget: &OrdinaryCargoCaptureBudget,
 ) -> Result<String, AttemptError> {
     capture_budget.validate(Some(&invocation.expected_outputs))?;
-    let boundary = ordinary_cargo_input_boundary(invocation, Some(capture_budget))?;
+    let boundary = ordinary_cargo_input_boundary(invocation, Some(capture_budget), None)?;
     canonical_digest(&boundary).map_err(|_| AttemptError::InvalidInput)
+}
+
+/// Canonical declared-workflow boundary used by route version 3. It carries
+/// its own versioned schema marker and the exact declaration digest, so a v2
+/// boundary or signature is never reinterpreted as a v3 one.
+pub fn ordinary_cargo_declared_input_boundary_digest(
+    invocation: &OrdinaryCargoInvocation,
+    capture_budget: &OrdinaryCargoCaptureBudget,
+    declaration_digest: &str,
+) -> Result<String, AttemptError> {
+    if !valid_digest(declaration_digest) {
+        return Err(AttemptError::InvalidInput);
+    }
+    capture_budget.validate(Some(&invocation.expected_outputs))?;
+    let boundary =
+        ordinary_cargo_input_boundary(invocation, Some(capture_budget), Some(declaration_digest))?;
+    canonical_digest(&boundary).map_err(|_| AttemptError::InvalidInput)
+}
+
+fn ordinary_cargo_input_boundary_digest_for_route(
+    invocation: &OrdinaryCargoInvocation,
+    route: &OrdinaryCargoRoute,
+) -> Result<String, AttemptError> {
+    match route {
+        OrdinaryCargoRoute::Exact => ordinary_cargo_input_boundary_digest(invocation),
+        OrdinaryCargoRoute::CaptureBudget(capture_budget) => {
+            ordinary_cargo_input_boundary_digest_with_capture_budget(invocation, capture_budget)
+        }
+        OrdinaryCargoRoute::Declared {
+            capture_budget,
+            declaration_digest,
+        } => ordinary_cargo_declared_input_boundary_digest(
+            invocation,
+            capture_budget,
+            declaration_digest,
+        ),
+    }
 }
 
 /// Canonical digest that binds capture receipts to their installed ceilings.
@@ -1163,6 +1330,7 @@ pub fn ordinary_cargo_capture_budget_digest(
 fn ordinary_cargo_input_boundary(
     invocation: &OrdinaryCargoInvocation,
     capture_budget: Option<&OrdinaryCargoCaptureBudget>,
+    declaration_digest: Option<&str>,
 ) -> Result<Value, AttemptError> {
     let binding = &invocation.request.acquire.envelope.binding;
     let mut boundary = json!({
@@ -1192,6 +1360,13 @@ fn ordinary_cargo_input_boundary(
     if let Some(capture_budget) = capture_budget {
         boundary["capture_budget"] =
             serde_json::to_value(capture_budget).map_err(|_| AttemptError::InvalidInput)?;
+    }
+    if let Some(declaration_digest) = declaration_digest {
+        if !valid_digest(declaration_digest) {
+            return Err(AttemptError::InvalidInput);
+        }
+        boundary["boundary_version"] = json!(ORDINARY_CARGO_DECLARED_BOUNDARY_VERSION);
+        boundary["declaration_digest"] = json!(declaration_digest);
     }
     Ok(boundary)
 }
@@ -1230,11 +1405,28 @@ pub fn ordinary_cargo_callback_context_v2(
     .map_err(|_| AttemptError::InvalidInput)
 }
 
+/// Version-3 declared-workflow context: its own operation domain and the exact
+/// v3 request digest, never the v1/v2 context.
+pub fn ordinary_cargo_callback_context_v3(
+    scope: &str,
+    request_digest: &str,
+) -> Result<String, AttemptError> {
+    if !valid_text(scope) || !valid_digest(request_digest) {
+        return Err(AttemptError::InvalidInput);
+    }
+    canonical_digest(&json!({
+        "scope": scope,
+        "operation": ORDINARY_CARGO_DECLARED_ATTEMPT_OPERATION,
+        "request_digest": request_digest,
+        "storage_protocol": crate::storage::STORAGE_PROTOCOL_VERSION,
+    }))
+    .map_err(|_| AttemptError::InvalidInput)
+}
+
 fn stable_reuse_reference_matches(request: &OrdinaryCargoRequest) -> bool {
-    let Some(reference) = request
-        .acceptance
-        .acceptance_reference
-        .strip_prefix(STABLE_REUSE_REFERENCE_PREFIX)
+    let Some(reference) = STABLE_REUSE_REFERENCE_PREFIXES
+        .iter()
+        .find_map(|prefix| request.acceptance.acceptance_reference.strip_prefix(prefix))
     else {
         return false;
     };
@@ -1247,50 +1439,49 @@ fn stable_reuse_reference_matches(request: &OrdinaryCargoRequest) -> bool {
             .is_ok_and(|expected| expected == request.acceptance.acceptance_reference)
 }
 
-fn attempt_route(capture_budget: Option<&OrdinaryCargoCaptureBudget>) -> (u32, &'static str) {
-    if capture_budget.is_some() {
-        (
-            ORDINARY_CARGO_CAPTURE_ATTEMPT_VERSION,
-            ORDINARY_CARGO_CAPTURE_ATTEMPT_OPERATION,
-        )
-    } else {
-        (
-            ORDINARY_CARGO_ATTEMPT_VERSION,
-            ORDINARY_CARGO_ATTEMPT_OPERATION,
-        )
-    }
-}
-
 fn attempt_bootstrap_route(
     version: u32,
     operation: &str,
-    capture_budget_installed: bool,
-) -> Option<(u32, &'static str)> {
-    match (version, operation, capture_budget_installed) {
-        (ORDINARY_CARGO_ATTEMPT_VERSION, ORDINARY_CARGO_ATTEMPT_OPERATION, false) => Some((
-            ORDINARY_CARGO_ATTEMPT_VERSION,
-            ORDINARY_CARGO_ATTEMPT_OPERATION,
-        )),
+    capture_budget: Option<OrdinaryCargoCaptureBudget>,
+    declaration_digest: Option<String>,
+) -> Option<OrdinaryCargoRoute> {
+    match (version, operation, capture_budget, declaration_digest) {
+        (ORDINARY_CARGO_ATTEMPT_VERSION, ORDINARY_CARGO_ATTEMPT_OPERATION, None, None) => {
+            Some(OrdinaryCargoRoute::Exact)
+        }
         (
             ORDINARY_CARGO_CAPTURE_ATTEMPT_VERSION,
             ORDINARY_CARGO_CAPTURE_ATTEMPT_OPERATION,
-            true,
-        ) => Some((
-            ORDINARY_CARGO_CAPTURE_ATTEMPT_VERSION,
-            ORDINARY_CARGO_CAPTURE_ATTEMPT_OPERATION,
-        )),
+            Some(capture_budget),
+            None,
+        ) => Some(OrdinaryCargoRoute::CaptureBudget(capture_budget)),
+        (
+            ORDINARY_CARGO_DECLARED_ATTEMPT_VERSION,
+            ORDINARY_CARGO_DECLARED_ATTEMPT_OPERATION,
+            Some(capture_budget),
+            Some(declaration_digest),
+        ) => Some(OrdinaryCargoRoute::Declared {
+            capture_budget,
+            declaration_digest,
+        }),
         _ => None,
     }
 }
 
 fn parse_attempt_bootstrap(bytes: &[u8]) -> Result<AttemptBootstrap, AttemptError> {
     let value: Value = parse_json_without_duplicates(bytes)?;
-    let budget_field_present = value
-        .as_object()
-        .is_some_and(|fields| fields.contains_key("capture_budget"));
+    let field_present = |name: &str| {
+        value
+            .as_object()
+            .is_some_and(|fields| fields.contains_key(name))
+    };
+    let budget_field_present = field_present("capture_budget");
+    let declaration_field_present = field_present("declaration_digest");
     let bootstrap: AttemptBootstrap =
         serde_json::from_value(value).map_err(|_| AttemptError::InvalidInput)?;
-    if budget_field_present != bootstrap.capture_budget.is_some() {
+    if budget_field_present != bootstrap.capture_budget.is_some()
+        || declaration_field_present != bootstrap.declaration_digest.is_some()
+    {
         return Err(AttemptError::InvalidInput);
     }
     Ok(bootstrap)
@@ -1902,6 +2093,8 @@ struct AttemptBootstrap {
     callback_context: String,
     #[serde(default)]
     capture_budget: Option<OrdinaryCargoCaptureBudget>,
+    #[serde(default)]
+    declaration_digest: Option<String>,
     invocation: InvocationWire,
 }
 
@@ -2045,10 +2238,10 @@ pub fn serve_bootstrap(path: &Path) -> Result<OrdinaryCargoAttemptResult, Attemp
     let route = attempt_bootstrap_route(
         bootstrap.version,
         &bootstrap.operation,
-        bootstrap.capture_budget.is_some(),
+        bootstrap.capture_budget.clone(),
+        bootstrap.declaration_digest.clone(),
     )
     .ok_or(AttemptError::InvalidInput)?;
-    let capture_budget = bootstrap.capture_budget;
     let invocation = bootstrap.invocation.into_invocation()?;
     let remaining = Duration::from_millis(bootstrap.remaining_ms.0);
     let callback_timeout = Duration::from_millis(bootstrap.callback_timeout_ms.0);
@@ -2061,17 +2254,8 @@ pub fn serve_bootstrap(path: &Path) -> Result<OrdinaryCargoAttemptResult, Attemp
     {
         return Err(AttemptError::InvalidInput);
     }
-    let request_digest =
-        validate_invocation_with_capture_budget(&invocation, capture_budget.as_ref())?;
-    let expected_context = match route.0 {
-        ORDINARY_CARGO_ATTEMPT_VERSION => {
-            ordinary_cargo_callback_context(&bootstrap.scope, &request_digest)?
-        }
-        ORDINARY_CARGO_CAPTURE_ATTEMPT_VERSION => {
-            ordinary_cargo_callback_context_v2(&bootstrap.scope, &request_digest)?
-        }
-        _ => return Err(AttemptError::InvalidInput),
-    };
+    let request_digest = validate_invocation_for_route(&invocation, &route)?;
+    let expected_context = route.callback_context(&bootstrap.scope, &request_digest)?;
     if bootstrap.callback_context != expected_context {
         return Err(AttemptError::InvalidInput);
     }
@@ -2092,7 +2276,7 @@ pub fn serve_bootstrap(path: &Path) -> Result<OrdinaryCargoAttemptResult, Attemp
         .open(&marker_path)
         .map_err(|_| AttemptError::InvalidInput)?;
     marker
-        .write_all(format!("{}\n", route.1).as_bytes())
+        .write_all(format!("{}\n", route.operation()).as_bytes())
         .map_err(|_| AttemptError::Protocol)?;
     marker.sync_all().map_err(|_| AttemptError::Protocol)?;
     fs::File::open(marker_parent)
@@ -2117,23 +2301,14 @@ pub fn serve_bootstrap(path: &Path) -> Result<OrdinaryCargoAttemptResult, Attemp
         return Err(AttemptError::InvalidInput);
     }
     let client = Client::new(storage_endpoint.path);
-    let runner = match capture_budget {
-        Some(capture_budget) => OrdinaryCargoAttemptRunner::new_with_capture_budget(
-            client,
-            storage_root,
-            parent_endpoint,
-            authenticator,
-            budget,
-            capture_budget,
-        )?,
-        None => OrdinaryCargoAttemptRunner::new(
-            client,
-            storage_root,
-            parent_endpoint,
-            authenticator,
-            budget,
-        )?,
-    };
+    let runner = OrdinaryCargoAttemptRunner::new_inner(
+        client,
+        storage_root,
+        parent_endpoint,
+        authenticator,
+        budget,
+        route.clone(),
+    )?;
     run_attempt(runner, invocation)
 }
 
@@ -2144,6 +2319,114 @@ fn check_endpoint(endpoint: &Endpoint) -> Result<(), AttemptError> {
         return Err(AttemptError::InvalidInput);
     }
     Ok(())
+}
+
+/// Failure of the declared-workflow front end: a declaration refusal or an
+/// ordinary attempt error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeclaredWorkflowError {
+    Refusal(crate::project::WorkflowRefusal),
+    Attempt(AttemptError),
+}
+
+impl fmt::Display for DeclaredWorkflowError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refusal(refusal) => f.write_str(&refusal.render()),
+            Self::Attempt(error) => write!(f, "ordinary-Cargo attempt error ({error:?})"),
+        }
+    }
+}
+
+impl std::error::Error for DeclaredWorkflowError {}
+
+/// Bind one resolved declaration to one protected, owner-issued v3 bootstrap
+/// before any storage acquire or submit. Read-only: the bootstrap is inspected
+/// but not consumed, so the unchanged private process still owns consumption.
+///
+/// The declaration digest is bound twice: the bootstrap must carry it and the
+/// owner-signed `input_boundary_digest` must be the v3 boundary of that exact
+/// digest, so a v2/v1 signature or a stale declaration is never reinterpreted.
+pub fn verify_declared_bootstrap(
+    path: &Path,
+    plan: &crate::project::WorkflowPlan,
+) -> Result<String, DeclaredWorkflowError> {
+    let bytes = read_protected(path)
+        .map_err(|_| DeclaredWorkflowError::Attempt(AttemptError::InvalidInput))?;
+    let bootstrap = parse_attempt_bootstrap(&bytes).map_err(DeclaredWorkflowError::Attempt)?;
+    let route = attempt_bootstrap_route(
+        bootstrap.version,
+        &bootstrap.operation,
+        bootstrap.capture_budget.clone(),
+        bootstrap.declaration_digest.clone(),
+    )
+    .ok_or(DeclaredWorkflowError::Attempt(AttemptError::InvalidInput))?;
+    let OrdinaryCargoRoute::Declared {
+        capture_budget,
+        declaration_digest,
+    } = &route
+    else {
+        return Err(DeclaredWorkflowError::Refusal(
+            crate::project::WorkflowRefusal {
+                code: "unversioned-route",
+                detail: "bootstrap is not the declared-workflow version 3 route".into(),
+            },
+        ));
+    };
+    if declaration_digest != &plan.declaration_digest {
+        return Err(DeclaredWorkflowError::Refusal(
+            crate::project::WorkflowRefusal {
+                code: "declaration-digest-mismatch",
+                detail: "owner-issued bootstrap does not bind the resolved declaration".into(),
+            },
+        ));
+    }
+    let invocation = bootstrap
+        .invocation
+        .into_invocation()
+        .map_err(DeclaredWorkflowError::Attempt)?;
+    validate_invocation_for_route(&invocation, &route).map_err(DeclaredWorkflowError::Attempt)?;
+    let environment_names: BTreeSet<String> = invocation.environment.keys().cloned().collect();
+    let observed_capture = crate::project::CaptureLimits {
+        version: capture_budget.version,
+        total_bytes: capture_budget.total_bytes.0,
+        role_bytes: capture_budget
+            .role_bytes
+            .iter()
+            .map(|(role, bytes)| (role.clone(), bytes.0))
+            .collect(),
+    };
+    let observed = crate::project::ObservedWorkflow {
+        source_root: &invocation.request.root.source_root,
+        consumer: &invocation.request.acquire.envelope.binding.consumer,
+        project: &invocation.request.acquire.envelope.binding.project,
+        component: &invocation.request.acquire.envelope.binding.component,
+        workflow: &invocation.request.acquire.envelope.binding.workflow,
+        selector: &invocation.selector,
+        argv: &invocation.argv,
+        profile: &invocation.request.acquire.envelope.partition.profile,
+        partition: invocation.request.partition.label(),
+        required_bytes: invocation.request.acquire.required_bytes,
+        environment_names: &environment_names,
+        capture: &observed_capture,
+    };
+    plan.verify_observed(&observed)
+        .map_err(DeclaredWorkflowError::Refusal)?;
+    Ok(declaration_digest.clone())
+}
+
+/// One declared-workflow entry point: resolve the declaration, bind it to the
+/// exact owner-issued attempt before acquire, then delegate to the unchanged
+/// single ordinary-Cargo submit/capture/not_submitted callbacks. No second
+/// executor, transport or protocol family is created.
+pub fn run_declared_attempt(
+    bootstrap: &Path,
+    declaration: &[u8],
+) -> Result<OrdinaryCargoAttemptResult, DeclaredWorkflowError> {
+    let plan = crate::project::WorkflowPlan::resolve(declaration)
+        .map_err(DeclaredWorkflowError::Refusal)?;
+    verify_declared_bootstrap(bootstrap, &plan)?;
+    serve_bootstrap(bootstrap).map_err(DeclaredWorkflowError::Attempt)
 }
 
 struct UnixCallbacks {
@@ -2385,11 +2668,17 @@ mod route_controls {
         admission_subject, ordinary_cargo_request_digest, ordinary_cargo_settlement_subject,
         CallbackAuthenticator, MacKey, QualificationAuthority,
     };
+    use crate::storage::ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION;
     use crate::storage::{ordinary_cargo_stable_reuse_reference, EvidenceAuthority};
     use sha2::Digest;
 
     fn digest(value: &str) -> String {
         format!("sha256:{:x}", sha2::Sha256::digest(value.as_bytes()))
+    }
+
+    fn capture_budget() -> OrdinaryCargoCaptureBudget {
+        OrdinaryCargoCaptureBudget::new(128, BTreeMap::from([("test-result".to_owned(), 64)]))
+            .unwrap()
     }
 
     fn invocation() -> OrdinaryCargoInvocation {
@@ -2867,32 +3156,168 @@ mod route_controls {
     }
 
     #[test]
+    fn declared_workflow_route_has_its_own_boundary_digest_and_context() {
+        let capture_budget = capture_budget();
+        let declaration = digest("declaration");
+        let other_declaration = digest("other declaration");
+        let mut invocation = invocation();
+        invocation.request.acceptance.policy_version =
+            crate::storage::ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION;
+        invocation.request.acceptance.acceptance_reference = ordinary_cargo_stable_reuse_reference(
+            &invocation.request,
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        )
+        .unwrap();
+        assert!(invocation
+            .request
+            .acceptance
+            .acceptance_reference
+            .starts_with("oxide-ordinary-cargo-stable-eligibility-v3/"));
+        let v3_digest = ordinary_cargo_declared_input_boundary_digest(
+            &invocation,
+            &capture_budget,
+            &declaration,
+        )
+        .unwrap();
+        invocation.request.acceptance.input_boundary_digest = v3_digest.clone();
+        // The v3 boundary is a distinct explicitly versioned subject and never
+        // equals the v2 boundary of the same invocation.
+        let v2_subject =
+            ordinary_cargo_input_boundary(&invocation, Some(&capture_budget), None).unwrap();
+        let v3_subject =
+            ordinary_cargo_input_boundary(&invocation, Some(&capture_budget), Some(&declaration))
+                .unwrap();
+        assert_ne!(v2_subject, v3_subject);
+        assert!(v2_subject.get("declaration_digest").is_none());
+        assert!(v2_subject.get("boundary_version").is_none());
+        assert_eq!(
+            v3_subject["boundary_version"],
+            json!(ORDINARY_CARGO_DECLARED_BOUNDARY_VERSION)
+        );
+        assert_eq!(v3_subject["declaration_digest"], json!(declaration));
+        // A changed declaration digest or capture ceiling yields a different
+        // exact boundary, so neither can reuse the other's signature.
+        let changed_declaration = ordinary_cargo_declared_input_boundary_digest(
+            &invocation,
+            &capture_budget,
+            &other_declaration,
+        )
+        .unwrap();
+        assert_ne!(changed_declaration, v3_digest);
+        let changed_budget = OrdinaryCargoCaptureBudget::new(
+            8 * 1024 * 1024,
+            BTreeMap::from([("test-result".to_owned(), 4 * 1024 * 1024)]),
+        )
+        .unwrap();
+        assert!(
+            ordinary_cargo_declared_input_boundary_digest(
+                &invocation,
+                &changed_budget,
+                &declaration,
+            )
+            .unwrap()
+                != v3_digest
+        );
+        // Version 3 has its own callback context domain.
+        assert_ne!(
+            ordinary_cargo_callback_context_v3("synthetic-scope", &v3_digest).unwrap(),
+            ordinary_cargo_callback_context_v2("synthetic-scope", &v3_digest).unwrap()
+        );
+        // The v2 stable reference never validates a policy-3 request, and the
+        // v3 reference never validates a policy-2 request.
+        let mut v2_request = invocation.clone();
+        v2_request.request.acceptance.policy_version =
+            crate::storage::ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION;
+        v2_request.request.acceptance.acceptance_reference = ordinary_cargo_stable_reuse_reference(
+            &v2_request.request,
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        )
+        .unwrap();
+        assert!(v2_request
+            .request
+            .acceptance
+            .acceptance_reference
+            .starts_with("oxide-ordinary-cargo-stable-eligibility-v2/"));
+        assert!(stable_reuse_reference_matches(&v2_request.request));
+        assert!(stable_reuse_reference_matches(&invocation.request));
+        // A v3 reference on a policy-2 request, or the reverse, refuses rather
+        // than being relabelled.
+        let mut mixed = v2_request.request.clone();
+        mixed.acceptance.policy_version =
+            crate::storage::ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION;
+        assert!(!stable_reuse_reference_matches(&mixed));
+    }
+
+    #[test]
     fn versioned_bootstrap_and_capture_fields_refuse_mixed_peers() {
-        assert!(attempt_bootstrap_route(
-            ORDINARY_CARGO_ATTEMPT_VERSION,
-            ORDINARY_CARGO_ATTEMPT_OPERATION,
-            false,
-        )
-        .is_some());
-        assert!(attempt_bootstrap_route(
-            ORDINARY_CARGO_CAPTURE_ATTEMPT_VERSION,
-            ORDINARY_CARGO_CAPTURE_ATTEMPT_OPERATION,
-            true,
-        )
-        .is_some());
-        assert!(attempt_bootstrap_route(
-            ORDINARY_CARGO_ATTEMPT_VERSION,
-            ORDINARY_CARGO_ATTEMPT_OPERATION,
-            true,
-        )
-        .is_none());
-        assert!(attempt_bootstrap_route(
-            ORDINARY_CARGO_CAPTURE_ATTEMPT_VERSION,
-            ORDINARY_CARGO_CAPTURE_ATTEMPT_OPERATION,
-            false,
-        )
-        .is_none());
-        assert!(attempt_bootstrap_route(3, "ordinary-cargo-attempt-v3", true).is_none());
+        assert_eq!(
+            attempt_bootstrap_route(
+                ORDINARY_CARGO_ATTEMPT_VERSION,
+                ORDINARY_CARGO_ATTEMPT_OPERATION,
+                None,
+                None,
+            ),
+            Some(OrdinaryCargoRoute::Exact)
+        );
+        let budget = capture_budget();
+        assert_eq!(
+            attempt_bootstrap_route(
+                ORDINARY_CARGO_CAPTURE_ATTEMPT_VERSION,
+                ORDINARY_CARGO_CAPTURE_ATTEMPT_OPERATION,
+                Some(budget.clone()),
+                None,
+            ),
+            Some(OrdinaryCargoRoute::CaptureBudget(budget.clone()))
+        );
+        assert_eq!(
+            attempt_bootstrap_route(
+                ORDINARY_CARGO_DECLARED_ATTEMPT_VERSION,
+                ORDINARY_CARGO_DECLARED_ATTEMPT_OPERATION,
+                Some(budget.clone()),
+                Some(digest("declaration")),
+            ),
+            Some(OrdinaryCargoRoute::Declared {
+                capture_budget: budget.clone(),
+                declaration_digest: digest("declaration"),
+            })
+        );
+        // Mixed peers refuse: a budget on the exact route, a missing budget on
+        // the capture route, and a missing declaration digest on the declared
+        // route are all invalid combinations.
+        for route in [
+            attempt_bootstrap_route(
+                ORDINARY_CARGO_ATTEMPT_VERSION,
+                ORDINARY_CARGO_ATTEMPT_OPERATION,
+                Some(budget.clone()),
+                None,
+            ),
+            attempt_bootstrap_route(
+                ORDINARY_CARGO_CAPTURE_ATTEMPT_VERSION,
+                ORDINARY_CARGO_CAPTURE_ATTEMPT_OPERATION,
+                None,
+                None,
+            ),
+            attempt_bootstrap_route(
+                ORDINARY_CARGO_DECLARED_ATTEMPT_VERSION,
+                ORDINARY_CARGO_DECLARED_ATTEMPT_OPERATION,
+                Some(budget.clone()),
+                None,
+            ),
+            attempt_bootstrap_route(
+                ORDINARY_CARGO_DECLARED_ATTEMPT_VERSION,
+                ORDINARY_CARGO_DECLARED_ATTEMPT_OPERATION,
+                None,
+                Some(digest("declaration")),
+            ),
+            attempt_bootstrap_route(
+                ORDINARY_CARGO_DECLARED_ATTEMPT_VERSION,
+                ORDINARY_CARGO_CAPTURE_ATTEMPT_OPERATION,
+                Some(budget.clone()),
+                Some(digest("declaration")),
+            ),
+        ] {
+            assert!(route.is_none());
+        }
 
         let versioned: Value =
             serde_json::from_str(include_str!("../../fixtures/ordinary-cargo-auth-v2.json"))
@@ -3166,6 +3591,153 @@ mod route_controls {
     }
 
     #[test]
+    fn typescript_v3_declared_workflow_bootstrap_and_callback_vectors_match_rust() {
+        let vector: Value =
+            serde_json::from_str(include_str!("../../fixtures/ordinary-cargo-auth-v3.json"))
+                .unwrap();
+        assert_eq!(vector["version"], json!(3));
+        assert_eq!(
+            vector["operation"],
+            json!(ORDINARY_CARGO_DECLARED_ATTEMPT_OPERATION)
+        );
+        let capture_budget: OrdinaryCargoCaptureBudget =
+            serde_json::from_value(vector["capture_budget"].clone()).unwrap();
+        let declaration_digest = vector["declaration_digest"].as_str().unwrap();
+        let mut invocation = invocation();
+        invocation.request.acceptance.policy_version =
+            crate::storage::ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION;
+        let stable_reference = ordinary_cargo_stable_reuse_reference(
+            &invocation.request,
+            vector["stable_invalidation_digest"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            stable_reference,
+            vector["stable_reference"].as_str().unwrap()
+        );
+        assert!(stable_reference.starts_with("oxide-ordinary-cargo-stable-eligibility-v3/"));
+        invocation.request.acceptance.acceptance_reference = stable_reference;
+        assert_eq!(
+            ordinary_cargo_input_boundary(
+                &invocation,
+                Some(&capture_budget),
+                Some(declaration_digest)
+            )
+            .unwrap(),
+            vector["input_boundary_subject"]
+        );
+        invocation.request.acceptance.input_boundary_digest =
+            ordinary_cargo_declared_input_boundary_digest(
+                &invocation,
+                &capture_budget,
+                declaration_digest,
+            )
+            .unwrap();
+        assert_eq!(
+            invocation.request.acceptance.input_boundary_digest,
+            vector["input_boundary_digest"].as_str().unwrap()
+        );
+        assert_eq!(
+            ordinary_cargo_request_digest(&invocation.request).unwrap(),
+            vector["request_digest"].as_str().unwrap()
+        );
+        assert_eq!(
+            ordinary_cargo_callback_context_v3(
+                vector["scope"].as_str().unwrap(),
+                vector["request_digest"].as_str().unwrap(),
+            )
+            .unwrap(),
+            vector["callback_context_digest"].as_str().unwrap()
+        );
+        let bootstrap =
+            parse_attempt_bootstrap(&serde_json::to_vec(&vector["bootstrap"]).unwrap()).unwrap();
+        assert_eq!(bootstrap.version, ORDINARY_CARGO_DECLARED_ATTEMPT_VERSION);
+        assert_eq!(
+            bootstrap.operation,
+            ORDINARY_CARGO_DECLARED_ATTEMPT_OPERATION
+        );
+        assert_eq!(bootstrap.capture_budget.as_ref(), Some(&capture_budget));
+        assert_eq!(
+            bootstrap.declaration_digest.as_deref(),
+            Some(declaration_digest)
+        );
+        assert_eq!(
+            bootstrap.callback_context,
+            vector["callback_context_digest"].as_str().unwrap()
+        );
+        assert_eq!(
+            attempt_bootstrap_route(
+                bootstrap.version,
+                &bootstrap.operation,
+                bootstrap.capture_budget.clone(),
+                bootstrap.declaration_digest.clone(),
+            ),
+            Some(OrdinaryCargoRoute::Declared {
+                capture_budget: capture_budget.clone(),
+                declaration_digest: declaration_digest.to_owned(),
+            })
+        );
+        assert_eq!(
+            bootstrap_digest(&serde_json::to_vec(&vector["bootstrap"]).unwrap()),
+            vector["bootstrap_digest"].as_str().unwrap()
+        );
+        // The exact signed boundary, admission and callback HMAC vectors all
+        // reproduce in Rust; none is reinterpreted from the v2 vector.
+        let key = MacKey::from_hex(vector["admission"]["key_hex"].as_str().unwrap()).unwrap();
+        let fields: Vec<String> = vector["admission"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect();
+        let borrowed: Vec<&str> = fields.iter().map(String::as_str).collect();
+        assert_eq!(
+            key.sign(vector["admission"]["domain"].as_str().unwrap(), &borrowed)
+                .unwrap(),
+            vector["admission"]["receipt"].as_str().unwrap()
+        );
+        let key =
+            MacKey::from_hex(vector["ordinary_admission"]["key_hex"].as_str().unwrap()).unwrap();
+        let fields: Vec<String> = vector["ordinary_admission"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect();
+        let borrowed: Vec<&str> = fields.iter().map(String::as_str).collect();
+        assert_eq!(
+            key.sign(
+                vector["ordinary_admission"]["domain"].as_str().unwrap(),
+                &borrowed
+            )
+            .unwrap(),
+            vector["ordinary_admission"]["receipt"].as_str().unwrap()
+        );
+        let authenticator = CallbackAuthenticator::new(
+            MacKey::from_hex(vector["callback"]["key_hex"].as_str().unwrap()).unwrap(),
+            vector["callback_context_digest"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )
+        .unwrap();
+        assert_eq!(
+            authenticator
+                .receipt(
+                    vector["callback_request"]["method"].as_str().unwrap(),
+                    vector["callback_request"]["id"].as_str().unwrap(),
+                    vector["callback_request"]["launch_digest"]
+                        .as_str()
+                        .unwrap(),
+                    ORDINARY_CARGO_DECLARED_ATTEMPT_OPERATION,
+                    vector["callback_result_digest"].as_str().unwrap(),
+                )
+                .unwrap(),
+            vector["callback_reply"]["receipt"].as_str().unwrap()
+        );
+    }
+
+    #[test]
     fn typescript_v2_capture_budget_bootstrap_and_callback_vectors_match_rust() {
         let vector: Value =
             serde_json::from_str(include_str!("../../fixtures/ordinary-cargo-auth-v2.json"))
@@ -3188,7 +3760,7 @@ mod route_controls {
             ordinary_cargo_input_boundary_digest_with_capture_budget(&invocation, &capture_budget)
                 .unwrap();
         assert_eq!(
-            ordinary_cargo_input_boundary(&invocation, Some(&capture_budget)).unwrap(),
+            ordinary_cargo_input_boundary(&invocation, Some(&capture_budget), None).unwrap(),
             vector["input_boundary_subject"]
         );
         assert_eq!(
@@ -3228,12 +3800,10 @@ mod route_controls {
             attempt_bootstrap_route(
                 bootstrap.version,
                 &bootstrap.operation,
-                bootstrap.capture_budget.is_some(),
+                bootstrap.capture_budget.clone(),
+                bootstrap.declaration_digest.clone(),
             ),
-            Some((
-                ORDINARY_CARGO_CAPTURE_ATTEMPT_VERSION,
-                ORDINARY_CARGO_CAPTURE_ATTEMPT_OPERATION
-            ))
+            Some(OrdinaryCargoRoute::CaptureBudget(capture_budget.clone()))
         );
         assert_eq!(
             bootstrap_digest(&serde_json::to_vec(&vector["bootstrap"]).unwrap()),
