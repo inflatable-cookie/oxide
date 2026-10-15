@@ -159,3 +159,28 @@ checked packet fixes pins, numeric footprint, deadlines, capture/debug evidence
 and owner conditions. No production activation, general installation/config
 change, new scheduler or consumer admission change is implied. Do not ask again
 for routine bounded progress already covered by this ruling.
+
+Tom approved the lifecycle-aware Rust build-policy proposal on 2026-10-15
+with "Approved". Authority covers an independently reviewed design and one
+small comparison of incremental-on/unpacked and incremental-off/unpacked
+on the same pinned workflow and edit sequence. The comparison is bounded by
+ten Cargo invocations in total, twenty minutes including preparation and
+capture, a fresh owned footprint of at most 16 GiB, and a monitored 20 GiB
+raw host free-space reserve. Cargo probes count toward the invocation cap.
+Exact source, tool, command, resource and evidence pins must be recorded in
+the checked execution brief before launch; there is no implicit retry or
+clock reset. Selected tests must execute, and retained bytes, file counts,
+hardlink-aware allocation, latency and attributable writes must be reported
+separately. Unmeasured writes and debugger capabilities remain unknown.
+
+The design distinguishes expected build/cache lifetime and debugging needs
+from human or agent identity. One-shot incremental-off and iterative
+incremental-on are candidates to qualify, not changes to consumer defaults.
+Nucleus's current managed-agent stopgap remains in force pending separately
+reviewed adoption. This approval does not enable a production policy resolver,
+shared warm slots, automatic generation retirement, selective object deletion,
+global configuration changes or scans/deletion of existing target trees.
+Object age, filename, compiler session locks or process disappearance cannot
+authorize Oxide lease release or evidence removal. The original four-Cargo,
+45-minute reuse proof remains separate and is neither consumed nor reset by
+this comparison. Queue owns the scoped briefs, dispatch and independent review.
