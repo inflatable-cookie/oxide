@@ -130,9 +130,18 @@ Probes count toward the invocation cap (see below).
 3. `cargo -vV`: record the version line. The Cargo version must match the rustc release line of the pinned toolchain.
 4. Mismatch stops the run before any Cargo build.
 
+### Loaded Cargo configuration and rustc identity
+
+Checked before the mode's C0 invocation, without running Cargo. Record names and results only.
+
+1. Repository config: `git -C <src> ls-files` must contain no `.cargo/config`, `.cargo/config.toml`, `rust-toolchain` or `rust-toolchain.toml`. Any match stops the run. The pinned commit contains none (checked read-only at `fb2bd04`).
+2. Ancestor config: Cargo searches the working directory and its parents. For `$OWNED/m/src-<mode>`, check `test -e` for `.cargo/config` and `.cargo/config.toml` in `$OWNED/m/src-<mode>`, `$OWNED/m`, `$OWNED`, `/private/var/tmp`, `/private/var`, `/private` and `/`, and the same two names under `$CARGO_HOME`. Read any file that exists. It stops the run if it sets `build`, `profile`, `rustc`, `rustc-wrapper`, `rustc-workspace-wrapper`, `target-dir`, `build-dir`, `incremental`, `rustflags` or `env`. Presence of an unrelated key is recorded and is not a stop.
+3. Wrapper and override variables are absent by construction. `env -i` with the allowlist below excludes `RUSTC`, `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `RUSTFLAGS` and `CARGO_BUILD_*`.
+4. Actual rustc: in the measured `-v` output, each `Running ... rustc` line must start with the rustc path or rustup proxy resolved in Tool identity step 1, with no wrapper prefix. A different path or a prefix stops the run. This check is part of each measured invocation, so it adds no probe.
+
 ### Selected test and selector
 
-- Route: the existing Nucleus Effigy selector `check:core:test`, which runs `cargo test --offline {args}`. Run it from the mode's source root as `effigy check:core:test -p nucleus-core --test packages -v -- --exact committed_workflow_packages_parse`.
+- Route: the existing Nucleus Effigy selector `check:core:test`, which runs `cargo test --offline {args}`. Run it from the mode's source root as `effigy check:core:test -- -p nucleus-core --test packages -v -- --exact committed_workflow_packages_parse`. The first `--` is Effigy's separator. The second passes `--exact` to the test binary. The pinned Nucleus instructions use the same first separator (`AGENTS.md`, `crates/README.md`).
 - Selected test: `committed_workflow_packages_parse` in `crates/nucleus-core/tests/packages.rs`. It is a single test. It reads `packages/` at the repository root. It executes and asserts `checked > 0`.
 - Effigy admission: the run must show effigy's admission (for example `waiting for QA capacity`) or an admitted start. If the selector is not admitted through effigy, stop. Do not run a direct cargo fallback.
 - Tests must execute. The success line must show `1 passed`. No-run output is compile evidence only, and no no-run builds are planned.
@@ -222,6 +231,7 @@ The preferred plan was three edits per mode (cold+3+1 = 5). It is reduced to two
 
 Per invocation:
 - command, cwd, effective env names and flag values, Cargo and rustc versions;
+- the config check results from "Loaded Cargo configuration" and the `Running ... rustc` path observed in `-v` output;
 - UTC start and end, monotonic duration, exit code;
 - `Compiling` and `Fresh` counts from `-v` output;
 - the test result line;

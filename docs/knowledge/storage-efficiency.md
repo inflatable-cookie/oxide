@@ -80,12 +80,15 @@ report and not re-observed here.
 | --- | --- | --- | --- | --- |
 | Incremental on, unpacked | 60 s + 38 s = 98 s | 12,303 | about 3 GB | Object set grows across builds. |
 | Incremental off, unpacked | 66 s + 107 s = 173 s | 408, unchanged after warm | none | Object set flat. |
-| Incremental off, packed | 82 s + 59 s = 141 s | zero loose | about 3 GB incremental and about 2x deps | Packed companion output adds bytes. |
+| Packed, incremental setting not reported | 82 s + 59 s = 141 s | zero loose | about 3 GB incremental state and about 2x deps, as reported | The source report does not state the incremental setting for this row. Do not read it as incremental off. |
 
 Method and caveats:
 
 - Compile-only no-run builds. No test execution is in these figures.
-- Off/packed file:line and LLDB behavior were not tested.
+- Packed-mode file:line and LLDB behavior were not tested.
+- The packed row's incremental setting is not in the source report. It is not a
+  clean comparison with the off/unpacked row, and it does not establish a packed
+  effect on incremental state.
 - The 37.4 GB `deps` object figure in the source report is apparent size across
   139,421 names. It is not proven stale or reclaimable. It may overlap the 38.4 GB
   incremental figure through hardlinks and multiple variants.
