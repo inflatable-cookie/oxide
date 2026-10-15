@@ -1466,7 +1466,7 @@ fields refuse. Its required fields are:
 
 | Field | Meaning |
 | --- | --- |
-| `version`, `host_protocol`, `storage_protocol` | `version` and `host_protocol` are exactly `1`; `storage_protocol` is exactly `2`. The storage wire is `OXSTOR01` version 2 and the durable ledger is version 4. |
+| `version`, `host_protocol`, `storage_protocol` | `version` and `host_protocol` are exactly `1`; `storage_protocol` is exactly `2`. The storage wire is `OXSTOR01` version 2 and the durable ledger is version 5. |
 | `map_pin` | Exactly `d9ff17988c7eaa5cf57747bc55bfe4f138692f15`. |
 | `expires_unix_seconds` | Current UTC seconds through at most 30 seconds ahead; checked at load and before acquire. |
 | `scope` | Owner-approved qualification scope, bounded to 4096 UTF-8 bytes. |
@@ -1599,7 +1599,7 @@ rules: canonical, owner-only mode 0600, one link, no-follow, stable identity, at
 
 | Field | Meaning |
 | --- | --- |
-| `version`, `control_protocol`, `storage_protocol` | `version` and `control_protocol` are `1`; `storage_protocol` is `2`. Storage uses `OXSTOR01` version 2 and ledger version 4. |
+| `version`, `control_protocol`, `storage_protocol` | `version` and `control_protocol` are `1`; `storage_protocol` is `2`. Storage uses `OXSTOR01` version 2 and ledger version 5. |
 | `scope` | Owner-approved qualification scope, 1–4096 bytes. |
 | `expires_unix_seconds` | Owner's remaining window end, as WireU64. The window is counted from the entry sample, taken when `serve_bootstrap` is called and before the bootstrap is read. The entry monotonic instant and the full-precision wall clock are sampled as a pair, with the instant first. The lifetime is `min(expires - entry_wall, 2700 s - stop_grace - 2 s)`, in exact arithmetic. No fractional second is dropped. The monotonic deadline is `entry_instant + lifetime`, so it never passes the owner's end. The published expiry is the whole second at or before `entry_wall + lifetime`. It is never later than the deadline, so the parent may refuse up to one second early and never late. Startup time is inside the window. |
 | `stop_grace_seconds` | WireU64, 1–10. Bounded wait after a stop before an in-flight storage operation is abandoned. Bound into `policy_digest`. |
@@ -2246,7 +2246,7 @@ not allocate, evict, settle, mint a token, or return a slot path. Normal
 `Client::acquire` still allocates on a miss and cannot replace lookup recovery.
 Lost tokens remain held, and a finalized replay grants no access.
 
-The local ledger format is version 4; version-3 and other unsupported data are
+The local ledger format is version 5; version-4 and other unsupported data are
 refused without migration or reinterpretation. The framed local protocol is
 `OXSTOR01` plus version 2 on every request and response. Unversioned or unsupported peers are
 refused before dispatch, so they cannot receive a misleading acquire result
