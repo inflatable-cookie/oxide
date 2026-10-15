@@ -295,6 +295,24 @@ class RecoveringSubmitter:
         return bcc.HeavySubmitOutcome(state=self.follow_state)
 
 
+class LostThenAbsentSubmitter:
+    """Lost submit reply, status shows authenticated absence, replay succeeds."""
+
+    def __init__(self) -> None:
+        self.submits: list[list[str]] = []
+        self.statuses = 0
+
+    def submit(self, *, argv, cwd, request_id, caller, env, timeout_ns=None):
+        self.submits.append(list(argv))
+        if len(self.submits) == 1:
+            return bcc.HeavySubmitOutcome(state="held")
+        return bcc.HeavySubmitOutcome(state="launched")
+
+    def request_status(self, *, caller, request_id, env, timeout_ns=None):
+        self.statuses += 1
+        return bcc.HeavySubmitOutcome(state="authenticated_absence")
+
+
 def _git_ok(argv, cwd=None) -> str:
     if argv[:2] == ["rev-parse", "HEAD"]:
         return bcc.NUCLEUS_COMMIT + "\n"
@@ -747,6 +765,32 @@ class SubmissionTests(unittest.TestCase):
         self.assertEqual(document["outcome"], "unknown")
         self.assertEqual(document["seam"], "submit_ambiguous")
         self.assertTrue(document["resources_retained"])
+
+    def test_held_then_authenticated_absence_replays_original_request(self) -> None:
+        plan = _plan(SCRATCH / "lostreply")
+        submitter = LostThenAbsentSubmitter()
+        launcher, _, _, _, _ = _launcher(SCRATCH, submitter=submitter)
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "launched")
+        self.assertEqual(len(submitter.submits), 2)
+        self.assertEqual(submitter.statuses, 1)
+        self.assertEqual(submitter.submits[0], submitter.submits[1])
+        self.assertIn("--host-run-request-id", submitter.submits[1])
+        self.assertIn(submitter.submits[1][2], submitter.submits[0])
+        self.assertIn("replaying the same request", document["log"])
+
+    def test_submitter_timeout_is_held_not_raised(self) -> None:
+        submitter = bcc.SubprocessSubmitter()
+        outcome = submitter.submit(
+            argv=[sys.executable, "-c", "import time; time.sleep(5)"],
+            cwd=str(SCRATCH),
+            request_id=REQUEST_ID,
+            caller="northstar-worker",
+            env={"PATH": os.environ.get("PATH", "/usr/bin")},
+            timeout_ns=50_000_000,
+        )
+        self.assertEqual(outcome.state, "held")
+        self.assertIn("timeout", outcome.detail or "")
 
     def test_held_reply_follows_found_request(self) -> None:
         plan = _plan(SCRATCH / "follow")

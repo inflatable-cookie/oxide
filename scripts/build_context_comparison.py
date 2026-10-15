@@ -172,6 +172,7 @@ PIPE_READ_CHUNK = 65536
 PIPE_CAPTURE_CAP = RAW_LOG_LIMIT
 PIPE_DRAIN_GRACE_NS = 1_000_000_000
 BINDING_SCHEMA = "oxide.build-context-comparison.binding.v1"
+MAX_SUBMIT_REPLAYS = 1
 
 
 class ComparisonError(Exception):
@@ -1991,31 +1992,8 @@ class ComparisonLauncher:
                 f"cwd={plan.parent} remaining_ns={self._remaining_hard()} argv={argv}",
                 critical=True,
             )
-            outcome = self.submitter.submit(
-                argv=argv,
-                cwd=str(plan.parent),
-                request_id=self.request_id,
-                caller=self.caller,
-                env=dict(self.parent_env),
-                timeout_ns=self._remaining_hard(),
-            )
-            if outcome.state == "authenticated_absence":
-                # Only the scheduler's authenticated unknown_run permits a
-                # replay of the same request identity.
-                self.log.write(
-                    "submit authenticated_absence=unknown_run; replaying the same request",
-                    critical=True,
-                )
-                outcome = self.submitter.submit(
-                    argv=argv,
-                    cwd=str(plan.parent),
-                    request_id=self.request_id,
-                    caller=self.caller,
-                    env=dict(self.parent_env),
-                    timeout_ns=self._remaining_hard(),
-                )
-            if outcome.state == "held":
-                outcome = self._recover_held()
+            outcome = self._submit_once(argv, plan)
+            outcome = self._resolve_submission(outcome, argv, plan)
             if outcome.state == "launched":
                 self.outcome = "launched"
             elif outcome.state == "capacity_timeout":
@@ -2034,12 +2012,57 @@ class ComparisonLauncher:
             self.resources_retained = True
         return self._result_document(plan, session)
 
+    def _submit_once(self, argv: list[str], plan: ResourcePlan) -> HeavySubmitOutcome:
+        assert self.submitter is not None
+        return self.submitter.submit(
+            argv=argv,
+            cwd=str(plan.parent),
+            request_id=self.request_id,
+            caller=self.caller,
+            env=dict(self.parent_env),
+            timeout_ns=self._remaining_hard(),
+        )
+
+    def _resolve_submission(
+        self, outcome: HeavySubmitOutcome, argv: list[str], plan: ResourcePlan
+    ) -> HeavySubmitOutcome:
+        """Resolve a submission, replaying only on authenticated absence.
+
+        A lost reply is recovered from the persisted caller/UUID: a found
+        request is followed to settlement, and an authenticated `unknown_run`
+        (`authenticated_absence`) permits replaying the original argv/UUID.
+        Replays are bounded so a scheduler that keeps answering absence cannot
+        loop; any other state stays held and never reports success.
+        """
+        replays = 0
+        recovered = False
+        while True:
+            if outcome.state == "authenticated_absence":
+                if replays >= MAX_SUBMIT_REPLAYS:
+                    return HeavySubmitOutcome(
+                        state="held", detail="authenticated absence after replay cap"
+                    )
+                replays += 1
+                # Only the scheduler's authenticated unknown_run permits a
+                # replay of the same request identity.
+                self.log.write(
+                    "submit authenticated_absence=unknown_run; replaying the same request",
+                    critical=True,
+                )
+                outcome = self._submit_once(argv, plan)
+                continue
+            if outcome.state == "held" and not recovered:
+                recovered = True
+                outcome = self._recover_held()
+                continue
+            return outcome
+
     def _recover_held(self) -> "HeavySubmitOutcome":
         """Recover a lost submit reply through the persisted request identity.
 
         A found request is followed to its settlement; only an authenticated
-        `unknown_run` returns `authenticated_absence`, which permits a same
-        request replay. Any other state stays held, never success.
+        `unknown_run` returns `authenticated_absence`, which the caller then
+        replays as the same request. Any other state stays held, never success.
         """
         status_probe = getattr(self.submitter, "request_status", None)
         if status_probe is None:
@@ -2658,6 +2681,24 @@ class SubprocessSubmitter:
     caller label. No plan or synthetic path constructs this adapter.
     """
 
+    @staticmethod
+    def _run(
+        argv: list[str], *, cwd: str | None, env: Mapping[str, str], timeout_ns: int | None
+    ) -> subprocess.CompletedProcess | None:
+        try:
+            return subprocess.run(
+                argv,
+                cwd=cwd,
+                env=dict(env),
+                capture_output=True,
+                text=True,
+                timeout=_timeout_seconds(timeout_ns),
+            )
+        except subprocess.TimeoutExpired:
+            return None
+        except OSError:
+            return None
+
     def submit(
         self,
         *,
@@ -2670,14 +2711,9 @@ class SubprocessSubmitter:
     ) -> HeavySubmitOutcome:
         run_env = dict(env)
         run_env["EFFIGY_CALLER"] = caller
-        result = subprocess.run(
-            argv,
-            cwd=cwd,
-            env=run_env,
-            capture_output=True,
-            text=True,
-            timeout=_timeout_seconds(timeout_ns),
-        )
+        result = self._run(argv, cwd=cwd, env=run_env, timeout_ns=timeout_ns)
+        if result is None:
+            return HeavySubmitOutcome(state="held", detail="submit timeout or transport failure")
         return _classify_submission(result.returncode, result.stdout + result.stderr)
 
     def request_status(
@@ -2690,13 +2726,14 @@ class SubprocessSubmitter:
     ) -> HeavySubmitOutcome:
         run_env = dict(env)
         run_env["EFFIGY_CALLER"] = caller
-        result = subprocess.run(
+        result = self._run(
             request_status_argv(caller, request_id),
+            cwd=None,
             env=run_env,
-            capture_output=True,
-            text=True,
-            timeout=_timeout_seconds(timeout_ns),
+            timeout_ns=timeout_ns,
         )
+        if result is None:
+            return HeavySubmitOutcome(state="held", detail="status timeout or transport failure")
         output = result.stdout + result.stderr
         if result.returncode == 0:
             return HeavySubmitOutcome(state="found")
@@ -2714,13 +2751,14 @@ class SubprocessSubmitter:
     ) -> HeavySubmitOutcome:
         run_env = dict(env)
         run_env["EFFIGY_CALLER"] = caller
-        result = subprocess.run(
+        result = self._run(
             request_follow_argv(caller, request_id),
+            cwd=None,
             env=run_env,
-            capture_output=True,
-            text=True,
-            timeout=_timeout_seconds(timeout_ns),
+            timeout_ns=timeout_ns,
         )
+        if result is None:
+            return HeavySubmitOutcome(state="held", detail="follow timeout or transport failure")
         output = result.stdout + result.stderr
         if result.returncode == 0:
             return HeavySubmitOutcome(state="launched")
