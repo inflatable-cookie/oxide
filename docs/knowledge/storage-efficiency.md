@@ -97,9 +97,9 @@ Method and caveats:
 - Cache sharing does not prevent per-slot growth. Shared warm reuse is a separate
   quantity from bounded growth and actual writes.
 
-The proposed policy and a frozen one-shot comparison are in the
-[build-context policy](contracts/build-context-policy.md). The comparison is
-not yet run.
+The proposed policy, frozen one-shot comparison, and private opt-in launcher
+are in the [build-context policy](contracts/build-context-policy.md). The
+comparison is not yet run.
 
 ## Disposable output and retention
 
