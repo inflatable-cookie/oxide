@@ -2153,7 +2153,7 @@ fn bounded_backing_binds_startup_ledger_and_refuses_mismatched_reopen() {
     let root = TaskRoot::new();
     let payload = TaskRoot::new();
     let identity = "a".repeat(16);
-    let mut daemon = start_bounded(root.path(), payload.path(), 128, &identity);
+    let daemon = start_bounded(root.path(), payload.path(), 128, &identity);
     let grant = daemon
         .client
         .acquire(request("bounded-bind", "bounded-bind-acquire", 64))
@@ -2217,7 +2217,7 @@ fn bounded_backing_binds_startup_ledger_and_refuses_mismatched_reopen() {
         ));
     }
     // Matching reopen binds and preserves the settled generation.
-    let mut reopened = start_bounded(root.path(), payload.path(), 128, &identity);
+    let reopened = start_bounded(root.path(), payload.path(), 128, &identity);
     let after = reopened.client.inventory("bounded-reopen").unwrap();
     assert_eq!(after.accounted_bytes, inventory.accounted_bytes);
     assert_eq!(after.slots.len(), 1);
@@ -2287,7 +2287,7 @@ fn bounded_payload_layout_refuses_unknown_entries_symlinks_and_shared_roots() {
 fn bounded_ceiling_stops_new_admission_with_known_accounting() {
     let root = TaskRoot::new();
     let payload = TaskRoot::new();
-    let mut daemon = start_bounded(root.path(), payload.path(), 4096, &"a".repeat(16));
+    let daemon = start_bounded(root.path(), payload.path(), 4096, &"a".repeat(16));
     let first = daemon
         .client
         .acquire(request_at_path(
@@ -2379,7 +2379,7 @@ fn bounded_ceiling_stops_new_admission_with_known_accounting() {
 fn bounded_full_payload_keeps_metadata_and_ownership_durable() {
     let root = TaskRoot::new();
     let payload = TaskRoot::new();
-    let mut daemon = start_bounded(
+    let daemon = start_bounded(
         root.path(),
         payload.path(),
         3 * 1024 * 1024,
