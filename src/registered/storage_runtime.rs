@@ -708,6 +708,11 @@ fn provision_bounded(
     if fs::canonicalize(&bounded.mount_point).map_err(|_| HostError::Io)? != bounded.mount_point {
         return Err(HostError::Storage);
     }
+    // A fresh APFS volume root mounts world-readable. The payload is private
+    // scratch, so provisioning makes the root owner-only before anything is
+    // written; a later open refuses a volume that is not private.
+    fs::set_permissions(&bounded.mount_point, fs::Permissions::from_mode(0o700))
+        .map_err(|_| HostError::Io)?;
     let sample = sample_volume(&bounded.mount_point)?;
     let identity = image_identity(&bounded.image_path)?;
     // The admission ceiling must fit inside the verified payload volume, so
