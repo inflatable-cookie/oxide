@@ -115,9 +115,32 @@ Private measurement launcher: `scripts/build_context_comparison.py`. Covering sy
 python3 scripts/build_context_comparison.py
 python3 scripts/build_context_comparison.py --plan --resource-plan <planner-owned-json>
 python3 scripts/build_context_comparison.py --live --resource-plan <planner-owned-json>
+python3 scripts/build_context_comparison.py --live --admitted-root <parent> --resource-plan <staged-plan-json>
 ```
 
-Default is plan/validate. Planned metadata does not prove effects. Live requires `--live` and a planner-owned unused resource plan naming `launch_id`, `parent`, `mount`, `backing`, `nucleus_source`, and exact `registry_inputs`. Absent those, live refuses `live_opt_in_incomplete` or `source_cache_unbound`. This PR does not pass `--live`.
+Default is plan/validate. Planned metadata does not prove effects. Live requires `--live` and a planner-owned unused resource plan naming `launch_id`, `parent`, `mount`, `backing` and `nucleus_source`. Registry inputs are optional: absent declared inputs the launcher derives the exact named inputs from the pinned lock metadata (see below), and a missing named input refuses `source_cache_unbound`. Without `--admitted-root` the launcher takes the outer bootstrap role; with it, the launcher takes the admitted inner role. This PR does not pass `--live`.
+
+### Heavy admission and the staged root
+
+The comparison runs admitted through one explicit heavy entry. The launcher's outer bootstrap (no `--admitted-root`) records the session clock, then creates a uniquely owned staged root at the resource plan's `parent`:
+
+- `effigy.toml` — a fixed manifest whose only task is `build-context:comparison:live` with `admission = "heavy"`, running the reviewed launcher through an absolute interpreter path (a scheduler launch does not rely on a forwarded `PATH`).
+- `resource-plan.json` — the pure registry-input plan document.
+- `binding.json` — the persisted caller label, request UUID, request-body digest, root, launcher digest, source pins and registry-plan digest.
+
+The outer bootstrap then runs the existing top-level selector from that root:
+
+```sh
+EFFIGY_CALLER=<label> effigy --host-run-request-id <uuid> build-context:comparison:live
+```
+
+Effigy classifies `admission = "heavy"` as heavy (Effigy `src/runner/execute/entry.rs`, `ManifestTaskAdmission::Heavy`; contract 049). Contract 010 fixes the token root as `"the run's canonical cwd"`, so the staged root is the token root. Every nested `effigy check:core:test` call runs with cwd under `<parent>/m/src-<mode>` and therefore satisfies the nested parent check (`current_cwd == token_root || current_cwd.starts_with(token_root)`). No plain-Python outer is left unadmitted, no token is minted, and the root is never widened to all of `/private/var/tmp`.
+
+The admitted inner launcher (with `--admitted-root`) refuses `admission_unverified` unless it is passed the staged parent and a present host-run identity, and accepts the staged root only when it is the exact owned bootstrap: directory mode `0700`, owner `uid`, no symlinks, exactly the three pinned entries, no extra names, and digests recomputed from the reviewed manifest template and the pure registry plan. A preexisting, mismatched or path-escaping root never qualifies.
+
+### Durable request identity
+
+Before delivery the outer bootstrap persists `binding.json` with the caller label, request UUID, request-body digest, root, launcher digest, source pins and registry-plan digest. It passes the same UUID through the existing `--host-run-request-id` flag. On a lost or ambiguous submit reply it queries the exact caller/UUID with `effigy tasks request status --caller <label> --request-id <uuid> --json` and only follows with `effigy tasks request follow ...`. Only the scheduler's authenticated `unknown_run` (`authenticated_absence`) permits replaying the same request identity; every other reply is held and reported as `unknown` with resources retained. Effigy does not persist the caller's body, so the launcher owns that binding.
 
 ### Source pin
 
@@ -128,7 +151,7 @@ Default is plan/validate. Planned metadata does not prove effects. Live requires
 
 ### Clone and verification
 
-1. Create unused `PARENT=/private/var/tmp/oxide-build-context-cmp-<launch-id>`, mount `$PARENT/m`, backing `$PARENT/cmp.sparseimage` (defined below).
+1. The outer bootstrap owns `PARENT=/private/var/tmp/oxide-build-context-cmp-<launch-id>` as the staged session root before submission. The admitted run accepts that exact root; it never creates a second root. `$PARENT/m` is the mount, `$PARENT/cmp.sparseimage` the backing, both siblings under the owned parent.
 2. For each mode, `git clone --no-local --no-checkout <nucleus-path> $PARENT/m/src-<mode>`. This reads the native repository and writes only inside the mount. Never create a worktree in the native repository and never move its refs.
 3. `git -C <src> checkout --detach fb2bd0449ede2d9d2089a47b0559182bd413b91f`.
 4. Verify `git -C <src> rev-parse HEAD^{tree}` equals the tree pin. Verify `shasum -a 256 Cargo.lock` equals the lock pin. Verify `git status --porcelain` is empty. Any mismatch stops the run.
@@ -165,7 +188,7 @@ Use a fixed allowlist merged onto preserved admission identity. Record only vari
 Allowlist, both modes:
 - `PATH`, `HOME`, `RUSTUP_HOME`: host toolchain identity.
 - `CARGO_HOME=$MOUNT/cargo-home`: fresh contained writable Cargo state. `--offline` does not make a host `CARGO_HOME` kernel read-only. The launcher does not chmod, remount, or recursively inventory the operator `CARGO_HOME`.
-- Declared `registry_inputs` only: copy exact named files into `$MOUNT/cargo-home/...` under a 4096-file / 512 MiB bound. Missing inputs refuse `source_cache_unbound`. Unrestricted cache copy is not a fallback.
+- Declared `registry_inputs` only: copy exact named files into `$MOUNT/cargo-home/...` under a 4096-file / 512 MiB bound. When the resource plan declares no inputs, the launcher derives the exact plan purely from the pinned lock metadata (committed 038 record, same `Cargo.lock` sha256 `ab2ed097…`): every locked crates.io `[[package]]` maps to `<cache>/index.crates.io-1949cf8c6b5b557f/<name>-<version>.crate` and to the Cargo sparse-index cache file under `<index>/index.crates.io-1949cf8c6b5b557f/.cache/<shard>/<name>`, plus the namespace `config.json`. Only the two canonical named roots are used; any other path refuses. A missing named input refuses `source_cache_unbound`. Unrestricted cache copy, a host `CARGO_HOME` walk, new Cargo metadata probes, namespace fallback and network are not fallbacks.
 - `CARGO_TARGET_DIR=$MOUNT/target-<mode>`.
 - `TMPDIR`, `TMP`, `TEMP` = `$MOUNT/tmp-<mode>`.
 - `CARGO_INCREMENTAL=0` for `off` mode, `=1` for `on` mode. `RUSTUP_TOOLCHAIN=1.97.1`.
@@ -229,8 +252,9 @@ The preferred plan was three edits per mode (cold+3+1 = 5). It is reduced to two
 
 ### Time cap
 
-- One `time.monotonic_ns` start and one UTC audit mark, taken before any live image, source, tool, or evidence preparation. `EPOCHREALTIME` and UTC are not the deadline clock. A UTC jump does not extend the session.
-- Total live budget: 1_200_000_000_000 ns (20 minutes) from that monotonic mark, including preparation, probes, builds, tests, measurement and capture. The cap is not reset and not extended. Five seconds are reserved to record partial or abort evidence.
+- One `time.monotonic_ns` start and one UTC audit mark, taken before any staging, live image, source, tool, or evidence preparation. `EPOCHREALTIME` and UTC are not the deadline clock. A UTC jump does not extend the session.
+- Total live budget: 1_200_000_000_000 ns (20 minutes) from that monotonic mark, including staging, capacity wait, probes, builds, tests, measurement and capture. The cap is not reset and not extended. Five seconds are reserved to record partial or abort evidence.
+- `binding.json` carries the original absolute UTC start and the absolute monotonic deadline. The admitted run adopts that deadline and never re-bases it on its own start: source-cache planning, bootstrap staging and capacity waiting spend from the same budget. A genuine capacity wait that yields no launch is reported `partial` with `never_launched`, not a fresh budget.
 - Independent review (up to 20 minutes) is outside this live budget.
 - Every subprocess, lock, read, copy and poll uses remaining time against the original deadline. A second operation after expiry refuses before spawn.
 - On breach, stop new delivery and terminate only helper-created child process groups (`killpg` of the spawned session, never kill-by-name). If positive writer closure is absent, retain uncertain resources; do not unmount, delete or release. Deadline, refusal, partial, unknown and success stay distinct. This scope is cooperative foreground Cargo/test behavior, not daemon ownership proof of arbitrary descendants.
@@ -265,11 +289,13 @@ Per invocation:
 - the rustc flag lines for the workspace crates (bounded excerpt).
 
 Per target and per mode, after each invocation:
-- logical bytes, file counts, and allocated bytes (`st_blocks * 512`) deduplicated by `(st_dev, st_ino)` across the **union** of `deps/` and incremental directories; a hardlink is counted as a file twice and added to allocated bytes once;
+- per-directory logical bytes, allocated bytes and file counts for `target/debug/deps` and `target/debug/incremental`, and the union across both deduplicated by `(st_dev, st_ino)`; a hardlink is counted as a file twice and added to allocated bytes once;
 - file count under `deps/` and count of `*.o` there;
-- incremental directory bytes;
-- `.dSYM` count (expected zero under unpacked).
+- `.dSYM` count (expected zero under unpacked);
+- a truncated walk budget marks the measurement `partial`, never a positive result.
 Walks are bounded in file count and time and stay inside the owned parent/mount. Host `CARGO_HOME` is not a walk root.
+
+Per measured invocation, positive proof requires: outcome `ok`, exit `0`, the exact selected-test line `test <name> ... ok` and `test result: ok. 1 passed; 0 failed; …`; every rustc `Running` line matching the resolved `rustc` path with no wrapper prefix; `-C debuginfo=line-tables-only` (or `1`) and `-C split-debuginfo=unpacked` on every rustc invocation; `-C incremental` present in `on` and absent or `off` in `off`; the expected workspace `Compiling nucleus-core` on C0/E1/E2; and, on U, no workspace `Compiling` while the test still executes. U is a no-op rebuild, so no rustc `Running` line is required there. A missing or truncated critical flag or test identity is `partial`, not a pass.
 
 Per mode:
 - image used and free before, after and sampled;
@@ -280,6 +306,7 @@ Limitations to state with results:
 - Hardlink-aware `(dev,ino)` accounting does not prove APFS clone or snapshot sharing is absent or cannot confound allocation, including when this recipe created none.
 - Effigy and Cargo control-plane state is separately identified and is not claimed as per-run SSD I/O. Attributable writes remain unknown unless an existing non-privileged counter is trustworthy.
 - Raw logs cap at 8 MiB with an explicit partial marker. Critical failure and selected-test identity keep a reserved tail so cap exhaustion cannot silently drop them.
+- Stream reads are deadline-aware and bounded; a child that exits while a descendant still holds the pipe is drained only within a bounded grace and reported with `writer_closed=false` (unknown closure, resources retained), never inferred closed from the parent's exit. Large output cannot grow captured buffers past the cap or block past the deadline. Only helper-created process groups are terminated; no process-name kills and no claim about arbitrary descendants.
 
 ### Evidence and raw limits
 
@@ -303,12 +330,12 @@ Stop and report, without changing the design, if the execution brief cannot pin 
 
 ### Single named seam
 
-The launcher binds the 050 gaps: whole-session monotonic deadline, sibling backing file, 16 GiB owned total including overhead, admission-preserving environment, counted deliveries before spawn, declared registry inputs instead of a host `CARGO_HOME` walk, exact reported-executable location from both streams, backtrace frame vs panic header, post-restore porcelain/lock verification, live union accounting, and 15s cadence 14 GiB / 20 GiB peak sampling. Live still needs a later checked execution brief, an unused planner-owned resource plan, and independent review. This PR does not run the comparison, create an image, or invoke real Cargo/rustc/Nucleus tests.
+The launcher binds the 050 gaps: whole-session monotonic deadline, sibling backing file, 16 GiB owned total including overhead, admission-preserving environment, counted deliveries before spawn, declared registry inputs instead of a host `CARGO_HOME` walk, exact reported-executable location from both streams, backtrace frame vs panic header, post-restore porcelain/lock verification, live union accounting, and 15s cadence 14 GiB / 20 GiB peak sampling. The 051 follow-up binds five concrete integration defects: one explicit heavy staged entry with the submission cwd as the authenticated token root; caller/UUID/body/root binding persisted before delivery with authenticated-absence-only replay; a pure lock-to-archive/index registry plan over the canonical namespaces; positive per-measurement proofs on `target/debug/deps` and `target/debug/incremental`; and deadline-aware bounded stream reads. Live still needs a later checked execution brief, an unused planner-owned resource plan, and independent review. This PR does not run the comparison, create an image, or invoke real Cargo/rustc/Nucleus tests.
 
 Missing declared registry inputs, an unbindable named copy, or an unsupported Effigy inheritance seam is a refuse with that seam name. Do not invent unrestricted cache copy or bypass admission.
 
 ## Evidence limits for this design
 
-- The design rests on the supervisor's reported single-machine observations, a read-only inspection of three Nucleus commits and one stopgap, and two pinned rustc source reads. Its raw logs were not available.
-- Synthetic fixtures cover launcher enforcement with stub adapters. They are not a live comparison. No Cargo, rustc, Effigy-heavy, or `hdiutil create/attach` run supports a qualification result.
+- The design rests on the supervisor's reported single-machine observations, a read-only inspection of three Nucleus commits and one stopgap, two pinned rustc source reads, and the installed Effigy source and contracts 010/049 for the heavy classification and token-root check. Its raw logs were not available.
+- Synthetic fixtures cover launcher enforcement, staging, admission and submission with stub adapters. They are not a live comparison. No Cargo, rustc, Effigy-heavy, or `hdiutil create/attach` run supports a qualification result.
 - Reported timings (see [storage efficiency](../storage-efficiency.md#incremental-and-debug-storage-measurements)) are not reproduced.
