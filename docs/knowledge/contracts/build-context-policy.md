@@ -1,8 +1,8 @@
 # Build-context policy (proposed)
 
-Status: proposed design, approved as design direction on 2026-10-15 in [vision](../vision.md#authority-boundaries). Nothing here is active. Shipped ordinary-Cargo behavior stays in [ordinary Cargo storage](ordinary-cargo-storage.md) and [reuse identity](ordinary-cargo-reuse-identity.md). The current ordinary prototype does not evict, does not enforce a new budget, and does not know about incremental state. Those are candidate implementation work, not shipped ability.
+Status: proposed design, approved as design direction on 2026-10-15 in [vision](../vision.md#authority-boundaries). Oxide does not activate a context resolver through this document. Shipped ordinary-Cargo behavior stays in [ordinary Cargo storage](ordinary-cargo-storage.md) and [reuse identity](ordinary-cargo-reuse-identity.md). The current ordinary prototype does not evict, does not enforce a new budget, and does not know about incremental state. Those are candidate implementation work, not shipped ability.
 
-Consumer defaults do not change. Nucleus's managed-agent stopgap (`CARGO_INCREMENTAL=0`, Nucleus commit `fb2bd04`) stays in force until a separately reviewed adoption.
+Consumer policy remains consumer-owned. Tom adopted incremental-on for Nucleus managed agents and incremental-off for one-shot validation in Nucleus `ff43e69701f08e5a9ddf84d424a381dea8d033de`, superseding its `fb2bd04` agent stopgap. [Storage efficiency](../storage-efficiency.md#nucleus-consumer-adoption-2026-10-15) owns that adoption receipt and its limits. This does not activate Oxide slots or imply a Queue policy change.
 
 ## Principle
 
@@ -196,7 +196,7 @@ Allowlist, both modes:
 - `TMPDIR`, `TMP`, `TEMP` = `$MOUNT/tmp-<mode>`.
 - `CARGO_INCREMENTAL=0` for `off` mode, `=1` for `on` mode. `RUSTUP_TOOLCHAIN=1.97.1`.
 - `CARGO_PROFILE_DEV_SPLIT_DEBUGINFO=unpacked`, `CARGO_PROFILE_TEST_SPLIT_DEBUGINFO=unpacked`.
-- No `CARGO_BUILD_BUILD_DIR`. No shared target. No `RUSTFLAGS`. No Nucleus stopgap env beyond the listed names. Nucleus's managed-agent stopgap stays in force for consumers.
+- No `CARGO_BUILD_BUILD_DIR`. No shared target. No `RUSTFLAGS`. No consumer-specific environment beyond the listed names. The benchmark's explicit off/on values do not define consumer defaults; the subsequent Nucleus adoption is recorded above.
 
 Expected effective values, verified from the `-v` rustc lines of the measured invocations:
 - debug is `line-tables-only` from the manifest's `[profile.dev]`. The test profile inherits dev.

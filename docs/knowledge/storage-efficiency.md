@@ -180,8 +180,9 @@ cross-task shared-slot reuse was measured. The original four-Cargo,
 
 **Recommendation:** retain lifecycle-aware policy as the direction. Iterative
 agent work can benefit from incremental just as interactive human work can;
-turning it off is a real speed/storage compromise. Keep the current consumer
-stopgaps until a separately reviewed adoption provides bounded owned storage.
+turning it off is a real speed/storage compromise. Consumer adoption is
+separate from Oxide activation; Nucleus's decision below supersedes its
+managed-agent stopgap without claiming a hard storage bound.
 Qualify a hard per-slot budget and safe whole-idle-generation retirement;
 do not substitute selective `.o` deletion or silently flip incremental state
 inside a partition. Unchanged Cargo reuse remains useful in either mode.
@@ -196,6 +197,23 @@ The [measurement recipe](evidence/incremental-comparison-20261015/measurement-re
 [on backtrace](evidence/incremental-comparison-20261015/raw/on-backtrace.log) and
 [authenticated settlement](evidence/incremental-comparison-20261015/follow.json)
 make the result independently inspectable without another build.
+
+## Nucleus consumer adoption (2026-10-15)
+
+Tom adopted the direct comparison for Nucleus in
+[`ff43e69701f08e5a9ddf84d424a381dea8d033de`](https://github.com/inflatable-cookie/nucleus/commit/ff43e69701f08e5a9ddf84d424a381dea8d033de).
+Its [Contract 002](https://github.com/inflatable-cookie/nucleus/blob/ff43e69701f08e5a9ddf84d424a381dea8d033de/docs/knowledge/contracts/002-core-requirements.md)
+cites Oxide `943c6f9`: managed agents build with incremental on again;
+one-shot validation retains `CARGO_INCREMENTAL=0`. This supersedes Nucleus's
+earlier agent-wide incremental-off stopgap at `fb2bd04`.
+
+Nucleus owns this policy and its closeout. Its contract states that closeout
+deletes the task workspace, limiting retention to the task lifetime. That is
+not a hard byte bound during a long-running task, does not prevent a task's
+target from growing, and does not reduce cold-build duplication or establish
+SSD-write savings. Oxide's size-limited owned build storage remains the
+longer-term bound. No shared slot, cross-task target reuse, object GC, Queue
+default change or production Oxide activation follows from this adoption.
 
 ## Bounded incremental comparison attempt (2026-10-15)
 

@@ -176,8 +176,9 @@ separately. Unmeasured writes and debugger capabilities remain unknown.
 The design distinguishes expected build/cache lifetime and debugging needs
 from human or agent identity. One-shot incremental-off and iterative
 incremental-on are candidates to qualify, not changes to consumer defaults.
-Nucleus's current managed-agent stopgap remains in force pending separately
-reviewed adoption. This approval does not enable a production policy resolver,
+At that approval, Nucleus's managed-agent stopgap remained in force pending
+consumer adoption; Tom's later Nucleus ruling below supersedes it. This
+approval does not enable a production policy resolver,
 shared warm slots, automatic generation retirement, selective object deletion,
 global configuration changes or scans/deletion of existing target trees.
 Object age, filename, compiler session locks or process disappearance cannot
@@ -201,3 +202,14 @@ existing evidence; do not reset a live clock, change consumer defaults or
 inspect/delete old targets. Record actual limitations rather than building
 another measurement framework. Product changes still require ordinary
 independent exact-head review.
+
+
+Tom's Nucleus adoption, relayed by its Supervisor on 2026-10-15 and recorded
+in Nucleus `ff43e69701f08e5a9ddf84d424a381dea8d033de` Contract 002:
+managed agents build with incremental on again; one-shot validation keeps
+`CARGO_INCREMENTAL=0`, citing Oxide's direct comparison `943c6f9`. Nucleus
+owns task-workspace deletion at closeout. This limits retention by task
+lifetime, not by an enforced per-task byte budget. It supersedes the prior
+Nucleus agent stopgap without activating Oxide shared storage or changing
+Queue policy. [Storage efficiency](storage-efficiency.md#nucleus-consumer-adoption-2026-10-15)
+owns the adoption receipt and its limits.
