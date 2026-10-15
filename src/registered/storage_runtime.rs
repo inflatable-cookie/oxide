@@ -124,6 +124,9 @@ pub struct RuntimeBoundedStorage {
     pub receipt_path: PathBuf,
     /// Canonical mount point of the payload volume.
     pub mount_point: PathBuf,
+    /// Nominal image size. Must cover the ceiling plus filesystem metadata,
+    /// because the usable volume capacity is always smaller.
+    pub image_bytes: WireU64,
     /// Must equal the bootstrap budget cap so there is one ceiling source.
     pub payload_ceiling_bytes: WireU64,
 }
@@ -137,6 +140,7 @@ struct BoundedReceipt {
     backend: String,
     image_path: PathBuf,
     mount_point: PathBuf,
+    image_bytes: WireU64,
     payload_ceiling_bytes: WireU64,
     verified_capacity_bytes: WireU64,
     identity: String,
@@ -508,6 +512,7 @@ fn validate_bounded(
 ) -> Result<(), HostError> {
     if !cfg!(target_os = "macos")
         || bounded.backend != BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1
+        || bounded.image_bytes.0 <= bounded.payload_ceiling_bytes.0
         || bounded.payload_ceiling_bytes.0 != budget.cap_bytes.0
     {
         return Err(HostError::Protocol);
@@ -655,7 +660,7 @@ fn provision_bounded(
         }
         command.output().map_err(|_| HostError::Io)
     };
-    let size = ceiling.to_string();
+    let size = bounded.image_bytes.0.to_string();
     let image = bounded
         .image_path
         .to_str()
@@ -715,6 +720,7 @@ fn provision_bounded(
         backend: BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1.to_owned(),
         image_path: bounded.image_path.clone(),
         mount_point: bounded.mount_point.clone(),
+        image_bytes: bounded.image_bytes,
         payload_ceiling_bytes: WireU64(ceiling),
         verified_capacity_bytes: WireU64(sample.capacity_bytes),
         identity,
@@ -750,6 +756,7 @@ fn open_bounded(
         || receipt.backend != BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1
         || receipt.image_path != bounded.image_path
         || receipt.mount_point != bounded.mount_point
+        || receipt.image_bytes != bounded.image_bytes
         || receipt.payload_ceiling_bytes.0 != ceiling
         || bounded.image_path.symlink_metadata().is_err()
     {

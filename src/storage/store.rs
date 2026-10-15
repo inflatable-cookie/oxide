@@ -370,30 +370,26 @@ impl Store {
         if budget.cap_bytes == 0 {
             return Err(StorageError::InvalidInput("budget cap must be positive"));
         }
+        // Resolve the backend and refuse every mismatch before creating any
+        // directory: a refused bind must leave the root exactly as it was.
         let (backend, slots_root) = match backing.as_ref() {
             Some(backing) => {
                 // The verified capability places slots on the payload volume;
                 // the daemon root keeps only control state. Unknown payload
                 // entries refuse so a foreign mount can never join the store.
                 validate_payload_entries(backing.payload_root())?;
-                let slots_root = backing.payload_root().join(SLOTS_NAME);
-                ensure_private_directory(&slots_root)?;
                 (
                     LedgerBackend::Bounded(backing.descriptor().clone()),
-                    slots_root,
+                    backing.payload_root().join(SLOTS_NAME),
                 )
             }
-            None => {
-                let slots_root = root.join(SLOTS_NAME);
-                ensure_private_directory(&slots_root)?;
-                (LedgerBackend::Directory, slots_root)
-            }
+            None => (LedgerBackend::Directory, root.join(SLOTS_NAME)),
         };
         validate_root_entries(&root, backend_is_bounded(&backend))?;
         let ledger_path = root.join("ledger.bin");
         let ledger = load_ledger(&ledger_path, budget, &backend)?;
         remove_stale_ledger_temps(&root)?;
-        validate_root_entries(&root, backend_is_bounded(&backend))?;
+        ensure_private_directory(&slots_root)?;
         let mut store = Self {
             root,
             slots_root,
