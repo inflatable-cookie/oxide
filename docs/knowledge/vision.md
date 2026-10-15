@@ -236,3 +236,14 @@ prior fixture receipts do not authorize restoration or activation. The current
 [consumer boundary](contracts/project-adoption.md#current-nucleus-integration-boundary)
 owns the source pins and evidence limits. This does not retire the upstream
 Oxide storage facility or undo Nucleus's independent incremental-policy adoption.
+
+The current Nucleus Supervisor subsequently clarified its consumer boundary:
+Tom's 2026-10-15 direction prioritizes declared workflow charts and fewer
+proof-heavy chains; Nucleus is not taking an Oxide integration now. Its owner
+has put the proposed scope to Tom and will return his decision. This is a
+pending consumer decision, not a new approval request from Oxide or authority
+to begin consumer work. The Supervisor owns Nucleus after the former Sol
+planner's handover. The [current consumer boundary](contracts/project-adoption.md#current-nucleus-integration-boundary)
+owns contact and approval details. Independent Oxide work may continue within
+its existing scope; no Nucleus dependency or integration is implied by that
+progress.

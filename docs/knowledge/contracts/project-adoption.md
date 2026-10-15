@@ -8,9 +8,10 @@ the separate reusable-slot adoption design.
 Status: proposed consumer design. Oxide now contains an unpublished Rust
 library adapter for task-owned fixtures. It defines no production Queue/Nucleus
 binding, consumer configuration key, daemon deployment or consumer adoption.
-Nucleus has a disabled synthetic runner client; its
-[implemented boundary and evidence limits](nucleus-core-reuse.md#inactive-nucleus-client)
-remain separate from production adoption.
+The [declared workflow entry point](declared-workflow-adoption.md) is available
+for private qualification. Nucleus removed its former synthetic client; the
+[current consumer boundary](#current-nucleus-integration-boundary) owns its
+integration status and authority.
 The storage rules remain in [architecture](../architecture.md),
 product authority remains in [vision](../vision.md), and Q-010/Q-011 hold the
 integration design answers. Q-012 remains open for the consumer-owned source
@@ -340,6 +341,22 @@ review.
 
 ## Current Nucleus integration boundary
 
+Nucleus development and planning belong to Supervisor
+`6585d6bf-a1aa-4877-91d6-a675b7ca6282`, following Tom's 2026-10-15 ownership
+ruling in Nucleus Contract 001 (recorded at `5b34f80`). The former Sol planner
+`cddd99af` has handed over; its assessments do not commit Nucleus. Route any
+future substantive coordination to the Supervisor, without prompting active
+workers or managing the former owner's retirement from Oxide.
+
+The Supervisor has deferred taking a consumer integration pending Tom's
+decision. Nucleus's current priority is declared workflow charts, followed by
+removing the hardcoded lifecycle order. No consumer implementation or rollout
+is authorized by Oxide's upstream delivery. A future integration requires the
+reviewed handover and Tom's approval under Nucleus Contract 002. The Supervisor
+owns the existing decision; do not create a duplicate approval request or
+treat an earlier technical assessment as consumer acceptance. Nucleus's
+incremental-on agent policy remains independently useful without Oxide.
+
 Nucleus intentionally removed its never-live disabled Oxide consumer code
 in the 2026-10-15 simplification reset. At reviewed owner inspection of
 Nucleus `15de6ac6b4f10bf4e17335fede01670ea2c5fb48`, there is **no current
@@ -350,8 +367,9 @@ supporting tests; `189373b0c296bfc3a4c6d5e8629c6caaa4e55de8` later removed
 `validation-client.ts`. Nucleus Contract 011 marks its later implementation
 sections as historical. Earlier delivery receipts are not current APIs.
 
-Oxide's ordinary-Cargo v2 library/process and storage client remain upstream
-implementation references. They acquire storage and request consumer
+Oxide's ordinary-Cargo library/process and storage client remain upstream
+implementation references, including the private
+[declared policy-3 route](declared-workflow-adoption.md). They acquire storage and request consumer
 submit/capture/not-submitted callbacks; they do not execute Cargo or supply
 Nucleus authority. A future consumer integration must start from Oxide's
 actual reviewed handover and Nucleus's current owners, not restore the old
