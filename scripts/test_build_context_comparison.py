@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -257,7 +258,7 @@ class RecordingSubmitter:
         self.states = list(states)
         self.calls: list[dict[str, object]] = []
 
-    def submit(self, *, argv, cwd, request_id, caller, env):
+    def submit(self, *, argv, cwd, request_id, caller, env, timeout_ns=None):
         binding = Path(cwd) / bcc.STAGED_BINDING_NAME
         self.calls.append(
             {
@@ -270,6 +271,28 @@ class RecordingSubmitter:
         )
         state = self.states.pop(0) if self.states else "held"
         return bcc.HeavySubmitOutcome(state=state, run_id="run_0001" if state == "launched" else None)
+
+
+class RecoveringSubmitter:
+    """Held submit reply, then a found request that is followed to settlement."""
+
+    def __init__(self, follow_state: str = "launched") -> None:
+        self.follow_state = follow_state
+        self.submits = 0
+        self.statuses = 0
+        self.follows = 0
+
+    def submit(self, *, argv, cwd, request_id, caller, env, timeout_ns=None):
+        self.submits += 1
+        return bcc.HeavySubmitOutcome(state="held")
+
+    def request_status(self, *, caller, request_id, env, timeout_ns=None):
+        self.statuses += 1
+        return bcc.HeavySubmitOutcome(state="found", run_id="run_0001")
+
+    def request_follow(self, *, caller, request_id, env, timeout_ns=None):
+        self.follows += 1
+        return bcc.HeavySubmitOutcome(state=self.follow_state)
 
 
 def _git_ok(argv, cwd=None) -> str:
@@ -469,6 +492,31 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(raised.exception.seam, "count")
         self.assertIn("11th", raised.exception.message)
 
+    def test_cli_live_wires_submitter_and_mints_uuid(self) -> None:
+        options = bcc.parse_cli(["--live", "--resource-plan", "/x/plan.json"])
+        launcher = bcc.build_launcher(options)
+        self.assertIsInstance(launcher.submitter, bcc.SubprocessSubmitter)
+        self.assertEqual(launcher.caller, bcc.DEFAULT_CALLER)
+        parsed = uuid.UUID(launcher.request_id)
+        self.assertEqual(str(parsed), launcher.request_id)
+        self.assertNotEqual(
+            launcher.request_id, "00000000-0000-4000-8000-000000000000"
+        )
+
+    def test_cli_admitted_and_plan_roles_have_no_submitter(self) -> None:
+        admitted = bcc.build_launcher(
+            bcc.parse_cli(["--live", "--admitted-root", "/p", "--resource-plan", "/x"])
+        )
+        self.assertIsNone(admitted.submitter)
+        planned = bcc.build_launcher(bcc.parse_cli(["--resource-plan", "/x"]))
+        self.assertIsNone(planned.submitter)
+
+    def test_cli_request_id_can_be_replayed(self) -> None:
+        launcher = bcc.build_launcher(
+            bcc.parse_cli(["--live", "--request-id", REQUEST_ID, "--resource-plan", "/x"])
+        )
+        self.assertEqual(launcher.request_id, REQUEST_ID)
+
 
 class RegistryPlanTests(unittest.TestCase):
     def test_lock_parser_and_shards(self) -> None:
@@ -579,6 +627,20 @@ class StagingTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.seam, "staged_session")
 
+    def test_staged_plan_is_loadable_resource_plan(self) -> None:
+        plan = _plan(SCRATCH / "loadable")
+        _stage(plan, bcc.derive_registry_input_plan_from_evidence(), FakeClock())
+        loaded = bcc.load_resource_plan(plan.parent / bcc.STAGED_PLAN_NAME)
+        self.assertEqual(loaded.launch_id, plan.launch_id)
+        self.assertEqual(loaded.parent, plan.parent)
+        self.assertEqual(loaded.mount, plan.mount)
+        self.assertEqual(loaded.backing, plan.backing)
+        self.assertEqual(loaded.nucleus_source, plan.nucleus_source)
+        self.assertTrue(loaded.registry_inputs)
+        self.assertTrue(
+            all(item.src.is_absolute() for item in loaded.registry_inputs)
+        )
+
     def test_path_escape_rel_refuses(self) -> None:
         plan = _plan(SCRATCH / "escape")
         plan = bcc.ResourcePlan(
@@ -680,6 +742,25 @@ class SubmissionTests(unittest.TestCase):
     def test_held_reply_is_unknown_not_success(self) -> None:
         plan = _plan(SCRATCH / "held")
         submitter = RecordingSubmitter(["held"])
+        launcher, _, _, _, _ = _launcher(SCRATCH, submitter=submitter)
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "unknown")
+        self.assertEqual(document["seam"], "submit_ambiguous")
+        self.assertTrue(document["resources_retained"])
+
+    def test_held_reply_follows_found_request(self) -> None:
+        plan = _plan(SCRATCH / "follow")
+        submitter = RecoveringSubmitter(follow_state="launched")
+        launcher, _, _, _, _ = _launcher(SCRATCH, submitter=submitter)
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "launched")
+        self.assertEqual(submitter.statuses, 1)
+        self.assertEqual(submitter.follows, 1)
+        self.assertIn("request found; following the settled host run", document["log"])
+
+    def test_held_reply_follow_failure_stays_unknown(self) -> None:
+        plan = _plan(SCRATCH / "followfail")
+        submitter = RecoveringSubmitter(follow_state="held")
         launcher, _, _, _, _ = _launcher(SCRATCH, submitter=submitter)
         document = launcher.run(live=True, resource_plan=plan)
         self.assertEqual(document["outcome"], "unknown")

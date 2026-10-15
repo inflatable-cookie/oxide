@@ -125,8 +125,10 @@ Default is plan/validate. Planned metadata does not prove effects. Live requires
 The comparison runs admitted through one explicit heavy entry. The launcher's outer bootstrap (no `--admitted-root`) records the session clock, then creates a uniquely owned staged root at the resource plan's `parent`:
 
 - `effigy.toml` — a fixed manifest whose only task is `build-context:comparison:live` with `admission = "heavy"`, running the reviewed launcher through an absolute interpreter path (a scheduler launch does not rely on a forwarded `PATH`).
-- `resource-plan.json` — the pure registry-input plan document.
+- `resource-plan.json` — a full loadable resource plan (`launch_id`, `parent`, `mount`, `backing`, `nucleus_source`, the effective `registry_inputs`, and the pure registry-plan view), so the inner `--resource-plan` loads through the ordinary `load_resource_plan` path.
 - `binding.json` — the persisted caller label, request UUID, request-body digest, root, launcher digest, source pins and registry-plan digest.
+
+The outer bootstrap mints a fresh request UUID (or reuses `--request-id`) and constructs the real Effigy submitter; the admitted inner role and every plan/default path construct none. `--caller` overrides the label.
 
 The outer bootstrap then runs the existing top-level selector from that root:
 
@@ -140,7 +142,7 @@ The admitted inner launcher (with `--admitted-root`) refuses `admission_unverifi
 
 ### Durable request identity
 
-Before delivery the outer bootstrap persists `binding.json` with the caller label, request UUID, request-body digest, root, launcher digest, source pins and registry-plan digest. It passes the same UUID through the existing `--host-run-request-id` flag. On a lost or ambiguous submit reply it queries the exact caller/UUID with `effigy tasks request status --caller <label> --request-id <uuid> --json` and only follows with `effigy tasks request follow ...`. Only the scheduler's authenticated `unknown_run` (`authenticated_absence`) permits replaying the same request identity; every other reply is held and reported as `unknown` with resources retained. Effigy does not persist the caller's body, so the launcher owns that binding.
+Before delivery the outer bootstrap persists `binding.json` with the caller label, request UUID, request-body digest, root, launcher digest, source pins and registry-plan digest. It passes the same UUID through the existing `--host-run-request-id` flag. On a lost or ambiguous submit reply it queries the exact caller/UUID with `effigy tasks request status --caller <label> --request-id <uuid> --json`; a found request is then followed with `effigy tasks request follow ...` to its settlement. Only the scheduler's authenticated `unknown_run` (`authenticated_absence`) permits replaying the same request identity; every other reply is held and reported as `unknown` with resources retained. Submit, status and follow are deadline-bounded and log the remaining time. Effigy does not persist the caller's body, so the launcher owns that binding.
 
 ### Source pin
 

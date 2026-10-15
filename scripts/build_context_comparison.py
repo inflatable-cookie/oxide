@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -513,12 +514,44 @@ def _write_staged_file(path: Path, data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def staged_plan_document(
+    plan: ResourcePlan,
+    registry: RegistryInputPlan,
+    inputs: tuple[RegistryInput, ...],
+) -> dict[str, object]:
+    """The inner `--resource-plan` document: a full loadable resource plan.
+
+    It carries the same `launch_id`/`parent`/`mount`/`backing`/`nucleus_source`
+    the outer bootstrap runs with, the effective registry inputs, and the pure
+    registry-plan view. The admitted inner run loads it through the ordinary
+    `load_resource_plan` path.
+    """
+    return {
+        "launch_id": plan.launch_id,
+        "parent": str(plan.parent),
+        "mount": str(plan.mount),
+        "backing": str(plan.backing),
+        "nucleus_source": str(plan.nucleus_source),
+        "registry_inputs": [{"src": str(i.src), "rel": i.rel} for i in inputs],
+        "registry_plan": registry.to_document(),
+    }
+
+
+def _staged_plan_bytes(
+    plan: ResourcePlan, registry: RegistryInputPlan, inputs: tuple[RegistryInput, ...]
+) -> bytes:
+    return (
+        json.dumps(staged_plan_document(plan, registry, inputs), indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
 def stage_session(
     plan: ResourcePlan,
     *,
     launcher_path: Path,
     binding: Mapping[str, object],
     registry_plan: RegistryInputPlan | None = None,
+    registry_inputs: tuple[RegistryInput, ...] | None = None,
 ) -> StagedSession:
     """Create the uniquely owned, exact staged bootstrap root.
 
@@ -530,6 +563,8 @@ def stage_session(
     st = os.lstat(plan.parent)
     if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid() or (st.st_mode & 0o777) != STAGED_ROOT_MODE:
         raise ComparisonError("refusal", "unsafe_path", "staged root owner/mode/symlink check failed")
+    registry = registry_plan or derive_registry_input_plan_from_evidence()
+    inputs = registry_inputs or effective_registry_inputs(plan, registry)
     manifest_path = plan.parent / STAGED_MANIFEST_NAME
     plan_path = plan.parent / STAGED_PLAN_NAME
     binding_path = plan.parent / STAGED_BINDING_NAME
@@ -537,10 +572,7 @@ def stage_session(
         manifest_path,
         staged_manifest_text(launcher_path, plan_path, plan.parent).encode("utf-8"),
     )
-    plan_document = {"registry_plan": (registry_plan or derive_registry_input_plan_from_evidence()).to_document()}
-    plan_digest = _write_staged_file(
-        plan_path, (json.dumps(plan_document, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    )
+    plan_digest = _write_staged_file(plan_path, _staged_plan_bytes(plan, registry, inputs))
     record = dict(binding)
     record.setdefault("schema", BINDING_SCHEMA)
     record["staged_manifest_sha256"] = manifest_digest
@@ -619,14 +651,9 @@ def validate_staged_session(
             ).encode("utf-8")
         ).hexdigest()
         recomputed_plan = hashlib.sha256(
-            (
-                json.dumps(
-                    {"registry_plan": registry_plan.to_document()},
-                    indent=2,
-                    sort_keys=True,
-                )
-                + "\n"
-            ).encode("utf-8")
+            _staged_plan_bytes(
+                plan, registry_plan, effective_registry_inputs(plan, registry_plan)
+            )
         ).hexdigest()
         for name, expected_digest, actual_digest in (
             (STAGED_MANIFEST_NAME, recomputed_manifest, digests[STAGED_MANIFEST_NAME]),
@@ -1945,11 +1972,13 @@ class ComparisonLauncher:
                 declared_budget_ns=self.budget_ns,
             )
             self.binding = binding
+            self.effective_inputs = effective_registry_inputs(plan, registry)
             self.staged = stage_session(
                 plan,
                 launcher_path=launcher_path,
                 binding=binding.to_document(),
                 registry_plan=registry,
+                registry_inputs=self.effective_inputs,
             )
             self.effects_executed = True
             if self.submitter is None:
@@ -1959,7 +1988,7 @@ class ComparisonLauncher:
             argv = self._heavy_argv(plan)
             self.log.write(
                 f"heavy_submit caller={self.caller} request_id={self.request_id} "
-                f"cwd={plan.parent} argv={argv}",
+                f"cwd={plan.parent} remaining_ns={self._remaining_hard()} argv={argv}",
                 critical=True,
             )
             outcome = self.submitter.submit(
@@ -1968,6 +1997,7 @@ class ComparisonLauncher:
                 request_id=self.request_id,
                 caller=self.caller,
                 env=dict(self.parent_env),
+                timeout_ns=self._remaining_hard(),
             )
             if outcome.state == "authenticated_absence":
                 # Only the scheduler's authenticated unknown_run permits a
@@ -1982,19 +2012,10 @@ class ComparisonLauncher:
                     request_id=self.request_id,
                     caller=self.caller,
                     env=dict(self.parent_env),
+                    timeout_ns=self._remaining_hard(),
                 )
             if outcome.state == "held":
-                status_probe = getattr(self.submitter, "request_status", None)
-                if status_probe is not None:
-                    self.log.write(
-                        "submit reply held; querying the persisted request identity",
-                        critical=True,
-                    )
-                    outcome = status_probe(
-                        caller=self.caller,
-                        request_id=self.request_id,
-                        env=dict(self.parent_env),
-                    )
+                outcome = self._recover_held()
             if outcome.state == "launched":
                 self.outcome = "launched"
             elif outcome.state == "capacity_timeout":
@@ -2012,6 +2033,43 @@ class ComparisonLauncher:
         if self.outcome not in {"launched"}:
             self.resources_retained = True
         return self._result_document(plan, session)
+
+    def _recover_held(self) -> "HeavySubmitOutcome":
+        """Recover a lost submit reply through the persisted request identity.
+
+        A found request is followed to its settlement; only an authenticated
+        `unknown_run` returns `authenticated_absence`, which permits a same
+        request replay. Any other state stays held, never success.
+        """
+        status_probe = getattr(self.submitter, "request_status", None)
+        if status_probe is None:
+            return HeavySubmitOutcome(state="held")
+        self.log.write(
+            "submit reply held; querying the persisted request identity",
+            critical=True,
+        )
+        status = status_probe(
+            caller=self.caller,
+            request_id=self.request_id,
+            env=dict(self.parent_env),
+            timeout_ns=self._remaining_hard(),
+        )
+        if status.state == "authenticated_absence":
+            return status
+        if status.state == "found":
+            follow = getattr(self.submitter, "request_follow", None)
+            if follow is None:
+                return HeavySubmitOutcome(state="held")
+            self.log.write(
+                "request found; following the settled host run", critical=True
+            )
+            return follow(
+                caller=self.caller,
+                request_id=self.request_id,
+                env=dict(self.parent_env),
+                timeout_ns=self._remaining_hard(),
+            )
+        return HeavySubmitOutcome(state="held")
 
     def _run_admitted(self, plan: ResourcePlan) -> dict[str, object]:
         registry = self.registry_plan or derive_registry_input_plan_from_evidence()
@@ -2608,15 +2666,28 @@ class SubprocessSubmitter:
         request_id: str,
         caller: str,
         env: Mapping[str, str],
+        timeout_ns: int | None = None,
     ) -> HeavySubmitOutcome:
         run_env = dict(env)
         run_env["EFFIGY_CALLER"] = caller
         result = subprocess.run(
-            argv, cwd=cwd, env=run_env, capture_output=True, text=True
+            argv,
+            cwd=cwd,
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=_timeout_seconds(timeout_ns),
         )
         return _classify_submission(result.returncode, result.stdout + result.stderr)
 
-    def request_status(self, *, caller: str, request_id: str, env: Mapping[str, str]) -> HeavySubmitOutcome:
+    def request_status(
+        self,
+        *,
+        caller: str,
+        request_id: str,
+        env: Mapping[str, str],
+        timeout_ns: int | None = None,
+    ) -> HeavySubmitOutcome:
         run_env = dict(env)
         run_env["EFFIGY_CALLER"] = caller
         result = subprocess.run(
@@ -2624,8 +2695,44 @@ class SubprocessSubmitter:
             env=run_env,
             capture_output=True,
             text=True,
+            timeout=_timeout_seconds(timeout_ns),
         )
-        return _classify_submission(result.returncode, result.stdout + result.stderr)
+        output = result.stdout + result.stderr
+        if result.returncode == 0:
+            return HeavySubmitOutcome(state="found")
+        if result.returncode == 3 and "authenticated_absence" in output:
+            return HeavySubmitOutcome(state="authenticated_absence")
+        return HeavySubmitOutcome(state="held", detail=output[-400:])
+
+    def request_follow(
+        self,
+        *,
+        caller: str,
+        request_id: str,
+        env: Mapping[str, str],
+        timeout_ns: int | None = None,
+    ) -> HeavySubmitOutcome:
+        run_env = dict(env)
+        run_env["EFFIGY_CALLER"] = caller
+        result = subprocess.run(
+            request_follow_argv(caller, request_id),
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=_timeout_seconds(timeout_ns),
+        )
+        output = result.stdout + result.stderr
+        if result.returncode == 0:
+            return HeavySubmitOutcome(state="launched")
+        return HeavySubmitOutcome(state="held", detail=output[-400:])
+
+
+def _timeout_seconds(timeout_ns: int | None) -> float | None:
+    if timeout_ns is None:
+        return None
+    if timeout_ns <= 0:
+        return 0.001
+    return timeout_ns / 1_000_000_000
 
 
 def request_status_argv(caller: str, request_id: str) -> list[str]:
@@ -2666,6 +2773,62 @@ def _classify_submission(returncode: int, output: str) -> HeavySubmitOutcome:
     return HeavySubmitOutcome(state="held", detail=output[-400:])
 
 
+DEFAULT_CALLER = "oxide-build-context-comparison"
+
+
+@dataclass
+class CliOptions:
+    live: bool
+    plan_path: Path | None
+    admitted_root: Path | None
+    caller: str
+    request_id: str | None
+
+
+def parse_cli(args: list[str]) -> CliOptions:
+    live = "--live" in args
+    plan_path = _option_path(args, "--resource-plan")
+    admitted_root = _option_path(args, "--admitted-root")
+    caller = _option_string(args, "--caller") or DEFAULT_CALLER
+    request_id = _option_string(args, "--request-id")
+    return CliOptions(
+        live=live,
+        plan_path=plan_path,
+        admitted_root=admitted_root,
+        caller=caller,
+        request_id=request_id,
+    )
+
+
+def _option_string(args: list[str], name: str) -> str | None:
+    if name in args:
+        index = args.index(name)
+        if index + 1 < len(args):
+            return args[index + 1]
+    return None
+
+
+def _option_path(args: list[str], name: str) -> Path | None:
+    value = _option_string(args, name)
+    return Path(value) if value is not None else None
+
+
+def build_launcher(options: CliOptions) -> "ComparisonLauncher":
+    """Wire the real submitter and a fresh stable request UUID for the outer role.
+
+    The outer bootstrap (live without `--admitted-root`) is the only role that
+    submits. The UUID is minted here, persisted in the staged binding before
+    delivery, and reused for any same-request recovery. The admitted inner run
+    and every plan/default path construct no submitter.
+    """
+    kwargs: dict[str, object] = {"admitted_root": options.admitted_root}
+    if options.live and options.admitted_root is None:
+        kwargs["submitter"] = SubprocessSubmitter()
+        kwargs["caller"] = options.caller
+        kwargs["request_id"] = options.request_id or str(uuid.uuid4())
+    return ComparisonLauncher(**kwargs)
+
+
 def load_resource_plan(path: Path) -> ResourcePlan:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
@@ -2674,24 +2837,10 @@ def load_resource_plan(path: Path) -> ResourcePlan:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = list(sys.argv[1:] if argv is None else argv)
-    live = "--live" in args
-    plan_path = None
-    if "--resource-plan" in args:
-        index = args.index("--resource-plan")
-        if index + 1 >= len(args):
-            print("missing --resource-plan path", file=sys.stderr)
-            return 2
-        plan_path = Path(args[index + 1])
-    admitted_root = None
-    if "--admitted-root" in args:
-        index = args.index("--admitted-root")
-        if index + 1 >= len(args):
-            print("missing --admitted-root path", file=sys.stderr)
-            return 2
-        admitted_root = Path(args[index + 1])
-    resource = load_resource_plan(plan_path) if plan_path else None
-    launcher = ComparisonLauncher(admitted_root=admitted_root)
+    options = parse_cli(sys.argv[1:] if argv is None else argv)
+    resource = load_resource_plan(options.plan_path) if options.plan_path else None
+    launcher = build_launcher(options)
+    live = options.live
     try:
         document = launcher.run(live=live, resource_plan=resource)
 
