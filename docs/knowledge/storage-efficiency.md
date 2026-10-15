@@ -110,18 +110,21 @@ the private launcher's outer bootstrap on 2026-10-15. The reviewed launcher
 SHA256 `36e89aefbe6d4a69659f05f37f6963d583f5d0376fa8648a0b28929e2a4084a0`,
 registry-plan digest `ce5c0381…baa` and semantic request-body digest
 `c0427e75…401` all matched the brief before effects. The resource-plan names
-were unused, host free space was about 1.09 TiB (above the 20 GiB reserve), and
-the Nucleus commit, tree and `Cargo.lock` pins resolved exactly.
+were unused, host free space was 1,169,873,059,840 bytes (about 1.06 TiB, above
+the 20 GiB reserve), and the Nucleus commit, tree and `Cargo.lock` pins resolved
+exactly.
 
 The forced read-only plan check returned `live_ready=true`. The outer bootstrap
 opened its single 1200 s session at `2026-10-15T14:00:14Z`, staged exactly
 `effigy.toml`, `resource-plan.json` and `binding.json` under the owned parent,
-and submitted the sole heavy selector. The admitted host run launched at
-`14:00:14.434Z` and settled `failed` at `14:00:15.063Z` (`exitCode 1`,
-629 ms, `escapedDescendants: []`). No capacity wait was needed
-(`position: null`).
+and submitted the sole heavy selector. The heavy host run was admitted by Effigy
+(`admittedAt` `14:00:14.422Z`) and launched at `14:00:14.434Z`, then settled
+`failed` at `14:00:15.063Z` (`exitCode 1`, 629 ms, `escapedDescendants: []`). No
+capacity wait was needed (`position: null`).
 
-The run failed before admission, with no Cargo or rustc invocation
+The heavy host run was admitted and launched, but the inner comparison launcher
+failed before its own admission validation (`verify_admission` /
+`validate_staged_session`): no Cargo or rustc invocation
 (`count_delivered=0`), no source clone, no APFS image and no measurement. The
 captured output was
 `sh: …/scripts/build_context_comparison.py: Permission denied` and
@@ -142,8 +145,9 @@ A second, inferred seam is recorded but was not reached: Effigy created
 the admitted inner launcher requires exactly the three staged entries and would
 refuse `staged_session` on a fourth. It needs confirmation by the correction.
 
-Disposition: a bounded failure before admission with a precise producer defect.
-It is not a qualified comparison, not shared warm reuse, not evidence about
+Disposition: a bounded failure in the inner comparison launcher before its own
+admission validation, with a precise producer defect. It is not a qualified
+comparison, not shared warm reuse, not evidence about
 object deletion or production policy, and it produced no incremental-on/off
 timing, storage, allocation or write data. The frozen methodology is unchanged;
 the comparison stays unqualified and needs a separately scoped producer

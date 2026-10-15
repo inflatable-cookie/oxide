@@ -115,7 +115,7 @@
     "detail": "Effigy deserialises [tasks.<name>.run] through ManifestManagedRun (crates/effigy-manifest/src/task_runtime.rs): a TOML array is ManifestManagedRun::Sequence(Vec<ManifestManagedRunStep>), i.e. a list of separate shell commands, not one argv vector. The staged manifest therefore ran `python3` with no arguments, then tried to execute the launcher script path directly as a shell command.",
     "script_mode": "git mode 100644 (not executable) for scripts/build_context_comparison.py at the pinned base 527ae622",
     "observed_code": 126,
-    "effect": "The admitted inner launcher never started: no admission check, no source clone, no Cargo/rustc, no image, no measurement."
+    "effect": "The inner comparison launcher never ran: no inner admission validation, no source clone, no Cargo/rustc, no image, no measurement. The heavy host run itself was admitted (admittedAt 2026-10-15T14:00:14.422Z) and launched (launchedAt 2026-10-15T14:00:14.434Z) by Effigy."
   },
   "second_seam_inferred_not_observed": {
     "seam": "effigy_run_state_inside_the_exact_staged_root",
@@ -124,7 +124,7 @@
     "retained_entries_after_attempt": [".effigy", "binding.json", "effigy.toml", "resource-plan.json"]
   },
   "bounded_disposition": {
-    "result": "failed before admission; comparison remains unqualified and unrun",
+    "result": "heavy host run admitted and launched, then failed: the inner comparison launcher failed before its own admission validation; comparison remains unqualified and unrun",
     "not_claimed": [
       "No incremental-on/off timing, storage, allocation or write measurement.",
       "No test execution, backtrace control or effective-flag observation.",

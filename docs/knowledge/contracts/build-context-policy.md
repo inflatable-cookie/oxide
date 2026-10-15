@@ -340,9 +340,11 @@ Missing declared registry inputs, an unbindable named copy, or an unsupported Ef
 
 One checked launch packet ran this recipe through the outer bootstrap on
 2026-10-15 (caller `oxide:planner:incremental-comparison:053`, request UUID
-`be2acbd8-7f3e-4488-b91d-6781ec0d6788`). The admitted run launched and settled
-`failed` after 629 ms, before admission, with no Cargo or rustc invocation. The
-staged manifest's `run` array was executed by Effigy as a sequence of shell
+`be2acbd8-7f3e-4488-b91d-6781ec0d6788`). The heavy host run was admitted and
+launched by Effigy, then settled `failed` after 629 ms: the inner comparison
+launcher failed before its own admission validation, with no Cargo or rustc
+invocation. The staged manifest's `run` array was executed by Effigy as a
+sequence of shell
 commands rather than as one argv vector, so the non-executable launcher script
 was executed directly (`Permission denied`, code 126). The recipe above stays
 frozen and unchanged; the comparison remains unqualified and needs a separately
