@@ -6,6 +6,16 @@ use std::path::PathBuf;
 pub const ORDINARY_CARGO_POLICY_VERSION: u32 = 1;
 /// Stable compatibility eligibility semantics for ordinary-Cargo policy v2.
 pub const ORDINARY_CARGO_STABLE_REUSE_POLICY_VERSION: u32 = 2;
+/// Handoff-eligible stable generation semantics for ordinary-Cargo policy v3.
+///
+/// Version 3 admits and settles exactly like version 2 within one allocation
+/// epoch, and additionally opts its generation in to one explicit
+/// owner-authenticated cross-allocation handoff at the same canonical
+/// physical source root. Versions 1 and 2 are never relabelled or migrated:
+/// a handoff naming them refuses as incompatible.
+pub const ORDINARY_CARGO_HANDOFF_ELIGIBLE_POLICY_VERSION: u32 = 3;
+/// Versioned cross-allocation handoff request/receipt semantics.
+pub const ORDINARY_CARGO_HANDOFF_VERSION: u32 = 1;
 
 /// Capacity limits for the Oxide-owned intermediate slots.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -198,6 +208,91 @@ pub struct OrdinaryCargoRetireRequest {
     pub generation: String,
     pub retire_id: String,
     pub retention: OrdinaryCargoRetention,
+}
+
+/// Consumer-owned immutable source transition observed across one task
+/// handoff at the same canonical physical source root.
+///
+/// The owner (Queue/Nucleus retention, never Oxide) attests the exact prior
+/// and successor source identities plus the accepted qualified complete
+/// invalidation policy that covers them. Oxide binds this observation to the
+/// handoff authorization; it does not traverse source/tool/SDK roots, alter
+/// mtimes, execute Cargo, or prove Cargo freshness. An installed authority
+/// must refuse unless it has accounted for older/equal-mtime changed inputs
+/// after checkout replacement across manifests, lock/config, generated,
+/// build-script, proc-macro, native, and dependency classes. Paths or Git
+/// heads matching alone never qualifies a transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrdinaryCargoSourceTransition {
+    pub prior_commit: String,
+    pub prior_tree_digest: String,
+    pub prior_content_digest: String,
+    pub successor_commit: String,
+    pub successor_tree_digest: String,
+    pub successor_content_digest: String,
+    /// Consumer-owned immutable observation identity for this transition.
+    pub transition_reference: String,
+    /// Accepted qualified complete invalidation declaration bound by both
+    /// stable eligibility references.
+    pub invalidation_declaration_digest: String,
+    /// True only when the owner positively accounted for older/equal-mtime
+    /// changed relevant inputs. False or unknown refuses warm handoff.
+    pub mtime_qualified: bool,
+    /// Relevant input classes the owner qualified for this transition
+    /// (for example manifests, lock, config, generated, build-script,
+    /// proc-macro, native, dependency). Empty or unknown refuses.
+    pub qualified_input_classes: Vec<String>,
+}
+
+/// Exact owner-authenticated request to hand one proven-idle reusable
+/// ordinary generation from a closed prior allocation to an assigned
+/// successor allocation at the SAME canonical physical source root.
+///
+/// `prior_request` repeats the exact current generation body (prior
+/// allocation epoch); `successor_request` carries the successor allocation
+/// epoch, task/workspace/run/attempt, source, and input-boundary identity
+/// at the same physical path and stable owner root. `handoff_id` is the
+/// idempotent operation identity: an exact replay returns the stored
+/// receipt, while the same ID with different data conflicts. The request
+/// grants no writer access, allocates no lease, and runs no command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrdinaryCargoHandoffRequest {
+    pub prior_request: OrdinaryCargoRequest,
+    pub successor_request: OrdinaryCargoRequest,
+    pub slot_id: String,
+    pub storage_instance_id: String,
+    /// Slot ordinal as canonical positive u64 decimal text.
+    pub generation: String,
+    pub handoff_id: String,
+    pub handoff_version: u32,
+    /// Independently retained prior source/artifact/debug evidence.
+    pub retention: OrdinaryCargoRetention,
+    pub source_transition: OrdinaryCargoSourceTransition,
+    /// Consumer proof that the prior allocation closed with all writers and
+    /// grants positively settled (never age/PID disappearance).
+    pub prior_closure_reference: String,
+    /// Consumer proof that the successor root/epoch/source assignment holds.
+    pub successor_assignment_reference: String,
+    pub credential: Credential,
+}
+
+/// Durable receipt for one committed ordinary-generation handoff. The SAME
+/// `(storage_instance_id, slot_id, generation)` identity and bytes are
+/// preserved; only the allocation ownership moves from prior to successor.
+/// The receipt is access-free: it carries no slot path or lease token.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrdinaryCargoHandoffReceipt {
+    pub handoff_version: u32,
+    pub prior_root: StrictPhysicalCargoRoot,
+    pub successor_root: StrictPhysicalCargoRoot,
+    pub partition: OrdinaryCargoPartition,
+    pub slot_id: String,
+    pub storage_instance_id: String,
+    /// Slot ordinal as canonical positive u64 decimal text.
+    pub generation: String,
+    pub handoff_id: String,
+    pub reuse_state: CargoReuseState,
+    pub transition_reference: String,
 }
 
 /// Durable receipt for one retired ordinary generation. The tombstoned

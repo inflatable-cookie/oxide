@@ -474,6 +474,120 @@ impl Decode for OrdinaryCargoRetirementReceipt {
     }
 }
 
+impl Encode for OrdinaryCargoSourceTransition {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        self.prior_commit.encode(writer)?;
+        self.prior_tree_digest.encode(writer)?;
+        self.prior_content_digest.encode(writer)?;
+        self.successor_commit.encode(writer)?;
+        self.successor_tree_digest.encode(writer)?;
+        self.successor_content_digest.encode(writer)?;
+        self.transition_reference.encode(writer)?;
+        self.invalidation_declaration_digest.encode(writer)?;
+        writer.u8(u8::from(self.mtime_qualified));
+        encode_vec(writer, &self.qualified_input_classes)
+    }
+}
+
+impl Decode for OrdinaryCargoSourceTransition {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        let prior_commit = String::decode(reader)?;
+        let prior_tree_digest = String::decode(reader)?;
+        let prior_content_digest = String::decode(reader)?;
+        let successor_commit = String::decode(reader)?;
+        let successor_tree_digest = String::decode(reader)?;
+        let successor_content_digest = String::decode(reader)?;
+        let transition_reference = String::decode(reader)?;
+        let invalidation_declaration_digest = String::decode(reader)?;
+        let mtime_qualified = match reader.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(StorageError::Protocol("invalid mtime qualification")),
+        };
+        let qualified_input_classes = decode_vec(reader)?;
+        Ok(Self {
+            prior_commit,
+            prior_tree_digest,
+            prior_content_digest,
+            successor_commit,
+            successor_tree_digest,
+            successor_content_digest,
+            transition_reference,
+            invalidation_declaration_digest,
+            mtime_qualified,
+            qualified_input_classes,
+        })
+    }
+}
+
+impl Encode for OrdinaryCargoHandoffRequest {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        self.prior_request.encode(writer)?;
+        self.successor_request.encode(writer)?;
+        self.slot_id.encode(writer)?;
+        self.storage_instance_id.encode(writer)?;
+        self.generation.encode(writer)?;
+        self.handoff_id.encode(writer)?;
+        writer.u32(self.handoff_version);
+        self.retention.encode(writer)?;
+        self.source_transition.encode(writer)?;
+        self.prior_closure_reference.encode(writer)?;
+        self.successor_assignment_reference.encode(writer)?;
+        self.credential.encode(writer)
+    }
+}
+
+impl Decode for OrdinaryCargoHandoffRequest {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        Ok(Self {
+            prior_request: OrdinaryCargoRequest::decode(reader)?,
+            successor_request: OrdinaryCargoRequest::decode(reader)?,
+            slot_id: String::decode(reader)?,
+            storage_instance_id: String::decode(reader)?,
+            generation: String::decode(reader)?,
+            handoff_id: String::decode(reader)?,
+            handoff_version: reader.u32()?,
+            retention: OrdinaryCargoRetention::decode(reader)?,
+            source_transition: OrdinaryCargoSourceTransition::decode(reader)?,
+            prior_closure_reference: String::decode(reader)?,
+            successor_assignment_reference: String::decode(reader)?,
+            credential: Credential::decode(reader)?,
+        })
+    }
+}
+
+impl Encode for OrdinaryCargoHandoffReceipt {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        writer.u32(self.handoff_version);
+        self.prior_root.encode(writer)?;
+        self.successor_root.encode(writer)?;
+        self.partition.encode(writer)?;
+        self.slot_id.encode(writer)?;
+        self.storage_instance_id.encode(writer)?;
+        self.generation.encode(writer)?;
+        self.handoff_id.encode(writer)?;
+        self.reuse_state.encode(writer)?;
+        self.transition_reference.encode(writer)
+    }
+}
+
+impl Decode for OrdinaryCargoHandoffReceipt {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        Ok(Self {
+            handoff_version: reader.u32()?,
+            prior_root: StrictPhysicalCargoRoot::decode(reader)?,
+            successor_root: StrictPhysicalCargoRoot::decode(reader)?,
+            partition: OrdinaryCargoPartition::decode(reader)?,
+            slot_id: String::decode(reader)?,
+            storage_instance_id: String::decode(reader)?,
+            generation: String::decode(reader)?,
+            handoff_id: String::decode(reader)?,
+            reuse_state: CargoReuseState::decode(reader)?,
+            transition_reference: String::decode(reader)?,
+        })
+    }
+}
+
 impl Encode for OrdinaryCargoFinalizeRequest {
     fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
         self.request.encode(writer)?;
