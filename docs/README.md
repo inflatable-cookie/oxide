@@ -9,6 +9,7 @@ Oxide aims to make Rust development easy and light: predictable storage, less bu
 - [Rust DX research landscape](knowledge/rust-dx-landscape.md)
 - [Storage-efficiency findings](knowledge/storage-efficiency.md)
 - [Build-context policy (proposed)](knowledge/contracts/build-context-policy.md)
+- [Storage inventory (read-only)](knowledge/contracts/storage-inventory.md)
 - [Rust toolchain and quality](knowledge/rust-toolchain-and-quality.md)
 - [Open decisions](knowledge/questions.md)
 - [Knowledge map](knowledge/README.md)

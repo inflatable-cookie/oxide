@@ -12,6 +12,8 @@ Proposed: effective build context (incremental, debug, split-debuginfo) would be
 
 Prepare only requested components lazily. No eager copying of all targets and no full-copy fallback. Evict idle slots only, within explicit budgets; occupied space and actual disk writes must be measured separately. Inventory/acquire/reconcile/finalize/budget describe interface semantics, not an existing CLI.
 
+A separate read-only [storage inventory](contracts/storage-inventory.md) command reports what occupies space in one explicitly selected target directory. It is a diagnostic only: it is not the daemon `inventory` operation above, grants no ownership or eviction authority and never recommends deletion.
+
 ## Qualification boundaries
 
 Cargo's `build.build-dir` / `CARGO_BUILD_BUILD_DIR` is stable starting in Rust 1.91 and is separate from `target-dir`. It is the smallest useful mechanism to qualify: direct Cargo to an Oxide-owned intermediate directory and let Cargo retain its own unit invalidation. It supplies no Oxide ownership, whole-workflow lease, budget, or run-evidence semantics. The exact pinned toolchain and different-path portability still need a controlled qualification. If portability fails, use path-isolated partitions and report the reduced benefit. Do not blindly adopt sccache: Acow's measured trial rejected it.
