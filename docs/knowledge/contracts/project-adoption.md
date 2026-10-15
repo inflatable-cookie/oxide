@@ -344,18 +344,19 @@ review.
 Nucleus development and planning belong to Supervisor
 `6585d6bf-a1aa-4877-91d6-a675b7ca6282`, following Tom's 2026-10-15 ownership
 ruling in Nucleus Contract 001 (recorded at `5b34f80`). The former Sol planner
-`cddd99af` has handed over; its assessments do not commit Nucleus. Route any
-future substantive coordination to the Supervisor, without prompting active
-workers or managing the former owner's retirement from Oxide.
+`cddd99af` has handed over and Tom has archived it; its assessments do not
+commit Nucleus. Send future substantive coordination only to the Supervisor,
+without prompting active workers.
 
-The Supervisor has deferred taking a consumer integration pending Tom's
-decision. Nucleus's current priority is declared workflow charts, followed by
-removing the hardcoded lifecycle order. No consumer implementation or rollout
-is authorized by Oxide's upstream delivery. A future integration requires the
-reviewed handover and Tom's approval under Nucleus Contract 002. The Supervisor
-owns the existing decision; do not create a duplicate approval request or
-treat an earlier technical assessment as consumer acceptance. Nucleus's
-incremental-on agent policy remains independently useful without Oxide.
+Tom settled the timing on 2026-10-15, relayed by the Supervisor: "I'll take your
+recommendation on oxide for now, but I will want to integrate it soon."
+Nucleus will take the declared-workflow API next after its coding-delivery
+chart port, under its owning Contract 001. Keep the reviewed handover and
+consumer-scope notes ready; do not reopen the settled timing question or start
+consumer work before that owner-controlled sequence. The Supervisor owns the
+scoped integration and reviewed handover under Contract 002. Upstream delivery
+does not itself activate a consumer or a real trial. Nucleus's incremental-on
+agent policy remains independently useful without Oxide.
 
 Nucleus intentionally removed its never-live disabled Oxide consumer code
 in the 2026-10-15 simplification reset. At reviewed owner inspection of
@@ -385,3 +386,23 @@ submission/settlement, independent native debug/source custody, installation
 acceptance and invalidation ownership therefore remain explicit integration
 work, separate from the size-bound storage core and from Nucleus's
 incremental-policy adoption.
+
+### Environment projection prerequisite
+
+The read-only inspection of Effigy
+`b8a6409a2d762c691fd3805f08244a1c9a245ece`,
+`src/runner/host_scheduler/submit.rs`, found that its default forwarded runtime
+environment includes `CARGO_TARGET_DIR` and `CARGO_INCREMENTAL`, but excludes
+`CARGO_BUILD_BUILD_DIR`, `TMPDIR`, `TMP` and `TEMP`. Explicit selected-task
+environment references can participate in its existing language-neutral
+projection. The inspected Nucleus `check:core:test` selector declares none of
+those additional references. Setting only the outer process environment is
+therefore insufficient to put Cargo intermediates and temporary output in the
+admitted paths.
+
+The consumer scope must establish the exact admitted projection through the
+existing execution surface and bind its final values before submission.
+Do not add Rust cache policy to Effigy, assume global forwarding, alter a
+signed request after acquire, or treat the real projection as proven by a
+synthetic callback. This is a retained integration prerequisite, not authority
+to change Effigy or Nucleus configuration now.
