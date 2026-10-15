@@ -160,8 +160,9 @@ slot receives the next ordinal; ledger recreation receives a new instance ID,
 so old maps and receipts cannot bind to the recreated ledger by ordinal alone.
 The counter is never reset by slot eviction.
 
-The local ledger format is version 4. Version-3 and other unsupported ledgers
-are refused without migration or reinterpretation. The local socket protocol
+The local ledger format is version 5, which records the durable backend mode.
+Version-4 and other unsupported ledgers are refused without migration or
+reinterpretation. The local socket protocol
 prefixes each request and response with `OXSTOR01` and protocol version 2;
 unversioned or unsupported peers are refused before request dispatch. The
 ordinary-Cargo request/response shapes and inventory additions cannot be
@@ -198,6 +199,8 @@ Slots partition by project/component, workflow, Cargo and rustc provenance, host
 The prototype refuses a new attempt while any slot for its partition is leased or uncertain, even when the configured budget could hold another slot. A compatible partition permits sequential reuse only after authenticated settlement; it never permits parallel mutable sharing.
 
 This remains a scratch-state prototype. It requires injected consumer evidence verification and a free-space probe; no Queue/Nucleus authenticator or host probe is included. Its cap accounts for measured slot bytes and requested reservations, but there is no filesystem quota to constrain growth while a client writes. Consumer-owned checkout and capture roots are outside its accounting. The storage core does not launch or contain build/test descendants, and the project adapter below does not spawn Cargo or prove path portability. No host filesystem is qualified. Real managed builds and adoption remain blocked.
+
+An opt-in hard-bounded payload backend now exists for this prototype: one fixed-size private APFS volume in a sparse disk image, provisioned and opened by the protected runtime under a verified capability, with the enforced aggregate-store ceiling owned by [bounded storage](contracts/bounded-storage.md). It is the first OS-enforced capacity bound; directory-only roots remain explicitly budget-only, and neither mode claims consumer adoption or a production deployment.
 
 ### Project adapter fixture prototype
 

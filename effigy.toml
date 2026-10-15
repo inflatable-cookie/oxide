@@ -19,3 +19,10 @@ minimum_effigy_version = "0.14.0"
 [test.suites.rust]
 run = "python3 scripts/bounded-test.py cargo test --workspace --all-targets --locked"
 default = false
+
+# One opt-in macOS filesystem-full proof (oxide#055). Heavy admission owns the
+# native effects; the selector is never part of ordinary validation and must
+# not become an alias for full QA.
+[tasks."rust:bounded-native-proof"]
+admission = "heavy"
+run = "python3 scripts/test-bounded-native.py"

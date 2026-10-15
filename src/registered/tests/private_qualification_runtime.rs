@@ -7,7 +7,8 @@ use crate::registered::qualification::{
 };
 use crate::registered::storage_runtime::{
     bootstrap_digest, policy_digest, serve_bootstrap, shutdown_frame, verify_ready, verify_stopped,
-    ApprovedSubject, ReadyExpectation, RuntimeBootstrap, RuntimeBudget, RuntimeEndpoint,
+    ApprovedSubject, ReadyExpectation, RuntimeBootstrap, RuntimeBoundedStorage, RuntimeBudget,
+    RuntimeEndpoint,
 };
 use crate::storage::{
     AcquireRequest, AcquireResult, CaptureReceipt, Client, ContainmentEvidence,
@@ -155,6 +156,37 @@ fn bootstrap_for(
     expires: u64,
     grace: u64,
 ) -> RuntimeBootstrap {
+    bootstrap_for_bounded(storage_root, control, subjects, expires, grace, None)
+}
+
+fn bootstrap_for_bounded(
+    storage_root: &Path,
+    control: &Path,
+    subjects: Vec<ApprovedSubject>,
+    expires: u64,
+    grace: u64,
+    bounded: Option<RuntimeBoundedStorage>,
+) -> RuntimeBootstrap {
+    bootstrap_for_bounded_budget(
+        storage_root,
+        control,
+        subjects,
+        expires,
+        grace,
+        bounded,
+        budget(),
+    )
+}
+
+fn bootstrap_for_bounded_budget(
+    storage_root: &Path,
+    control: &Path,
+    subjects: Vec<ApprovedSubject>,
+    expires: u64,
+    grace: u64,
+    bounded: Option<RuntimeBoundedStorage>,
+    session_budget: RuntimeBudget,
+) -> RuntimeBootstrap {
     let endpoint = Endpoint::capture(control.to_path_buf()).unwrap();
     RuntimeBootstrap {
         version: 1,
@@ -164,9 +196,10 @@ fn bootstrap_for(
         expires_unix_seconds: serde_json::from_value(json!(expires)).unwrap(),
         stop_grace_seconds: serde_json::from_value(json!(grace)).unwrap(),
         storage_root: storage_root.to_path_buf(),
-        budget: budget(),
+        budget: session_budget,
         admissions: subjects,
         ordinary_cargo_request_digests: Vec::new(),
+        bounded,
         authority_key_hex: AUTHORITY_KEY.into(),
         control_key_hex: CONTROL_KEY.into(),
         control: RuntimeEndpoint {
@@ -209,28 +242,61 @@ impl Runtime {
         subjects: Vec<ApprovedSubject>,
         window: u64,
     ) -> Self {
-        Self::start_with_grace(base, name, storage_root, subjects, window, DEFAULT_GRACE)
+        Self::start_bounded(
+            base,
+            name,
+            storage_root,
+            subjects,
+            window,
+            DEFAULT_GRACE,
+            None,
+        )
     }
 
-    fn start_with_grace(
+    fn start_bounded(
         base: &Path,
         name: &str,
         storage_root: &Path,
         subjects: Vec<ApprovedSubject>,
         window: u64,
         grace: u64,
+        bounded: Option<RuntimeBoundedStorage>,
+    ) -> Self {
+        Self::start_bounded_budget(
+            base,
+            name,
+            storage_root,
+            subjects,
+            window,
+            grace,
+            bounded,
+            budget(),
+        )
+    }
+
+    fn start_bounded_budget(
+        base: &Path,
+        name: &str,
+        storage_root: &Path,
+        subjects: Vec<ApprovedSubject>,
+        window: u64,
+        grace: u64,
+        bounded: Option<RuntimeBoundedStorage>,
+        session_budget: RuntimeBudget,
     ) -> Self {
         let control_dir = base.join(format!("ctl-{name}"));
         private_dir(&control_dir);
         let control = control_dir.join("p.sock");
         let listener = UnixListener::bind(&control).unwrap();
         fs::set_permissions(&control, fs::Permissions::from_mode(0o600)).unwrap();
-        let bootstrap = bootstrap_for(
+        let bootstrap = bootstrap_for_bounded_budget(
             storage_root,
             &control,
             subjects.clone(),
             now() + window,
             grace,
+            bounded,
+            session_budget,
         );
         let bytes = serde_json::to_vec(&bootstrap).unwrap();
         let file = base.join(format!("bootstrap-{name}.json"));
@@ -273,10 +339,11 @@ impl Runtime {
         let bootstrap_digest = bootstrap_digest(&bytes);
         let policy = policy_digest(
             SCOPE,
-            &budget(),
+            &session_budget,
             serde_json::from_value(json!(grace)).unwrap(),
             &subjects,
             &[],
+            bootstrap.bounded.as_ref(),
         )
         .unwrap();
         let storage_socket = storage_root.join("daemon.sock");
@@ -655,7 +722,7 @@ fn private_qualification_runtime_blocked_storage_operation_is_abandoned_at_the_g
     let storage_root = base.join("store");
     private_dir(&storage_root);
     let subjects = vec![approved(1)];
-    let mut runtime = Runtime::start_with_grace(&base, "blocked", &storage_root, subjects, 3, 1);
+    let mut runtime = Runtime::start_bounded(&base, "blocked", &storage_root, subjects, 3, 1, None);
     // A stalled client keeps the storage thread inside one request until its 5-second read timeout.
     let stalled = UnixStream::connect(&runtime.storage_socket).unwrap();
     let started = Instant::now();
@@ -1013,4 +1080,299 @@ fn private_qualification_runtime_bootstrap_substitution_and_replay_refuse_before
     no_effects(&storage_root);
 
     fs::remove_dir_all(&base).unwrap();
+}
+
+/// The one authorized native filesystem-full proof (oxide#055). Per
+/// participant: exactly one fresh owned 128 MiB APFS sparse image, a writer
+/// payload bounded by 128 MiB, 1 MiB IO buffers, 512 MiB owned scratch and a
+/// 120-second native fixture phase, after a 20 GiB host reserve. It proves a
+/// genuine OS allocation refusal under an open lease and control-ledger
+/// durability afterward, then performs the ordinary detach and cleanup only
+/// after positive owned-writer completion. Failed runs retain every resource.
+#[ignore = "one authorized macOS filesystem-full proof per participant; run only with OXIDE_BOUNDED_NATIVE_RUN=1"]
+#[test]
+fn bounded_native_payload_filesystem_full_refuses_under_open_lease() {
+    if std::env::var("OXIDE_BOUNDED_NATIVE_RUN").as_deref() != Ok("1") {
+        panic!("native bounded proof requires OXIDE_BOUNDED_NATIVE_RUN=1");
+    }
+    if !cfg!(target_os = "macos") {
+        panic!("bounded native proof requires macOS; refusing instead of falling back");
+    }
+    const MIB: u64 = 1024 * 1024;
+    const HOST_RESERVE_BYTES: u64 = 20 * 1024 * MIB;
+    const IMAGE_BYTES: u64 = 128 * MIB;
+    const CEILING_BYTES: u64 = 120 * MIB;
+    const MAX_WRITER_BYTES: u64 = 128 * MIB;
+    const IO_BUFFER_BYTES: usize = 1024 * 1024;
+    const SCRATCH_LIMIT_BYTES: u64 = 512 * MIB;
+    const PHASE_LIMIT: Duration = Duration::from_secs(120);
+    let phase_started = Instant::now();
+    let phase_left = |what: &str| {
+        let elapsed = phase_started.elapsed();
+        assert!(
+            elapsed < PHASE_LIMIT,
+            "native fixture phase {what} exceeded 120s at {elapsed:?}"
+        );
+    };
+
+    let base = scratch("bounded-native");
+    // Host reserve before any effect: an unknown or short reading refuses.
+    let df = Command::new("/bin/df")
+        .arg("-k")
+        .arg(&base)
+        .output()
+        .expect("df preflight");
+    assert!(df.status.success(), "df preflight failed");
+    let free_bytes: u64 = String::from_utf8_lossy(&df.stdout)
+        .lines()
+        .last()
+        .and_then(|line| line.split_whitespace().nth(3))
+        .and_then(|blocks| blocks.parse::<u64>().ok())
+        .expect("df reported available blocks")
+        .saturating_mul(1024);
+    assert!(
+        free_bytes >= HOST_RESERVE_BYTES,
+        "host free {free_bytes} is below the 20 GiB native reserve; nothing was created"
+    );
+
+    let storage_root = base.join("store");
+    private_dir(&storage_root);
+    let bounded = RuntimeBoundedStorage {
+        backend: "apfs-sparse-image-v1".into(),
+        image_path: base.join("owned.sparseimage"),
+        receipt_path: base.join("owned-receipt.json"),
+        mount_point: base.join("payload"),
+        image_bytes: serde_json::from_value(json!(IMAGE_BYTES)).unwrap(),
+        payload_ceiling_bytes: serde_json::from_value(json!(CEILING_BYTES)).unwrap(),
+    };
+    let subjects = vec![approved(1), approved(2)];
+    let native_budget = RuntimeBudget {
+        cap_bytes: serde_json::from_value(json!(CEILING_BYTES)).unwrap(),
+        free_reserve_bytes: serde_json::from_value(json!(1024 * 1024)).unwrap(),
+    };
+
+    // Session one: provision (create + attach + capacity receipt) and serve.
+    let mut runtime = Runtime::start_bounded_budget(
+        &base,
+        "native-one",
+        &storage_root,
+        subjects.clone(),
+        240,
+        DEFAULT_GRACE,
+        Some(bounded.clone()),
+        native_budget,
+    );
+    let client = runtime.client();
+    let authority = runtime.authority();
+    phase_left("provision-and-ready");
+
+    let acquired = client
+        .acquire(AcquireRequest {
+            envelope: envelope(&authority, &subjects[0]),
+            acquire_id: "native-acquire-1".into(),
+            required_bytes: 64 * MIB,
+        })
+        .expect("bounded acquire");
+    assert_eq!(acquired.state, SlotState::Leased);
+    let slot = acquired.slot_path.clone().expect("slot path");
+    assert!(slot.starts_with(bounded.mount_point.join("slots")));
+
+    // An active cooperative writer writes real bytes until the operating
+    // system refuses allocation while the lease stays open.
+    let payload_file_path = slot.join("payload.bin");
+    let mut payload = std::fs::File::create(&payload_file_path).expect("create payload file");
+    let buffer = vec![0xA5_u8; IO_BUFFER_BYTES];
+    let mut written: u64 = 0;
+    let mut refusal = None;
+    while written < MAX_WRITER_BYTES {
+        match payload.write_all(&buffer) {
+            Ok(()) => written += IO_BUFFER_BYTES as u64,
+            Err(error) => {
+                refusal = Some(error);
+                break;
+            }
+        }
+    }
+    let sync_refusal = payload.sync_all().err();
+    let os_refusal = refusal
+        .or(sync_refusal)
+        .unwrap_or_else(|| panic!("writer filled {written} bytes with no OS allocation refusal"));
+    assert!(
+        matches!(os_refusal.kind(), std::io::ErrorKind::StorageFull),
+        "expected ENOSPC allocation refusal, got {os_refusal}"
+    );
+    assert!(written <= MAX_WRITER_BYTES);
+    // Close the writer before any settlement so the lease holds the payload,
+    // not an open fixture handle.
+    drop(payload);
+    phase_left("filesystem-full-refusal");
+
+    // Control-ledger durability while the payload is full: inventory is
+    // served, the lease stays held and the accounting is known.
+    let full = client
+        .inventory("native-full")
+        .expect("inventory under full payload");
+    assert_eq!(full.slots[0].state, SlotState::Leased);
+    assert_eq!(full.accounted_bytes, Some(64 * MIB));
+    assert_eq!(full.budget.cap_bytes, CEILING_BYTES);
+    assert_eq!(
+        full.free_bytes,
+        client.inventory("native-free").unwrap().free_bytes
+    );
+    let receipt = finalize_cooperative(&client, &authority, &acquired, &subjects[0], 1)
+        .expect("settle after the OS refusal");
+    assert_eq!(receipt.state, SlotState::Idle);
+    let settled = client.inventory("native-settled").unwrap();
+    let measured = settled.slots[0].measured_bytes.expect("measured payload");
+    assert!(measured >= 64 * MIB && measured <= MAX_WRITER_BYTES);
+    runtime.shutdown_and_expect_ack("native-stop-one");
+    phase_left("settle-and-shutdown");
+
+    // Session two: the same backing reopens from its capacity proof. The
+    // settled generation and its measured bytes survive the daemon restart.
+    let mut reopened = Runtime::start_bounded_budget(
+        &base,
+        "native-two",
+        &storage_root,
+        subjects.clone(),
+        240,
+        DEFAULT_GRACE,
+        Some(bounded.clone()),
+        native_budget,
+    );
+    let client = reopened.client();
+    let authority = reopened.authority();
+    let reopened_inventory = client.inventory("native-reopen").unwrap();
+    assert_eq!(reopened_inventory.slots.len(), 1);
+    assert_eq!(reopened_inventory.slots[0].state, SlotState::Idle);
+    assert_eq!(reopened_inventory.slots[0].measured_bytes, Some(measured));
+    let warm = client
+        .acquire(AcquireRequest {
+            envelope: envelope(&authority, &subjects[1]),
+            acquire_id: "native-acquire-2".into(),
+            required_bytes: MIB,
+        })
+        .expect("bounded warm reuse on the reopened backing");
+    assert!(warm.reused);
+    assert_eq!(warm.slot_id, acquired.slot_id);
+    assert_eq!(
+        finalize_cooperative(&client, &authority, &warm, &subjects[1], 2)
+            .expect("settle warm reuse")
+            .state,
+        SlotState::Idle
+    );
+    reopened.shutdown_and_expect_ack("native-stop-two");
+    phase_left("reopen-and-resettle");
+
+    // Positive owned-writer completion reached: ordinary detach, then the
+    // owned scratch bound, then cleanup of this test's fixture only.
+    let detached = Command::new("/usr/bin/hdiutil")
+        .arg("detach")
+        .arg(&bounded.mount_point)
+        .output()
+        .expect("hdiutil detach");
+    assert!(
+        detached.status.success(),
+        "ordinary detach failed: {}",
+        String::from_utf8_lossy(&detached.stderr)
+    );
+    let entries = fs::read_dir(&bounded.mount_point)
+        .expect("mount point remains as an owned directory")
+        .filter_map(|entry| entry.ok())
+        .count();
+    assert_eq!(
+        entries, 0,
+        "detached volume must leave an empty mount point"
+    );
+
+    let mut allocated: u64 = 0;
+    let mut stack = vec![base.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("walk owned scratch") {
+            let entry = entry.expect("owned scratch entry");
+            let metadata = entry.metadata().expect("owned scratch metadata");
+            if metadata.is_dir() {
+                stack.push(entry.path());
+            } else {
+                use std::os::unix::fs::MetadataExt;
+                allocated += metadata.blocks() * 512;
+            }
+        }
+    }
+    assert!(
+        allocated <= SCRATCH_LIMIT_BYTES,
+        "owned scratch {allocated} exceeded the 512 MiB native bound"
+    );
+    phase_left("detach-and-accounting");
+    drop(runtime);
+    drop(reopened);
+    let total = phase_started.elapsed();
+    println!(
+        "native bounded proof: os refusal after {written} bytes, measured {measured}, scratch {allocated}, phase {total:?}"
+    );
+}
+
+#[test]
+fn private_qualification_runtime_bounded_declarations_refuse_unsupported_backends_before_effects() {
+    let base = scratch("bounded-refusal");
+    let storage_root = base.join("store");
+    private_dir(&storage_root);
+    let control_dir = base.join("ctl-bounded-refusal");
+    private_dir(&control_dir);
+    let control = control_dir.join("p.sock");
+    let listener = UnixListener::bind(&control).unwrap();
+    fs::set_permissions(&control, fs::Permissions::from_mode(0o600)).unwrap();
+    // The ceiling check is designed to pass so the unsupported backend itself
+    // is what refuses; a supported tag on this host would be the native proof.
+    let declared = RuntimeBoundedStorage {
+        backend: "directory-v9".into(),
+        image_path: base.join("owned.sparseimage"),
+        receipt_path: base.join("owned-receipt.json"),
+        mount_point: base.join("payload"),
+        image_bytes: serde_json::from_value(json!(17 * 1024 * 1024)).unwrap(),
+        payload_ceiling_bytes: serde_json::from_value(json!(16 * 1024 * 1024)).unwrap(),
+    };
+    let bootstrap = bootstrap_for_bounded(
+        &storage_root,
+        &control,
+        vec![approved(1)],
+        now() + 60,
+        DEFAULT_GRACE,
+        Some(declared),
+    );
+    let file = base.join("bootstrap-bounded-refusal.json");
+    write_private(&file, &serde_json::to_vec(&bootstrap).unwrap());
+    let mut child = ChildGuard(Some(
+        Command::new(
+            std::env::var_os("OXIDE_STORAGE_RUNTIME").expect("Effigy compiled the runtime"),
+        )
+        .arg(&file)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap(),
+    ));
+    let status = child.wait_exit(Duration::from_secs(30));
+    assert!(!status.success(), "unsupported bounded backend must refuse");
+    // The refusal happened before any effect: no replay marker, no daemon
+    // socket, no consumed bootstrap and no control connection.
+    assert!(file.exists(), "bootstrap must not be consumed on refusal");
+    assert_eq!(
+        fs::read_dir(&control_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("runtime-"))
+            .count(),
+        0,
+        "replay marker must not exist"
+    );
+    assert!(!storage_root.join("daemon.sock").exists());
+    assert!(!base.join("payload").exists());
+    listener.set_nonblocking(true).unwrap();
+    assert!(matches!(
+        listener.accept(),
+        Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
 }

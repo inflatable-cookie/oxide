@@ -197,6 +197,7 @@ impl RunningDaemon {
                     cap_bytes: 10_000,
                     free_reserve_bytes: 100,
                 },
+                backing: None,
             },
             Arc::new(FixtureAuthority),
             free_space,

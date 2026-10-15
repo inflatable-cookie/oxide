@@ -138,6 +138,7 @@ impl TestDaemon {
                     cap_bytes: 16 * 1024 * 1024,
                     free_reserve_bytes: 0,
                 },
+                backing: None,
             },
             authority.clone() as Arc<dyn EvidenceAuthority>,
             Arc::new(FixedFreeSpace(Some(u64::MAX))) as Arc<dyn FreeSpaceProbe>,

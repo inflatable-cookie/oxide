@@ -83,8 +83,10 @@ stays `pending`; lookup cannot clear it.
 ## Shipped ordinary storage API
 
 The private local transport is `OXSTOR01` protocol version 2. The durable
-ledger keeps the `OXIDEST1` magic and uses version 4. Version-3 and other
-unsupported ledgers are refused without migration or mutation. Protocol
+ledger keeps the `OXIDEST1` magic and uses version 5, which records the
+durable backend mode (budget-only directory or verified bounded payload).
+Version-4 and other unsupported ledgers are refused without migration or
+mutation. Protocol
 version 1, unversioned frames, and unsupported peers are rejected before
 dispatch. Changing these request or response encodings requires another
 protocol version.
@@ -556,7 +558,7 @@ extra operations, and invalid version/method/type refuse. `MAX_CAPTURE_BYTES`
 remains 16 MiB for route version 1; route version 2 uses its owner-installed
 budget only for artifact receipt accounting. These private attempt limits are
 independent of the storage transport: `OXSTOR01` storage wire version is 2,
-and durable `OXIDEST1` ledger version is 4. Private attempt operations are
+and durable `OXIDEST1` ledger version is 5. Private attempt operations are
 explicitly versioned 1 and 2. The capture-budget schema, storage-runtime
 bootstrap, readiness schema, and runtime control protocol are version 1; the
 storage runtime bootstrap and readiness carry independent

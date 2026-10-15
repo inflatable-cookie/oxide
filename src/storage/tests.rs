@@ -136,10 +136,21 @@ impl RunningDaemon {
         free_bytes: Option<u64>,
         authority: Arc<dyn EvidenceAuthority>,
     ) -> Self {
+        Self::bind(root, budget, free_bytes, authority, None)
+    }
+
+    fn bind(
+        root: &Path,
+        budget: Budget,
+        free_bytes: Option<u64>,
+        authority: Arc<dyn EvidenceAuthority>,
+        backing: Option<BoundedBacking>,
+    ) -> Self {
         let daemon = Daemon::bind(
             DaemonConfig {
                 root: root.to_path_buf(),
                 budget,
+                backing,
             },
             authority,
             Arc::new(FixedFreeSpace(free_bytes)),
@@ -388,6 +399,7 @@ fn child_daemon_process() {
         DaemonConfig {
             root: PathBuf::from(root),
             budget: budget(128),
+            backing: None,
         },
         Arc::new(TestAuthority),
         Arc::new(FixedFreeSpace(Some(1024))),
@@ -807,6 +819,7 @@ fn unsupported_ledger_version_preserves_old_ledger_and_slot_evidence() {
         DaemonConfig {
             root: root.path().to_path_buf(),
             budget: budget(128),
+            backing: None,
         },
         Arc::new(TestAuthority),
         Arc::new(FixedFreeSpace(Some(1024))),
@@ -837,6 +850,7 @@ fn a_second_daemon_cannot_bind_the_same_private_root() {
         DaemonConfig {
             root: root.path().to_path_buf(),
             budget: budget(128),
+            backing: None,
         },
         Arc::new(TestAuthority),
         Arc::new(FixedFreeSpace(Some(1024))),
@@ -1162,6 +1176,7 @@ fn daemon_refuses_symlinked_roots_and_preserves_unknown_root_files() {
         DaemonConfig {
             root: alias,
             budget: budget(128),
+            backing: None,
         },
         Arc::new(TestAuthority),
         Arc::new(FixedFreeSpace(Some(1024))),
@@ -1175,6 +1190,7 @@ fn daemon_refuses_symlinked_roots_and_preserves_unknown_root_files() {
         DaemonConfig {
             root: unknown_root.path().to_path_buf(),
             budget: budget(128),
+            backing: None,
         },
         Arc::new(TestAuthority),
         Arc::new(FixedFreeSpace(Some(1024))),
@@ -1902,6 +1918,7 @@ fn ordinary_cargo_defaults_to_rejecting_uninstalled_policy() {
         DaemonConfig {
             root: storage.path().to_path_buf(),
             budget: budget(128),
+            backing: None,
         },
         Arc::new(RejectingOrdinaryAuthority),
         Arc::new(FixedFreeSpace(Some(1024))),
@@ -2012,6 +2029,7 @@ fn ordinary_cargo_uses_checked_budget_and_free_space_and_refuses_incompatible_ep
         DaemonConfig {
             root: unknown_storage.path().to_path_buf(),
             budget: budget(64),
+            backing: None,
         },
         Arc::new(TestAuthority),
         Arc::new(FixedFreeSpace(None)),
@@ -2042,6 +2060,7 @@ fn ordinary_cargo_uses_checked_budget_and_free_space_and_refuses_incompatible_ep
                 cap_bytes: 64,
                 free_reserve_bytes: u64::MAX,
             },
+            backing: None,
         },
         Arc::new(TestAuthority),
         Arc::new(FixedFreeSpace(Some(u64::MAX))),
@@ -2091,4 +2110,319 @@ fn ordinary_cargo_uses_checked_budget_and_free_space_and_refuses_incompatible_ep
             RefusalReason::OrdinaryCargoIncompatible
         ))
     );
+}
+
+fn synthetic_backing(payload_root: &Path, identity: &str) -> BoundedBacking {
+    BoundedBacking::verified(BoundedBackendDescriptor {
+        backend: BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1.to_owned(),
+        payload_root: payload_root.to_path_buf(),
+        identity: identity.to_owned(),
+        verified_capacity_bytes: 1024 * 1024,
+    })
+    .expect("synthetic verified backing")
+}
+
+fn start_bounded(
+    root: &Path,
+    payload_root: &Path,
+    cap_bytes: u64,
+    identity: &str,
+) -> RunningDaemon {
+    RunningDaemon::bind(
+        root,
+        budget(cap_bytes),
+        Some(64 * 1024 * 1024),
+        Arc::new(TestAuthority),
+        Some(synthetic_backing(payload_root, identity)),
+    )
+}
+
+fn request_at_path(
+    attempt: &str,
+    acquire_id: &str,
+    required_bytes: u64,
+    path: &str,
+) -> AcquireRequest {
+    let mut request = request(attempt, acquire_id, required_bytes);
+    request.envelope.partition.path_identity = path.to_owned();
+    request
+}
+
+#[test]
+fn bounded_backing_binds_startup_ledger_and_refuses_mismatched_reopen() {
+    let root = TaskRoot::new();
+    let payload = TaskRoot::new();
+    let identity = "a".repeat(16);
+    let mut daemon = start_bounded(root.path(), payload.path(), 128, &identity);
+    let grant = daemon
+        .client
+        .acquire(request("bounded-bind", "bounded-bind-acquire", 64))
+        .expect("bounded acquire");
+    let slot_path = grant.slot_path.expect("bounded slot path");
+    assert!(slot_path.starts_with(payload.path().join("slots")));
+    // Control state stays on the daemon root; the payload holds only slots.
+    assert!(!root.path().join("slots").exists());
+    let evidence = slot_path.join("bounded-evidence.bin");
+    fs::write(&evidence, b"bounded task-owned fixture bytes")
+        .expect("write bounded fixture evidence");
+    let token = grant.token.expect("lease token");
+    let receipt = daemon
+        .client
+        .finalize(
+            &grant.lease_id,
+            Some(&token),
+            "bounded-bind-finalize",
+            passing_evidence(
+                &request("bounded-bind", "bounded-bind-acquire", 64)
+                    .envelope
+                    .binding,
+                &grant.lease_id,
+                &grant.slot_id,
+                &slot_path,
+                &token,
+            ),
+        )
+        .expect("bounded finalize");
+    assert_eq!(receipt.state, SlotState::Idle);
+    let inventory = daemon.client.inventory("bounded-bind").unwrap();
+    assert_eq!(
+        inventory.accounted_bytes,
+        inventory
+            .slots
+            .iter()
+            .map(|slot| slot.measured_bytes.unwrap_or(0))
+            .reduce(u64::saturating_add)
+    );
+    daemon.stop();
+
+    // A different recorded identity, a directory reopen, or a missing
+    // capability each refuse instead of reinterpreting the bounded ledger.
+    let budget = budget(128);
+    for mismatched in [
+        Some(synthetic_backing(payload.path(), &"b".repeat(16))),
+        None,
+    ] {
+        let result = Daemon::bind(
+            DaemonConfig {
+                root: root.path().to_path_buf(),
+                budget,
+                backing: mismatched,
+            },
+            Arc::new(TestAuthority),
+            Arc::new(FixedFreeSpace(Some(1024))),
+        );
+        assert!(matches!(
+            result,
+            Err(StorageError::Refused(RefusalReason::UnknownAccounting))
+        ));
+    }
+    // Matching reopen binds and preserves the settled generation.
+    let reopened = start_bounded(root.path(), payload.path(), 128, &identity);
+    let after = reopened.client.inventory("bounded-reopen").unwrap();
+    assert_eq!(after.accounted_bytes, inventory.accounted_bytes);
+    assert_eq!(after.slots.len(), 1);
+    assert_eq!(after.slots[0].state, SlotState::Idle);
+    assert_eq!(
+        fs::read(&evidence).expect("bounded evidence remains"),
+        b"bounded task-owned fixture bytes"
+    );
+}
+
+#[test]
+fn bounded_payload_layout_refuses_unknown_entries_symlinks_and_shared_roots() {
+    let root = TaskRoot::new();
+    // A foreign entry in the payload root refuses before any effect.
+    let payload = TaskRoot::new();
+    fs::write(payload.path().join("foreign.bin"), b"not owned")
+        .expect("write bounded foreign fixture entry");
+    let result = Daemon::bind(
+        DaemonConfig {
+            root: root.path().to_path_buf(),
+            budget: budget(128),
+            backing: Some(synthetic_backing(payload.path(), &"a".repeat(16))),
+        },
+        Arc::new(TestAuthority),
+        Arc::new(FixedFreeSpace(Some(1024))),
+    );
+    assert!(matches!(
+        result,
+        Err(StorageError::Refused(RefusalReason::UnknownAccounting))
+    ));
+
+    // A symlinked payload root never binds, even with matching ledger intent:
+    // the verified capability refuses it before any daemon state exists.
+    let link_root = TaskRoot::new();
+    let target = TaskRoot::new();
+    let alias = link_root.path().join("payload-alias");
+    symlink(target.path(), &alias).expect("create bounded symlink fixture");
+    assert!(matches!(
+        BoundedBacking::verified(BoundedBackendDescriptor {
+            backend: BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1.to_owned(),
+            payload_root: alias,
+            identity: "a".repeat(16),
+            verified_capacity_bytes: 1024 * 1024,
+        }),
+        Err(StorageError::InvalidInput(_))
+    ));
+
+    // Sharing the daemon control root as the payload refuses: the store
+    // rejects a bounded control root that gains slot-shaped entries.
+    let shared = TaskRoot::new();
+    let result = Daemon::bind(
+        DaemonConfig {
+            root: shared.path().to_path_buf(),
+            budget: budget(128),
+            backing: Some(synthetic_backing(shared.path(), &"a".repeat(16))),
+        },
+        Arc::new(TestAuthority),
+        Arc::new(FixedFreeSpace(Some(1024))),
+    );
+    assert!(matches!(
+        result,
+        Err(StorageError::Refused(RefusalReason::UnknownAccounting))
+    ));
+}
+
+#[test]
+fn bounded_ceiling_stops_new_admission_with_known_accounting() {
+    let root = TaskRoot::new();
+    let payload = TaskRoot::new();
+    let daemon = start_bounded(root.path(), payload.path(), 4096, &"a".repeat(16));
+    let first = daemon
+        .client
+        .acquire(request_at_path(
+            "bounded-cap-a",
+            "bounded-cap-acquire-a",
+            4096,
+            "/task/checkouts/a",
+        ))
+        .expect("first bounded lease fills the aggregate bound");
+    // A different partition may not silently expand the aggregate pool.
+    let second = daemon.client.acquire(request_at_path(
+        "bounded-cap-b",
+        "bounded-cap-acquire-b",
+        4096,
+        "/task/checkouts/b",
+    ));
+    assert!(matches!(
+        second,
+        Err(StorageError::Refused(RefusalReason::BudgetExceeded))
+    ));
+    // Identical retries replay the original lease unchanged.
+    let replay = daemon
+        .client
+        .acquire(request_at_path(
+            "bounded-cap-a",
+            "bounded-cap-acquire-a",
+            4096,
+            "/task/checkouts/a",
+        ))
+        .expect("bounded replay");
+    assert_eq!(replay.lease_id, first.lease_id);
+
+    let token = first.token.expect("lease token");
+    let slot_path = first.slot_path.clone().expect("slot path");
+    fs::write(slot_path.join("unit.bin"), vec![0u8; 100]).expect("bounded fixture write");
+    daemon
+        .client
+        .finalize(
+            &first.lease_id,
+            Some(&token),
+            "bounded-cap-finalize",
+            passing_evidence(
+                &request_at_path(
+                    "bounded-cap-a",
+                    "bounded-cap-acquire-a",
+                    4096,
+                    "/task/checkouts/a",
+                )
+                .envelope
+                .binding,
+                &first.lease_id,
+                &first.slot_id,
+                &slot_path,
+                &token,
+            ),
+        )
+        .expect("bounded finalize");
+    // A proven-idle settled slot may still be evicted inside the same finite
+    // aggregate: eviction is the bounded relief valve, never pool expansion.
+    let after_eviction = daemon
+        .client
+        .acquire(request_at_path(
+            "bounded-cap-c",
+            "bounded-cap-acquire-c",
+            4096,
+            "/task/checkouts/c",
+        ))
+        .expect("eviction frees the settled aggregate space");
+    let mid = daemon.client.inventory("bounded-cap-mid").unwrap();
+    assert_eq!(mid.slots.len(), 1);
+    assert_ne!(mid.slots[0].slot_id, first.slot_id);
+    assert_eq!(mid.accounted_bytes, Some(4096));
+    // With the only slot leased, nothing evictable remains and the aggregate
+    // bound stops new admission with a known refusal.
+    let still_full = daemon.client.acquire(request_at_path(
+        "bounded-cap-d",
+        "bounded-cap-acquire-d",
+        4096,
+        "/task/checkouts/d",
+    ));
+    assert!(matches!(
+        still_full,
+        Err(StorageError::Refused(RefusalReason::BudgetExceeded))
+    ));
+    let _ = after_eviction;
+}
+
+#[test]
+fn bounded_full_payload_keeps_metadata_and_ownership_durable() {
+    let root = TaskRoot::new();
+    let payload = TaskRoot::new();
+    let daemon = start_bounded(
+        root.path(),
+        payload.path(),
+        3 * 1024 * 1024,
+        &"a".repeat(16),
+    );
+    let grant = daemon
+        .client
+        .acquire(request(
+            "bounded-full",
+            "bounded-full-acquire",
+            3 * 1024 * 1024,
+        ))
+        .expect("bounded lease against the whole payload");
+    let slot_path = grant.slot_path.expect("bounded slot path");
+    // The cooperative writer fills the payload to its recorded ceiling while
+    // the lease stays open.
+    fs::write(slot_path.join("payload.bin"), vec![0u8; 2 * 1024 * 1024])
+        .expect("write bounded full-payload fixture");
+    let inventory = daemon.client.inventory("bounded-full").unwrap();
+    assert_eq!(inventory.accounted_bytes, Some(3 * 1024 * 1024));
+    // Control metadata remains durable while the payload is full: settlement
+    // records its transition on the daemon root, never on the payload.
+    let token = grant.token.expect("lease token");
+    let receipt = daemon
+        .client
+        .finalize(
+            &grant.lease_id,
+            Some(&token),
+            "bounded-full-finalize",
+            passing_evidence(
+                &request("bounded-full", "bounded-full-acquire", 3 * 1024 * 1024)
+                    .envelope
+                    .binding,
+                &grant.lease_id,
+                &grant.slot_id,
+                &slot_path,
+                &token,
+            ),
+        )
+        .expect("bounded finalize over a full payload");
+    assert_eq!(receipt.state, SlotState::Idle);
+    let settled = daemon.client.inventory("bounded-full-settled").unwrap();
+    let measured = settled.slots[0].measured_bytes.expect("measured payload");
+    assert_eq!(settled.accounted_bytes, Some(measured));
+    assert!(measured >= 2 * 1024 * 1024 && measured <= 3 * 1024 * 1024);
 }

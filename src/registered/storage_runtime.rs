@@ -15,8 +15,9 @@ use super::qualification::{
 };
 use super::runner_host::{HostError, WireU64};
 use crate::storage::{
-    Budget, Credential, Daemon, DaemonConfig, FreeSpaceProbe, PartitionKey, RunBinding,
-    RunEnvelope, StorageError,
+    BoundedBackendDescriptor, BoundedBacking, Budget, Credential, Daemon, DaemonConfig,
+    FreeSpaceProbe, PartitionKey, RunBinding, RunEnvelope, StorageError,
+    BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -30,9 +31,10 @@ use std::net::Shutdown;
 use std::os::unix::ffi::OsStrExt;
 #[cfg(feature = "private-qualification-fixture")]
 use std::os::unix::fs::FileTypeExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -87,6 +89,11 @@ pub struct RuntimeBootstrap {
     /// Absent or empty keeps the ordinary route disabled.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ordinary_cargo_request_digests: Vec<String>,
+    /// Opt-in hard-bounded payload backing. Absent keeps the directory-only
+    /// budget-only store. Present requires the supported macOS backend and
+    /// changes neither the control protocol version nor the storage wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounded: Option<RuntimeBoundedStorage>,
     /// Admission and settlement authenticator. Distinct from `control_key_hex`.
     pub authority_key_hex: String,
     /// Readiness and shutdown authenticator. Distinct purposes and domains.
@@ -101,6 +108,42 @@ pub struct RuntimeBootstrap {
 pub struct RuntimeBudget {
     pub cap_bytes: WireU64,
     pub free_reserve_bytes: WireU64,
+}
+
+/// Owner-declared opt-in bounded backing paths. The runtime provisions or
+/// opens the recorded image under these exact names; the payload ceiling is
+/// the bootstrap budget cap, so every bounded ceiling is bound to startup.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeBoundedStorage {
+    /// Exactly the one supported backend tag. Anything else refuses.
+    pub backend: String,
+    /// Owner-sparse image file, created if absent with its receipt.
+    pub image_path: PathBuf,
+    /// Capacity proof written at provisioning and required at every open.
+    pub receipt_path: PathBuf,
+    /// Canonical mount point of the payload volume.
+    pub mount_point: PathBuf,
+    /// Nominal image size. Must cover the ceiling plus filesystem metadata,
+    /// because the usable volume capacity is always smaller.
+    pub image_bytes: WireU64,
+    /// Must equal the bootstrap budget cap so there is one ceiling source.
+    pub payload_ceiling_bytes: WireU64,
+}
+
+/// Durable capacity proof for one provisioned image. Written once by the
+/// runtime; every later open verifies the live volume against it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BoundedReceipt {
+    version: u32,
+    backend: String,
+    image_path: PathBuf,
+    mount_point: PathBuf,
+    image_bytes: WireU64,
+    payload_ceiling_bytes: WireU64,
+    verified_capacity_bytes: WireU64,
+    identity: String,
 }
 
 /// Socket identity with lossless integer encoding for TypeScript owners.
@@ -178,15 +221,18 @@ pub fn bootstrap_digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
-/// Digest of the scope, budget and exact approved subjects. Excludes credentials.
+/// Digest of the scope, budget, bounded backing and exact approved subjects.
+/// Excludes credentials. The bounded key is present only when bounded mode is
+/// declared, so a directory bootstrap keeps its recorded digest.
 pub fn policy_digest(
     scope: &str,
     budget: &RuntimeBudget,
     stop_grace_seconds: WireU64,
     admissions: &[ApprovedSubject],
     ordinary_cargo_request_digests: &[String],
+    bounded: Option<&RuntimeBoundedStorage>,
 ) -> Result<String, HostError> {
-    canonical_digest(&json!({
+    let mut policy = json!({
         "scope": scope,
         "storage_protocol": STORAGE_PROTOCOL_VERSION,
         "control_protocol": PROTOCOL_VERSION,
@@ -194,7 +240,11 @@ pub fn policy_digest(
         "stop_grace_seconds": serde_json::to_value(stop_grace_seconds).map_err(|_| HostError::Protocol)?,
         "admissions": serde_json::to_value(admissions).map_err(|_| HostError::Protocol)?,
         "ordinary_cargo_request_digests": ordinary_cargo_request_digests,
-    }))
+    });
+    if let Some(bounded) = bounded {
+        policy["bounded"] = serde_json::to_value(bounded).map_err(|_| HostError::Protocol)?;
+    }
+    canonical_digest(&policy)
 }
 
 /// Parent-side check of a readiness frame. Verifies the control MAC over every
@@ -323,6 +373,7 @@ struct Plan {
     bootstrap_digest: String,
     policy_digest: String,
     budget: RuntimeBudget,
+    bounded: Option<RuntimeBoundedStorage>,
     ordinary_cargo_request_digests: Vec<String>,
     authority_key: MacKey,
     control_key: MacKey,
@@ -420,6 +471,9 @@ impl RuntimeBootstrap {
             return Err(HostError::Protocol);
         }
         let stop_grace = Duration::from_secs(self.stop_grace_seconds.0);
+        if let Some(bounded) = self.bounded.as_ref() {
+            validate_bounded(bounded, &self.storage_root, control_parent, &self.budget)?;
+        }
         let (deadline, expires_unix_seconds) =
             session_window(entry, self.expires_unix_seconds.0, stop_grace)
                 .ok_or(HostError::Protocol)?;
@@ -432,8 +486,10 @@ impl RuntimeBootstrap {
                 self.stop_grace_seconds,
                 &self.admissions,
                 &self.ordinary_cargo_request_digests,
+                self.bounded.as_ref(),
             )?,
             budget: self.budget,
+            bounded: self.bounded.clone(),
             ordinary_cargo_request_digests: self.ordinary_cargo_request_digests.clone(),
             authority_key,
             control_key,
@@ -445,6 +501,298 @@ impl RuntimeBootstrap {
     }
 }
 
+/// Refuses any bounded declaration that is not the one supported macOS
+/// backend with one ceiling source. This runs before any host effect, so an
+/// unsupported platform or unknown backend is an explicit startup refusal.
+fn validate_bounded(
+    bounded: &RuntimeBoundedStorage,
+    storage_root: &Path,
+    control_parent: &Path,
+    budget: &RuntimeBudget,
+) -> Result<(), HostError> {
+    if !cfg!(target_os = "macos")
+        || bounded.backend != BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1
+        || bounded.image_bytes.0 <= bounded.payload_ceiling_bytes.0
+        || bounded.payload_ceiling_bytes.0 != budget.cap_bytes.0
+    {
+        return Err(HostError::Protocol);
+    }
+    let image = bounded.image_path.as_os_str().as_bytes();
+    let receipt = bounded.receipt_path.as_os_str().as_bytes();
+    let mount = bounded.mount_point.as_os_str().as_bytes();
+    let empty_or_relative = |path: &[u8]| path.is_empty() || path[0] != b'/';
+    if empty_or_relative(image)
+        || empty_or_relative(receipt)
+        || empty_or_relative(mount)
+        || image == receipt
+        || image == mount
+        || receipt == mount
+        || bounded.image_path == storage_root
+        || bounded.receipt_path == storage_root
+        || bounded.mount_point == storage_root
+        || bounded.image_path == control_parent
+        || bounded.receipt_path == control_parent
+        || bounded.mount_point == control_parent
+        || bounded.mount_point == storage_root.join(SOCKET_NAME)
+    {
+        return Err(HostError::Protocol);
+    }
+    Ok(())
+}
+
+/// One live payload-volume sample. The sample only verifies that the mounted
+/// filesystem at the declared mount point is the supported APFS backend and
+/// that its capacity matches the recorded proof; the recorded descriptor, not
+/// a fresh sample, is the durable accounting truth.
+#[cfg(target_os = "macos")]
+struct VolumeSample {
+    capacity_bytes: u64,
+}
+
+#[cfg(target_os = "macos")]
+fn c_field_bytes(field: &[libc::c_char]) -> Vec<u8> {
+    field
+        .iter()
+        .take_while(|&&value| value != 0)
+        .map(|&value| value as u8)
+        .collect()
+}
+
+/// Samples the mounted filesystem at one path and refuses anything but the
+/// supported APFS backend mounted exactly there. Unsupported platforms never
+/// reach this: the bounded declaration refuses before any effect.
+#[cfg(target_os = "macos")]
+fn sample_volume(mount_point: &Path) -> Result<VolumeSample, HostError> {
+    let path = CString::new(mount_point.as_os_str().as_bytes()).map_err(|_| HostError::Protocol)?;
+    let mut stat = MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `stat` is writable storage for one
+    // statfs record, which a zero return fully initializes.
+    let status = unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) };
+    if status != 0 {
+        return Err(HostError::Io);
+    }
+    // SAFETY: a zero return means statfs initialized the complete record.
+    let stat = unsafe { stat.assume_init() };
+    if c_field_bytes(&stat.f_fstypename) != b"apfs"
+        || c_field_bytes(&stat.f_mntonname) != mount_point.as_os_str().as_bytes()
+    {
+        return Err(HostError::Storage);
+    }
+    let capacity_bytes = u64::from(stat.f_blocks)
+        .checked_mul(u64::from(stat.f_bsize))
+        .ok_or(HostError::Storage)?;
+    if capacity_bytes == 0 {
+        return Err(HostError::Storage);
+    }
+    Ok(VolumeSample { capacity_bytes })
+}
+
+/// Stable identity of the owned image file itself. Device and inode cannot
+/// change while the file exists, so a replaced or recreated image always
+/// refuses against the recorded receipt.
+fn image_identity(image_path: &Path) -> Result<String, HostError> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(image_path).map_err(|_| HostError::Io)?;
+    if !metadata.is_file() {
+        return Err(HostError::Storage);
+    }
+    Ok(format!("{:016x}{:016x}", metadata.dev(), metadata.ino()))
+}
+
+/// Routes one bounded declaration to provisioning or opening. An image
+/// without its capacity proof, or a receipt without its image, refuses.
+#[cfg(target_os = "macos")]
+fn open_or_provision_bounded(
+    bounded: &RuntimeBoundedStorage,
+    ceiling: u64,
+) -> Result<BoundedBacking, HostError> {
+    let image_exists = bounded.image_path.symlink_metadata().is_ok();
+    let receipt_exists = bounded.receipt_path.symlink_metadata().is_ok();
+    match (image_exists, receipt_exists) {
+        (false, false) => provision_bounded(bounded, ceiling),
+        (true, false) => Err(HostError::Storage),
+        (_, true) => open_bounded(bounded, ceiling),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_or_provision_bounded(
+    _bounded: &RuntimeBoundedStorage,
+    _ceiling: u64,
+) -> Result<BoundedBacking, HostError> {
+    // Unreachable: the bounded declaration refuses before any effect.
+    Err(HostError::Storage)
+}
+
+/// Creates one fresh fixed-size sparse APFS image, attaches it at the
+/// declared mount point, records the capacity proof, and returns the verified
+/// capability. No host setting, service or mount outside the owner scratch
+/// paths is touched.
+#[cfg(target_os = "macos")]
+fn provision_bounded(
+    bounded: &RuntimeBoundedStorage,
+    ceiling: u64,
+) -> Result<BoundedBacking, HostError> {
+    // A fresh capability needs a fresh image: an existing file without a
+    // receipt is a mismatched or partial backing and refuses.
+    if bounded.image_path.symlink_metadata().is_ok()
+        || bounded.receipt_path.symlink_metadata().is_ok()
+    {
+        return Err(HostError::Storage);
+    }
+    let scratch = bounded
+        .image_path
+        .parent()
+        .ok_or(HostError::Protocol)?
+        .to_path_buf();
+    owned_directory(&scratch)?;
+    fs::create_dir(&bounded.mount_point).map_err(|_| HostError::Io)?;
+    owned_directory(&bounded.mount_point)?;
+    let hdiutil = |arguments: &[&str], extra_env: bool| {
+        let mut command = Command::new("/usr/bin/hdiutil");
+        command
+            .args(arguments)
+            .env("TMPDIR", &scratch)
+            .env("TMP", &scratch)
+            .env("TEMP", &scratch);
+        if extra_env {
+            command.current_dir(&scratch);
+        }
+        command.output().map_err(|_| HostError::Io)
+    };
+    let size = bounded.image_bytes.0.to_string();
+    let image = bounded
+        .image_path
+        .to_str()
+        .ok_or(HostError::Protocol)?
+        .to_owned();
+    let mount = bounded
+        .mount_point
+        .to_str()
+        .ok_or(HostError::Protocol)?
+        .to_owned();
+    let created = hdiutil(
+        &[
+            "create",
+            "-size",
+            &size,
+            "-type",
+            "SPARSE",
+            "-fs",
+            "APFS",
+            "-volname",
+            "oxide-bounded-v1",
+            "-nospotlight",
+            "-quiet",
+            &image,
+        ],
+        false,
+    )?;
+    if !created.status.success() {
+        return Err(HostError::Storage);
+    }
+    let attached = hdiutil(
+        &[
+            "attach",
+            "-nobrowse",
+            "-noverify",
+            "-mountpoint",
+            &mount,
+            &image,
+        ],
+        false,
+    )?;
+    if !attached.status.success() {
+        return Err(HostError::Storage);
+    }
+    if fs::canonicalize(&bounded.mount_point).map_err(|_| HostError::Io)? != bounded.mount_point {
+        return Err(HostError::Storage);
+    }
+    // A fresh APFS volume root mounts world-readable. The payload is private
+    // scratch, so provisioning makes the root owner-only before anything is
+    // written; a later open refuses a volume that is not private.
+    fs::set_permissions(&bounded.mount_point, fs::Permissions::from_mode(0o700))
+        .map_err(|_| HostError::Io)?;
+    let sample = sample_volume(&bounded.mount_point)?;
+    let identity = image_identity(&bounded.image_path)?;
+    // The admission ceiling must fit inside the verified payload volume, so
+    // reservations stay meaningful in front of the OS-enforced bound.
+    if sample.capacity_bytes < ceiling {
+        return Err(HostError::Storage);
+    }
+    let receipt = BoundedReceipt {
+        version: 1,
+        backend: BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1.to_owned(),
+        image_path: bounded.image_path.clone(),
+        mount_point: bounded.mount_point.clone(),
+        image_bytes: bounded.image_bytes,
+        payload_ceiling_bytes: WireU64(ceiling),
+        verified_capacity_bytes: WireU64(sample.capacity_bytes),
+        identity,
+    };
+    let bytes = serde_json::to_vec(&receipt).map_err(|_| HostError::Protocol)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&bounded.receipt_path)
+        .map_err(|_| HostError::Io)?;
+    file.write_all(&bytes).map_err(|_| HostError::Io)?;
+    file.sync_all().map_err(|_| HostError::Io)?;
+    drop(file);
+    fs::File::open(scratch)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| HostError::Io)?;
+    bounded_descriptor(bounded, sample.capacity_bytes)
+}
+
+/// Opens an existing provisioned backing: the capacity proof must match the
+/// declaration and the live mounted volume exactly, otherwise the bounded
+/// mode refuses rather than reinterpreting the recorded store.
+#[cfg(target_os = "macos")]
+fn open_bounded(
+    bounded: &RuntimeBoundedStorage,
+    ceiling: u64,
+) -> Result<BoundedBacking, HostError> {
+    let bytes = read_protected(&bounded.receipt_path)?;
+    let receipt: BoundedReceipt =
+        serde_json::from_slice(&bytes).map_err(|_| HostError::Protocol)?;
+    if receipt.version != 1
+        || receipt.backend != BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1
+        || receipt.image_path != bounded.image_path
+        || receipt.mount_point != bounded.mount_point
+        || receipt.image_bytes != bounded.image_bytes
+        || receipt.payload_ceiling_bytes.0 != ceiling
+        || bounded.image_path.symlink_metadata().is_err()
+    {
+        return Err(HostError::Storage);
+    }
+    let sample = sample_volume(&bounded.mount_point)?;
+    let identity = image_identity(&bounded.image_path)?;
+    if identity != receipt.identity
+        || sample.capacity_bytes != receipt.verified_capacity_bytes.0
+        || sample.capacity_bytes < ceiling
+    {
+        return Err(HostError::Storage);
+    }
+    bounded_descriptor(bounded, sample.capacity_bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn bounded_descriptor(
+    bounded: &RuntimeBoundedStorage,
+    verified_capacity_bytes: u64,
+) -> Result<BoundedBacking, HostError> {
+    let identity = image_identity(&bounded.image_path)?;
+    BoundedBacking::verified(BoundedBackendDescriptor {
+        backend: BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1.to_owned(),
+        payload_root: bounded.mount_point.clone(),
+        identity,
+        verified_capacity_bytes,
+    })
+    .map_err(|_| HostError::Storage)
+}
+
 fn valid_sha256_digest(value: &str) -> bool {
     value.strip_prefix("sha256:").is_some_and(|hex| {
         hex.len() == 64
@@ -454,17 +802,24 @@ fn valid_sha256_digest(value: &str) -> bool {
     })
 }
 
-/// Statvfs-backed probe, limited to the one owned canonical storage root.
+/// Statvfs-backed probe, limited to the owned canonical roots: the daemon
+/// control root and, in bounded mode, the payload volume root.
 #[derive(Debug)]
 struct OwnedRootFreeSpace {
-    root: PathBuf,
+    roots: Vec<PathBuf>,
+}
+
+impl OwnedRootFreeSpace {
+    fn for_roots(roots: Vec<PathBuf>) -> Self {
+        Self { roots }
+    }
 }
 
 impl FreeSpaceProbe for OwnedRootFreeSpace {
     fn available_bytes(&self, root: &Path) -> Result<Option<u64>, StorageError> {
-        if root != self.root {
+        if !self.roots.iter().any(|owned| owned == root) {
             return Err(StorageError::InvalidInput(
-                "free-space probe is limited to the owned storage root",
+                "free-space probe is limited to the owned storage roots",
             ));
         }
         let path = CString::new(root.as_os_str().as_bytes())
@@ -689,6 +1044,20 @@ fn run(
             .map_err(|_| HostError::Protocol)?,
     );
     let root = bootstrap.storage_root.clone();
+    // The verified bounded capability is the only way slots leave the daemon
+    // root. Provisioning happens after the replay marker, so a refused or
+    // failed backing leaves no partial store behind.
+    let backing = match plan.bounded.as_ref() {
+        Some(bounded) => Some(
+            open_or_provision_bounded(bounded, plan.budget.cap_bytes.0)
+                .map_err(|_| HostError::Storage)?,
+        ),
+        None => None,
+    };
+    let mut probe_roots = vec![root.clone()];
+    if let Some(backing) = backing.as_ref() {
+        probe_roots.push(backing.payload_root().to_path_buf());
+    }
     let daemon = Daemon::bind(
         DaemonConfig {
             root: root.clone(),
@@ -696,9 +1065,10 @@ fn run(
                 cap_bytes: plan.budget.cap_bytes.0,
                 free_reserve_bytes: plan.budget.free_reserve_bytes.0,
             },
+            backing,
         },
         authority.clone(),
-        Arc::new(OwnedRootFreeSpace { root }),
+        Arc::new(OwnedRootFreeSpace::for_roots(probe_roots)),
     )
     .map_err(|_| HostError::Storage)?;
     before(plan.deadline)?;
@@ -1048,6 +1418,7 @@ mod tests {
                 grace,
                 &admissions,
                 &ordinary,
+                None,
             )
             .unwrap(),
             fixture["policy_digest"].as_str().unwrap()
@@ -1060,6 +1431,7 @@ mod tests {
                 grace,
                 &admissions,
                 &enabled,
+                None,
             )
             .unwrap(),
             fixture["policy_digest"].as_str().unwrap()
@@ -1438,9 +1810,7 @@ mod tests {
         let other = base.join(format!("probe-other-{}", std::process::id()));
         fs::create_dir_all(&owned).unwrap();
         fs::create_dir_all(&other).unwrap();
-        let probe = OwnedRootFreeSpace {
-            root: owned.clone(),
-        };
+        let probe = OwnedRootFreeSpace::for_roots(vec![owned.clone()]);
         let free = probe
             .available_bytes(&owned)
             .unwrap()
