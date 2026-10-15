@@ -40,12 +40,9 @@ const STORAGE_KEY_HEX: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const CALLBACK_KEY_HEX: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const REMAINING_MS: u64 = 25_000;
-// Fixture window for each callback exchange, shared with the parent trace so
-// deadline offsets are reported against the same value the child receives.
+// Owner-issued callback window for the fixture; the parent does not impose a
+// shorter socket timeout that can race this bound under load.
 const CALLBACK_TIMEOUT_MS: u64 = 15_000;
-// Withheld replies outlive one callback window by a fixed margin, so the child
-// has reached its deadline before any late reply is written.
-const WITHHELD_REPLY_MS: u64 = 18_000;
 const TRACE_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy)]
@@ -58,6 +55,7 @@ enum Scenario {
     FullTupleChanged,
     CaptureDelayed,
     CaptureMismatch,
+    CaptureReplay,
     CaptureLost,
     BudgetReuse,
 }
@@ -418,6 +416,62 @@ fn write_frame(stream: &mut UnixStream, value: &Value) -> std::io::Result<()> {
     stream.write_all(&body)
 }
 
+/// Keep the callback peer alive until the child closes its side after the
+/// attempt result. `run_child`'s unchanged 30-second scenario watchdog bounds
+/// this wait; a shorter fixture read timeout can close a valid exchange while
+/// the child is descheduled under load.
+fn wait_for_child_callback_close(stream: &mut UnixStream, trace: &Trace, phase: &str) {
+    stream
+        .set_read_timeout(None)
+        .unwrap_or_else(|error| panic!("clear callback read timeout: {:?}", error.kind()));
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => {
+                trace.mark("callback_channel_closed", phase);
+                return;
+            }
+            Ok(_) => panic!(
+                "unexpected child callback after {phase}\ntrace:\n{}",
+                trace.render()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => panic!(
+                "waiting for callback channel close after {phase} failed {:?}\ntrace:\n{}",
+                error.kind(),
+                trace.render()
+            ),
+        }
+    }
+}
+
+fn require_late_callback_refused(result: std::io::Result<()>, trace: &Trace) {
+    match result {
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            trace.mark(
+                "late_reply_refused",
+                &format!("peer closed ({:?})", error.kind()),
+            );
+        }
+        Err(error) => panic!(
+            "late callback failed for unexpected reason {:?}\ntrace:\n{}",
+            error.kind(),
+            trace.render()
+        ),
+        Ok(()) => panic!(
+            "late callback write succeeded after child closed its channel\ntrace:\n{}",
+            trace.render()
+        ),
+    }
+}
+
 fn signed_callback_reply(request: &Value, payload: Value, context: &str) -> Value {
     let method = request["method"].as_str().unwrap();
     let id = request["id"].as_str().unwrap();
@@ -720,17 +774,17 @@ fn start_callback_server(
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         trace.mark("callback_accepted", "");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
+        // The child owns the 15-second callback deadline, and run_child owns
+        // the unchanged 30-second scenario ceiling. Do not impose a shorter
+        // parent-side read timeout on a peer that may be descheduled.
         let submit = read_frame(&mut stream).unwrap();
         assert_eq!(submit["method"], "ordinary_cargo.submit");
         trace.mark("submit_received", "");
         *acquired.lock().unwrap() = Some(submit["acquired"].clone());
         match scenario {
             Scenario::Timeout => {
-                trace.mark("submit_withheld", "no reply inside callback window");
-                thread::sleep(Duration::from_millis(WITHHELD_REPLY_MS));
+                trace.mark("submit_withheld", "waiting for child callback deadline");
+                wait_for_child_callback_close(&mut stream, &trace, "submit timeout");
                 return;
             }
             Scenario::LostReply => {
@@ -746,11 +800,14 @@ fn start_callback_server(
                     &context,
                 );
                 write_frame(&mut stream, &response).unwrap();
+                trace.mark("started_reply_written", "not_started");
                 let no_submit = read_frame(&mut stream).unwrap();
                 assert_eq!(no_submit["method"], "ordinary_cargo.not_submitted");
                 let payload = make_no_submit_payload(&no_submit, &request, &instance);
                 let response = signed_callback_reply(&no_submit, payload, &context);
                 write_frame(&mut stream, &response).unwrap();
+                trace.mark("no_submit_reply_written", "waiting for child settlement");
+                wait_for_child_callback_close(&mut stream, &trace, "not_submitted settlement");
                 return;
             }
             _ => {}
@@ -759,11 +816,12 @@ fn start_callback_server(
             &submit["source"],
             matches!(scenario, Scenario::FullTupleChanged),
         );
-        let response =
+        let started_response =
             signed_callback_reply(&submit, json!({"status":"started","run":run}), &context);
-        write_frame(&mut stream, &response).unwrap();
-        trace.mark("started_reply", "written");
+        write_frame(&mut stream, &started_response).unwrap();
+        trace.mark("started_reply_written", "started");
         if matches!(scenario, Scenario::FullTupleChanged) {
+            wait_for_child_callback_close(&mut stream, &trace, "full tuple refusal");
             return;
         }
         let capture = match read_frame(&mut stream) {
@@ -776,23 +834,29 @@ fn start_callback_server(
         assert_eq!(capture["method"], "ordinary_cargo.capture");
         trace.mark(
             "capture_received",
-            &format!("callback window ends at +{CALLBACK_TIMEOUT_MS}ms (child send is earlier)"),
+            "child callback deadline owns this exchange",
         );
         let response = match scenario {
+            Scenario::CaptureDelayed => {
+                trace.mark(
+                    "capture_reply_withheld",
+                    "waiting for child callback deadline",
+                );
+                wait_for_child_callback_close(&mut stream, &trace, "capture timeout");
+                let response = signed_callback_reply(
+                    &capture,
+                    capture_payload(&capture, &request, &instance, false),
+                    &context,
+                );
+                trace.mark("late_reply_attempt", "valid capture after child closed");
+                require_late_callback_refused(write_frame(&mut stream, &response), &trace);
+                return;
+            }
             Scenario::CaptureLost => {
                 trace.mark("capture_reply", "partial frame then close");
                 stream.write_all(&100u32.to_be_bytes()).unwrap();
                 stream.write_all(b"{}").unwrap();
                 return;
-            }
-            Scenario::CaptureDelayed => {
-                thread::sleep(Duration::from_millis(WITHHELD_REPLY_MS));
-                trace.mark("capture_reply", "valid reply written after window");
-                signed_callback_reply(
-                    &capture,
-                    capture_payload(&capture, &request, &instance, false),
-                    &context,
-                )
             }
             Scenario::CaptureMismatch => {
                 // Authentic for a different operation: correspondence must refuse.
@@ -804,6 +868,10 @@ fn start_callback_server(
                     capture_payload(&capture, &request, &instance, false),
                     &context,
                 )
+            }
+            Scenario::CaptureReplay => {
+                trace.mark("capture_reply", "replay of the signed submit response");
+                started_response.clone()
             }
             _ => {
                 trace.mark("capture_reply", "valid reply written inside window");
@@ -819,9 +887,15 @@ fn start_callback_server(
                 )
             }
         };
-        if let Err(error) = write_frame(&mut stream, &response) {
-            trace.mark("capture_write", &format!("failed {:?}", error.kind()));
-        }
+        write_frame(&mut stream, &response).unwrap_or_else(|error| {
+            panic!(
+                "capture callback write failed {:?}\ntrace:\n{}",
+                error.kind(),
+                trace.render()
+            )
+        });
+        trace.mark("capture_reply_written", "complete response frame");
+        wait_for_child_callback_close(&mut stream, &trace, "capture response consumed");
     })
 }
 
@@ -930,6 +1004,32 @@ fn one_scenario(
     callbacks.join().unwrap();
     let report = trace.render();
 
+    match scenario {
+        Scenario::Passed | Scenario::Failed | Scenario::BudgetReuse => {
+            assert_trace_order(&report, "capture_reply_written", "callback_channel_closed");
+        }
+        Scenario::NotSubmitted => {
+            assert_trace_order(
+                &report,
+                "no_submit_reply_written",
+                "callback_channel_closed",
+            );
+        }
+        Scenario::FullTupleChanged => {
+            assert_trace_order(&report, "started_reply_written", "callback_channel_closed");
+        }
+        Scenario::CaptureDelayed => {
+            assert_trace_order(&report, "callback_channel_closed", "late_reply_refused");
+        }
+        Scenario::CaptureMismatch | Scenario::CaptureReplay => {
+            assert_trace_order(&report, "capture_reply_written", "callback_channel_closed");
+        }
+        Scenario::Timeout => {
+            assert_trace_order(&report, "submit_withheld", "callback_channel_closed");
+        }
+        Scenario::LostReply | Scenario::CaptureLost => {}
+    }
+
     let tuple = acquired
         .lock()
         .unwrap()
@@ -966,6 +1066,19 @@ fn one_scenario(
         _ => assert_eq!(slot.state, SlotState::Idle, "trace:\n{report}"),
     }
     daemon.stop();
+}
+
+fn assert_trace_order(report: &str, earlier: &str, later: &str) {
+    let earlier_offset = report
+        .find(earlier)
+        .unwrap_or_else(|| panic!("trace is missing {earlier}\ntrace:\n{report}"));
+    let later_offset = report
+        .find(later)
+        .unwrap_or_else(|| panic!("trace is missing {later}\ntrace:\n{report}"));
+    assert!(
+        earlier_offset < later_offset,
+        "trace order must be {earlier} before {later}\ntrace:\n{report}"
+    );
 }
 
 fn capture_policy(total: u64, binary: u64, full_debug: u64) -> OrdinaryCargoCaptureBudget {
@@ -1085,6 +1198,7 @@ fn run_budget_attempt(
     run_child(&bootstrap, true, &trace);
     callbacks.join().unwrap();
     let report = trace.render();
+    assert_trace_order(&report, "capture_reply_written", "callback_channel_closed");
     let acquired = acquired
         .lock()
         .unwrap()
@@ -1257,8 +1371,15 @@ fn private_ordinary_cargo_compiled_process_lifecycle_and_controls() {
             CargoReuseState::Pending,
         ),
         (
-            "09-capture-lost",
+            "09-capture-replayed-response",
             "09",
+            Scenario::CaptureReplay,
+            false,
+            CargoReuseState::Pending,
+        ),
+        (
+            "10-capture-lost",
+            "10",
             Scenario::CaptureLost,
             false,
             CargoReuseState::Pending,

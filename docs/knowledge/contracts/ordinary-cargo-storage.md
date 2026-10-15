@@ -896,23 +896,48 @@ independent aeb41c1 run held the pass case at Capture. Its cause is unresolved:
 no retained trace exists, and the historical load condition is unknown. Do
 not infer load reliability from later passing runs.
 
+The later private-process failures had a source-backed fixture cause. The
+parent callback server used a 3-second socket read timeout even though the
+child owns a 15-second callback deadline, and it closed the channel after
+`write_all` without waiting for the child to consume the reply. Under load the
+parent could time out while waiting for the next callback or close after a
+positive write before the child read it. Retained 055 evidence records a
+capture reply at +0.063s and a child exit at +0.072s with ownership still held
+at Capture; 057 recorded the pass case held at Capture and no-submit held at
+Submit. The fixture now leaves callback reads to the child deadline and keeps
+the channel open until the child closes it. Its existing 30-second child
+watchdog remains the outer fixture bound. For a delayed capture, the fixture
+waits for the child's actual timeout/close, then attempts the valid reply and
+requires the closed peer to refuse the write. This changes no product callback,
+session, authentication, request, or lease limit. The separately observed
+private qualification child stall remains a distinct runtime finding.
+
 Synthetic compiled-process fixtures exercise pass/capture, settled failure,
 positive no-submit, submit timeout, submit lost reply, full-tuple mismatch,
-and the three capture-path controls below, plus command/root/epoch/environment
+and the four capture-path controls below, plus command/root/epoch/environment
 mutation, acquired-path substitution and secret redaction. The legacy suite
-runs nine native child scenarios; the v2 control adds two child attempts
+runs ten native child scenarios; the v2 control adds two child attempts
 against one storage generation. Each child has a 30-second ceiling. The
 parent-side trace for each child records phase labels, monotonic offsets, and
 bounded reasons, capped at 64 KiB per scenario. The trace never records frame
-bodies, keys, or environment values, and failures print it. The three legacy
+bodies, keys, or environment values, and failures print it. The four legacy
 capture-path cases are:
 
 - expiry: `CaptureDelayed` withholds a valid reply past the callback window.
   The child must stay held at Capture, pending, with no release;
 - receipt/body correspondence: `CaptureMismatch` returns a validly signed reply
   for a foreign operation ID. The child must refuse correspondence and hold;
+- replay: `CaptureReplay` returns the exact signed submit reply during Capture.
+  The child must refuse the prior operation and hold;
 - channel loss: `CaptureLost` writes a partial frame and closes. The child must
   hold at Capture.
+
+After a complete capture reply, the parent also waits for the child's callback
+channel to close before the fixture ends that peer. A successful child then
+proves the expected durable terminal state; an invalid callback remains
+pending. The trace asserts reply/close ordering. This barrier establishes that
+the fixture peer outlives reply consumption and attempt settlement; a positive
+socket write alone does not establish either.
 
 The v2 control changes run/source identity and output paths between attempts,
 and signs a changed exact boundary and capture-budget digest while retaining
