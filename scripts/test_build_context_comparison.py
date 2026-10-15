@@ -6,6 +6,7 @@ mktemp directory. Aggregate budget is 60 seconds.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -15,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -47,6 +49,13 @@ IMAGEINFO_AT_THRESHOLD = (
     "\tTotal Empty Bytes: 1073741824\n"
 )
 TOKEN = "eyJydW5JZCI6InJ1bl8wMDAxIiwiZXBvY2giOjN9.synthetic-fixture-token"
+REQUEST_ID = "8f2c0c4e-0f4a-4a4a-9a4a-2b2b2b2b2b2b"
+RUSTC_PATH = "/usr/bin/rustc"
+CARGO_PATH = "/usr/bin/cargo"
+DEFAULT_TEST_LINE = (
+    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; "
+    "finished in 0.01s"
+)
 DEFAULT_NEGATIVE_STDERR = (
     "thread 'committed_workflow_packages_parse' panicked at tests/packages.rs:11:5:\n"
     "packages directory\n"
@@ -120,18 +129,46 @@ class FakeSpawner:
         rustc_ok: bool = True,
         cargo_ok: bool = True,
         advance_ns: int = 1_000_000,
-        rustc_running_prefix: str = "/usr/bin/rustc",
+        rustc_path: str = RUSTC_PATH,
+        emit_rustc: bool = True,
+        emit_debuginfo: bool = True,
+        force_incremental: str | None = None,
+        test_line: str | None = DEFAULT_TEST_LINE,
+        test_ran: bool = True,
+        exit_code: int = 0,
         negative_stderr: str | None = None,
     ) -> None:
         self.clock = clock
         self.rustc_ok = rustc_ok
         self.cargo_ok = cargo_ok
         self.advance_ns = advance_ns
-        self.rustc_running_prefix = rustc_running_prefix
+        self.rustc_path = rustc_path
+        self.emit_rustc = emit_rustc
+        self.emit_debuginfo = emit_debuginfo
+        self.force_incremental = force_incremental
+        self.test_line = test_line
+        self.test_ran = test_ran
+        self.exit_code = exit_code
         self.negative_stderr = negative_stderr if negative_stderr is not None else DEFAULT_NEGATIVE_STDERR
         self.calls: list[tuple[str, ...]] = []
         self.envs: list[dict[str, str]] = []
         self.unknown_closure = False
+        self.effigy_calls = 0
+
+    def _rustc_flags(self, mode: str, crate: str) -> str:
+        pieces = [
+            f"{self.rustc_path} --crate-name {crate} --edition 2021",
+        ]
+        if self.emit_debuginfo:
+            pieces.append("-C debuginfo=line-tables-only")
+        pieces.append("-C split-debuginfo=unpacked")
+        if crate == "nucleus-core":
+            flag = self.force_incremental
+            if flag is None:
+                flag = "on" if mode == "on" else "off"
+            if flag == "on":
+                pieces.append("-C incremental=/scratch/incremental")
+        return " ".join(pieces)
 
     def run(self, argv, *, env, cwd, remaining_ns, log, clock, session, poll=None) -> bcc.RunResult:
         if remaining_ns <= 0 or session.expired_hard(clock.monotonic_ns()):
@@ -143,6 +180,7 @@ class FakeSpawner:
             poll()
         stdout = ""
         stderr = ""
+        code = 0
         if argv[:2] == ["cargo", "-vV"]:
             stdout = f"cargo {bcc.RUSTC_RELEASE} (aaaaaaaaaaa 2026-01-01)\n" if self.cargo_ok else "cargo 1.96.1\n"
         elif argv[:2] == ["rustc", "-vV"]:
@@ -151,8 +189,17 @@ class FakeSpawner:
             else:
                 stdout = "release: 1.96.1\ncommit-hash: 000000000\n"
         elif argv and argv[0] == "effigy":
+            self.effigy_calls += 1
+            index = self.effigy_calls
+            step = ("C0", "E1", "E2", "U")[(index - 1) % 4]
+            mode = "off" if index <= 4 else "on"
             target = Path(env["CARGO_TARGET_DIR"]) / "debug" / "deps"
+            incremental = Path(env["CARGO_TARGET_DIR"]) / "debug" / "incremental"
             target.mkdir(parents=True, exist_ok=True)
+            incremental.mkdir(parents=True, exist_ok=True)
+            session_dir = incremental / "sess-deadbeef"
+            session_dir.mkdir(exist_ok=True)
+            (session_dir / "work.o").write_bytes(b"incremental")
             exe = target / "packages-deadbeef"
             if not exe.exists():
                 exe.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
@@ -160,19 +207,26 @@ class FakeSpawner:
             obj = target / "packages-deadbeef.o"
             if not obj.exists():
                 obj.write_bytes(b"obj")
+            lines = []
+            if step == "U":
+                lines.append("       Fresh nucleus-core v0.0.0")
+            else:
+                lines.append("   Compiling nucleus-core v0.0.0")
+                if self.emit_rustc:
+                    lines.append(f"     Running `{self._rustc_flags(mode, 'nucleus-core')}`")
             rel = "target/debug/deps/packages-deadbeef"
-            stderr = (
-                "   Compiling nucleus-core v0.0.0\n"
-                "    Fresh syn v2.0.0\n"
-                f"     Running `{self.rustc_running_prefix} --crate-name packages --edition 2021`\n"
-                f"     Running tests/packages.rs ({rel})\n"
-            )
-            stdout = (
-                f"test {bcc.TEST_NAME} ... ok\n"
-                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n"
-            )
+            lines.append(f"     Running tests/packages.rs ({rel})")
+            stderr = "\n".join(lines) + "\n"
+            body = ""
+            if self.test_ran:
+                body += f"test {bcc.TEST_NAME} ... ok\n"
+            if self.test_line is not None:
+                body += self.test_line + "\n"
+            stdout = body
+            code = self.exit_code
         elif argv and "packages-deadbeef" in argv[0]:
             stderr = self.negative_stderr
+            code = 1
         log.write(stdout + stderr)
         if self.unknown_closure:
             return bcc.RunResult(
@@ -190,13 +244,73 @@ class FakeSpawner:
             outcome="ok",
             spawned=True,
             argv=tuple(argv),
-            exit_code=1 if argv and "packages-deadbeef" in argv[0] else 0,
+            exit_code=code,
             pgid=1000 + len(self.calls),
             writer_closed=True,
             stdout=stdout,
             stderr=stderr,
             duration_ns=self.advance_ns,
         )
+
+
+class RecordingSubmitter:
+    def __init__(self, states: list[str]) -> None:
+        self.states = list(states)
+        self.calls: list[dict[str, object]] = []
+
+    def submit(self, *, argv, cwd, request_id, caller, env, timeout_ns=None):
+        binding = Path(cwd) / bcc.STAGED_BINDING_NAME
+        self.calls.append(
+            {
+                "argv": list(argv),
+                "cwd": cwd,
+                "request_id": request_id,
+                "caller": caller,
+                "binding_present": binding.is_file(),
+            }
+        )
+        state = self.states.pop(0) if self.states else "held"
+        return bcc.HeavySubmitOutcome(state=state, run_id="run_0001" if state == "launched" else None)
+
+
+class RecoveringSubmitter:
+    """Held submit reply, then a found request that is followed to settlement."""
+
+    def __init__(self, follow_state: str = "launched") -> None:
+        self.follow_state = follow_state
+        self.submits = 0
+        self.statuses = 0
+        self.follows = 0
+
+    def submit(self, *, argv, cwd, request_id, caller, env, timeout_ns=None):
+        self.submits += 1
+        return bcc.HeavySubmitOutcome(state="held")
+
+    def request_status(self, *, caller, request_id, env, timeout_ns=None):
+        self.statuses += 1
+        return bcc.HeavySubmitOutcome(state="found", run_id="run_0001")
+
+    def request_follow(self, *, caller, request_id, env, timeout_ns=None):
+        self.follows += 1
+        return bcc.HeavySubmitOutcome(state=self.follow_state)
+
+
+class LostThenAbsentSubmitter:
+    """Lost submit reply, status shows authenticated absence, replay succeeds."""
+
+    def __init__(self) -> None:
+        self.submits: list[list[str]] = []
+        self.statuses = 0
+
+    def submit(self, *, argv, cwd, request_id, caller, env, timeout_ns=None):
+        self.submits.append(list(argv))
+        if len(self.submits) == 1:
+            return bcc.HeavySubmitOutcome(state="held")
+        return bcc.HeavySubmitOutcome(state="launched")
+
+    def request_status(self, *, caller, request_id, env, timeout_ns=None):
+        self.statuses += 1
+        return bcc.HeavySubmitOutcome(state="authenticated_absence")
 
 
 def _git_ok(argv, cwd=None) -> str:
@@ -206,7 +320,7 @@ def _git_ok(argv, cwd=None) -> str:
         return bcc.NUCLEUS_TREE + "\n"
     if argv == ["ls-files"]:
         return "Cargo.lock\nCargo.toml\n"
-    if argv[:2] == ["status", "--porcelain"] or argv[:1] == ["status"]:
+    if argv[:1] == ["status"]:
         return ""
     return ""
 
@@ -229,26 +343,61 @@ def _clone(plan, mode, dest: Path) -> None:
         path.write_text("fn item() {}\n", encoding="utf-8")
 
 
+def _copy(src: Path, dest: Path) -> int:
+    data = b"crate"
+    dest.write_bytes(data)
+    os.chmod(dest, 0o600)
+    return len(data)
+
+
 def _plan(scratch: Path, launch_id: str = "fixture") -> bcc.ResourcePlan:
     parent = scratch / f"cmp-{launch_id}"
-    src = scratch / "registry-src"
-    src.mkdir(parents=True, exist_ok=True)
-    crate = src / "foo.crate"
-    crate.write_bytes(b"crate")
+    parent.parent.mkdir(parents=True, exist_ok=True)
     return bcc.ResourcePlan(
         launch_id=launch_id,
         parent=parent,
         mount=parent / "m",
         backing=parent / "cmp.sparseimage",
         nucleus_source=scratch / "nucleus",
-        registry_inputs=(bcc.RegistryInput(src=crate, rel="registry/cache/foo.crate"),),
+        registry_inputs=(
+            bcc.RegistryInput(
+                src=bcc.CARGO_CACHE_ROOT / "foo-0.1.0.crate",
+                rel="registry/cache/index.crates.io-1949cf8c6b5b557f/foo-0.1.0.crate",
+            ),
+            bcc.RegistryInput(
+                src=bcc.CARGO_INDEX_ROOT / ".cache" / "3" / "foo",
+                rel="registry/index/index.crates.io-1949cf8c6b5b557f/.cache/3/foo",
+            ),
+        ),
     )
 
 
-def _launcher(scratch: Path, **overrides):
+def _stage(plan: bcc.ResourcePlan, registry: bcc.RegistryInputPlan, clock: FakeClock) -> bcc.StagedSession:
+    launcher_path = Path(bcc.__file__).resolve()
+    binding = bcc.LaunchBinding(
+        caller="northstar-worker",
+        request_id=REQUEST_ID,
+        request_body_digest="0" * 64,
+        parent=plan.parent,
+        launcher_sha256=hashlib.sha256(launcher_path.read_bytes()).hexdigest(),
+        nucleus_commit=bcc.NUCLEUS_COMMIT,
+        nucleus_tree=bcc.NUCLEUS_TREE,
+        cargo_lock_sha256=bcc.CARGO_LOCK_SHA256,
+        registry_plan_digest=registry.digest(),
+        audit_start_utc=clock.utc_iso(),
+        deadline_monotonic_ns=clock.monotonic_ns() + bcc.BUDGET_NS,
+        declared_budget_ns=bcc.BUDGET_NS,
+    )
+    return bcc.stage_session(
+        plan, launcher_path=launcher_path, binding=binding.to_document(), registry_plan=registry
+    )
+
+
+def _launcher(scratch: Path, *, plan=None, stage=False, **overrides):
     clock = overrides.pop("clock", FakeClock())
     image = overrides.pop("image", FakeImage(clock))
     spawner = overrides.pop("spawner", FakeSpawner(clock))
+    registry = overrides.pop("registry_plan", bcc.derive_registry_input_plan_from_evidence())
     parent_env = overrides.pop(
         "parent_env",
         {
@@ -260,7 +409,12 @@ def _launcher(scratch: Path, **overrides):
             "EFFIGY_HOST_SCHEDULER": "1",
         },
     )
-    return bcc.ComparisonLauncher(
+    admitted_root = overrides.pop("admitted_root", None)
+    if stage:
+        assert plan is not None
+        _stage(plan, registry, clock)
+        admitted_root = plan.parent
+    launcher = bcc.ComparisonLauncher(
         clock=clock,
         spawner=spawner,
         image=image,
@@ -273,13 +427,30 @@ def _launcher(scratch: Path, **overrides):
         strict_names=overrides.pop("strict_names", False),
         budget_ns=overrides.pop("budget_ns", bcc.BUDGET_NS),
         reserve_ns=overrides.pop("reserve_ns", bcc.RESERVE_NS),
+        registry_plan=registry,
+        admitted_root=admitted_root,
+        tool_paths={"rustc": RUSTC_PATH, "cargo": CARGO_PATH},
+        caller="northstar-worker",
+        request_id=REQUEST_ID,
+        copy=overrides.pop("copy", _copy),
         **overrides,
-    ), clock, image, spawner
+    )
+    return launcher, plan, clock, image, spawner
+
+
+def _admitted_launcher(scratch: Path, name: str, **overrides):
+    plan = _plan(scratch / name)
+    clock = overrides.pop("clock", FakeClock())
+    _stage(plan, bcc.derive_registry_input_plan_from_evidence(), clock)
+    launcher, _, _, _, spawner = _launcher(
+        scratch, plan=plan, clock=clock, admitted_root=plan.parent, **overrides
+    )
+    return launcher, plan, spawner
 
 
 class PlanTests(unittest.TestCase):
     def test_plan_does_not_execute_effects(self) -> None:
-        launcher, _, image, spawner = _launcher(SCRATCH)
+        launcher, _, _, image, spawner = _launcher(SCRATCH)
         document = launcher.run(live=False, resource_plan=None)
         self.assertFalse(document["effects_executed"])
         self.assertEqual(document["outcome"], "plan")
@@ -289,8 +460,22 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(spawner.calls, [])
         self.assertIn("time.monotonic_ns", document["clocks"]["deadline_clock"])
 
+    def test_plan_reports_heavy_entry_and_registry_plan(self) -> None:
+        launcher, _, _, _, _ = _launcher(SCRATCH)
+        plan = _plan(SCRATCH / "packet")
+        document = launcher.plan(plan)
+        packet = document["launch_packet"]
+        self.assertEqual(packet["heavy_selector"], bcc.HEAVY_SELECTOR)
+        self.assertEqual(packet["admission"], "heavy")
+        self.assertEqual(packet["token_root"], str(plan.parent))
+        self.assertIn('admission = "heavy"', packet["manifest_template"])
+        self.assertIn("--host-run-request-id", packet["submit_argv"])
+        self.assertGreater(packet["registry_plan"]["archive_count"], 0)
+        self.assertGreater(packet["registry_plan"]["index_count"], 0)
+        self.assertFalse(document["effects_executed"])
+
     def test_live_disabled_without_resource_plan(self) -> None:
-        launcher, _, _, _ = _launcher(SCRATCH)
+        launcher, _, _, _, _ = _launcher(SCRATCH)
         with self.assertRaises(bcc.ComparisonError) as raised:
             launcher.run(live=True, resource_plan=None)
         self.assertEqual(raised.exception.seam, "live_opt_in_incomplete")
@@ -325,6 +510,307 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(raised.exception.seam, "count")
         self.assertIn("11th", raised.exception.message)
 
+    def test_cli_live_wires_submitter_and_mints_uuid(self) -> None:
+        options = bcc.parse_cli(["--live", "--resource-plan", "/x/plan.json"])
+        launcher = bcc.build_launcher(options)
+        self.assertIsInstance(launcher.submitter, bcc.SubprocessSubmitter)
+        self.assertEqual(launcher.caller, bcc.DEFAULT_CALLER)
+        parsed = uuid.UUID(launcher.request_id)
+        self.assertEqual(str(parsed), launcher.request_id)
+        self.assertNotEqual(
+            launcher.request_id, "00000000-0000-4000-8000-000000000000"
+        )
+
+    def test_cli_admitted_and_plan_roles_have_no_submitter(self) -> None:
+        admitted = bcc.build_launcher(
+            bcc.parse_cli(["--live", "--admitted-root", "/p", "--resource-plan", "/x"])
+        )
+        self.assertIsNone(admitted.submitter)
+        planned = bcc.build_launcher(bcc.parse_cli(["--resource-plan", "/x"]))
+        self.assertIsNone(planned.submitter)
+
+    def test_cli_request_id_can_be_replayed(self) -> None:
+        launcher = bcc.build_launcher(
+            bcc.parse_cli(["--live", "--request-id", REQUEST_ID, "--resource-plan", "/x"])
+        )
+        self.assertEqual(launcher.request_id, REQUEST_ID)
+
+
+class RegistryPlanTests(unittest.TestCase):
+    def test_lock_parser_and_shards(self) -> None:
+        text = (
+            '[[package]]\nname = "cc"\nversion = "1.4.7"\n'
+            'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+            'checksum = "abc"\n\n'
+            '[[package]]\nname = "serde"\nversion = "1.0.0"\n'
+            'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+            'checksum = "def"\n'
+        )
+        packages = bcc.parse_lock_packages(text)
+        self.assertEqual([p.name for p in packages], ["cc", "serde"])
+        self.assertEqual(bcc.sparse_index_shard("cc"), "2")
+        self.assertEqual(bcc.sparse_index_shard("a"), "1")
+        self.assertEqual(bcc.sparse_index_shard("abc"), "3/a")
+        self.assertEqual(bcc.sparse_index_shard("serde"), "se/rd")
+        plan = bcc.derive_registry_input_plan(packages, lock_sha256=bcc.CARGO_LOCK_SHA256)
+        rels = [item.rel for item in plan.inputs()]
+        self.assertIn("registry/cache/index.crates.io-1949cf8c6b5b557f/cc-1.4.7.crate", rels)
+        self.assertIn(
+            "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/2/cc", rels
+        )
+
+    def test_evidence_derivation_is_canonical_and_deterministic(self) -> None:
+        first = bcc.derive_registry_input_plan_from_evidence()
+        second = bcc.derive_registry_input_plan_from_evidence()
+        self.assertEqual(first.digest(), second.digest())
+        self.assertEqual(first.lock_sha256, bcc.CARGO_LOCK_SHA256)
+        for item in first.inputs():
+            self.assertTrue(
+                bcc._is_relative_to(item.src, bcc.CARGO_CACHE_ROOT)
+                or bcc._is_relative_to(item.src, bcc.CARGO_INDEX_ROOT)
+            )
+
+    def test_non_crates_io_source_refuses(self) -> None:
+        package = bcc.LockedPackage(name="x", version="1", source="git+https://example", checksum="a")
+        with self.assertRaises(bcc.ComparisonError) as raised:
+            bcc.derive_registry_input_plan([package], lock_sha256=bcc.CARGO_LOCK_SHA256)
+        self.assertEqual(raised.exception.seam, "registry_plan")
+
+    def test_registry_input_outside_roots_refuses(self) -> None:
+        plan = _plan(SCRATCH / "outside")
+        plan = bcc.ResourcePlan(
+            launch_id=plan.launch_id,
+            parent=plan.parent,
+            mount=plan.mount,
+            backing=plan.backing,
+            nucleus_source=plan.nucleus_source,
+            registry_inputs=(
+                bcc.RegistryInput(src=Path("/tmp/elsewhere/foo.crate"), rel="registry/cache/x"),
+            ),
+        )
+        with self.assertRaises(bcc.ComparisonError) as raised:
+            bcc.validate_resource_plan(plan, strict_names=False)
+        self.assertEqual(raised.exception.seam, "source_cache_unbound")
+
+
+class StagingTests(unittest.TestCase):
+    def test_stage_and_validate_exact_bootstrap(self) -> None:
+        plan = _plan(SCRATCH / "stage")
+        registry = bcc.derive_registry_input_plan_from_evidence()
+        clock = FakeClock()
+        staged = _stage(plan, registry, clock)
+        self.assertEqual(sorted(p.name for p in plan.parent.iterdir()), sorted(bcc.STAGED_ENTRIES))
+        validated = bcc.validate_staged_session(
+            plan,
+            expected=None,
+            launcher_path=Path(bcc.__file__).resolve(),
+            registry_plan=registry,
+        )
+        self.assertEqual(validated.manifest_digest, staged.manifest_digest)
+        self.assertEqual(validated.plan_digest, staged.plan_digest)
+
+    def test_preexisting_root_is_refused(self) -> None:
+        plan = _plan(SCRATCH / "preexisting")
+        plan.parent.mkdir(parents=True)
+        launcher, _, _, _, _ = _launcher(SCRATCH)
+        document = launcher.plan(plan)
+        self.assertFalse(document["live_ready"])
+        self.assertTrue(any("path_exists" in note for note in document["notes"]))
+
+    def test_unexpected_entry_refuses(self) -> None:
+        plan = _plan(SCRATCH / "extra")
+        registry = bcc.derive_registry_input_plan_from_evidence()
+        _stage(plan, registry, FakeClock())
+        (plan.parent / "unexpected.txt").write_text("nope", encoding="utf-8")
+        with self.assertRaises(bcc.ComparisonError) as raised:
+            bcc.validate_staged_session(
+                plan,
+                expected=None,
+                launcher_path=Path(bcc.__file__).resolve(),
+                registry_plan=registry,
+            )
+        self.assertEqual(raised.exception.seam, "staged_session")
+
+    def test_tampered_manifest_refuses(self) -> None:
+        plan = _plan(SCRATCH / "tamper")
+        registry = bcc.derive_registry_input_plan_from_evidence()
+        _stage(plan, registry, FakeClock())
+        (plan.parent / bcc.STAGED_MANIFEST_NAME).write_text("garbage", encoding="utf-8")
+        with self.assertRaises(bcc.ComparisonError) as raised:
+            bcc.validate_staged_session(
+                plan,
+                expected=None,
+                launcher_path=Path(bcc.__file__).resolve(),
+                registry_plan=registry,
+            )
+        self.assertEqual(raised.exception.seam, "staged_session")
+
+    def test_staged_plan_is_loadable_resource_plan(self) -> None:
+        plan = _plan(SCRATCH / "loadable")
+        _stage(plan, bcc.derive_registry_input_plan_from_evidence(), FakeClock())
+        loaded = bcc.load_resource_plan(plan.parent / bcc.STAGED_PLAN_NAME)
+        self.assertEqual(loaded.launch_id, plan.launch_id)
+        self.assertEqual(loaded.parent, plan.parent)
+        self.assertEqual(loaded.mount, plan.mount)
+        self.assertEqual(loaded.backing, plan.backing)
+        self.assertEqual(loaded.nucleus_source, plan.nucleus_source)
+        self.assertTrue(loaded.registry_inputs)
+        self.assertTrue(
+            all(item.src.is_absolute() for item in loaded.registry_inputs)
+        )
+
+    def test_path_escape_rel_refuses(self) -> None:
+        plan = _plan(SCRATCH / "escape")
+        plan = bcc.ResourcePlan(
+            launch_id=plan.launch_id,
+            parent=plan.parent,
+            mount=plan.mount,
+            backing=plan.backing,
+            nucleus_source=plan.nucleus_source,
+            registry_inputs=(
+                bcc.RegistryInput(
+                    src=bcc.CARGO_CACHE_ROOT / "foo.crate",
+                    rel="../../escape/foo.crate",
+                ),
+            ),
+        )
+        with self.assertRaises(bcc.ComparisonError) as raised:
+            bcc.validate_resource_plan(plan, strict_names=False)
+        self.assertEqual(raised.exception.seam, "source_cache_unbound")
+
+
+class AdmissionTests(unittest.TestCase):
+    def test_admitted_run_requires_supplied_root(self) -> None:
+        plan = _plan(SCRATCH / "noadmit")
+        registry = bcc.derive_registry_input_plan_from_evidence()
+        _stage(plan, registry, FakeClock())
+        launcher, _, _, _, _ = _launcher(SCRATCH, plan=plan, admitted_root=plan.parent / "other")
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["seam"], "admission_unverified")
+        self.assertFalse(document["effects_executed"])
+
+    def test_admitted_root_mismatch_refuses(self) -> None:
+        plan = _plan(SCRATCH / "wrongroot")
+        with self.assertRaises(bcc.ComparisonError) as raised:
+            bcc.verify_admission(
+                plan,
+                admitted_root=plan.parent.parent / "other",
+                parent_env={"HOST_RUN_ID": "r", "HOST_RUN_TOKEN": "t"},
+            )
+        self.assertEqual(raised.exception.seam, "admission_unverified")
+
+    def test_absent_token_refuses(self) -> None:
+        plan = _plan(SCRATCH / "notoken")
+        with self.assertRaises(bcc.ComparisonError) as raised:
+            bcc.verify_admission(plan, admitted_root=plan.parent, parent_env={})
+        self.assertEqual(raised.exception.seam, "admission_unverified")
+
+    def test_admitted_run_under_staged_root_succeeds(self) -> None:
+        plan = _plan(SCRATCH / "admitted")
+        registry = bcc.derive_registry_input_plan_from_evidence()
+        _stage(plan, registry, FakeClock())
+        launcher, _, _, _, spawner = _launcher(SCRATCH, plan=plan, admitted_root=plan.parent)
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "success", document.get("seam"))
+        self.assertEqual(document["count_delivered"], 10)
+        self.assertEqual(document["launch_packet"]["admission"]["root"], str(plan.parent))
+        self.assertTrue(document["log"].find("<redacted>") >= 0)
+        self.assertNotIn(TOKEN, document["log"])
+        for call in spawner.calls:
+            if call and call[0] == "effigy":
+                self.assertEqual(call[1], bcc.SELECTOR)
+        source = plan.mount / "src-on"
+        self.assertTrue(str(source).startswith(str(plan.parent)))
+
+
+class SubmissionTests(unittest.TestCase):
+    def test_binding_persisted_before_delivery(self) -> None:
+        plan = _plan(SCRATCH / "bind")
+        submitter = RecordingSubmitter(["launched"])
+        launcher, _, _, _, _ = _launcher(SCRATCH, submitter=submitter)
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "launched")
+        self.assertTrue(submitter.calls[0]["binding_present"])
+        self.assertEqual(submitter.calls[0]["request_id"], REQUEST_ID)
+        self.assertIn("--host-run-request-id", submitter.calls[0]["argv"])
+        self.assertEqual(submitter.calls[0]["cwd"], str(plan.parent))
+        self.assertEqual(document["launch_packet"]["binding"]["request_id"], REQUEST_ID)
+        self.assertFalse(document["launch_packet"]["never_launched"])
+
+    def test_authenticated_absence_allows_same_request_replay(self) -> None:
+        plan = _plan(SCRATCH / "replay")
+        submitter = RecordingSubmitter(["authenticated_absence", "launched"])
+        launcher, _, _, _, _ = _launcher(SCRATCH, submitter=submitter)
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "launched")
+        self.assertEqual(len(submitter.calls), 2)
+        self.assertEqual(submitter.calls[0]["request_id"], submitter.calls[1]["request_id"])
+        self.assertIn("authenticated_absence=unknown_run", document["log"])
+
+    def test_capacity_timeout_is_never_launched_partial(self) -> None:
+        plan = _plan(SCRATCH / "capacity")
+        submitter = RecordingSubmitter(["capacity_timeout"])
+        launcher, _, _, _, _ = _launcher(SCRATCH, submitter=submitter)
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "partial")
+        self.assertEqual(document["seam"], "never_launched_capacity_timeout")
+        self.assertTrue(document["launch_packet"]["never_launched"])
+        self.assertTrue(document["resources_retained"])
+
+    def test_held_reply_is_unknown_not_success(self) -> None:
+        plan = _plan(SCRATCH / "held")
+        submitter = RecordingSubmitter(["held"])
+        launcher, _, _, _, _ = _launcher(SCRATCH, submitter=submitter)
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "unknown")
+        self.assertEqual(document["seam"], "submit_ambiguous")
+        self.assertTrue(document["resources_retained"])
+
+    def test_held_then_authenticated_absence_replays_original_request(self) -> None:
+        plan = _plan(SCRATCH / "lostreply")
+        submitter = LostThenAbsentSubmitter()
+        launcher, _, _, _, _ = _launcher(SCRATCH, submitter=submitter)
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "launched")
+        self.assertEqual(len(submitter.submits), 2)
+        self.assertEqual(submitter.statuses, 1)
+        self.assertEqual(submitter.submits[0], submitter.submits[1])
+        self.assertIn("--host-run-request-id", submitter.submits[1])
+        self.assertIn(submitter.submits[1][2], submitter.submits[0])
+        self.assertIn("replaying the same request", document["log"])
+
+    def test_submitter_timeout_is_held_not_raised(self) -> None:
+        submitter = bcc.SubprocessSubmitter()
+        outcome = submitter.submit(
+            argv=[sys.executable, "-c", "import time; time.sleep(5)"],
+            cwd=str(SCRATCH),
+            request_id=REQUEST_ID,
+            caller="northstar-worker",
+            env={"PATH": os.environ.get("PATH", "/usr/bin")},
+            timeout_ns=50_000_000,
+        )
+        self.assertEqual(outcome.state, "held")
+        self.assertIn("timeout", outcome.detail or "")
+
+    def test_held_reply_follows_found_request(self) -> None:
+        plan = _plan(SCRATCH / "follow")
+        submitter = RecoveringSubmitter(follow_state="launched")
+        launcher, _, _, _, _ = _launcher(SCRATCH, submitter=submitter)
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "launched")
+        self.assertEqual(submitter.statuses, 1)
+        self.assertEqual(submitter.follows, 1)
+        self.assertIn("request found; following the settled host run", document["log"])
+
+    def test_held_reply_follow_failure_stays_unknown(self) -> None:
+        plan = _plan(SCRATCH / "followfail")
+        submitter = RecoveringSubmitter(follow_state="held")
+        launcher, _, _, _, _ = _launcher(SCRATCH, submitter=submitter)
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "unknown")
+        self.assertEqual(document["seam"], "submit_ambiguous")
+        self.assertTrue(document["resources_retained"])
+
 
 class DeadlineTests(unittest.TestCase):
     def test_utc_jump_does_not_extend_deadline(self) -> None:
@@ -342,9 +828,21 @@ class DeadlineTests(unittest.TestCase):
         self.assertTrue(session.expired_hard(clock.monotonic_ns()))
         self.assertEqual(session.deadline_monotonic_ns, 2_000_000_000)
 
+    def test_binding_deadline_is_adopted_not_reset(self) -> None:
+        plan = _plan(SCRATCH / "adopt")
+        registry = bcc.derive_registry_input_plan_from_evidence()
+        clock = FakeClock()
+        _stage(plan, registry, clock)
+        clock.advance(300_000_000_000)  # 5 minutes of capacity wait
+        launcher, _, _, _, _ = _launcher(SCRATCH, plan=plan, clock=clock, admitted_root=plan.parent)
+        document = launcher.run(live=True, resource_plan=plan)
+        expected_deadline = 1_000_000_000 + bcc.BUDGET_NS
+        self.assertEqual(document["session"]["deadline_monotonic_ns"], expected_deadline)
+        self.assertIn("session_adopted", document["log"])
+
     def test_second_operation_after_expiry_refused(self) -> None:
         clock = FakeClock()
-        launcher, _, _, spawner = _launcher(SCRATCH, clock=clock, budget_ns=10, reserve_ns=0)
+        launcher, _, _, _, spawner = _launcher(SCRATCH, clock=clock, budget_ns=10, reserve_ns=0)
         launcher._open_session()
         clock.advance(50)
         with self.assertRaises(bcc.ComparisonError) as raised:
@@ -381,18 +879,70 @@ class DeadlineTests(unittest.TestCase):
             self.assertFalse(alive)
 
     def test_unknown_closure_retains_resources(self) -> None:
+        plan = _plan(SCRATCH / "unknown")
         clock = FakeClock()
         spawner = FakeSpawner(clock)
         spawner.unknown_closure = True
         image = FakeImage(clock)
-        launcher, _, _, _ = _launcher(SCRATCH, clock=clock, spawner=spawner, image=image)
-        document = launcher.run(live=True, resource_plan=_plan(SCRATCH / "unknown"))
+        _stage(plan, bcc.derive_registry_input_plan_from_evidence(), clock)
+        launcher, _, _, _, _ = _launcher(
+            SCRATCH, plan=plan, clock=clock, spawner=spawner, image=image, admitted_root=plan.parent
+        )
+        document = launcher.run(live=True, resource_plan=plan)
         self.assertEqual(document["outcome"], "unknown")
         self.assertTrue(document["resources_retained"])
         self.assertFalse(image.detached)
         self.assertTrue(document["preparation_after_clock"])
-        self.assertIsNotNone(image.create_at)
-        self.assertGreaterEqual(image.create_at, document["session"]["start_monotonic_ns"])
+
+
+class BoundedIOTests(unittest.TestCase):
+    def _real_launcher(self, budget_ns: int = 5_000_000_000):
+        return bcc.ComparisonLauncher(
+            clock=bcc.RealClock(),
+            spawner=bcc.RealSpawner(),
+            budget_ns=budget_ns,
+            reserve_ns=100_000_000,
+            parent_env={"PATH": os.environ.get("PATH", "/usr/bin")},
+        )
+
+    def test_descendant_holding_pipe_is_not_infinite(self) -> None:
+        launcher = self._real_launcher()
+        started = time.monotonic_ns()
+        result = launcher.run_timed_helper(
+            [
+                "/bin/sh",
+                "-c",
+                "sleep 20 & echo emitted; exit 0",
+            ],
+            env={"PATH": os.environ.get("PATH", "/usr/bin")},
+            cwd=str(SCRATCH),
+        )
+        elapsed = time.monotonic_ns() - started
+        try:
+            self.assertEqual(result.outcome, "ok")
+            self.assertIn("emitted", result.stdout)
+            self.assertFalse(result.writer_closed)
+            self.assertFalse(result.child_terminated)
+            self.assertLess(elapsed, 3_000_000_000)
+            self.assertGreaterEqual(elapsed, bcc.PIPE_DRAIN_GRACE_NS - 200_000_000)
+        finally:
+            if result.pgid is not None:
+                try:
+                    os.killpg(result.pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_large_eof_output_is_bounded(self) -> None:
+        launcher = self._real_launcher()
+        size = bcc.PIPE_CAPTURE_CAP + 1024 * 1024
+        result = launcher.run_timed_helper(
+            [sys.executable, "-c", f"import sys; sys.stdout.write('x' * {size})"],
+            env={"PATH": os.environ.get("PATH", "/usr/bin")},
+            cwd=str(SCRATCH),
+        )
+        self.assertEqual(result.outcome, "ok")
+        self.assertTrue(result.writer_closed)
+        self.assertLessEqual(len(result.stdout.encode("utf-8")), bcc.PIPE_CAPTURE_CAP)
 
 
 class ContainmentTests(unittest.TestCase):
@@ -404,19 +954,11 @@ class ContainmentTests(unittest.TestCase):
             mount=parent / "m",
             backing=parent / "m" / "cmp.sparseimage",
             nucleus_source=Path("/Users/tom/Dev/projects/nucleus"),
-            registry_inputs=(bcc.RegistryInput(src=SCRATCH / "c", rel="a"),),
+            registry_inputs=(bcc.RegistryInput(src=bcc.CARGO_CACHE_ROOT / "c", rel="a"),),
         )
         with self.assertRaises(bcc.ComparisonError) as raised:
             bcc.validate_resource_plan(plan)
         self.assertIn(raised.exception.seam, {"backing_under_mount", "containment_names"})
-
-    def test_existing_parent_refuses(self) -> None:
-        plan = _plan(SCRATCH / "exists")
-        plan.parent.mkdir(parents=True)
-        launcher, _, _, _ = _launcher(SCRATCH)
-        document = launcher.plan(plan)
-        self.assertFalse(document["live_ready"])
-        self.assertTrue(any("path_exists" in note for note in document["notes"]))
 
     def test_symlink_path_refuses(self) -> None:
         root = SCRATCH / "sym"
@@ -429,71 +971,93 @@ class ContainmentTests(unittest.TestCase):
         self.assertTrue(bcc.ancestor_symlink(nested))
 
     def test_imageinfo_overhead_sum_included(self) -> None:
+        plan = _plan(SCRATCH / "over")
         clock = FakeClock()
         image = FakeImage(clock, IMAGEINFO_OVER)
-        launcher, _, _, _ = _launcher(SCRATCH, clock=clock, image=image)
-        document = launcher.run(live=True, resource_plan=_plan(SCRATCH / "over"))
+        _stage(plan, bcc.derive_registry_input_plan_from_evidence(), clock)
+        launcher, _, _, _, _ = _launcher(
+            SCRATCH, plan=plan, clock=clock, image=image, admitted_root=plan.parent
+        )
+        document = launcher.run(live=True, resource_plan=plan)
         self.assertEqual(document["outcome"], "refusal")
         self.assertEqual(document["seam"], "footprint")
 
     def test_host_space_unknown_stops(self) -> None:
-        launcher, _, _, _ = _launcher(SCRATCH, space_probe=lambda: None)
-        document = launcher.run(live=True, resource_plan=_plan(SCRATCH / "space"))
+        plan = _plan(SCRATCH / "space")
+        clock = FakeClock()
+        _stage(plan, bcc.derive_registry_input_plan_from_evidence(), clock)
+        launcher, _, _, _, _ = _launcher(
+            SCRATCH, plan=plan, clock=clock, space_probe=lambda: None, admitted_root=plan.parent
+        )
+        document = launcher.run(live=True, resource_plan=plan)
         self.assertEqual(document["outcome"], "refusal")
         self.assertEqual(document["seam"], "host_reserve")
 
-    def test_source_cache_unbound_refuses(self) -> None:
-        parent = Path("/private/var/tmp/oxide-build-context-cmp-unbound")
-        plan = bcc.ResourcePlan(
-            launch_id="unbound",
-            parent=parent,
-            mount=parent / "m",
-            backing=parent / "cmp.sparseimage",
-            nucleus_source=Path("/Users/tom/Dev/projects/nucleus"),
-            registry_inputs=(),
+    def test_missing_named_input_refuses(self) -> None:
+        plan = _plan(SCRATCH / "missing")
+        clock = FakeClock()
+        _stage(plan, bcc.derive_registry_input_plan_from_evidence(), clock)
+
+        def failing_copy(src, dest):
+            raise FileNotFoundError(str(src))
+
+        launcher, _, _, _, _ = _launcher(
+            SCRATCH, plan=plan, clock=clock, copy=failing_copy, admitted_root=plan.parent
         )
-        with self.assertRaises(bcc.ComparisonError) as raised:
-            bcc.validate_resource_plan(plan)
-        self.assertEqual(raised.exception.seam, "source_cache_unbound")
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "refusal")
+        self.assertEqual(document["seam"], "source_cache_unbound")
 
     def test_source_cache_copy_stays_inside_mount(self) -> None:
+        plan = _plan(SCRATCH / "cache")
         clock = FakeClock()
         image = FakeImage(clock)
-        launcher, _, _, _ = _launcher(SCRATCH, clock=clock, image=image)
-        plan = _plan(SCRATCH / "cache")
+        _stage(plan, bcc.derive_registry_input_plan_from_evidence(), clock)
+        launcher, _, _, _, _ = _launcher(
+            SCRATCH, plan=plan, clock=clock, image=image, admitted_root=plan.parent
+        )
         document = launcher.run(live=True, resource_plan=plan)
-        copied = plan.mount / "cargo-home" / "registry" / "cache" / "foo.crate"
+        copied = plan.mount / "cargo-home" / "registry" / "cache" / "index.crates.io-1949cf8c6b5b557f" / "foo-0.1.0.crate"
         self.assertTrue(copied.is_file())
         self.assertEqual(copied.read_bytes(), b"crate")
         self.assertTrue(document["preparation_after_clock"])
 
 
 class IdentityTests(unittest.TestCase):
+    def _admitted(self, name: str, **overrides):
+        plan = _plan(SCRATCH / name)
+        clock = overrides.pop("clock", FakeClock())
+        _stage(plan, bcc.derive_registry_input_plan_from_evidence(), clock)
+        launcher, _, _, _, spawner = _launcher(
+            SCRATCH, plan=plan, clock=clock, admitted_root=plan.parent, **overrides
+        )
+        return launcher, plan, spawner
+
     def test_tool_mismatch_refuses_before_tests(self) -> None:
         clock = FakeClock()
-        spawner = FakeSpawner(clock, rustc_ok=False)
-        launcher, _, _, _ = _launcher(SCRATCH, clock=clock, spawner=spawner)
-        document = launcher.run(live=True, resource_plan=_plan(SCRATCH / "tool"))
+        launcher, plan, spawner = self._admitted("tool", clock=clock, spawner=FakeSpawner(clock, rustc_ok=False))
+        document = launcher.run(live=True, resource_plan=plan)
         self.assertEqual(document["outcome"], "refusal")
         self.assertEqual(document["seam"], "tool_identity")
         self.assertFalse(any(call and call[0] == "effigy" for call in spawner.calls))
 
     def test_mixed_cargo_rustc_refuses(self) -> None:
         clock = FakeClock()
-        spawner = FakeSpawner(clock, cargo_ok=False)
-        launcher, _, _, _ = _launcher(SCRATCH, clock=clock, spawner=spawner)
-        document = launcher.run(live=True, resource_plan=_plan(SCRATCH / "mixed"))
+        launcher, plan, spawner = self._admitted("mixed", clock=clock, spawner=FakeSpawner(clock, cargo_ok=False))
+        document = launcher.run(live=True, resource_plan=plan)
         self.assertEqual(document["seam"], "tool_identity")
         self.assertEqual(spawner.calls, [("cargo", "-vV")])
 
     def test_source_pin_mismatch_refuses(self) -> None:
-        launcher, _, _, spawner = _launcher(SCRATCH, git=_git_bad_tree)
-        document = launcher.run(live=True, resource_plan=_plan(SCRATCH / "src"))
+        launcher, plan, spawner = self._admitted("src", git=_git_bad_tree)
+        document = launcher.run(live=True, resource_plan=plan)
         self.assertEqual(document["seam"], "source_identity")
         self.assertFalse(any(call and call[0] == "effigy" for call in spawner.calls))
 
     def test_forbidden_config_refuses(self) -> None:
         plan = _plan(SCRATCH / "cfg")
+        clock = FakeClock()
+        _stage(plan, bcc.derive_registry_input_plan_from_evidence(), clock)
         config_dir = SCRATCH / "cfg-config"
         config_dir.mkdir()
         config = config_dir / "config.toml"
@@ -502,47 +1066,76 @@ class IdentityTests(unittest.TestCase):
         def paths(*args):
             return [config]
 
-        launcher, _, _, _ = _launcher(SCRATCH, config_paths=paths)
+        launcher, _, _, _, _ = _launcher(
+            SCRATCH, plan=plan, clock=clock, config_paths=paths, admitted_root=plan.parent
+        )
         document = launcher.run(live=True, resource_plan=plan)
         self.assertEqual(document["seam"], "config_identity")
 
 
-class AdmissionTests(unittest.TestCase):
-    def test_admission_fields_propagated_and_token_redacted(self) -> None:
-        clock = FakeClock()
-        spawner = FakeSpawner(clock)
-        launcher, _, _, _ = _launcher(SCRATCH, clock=clock, spawner=spawner)
-        document = launcher.run(live=True, resource_plan=_plan(SCRATCH / "adm"))
-        self.assertGreaterEqual(len(spawner.envs), 1)
-        child = spawner.envs[0]
-        self.assertEqual(child["HOST_RUN_TOKEN"], TOKEN)
-        self.assertEqual(child["HOST_RUN_ID"], "run_0001")
-        self.assertEqual(child["EFFIGY_HOST_SCHEDULER"], "1")
-        self.assertIn("EFFIGY_HOST_RUN_ROOT", child)
-        self.assertNotIn(TOKEN, document["log"])
-        self.assertIn("<redacted>", document["log"])
-        self.assertEqual(child["CARGO_INCREMENTAL"], "0")
-        self.assertEqual(child["CARGO_PROFILE_DEV_SPLIT_DEBUGINFO"], "unpacked")
+class MeasurementTests(unittest.TestCase):
+    def _admitted(self, name: str, **overrides):
+        return _admitted_launcher(SCRATCH, name, **overrides)
 
-    def test_admission_names_match_contract(self) -> None:
-        self.assertEqual(
-            bcc.ADMISSION_PRESERVE[:2],
-            ("HOST_RUN_TOKEN", "HOST_RUN_ID"),
+    def test_measurements_use_debug_dirs_and_union(self) -> None:
+        launcher, plan, _ = self._admitted("meas")
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "success", document.get("seam"))
+        self.assertEqual(len(document["measurements"]), 8)
+        rec = document["measurements"][0]
+        self.assertEqual((rec["mode"], rec["step"]), ("off", "C0"))
+        self.assertEqual(rec["problems"], [])
+        self.assertIn(
+            str(plan.mount / "target-off" / "debug" / "deps"), rec["per_dir"]
         )
-        self.assertIn("EFFIGY_HOST_RUN_ROOT", bcc.ADMISSION_PRESERVE)
-        self.assertIn("EFFIGY_HOST_SCHEDULER", bcc.ADMISSION_PRESERVE)
-        self.assertIn("EFFIGY_SCHEDULER_OVERRIDE", bcc.ADMISSION_PRESERVE)
+        self.assertIn(
+            str(plan.mount / "target-off" / "debug" / "incremental"), rec["per_dir"]
+        )
+        self.assertGreater(rec["union_file_count"], 0)
+        self.assertIn("cannot confound", rec["apfs_clone_sharing"])
 
+    def test_zero_test_result_is_partial(self) -> None:
+        launcher, plan, _ = self._admitted(
+            "zero",
+            spawner=FakeSpawner(
+                FakeClock(), test_line="test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out", test_ran=False
+            ),
+        )
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "partial")
+        self.assertEqual(document["seam"], "measurement")
 
-class EvidenceTests(unittest.TestCase):
-    def test_output_overflow_keeps_critical_identity(self) -> None:
-        log = bcc.EvidenceLog(limit=2048, critical_reserve=256)
-        log.write("x" * 4000)
-        self.assertTrue(log.overflow)
-        log.write(f"selected_test={bcc.TEST_NAME} failed", critical=True)
-        text = log.text()
-        self.assertIn("partial=true", text)
-        self.assertIn(bcc.TEST_NAME, text)
+    def test_wrong_incremental_flag_is_partial(self) -> None:
+        launcher, plan, _ = self._admitted(
+            "wronginc", spawner=FakeSpawner(FakeClock(), force_incremental="off")
+        )
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "partial")
+        self.assertEqual(document["seam"], "measurement")
+
+    def test_missing_debuginfo_is_partial(self) -> None:
+        launcher, plan, _ = self._admitted(
+            "nodebug", spawner=FakeSpawner(FakeClock(), emit_debuginfo=False)
+        )
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "partial")
+        self.assertEqual(document["seam"], "measurement")
+
+    def test_missing_rustc_invocations_is_partial(self) -> None:
+        launcher, plan, _ = self._admitted(
+            "norustc", spawner=FakeSpawner(FakeClock(), emit_rustc=False)
+        )
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "partial")
+        self.assertEqual(document["seam"], "measurement")
+
+    def test_rustc_wrapper_prefix_refuses(self) -> None:
+        launcher, plan, _ = self._admitted(
+            "wrap", spawner=FakeSpawner(FakeClock(), rustc_path="/usr/bin/sccache")
+        )
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "refusal")
+        self.assertEqual(document["seam"], "rustc_wrapper")
 
     def test_hardlink_union_accounting(self) -> None:
         root = SCRATCH / "acct"
@@ -565,6 +1158,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(acc.logical_bytes, 2 * len(b"hello-world-bytes"))
         self.assertEqual(acc.allocated_bytes, bcc.allocated_bytes(os.lstat(one)))
         self.assertIn("cannot confound", acc.apfs_clone_sharing)
+        self.assertEqual(acc.per_dir[str(deps)].file_count, 1)
 
     def test_host_cargo_home_is_not_scanned(self) -> None:
         outside = SCRATCH / "fake-cargo-home"
@@ -579,19 +1173,32 @@ class EvidenceTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.seam, "accounting_root_outside_owned")
 
-    def test_stale_executable_ambiguity(self) -> None:
-        target = SCRATCH / "tgt"
-        deps = target / "debug" / "deps"
-        deps.mkdir(parents=True)
-        first = deps / "packages-old"
-        second = deps / "packages-new"
-        first.write_text("old", encoding="utf-8")
-        second.write_text("new", encoding="utf-8")
-        with self.assertRaises(bcc.ComparisonError) as raised:
-            bcc.locate_reported_executable(None, target)
-        self.assertEqual(raised.exception.seam, "stale_executable_ambiguity")
-        located = bcc.locate_reported_executable(str(second), target)
-        self.assertEqual(located, second)
+
+class EvidenceTests(unittest.TestCase):
+    def test_output_overflow_keeps_critical_identity(self) -> None:
+        log = bcc.EvidenceLog(limit=2048, critical_reserve=256)
+        log.write("x" * 4000)
+        self.assertTrue(log.overflow)
+        log.write(f"selected_test={bcc.TEST_NAME} failed", critical=True)
+        text = log.text()
+        self.assertIn("partial=true", text)
+        self.assertIn(bcc.TEST_NAME, text)
+
+    def test_admission_fields_propagated_and_token_redacted(self) -> None:
+        launcher, plan, _ = _admitted_launcher(SCRATCH, "adm")
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "success", document.get("seam"))
+        self.assertNotIn(TOKEN, document["log"])
+        self.assertIn("<redacted>", document["log"])
+
+    def test_admission_names_match_contract(self) -> None:
+        self.assertEqual(
+            bcc.ADMISSION_PRESERVE[:2],
+            ("HOST_RUN_TOKEN", "HOST_RUN_ID"),
+        )
+        self.assertIn("EFFIGY_HOST_RUN_ROOT", bcc.ADMISSION_PRESERVE)
+        self.assertIn("EFFIGY_HOST_SCHEDULER", bcc.ADMISSION_PRESERVE)
+        self.assertIn("EFFIGY_SCHEDULER_OVERRIDE", bcc.ADMISSION_PRESERVE)
 
     def test_restore_after_negative_check(self) -> None:
         clock = FakeClock()
@@ -601,8 +1208,11 @@ class EvidenceTests(unittest.TestCase):
             git_calls.append(list(argv))
             return _git_ok(argv, cwd)
 
-        launcher, _, _, _ = _launcher(SCRATCH, clock=clock, git=git)
         plan = _plan(SCRATCH / "neg")
+        _stage(plan, bcc.derive_registry_input_plan_from_evidence(), clock)
+        launcher, _, _, _, _ = _launcher(
+            SCRATCH, plan=plan, clock=clock, git=git, admitted_root=plan.parent
+        )
         document = launcher.run(live=True, resource_plan=plan)
         source = plan.mount / "src-on"
         self.assertTrue((source / "packages").is_dir())
@@ -614,50 +1224,33 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(document["outcome"], "success")
 
     def test_panic_header_without_frame_is_partial(self) -> None:
+        plan = _plan(SCRATCH / "hdr")
         clock = FakeClock()
+        _stage(plan, bcc.derive_registry_input_plan_from_evidence(), clock)
         spawner = FakeSpawner(clock, negative_stderr=HEADER_ONLY_NEGATIVE_STDERR)
-        launcher, _, _, _ = _launcher(SCRATCH, clock=clock, spawner=spawner)
-        document = launcher.run(live=True, resource_plan=_plan(SCRATCH / "hdr"))
+        launcher, _, _, _, _ = _launcher(
+            SCRATCH, plan=plan, clock=clock, spawner=spawner, admitted_root=plan.parent
+        )
+        document = launcher.run(live=True, resource_plan=plan)
         self.assertEqual(document["outcome"], "partial")
         self.assertEqual(document["seam"], "backtrace_frame")
 
     def test_restore_dirty_porcelain_is_partial(self) -> None:
+        plan = _plan(SCRATCH / "dirty")
+        clock = FakeClock()
+        _stage(plan, bcc.derive_registry_input_plan_from_evidence(), clock)
+
         def git(argv, cwd=None):
             if argv[:2] == ["status", "--porcelain"]:
                 return " M crates/nucleus-core/src/lib.rs\n"
             return _git_ok(argv, cwd)
 
-        launcher, _, _, _ = _launcher(SCRATCH, git=git)
-        document = launcher.run(live=True, resource_plan=_plan(SCRATCH / "dirty"))
+        launcher, _, _, _, _ = _launcher(
+            SCRATCH, plan=plan, clock=clock, git=git, admitted_root=plan.parent
+        )
+        document = launcher.run(live=True, resource_plan=plan)
         self.assertEqual(document["outcome"], "partial")
         self.assertEqual(document["seam"], "restore")
-
-    def test_union_and_invocation_measurements_wired(self) -> None:
-        clock = FakeClock()
-        launcher, _, _, _ = _launcher(SCRATCH, clock=clock)
-        document = launcher.run(live=True, resource_plan=_plan(SCRATCH / "meas"))
-        self.assertEqual(document["outcome"], "success")
-        self.assertEqual(len(document["measurements"]), 8)
-        rec = document["measurements"][0]
-        self.assertEqual(rec["mode"], "off")
-        self.assertEqual(rec["step"], "C0")
-        self.assertEqual(rec["exit_code"], 0)
-        self.assertGreater(rec["duration_ns"], 0)
-        self.assertGreaterEqual(rec["compiling"], 1)
-        self.assertGreaterEqual(rec["fresh"], 1)
-        self.assertIn("test result:", rec["test_result"] or "")
-        self.assertGreaterEqual(rec["deps_files"], 1)
-        self.assertGreaterEqual(rec["union_file_count"], 1)
-        self.assertIn("cannot confound", rec["apfs_clone_sharing"])
-        self.assertIn("measure off C0", document["log"])
-
-    def test_rustc_wrapper_prefix_refuses(self) -> None:
-        clock = FakeClock()
-        spawner = FakeSpawner(clock, rustc_running_prefix="/usr/bin/sccache /usr/bin/rustc")
-        launcher, _, _, _ = _launcher(SCRATCH, clock=clock, spawner=spawner)
-        document = launcher.run(live=True, resource_plan=_plan(SCRATCH / "wrap"))
-        self.assertEqual(document["outcome"], "refusal")
-        self.assertEqual(document["seam"], "rustc_wrapper")
 
 
 class LocatorTests(unittest.TestCase):
@@ -698,15 +1291,46 @@ class LocatorTests(unittest.TestCase):
         self.assertFalse(bcc.backtrace_has_packages_frame(HEADER_ONLY_NEGATIVE_STDERR))
         self.assertTrue(bcc.backtrace_has_packages_frame(DEFAULT_NEGATIVE_STDERR))
 
+    def test_stale_executable_ambiguity(self) -> None:
+        target = SCRATCH / "tgt"
+        deps = target / "debug" / "deps"
+        deps.mkdir(parents=True)
+        first = deps / "packages-old"
+        second = deps / "packages-new"
+        first.write_text("old", encoding="utf-8")
+        second.write_text("new", encoding="utf-8")
+        with self.assertRaises(bcc.ComparisonError) as raised:
+            bcc.locate_reported_executable(None, target)
+        self.assertEqual(raised.exception.seam, "stale_executable_ambiguity")
+        located = bcc.locate_reported_executable(str(second), target)
+        self.assertEqual(located, second)
+
+    def test_parses_rustc_flags(self) -> None:
+        text = (
+            "     Running `/usr/bin/rustc --crate-name nucleus-core --edition 2021 "
+            "-C debuginfo=line-tables-only -C split-debuginfo=unpacked "
+            "-C incremental=/tmp/inc`\n"
+        )
+        invocations = bcc.parse_rustc_invocations(text)
+        self.assertEqual(len(invocations), 1)
+        self.assertEqual(invocations[0].crate_name, "nucleus-core")
+        self.assertEqual(invocations[0].incremental, "/tmp/inc")
+        self.assertEqual(invocations[0].debuginfo, "line-tables-only")
+        self.assertEqual(invocations[0].split_debuginfo, "unpacked")
+
 
 class SamplingTests(unittest.TestCase):
     def test_cadence_sample_during_helper(self) -> None:
+        plan = _plan(SCRATCH / "cadence")
         clock = FakeClock()
+        _stage(plan, bcc.derive_registry_input_plan_from_evidence(), clock)
         spawner = FakeSpawner(clock, advance_ns=bcc.SAMPLE_CADENCE_NS)
         image = FakeImage(clock)
-        launcher, _, _, _ = _launcher(SCRATCH, clock=clock, spawner=spawner, image=image)
-        document = launcher.run(live=True, resource_plan=_plan(SCRATCH / "cadence"))
-        self.assertEqual(document["outcome"], "success")
+        launcher, _, _, _, _ = _launcher(
+            SCRATCH, plan=plan, clock=clock, spawner=spawner, image=image, admitted_root=plan.parent
+        )
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "success", document.get("seam"))
         self.assertGreaterEqual(document["sampling"]["sample_count"], 2)
         self.assertIn("reason=cadence", document["log"])
         self.assertGreaterEqual(document["sampling"]["peak_image_used"], 4096)
@@ -714,7 +1338,9 @@ class SamplingTests(unittest.TestCase):
         self.assertEqual(document["sampling"]["cadence_ns"], bcc.SAMPLE_CADENCE_NS)
 
     def test_cadence_image_threshold_stops(self) -> None:
+        plan = _plan(SCRATCH / "cad-th")
         clock = FakeClock()
+        _stage(plan, bcc.derive_registry_input_plan_from_evidence(), clock)
         image = FakeImage(clock)
         n = {"c": 0}
         original = image.imageinfo
@@ -727,8 +1353,10 @@ class SamplingTests(unittest.TestCase):
 
         image.imageinfo = wrapped  # type: ignore[method-assign]
         spawner = FakeSpawner(clock, advance_ns=bcc.SAMPLE_CADENCE_NS)
-        launcher, _, _, _ = _launcher(SCRATCH, clock=clock, spawner=spawner, image=image)
-        document = launcher.run(live=True, resource_plan=_plan(SCRATCH / "cad-th"))
+        launcher, _, _, _, _ = _launcher(
+            SCRATCH, plan=plan, clock=clock, spawner=spawner, image=image, admitted_root=plan.parent
+        )
+        document = launcher.run(live=True, resource_plan=plan)
         self.assertEqual(document["outcome"], "refusal")
         self.assertEqual(document["seam"], "image_threshold")
 
@@ -742,7 +1370,7 @@ class ParseTests(unittest.TestCase):
     def test_counted_effigy_argv_has_separators(self) -> None:
         argv = bcc.EFFIGY_TEST_ARGV
         self.assertEqual(argv[0], "effigy")
-        self.assertEqual(argv[1], "check:core:test")
+        self.assertEqual(argv[1], bcc.SELECTOR)
         self.assertEqual(argv[2], "--")
         self.assertIn("--exact", argv)
         self.assertIn(bcc.TEST_NAME, argv)
