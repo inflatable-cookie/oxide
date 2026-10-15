@@ -1403,6 +1403,7 @@ impl ProbeDaemon {
                     cap_bytes: 7 * GIB,
                     free_reserve_bytes: HOST_RESERVE,
                 },
+                backing: None,
             },
             Arc::new(FixtureAuthority),
             free_space,

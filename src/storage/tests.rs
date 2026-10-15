@@ -140,6 +140,7 @@ impl RunningDaemon {
             DaemonConfig {
                 root: root.to_path_buf(),
                 budget,
+                backing: None,
             },
             authority,
             Arc::new(FixedFreeSpace(free_bytes)),
@@ -388,6 +389,7 @@ fn child_daemon_process() {
         DaemonConfig {
             root: PathBuf::from(root),
             budget: budget(128),
+            backing: None,
         },
         Arc::new(TestAuthority),
         Arc::new(FixedFreeSpace(Some(1024))),
@@ -807,6 +809,7 @@ fn unsupported_ledger_version_preserves_old_ledger_and_slot_evidence() {
         DaemonConfig {
             root: root.path().to_path_buf(),
             budget: budget(128),
+            backing: None,
         },
         Arc::new(TestAuthority),
         Arc::new(FixedFreeSpace(Some(1024))),
@@ -837,6 +840,7 @@ fn a_second_daemon_cannot_bind_the_same_private_root() {
         DaemonConfig {
             root: root.path().to_path_buf(),
             budget: budget(128),
+            backing: None,
         },
         Arc::new(TestAuthority),
         Arc::new(FixedFreeSpace(Some(1024))),
@@ -1162,6 +1166,7 @@ fn daemon_refuses_symlinked_roots_and_preserves_unknown_root_files() {
         DaemonConfig {
             root: alias,
             budget: budget(128),
+            backing: None,
         },
         Arc::new(TestAuthority),
         Arc::new(FixedFreeSpace(Some(1024))),
@@ -1175,6 +1180,7 @@ fn daemon_refuses_symlinked_roots_and_preserves_unknown_root_files() {
         DaemonConfig {
             root: unknown_root.path().to_path_buf(),
             budget: budget(128),
+            backing: None,
         },
         Arc::new(TestAuthority),
         Arc::new(FixedFreeSpace(Some(1024))),
@@ -1902,6 +1908,7 @@ fn ordinary_cargo_defaults_to_rejecting_uninstalled_policy() {
         DaemonConfig {
             root: storage.path().to_path_buf(),
             budget: budget(128),
+            backing: None,
         },
         Arc::new(RejectingOrdinaryAuthority),
         Arc::new(FixedFreeSpace(Some(1024))),
@@ -2012,6 +2019,7 @@ fn ordinary_cargo_uses_checked_budget_and_free_space_and_refuses_incompatible_ep
         DaemonConfig {
             root: unknown_storage.path().to_path_buf(),
             budget: budget(64),
+            backing: None,
         },
         Arc::new(TestAuthority),
         Arc::new(FixedFreeSpace(None)),
@@ -2042,6 +2050,7 @@ fn ordinary_cargo_uses_checked_budget_and_free_space_and_refuses_incompatible_ep
                 cap_bytes: 64,
                 free_reserve_bytes: u64::MAX,
             },
+            backing: None,
         },
         Arc::new(TestAuthority),
         Arc::new(FixedFreeSpace(Some(u64::MAX))),

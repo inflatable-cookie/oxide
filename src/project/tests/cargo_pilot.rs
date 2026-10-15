@@ -392,6 +392,7 @@ impl DaemonGuard {
                     cap_bytes: 7 * GIB,
                     free_reserve_bytes: 20 * GIB,
                 },
+                backing: None,
             },
             Arc::new(FixtureAuthority),
             Arc::new(PilotSpace),

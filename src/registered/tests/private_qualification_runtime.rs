@@ -167,6 +167,7 @@ fn bootstrap_for(
         budget: budget(),
         admissions: subjects,
         ordinary_cargo_request_digests: Vec::new(),
+        bounded: None,
         authority_key_hex: AUTHORITY_KEY.into(),
         control_key_hex: CONTROL_KEY.into(),
         control: RuntimeEndpoint {
@@ -277,6 +278,7 @@ impl Runtime {
             serde_json::from_value(json!(grace)).unwrap(),
             &subjects,
             &[],
+            None,
         )
         .unwrap();
         let storage_socket = storage_root.join("daemon.sock");

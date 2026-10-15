@@ -1,3 +1,4 @@
+use super::bounded::{validate_payload_entries, BoundedBackendDescriptor, BoundedBacking};
 use super::codec::{decode_vec, encode_vec, Decode, Encode, Reader, Writer};
 use super::transport;
 use super::types::*;
@@ -15,11 +16,32 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const LEDGER_MAGIC: &[u8; 8] = b"OXIDEST1";
-const LEDGER_VERSION: u32 = 4;
+/// Version 5 adds the durable backend record: version-4 ledgers predate the
+/// hard-bounded payload store and refuse without migration or reinterpretation.
+const LEDGER_VERSION: u32 = 5;
 const MAX_LEDGER_BYTES: u64 = 64 * 1024 * 1024;
 const SOCKET_NAME: &str = "daemon.sock";
-const SLOTS_NAME: &str = "slots";
+pub(crate) const SLOTS_NAME: &str = "slots";
 const ORDINARY_CARGO_PATH_IDENTITY: &str = "ordinary-cargo-storage-v1";
+
+/// Finite control-history limits. Exhaustion refuses new control records
+/// instead of pruning required evidence or growing the ledger indefinitely.
+const MAX_LEDGER_SLOTS: usize = 1024;
+const MAX_LEDGER_LEASES: usize = 4096;
+const MAX_LEDGER_OPERATIONS: usize = 16384;
+
+/// Durable backend mode of one store root. It is bound at daemon startup and
+/// recorded in the ledger; a restart with a different mode refuses.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LedgerBackend {
+    /// Explicit budget-only accounting on a plain directory. This mode makes
+    /// no hard-bound claim: nothing constrains a writer after acquire.
+    Directory,
+    /// Slots live on the verified hard-bounded payload filesystem. The
+    /// aggregate payload ceiling is the ledger budget cap, and the operating
+    /// system enforces the volume's finite size against active writers.
+    Bounded(BoundedBackendDescriptor),
+}
 
 /// Verifies the consumer's admission envelope and settlement evidence.
 ///
@@ -62,8 +84,14 @@ pub trait FreeSpaceProbe: Send + Sync + 'static {
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
     /// Existing, canonical, user-private directory reserved for this prototype.
+    /// Holds only the ledger, socket and temporary files; in bounded mode the
+    /// payload volume holds the slots so a full payload cannot wedge durable
+    /// control updates.
     pub root: PathBuf,
     pub budget: Budget,
+    /// Verified hard-bounded payload backing. Absent keeps explicit
+    /// budget-only directory semantics; caller JSON cannot mint this value.
+    pub backing: Option<BoundedBacking>,
 }
 
 /// A single-owner local daemon. Its Unix socket lives under the private root.
@@ -110,7 +138,7 @@ impl Daemon {
         let socket_device = socket_meta.dev();
         let socket_inode = socket_meta.ino();
 
-        let store = match Store::open(root, config.budget, authority, free_space) {
+        let store = match Store::open(root, config.budget, config.backing, authority, free_space) {
             Ok(store) => store,
             Err(error) => {
                 remove_owned_socket(&socket_path, socket_device, socket_inode);
@@ -296,6 +324,7 @@ struct SettlementOperation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Ledger {
     budget: Budget,
+    backend: LedgerBackend,
     storage_instance_id: String,
     next_slot: u64,
     next_sequence: u64,
@@ -305,9 +334,10 @@ struct Ledger {
 }
 
 impl Ledger {
-    fn empty(budget: Budget) -> Result<Self, StorageError> {
+    fn empty(budget: Budget, backend: LedgerBackend) -> Result<Self, StorageError> {
         Ok(Self {
             budget,
+            backend,
             storage_instance_id: random_hex(32)?,
             next_slot: 1,
             next_sequence: 1,
@@ -333,19 +363,37 @@ impl Store {
     fn open(
         root: PathBuf,
         budget: Budget,
+        backing: Option<BoundedBacking>,
         authority: Arc<dyn EvidenceAuthority>,
         free_space: Arc<dyn FreeSpaceProbe>,
     ) -> Result<Self, StorageError> {
         if budget.cap_bytes == 0 {
             return Err(StorageError::InvalidInput("budget cap must be positive"));
         }
-        validate_root_entries(&root)?;
+        let (backend, slots_root) = match backing.as_ref() {
+            Some(backing) => {
+                // The verified capability places slots on the payload volume;
+                // the daemon root keeps only control state. Unknown payload
+                // entries refuse so a foreign mount can never join the store.
+                validate_payload_entries(backing.payload_root())?;
+                let slots_root = backing.payload_root().join(SLOTS_NAME);
+                ensure_private_directory(&slots_root)?;
+                (
+                    LedgerBackend::Bounded(backing.descriptor().clone()),
+                    slots_root,
+                )
+            }
+            None => {
+                let slots_root = root.join(SLOTS_NAME);
+                ensure_private_directory(&slots_root)?;
+                (LedgerBackend::Directory, slots_root)
+            }
+        };
+        validate_root_entries(&root, backend_is_bounded(&backend))?;
         let ledger_path = root.join("ledger.bin");
-        let ledger = load_ledger(&ledger_path, budget)?;
+        let ledger = load_ledger(&ledger_path, budget, &backend)?;
         remove_stale_ledger_temps(&root)?;
-        validate_root_entries(&root)?;
-        let slots_root = root.join(SLOTS_NAME);
-        ensure_private_directory(&slots_root)?;
+        validate_root_entries(&root, backend_is_bounded(&backend))?;
         let mut store = Self {
             root,
             slots_root,
@@ -700,7 +748,15 @@ impl Store {
     }
 
     fn validate_root_inventory(&self) -> Result<(), StorageError> {
-        validate_root_entries(&self.root)
+        validate_root_entries(&self.root, backend_is_bounded(&self.ledger.backend))?;
+        if backend_is_bounded(&self.ledger.backend) {
+            validate_payload_entries(
+                self.slots_root
+                    .parent()
+                    .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))?,
+            )?;
+        }
+        Ok(())
     }
 
     pub(super) fn inventory(&self) -> Result<Inventory, StorageError> {
@@ -749,7 +805,13 @@ impl Store {
             });
         }
         slots.sort_by(|left, right| left.slot_id.cmp(&right.slot_id));
-        let free_bytes = self.free_space.available_bytes(&self.root)?;
+        // In bounded mode the actionable free reading is the payload volume's,
+        // not the host control filesystem's; a full payload must be visible.
+        let free_root = match &self.ledger.backend {
+            LedgerBackend::Bounded(descriptor) => descriptor.payload_root.clone(),
+            LedgerBackend::Directory => self.root.clone(),
+        };
+        let free_bytes = self.free_space.available_bytes(&free_root)?;
         Ok(Inventory {
             budget: self.ledger.budget,
             accounted_bytes: accounted,
@@ -813,6 +875,7 @@ impl Store {
         };
         let reservation = measured.max(request.required_bytes);
         let growth = reservation.saturating_sub(measured);
+        self.require_ledger_capacity(matching.is_none())?;
         if request
             .envelope
             .partition
@@ -865,23 +928,7 @@ impl Store {
                     last_used: self.take_sequence()?,
                     ordinary_cargo: None,
                 };
-                self.ledger.slots.push(slot);
-                self.persist()?;
-                let path = self.slot_path(&id)?;
-                fs::create_dir(&path).map_err(|error| {
-                    self.poisoned = true;
-                    io_error(error)
-                })?;
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(|error| {
-                    self.poisoned = true;
-                    io_error(error)
-                })?;
-                File::open(&self.slots_root)
-                    .and_then(|directory| directory.sync_all())
-                    .map_err(|error| {
-                        self.poisoned = true;
-                        io_error(error)
-                    })?;
+                self.prepare_slot(slot)?;
                 (id, false)
             }
         };
@@ -1034,9 +1081,11 @@ impl Store {
                     RefusalReason::OrdinaryCargoPartitionLimit,
                 ));
             }
+            self.require_ledger_capacity(true)?;
             (String::new(), CargoReuseState::Empty, 0, false)
         };
 
+        self.require_ledger_capacity(slot_id.is_empty())?;
         let reservation = measured.max(request.acquire.required_bytes);
         let growth = reservation
             .checked_sub(measured)
@@ -1079,7 +1128,7 @@ impl Store {
                 reuse_state: CargoReuseState::Empty,
             };
             let last_used = self.take_sequence()?;
-            self.ledger.slots.push(Slot {
+            self.prepare_slot(Slot {
                 id: id.clone(),
                 partition: acquire.envelope.partition.clone(),
                 state: InternalSlotState::Preparing,
@@ -1088,23 +1137,7 @@ impl Store {
                 lease_id: None,
                 last_used,
                 ordinary_cargo: Some(ordinary),
-            });
-            self.persist()?;
-            let path = self.slot_path(&id)?;
-            fs::create_dir(&path).map_err(|error| {
-                self.poisoned = true;
-                io_error(error)
             })?;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(|error| {
-                self.poisoned = true;
-                io_error(error)
-            })?;
-            File::open(&self.slots_root)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|error| {
-                    self.poisoned = true;
-                    io_error(error)
-                })?;
             id
         } else {
             slot_id
@@ -1623,6 +1656,9 @@ impl Store {
         if lease.status == LeaseStatus::Finalized {
             return Err(StorageError::Refused(RefusalReason::LeaseUnavailable));
         }
+        // A settlement that cannot be recorded durably must not half-apply.
+        // Refusal keeps the lease exactly as it was, so ownership stays held.
+        self.require_operation_capacity()?;
         let slot_id = lease.slot_id.clone();
         let capture_digest = evidence
             .capture
@@ -1874,6 +1910,55 @@ impl Store {
             sum.checked_add(measured.max(slot.reserved_bytes))
                 .ok_or(StorageError::Refused(RefusalReason::UnknownAccounting))
         })
+    }
+
+    /// Refuses when a finite control-history limit is reached. Exhaustion keeps
+    /// every recorded lease and settlement intact and refuses new control
+    /// records instead of pruning required evidence or growing indefinitely.
+    fn require_ledger_capacity(&self, new_slot: bool) -> Result<(), StorageError> {
+        if (new_slot && self.ledger.slots.len() >= MAX_LEDGER_SLOTS)
+            || self.ledger.leases.len() >= MAX_LEDGER_LEASES
+        {
+            return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+        }
+        Ok(())
+    }
+
+    fn require_operation_capacity(&self) -> Result<(), StorageError> {
+        if self.ledger.operations.len() >= MAX_LEDGER_OPERATIONS {
+            return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
+        }
+        Ok(())
+    }
+
+    /// Records one preparing slot and creates its directory. On a bounded
+    /// payload that is already full at the OS level, the record rolls back so
+    /// the store stays healthy and the caller receives the actionable
+    /// admission refusal instead of a poisoned daemon.
+    fn prepare_slot(&mut self, slot: Slot) -> Result<String, StorageError> {
+        let id = slot.id.clone();
+        let bounded = backend_is_bounded(&self.ledger.backend);
+        self.ledger.slots.push(slot);
+        self.persist()?;
+        let path = self.slot_path(&id)?;
+        if let Err(error) = fs::create_dir(&path) {
+            if bounded && error.kind() == std::io::ErrorKind::StorageFull {
+                self.ledger.slots.retain(|record| record.id != id);
+                self.persist()?;
+                return Err(StorageError::Refused(RefusalReason::BudgetExceeded));
+            }
+            self.poisoned = true;
+            return Err(io_error(error));
+        }
+        if let Err(error) = fs::set_permissions(&path, fs::Permissions::from_mode(0o700)) {
+            self.poisoned = true;
+            return Err(io_error(error));
+        }
+        if let Err(error) = File::open(&self.slots_root).and_then(|d| d.sync_all()) {
+            self.poisoned = true;
+            return Err(io_error(error));
+        }
+        Ok(id)
     }
 
     fn ensure_healthy(&self) -> Result<(), StorageError> {
@@ -2517,15 +2602,24 @@ fn ensure_private_directory(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn validate_root_entries(root: &Path) -> Result<(), StorageError> {
+fn backend_is_bounded(backend: &LedgerBackend) -> bool {
+    matches!(backend, LedgerBackend::Bounded(_))
+}
+
+/// Directory roots may hold the slots directory; bounded roots keep slots on
+/// the payload volume, so the daemon root must not contain one.
+fn validate_root_entries(root: &Path, bounded: bool) -> Result<(), StorageError> {
     for entry in fs::read_dir(root).map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name == SLOTS_NAME || name == "ledger.bin" || name == SOCKET_NAME {
+        if name == "ledger.bin" || name == SOCKET_NAME {
             continue;
         }
         if is_ledger_temp_name(&name) {
+            continue;
+        }
+        if !bounded && name == SLOTS_NAME {
             continue;
         }
         return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
@@ -2696,15 +2790,19 @@ fn valid_hash(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn io_error(error: std::io::Error) -> StorageError {
+pub(crate) fn io_error(error: std::io::Error) -> StorageError {
     StorageError::Io(error.to_string())
 }
 
-fn load_ledger(path: &Path, budget: Budget) -> Result<Ledger, StorageError> {
+fn load_ledger(
+    path: &Path,
+    budget: Budget,
+    backend: &LedgerBackend,
+) -> Result<Ledger, StorageError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ledger::empty(budget);
+            return Ledger::empty(budget, backend.clone());
         }
         Err(error) => return Err(io_error(error)),
     };
@@ -2727,7 +2825,7 @@ fn load_ledger(path: &Path, budget: Budget) -> Result<Ledger, StorageError> {
         return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
     }
     let ledger = Ledger::decode(&mut reader)?;
-    if !reader.done() || ledger.budget != budget {
+    if !reader.done() || ledger.budget != budget || ledger.backend != *backend {
         return Err(StorageError::Refused(RefusalReason::UnknownAccounting));
     }
     Ok(ledger)
@@ -3104,9 +3202,33 @@ impl Decode for SettlementOperation {
     }
 }
 
+impl Encode for LedgerBackend {
+    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
+        match self {
+            Self::Directory => writer.u8(0),
+            Self::Bounded(descriptor) => {
+                writer.u8(1);
+                descriptor.encode(writer)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Decode for LedgerBackend {
+    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
+        match reader.u8()? {
+            0 => Ok(Self::Directory),
+            1 => Ok(Self::Bounded(BoundedBackendDescriptor::decode(reader)?)),
+            _ => Err(StorageError::Protocol("unknown durable backend")),
+        }
+    }
+}
+
 impl Encode for Ledger {
     fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
         self.budget.encode(writer)?;
+        self.backend.encode(writer)?;
         self.storage_instance_id.encode(writer)?;
         writer.u64(self.next_slot);
         writer.u64(self.next_sequence);
@@ -3120,6 +3242,7 @@ impl Decode for Ledger {
     fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
         Ok(Self {
             budget: Budget::decode(reader)?,
+            backend: LedgerBackend::decode(reader)?,
             storage_instance_id: String::decode(reader)?,
             next_slot: reader.u64()?,
             next_sequence: reader.u64()?,
