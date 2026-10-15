@@ -11,7 +11,9 @@ import io
 import json
 import os
 import py_compile
+import shlex
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -78,6 +80,9 @@ class FakeClock:
 
     def monotonic_ns(self) -> int:
         return self.mono
+
+    def clock_basis(self) -> str:
+        return "fake:monotonic"
 
     def utc_iso(self) -> str:
         return self.utc
@@ -372,7 +377,13 @@ def _plan(scratch: Path, launch_id: str = "fixture") -> bcc.ResourcePlan:
     )
 
 
-def _stage(plan: bcc.ResourcePlan, registry: bcc.RegistryInputPlan, clock: FakeClock) -> bcc.StagedSession:
+def _stage(
+    plan: bcc.ResourcePlan,
+    registry: bcc.RegistryInputPlan,
+    clock: FakeClock,
+    *,
+    smoke: bool = False,
+) -> bcc.StagedSession:
     launcher_path = Path(bcc.__file__).resolve()
     binding = bcc.LaunchBinding(
         caller="northstar-worker",
@@ -387,9 +398,15 @@ def _stage(plan: bcc.ResourcePlan, registry: bcc.RegistryInputPlan, clock: FakeC
         audit_start_utc=clock.utc_iso(),
         deadline_monotonic_ns=clock.monotonic_ns() + bcc.BUDGET_NS,
         declared_budget_ns=bcc.BUDGET_NS,
+        mode="smoke" if smoke else "live",
+        clock_basis=clock.clock_basis(),
     )
     return bcc.stage_session(
-        plan, launcher_path=launcher_path, binding=binding.to_document(), registry_plan=registry
+        plan,
+        launcher_path=launcher_path,
+        binding=binding.to_document(),
+        registry_plan=registry,
+        smoke=smoke,
     )
 
 
@@ -458,7 +475,7 @@ class PlanTests(unittest.TestCase):
         self.assertFalse(document["cargo_offline_readonly"])
         self.assertEqual(image.creates, [])
         self.assertEqual(spawner.calls, [])
-        self.assertIn("time.monotonic_ns", document["clocks"]["deadline_clock"])
+        self.assertIn(bcc.CLOCK_BASIS, document["clocks"]["deadline_clock"])
 
     def test_plan_reports_heavy_entry_and_registry_plan(self) -> None:
         launcher, _, _, _, _ = _launcher(SCRATCH)
@@ -1374,6 +1391,363 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(argv[2], "--")
         self.assertIn("--exact", argv)
         self.assertIn(bcc.TEST_NAME, argv)
+
+
+class ManifestCommandTests(unittest.TestCase):
+    def test_staged_manifest_is_one_command_not_an_argv_sequence(self) -> None:
+        plan = _plan(SCRATCH / "manifest-live")
+        launcher_path = Path(bcc.__file__).resolve()
+        plan_path = plan.parent / bcc.STAGED_PLAN_NAME
+        text = bcc.staged_manifest_text(launcher_path, plan_path, plan.parent)
+        # A TOML array is a sequence of separate shell commands in Effigy, not
+        # one argv vector. The staged entry must be a single command string.
+        self.assertNotIn("run = [", text)
+        run_lines = [line for line in text.splitlines() if line.startswith("run = ")]
+        self.assertEqual(len(run_lines), 1)
+        self.assertTrue(run_lines[0].startswith('run = "'))
+        command = json.loads(run_lines[0][len("run = "):])
+        parts = shlex.split(command)
+        self.assertEqual(
+            parts,
+            [
+                sys.executable,
+                launcher_path.as_posix(),
+                "--live",
+                "--admitted-root",
+                plan.parent.as_posix(),
+                "--resource-plan",
+                plan_path.as_posix(),
+            ],
+        )
+
+    def test_smoke_manifest_adds_only_the_smoke_binding_flag(self) -> None:
+        plan = _plan(SCRATCH / "manifest-smoke")
+        launcher_path = Path(bcc.__file__).resolve()
+        plan_path = plan.parent / bcc.STAGED_PLAN_NAME
+        text = bcc.staged_manifest_text(launcher_path, plan_path, plan.parent, smoke=True)
+        run_lines = [line for line in text.splitlines() if line.startswith("run = ")]
+        parts = shlex.split(json.loads(run_lines[0][len("run = "):]))
+        self.assertEqual(parts[-1], "--smoke")
+        self.assertEqual(parts.count("--smoke"), 1)
+
+    def test_shell_execution_preserves_spaces_and_metacharacters(self) -> None:
+        root = SCRATCH / "shell-exec"
+        root.mkdir(parents=True, exist_ok=True)
+        output = root / "argv'out.json"
+        stub = root / "stub script.py"
+        stub.write_text(
+            "import json,sys\nopen(sys.argv[1],'w').write(json.dumps(sys.argv[2:]))\n",
+            encoding="utf-8",
+        )
+        argv = [
+            sys.executable,
+            str(stub),
+            str(output),
+            "a b",
+            "c'd",
+            "e;f",
+            "$HOME",
+            "*",
+            "sp ace",
+            "line\nbreak",
+        ]
+        command = bcc.shell_command_for_argv(argv)
+        completed = subprocess.run(
+            ["/bin/sh", "-c", command], capture_output=True, text=True, cwd=str(root)
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-400:])
+        recorded = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(recorded, argv[3:])
+
+
+class StagedRuntimeStateTests(unittest.TestCase):
+    def _staged(self, name: str) -> tuple[bcc.ResourcePlan, bcc.RegistryInputPlan, bcc.StagedSession]:
+        plan = _plan(SCRATCH / name)
+        registry = bcc.derive_registry_input_plan_from_evidence()
+        staged = _stage(plan, registry, FakeClock())
+        return plan, registry, staged
+
+    def _validate(self, plan: bcc.ResourcePlan, registry: bcc.RegistryInputPlan) -> bcc.StagedSession:
+        return bcc.validate_staged_session(
+            plan,
+            expected=None,
+            launcher_path=Path(bcc.__file__).resolve(),
+            registry_plan=registry,
+        )
+
+    def test_installed_effigy_runtime_state_is_accepted_narrowly(self) -> None:
+        plan, registry, staged = self._staged("runtime-ok")
+        runtime = plan.parent / bcc.STAGED_RUNTIME_DIR
+        (runtime / "locks").mkdir(parents=True)
+        (runtime / "runtime" / "tasks" / "active").mkdir(parents=True)
+        (runtime / "reports" / "tasks").mkdir(parents=True)
+        validated = self._validate(plan, registry)
+        self.assertEqual(validated.manifest_digest, staged.manifest_digest)
+        self.assertEqual(validated.binding_digest, staged.binding_digest)
+
+    def test_runtime_state_unknown_entry_refuses(self) -> None:
+        plan, registry, _ = self._staged("runtime-evil")
+        runtime = plan.parent / bcc.STAGED_RUNTIME_DIR
+        runtime.mkdir()
+        (runtime / "gateway").mkdir()
+        with self.assertRaises(bcc.ComparisonError) as raised:
+            self._validate(plan, registry)
+        self.assertEqual(raised.exception.seam, "staged_session")
+
+    def test_symlinked_runtime_state_refuses(self) -> None:
+        plan, registry, _ = self._staged("runtime-link")
+        target = SCRATCH / "runtime-link-target"
+        target.mkdir()
+        os.symlink(target, plan.parent / bcc.STAGED_RUNTIME_DIR)
+        with self.assertRaises(bcc.ComparisonError) as raised:
+            self._validate(plan, registry)
+        self.assertEqual(raised.exception.seam, "staged_session")
+
+    def test_runtime_state_does_not_weaken_bootstrap_digests(self) -> None:
+        plan, registry, _ = self._staged("runtime-tamper")
+        (plan.parent / bcc.STAGED_RUNTIME_DIR).mkdir()
+        (plan.parent / bcc.STAGED_MANIFEST_NAME).write_text("garbage", encoding="utf-8")
+        with self.assertRaises(bcc.ComparisonError) as raised:
+            self._validate(plan, registry)
+        self.assertEqual(raised.exception.seam, "staged_session")
+
+    def test_extra_root_file_still_refuses(self) -> None:
+        plan, registry, _ = self._staged("runtime-extra")
+        (plan.parent / "unexpected.txt").write_text("nope", encoding="utf-8")
+        with self.assertRaises(bcc.ComparisonError) as raised:
+            self._validate(plan, registry)
+        self.assertEqual(raised.exception.seam, "staged_session")
+
+
+_CLOCK_CHILD_CODE = (
+    "import importlib.util, sys\n"
+    "spec = importlib.util.spec_from_file_location('bcc', sys.argv[1])\n"
+    "m = importlib.util.module_from_spec(spec)\n"
+    "sys.modules['bcc'] = m\n"
+    "spec.loader.exec_module(m)\n"
+    "print(m.RealClock().monotonic_ns())\n"
+)
+
+_NATIVE_CHILD_CODE = (
+    "import importlib.util, json, sys\n"
+    "spec = importlib.util.spec_from_file_location('bcc', sys.argv[1])\n"
+    "m = importlib.util.module_from_spec(spec)\n"
+    "sys.modules['bcc'] = m\n"
+    "spec.loader.exec_module(m)\n"
+    "plan = m.load_resource_plan(m.Path(sys.argv[2]))\n"
+    "launcher = m.ComparisonLauncher(\n"
+    "    admitted_root=plan.parent,\n"
+    "    smoke=('--smoke' in sys.argv),\n"
+    "    strict_names=False,\n"
+    "    registry_plan=m.derive_registry_input_plan_from_evidence(),\n"
+    ")\n"
+    "document = launcher.run(live=True, resource_plan=plan)\n"
+    "print(json.dumps(document))\n"
+    "sys.exit(0 if document.get('outcome') in {'success', 'smoke_reached'} else 2)\n"
+)
+
+
+def _stage_real(
+    plan: bcc.ResourcePlan,
+    registry: bcc.RegistryInputPlan,
+    clock: bcc.RealClock,
+    *,
+    deadline: int,
+    budget: int,
+    smoke: bool,
+) -> bcc.StagedSession:
+    launcher_path = Path(bcc.__file__).resolve()
+    binding = bcc.LaunchBinding(
+        caller="northstar-worker",
+        request_id=REQUEST_ID,
+        request_body_digest="0" * 64,
+        parent=plan.parent,
+        launcher_sha256=hashlib.sha256(launcher_path.read_bytes()).hexdigest(),
+        nucleus_commit=bcc.NUCLEUS_COMMIT,
+        nucleus_tree=bcc.NUCLEUS_TREE,
+        cargo_lock_sha256=bcc.CARGO_LOCK_SHA256,
+        registry_plan_digest=registry.digest(),
+        audit_start_utc=clock.utc_iso(),
+        deadline_monotonic_ns=deadline,
+        declared_budget_ns=budget,
+        mode="smoke" if smoke else "live",
+        clock_basis=clock.clock_basis(),
+    )
+    return bcc.stage_session(
+        plan,
+        launcher_path=launcher_path,
+        binding=binding.to_document(),
+        registry_plan=registry,
+        smoke=smoke,
+    )
+
+
+def _run_native_admitted_child(
+    plan: bcc.ResourcePlan, *, smoke: bool, timeout: float = 30.0
+) -> tuple[subprocess.CompletedProcess, dict]:
+    argv = [
+        sys.executable,
+        "-c",
+        _NATIVE_CHILD_CODE,
+        str(Path(bcc.__file__).resolve()),
+        str(plan.parent / bcc.STAGED_PLAN_NAME),
+    ]
+    if smoke:
+        argv.append("--smoke")
+    env = dict(os.environ)
+    env.update({"HOST_RUN_ID": "native_test_run", "HOST_RUN_TOKEN": "native-test-token"})
+    completed = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=timeout)
+    document: dict = {}
+    for line in completed.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("{"):
+            document = json.loads(stripped)
+    return completed, document
+
+
+class NativeClockTests(unittest.TestCase):
+    def test_real_clock_basis_is_shared_by_a_spawned_child(self) -> None:
+        clock = bcc.RealClock()
+        before = clock.monotonic_ns()
+        completed = subprocess.run(
+            [sys.executable, "-c", _CLOCK_CHILD_CODE, str(Path(bcc.__file__).resolve())],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        after = clock.monotonic_ns()
+        child = int(completed.stdout.strip())
+        # A process-local clock (this host's `time.monotonic_ns()`) would be a
+        # few milliseconds here and could not fall inside the parent interval.
+        self.assertGreaterEqual(child, before)
+        self.assertLessEqual(child, after)
+
+    def test_delayed_admitted_child_adopts_parent_deadline_without_reset(self) -> None:
+        plan = _plan(SCRATCH / "native-delay")
+        registry = bcc.derive_registry_input_plan_from_evidence()
+        clock = bcc.RealClock()
+        budget = 600_000_000_000
+        start = clock.monotonic_ns()
+        deadline = start + budget
+        _stage_real(plan, registry, clock, deadline=deadline, budget=budget, smoke=True)
+        time.sleep(0.25)
+        parent_remaining = deadline - clock.monotonic_ns()
+        completed, document = _run_native_admitted_child(plan, smoke=True)
+        self.assertEqual(document.get("outcome"), "smoke_reached", completed.stderr[-500:])
+        self.assertEqual(document["session"]["deadline_monotonic_ns"], deadline)
+        self.assertEqual(document["session"]["start_monotonic_ns"], start)
+        child_remaining = document["session"]["remaining_hard_ns"]
+        self.assertGreater(child_remaining, 0)
+        self.assertLessEqual(child_remaining, parent_remaining)
+
+    def test_expired_admitted_child_refuses_before_effects(self) -> None:
+        plan = _plan(SCRATCH / "native-expired")
+        registry = bcc.derive_registry_input_plan_from_evidence()
+        clock = bcc.RealClock()
+        deadline = clock.monotonic_ns() - 1
+        _stage_real(plan, registry, clock, deadline=deadline, budget=bcc.BUDGET_NS, smoke=True)
+        completed, document = _run_native_admitted_child(plan, smoke=True)
+        self.assertEqual(document.get("outcome"), "deadline", completed.stderr[-500:])
+        self.assertEqual(document.get("seam"), "deadline")
+        self.assertEqual(completed.returncode, 2)
+        self.assertFalse(plan.mount.exists())
+        self.assertFalse(plan.backing.exists())
+
+    def test_binding_with_unsupported_clock_basis_refuses(self) -> None:
+        base = {
+            "schema": bcc.BINDING_SCHEMA,
+            "caller": "northstar-worker",
+            "request_id": REQUEST_ID,
+            "request_body_digest": "0" * 64,
+            "parent": "/x",
+            "launcher_sha256": "0" * 64,
+            "nucleus_commit": bcc.NUCLEUS_COMMIT,
+            "nucleus_tree": bcc.NUCLEUS_TREE,
+            "cargo_lock_sha256": bcc.CARGO_LOCK_SHA256,
+            "registry_plan_digest": "0" * 64,
+            "audit_start_utc": "2026-10-15T00:00:00Z",
+            "deadline_monotonic_ns": 1,
+            "declared_budget_ns": 1,
+            "mode": "live",
+        }
+        with self.assertRaises(bcc.ComparisonError) as missing:
+            bcc.LaunchBinding.from_document(base)
+        self.assertEqual(missing.exception.seam, "launch_binding")
+        # A recorded but different basis is refused when the binding is adopted
+        # by a clock that does not match it (no stale compatibility claim).
+        stale = bcc.LaunchBinding.from_document(dict(base, clock_basis="time.monotonic_ns"))
+        launcher = bcc.ComparisonLauncher(clock=bcc.RealClock())
+        with self.assertRaises(bcc.ComparisonError) as adopted:
+            launcher._open_session_from_binding(stale)
+        self.assertEqual(adopted.exception.seam, "clock_basis")
+
+
+class SmokingSubmitter:
+    def __init__(self, output: str, state: str = "launched") -> None:
+        self.output = output
+        self.state = state
+        self.submits = 0
+        self.follows = 0
+
+    def submit(self, *, argv, cwd, request_id, caller, env, timeout_ns=None):
+        self.submits += 1
+        return bcc.HeavySubmitOutcome(state=self.state, output=self.output)
+
+    def request_follow(self, *, caller, request_id, env, timeout_ns=None):
+        self.follows += 1
+        return bcc.HeavySubmitOutcome(state="launched", output=self.output)
+
+
+class SmokeModeTests(unittest.TestCase):
+    def test_smoke_outer_confirms_sentinel_in_settlement(self) -> None:
+        plan = _plan(SCRATCH / "smoke-ok")
+        submitter = SmokingSubmitter(f"relay prefix {bcc.SMOKE_SENTINEL} relay suffix")
+        launcher, _, _, _, _ = _launcher(SCRATCH, submitter=submitter, smoke=True)
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "smoke_reached")
+        self.assertEqual(document["smoke_sentinel"], bcc.SMOKE_SENTINEL)
+        self.assertEqual(document["count_delivered"], 0)
+        self.assertEqual(submitter.submits, 1)
+
+    def test_smoke_outer_without_sentinel_is_partial(self) -> None:
+        plan = _plan(SCRATCH / "smoke-nosentinel")
+        submitter = SmokingSubmitter("the run produced no sentinel")
+        launcher, _, _, _, _ = _launcher(SCRATCH, submitter=submitter, smoke=True)
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "partial")
+        self.assertEqual(document["seam"], "smoke_evidence")
+
+    def test_smoke_staging_binds_mode_and_manifest_flag(self) -> None:
+        plan = _plan(SCRATCH / "smoke-bind")
+        registry = bcc.derive_registry_input_plan_from_evidence()
+        _stage(plan, registry, FakeClock(), smoke=True)
+        binding = bcc.binding_from_staged_root(plan)
+        self.assertEqual(binding.mode, "smoke")
+        manifest = (plan.parent / bcc.STAGED_MANIFEST_NAME).read_text(encoding="utf-8")
+        self.assertIn("--smoke", manifest)
+        with self.assertRaises(bcc.ComparisonError) as raised:
+            bcc.validate_staged_session(
+                plan,
+                expected=None,
+                launcher_path=Path(bcc.__file__).resolve(),
+                registry_plan=registry,
+                smoke=False,
+            )
+        self.assertEqual(raised.exception.seam, "staged_session")
+
+    def test_live_inner_against_smoke_binding_refuses_before_effects(self) -> None:
+        plan = _plan(SCRATCH / "smoke-live-mismatch")
+        clock = FakeClock()
+        registry = bcc.derive_registry_input_plan_from_evidence()
+        _stage(plan, registry, clock, smoke=True)
+        launcher, _, _, image, spawner = _launcher(
+            SCRATCH, plan=plan, clock=clock, admitted_root=plan.parent, smoke=False
+        )
+        document = launcher.run(live=True, resource_plan=plan)
+        self.assertEqual(document["outcome"], "refusal")
+        self.assertEqual(document["seam"], "staged_session")
+        self.assertEqual(spawner.calls, [])
+        self.assertEqual(image.creates, [])
 
 
 def main() -> int:

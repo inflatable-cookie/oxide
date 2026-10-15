@@ -116,6 +116,7 @@ python3 scripts/build_context_comparison.py
 python3 scripts/build_context_comparison.py --plan --resource-plan <planner-owned-json>
 python3 scripts/build_context_comparison.py --live --resource-plan <planner-owned-json>
 python3 scripts/build_context_comparison.py --live --admitted-root <parent> --resource-plan <staged-plan-json>
+python3 scripts/build_context_comparison.py --live --smoke --resource-plan <planner-owned-json>
 ```
 
 Default is plan/validate. Planned metadata does not prove effects. Live requires `--live` and a planner-owned unused resource plan naming `launch_id`, `parent`, `mount`, `backing` and `nucleus_source`. Registry inputs are optional: absent declared inputs the launcher derives the exact named inputs from the pinned lock metadata (see below), and a missing named input refuses `source_cache_unbound`. Without `--admitted-root` the launcher takes the outer bootstrap role; with it, the launcher takes the admitted inner role. This PR does not pass `--live`.
@@ -124,9 +125,9 @@ Default is plan/validate. Planned metadata does not prove effects. Live requires
 
 The comparison runs admitted through one explicit heavy entry. The launcher's outer bootstrap (no `--admitted-root`) records the session clock, then creates a uniquely owned staged root at the resource plan's `parent`:
 
-- `effigy.toml` — a fixed manifest whose only task is `build-context:comparison:live` with `admission = "heavy"`, running the reviewed launcher through an absolute interpreter path (a scheduler launch does not rely on a forwarded `PATH`).
+- `effigy.toml` — a fixed manifest whose only task is `build-context:comparison:live` with `admission = "heavy"`. Installed Effigy deserialises `[tasks.<name>.run]` through `ManifestManagedRun` (`crates/effigy-manifest/src/task_runtime.rs`): a bare TOML string is **one** command, and a TOML array is a *sequence of separate shell commands joined with `&&`*. Each command is executed with `sh -c` (`crates/effigy-process/src/lifecycle/spawn.rs`). The staged entry is therefore a single string with the absolute interpreter, the launcher and every argument POSIX single-quote escaped; it is never an argv-shaped array. The absolute interpreter is used because a scheduler launch does not rely on a forwarded `PATH`.
 - `resource-plan.json` — a full loadable resource plan (`launch_id`, `parent`, `mount`, `backing`, `nucleus_source`, the effective `registry_inputs`, and the pure registry-plan view), so the inner `--resource-plan` loads through the ordinary `load_resource_plan` path.
-- `binding.json` — the persisted caller label, request UUID, request-body digest, root, launcher digest, source pins and registry-plan digest.
+- `binding.json` — the persisted caller label, request UUID, request-body digest, root, launcher digest, source pins, registry-plan digest, the bound `mode` (`live` or `smoke`) and the bound clock basis.
 
 The outer bootstrap mints a fresh request UUID (or reuses `--request-id`) and constructs the real Effigy submitter; the admitted inner role and every plan/default path construct none. `--caller` overrides the label.
 
@@ -138,7 +139,7 @@ EFFIGY_CALLER=<label> effigy --host-run-request-id <uuid> build-context:comparis
 
 Effigy classifies `admission = "heavy"` as heavy (Effigy `src/runner/execute/entry.rs`, `ManifestTaskAdmission::Heavy`; contract 049). Contract 010 fixes the token root as `"the run's canonical cwd"`, so the staged root is the token root. Every nested `effigy check:core:test` call runs with cwd under `<parent>/m/src-<mode>` and therefore satisfies the nested parent check (`current_cwd == token_root || current_cwd.starts_with(token_root)`). No plain-Python outer is left unadmitted, no token is minted, and the root is never widened to all of `/private/var/tmp`.
 
-The admitted inner launcher (with `--admitted-root`) refuses `admission_unverified` unless it is passed the staged parent and a present host-run identity, and accepts the staged root only when it is the exact owned bootstrap: directory mode `0700`, owner `uid`, no symlinks, exactly the three pinned entries, no extra names, and digests recomputed from the reviewed manifest template and the pure registry plan. A preexisting, mismatched or path-escaping root never qualifies.
+Before the task command runs, installed Effigy creates its own state root `.effigy/` inside the admitted run root (`locks` from `src/runner/locking/io.rs`, `runtime/tasks/active` and `reports/tasks/...` from `crates/effigy-runtime/src/task_status.rs`). The admitted inner launcher (with `--admitted-root`) refuses `admission_unverified` unless it is passed the staged parent and a present host-run identity. It accepts the staged root only as the exact owned bootstrap: directory mode `0700`, owner `uid`, no symlinks, exactly the three pinned entries with no extra names, and digests recomputed from the reviewed manifest template and the pure registry plan. The single `.effigy` entry is then accepted as supported runtime state, and only when it is a real directory owned by `uid`, not group/world writable, whose top-level entries are all within `{locks, runtime, reports}` and each a real directory. Any other root name, any other `.effigy` name, a symlink or a wrong owner still refuses `staged_session`; the three pinned files keep their own mode/owner/link/digest checks. `.effigy` is never a blanket ignore of unknown content.
 
 ### Durable request identity
 
@@ -254,9 +255,10 @@ The preferred plan was three edits per mode (cold+3+1 = 5). It is reduced to two
 
 ### Time cap
 
-- One `time.monotonic_ns` start and one UTC audit mark, taken before any staging, live image, source, tool, or evidence preparation. `EPOCHREALTIME` and UTC are not the deadline clock. A UTC jump does not extend the session.
+- One monotonic start and one UTC audit mark, taken before any staging, live image, source, tool, or evidence preparation. `EPOCHREALTIME` and UTC are not the deadline clock. A UTC jump does not extend the session.
+- **Clock basis.** The deadline clock is `time.clock_gettime_ns(CLOCK_MONOTONIC)`; `binding.json` binds the basis string `time.clock_gettime_ns:CLOCK_MONOTONIC`, and the admitted run refuses `clock_basis` if the running clock does not match the recorded basis. This is the genuine shared, non-adjustable native basis: a parent and its spawned child observe the same values on one timeline. It is **not** `time.monotonic_ns()`: on the observed host's Python 3.9.6 `time.monotonic_ns()` reports a process-local value (tens of milliseconds since process start) that does not share a basis between parent and child, so it cannot carry an absolute deadline across processes. Recorded limitation: `CLOCK_MONOTONIC` (like `time.monotonic`) does not advance while the machine is suspended, so a suspend is not charged against the budget. No portability beyond the observed host is claimed.
 - Total live budget: 1_200_000_000_000 ns (20 minutes) from that monotonic mark, including staging, capacity wait, probes, builds, tests, measurement and capture. The cap is not reset and not extended. Five seconds are reserved to record partial or abort evidence.
-- `binding.json` carries the original absolute UTC start and the absolute monotonic deadline. The admitted run adopts that deadline and never re-bases it on its own start: source-cache planning, bootstrap staging and capacity waiting spend from the same budget. A genuine capacity wait that yields no launch is reported `partial` with `never_launched`, not a fresh budget.
+- `binding.json` carries the original absolute UTC start, the absolute monotonic deadline and the clock basis. The admitted run adopts that deadline and never re-bases it on its own start: source-cache planning, bootstrap staging and capacity waiting spend from the same budget, and an admitted entry that begins after the deadline refuses before any effect. A genuine capacity wait that yields no launch is reported `partial` with `never_launched`, not a fresh budget.
 - Independent review (up to 20 minutes) is outside this live budget.
 - Every subprocess, lock, read, copy and poll uses remaining time against the original deadline. A second operation after expiry refuses before spawn.
 - On breach, stop new delivery and terminate only helper-created child process groups (`killpg` of the spawned session, never kill-by-name). If positive writer closure is absent, retain uncertain resources; do not unmount, delete or release. Deadline, refusal, partial, unknown and success stay distinct. This scope is cooperative foreground Cargo/test behavior, not daemon ownership proof of arbitrary descendants.
@@ -351,6 +353,49 @@ frozen and unchanged; the comparison remains unqualified and needs a separately
 scoped producer correction. See
 [storage efficiency](../storage-efficiency.md#bounded-incremental-comparison-attempt-2026-10-15)
 and the [attempt evidence record](../evidence/build-context-comparison-053-attempt.json).
+
+### Bootstrap correction and compiler-free smoke (2026-10-15)
+
+A separately scoped producer correction (`oxide#054`) fixed the three observed
+050/051 integration defects, then proved the corrected bootstrap with one
+compiler-free heavy run. It did not run the comparison and creates no
+comparison result.
+
+1. **Command shape.** The staged manifest now emits one `sh -c` command string
+   with the absolute interpreter, launcher and every argument POSIX
+   single-quote escaped (`run = "…"`), not a TOML array of argv words. A
+   synthetic shell-execution fixture runs the generated command through
+   `/bin/sh -c` with spaces, quotes, `;`, `$`, `*` and a newline and asserts the
+   child receives the exact argv. Installed Effigy `--plan` on the generated
+   selector reports the same single command.
+2. **Runtime state.** `.effigy/{locks,runtime,reports}` created by installed
+   Effigy in the admitted root is accepted narrowly, as described above. Bad
+   root, tamper, symlink, wrong-owner and extra-entry cases still refuse.
+3. **Clock.** The deadline clock is now
+   `time.clock_gettime_ns(CLOCK_MONOTONIC)` and its basis is bound in
+   `binding.json`. A native parent/child regression proves the shared basis, a
+   delayed child adopts the original deadline without a reset, and an entry
+   that begins after the original deadline refuses before effects.
+
+One genuine compiler-free smoke ran through the installed Effigy heavy
+admission: caller `oxide:planner:bootstrap-smoke:054`, request UUID
+`e09afaa3-0694-47a4-996a-c4077a413f60`, staged root
+`/private/var/tmp/oxide-build-context-cmp-smoke-e09afaa3`, mode `smoke` bound
+in the staged request. The heavy host run (`2ba120c93a39c5468e937e594a63c138885bccf3a796db0b4f54c111208a2a03`,
+epoch 1) settled `passed` with exit `0`. The admitted inner role reached
+`verify_admission` and `validate_staged_session` against the real installed
+runtime state, adopted the original deadline
+(`25892414356000`, remaining `119465832000` against the parent's
+`119990944000`) and returned the smoke sentinel
+`oxide-build-context-smoke-reached-v1` before any image, source, registry,
+tool or compiler operation (`count_delivered=0`, `effects_executed=false`,
+empty helper list). The reserved mount and backing names were never created.
+The smoke is not a comparison result and no Cargo or rustc ran. Both the
+staged root and the smoke control directory are retained read-only for review;
+nothing was deleted, detached or repaired. Receipt:
+[smoke evidence record](../evidence/build-context-comparison-054-smoke.json).
+The comparison itself stays unqualified and needs its own separately pinned
+execution brief.
 
 ## Evidence limits for this design
 
