@@ -213,3 +213,17 @@ lifetime, not by an enforced per-task byte budget. It supersedes the prior
 Nucleus agent stopgap without activating Oxide shared storage or changing
 Queue policy. [Storage efficiency](storage-efficiency.md#nucleus-consumer-adoption-2026-10-15)
 owns the adoption receipt and its limits.
+
+
+Tom requested the next roadmap and board work on 2026-10-15: “Update the
+planner, get the tasks on the board. What's next?” Together with the standing
+Oxide development authority, this authorizes the next bounded Oxide-only
+product tranche through checked Queue briefs and independent exact-head
+review: enforced owned build-storage bounds, a bounded read-only storage
+inventory, and explicit retirement of proven-idle generations. Preserve the
+usual 90-minute author / 30-minute review scope per task and name finite
+fresh fixture limits before dispatch. This is product delivery, rather than
+another comparison-launcher or generic provenance-wrapper chain. The direct
+measurement exception stays specific to that experiment. Real consumer
+integration, the original representative trial, installation, default changes
+and cleanup of existing storage retain their separate boundaries.
