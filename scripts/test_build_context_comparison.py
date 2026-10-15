@@ -40,7 +40,26 @@ IMAGEINFO_OVER = (
     "\tTotal Non-Empty Bytes: 17179869185\n"
     "\tTotal Empty Bytes: 0\n"
 )
+IMAGEINFO_AT_THRESHOLD = (
+    "Size Information:\n"
+    "\tTotal Bytes: 16106127360\n"
+    "\tTotal Non-Empty Bytes: 15032385536\n"
+    "\tTotal Empty Bytes: 1073741824\n"
+)
 TOKEN = "eyJydW5JZCI6InJ1bl8wMDAxIiwiZXBvY2giOjN9.synthetic-fixture-token"
+DEFAULT_NEGATIVE_STDERR = (
+    "thread 'committed_workflow_packages_parse' panicked at tests/packages.rs:11:5:\n"
+    "packages directory\n"
+    "stack backtrace:\n"
+    "   0: rust_begin_unwind\n"
+    "             at /rustc/8bab26f4f/library/std/src/panicking.rs:698:5\n"
+    "   1: committed_workflow_packages_parse\n"
+    "             at crates/nucleus-core/tests/packages.rs:11:5\n"
+)
+HEADER_ONLY_NEGATIVE_STDERR = (
+    "thread 'committed_workflow_packages_parse' panicked at tests/packages.rs:11:5:\n"
+    "packages directory\n"
+)
 
 
 class FakeClock:
@@ -94,20 +113,34 @@ class FakeImage:
 
 
 class FakeSpawner:
-    def __init__(self, clock: FakeClock, *, rustc_ok: bool = True, cargo_ok: bool = True) -> None:
+    def __init__(
+        self,
+        clock: FakeClock,
+        *,
+        rustc_ok: bool = True,
+        cargo_ok: bool = True,
+        advance_ns: int = 1_000_000,
+        rustc_running_prefix: str = "/usr/bin/rustc",
+        negative_stderr: str | None = None,
+    ) -> None:
         self.clock = clock
         self.rustc_ok = rustc_ok
         self.cargo_ok = cargo_ok
+        self.advance_ns = advance_ns
+        self.rustc_running_prefix = rustc_running_prefix
+        self.negative_stderr = negative_stderr if negative_stderr is not None else DEFAULT_NEGATIVE_STDERR
         self.calls: list[tuple[str, ...]] = []
         self.envs: list[dict[str, str]] = []
         self.unknown_closure = False
 
-    def run(self, argv, *, env, cwd, remaining_ns, log, clock, session) -> bcc.RunResult:
+    def run(self, argv, *, env, cwd, remaining_ns, log, clock, session, poll=None) -> bcc.RunResult:
         if remaining_ns <= 0 or session.expired_hard(clock.monotonic_ns()):
             return bcc.RunResult(outcome="deadline", spawned=False, argv=tuple(argv), seam="deadline_before_spawn")
         self.calls.append(tuple(argv))
         self.envs.append(dict(env))
-        self.clock.advance(1_000_000)
+        self.clock.advance(self.advance_ns)
+        if poll is not None:
+            poll()
         stdout = ""
         stderr = ""
         if argv[:2] == ["cargo", "-vV"]:
@@ -124,9 +157,22 @@ class FakeSpawner:
             if not exe.exists():
                 exe.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
                 os.chmod(exe, 0o755)
-            stdout = f"Running {exe}\ntest {bcc.TEST_NAME} ... ok\n1 passed\n"
+            obj = target / "packages-deadbeef.o"
+            if not obj.exists():
+                obj.write_bytes(b"obj")
+            rel = "target/debug/deps/packages-deadbeef"
+            stderr = (
+                "   Compiling nucleus-core v0.0.0\n"
+                "    Fresh syn v2.0.0\n"
+                f"     Running `{self.rustc_running_prefix} --crate-name packages --edition 2021`\n"
+                f"     Running tests/packages.rs ({rel})\n"
+            )
+            stdout = (
+                f"test {bcc.TEST_NAME} ... ok\n"
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n"
+            )
         elif argv and "packages-deadbeef" in argv[0]:
-            stderr = "thread 'committed_workflow_packages_parse' panicked at tests/packages.rs:11:5:\npackages directory\n"
+            stderr = self.negative_stderr
         log.write(stdout + stderr)
         if self.unknown_closure:
             return bcc.RunResult(
@@ -138,6 +184,7 @@ class FakeSpawner:
                 writer_closed=False,
                 stdout=stdout,
                 stderr=stderr,
+                duration_ns=self.advance_ns,
             )
         return bcc.RunResult(
             outcome="ok",
@@ -148,6 +195,7 @@ class FakeSpawner:
             writer_closed=True,
             stdout=stdout,
             stderr=stderr,
+            duration_ns=self.advance_ns,
         )
 
 
@@ -158,6 +206,8 @@ def _git_ok(argv, cwd=None) -> str:
         return bcc.NUCLEUS_TREE + "\n"
     if argv == ["ls-files"]:
         return "Cargo.lock\nCargo.toml\n"
+    if argv[:2] == ["status", "--porcelain"] or argv[:1] == ["status"]:
+        return ""
     return ""
 
 
@@ -558,8 +608,129 @@ class EvidenceTests(unittest.TestCase):
         self.assertTrue((source / "packages").is_dir())
         self.assertFalse((source / "packages.oxide-moved").exists())
         self.assertTrue(any(call[:1] == ["checkout"] for call in git_calls))
+        self.assertTrue(any(call[:2] == ["status", "--porcelain"] for call in git_calls))
         self.assertIn("restore packages=True", document["log"])
         self.assertEqual(document["count_delivered"], 10)
+        self.assertEqual(document["outcome"], "success")
+
+    def test_panic_header_without_frame_is_partial(self) -> None:
+        clock = FakeClock()
+        spawner = FakeSpawner(clock, negative_stderr=HEADER_ONLY_NEGATIVE_STDERR)
+        launcher, _, _, _ = _launcher(SCRATCH, clock=clock, spawner=spawner)
+        document = launcher.run(live=True, resource_plan=_plan(SCRATCH / "hdr"))
+        self.assertEqual(document["outcome"], "partial")
+        self.assertEqual(document["seam"], "backtrace_frame")
+
+    def test_restore_dirty_porcelain_is_partial(self) -> None:
+        def git(argv, cwd=None):
+            if argv[:2] == ["status", "--porcelain"]:
+                return " M crates/nucleus-core/src/lib.rs\n"
+            return _git_ok(argv, cwd)
+
+        launcher, _, _, _ = _launcher(SCRATCH, git=git)
+        document = launcher.run(live=True, resource_plan=_plan(SCRATCH / "dirty"))
+        self.assertEqual(document["outcome"], "partial")
+        self.assertEqual(document["seam"], "restore")
+
+    def test_union_and_invocation_measurements_wired(self) -> None:
+        clock = FakeClock()
+        launcher, _, _, _ = _launcher(SCRATCH, clock=clock)
+        document = launcher.run(live=True, resource_plan=_plan(SCRATCH / "meas"))
+        self.assertEqual(document["outcome"], "success")
+        self.assertEqual(len(document["measurements"]), 8)
+        rec = document["measurements"][0]
+        self.assertEqual(rec["mode"], "off")
+        self.assertEqual(rec["step"], "C0")
+        self.assertEqual(rec["exit_code"], 0)
+        self.assertGreater(rec["duration_ns"], 0)
+        self.assertGreaterEqual(rec["compiling"], 1)
+        self.assertGreaterEqual(rec["fresh"], 1)
+        self.assertIn("test result:", rec["test_result"] or "")
+        self.assertGreaterEqual(rec["deps_files"], 1)
+        self.assertGreaterEqual(rec["union_file_count"], 1)
+        self.assertIn("cannot confound", rec["apfs_clone_sharing"])
+        self.assertIn("measure off C0", document["log"])
+
+    def test_rustc_wrapper_prefix_refuses(self) -> None:
+        clock = FakeClock()
+        spawner = FakeSpawner(clock, rustc_running_prefix="/usr/bin/sccache /usr/bin/rustc")
+        launcher, _, _, _ = _launcher(SCRATCH, clock=clock, spawner=spawner)
+        document = launcher.run(live=True, resource_plan=_plan(SCRATCH / "wrap"))
+        self.assertEqual(document["outcome"], "refusal")
+        self.assertEqual(document["seam"], "rustc_wrapper")
+
+
+class LocatorTests(unittest.TestCase):
+    def test_paren_form_on_stderr_resolves_via_target_dir(self) -> None:
+        target = SCRATCH / "tgt-paren"
+        deps = target / "debug" / "deps"
+        deps.mkdir(parents=True)
+        exe = deps / "packages-abc123"
+        exe.write_text("x", encoding="utf-8")
+        cwd = SCRATCH / "src-paren"
+        cwd.mkdir(exist_ok=True)
+        text = (
+            "     Running `/usr/bin/rustc --crate-name packages`\n"
+            "     Running tests/packages.rs (target/debug/deps/packages-abc123)\n"
+        )
+        reported = bcc.parse_reported_executable(text)
+        self.assertEqual(reported, "target/debug/deps/packages-abc123")
+        located = bcc.locate_reported_executable(reported, target, cwd=cwd)
+        self.assertEqual(located.resolve(), exe.resolve())
+
+    def test_backtick_form_absolute(self) -> None:
+        target = SCRATCH / "tgt-tick"
+        deps = target / "debug" / "deps"
+        deps.mkdir(parents=True)
+        exe = deps / "packages-bead"
+        exe.write_text("x", encoding="utf-8")
+        text = f"     Running `{exe} --exact {bcc.TEST_NAME}`\n"
+        reported = bcc.parse_reported_executable(text)
+        self.assertEqual(reported, str(exe))
+        located = bcc.locate_reported_executable(reported, target)
+        self.assertEqual(located, exe)
+
+    def test_skips_rustc_running_line(self) -> None:
+        text = "     Running `/usr/bin/rustc --crate-name packages --edition 2021`\n"
+        self.assertIsNone(bcc.parse_reported_executable(text))
+
+    def test_panic_header_is_not_a_frame(self) -> None:
+        self.assertFalse(bcc.backtrace_has_packages_frame(HEADER_ONLY_NEGATIVE_STDERR))
+        self.assertTrue(bcc.backtrace_has_packages_frame(DEFAULT_NEGATIVE_STDERR))
+
+
+class SamplingTests(unittest.TestCase):
+    def test_cadence_sample_during_helper(self) -> None:
+        clock = FakeClock()
+        spawner = FakeSpawner(clock, advance_ns=bcc.SAMPLE_CADENCE_NS)
+        image = FakeImage(clock)
+        launcher, _, _, _ = _launcher(SCRATCH, clock=clock, spawner=spawner, image=image)
+        document = launcher.run(live=True, resource_plan=_plan(SCRATCH / "cadence"))
+        self.assertEqual(document["outcome"], "success")
+        self.assertGreaterEqual(document["sampling"]["sample_count"], 2)
+        self.assertIn("reason=cadence", document["log"])
+        self.assertGreaterEqual(document["sampling"]["peak_image_used"], 4096)
+        self.assertIsNotNone(document["sampling"]["min_host_free"])
+        self.assertEqual(document["sampling"]["cadence_ns"], bcc.SAMPLE_CADENCE_NS)
+
+    def test_cadence_image_threshold_stops(self) -> None:
+        clock = FakeClock()
+        image = FakeImage(clock)
+        n = {"c": 0}
+        original = image.imageinfo
+
+        def wrapped(backing, remaining_ns):
+            n["c"] += 1
+            if n["c"] >= 3:
+                image.info = IMAGEINFO_AT_THRESHOLD
+            return original(backing, remaining_ns)
+
+        image.imageinfo = wrapped  # type: ignore[method-assign]
+        spawner = FakeSpawner(clock, advance_ns=bcc.SAMPLE_CADENCE_NS)
+        launcher, _, _, _ = _launcher(SCRATCH, clock=clock, spawner=spawner, image=image)
+        document = launcher.run(live=True, resource_plan=_plan(SCRATCH / "cad-th"))
+        self.assertEqual(document["outcome"], "refusal")
+        self.assertEqual(document["seam"], "image_threshold")
 
 
 class ParseTests(unittest.TestCase):

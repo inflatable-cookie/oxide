@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import select
 import signal
 import stat
@@ -69,6 +70,11 @@ PARTIAL_MARKER = (
     "\n[oxide-build-context: log cap reached; subsequent non-critical "
     "bytes dropped; partial=true]\n"
 )
+_PAREN_RUNNING = re.compile(r"^\s*Running\s+\S.*\s+\(([^)]+)\)\s*$")
+_BACKTICK_RUNNING = re.compile(r"^\s*Running\s+`([^`]+)`")
+_FRAME_RE = re.compile(r"^\s+at\s+\S*tests/packages\.rs:\d+", re.MULTILINE)
+_COMPILING_RE = re.compile(r"^\s*Compiling\s+", re.MULTILINE)
+_FRESH_RE = re.compile(r"^\s*Fresh\s+", re.MULTILINE)
 
 # Contract 010 / 049 field names. Values of REDACT are never written to logs.
 ADMISSION_PRESERVE = (
@@ -292,6 +298,7 @@ class RealSpawner:
         log: EvidenceLog,
         clock,
         session: SessionClock,
+        poll=None,
     ) -> RunResult:
         if remaining_ns <= 0 or session.expired_hard(clock.monotonic_ns()):
             return RunResult(
@@ -335,6 +342,23 @@ class RealSpawner:
                             seam="writer_closure_unknown",
                         )
                     break
+                if poll is not None:
+                    try:
+                        poll()
+                    except ComparisonError:
+                        closed = _terminate_pgid(pgid, proc)
+                        if not closed:
+                            return RunResult(
+                                outcome="unknown",
+                                spawned=True,
+                                argv=tuple(argv),
+                                pgid=pgid,
+                                child_terminated=False,
+                                writer_closed=False,
+                                duration_ns=clock.monotonic_ns() - start,
+                                seam="writer_closure_unknown",
+                            )
+                        raise
                 timeout = min(0.05, hard / 1_000_000_000)
                 readable, _, _ = select.select(
                     [s for s in streams if s is not None], [], [], timeout
@@ -732,24 +756,104 @@ def footprint_sum(*, backing: Path, extras: list[Path], imageinfo: dict[str, int
     return total
 
 
-def locate_reported_executable(reported: str | None, target_dir: Path) -> Path:
+def parse_reported_executable(text: str) -> str | None:
+    """Last packages-* test binary from Cargo Running lines on stdout or stderr.
+
+    Accepts the unit-graph form ``Running tests/packages.rs (target/debug/deps/packages-<hash>)``
+    and the verbose backtick form ``Running `<path> --exact ...```. rustc Running
+    lines are skipped. Relative paths are returned as reported; locate resolves them.
+    """
+    last = None
+    for line in text.splitlines():
+        reported = None
+        paren = _PAREN_RUNNING.match(line)
+        if paren:
+            reported = paren.group(1).strip()
+        else:
+            tick = _BACKTICK_RUNNING.match(line)
+            if tick:
+                reported = tick.group(1).strip().split()[0]
+        if not reported:
+            continue
+        name = Path(reported).name
+        if name == "rustc" or name.startswith("rustc-"):
+            continue
+        posix = reported.replace("\\", "/")
+        if "/deps/" not in posix and Path(reported).parent.name != "deps":
+            continue
+        if not name.startswith("packages-"):
+            continue
+        last = reported
+    return last
+
+
+def locate_reported_executable(
+    reported: str | None, target_dir: Path, *, cwd: Path | None = None
+) -> Path:
     if not reported:
         raise ComparisonError("partial", "stale_executable_ambiguity", "no reported test executable")
-    path = Path(reported)
-    if not path.is_absolute():
-        raise ComparisonError("partial", "stale_executable_ambiguity", "reported executable is not absolute")
+    raw = Path(reported)
+    candidates: list[Path] = []
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        if cwd is not None:
+            candidates.append(cwd / raw)
+        candidates.append(target_dir / raw)
+        parts = raw.parts
+        if parts and parts[0] == "target":
+            candidates.append(target_dir.joinpath(*parts[1:]))
+        if "debug" in parts:
+            idx = list(parts).index("debug")
+            candidates.append(target_dir.joinpath(*parts[idx:]))
     try:
-        st = os.lstat(path)
+        deps = (target_dir / "debug" / "deps").resolve()
     except FileNotFoundError as exc:
-        raise ComparisonError("partial", "stale_executable_ambiguity", "reported executable missing") from exc
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-        raise ComparisonError("partial", "stale_executable_ambiguity", "reported executable is not a regular file")
-    deps = target_dir / "debug" / "deps"
-    try:
-        path.resolve().relative_to(deps.resolve())
-    except (ValueError, FileNotFoundError) as exc:
-        raise ComparisonError("partial", "stale_executable_ambiguity", "reported executable outside target deps") from exc
-    return path
+        raise ComparisonError("partial", "stale_executable_ambiguity", "target deps missing") from exc
+    for cand in candidates:
+        try:
+            st = os.lstat(cand)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            continue
+        try:
+            resolved = Path(cand).resolve()
+            resolved.relative_to(deps)
+        except (ValueError, OSError):
+            continue
+        return cand
+    raise ComparisonError(
+        "partial",
+        "stale_executable_ambiguity",
+        "reported executable missing, not a regular file, or outside target deps",
+    )
+
+
+def backtrace_has_packages_frame(text: str) -> bool:
+    if "packages directory" not in text:
+        return False
+    body = "\n".join(line for line in text.splitlines() if "panicked at" not in line)
+    return _FRAME_RE.search(body) is not None
+
+
+def deps_artifact_counts(path: Path) -> tuple[int, int, int]:
+    files = 0
+    objects = 0
+    dsyms = 0
+    if not path.exists():
+        return 0, 0, 0
+    for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+        for name in filenames:
+            files += 1
+            if name.endswith(".o"):
+                objects += 1
+            if name.endswith(".dSYM"):
+                dsyms += 1
+        for name in dirnames:
+            if name.endswith(".dSYM"):
+                dsyms += 1
+    return files, objects, dsyms
 
 
 class CommandCounter:
@@ -816,6 +920,12 @@ class ComparisonLauncher:
         self.seam: str | None = None
         self.helper_pgids: list[int] = []
         self.created_paths: list[Path] = []
+        self.active_plan: ResourcePlan | None = None
+        self.last_sample_ns = 0
+        self.sample_count = 0
+        self.peak_image_used = 0
+        self.min_host_free: int | None = None
+        self.measurements: list[dict[str, object]] = []
 
     def plan(self, resource_plan: ResourcePlan | None = None) -> dict[str, object]:
         notes = []
@@ -867,6 +977,7 @@ class ComparisonLauncher:
                 "total_footprint_limit": TOTAL_FOOTPRINT_LIMIT,
                 "image_used_threshold": IMAGE_USED_THRESHOLD,
                 "host_free_reserve": HOST_FREE_RESERVE,
+                "sample_cadence_ns": SAMPLE_CADENCE_NS,
                 "image_create_size": IMAGE_CREATE_SIZE,
             },
             "admission_preserve": list(ADMISSION_PRESERVE),
@@ -902,6 +1013,7 @@ class ComparisonLauncher:
             reserve_ns=self.reserve_ns,
         )
         self.session = session
+        self.last_sample_ns = start
         self.log.write(
             f"session_start utc={utc} monotonic_ns={start} deadline_ns={session.deadline_monotonic_ns}",
             critical=True,
@@ -921,6 +1033,7 @@ class ComparisonLauncher:
 
     def _run_live(self, plan: ResourcePlan) -> dict[str, object]:
         session = self._open_session()
+        self.active_plan = plan
         try:
             validate_resource_plan(plan, strict_names=self.strict_names)
             self.preparation_after_clock = True
@@ -1019,7 +1132,10 @@ class ComparisonLauncher:
             if step == "E2":
                 self._edit(source, EDIT_FILES[1], " // oxide-build-context comparison edit 2")
             result = self._deliver(mode, step, list(EFFIGY_TEST_ARGV), env, str(source))
-            reported = _parse_reported_executable(result.stdout) or reported
+            streams = result.stdout + "\n" + result.stderr
+            self._check_rustc_running_lines(streams)
+            reported = parse_reported_executable(streams) or reported
+            self._record_invocation(plan, mode, step, result, target)
             if result.outcome != "ok" or result.exit_code not in {0, None}:
                 raise ComparisonError("partial", "selected_test", f"{mode} {step} failed")
         self._negative_check(source, target, env, reported)
@@ -1031,7 +1147,7 @@ class ComparisonLauncher:
         moved = source / "packages.oxide-moved"
         restored = {"packages": False, "files": False}
         try:
-            executable = locate_reported_executable(reported, target)
+            executable = locate_reported_executable(reported, target, cwd=source)
             if packages.exists():
                 os.rename(packages, moved)
             result = self._run_helper(
@@ -1039,12 +1155,23 @@ class ComparisonLauncher:
                 env=dict(env, RUST_BACKTRACE="1"),
                 cwd=str(source),
             )
+            streams = result.stderr + "\n" + result.stdout
             self.log.write(
                 f"negative_check exit={result.exit_code} expected_panic=packages directory",
                 critical=True,
             )
-            if "packages.rs:" not in (result.stderr + result.stdout):
-                raise ComparisonError("partial", "backtrace_frame", "missing tests/packages.rs frame")
+            if "packages directory" not in streams:
+                raise ComparisonError(
+                    "partial",
+                    "backtrace_frame",
+                    "missing expected panic packages directory",
+                )
+            if not backtrace_has_packages_frame(streams):
+                raise ComparisonError(
+                    "partial",
+                    "backtrace_frame",
+                    "missing tests/packages.rs frame (panic header is not a frame)",
+                )
         finally:
             if moved.exists() and not packages.exists():
                 os.rename(moved, packages)
@@ -1052,6 +1179,7 @@ class ComparisonLauncher:
             self._restore_tracked(source)
             restored["files"] = True
             self.log.write(f"restore packages={restored['packages']} files={restored['files']}", critical=True)
+            self._verify_restore(source)
 
     def _edit(self, source: Path, rel: str, suffix: str) -> None:
         path = source / rel
@@ -1149,12 +1277,117 @@ class ComparisonLauncher:
         if result.returncode != 0:
             raise ComparisonError("partial", "restore", result.stderr[-400:])
 
+    def _verify_restore(self, source: Path) -> None:
+        packages = source / "packages"
+        moved = source / "packages.oxide-moved"
+        if not packages.is_dir():
+            raise ComparisonError("partial", "restore", "packages directory missing after restore")
+        if moved.exists():
+            raise ComparisonError("partial", "restore", "packages.oxide-moved still present")
+        porcelain = self._git_out(["status", "--porcelain"], cwd=str(source))
+        if porcelain.strip():
+            raise ComparisonError(
+                "partial",
+                "restore",
+                f"dirty after restore: {porcelain.strip()[:200]}",
+            )
+        digest = self._digest_lock(source / "Cargo.lock")
+        if digest != CARGO_LOCK_SHA256:
+            raise ComparisonError("partial", "restore", "Cargo.lock digest mismatch after restore")
+
+    def _check_rustc_running_lines(self, text: str) -> None:
+        for line in text.splitlines():
+            tick = _BACKTICK_RUNNING.match(line)
+            if tick is None:
+                continue
+            tokens = tick.group(1).strip().split()
+            if not tokens:
+                continue
+            first = tokens[0]
+            rest = " ".join(tokens[1:])
+            looks_like_rustc = (
+                Path(first).name == "rustc"
+                or Path(first).name.startswith("rustc-")
+                or "--crate-name" in rest
+                or "--emit" in rest
+            )
+            if not looks_like_rustc:
+                continue
+            name = Path(first).name
+            if name != "rustc" and not name.startswith("rustc-"):
+                raise ComparisonError(
+                    "refusal",
+                    "rustc_wrapper",
+                    f"rustc Running line first token is not rustc: {first}",
+                )
+
+    def _record_invocation(
+        self, plan: ResourcePlan, mode: str, step: str, result: RunResult, target: Path
+    ) -> None:
+        deps = target / "debug" / "deps"
+        incremental = target / "incremental"
+        roots = [path for path in (deps, incremental) if path.exists()]
+        if roots:
+            acc = union_account(
+                roots,
+                owned_roots=[plan.mount, plan.parent],
+                clock=self.clock,
+                remaining_ns=self._remaining_hard(),
+            )
+        else:
+            acc = Accounting()
+        streams = result.stdout + "\n" + result.stderr
+        compiling = len(_COMPILING_RE.findall(streams))
+        fresh = len(_FRESH_RE.findall(streams))
+        test_line = None
+        for line in streams.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("test result:"):
+                test_line = stripped
+        deps_files, objects, dsyms = deps_artifact_counts(deps)
+        inc_files, _, _ = deps_artifact_counts(incremental)
+        rec = {
+            "mode": mode,
+            "step": step,
+            "utc_end": self.clock.utc_iso(),
+            "duration_ns": result.duration_ns,
+            "exit_code": result.exit_code,
+            "compiling": compiling,
+            "fresh": fresh,
+            "test_result": test_line,
+            "deps_files": deps_files,
+            "object_files": objects,
+            "dsym_count": dsyms,
+            "incremental_files": inc_files,
+            "union_logical_bytes": acc.logical_bytes,
+            "union_allocated_bytes": acc.allocated_bytes,
+            "union_file_count": acc.file_count,
+            "union_hardlink_dedup": acc.hardlink_dedup_count,
+            "apfs_clone_sharing": acc.apfs_clone_sharing,
+        }
+        self.measurements.append(rec)
+        self.log.write(
+            f"measure {mode} {step} duration_ns={result.duration_ns} exit={result.exit_code} "
+            f"compiling={compiling} fresh={fresh} test={test_line} "
+            f"deps_files={deps_files} o={objects} dsym={dsyms} "
+            f"logical={acc.logical_bytes} allocated={acc.allocated_bytes}",
+            critical=True,
+        )
+
     def run_timed_helper(self, argv: list[str], *, env: Mapping[str, str] | None = None, cwd: str | None = None) -> RunResult:
         if self.session is None:
             self._open_session()
         return self._run_helper(argv, env=env or {}, cwd=cwd)
 
-    def _sample(self, plan: ResourcePlan) -> None:
+    def _poll_sample(self) -> None:
+        if self.active_plan is None or self.session is None:
+            return
+        now = self._now()
+        if now - self.last_sample_ns < SAMPLE_CADENCE_NS:
+            return
+        self._sample(self.active_plan, reason="cadence")
+
+    def _sample(self, plan: ResourcePlan, *, reason: str = "boundary") -> None:
         if self._remaining_hard() <= 0:
             raise ComparisonError("deadline", "deadline", "expired before sample")
         host = self._host_free()
@@ -1167,7 +1400,18 @@ class ComparisonLauncher:
         total = footprint_sum(backing=plan.backing, extras=[plan.parent / "control"], imageinfo=info)
         if total > TOTAL_FOOTPRINT_LIMIT:
             raise ComparisonError("refusal", "footprint", f"owned footprint {total} exceeds 16 GiB")
-        self.log.write(f"sample host_free={host} image_used={used} footprint={total}", critical=True)
+        self.last_sample_ns = self._now()
+        self.sample_count += 1
+        self.peak_image_used = max(self.peak_image_used, used)
+        if self.min_host_free is None:
+            self.min_host_free = host
+        else:
+            self.min_host_free = min(self.min_host_free, host)
+        self.log.write(
+            f"sample reason={reason} host_free={host} image_used={used} footprint={total} "
+            f"peak_image_used={self.peak_image_used} min_host_free={self.min_host_free}",
+            critical=True,
+        )
 
     def _host_free(self) -> int:
         if self.space_probe is not None:
@@ -1194,6 +1438,7 @@ class ComparisonLauncher:
             log=self.log,
             clock=self.clock,
             session=self.session,
+            poll=self._poll_sample,
         )
         if result.pgid is not None:
             self.helper_pgids.append(result.pgid)
@@ -1202,8 +1447,9 @@ class ComparisonLauncher:
         if result.outcome == "unknown" or (result.spawned and not result.writer_closed):
             self.resources_retained = True
             raise ComparisonError("unknown", "writer_closure_unknown", f"{mode} {name} writer closure unknown")
-        if "effigy" in argv[0] and result.exit_code not in {0, None}:
-            if "cargo test" in result.stdout and "effigy" not in result.stdout:
+        combined = result.stdout + result.stderr
+        if argv and "effigy" in argv[0] and result.exit_code not in {0, None}:
+            if "cargo test" in combined and "effigy" not in combined:
                 raise ComparisonError("refusal", "raw_cargo_fallback", "raw cargo fallback is forbidden")
         return result
 
@@ -1218,6 +1464,7 @@ class ComparisonLauncher:
             log=self.log,
             clock=self.clock,
             session=self.session,
+            poll=self._poll_sample,
         )
         if result.pgid is not None:
             self.helper_pgids.append(result.pgid)
@@ -1242,6 +1489,13 @@ class ComparisonLauncher:
             "helper_pgids": list(self.helper_pgids),
             "log_overflow": self.log.overflow,
             "log": self.log.text(),
+            "measurements": list(self.measurements),
+            "sampling": {
+                "cadence_ns": SAMPLE_CADENCE_NS,
+                "sample_count": self.sample_count,
+                "peak_image_used": self.peak_image_used,
+                "min_host_free": self.min_host_free,
+            },
             "containment": {
                 "parent": str(plan.parent),
                 "mount": str(plan.mount),
@@ -1256,18 +1510,6 @@ def _argv_for(mode: str, name: str) -> tuple[str, ...]:
     if name == "rustc-vV":
         return ("rustc", "-vV")
     return EFFIGY_TEST_ARGV
-
-
-def _parse_reported_executable(stdout: str) -> str | None:
-    marker = "Running "
-    for line in stdout.splitlines():
-        stripped = line.strip()
-        if stripped.startswith(marker) and "/debug/deps/" in stripped:
-            body = stripped[len(marker) :].strip().strip("`")
-            token = body.split(" ", 1)[0]
-            if token:
-                return token
-    return None
 
 
 def _copy_file(src: Path, dest: Path) -> int:
