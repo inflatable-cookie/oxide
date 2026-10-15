@@ -157,6 +157,46 @@ nothing was deleted, detached or repaired. The exact receipts are in the
 [attempt evidence record](evidence/build-context-comparison-053-attempt.json).
 The original shared-reuse four-Cargo, 45-minute trial remains unstarted.
 
+## Bootstrap correction and compiler-free smoke (2026-10-15)
+
+A separately scoped producer correction (`oxide#054`) fixed the three observed
+integration defects from the 053 attempt and proved the corrected bootstrap.
+It did not run the comparison.
+
+- **Launchability.** The staged heavy entry is now one POSIX-quoted `sh -c`
+  command string instead of a TOML argv array. The 053 `run = [python3,
+  <launcher>, …]` array was a *sequence* of separate shell commands in
+  installed Effigy, so it executed bare `python3` and then the non-executable
+  launcher path (code 126). The corrected launcher is launchable through
+  installed Effigy; the comparison itself remains unrun and unqualified.
+- **Runtime state.** Installed Effigy creates `.effigy/{locks,runtime,reports}`
+  in the admitted root before the task command runs, so the previous
+  exact-three-entry check rejected genuine state. The admitted bootstrap now
+  accepts exactly that one Effigy state directory narrowly, while the pinned
+  files keep their mode/owner/link/digest checks and arbitrary extra entries
+  still refuse.
+- **Clock.** `time.monotonic_ns()` on this host's Python 3.9.6 is process-local
+  (tens of milliseconds since process start) and does not share a basis with a
+  spawned child, so the 053 absolute deadline could not transfer. The deadline
+  clock is now `time.clock_gettime_ns(CLOCK_MONOTONIC)`, the shared native
+  basis, bound in `binding.json`. Recorded limitation: `CLOCK_MONOTONIC` does
+  not advance during machine suspend, so a suspend is not charged against the
+  budget.
+
+One genuine compiler-free smoke through installed Effigy heavy admission
+(caller `oxide:planner:bootstrap-smoke:054`, request UUID
+`e09afaa3-0694-47a4-996a-c4077a413f60`, staged root
+`/private/var/tmp/oxide-build-context-cmp-smoke-e09afaa3`) settled `passed`
+(exit 0, 655 ms). The admitted inner role reached the real
+admission/staged-root validation, adopted the original deadline across
+processes and returned the smoke sentinel before any image, source, registry,
+tool or compiler operation (`count_delivered=0`, `effects_executed=false`). The
+reserved mount and backing names were never created. This is a bootstrap proof,
+not a comparison: no incremental-on/off timing, storage, allocation, write,
+test-execution or reuse result exists. See the
+[bootstrap and smoke record](contracts/build-context-policy.md#bootstrap-correction-and-compiler-free-smoke-2026-10-15)
+and the [smoke evidence record](evidence/build-context-comparison-054-smoke.json).
+
 ## Disposable output and retention
 
 At Queue commit `7b9b840354a638a529ab023542903949b5b562ac`, Spec 028 keeps
