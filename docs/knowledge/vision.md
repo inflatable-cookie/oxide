@@ -46,6 +46,25 @@ Assess shipped behavior and supported pinned toolchains, not promised completion
 
 ## Authority boundaries
 
+Tom approved the prepared opt-in stable-Cargo light/full-debug profile qualification
+on 2026-10-16 with "Yes" (Queue decision
+`a1dd9a16-5b5f-4b88-a0d5-b92dc0313f66`, prepared lead
+`69dbee12-bcaa-40a8-8347-d2598d6c8736`). Authority covers one Oxide-only
+implementation/qualification PR adding explicit optional light and full-debug
+profiles, preserving current defaults, workspace backtrace file/line behavior,
+panic unwinding and selected tests. Dependency debug reduction is an explicit
+opt-in tradeoff; the full-debug control must restore the relevant dependency
+information. Author work is bounded to 60 minutes and independent exact-head
+review to 20 minutes. The author comparison allows at most eight Cargo driver
+invocations within one original 20-minute total phase including setup, one fresh
+16 GiB APFS experimental payload, at most 64 MiB outside-volume control/evidence
+and a raw 20 GiB host reserve. Tests always execute; preserve raw observations
+and partial/no-go results without resetting clocks, calls or resources. Review
+checks the raw comparison rather than repeating the timing trial. No consumer,
+existing pool, default/global configuration, tool installation, nightly/JIT,
+release or scheduler changes are authorized. The approved Queue brief owns the
+exact invocation sequence, finite validation and cleanup conditions.
+
 Tom's retained ruling, 2026-10-09: Effigy must remain language agnostic. Cargo/compiler-cache policy must not be added to Effigy. Oxide is a separate Rust-oriented development efficiency/DX project. Queue and Nucleus should consume one reusable Oxide facility rather than two implementations.
 
 Tom's Atlas confirmation, 2026-10-09: Queue/Nucleus manage tasks, agents and milestone QA run slots — the what and when. Oxide manages how Rust work executes efficiently within consumer-authorized workflows and resource bounds, including compatible build storage and Rust-specific execution strategy. Effigy owns language-neutral selector/process/env/lifecycle orchestration. Queue and Nucleus retain scheduler/admission authority, managed Git/source/task/workspace/run identity, authenticated settlement, source/evidence retention and artifact capture policy. Frozen Contract010 must not change.
