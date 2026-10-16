@@ -493,13 +493,16 @@ when reported because the task board was empty.
 
 Nucleus's deployed guard `75675d2` uses private cold fallback once the compatible
 slot exceeds half the cap. The owner requested Oxide-owned lease-time recycling
-of oversized compatible idle slots, accepting a cold build. That correction is
-not yet shipped by the handover above. Keep threshold policy in the facility;
-use complete unique-allocated accounting and the existing durable whole-idle-slot
-deletion/identity rules. A threshold is headroom policy, not a bound on a single
+of oversized compatible idle slots, accepting a cold build. The replacement
+[local CLI](local-lease.md#reviewed-local-handover-artifact) now supplies that
+policy: at `ceil(cap_bytes / 2)` or above, complete unique-allocated accounting
+triggers durable whole-idle-slot deletion and a fresh monotonic slot/lease;
+below it warm reuse continues. No new flag or pool migration is required. A threshold is headroom policy, not a bound on a single
 leased build: ENOSPC remains possible and never releases ownership. Held,
 uncertain or unknown-accounting occupancy must not be deleted to satisfy it.
-Nucleus owns removing its temporary guard after the reviewed replacement lands.
+Nucleus owns installing that replacement and removing its temporary guard;
+ordinary busy/full/refusal fallback remains. No consumer update or post-swap
+production-task outcome is inferred from the Oxide delivery.
 
 ### Historical protected-route references
 

@@ -178,26 +178,27 @@ go to stderr as `oxide-storage-lease: <reason>: <message>`.
 ## Reviewed local handover artifact
 
 A packaging-only rebuild from merged reviewed source
-`34e69090ac40c3fb8daa9de283020e972587a91f` (reviewed head
-`8941ae075356b456957d5678b77dd919f34eb65f`, PR #65) is available at:
+`c116666feb6916eae9e4adcba15775d9566c4ffe` (reviewed head
+`376844daedd363ff5c2441e3ba12d1dfbe4e54b0`, PR #66) is available at:
 
 ```text
-/Users/tom/Dev/projects/oxide/target/oxide-handover/8941ae075356b456957d5678b77dd919f34eb65f/oxide-storage-lease
+/Users/tom/Dev/projects/oxide/target/oxide-handover/376844daedd363ff5c2441e3ba12d1dfbe4e54b0/oxide-storage-lease
 ```
 
-SHA-256: `9b0b0fc853c8607a94ccec765b84323d25ab42e0dcb95a40e1446b5a6cf12fbd`.
+SHA-256: `637a68b740b0ad424a085bd42b5b30feee129962334831c3cb4ee8f60e087785`.
 This canonical-checkout rebuild has its own hash; the experimental binary
 hash remains unchanged in the evidence. No native fixture, consumer Cargo
 experiment, pool initialization or installation was performed by packaging.
 
-This replaces the earlier `9d468378…` artifact, which refused real pools after
-macOS created `.fseventsd`. The fix accepts the exact safe metadata directories
-above even when they arrive after init. Existing receipt-v2/ledger-v1 pools
-reopen with this binary: no re-init, migration, metadata deletion or settings
-change is required. Lease identities, JSON and exit codes are unchanged. The
-independent reviewer ran all covering selectors successfully, including 226
-Rust tests (three environment-gated probes ignored) and a fresh native CLI
-proof with after-init metadata.
+This replaces the `9b0b0fc8…` artifact with automatic half-cap recycling of
+compatible idle slots, as specified above. The delayed-APFS-metadata correction
+is retained. Existing receipt-v2/ledger-v1 pools reopen without re-init or
+migration; lease identities, JSON and exit codes are unchanged. The independent
+reviewer ran all covering selectors successfully, including 231 Rust tests
+(three environment-gated probes ignored), real allocated-byte recycling
+fixtures and a fresh native CLI proof. No threshold flag is needed. Consumers
+can remove a temporary pre-lease half-cap cold-fallback guard after installing
+this replacement, leaving ordinary busy/full/refusal fallback in place.
 
 Lease JSON v1 includes `lease_id`, `store_id`, `slot_id`, `incarnation`,
 `project`, `workspace`, `profile`, `holder`, `state`, `reused_slot` and the
