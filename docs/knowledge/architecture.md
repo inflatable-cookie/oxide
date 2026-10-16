@@ -86,6 +86,16 @@ keeps its task-owned disposable footprint below 10 GiB. Those bounds cover the
 fixed fixture construction only; they do not impose a filesystem quota or cap
 arbitrary Cargo output.
 
+Whenever a caller requests a writer rendezvous, the fixture reports exactly one
+bounded readiness outcome: either the held child, proved by its per-spawn marker
+and a still-active owned handle, or a typed, non-secret refusal. An early
+fixture refusal is therefore explicit and fail-closed; it never appears as a
+channel timeout or as a started writer. The task-wide disposable-byte
+accounting walk counts non-regular sibling entries (for example a FIFO created
+by another isolated test under the shared scratch root) without following them,
+while the active scenario's own walk still rejects any non-regular entry in its
+tree.
+
 This evidence means the registered, trusted foreground fixture honored its
 promise to wait for its writing child and close its write handle before
 completion. It does not discover or fence an unregistered same-user writer,

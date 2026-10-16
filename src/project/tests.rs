@@ -3,6 +3,7 @@ use crate::storage::{
     Budget, Daemon, DaemonConfig, EvidenceAuthority, FreeSpaceProbe, RunEnvelope, TerminalOutcome,
 };
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -875,6 +876,55 @@ fn assert_native_fixture_bounds(root: &FixtureRoot) {
     }
 }
 
+fn expect_held(
+    readiness: native::NativeWriterReadiness,
+    context: &str,
+) -> native::NativeChildStarted {
+    match readiness {
+        native::NativeWriterReadiness::Held(started) => started,
+        native::NativeWriterReadiness::Refused(reason) => panic!(
+            "{context}: fixture refused before a held writer ({})",
+            reason.label()
+        ),
+    }
+}
+
+/// A controlled sibling entry under the shared task scratch root. Another
+/// isolated fixture test (the declared-workflow FIFO reader case) can create a
+/// non-regular entry there while a native runner is active; this helper proves
+/// the runner accounts for it instead of mistaking it for its own fixture.
+struct SiblingSpecialEntry {
+    parent: PathBuf,
+    path: PathBuf,
+}
+
+impl SiblingSpecialEntry {
+    fn fifo() -> Self {
+        let parent = task_scratch_root().join("sibling").join(format!(
+            "f{:x}-{:x}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&parent).expect("create sibling fixture directory");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
+            .expect("restrict sibling fixture directory");
+        let path = parent.join("in-use-fifo");
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).expect("nul-free fifo path");
+        // SAFETY: `c_path` is a NUL-terminated path inside the task scratch tree.
+        let status = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(status, 0, "create sibling fifo fixture");
+        Self { parent, path }
+    }
+}
+
+impl Drop for SiblingSpecialEntry {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_dir(&self.parent);
+    }
+}
+
 fn write_free_space_record(space: &NativeScenarioSpace, root: &FixtureRoot) {
     space.sample(&root.path);
     let record = space.save(root);
@@ -987,9 +1037,12 @@ fn native_active_owner_refuses_competitors_then_allows_one_racing_winner() {
             consumer.last_terminal_outcome,
         )
     });
-    let active = started_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("known writer handle reached the held state");
+    let active = expect_held(
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("known writer handle reached the held state"),
+        "exclusive race",
+    );
     assert!(active.pid > 0 && active.start_identity.starts_with("sha256:"));
     let (busy_invocation, mut busy_consumer) = another_attempt(
         &invocation,
@@ -1131,11 +1184,11 @@ fn native_cancellation_and_daemon_restart_keep_attempt_uncertain() {
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let cancel_signal = Arc::clone(&cancel_flag);
     let cancellation = thread::spawn(move || {
-        let started = started_rx
+        let readiness = started_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("native child started before cancellation");
         cancel_signal.store(true, Ordering::SeqCst);
-        started
+        readiness
     });
     let mut runner = native::NativeFixtureCommandRunner::gated(started_tx, release_rx)
         .expect("bounded gated runner");
@@ -1146,7 +1199,10 @@ fn native_cancellation_and_daemon_restart_keep_attempt_uncertain() {
         &mut runner,
         &AtomicCancellation(cancel_flag),
     );
-    let started = cancellation.join().expect("cancellation controller joins");
+    let started = expect_held(
+        cancellation.join().expect("cancellation controller joins"),
+        "cancellation",
+    );
     assert!(started.pid > 0);
     assert_eq!(result.disposition, ExecutionDisposition::Uncertain);
     assert_eq!(consumer.capture_calls, 0);
@@ -1220,10 +1276,14 @@ fn native_retained_writer_blocks_release_and_remains_reserved_after_reap() {
         &mut runner,
         &NeverCancelled,
     );
-    let started = started_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("known fixture writer remains active");
-    assert!(started.pid > 0 && runner.has_retained_writer());
+    let started = expect_held(
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("known fixture writer remains active"),
+        "retained writer",
+    );
+    assert!(started.pid > 0);
+    assert!(runner.has_retained_writer() && runner.retained_writer_is_active());
     assert_eq!(result.disposition, ExecutionDisposition::Uncertain);
     assert_eq!(consumer.last_terminal_outcome, None);
     assert_eq!(consumer.capture_calls, 0);
@@ -1269,6 +1329,106 @@ fn native_retained_writer_blocks_release_and_remains_reserved_after_reap() {
     let slot_path = storage_root.join("slots").join(&slot.slot_id);
     let contents = fs::read(slot_path.join("fixture-output.bin")).unwrap();
     assert!(contents.ends_with(b"awaited-child-finished\n"));
+    assert_eq!(daemon.client.evict("no-uncertain-eviction", 1).unwrap(), 0);
+    write_free_space_record(&space, &root);
+}
+
+#[test]
+fn native_retained_writer_readiness_accounts_for_a_sibling_special_entry() {
+    // Regression proof for the shared task-root accounting walk: a concurrently
+    // running isolated fixture (the declared-workflow FIFO reader) creates a
+    // non-regular sibling entry. That entry is accounted, not treated as this
+    // scenario's ownership failure, and the owned writer still reaches its
+    // held state and stays reserved.
+    let root = FixtureRoot::scenario("07-sibling-special");
+    let space = NativeScenarioSpace::new();
+    space.sample(&root.path);
+    let sibling = SiblingSpecialEntry::fifo();
+    let storage_root = root.dir("storage");
+    let daemon = RunningDaemon::start_with_probe(&storage_root, space.probe());
+    let invocation = fixture_invocation_named(&root, "sibling-special");
+    let (started_tx, started_rx) = mpsc::channel();
+    let mut runner = native::NativeFixtureCommandRunner::retain_writer(started_tx)
+        .expect("bounded retained-writer runner");
+    let mut adapter = ProjectAdapter::new(daemon.client.clone());
+    let mut consumer = FixtureConsumer::new();
+    let result = adapter.execute(
+        &invocation,
+        &mut consumer,
+        &mut NoWait,
+        &mut runner,
+        &NeverCancelled,
+    );
+    let started = expect_held(
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("retained writer reaches readiness despite the sibling fifo"),
+        "sibling special entry",
+    );
+    assert!(started.pid > 0);
+    assert!(runner.has_retained_writer() && runner.retained_writer_is_active());
+    assert_eq!(result.disposition, ExecutionDisposition::Uncertain);
+    assert_eq!(consumer.last_terminal_outcome, None);
+    assert_eq!(consumer.capture_calls, 0);
+    assert!(invocation.capture_dir.join("writer-progress.txt").is_file());
+    let slot = daemon
+        .client
+        .inventory("sibling-special-retained")
+        .unwrap()
+        .slots
+        .pop()
+        .expect("uncertain slot remains reserved");
+    assert_eq!(slot.state, SlotState::Uncertain);
+    runner
+        .release_and_reap_retained()
+        .expect("reap only the identified fixture writer");
+    drop(sibling);
+    write_free_space_record(&space, &root);
+}
+
+#[test]
+fn native_retained_writer_readiness_refuses_a_foreign_start_marker() {
+    // Deterministic pre-readiness error path: the child writes a start marker
+    // that is not its own spawn identity and exits. Readiness must report a
+    // bounded refusal, and the runner must neither retain nor claim a writer.
+    let root = FixtureRoot::scenario("08-foreign-marker");
+    let space = NativeScenarioSpace::new();
+    space.sample(&root.path);
+    let storage_root = root.dir("storage");
+    let daemon = RunningDaemon::start_with_probe(&storage_root, space.probe());
+    let invocation = fixture_invocation_named(&root, "foreign-marker");
+    let (started_tx, started_rx) = mpsc::channel();
+    let mut runner = native::NativeFixtureCommandRunner::bad_start_marker(started_tx)
+        .expect("bounded refusal runner");
+    let mut adapter = ProjectAdapter::new(daemon.client.clone());
+    let mut consumer = FixtureConsumer::new();
+    let result = adapter.execute(
+        &invocation,
+        &mut consumer,
+        &mut NoWait,
+        &mut runner,
+        &NeverCancelled,
+    );
+    assert_eq!(
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a pre-readiness refusal is always reported"),
+        native::NativeWriterReadiness::Refused(native::NativeReadinessRefusal::StartMarker)
+    );
+    assert_eq!(runner.launched_children(), 1);
+    assert!(!runner.has_retained_writer());
+    assert!(!runner.retained_writer_is_active());
+    assert_eq!(result.disposition, ExecutionDisposition::Uncertain);
+    assert_eq!(consumer.last_terminal_outcome, None);
+    assert_eq!(consumer.capture_calls, 0);
+    let slot = daemon
+        .client
+        .inventory("foreign-marker")
+        .unwrap()
+        .slots
+        .pop()
+        .expect("refused attempt keeps its slot uncertain");
+    assert_eq!(slot.state, SlotState::Uncertain);
     assert_eq!(daemon.client.evict("no-uncertain-eviction", 1).unwrap(), 0);
     write_free_space_record(&space, &root);
 }
@@ -2971,10 +3131,14 @@ fn mapped_source_map_run_with_retained_writer_keeps_slot_uncertain() {
         &mut runner,
         &NeverCancelled,
     );
-    let started = started_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("mapped fixture writer remains active");
-    assert!(started.pid > 0 && runner.has_retained_writer());
+    let started = expect_held(
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("mapped fixture writer remains active"),
+        "mapped retained writer",
+    );
+    assert!(started.pid > 0);
+    assert!(runner.has_retained_writer() && runner.retained_writer_is_active());
     assert_eq!(result.disposition, ExecutionDisposition::Uncertain);
     assert_eq!(consumer.last_terminal_outcome, None);
     assert_eq!(consumer.capture_calls, 0);
