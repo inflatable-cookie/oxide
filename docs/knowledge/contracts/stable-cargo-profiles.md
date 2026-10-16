@@ -111,14 +111,20 @@ full QA.
 
 The brief's `bounded_comparison` gate is **not met**, and this task records an
 explicit **no-go** for the bounded profile comparison. Independent exact-head
-review (PR 68, review comment 6220360222) recorded `bounded_comparison: fail`
-and `truthful_delivery: fail`; the product/profile gates passed. The reviewer
-found that the author ran four fresh sessions (2, 2, 8 and 8 Cargo driver
-invocations, 20 in total) across four fresh roots, images, clocks and call
-budgets instead of the brief's one original capped session, that one complete
-run was unmatched, and that the recorded session's timer starts after
-submission staging. The later session's figures are therefore retained only as
-unqualified observations and must not be read as the approved comparison.
+review recorded the violation at PR 68 review comment 6220360222
+(`bounded_comparison: fail`, with a `truthful_delivery: fail` that the next
+head superseded), and the follow-up review at head
+`0d882443564f3384cf8bea0473386f5a77a09fc8` (review comment 6220502241)
+confirmed `opt_in_profiles: pass`, `correctness_and_debug: pass`,
+`truthful_delivery: pass` and `bounded_comparison: fail`, stating that a later
+valid-looking sequence cannot repair the violation. The reviewer found that the
+author ran four fresh sessions (2, 2, 8 and 8 Cargo driver invocations, 20 in
+total) across four fresh roots, images, clocks and call budgets instead of the
+brief's one original capped session, that one complete run was unmatched
+(attempt 3 rebuilt zero workspace units in its light edit step), and that the
+recorded session's timer starts after submission staging. The later session's
+figures are therefore retained only as unqualified observations and must not be
+read as the approved comparison.
 
 The recorded session's timer starts inside the measurement recipe at run
 launch, after the root, packet and recipe were staged and after Effigy
@@ -128,7 +134,11 @@ any effects that the brief requires. The attempt accounting and the diagnosed
 defect of each session are retained in the
 [attempt-session record](../evidence/stable-cargo-profiles-20261016/sessions.json).
 A future comparison requires a fresh, separately scoped record; the existing
-roots and images are closed and are not reused.
+roots and images are closed and are not reused. Because the
+one-original-session cap was exceeded and this brief authorizes no further
+session, the author cannot repair the `bounded_comparison` gate by another
+measurement; the disposition is a no-go, and the merge-or-close decision
+belongs to the planner and operator.
 
 No adoption, default change, consumer decision or policy change follows from
 these observations. The profiles and selectors themselves remain opt-in and

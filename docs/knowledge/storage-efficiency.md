@@ -226,14 +226,18 @@ make the result independently inspectable without another build.
 ## Stable Cargo profile observations (2026-10-16): no-go
 
 The oxide#068 comparison is an explicit **no-go**. Independent exact-head
-review (PR 68, review comment 6220360222) recorded `bounded_comparison: fail`
-and `truthful_delivery: fail` because the author ran four fresh sessions (2, 2,
-8 and 8 Cargo driver invocations, 20 in total) with fresh roots, images,
-clocks and call budgets instead of the brief's one original capped session,
-because one complete run was unmatched, and because the recorded session's
-timer starts after submission staging. The
-[stable Cargo profile contract](contracts/stable-cargo-profiles.md) owns the
-profile recipe, the no-go disposition and the limits; the numbers below are
+review recorded `bounded_comparison: fail` at PR 68 review comment 6220360222,
+and the follow-up review at head `0d88244` (review comment 6220502241)
+confirmed `opt_in_profiles: pass`, `correctness_and_debug: pass`,
+`truthful_delivery: pass` and `bounded_comparison: fail` because the author ran
+four fresh sessions (2, 2, 8 and 8 Cargo driver invocations, 20 in total) with
+fresh roots, images, clocks and call budgets instead of the brief's one
+original capped session, because one complete run was unmatched, and because
+the recorded session's timer starts after submission staging. A later
+valid-looking sequence cannot repair those violations, and this brief
+authorizes no further session, so the gate cannot be repaired by the author.
+The [stable Cargo profile contract](contracts/stable-cargo-profiles.md) owns
+the profile recipe, the no-go disposition and the limits; the numbers below are
 retained only as **unqualified observations**, not as the approved comparison
 and not as acceptance evidence for adoption.
 

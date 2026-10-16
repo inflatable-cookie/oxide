@@ -56,16 +56,33 @@
   "disposition": {
     "verdict": "no-go",
     "review_pr": 68,
-    "review_comment_id": 6220360222,
-    "reviewed_head": "24a894ac3c2551adc018d62ff26f4f48571ceaae",
-    "gates": {
-      "opt_in_profiles": "pass",
-      "correctness_and_debug": "pass",
-      "bounded_comparison": "fail",
-      "truthful_delivery": "fail"
-    },
+    "reviews": [
+      {
+        "review_comment_id": 6220360222,
+        "reviewed_head": "24a894ac3c2551adc018d62ff26f4f48571ceaae",
+        "gates": {
+          "opt_in_profiles": "pass",
+          "correctness_and_debug": "pass",
+          "bounded_comparison": "fail",
+          "truthful_delivery": "fail"
+        },
+        "note": "truthful_delivery was superseded by the next head"
+      },
+      {
+        "review_comment_id": 6220502241,
+        "reviewed_head": "0d882443564f3384cf8bea0473386f5a77a09fc8",
+        "gates": {
+          "opt_in_profiles": "pass",
+          "correctness_and_debug": "pass",
+          "bounded_comparison": "fail",
+          "truthful_delivery": "pass"
+        },
+        "note": "bounded_comparison remains fail; the reviewer states a later valid-looking sequence cannot repair the violations"
+      }
+    ],
     "reason": "four fresh sessions (2, 2, 8 and 8 Cargo driver invocations, 20 total) with fresh roots, images, clocks and call budgets were used instead of the brief's one original capped session, and one complete run (attempt 3) was unmatched; the recorded session's timer also starts after submission staging",
     "recorded_session_timer": "the measurement recipe records its clock at run launch, after the root, packet and recipe were staged and after Effigy admission, so the 67.0-second total excludes that staging and is not the brief's original monotonic session recording made before any effects",
+    "repair": "the one-original-session cap was exceeded and this brief authorizes no further session, so the bounded_comparison gate cannot be repaired by another measurement; the merge-or-close decision belongs to the planner and operator",
     "figures_status": "retained as unqualified observations only; not acceptance evidence and no adoption decision follows",
     "note": "no attempt measured a comparison result, reset a running clock, reset a call budget or reused another root or image"
   }
