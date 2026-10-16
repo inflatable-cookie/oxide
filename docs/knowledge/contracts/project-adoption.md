@@ -515,6 +515,24 @@ output are separate, as detailed in [local capacity](local-lease.md#capacity-and
 No larger pool, compaction, selective package cleaning or cache removal was
 authorized or performed by Oxide in response to that sizing discussion.
 
+The Supervisor reports consumer correction `a4e3ca0` deployed: release now
+requires kernel `CloseoutStatus.retire_participants` to be `applied`. Its host
+applies that obligation only after observing each participant absent through
+`port.agent(id)`; validation's process group has exited before closeout. The
+prior idle-agent release was a real defect, not an external guarantee. The
+owner names a regression in `hosts/paseo/tests/build-cache.test.ts`: a lease is
+released only on the retirement receipt, never on idle agents. This is an
+owner deployment report; Oxide has not independently rerun consumer tests.
+
+Pre-merge cancellation currently stops agents without deleting them and has
+no closeout receipt. That occupancy stays held; subsequent same-project
+acquisitions are busy and use private cold fallback. Nucleus logs the exact
+`recover --lease <id>` once for its owner to run only after confirming all
+writers ended and participants are gone. Idle/archived agents, PID, elapsed
+time and the logged command itself do not establish closure. No automatic
+recovery or Oxide-side cancellation cleanup is selected. Nucleus owns any
+later cancellation-retirement correction.
+
 ### Historical protected-route references
 
 The following describes the earlier removed consumer/protected route, not
