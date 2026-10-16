@@ -322,6 +322,95 @@ pub(super) struct NativeChildStarted {
     pub start_identity: String,
 }
 
+/// The single bounded readiness outcome for a requested fixture rendezvous.
+///
+/// The runner always reports exactly one of these when a caller asked for a
+/// rendezvous, including every pre-readiness refusal, so a caller never has to
+/// read a channel timeout or a dropped sender as a statement about the writer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum NativeWriterReadiness {
+    /// The owned child proved its held-writer marker and is still active.
+    Held(NativeChildStarted),
+    /// The fixture refused or failed before a held writer could be proved.
+    Refused(NativeReadinessRefusal),
+}
+
+/// A bounded, non-secret reason a requested rendezvous did not reach a writer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NativeReadinessRefusal {
+    Ownership,
+    Budget,
+    Reserve,
+    Space,
+    Directory,
+    Identity,
+    Spawn,
+    StartMarker,
+    WriterMarker,
+    ChildExit,
+    Refused,
+    Unavailable,
+}
+
+impl NativeReadinessRefusal {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Ownership => "ownership",
+            Self::Budget => "budget",
+            Self::Reserve => "reserve",
+            Self::Space => "space",
+            Self::Directory => "directory",
+            Self::Identity => "identity",
+            Self::Spawn => "spawn",
+            Self::StartMarker => "start-marker",
+            Self::WriterMarker => "writer-marker",
+            Self::ChildExit => "child-exit",
+            Self::Refused => "refused",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    fn from_boundary(failure: BoundaryFailure) -> Self {
+        match failure {
+            BoundaryFailure::Unavailable => Self::Unavailable,
+            BoundaryFailure::InvalidIdentity => Self::Identity,
+            BoundaryFailure::Rejected => Self::Refused,
+        }
+    }
+}
+
+/// Reports at most one bounded readiness outcome for a requested rendezvous.
+/// The drop backstop closes the channel with a `Refused` outcome even if an
+/// early return forgot to report, so the caller observes a bounded refusal
+/// rather than an unrelated timeout.
+struct ReadinessReporter {
+    sender: Option<Sender<NativeWriterReadiness>>,
+}
+
+impl ReadinessReporter {
+    fn held(&mut self, started: NativeChildStarted) {
+        self.report(NativeWriterReadiness::Held(started));
+    }
+
+    fn refuse(&mut self, reason: NativeReadinessRefusal) {
+        self.report(NativeWriterReadiness::Refused(reason));
+    }
+
+    fn report(&mut self, readiness: NativeWriterReadiness) {
+        if let Some(sender) = self.sender.take() {
+            // A dropped receiver means the caller no longer observes this
+            // rendezvous; the fixture outcome is unchanged either way.
+            let _ = sender.send(readiness);
+        }
+    }
+}
+
+impl Drop for ReadinessReporter {
+    fn drop(&mut self) {
+        self.refuse(NativeReadinessRefusal::Refused);
+    }
+}
+
 /// Inputs supplied by the registered Cargo runner. The storage core still verifies them.
 pub(super) struct CargoCompletion {
     pub claim: NativeExecutionClaim,
@@ -364,13 +453,17 @@ enum ChildBehavior {
     Complete,
     WaitForRelease,
     LeaveWriterRunning,
+    /// Test-only: the child writes a start marker that is not this spawn's
+    /// identity and exits, so the parent must refuse before readiness.
+    #[cfg(test)]
+    WriteBadStartMarker,
 }
 
 pub(super) struct NativeFixtureCommandRunner {
     task_root: PathBuf,
     limits: NativeFixtureLimits,
     behavior: ChildBehavior,
-    started: Option<Sender<NativeChildStarted>>,
+    readiness: Option<Sender<NativeWriterReadiness>>,
     release: Option<Receiver<()>>,
     expected_prior: Option<String>,
     pending: Option<(OwnedChild, PathBuf)>,
@@ -384,16 +477,27 @@ impl NativeFixtureCommandRunner {
     }
 
     pub(super) fn gated(
-        started: Sender<NativeChildStarted>,
+        readiness: Sender<NativeWriterReadiness>,
         release: Receiver<()>,
     ) -> Result<Self, BoundaryFailure> {
-        Self::new(ChildBehavior::WaitForRelease, Some(started), Some(release))
+        Self::new(
+            ChildBehavior::WaitForRelease,
+            Some(readiness),
+            Some(release),
+        )
     }
 
     pub(super) fn retain_writer(
-        started: Sender<NativeChildStarted>,
+        readiness: Sender<NativeWriterReadiness>,
     ) -> Result<Self, BoundaryFailure> {
-        Self::new(ChildBehavior::LeaveWriterRunning, Some(started), None)
+        Self::new(ChildBehavior::LeaveWriterRunning, Some(readiness), None)
+    }
+
+    #[cfg(test)]
+    pub(super) fn bad_start_marker(
+        readiness: Sender<NativeWriterReadiness>,
+    ) -> Result<Self, BoundaryFailure> {
+        Self::new(ChildBehavior::WriteBadStartMarker, Some(readiness), None)
     }
 
     pub(super) fn with_limits(limits: NativeFixtureLimits) -> Result<Self, BoundaryFailure> {
@@ -403,7 +507,7 @@ impl NativeFixtureCommandRunner {
             task_root,
             limits,
             behavior: ChildBehavior::Complete,
-            started: None,
+            readiness: None,
             release: None,
             expected_prior: None,
             pending: None,
@@ -414,12 +518,12 @@ impl NativeFixtureCommandRunner {
 
     fn new(
         behavior: ChildBehavior,
-        started: Option<Sender<NativeChildStarted>>,
+        readiness: Option<Sender<NativeWriterReadiness>>,
         release: Option<Receiver<()>>,
     ) -> Result<Self, BoundaryFailure> {
         let mut runner = Self::with_limits(NativeFixtureLimits::default())?;
         runner.behavior = behavior;
-        runner.started = started;
+        runner.readiness = readiness;
         runner.release = release;
         Ok(runner)
     }
@@ -434,6 +538,15 @@ impl NativeFixtureCommandRunner {
 
     pub(super) fn has_retained_writer(&self) -> bool {
         self.pending.is_some()
+    }
+
+    /// Proves the owned writer is still active: its held-writer marker exists
+    /// and its child has not exited. This is the readiness claim a retained
+    /// writer test must establish before asserting the uncertain outcome.
+    pub(super) fn retained_writer_is_active(&mut self) -> bool {
+        self.pending.as_mut().is_some_and(|(child, control_dir)| {
+            control_dir.join("writer-held").is_file() && child.0.try_wait().ok().flatten().is_none()
+        })
     }
 
     pub(super) fn expect_prior_slot_digest(&mut self, digest: String) {
@@ -471,15 +584,43 @@ impl FixtureCommandRunner for NativeFixtureCommandRunner {
         cancellation: &dyn CancellationProbe,
     ) -> Result<FixtureCommandOutput, BoundaryFailure> {
         self.executions = self.executions.saturating_add(1);
-        self.limits.validate()?;
-        if cancellation.is_cancelled() || !claim_is_task_owned(&plan.claim, &self.task_root) {
+        let mut readiness = ReadinessReporter {
+            sender: self.readiness.take(),
+        };
+        let result = self.execute_inner(plan, cancellation, &mut readiness);
+        if let Err(error) = &result {
+            readiness.refuse(NativeReadinessRefusal::from_boundary(*error));
+        }
+        result
+    }
+}
+
+impl NativeFixtureCommandRunner {
+    fn execute_inner(
+        &mut self,
+        plan: &FixtureExecutionPlan,
+        cancellation: &dyn CancellationProbe,
+        readiness: &mut ReadinessReporter,
+    ) -> Result<FixtureCommandOutput, BoundaryFailure> {
+        if self.limits.validate().is_err() {
+            readiness.refuse(NativeReadinessRefusal::Budget);
             return Err(BoundaryFailure::Rejected);
         }
-        let fixture_root = fixture_root(&self.task_root, &plan.claim.capture_dir)?;
+        if cancellation.is_cancelled() || !claim_is_task_owned(&plan.claim, &self.task_root) {
+            readiness.refuse(NativeReadinessRefusal::Ownership);
+            return Err(BoundaryFailure::Rejected);
+        }
+        let fixture_root =
+            fixture_root(&self.task_root, &plan.claim.capture_dir).map_err(|error| {
+                readiness.refuse(NativeReadinessRefusal::Ownership);
+                error
+            })?;
         let new_files = match self.behavior {
             ChildBehavior::Complete => 4,
             ChildBehavior::WaitForRelease => 6,
             ChildBehavior::LeaveWriterRunning => 4,
+            #[cfg(test)]
+            ChildBehavior::WriteBadStartMarker => 4,
         } + usize::from(
             !plan
                 .command
@@ -487,15 +628,37 @@ impl FixtureCommandRunner for NativeFixtureCommandRunner {
                 .join("fixture-output.bin")
                 .exists(),
         );
-        check_fixture_budget(&self.task_root, &fixture_root, new_files, self.limits)?;
+        check_fixture_budget(&self.task_root, &fixture_root, new_files, self.limits).map_err(
+            |error| {
+                readiness.refuse(NativeReadinessRefusal::Budget);
+                error
+            },
+        )?;
         let mut child_reservation =
-            reserve_scenario_child(&fixture_root, self.limits.child_processes)?;
+            reserve_scenario_child(&fixture_root, self.limits.child_processes).map_err(
+                |error| {
+                    readiness.refuse(NativeReadinessRefusal::Reserve);
+                    error
+                },
+            )?;
         let mut space = SpaceMonitor::new(self.task_root.clone());
-        space.check()?;
-        fs::create_dir_all(&plan.command.capture_dir).map_err(|_| BoundaryFailure::Unavailable)?;
+        space.check().map_err(|error| {
+            readiness.refuse(NativeReadinessRefusal::Space);
+            error
+        })?;
+        fs::create_dir_all(&plan.command.capture_dir).map_err(|_| {
+            readiness.refuse(NativeReadinessRefusal::Directory);
+            BoundaryFailure::Unavailable
+        })?;
         let control_dir = plan.command.capture_dir.join(CONTROL_NAME);
-        fs::create_dir(&control_dir).map_err(|_| BoundaryFailure::Unavailable)?;
-        let repository_head = repository_head()?;
+        fs::create_dir(&control_dir).map_err(|_| {
+            readiness.refuse(NativeReadinessRefusal::Directory);
+            BoundaryFailure::Unavailable
+        })?;
+        let repository_head = repository_head().map_err(|error| {
+            readiness.refuse(NativeReadinessRefusal::Identity);
+            error
+        })?;
         let source_digest = fixture_source_digest();
         let definition_digest =
             workflow_definition_digest(&plan.claim.workflow, &plan.claim.selector, &source_digest);
@@ -505,6 +668,8 @@ impl FixtureCommandRunner for NativeFixtureCommandRunner {
             ChildBehavior::Complete => "complete",
             ChildBehavior::WaitForRelease => "wait",
             ChildBehavior::LeaveWriterRunning => "wait",
+            #[cfg(test)]
+            ChildBehavior::WriteBadStartMarker => "bad-marker",
         };
         let current_exe = std::env::current_exe().map_err(|_| BoundaryFailure::Unavailable)?;
         let test_name = "project::native::native_fixture_child_entry";
@@ -531,20 +696,27 @@ impl FixtureCommandRunner for NativeFixtureCommandRunner {
         } else {
             command.stdout(Stdio::null()).stderr(Stdio::null());
         }
-        let child = command.spawn().map_err(|_| BoundaryFailure::Unavailable)?;
+        let child = command.spawn().map_err(|_| {
+            readiness.refuse(NativeReadinessRefusal::Spawn);
+            BoundaryFailure::Unavailable
+        })?;
         child_reservation.mark_spawned();
         self.launched_children = self.launched_children.saturating_add(1);
         if self.launched_children > self.limits.child_processes {
             let mut child = OwnedChild(child);
             let _ = child.0.kill();
             let _ = child.0.wait();
+            readiness.refuse(NativeReadinessRefusal::Reserve);
             return Err(BoundaryFailure::Rejected);
         }
         let mut child = OwnedChild(child);
         let pid = child.0.id();
         let stdout = if captures_stdout {
             Some(spawn_bounded_reader(
-                child.0.stdout.take().ok_or(BoundaryFailure::Unavailable)?,
+                child.0.stdout.take().ok_or_else(|| {
+                    readiness.refuse(NativeReadinessRefusal::Spawn);
+                    BoundaryFailure::Unavailable
+                })?,
                 self.limits.stdout_bytes,
             ))
         } else {
@@ -563,6 +735,7 @@ impl FixtureCommandRunner for NativeFixtureCommandRunner {
             let _ = child.0.wait();
             let _ = join_reader(stdout)?;
             let _ = join_reader(stderr)?;
+            readiness.refuse(NativeReadinessRefusal::StartMarker);
             return Ok(incomplete_output(FixtureCommandStatus::Incomplete));
         }
         if self.behavior != ChildBehavior::Complete
@@ -572,15 +745,8 @@ impl FixtureCommandRunner for NativeFixtureCommandRunner {
             let _ = child.0.wait();
             let _ = join_reader(stdout)?;
             let _ = join_reader(stderr)?;
+            readiness.refuse(NativeReadinessRefusal::WriterMarker);
             return Ok(incomplete_output(FixtureCommandStatus::Incomplete));
-        }
-        if let Some(started) = self.started.take() {
-            started
-                .send(NativeChildStarted {
-                    pid,
-                    start_identity: start_identity.clone(),
-                })
-                .map_err(|_| BoundaryFailure::Unavailable)?;
         }
 
         if self.behavior == ChildBehavior::LeaveWriterRunning {
@@ -591,6 +757,7 @@ impl FixtureCommandRunner for NativeFixtureCommandRunner {
                 .is_some()
             {
                 child.0.wait().map_err(|_| BoundaryFailure::Unavailable)?;
+                readiness.refuse(NativeReadinessRefusal::ChildExit);
                 return Ok(incomplete_output(FixtureCommandStatus::Incomplete));
             }
             write_bounded(
@@ -599,6 +766,12 @@ impl FixtureCommandRunner for NativeFixtureCommandRunner {
                 256,
             )?;
             self.pending = Some((child, control_dir));
+            // Readiness is reported only after the owned writer is retained, so
+            // a successful outcome proves the held writer really was captured.
+            readiness.held(NativeChildStarted {
+                pid,
+                start_identity: start_identity.clone(),
+            });
             return Ok(FixtureCommandOutput::new(
                 FixtureCommandStatus::Incomplete,
                 vec!["writer-progress.txt".to_owned()],
@@ -612,6 +785,10 @@ impl FixtureCommandRunner for NativeFixtureCommandRunner {
 
         if self.behavior == ChildBehavior::WaitForRelease {
             let release = self.release.take().ok_or(BoundaryFailure::Rejected)?;
+            readiness.held(NativeChildStarted {
+                pid,
+                start_identity: start_identity.clone(),
+            });
             let deadline = Instant::now() + CHILD_WAIT_LIMIT;
             loop {
                 if cancellation.is_cancelled() {
@@ -912,6 +1089,26 @@ fn wait_child(
     }
 }
 
+/// The bounded observation of a child's written start marker against the
+/// exact identity this spawn expected. A partial write is not a mismatch: the
+/// reader keeps waiting until the file either completes or diverges.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartMarkerObservation {
+    Complete,
+    Partial,
+    Mismatch,
+}
+
+fn observe_start_marker(expected: &str, value: &str) -> StartMarkerObservation {
+    if value == expected {
+        StartMarkerObservation::Complete
+    } else if expected.starts_with(value) {
+        StartMarkerObservation::Partial
+    } else {
+        StartMarkerObservation::Mismatch
+    }
+}
+
 fn wait_for_start_marker(
     child: &mut Child,
     control_dir: &Path,
@@ -925,16 +1122,15 @@ fn wait_for_start_marker(
     loop {
         if marker.is_file() {
             let value = fs::read_to_string(&marker).map_err(|_| BoundaryFailure::Unavailable)?;
-            if value == expected {
-                return Ok(true);
-            }
-            // The child creates this marker before writing its identity. A
-            // reader can observe that empty or partially written file, so
-            // wait for the exact marker instead of classifying that race as
-            // an identity mismatch. Any bytes outside the expected prefix
-            // remain a fail-closed mismatch.
-            if !expected.starts_with(&value) {
-                return Ok(false);
+            match observe_start_marker(&expected, &value) {
+                StartMarkerObservation::Complete => return Ok(true),
+                // The child creates this marker before writing its identity. A
+                // reader can observe that empty or partially written file, so
+                // wait for the exact marker instead of classifying that race
+                // as an identity mismatch. Any bytes outside the expected
+                // prefix remain a fail-closed mismatch.
+                StartMarkerObservation::Partial => {}
+                StartMarkerObservation::Mismatch => return Ok(false),
             }
         }
         if child
@@ -1314,7 +1510,7 @@ struct TreeUsage {
     largest_file: u64,
 }
 
-fn tree_usage(root: &Path, account_sibling_links: bool) -> Result<TreeUsage, BoundaryFailure> {
+fn tree_usage(root: &Path, account_sibling_entries: bool) -> Result<TreeUsage, BoundaryFailure> {
     let mut usage = TreeUsage {
         files: 0,
         bytes: 0,
@@ -1323,7 +1519,7 @@ fn tree_usage(root: &Path, account_sibling_links: bool) -> Result<TreeUsage, Bou
     fn visit(
         root: &Path,
         required: bool,
-        account_sibling_links: bool,
+        account_sibling_entries: bool,
         usage: &mut TreeUsage,
     ) -> Result<(), BoundaryFailure> {
         let entries = match fs::read_dir(root) {
@@ -1343,14 +1539,17 @@ fn tree_usage(root: &Path, account_sibling_links: bool) -> Result<TreeUsage, Bou
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(_) => return Err(BoundaryFailure::Unavailable),
             };
-            if metadata.file_type().is_symlink() {
-                if !account_sibling_links {
+            if metadata.file_type().is_symlink()
+                || (!metadata.is_dir() && !metadata.is_file() && !metadata.file_type().is_socket())
+            {
+                if !account_sibling_entries {
                     return Err(BoundaryFailure::Rejected);
                 }
-                // The task-wide accounting walk can overlap isolated storage
-                // tests that deliberately create symlinks. Count the link's
-                // own directory entry without following it; the active
-                // scenario walk still rejects any link in its fixture tree.
+                // The task-wide accounting walk overlaps other isolated fixture
+                // tests that deliberately create symlinks and other non-regular
+                // entries (a FIFO, for example) under the shared task root. Count
+                // the directory entry without following it; the active scenario
+                // walk still rejects any non-regular entry in its own tree.
                 usage.files = usage
                     .files
                     .checked_add(1)
@@ -1363,7 +1562,7 @@ fn tree_usage(root: &Path, account_sibling_links: bool) -> Result<TreeUsage, Bou
                 continue;
             }
             if metadata.is_dir() {
-                visit(&path, false, account_sibling_links, usage)?;
+                visit(&path, false, account_sibling_entries, usage)?;
             } else if metadata.is_file() {
                 usage.files = usage
                     .files
@@ -1374,13 +1573,11 @@ fn tree_usage(root: &Path, account_sibling_links: bool) -> Result<TreeUsage, Bou
                     .checked_add(metadata.len())
                     .ok_or(BoundaryFailure::Rejected)?;
                 usage.largest_file = usage.largest_file.max(metadata.len());
-            } else if !metadata.file_type().is_socket() {
-                return Err(BoundaryFailure::Rejected);
             }
         }
         Ok(())
     }
-    visit(root, true, account_sibling_links, &mut usage)?;
+    visit(root, true, account_sibling_entries, &mut usage)?;
     Ok(usage)
 }
 
@@ -1603,6 +1800,18 @@ fn child_fixture() -> io::Result<()> {
     let run = std::env::var(CHILD_RUN_ENV).map_err(invalid_data)?;
     let attempt = std::env::var(CHILD_ATTEMPT_ENV).map_err(invalid_data)?;
     let expected = std::env::var(CHILD_EXPECT_ENV).unwrap_or_default();
+    if mode == "bad-marker" {
+        // Test-only refusal path: write a start marker that is not this
+        // spawn's identity and exit, so the parent must refuse before
+        // readiness rather than reaching a held writer.
+        write_bounded(
+            &control.join("started"),
+            b"not-the-owned-fixture-child\n",
+            256,
+        )
+        .map_err(|_| invalid_data("bad start marker"))?;
+        return Ok(());
+    }
     let marker = format!("{}\n{}\n", std::process::id(), token);
     write_bounded(&control.join("started"), marker.as_bytes(), 256)
         .map_err(|_| invalid_data("start marker"))?;
@@ -1646,4 +1855,34 @@ fn child_fixture() -> io::Result<()> {
 
 fn invalid_data(message: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{observe_start_marker, StartMarkerObservation};
+
+    #[test]
+    fn start_marker_observation_separates_partial_from_mismatch() {
+        let expected = "4321\nsha256:abcdef\n";
+        assert_eq!(
+            observe_start_marker(expected, "4321\nsha256:abcdef\n"),
+            StartMarkerObservation::Complete
+        );
+        assert_eq!(
+            observe_start_marker(expected, ""),
+            StartMarkerObservation::Partial
+        );
+        assert_eq!(
+            observe_start_marker(expected, "4321\nsha256:ab"),
+            StartMarkerObservation::Partial
+        );
+        assert_eq!(
+            observe_start_marker(expected, "4321\nsha256:abcdef\nstray"),
+            StartMarkerObservation::Mismatch
+        );
+        assert_eq!(
+            observe_start_marker(expected, "1234\n"),
+            StartMarkerObservation::Mismatch
+        );
+    }
 }
