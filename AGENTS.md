@@ -24,6 +24,7 @@ Tom's 2026-10-10 blanket approval in [vision](docs/knowledge/vision.md#authority
 - `effigy docs:check` runs the Northstar link and retired-concept checks plus `git diff --check HEAD`. The link check excludes `docs/knowledge/architecture.md`, whose references to optional sibling repositories are unavailable in a standalone checkout.
 - `effigy build-context:comparison:test` runs synthetic fixtures for the private incremental comparison launcher. It never enters the live image or Cargo path.
 - `effigy rust:storage-inventory-cli` builds the unpublished `oxide-storage-inventory` binary and proves the rendered output-byte ceiling on tiny synthetic fixtures. It does not inventory a real project target and is not an alias for full QA.
+- `effigy rust:storage-lease-cli` builds the unpublished `oxide-storage-lease` binary, proves usage refusals, and on macOS with a 20 GiB host reserve runs one fresh 128 MiB APFS pool through lease/release/recover/status. It is not a filesystem-fill benchmark and is not an alias for full QA.
 
 There is no product QA selector yet. Use the focused selectors above; they do not replace milestone QA.
 

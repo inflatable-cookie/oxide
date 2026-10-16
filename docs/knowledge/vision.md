@@ -255,7 +255,9 @@ integration ruling: Nucleus will **not** integrate the reviewed #060 protected
 policy-3 route. Tom chose a same-user local lease CLI instead of signed
 attempts and a consumer submit/capture/not-submitted callback service. This
 supersedes the earlier plan to integrate #060 after the chart port; it does
-not remove that upstream implementation or declare a new CLI shipped.
+not remove that upstream implementation. The unpublished
+[local lease CLI](contracts/local-lease.md) now exists as Oxide-only product
+code; it is not Nucleus-ready and does not qualify cross-worktree reuse.
 
 The requested surface is lease by canonical project/profile/opaque holder,
 idempotent release, status, a finite total storage cap and idle-slot eviction

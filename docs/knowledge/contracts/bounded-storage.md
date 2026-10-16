@@ -103,3 +103,9 @@ no Linux or non-APFS support (explicit refusal, no fallback). The write
 attribution of the image backing file remains unavailable, as everywhere else
 in Oxide. Real managed builds, adoption, and production capacity policy stay
 separately gated.
+
+The unpublished [local lease CLI](local-lease.md) reuses this verified APFS
+backend for its aggregate payload ceiling. It factors provision/open into
+the ordinary crate so the lean command does not go through the private
+storage runtime. Directory-only roots remain budget-only and are not a
+product mode of that CLI. The CLI does not repeat the filesystem-full proof.
