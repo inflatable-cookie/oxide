@@ -50,8 +50,8 @@ Pinned at init and recorded in `config.json`:
 | `version` | `1` |
 | `backend` | exactly `apfs-sparse-image-v1` |
 | `store_id` | 32 lowercase hex chars, never reused |
-| `cap_bytes` | finite payload ceiling; callers cannot raise it |
-| `image_bytes` | sparse image size; must cover the cap plus APFS metadata |
+| `cap_bytes` | declared payload size; must equal `image_bytes` at init; callers cannot raise it |
+| `image_bytes` | sparse image size; must equal the declared cap so the volume size is the enforced ceiling |
 
 Control files stay on the host: `config.json`, `ledger.json`, `lock`,
 `image.sparseimage`, `receipt.json`. The payload mount is `<pool>/payload`.
@@ -67,9 +67,16 @@ CLI and does not claim an OS hard bound.
 ## Commands
 
 **init** checks cap and image size, and refuses unsupported platforms, before
-any host effect. It then provisions one sparse APFS image, attaches it at
+any host effect. A declared cap that differs from the image size refuses:
+a smaller cap on a larger volume is admission only and is not OS-enforced.
+It then provisions one sparse APFS image, attaches it at
 `payload`, writes the capacity receipt, pins the cap, and returns JSON
-`PoolInfo`. A leftover empty `lock` from a failed init does not prevent retry.
+`PoolInfo`. The receipt's measured `verified_capacity_bytes` is the effective
+OS hard bound; it sits slightly below the declared size by APFS metadata
+overhead, and writers cannot exceed the declared ceiling through it. A volume
+that measures larger than declared refuses without migration. Receipts that
+predate this rule (version 1, or cap not equal to image size) refuse as
+mismatched backing. A leftover empty `lock` from a failed init does not prevent retry.
 
 **lease** requires canonical existing project and workspace directories,
 `dev` or `full-debug`, and an opaque holder. Project is stable identity;
@@ -105,9 +112,14 @@ or secret content is printed.
 
 ## Capacity and eviction
 
-The verified APFS volume is the hard aggregate bound. Admission uses the
+The verified APFS volume is the hard aggregate bound, and the declared cap
+must equal the image size so that volume size is the enforced ceiling. A
+smaller declared cap on a larger volume is refused at init and at open:
+admission accounting alone is not a quota. Admission uses the
 pinned cap and the [storage inventory](storage-inventory.md) unique-allocated
-figure for owned slots. Control/ledger headroom stays outside the payload and
+figure for owned slots; the measured `verified_capacity_bytes` (APFS metadata
+overhead below the declared size) is the effective OS bound, and writers
+cannot exceed the declared ceiling through it. Control/ledger headroom stays outside the payload and
 is bounded (`MAX_LEDGER_BYTES` 256 KiB, `MAX_SLOTS` 32). Eviction happens only
 at lease time and only for known owned idle whole slots. Held occupancy,
 foreign entries, symlinks, unknown accounting and mismatched backing refuse.
@@ -139,6 +151,8 @@ go to stderr as `oxide-storage-lease: <reason>: <message>`.
 - Paths ≤ 1024 bytes, absolute, canonical, no symlinks
 - Status output default 65536 bytes (minimum 64)
 - Finite slots 32; new slots refuse at exhaustion rather than dropping active state
+- Init refuses a declared cap that differs from the image size; pre-rule pools
+  refuse as mismatched backing without migration
 
 ## Not claimed
 

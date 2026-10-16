@@ -28,7 +28,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 
-const RECEIPT_VERSION: u32 = 1;
+const RECEIPT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -73,9 +73,9 @@ pub(super) fn provision(
     cap_bytes: u64,
     image_bytes: u64,
 ) -> Result<BoundedBacking, LeaseError> {
-    if cap_bytes == 0 || image_bytes < cap_bytes {
+    if cap_bytes == 0 || image_bytes != cap_bytes {
         return Err(LeaseError::InvalidInput(
-            "image-bytes must cover the pool cap",
+            "cap-bytes must equal image-bytes so the volume size is the enforced ceiling",
         ));
     }
     if paths.image.symlink_metadata().is_ok() || paths.receipt.symlink_metadata().is_ok() {
@@ -125,7 +125,12 @@ pub(super) fn provision(
     }
     fs::set_permissions(&paths.mount, fs::Permissions::from_mode(0o700)).map_err(io_error)?;
     let verified_capacity_bytes = sample_volume(&paths.mount)?;
-    if verified_capacity_bytes < cap_bytes {
+    // A volume larger than the declared ceiling would leave that ceiling
+    // unenforced: an admitted writer could exceed it before ENOSPC. Refuse
+    // that shape. A shortfall below the declared size is APFS metadata
+    // overhead; the measured value below is the effective enforced bound and
+    // writers cannot exceed the declared ceiling through it.
+    if verified_capacity_bytes > cap_bytes {
         return Err(LeaseError::BackingMismatch);
     }
     let identity = image_identity(&paths.image)?;
@@ -175,6 +180,11 @@ pub(super) fn open(
     if paths.image.symlink_metadata().is_err() || paths.receipt.symlink_metadata().is_err() {
         return Err(LeaseError::BackingMismatch);
     }
+    // Pools whose declared cap differs from the image size predate the
+    // enforced-ceiling rule and are refused without migration.
+    if image_bytes != cap_bytes {
+        return Err(LeaseError::BackingMismatch);
+    }
     let bytes = read_private_file(&paths.receipt)?;
     let receipt: BoundedReceipt =
         serde_json::from_slice(&bytes).map_err(|_| LeaseError::BackingMismatch)?;
@@ -195,7 +205,7 @@ pub(super) fn open(
     let identity = image_identity(&paths.image)?;
     if identity != receipt.identity
         || verified_capacity_bytes != receipt.verified_capacity_bytes
-        || verified_capacity_bytes < cap_bytes
+        || verified_capacity_bytes > cap_bytes
     {
         return Err(LeaseError::BackingMismatch);
     }

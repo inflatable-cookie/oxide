@@ -16,8 +16,9 @@ minimum_effigy_version = "0.14.0"
 "rust:storage-inventory-cli" = "python3 scripts/test-storage-inventory-cli.py"
 # Builds the unpublished oxide-storage-lease binary, proves usage refusals,
 # and on macOS runs one 128 MiB APFS pool through lease/release/recover/status.
-# Not a QA alias and not a filesystem-fill benchmark.
-"rust:storage-lease-cli" = "python3 scripts/test-storage-lease-cli.py"
+# Heavy admission owns the real image provisioning; it is not a
+# filesystem-fill benchmark and not full QA. Table lives at the end of this
+# file so later bare task entries stay under [tasks].
 "rust:private-process" = "python3 scripts/test-private-process.py"
 "registry:acquire:nucleus" = "python3 scripts/acquire-nucleus-registry.py"
 "registry:stream:nucleus" = "python3 scripts/acquire-nucleus-registry-stream.py"
@@ -38,3 +39,10 @@ default = false
 [tasks."rust:bounded-native-proof"]
 admission = "heavy"
 run = "python3 scripts/test-bounded-native.py"
+
+# Heavy admission owns the real image provisioning in
+# scripts/test-storage-lease-cli.py; it is not a filesystem-fill benchmark
+# and not full QA.
+[tasks."rust:storage-lease-cli"]
+admission = "heavy"
+run = "python3 scripts/test-storage-lease-cli.py"
