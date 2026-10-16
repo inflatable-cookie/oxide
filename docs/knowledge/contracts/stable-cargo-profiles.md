@@ -5,7 +5,7 @@ feedback: `oxide-light` and its explicit `oxide-full-debug` control. They are
 an explicitly named recipe on the pinned stable Cargo 1.97.1 toolchain. They do
 not change the default `dev`/`test`/`release` profiles, any consumer, any
 global Cargo configuration or the pinned toolchain, and nothing selects them
-automatically. The [Rust DX landscape](rust-dx-landscape.md#stable-profile-and-backend-eligibility)
+automatically. The [Rust DX landscape](../rust-dx-landscape.md#stable-profile-and-backend-eligibility)
 owns the upstream eligibility finding; the [measured comparison](../storage-efficiency.md#stable-cargo-profile-comparison-2026-10-16)
 owns the numbers.
 
