@@ -296,7 +296,8 @@ symlinks. These limits are separate from its observed reuse result.
 
 ## Not claimed
 
-- No Nucleus, Queue, Effigy or editor integration
+- No general Queue, Effigy or editor integration; the consumer-owned Nucleus
+  integration and its first observed task are recorded in the [consumer boundary](project-adoption.md#observed-ordinary-task-lifecycle)
 - No general cross-worktree/source-invalidation guarantee beyond the recorded
   pinned dev workflow; timestamp-restored input-only changes were not isolated
 - No debug retention after release; released bytes are disposable

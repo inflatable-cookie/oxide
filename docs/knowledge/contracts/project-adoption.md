@@ -539,9 +539,40 @@ code/lease/release behavior. On the existing live 8 GiB pool it reports
 7.58 GB free, an image file on disk of 824 MB, and slot 1 idle at 780 MB from
 the earlier smoke. These rounded units are preserved as reported, not an
 independent raw-byte receipt or synchronized snapshot. Do not add image and
-mounted-slot figures. No real task had yet supplied lease, peak growth,
-free-before/after and retirement-receipt release evidence; that is the next
-consumer outcome, not a reason to manufacture another experiment.
+mounted-slot figures. That diagnostic check preceded the actual-task receipt
+below; it did not by itself establish a production-task lifecycle.
+
+### Observed ordinary task lifecycle
+
+Nucleus Supervisor reports the first actual task on the lean facility:
+Nucleus #252, kernel task 3763, PR #318, merged `daced47`, using the installed
+`ddceaf50…` diagnostic binary. At workspace placement, before the worker
+started, the task acquired a new lease over idle slot 1 (779 MB from the earlier
+smoke); its build directory reached Cargo through the parent `.cargo/config.toml`.
+The reported lease identity is abbreviated as `v1.e449de33….1.1.3`, not a
+complete ID usable for recovery.
+
+The reported held-slot samples, in MB, were
+`779 → 887 → 1685 → 2097 → 2636 → 2353 → 2988` through worker and reviewer
+builds, selected `check:core:history-bound`/state-checkpoint tests and clippy.
+The largest observed held sample was 2988 MB; continuous peak measurement and
+sampling intervals were not supplied. No ENOSPC or cold-fallback log lines
+were reported. After closeout recorded `retire_participants: applied`, the
+next reconcile tick released the lease. No active consumer lease remained;
+Oxide retained slot 1 idle at 2988 MB unique allocated. The final capacity
+report gave payload free 5371 MB and image logical size 3181 MB. Image logical
+size is not host-allocated bytes; do not add these figures to slot allocation.
+
+This owner receipt establishes actual placement-time acquisition, reuse,
+held growth within the finite payload and retirement-receipt-gated release
+for one task. Normal source, tests, review, final outputs and closeout remain
+Nucleus-owned under the selected disposable-cache policy. It does not prove
+per-build speedup, a workload size distribution, continuous resource maxima,
+SSD-write savings, live eviction/cancellation recovery or post-release debug
+lookup. Per-build warm/cold timings were not measured. The earlier independently
+reviewed cross-path experiment remains the separate narrow reuse evidence.
+Oxide did not rerun the consumer workload or inspect the live pool to record
+this report.
 
 ### Historical protected-route references
 
