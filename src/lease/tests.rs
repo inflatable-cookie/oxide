@@ -2,7 +2,8 @@ use super::pool::{
     create_injected, lease_injected, recover_injected, release_injected, status_injected,
 };
 use super::{
-    render_status_json, AccountingCoverage, LeaseError, LeaseRequest, Profile, SlotOccupancy,
+    init_pool, render_status_json, AccountingCoverage, LeaseError, LeaseRequest, Profile,
+    SlotOccupancy,
 };
 use std::fs::{self, File};
 use std::io::Write;
@@ -255,6 +256,34 @@ fn status_json_stays_bounded() {
     let rendered = render_status_json(&status, 64).expect("render");
     assert!(rendered.bytes.len() <= 64);
     assert!(rendered.truncated);
+}
+
+#[test]
+fn failed_init_lock_only_retry_succeeds() {
+    let fx = Fixture::new("init-retry");
+    let pool = fx.dir("pool");
+    let undersized = init_pool(&pool, 1024, 512);
+    assert!(
+        matches!(undersized, Err(LeaseError::InvalidInput(_))),
+        "{undersized:?}"
+    );
+    assert!(
+        !pool.join("lock").exists(),
+        "cap check must run before creating lock"
+    );
+
+    File::create(pool.join("lock")).unwrap();
+    fs::set_permissions(pool.join("lock"), fs::Permissions::from_mode(0o600)).unwrap();
+    create_injected(&pool, 1024 * 1024).expect("lock-only leftover must be init-able");
+
+    let occupied = fx.dir("occupied");
+    File::create(occupied.join("lock")).unwrap();
+    File::create(occupied.join("foreign")).unwrap();
+    let refused = create_injected(&occupied, 1024 * 1024);
+    assert!(
+        matches!(refused, Err(LeaseError::InvalidInput(_))),
+        "{refused:?}"
+    );
 }
 
 #[test]

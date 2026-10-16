@@ -115,6 +115,35 @@ def prove_usage(executable: str) -> None:
     if code not in (1, 4):
         fail(f"missing pool exit {code}, expected 1 or 4")
 
+    usage = os.path.join(scratch_root(), "storage-lease-cli", "usage")
+    os.makedirs(usage, exist_ok=True)
+    empty = os.path.join(usage, "empty-init")
+    os.mkdir(empty, 0o700)
+    code, stdout, stderr = run_cli(
+        executable,
+        ["--pool", empty, "init", "--cap-bytes", "8", "--image-bytes", "4"],
+    )
+    if code != 1:
+        fail(f"undersized init exit {code}, expected 1")
+    if b"image-bytes" not in stderr:
+        fail(f"undersized init diagnostic {stderr!r}")
+    if os.path.exists(os.path.join(empty, "lock")):
+        fail("undersized init created a lock file")
+
+    leftover = os.path.join(usage, "lock-only")
+    os.mkdir(leftover, 0o700)
+    os.close(os.open(os.path.join(leftover, "lock"), os.O_CREAT | os.O_WRONLY, 0o600))
+    code, stdout, stderr = run_cli(
+        executable,
+        ["--pool", leftover, "init", "--cap-bytes", "8", "--image-bytes", "4"],
+    )
+    if code != 1:
+        fail(f"lock-only undersized init exit {code}, expected 1")
+    if b"empty pool directory" in stderr:
+        fail(f"lock-only leftover refused as nonempty: {stderr!r}")
+    if b"image-bytes" not in stderr:
+        fail(f"lock-only leftover missed cap check: {stderr!r}")
+
 
 def load_json(payload: bytes, label: str) -> dict:
     try:
@@ -132,6 +161,7 @@ def prove_native(executable: str, parent: str) -> None:
         fail(f"host free {free} is below the 20 GiB native reserve")
     pool = os.path.join(parent, "pool")
     os.mkdir(pool, 0o700)
+    os.close(os.open(os.path.join(pool, "lock"), os.O_CREAT | os.O_WRONLY, 0o600))
     project = os.path.join(parent, "project")
     workspace_a = os.path.join(parent, "ws-a")
     workspace_b = os.path.join(parent, "ws-b")

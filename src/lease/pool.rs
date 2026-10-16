@@ -7,7 +7,7 @@ use super::{
     LeaseError, LeaseGrant, PoolInfo, PoolStatus, Profile, ReleaseReceipt, SlotOccupancy,
     SlotStatus, ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES,
     CONFIG_NAME, LEASE_VERSION, LEDGER_NAME, LOCK_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES,
-    MAX_PATH_BYTES, MAX_SLOTS, PAYLOAD_NAME, SLOTS_NAME,
+    MAX_PATH_BYTES, MAX_SLOTS, SLOTS_NAME,
 };
 use crate::inventory::{inventory_directory, InventoryLimits};
 use crate::storage::bounded::validate_payload_entries;
@@ -89,6 +89,12 @@ pub fn init(request: InitRequest) -> Result<PoolInfo, LeaseError> {
     if request.cap_bytes == 0 {
         return Err(LeaseError::InvalidInput("cap-bytes must be positive"));
     }
+    if request.image_bytes < request.cap_bytes {
+        return Err(LeaseError::InvalidInput(
+            "image-bytes must cover the pool cap",
+        ));
+    }
+    refuse_unsupported_init_platform()?;
     let pool = prepare_new_pool(&request.pool)?;
     let _lock = lock_pool(&pool)?;
     if pool.join(CONFIG_NAME).symlink_metadata().is_ok() {
@@ -149,7 +155,7 @@ pub fn status(pool: &Path) -> Result<PoolStatus, LeaseError> {
 pub(super) fn create_injected(pool: &Path, cap_bytes: u64) -> Result<PoolInfo, LeaseError> {
     let pool = prepare_new_pool(pool)?;
     let _lock = lock_pool(&pool)?;
-    let mount = pool.join(PAYLOAD_NAME);
+    let mount = pool.join(super::PAYLOAD_NAME);
     let backing = backing::inject_directory(&mount, cap_bytes)?;
     ensure_private_dir(&backing.payload_root().join(SLOTS_NAME))?;
     let store_id = random_hex(16)?;
@@ -703,12 +709,7 @@ fn prepare_new_pool(pool: &Path) -> Result<PathBuf, LeaseError> {
                     "pool must be an owner-only directory",
                 ));
             }
-            let mut entries = fs::read_dir(pool).map_err(io_error)?;
-            if entries.next().is_some() {
-                return Err(LeaseError::InvalidInput(
-                    "init requires an empty pool directory",
-                ));
-            }
+            refuse_occupied_init_directory(pool)?;
             if metadata.permissions().mode() & 0o077 != 0 {
                 fs::set_permissions(pool, fs::Permissions::from_mode(0o700)).map_err(io_error)?;
             }
@@ -732,6 +733,42 @@ fn prepare_new_pool(pool: &Path) -> Result<PathBuf, LeaseError> {
         Err(error) => return Err(io_error(error)),
     }
     canonical_existing_dir(pool, true)
+}
+
+fn refuse_unsupported_init_platform() -> Result<(), LeaseError> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        return Err(LeaseError::Unsupported(
+            "bounded APFS payload backing is macOS-only",
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    Ok(())
+}
+
+/// Empty, or only the CLI's leftover `lock` from a failed init.
+fn refuse_occupied_init_directory(pool: &Path) -> Result<(), LeaseError> {
+    let mut leftover_lock = false;
+    for entry in fs::read_dir(pool).map_err(io_error)? {
+        let entry = entry.map_err(io_error)?;
+        let name = entry.file_name();
+        if leftover_lock || name != LOCK_NAME {
+            return Err(LeaseError::InvalidInput(
+                "init requires an empty pool directory",
+            ));
+        }
+        let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
+        if metadata.file_type().is_symlink() {
+            return Err(LeaseError::UnsafePath("symlinks are refused"));
+        }
+        if !metadata.file_type().is_file() || metadata.uid() != current_uid() {
+            return Err(LeaseError::InvalidInput(
+                "init requires an empty pool directory",
+            ));
+        }
+        leftover_lock = true;
+    }
+    Ok(())
 }
 
 fn lock_pool(pool: &Path) -> Result<File, LeaseError> {

@@ -38,8 +38,10 @@ QA.
 
 `--pool` is required. It is the owner-only control directory (mode `0700`,
 caller uid). Init creates it empty, or tightens an empty caller-owned directory
-to `0700`. An existing pool cannot have its cap raised and cannot be
-reinitialized. Arbitrary directories are not reinterpreted as bounded.
+to `0700`. A directory whose only occupant is the CLI's leftover `lock` file
+from a failed init is still init-able. An existing pool cannot have its cap
+raised and cannot be reinitialized. Arbitrary directories are not reinterpreted
+as bounded.
 
 Pinned at init and recorded in `config.json`:
 
@@ -64,9 +66,10 @@ CLI and does not claim an OS hard bound.
 
 ## Commands
 
-**init** provisions one sparse APFS image, attaches it at `payload`, writes the
-capacity receipt, pins the cap, and returns JSON `PoolInfo`. Unsupported
-platforms refuse before any host effect.
+**init** checks cap and image size, and refuses unsupported platforms, before
+any host effect. It then provisions one sparse APFS image, attaches it at
+`payload`, writes the capacity receipt, pins the cap, and returns JSON
+`PoolInfo`. A leftover empty `lock` from a failed init does not prevent retry.
 
 **lease** requires canonical existing project and workspace directories,
 `dev` or `full-debug`, and an opaque holder. Project is stable identity;
