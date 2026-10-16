@@ -30,8 +30,10 @@ A resident daemon, signatures and consumer callback service are not required
 for that proposed route. The earlier implementations below remain separate
 upstream mechanisms, not activation prerequisites. UID trust permits a
 cooperative caller's explicit writer-closed release; TTL or holder loss alone
-still does not establish closure. No lean CLI is implemented or qualified by
-this knowledge change.
+still does not establish closure. The unpublished
+[local lease CLI](contracts/local-lease.md) is the implemented lean surface;
+cross-worktree usefulness remains a dependent qualification and is not claimed
+here.
 
 ## Preferred daemon hub to qualify
 

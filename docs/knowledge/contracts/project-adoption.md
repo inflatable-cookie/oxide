@@ -357,23 +357,24 @@ consumer callback-service shape conflicts with the simplification reset.
 The earlier plan to take that API after the chart port is superseded.
 Nucleus requests a same-user local CLI and will own its dispatch/validation
 calls, environment forwarding, closeout/cancellation release and private cold
-fallback when storage is busy. No current accepted CLI binary or consumer
-binding exists; the proposed replacement is described below. Do not restore
-the historical adapters or make the protected route a prerequisite.
+fallback when storage is busy. The unpublished [local lease CLI](local-lease.md) is the Oxide-only
+replacement described below. No consumer binding exists. Do not restore
+the historical adapters or make the protected route a prerequisite. Cross-worktree
+correctness remains a dependent qualification; this CLI is not Nucleus-ready.
 
 ### Lean local lease interface agreed for delivery
 
-The requested public shape is `lease --project <canonical-root> --profile
-<dev|full-debug> --holder <opaque-id>`, idempotent `release --lease <id>`, and
-`status`. Lease success returns bounded versioned JSON containing a lease ID
-and exact environment; refusals distinguish busy from invalid input or
-storage failure. Same-UID cooperative callers and private owner-only local
-state replace signed attempts and callback authority. A local OS lock and
-durable lease state can serialize CLI mutations without a resident service;
-this is a candidate implementation, not a shipped command or lock-only proof
-of writer closure. Caller-provided paths must never authorize deletion outside
-Oxide-owned storage. Exact JSON, exit codes and binary path belong in the
-reviewed implementation handover, not an invented current API.
+The implemented unpublished surface is `oxide-storage-lease` with `init`,
+`lease --project <canonical-root> --workspace <checkout> --profile
+<dev|full-debug> --holder <opaque-id>`, idempotent `release --lease <id>`,
+`recover --lease <id>`, and `status`. Lease success returns bounded versioned
+JSON containing a lease ID and exact environment; refusals distinguish busy
+from invalid input or storage failure. Same-UID cooperative callers and
+private owner-only local state replace signed attempts and callback authority.
+A local OS lock and durable lease state serialize CLI mutations without a
+resident service. A finished CLI process is not writer closure. Caller-provided
+paths never authorize deletion outside Oxide-owned storage. Exact JSON, exit
+codes, binary path and limits are owned by [local lease](local-lease.md).
 
 On 2026-10-16 the Supervisor accepted these boundary clarifications and
 required cross-worktree correctness qualification in this delivery:
@@ -421,16 +422,15 @@ or retain the lease. Do not claim independent debug retention from a copied
 binary alone. Do not impose the old signed capture protocol on this lean
 route. Existing private cold fallback must omit all acquired shared paths.
 
-The delivery is scoped as two focused PRs: the usable local lease CLI with
-bounded backing/admission/idle eviction, then the focused real cross-worktree
-qualification and only necessary corrections plus the short consumer handover.
-Each needs a checked Queue brief and independent exact-head review. Cross-path
-reuse must pass before Nucleus is told the CLI is ready; a precise negative
-result is reported instead of handing over a path-isolated substitute. This
-is an estimate, not a budget reset or a claim that the gate already passes. Reuse the existing bounded filesystem and inventory implementation;
-old authentication/callback plumbing is not required. Exact implementation
-briefs must name finite fixture limits and independent review. This
-assessment creates no live consumer, host installation or real experiment.
+The first of those two deliveries is the unpublished local lease CLI with
+bounded backing, admission and idle-only eviction, owned by
+[local lease](local-lease.md). The focused real cross-worktree qualification
+and consumer handover remain a dependent gate. Cross-path reuse must pass
+before Nucleus is told the CLI is ready; a precise negative result is reported
+instead of handing over a path-isolated substitute. Reuse the existing bounded
+filesystem and inventory implementation; old authentication/callback plumbing
+is not required. This assessment creates no live consumer, host installation
+or real experiment.
 
 Nucleus intentionally removed its never-live disabled Oxide consumer code
 in the 2026-10-15 simplification reset. At reviewed owner inspection of

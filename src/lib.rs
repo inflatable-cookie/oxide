@@ -16,6 +16,10 @@ pub use project::*;
 #[cfg(unix)]
 pub mod inventory;
 
+/// Unpublished same-user local lease CLI over bounded exclusive slots.
+#[cfg(unix)]
+pub mod lease;
+
 /// Private ordinary-Cargo qualification route, available only in explicit
 /// qualification builds.
 #[cfg(all(unix, feature = "private-qualification"))]

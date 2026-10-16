@@ -48,5 +48,9 @@ required-features = ["private-qualification"]
 name = "oxide-storage-inventory"
 path = "src/bin/storage_inventory.rs"
 
+[[bin]]
+name = "oxide-storage-lease"
+path = "src/bin/storage_lease.rs"
+
 [lib]
 path = "src/lib.rs"

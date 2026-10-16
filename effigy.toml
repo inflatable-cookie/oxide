@@ -14,6 +14,10 @@ minimum_effigy_version = "0.14.0"
 # rendered output-byte ceiling on tiny synthetic fixtures. Not a QA alias
 # and not a real project-target scan.
 "rust:storage-inventory-cli" = "python3 scripts/test-storage-inventory-cli.py"
+# Builds the unpublished oxide-storage-lease binary, proves usage refusals,
+# and on macOS runs one 128 MiB APFS pool through lease/release/recover/status.
+# Not a QA alias and not a filesystem-fill benchmark.
+"rust:storage-lease-cli" = "python3 scripts/test-storage-lease-cli.py"
 "rust:private-process" = "python3 scripts/test-private-process.py"
 "registry:acquire:nucleus" = "python3 scripts/acquire-nucleus-registry.py"
 "registry:stream:nucleus" = "python3 scripts/acquire-nucleus-registry-stream.py"
