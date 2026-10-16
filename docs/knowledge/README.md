@@ -12,6 +12,6 @@
 
 [Local lease](contracts/local-lease.md) owns the unpublished same-user local lease CLI: init/lease/release/recover/status, JSON and exits, finite pool/ledger limits, idle-only eviction and the explicit not-Nucleus-ready / cross-worktree-unqualified boundary.
 
-[Project adoption](contracts/project-adoption.md) owns the proposed opt-in adapter and coordinated waiting contract, including consumer lifecycle gates. [Rust toolchain and quality](rust-toolchain-and-quality.md) owns the development compiler, initial minimum Rust version and quality-policy routing.
+[Project adoption](contracts/project-adoption.md) owns the proposed opt-in adapter and coordinated waiting contract, including consumer lifecycle gates. [Rust toolchain and quality](rust-toolchain-and-quality.md) owns the development compiler, initial minimum Rust version and quality-policy routing. [Opt-in stable Cargo profiles](contracts/stable-cargo-profiles.md) owns Oxide's own `oxide-light`/`oxide-full-debug` recipes, their debugging tradeoff, the focused profile-proof selectors and the no-go disposition of the comparison observations.
 
 [Qualification readiness](qualification-readiness.md) owns the reviewed macOS containment and capacity findings, proposed narrow selector, remaining execution prerequisites, and the Task 019 useful-reuse architecture (physical-root slot reuse versus a dependency-only boundary). Its design proposals do not grant experimental execution authority.

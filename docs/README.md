@@ -13,6 +13,7 @@ Oxide aims to make Rust development easy and light: predictable storage, less bu
 - [Storage inventory (read-only)](knowledge/contracts/storage-inventory.md)
 - [Same-user local lease CLI](knowledge/contracts/local-lease.md)
 - [Rust toolchain and quality](knowledge/rust-toolchain-and-quality.md)
+- [Opt-in stable Cargo profiles](knowledge/contracts/stable-cargo-profiles.md)
 - [Open decisions](knowledge/questions.md)
 - [Knowledge map](knowledge/README.md)
 - [Release contract](knowledge/contracts/release.md)

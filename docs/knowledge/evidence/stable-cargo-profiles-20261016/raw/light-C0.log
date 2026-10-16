@@ -1,0 +1,1041 @@
+   Compiling libc v0.2.190
+   Compiling version_check v0.9.5
+   Compiling proc-macro2 v1.0.107
+   Compiling cfg-if v1.0.5
+   Compiling typenum v1.20.1
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.26
+   Compiling rustix v1.1.5
+   Compiling serde_core v1.0.229
+   Compiling zmij v1.0.23
+   Compiling crc32fast v1.5.2
+   Compiling bitflags v2.13.2
+   Compiling simd-adler32 v0.3.10
+   Compiling adler2 v2.0.1
+   Compiling serde_json v1.0.151
+   Compiling serde v1.0.229
+   Compiling itoa v1.0.18
+   Compiling memchr v2.8.3
+     Running `rustc --crate-name version_check --edition=2015 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/version_check-0.9.5/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=6008c168ae823386 -C extra-filename=-8ec1afee83d917d9 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow`
+     Running `rustc --crate-name build_script_build --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.190/build.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no --allow=unused_qualifications '--warn=clippy::unnecessary_semicolon' '--allow=clippy::unnecessary_cast' '--warn=clippy::ptr_as_ptr' '--allow=clippy::non_minimal_cfg' '--allow=clippy::missing_safety_doc' '--warn=clippy::map_unwrap_or' '--warn=clippy::manual_assert' '--allow=clippy::identity_op' '--warn=clippy::explicit_iter_loop' --cfg 'feature="default"' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("align", "const-extern-fn", "default", "extra_traits", "rustc-dep-of-std", "rustc-std-workspace-core", "std", "use_std"))' -C metadata=96042aeb1862e52b -C extra-filename=-ebd5576d3ee55c60 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/build/libc-ebd5576d3ee55c60 -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow`
+     Running `rustc --crate-name build_script_build --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107/build.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no --cfg 'feature="proc-macro"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "nightly", "proc-macro", "span-locations"))' -C metadata=d98ec1972c3a0541 -C extra-filename=-7f7a7a454a32e35e --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/build/proc-macro2-7f7a7a454a32e35e -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow`
+     Running `rustc --crate-name cfg_if --edition=2018 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.5/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("core", "rustc-dep-of-std"))' -C metadata=1861ea90b95c32e5 -C extra-filename=-7b6d01c2d899540a --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow`
+     Running `rustc --crate-name typenum --edition=2018 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/typenum-1.20.1/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("const-generics", "i128", "scale-info", "scale_info", "strict"))' -C metadata=cffb7df40e1d19a2 -C extra-filename=-a4eaa2b6e0ccd66e --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow`
+     Running `rustc --crate-name unicode_ident --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.26/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=0ed34846123ae167 -C extra-filename=-eeadbe15e4f6eb85 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow`
+     Running `rustc --crate-name build_script_build --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.47/build.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no --cfg 'feature="proc-macro"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "proc-macro"))' -C metadata=85f1527c2ac82b89 -C extra-filename=-42c920a6cbcd942b --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/build/quote-42c920a6cbcd942b -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow`
+     Running `rustc --crate-name build_script_build --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229/build.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no --cfg 'feature="result"' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("alloc", "default", "rc", "result", "std", "unstable"))' -C metadata=98962e2b2c5377b2 -C extra-filename=-5ab0a7ecec64a104 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/build/serde_core-5ab0a7ecec64a104 -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow`
+     Running `rustc --crate-name build_script_build --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.5/build.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no --warn=unexpected_cfgs --check-cfg 'cfg(alloc_c_string)' --check-cfg 'cfg(alloc_ffi)' --check-cfg 'cfg(apple)' --check-cfg 'cfg(asm_experimental_arch)' --check-cfg 'cfg(bsd)' --check-cfg 'cfg(core_c_str)' --check-cfg 'cfg(core_ffi_c)' --check-cfg 'cfg(core_intrinsics)' --check-cfg 'cfg(criterion)' --check-cfg 'cfg(document_experimental_runtime_api)' --check-cfg 'cfg(error_in_core)' --check-cfg 'cfg(fix_y2038)' --check-cfg 'cfg(freebsdlike)' --check-cfg 'cfg(libc)' --check-cfg 'cfg(linux_kernel)' --check-cfg 'cfg(linux_like)' --check-cfg 'cfg(linux_raw)' --check-cfg 'cfg(linux_raw_dep)' --check-cfg 'cfg(lower_upper_exp_for_non_zero)' --check-cfg 'cfg(sanitize_memory)' --check-cfg 'cfg(netbsdlike)' --check-cfg 'cfg(rustc_diagnostics)' --check-cfg 'cfg(solarish)' --check-cfg 'cfg(staged_api)' --check-cfg 'cfg(thumb_mode)' --check-cfg 'cfg(wasi)' --check-cfg 'cfg(wasi_ext)' --check-cfg 'cfg(wasip2)' --check-cfg 'cfg(target_arch, values("xtensa"))' --check-cfg 'cfg(target_os, values("cygwin"))' --cfg 'feature="alloc"' --cfg 'feature="fs"' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("all-apis", "alloc", "core", "default", "event", "fs", "io_uring", "libc", "libc_errno", "linux_4_11", "linux_5_1", "linux_5_11", "linux_latest", "mm", "mount", "net", "param", "pipe", "process", "pty", "rand", "runtime", "rustc-dep-of-std", "rustc-std-workspace-alloc", "shm", "std", "stdio", "system", "termios", "thread", "time", "try_close", "use-explicitly-provided-auxv", "use-libc", "use-libc-auxv"))' -C metadata=9dcc8368f9b31541 -C extra-filename=-90473c6330bbe146 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/build/rustix-90473c6330bbe146 -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow`
+     Running `rustc --crate-name build_script_build --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23/build.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("no-panic"))' -C metadata=9df4883c72e1d075 -C extra-filename=-ba2c041e33c0ea13 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/build/zmij-ba2c041e33c0ea13 -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow`
+     Running `rustc --crate-name build_script_build --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/crc32fast-1.5.2/build.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "nightly", "std"))' -C metadata=4c01ee4ce885a6d2 -C extra-filename=-9514fbdbdd7b8945 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/build/crc32fast-9514fbdbdd7b8945 -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow`
+     Running `rustc --crate-name bitflags --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/bitflags-2.13.2/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("arbitrary", "bytemuck", "example_generated", "serde", "serde_core", "std"))' -C metadata=952a279ef2079498 -C extra-filename=-68349dc936cda5ee --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow`
+     Running `rustc --crate-name simd_adler32 --edition=2018 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/simd-adler32-0.3.10/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("const-generics", "default", "nightly", "std"))' -C metadata=dad9fbf88fcc8bc1 -C extra-filename=-c1c8629cf393526e --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow`
+     Running `rustc --crate-name memchr --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.8.3/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --cfg 'feature="alloc"' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("alloc", "core", "default", "libc", "logging", "rustc-dep-of-std", "std", "use_std"))' -C metadata=8ee955d39172f7f7 -C extra-filename=-a96d71851c4af673 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow`
+     Running `rustc --crate-name build_script_build --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/build.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no --cfg 'feature="default"' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("alloc", "arbitrary_precision", "default", "float_roundtrip", "indexmap", "preserve_order", "raw_value", "std", "unbounded_depth"))' -C metadata=6c04c4f66c47f08e -C extra-filename=-613de38bdedea73a --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/build/serde_json-613de38bdedea73a -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow`
+     Running `rustc --crate-name build_script_build --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/build.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no --cfg 'feature="default"' --cfg 'feature="derive"' --cfg 'feature="serde_derive"' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("alloc", "default", "derive", "rc", "serde_derive", "std", "unstable"))' -C metadata=f7ef14f634eeaa43 -C extra-filename=-a0384f2307a2b2d2 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/build/serde-a0384f2307a2b2d2 -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow`
+     Running `rustc --crate-name adler2 --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/adler2-2.0.1/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("core", "default", "rustc-dep-of-std", "std"))' -C metadata=2f16515fa2be492f -C extra-filename=-92b0189f04af0cd9 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow`
+     Running `rustc --crate-name itoa --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/itoa-1.0.18/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("no-panic"))' -C metadata=a0e3fbbca9ade836 -C extra-filename=-3bbdafa2d3d2c047 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow`
+     Running `/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/build/serde_core-5ab0a7ecec64a104/build-script-build`
+     Running `/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/build/proc-macro2-7f7a7a454a32e35e/build-script-build`
+     Running `/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/build/crc32fast-9514fbdbdd7b8945/build-script-build`
+     Running `/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/build/zmij-ba2c041e33c0ea13/build-script-build`
+     Running `/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/build/rustix-90473c6330bbe146/build-script-build`
+     Running `/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/build/serde_json-613de38bdedea73a/build-script-build`
+   Compiling generic-array v0.14.7
+     Running `rustc --crate-name build_script_build --edition=2015 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7/build.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no --cfg 'feature="more_lengths"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("more_lengths", "serde", "zeroize"))' -C metadata=9234bf9b58621e6f -C extra-filename=-79658a36c155e886 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/build/generic-array-79658a36c155e886 -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern version_check=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libversion_check-8ec1afee83d917d9.rlib --cap-lints allow`
+   Compiling miniz_oxide v0.9.1
+     Running `rustc --crate-name miniz_oxide --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/miniz_oxide-0.9.1/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --warn=unexpected_cfgs --check-cfg 'cfg(fuzzing)' --cfg 'feature="default"' --cfg 'feature="simd"' --cfg 'feature="simd-adler32"' --cfg 'feature="with-alloc"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("alloc", "block-boundary", "core", "default", "rustc-dep-of-std", "serde", "simd", "simd-adler32", "std", "with-alloc"))' -C metadata=c50e893394cfddae -C extra-filename=-9e88b0717d15af83 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern adler2=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libadler2-92b0189f04af0cd9.rmeta --extern simd_adler32=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libsimd_adler32-c1c8629cf393526e.rmeta --cap-lints allow`
+     Running `/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/build/quote-42c920a6cbcd942b/build-script-build`
+     Running `/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/build/libc-ebd5576d3ee55c60/build-script-build`
+     Running `/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/build/serde-a0384f2307a2b2d2/build-script-build`
+     Running `/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/build/generic-array-79658a36c155e886/build-script-build`
+     Running `rustc --crate-name serde_core --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --cfg 'feature="result"' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("alloc", "default", "rc", "result", "std", "unstable"))' -C metadata=ae8d0ce359a6beb7 -C extra-filename=-cf82f213160a1cfe --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow --check-cfg 'cfg(if_docsrs_then_no_serde_core)' --check-cfg 'cfg(no_core_cstr)' --check-cfg 'cfg(no_core_error)' --check-cfg 'cfg(no_core_net)' --check-cfg 'cfg(no_core_num_saturating)' --check-cfg 'cfg(no_diagnostic_namespace)' --check-cfg 'cfg(no_serde_derive)' --check-cfg 'cfg(no_std_atomic)' --check-cfg 'cfg(no_std_atomic64)' --check-cfg 'cfg(no_target_has_atomic)'`
+     Running `rustc --crate-name proc_macro2 --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --cfg 'feature="proc-macro"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "nightly", "proc-macro", "span-locations"))' -C metadata=33063a9702158786 -C extra-filename=-1e547c282cf743ad --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern unicode_ident=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libunicode_ident-eeadbe15e4f6eb85.rmeta --cap-lints allow --cfg wrap_proc_macro --cfg proc_macro_span_location --cfg proc_macro_span_file --check-cfg 'cfg(fuzzing)' --check-cfg 'cfg(no_is_available)' --check-cfg 'cfg(no_literal_byte_character)' --check-cfg 'cfg(no_literal_c_string)' --check-cfg 'cfg(no_source_text)' --check-cfg 'cfg(proc_macro_span)' --check-cfg 'cfg(proc_macro_span_file)' --check-cfg 'cfg(proc_macro_span_location)' --check-cfg 'cfg(procmacro2_backtrace)' --check-cfg 'cfg(procmacro2_build_probe)' --check-cfg 'cfg(procmacro2_nightly_testing)' --check-cfg 'cfg(procmacro2_semver_exempt)' --check-cfg 'cfg(randomize_layout)' --check-cfg 'cfg(span_locations)' --check-cfg 'cfg(super_unstable)' --check-cfg 'cfg(wrap_proc_macro)'`
+     Running `rustc --crate-name crc32fast --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/crc32fast-1.5.2/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "nightly", "std"))' -C metadata=829bef6309bf7775 -C extra-filename=-e7c0222f978a473c --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern cfg_if=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libcfg_if-7b6d01c2d899540a.rmeta --cap-lints allow --cfg stable_arm_crc32_intrinsics --cfg stable_vpclmulqdq --check-cfg 'cfg(stable_arm_crc32_intrinsics)' --check-cfg 'cfg(stable_vpclmulqdq)'`
+   Compiling flate2 v1.1.10
+     Running `rustc --crate-name flate2 --edition=2018 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/flate2-1.1.10/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --warn=unexpected_cfgs --check-cfg 'cfg(flate2_unstable_nightly_alloc_io)' --cfg 'feature="any_impl"' --cfg 'feature="default"' --cfg 'feature="miniz_oxide"' --cfg 'feature="runtime_detection"' --cfg 'feature="rust_backend"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("any_c_zlib", "any_impl", "any_zlib", "cloudflare_zlib", "default", "document-features", "libz-ng-sys", "libz-sys", "miniz-sys", "miniz_oxide", "runtime_detection", "rust_backend", "zlib", "zlib-default", "zlib-ng", "zlib-ng-compat", "zlib-rs"))' -C metadata=15e32804dde84e26 -C extra-filename=-4f745d666bfdd526 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern crc32fast=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libcrc32fast-e7c0222f978a473c.rmeta --extern miniz_oxide=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libminiz_oxide-9e88b0717d15af83.rmeta --cap-lints allow`
+     Running `rustc --crate-name zmij --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("no-panic"))' -C metadata=5971d83b2f2ad02f -C extra-filename=-34b1a056a4672765 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow --check-cfg 'cfg(exhaustive)' --check-cfg 'cfg(opt_level, values("s"))' --check-cfg 'cfg(zmij_no_select_unpredictable)'`
+     Running `rustc --crate-name serde_json --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --cfg 'feature="default"' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("alloc", "arbitrary_precision", "default", "float_roundtrip", "indexmap", "preserve_order", "raw_value", "std", "unbounded_depth"))' -C metadata=ff9fe0981e291735 -C extra-filename=-bfdb34bcb82dcdc5 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern itoa=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libitoa-3bbdafa2d3d2c047.rmeta --extern memchr=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libmemchr-a96d71851c4af673.rmeta --extern serde_core=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libserde_core-cf82f213160a1cfe.rmeta --extern zmij=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libzmij-34b1a056a4672765.rmeta --cap-lints allow --cfg 'fast_arithmetic="64"' --check-cfg 'cfg(fast_arithmetic, values("32", "64"))'`
+     Running `rustc --crate-name quote --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.47/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --cfg 'feature="proc-macro"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "proc-macro"))' -C metadata=edb8e84e099bbeb4 -C extra-filename=-d2e0e5b4599956f3 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern proc_macro2=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libproc_macro2-1e547c282cf743ad.rmeta --cap-lints allow --check-cfg 'cfg(no_diagnostic_namespace)'`
+   Compiling syn v3.0.7
+     Running `rustc --crate-name syn --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/syn-3.0.7/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --cfg 'feature="clone-impls"' --cfg 'feature="derive"' --cfg 'feature="parsing"' --cfg 'feature="printing"' --cfg 'feature="proc-macro"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("clone-impls", "default", "derive", "extra-traits", "fold", "full", "parsing", "printing", "proc-macro", "test", "visit", "visit-mut"))' -C metadata=5e4740a9b317e561 -C extra-filename=-336714fa42fff698 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern proc_macro2=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libproc_macro2-1e547c282cf743ad.rmeta --extern quote=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libquote-d2e0e5b4599956f3.rmeta --extern unicode_ident=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libunicode_ident-eeadbe15e4f6eb85.rmeta --cap-lints allow`
+     Running `rustc --crate-name libc --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.190/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --allow=unused_qualifications '--warn=clippy::unnecessary_semicolon' '--allow=clippy::unnecessary_cast' '--warn=clippy::ptr_as_ptr' '--allow=clippy::non_minimal_cfg' '--allow=clippy::missing_safety_doc' '--warn=clippy::map_unwrap_or' '--warn=clippy::manual_assert' '--allow=clippy::identity_op' '--warn=clippy::explicit_iter_loop' --cfg 'feature="default"' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("align", "const-extern-fn", "default", "extra_traits", "rustc-dep-of-std", "rustc-std-workspace-core", "std", "use_std"))' -C metadata=fd63529adfd4eb5a -C extra-filename=-e738004579f2762e --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --cap-lints allow --check-cfg 'cfg(libc_deny_warnings)' --check-cfg 'cfg(emscripten_old_stat_abi)' --check-cfg 'cfg(espidf_picolibc)' --check-cfg 'cfg(espidf_time32)' --check-cfg 'cfg(freebsd10)' --check-cfg 'cfg(freebsd11)' --check-cfg 'cfg(freebsd12)' --check-cfg 'cfg(freebsd13)' --check-cfg 'cfg(freebsd14)' --check-cfg 'cfg(freebsd15)' --check-cfg 'cfg(libc_elfv2)' --check-cfg 'cfg(vxworks_lt_25_09)' --check-cfg 'cfg(libc_pauthtest)' --check-cfg 'cfg(gnu_file_offset_bits64)' --check-cfg 'cfg(gnu_time_bits64)' --check-cfg 'cfg(linux_time_bits64)' --check-cfg 'cfg(musl_v1_2)' --check-cfg 'cfg(musl32_time64)' --check-cfg 'cfg(musl_redir_time64)' --check-cfg 'cfg(uclibc32_time64)' --check-cfg 'cfg(target_os,values("switch","aix","ohos","hurd","rtems","visionos","nuttx","cygwin","qurt","qnx","helenos"))' --check-cfg 'cfg(target_env,values("illumos","wasi","aix","ohos","nto71_iosock"))' --check-cfg 'cfg(target_arch,values("loongarch64","mips32r6","mips64r6","csky"))'`
+   Compiling errno v0.3.14
+   Compiling cpufeatures v0.2.17
+   Compiling filetime v0.2.29
+     Running `rustc --crate-name errno --edition=2018 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/errno-0.3.14/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --warn=unexpected_cfgs --check-cfg 'cfg(target_os, values("cygwin"))' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "std"))' -C metadata=e2aee89fc933bd65 -C extra-filename=-75ea82574463a4c8 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern libc=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/liblibc-e738004579f2762e.rmeta --cap-lints allow`
+     Running `rustc --crate-name cpufeatures --edition=2018 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/cpufeatures-0.2.17/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=cecc56eb92b7639f -C extra-filename=-79d1197d647cb53e --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern libc=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/liblibc-e738004579f2762e.rmeta --cap-lints allow`
+     Running `rustc --crate-name filetime --edition=2018 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/filetime-0.2.29/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --warn=unexpected_cfgs --check-cfg 'cfg(emulate_second_only_system)' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=909835f1727c4dc0 -C extra-filename=-316ce9e31f53d89b --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern cfg_if=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libcfg_if-7b6d01c2d899540a.rmeta --extern libc=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/liblibc-e738004579f2762e.rmeta --cap-lints allow`
+     Running `rustc --crate-name rustix --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.5/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --warn=unexpected_cfgs --check-cfg 'cfg(alloc_c_string)' --check-cfg 'cfg(alloc_ffi)' --check-cfg 'cfg(apple)' --check-cfg 'cfg(asm_experimental_arch)' --check-cfg 'cfg(bsd)' --check-cfg 'cfg(core_c_str)' --check-cfg 'cfg(core_ffi_c)' --check-cfg 'cfg(core_intrinsics)' --check-cfg 'cfg(criterion)' --check-cfg 'cfg(document_experimental_runtime_api)' --check-cfg 'cfg(error_in_core)' --check-cfg 'cfg(fix_y2038)' --check-cfg 'cfg(freebsdlike)' --check-cfg 'cfg(libc)' --check-cfg 'cfg(linux_kernel)' --check-cfg 'cfg(linux_like)' --check-cfg 'cfg(linux_raw)' --check-cfg 'cfg(linux_raw_dep)' --check-cfg 'cfg(lower_upper_exp_for_non_zero)' --check-cfg 'cfg(sanitize_memory)' --check-cfg 'cfg(netbsdlike)' --check-cfg 'cfg(rustc_diagnostics)' --check-cfg 'cfg(solarish)' --check-cfg 'cfg(staged_api)' --check-cfg 'cfg(thumb_mode)' --check-cfg 'cfg(wasi)' --check-cfg 'cfg(wasi_ext)' --check-cfg 'cfg(wasip2)' --check-cfg 'cfg(target_arch, values("xtensa"))' --check-cfg 'cfg(target_os, values("cygwin"))' --cfg 'feature="alloc"' --cfg 'feature="fs"' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("all-apis", "alloc", "core", "default", "event", "fs", "io_uring", "libc", "libc_errno", "linux_4_11", "linux_5_1", "linux_5_11", "linux_latest", "mm", "mount", "net", "param", "pipe", "process", "pty", "rand", "runtime", "rustc-dep-of-std", "rustc-std-workspace-alloc", "shm", "std", "stdio", "system", "termios", "thread", "time", "try_close", "use-explicitly-provided-auxv", "use-libc", "use-libc-auxv"))' -C metadata=9ac130cda8de0011 -C extra-filename=-39a7b98daaf62191 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern bitflags=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libbitflags-68349dc936cda5ee.rmeta --extern libc_errno=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/liberrno-75ea82574463a4c8.rmeta --extern libc=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/liblibc-e738004579f2762e.rmeta --cap-lints allow --cfg lower_upper_exp_for_non_zero --cfg rustc_diagnostics --cfg libc --cfg apple --cfg bsd`
+     Running `rustc --crate-name generic_array --edition=2015 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --cfg 'feature="more_lengths"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("more_lengths", "serde", "zeroize"))' -C metadata=a49bcfc8e6262683 -C extra-filename=-cc03586324aff099 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern typenum=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libtypenum-a4eaa2b6e0ccd66e.rmeta --cap-lints allow --cfg relaxed_coherence`
+   Compiling serde_derive v1.0.229
+     Running `rustc --crate-name serde_derive --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_derive-1.0.229/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type proc-macro --emit=dep-info,link -C prefer-dynamic -C embed-bitcode=no --cfg 'feature="default"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "deserialize_in_place"))' -C metadata=6cef1148cb10e8b8 -C extra-filename=-f7035dea84f9e681 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern proc_macro2=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libproc_macro2-1e547c282cf743ad.rlib --extern quote=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libquote-d2e0e5b4599956f3.rlib --extern syn=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libsyn-336714fa42fff698.rlib --extern proc_macro --cap-lints allow`
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+     Running `rustc --crate-name crypto_common --edition=2018 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/crypto-common-0.1.7/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("getrandom", "rand_core", "std"))' -C metadata=72360234f837655b -C extra-filename=-8ebd91af30961820 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern generic_array=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libgeneric_array-cc03586324aff099.rmeta --extern typenum=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libtypenum-a4eaa2b6e0ccd66e.rmeta --cap-lints allow`
+     Running `rustc --crate-name block_buffer --edition=2018 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/block-buffer-0.10.4/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=aabfbe93e41b3c3a -C extra-filename=-613e38f9d2a16a4f --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern generic_array=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libgeneric_array-cc03586324aff099.rmeta --cap-lints allow`
+   Compiling digest v0.10.7
+     Running `rustc --crate-name digest --edition=2018 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/digest-0.10.7/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --cfg 'feature="alloc"' --cfg 'feature="block-buffer"' --cfg 'feature="core-api"' --cfg 'feature="default"' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("alloc", "blobby", "block-buffer", "const-oid", "core-api", "default", "dev", "mac", "oid", "rand_core", "std", "subtle"))' -C metadata=a30f29763a15566f -C extra-filename=-77a2a136562f221a --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern block_buffer=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libblock_buffer-613e38f9d2a16a4f.rmeta --extern crypto_common=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libcrypto_common-8ebd91af30961820.rmeta --cap-lints allow`
+   Compiling sha2 v0.10.9
+     Running `rustc --crate-name sha2 --edition=2018 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/sha2-0.10.9/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --cfg 'feature="default"' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("asm", "asm-aarch64", "compress", "default", "force-soft", "force-soft-compact", "loongarch64_asm", "oid", "sha2-asm", "std"))' -C metadata=9511a63a131f9764 -C extra-filename=-238833b6ce06e53d --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern cfg_if=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libcfg_if-7b6d01c2d899540a.rmeta --extern cpufeatures=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libcpufeatures-79d1197d647cb53e.rmeta --extern digest=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libdigest-77a2a136562f221a.rmeta --cap-lints allow`
+   Compiling xattr v1.6.1
+     Running `rustc --crate-name xattr --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-1.6.1/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --cfg 'feature="default"' --cfg 'feature="unsupported"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "unsupported"))' -C metadata=fbd47be86499f0ae -C extra-filename=-9a98a40b10047487 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern rustix=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/librustix-39a7b98daaf62191.rmeta --cap-lints allow`
+   Compiling tar v0.4.46
+     Running `rustc --crate-name tar --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/tar-0.4.46/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --deny=dead_code --cfg 'feature="default"' --cfg 'feature="xattr"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "xattr"))' -C metadata=f7b7d0ae572279c8 -C extra-filename=-31129c1c490aa32b --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern filetime=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libfiletime-316ce9e31f53d89b.rmeta --extern libc=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/liblibc-e738004579f2762e.rmeta --extern xattr=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libxattr-9a98a40b10047487.rmeta --cap-lints allow`
+     Running `rustc --crate-name serde --edition=2021 /private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no --cfg 'feature="default"' --cfg 'feature="derive"' --cfg 'feature="serde_derive"' --cfg 'feature="std"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("alloc", "default", "derive", "rc", "serde_derive", "std", "unstable"))' -C metadata=d9b5c3260741a02a -C extra-filename=-1668ac10764c3865 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C strip=debuginfo -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern serde_core=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libserde_core-cf82f213160a1cfe.rmeta --extern serde_derive=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libserde_derive-f7035dea84f9e681.dylib --cap-lints allow --cfg if_docsrs_then_no_serde_core --check-cfg 'cfg(feature, values("result"))' --check-cfg 'cfg(if_docsrs_then_no_serde_core)' --check-cfg 'cfg(no_core_cstr)' --check-cfg 'cfg(no_core_error)' --check-cfg 'cfg(no_core_net)' --check-cfg 'cfg(no_core_num_saturating)' --check-cfg 'cfg(no_diagnostic_namespace)' --check-cfg 'cfg(no_serde_derive)' --check-cfg 'cfg(no_std_atomic)' --check-cfg 'cfg(no_std_atomic64)' --check-cfg 'cfg(no_target_has_atomic)'`
+   Compiling oxide-storage v0.1.0 (/private/tmp/oxide-stable-profiles.0l_xctvm/m/src-light)
+     Running `rustc --crate-name oxide_storage --edition=2021 src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=line-tables-only -C split-debuginfo=unpacked --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("private-qualification", "private-qualification-fixture"))' -C metadata=8e331ea720cfb750 -C extra-filename=-9ae9bc94ec14be2d --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C incremental=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/incremental -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern flate2=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libflate2-4f745d666bfdd526.rmeta --extern libc=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/liblibc-e738004579f2762e.rmeta --extern serde=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libserde-1668ac10764c3865.rmeta --extern serde_json=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libserde_json-bfdb34bcb82dcdc5.rmeta --extern sha2=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libsha2-238833b6ce06e53d.rmeta --extern tar=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libtar-31129c1c490aa32b.rmeta`
+warning: unused imports: `ArchiveEvidence` and `ImmutableManifest`
+  --> src/registered/archive.rs:9:78
+   |
+ 9 |     canonical_dir, digest, io, receipt_bound, relative, stamp, valid_digest, ArchiveEvidence,
+   |                                                                              ^^^^^^^^^^^^^^^
+10 |     Attempt, ImmutableClass, ImmutableManifest, InputEvidenceOwner, Limits, Refusal, Result,
+   |                              ^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `manifests`
+    --> src/registered/runner_host.rs:1414:9
+     |
+1414 |         manifests: &std::collections::BTreeMap<String, ImmutableManifest>,
+     |         ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_manifests`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `budget`
+    --> src/registered/runner_host.rs:1415:9
+     |
+1415 |         budget: &mut super::EvidenceReadBudget,
+     |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_budget`
+
+warning: constant `MAX_SAMPLES` is never used
+  --> src/project/cargo.rs:28:7
+   |
+28 | const MAX_SAMPLES: usize = 16;
+   |       ^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `SAMPLE_INTERVAL` is never used
+  --> src/project/cargo.rs:29:7
+   |
+29 | const SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
+   |       ^^^^^^^^^^^^^^^
+
+warning: constant `POLL_INTERVAL` is never used
+  --> src/project/cargo.rs:30:7
+   |
+30 | const POLL_INTERVAL: Duration = Duration::from_millis(200);
+   |       ^^^^^^^^^^^^^
+
+warning: constant `MAX_RUN_TIME` is never used
+  --> src/project/cargo.rs:31:7
+   |
+31 | const MAX_RUN_TIME: Duration = Duration::from_secs(60 * 60);
+   |       ^^^^^^^^^^^^
+
+warning: constant `REQUIRED_FREE_BYTES` is never used
+  --> src/project/cargo.rs:32:7
+   |
+32 | const REQUIRED_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+   |       ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `FORCED_ENVIRONMENT` is never used
+  --> src/project/cargo.rs:33:7
+   |
+33 | const FORCED_ENVIRONMENT: [&str; 6] = [
+   |       ^^^^^^^^^^^^^^^^^^
+
+warning: struct `CargoWorkflowRunner` is never constructed
+  --> src/project/cargo.rs:43:19
+   |
+43 | pub(super) struct CargoWorkflowRunner {
+   |                   ^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `new` and `validate_plan` are never used
+  --> src/project/cargo.rs:53:19
+   |
+50 | impl CargoWorkflowRunner {
+   | ------------------------ associated items in this implementation
+...
+53 |     pub(super) fn new(
+   |                   ^^^
+...
+74 |     pub(super) fn validate_plan(
+   |                   ^^^^^^^^^^^^^
+
+warning: struct `FreeSpaceLog` is never constructed
+   --> src/project/cargo.rs:116:8
+    |
+116 | struct FreeSpaceLog {
+    |        ^^^^^^^^^^^^
+
+warning: method `record` is never used
+   --> src/project/cargo.rs:121:8
+    |
+120 | impl FreeSpaceLog {
+    | ----------------- method in this implementation
+121 |     fn record(&mut self, free: u64) {
+    |        ^^^^^^
+
+warning: method `free_bytes` is never used
+   --> src/project/cargo.rs:505:8
+    |
+504 | impl CargoWorkflowRunner {
+    | ------------------------ method in this implementation
+505 |     fn free_bytes(&self) -> Result<u64, BoundaryFailure> {
+    |        ^^^^^^^^^^
+
+warning: function `forces_environment` is never used
+   --> src/project/cargo.rs:514:4
+    |
+514 | fn forces_environment(value: &EffectiveValue) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `is_source_map_probe` is never used
+   --> src/project/cargo.rs:518:4
+    |
+518 | fn is_source_map_probe(command: &super::HostRunRequest) -> bool {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `environment_digest` is never used
+   --> src/project/cargo.rs:522:4
+    |
+522 | fn environment_digest(values: &[EffectiveValue]) -> String {
+    |    ^^^^^^^^^^^^^^^^^^
+
+warning: function `repository_head` is never used
+   --> src/project/cargo.rs:573:4
+    |
+573 | fn repository_head(workspace: &Path) -> Result<String, BoundaryFailure> {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `inside_trial` is never used
+   --> src/project/cargo.rs:625:4
+    |
+625 | fn inside_trial(root: &Path, path: &Path) -> Result<(), BoundaryFailure> {
+    |    ^^^^^^^^^^^^
+
+warning: function `canonical_directory` is never used
+   --> src/project/cargo.rs:633:4
+    |
+633 | fn canonical_directory(path: &Path) -> Result<PathBuf, BoundaryFailure> {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `single_component` is never used
+   --> src/project/cargo.rs:641:4
+    |
+641 | fn single_component(value: &str) -> bool {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `read_capture` is never used
+   --> src/project/cargo.rs:649:4
+    |
+649 | fn read_capture(path: &Path) -> Result<Vec<u8>, BoundaryFailure> {
+    |    ^^^^^^^^^^^^
+
+warning: function `kill_group` is never used
+   --> src/project/cargo.rs:662:4
+    |
+662 | fn kill_group(pgid: u32) {
+    |    ^^^^^^^^^^
+
+warning: function `group_alive` is never used
+   --> src/project/cargo.rs:672:4
+    |
+672 | fn group_alive(pgid: u32) -> bool {
+    |    ^^^^^^^^^^^
+
+warning: function `io_failure` is never used
+   --> src/project/cargo.rs:683:4
+    |
+683 | fn io_failure(_: std::io::Error) -> BoundaryFailure {
+    |    ^^^^^^^^^^
+
+warning: function `elapsed_millis` is never used
+   --> src/project/cargo.rs:687:4
+    |
+687 | fn elapsed_millis(started: Instant) -> u64 {
+    |    ^^^^^^^^^^^^^^
+
+warning: function `unique_nanos` is never used
+   --> src/project/cargo.rs:691:4
+    |
+691 | fn unique_nanos() -> String {
+    |    ^^^^^^^^^^^^
+
+warning: function `hex_digest` is never used
+   --> src/project/cargo.rs:699:4
+    |
+699 | fn hex_digest(bytes: &[u8]) -> String {
+    |    ^^^^^^^^^^
+
+warning: constant `MAX_FIXTURE_CHILDREN` is never used
+  --> src/project/native.rs:21:18
+   |
+21 | pub(super) const MAX_FIXTURE_CHILDREN: usize = 8;
+   |                  ^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `MAX_FIXTURE_FILE_BYTES` is never used
+  --> src/project/native.rs:23:18
+   |
+23 | pub(super) const MAX_FIXTURE_FILE_BYTES: u64 = 1024 * 1024;
+   |                  ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `MAX_MANIFEST_BYTES` is never used
+  --> src/project/native.rs:30:7
+   |
+30 | const MAX_MANIFEST_BYTES: usize = 16 * 1024;
+   |       ^^^^^^^^^^^^^^^^^^
+
+warning: constant `CHILD_WAIT_LIMIT` is never used
+  --> src/project/native.rs:31:7
+   |
+31 | const CHILD_WAIT_LIMIT: Duration = Duration::from_secs(8);
+   |       ^^^^^^^^^^^^^^^^
+
+warning: constant `SPACE_PROBE_WAIT_LIMIT` is never used
+  --> src/project/native.rs:32:7
+   |
+32 | const SPACE_PROBE_WAIT_LIMIT: Duration = Duration::from_secs(2);
+   |       ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `SPACE_SAMPLE_INTERVAL` is never used
+  --> src/project/native.rs:33:7
+   |
+33 | const SPACE_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
+   |       ^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `CONTROL_NAME` is never used
+  --> src/project/native.rs:34:7
+   |
+34 | const CONTROL_NAME: &str = "oxide-native-control";
+   |       ^^^^^^^^^^^^
+
+warning: constant `CHILD_MODE_ENV` is never used
+  --> src/project/native.rs:35:7
+   |
+35 | const CHILD_MODE_ENV: &str = "OXIDE_NATIVE_CHILD_MODE";
+   |       ^^^^^^^^^^^^^^
+
+warning: constant `CHILD_SLOT_ENV` is never used
+  --> src/project/native.rs:36:7
+   |
+36 | const CHILD_SLOT_ENV: &str = "OXIDE_NATIVE_CHILD_SLOT";
+   |       ^^^^^^^^^^^^^^
+
+warning: constant `CHILD_CONTROL_ENV` is never used
+  --> src/project/native.rs:37:7
+   |
+37 | const CHILD_CONTROL_ENV: &str = "OXIDE_NATIVE_CHILD_CONTROL";
+   |       ^^^^^^^^^^^^^^^^^
+
+warning: constant `CHILD_TOKEN_ENV` is never used
+  --> src/project/native.rs:38:7
+   |
+38 | const CHILD_TOKEN_ENV: &str = "OXIDE_NATIVE_CHILD_TOKEN";
+   |       ^^^^^^^^^^^^^^^
+
+warning: constant `CHILD_RUN_ENV` is never used
+  --> src/project/native.rs:39:7
+   |
+39 | const CHILD_RUN_ENV: &str = "OXIDE_NATIVE_CHILD_RUN";
+   |       ^^^^^^^^^^^^^
+
+warning: constant `CHILD_ATTEMPT_ENV` is never used
+  --> src/project/native.rs:40:7
+   |
+40 | const CHILD_ATTEMPT_ENV: &str = "OXIDE_NATIVE_CHILD_ATTEMPT";
+   |       ^^^^^^^^^^^^^^^^^
+
+warning: constant `CHILD_EXPECT_ENV` is never used
+  --> src/project/native.rs:41:7
+   |
+41 | const CHILD_EXPECT_ENV: &str = "OXIDE_NATIVE_CHILD_EXPECT";
+   |       ^^^^^^^^^^^^^^^^
+
+warning: constant `MAX_NEW_FIXTURE_FILES` is never used
+  --> src/project/native.rs:42:7
+   |
+42 | const MAX_NEW_FIXTURE_FILES: usize = 7;
+   |       ^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `MAX_NEW_FIXTURE_BYTES` is never used
+  --> src/project/native.rs:43:7
+   |
+43 | const MAX_NEW_FIXTURE_BYTES: u64 = MAX_NEW_FIXTURE_FILES as u64 * MAX_FIXTURE_FILE_BYTES;
+   |       ^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `SCENARIO_CHILDREN` is never used
+  --> src/project/native.rs:45:8
+   |
+45 | static SCENARIO_CHILDREN: OnceLock<Mutex<std::collections::BTreeMap<PathBuf, usize>>> =
+   |        ^^^^^^^^^^^^^^^^^
+
+warning: struct `NativeFixtureLimits` is never constructed
+  --> src/project/native.rs:49:19
+   |
+49 | pub(super) struct NativeFixtureLimits {
+   |                   ^^^^^^^^^^^^^^^^^^^
+
+warning: method `validate` is never used
+  --> src/project/native.rs:72:19
+   |
+71 | impl NativeFixtureLimits {
+   | ------------------------ method in this implementation
+72 |     pub(super) fn validate(self) -> Result<(), BoundaryFailure> {
+   |                   ^^^^^^^^
+
+warning: struct `NativeChildStarted` is never constructed
+   --> src/project/native.rs:320:19
+    |
+320 | pub(super) struct NativeChildStarted {
+    |                   ^^^^^^^^^^^^^^^^^^
+
+warning: enum `NativeWriterReadiness` is never used
+   --> src/project/native.rs:331:17
+    |
+331 | pub(super) enum NativeWriterReadiness {
+    |                 ^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `NativeReadinessRefusal` is never used
+   --> src/project/native.rs:340:17
+    |
+340 | pub(super) enum NativeReadinessRefusal {
+    |                 ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `label` and `from_boundary` are never used
+   --> src/project/native.rs:356:19
+    |
+355 | impl NativeReadinessRefusal {
+    | --------------------------- associated items in this implementation
+356 |     pub(super) fn label(self) -> &'static str {
+    |                   ^^^^^
+...
+373 |     fn from_boundary(failure: BoundaryFailure) -> Self {
+    |        ^^^^^^^^^^^^^
+
+warning: struct `ReadinessReporter` is never constructed
+   --> src/project/native.rs:386:8
+    |
+386 | struct ReadinessReporter {
+    |        ^^^^^^^^^^^^^^^^^
+
+warning: methods `held`, `refuse`, and `report` are never used
+   --> src/project/native.rs:391:8
+    |
+390 | impl ReadinessReporter {
+    | ---------------------- methods in this implementation
+391 |     fn held(&mut self, started: NativeChildStarted) {
+    |        ^^^^
+...
+395 |     fn refuse(&mut self, reason: NativeReadinessRefusal) {
+    |        ^^^^^^
+...
+399 |     fn report(&mut self, readiness: NativeWriterReadiness) {
+    |        ^^^^^^
+
+warning: struct `CargoCompletion` is never constructed
+   --> src/project/native.rs:415:19
+    |
+415 | pub(super) struct CargoCompletion {
+    |                   ^^^^^^^^^^^^^^^
+
+warning: associated function `cargo` is never used
+   --> src/project/native.rs:431:19
+    |
+429 | impl NativeCompletionCertificate {
+    | -------------------------------- associated function in this implementation
+430 |     /// Issued only by the registered Cargo runner after a normal exit and complete capture.
+431 |     pub(super) fn cargo(parts: CargoCompletion) -> Self {
+    |                   ^^^^^
+
+warning: enum `ChildBehavior` is never used
+   --> src/project/native.rs:452:6
+    |
+452 | enum ChildBehavior {
+    |      ^^^^^^^^^^^^^
+
+warning: struct `NativeFixtureCommandRunner` is never constructed
+   --> src/project/native.rs:462:19
+    |
+462 | pub(super) struct NativeFixtureCommandRunner {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: multiple associated items are never used
+   --> src/project/native.rs:475:19
+    |
+474 | impl NativeFixtureCommandRunner {
+    | ------------------------------- associated items in this implementation
+475 |     pub(super) fn healthy() -> Result<Self, BoundaryFailure> {
+    |                   ^^^^^^^
+...
+479 |     pub(super) fn gated(
+    |                   ^^^^^
+...
+490 |     pub(super) fn retain_writer(
+    |                   ^^^^^^^^^^^^^
+...
+503 |     pub(super) fn with_limits(limits: NativeFixtureLimits) -> Result<Self, BoundaryFailure> {
+    |                   ^^^^^^^^^^^
+...
+519 |     fn new(
+    |        ^^^
+...
+531 |     pub(super) fn executions(&self) -> usize {
+    |                   ^^^^^^^^^^
+...
+535 |     pub(super) fn launched_children(&self) -> usize {
+    |                   ^^^^^^^^^^^^^^^^^
+...
+539 |     pub(super) fn has_retained_writer(&self) -> bool {
+    |                   ^^^^^^^^^^^^^^^^^^^
+...
+546 |     pub(super) fn retained_writer_is_active(&mut self) -> bool {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+552 |     pub(super) fn expect_prior_slot_digest(&mut self, digest: String) {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+556 |     pub(super) fn release_and_reap_retained(&mut self) -> Result<(), BoundaryFailure> {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `execute_inner` is never used
+   --> src/project/native.rs:599:8
+    |
+598 | impl NativeFixtureCommandRunner {
+    | ------------------------------- method in this implementation
+599 |     fn execute_inner(
+    |        ^^^^^^^^^^^^^
+
+warning: struct `OwnedChild` is never constructed
+   --> src/project/native.rs:944:8
+    |
+944 | struct OwnedChild(Child);
+    |        ^^^^^^^^^^
+
+warning: struct `BoundedOutput` is never constructed
+   --> src/project/native.rs:955:8
+    |
+955 | struct BoundedOutput {
+    |        ^^^^^^^^^^^^^
+
+warning: function `spawn_bounded_reader` is never used
+   --> src/project/native.rs:960:4
+    |
+960 | fn spawn_bounded_reader<R: Read + Send + 'static>(
+    |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `join_reader` is never used
+   --> src/project/native.rs:987:4
+    |
+987 | fn join_reader(
+    |    ^^^^^^^^^^^
+
+warning: function `cancelled_output` is never used
+    --> src/project/native.rs:1001:4
+     |
+1001 | fn cancelled_output(
+     |    ^^^^^^^^^^^^^^^^
+
+warning: function `cancelled_or_incomplete_output` is never used
+    --> src/project/native.rs:1034:4
+     |
+1034 | fn cancelled_or_incomplete_output(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `wait_child` is never used
+    --> src/project/native.rs:1067:4
+     |
+1067 | fn wait_child(
+     |    ^^^^^^^^^^
+
+warning: enum `StartMarkerObservation` is never used
+    --> src/project/native.rs:1096:6
+     |
+1096 | enum StartMarkerObservation {
+     |      ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `observe_start_marker` is never used
+    --> src/project/native.rs:1102:4
+     |
+1102 | fn observe_start_marker(expected: &str, value: &str) -> StartMarkerObservation {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `wait_for_start_marker` is never used
+    --> src/project/native.rs:1112:4
+     |
+1112 | fn wait_for_start_marker(
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `wait_for_control_marker` is never used
+    --> src/project/native.rs:1152:4
+     |
+1152 | fn wait_for_control_marker(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `incomplete_output` is never used
+    --> src/project/native.rs:1178:4
+     |
+1178 | fn incomplete_output(status: FixtureCommandStatus) -> FixtureCommandOutput {
+     |    ^^^^^^^^^^^^^^^^^
+
+warning: function `write_control` is never used
+    --> src/project/native.rs:1190:4
+     |
+1190 | fn write_control(path: &Path) -> Result<(), BoundaryFailure> {
+     |    ^^^^^^^^^^^^^
+
+warning: function `write_bounded` is never used
+    --> src/project/native.rs:1199:4
+     |
+1199 | fn write_bounded(path: &Path, bytes: &[u8], maximum: u64) -> Result<(), BoundaryFailure> {
+     |    ^^^^^^^^^^^^^
+
+warning: function `capture_bundle_digest` is never used
+    --> src/project/native.rs:1213:4
+     |
+1213 | fn capture_bundle_digest(
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `capture_receipt_digest` is never used
+    --> src/project/native.rs:1285:15
+     |
+1285 | pub(super) fn capture_receipt_digest(
+     |               ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `read_bounded` is never used
+    --> src/project/native.rs:1304:4
+     |
+1304 | fn read_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>, BoundaryFailure> {
+     |    ^^^^^^^^^^^^
+
+warning: function `file_digest` is never used
+    --> src/project/native.rs:1316:4
+     |
+1316 | fn file_digest(path: &Path) -> Result<String, BoundaryFailure> {
+     |    ^^^^^^^^^^^
+
+warning: function `evidence_manifest` is never used
+    --> src/project/native.rs:1320:4
+     |
+1320 | fn evidence_manifest(
+     |    ^^^^^^^^^^^^^^^^^
+
+warning: function `repository_head` is never used
+    --> src/project/native.rs:1357:15
+     |
+1357 | pub(super) fn repository_head() -> Result<String, BoundaryFailure> {
+     |               ^^^^^^^^^^^^^^^
+
+warning: function `packed_ref` is never used
+    --> src/project/native.rs:1413:4
+     |
+1413 | fn packed_ref(path: &Path, expected: &str) -> Option<String> {
+     |    ^^^^^^^^^^
+
+warning: function `fixture_source_digest` is never used
+    --> src/project/native.rs:1422:4
+     |
+1422 | fn fixture_source_digest() -> String {
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `workflow_definition_digest` is never used
+    --> src/project/native.rs:1430:4
+     |
+1430 | fn workflow_definition_digest(workflow: &str, selector: &str, source: &str) -> String {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `spawn_identity` is never used
+    --> src/project/native.rs:1438:4
+     |
+1438 | fn spawn_identity(claim: &NativeExecutionClaim) -> String {
+     |    ^^^^^^^^^^^^^^
+
+warning: function `claim_is_task_owned` is never used
+    --> src/project/native.rs:1456:4
+     |
+1456 | fn claim_is_task_owned(claim: &NativeExecutionClaim, task_root: &Path) -> bool {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `fixture_root` is never used
+    --> src/project/native.rs:1470:4
+     |
+1470 | fn fixture_root(task_root: &Path, capture_dir: &Path) -> Result<PathBuf, BoundaryFailure> {
+     |    ^^^^^^^^^^^^
+
+warning: struct `TreeUsage` is never constructed
+    --> src/project/native.rs:1507:8
+     |
+1507 | struct TreeUsage {
+     |        ^^^^^^^^^
+
+warning: function `tree_usage` is never used
+    --> src/project/native.rs:1513:4
+     |
+1513 | fn tree_usage(root: &Path, account_sibling_entries: bool) -> Result<TreeUsage, BoundaryFailure> {
+     |    ^^^^^^^^^^
+
+warning: function `check_fixture_budget` is never used
+    --> src/project/native.rs:1584:4
+     |
+1584 | fn check_fixture_budget(
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ScenarioChildReservation` is never constructed
+    --> src/project/native.rs:1614:8
+     |
+1614 | struct ScenarioChildReservation {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `mark_spawned` is never used
+    --> src/project/native.rs:1620:8
+     |
+1619 | impl ScenarioChildReservation {
+     | ----------------------------- method in this implementation
+1620 |     fn mark_spawned(&mut self) {
+     |        ^^^^^^^^^^^^
+
+warning: function `reserve_scenario_child` is never used
+    --> src/project/native.rs:1646:4
+     |
+1646 | fn reserve_scenario_child(
+     |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `task_root` is never used
+    --> src/project/native.rs:1663:4
+     |
+1663 | fn task_root() -> Result<PathBuf, BoundaryFailure> {
+     |    ^^^^^^^^^
+
+warning: function `digest` is never used
+    --> src/project/native.rs:1674:4
+     |
+1674 | fn digest(bytes: &[u8]) -> String {
+     |    ^^^^^^
+
+warning: function `expected_slot_digest` is never used
+    --> src/project/native.rs:1678:15
+     |
+1678 | pub(super) fn expected_slot_digest(run: &str, attempt: &str) -> String {
+     |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `hex` is never used
+    --> src/project/native.rs:1692:4
+     |
+1692 | fn hex(bytes: &[u8]) -> String {
+     |    ^^^
+
+warning: struct `SpaceMonitor` is never constructed
+    --> src/project/native.rs:1696:8
+     |
+1696 | struct SpaceMonitor {
+     |        ^^^^^^^^^^^^
+
+warning: associated items `new`, `check`, and `check_if_due` are never used
+    --> src/project/native.rs:1703:8
+     |
+1702 | impl SpaceMonitor {
+     | ----------------- associated items in this implementation
+1703 |     fn new(root: PathBuf) -> Self {
+     |        ^^^
+...
+1711 |     fn check(&mut self) -> Result<u64, BoundaryFailure> {
+     |        ^^^^^
+...
+1721 |     fn check_if_due(&mut self) -> Result<(), BoundaryFailure> {
+     |        ^^^^^^^^^^^^
+
+warning: function `host_free_bytes` is never used
+    --> src/project/native.rs:1732:15
+     |
+1732 | pub(super) fn host_free_bytes(path: &Path) -> Result<u64, BoundaryFailure> {
+     |               ^^^^^^^^^^^^^^^
+
+warning: function `child_fixture` is never used
+    --> src/project/native.rs:1794:4
+     |
+1794 | fn child_fixture() -> io::Result<()> {
+     |    ^^^^^^^^^^^^^
+
+warning: function `invalid_data` is never used
+    --> src/project/native.rs:1856:4
+     |
+1856 | fn invalid_data(message: impl std::fmt::Display) -> io::Error {
+     |    ^^^^^^^^^^^^
+
+warning: constant `MAX_SOURCE_MAP_BINARIES` is never used
+  --> src/project/source_map.rs:17:7
+   |
+17 | const MAX_SOURCE_MAP_BINARIES: usize = 128;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `MAX_SOURCE_MAP_CAPTURE_REFERENCES` is never used
+  --> src/project/source_map.rs:18:7
+   |
+18 | const MAX_SOURCE_MAP_CAPTURE_REFERENCES: usize = 256;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `MAX_SOURCE_MAP_CAPTURE_BYTES` is never used
+  --> src/project/source_map.rs:19:7
+   |
+19 | const MAX_SOURCE_MAP_CAPTURE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `MAX_SOURCE_MAP_OBSERVATIONS` is never used
+  --> src/project/source_map.rs:20:7
+   |
+20 | const MAX_SOURCE_MAP_OBSERVATIONS: usize = 256;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `MAX_SOURCE_MAP_REPORT_BYTES` is never used
+  --> src/project/source_map.rs:21:7
+   |
+21 | const MAX_SOURCE_MAP_REPORT_BYTES: usize = 64 * 1024;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `MAX_SOURCE_MAP_HOOK_BYTES` is never used
+  --> src/project/source_map.rs:22:7
+   |
+22 | const MAX_SOURCE_MAP_HOOK_BYTES: usize = 64 * 1024;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `build_identity_digest` is never used
+   --> src/project/source_map.rs:169:19
+    |
+160 | impl ResolvedSourceMap {
+    | ---------------------- method in this implementation
+...
+169 |     pub(super) fn build_identity_digest(&self) -> &str {
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+
+warning: variant `RegisteredCargoWorkflow` is never constructed
+   --> src/project/source_map.rs:808:5
+    |
+807 | pub(super) enum EvidenceProvenance {
+    |                 ------------------ variant in this enum
+808 |     RegisteredCargoWorkflow,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `EvidenceProvenance` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: multiple variants are never constructed
+   --> src/project/source_map.rs:814:5
+    |
+813 | pub(super) enum MissingEvidenceClass {
+    |                 -------------------- variants in this enum
+814 |     ObservationHook,
+    |     ^^^^^^^^^^^^^^^
+815 |     CompileOrigins,
+    |     ^^^^^^^^^^^^^^
+816 |     BinaryArtifacts,
+    |     ^^^^^^^^^^^^^^^
+817 |     BinaryScan,
+    |     ^^^^^^^^^^
+818 |     CompilerDebug,
+    |     ^^^^^^^^^^^^^
+819 |     FileMacro,
+    |     ^^^^^^^^^
+820 |     PanicLocation,
+    |     ^^^^^^^^^^^^^
+821 |     AppleOsoScan,
+    |     ^^^^^^^^^^^^
+822 |     ManifestDirectory,
+    |     ^^^^^^^^^^^^^^^^^
+823 |     IncludeInput,
+    |     ^^^^^^^^^^^^
+824 |     BuildScriptInput,
+    |     ^^^^^^^^^^^^^^^^
+825 |     OutDirectory,
+    |     ^^^^^^^^^^^^
+826 |     GeneratedOutput,
+    |     ^^^^^^^^^^^^^^^
+827 |     ProcMacroInput,
+    |     ^^^^^^^^^^^^^^
+828 |     RuntimeResource,
+    |     ^^^^^^^^^^^^^^^
+    |
+    = note: `MissingEvidenceClass` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: method `label` is never used
+   --> src/project/source_map.rs:832:8
+    |
+831 | impl MissingEvidenceClass {
+    | ------------------------- method in this implementation
+832 |     fn label(self) -> &'static str {
+    |        ^^^^^
+
+warning: struct `SourceMapObservations` is never constructed
+   --> src/project/source_map.rs:856:19
+    |
+856 | pub(super) struct SourceMapObservations {
+    |                   ^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `ObservationHookState` is never used
+   --> src/project/source_map.rs:867:17
+    |
+867 | pub(super) enum ObservationHookState {
+    |                 ^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `BinaryArtifactObservation` is never constructed
+   --> src/project/source_map.rs:873:19
+    |
+873 | pub(super) struct BinaryArtifactObservation {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `read_registered_cargo_hook` is never used
+   --> src/project/source_map.rs:881:15
+    |
+881 | pub(super) fn read_registered_cargo_hook(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_registered_cargo_hook` is never used
+   --> src/project/source_map.rs:953:4
+    |
+953 | fn parse_registered_cargo_hook(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_source_path_class` is never used
+    --> src/project/source_map.rs:1130:4
+     |
+1130 | fn parse_source_path_class(value: &str) -> Option<SourcePathClass> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `parse_behavior_path_class` is never used
+    --> src/project/source_map.rs:1139:4
+     |
+1139 | fn parse_behavior_path_class(value: &str) -> Option<BehaviorPathClass> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `resolve_observed_source_path` is never used
+    --> src/project/source_map.rs:1152:15
+     |
+1152 | pub(super) fn resolve_observed_source_path(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `CollectedSourceMapEvidence` is never constructed
+    --> src/project/source_map.rs:1175:19
+     |
+1175 | pub(super) struct CollectedSourceMapEvidence {
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `collect` is never used
+    --> src/project/source_map.rs:1183:15
+     |
+1183 | pub(super) fn collect(
+     |               ^^^^^^^
+
+warning: function `collect_binary_digests` is never used
+    --> src/project/source_map.rs:1326:4
+     |
+1326 | fn collect_binary_digests(
+     |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `copy_binary_artifacts` is never used
+    --> src/project/source_map.rs:1361:4
+     |
+1361 | fn copy_binary_artifacts(
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `unique_safe_references` is never used
+    --> src/project/source_map.rs:1415:4
+     |
+1415 | fn unique_safe_references(references: &[String]) -> Result<Vec<String>, AdapterRefusal> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `safe_reference` is never used
+    --> src/project/source_map.rs:1425:4
+     |
+1425 | fn safe_reference(reference: &str) -> bool {
+     |    ^^^^^^^^^^^^^^
+
+warning: function `digest_captured_file` is never used
+    --> src/project/source_map.rs:1435:4
+     |
+1435 | fn digest_captured_file(capture_dir: &Path, reference: &str) -> Result<String, AdapterRefusal> {
+     |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `digest_captured_file_with_size` is never used
+    --> src/project/source_map.rs:1439:4
+     |
+1439 | fn digest_captured_file_with_size(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `missing_evidence_classes` is never used
+    --> src/project/source_map.rs:1460:4
+     |
+1460 | fn missing_evidence_classes(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `evidence_report` is never used
+    --> src/project/source_map.rs:1545:4
+     |
+1545 | fn evidence_report(
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `encode_report_field` is never used
+    --> src/project/source_map.rs:1674:4
+     |
+1674 | fn encode_report_field(value: &str) -> String {
+     |    ^^^^^^^^^^^^^^^^^^^
+
+warning: function `encode_path` is never used
+    --> src/project/source_map.rs:1682:4
+     |
+1682 | fn encode_path(path: &Path) -> String {
+     |    ^^^^^^^^^^^
+
+warning: function `source_path_class_name` is never used
+    --> src/project/source_map.rs:1690:4
+     |
+1690 | fn source_path_class_name(class: SourcePathClass) -> &'static str {
+     |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `behavior_path_class_name` is never used
+    --> src/project/source_map.rs:1698:4
+     |
+1698 | fn behavior_path_class_name(class: BehaviorPathClass) -> &'static str {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `copy_new_capture_file` is never used
+    --> src/project/source_map.rs:2012:4
+     |
+2012 | fn copy_new_capture_file(
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `write_new_capture_file` is never used
+    --> src/project/source_map.rs:2042:4
+     |
+2042 | fn write_new_capture_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `oxide-storage` (lib) generated 134 warnings (run `cargo fix --lib -p oxide-storage` to apply 3 suggestions)
+     Running `rustc --crate-name oxide_storage_inventory --edition=2021 src/bin/storage_inventory.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no -C debuginfo=line-tables-only -C split-debuginfo=unpacked --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("private-qualification", "private-qualification-fixture"))' -C metadata=435a0bb46fb9bdd9 -C extra-filename=-4f86c1b2ba26beea --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C incremental=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/incremental -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern flate2=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libflate2-4f745d666bfdd526.rlib --extern libc=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/liblibc-e738004579f2762e.rlib --extern oxide_storage=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/liboxide_storage-9ae9bc94ec14be2d.rlib --extern serde=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libserde-1668ac10764c3865.rlib --extern serde_json=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libserde_json-bfdb34bcb82dcdc5.rlib --extern sha2=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libsha2-238833b6ce06e53d.rlib --extern tar=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libtar-31129c1c490aa32b.rlib`
+     Running `rustc --crate-name profile_backtrace --edition=2021 tests/profile_backtrace.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=line-tables-only -C split-debuginfo=unpacked --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("private-qualification", "private-qualification-fixture"))' -C metadata=3a0392b5e843efe4 -C extra-filename=-c81e2c05cf86dadf --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C incremental=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/incremental -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern flate2=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libflate2-4f745d666bfdd526.rlib --extern libc=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/liblibc-e738004579f2762e.rlib --extern oxide_storage=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/liboxide_storage-9ae9bc94ec14be2d.rlib --extern serde=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libserde-1668ac10764c3865.rlib --extern serde_json=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libserde_json-bfdb34bcb82dcdc5.rlib --extern sha2=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libsha2-238833b6ce06e53d.rlib --extern tar=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libtar-31129c1c490aa32b.rlib`
+     Running `rustc --crate-name oxide_storage_lease --edition=2021 src/bin/storage_lease.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no -C debuginfo=line-tables-only -C split-debuginfo=unpacked --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("private-qualification", "private-qualification-fixture"))' -C metadata=d6b616763e7e564f -C extra-filename=-d100bf59101b0c12 --out-dir /private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps -C incremental=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/incremental -L dependency=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps --extern flate2=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libflate2-4f745d666bfdd526.rlib --extern libc=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/liblibc-e738004579f2762e.rlib --extern oxide_storage=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/liboxide_storage-9ae9bc94ec14be2d.rlib --extern serde=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libserde-1668ac10764c3865.rlib --extern serde_json=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libserde_json-bfdb34bcb82dcdc5.rlib --extern sha2=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libsha2-238833b6ce06e53d.rlib --extern tar=/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/libtar-31129c1c490aa32b.rlib`
+    Finished `oxide-light` profile [unoptimized + debuginfo] target(s) in 11.66s
+     Running `/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light/oxide-light/deps/profile_backtrace-c81e2c05cf86dadf`
+
+running 1 test
+test profile_probe_keeps_workspace_frames_and_unwind ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+       11.94 real        18.58 user         3.41 sys
+           671219712  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              704449  page reclaims
+                4960  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                  47  signals received
+                 613  voluntary context switches
+               57965  involuntary context switches
+           996847298  instructions retired
+           633785968  cycles elapsed
+            18580056  peak memory footprint

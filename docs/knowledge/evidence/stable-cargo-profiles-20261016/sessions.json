@@ -1,0 +1,89 @@
+{
+  "recorded_session": {
+    "attempt": 4,
+    "root": "/private/tmp/oxide-stable-profiles.0l_xctvm",
+    "outcome": "complete",
+    "cargo_calls": 8,
+    "total_seconds": 67.023,
+    "host_run_id": "d3b79d01e089c8647cb03db0df40dafaad52cd2925226ad416498f16feac50cb",
+    "request_id": "c116b7d1-0f3a-41b6-a0c3-0d6bc5a158a2",
+    "note": "carries the comparison numbers in summary.json and result.json"
+  },
+  "harness_corrections": [
+    {
+      "attempt": 1,
+      "root": "/private/tmp/oxide-stable-profiles.n3fls3qu",
+      "outcome": "partial",
+      "cargo_calls": 2,
+      "total_seconds": 8.36,
+      "defect": "the copied CARGO_HOME omitted the sparse registry index cache",
+      "observed": "cargo: no matching package named `flate2` found; location searched: crates.io index",
+      "correction": "copy registry/index/*/.cache/**/<name> and registry/index/*/config.json",
+      "evidence": "attempt-1-partial/result.json, attempt-1-partial/baseline-C0.log"
+    },
+    {
+      "attempt": 2,
+      "root": "/private/tmp/oxide-stable-profiles.4ky1gl0s",
+      "outcome": "partial",
+      "cargo_calls": 2,
+      "total_seconds": 12.69,
+      "defect": "copied .crate and extracted src entries without their registry-hash directory",
+      "observed": "cargo: failed to download `adler2 v2.0.1`; attempting to make an HTTP request, but --offline was specified",
+      "correction": "copy registry/cache/<registry-hash>/<name>-<version>.crate and registry/src/<registry-hash>/<name>-<version>",
+      "evidence": "attempt-2-partial/result.json, attempt-2-partial/baseline-C0.log"
+    },
+    {
+      "attempt": 3,
+      "root": "/private/tmp/oxide-stable-profiles.i0g2ep4r",
+      "outcome": "complete but not matched",
+      "cargo_calls": 8,
+      "total_seconds": 51.62,
+      "defect": "both source copies were edited before either cold build, so the light edit step ran on an already-edited tree and rebuilt nothing (light-E1 compiled=0)",
+      "correction": "apply each mode's identical edit after that mode's cold build and assert the edit step rebuilt the workspace",
+      "evidence": "attempt-3-partial/result.json"
+    }
+  ],
+  "session_rules": "each attempt used a fresh root, a fresh 16 GiB image, its own 20-minute clock and its own at most eight Cargo driver invocations; no running clock, call count or cap was reset, and attempts 1-3 were detached only after their Effigy run had settled with no writers",
+  "measurements_mib": {
+    "baseline_cold_du": 276.25,
+    "light_cold_du": 223.29,
+    "full_debug_cold_du": 304.2,
+    "baseline_cold_union": 260.58,
+    "light_cold_union": 208.51,
+    "baseline_edit_du": 361.9,
+    "light_edit_du": 307.84
+  },
+  "disposition": {
+    "verdict": "no-go",
+    "review_pr": 68,
+    "reviews": [
+      {
+        "review_comment_id": 6220360222,
+        "reviewed_head": "24a894ac3c2551adc018d62ff26f4f48571ceaae",
+        "gates": {
+          "opt_in_profiles": "pass",
+          "correctness_and_debug": "pass",
+          "bounded_comparison": "fail",
+          "truthful_delivery": "fail"
+        },
+        "note": "truthful_delivery was superseded by the next head"
+      },
+      {
+        "review_comment_id": 6220502241,
+        "reviewed_head": "0d882443564f3384cf8bea0473386f5a77a09fc8",
+        "gates": {
+          "opt_in_profiles": "pass",
+          "correctness_and_debug": "pass",
+          "bounded_comparison": "fail",
+          "truthful_delivery": "pass"
+        },
+        "note": "bounded_comparison remains fail; the reviewer states a later valid-looking sequence cannot repair the violations"
+      }
+    ],
+    "reason": "four fresh sessions (2, 2, 8 and 8 Cargo driver invocations, 20 total) with fresh roots, images, clocks and call budgets were used instead of the brief's one original capped session, and one complete run (attempt 3) was unmatched; the recorded session's timer also starts after submission staging",
+    "recorded_session_timer": "the measurement recipe records its clock at run launch, after the root, packet and recipe were staged and after Effigy admission, so the 67.0-second total excludes that staging and is not the brief's original monotonic session recording made before any effects",
+    "repair": "the one-original-session cap was exceeded and this brief authorizes no further session, so the bounded_comparison gate cannot be repaired by another measurement; the merge-or-close decision belongs to the planner and operator",
+    "figures_status": "retained as unqualified observations only; not acceptance evidence and no adoption decision follows",
+    "note": "no attempt measured a comparison result, reset a running clock, reset a call budget or reused another root or image"
+  }
+}

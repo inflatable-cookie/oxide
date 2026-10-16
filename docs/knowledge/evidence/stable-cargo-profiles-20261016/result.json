@@ -1,0 +1,3022 @@
+{
+  "packet": {
+    "root": "/private/tmp/oxide-stable-profiles.0l_xctvm",
+    "request_id": "c116b7d1-0f3a-41b6-a0c3-0d6bc5a158a2",
+    "caller": "oxide:worker:068-stable-profiles",
+    "source_repository": "/Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-0cd1e55f-2014-4e56-902c-1bac4d68696d",
+    "source_head": "c762a731276c6677993002064ef5287676344fde",
+    "source_tree": "c3c98d78a59cf1b8ed8973f67a66404bd0554dfd",
+    "lock_sha256": "502802e141665aee3881aee515e1370da964b45e0cfc3d3402d6a57ce028c398",
+    "recipe_sha256": "dcdf28652b33e05407a3a20755481b5ee0daad777032df50adacf50c28ac5076",
+    "host_cargo_home": "/Users/tom/.cargo",
+    "toolchain_bin": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin",
+    "cargo_call_cap": 8,
+    "session_seconds_cap": 1200,
+    "image_size": "16g",
+    "submitted_utc": "2026-10-16T16:35:49Z",
+    "note": "measured tree is the implementation commit; later commits are docs/evidence only"
+  },
+  "session_start_ns": 119732894117416,
+  "deadline_ns": 120932894117416,
+  "session_seconds_cap": 1200,
+  "clock": "raw mach_continuous_time converted by mach_timebase_info, same boot",
+  "calls": [
+    {
+      "name": "image-create",
+      "argv": [
+        "/usr/bin/hdiutil",
+        "create",
+        "-size",
+        "16g",
+        "-type",
+        "SPARSE",
+        "-fs",
+        "APFS",
+        "-volname",
+        "OxideProfiles",
+        "/private/tmp/oxide-stable-profiles.0l_xctvm/profiles.sparseimage"
+      ],
+      "counted_cargo_call": false,
+      "wall_seconds": 5.095549042,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/image-create.log",
+      "log_bytes": 74,
+      "utc_end": "2026-10-16T16:35:55Z"
+    },
+    {
+      "name": "image-attach",
+      "argv": [
+        "/usr/bin/hdiutil",
+        "attach",
+        "-nobrowse",
+        "-mountpoint",
+        "/private/tmp/oxide-stable-profiles.0l_xctvm/m",
+        "/private/tmp/oxide-stable-profiles.0l_xctvm/profiles.sparseimage"
+      ],
+      "counted_cargo_call": false,
+      "wall_seconds": 1.0133015,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/image-attach.log",
+      "log_bytes": 315,
+      "utc_end": "2026-10-16T16:35:56Z"
+    },
+    {
+      "name": "clone-src-baseline",
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--no-local",
+        "--no-checkout",
+        "/Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-0cd1e55f-2014-4e56-902c-1bac4d68696d",
+        "/private/tmp/oxide-stable-profiles.0l_xctvm/m/src-baseline"
+      ],
+      "counted_cargo_call": false,
+      "wall_seconds": 0.768299042,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/clone-src-baseline.log",
+      "log_bytes": 77,
+      "utc_end": "2026-10-16T16:35:56Z"
+    },
+    {
+      "name": "checkout-src-baseline",
+      "argv": [
+        "/usr/bin/git",
+        "checkout",
+        "--detach",
+        "c762a731276c6677993002064ef5287676344fde"
+      ],
+      "counted_cargo_call": false,
+      "wall_seconds": 0.258612458,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/checkout-src-baseline.log",
+      "log_bytes": 82,
+      "utc_end": "2026-10-16T16:35:57Z"
+    },
+    {
+      "name": "tree-src-baseline",
+      "argv": [
+        "/usr/bin/git",
+        "rev-parse",
+        "HEAD^{tree}"
+      ],
+      "counted_cargo_call": false,
+      "wall_seconds": 0.255927083,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/tree-src-baseline.log",
+      "log_bytes": 41,
+      "utc_end": "2026-10-16T16:35:57Z"
+    },
+    {
+      "name": "clone-src-light",
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--no-local",
+        "--no-checkout",
+        "/Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-0cd1e55f-2014-4e56-902c-1bac4d68696d",
+        "/private/tmp/oxide-stable-profiles.0l_xctvm/m/src-light"
+      ],
+      "counted_cargo_call": false,
+      "wall_seconds": 0.25762425,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/clone-src-light.log",
+      "log_bytes": 74,
+      "utc_end": "2026-10-16T16:35:57Z"
+    },
+    {
+      "name": "checkout-src-light",
+      "argv": [
+        "/usr/bin/git",
+        "checkout",
+        "--detach",
+        "c762a731276c6677993002064ef5287676344fde"
+      ],
+      "counted_cargo_call": false,
+      "wall_seconds": 0.257507,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/checkout-src-light.log",
+      "log_bytes": 82,
+      "utc_end": "2026-10-16T16:35:57Z"
+    },
+    {
+      "name": "tree-src-light",
+      "argv": [
+        "/usr/bin/git",
+        "rev-parse",
+        "HEAD^{tree}"
+      ],
+      "counted_cargo_call": false,
+      "wall_seconds": 0.253641333,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/tree-src-light.log",
+      "log_bytes": 41,
+      "utc_end": "2026-10-16T16:35:58Z"
+    },
+    {
+      "name": "cargo-version",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo",
+        "-vV"
+      ],
+      "counted_cargo_call": true,
+      "wall_seconds": 0.257393209,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/cargo-version.log",
+      "log_bytes": 335,
+      "utc_end": "2026-10-16T16:36:05Z"
+    },
+    {
+      "name": "rustc-version",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc",
+        "-vV"
+      ],
+      "counted_cargo_call": false,
+      "wall_seconds": 0.258258958,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/rustc-version.log",
+      "log_bytes": 192,
+      "utc_end": "2026-10-16T16:36:05Z"
+    },
+    {
+      "name": "baseline-C0",
+      "argv": [
+        "/usr/bin/time",
+        "-l",
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo",
+        "test",
+        "--locked",
+        "--test",
+        "profile_backtrace",
+        "-v"
+      ],
+      "counted_cargo_call": true,
+      "wall_seconds": 14.238145084,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/baseline-C0.log",
+      "log_bytes": 83772,
+      "utc_end": "2026-10-16T16:36:20Z",
+      "time_l_real_seconds": 13.98,
+      "time_l_max_rss_bytes": 763035648
+    },
+    {
+      "name": "baseline-baseline-C0-du",
+      "argv": [
+        "/usr/bin/du",
+        "-sk",
+        "/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-baseline"
+      ],
+      "counted_cargo_call": false,
+      "wall_seconds": 0.260841834,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/baseline-baseline-C0-du.log",
+      "log_bytes": 69,
+      "utc_end": "2026-10-16T16:36:20Z"
+    },
+    {
+      "name": "baseline-E1",
+      "argv": [
+        "/usr/bin/time",
+        "-l",
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo",
+        "test",
+        "--locked",
+        "--test",
+        "profile_backtrace",
+        "-v"
+      ],
+      "counted_cargo_call": true,
+      "wall_seconds": 6.408713,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/baseline-E1.log",
+      "log_bytes": 38079,
+      "utc_end": "2026-10-16T16:36:26Z",
+      "time_l_real_seconds": 6.36,
+      "time_l_max_rss_bytes": 438632448
+    },
+    {
+      "name": "baseline-baseline-E1-du",
+      "argv": [
+        "/usr/bin/du",
+        "-sk",
+        "/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-baseline"
+      ],
+      "counted_cargo_call": false,
+      "wall_seconds": 0.254794542,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/baseline-baseline-E1-du.log",
+      "log_bytes": 69,
+      "utc_end": "2026-10-16T16:36:27Z"
+    },
+    {
+      "name": "baseline-U",
+      "argv": [
+        "/usr/bin/time",
+        "-l",
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo",
+        "test",
+        "--locked",
+        "--test",
+        "profile_backtrace",
+        "-v"
+      ],
+      "counted_cargo_call": true,
+      "wall_seconds": 0.259591375,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/baseline-U.log",
+      "log_bytes": 31701,
+      "utc_end": "2026-10-16T16:36:27Z",
+      "time_l_real_seconds": 0.08,
+      "time_l_max_rss_bytes": 42139648
+    },
+    {
+      "name": "baseline-baseline-U-du",
+      "argv": [
+        "/usr/bin/du",
+        "-sk",
+        "/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-baseline"
+      ],
+      "counted_cargo_call": false,
+      "wall_seconds": 0.25756175,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/baseline-baseline-U-du.log",
+      "log_bytes": 69,
+      "utc_end": "2026-10-16T16:36:27Z"
+    },
+    {
+      "name": "light-C0",
+      "argv": [
+        "/usr/bin/time",
+        "-l",
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo",
+        "test",
+        "--locked",
+        "--profile",
+        "oxide-light",
+        "--test",
+        "profile_backtrace",
+        "-v"
+      ],
+      "counted_cargo_call": true,
+      "wall_seconds": 11.981414375,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/light-C0.log",
+      "log_bytes": 84038,
+      "utc_end": "2026-10-16T16:36:39Z",
+      "time_l_real_seconds": 11.94,
+      "time_l_max_rss_bytes": 671219712
+    },
+    {
+      "name": "light-light-C0-du",
+      "argv": [
+        "/usr/bin/du",
+        "-sk",
+        "/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light"
+      ],
+      "counted_cargo_call": false,
+      "wall_seconds": 0.258345208,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/light-light-C0-du.log",
+      "log_bytes": 66,
+      "utc_end": "2026-10-16T16:36:40Z"
+    },
+    {
+      "name": "light-E1",
+      "argv": [
+        "/usr/bin/time",
+        "-l",
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo",
+        "test",
+        "--locked",
+        "--profile",
+        "oxide-light",
+        "--test",
+        "profile_backtrace",
+        "-v"
+      ],
+      "counted_cargo_call": true,
+      "wall_seconds": 2.810175375,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/light-E1.log",
+      "log_bytes": 38260,
+      "utc_end": "2026-10-16T16:36:42Z",
+      "time_l_real_seconds": 2.73,
+      "time_l_max_rss_bytes": 437485568
+    },
+    {
+      "name": "light-light-E1-du",
+      "argv": [
+        "/usr/bin/du",
+        "-sk",
+        "/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light"
+      ],
+      "counted_cargo_call": false,
+      "wall_seconds": 0.254947084,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/light-light-E1-du.log",
+      "log_bytes": 66,
+      "utc_end": "2026-10-16T16:36:43Z"
+    },
+    {
+      "name": "light-U",
+      "argv": [
+        "/usr/bin/time",
+        "-l",
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo",
+        "test",
+        "--locked",
+        "--profile",
+        "oxide-light",
+        "--test",
+        "profile_backtrace",
+        "-v"
+      ],
+      "counted_cargo_call": true,
+      "wall_seconds": 0.256529167,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/light-U.log",
+      "log_bytes": 31708,
+      "utc_end": "2026-10-16T16:36:43Z",
+      "time_l_real_seconds": 0.12,
+      "time_l_max_rss_bytes": 42188800
+    },
+    {
+      "name": "light-light-U-du",
+      "argv": [
+        "/usr/bin/du",
+        "-sk",
+        "/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-light"
+      ],
+      "counted_cargo_call": false,
+      "wall_seconds": 0.256621792,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/light-light-U-du.log",
+      "log_bytes": 66,
+      "utc_end": "2026-10-16T16:36:43Z"
+    },
+    {
+      "name": "full-debug-C0",
+      "argv": [
+        "/usr/bin/time",
+        "-l",
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo",
+        "test",
+        "--locked",
+        "--profile",
+        "oxide-full-debug",
+        "--test",
+        "profile_backtrace",
+        "-v"
+      ],
+      "counted_cargo_call": true,
+      "wall_seconds": 12.487136792,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/full-debug-C0.log",
+      "log_bytes": 86731,
+      "utc_end": "2026-10-16T16:36:56Z",
+      "time_l_real_seconds": 12.4,
+      "time_l_max_rss_bytes": 759726080
+    },
+    {
+      "name": "full-debug-full-debug-C0-du",
+      "argv": [
+        "/usr/bin/du",
+        "-sk",
+        "/private/tmp/oxide-stable-profiles.0l_xctvm/m/target-full-debug"
+      ],
+      "counted_cargo_call": false,
+      "wall_seconds": 0.26069025,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/full-debug-full-debug-C0-du.log",
+      "log_bytes": 71,
+      "utc_end": "2026-10-16T16:36:56Z"
+    },
+    {
+      "name": "image-detach",
+      "argv": [
+        "/usr/bin/hdiutil",
+        "detach",
+        "/private/tmp/oxide-stable-profiles.0l_xctvm/m"
+      ],
+      "counted_cargo_call": false,
+      "wall_seconds": 0.515197292,
+      "exit": 0,
+      "log": "/private/tmp/oxide-stable-profiles.0l_xctvm/raw/image-detach.log",
+      "log_bytes": 18,
+      "utc_end": "2026-10-16T16:36:57Z"
+    }
+  ],
+  "measurements": [
+    {
+      "mode": "baseline",
+      "step": "baseline-C0",
+      "profile_dir": "debug",
+      "directories": {
+        "deps": {
+          "files": 544,
+          "objects": 440,
+          "apparent_bytes": 184312253
+        },
+        "incremental": {
+          "files": 411,
+          "objects": 394,
+          "apparent_bytes": 140108586
+        }
+      },
+      "deps_incremental_unique_inode_allocated_bytes": 273235968
+    },
+    {
+      "mode": "baseline",
+      "step": "baseline-E1",
+      "profile_dir": "debug",
+      "directories": {
+        "deps": {
+          "files": 938,
+          "objects": 834,
+          "apparent_bytes": 230512275
+        },
+        "incremental": {
+          "files": 822,
+          "objects": 788,
+          "apparent_bytes": 276069798
+        }
+      },
+      "deps_incremental_unique_inode_allocated_bytes": 363053056
+    },
+    {
+      "mode": "baseline",
+      "step": "baseline-U",
+      "profile_dir": "debug",
+      "directories": {
+        "deps": {
+          "files": 938,
+          "objects": 834,
+          "apparent_bytes": 230512275
+        },
+        "incremental": {
+          "files": 822,
+          "objects": 788,
+          "apparent_bytes": 276069798
+        }
+      },
+      "deps_incremental_unique_inode_allocated_bytes": 363053056
+    },
+    {
+      "mode": "light",
+      "step": "light-C0",
+      "profile_dir": "oxide-light",
+      "directories": {
+        "deps": {
+          "files": 498,
+          "objects": 394,
+          "apparent_bytes": 130352910
+        },
+        "incremental": {
+          "files": 411,
+          "objects": 394,
+          "apparent_bytes": 120261496
+        }
+      },
+      "deps_incremental_unique_inode_allocated_bytes": 218636288
+    },
+    {
+      "mode": "light",
+      "step": "light-E1",
+      "profile_dir": "oxide-light",
+      "directories": {
+        "deps": {
+          "files": 892,
+          "objects": 788,
+          "apparent_bytes": 157496172
+        },
+        "incremental": {
+          "files": 822,
+          "objects": 788,
+          "apparent_bytes": 236381357
+        }
+      },
+      "deps_incremental_unique_inode_allocated_bytes": 307339264
+    },
+    {
+      "mode": "light",
+      "step": "light-U",
+      "profile_dir": "oxide-light",
+      "directories": {
+        "deps": {
+          "files": 892,
+          "objects": 788,
+          "apparent_bytes": 157496172
+        },
+        "incremental": {
+          "files": 822,
+          "objects": 788,
+          "apparent_bytes": 236381357
+        }
+      },
+      "deps_incremental_unique_inode_allocated_bytes": 307339264
+    },
+    {
+      "mode": "full-debug",
+      "step": "full-debug-C0",
+      "profile_dir": "oxide-full-debug",
+      "directories": {
+        "deps": {
+          "files": 585,
+          "objects": 481,
+          "apparent_bytes": 209130130
+        },
+        "incremental": {
+          "files": 411,
+          "objects": 394,
+          "apparent_bytes": 140101135
+        }
+      },
+      "deps_incremental_unique_inode_allocated_bytes": 298135552
+    }
+  ],
+  "outcome": "complete",
+  "writes": "unknown; occupancy and time -l block operations are not SSD writes",
+  "host_run_id": "d3b79d01e089c8647cb03db0df40dafaad52cd2925226ad416498f16feac50cb",
+  "effigy_executable": "/Users/tom/.local/bin/effigy",
+  "volume": {
+    "declared_image_size": "16g",
+    "mount_total_bytes": 16970113024,
+    "mount_available_bytes_at_start": 16925970432
+  },
+  "source_lock_sha256": {
+    "src-baseline": "502802e141665aee3881aee515e1370da964b45e0cfc3d3402d6a57ce028c398",
+    "src-light": "502802e141665aee3881aee515e1370da964b45e0cfc3d3402d6a57ce028c398"
+  },
+  "edit_marker_sha256": "c77586597749e5b18c8e6c980245147a91e437f76a27908ac113967de03262af",
+  "edit_marker_bytes": 136,
+  "registry_copy": {
+    "copied_bytes": 68590174,
+    "crate_sha256": {
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/adler2-2.0.1.crate": "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/bitflags-2.13.2.crate": "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/block-buffer-0.10.4.crate": "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.5.crate": "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/cpufeatures-0.2.17.crate": "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/crc32fast-1.5.2.crate": "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/crypto-common-0.1.7.crate": "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/digest-0.10.7.crate": "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/errno-0.3.14.crate": "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/filetime-0.2.29.crate": "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/flate2-1.1.10.crate": "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7.crate": "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/hmac-0.12.1.crate": "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/itoa-1.0.18.crate": "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/libc-0.2.190.crate": "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/linux-raw-sys-0.12.1.crate": "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/memchr-2.8.3.crate": "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/miniz_oxide-0.9.1.crate": "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107.crate": "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/quote-1.0.47.crate": "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/rustix-1.1.5.crate": "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/serde-1.0.229.crate": "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229.crate": "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/serde_derive-1.0.229.crate": "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151.crate": "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/sha2-0.10.9.crate": "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/simd-adler32-0.3.10.crate": "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/subtle-2.6.1.crate": "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/syn-3.0.7.crate": "d62a2e0561533f2ca2561d0cf27fd9fedb640a1bf2616ff5d5c80d99017faadc",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/tar-0.4.46.crate": "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/typenum-1.20.1.crate": "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.26.crate": "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/version_check-0.9.5.crate": "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/windows-link-0.2.1.crate": "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/windows-sys-0.61.2.crate": "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/xattr-1.6.1.crate": "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/zlib-rs-0.6.8.crate": "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112",
+      "registry/cache/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23.crate": "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+    }
+  },
+  "environment": {
+    "RUSTUP_TOOLCHAIN": "1.97.1",
+    "CARGO_HOME": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home",
+    "CARGO_NET_OFFLINE": "true",
+    "CARGO_INCREMENTAL": "1",
+    "PATH_prefix": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin"
+  },
+  "toolchain_versions": {
+    "cargo": [
+      "cargo 1.97.1 (c980f4866 2026-06-30)",
+      "release: 1.97.1",
+      "commit-hash: c980f4866141969fab6254a680546a277789d6f0",
+      "commit-date: 2026-06-30",
+      "host: aarch64-apple-darwin",
+      "libgit2: 1.9.2 (sys:0.20.4 vendored)",
+      "libcurl: 8.7.1 (sys:0.4.88+curl-8.20.0 system ssl:(SecureTransport) LibreSSL/3.3.6)",
+      "ssl: OpenSSL 3.6.2 7 Apr 2026",
+      "os: Mac OS 26.6.2 [64-bit]"
+    ],
+    "rustc": [
+      "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+      "binary: rustc",
+      "commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452",
+      "commit-date: 2026-07-14",
+      "host: aarch64-apple-darwin",
+      "release: 1.97.1",
+      "LLVM version: 22.1.6"
+    ]
+  },
+  "calls_detail": {
+    "baseline-C0": {
+      "packages": {
+        "compiled": [
+          "libc 0.2.190",
+          "version_check 0.9.5",
+          "proc-macro2 1.0.107",
+          "unicode-ident 1.0.26",
+          "quote 1.0.47",
+          "typenum 1.20.1",
+          "cfg-if 1.0.5",
+          "rustix 1.1.5",
+          "serde_core 1.0.229",
+          "zmij 1.0.23",
+          "bitflags 2.13.2",
+          "crc32fast 1.5.2",
+          "serde 1.0.229",
+          "adler2 2.0.1",
+          "simd-adler32 0.3.10",
+          "serde_json 1.0.151",
+          "memchr 2.8.3",
+          "itoa 1.0.18",
+          "miniz_oxide 0.9.1",
+          "generic-array 0.14.7",
+          "errno 0.3.14",
+          "filetime 0.2.29",
+          "cpufeatures 0.2.17",
+          "flate2 1.1.10",
+          "xattr 1.6.1",
+          "syn 3.0.7",
+          "tar 0.4.46",
+          "crypto-common 0.1.7",
+          "block-buffer 0.10.4",
+          "digest 0.10.7",
+          "sha2 0.10.9",
+          "serde_derive 1.0.229",
+          "oxide-storage 0.1.0"
+        ],
+        "fresh": [],
+        "rustc_invocations": 46
+      },
+      "profile_settings": [
+        {
+          "crate": "adler2",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/adler2-2.0.1/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "bitflags",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/bitflags-2.13.2/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "block_buffer",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/block-buffer-0.10.4/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/crc32fast-1.5.2/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": null,
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": null,
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.190/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": null,
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": null,
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.47/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": null,
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.5/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": null,
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": null,
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": null,
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": null,
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": null,
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "cfg_if",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.5/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "cpufeatures",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/cpufeatures-0.2.17/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "crc32fast",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/crc32fast-1.5.2/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "crypto_common",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/crypto-common-0.1.7/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "digest",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/digest-0.10.7/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "errno",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/errno-0.3.14/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "filetime",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/filetime-0.2.29/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "flate2",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/flate2-1.1.10/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "generic_array",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "itoa",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/itoa-1.0.18/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "libc",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.190/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "memchr",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.8.3/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "miniz_oxide",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/miniz_oxide-0.9.1/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "oxide_storage",
+          "source": "src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": true,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "oxide_storage_inventory",
+          "source": "src/bin/storage_inventory.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": true,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "oxide_storage_lease",
+          "source": "src/bin/storage_lease.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": true,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "proc_macro2",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "profile_backtrace",
+          "source": "tests/profile_backtrace.rs",
+          "crate_types": [],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": true,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "quote",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.47/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "rustix",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.5/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "serde",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "serde_core",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "serde_derive",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_derive-1.0.229/src/lib.rs",
+          "crate_types": [
+            "proc-macro"
+          ],
+          "debuginfo": null,
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "serde_json",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "sha2",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/sha2-0.10.9/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "simd_adler32",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/simd-adler32-0.3.10/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "syn",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/syn-3.0.7/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "tar",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/tar-0.4.46/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "typenum",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/typenum-1.20.1/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "unicode_ident",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.26/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "version_check",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/version_check-0.9.5/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "xattr",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-1.6.1/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "zmij",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        }
+      ]
+    },
+    "baseline-E1": {
+      "packages": {
+        "compiled": [
+          "oxide-storage 0.1.0"
+        ],
+        "fresh": [
+          "version_check 0.9.5",
+          "cfg-if 1.0.5",
+          "typenum 1.20.1",
+          "unicode-ident 1.0.26",
+          "bitflags 2.13.2",
+          "simd-adler32 0.3.10",
+          "adler2 2.0.1",
+          "memchr 2.8.3",
+          "itoa 1.0.18",
+          "libc 0.2.190",
+          "miniz_oxide 0.9.1",
+          "proc-macro2 1.0.107",
+          "errno 0.3.14",
+          "serde_core 1.0.229",
+          "zmij 1.0.23",
+          "crc32fast 1.5.2",
+          "cpufeatures 0.2.17",
+          "filetime 0.2.29",
+          "generic-array 0.14.7",
+          "quote 1.0.47",
+          "rustix 1.1.5",
+          "flate2 1.1.10",
+          "serde_json 1.0.151",
+          "syn 3.0.7",
+          "block-buffer 0.10.4",
+          "crypto-common 0.1.7",
+          "xattr 1.6.1",
+          "digest 0.10.7",
+          "serde_derive 1.0.229",
+          "tar 0.4.46",
+          "serde 1.0.229",
+          "sha2 0.10.9"
+        ],
+        "rustc_invocations": 4
+      },
+      "profile_settings": [
+        {
+          "crate": "oxide_storage",
+          "source": "src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": true,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "oxide_storage_inventory",
+          "source": "src/bin/storage_inventory.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": true,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "oxide_storage_lease",
+          "source": "src/bin/storage_lease.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": true,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "profile_backtrace",
+          "source": "tests/profile_backtrace.rs",
+          "crate_types": [],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": true,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        }
+      ]
+    },
+    "baseline-U": {
+      "packages": {
+        "compiled": [],
+        "fresh": [
+          "version_check 0.9.5",
+          "unicode-ident 1.0.26",
+          "cfg-if 1.0.5",
+          "typenum 1.20.1",
+          "bitflags 2.13.2",
+          "simd-adler32 0.3.10",
+          "adler2 2.0.1",
+          "memchr 2.8.3",
+          "itoa 1.0.18",
+          "libc 0.2.190",
+          "miniz_oxide 0.9.1",
+          "proc-macro2 1.0.107",
+          "errno 0.3.14",
+          "serde_core 1.0.229",
+          "zmij 1.0.23",
+          "filetime 0.2.29",
+          "crc32fast 1.5.2",
+          "cpufeatures 0.2.17",
+          "generic-array 0.14.7",
+          "quote 1.0.47",
+          "rustix 1.1.5",
+          "flate2 1.1.10",
+          "serde_json 1.0.151",
+          "crypto-common 0.1.7",
+          "syn 3.0.7",
+          "block-buffer 0.10.4",
+          "xattr 1.6.1",
+          "serde_derive 1.0.229",
+          "digest 0.10.7",
+          "tar 0.4.46",
+          "serde 1.0.229",
+          "sha2 0.10.9",
+          "oxide-storage 0.1.0"
+        ],
+        "rustc_invocations": 0
+      },
+      "profile_settings": []
+    },
+    "light-C0": {
+      "packages": {
+        "compiled": [
+          "libc 0.2.190",
+          "version_check 0.9.5",
+          "proc-macro2 1.0.107",
+          "cfg-if 1.0.5",
+          "typenum 1.20.1",
+          "quote 1.0.47",
+          "unicode-ident 1.0.26",
+          "rustix 1.1.5",
+          "serde_core 1.0.229",
+          "zmij 1.0.23",
+          "crc32fast 1.5.2",
+          "bitflags 2.13.2",
+          "simd-adler32 0.3.10",
+          "adler2 2.0.1",
+          "serde_json 1.0.151",
+          "serde 1.0.229",
+          "itoa 1.0.18",
+          "memchr 2.8.3",
+          "generic-array 0.14.7",
+          "miniz_oxide 0.9.1",
+          "flate2 1.1.10",
+          "syn 3.0.7",
+          "errno 0.3.14",
+          "cpufeatures 0.2.17",
+          "filetime 0.2.29",
+          "serde_derive 1.0.229",
+          "crypto-common 0.1.7",
+          "block-buffer 0.10.4",
+          "digest 0.10.7",
+          "sha2 0.10.9",
+          "xattr 1.6.1",
+          "tar 0.4.46",
+          "oxide-storage 0.1.0"
+        ],
+        "fresh": [],
+        "rustc_invocations": 46
+      },
+      "profile_settings": [
+        {
+          "crate": "adler2",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/adler2-2.0.1/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "bitflags",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/bitflags-2.13.2/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "block_buffer",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/block-buffer-0.10.4/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/crc32fast-1.5.2/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.190/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.47/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.5/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "cfg_if",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.5/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "cpufeatures",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/cpufeatures-0.2.17/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "crc32fast",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/crc32fast-1.5.2/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "crypto_common",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/crypto-common-0.1.7/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "digest",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/digest-0.10.7/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "errno",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/errno-0.3.14/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "filetime",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/filetime-0.2.29/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "flate2",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/flate2-1.1.10/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "generic_array",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "itoa",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/itoa-1.0.18/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "libc",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.190/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "memchr",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.8.3/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "miniz_oxide",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/miniz_oxide-0.9.1/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "oxide_storage",
+          "source": "src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "line-tables-only",
+          "strip": null,
+          "incremental": true,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "oxide_storage_inventory",
+          "source": "src/bin/storage_inventory.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": "line-tables-only",
+          "strip": null,
+          "incremental": true,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "oxide_storage_lease",
+          "source": "src/bin/storage_lease.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": "line-tables-only",
+          "strip": null,
+          "incremental": true,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "proc_macro2",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "profile_backtrace",
+          "source": "tests/profile_backtrace.rs",
+          "crate_types": [],
+          "debuginfo": "line-tables-only",
+          "strip": null,
+          "incremental": true,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "quote",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.47/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "rustix",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.5/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "serde",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "serde_core",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "serde_derive",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_derive-1.0.229/src/lib.rs",
+          "crate_types": [
+            "proc-macro"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "serde_json",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "sha2",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/sha2-0.10.9/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "simd_adler32",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/simd-adler32-0.3.10/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "syn",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/syn-3.0.7/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "tar",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/tar-0.4.46/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "typenum",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/typenum-1.20.1/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "unicode_ident",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.26/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "version_check",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/version_check-0.9.5/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "xattr",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-1.6.1/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "zmij",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": null,
+          "strip": "debuginfo",
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        }
+      ]
+    },
+    "light-E1": {
+      "packages": {
+        "compiled": [
+          "oxide-storage 0.1.0"
+        ],
+        "fresh": [
+          "version_check 0.9.5",
+          "cfg-if 1.0.5",
+          "unicode-ident 1.0.26",
+          "typenum 1.20.1",
+          "bitflags 2.13.2",
+          "simd-adler32 0.3.10",
+          "adler2 2.0.1",
+          "memchr 2.8.3",
+          "itoa 1.0.18",
+          "libc 0.2.190",
+          "miniz_oxide 0.9.1",
+          "proc-macro2 1.0.107",
+          "errno 0.3.14",
+          "serde_core 1.0.229",
+          "zmij 1.0.23",
+          "crc32fast 1.5.2",
+          "cpufeatures 0.2.17",
+          "filetime 0.2.29",
+          "generic-array 0.14.7",
+          "quote 1.0.47",
+          "rustix 1.1.5",
+          "flate2 1.1.10",
+          "serde_json 1.0.151",
+          "block-buffer 0.10.4",
+          "crypto-common 0.1.7",
+          "syn 3.0.7",
+          "xattr 1.6.1",
+          "serde_derive 1.0.229",
+          "digest 0.10.7",
+          "tar 0.4.46",
+          "serde 1.0.229",
+          "sha2 0.10.9"
+        ],
+        "rustc_invocations": 4
+      },
+      "profile_settings": [
+        {
+          "crate": "oxide_storage",
+          "source": "src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "line-tables-only",
+          "strip": null,
+          "incremental": true,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "oxide_storage_inventory",
+          "source": "src/bin/storage_inventory.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": "line-tables-only",
+          "strip": null,
+          "incremental": true,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "oxide_storage_lease",
+          "source": "src/bin/storage_lease.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": "line-tables-only",
+          "strip": null,
+          "incremental": true,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "profile_backtrace",
+          "source": "tests/profile_backtrace.rs",
+          "crate_types": [],
+          "debuginfo": "line-tables-only",
+          "strip": null,
+          "incremental": true,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        }
+      ]
+    },
+    "light-U": {
+      "packages": {
+        "compiled": [],
+        "fresh": [
+          "version_check 0.9.5",
+          "unicode-ident 1.0.26",
+          "typenum 1.20.1",
+          "cfg-if 1.0.5",
+          "bitflags 2.13.2",
+          "simd-adler32 0.3.10",
+          "adler2 2.0.1",
+          "memchr 2.8.3",
+          "itoa 1.0.18",
+          "libc 0.2.190",
+          "miniz_oxide 0.9.1",
+          "proc-macro2 1.0.107",
+          "errno 0.3.14",
+          "serde_core 1.0.229",
+          "crc32fast 1.5.2",
+          "cpufeatures 0.2.17",
+          "zmij 1.0.23",
+          "filetime 0.2.29",
+          "generic-array 0.14.7",
+          "quote 1.0.47",
+          "rustix 1.1.5",
+          "serde_json 1.0.151",
+          "flate2 1.1.10",
+          "block-buffer 0.10.4",
+          "syn 3.0.7",
+          "crypto-common 0.1.7",
+          "xattr 1.6.1",
+          "serde_derive 1.0.229",
+          "digest 0.10.7",
+          "tar 0.4.46",
+          "sha2 0.10.9",
+          "serde 1.0.229",
+          "oxide-storage 0.1.0"
+        ],
+        "rustc_invocations": 0
+      },
+      "profile_settings": []
+    },
+    "full-debug-C0": {
+      "packages": {
+        "compiled": [
+          "libc 0.2.190",
+          "version_check 0.9.5",
+          "proc-macro2 1.0.107",
+          "typenum 1.20.1",
+          "cfg-if 1.0.5",
+          "unicode-ident 1.0.26",
+          "quote 1.0.47",
+          "rustix 1.1.5",
+          "serde_core 1.0.229",
+          "crc32fast 1.5.2",
+          "zmij 1.0.23",
+          "bitflags 2.13.2",
+          "serde_json 1.0.151",
+          "adler2 2.0.1",
+          "serde 1.0.229",
+          "simd-adler32 0.3.10",
+          "memchr 2.8.3",
+          "itoa 1.0.18",
+          "miniz_oxide 0.9.1",
+          "generic-array 0.14.7",
+          "syn 3.0.7",
+          "flate2 1.1.10",
+          "serde_derive 1.0.229",
+          "errno 0.3.14",
+          "cpufeatures 0.2.17",
+          "filetime 0.2.29",
+          "crypto-common 0.1.7",
+          "block-buffer 0.10.4",
+          "digest 0.10.7",
+          "sha2 0.10.9",
+          "xattr 1.6.1",
+          "tar 0.4.46",
+          "oxide-storage 0.1.0"
+        ],
+        "fresh": [],
+        "rustc_invocations": 46
+      },
+      "profile_settings": [
+        {
+          "crate": "adler2",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/adler2-2.0.1/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "bitflags",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/bitflags-2.13.2/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "block_buffer",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/block-buffer-0.10.4/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/crc32fast-1.5.2/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.190/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.47/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.5/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "build_script_build",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23/build.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "cfg_if",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.5/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "cpufeatures",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/cpufeatures-0.2.17/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "crc32fast",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/crc32fast-1.5.2/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "crypto_common",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/crypto-common-0.1.7/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "digest",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/digest-0.10.7/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "errno",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/errno-0.3.14/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "filetime",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/filetime-0.2.29/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "flate2",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/flate2-1.1.10/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "generic_array",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "itoa",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/itoa-1.0.18/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "libc",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.190/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "memchr",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.8.3/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "miniz_oxide",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/miniz_oxide-0.9.1/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "oxide_storage",
+          "source": "src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": true,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "oxide_storage_inventory",
+          "source": "src/bin/storage_inventory.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": true,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "oxide_storage_lease",
+          "source": "src/bin/storage_lease.rs",
+          "crate_types": [
+            "bin"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": true,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "proc_macro2",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "profile_backtrace",
+          "source": "tests/profile_backtrace.rs",
+          "crate_types": [],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": true,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "quote",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.47/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "rustix",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/rustix-1.1.5/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "serde",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "serde_core",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "serde_derive",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_derive-1.0.229/src/lib.rs",
+          "crate_types": [
+            "proc-macro"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "serde_json",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "sha2",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/sha2-0.10.9/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "simd_adler32",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/simd-adler32-0.3.10/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "syn",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/syn-3.0.7/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "tar",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/tar-0.4.46/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "typenum",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/typenum-1.20.1/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "unicode_ident",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.26/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "version_check",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/version_check-0.9.5/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "xattr",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/xattr-1.6.1/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        },
+        {
+          "crate": "zmij",
+          "source": "/private/tmp/oxide-stable-profiles.0l_xctvm/m/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23/src/lib.rs",
+          "crate_types": [
+            "lib"
+          ],
+          "debuginfo": "2",
+          "strip": null,
+          "incremental": false,
+          "opt_level": null,
+          "panic": null,
+          "debug_assertions": null,
+          "overflow_checks": null
+        }
+      ]
+    }
+  },
+  "edits": {
+    "baseline": {
+      "before_sha256": "4a9daf126f1765bc86a46a929157d73d0d13f99218d1e1c9f0bbd21b90ad277d",
+      "after_sha256": "13bee903cdfcfeeb546b38aa50f06a39d48768df7ed13ac670a2d5bc2f792beb"
+    },
+    "light": {
+      "before_sha256": "4a9daf126f1765bc86a46a929157d73d0d13f99218d1e1c9f0bbd21b90ad277d",
+      "after_sha256": "13bee903cdfcfeeb546b38aa50f06a39d48768df7ed13ac670a2d5bc2f792beb"
+    }
+  },
+  "image": {
+    "logical_bytes": 1345331200,
+    "allocated_bytes": 1345331200
+  },
+  "raw_log_bytes": 396078,
+  "outside_evidence_bytes": 663552,
+  "detach": "\"disk16\" ejected.",
+  "count_delivered": 8,
+  "end_ns": 119799917154791,
+  "total_seconds": 67.023040542,
+  "utc_end": "2026-10-16T16:36:57Z"
+}

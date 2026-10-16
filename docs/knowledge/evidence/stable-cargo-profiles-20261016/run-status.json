@@ -1,0 +1,74 @@
+{
+  "binary": {
+    "active_version": "v0.14.1+local.d3d8689",
+    "display_version": "v0.14.1+local.d3d8689",
+    "name": "effigy",
+    "version": "0.14.1"
+  },
+  "command": {
+    "kind": "tasks",
+    "name": "tasks"
+  },
+  "error": null,
+  "ok": true,
+  "result": {
+    "caller": "oxide:worker:068-stable-profiles",
+    "request_id": "c116b7d1-0f3a-41b6-a0c3-0d6bc5a158a2",
+    "run": {
+      "admittedAt": "2026-10-16T16:35:49.514Z",
+      "caller": "oxide:worker:068-stable-profiles",
+      "capacityDeadlineAt": "2026-10-16T17:05:49.319Z",
+      "classSource": "manifest",
+      "containers": [],
+      "cpuMs": null,
+      "epoch": 1,
+      "launchedAt": "2026-10-16T16:35:49.530Z",
+      "pgid": 31298,
+      "pid": 31298,
+      "position": null,
+      "priority": "validation",
+      "repository": {
+        "origin": "/private/tmp/oxide-stable-profiles.0l_xctvm",
+        "path": "/private/tmp/oxide-stable-profiles.0l_xctvm"
+      },
+      "runClass": "heavy",
+      "runId": "d3b79d01e089c8647cb03db0df40dafaad52cd2925226ad416498f16feac50cb",
+      "runTimeoutMs": 7200000,
+      "selector": "comparison",
+      "settledAt": "2026-10-16T16:36:57.399Z",
+      "settlement": {
+        "containers": [],
+        "format": "host.run.settlement",
+        "launched": true,
+        "outcome": "passed",
+        "result": {
+          "cpuMs": null,
+          "endedAt": "2026-10-16T16:36:57.399Z",
+          "epoch": 1,
+          "escapedDescendants": [],
+          "exitCode": 0,
+          "format": "host.run.result",
+          "pgid": 31298,
+          "runId": "d3b79d01e089c8647cb03db0df40dafaad52cd2925226ad416498f16feac50cb",
+          "signal": null,
+          "startIdentity": "31298@2026-10-16T16:35:49Z",
+          "startedAt": "2026-10-16T16:35:49.530Z",
+          "version": 1,
+          "wallMs": 67869
+        },
+        "runId": "d3b79d01e089c8647cb03db0df40dafaad52cd2925226ad416498f16feac50cb",
+        "settledAt": "2026-10-16T16:36:57.399Z",
+        "version": 1
+      },
+      "startIdentity": "31298@2026-10-16T16:35:49Z",
+      "state": "settled",
+      "submittedAt": "2026-10-16T16:35:49.319Z",
+      "wallMs": 67869
+    },
+    "schema": "effigy.host_run.request-status.v1",
+    "schema_version": 1,
+    "state": "found"
+  },
+  "schema": "effigy.command.v1",
+  "schema_version": 1
+}

@@ -4,6 +4,13 @@ minimum_effigy_version = "0.14.0"
 [tasks]
 "rust:compile" = "cargo check --workspace --all-targets --locked"
 "rust:format" = "cargo fmt --all -- --check"
+# Opt-in stable-Cargo profile proofs (oxide#068). Each verifies the resolved
+# rustc debug settings Cargo actually passed for workspace, dependency and
+# build-time units, then runs the focused native backtrace/unwind probe under
+# the named profile. They are focused proofs, not benchmarks and not aliases
+# for full QA.
+"rust:profile-light" = "python3 scripts/test-cargo-profiles.py --profile oxide-light"
+"rust:profile-full-debug" = "python3 scripts/test-cargo-profiles.py --profile oxide-full-debug"
 "rust:private-compile" = "cargo check --workspace --all-targets --locked --features private-qualification"
 "rust:test-ordinary-cargo-stable-reuse" = "python3 scripts/bounded-test.py cargo test --lib --locked --features private-qualification storage::tests::stable_reuse::ordinary_cargo_stable_reuse_identity_reuses_across_exact_attempts -- --exact"
 "rust:test-declared-workflow" = "python3 scripts/bounded-test.py cargo test --lib --locked project::workflow::tests -- --nocapture"
