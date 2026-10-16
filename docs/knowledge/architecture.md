@@ -20,6 +20,19 @@ Cargo's `build.build-dir` / `CARGO_BUILD_BUILD_DIR` is stable starting in Rust 1
 
 Nucleus Contract002 prohibits mutable target sharing. An exclusive-intermediate design requires narrow qualification before adoption and cannot weaken that contract. Frozen Contract010 remains unchanged. Queue/Nucleus own admission, source and run identities, authenticated settlement, retention and artifact capture; Oxide owns only its bounded storage semantics. See [scope](vision.md).
 
+## Lean local consumer direction
+
+Tom's 2026-10-16 Nucleus ruling selects a same-user local lease CLI in place
+of the protected policy-3/callback integration. The current interface
+assessment and remaining source-path, release/expiry and hard-cap boundaries
+live in [project adoption](contracts/project-adoption.md#current-nucleus-integration-boundary).
+A resident daemon, signatures and consumer callback service are not required
+for that proposed route. The earlier implementations below remain separate
+upstream mechanisms, not activation prerequisites. UID trust permits a
+cooperative caller's explicit writer-closed release; TTL or holder loss alone
+still does not establish closure. No lean CLI is implemented or qualified by
+this knowledge change.
+
 ## Preferred daemon hub to qualify
 
 Tom's direction, 2026-10-09: a central daemon could normalize project workflows, own reusable storage and provide a consistent place to measure real-world use. It remains the preferred candidate, not a production deployment choice.

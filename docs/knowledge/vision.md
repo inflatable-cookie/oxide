@@ -248,3 +248,28 @@ Tom has archived the former Sol planner. The [current consumer boundary](contrac
 owns contact, handover and projection details. Independent Oxide work may
 continue within its existing scope; this ruling does not activate shared
 storage, a real trial or production adoption.
+
+
+On 2026-10-16 the current Nucleus Supervisor relayed Tom's replacement
+integration ruling: Nucleus will **not** integrate the reviewed #060 protected
+policy-3 route. Tom chose a same-user local lease CLI instead of signed
+attempts and a consumer submit/capture/not-submitted callback service. This
+supersedes the earlier plan to integrate #060 after the chart port; it does
+not remove that upstream implementation or declare a new CLI shipped.
+
+The requested surface is lease by canonical project/profile/opaque holder,
+idempotent release, status, a finite total storage cap and idle-slot eviction
+at acquisition. Nucleus would own dispatch/validation environment projection,
+release at closeout/cancel, ordinary execution and private cold fallback on
+busy. UID/private local storage is the proposed trust boundary; no signature,
+callback service, new scheduler or frozen010 change is required. The
+[current consumer boundary](contracts/project-adoption.md#current-nucleus-integration-boundary)
+owns Oxide's necessary lease-liveness, source-path and capacity clarifications.
+The requested TTL/holder-loss reclamation must not silently override the
+existing invariant that missing processes or elapsed time do not establish
+writer closure. Those events may identify abandoned leases; safe reuse or
+eviction still needs actual closure. This is a concrete interface issue to
+resolve with the owning Supervisor, not another blanket approval request.
+Checked bounded implementation and independent exact-head review remain
+required; no installation, consumer activation, existing-cache cleanup or
+live experiment was performed or granted merely by recording this ruling.

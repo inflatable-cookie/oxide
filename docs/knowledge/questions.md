@@ -78,6 +78,12 @@ JIT, Cranelift and other code generation/execution solutions are confirmed resea
 
 ## Q-010 — Which integration surface best preserves familiar development loops?
 
+Tom's 2026-10-16 Nucleus ruling replaces its planned protected-route adoption
+with a same-user local lease CLI. The [current consumer boundary](contracts/project-adoption.md#current-nucleus-integration-boundary)
+owns the request and Oxide's source-path, release/expiry and capacity
+clarifications. The earlier hybrid design below remains a separate upstream
+route, not a prerequisite for the lean CLI.
+
 Design answer: [project adoption](contracts/project-adoption.md#recommendation) recommends explicit project/workflow opt-in plus an adapter around familiar commands, with per-invocation Cargo settings and private final output. This is a proposed integration contract, not an implemented consumer registration or rollout. The concrete consumer binding remains Q-012.
 
 ## Q-011 — How should slot waiting coordinate with host admission?

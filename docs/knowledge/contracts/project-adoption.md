@@ -19,6 +19,9 @@ path and task-attempt lifecycle gates described below.
 
 ## Recommendation
 
+The following describes the earlier protected route; it is not a requirement
+for the lean Nucleus interface now requested in the current boundary below.
+
 Use a hybrid boundary: one explicit project-and-workflow opt-in, plus a
 consumer-owned adapter that invokes the project's existing Cargo command or
 Effigy selector. Queue or Nucleus supplies the admitted run identity and decides
@@ -348,15 +351,74 @@ ruling in Nucleus Contract 001 (recorded at `5b34f80`). The former Sol planner
 commit Nucleus. Send future substantive coordination only to the Supervisor,
 without prompting active workers.
 
-Tom settled the timing on 2026-10-15, relayed by the Supervisor: "I'll take your
-recommendation on oxide for now, but I will want to integrate it soon."
-Nucleus will take the declared-workflow API next after its coding-delivery
-chart port, under its owning Contract 001. Keep the reviewed handover and
-consumer-scope notes ready; do not reopen the settled timing question or start
-consumer work before that owner-controlled sequence. The Supervisor owns the
-scoped integration and reviewed handover under Contract 002. Upstream delivery
-does not itself activate a consumer or a real trial. Nucleus's incremental-on
-agent policy remains independently useful without Oxide.
+On 2026-10-16 the Supervisor relayed Tom's replacement ruling: Nucleus
+will **not** integrate #060 as reviewed. The signed policy-3 attempt and
+consumer callback-service shape conflicts with the simplification reset.
+The earlier plan to take that API after the chart port is superseded.
+Nucleus requests a same-user local CLI and will own its dispatch/validation
+calls, environment forwarding, closeout/cancellation release and private cold
+fallback when storage is busy. No current accepted CLI binary or consumer
+binding exists; the proposed replacement is described below. Do not restore
+the historical adapters or make the protected route a prerequisite.
+
+### Lean local lease interface under assessment
+
+The requested public shape is `lease --project <canonical-root> --profile
+<dev|full-debug> --holder <opaque-id>`, idempotent `release --lease <id>`, and
+`status`. Lease success returns bounded versioned JSON containing a lease ID
+and exact environment; refusals distinguish busy from invalid input or
+storage failure. Same-UID cooperative callers and private owner-only local
+state replace signed attempts and callback authority. A local OS lock and
+durable lease state can serialize CLI mutations without a resident service;
+this is a candidate implementation, not a shipped command or lock-only proof
+of writer closure. Caller-provided paths must never authorize deletion outside
+Oxide-owned storage. Exact JSON, exit codes and binary path belong in the
+reviewed implementation handover, not an invented current API.
+
+Oxide recommends three explicit boundary clarifications:
+
+- `release` is the same-user caller's assertion that every writer using this
+  lease has ended, including cancellation descendants, and any outputs it
+  needs beyond cache lifetime have been preserved. No signature, callback or
+  validation-success receipt is required for this lean ownership assertion.
+  Release never asserts tests passed. A repeated release is access-free and
+  idempotent. TTL expiry or holder loss marks an abandoned lease; neither
+  proves compiler descendants stopped. Keep it unavailable for reuse/deletion
+  until the owner establishes writer closure. An opaque holder cannot itself
+  be probed for process liveness. Automatic expiry-based reuse remains an
+  unresolved request, not accepted release evidence.
+- Separate canonical project identity from the actual source checkout path
+  (for example an explicit workspace argument). The latter and effective
+  build context must be known before selecting a warm generation. Existing
+  evidence found stale source behavior across checkout paths; project/profile
+  alone is not a qualified cross-worktree compatibility key. Start with
+  path-isolated warm reuse until a supported cross-path boundary is proved,
+  reporting the reduced benefit honestly. This constraint affects the main
+  duplication goal and must not be hidden in an implementation detail.
+- Lease-time idle eviction is admission management; it cannot constrain
+  writes after return. Reuse the verified bounded payload filesystem for an
+  actual aggregate byte ceiling, with durable control outside it. Full writes
+  fail normally without releasing a lease. Evict whole idle slots only; active
+  or abandoned/uncertain slots remain protected. Directory-only mode, if
+  offered, must say budget-only rather than claim a hard cap.
+
+Prefer shared intermediates with private final target output where the pinned
+Cargo behavior supports that separation; returned variables must specify the
+actual supported choice. On macOS unpacked debug information may reference
+intermediate objects. Cache bytes are disposable after a valid release, so
+callers needing later source/debug lookup must preserve the needed bytes first
+or retain the lease. Do not claim independent debug retention from a copied
+binary alone. Do not impose the old signed capture protocol on this lean
+route. Existing private cold fallback must omit all acquired shared paths.
+
+Expected scope is roughly two focused PRs: local lease/lock/ledger CLI and
+status, then bounded backend/admission/idle eviction integration with the
+actual command-level safety tests and short consumer handover. This is an
+estimate, not a spent-budget reset or commitment that real cross-path reuse
+is solved. Reuse the existing bounded filesystem and inventory implementation;
+old authentication/callback plumbing is not required. Exact implementation
+briefs must name finite fixture limits and independent review. This
+assessment creates no live consumer, host installation or real experiment.
 
 Nucleus intentionally removed its never-live disabled Oxide consumer code
 in the 2026-10-15 simplification reset. At reviewed owner inspection of
@@ -402,7 +464,8 @@ admitted paths.
 
 The consumer scope must establish the exact admitted projection through the
 existing execution surface and bind its final values before submission.
-Do not add Rust cache policy to Effigy, assume global forwarding, alter a
-signed request after acquire, or treat the real projection as proven by a
-synthetic callback. This is a retained integration prerequisite, not authority
+Do not add Rust cache policy to Effigy or assume global forwarding. Final
+values must reach the actual worker and validation commands; synthetic
+callback tests do not establish that projection. Signed-request rules apply
+only to the earlier protected route. This is a retained integration prerequisite, not authority
 to change Effigy or Nucleus configuration now.
