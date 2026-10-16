@@ -388,8 +388,12 @@ required cross-worktree correctness qualification in this delivery:
   leases until an explicit owner `recover` operation asserts writer closure;
   automatic TTL-based reuse is not required. Nucleus owns its closeout/cancel
   retirement path and validation-process-group termination before release.
-  It identified its direct-child-only validation timeout handling as a
-  consumer fix to make before adopting the release contract.
+  On 2026-10-16 its owner reported the validation process-group correction
+  `49e3272` live: normal exit and timeout terminate the owned group, and a
+  regression covers a descendant retaining the output pipe. This resolves
+  that identified consumer prerequisite by owner report; Oxide has not
+  independently exercised the Nucleus deployment. It does not prove
+  arbitrary detached-writer closure or qualify the pending Oxide CLI/reuse.
 - Separate canonical project identity from the actual source checkout path
   through an explicit `--workspace <checkout>` argument. The Supervisor
   accepted it and requires useful registry-dependency reuse across different
