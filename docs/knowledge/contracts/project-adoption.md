@@ -491,18 +491,29 @@ These are owner-reported smoke observations, not additional Oxide qualification
 calls or attributable SSD-write measurements. No production worker had used it
 when reported because the task board was empty.
 
-Nucleus's deployed guard `75675d2` uses private cold fallback once the compatible
-slot exceeds half the cap. The owner requested Oxide-owned lease-time recycling
+Nucleus's temporary guard `75675d2` used private cold fallback once the compatible
+slot exceeded half the cap. The owner requested Oxide-owned lease-time recycling
 of oversized compatible idle slots, accepting a cold build. The replacement
 [local CLI](local-lease.md#reviewed-local-handover-artifact) now supplies that
 policy: at `ceil(cap_bytes / 2)` or above, complete unique-allocated accounting
 triggers durable whole-idle-slot deletion and a fresh monotonic slot/lease;
-below it warm reuse continues. No new flag or pool migration is required. A threshold is headroom policy, not a bound on a single
-leased build: ENOSPC remains possible and never releases ownership. Held,
+below it warm reuse continues. No new flag or pool migration is required.
+A threshold is headroom policy, not a bound on a single leased build: ENOSPC
+remains possible and never releases ownership. Held,
 uncertain or unknown-accounting occupancy must not be deleted to satisfy it.
-Nucleus owns installing that replacement and removing its temporary guard;
-ordinary busy/full/refusal fallback remains. No consumer update or post-swap
-production-task outcome is inferred from the Oxide delivery.
+The Supervisor reports the recycling binary installed, the guard removed in
+`a6baf85`, and the adapter redeployed on the same 8 GiB pool. Ordinary
+busy/full/refusal fallback remains. The first real task's lease, slot growth
+and writer-closed release remain unobserved by this report; installation and
+smoke do not establish a production-task lifecycle or build-size distribution.
+
+Pool sizing remains a consumer/operator budget choice. A build can exceed the
+remaining payload capacity during a lease, including on a fresh slot; there is
+no automatic mid-build private fallback. The nominal cap is not an exact
+whole-host disk-cost ceiling: image/control metadata and private target/temp
+output are separate, as detailed in [local capacity](local-lease.md#capacity-and-eviction).
+No larger pool, compaction, selective package cleaning or cache removal was
+authorized or performed by Oxide in response to that sizing discussion.
 
 ### Historical protected-route references
 
