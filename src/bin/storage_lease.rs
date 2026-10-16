@@ -4,8 +4,9 @@
 //! `docs/knowledge/contracts/local-lease.md`.
 
 use oxide_storage::lease::{
-    init_pool, lease, recover, release, render_status_human, render_status_json, status,
-    LeaseError, LeaseRequest, Profile, BINARY_NAME, DEFAULT_STATUS_OUTPUT_BYTES,
+    capacity_status, init_pool, lease, recover, release, render_capacity_status_human,
+    render_capacity_status_json, render_status_human, render_status_json, status, LeaseError,
+    LeaseRequest, Profile, BINARY_NAME, DEFAULT_STATUS_OUTPUT_BYTES,
 };
 use std::ffi::OsString;
 use std::io::Write;
@@ -21,7 +22,7 @@ USAGE:
         --profile <dev|full-debug> --holder <id>
     oxide-storage-lease --pool <path> release --lease <id>
     oxide-storage-lease --pool <path> recover --lease <id>
-    oxide-storage-lease --pool <path> status [--json] [--max-output-bytes <n>]
+    oxide-storage-lease --pool <path> status [--capacity] [--json] [--max-output-bytes <n>]
 
 The pool directory is owner-only control state. Payload slots live on the
 verified APFS backing mounted at <pool>/payload. The CLI holds an exclusive
@@ -54,6 +55,7 @@ fn run(args: Vec<OsString>) -> Result<ExitCode, LeaseError> {
     let mut holder = None;
     let mut lease_id = None;
     let mut json = false;
+    let mut capacity = false;
     let mut max_output_bytes = DEFAULT_STATUS_OUTPUT_BYTES;
     let mut iter = args.into_iter();
     while let Some(argument) = iter.next() {
@@ -70,6 +72,7 @@ fn run(args: Vec<OsString>) -> Result<ExitCode, LeaseError> {
             Some("--holder") => holder = Some(next_text(&mut iter, "--holder")?),
             Some("--lease") => lease_id = Some(next_text(&mut iter, "--lease")?),
             Some("--json") => json = true,
+            Some("--capacity") => capacity = true,
             Some("--max-output-bytes") => {
                 max_output_bytes = parse_usize(&mut iter, "--max-output-bytes")?;
             }
@@ -85,6 +88,9 @@ fn run(args: Vec<OsString>) -> Result<ExitCode, LeaseError> {
         }
     }
     let pool = pool.ok_or(LeaseError::Usage("--pool <path> is required"))?;
+    if capacity && command.as_deref() != Some("status") {
+        return Err(LeaseError::Usage("--capacity is only valid with status"));
+    }
     match command.as_deref() {
         Some("init") => {
             let cap_bytes = cap_bytes.ok_or(LeaseError::Usage("--cap-bytes is required"))?;
@@ -115,11 +121,20 @@ fn run(args: Vec<OsString>) -> Result<ExitCode, LeaseError> {
             Ok(ExitCode::SUCCESS)
         }
         Some("status") => {
-            let report = status(&pool)?;
-            let rendered = if json {
-                render_status_json(&report, max_output_bytes)?
+            let rendered = if capacity {
+                let report = capacity_status(&pool)?;
+                if json {
+                    render_capacity_status_json(&report, max_output_bytes)?
+                } else {
+                    render_capacity_status_human(&report, max_output_bytes)?
+                }
             } else {
-                render_status_human(&report, max_output_bytes)?
+                let report = status(&pool)?;
+                if json {
+                    render_status_json(&report, max_output_bytes)?
+                } else {
+                    render_status_human(&report, max_output_bytes)?
+                }
             };
             let stdout = std::io::stdout();
             let mut output = stdout.lock();

@@ -1,14 +1,17 @@
 //! Exclusive pool: short-lived flock, durable JSON ledger, idle-only eviction.
 
-use super::backing::{self, BackingPaths};
+use super::backing::{self, BackingPaths, CapacitySample};
 use super::{
     canonical_existing_dir, current_uid, ensure_private_dir, io_error, persist_private_file,
-    random_hex, read_private_file, remove_tree_owned, AccountingCoverage, LeaseEnvironment,
-    LeaseError, LeaseGrant, PoolInfo, PoolStatus, Profile, ReleaseReceipt, SlotOccupancy,
-    SlotStatus, ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES,
-    CONFIG_NAME, LEASE_VERSION, LEDGER_NAME, LOCK_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES,
-    MAX_PATH_BYTES, MAX_SLOTS, SLOTS_NAME,
+    random_hex, read_private_file, remove_tree_owned, AccountingCoverage, CapacityObservations,
+    CapacityStatus, LeaseEnvironment, LeaseError, LeaseGrant, PoolInfo, PoolStatus, Profile,
+    ReleaseReceipt, SlotOccupancy, SlotStatus, ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS,
+    ACCOUNTING_MAX_ENTRIES, CAPACITY_STATUS_NOTES, CAPACITY_STATUS_VERSION, CONFIG_NAME,
+    LEASE_VERSION, LEDGER_NAME, LOCK_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_PATH_BYTES,
+    MAX_SLOTS, SLOTS_NAME,
 };
+#[cfg(test)]
+use super::{ByteObservation, ObservationUnknownReason};
 use crate::inventory::{inventory_directory, InventoryLimits};
 use crate::{BoundedBacking, BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1};
 use serde::{Deserialize, Serialize};
@@ -154,6 +157,11 @@ pub fn status(pool: &Path) -> Result<PoolStatus, LeaseError> {
     opened.status()
 }
 
+pub fn capacity_status(pool: &Path) -> Result<CapacityStatus, LeaseError> {
+    let (opened, sample) = Pool::open_observational(pool, false)?;
+    opened.capacity_status(sample)
+}
+
 #[cfg(test)]
 pub(super) fn create_injected(pool: &Path, cap_bytes: u64) -> Result<PoolInfo, LeaseError> {
     let pool = prepare_new_pool(pool)?;
@@ -212,6 +220,15 @@ pub(super) fn status_injected(pool: &Path) -> Result<PoolStatus, LeaseError> {
 }
 
 #[cfg(test)]
+pub(super) fn capacity_status_injected(
+    pool: &Path,
+    sample: CapacitySample,
+) -> Result<CapacityStatus, LeaseError> {
+    let (opened, _) = Pool::open_observational(pool, true)?;
+    opened.capacity_status(sample)
+}
+
+#[cfg(test)]
 pub(super) fn mark_evicting_for_test(pool: &Path, slot_id: u64) -> Result<(), LeaseError> {
     let mut opened = Pool::open_with(pool, true)?;
     let slot = opened
@@ -232,6 +249,78 @@ impl Pool {
     #[cfg(test)]
     fn open_with(root: &Path, injected: bool) -> Result<Self, LeaseError> {
         Self::open_inner(root, injected)
+    }
+
+    fn open_observational(
+        root: &Path,
+        injected: bool,
+    ) -> Result<(Self, CapacitySample), LeaseError> {
+        // Capacity status preserves Evicting records; only ordinary opens reconcile them.
+        let root = canonical_existing_dir(root, true)?;
+        refuse_foreign_pool_entries(&root)?;
+        let lock = lock_pool_existing(&root)?;
+        let config = read_config(&root)?;
+        if config.version != LEASE_VERSION
+            || config.backend != BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1
+            || config.cap_bytes == 0
+            || config.cap_bytes != config.image_bytes
+        {
+            return Err(LeaseError::BackingMismatch);
+        }
+        let paths = BackingPaths::under(&root);
+        let (backing, sample) = if injected {
+            #[cfg(test)]
+            {
+                let backing = backing::inject_directory(&paths.mount, config.cap_bytes)?;
+                let unknown = ByteObservation::unknown(ObservationUnknownReason::Unsupported);
+                (
+                    backing,
+                    CapacitySample {
+                        payload_free_bytes: unknown,
+                        payload_available_bytes: unknown,
+                        image_logical_bytes: unknown,
+                        image_allocated_bytes: unknown,
+                        host_available_bytes: unknown,
+                    },
+                )
+            }
+            #[cfg(not(test))]
+            {
+                let _ = (&paths, &config);
+                return Err(LeaseError::BackingMismatch);
+            }
+        } else {
+            backing::open_observational(&paths, config.cap_bytes, config.image_bytes)?
+        };
+        if backing.descriptor().payload_root != paths.mount {
+            return Err(LeaseError::BackingMismatch);
+        }
+        validate_lease_payload_entries(backing.payload_root())?;
+        let ledger = read_ledger(&root)?;
+        if ledger.version != LEASE_VERSION
+            || ledger.store_id != config.store_id
+            || ledger.cap_bytes != config.cap_bytes
+        {
+            return Err(LeaseError::BackingMismatch);
+        }
+        if ledger.slots.len() > MAX_SLOTS {
+            return Err(LeaseError::LedgerExhausted);
+        }
+        let reconciliation_blocked = ledger
+            .slots
+            .iter()
+            .any(|slot| slot.state == SlotPersistState::Evicting);
+        Ok((
+            Self {
+                _lock: lock,
+                root,
+                config,
+                backing,
+                ledger,
+                reconciliation_blocked,
+            },
+            sample,
+        ))
     }
 
     fn open_inner(root: &Path, injected: bool) -> Result<Self, LeaseError> {
@@ -514,6 +603,25 @@ impl Pool {
             coverage,
             full,
             slots,
+        })
+    }
+
+    fn capacity_status(&self, sample: CapacitySample) -> Result<CapacityStatus, LeaseError> {
+        let status = self.status()?;
+        let capacity = CapacityObservations::new(
+            self.config.cap_bytes,
+            self.backing.descriptor().verified_capacity_bytes,
+            sample.payload_free_bytes,
+            sample.payload_available_bytes,
+            sample.image_logical_bytes,
+            sample.image_allocated_bytes,
+            sample.host_available_bytes,
+        );
+        Ok(CapacityStatus {
+            version: CAPACITY_STATUS_VERSION,
+            status,
+            capacity,
+            notes: CAPACITY_STATUS_NOTES,
         })
     }
 
@@ -941,16 +1049,42 @@ fn refuse_occupied_init_directory(pool: &Path) -> Result<(), LeaseError> {
 }
 
 fn lock_pool(pool: &Path) -> Result<File, LeaseError> {
+    lock_pool_inner(pool, true)
+}
+
+fn lock_pool_existing(pool: &Path) -> Result<File, LeaseError> {
+    lock_pool_inner(pool, false)
+}
+
+fn lock_pool_inner(pool: &Path, create: bool) -> Result<File, LeaseError> {
     let path = pool.join(LOCK_NAME);
-    let file = OpenOptions::new()
+    let existing = match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(LeaseError::UnsafePath("lock file must be a regular file"));
+            }
+            Some(metadata)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => None,
+        Err(error) => return Err(io_error(error)),
+    };
+    let mut options = OpenOptions::new();
+    options
         .read(true)
         .write(true)
-        .create(true)
         .mode(0o600)
-        .open(&path)
-        .map_err(io_error)?;
+        .custom_flags(libc::O_NOFOLLOW);
+    if create {
+        options.create(true);
+    }
+    let file = options.open(&path).map_err(io_error)?;
     let metadata = file.metadata().map_err(io_error)?;
-    if metadata.permissions().mode() & 0o077 != 0 || metadata.uid() != current_uid() {
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.uid() != current_uid()
+        || existing
+            .is_some_and(|before| before.dev() != metadata.dev() || before.ino() != metadata.ino())
+    {
         return Err(LeaseError::UnsafePath("lock file must be private"));
     }
     // SAFETY: `file` is open for the pool lock; flock holds until File drop.

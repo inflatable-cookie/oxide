@@ -27,17 +27,18 @@ oxide-storage-lease --pool <path> lease --project <canonical-root> \
     --workspace <checkout> --profile <dev|full-debug> --holder <id>
 oxide-storage-lease --pool <path> release --lease <id>
 oxide-storage-lease --pool <path> recover --lease <id>
-oxide-storage-lease --pool <path> status [--json] [--max-output-bytes <n>]
+oxide-storage-lease --pool <path> status [--capacity] [--json] [--max-output-bytes <n>]
 ```
 
 Covering CLI proof is `effigy rust:storage-lease-cli`: it builds the binary,
 exercises usage refusals, then on macOS with a 20 GiB host reserve provisions
-one fresh 128 MiB APFS image and runs lease/release/recover/status, concurrent
-acquire, duplicate-holder replay, busy, symlink/foreign refusal, idle reuse,
-delayed APFS metadata arrival and mismatched-backing refusal. Rust lease tests
-cover direct/dangling/nested symlink reclamation, interrupted-delete recovery,
-unsafe-root status/release and invalid metadata entries. It is not a
-filesystem-fill benchmark and not full QA.
+one fresh 128 MiB APFS image and runs lease/release/recover/status, capacity
+sampling, concurrent acquire, duplicate-holder replay, busy, symlink/foreign
+refusal, idle reuse, delayed APFS metadata arrival and mismatched-backing
+refusal. Rust lease tests cover injected zero/unknown samples, hardlinks,
+metadata separation and byte-for-byte observational behavior. Synthetic
+fixtures do not claim native quota behavior. It is not a filesystem-fill
+benchmark and not full QA.
 
 ## Pool
 
@@ -120,7 +121,45 @@ release or recover. Automatic TTL reuse is not implemented.
 **status** lists finite slots with holder, observed workspace, occupancy,
 logical and unique allocated bytes, pool cap, and full/unknown. Coverage is
 `complete`, `partial` or `unknown`. Unknown accounting is honest. No payload
-or secret content is printed.
+or secret content is printed. The legacy `full` field compares owned-slot
+unique allocated bytes with the declared cap. It retains that documented
+meaning and does not establish physical filesystem headroom.
+
+**status --capacity** reports the same ordinary status inside a separate
+version-1 JSON envelope (`version`, `status`, `capacity`, `notes`) or concise
+human output. The nested legacy `PoolStatus` fields do not change. The capacity
+section reports the declared cap and receipt-verified payload ceiling, raw
+payload filesystem free and unprivileged available bytes, the pinned sparse
+image's logical and allocated file bytes, and host filesystem available bytes
+at the pool directory. Byte fields are exact integer byte counts or `null`
+with a bounded `unknown_reason`; zero is a measured zero. The source fields
+are `statfs f_bfree * f_bsize` and `statfs f_bavail * f_bsize` on the exact
+verified payload mount, image `st_size`, image `st_blocks * 512`, and host
+`statfs f_bavail * f_bsize`. Unsupported or failed non-payload samples remain
+unknown. `coverage` is complete only when each capacity observation is known.
+
+Capacity mode takes the existing pool lock without creating it, verifies the
+already-pinned receipt, image identity and mounted APFS root, then samples
+metadata only. A missing, replaced, unmounted, symlinked or unsafe backing
+refuses; it does not attach an image or sample a replacement filesystem. It
+does not reconcile or remove an `Evicting` slot, or write the config, ledger,
+receipt or payload. Existing `Evicting` state remains visible and makes the
+nested accounting coverage unknown. Held slot accounting remains observational.
+Writers may still mutate held payload files while the command samples them, so
+the report is not an atomic snapshot.
+
+The payload filesystem free/available sample is not a reservation, build-fit
+prediction, attributable write total or guaranteed reclaimable space. Do not
+add slot accounting to image allocation or subtract slots from the nominal cap
+to infer physical free space. Image `st_blocks` is the host-reported allocation
+of that file, not APFS unique extents or snapshot accounting. Private target and
+temporary files, control files, OS metadata and snapshots are not combined
+into a whole-host cost; total host cost and Finder purgeable space remain
+unknown. Capacity reporting grants no storage ownership or cleanup authority.
+The envelope notes explicitly retain the legacy meaning of `status.full` and
+the limits of sampled capacity and image allocation.
+Either capacity observation coverage or nested slot coverage that is partial
+or unknown, and any output truncation, returns exit 2.
 
 ## Capacity and eviction
 
@@ -183,7 +222,7 @@ it cannot be added after an assertion that all writers have ended.
 
 | Code | When |
 | --- | --- |
-| 0 | init/lease/release/recover success; complete status |
+| 0 | init/lease/release/recover success; complete status and capacity observations |
 | 1 | usage, invalid input, I/O, unsupported platform |
 | 2 | busy or holder conflict; also partial/truncated status |
 | 3 | full, unknown accounting, or ledger/slot exhaustion |

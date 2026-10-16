@@ -5,7 +5,12 @@
 //! receipt, and mint `BoundedBacking` only after live verification. Caller JSON
 //! cannot upgrade a directory to a hard-bound claim.
 
-use super::{io_error, read_private_file, LeaseError, IMAGE_NAME, PAYLOAD_NAME, RECEIPT_NAME};
+#[cfg(target_os = "macos")]
+use super::ObservationUnknownReason;
+use super::{
+    io_error, read_private_file, ByteObservation, LeaseError, IMAGE_NAME, PAYLOAD_NAME,
+    RECEIPT_NAME,
+};
 use crate::storage::bounded::verify_payload_root;
 use crate::{BoundedBackendDescriptor, BoundedBacking, BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1};
 use serde::{Deserialize, Serialize};
@@ -13,8 +18,6 @@ use std::fs::{self, File};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-#[cfg(target_os = "macos")]
-use std::ffi::CString;
 #[cfg(target_os = "macos")]
 use std::fs::OpenOptions;
 #[cfg(target_os = "macos")]
@@ -25,6 +28,8 @@ use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(target_os = "macos")]
+use std::os::unix::io::AsRawFd;
 #[cfg(target_os = "macos")]
 use std::process::Command;
 
@@ -49,6 +54,14 @@ pub(super) struct BackingPaths {
     pub mount: PathBuf,
 }
 
+pub(super) struct CapacitySample {
+    pub payload_free_bytes: ByteObservation,
+    pub payload_available_bytes: ByteObservation,
+    pub image_logical_bytes: ByteObservation,
+    pub image_allocated_bytes: ByteObservation,
+    pub host_available_bytes: ByteObservation,
+}
+
 impl BackingPaths {
     pub(super) fn under(pool: &Path) -> Self {
         Self {
@@ -59,6 +72,7 @@ impl BackingPaths {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub(super) fn image_identity(image_path: &Path) -> Result<String, LeaseError> {
     let metadata = fs::symlink_metadata(image_path).map_err(io_error)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -177,11 +191,92 @@ pub(super) fn open(
     cap_bytes: u64,
     image_bytes: u64,
 ) -> Result<BoundedBacking, LeaseError> {
+    let (receipt, identity) = verify_receipt(paths, cap_bytes, image_bytes)?;
+    // Pools whose declared cap differs from the image size predate the
+    // enforced-ceiling rule and are refused without migration.
+    ensure_attached(paths)?;
+    let verified_capacity_bytes = sample_volume(&paths.mount)?;
+    if identity != receipt.identity
+        || verified_capacity_bytes != receipt.verified_capacity_bytes
+        || verified_capacity_bytes > cap_bytes
+    {
+        return Err(LeaseError::BackingMismatch);
+    }
+    mint_backing(paths, identity, verified_capacity_bytes)
+}
+
+/// Verify and sample the already-mounted pinned backing without attaching it.
+#[cfg(target_os = "macos")]
+pub(super) fn open_observational(
+    paths: &BackingPaths,
+    cap_bytes: u64,
+    image_bytes: u64,
+) -> Result<(BoundedBacking, CapacitySample), LeaseError> {
+    let (receipt, identity) = verify_receipt(paths, cap_bytes, image_bytes)?;
+    let (verified_capacity_bytes, payload_free_bytes, payload_available_bytes) =
+        sample_volume_observations(&paths.mount)?;
+    if identity != receipt.identity
+        || verified_capacity_bytes != receipt.verified_capacity_bytes
+        || verified_capacity_bytes > cap_bytes
+    {
+        return Err(LeaseError::BackingMismatch);
+    }
+    let image_metadata = image_metadata(&paths.image)?;
+    let sampled_identity = format!("{:016x}{:016x}", image_metadata.dev(), image_metadata.ino());
+    if sampled_identity != identity {
+        return Err(LeaseError::BackingMismatch);
+    }
+    let image_logical_bytes = ByteObservation::observed(image_metadata.len());
+    let image_allocated_bytes = blocks_observation(image_metadata.blocks(), 512);
+    let host_available_bytes = paths
+        .image
+        .parent()
+        .map(host_available_observation)
+        .unwrap_or_else(|| ByteObservation::unknown(ObservationUnknownReason::Unsupported));
+    let backing = mint_backing(paths, identity, verified_capacity_bytes)?;
+    Ok((
+        backing,
+        CapacitySample {
+            payload_free_bytes,
+            payload_available_bytes,
+            image_logical_bytes,
+            image_allocated_bytes,
+            host_available_bytes,
+        },
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(super) fn open(
+    _paths: &BackingPaths,
+    _cap_bytes: u64,
+    _image_bytes: u64,
+) -> Result<BoundedBacking, LeaseError> {
+    Err(LeaseError::Unsupported(
+        "bounded APFS payload backing is macOS-only",
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(super) fn open_observational(
+    _paths: &BackingPaths,
+    _cap_bytes: u64,
+    _image_bytes: u64,
+) -> Result<(BoundedBacking, CapacitySample), LeaseError> {
+    Err(LeaseError::Unsupported(
+        "bounded APFS payload backing is macOS-only",
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn verify_receipt(
+    paths: &BackingPaths,
+    cap_bytes: u64,
+    image_bytes: u64,
+) -> Result<(BoundedReceipt, String), LeaseError> {
     if paths.image.symlink_metadata().is_err() || paths.receipt.symlink_metadata().is_err() {
         return Err(LeaseError::BackingMismatch);
     }
-    // Pools whose declared cap differs from the image size predate the
-    // enforced-ceiling rule and are refused without migration.
     if image_bytes != cap_bytes {
         return Err(LeaseError::BackingMismatch);
     }
@@ -197,30 +292,8 @@ pub(super) fn open(
     {
         return Err(LeaseError::BackingMismatch);
     }
-    if paths.image.symlink_metadata().is_err() {
-        return Err(LeaseError::BackingMismatch);
-    }
-    ensure_attached(paths)?;
-    let verified_capacity_bytes = sample_volume(&paths.mount)?;
     let identity = image_identity(&paths.image)?;
-    if identity != receipt.identity
-        || verified_capacity_bytes != receipt.verified_capacity_bytes
-        || verified_capacity_bytes > cap_bytes
-    {
-        return Err(LeaseError::BackingMismatch);
-    }
-    mint_backing(paths, identity, verified_capacity_bytes)
-}
-
-#[cfg(not(target_os = "macos"))]
-pub(super) fn open(
-    _paths: &BackingPaths,
-    _cap_bytes: u64,
-    _image_bytes: u64,
-) -> Result<BoundedBacking, LeaseError> {
-    Err(LeaseError::Unsupported(
-        "bounded APFS payload backing is macOS-only",
-    ))
+    Ok((receipt, identity))
 }
 
 fn mint_backing(
@@ -298,28 +371,81 @@ fn hdiutil(scratch: &Path, arguments: &[&str]) -> Result<std::process::Output, L
 
 #[cfg(target_os = "macos")]
 fn sample_volume(mount_point: &Path) -> Result<u64, LeaseError> {
-    let path = CString::new(mount_point.as_os_str().as_bytes())
-        .map_err(|_| LeaseError::InvalidInput("path contains NUL"))?;
-    let mut stat = MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: path is NUL-terminated; a zero return initializes statfs.
-    let status = unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) };
-    if status != 0 {
-        return Err(LeaseError::BackingMismatch);
-    }
-    // SAFETY: zero return means the record is initialized.
-    let stat = unsafe { stat.assume_init() };
+    Ok(sample_volume_observations(mount_point)?.0)
+}
+
+#[cfg(target_os = "macos")]
+fn sample_volume_observations(
+    mount_point: &Path,
+) -> Result<(u64, ByteObservation, ByteObservation), LeaseError> {
+    let stat = sample_statfs(mount_point).map_err(|_| LeaseError::BackingMismatch)?;
     if c_field_bytes(&stat.f_fstypename) != b"apfs"
         || c_field_bytes(&stat.f_mntonname) != mount_point.as_os_str().as_bytes()
     {
         return Err(LeaseError::BackingMismatch);
     }
-    let capacity_bytes = u64::from(stat.f_blocks)
-        .checked_mul(u64::from(stat.f_bsize))
-        .ok_or(LeaseError::UnknownAccounting)?;
-    if capacity_bytes == 0 {
+    let block_size = u64::try_from(stat.f_bsize).map_err(|_| LeaseError::BackingMismatch)?;
+    let blocks = u64::try_from(stat.f_blocks).map_err(|_| LeaseError::BackingMismatch)?;
+    let capacity_bytes = blocks
+        .checked_mul(block_size)
+        .filter(|bytes| *bytes > 0)
+        .ok_or(LeaseError::BackingMismatch)?;
+    Ok((
+        capacity_bytes,
+        blocks_observation(stat.f_bfree, block_size),
+        blocks_observation(stat.f_bavail, block_size),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn host_available_observation(path: &Path) -> ByteObservation {
+    let Ok(stat) = sample_statfs(path) else {
+        return ByteObservation::unknown(ObservationUnknownReason::SampleFailed);
+    };
+    let block_size = u64::from(stat.f_bsize);
+    if block_size == 0 {
+        return ByteObservation::unknown(ObservationUnknownReason::Unsupported);
+    }
+    blocks_observation(stat.f_bavail, block_size)
+}
+
+#[cfg(target_os = "macos")]
+fn sample_statfs(path: &Path) -> Result<libc::statfs, std::io::Error> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(path)?;
+    let mut stat = MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: the open directory descriptor is valid; zero initializes statfs.
+    let status = unsafe { libc::fstatfs(directory.as_raw_fd(), stat.as_mut_ptr()) };
+    if status != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: zero return means the record is initialized.
+    Ok(unsafe { stat.assume_init() })
+}
+
+#[cfg(target_os = "macos")]
+fn blocks_observation<T>(blocks: T, block_size: u64) -> ByteObservation
+where
+    T: TryInto<u64>,
+{
+    let Ok(blocks) = blocks.try_into() else {
+        return ByteObservation::unknown(ObservationUnknownReason::Unsupported);
+    };
+    match blocks.checked_mul(block_size) {
+        Some(bytes) => ByteObservation::observed(bytes),
+        None => ByteObservation::unknown(ObservationUnknownReason::Overflow),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn image_metadata(image_path: &Path) -> Result<fs::Metadata, LeaseError> {
+    let metadata = fs::symlink_metadata(image_path).map_err(io_error)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(LeaseError::BackingMismatch);
     }
-    Ok(capacity_bytes)
+    Ok(metadata)
 }
 
 #[cfg(target_os = "macos")]

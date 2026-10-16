@@ -1,10 +1,12 @@
+use super::backing::CapacitySample;
 use super::pool::{
-    create_injected, lease_injected, mark_evicting_for_test, recover_injected, release_injected,
-    status_injected,
+    capacity_status_injected, create_injected, lease_injected, mark_evicting_for_test,
+    recover_injected, release_injected, status_injected,
 };
 use super::{
-    init_pool, render_status_json, AccountingCoverage, LeaseError, LeaseRequest, Profile,
-    SlotOccupancy,
+    init_pool, render_capacity_status_human, render_capacity_status_json, render_status_json,
+    AccountingCoverage, ByteObservation, LeaseError, LeaseRequest, ObservationUnknownReason,
+    Profile, SlotOccupancy,
 };
 use std::fs::{self, File};
 use std::io::Write;
@@ -86,6 +88,42 @@ fn lease_sequence(lease_id: &str) -> u64 {
         .expect("lease sequence")
         .parse()
         .expect("numeric lease sequence")
+}
+
+fn injected_capacity_sample() -> CapacitySample {
+    CapacitySample {
+        payload_free_bytes: ByteObservation::observed(0),
+        payload_available_bytes: ByteObservation::observed(0),
+        image_logical_bytes: ByteObservation::observed(0),
+        image_allocated_bytes: ByteObservation::observed(0),
+        host_available_bytes: ByteObservation::observed(0),
+    }
+}
+
+fn snapshot_tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn visit(root: &Path, directory: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
+        for entry in fs::read_dir(directory).expect("snapshot directory") {
+            let path = entry.expect("snapshot entry").path();
+            let metadata = fs::symlink_metadata(&path).expect("snapshot metadata");
+            if metadata.is_dir() {
+                visit(root, &path, files);
+            } else if metadata.is_file() {
+                files.push((
+                    path.strip_prefix(root)
+                        .expect("relative snapshot path")
+                        .to_path_buf(),
+                    fs::read(path).expect("snapshot file bytes"),
+                ));
+            } else {
+                panic!("unexpected fixture entry type: {path:?}");
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    visit(root, root, &mut files);
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
 }
 
 #[test]
@@ -775,6 +813,178 @@ fn unknown_or_non_directory_macos_metadata_entries_refuse() {
             Err(LeaseError::UnknownAccounting)
         ));
     }
+}
+
+#[test]
+fn injected_capacity_samples_keep_zero_unknown_and_partial_distinct() {
+    let fx = Fixture::new("capacity-samples-injected");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 4 * 1024 * 1024).expect("init synthetic pool");
+
+    let partial = capacity_status_injected(
+        &pool,
+        CapacitySample {
+            payload_free_bytes: ByteObservation::observed(0),
+            payload_available_bytes: ByteObservation::unknown(
+                ObservationUnknownReason::Unsupported,
+            ),
+            image_logical_bytes: ByteObservation::observed(0),
+            image_allocated_bytes: ByteObservation::unknown(ObservationUnknownReason::Overflow),
+            host_available_bytes: ByteObservation::unknown(ObservationUnknownReason::SampleFailed),
+        },
+    )
+    .expect("injected partial capacity report");
+    assert_eq!(partial.capacity.coverage, AccountingCoverage::Partial);
+    assert_eq!(partial.capacity.payload_free_bytes.value_bytes, Some(0));
+    assert_eq!(partial.capacity.payload_available_bytes.value_bytes, None);
+    assert_eq!(
+        partial.capacity.payload_available_bytes.unknown_reason,
+        Some(ObservationUnknownReason::Unsupported)
+    );
+    let json = serde_json::to_value(&partial).expect("serialize injected report");
+    assert_eq!(json["capacity"]["payload_free_bytes"]["value_bytes"], 0);
+    assert!(json["capacity"]["payload_available_bytes"]["value_bytes"].is_null());
+
+    let unknown = ByteObservation::unknown(ObservationUnknownReason::Unsupported);
+    let report = capacity_status_injected(
+        &pool,
+        CapacitySample {
+            payload_free_bytes: unknown,
+            payload_available_bytes: unknown,
+            image_logical_bytes: unknown,
+            image_allocated_bytes: unknown,
+            host_available_bytes: unknown,
+        },
+    )
+    .expect("injected unknown capacity report");
+    assert_eq!(report.capacity.coverage, AccountingCoverage::Unknown);
+}
+
+#[test]
+fn injected_capacity_keeps_hardlink_and_metadata_accounting_separate() {
+    let fx = Fixture::new("capacity-hardlinks-injected");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 4 * 1024 * 1024).expect("init synthetic pool");
+    let payload = pool.join("payload");
+    fs::create_dir(payload.join(".fseventsd")).expect("synthetic APFS metadata directory");
+    fs::write(
+        payload.join(".fseventsd").join("fseventsd-uuid"),
+        vec![b'm'; 16 * 1024],
+    )
+    .expect("synthetic APFS metadata file");
+
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let grant = lease_injected(request(&pool, &project, &workspace, "capacity-holder"))
+        .expect("held synthetic lease");
+    let original = grant.env.cargo_build_build_dir.join("payload.bin");
+    let hardlink = grant.env.cargo_build_build_dir.join("payload-hardlink.bin");
+    fs::write(&original, vec![b'x'; 4096]).expect("synthetic payload");
+    fs::hard_link(&original, &hardlink).expect("synthetic hardlink");
+
+    let report = capacity_status_injected(&pool, injected_capacity_sample())
+        .expect("injected capacity status");
+    assert_eq!(report.capacity.coverage, AccountingCoverage::Complete);
+    assert_eq!(report.capacity.payload_available_bytes.value_bytes, Some(0));
+    assert_eq!(report.status.full, Some(false));
+    assert!(report.notes[0].contains("not filesystem headroom"));
+    assert!(
+        !render_capacity_status_json(&report, 65_536)
+            .expect("complete zero-sample render")
+            .partial
+    );
+    assert_eq!(report.status.payload_logical_bytes, Some(8192));
+    let unique = report
+        .status
+        .payload_unique_allocated_bytes
+        .expect("complete synthetic slot allocation");
+    assert!(unique > 0 && unique < 8192);
+    assert_eq!(report.status.slots.len(), 1);
+    assert_eq!(report.capacity.payload_free_bytes.value_bytes, Some(0));
+}
+
+#[test]
+fn injected_capacity_status_preserves_held_and_evicting_bytes() {
+    let fx = Fixture::new("capacity-observational-injected");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 4 * 1024 * 1024).expect("init synthetic pool");
+    let project_held = fx.dir("project-held");
+    let project_evicting = fx.dir("project-evicting");
+    let workspace = fx.dir("workspace");
+    let held = lease_injected(request(
+        &pool,
+        &project_held,
+        &workspace,
+        "held-capacity-holder",
+    ))
+    .expect("held lease");
+    let held_bytes = held.env.cargo_build_build_dir.join("held.bin");
+    fs::write(&held_bytes, b"held bytes remain byte-for-byte").expect("held payload");
+
+    let evicting = lease_injected(request(
+        &pool,
+        &project_evicting,
+        &workspace,
+        "evicting-capacity-holder",
+    ))
+    .expect("second lease");
+    let evicting_bytes = evicting.env.cargo_build_build_dir.join("evicting.bin");
+    fs::write(&evicting_bytes, b"evicting bytes remain byte-for-byte").expect("evicting payload");
+    release_injected(&pool, &evicting.lease_id).expect("release second lease");
+    mark_evicting_for_test(&pool, evicting.slot_id.parse().expect("numeric slot id"))
+        .expect("record Evicting state");
+
+    let before = snapshot_tree(&pool);
+    let report = capacity_status_injected(&pool, injected_capacity_sample())
+        .expect("injected observational capacity status");
+    let after = snapshot_tree(&pool);
+    assert_eq!(before, after);
+    assert_eq!(report.status.coverage, AccountingCoverage::Unknown);
+    assert_eq!(report.status.full, None);
+    assert!(report
+        .status
+        .slots
+        .iter()
+        .any(|slot| { slot.slot_id == held.slot_id && slot.state == SlotOccupancy::Held }));
+    assert!(report.status.slots.iter().any(|slot| {
+        slot.slot_id == evicting.slot_id && slot.state == SlotOccupancy::Abandoned
+    }));
+    assert!(evicting_bytes.exists());
+}
+
+#[test]
+fn capacity_rendering_is_utf8_valid_and_obeys_64_byte_and_normal_caps() {
+    let fx = Fixture::new("capacity-rendering");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 4 * 1024 * 1024).expect("init synthetic pool");
+    let mut report = capacity_status_injected(&pool, injected_capacity_sample())
+        .expect("injected complete capacity report");
+    report.status.store_id = "🦀".repeat(48);
+
+    let tiny_json = render_capacity_status_json(&report, 64).expect("64-byte JSON cap");
+    assert!(tiny_json.truncated);
+    assert!(tiny_json.bytes.len() <= 64);
+    let tiny_json_value: serde_json::Value =
+        serde_json::from_slice(&tiny_json.bytes).expect("valid truncated JSON");
+    assert_eq!(tiny_json_value["truncated"], true);
+
+    let tiny_human = render_capacity_status_human(&report, 64).expect("64-byte human cap");
+    assert!(tiny_human.truncated);
+    assert!(tiny_human.bytes.len() <= 64);
+    std::str::from_utf8(&tiny_human.bytes).expect("truncated human UTF-8");
+
+    let normal_json = render_capacity_status_json(&report, 65_536).expect("normal JSON cap");
+    assert!(!normal_json.truncated);
+    serde_json::from_slice::<serde_json::Value>(&normal_json.bytes).expect("normal JSON");
+    let normal_human = render_capacity_status_human(&report, 65_536).expect("normal human cap");
+    assert!(!normal_human.truncated);
+    let human = std::str::from_utf8(&normal_human.bytes).expect("normal human UTF-8");
+    assert!(human.contains("payload filesystem available (statfs f_bavail)"));
+    assert!(human.contains("not APFS unique extents"));
+    assert!(matches!(
+        render_capacity_status_json(&report, 63),
+        Err(LeaseError::InvalidInput(_))
+    ));
 }
 
 #[test]
