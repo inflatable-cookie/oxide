@@ -254,10 +254,11 @@ re-init or migration; legacy lease/status JSON and exits remain compatible.
 The independent reviewer ran all covering selectors successfully, including
 235 Rust tests (three environment-gated probes ignored) and a fresh native
 CLI proof with capacity sampling and byte-for-byte non-mutation checks.
-Nucleus's reported installed artifact remains the earlier recycling build
-until its owner chooses to replace it; no upgrade or live-pool read is needed
-to continue ordinary task use. The diagnostic does not expand the pool, clean
-packages, compact the image or change admission/ownership policy.
+The Nucleus owner reports this diagnostic artifact installed and hash-checked,
+with no adapter restart or consumer code change. The [consumer boundary](project-adoption.md#first-consumer-use-and-apfs-metadata-correction)
+owns its live-pool observation and remaining first-task gate. The diagnostic
+does not expand the pool, clean packages, compact the image or change
+admission/ownership policy.
 
 Lease JSON v1 includes `lease_id`, `store_id`, `slot_id`, `incarnation`,
 `project`, `workspace`, `profile`, `holder`, `state`, `reused_slot` and the

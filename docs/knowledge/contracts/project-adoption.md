@@ -533,6 +533,16 @@ time and the logged command itself do not establish closure. No automatic
 recovery or Oxide-side cancellation cleanup is selected. Nucleus owns any
 later cancellation-retirement correction.
 
+The owner subsequently reports the optional capacity-diagnostic binary
+installed with its hash verified, no adapter restart and unchanged consumer
+code/lease/release behavior. On the existing live 8 GiB pool it reports
+7.58 GB free, an image file on disk of 824 MB, and slot 1 idle at 780 MB from
+the earlier smoke. These rounded units are preserved as reported, not an
+independent raw-byte receipt or synchronized snapshot. Do not add image and
+mounted-slot figures. No real task had yet supplied lease, peak growth,
+free-before/after and retirement-receipt release evidence; that is the next
+consumer outcome, not a reason to manufacture another experiment.
+
 ### Historical protected-route references
 
 The following describes the earlier removed consumer/protected route, not
