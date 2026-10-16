@@ -88,10 +88,10 @@ existing test-profile reductions and Nucleus's explicit full-debug route leave
 no source-backed case for another profile edit in this assessment. Disabling
 incremental output can increase rebuild work, and final target size alone
 would not establish reduced disk writes. That assessment covered the inspected
-consumer projects; Oxide later added its own opt-in profiles with measured
-evidence. The [stable Cargo profile contract](contracts/stable-cargo-profiles.md)
-owns them and the [comparison below](#stable-cargo-profile-comparison-2026-10-16)
-summarizes the result for this workspace.
+consumer projects; Oxide later added its own opt-in profiles whose comparison
+were recorded as a no-go. The [stable Cargo profile contract](contracts/stable-cargo-profiles.md)
+owns them and the [observations below](#stable-cargo-profile-observations-2026-10-16-no-go)
+are retained only as unqualified readings.
 
 ## Incremental and debug storage measurements
 
@@ -223,16 +223,24 @@ The [measurement recipe](evidence/incremental-comparison-20261015/measurement-re
 [authenticated settlement](evidence/incremental-comparison-20261015/follow.json)
 make the result independently inspectable without another build.
 
-## Stable Cargo profile comparison (2026-10-16)
+## Stable Cargo profile observations (2026-10-16): no-go
 
-The author ran the bounded comparison approved for oxide#068 directly, under
-one genuine Effigy heavy-admitted run (run class `heavy`, outcome `passed`,
-run `d3b79d01e089c8647cb03db0df40dafaad52cd2925226ad416498f16feac50cb`). The
+The oxide#068 comparison is an explicit **no-go**. Independent exact-head
+review (PR 68, review comment 6220360222) recorded `bounded_comparison: fail`
+and `truthful_delivery: fail` because the author ran four fresh sessions (2, 2,
+8 and 8 Cargo driver invocations, 20 in total) with fresh roots, images,
+clocks and call budgets instead of the brief's one original capped session,
+because one complete run was unmatched, and because the recorded session's
+timer starts after submission staging. The
 [stable Cargo profile contract](contracts/stable-cargo-profiles.md) owns the
-profile recipe, the debugging tradeoff and the limits; this section records
-the measured result and its receipts.
+profile recipe, the no-go disposition and the limits; the numbers below are
+retained only as **unqualified observations**, not as the approved comparison
+and not as acceptance evidence for adoption.
 
-Two source-identical disposable copies of the pushed implementation commit
+The observations below come from one genuine Effigy heavy-admitted run (run
+class `heavy`, outcome `passed`, run
+`d3b79d01e089c8647cb03db0df40dafaad52cd2925226ad416498f16feac50cb`). Two
+source-identical disposable copies of the pushed implementation commit
 `c762a731276c6677993002064ef5287676344fde` (tree
 `c3c98d78a59cf1b8ed8973f67a66404bd0554dfd`) received the same appended public
 constant. The default `test` profile and `oxide-light` each ran a cold test
@@ -240,7 +248,11 @@ build, the identical edit rebuild and an unchanged rerun; one explicit
 `oxide-full-debug` cold control followed. Every positive call executed the
 same probe test and feature set. Eight Cargo driver invocations ran in a
 67.0-second session inside one fresh 16 GiB APFS payload volume; the 20 GiB
-raw host reserve held throughout.
+raw host reserve held throughout. The 67.0 seconds exclude the staging that
+preceded the recorded clock, and this session is one of four rather than the
+brief's single original session.
+
+Unqualified observations (not acceptance evidence):
 
 | Step | Default `test` | `oxide-light` |
 | --- | ---: | ---: |
@@ -259,14 +271,14 @@ proc-macro units. The default `test` profile resolved the same full workspace
 and dependency debug information it resolved before the profiles were added,
 and no default profile was overridden.
 
-In this one host and sequence the light profile kept the executed tests,
+Read as, in that one session: the light profile kept the executed tests,
 unwinding, assertions and overflow checks, rebuilt the small semantic edit
 about 2.3 times faster, and used about 53 MiB less allocated build storage.
-The cold difference is a single observation and is not isolated as a profile
-effect. No attributable SSD writes, SSD lifetime, debugger-variable custody
-or general project-wide speed claim follows.
+Those directions are not established as the brief's bounded comparison, so no
+adoption follows. No attributable SSD writes, SSD lifetime, debugger-variable
+custody or general project-wide speed claim follows either.
 
-The three harness corrections that preceded the measured session are recorded
+The three harness corrections that preceded the recorded session are recorded
 in [attempt sessions](evidence/stable-cargo-profiles-20261016/sessions.json)
 rather than hidden: each used a fresh root, fresh image, fresh clock and its
 own call budget, and no running clock or cap was reset. Raw logs, the exact

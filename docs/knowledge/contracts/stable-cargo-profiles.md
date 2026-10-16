@@ -6,8 +6,8 @@ an explicitly named recipe on the pinned stable Cargo 1.97.1 toolchain. They do
 not change the default `dev`/`test`/`release` profiles, any consumer, any
 global Cargo configuration or the pinned toolchain, and nothing selects them
 automatically. The [Rust DX landscape](../rust-dx-landscape.md#stable-profile-and-backend-eligibility)
-owns the upstream eligibility finding; the [measured comparison](../storage-efficiency.md#stable-cargo-profile-comparison-2026-10-16)
-owns the numbers.
+owns the upstream eligibility finding; the no-go disposition below owns the
+recorded observations, which are not acceptance evidence.
 
 ## Declared profiles
 
@@ -107,14 +107,43 @@ evidence that the opt-in profiles were added rather than defaults replaced.
 The selectors are focused profile proofs, not benchmarks and not an alias for
 full QA.
 
-## Measured comparison (2026-10-16)
+## Qualification disposition: no-go (2026-10-16)
+
+The brief's `bounded_comparison` gate is **not met**, and this task records an
+explicit **no-go** for the bounded profile comparison. Independent exact-head
+review (PR 68, review comment 6220360222) recorded `bounded_comparison: fail`
+and `truthful_delivery: fail`; the product/profile gates passed. The reviewer
+found that the author ran four fresh sessions (2, 2, 8 and 8 Cargo driver
+invocations, 20 in total) across four fresh roots, images, clocks and call
+budgets instead of the brief's one original capped session, that one complete
+run was unmatched, and that the recorded session's timer starts after
+submission staging. The later session's figures are therefore retained only as
+unqualified observations and must not be read as the approved comparison.
+
+The recorded session's timer starts inside the measurement recipe at run
+launch, after the root, packet and recipe were staged and after Effigy
+admission. Its 67.0-second total therefore excludes that staging and is not the
+"original monotonic 20-minute TOTAL session including setup" recorded before
+any effects that the brief requires. The attempt accounting and the diagnosed
+defect of each session are retained in the
+[attempt-session record](../evidence/stable-cargo-profiles-20261016/sessions.json).
+A future comparison requires a fresh, separately scoped record; the existing
+roots and images are closed and are not reused.
+
+No adoption, default change, consumer decision or policy change follows from
+these observations. The profiles and selectors themselves remain opt-in and
+are unaffected by this no-go; only the comparison claim is withdrawn.
+
+## Unqualified observations (2026-10-16, not acceptance evidence)
 
 One bounded session compared the default `test` profile with `oxide-light`, and
 ran one explicit `oxide-full-debug` control, on two source-identical disposable
 copies of the pushed implementation at the same commit with the same appended
 public-constant edit. Every positive call executed the same probe test and the
 same feature set. The [evidence package](../evidence/stable-cargo-profiles-20261016/summary.json)
-holds the raw logs, the exact recipe and the per-unit resolved settings.
+holds the raw logs, the exact recipe and the per-unit resolved settings. These
+numbers describe what happened in that session; they are not the brief's
+bounded comparison and are not acceptance evidence.
 
 | Step | Default `test` | `oxide-light` |
 | --- | ---: | ---: |
@@ -131,16 +160,19 @@ and resolved `-C debuginfo=2` for workspace, dependency, build-script and
 proc-macro units; the default `test` profile resolved the same full workspace
 and dependency debug information it resolved before this change.
 
-Read as: on this one host and edit sequence, the light profile kept the same
-executed tests and unwinding behavior, rebuilt one small semantic edit about
-2.3 times faster than the default profile, and used about 53 MiB less
-allocated build storage in this small workspace. The cold difference is a
-single observation and is not isolated as a profile effect. This is not a
-benchmark, a sustained study, an SSD-write or SSD-lifetime measurement, or a
-general speed claim, and it does not measure a consumer or shared cache.
+Read as: in that one session the light profile kept the same executed tests and
+unwinding behavior, rebuilt one small semantic edit about 2.3 times faster than
+the default profile, and used about 53 MiB less allocated build storage in this
+small workspace. Because the session was one of four and its clock started
+after staging, even this light-versus-default direction is not established as
+the brief's bounded comparison. This is not a benchmark, a sustained study, an
+SSD-write or SSD-lifetime measurement, or a general speed claim, and it does
+not measure a consumer or shared cache.
 
 ## Limits
 
+- The comparison claim is withdrawn (no-go); the observations above are
+  unqualified and one of four sessions rather than one original capped session.
 - One busy-machine session on the maintainer host; the default profile ran
   before the light profile, so extracted registry and OS caches were warmer for
   the later mode.
