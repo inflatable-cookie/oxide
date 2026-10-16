@@ -164,17 +164,26 @@ go to stderr as `oxide-storage-lease: <reason>: <message>`.
 ## Reviewed local handover artifact
 
 A packaging-only rebuild from merged reviewed source
-`0496f2fbad544d59f515d7dda3051e19a8c3524c` (runtime source identical to reviewed
-`ecc185bc77ce382d5a832656166a144822a1bc6a`) is available at:
+`34e69090ac40c3fb8daa9de283020e972587a91f` (reviewed head
+`8941ae075356b456957d5678b77dd919f34eb65f`, PR #65) is available at:
 
 ```text
-/Users/tom/Dev/projects/oxide/target/oxide-handover/ecc185bc77ce382d5a832656166a144822a1bc6a/oxide-storage-lease
+/Users/tom/Dev/projects/oxide/target/oxide-handover/8941ae075356b456957d5678b77dd919f34eb65f/oxide-storage-lease
 ```
 
-SHA-256: `9d468378af13b1438227d93c5b166ab638ce5a19adfe2ead3857ee4f6085d1a8`.
+SHA-256: `9b0b0fc853c8607a94ccec765b84323d25ab42e0dcb95a40e1446b5a6cf12fbd`.
 This canonical-checkout rebuild has its own hash; the experimental binary
 hash remains unchanged in the evidence. No native fixture, consumer Cargo
 experiment, pool initialization or installation was performed by packaging.
+
+This replaces the earlier `9d468378…` artifact, which refused real pools after
+macOS created `.fseventsd`. The fix accepts the exact safe metadata directories
+above even when they arrive after init. Existing receipt-v2/ledger-v1 pools
+reopen with this binary: no re-init, migration, metadata deletion or settings
+change is required. Lease identities, JSON and exit codes are unchanged. The
+independent reviewer ran all covering selectors successfully, including 226
+Rust tests (three environment-gated probes ignored) and a fresh native CLI
+proof with after-init metadata.
 
 Lease JSON v1 includes `lease_id`, `store_id`, `slot_id`, `incarnation`,
 `project`, `workspace`, `profile`, `holder`, `state`, `reused_slot` and the

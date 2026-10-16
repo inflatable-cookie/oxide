@@ -460,6 +460,29 @@ general source-path/invalidation, native-write, SSD-lifetime or production
 activation claim. The [local CLI contract](local-lease.md) owns actual command,
 JSON, exits, artifact path and recovery limits.
 
+### First consumer use and APFS metadata correction
+
+On 2026-10-16 Nucleus Supervisor reported consumer implementation `56a4c20`
+pushed but not deployed. It leases at task placement and validation, uses a
+Nucleus-owned parent `.cargo/config.toml` `[build] build-dir` to project the
+returned intermediate directory into actual Cargo calls, and keeps final
+outputs private. Sibling-repository tasks and busy/full/refused leases use
+private cold fallback. The owner reports four client fixtures, 124 affected
+file tests and an Effigy redirect smoke; these are consumer reports, not an
+Oxide observation of deployed cache use.
+
+The first real pool exposed a delayed-init defect: macOS added
+`payload/.fseventsd/fseventsd-uuid`, and the original CLI refused every lease
+as unknown accounting. Independently reviewed PR #65 (head `8941ae0`, merged
+`34e6909`) fixes that lean-only payload check. Its native proof covers metadata
+arriving after init; unknown entries, symlinked metadata and foreign-volume
+entries still refuse. It also fixes safe idle-slot symlink reclamation without
+following the target. The [local lease contract](local-lease.md#reviewed-local-handover-artifact)
+owns the replacement binary/hash. Receipt v2, ledger v1, lease IDs, JSON and
+exits are unchanged; the existing pool can reopen without re-init or migration.
+Do not delete its metadata. Nucleus owns the binary swap, two-worktree smoke
+and deployment; none has been performed by Oxide.
+
 ### Historical protected-route references
 
 The following describes the earlier removed consumer/protected route, not
