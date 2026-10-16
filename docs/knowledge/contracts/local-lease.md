@@ -33,9 +33,11 @@ oxide-storage-lease --pool <path> status [--json] [--max-output-bytes <n>]
 Covering CLI proof is `effigy rust:storage-lease-cli`: it builds the binary,
 exercises usage refusals, then on macOS with a 20 GiB host reserve provisions
 one fresh 128 MiB APFS image and runs lease/release/recover/status, concurrent
-acquire, duplicate-holder replay, busy, symlink/foreign refusal, idle reuse and
-mismatched-backing refusal. It is not a filesystem-fill benchmark and not full
-QA.
+acquire, duplicate-holder replay, busy, symlink/foreign refusal, idle reuse,
+delayed APFS metadata arrival and mismatched-backing refusal. Rust lease tests
+cover direct/dangling/nested symlink reclamation, interrupted-delete recovery,
+unsafe-root status/release and invalid metadata entries. It is not a
+filesystem-fill benchmark and not full QA.
 
 ## Pool
 
@@ -66,6 +68,13 @@ completion.
 Directory-only roots are not a product mode. Tests may inject a private
 directory solely to exercise the ledger; that path is not compiled into the
 CLI and does not claim an OS hard bound.
+
+The lean pool accepts these exact APFS metadata directories alongside
+`slots`: `.fseventsd`, `.Spotlight-V100`, `.Trashes` and `.TemporaryItems`.
+Each must be a real directory on the verified payload volume; the operating
+system may own it. The pool does not recurse into or inventory these entries,
+and every other payload-root entry refuses. Their writes still consume the
+APFS volume's enforced capacity.
 
 ## Commands
 
@@ -120,14 +129,18 @@ must equal the image size so that volume size is the enforced ceiling. A
 smaller declared cap on a larger volume is refused at init and at open:
 admission accounting alone is not a quota. Admission uses the
 pinned cap and the [storage inventory](storage-inventory.md) unique-allocated
-figure for owned slots; the measured `verified_capacity_bytes` (APFS metadata
+figure for owned slots; filesystem metadata directories remain outside that
+slot accounting. The measured `verified_capacity_bytes` (APFS metadata
 overhead below the declared size) is the effective OS bound, and writers
 cannot exceed the declared ceiling through it. Control/ledger headroom stays outside the payload and
 is bounded (`MAX_LEDGER_BYTES` 256 KiB, `MAX_SLOTS` 32). Eviction happens only
 at lease time and only for known owned idle whole slots. Held occupancy,
-foreign entries, symlinks, unknown accounting and mismatched backing refuse.
-Deletion never follows a symlink and never touches project or workspace
-paths. A lost delete is reconciled only for the recorded evicting slot path.
+foreign entries, symlinked pool/payload/slots/slot roots, unknown accounting
+and mismatched backing refuse. During a durably recorded whole-slot deletion,
+an owned nested symlink entry may be unlinked as a leaf after its parent and
+entry ownership are verified. The target is never followed or removed.
+Deletion never touches project or workspace paths. A lost delete is
+reconciled only for the recorded evicting slot path.
 Writes that fill the volume return ENOSPC from the OS and remain leased; this
 CLI does not repeat the filesystem-full proof (see bounded storage).
 
@@ -178,11 +191,14 @@ may return exit 5 without touching any new holder. Do not treat an unknown
 or mistyped ID as evidence that the intended writer ended. A held compatible
 project/profile returns busy rather than allowing a concurrent writer.
 
-Known recovery limits: a nested symlink is refused during idle deletion;
-interrupted `Evicting` reconciliation can then block pool opening. Failed
-provisioning with files beyond the lock can also need explicit owner recovery.
-Do not edit a live ledger, follow/delete a foreign target, or use TTL to clear
-these refusals. The focused real run did not exercise eviction or census slot
+If an interrupted `Evicting` deletion cannot safely remove its recorded slot
+root or an owned entry, the generation remains `Evicting` and unavailable.
+Status stays bounded and reports unknown accounting; an unrelated held lease
+can still be released. New leases remain refused until the recorded deletion
+can safely finish. A later open resumes only that recorded slot path. Do not
+edit a live ledger, follow/delete a foreign target, or use TTL to clear a
+refusal. Failed provisioning with files beyond the lock can also need explicit
+owner recovery. The focused real run did not exercise eviction or census slot
 symlinks. These limits are separate from its observed reuse result.
 
 ## Limits

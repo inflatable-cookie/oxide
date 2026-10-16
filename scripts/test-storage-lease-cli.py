@@ -233,6 +233,46 @@ def prove_native(executable: str, parent: str) -> None:
     def remaining() -> int:
         return max(5, int(NATIVE_PHASE_SECONDS - (time.monotonic() - started)))
 
+    payload_root = os.path.join(pool, "payload")
+    metadata_names = (".fseventsd", ".Spotlight-V100", ".Trashes", ".TemporaryItems")
+    initially_absent = [
+        name for name in metadata_names
+        if not os.path.lexists(os.path.join(payload_root, name))
+    ]
+    delayed_metadata_name = initially_absent[0] if initially_absent else None
+    # Give macOS time to add filesystem metadata after init. If this host does
+    # not create an initially absent known directory, add that exact directory
+    # in this fresh proof image. The Rust fixture covers the deterministic
+    # post-init transition on hosts where all known directories already exist.
+    time.sleep(3)
+    payload_stat = os.stat(payload_root)
+    if delayed_metadata_name is not None:
+        delayed_metadata = os.path.join(payload_root, delayed_metadata_name)
+        metadata_deadline = min(time.monotonic() + 5, started + NATIVE_PHASE_SECONDS - 5)
+        while not os.path.lexists(delayed_metadata) and time.monotonic() < metadata_deadline:
+            time.sleep(0.25)
+        if not os.path.lexists(delayed_metadata):
+            try:
+                os.mkdir(delayed_metadata)
+            except FileExistsError:
+                pass
+        metadata_stat = os.lstat(delayed_metadata)
+        if not os.path.isdir(delayed_metadata) or os.path.islink(delayed_metadata):
+            fail("delayed APFS metadata entry is not a real directory")
+        if metadata_stat.st_dev != payload_stat.st_dev:
+            fail("delayed APFS metadata directory is on another volume")
+
+    code, stdout, stderr = run_cli(
+        executable, ["--pool", pool, "status", "--json"], timeout=remaining()
+    )
+    if code != 0:
+        fail(f"status after delayed filesystem metadata failed: exit {code} stderr={stderr!r}")
+    delayed_status = load_json(stdout, "status after delayed metadata")
+    if delayed_status.get("slots") or delayed_status.get("coverage") != "complete":
+        fail("delayed OS metadata changed empty-slot accounting")
+    if delayed_status.get("payload_unique_allocated_bytes") != 0:
+        fail("delayed OS metadata was counted as a lease slot")
+
     code, stdout, stderr = run_cli(
         executable,
         [

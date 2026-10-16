@@ -4,8 +4,9 @@
 //! This is the unpublished lean product surface: a short-lived OS lock plus an
 //! atomic local ledger, no resident daemon, HMAC, issuer, callback service or
 //! Cargo invocation. Same-UID callers are trusted cooperators; private paths
-//! and safety checks still refuse foreign or symlink deletion. Owning contract:
-//! `docs/knowledge/contracts/local-lease.md`.
+//! and safety checks still refuse foreign paths and symlinked roots. A
+//! durably recorded idle deletion unlinks an owned nested symlink entry without
+//! following its target. Owning contract: `docs/knowledge/contracts/local-lease.md`.
 
 mod backing;
 mod pool;
@@ -546,7 +547,29 @@ fn random_hex(bytes: usize) -> Result<String, LeaseError> {
 fn remove_tree_owned(root: &Path, path: &Path) -> Result<(), LeaseError> {
     let metadata = fs::symlink_metadata(path).map_err(io_error)?;
     if metadata.file_type().is_symlink() {
-        return Err(LeaseError::UnknownAccounting);
+        if metadata.uid() != current_uid() {
+            return Err(LeaseError::UnsafePath(
+                "refusing to delete a foreign symlink",
+            ));
+        }
+        let parent = path.parent().ok_or(LeaseError::UnknownAccounting)?;
+        let parent_metadata = fs::symlink_metadata(parent).map_err(io_error)?;
+        if parent_metadata.file_type().is_symlink()
+            || !parent_metadata.file_type().is_dir()
+            || parent_metadata.uid() != current_uid()
+        {
+            return Err(LeaseError::UnsafePath(
+                "symlink parent must be an owned directory",
+            ));
+        }
+        let canonical_root = fs::canonicalize(root).map_err(io_error)?;
+        let canonical_parent = fs::canonicalize(parent).map_err(io_error)?;
+        if canonical_parent == canonical_root || !canonical_parent.starts_with(&canonical_root) {
+            return Err(LeaseError::UnsafePath(
+                "deletion is limited to recorded owned slot paths",
+            ));
+        }
+        return fs::remove_file(path).map_err(io_error);
     }
     if metadata.file_type().is_file() {
         if metadata.uid() != current_uid() {
@@ -558,7 +581,8 @@ fn remove_tree_owned(root: &Path, path: &Path) -> Result<(), LeaseError> {
         return Err(LeaseError::UnknownAccounting);
     }
     let canonical = fs::canonicalize(path).map_err(io_error)?;
-    if !canonical.starts_with(root) || canonical == root {
+    let canonical_root = fs::canonicalize(root).map_err(io_error)?;
+    if !canonical.starts_with(&canonical_root) || canonical == canonical_root {
         return Err(LeaseError::UnsafePath(
             "deletion is limited to recorded owned slot paths",
         ));
