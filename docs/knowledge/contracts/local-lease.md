@@ -235,27 +235,29 @@ go to stderr as `oxide-storage-lease: <reason>: <message>`.
 ## Reviewed local handover artifact
 
 A packaging-only rebuild from merged reviewed source
-`c116666feb6916eae9e4adcba15775d9566c4ffe` (reviewed head
-`376844daedd363ff5c2441e3ba12d1dfbe4e54b0`, PR #66) is available at:
+`556171b63b69c32a89ec927ca2763b78f18efbc1` (reviewed head
+`f75cbb4d0efd11034adb3d1dd826df9bb993ecf0`, PR #67) is available at:
 
 ```text
-/Users/tom/Dev/projects/oxide/target/oxide-handover/376844daedd363ff5c2441e3ba12d1dfbe4e54b0/oxide-storage-lease
+/Users/tom/Dev/projects/oxide/target/oxide-handover/f75cbb4d0efd11034adb3d1dd826df9bb993ecf0/oxide-storage-lease
 ```
 
-SHA-256: `637a68b740b0ad424a085bd42b5b30feee129962334831c3cb4ee8f60e087785`.
+SHA-256: `ddceaf502589ea760a86edec8f47e3563675727f754c00888127eb4074535045`.
 This canonical-checkout rebuild has its own hash; the experimental binary
 hash remains unchanged in the evidence. No native fixture, consumer Cargo
 experiment, pool initialization or installation was performed by packaging.
 
-This replaces the `9b0b0fc8…` artifact with automatic half-cap recycling of
-compatible idle slots, as specified above. The delayed-APFS-metadata correction
-is retained. Existing receipt-v2/ledger-v1 pools reopen without re-init or
-migration; lease identities, JSON and exit codes are unchanged. The independent
-reviewer ran all covering selectors successfully, including 231 Rust tests
-(three environment-gated probes ignored), real allocated-byte recycling
-fixtures and a fresh native CLI proof. No threshold flag is needed. Consumers
-can remove a temporary pre-lease half-cap cold-fallback guard after installing
-this replacement, leaving ordinary busy/full/refusal fallback in place.
+This optional diagnostic upgrade adds `status --capacity` to the earlier
+`637a68b7…` recycling artifact. The APFS metadata correction and half-cap idle
+recycling remain present. Existing receipt-v2/ledger-v1 pools reopen without
+re-init or migration; legacy lease/status JSON and exits remain compatible.
+The independent reviewer ran all covering selectors successfully, including
+235 Rust tests (three environment-gated probes ignored) and a fresh native
+CLI proof with capacity sampling and byte-for-byte non-mutation checks.
+Nucleus's reported installed artifact remains the earlier recycling build
+until its owner chooses to replace it; no upgrade or live-pool read is needed
+to continue ordinary task use. The diagnostic does not expand the pool, clean
+packages, compact the image or change admission/ownership policy.
 
 Lease JSON v1 includes `lease_id`, `store_id`, `slot_id`, `incarnation`,
 `project`, `workspace`, `profile`, `holder`, `state`, `reused_slot` and the
