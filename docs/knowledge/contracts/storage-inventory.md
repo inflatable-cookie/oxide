@@ -40,8 +40,13 @@ cargo run --bin oxide-storage-inventory -- --root /path/to/target \
     --max-entries 50000 --max-depth 24 --max-output-bytes 32768 --max-elapsed-ms 10000
 ```
 
-There is intentionally no Effigy alias: the inventory is a runnable product
-command, not a language-neutral selector or a task-runner alias for QA.
+The inventory stays a runnable product command. It is not a language-neutral
+QA alias and does not scan a real project target. Covering exact-head CLI
+proof of the unpublished binary is `effigy rust:storage-inventory-cli`: it
+builds `oxide-storage-inventory` through Effigy and checks the output-byte
+ceiling on tiny synthetic fixtures (the 64-byte minimum and a normal cap,
+long or multibyte root fields, valid UTF-8 and JSON, explicit truncation,
+and exit 2 when the cap is reached).
 
 ## Required root and finite limits
 
@@ -170,9 +175,10 @@ without predicting benefit:
 ## Validation and evidence limits
 
 Covering repository checks are the ordinary selectors: `effigy rust:compile`,
-`effigy rust:format`, `effigy test rust` and `effigy docs:check`. The inventory
-itself never invokes Cargo or the compiler, so its fixtures are synthetic and
-small.
+`effigy rust:format`, `effigy test rust` and `effigy docs:check`. When the
+inventory binary or rendered output path changes, also run
+`effigy rust:storage-inventory-cli`. The inventory command itself never
+invokes Cargo or the compiler, so its fixtures are synthetic and small.
 
 The library unit tests build fresh fixtures under the task-owned scratch root
 and cover: known category grouping, a real hardlink across two categories with
