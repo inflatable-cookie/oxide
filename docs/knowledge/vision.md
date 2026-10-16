@@ -65,6 +65,19 @@ existing pool, default/global configuration, tool installation, nightly/JIT,
 release or scheduler changes are authorized. The approved Queue brief owns the
 exact invocation sequence, finite validation and cleanup conditions.
 
+Tom approved the narrower profile-only disposition on 2026-10-16 with
+"Approve" (Queue decision `00c38725-23c7-416a-8264-144add07177a`). The
+optional profiles may proceed through independent acceptance and normal Queue
+closeout using their existing exact-head behavior checks. The comparison remains
+failed: four sessions and 20 Cargo driver calls exceeded the authorized one
+session and eight calls, and the recorded clock excluded setup. This approval
+does not authorize those overruns retroactively or establish a performance,
+storage-saving or adoption claim. Preserve the failed verdict and raw evidence.
+A single additional documentary acceptance review is bounded to ten minutes;
+no new authoring, Cargo/build invocation, image or measurement session is
+authorized. Current defaults, consumer policy, installation and live pools remain
+unchanged. A source change or new defect must return for a scoped disposition.
+
 Tom's retained ruling, 2026-10-09: Effigy must remain language agnostic. Cargo/compiler-cache policy must not be added to Effigy. Oxide is a separate Rust-oriented development efficiency/DX project. Queue and Nucleus should consume one reusable Oxide facility rather than two implementations.
 
 Tom's Atlas confirmation, 2026-10-09: Queue/Nucleus manage tasks, agents and milestone QA run slots — the what and when. Oxide manages how Rust work executes efficiently within consumer-authorized workflows and resource bounds, including compatible build storage and Rust-specific execution strategy. Effigy owns language-neutral selector/process/env/lifecycle orchestration. Queue and Nucleus retain scheduler/admission authority, managed Git/source/task/workspace/run identity, authenticated settlement, source/evidence retention and artifact capture policy. Frozen Contract010 must not change.
