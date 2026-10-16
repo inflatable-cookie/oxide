@@ -57,6 +57,27 @@ target path; forced recompilation at the same path reported three hits. The
 trial is configuration-specific. It does not reject shared compiler caching
 for every project or configuration.
 
+The pinned [sccache 0.18.0 Rust notes](https://github.com/mozilla/sccache/blob/v0.18.0/docs/Rust.md)
+require incremental compilation to be disabled and exclude crates invoking the
+system linker, including binaries and proc-macro crates. They also warn about
+untracked filesystem reads by procedural macros. The [Rust implementation](https://github.com/mozilla/sccache/blob/v0.18.0/src/compiler/rust.rs)
+explicitly rejects incremental arguments. These constraints limit its value
+for the iterative incremental-on workflow now adopted by Nucleus; they do not
+exclude eligible dependencies or one-shot workloads. An unchanged warm Cargo
+slot can avoid invoking rustc at all, leaving no compiler-result lookup to
+accelerate. That is a reason to identify additional cacheable rebuild work
+before another trial, not a measured universal overhead claim. No `sccache`
+was found on the planner's current PATH during this read-only assessment; no
+installation or compilation was performed.
+
+Acow's current operations267 also records a concrete failed selective-clean
+configuration: cleaning workspace packages on source changes left shared
+registry artifacts unusable (`E0463` for `getrandom` and `digest`, milestone
+`1f5e26c5`), and that cleanup was removed. This is configuration-specific owner
+evidence, not proof all `cargo clean -p` usage fails. It reinforces the need
+to qualify a package-clean policy before offering it as dependency-only cache
+isolation; it is not an approved cleanup path for the Nucleus pool.
+
 ## Profiles and debug access
 
 At Nucleus commit `92dfb60cbae3b2eece70f03aa448e7b0cebc61d7`, the root Cargo
