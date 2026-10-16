@@ -2,10 +2,10 @@
 
 Usage refusals always run. On macOS, after a 20 GiB host reserve, the script
 provisions exactly one fresh 128 MiB APFS image (128 MiB declared cap, 512 MiB
-scratch, 120 s native phase), exercises lease/release/recover/status,
-concurrent acquire, duplicate-holder replay, busy, symlink/foreign refusal,
-idle reuse and mismatched backing, then detaches only after positive
-completion. This is not a filesystem-fill benchmark.
+scratch, 120 s native phase), exercises lease/release/recover/status and
+capacity sampling, concurrent acquire, duplicate-holder replay, busy,
+symlink/foreign refusal, idle reuse and mismatched backing, then detaches only
+after positive completion. This is not a filesystem-fill benchmark.
 """
 import json
 import os
@@ -172,6 +172,37 @@ def load_json(payload: bytes, label: str) -> dict:
     return value
 
 
+def snapshot_capacity_state(pool: str, slot_root: str) -> list[tuple[str, bytes]]:
+    snapshots = []
+    for name in ("config.json", "ledger.json", "receipt.json"):
+        path = os.path.join(pool, name)
+        with open(path, "rb") as handle:
+            snapshots.append((name, handle.read()))
+    for current, dirs, files in os.walk(slot_root, followlinks=False):
+        for name in sorted(dirs + files):
+            path = os.path.join(current, name)
+            relative = os.path.relpath(path, pool)
+            if os.path.islink(path):
+                fail(f"capacity fixture unexpectedly contains a symlink: {relative}")
+            if os.path.isfile(path):
+                with open(path, "rb") as handle:
+                    snapshots.append((relative, handle.read()))
+    return sorted(snapshots, key=lambda item: item[0])
+
+
+def fixture_footprint_bytes(root: str) -> int:
+    total = 0
+    for current, dirs, files in os.walk(root, followlinks=False):
+        for name in dirs + files:
+            path = os.path.join(current, name)
+            if os.path.islink(path):
+                continue
+            if os.path.isfile(path):
+                metadata = os.stat(path)
+                total += max(metadata.st_size, metadata.st_blocks * 512)
+    return total
+
+
 def prove_native(executable: str, parent: str) -> None:
     free = host_free_bytes(parent)
     if free < HOST_RESERVE_BYTES:
@@ -300,6 +331,107 @@ def prove_native(executable: str, parent: str) -> None:
         fail("lease omitted exact environment")
     if env["CARGO_TARGET_DIR"] != os.path.join(workspace_a, "target"):
         fail("CARGO_TARGET_DIR must stay private to the workspace")
+
+    sample_path = os.path.join(env["CARGO_BUILD_BUILD_DIR"], "capacity-sample.bin")
+    with open(sample_path, "wb") as handle:
+        handle.write(b"capacity fixture" * 256)
+    slot_root = os.path.dirname(env["CARGO_BUILD_BUILD_DIR"])
+    before_capacity = snapshot_capacity_state(pool, slot_root)
+    code, stdout, stderr = run_cli(
+        executable,
+        ["--pool", pool, "status", "--capacity", "--json"],
+        timeout=remaining(),
+    )
+    capacity_exit = code
+    capacity_report = load_json(stdout, "capacity status")
+    if capacity_report.get("version") != 1:
+        fail("capacity status did not use envelope version 1")
+    notes = capacity_report.get("notes") or []
+    if not any("not filesystem headroom" in note for note in notes):
+        fail("capacity JSON did not label legacy full as a cap comparison")
+    nested = capacity_report.get("status")
+    if not isinstance(nested, dict):
+        fail("capacity status omitted nested ordinary status")
+    expected_status_fields = {
+        "version", "store_id", "backend", "cap_bytes", "payload_logical_bytes",
+        "payload_unique_allocated_bytes", "coverage", "full", "slots",
+    }
+    if set(nested) != expected_status_fields:
+        fail(f"nested ordinary status shape changed: {set(nested)!r}")
+    if nested.get("full") is not False:
+        fail("legacy full must retain its declared-cap comparison for a small slot")
+    if nested.get("coverage") != "complete" or not nested.get("slots"):
+        fail("capacity report lost complete ordinary slot accounting")
+    slot = next(
+        (item for item in nested["slots"] if item.get("slot_id") == grant["slot_id"]),
+        None,
+    )
+    if not slot or slot.get("state") != "held" or slot.get("logical_bytes", 0) < 4096:
+        fail("capacity report did not retain the held slot observation")
+    observed = capacity_report.get("capacity")
+    if not isinstance(observed, dict):
+        fail("capacity report omitted observations")
+    if observed.get("declared_cap_bytes") != CAP_BYTES:
+        fail("capacity report declared cap mismatch")
+    if observed.get("verified_capacity_bytes") != verified:
+        fail("capacity report changed the verified payload ceiling")
+    for name in ("payload_free_bytes", "payload_available_bytes"):
+        sample = observed.get(name) or {}
+        value = sample.get("value_bytes")
+        if not isinstance(value, int) or not 0 <= value <= verified:
+            fail(f"{name} is not a raw payload byte sample: {sample!r}")
+    image_logical = observed.get("image_logical_bytes", {}).get("value_bytes")
+    if not isinstance(image_logical, int) or image_logical < 0:
+        fail("image logical st_size is not an exact byte count")
+    image_allocated = observed.get("image_allocated_bytes", {}).get("value_bytes")
+    if not isinstance(image_allocated, int) or image_allocated < 0:
+        fail("image st_blocks allocation is not an exact byte count")
+    host_available = observed.get("host_available_bytes") or {}
+    if host_available.get("value_bytes") is None and not host_available.get("unknown_reason"):
+        fail("unknown host available capacity omitted its reason")
+    if observed.get("coverage") not in ("complete", "partial"):
+        fail(f"unexpected capacity coverage: {observed.get('coverage')!r}")
+    expected_partial = (
+        nested.get("coverage") != "complete" or observed.get("coverage") != "complete"
+    )
+    if (capacity_exit == 2) != expected_partial:
+        fail(f"capacity status partial exit mismatch: exit {capacity_exit}")
+    if capacity_exit not in (0, 2):
+        fail(f"capacity status failed exit {capacity_exit}: {stderr!r}")
+    if snapshot_capacity_state(pool, slot_root) != before_capacity:
+        fail("capacity status changed config, ledger, receipt or held slot bytes")
+
+    code, stdout, stderr = run_cli(
+        executable,
+        ["--pool", pool, "status", "--capacity"],
+        timeout=remaining(),
+    )
+    if code != capacity_exit:
+        fail(f"human capacity partial exit mismatch: {code} != {capacity_exit}")
+    human = stdout.decode("utf-8")
+    if "legacy cap" not in human or "not reservations" not in human:
+        fail("human capacity output omitted its scope and limits")
+
+    code, stdout, stderr = run_cli(
+        executable,
+        [
+            "--pool", pool, "status", "--capacity", "--json",
+            "--max-output-bytes", "64",
+        ],
+        timeout=remaining(),
+    )
+    if code != 2 or len(stdout) > 64:
+        fail(f"64-byte capacity JSON cap failed: exit {code}, bytes {len(stdout)}")
+    if not load_json(stdout, "64-byte capacity JSON").get("truncated"):
+        fail("64-byte capacity JSON did not mark truncation")
+    code, stdout, stderr = run_cli(
+        executable,
+        ["--pool", pool, "status", "--capacity", "--max-output-bytes", "64"],
+        timeout=remaining(),
+    )
+    if code != 2 or len(stdout) > 64:
+        fail(f"64-byte capacity human cap failed: exit {code}, bytes {len(stdout)}")
+    stdout.decode("utf-8")
 
     code, stdout, stderr = run_cli(
         executable,
@@ -432,10 +564,18 @@ def prove_native(executable: str, parent: str) -> None:
     )
     if code != 4:
         fail(f"symlink pool exit {code}, expected 4")
+    code, stdout, stderr = run_cli(
+        executable,
+        ["--pool", link, "status", "--capacity", "--json"],
+        timeout=remaining(),
+    )
+    if code != 4:
+        fail(f"capacity symlink pool exit {code}, expected 4")
 
     fake = os.path.join(parent, "fake-pool")
     os.mkdir(fake, 0o700)
-    with open(os.path.join(fake, "config.json"), "w", encoding="utf-8") as handle:
+    fake_config = os.path.join(fake, "config.json")
+    with open(fake_config, "w", encoding="utf-8") as handle:
         json.dump(
             {
                 "version": 1,
@@ -446,11 +586,20 @@ def prove_native(executable: str, parent: str) -> None:
             },
             handle,
         )
+    os.chmod(fake_config, 0o600)
+    os.close(os.open(os.path.join(fake, "lock"), os.O_CREAT | os.O_WRONLY, 0o600))
     code, stdout, stderr = run_cli(
         executable, ["--pool", fake, "status", "--json"], timeout=remaining()
     )
     if code not in (3, 4):
         fail(f"mismatched backing exit {code}, expected 3 or 4")
+    code, stdout, stderr = run_cli(
+        executable,
+        ["--pool", fake, "status", "--capacity", "--json"],
+        timeout=remaining(),
+    )
+    if code != 4:
+        fail(f"capacity missing-backing exit {code}, expected 4")
 
     code, stdout, stderr = run_cli(
         executable, ["--pool", pool, "status", "--json"], timeout=remaining()
@@ -489,6 +638,9 @@ def main() -> int:
     except Exception:
         print(f"native lease proof retained its owned scratch at {native}", file=sys.stderr)
         raise
+    footprint = fixture_footprint_bytes(native)
+    if footprint > SCRATCH_LIMIT_BYTES:
+        fail(f"native fixture footprint {footprint} exceeds the 512 MiB scratch cap")
     shutil.rmtree(native)
     print("oxide-storage-lease CLI proof held")
     return 0

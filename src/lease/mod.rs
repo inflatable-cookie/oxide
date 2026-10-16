@@ -18,7 +18,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-pub use pool::{lease, recover, release, status, LeaseRequest};
+pub use pool::{capacity_status, lease, recover, release, status, LeaseRequest};
 
 #[cfg(test)]
 mod tests;
@@ -31,6 +31,14 @@ pub const BINARY_NAME: &str = "oxide-storage-lease";
 pub const DEFAULT_STATUS_OUTPUT_BYTES: usize = 64 * 1024;
 /// Minimum rendered status cap.
 pub const MIN_STATUS_OUTPUT_BYTES: usize = 64;
+/// Version of the separate status capacity envelope.
+pub const CAPACITY_STATUS_VERSION: u32 = 1;
+pub const CAPACITY_STATUS_NOTES: [&str; 4] = [
+    "status.full compares owned slot allocation with declared cap; it is not filesystem headroom",
+    "payload free and available bytes are samples, not reservations, build-fit predictions, attributable writes, or guaranteed reclaimable space",
+    "image st_blocks is host file allocation, not APFS unique extents or snapshot accounting",
+    "private target/temp, control, OS and snapshot overhead are excluded; whole-host cost and Finder purgeable are unknown",
+];
 /// Finite slot count. Exhaustion refuses a new slot.
 pub const MAX_SLOTS: usize = 32;
 /// Finite ledger file size including the atomic temp.
@@ -252,6 +260,102 @@ pub struct PoolStatus {
     pub slots: Vec<SlotStatus>,
 }
 
+/// A byte sample is either an exact value or an explicit bounded unknown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ByteObservation {
+    pub value_bytes: Option<u64>,
+    pub unknown_reason: Option<ObservationUnknownReason>,
+}
+
+impl ByteObservation {
+    pub const fn observed(value_bytes: u64) -> Self {
+        Self {
+            value_bytes: Some(value_bytes),
+            unknown_reason: None,
+        }
+    }
+
+    pub const fn unknown(reason: ObservationUnknownReason) -> Self {
+        Self {
+            value_bytes: None,
+            unknown_reason: Some(reason),
+        }
+    }
+}
+
+/// Finite reasons for a capacity sample that could not be reported.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationUnknownReason {
+    Unsupported,
+    SampleFailed,
+    Overflow,
+}
+
+/// Measurements from the explicitly verified pool payload and pinned image.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityObservations {
+    pub declared_cap_bytes: u64,
+    pub verified_capacity_bytes: u64,
+    pub payload_free_bytes: ByteObservation,
+    pub payload_available_bytes: ByteObservation,
+    pub image_logical_bytes: ByteObservation,
+    pub image_allocated_bytes: ByteObservation,
+    pub host_available_bytes: ByteObservation,
+    pub coverage: AccountingCoverage,
+}
+
+impl CapacityObservations {
+    fn new(
+        declared_cap_bytes: u64,
+        verified_capacity_bytes: u64,
+        payload_free_bytes: ByteObservation,
+        payload_available_bytes: ByteObservation,
+        image_logical_bytes: ByteObservation,
+        image_allocated_bytes: ByteObservation,
+        host_available_bytes: ByteObservation,
+    ) -> Self {
+        let known = [
+            payload_free_bytes,
+            payload_available_bytes,
+            image_logical_bytes,
+            image_allocated_bytes,
+            host_available_bytes,
+        ]
+        .into_iter()
+        .filter(|sample| sample.value_bytes.is_some())
+        .count();
+        let coverage = if known == 5 {
+            AccountingCoverage::Complete
+        } else if known == 0 {
+            AccountingCoverage::Unknown
+        } else {
+            AccountingCoverage::Partial
+        };
+        Self {
+            declared_cap_bytes,
+            verified_capacity_bytes,
+            payload_free_bytes,
+            payload_available_bytes,
+            image_logical_bytes,
+            image_allocated_bytes,
+            host_available_bytes,
+            coverage,
+        }
+    }
+}
+
+/// Versioned capacity output. The nested status retains its strict legacy shape.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CapacityStatus {
+    pub version: u32,
+    pub status: PoolStatus,
+    pub capacity: CapacityObservations,
+    pub notes: [&'static str; 4],
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountingCoverage {
@@ -324,6 +428,91 @@ pub fn render_status_human(
         false,
         status.coverage != AccountingCoverage::Complete,
     )
+}
+
+pub fn render_capacity_status_json(
+    report: &CapacityStatus,
+    max_output_bytes: usize,
+) -> Result<RenderedStatus, LeaseError> {
+    render_bounded(
+        serde_json::to_vec(report).map_err(|error| LeaseError::Io(error.to_string()))?,
+        max_output_bytes,
+        true,
+        report.status.coverage != AccountingCoverage::Complete
+            || report.capacity.coverage != AccountingCoverage::Complete,
+    )
+}
+
+pub fn render_capacity_status_human(
+    report: &CapacityStatus,
+    max_output_bytes: usize,
+) -> Result<RenderedStatus, LeaseError> {
+    let status = &report.status;
+    let capacity = &report.capacity;
+    let mut text = format!(
+        "oxide-storage-lease status --capacity\nstore {} backend {}\nlegacy cap {} bytes; full {:?} (slot allocation vs declared cap, not filesystem headroom)\nslot accounting {:?}: logical {:?} bytes, unique allocated {:?} bytes\ncapacity observation coverage {:?}\n",
+        status.store_id,
+        status.backend,
+        status.cap_bytes,
+        status.full,
+        status.coverage,
+        status.payload_logical_bytes,
+        status.payload_unique_allocated_bytes,
+        capacity.coverage,
+    );
+    for slot in &status.slots {
+        text.push_str(&format!(
+            "  slot {} {:?} logical {:?} bytes, unique allocated {:?} bytes\n",
+            slot.slot_id, slot.state, slot.logical_bytes, slot.unique_allocated_bytes
+        ));
+    }
+    text.push_str(&format!(
+        "declared payload cap {} bytes; verified payload ceiling {} bytes\n",
+        capacity.declared_cap_bytes, capacity.verified_capacity_bytes
+    ));
+    append_observation(
+        &mut text,
+        "payload filesystem free (statfs f_bfree)",
+        capacity.payload_free_bytes,
+    );
+    append_observation(
+        &mut text,
+        "payload filesystem available (statfs f_bavail)",
+        capacity.payload_available_bytes,
+    );
+    append_observation(
+        &mut text,
+        "image file logical (st_size)",
+        capacity.image_logical_bytes,
+    );
+    append_observation(
+        &mut text,
+        "image file allocated (st_blocks x 512; not APFS unique extents)",
+        capacity.image_allocated_bytes,
+    );
+    append_observation(
+        &mut text,
+        "host filesystem available at pool (statfs f_bavail)",
+        capacity.host_available_bytes,
+    );
+    text.push_str(
+        "observations are not reservations, fit predictions or attributable writes\nnot whole-host cost: control, private target/temp, OS and snapshot overhead excluded; Finder purgeable unknown\n",
+    );
+    render_bounded(
+        text.into_bytes(),
+        max_output_bytes,
+        false,
+        status.coverage != AccountingCoverage::Complete
+            || capacity.coverage != AccountingCoverage::Complete,
+    )
+}
+
+fn append_observation(text: &mut String, label: &str, observation: ByteObservation) {
+    match (observation.value_bytes, observation.unknown_reason) {
+        (Some(bytes), None) => text.push_str(&format!("{label}: {bytes} bytes\n")),
+        (None, Some(reason)) => text.push_str(&format!("{label}: unknown ({reason:?})\n")),
+        _ => text.push_str(&format!("{label}: unknown (sample_failed)\n")),
+    }
 }
 
 fn render_bounded(
