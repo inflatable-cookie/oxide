@@ -33,3 +33,7 @@ The installed package route supplies the authoring rules; these repository
 files activate the route and define its local profile.
 
 Repository validation selectors are listed in [`AGENTS.md`](../../AGENTS.md).
+The opt-in `oxide-light`/`oxide-full-debug` development profiles, their
+selectors and their measured tradeoff are owned by the
+[stable Cargo profiles contract](contracts/stable-cargo-profiles.md); they do
+not change the default profiles or the pinned toolchain.

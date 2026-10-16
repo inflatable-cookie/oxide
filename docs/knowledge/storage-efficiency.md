@@ -87,7 +87,11 @@ does not declare a `rust-version`; no MSRV is inferred here. Acowtancy's
 existing test-profile reductions and Nucleus's explicit full-debug route leave
 no source-backed case for another profile edit in this assessment. Disabling
 incremental output can increase rebuild work, and final target size alone
-would not establish reduced disk writes.
+would not establish reduced disk writes. That assessment covered the inspected
+consumer projects; Oxide later added its own opt-in profiles with measured
+evidence. The [stable Cargo profile contract](contracts/stable-cargo-profiles.md)
+owns them and the [comparison below](#stable-cargo-profile-comparison-2026-10-16)
+summarizes the result for this workspace.
 
 ## Incremental and debug storage measurements
 
@@ -218,6 +222,58 @@ The [measurement recipe](evidence/incremental-comparison-20261015/measurement-re
 [on backtrace](evidence/incremental-comparison-20261015/raw/on-backtrace.log) and
 [authenticated settlement](evidence/incremental-comparison-20261015/follow.json)
 make the result independently inspectable without another build.
+
+## Stable Cargo profile comparison (2026-10-16)
+
+The author ran the bounded comparison approved for oxide#068 directly, under
+one genuine Effigy heavy-admitted run (run class `heavy`, outcome `passed`,
+run `d3b79d01e089c8647cb03db0df40dafaad52cd2925226ad416498f16feac50cb`). The
+[stable Cargo profile contract](contracts/stable-cargo-profiles.md) owns the
+profile recipe, the debugging tradeoff and the limits; this section records
+the measured result and its receipts.
+
+Two source-identical disposable copies of the pushed implementation commit
+`c762a731276c6677993002064ef5287676344fde` (tree
+`c3c98d78a59cf1b8ed8973f67a66404bd0554dfd`) received the same appended public
+constant. The default `test` profile and `oxide-light` each ran a cold test
+build, the identical edit rebuild and an unchanged rerun; one explicit
+`oxide-full-debug` cold control followed. Every positive call executed the
+same probe test and feature set. Eight Cargo driver invocations ran in a
+67.0-second session inside one fresh 16 GiB APFS payload volume; the 20 GiB
+raw host reserve held throughout.
+
+| Step | Default `test` | `oxide-light` |
+| --- | ---: | ---: |
+| Cold test build | 14.24 s; 276.3 MiB whole target | 11.98 s; 223.3 MiB whole target |
+| Identical source edit rebuild | 6.41 s | 2.81 s |
+| Unchanged rerun (test executed) | 0.26 s | 0.26 s |
+| `deps` + `incremental` union, cold | 260.6 MiB | 208.5 MiB |
+| `deps` + `incremental` union, after edit | 346.2 MiB | 293.1 MiB |
+| Workspace unit debug (`-C debuginfo`) | `2` | `line-tables-only` |
+| Dependency / build-time unit debug | `2` / none | none (`strip=debuginfo`) |
+
+The unchanged rerun rebuilt no workspace unit in either mode. The
+`oxide-full-debug` control compiled in 12.49 s, used a 304.2 MiB whole target
+and resolved `-C debuginfo=2` for workspace, dependency, build-script and
+proc-macro units. The default `test` profile resolved the same full workspace
+and dependency debug information it resolved before the profiles were added,
+and no default profile was overridden.
+
+In this one host and sequence the light profile kept the executed tests,
+unwinding, assertions and overflow checks, rebuilt the small semantic edit
+about 2.3 times faster, and used about 53 MiB less allocated build storage.
+The cold difference is a single observation and is not isolated as a profile
+effect. No attributable SSD writes, SSD lifetime, debugger-variable custody
+or general project-wide speed claim follows.
+
+The three harness corrections that preceded the measured session are recorded
+in [attempt sessions](evidence/stable-cargo-profiles-20261016/sessions.json)
+rather than hidden: each used a fresh root, fresh image, fresh clock and its
+own call budget, and no running clock or cap was reset. Raw logs, the exact
+recipe, the per-unit resolved settings and the authenticated run status are in
+the [evidence package](evidence/stable-cargo-profiles-20261016/summary.json).
+The measured build inputs are the implementation commit in the packet; later
+commits are evidence and documentation only.
 
 ## Nucleus consumer adoption (2026-10-15)
 
