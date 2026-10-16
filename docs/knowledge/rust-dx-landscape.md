@@ -46,6 +46,39 @@ Compare representative edit/check/run/test loops across supported approaches. Co
 
 Remote execution/cache could reduce local compilation, but adds transfer/storage cost, source trust, credentials, latency and a new failure surface. RAM-backed intermediates could reduce some file writes but introduce memory pressure, volatility and possible swap; neither approach is selected. A user should not need to administer infrastructure to obtain the core experience.
 
+## Stable profile and backend eligibility
+
+Read-only recheck, 2026-10-16: the [Cargo build-performance guide](https://doc.rust-lang.org/cargo/guide/build-performance.html#reduce-amount-of-generated-debug-information)
+recommends workspace line tables, dependency debug disabled and an explicit
+high-quality-debug route as a possible faster/smaller development tradeoff.
+Cargo's [profile override rules](https://doc.rust-lang.org/cargo/reference/profiles.html#overrides)
+make `package."*"` apply to non-workspace members; named overrides,
+build overrides, configuration and environment precedence still matter.
+The tradeoff loses dependency source/type/variable debugging in that light
+build and requires a rebuild for richer debugging. It is a candidate to
+measure, not a benefit established on every project.
+
+At this check Oxide's manifest has no custom profiles and uses pinned stable
+1.97.1. An explicit custom light profile can leave existing dev/test/release
+defaults intact, preserve incremental compilation, assertions, overflow checks
+and panic unwinding, retain workspace backtrace lines and reduce dependency
+debug output. A separately explicit full-debug profile must resolve full debug
+for the relevant workspace, dependency and build-time units; a profile name or
+inheritance statement alone is not proof. Compare the same tests and semantic
+edit on identical source, and verify actual Cargo/rustc debug settings and
+backtraces. This neither configures Nucleus nor adds context policy to Effigy.
+
+The upstream [Cranelift README](https://github.com/rust-lang/rustc_codegen_cranelift#not-yet-supported)
+lists aarch64 macOS as supported but still excludes macOS panic unwinding;
+panic-abort is its default. Its [JIT mode](https://github.com/rust-lang/rustc_codegen_cranelift/blob/main/docs/usage.md#jit-mode)
+remains experimental, lacks incremental compilation and requires dynamically
+available dependencies. Those constraints prevent claiming a drop-in replacement
+for the current unwind-dependent test loop. A narrower run-only or another
+platform experiment remains possible; JIT is not retired. The local toolchain
+list includes nightly-2026-08-05, but its installed-component list contains no
+Cranelift backend; no component, compiler or global override was installed or
+changed during this check. Merely having nightly does not qualify the backend.
+
 ## Product assessment
 
 Planner recommendation: a small coherent entry point over evidence-backed mechanisms, with three capabilities: see and explain costs, bound and reuse owned storage, and apply qualified improvements with clear trade-offs. The reusable storage core must work for ordinary developers as well as orchestrators. A daemon, CLI, editor surface or UI is still an open choice.

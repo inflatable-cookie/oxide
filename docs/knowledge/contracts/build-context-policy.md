@@ -1,6 +1,14 @@
 # Build-context policy (proposed)
 
-Status: proposed design, approved as design direction on 2026-10-15 in [vision](../vision.md#authority-boundaries). Oxide does not activate a context resolver through this document. Shipped ordinary-Cargo behavior stays in [ordinary Cargo storage](ordinary-cargo-storage.md) and [reuse identity](ordinary-cargo-reuse-identity.md). The current ordinary prototype does not evict, does not enforce a new budget, and does not know about incremental state. Those are candidate implementation work, not shipped ability.
+Status: proposed context-resolution design, approved as design direction on
+2026-10-15 in [vision](../vision.md#authority-boundaries). No automatic context
+resolver is activated by this document. The current [lean local CLI](local-lease.md)
+does enforce a bounded payload and retire known idle slots; its profile label
+does not set Cargo debug or incremental values. The ordinary-Cargo
+[protected route](ordinary-cargo-storage.md) and [reuse identity](ordinary-cargo-reuse-identity.md)
+below are separate historical design/implementation context. Do not infer that
+the lean route requires their signing machinery or that storage bounds are
+still unimplemented.
 
 Consumer policy remains consumer-owned. Tom adopted incremental-on for Nucleus managed agents and incremental-off for one-shot validation in Nucleus `ff43e69701f08e5a9ddf84d424a381dea8d033de`, superseding its `fb2bd04` agent stopgap. [Storage efficiency](../storage-efficiency.md#nucleus-consumer-adoption-2026-10-15) owns that adoption receipt and its limits. This does not activate Oxide slots or imply a Queue policy change.
 
