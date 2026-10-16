@@ -20,6 +20,7 @@ Tom's 2026-10-10 blanket approval in [vision](docs/knowledge/vision.md#authority
 
 - `effigy rust:compile` checks the workspace and all targets with the committed lockfile.
 - `effigy rust:format` checks Rust formatting.
+- `effigy rust:profile-light` and `effigy rust:profile-full-debug` are opt-in profile proofs: each verifies the resolved rustc debug settings Cargo passed for workspace, dependency and build-time units and runs the focused backtrace/unwind probe under that profile. They are focused proofs, not benchmarks or an alias for full QA.
 - `effigy test rust` is the named Rust test suite. Do not add a `tasks.test` alias.
 - `effigy docs:check` runs the Northstar link and retired-concept checks plus `git diff --check HEAD`. The link check excludes `docs/knowledge/architecture.md`, whose references to optional sibling repositories are unavailable in a standalone checkout.
 - `effigy build-context:comparison:test` runs synthetic fixtures for the private incremental comparison launcher. It never enters the live image or Cargo path.
