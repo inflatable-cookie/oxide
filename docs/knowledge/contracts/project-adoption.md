@@ -428,33 +428,42 @@ route. Existing private cold fallback must omit all acquired shared paths.
 
 The first of those two deliveries is the unpublished local lease CLI with
 bounded backing, admission and idle-only eviction, owned by
-[local lease](local-lease.md). The focused real cross-worktree qualification
-and consumer handover remain a dependent gate. Cross-path reuse must pass
-before Nucleus is told the CLI is ready; a precise negative result is reported
-instead of handing over a path-isolated substitute. Reuse the existing bounded
+[local lease](local-lease.md). The focused qualification below establishes the narrow real cross-worktree
+result; the [local CLI contract](local-lease.md) supplies its reviewed interface
+and handover artifact. Nucleus owns integration of that interface. Broader
+source/configuration/workflow guarantees are not implied. Reuse the existing bounded
 filesystem and inventory implementation; old authentication/callback plumbing
 is not required. This assessment creates no live consumer, host installation
 or real experiment.
 
-On 2026-10-16 oxide#064 qualified the focused cross-worktree gate on the
-lean CLI plus its volume-size-ceiling correction (declared cap must equal
-image size; measured verified capacity is the effective bound): one shared
-`dev` slot served the pinned Nucleus planning/diagnostics workflow at two
-disposable checkout paths in four Cargo calls and 112 seconds. Cold A rebuilt
-73 units; different-path B rebuilt only its changed planning test (72 fresh,
-`libsqlite3-sys` fresh with no rebuild); changed A repeated that shape; the
-unchanged rerun rebuilt nothing (73 fresh) with all 67 tests green, each run
-asserting its current include-marker and compile-time manifest path. Same-slot
-reuse, same-holder replay, busy refusal, writer-closed releases, the 10 GiB /
-45 min / 4-call / 20 GiB-reserve bounds and ordinary detach all held. Raw
-per-run unit/test/footprint records and the frozen execution packet are in
-`docs/knowledge/evidence/oxide-064-cross-path-qualification.json` (host raw
-logs retained under the recorded proof root). Known limits: build-script
-`executed` messages recur identically on every run without downstream rebuilds
-and are not repeated native compilation; native byte hashes and a slot symlink
-census were not taken; eviction never triggered. This is a handover-grade
-positive for registry/native reuse on fresh paths, not consumer activation,
-installation or everyday-relief proof.
+The focused 2026-10-16 cross-worktree result uses one shared `dev` slot
+and pinned Nucleus planning/diagnostics workflow. Cold A rebuilt 73 units in
+48.16s; different-path B rebuilt only its changed planning test (72 fresh,
+including `libsqlite3-sys`) in 18.40s; changed A repeated that shape; the
+unchanged rerun rebuilt nothing. Selected tests executed every time, including
+the current marker/manifest-path test where introduced. Same-holder replay,
+busy refusal and writer-closed releases were observed. Four Cargo calls were
+used; no further experimental call is implied by the positive review.
+
+[Evidence](../evidence/oxide-064-cross-path-qualification.json) preserves the
+frozen pins/raw paths and the original driver's `go=false`. The driver's
+judge misclassified recurring build-script JSON rows as process executions;
+independent review accepted raw Cargo fresh/test receipts with that limitation
+explicit. The reported 5.70 GB footprint conservatively counted image apparent
+and allocated bytes twice; the union estimate is about 3.46 GB. Footprint and
+host reserve were sampled at run boundaries, not continuously. The old/equal
+mtime include files accompanied fresh Rust test edits, so input-only timestamp
+invalidation was not isolated. No native `.a` hashes, slot symlink census,
+full-debug live run or live eviction result was captured. This supports
+consumer integration of the observed ordinary-Cargo workflow; it is not a
+general source-path/invalidation, native-write, SSD-lifetime or production
+activation claim. The [local CLI contract](local-lease.md) owns actual command,
+JSON, exits, artifact path and recovery limits.
+
+### Historical protected-route references
+
+The following describes the earlier removed consumer/protected route, not
+requirements to recreate its issuer/capture machinery for the lean CLI.
 
 Nucleus intentionally removed its never-live disabled Oxide consumer code
 in the 2026-10-15 simplification reset. At reviewed owner inspection of

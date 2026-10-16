@@ -128,19 +128,52 @@
     "read_copy_bytes": 186988446,
     "read_copy_limit_bytes": 2147483648,
     "measurement_output_bytes": "~300000 (raw logs, limit 67108864)",
-    "host_reserve_bytes": "held above 21474836480 before every run"
+    "host_reserve_bytes": "held above 21474836480 before every run",
+    "footprint_interpretation": "Conservative upper estimate: image apparent and allocated bytes were both added; not an exact physical total.",
+    "image_counted_twice_bytes": 2246062080,
+    "physical_union_estimate_bytes": 3456069632,
+    "sampling_limit": "Host reserve and owned footprint observed at run boundaries, not continuously during each Cargo call."
   },
   "patches": {
     "b": "tests/fixtures/oxide-064-b.txt ('oxide-064-marker-b') + appended include_str!/manifest-dir test; fixture mtime pinned to B-clone anchor (older than all build outputs), test source fresh",
     "a": "tests/fixtures/oxide-064-a2.txt ('oxide-064-marker-a2') + appended test; fixture mtime pinned equal to B's fixture anchor, test source fresh",
     "status": "both checkouts show exactly the two recorded patch files; canonical /Users/tom/Dev/projects/nucleus never written"
   },
-  "build_script_notes": "build-script-executed messages recur identically (10 registry script packages, 11 messages) on cold, cross-path and fully-fresh runs; zero downstream rebuilds follow them on warm runs and the unchanged rerun finished in 14s including 67 tests, which is incompatible with repeated bundled-SQLite C compilation. The messages therefore do not represent repeated native compilation; whether Cargo replays cached execution records or re-runs scripts with identical output was not isolated and is recorded as an explicit unknown, not a reuse failure.",
+  "build_script_notes": "The same 11 build-script-executed rows occur even on the fully-fresh final run, whose Cargo compile phase reports 0.94s and zero Compiling lines. Message count is not a process-execution count. Independent review accepted the observed Cargo fresh lib/build-script-unit and selected-test evidence for reuse. There was no native .a hash/inode comparison or direct C-compiler process trace; do not turn this into a general native-write or no-execution claim.",
   "limits": [
     "Native .a byte hashes were not taken (slot detached after settled proof); reuse rests on Cargo fresh flags, collapsed wall times and executed current-behavior asserts, which a stale binary would fail.",
     "Slot-directory symlink census unobserved after detach; private target trees and the private cargo home are symlink-free; idle-only eviction never triggered, so the nested-symlink eviction wedge was not exercised and its safety refusal is unchanged.",
     "Nucleus observer/ps/lsof paths are compiled but unused by the selected planning/diagnostics tests (pre-existing selector limit).",
-    "Private offline cargo home served all runs; --offline/--locked/CARGO_NET_OFFLINE=true; no network, no toolchain install, no canonical-source mutation."
+    "Private offline cargo home served all runs; --offline/--locked/CARGO_NET_OFFLINE=true; no network, no toolchain install, no canonical-source mutation.",
+    "Older/equal-mtime input-only invalidation was not isolated: each old-mtime include file was added alongside freshly changed planning.rs. The current marker/path test passed; do not claim coverage of an input-only timestamp-restored change or all workspace-library path dependencies.",
+    "Only the pinned dev/incremental/line-table workflow was exercised live; full-debug/profile/configuration/toolchain-change behavior was not a new experimental matrix.",
+    "Original source/setup/empty staging and measured phase remain in raw packet/receipts; no authority to repeat any of the four calls."
   ],
-  "raw_records": "proof_root/evidence/driver-state.json (leases, units, footprints), proof_root/raw/run*.stdout|stderr.log, proof_root/packet.json (frozen pre-effects execution packet)"
+  "raw_records": "proof_root/evidence/driver-state.json (leases, units, footprints), proof_root/raw/run*.stdout|stderr.log, proof_root/packet.json (frozen pre-effects execution packet)",
+  "independent_review": {
+    "head": "ecc185bc77ce382d5a832656166a144822a1bc6a",
+    "run": "86705854-9d1f-4040-ac14-23a8cb3773f3",
+    "comment": 6213212075,
+    "verdict": "all five gates pass for the observed ordinary-Cargo workflow, with the limitations below"
+  },
+  "driver_verdict": {
+    "go": false,
+    "cross_path_native_reuse_b": false,
+    "reason": "The raw judge rejects any libsqlite3-sys build-script-executed JSON row, including rows emitted by the fully-fresh run. Independent review accepted Cargo fresh/unit/test receipts rather than this message-count predicate. Raw judge output is preserved unchanged."
+  },
+  "lock_staging": {
+    "input": "/tmp/nuc.lock",
+    "use": "measure.py private Cargo-home package selection",
+    "sha256": "ab2ed097a6d9cc740cc738b32d1c361d99214b16f0dbdeacfeb061bc10d1d57d",
+    "provenance": "Reviewer observed hash correspondence to the pinned lock. The staging file creator/time was not recorded in this summary; the file is now absent. No stronger provenance claim."
+  },
+  "handover_artifact": {
+    "source_commit": "0496f2fbad544d59f515d7dda3051e19a8c3524c",
+    "reviewed_head": "ecc185bc77ce382d5a832656166a144822a1bc6a",
+    "binary": "/Users/tom/Dev/projects/oxide/target/oxide-handover/ecc185bc77ce382d5a832656166a144822a1bc6a/oxide-storage-lease",
+    "sha256": "9d468378af13b1438227d93c5b166ab638ce5a19adfe2ead3857ee4f6085d1a8",
+    "size_bytes": 1999048,
+    "toolchain": "1.97.1",
+    "note": "Packaging rebuild from merged reviewed source at canonical checkout. No native fixture, Nucleus Cargo experiment, install, or pool creation."
+  }
 }

@@ -3,9 +3,12 @@
 Status: unpublished Oxide-only product command. Same-UID callers take exclusive
 owned slots on a verified APFS payload volume through a short-lived OS lock and
 a durable JSON ledger. There is no resident daemon, HMAC credential, issuer,
-callback service, Cargo runner, scheduler or Git manager. Cross-worktree
-usefulness is a mandatory dependent qualification and is **not** established by
-this command. Do not treat this CLI as Nucleus-ready.
+callback service, Cargo runner, scheduler or Git manager. A focused pinned
+Nucleus `dev` workflow demonstrated cross-worktree registry reuse under
+ordinary Cargo and cooperative writer-closed release. The [consumer boundary](project-adoption.md#current-nucleus-integration-boundary)
+and [raw-backed evidence](../evidence/oxide-064-cross-path-qualification.json)
+record the qualified scope and limits. Consumer integration remains owner-run;
+this is not an installed service or a general source-invalidation guarantee.
 
 Publication naming remains [Q-005](../questions.md#q-005--what-names-are-safe-to-publish).
 The package stays `publish = false`. The binary name `oxide-storage-lease` is
@@ -145,6 +148,43 @@ distinct from managed payload bytes. Status does not add them together.
 Lease/release/recover/init emit one versioned JSON object on stdout. Errors
 go to stderr as `oxide-storage-lease: <reason>: <message>`.
 
+## Reviewed local handover artifact
+
+A packaging-only rebuild from merged reviewed source
+`0496f2fbad544d59f515d7dda3051e19a8c3524c` (runtime source identical to reviewed
+`ecc185bc77ce382d5a832656166a144822a1bc6a`) is available at:
+
+```text
+/Users/tom/Dev/projects/oxide/target/oxide-handover/ecc185bc77ce382d5a832656166a144822a1bc6a/oxide-storage-lease
+```
+
+SHA-256: `9d468378af13b1438227d93c5b166ab638ce5a19adfe2ead3857ee4f6085d1a8`.
+This canonical-checkout rebuild has its own hash; the experimental binary
+hash remains unchanged in the evidence. No native fixture, consumer Cargo
+experiment, pool initialization or installation was performed by packaging.
+
+Lease JSON v1 includes `lease_id`, `store_id`, `slot_id`, `incarnation`,
+`project`, `workspace`, `profile`, `holder`, `state`, `reused_slot` and the
+`env` object with the two exact variable names above. Release/recover returns
+`{version:1, lease_id, state:"idle", replay}`. Status uses `slots`,
+`payload_logical_bytes`, `payload_unique_allocated_bytes`, `coverage`, `full`
+and pool identity/cap fields. Actual serialization is JSON with quoted keys.
+The profile label selects storage; callers must use the corresponding Cargo
+profile themselves. Apply the returned environment through actual Effigy
+projection; an outer assignment alone is insufficient for an admitted run.
+
+Replay of the latest released lease returns success; older/evicted lease IDs
+may return exit 5 without touching any new holder. Do not treat an unknown
+or mistyped ID as evidence that the intended writer ended. A held compatible
+project/profile returns busy rather than allowing a concurrent writer.
+
+Known recovery limits: a nested symlink is refused during idle deletion;
+interrupted `Evicting` reconciliation can then block pool opening. Failed
+provisioning with files beyond the lock can also need explicit owner recovery.
+Do not edit a live ledger, follow/delete a foreign target, or use TTL to clear
+these refusals. The focused real run did not exercise eviction or census slot
+symlinks. These limits are separate from its observed reuse result.
+
 ## Limits
 
 - Holder ≤ 128 printable ASCII bytes without `/`
@@ -157,7 +197,8 @@ go to stderr as `oxide-storage-lease: <reason>: <message>`.
 ## Not claimed
 
 - No Nucleus, Queue, Effigy or editor integration
-- No cross-worktree correctness, cache-hit proof or source invalidation
+- No general cross-worktree/source-invalidation guarantee beyond the recorded
+  pinned dev workflow; timestamp-restored input-only changes were not isolated
 - No debug retention after release; released bytes are disposable
 - No publication, install, service, global settings or frozen Contract 010 change
 - No automatic process-group kill, TTL release or foreign cleanup
