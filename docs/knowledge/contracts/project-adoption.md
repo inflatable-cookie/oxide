@@ -480,8 +480,26 @@ entries still refuse. It also fixes safe idle-slot symlink reclamation without
 following the target. The [local lease contract](local-lease.md#reviewed-local-handover-artifact)
 owns the replacement binary/hash. Receipt v2, ledger v1, lease IDs, JSON and
 exits are unchanged; the existing pool can reopen without re-init or migration.
-Do not delete its metadata. Nucleus owns the binary swap, two-worktree smoke
-and deployment; none has been performed by Oxide.
+Do not delete its metadata. The Supervisor subsequently reports the fixed
+`9b0b0fc8…` binary installed, the same store `e449de33…` reopened with complete
+coverage, and consumer deployment live. Its two-worktree live-pool smoke ran
+`cargo check --offline -p nucleus-core --tests` through the parent Cargo config:
+A leased slot 1 cold in 14.4 seconds; different-path B reused slot 1 in 9.6
+seconds. Both leases released and both worktrees were removed. Slot usage grew
+from 445 MB to 792 MB; the final idle unique-allocation report was 780 MB.
+These are owner-reported smoke observations, not additional Oxide qualification
+calls or attributable SSD-write measurements. No production worker had used it
+when reported because the task board was empty.
+
+Nucleus's deployed guard `75675d2` uses private cold fallback once the compatible
+slot exceeds half the cap. The owner requested Oxide-owned lease-time recycling
+of oversized compatible idle slots, accepting a cold build. That correction is
+not yet shipped by the handover above. Keep threshold policy in the facility;
+use complete unique-allocated accounting and the existing durable whole-idle-slot
+deletion/identity rules. A threshold is headroom policy, not a bound on a single
+leased build: ENOSPC remains possible and never releases ownership. Held,
+uncertain or unknown-accounting occupancy must not be deleted to satisfy it.
+Nucleus owns removing its temporary guard after the reviewed replacement lands.
 
 ### Historical protected-route references
 

@@ -257,7 +257,9 @@ attempts and a consumer submit/capture/not-submitted callback service. This
 supersedes the earlier plan to integrate #060 after the chart port; it does
 not remove that upstream implementation. The unpublished
 [local lease CLI](contracts/local-lease.md) now exists as Oxide-only product
-code; it is not Nucleus-ready and does not qualify cross-worktree reuse.
+code. The [current consumer boundary](contracts/project-adoption.md#current-nucleus-integration-boundary)
+owns its narrow reviewed reuse result, owner-reported deployment and remaining
+limits; the former protected route's requirements do not apply to this CLI.
 
 The requested surface is lease by canonical project/profile/opaque holder,
 idempotent release, status, a finite total storage cap and idle-slot eviction
