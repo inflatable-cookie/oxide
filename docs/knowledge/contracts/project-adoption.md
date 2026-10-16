@@ -436,6 +436,26 @@ filesystem and inventory implementation; old authentication/callback plumbing
 is not required. This assessment creates no live consumer, host installation
 or real experiment.
 
+On 2026-10-16 oxide#064 qualified the focused cross-worktree gate on the
+lean CLI plus its volume-size-ceiling correction (declared cap must equal
+image size; measured verified capacity is the effective bound): one shared
+`dev` slot served the pinned Nucleus planning/diagnostics workflow at two
+disposable checkout paths in four Cargo calls and 112 seconds. Cold A rebuilt
+73 units; different-path B rebuilt only its changed planning test (72 fresh,
+`libsqlite3-sys` fresh with no rebuild); changed A repeated that shape; the
+unchanged rerun rebuilt nothing (73 fresh) with all 67 tests green, each run
+asserting its current include-marker and compile-time manifest path. Same-slot
+reuse, same-holder replay, busy refusal, writer-closed releases, the 10 GiB /
+45 min / 4-call / 20 GiB-reserve bounds and ordinary detach all held. Raw
+per-run unit/test/footprint records and the frozen execution packet are in
+`docs/knowledge/evidence/oxide-064-cross-path-qualification.json` (host raw
+logs retained under the recorded proof root). Known limits: build-script
+`executed` messages recur identically on every run without downstream rebuilds
+and are not repeated native compilation; native byte hashes and a slot symlink
+census were not taken; eviction never triggered. This is a handover-grade
+positive for registry/native reuse on fresh paths, not consumer activation,
+installation or everyday-relief proof.
+
 Nucleus intentionally removed its never-live disabled Oxide consumer code
 in the 2026-10-15 simplification reset. At reviewed owner inspection of
 Nucleus `15de6ac6b4f10bf4e17335fede01670ea2c5fb48`, there is **no current

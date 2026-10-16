@@ -1,0 +1,146 @@
+{
+  "task": "oxide#064",
+  "result": "GO: useful registry/native reuse across fresh checkout paths",
+  "proof_root": "/private/tmp/oxide-064.ExaImc",
+  "superseded_staging_root": "/private/tmp/oxide-064.pZJiik",
+  "pins": {
+    "oxide_head": "531be18c62b184478fefad1c398613ff69937e35",
+    "cli_binary": "target/debug/oxide-storage-lease",
+    "cli_binary_sha256": "7328c355fe4bbdacd2e09749fb2f8db2e4c70fa72027127ca9acfc4095a3c75a",
+    "nucleus_commit": "7b0c5047c14dfb1b108c232613685137762a37c0",
+    "nucleus_tree": "992cef8ccbf6b8df247ec9a951ee5231fd1cffcd",
+    "nucleus_lock_sha256": "ab2ed097a6d9cc740cc738b32d1c361d99214b16f0dbdeacfeb061bc10d1d57d",
+    "rustc": "1.97.1 (8bab26f4f 2026-07-14)",
+    "cargo_receipt": "c980f4866",
+    "cargo_proxy_sha256": "ec1b9233e7f72990ecd8e62063fa7f6c3dfc2bec8e97f88bff165f9100ac696a",
+    "cargo_1_97_1_sha256": "7672ead309d505577c018fff2cafb3433601f073e38cbe87359ac1f7b944bbf5",
+    "rustc_1_97_1_sha256": "210df6794001b73ec3d453878707fa1e0bdcb63c427024a6e6574bbe5615a4da"
+  },
+  "cargo_argv": [
+    "/Users/tom/.cargo/bin/cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "--message-format=json-render-diagnostics",
+    "-p",
+    "nucleus-core",
+    "--test",
+    "planning",
+    "--test",
+    "build_diagnostics",
+    "--",
+    "--nocapture"
+  ],
+  "cargo_env": {
+    "CARGO_INCREMENTAL": "1",
+    "CARGO_NET_OFFLINE": "true",
+    "RUSTUP_TOOLCHAIN": "1.97.1",
+    "CARGO_BUILD_BUILD_DIR": "<slot>/build (lease JSON, shared slot 1)",
+    "CARGO_TARGET_DIR": "<checkout>/target (lease JSON, private per checkout)",
+    "TMPDIR_TMP_TEMP": "<root>/disp-tmp",
+    "CARGO_HOME": "<root>/cargo-home (private offline copy of 58 lock packages)"
+  },
+  "pool": {
+    "cap_bytes": 8589934592,
+    "image_bytes": 8589934592,
+    "verified_capacity_bytes": 8380178432,
+    "backend": "apfs-sparse-image-v1",
+    "store_id": "4893492b2ba56436ef2d96b1e36e42b5",
+    "slot": "1 (shared by all four runs; project nucleus-core/dev)"
+  },
+  "leases": {
+    "run1": "h1 second lease (first h1 lease proved same-holder replay, then released)",
+    "run2": "h2 at B",
+    "run3": "h3 at A",
+    "run4": "h3 at A again (new lease id, same slot)",
+    "same_holder_replay": "same lease id, exit 0",
+    "busy_other_holder": "exit 2",
+    "releases": "all writer-closed after owned-group-empty verification, state idle"
+  },
+  "runs": [
+    {
+      "label": "run1-cold-a",
+      "checkout": "a (clean pinned tree)",
+      "exit": 0,
+      "wall_ms": 48163,
+      "units_total": 73,
+      "units_fresh": 0,
+      "units_rebuilt": 73,
+      "tests_ok": 66,
+      "tests_failed": 0
+    },
+    {
+      "label": "run2-warm-b",
+      "checkout": "b (pinned + marker-b patch)",
+      "exit": 0,
+      "wall_ms": 18401,
+      "units_total": 73,
+      "units_fresh": 72,
+      "units_rebuilt": 1,
+      "rebuilt_unit": "planning test at B (carries the marker change)",
+      "libsqlite3_sys": {
+        "fresh": 2,
+        "rebuilt": 0
+      },
+      "tests_ok": 67,
+      "tests_failed": 0,
+      "marker": "oxide-064 marker=oxide-064-marker-b manifest=<root>/b/crates/nucleus-core"
+    },
+    {
+      "label": "run3-a-changed",
+      "checkout": "a (pinned + marker-a2 patch)",
+      "exit": 0,
+      "wall_ms": 17582,
+      "units_total": 73,
+      "units_fresh": 72,
+      "units_rebuilt": 1,
+      "rebuilt_unit": "planning test at A (carries the marker change)",
+      "libsqlite3_sys": {
+        "fresh": 2,
+        "rebuilt": 0
+      },
+      "tests_ok": 67,
+      "tests_failed": 0,
+      "marker": "oxide-064 marker=oxide-064-marker-a2 manifest=<root>/a/crates/nucleus-core"
+    },
+    {
+      "label": "run4-a-unchanged",
+      "checkout": "a (identical tree to run3, no new edits)",
+      "exit": 0,
+      "wall_ms": 14095,
+      "units_total": 73,
+      "units_fresh": 73,
+      "units_rebuilt": 0,
+      "libsqlite3_sys": {
+        "fresh": 2,
+        "rebuilt": 0
+      },
+      "tests_ok": 67,
+      "tests_failed": 0,
+      "marker": "oxide-064 marker=oxide-064-marker-a2 manifest=<root>/a/crates/nucleus-core"
+    }
+  ],
+  "budget_use": {
+    "session_clock": "2026-10-16T09:58:48Z to 2026-10-16T10:00:40Z (112s of 45min)",
+    "cargo_processes": 4,
+    "footprint_final_bytes": 5702131712,
+    "footprint_limit_bytes": 10737418240,
+    "read_copy_bytes": 186988446,
+    "read_copy_limit_bytes": 2147483648,
+    "measurement_output_bytes": "~300000 (raw logs, limit 67108864)",
+    "host_reserve_bytes": "held above 21474836480 before every run"
+  },
+  "patches": {
+    "b": "tests/fixtures/oxide-064-b.txt ('oxide-064-marker-b') + appended include_str!/manifest-dir test; fixture mtime pinned to B-clone anchor (older than all build outputs), test source fresh",
+    "a": "tests/fixtures/oxide-064-a2.txt ('oxide-064-marker-a2') + appended test; fixture mtime pinned equal to B's fixture anchor, test source fresh",
+    "status": "both checkouts show exactly the two recorded patch files; canonical /Users/tom/Dev/projects/nucleus never written"
+  },
+  "build_script_notes": "build-script-executed messages recur identically (10 registry script packages, 11 messages) on cold, cross-path and fully-fresh runs; zero downstream rebuilds follow them on warm runs and the unchanged rerun finished in 14s including 67 tests, which is incompatible with repeated bundled-SQLite C compilation. The messages therefore do not represent repeated native compilation; whether Cargo replays cached execution records or re-runs scripts with identical output was not isolated and is recorded as an explicit unknown, not a reuse failure.",
+  "limits": [
+    "Native .a byte hashes were not taken (slot detached after settled proof); reuse rests on Cargo fresh flags, collapsed wall times and executed current-behavior asserts, which a stale binary would fail.",
+    "Slot-directory symlink census unobserved after detach; private target trees and the private cargo home are symlink-free; idle-only eviction never triggered, so the nested-symlink eviction wedge was not exercised and its safety refusal is unchanged.",
+    "Nucleus observer/ps/lsof paths are compiled but unused by the selected planning/diagnostics tests (pre-existing selector limit).",
+    "Private offline cargo home served all runs; --offline/--locked/CARGO_NET_OFFLINE=true; no network, no toolchain install, no canonical-source mutation."
+  ],
+  "raw_records": "proof_root/evidence/driver-state.json (leases, units, footprints), proof_root/raw/run*.stdout|stderr.log, proof_root/packet.json (frozen pre-effects execution packet)"
+}

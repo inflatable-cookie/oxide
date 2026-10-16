@@ -89,9 +89,12 @@ pub fn init(request: InitRequest) -> Result<PoolInfo, LeaseError> {
     if request.cap_bytes == 0 {
         return Err(LeaseError::InvalidInput("cap-bytes must be positive"));
     }
-    if request.image_bytes < request.cap_bytes {
+    // Checked before any host effect: the declared cap must equal the image
+    // size so the volume size is the enforced ceiling. A smaller cap on a
+    // larger volume is not OS-enforced and is refused.
+    if request.image_bytes != request.cap_bytes {
         return Err(LeaseError::InvalidInput(
-            "image-bytes must cover the pool cap",
+            "cap-bytes must equal image-bytes so the volume size is the enforced ceiling",
         ));
     }
     refuse_unsupported_init_platform()?;
@@ -226,6 +229,7 @@ impl Pool {
         if config.version != LEASE_VERSION
             || config.backend != BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1
             || config.cap_bytes == 0
+            || config.cap_bytes != config.image_bytes
         {
             return Err(LeaseError::BackingMismatch);
         }

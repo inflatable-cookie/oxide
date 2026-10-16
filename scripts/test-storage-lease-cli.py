@@ -1,7 +1,7 @@
 """Build oxide-storage-lease and prove the unpublished CLI.
 
 Usage refusals always run. On macOS, after a 20 GiB host reserve, the script
-provisions exactly one fresh 128 MiB APFS image (8 MiB payload cap, 512 MiB
+provisions exactly one fresh 128 MiB APFS image (128 MiB declared cap, 512 MiB
 scratch, 120 s native phase), exercises lease/release/recover/status,
 concurrent acquire, duplicate-holder replay, busy, symlink/foreign refusal,
 idle reuse and mismatched backing, then detaches only after positive
@@ -15,8 +15,11 @@ import sys
 import time
 
 BINARY_NAME = "oxide-storage-lease"
+# The declared cap must equal the image size so the volume size is the
+# enforced ceiling. The measured verified capacity (APFS metadata overhead
+# below this size) is the effective hard bound.
 IMAGE_BYTES = 128 * 1024 * 1024
-CAP_BYTES = 8 * 1024 * 1024
+CAP_BYTES = 128 * 1024 * 1024
 SCRATCH_LIMIT_BYTES = 512 * 1024 * 1024
 HOST_RESERVE_BYTES = 20 * 1024 * 1024 * 1024
 NATIVE_PHASE_SECONDS = 120
@@ -28,11 +31,25 @@ def fail(message: str) -> None:
 
 def scratch_root() -> str:
     raw = os.environ.get("OXIDE_TASK_SCRATCH_ROOT")
-    if not raw:
-        fail("OXIDE_TASK_SCRATCH_ROOT is required")
-    path = os.path.realpath(raw)
+    if raw:
+        path = os.path.realpath(raw)
+        if not os.path.isdir(path):
+            fail("OXIDE_TASK_SCRATCH_ROOT must be an existing directory")
+        return path
+    # Under heavy admission the outer environment is not forwarded; provision
+    # one fresh canonical private scratch directory instead of failing.
+    result = subprocess.run(
+        ["mktemp", "-d", "/private/tmp/oxide-storage-lease-cli.XXXXXX"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode:
+        fail("mktemp scratch failed")
+    path = os.path.realpath(result.stdout.strip())
+    os.chmod(path, 0o700)
     if not os.path.isdir(path):
-        fail("OXIDE_TASK_SCRATCH_ROOT must be an existing directory")
+        fail("provisioned scratch is not a directory")
     return path
 
 
@@ -189,6 +206,29 @@ def prove_native(executable: str, parent: str) -> None:
         fail("init did not pin apfs-sparse-image-v1")
     if info.get("cap_bytes") != CAP_BYTES:
         fail("init cap mismatch")
+    verified = info.get("verified_capacity_bytes")
+    if not isinstance(verified, int) or verified <= 0 or verified > CAP_BYTES:
+        fail(f"init verified capacity is not an enforced bound below cap: {verified!r}")
+
+    # A smaller declared cap on a larger image is not OS-enforced and must
+    # refuse before any host effect beyond the empty pool directory.
+    refused_pool = os.path.join(parent, "refused-pool")
+    os.mkdir(refused_pool, 0o700)
+    code, stdout, stderr = run_cli(
+        executable,
+        [
+            "--pool",
+            refused_pool,
+            "init",
+            "--cap-bytes",
+            str(8 * 1024 * 1024),
+            "--image-bytes",
+            str(IMAGE_BYTES),
+        ],
+        timeout=NATIVE_PHASE_SECONDS,
+    )
+    if code != 1:
+        fail(f"smaller-cap init exit {code}, expected 1")
 
     def remaining() -> int:
         return max(5, int(NATIVE_PHASE_SECONDS - (time.monotonic() - started)))
