@@ -323,6 +323,17 @@ impl Pool {
             })
             .map(|slot| (slot.id, slot.incarnation))
         {
+            let slot_path =
+                self.validate_idle_slot_scope(idle, incarnation, &project, request.profile)?;
+            let sizes = inventory_sizes(&slot_path)?;
+            if sizes.coverage != AccountingCoverage::Complete {
+                return Err(LeaseError::UnknownAccounting);
+            }
+            let unique = sizes.unique.ok_or(LeaseError::UnknownAccounting)?;
+            if should_recycle_slot(unique, self.config.cap_bytes) {
+                self.retire_idle_slot(idle, incarnation, &project, request.profile)?;
+                return self.allocate(project, workspace, request);
+            }
             return self.take_idle(idle, incarnation, project, workspace, request);
         }
         self.allocate(project, workspace, request)
@@ -600,16 +611,34 @@ impl Pool {
     }
 
     fn evict_one_idle(&mut self) -> Result<bool, LeaseError> {
-        let Some(id) = self
+        let Some((id, incarnation, project, profile)) = self
             .ledger
             .slots
             .iter()
             .find(|slot| slot.state == SlotPersistState::Idle && slot.lease_id.is_none())
-            .map(|slot| slot.id)
+            .map(|slot| {
+                (
+                    slot.id,
+                    slot.incarnation,
+                    slot.project.clone(),
+                    slot.profile,
+                )
+            })
         else {
             return Ok(false);
         };
-        let path = self.slot_path(id)?;
+        self.retire_idle_slot(id, incarnation, &project, profile)?;
+        Ok(true)
+    }
+
+    fn retire_idle_slot(
+        &mut self,
+        id: u64,
+        incarnation: u64,
+        project: &Path,
+        profile: Profile,
+    ) -> Result<(), LeaseError> {
+        let path = self.validate_idle_slot_scope(id, incarnation, project, profile)?;
         {
             let slot = self.slot_mut(id).ok_or(LeaseError::UnknownAccounting)?;
             slot.state = SlotPersistState::Evicting;
@@ -618,7 +647,42 @@ impl Pool {
         self.remove_owned_slot(&path)?;
         self.ledger.slots.retain(|slot| slot.id != id);
         self.persist()?;
-        Ok(true)
+        Ok(())
+    }
+
+    fn validate_idle_slot_scope(
+        &self,
+        id: u64,
+        incarnation: u64,
+        project: &Path,
+        profile: Profile,
+    ) -> Result<PathBuf, LeaseError> {
+        let slot = self.slot(id).ok_or(LeaseError::UnknownAccounting)?;
+        if slot.id != id
+            || slot.incarnation != incarnation
+            || slot.state != SlotPersistState::Idle
+            || slot.lease_id.is_some()
+            || slot.project.as_path() != project
+            || slot.profile != profile
+        {
+            return Err(LeaseError::UnknownAccounting);
+        }
+
+        let path = self.slot_path(id)?;
+        let slots_root = self.backing.payload_root().join(SLOTS_NAME);
+        let slots_root = canonical_existing_dir(&slots_root, true)?;
+        if path.parent() != Some(slots_root.as_path()) {
+            return Err(LeaseError::UnsafePath(
+                "deletion is limited to recorded owned slot paths",
+            ));
+        }
+        canonical_existing_dir(&path, true)?;
+        let slots_device = fs::symlink_metadata(&slots_root).map_err(io_error)?.dev();
+        let slot_device = fs::symlink_metadata(&path).map_err(io_error)?.dev();
+        if slots_device != slot_device {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        Ok(path)
     }
 
     fn reconcile_evicting(&mut self) -> Result<(), LeaseError> {
@@ -778,6 +842,14 @@ fn inventory_sizes(path: &Path) -> Result<Sizes, LeaseError> {
             coverage: AccountingCoverage::Unknown,
         }),
     }
+}
+
+pub(super) fn recycle_threshold(cap_bytes: u64) -> u64 {
+    cap_bytes / 2 + cap_bytes % 2
+}
+
+pub(super) fn should_recycle_slot(allocated_bytes: u64, cap_bytes: u64) -> bool {
+    allocated_bytes >= recycle_threshold(cap_bytes)
 }
 
 fn require_holder(holder: &str) -> Result<(), LeaseError> {

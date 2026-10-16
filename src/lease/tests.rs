@@ -60,13 +60,32 @@ impl Drop for Fixture {
 }
 
 fn request(pool: &Path, project: &Path, workspace: &Path, holder: &str) -> LeaseRequest {
+    request_with_profile(pool, project, workspace, holder, Profile::Dev)
+}
+
+fn request_with_profile(
+    pool: &Path,
+    project: &Path,
+    workspace: &Path,
+    holder: &str,
+    profile: Profile,
+) -> LeaseRequest {
     LeaseRequest {
         pool: pool.to_path_buf(),
         project: project.to_path_buf(),
         workspace: workspace.to_path_buf(),
-        profile: Profile::Dev,
+        profile,
         holder: holder.to_owned(),
     }
+}
+
+fn lease_sequence(lease_id: &str) -> u64 {
+    lease_id
+        .rsplit('.')
+        .next()
+        .expect("lease sequence")
+        .parse()
+        .expect("numeric lease sequence")
 }
 
 #[test]
@@ -175,8 +194,257 @@ fn idle_slot_keeps_workspace_observation_on_reuse() {
         b"cached"
     );
     let report = status_injected(&pool).expect("status");
+    let reused_size = report
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == first.slot_id)
+        .and_then(|slot| slot.unique_allocated_bytes)
+        .expect("complete warm-slot allocation");
+    assert!(reused_size < 512 * 1024);
     assert_eq!(report.slots[0].workspace, ws2);
     assert_eq!(report.coverage, AccountingCoverage::Complete);
+}
+
+#[test]
+fn recycle_threshold_is_the_overflow_safe_ceiling_of_half_the_cap() {
+    assert_eq!(super::pool::recycle_threshold(1), 1);
+    assert_eq!(super::pool::recycle_threshold(2), 1);
+    assert_eq!(super::pool::recycle_threshold(3), 2);
+    assert_eq!(super::pool::recycle_threshold(4), 2);
+    assert!(!super::pool::should_recycle_slot(0, 1));
+    assert!(!super::pool::should_recycle_slot(2, 5));
+    assert!(super::pool::should_recycle_slot(3, 5));
+    assert!(super::pool::should_recycle_slot(4, 5));
+    assert_eq!(super::pool::recycle_threshold(u64::MAX), u64::MAX / 2 + 1);
+}
+
+#[test]
+fn oversized_compatible_idle_slot_is_replaced_then_fresh_slot_is_warm() {
+    let fx = Fixture::new("recycle-compatible");
+    let pool = fx.dir("pool");
+    let cap = 8 * 1024 * 1024;
+    create_injected(&pool, cap).expect("init");
+    let project = fx.dir("project");
+    let first_workspace = fx.dir("first-workspace");
+    let replacement_workspace = fx.dir("replacement-workspace");
+    let first = lease_injected(request(&pool, &project, &first_workspace, "holder-a"))
+        .expect("first lease");
+    assert!(!first.reused_slot);
+    let old_slot_root = pool.join("payload").join("slots").join(&first.slot_id);
+    let old_payload = first.env.cargo_build_build_dir.join("generated.bin");
+    fs::write(&old_payload, vec![b'x'; 5 * 1024 * 1024]).expect("allocated payload");
+    release_injected(&pool, &first.lease_id).expect("release first slot");
+
+    let idle_status = status_injected(&pool).expect("inventory idle slot");
+    let allocated = idle_status
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == first.slot_id)
+        .and_then(|slot| slot.unique_allocated_bytes)
+        .expect("complete allocated-byte inventory");
+    assert!(allocated >= cap.div_ceil(2));
+
+    let replacement = lease_injected(request(&pool, &project, &replacement_workspace, "holder-b"))
+        .expect("replace oversized compatible slot");
+    assert!(!replacement.reused_slot);
+    assert_ne!(replacement.slot_id, first.slot_id);
+    assert!(replacement.slot_id.parse::<u64>().unwrap() > first.slot_id.parse::<u64>().unwrap());
+    assert!(lease_sequence(&replacement.lease_id) > lease_sequence(&first.lease_id));
+    assert!(!old_slot_root.exists());
+    assert!(!old_payload.exists());
+    assert_ne!(
+        replacement.env.cargo_build_build_dir,
+        first.env.cargo_build_build_dir
+    );
+    assert!(matches!(
+        release_injected(&pool, &first.lease_id),
+        Err(LeaseError::NotFound)
+    ));
+    let held_status = status_injected(&pool).expect("replacement remains held");
+    let held = held_status
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == replacement.slot_id)
+        .expect("replacement record");
+    assert_eq!(held.state, SlotOccupancy::Held);
+    assert_eq!(
+        held.lease_id.as_deref(),
+        Some(replacement.lease_id.as_str())
+    );
+
+    release_injected(&pool, &replacement.lease_id).expect("release replacement");
+    let warm = lease_injected(request(&pool, &project, &replacement_workspace, "holder-c"))
+        .expect("reuse fresh slot below threshold");
+    assert_eq!(warm.slot_id, replacement.slot_id);
+    assert!(warm.reused_slot);
+    assert!(lease_sequence(&warm.lease_id) > lease_sequence(&replacement.lease_id));
+}
+
+#[test]
+fn oversized_recycling_targets_only_the_selected_project_and_profile() {
+    let fx = Fixture::new("recycle-scope");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let other_project = fx.dir("other-project");
+    let workspace = fx.dir("workspace");
+
+    let other = lease_injected(request(&pool, &other_project, &workspace, "other-project"))
+        .expect("unrelated project slot");
+    let other_marker = other.env.cargo_build_build_dir.join("keep-project");
+    fs::write(&other_marker, vec![b'p'; 64 * 1024]).expect("unrelated project payload");
+    release_injected(&pool, &other.lease_id).expect("release unrelated project");
+
+    let other_profile = lease_injected(request_with_profile(
+        &pool,
+        &project,
+        &workspace,
+        "other-profile",
+        Profile::FullDebug,
+    ))
+    .expect("unrelated profile slot");
+    let profile_marker = other_profile.env.cargo_build_build_dir.join("keep-profile");
+    fs::write(&profile_marker, vec![b'f'; 64 * 1024]).expect("unrelated profile payload");
+    release_injected(&pool, &other_profile.lease_id).expect("release unrelated profile");
+
+    let selected = lease_injected(request(&pool, &project, &workspace, "selected"))
+        .expect("selected compatible slot");
+    let selected_root = pool.join("payload").join("slots").join(&selected.slot_id);
+    let selected_payload = selected.env.cargo_build_build_dir.join("oversized");
+    fs::write(&selected_payload, vec![b's'; 5 * 1024 * 1024]).expect("selected payload");
+    release_injected(&pool, &selected.lease_id).expect("release selected slot");
+
+    let replacement = lease_injected(request(&pool, &project, &workspace, "replacement"))
+        .expect("replace only selected compatible slot");
+    assert!(!replacement.reused_slot);
+    assert_ne!(replacement.slot_id, selected.slot_id);
+    assert!(!selected_root.exists());
+    assert!(!selected_payload.exists());
+    assert_eq!(
+        fs::read(&other_marker).expect("other project survives"),
+        vec![b'p'; 64 * 1024]
+    );
+    assert_eq!(
+        fs::read(&profile_marker).expect("other profile survives"),
+        vec![b'f'; 64 * 1024]
+    );
+    let status = status_injected(&pool).expect("status after selected replacement");
+    assert!(status
+        .slots
+        .iter()
+        .any(|slot| slot.slot_id == other.slot_id));
+    assert!(status
+        .slots
+        .iter()
+        .any(|slot| slot.slot_id == other_profile.slot_id));
+    assert!(status
+        .slots
+        .iter()
+        .all(|slot| slot.slot_id != selected.slot_id));
+}
+
+#[test]
+fn held_oversized_compatible_slot_keeps_same_holder_replay_and_other_holder_busy() {
+    let fx = Fixture::new("recycle-held");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let first =
+        lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("held lease");
+    let payload = first.env.cargo_build_build_dir.join("held-data");
+    fs::write(&payload, vec![b'h'; 5 * 1024 * 1024]).expect("held payload");
+
+    let replay = lease_injected(request(&pool, &project, &workspace, "holder-a"))
+        .expect("same-holder replay");
+    assert_eq!(replay.lease_id, first.lease_id);
+    assert_eq!(replay.slot_id, first.slot_id);
+    assert_eq!(
+        replay.env.cargo_build_build_dir,
+        first.env.cargo_build_build_dir
+    );
+    assert_eq!(
+        fs::metadata(&payload).expect("payload remains").len(),
+        5 * 1024 * 1024
+    );
+    assert!(matches!(
+        lease_injected(request(&pool, &project, &workspace, "holder-b")),
+        Err(LeaseError::Busy)
+    ));
+    assert_eq!(
+        fs::metadata(&payload).expect("busy does not delete").len(),
+        5 * 1024 * 1024
+    );
+}
+
+#[test]
+fn partial_accounting_and_unsafe_slot_root_refuse_compatible_reuse() {
+    let fx = Fixture::new("recycle-unsafe");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    let workspace = fx.dir("workspace");
+    let partial_project = fx.dir("partial-project");
+    let partial = lease_injected(request(
+        &pool,
+        &partial_project,
+        &workspace,
+        "partial-holder",
+    ))
+    .expect("partial candidate");
+    let mut nested = partial.env.cargo_build_build_dir.clone();
+    for _ in 0..30 {
+        nested.push("nested");
+        fs::create_dir(&nested).expect("nested fixture directory");
+    }
+    release_injected(&pool, &partial.lease_id).expect("release partial candidate");
+    assert!(matches!(
+        lease_injected(request(
+            &pool,
+            &partial_project,
+            &workspace,
+            "partial-retry"
+        )),
+        Err(LeaseError::UnknownAccounting)
+    ));
+    assert!(pool
+        .join("payload")
+        .join("slots")
+        .join(&partial.slot_id)
+        .exists());
+
+    let unsafe_pool = fx.dir("unsafe-pool");
+    create_injected(&unsafe_pool, 8 * 1024 * 1024).expect("init unsafe pool");
+    let unsafe_project = fx.dir("unsafe-project");
+    let unsafe_slot = lease_injected(request(
+        &unsafe_pool,
+        &unsafe_project,
+        &workspace,
+        "unsafe-holder",
+    ))
+    .expect("unsafe candidate");
+    release_injected(&unsafe_pool, &unsafe_slot.lease_id).expect("release unsafe candidate");
+    let external = fx.dir("external-target");
+    let sentinel = external.join("sentinel");
+    fs::write(&sentinel, b"foreign target survives").expect("sentinel");
+    let slot_root = unsafe_pool
+        .join("payload")
+        .join("slots")
+        .join(&unsafe_slot.slot_id);
+    fs::remove_dir_all(&slot_root).expect("remove fixture slot root");
+    symlink(&external, &slot_root).expect("unsafe slot root");
+    assert!(matches!(
+        lease_injected(request(
+            &unsafe_pool,
+            &unsafe_project,
+            &workspace,
+            "unsafe-retry"
+        )),
+        Err(LeaseError::UnsafePath(_)) | Err(LeaseError::UnknownAccounting)
+    ));
+    assert_eq!(
+        fs::read(&sentinel).expect("external target survives"),
+        b"foreign target survives"
+    );
 }
 
 #[test]

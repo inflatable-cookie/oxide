@@ -141,6 +141,20 @@ an owned nested symlink entry may be unlinked as a leaf after its parent and
 entry ownership are verified. The target is never followed or removed.
 Deletion never touches project or workspace paths. A lost delete is
 reconciled only for the recorded evicting slot path.
+
+Before leasing a compatible idle slot, the CLI inventories that exact slot's
+complete unique allocated bytes. At `ceil(cap_bytes / 2)` or above, it durably
+retires that idle generation and allocates a fresh monotonic slot and lease;
+the grant reports `reused_slot: false`. Below the threshold, it keeps the warm
+slot. Incomplete or unknown accounting refuses the lease. A held same-holder
+replay keeps its exact lease and path, and another holder remains busy without
+recycling the held slot. This policy can make an acquisition pay a cold-build
+cost to discard a large idle cache. The threshold supplies headroom at
+acquisition; it does not guarantee that a particular build fits, reserve half
+the volume, constrain writes during a lease, or prevent `ENOSPC`. Other slots
+and OS metadata still consume the aggregate cap, so ordinary admission and
+refusal rules apply after the selected generation is removed.
+
 Writes that fill the volume return ENOSPC from the OS and remain leased; this
 CLI does not repeat the filesystem-full proof (see bounded storage).
 
