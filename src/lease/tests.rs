@@ -1,5 +1,6 @@
 use super::pool::{
-    create_injected, lease_injected, recover_injected, release_injected, status_injected,
+    create_injected, lease_injected, mark_evicting_for_test, recover_injected, release_injected,
+    status_injected,
 };
 use super::{
     init_pool, render_status_json, AccountingCoverage, LeaseError, LeaseRequest, Profile,
@@ -242,6 +243,270 @@ fn eviction_removes_only_idle_owned_slots() {
     assert_ne!(second.slot_id, first.slot_id);
     assert!(!marker.exists());
     assert!(sentinel.exists());
+}
+
+#[test]
+fn idle_eviction_unlinks_direct_dangling_and_nested_symlinks() {
+    let fx = Fixture::new("evict-symlinks");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let workspace = fx.dir("workspace");
+    let mut grants = Vec::new();
+    for index in 0..super::MAX_SLOTS {
+        let project = fx.dir(&format!("project-{index}"));
+        let granted = lease_injected(request(
+            &pool,
+            &project,
+            &workspace,
+            &format!("holder-{index}"),
+        ))
+        .expect("fill slot table");
+        if index > 0 {
+            release_injected(&pool, &granted.lease_id).expect("idle slot");
+        }
+        grants.push(granted);
+    }
+    let held = grants[0].clone();
+    let held_marker = held.env.cargo_build_build_dir.join("held");
+    fs::write(&held_marker, b"held slot stays byte-for-byte").expect("held marker");
+
+    let sentinel = fx.path().join("external-sentinel");
+    fs::write(&sentinel, b"external target survives byte-for-byte").expect("sentinel");
+    let dangling_target = fx.path().join("absent-sentinel");
+    let mut links = Vec::new();
+    for (index, kind) in ["direct", "dangling", "nested"].into_iter().enumerate() {
+        let build = &grants[index + 1].env.cargo_build_build_dir;
+        let link = match kind {
+            "direct" => build.join("external-link"),
+            "dangling" => build.join("dangling-link"),
+            "nested" => {
+                let nested = build.join("nested");
+                fs::create_dir(&nested).expect("nested directory");
+                nested.join("external-link")
+            }
+            _ => unreachable!(),
+        };
+        symlink(
+            if kind == "dangling" {
+                &dangling_target
+            } else {
+                &sentinel
+            },
+            &link,
+        )
+        .expect("symlink entry");
+        links.push(link);
+    }
+
+    for index in 0..links.len() {
+        let project = fx.dir(&format!("new-project-{index}"));
+        let granted = lease_injected(request(
+            &pool,
+            &project,
+            &workspace,
+            &format!("new-holder-{index}"),
+        ))
+        .expect("evict the oldest idle slot and allocate");
+        assert_ne!(granted.slot_id, grants[index + 1].slot_id);
+        assert_eq!(
+            fs::symlink_metadata(&links[index])
+                .expect_err("owned symlink entry was unlinked")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            fs::read(&sentinel).expect("external sentinel remains"),
+            b"external target survives byte-for-byte"
+        );
+        let status = status_injected(&pool).expect("status after eviction");
+        let held_status = status
+            .slots
+            .iter()
+            .find(|slot| slot.slot_id == held.slot_id)
+            .expect("held slot remains recorded");
+        assert_eq!(held_status.state, SlotOccupancy::Held);
+        assert_eq!(
+            held_status.lease_id.as_deref(),
+            Some(held.lease_id.as_str())
+        );
+        assert_eq!(
+            fs::read(&held_marker).expect("held slot contents remain"),
+            b"held slot stays byte-for-byte"
+        );
+        assert!(matches!(
+            release_injected(&pool, &grants[index + 1].lease_id),
+            Err(LeaseError::NotFound)
+        ));
+    }
+}
+
+#[test]
+fn interrupted_idle_eviction_resumes_after_partial_removal() {
+    let fx = Fixture::new("evict-resume");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let other_project = fx.dir("other-project");
+    let workspace = fx.dir("workspace");
+    let idle =
+        lease_injected(request(&pool, &project, &workspace, "idle-holder")).expect("idle lease");
+    let slot_root = pool.join("payload").join("slots").join(&idle.slot_id);
+    let partial = idle.env.cargo_build_build_dir.join("partial");
+    fs::write(&partial, b"removed before restart").expect("partial entry");
+    let sentinel = fx.path().join("external-sentinel");
+    fs::write(&sentinel, b"external target survives byte-for-byte").expect("sentinel");
+    let link = idle.env.cargo_build_build_dir.join("external-link");
+    symlink(&sentinel, &link).expect("nested link");
+    release_injected(&pool, &idle.lease_id).expect("idle slot");
+
+    let held = lease_injected(request(&pool, &other_project, &workspace, "held-holder"))
+        .expect("held lease");
+    mark_evicting_for_test(&pool, idle.slot_id.parse().expect("numeric slot id"))
+        .expect("persist eviction intent");
+    fs::remove_file(&partial).expect("simulate partial removal after durable intent");
+
+    let status = status_injected(&pool).expect("restart reconciles recorded deletion");
+    assert!(status.slots.iter().all(|slot| slot.slot_id != idle.slot_id));
+    assert!(status.slots.iter().any(
+        |slot| slot.slot_id == held.slot_id && slot.lease_id.as_deref() == Some(&held.lease_id)
+    ));
+    assert!(!slot_root.exists());
+    assert!(matches!(
+        release_injected(&pool, &idle.lease_id),
+        Err(LeaseError::NotFound)
+    ));
+    assert_eq!(
+        fs::read(&sentinel).expect("external target survives"),
+        b"external target survives byte-for-byte"
+    );
+    release_injected(&pool, &held.lease_id).expect("unrelated held lease closes");
+    let next_project = fx.dir("next-project");
+    let next = lease_injected(request(&pool, &next_project, &workspace, "next-holder"))
+        .expect("safe new generation after deletion settles");
+    assert_ne!(next.slot_id, idle.slot_id);
+}
+
+#[test]
+fn unsafe_evicting_slot_root_stays_unavailable_without_blocking_status_or_release() {
+    let fx = Fixture::new("evict-unsafe-root");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let other_project = fx.dir("other-project");
+    let workspace = fx.dir("workspace");
+    let idle =
+        lease_injected(request(&pool, &project, &workspace, "idle-holder")).expect("idle lease");
+    release_injected(&pool, &idle.lease_id).expect("idle slot");
+    let held = lease_injected(request(&pool, &other_project, &workspace, "held-holder"))
+        .expect("held lease");
+    mark_evicting_for_test(&pool, idle.slot_id.parse().expect("numeric slot id"))
+        .expect("persist eviction intent");
+
+    let target = fx.dir("external-target");
+    let sentinel = target.join("sentinel");
+    fs::write(&sentinel, b"root target survives byte-for-byte").expect("sentinel");
+    let slot_root = pool.join("payload").join("slots").join(&idle.slot_id);
+    fs::remove_dir_all(&slot_root).expect("remove slot directory in unsafe fixture");
+    symlink(&target, &slot_root).expect("replace slot root with symlink");
+
+    let status = status_injected(&pool).expect("unknown slot does not block status");
+    assert_eq!(status.coverage, AccountingCoverage::Unknown);
+    let abandoned = status
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == idle.slot_id)
+        .expect("unsafe generation remains recorded");
+    assert_eq!(abandoned.state, SlotOccupancy::Abandoned);
+    assert_eq!(abandoned.unique_allocated_bytes, None);
+    let held_status = status
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == held.slot_id)
+        .expect("held lease remains recorded");
+    assert_eq!(
+        held_status.lease_id.as_deref(),
+        Some(held.lease_id.as_str())
+    );
+    assert!(matches!(
+        lease_injected(request(
+            &pool,
+            &fx.dir("blocked-project"),
+            &workspace,
+            "blocked-holder"
+        )),
+        Err(LeaseError::UnknownAccounting)
+    ));
+    release_injected(&pool, &held.lease_id).expect("unrelated held lease closes");
+    assert_eq!(
+        fs::read(&sentinel).expect("root symlink target is untouched"),
+        b"root target survives byte-for-byte"
+    );
+    assert!(fs::symlink_metadata(&slot_root)
+        .expect("unsafe slot root remains present")
+        .file_type()
+        .is_symlink());
+    assert!(matches!(
+        release_injected(&pool, &idle.lease_id),
+        Err(LeaseError::UnknownAccounting)
+    ));
+}
+
+#[test]
+fn known_macos_metadata_added_after_init_is_outside_slot_accounting() {
+    let fx = Fixture::new("metadata-after-init");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init before OS metadata appears");
+    let payload = pool.join("payload");
+    for name in [
+        ".fseventsd",
+        ".Spotlight-V100",
+        ".Trashes",
+        ".TemporaryItems",
+    ] {
+        let metadata_dir = payload.join(name);
+        fs::create_dir(&metadata_dir).expect("post-init metadata directory");
+        if name == ".fseventsd" {
+            fs::write(metadata_dir.join("fseventsd-uuid"), b"metadata").expect("FSEvents UUID");
+        }
+    }
+
+    let status = status_injected(&pool).expect("known metadata directories are accepted");
+    assert_eq!(status.coverage, AccountingCoverage::Complete);
+    assert_eq!(status.payload_logical_bytes, Some(0));
+    assert_eq!(status.payload_unique_allocated_bytes, Some(0));
+    assert!(status.slots.is_empty());
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let grant = lease_injected(request(&pool, &project, &workspace, "holder-a"))
+        .expect("lease after delayed metadata arrival");
+    assert_eq!(grant.slot_id, "1");
+}
+
+#[test]
+fn unknown_or_non_directory_macos_metadata_entries_refuse() {
+    for case in ["unknown-name", "known-file", "known-symlink"] {
+        let fx = Fixture::new(case);
+        let pool = fx.dir("pool");
+        create_injected(&pool, 1024 * 1024).expect("init");
+        let payload = pool.join("payload");
+        match case {
+            "unknown-name" => {
+                fs::create_dir(payload.join(".unrecognized")).expect("unknown dot directory")
+            }
+            "known-file" => {
+                File::create(payload.join(".fseventsd")).expect("metadata file");
+            }
+            "known-symlink" => {
+                let target = fx.dir("metadata-target");
+                symlink(target, payload.join(".fseventsd")).expect("metadata symlink");
+            }
+            _ => unreachable!(),
+        };
+        assert!(matches!(
+            status_injected(&pool),
+            Err(LeaseError::UnknownAccounting)
+        ));
+    }
 }
 
 #[test]

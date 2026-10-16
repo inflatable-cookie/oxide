@@ -10,7 +10,6 @@ use super::{
     MAX_PATH_BYTES, MAX_SLOTS, SLOTS_NAME,
 };
 use crate::inventory::{inventory_directory, InventoryLimits};
-use crate::storage::bounded::validate_payload_entries;
 use crate::{BoundedBacking, BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -83,6 +82,7 @@ pub(super) struct Pool {
     config: PoolConfig,
     backing: BoundedBacking,
     ledger: Ledger,
+    reconciliation_blocked: bool,
 }
 
 pub fn init(request: InitRequest) -> Result<PoolInfo, LeaseError> {
@@ -106,7 +106,7 @@ pub fn init(request: InitRequest) -> Result<PoolInfo, LeaseError> {
     let paths = BackingPaths::under(&pool);
     let backing = backing::provision(&paths, request.cap_bytes, request.image_bytes)?;
     ensure_private_dir(&backing.payload_root().join(SLOTS_NAME))?;
-    validate_payload_entries(backing.payload_root()).map_err(|_| LeaseError::UnknownAccounting)?;
+    validate_lease_payload_entries(backing.payload_root())?;
     let store_id = random_hex(16)?;
     let config = PoolConfig {
         version: LEASE_VERSION,
@@ -211,6 +211,19 @@ pub(super) fn status_injected(pool: &Path) -> Result<PoolStatus, LeaseError> {
     Pool::open_with(pool, true)?.status()
 }
 
+#[cfg(test)]
+pub(super) fn mark_evicting_for_test(pool: &Path, slot_id: u64) -> Result<(), LeaseError> {
+    let mut opened = Pool::open_with(pool, true)?;
+    let slot = opened
+        .slot_mut(slot_id)
+        .ok_or(LeaseError::UnknownAccounting)?;
+    if slot.state != SlotPersistState::Idle || slot.lease_id.is_some() {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    slot.state = SlotPersistState::Evicting;
+    opened.persist()
+}
+
 impl Pool {
     fn open(root: &Path) -> Result<Self, LeaseError> {
         Self::open_inner(root, false)
@@ -238,8 +251,7 @@ impl Pool {
         if backing.descriptor().payload_root != paths.mount {
             return Err(LeaseError::BackingMismatch);
         }
-        validate_payload_entries(backing.payload_root())
-            .map_err(|_| LeaseError::UnknownAccounting)?;
+        validate_lease_payload_entries(backing.payload_root())?;
         let ledger = read_ledger(&root)?;
         if ledger.version != LEASE_VERSION
             || ledger.store_id != config.store_id
@@ -256,6 +268,7 @@ impl Pool {
             config,
             backing,
             ledger,
+            reconciliation_blocked: false,
         };
         pool.reconcile_evicting()?;
         Ok(pool)
@@ -266,6 +279,9 @@ impl Pool {
     }
 
     fn lease(&mut self, request: &LeaseRequest) -> Result<LeaseGrant, LeaseError> {
+        if self.reconciliation_blocked {
+            return Err(LeaseError::UnknownAccounting);
+        }
         let project = canonical_existing_dir(&request.project, false)?;
         let workspace = canonical_existing_dir(&request.workspace, false)?;
         require_holder(&request.holder)?;
@@ -437,9 +453,23 @@ impl Pool {
 
     fn status(&self) -> Result<PoolStatus, LeaseError> {
         let accounted = self.payload_accounting()?;
+        let mut coverage = if self.reconciliation_blocked {
+            AccountingCoverage::Unknown
+        } else {
+            accounted.coverage
+        };
         let mut slots = Vec::new();
         for slot in &self.ledger.slots {
             let sizes = self.slot_accounting(slot.id)?;
+            match sizes.coverage {
+                AccountingCoverage::Complete => {}
+                AccountingCoverage::Partial if coverage == AccountingCoverage::Complete => {
+                    coverage = AccountingCoverage::Partial;
+                }
+                AccountingCoverage::Partial | AccountingCoverage::Unknown => {
+                    coverage = AccountingCoverage::Unknown;
+                }
+            }
             slots.push(SlotStatus {
                 slot_id: slot.id.to_string(),
                 incarnation: slot.incarnation.to_string(),
@@ -457,7 +487,7 @@ impl Pool {
                 unique_allocated_bytes: sizes.unique,
             });
         }
-        let full = match accounted.coverage {
+        let full = match coverage {
             AccountingCoverage::Complete => {
                 Some(accounted.unique.unwrap_or(0) >= self.config.cap_bytes)
             }
@@ -470,7 +500,7 @@ impl Pool {
             cap_bytes: self.config.cap_bytes,
             payload_logical_bytes: accounted.logical,
             payload_unique_allocated_bytes: accounted.unique,
-            coverage: accounted.coverage,
+            coverage,
             full,
             slots,
         })
@@ -601,7 +631,10 @@ impl Pool {
             .collect();
         for id in evicting {
             let path = self.slot_path(id)?;
-            self.remove_owned_slot(&path)?;
+            if self.remove_owned_slot(&path).is_err() {
+                self.reconciliation_blocked = true;
+                continue;
+            }
             self.ledger.slots.retain(|slot| slot.id != id);
             self.persist()?;
         }
@@ -610,15 +643,26 @@ impl Pool {
 
     fn remove_owned_slot(&self, path: &Path) -> Result<(), LeaseError> {
         let slots_root = self.backing.payload_root().join(SLOTS_NAME);
+        let slots_root = canonical_existing_dir(&slots_root, true)?;
+        if path.parent() != Some(slots_root.as_path()) {
+            return Err(LeaseError::UnsafePath(
+                "deletion is limited to recorded owned slot paths",
+            ));
+        }
         match fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(io_error(error)),
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() {
-                    return Err(LeaseError::UnknownAccounting);
-                }
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    || !metadata.file_type().is_dir()
+                    || metadata.uid() != current_uid()
+                    || metadata.permissions().mode() & 0o077 != 0 =>
+            {
+                return Err(LeaseError::UnknownAccounting);
             }
+            Ok(_) => {}
         }
+        canonical_existing_dir(path, true)?;
         remove_tree_owned(&slots_root, path)
     }
 
@@ -639,12 +683,61 @@ impl Pool {
             }
             Err(error) => return Err(io_error(error)),
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(LeaseError::UnknownAccounting);
+                return Ok(Sizes {
+                    logical: None,
+                    unique: None,
+                    coverage: AccountingCoverage::Unknown,
+                });
             }
             Ok(_) => {}
         }
         inventory_sizes(&path)
     }
+}
+
+const LEASE_METADATA_DIRS: [&str; 4] = [
+    ".fseventsd",
+    ".Spotlight-V100",
+    ".Trashes",
+    ".TemporaryItems",
+];
+
+fn validate_lease_payload_entries(payload_root: &Path) -> Result<(), LeaseError> {
+    let root_metadata = fs::symlink_metadata(payload_root).map_err(io_error)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.file_type().is_dir() {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    let root_device = root_metadata.dev();
+    let mut found_slots = false;
+    for entry in fs::read_dir(payload_root).map_err(io_error)? {
+        let entry = entry.map_err(io_error)?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or(LeaseError::UnknownAccounting)?;
+        let is_slots = name == SLOTS_NAME;
+        if !is_slots && !LEASE_METADATA_DIRS.contains(&name) {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.file_type().is_dir()
+            || metadata.dev() != root_device
+        {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        if is_slots {
+            if metadata.uid() != current_uid() || metadata.permissions().mode() & 0o077 != 0 {
+                return Err(LeaseError::UnsafePath(
+                    "slots root must be a private caller-owned directory",
+                ));
+            }
+            found_slots = true;
+        }
+    }
+    if !found_slots {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    canonical_existing_dir(&payload_root.join(SLOTS_NAME), true)?;
+    Ok(())
 }
 
 struct Sizes {
