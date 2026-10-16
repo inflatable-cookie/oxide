@@ -273,3 +273,27 @@ resolve with the owning Supervisor, not another blanket approval request.
 Checked bounded implementation and independent exact-head review remain
 required; no installation, consumer activation, existing-cache cleanup or
 live experiment was performed or granted merely by recording this ruling.
+
+
+The Supervisor accepted Oxide's lean-interface clarifications on 2026-10-16:
+Nucleus supplies writer-closed release after its owned retirement/cancellation
+or validation process-group completion; no automatic TTL reuse is needed.
+Abandoned slots wait for explicit owner recovery. It accepts `--workspace`
+in addition to project identity, the filesystem-backed aggregate cap and
+idle-only eviction, and requires no debug lookup after release.
+
+The same return makes cross-worktree registry-dependency reuse a delivery
+acceptance gate, not deferred research: fresh task and validation paths mean
+path-isolated reuse is not worth Nucleus wiring. Include one focused real
+cross-worktree correctness qualification with selected tests always run,
+actual registry/native dependency reuse and source-change controls. Ordinary
+Cargo keying is a hypothesis to verify, not evidence by assertion. Do not
+hand over a path-isolated substitute as successful delivery, reintroduce
+signed/callback machinery, or dispatch a new generic proof-wrapper chain.
+Use checked bounded Queue implementation/qualification scopes with independent
+exact-head review under the accepted shape; no further blanket approval ask.
+Nucleus owns its identified validation process-group fix and subsequent
+consumer integration. No live consumer activation or existing-cache cleanup
+is implied. The original unstarted real-workflow packet's time, invocation and
+storage boundaries must be reconciled before its first launch, never reset
+or duplicated silently.

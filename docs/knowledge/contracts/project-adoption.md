@@ -361,7 +361,7 @@ fallback when storage is busy. No current accepted CLI binary or consumer
 binding exists; the proposed replacement is described below. Do not restore
 the historical adapters or make the protected route a prerequisite.
 
-### Lean local lease interface under assessment
+### Lean local lease interface agreed for delivery
 
 The requested public shape is `lease --project <canonical-root> --profile
 <dev|full-debug> --holder <opaque-id>`, idempotent `release --lease <id>`, and
@@ -375,7 +375,8 @@ of writer closure. Caller-provided paths must never authorize deletion outside
 Oxide-owned storage. Exact JSON, exit codes and binary path belong in the
 reviewed implementation handover, not an invented current API.
 
-Oxide recommends three explicit boundary clarifications:
+On 2026-10-16 the Supervisor accepted these boundary clarifications and
+required cross-worktree correctness qualification in this delivery:
 
 - `release` is the same-user caller's assertion that every writer using this
   lease has ended, including cancellation descendants, and any outputs it
@@ -383,24 +384,33 @@ Oxide recommends three explicit boundary clarifications:
   validation-success receipt is required for this lean ownership assertion.
   Release never asserts tests passed. A repeated release is access-free and
   idempotent. TTL expiry or holder loss marks an abandoned lease; neither
-  proves compiler descendants stopped. Keep it unavailable for reuse/deletion
-  until the owner establishes writer closure. An opaque holder cannot itself
-  be probed for process liveness. Automatic expiry-based reuse remains an
-  unresolved request, not accepted release evidence.
+  proves compiler descendants stopped. The Supervisor accepted holding such
+  leases until an explicit owner `recover` operation asserts writer closure;
+  automatic TTL-based reuse is not required. Nucleus owns its closeout/cancel
+  retirement path and validation-process-group termination before release.
+  It identified its direct-child-only validation timeout handling as a
+  consumer fix to make before adopting the release contract.
 - Separate canonical project identity from the actual source checkout path
-  (for example an explicit workspace argument). The latter and effective
-  build context must be known before selecting a warm generation. Existing
-  evidence found stale source behavior across checkout paths; project/profile
-  alone is not a qualified cross-worktree compatibility key. Start with
-  path-isolated warm reuse until a supported cross-path boundary is proved,
-  reporting the reduced benefit honestly. This constraint affects the main
-  duplication goal and must not be hidden in an implementation detail.
+  through an explicit `--workspace <checkout>` argument. The Supervisor
+  accepted it and requires useful registry-dependency reuse across different
+  task/validation paths, including bundled SQLite. Path-isolated warm reuse
+  provides insufficient benefit and is not an acceptable Nucleus handover.
+  Include a focused real cross-worktree correctness qualification in this
+  delivery: observe actual dependency reuse, run selected tests every time,
+  and verify changed/older-or-equal-mtime local source cannot produce stale
+  success when alternating checkout paths. Cargo's source-path/package-key
+  behavior is a hypothesis to test, not an already qualified fact. Do not
+  restore the old signed input-audit route to pursue this gate.
 - Lease-time idle eviction is admission management; it cannot constrain
   writes after return. Reuse the verified bounded payload filesystem for an
   actual aggregate byte ceiling, with durable control outside it. Full writes
   fail normally without releasing a lease. Evict whole idle slots only; active
   or abandoned/uncertain slots remain protected. Directory-only mode, if
   offered, must say budget-only rather than claim a hard cap.
+
+Nucleus explicitly needs no debug lookup after release. Released bytes are
+therefore disposable under its chosen lean policy; no native debug retention
+receipt is a prerequisite for that consumer handover.
 
 Prefer shared intermediates with private final target output where the pinned
 Cargo behavior supports that separation; returned variables must specify the
@@ -411,11 +421,13 @@ or retain the lease. Do not claim independent debug retention from a copied
 binary alone. Do not impose the old signed capture protocol on this lean
 route. Existing private cold fallback must omit all acquired shared paths.
 
-Expected scope is roughly two focused PRs: local lease/lock/ledger CLI and
-status, then bounded backend/admission/idle eviction integration with the
-actual command-level safety tests and short consumer handover. This is an
-estimate, not a spent-budget reset or commitment that real cross-path reuse
-is solved. Reuse the existing bounded filesystem and inventory implementation;
+The delivery is scoped as two focused PRs: the usable local lease CLI with
+bounded backing/admission/idle eviction, then the focused real cross-worktree
+qualification and only necessary corrections plus the short consumer handover.
+Each needs a checked Queue brief and independent exact-head review. Cross-path
+reuse must pass before Nucleus is told the CLI is ready; a precise negative
+result is reported instead of handing over a path-isolated substitute. This
+is an estimate, not a budget reset or a claim that the gate already passes. Reuse the existing bounded filesystem and inventory implementation;
 old authentication/callback plumbing is not required. Exact implementation
 briefs must name finite fixture limits and independent review. This
 assessment creates no live consumer, host installation or real experiment.
