@@ -36,6 +36,24 @@ All remedies below are candidates for qualification, not selected defaults or pe
 | Dependency maintenance has too many separate checks | [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) covers dependency policy | Offer optional coherent reporting using existing tools; repository policy remains authoritative. Automatic dependency upgrades/removal are not established scope. |
 | Debugging async behavior is hard | [Tokio console](https://github.com/tokio-rs/console) supplies async observability | Explore optional integration and explain instrumentation requirements. It is Tokio-specific, not a general solution for every Rust runtime. |
 
+## Cargo build-message diagnostic boundary
+
+Cargo's [JSON message contract](https://doc.rust-lang.org/cargo/reference/external-tools.html#json-messages)
+provides an observation surface without interpreting mutable compiler internals.
+Artifact rows distinguish up-to-date artifacts from steps that ran rustc and
+report selected compiler profile fields. A report can describe those observed
+settings; the stream does not supply the complete effective Cargo configuration
+or why each unit became dirty. Treat package IDs as opaque identities and avoid
+turning message counts into a complete unit graph, elapsed time or writes.
+
+Build-script result rows can be emitted from cached results, so they do not
+prove a script or native compiler reran. Build-finished success describes the
+build stage; test execution can follow it and still fail. A retained log is
+user-supplied diagnostic input, not authenticated exact-run QA evidence.
+Unrecognized, mixed, malformed or truncated input needs explicit coverage
+limits rather than guessed success, cache-hit rates or rebuild causes. No
+settings change, new build or host scan is necessary to analyze a named log.
+
 ## Experimental frontier
 
 The Cargo performance guide also describes nightly parallel frontend and feature-unification experiments. [Cranelift's backend](https://github.com/rust-lang/rustc_codegen_cranelift) offers a faster-codegen candidate but has platform/feature limits; its documentation warns about unwinding support on macOS/Windows. These require opt-in qualification and cannot silently change test/runtime semantics. Hot reload, incremental linking and compiler-level invalidation improvements need targeted upstream/tool research rather than a universal promise.
