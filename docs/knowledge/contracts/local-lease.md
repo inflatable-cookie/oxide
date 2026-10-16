@@ -161,6 +161,24 @@ CLI does not repeat the filesystem-full proof (see bounded storage).
 Host reserve, APFS metadata and private workspace `target`/temp bytes are
 distinct from managed payload bytes. Status does not add them together.
 
+Deletion of an idle slot frees space inside the payload filesystem for later
+builds. Returning host-allocated sparse-image space is a different operation:
+this CLI does not compact its backing image. A retained host allocation does
+not itself mean the deleted slot still consumes live payload space. Apple's
+installed `hdiutil(1)` manual documents conditional APFS sparse-image compaction;
+that is not a shipped Oxide operation or authority to compact a mounted or
+uncertain pool. The payload ceiling also does not claim an exact ceiling on
+all host-side image/control metadata, snapshots or private target/temp output.
+
+A new empty slot still cannot hold a build larger than the remaining payload
+capacity. Increasing the pool changes that finite limit; it does not remove
+it. No build-size distribution or failure percentage is established. Selective
+`cargo clean -p` before release is not part of this interface and has not been
+qualified as removing all historical path-specific workspace artifacts while
+preserving the desired shared intermediates. Any such cleanup would remain
+inside exclusive ownership with admitted execution and positive completion;
+it cannot be added after an assertion that all writers have ended.
+
 ## Exit codes
 
 | Code | When |
