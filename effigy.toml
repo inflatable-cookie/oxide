@@ -7,6 +7,10 @@ minimum_effigy_version = "0.14.0"
 "rust:private-compile" = "cargo check --workspace --all-targets --locked --features private-qualification"
 "rust:test-ordinary-cargo-stable-reuse" = "python3 scripts/bounded-test.py cargo test --lib --locked --features private-qualification storage::tests::stable_reuse::ordinary_cargo_stable_reuse_identity_reuses_across_exact_attempts -- --exact"
 "rust:test-declared-workflow" = "python3 scripts/bounded-test.py cargo test --lib --locked project::workflow::tests -- --nocapture"
+# Builds the unpublished oxide-storage-inventory binary and proves the
+# rendered output-byte ceiling on tiny synthetic fixtures. Not a QA alias
+# and not a real project-target scan.
+"rust:storage-inventory-cli" = "python3 scripts/test-storage-inventory-cli.py"
 "rust:private-process" = "python3 scripts/test-private-process.py"
 "registry:acquire:nucleus" = "python3 scripts/acquire-nucleus-registry.py"
 "registry:stream:nucleus" = "python3 scripts/acquire-nucleus-registry-stream.py"

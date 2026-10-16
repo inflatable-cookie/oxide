@@ -19,7 +19,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Read;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
 /// The only declaration format this crate accepts. Mixed or unknown versions
@@ -81,6 +83,87 @@ impl fmt::Display for WorkflowRefusal {
 }
 
 impl std::error::Error for WorkflowRefusal {}
+
+/// Read one explicit local declaration file with the 64 KiB ceiling enforced
+/// while reading.
+///
+/// The named path is opened once. A FIFO, socket, device or directory is
+/// refused from `lstat` without opening it. A symlink is opened with
+/// `O_NONBLOCK` so a special-file target cannot block the process; the opened
+/// descriptor must still be a regular file. At most `cap + 1` bytes are
+/// allocated and copied, so a size hint or a file that grows cannot cause
+/// unbounded allocation. Refusals are bounded and never include file
+/// contents, secrets or the full path.
+///
+/// Open and read remain ordinary filesystem syscalls. This function does not
+/// impose a hard deadline against an uninterruptible kernel wait, walk
+/// directories or discover other host paths.
+pub fn read_workflow_declaration(path: &Path) -> Result<Vec<u8>, WorkflowRefusal> {
+    read_declaration_file(path, MAX_WORKFLOW_DECLARATION_BYTES)
+}
+
+fn read_declaration_file(path: &Path, cap: usize) -> Result<Vec<u8>, WorkflowRefusal> {
+    let named = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return Err(unreadable_declaration()),
+    };
+    let named_type = named.file_type();
+    if named_type.is_dir()
+        || named_type.is_fifo()
+        || named_type.is_socket()
+        || named_type.is_block_device()
+        || named_type.is_char_device()
+    {
+        return Err(not_regular_declaration());
+    }
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(_) => return Err(unreadable_declaration()),
+    };
+    let opened = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) => return Err(unreadable_declaration()),
+    };
+    if !opened.is_file() {
+        return Err(not_regular_declaration());
+    }
+    read_capped(&mut file, cap)
+}
+
+/// Copy at most `cap + 1` bytes from `reader`. Used by the file reader and as
+/// the allocation/read-count test seam so a huge source is unnecessary.
+fn read_capped<R: Read>(reader: &mut R, cap: usize) -> Result<Vec<u8>, WorkflowRefusal> {
+    let mut bytes = Vec::with_capacity(cap.saturating_add(1));
+    let take_limit = u64::try_from(cap).unwrap_or(u64::MAX).saturating_add(1);
+    if reader.take(take_limit).read_to_end(&mut bytes).is_err() {
+        return Err(unreadable_declaration());
+    }
+    if bytes.len() > cap {
+        return Err(WorkflowRefusal::new(
+            "declaration-too-large",
+            format!("declaration exceeds the {cap} byte ceiling"),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn unreadable_declaration() -> WorkflowRefusal {
+    WorkflowRefusal::new(
+        "declaration-unreadable",
+        "declaration file could not be read",
+    )
+}
+
+fn not_regular_declaration() -> WorkflowRefusal {
+    WorkflowRefusal::new(
+        "declaration-not-regular",
+        "declaration path is not a regular file",
+    )
+}
 
 /// Declared project/component/workflow identity, the declared project root and
 /// the workspace relative to it.
@@ -857,7 +940,13 @@ fn parse_unique_json(bytes: &[u8]) -> Result<Value, WorkflowRefusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
+    use std::io::{self, Read};
+    use std::os::unix::ffi::OsStrExt;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
@@ -1245,5 +1334,123 @@ mod tests {
             WorkflowPlan::resolve(absent.as_bytes()).unwrap_err().code,
             "workspace-missing"
         );
+    }
+
+    struct CountingReader {
+        remaining: usize,
+        copied: usize,
+        reads: usize,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            let n = buf.len().min(self.remaining);
+            for slot in buf.iter_mut().take(n) {
+                *slot = b'x';
+            }
+            self.remaining -= n;
+            self.copied += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn capped_reader_stops_at_cap_plus_one_without_a_huge_source() {
+        let mut reader = CountingReader {
+            remaining: usize::MAX,
+            copied: 0,
+            reads: 0,
+        };
+        let refusal = read_capped(&mut reader, 32).unwrap_err();
+        assert_eq!(refusal.code, "declaration-too-large");
+        assert_eq!(reader.copied, 33);
+        assert!(reader.reads >= 1);
+        let rendered = refusal.render();
+        assert!(rendered.contains("declaration-too-large"));
+        assert!(!rendered.contains("xxxx"));
+    }
+
+    #[test]
+    fn declaration_file_reader_accepts_regular_files_and_refuses_oversize() {
+        let (root, _) = fixture("declaration-file");
+        let in_bounds = root.path.join("ok.json");
+        let body = declaration(&root.path);
+        fs::write(&in_bounds, &body).unwrap();
+        let bytes = read_workflow_declaration(&in_bounds).unwrap();
+        assert_eq!(bytes, body.as_bytes());
+        let plan = WorkflowPlan::resolve(&bytes).unwrap();
+        assert_eq!(plan.selector, "rust:test");
+
+        let oversize = root.path.join("oversize.json");
+        fs::write(&oversize, vec![b'y'; MAX_WORKFLOW_DECLARATION_BYTES + 1]).unwrap();
+        let refusal = read_workflow_declaration(&oversize).unwrap_err();
+        assert_eq!(refusal.code, "declaration-too-large");
+        let rendered = refusal.render();
+        assert!(rendered.contains("65536 byte ceiling"));
+        assert!(!rendered.contains("yyyy"));
+        assert!(!rendered.contains("oversize.json"));
+
+        let tiny = root.path.join("tiny.bin");
+        fs::write(&tiny, [b'z'; 9]).unwrap();
+        let refusal = read_declaration_file(&tiny, 8).unwrap_err();
+        assert_eq!(refusal.code, "declaration-too-large");
+        let exact = read_declaration_file(&tiny, 9).unwrap();
+        assert_eq!(exact.len(), 9);
+
+        let missing = root.path.join("missing.json");
+        assert_eq!(
+            read_workflow_declaration(&missing).unwrap_err().code,
+            "declaration-unreadable"
+        );
+    }
+
+    #[test]
+    fn declaration_file_reader_refuses_non_regular_inputs_without_blocking() {
+        let root = TempRoot::new("declaration-special");
+        let directory = root.path.join("dir");
+        fs::create_dir(&directory).unwrap();
+        assert_eq!(
+            read_workflow_declaration(&directory).unwrap_err().code,
+            "declaration-not-regular"
+        );
+
+        let fifo = root.path.join("fifo");
+        let c_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a NUL-terminated path in the task scratch tree.
+        let status = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(status, 0, "create fifo fixture");
+        let fifo_for_thread = fifo.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(read_workflow_declaration(&fifo_for_thread));
+        });
+        let refusal = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("FIFO open must return without blocking")
+            .unwrap_err();
+        assert_eq!(refusal.code, "declaration-not-regular");
+        assert!(!refusal.render().contains("fifo"));
+
+        let (plan_root, _) = fixture("declaration-symlink-target");
+        let target = plan_root.path.join("regular.json");
+        fs::write(&target, declaration(&plan_root.path)).unwrap();
+        let link = root.path.join("link.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let bytes = read_workflow_declaration(&link).unwrap();
+        assert_eq!(WorkflowPlan::resolve(&bytes).unwrap().selector, "rust:test");
+
+        let fifo_link = root.path.join("fifo-link");
+        std::os::unix::fs::symlink(&fifo, &fifo_link).unwrap();
+        let fifo_link_for_thread = fifo_link.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(read_workflow_declaration(&fifo_link_for_thread));
+        });
+        let refusal = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("symlink-to-FIFO open must return without blocking")
+            .unwrap_err();
+        assert_eq!(refusal.code, "declaration-not-regular");
     }
 }

@@ -104,9 +104,6 @@ fn run(args: Vec<OsString>) -> Result<ExitCode, String> {
     output
         .write_all(&rendered.bytes)
         .map_err(|error| error.to_string())?;
-    if !rendered.bytes.ends_with(b"\n") {
-        output.write_all(b"\n").map_err(|error| error.to_string())?;
-    }
     output.flush().map_err(|error| error.to_string())?;
 
     if rendered.truncated || !report.coverage.complete {

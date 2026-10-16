@@ -9,7 +9,7 @@
 use oxide_storage::ordinary_cargo::{
     run_declared_attempt, DeclaredWorkflowError, OrdinaryCargoAttemptResult,
 };
-use oxide_storage::WorkflowPlan;
+use oxide_storage::{read_workflow_declaration, WorkflowPlan};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -25,10 +25,10 @@ fn main() -> ExitCode {
         if args.next().is_some() {
             return ExitCode::from(2);
         }
-        let bytes = match std::fs::read(Path::new(&declaration)) {
+        let bytes = match read_workflow_declaration(Path::new(&declaration)) {
             Ok(bytes) => bytes,
-            Err(_) => {
-                eprintln!("refused: declaration-unreadable (declaration file could not be read)");
+            Err(refusal) => {
+                eprintln!("{}", refusal.render());
                 return ExitCode::from(1);
             }
         };
@@ -53,10 +53,10 @@ fn main() -> ExitCode {
         if args.next().is_some() {
             return ExitCode::from(2);
         }
-        let bytes = match std::fs::read(Path::new(&declaration)) {
+        let bytes = match read_workflow_declaration(Path::new(&declaration)) {
             Ok(bytes) => bytes,
-            Err(_) => {
-                eprintln!("refused: declaration-unreadable (declaration file could not be read)");
+            Err(refusal) => {
+                eprintln!("{}", refusal.render());
                 return ExitCode::from(1);
             }
         };

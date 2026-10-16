@@ -891,26 +891,41 @@ impl InventoryReport {
     /// Render machine-readable JSON bounded to `limits.max_output_bytes`.
     ///
     /// The schema is fixed-size, so truncation is expected only for a
-    /// deliberately tiny cap; in that case a compact `truncated` object is
-    /// returned instead of invalid JSON.
+    /// deliberately tiny cap. The fallback is a small fixed object so a long
+    /// root, note or escaped field cannot exceed the cap or produce invalid
+    /// JSON.
     pub fn render_json(&self) -> Result<Rendered, serde_json::Error> {
-        let bytes = serde_json::to_vec_pretty(self)?;
+        let mut bytes = serde_json::to_vec_pretty(self)?;
         if bytes.len() <= self.limits.max_output_bytes {
+            append_newline_within(&mut bytes, self.limits.max_output_bytes);
             return Ok(Rendered {
                 bytes,
                 truncated: false,
             });
         }
-        let fallback = serde_json::json!({
-            "truncated": true,
-            "partial": true,
-            "root": self.root.to_string_lossy(),
-            "max_output_bytes": self.limits.max_output_bytes,
-        });
-        Ok(Rendered {
-            bytes: serde_json::to_vec(&fallback)?,
-            truncated: true,
-        })
+        Ok(truncated_json(self.limits.max_output_bytes))
+    }
+}
+
+/// Compact truncated JSON, including the trailing newline, stays well under
+/// the 64-byte minimum output cap and has no path or note fields.
+const JSON_TRUNCATED_FALLBACK: &[u8] = b"{\"truncated\":true,\"partial\":true}\n";
+const HUMAN_TRUNCATION_MARKER: &[u8] = b"\n[output truncated at max_output_bytes]\n";
+
+fn truncated_json(limit: usize) -> Rendered {
+    assert!(
+        JSON_TRUNCATED_FALLBACK.len() <= limit,
+        "truncated JSON fallback must fit the minimum output cap"
+    );
+    Rendered {
+        bytes: JSON_TRUNCATED_FALLBACK.to_vec(),
+        truncated: true,
+    }
+}
+
+fn append_newline_within(bytes: &mut Vec<u8>, limit: usize) {
+    if !bytes.ends_with(b"\n") && bytes.len() < limit {
+        bytes.push(b'\n');
     }
 }
 
@@ -922,14 +937,16 @@ fn bound_utf8(text: String, limit: usize) -> Rendered {
             truncated: false,
         };
     }
-    let mut cut = limit;
+    let marker = HUMAN_TRUNCATION_MARKER;
+    let body_budget = limit.saturating_sub(marker.len());
+    let mut cut = body_budget.min(bytes.len());
     while cut > 0 && (bytes[cut] & 0b1100_0000) == 0b1000_0000 {
         cut -= 1;
     }
-    let marker = b"\n[output truncated at max_output_bytes]\n";
     let mut bounded = Vec::with_capacity(cut + marker.len());
     bounded.extend_from_slice(&bytes[..cut]);
     bounded.extend_from_slice(marker);
+    debug_assert!(bounded.len() <= limit);
     Rendered {
         bytes: bounded,
         truncated: true,
@@ -1180,13 +1197,59 @@ mod tests {
 
         let human = report.render_human();
         assert!(human.truncated);
-        assert!(human.bytes.len() >= 64);
-        assert!(String::from_utf8(human.bytes).is_ok());
+        assert!(human.bytes.len() <= 64);
+        let human_text = String::from_utf8(human.bytes.clone()).unwrap();
+        assert!(human_text.contains("truncated"));
 
         let json = report.render_json().unwrap();
         assert!(json.truncated);
+        assert!(json.bytes.len() <= 64);
         let value: serde_json::Value = serde_json::from_slice(&json.bytes).unwrap();
         assert_eq!(value["truncated"], serde_json::Value::Bool(true));
+        assert_eq!(value["partial"], serde_json::Value::Bool(true));
+        assert!(value.get("root").is_none());
+    }
+
+    #[test]
+    fn tiny_output_cap_holds_with_long_multibyte_root_and_notes() {
+        let fixture = Fixture::new("output-multibyte");
+        fixture.file("debug/deps/f.rlib", 10);
+        let limits = InventoryLimits {
+            max_output_bytes: 64,
+            ..InventoryLimits::default()
+        };
+        let mut report = inventory_directory(fixture.path(), limits).unwrap();
+        report.root = PathBuf::from(format!("{}{}", "é".repeat(80), "/debug"));
+        report.notes = vec![format!("{}{}", "α".repeat(40), " remaining note")];
+
+        let human = report.render_human();
+        assert!(human.truncated);
+        assert!(human.bytes.len() <= 64);
+        let human_text = String::from_utf8(human.bytes).unwrap();
+        assert!(human_text.contains("truncated"));
+
+        let json = report.render_json().unwrap();
+        assert!(json.truncated);
+        assert!(json.bytes.len() <= 64);
+        let json_text = String::from_utf8(json.bytes.clone()).unwrap();
+        serde_json::from_str::<serde_json::Value>(&json_text).unwrap();
+        assert!(!json_text.contains("é"));
+        assert!(!json_text.contains("α"));
+    }
+
+    #[test]
+    fn default_output_cap_is_honored_for_complete_reports() {
+        let fixture = Fixture::new("output-default");
+        fixture.file("debug/deps/f.rlib", 10);
+        let report = inventory_directory(fixture.path(), InventoryLimits::default()).unwrap();
+        let human = report.render_human();
+        assert!(!human.truncated);
+        assert!(human.bytes.len() <= DEFAULT_MAX_OUTPUT_BYTES);
+        assert!(String::from_utf8(human.bytes.clone()).is_ok());
+        let json = report.render_json().unwrap();
+        assert!(!json.truncated);
+        assert!(json.bytes.len() <= DEFAULT_MAX_OUTPUT_BYTES);
+        serde_json::from_slice::<serde_json::Value>(&json.bytes).unwrap();
     }
 
     #[test]
