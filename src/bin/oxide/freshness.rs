@@ -8,11 +8,12 @@
 //! file whose content may differ from what the slot compiled and that is not
 //! newer than the build anchor. On a checkout-path change it does the same
 //! for every file of every local package under the checkout, as Cargo's
-//! metadata names them under the guarded command's own lock, network and
-//! config arguments. File contents, Cargo fingerprints
+//! effect-free metadata names them under the guarded command's own lock,
+//! network and config arguments. File contents, Cargo fingerprints
 //! and the slot are never touched. Inputs outside Git or ignored by it are
 //! not covered.
 
+use crate::cli::Resolution;
 use crate::MIB;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -203,10 +204,10 @@ impl Gate {
     }
 }
 
-/// Run the gate for `checkout` before Cargo. `resolution` holds the guarded
-/// command's lock, network and config arguments (`cli::resolution_args`).
-/// An error means the caller must not run Cargo on the slot.
-pub fn prepare(checkout: &Path, prior: &Prior, resolution: &[OsString]) -> Result<Gate, Refusal> {
+/// Run the gate for `checkout` before Cargo. `request` is the guarded
+/// command's resolution request (`cli::resolution`). An error means the
+/// caller must not run Cargo on the slot.
+pub fn prepare(checkout: &Path, prior: &Prior, request: &Resolution) -> Result<Gate, Refusal> {
     match prior {
         Prior::Unknown => Err(Refusal::Unvouched(
             "the slot has no trusted build record".to_owned(),
@@ -234,7 +235,7 @@ pub fn prepare(checkout: &Path, prior: &Prior, resolution: &[OsString]) -> Resul
             let mut refreshed = refresh(&top, stale, origin.anchor_ns)?;
             let mut packages = 0;
             if cross {
-                let metadata = cargo_metadata(checkout, resolution)?;
+                let metadata = cargo_metadata(checkout, request)?;
                 let (count, files) = local_package_files(&top, &metadata)?;
                 packages = count;
                 refreshed += refresh(&top, files.iter(), origin.anchor_ns)?;
@@ -552,24 +553,130 @@ fn local_package_files(
     Ok((local.len(), files))
 }
 
-/// `cargo metadata` for the workspace in the guarded command's context: the
-/// same Cargo, working directory (so the same config files) and inherited
-/// environment, plus its lock, network and config arguments. Without
-/// `--locked` or `--frozen` it may create or update the lock file exactly
-/// as the guarded command would.
-fn metadata_command(checkout: &Path, resolution: &[OsString]) -> Command {
+/// A Cargo call in the guarded command's context: the same Cargo, working
+/// directory (so the same config files) and inherited environment, plus
+/// `args` and the workspace manifest.
+fn cargo_command(checkout: &Path, leading: &[&str], args: &[OsString]) -> Command {
     let mut command = Command::new(crate::CARGO);
     command
-        .args(["metadata", "--format-version", "1"])
-        .args(resolution)
+        .args(leading)
+        .args(args)
         .arg("--manifest-path")
         .arg(checkout.join("Cargo.toml"));
     command
 }
 
-/// Run `cargo metadata` for the workspace, bounded in output and lifetime.
-fn cargo_metadata(checkout: &Path, resolution: &[OsString]) -> Result<serde_json::Value, Refusal> {
-    let mut child = metadata_command(checkout, resolution)
+/// The gate's metadata arguments: the guarded command's own, plus
+/// `--offline` and `--locked` where it lacks them. Metadata then never
+/// downloads a package or writes the lock file, whatever the request.
+fn probe_args(request: &Resolution) -> Vec<OsString> {
+    let mut args = request.args.clone();
+    if !request.offline() {
+        args.push(OsString::from("--offline"));
+    }
+    if !request.locked() {
+        args.push(OsString::from("--locked"));
+    }
+    args
+}
+
+/// The workspace graph from `cargo metadata`. The call itself has no
+/// effects. When Cargo refuses because the lock file is missing or stale:
+/// - a help request resolves nothing, so the slot is only refused;
+/// - a `--locked` or `--frozen` command fails the same way under plain Cargo
+///   when the lock is missing, or when it is offline in any case: the
+///   refusal is the command's own;
+/// - a command allowed to write a missing lock gets it from `cargo
+///   generate-lockfile` with its own arguments, Cargo's resolution with no
+///   previous lock, as its build would do; no package is downloaded;
+/// - anything else refuses the slot, and the cold build does Cargo's own
+///   lock work.
+fn cargo_metadata(checkout: &Path, request: &Resolution) -> Result<serde_json::Value, Refusal> {
+    let refused = match probe(checkout, request)? {
+        Ok(metadata) => return Ok(metadata),
+        Err(refused) => refused,
+    };
+    let missing = !request.moves_lockfile() && !checkout.join("Cargo.lock").exists();
+    let reason =
+        |message: &str| -> Refusal { format!("cargo metadata failed: {}", message.trim()).into() };
+    if request.help {
+        return Err(reason(&refused.message));
+    }
+    if request.locked() {
+        return Err(if missing || request.offline() {
+            Refusal::Lock {
+                code: refused.code,
+                message: refused.message,
+            }
+        } else {
+            reason(&refused.message)
+        });
+    }
+    if !missing {
+        return Err(Refusal::Unvouched(
+            "the lock file needs updating; this command's Cargo updates it".to_owned(),
+        ));
+    }
+    let generated = run_cargo(
+        cargo_command(checkout, &["generate-lockfile"], &request.args),
+        MAX_METADATA_ERROR_BYTES,
+    )?;
+    if !generated.status.success() {
+        return Err(format!(
+            "cargo generate-lockfile failed: {}",
+            generated.stderr.trim()
+        )
+        .into());
+    }
+    probe(checkout, request)?.map_err(|refused| reason(&refused.message))
+}
+
+/// Cargo's refusal to create or update the lock file.
+struct LockRefused {
+    code: u8,
+    message: String,
+}
+
+/// One effect-free metadata call. `Ok(Err(_))` is Cargo's lock refusal.
+fn probe(
+    checkout: &Path,
+    request: &Resolution,
+) -> Result<Result<serde_json::Value, LockRefused>, String> {
+    let output = run_cargo(
+        cargo_command(
+            checkout,
+            &["metadata", "--format-version", "1"],
+            &probe_args(request),
+        ),
+        MAX_METADATA_BYTES,
+    )?;
+    if !output.status.success() {
+        if output.status.code().is_some() && output.stderr.contains(LOCK_REFUSAL) {
+            return Ok(Err(LockRefused {
+                code: crate::process::exit_code(output.status),
+                message: output.stderr,
+            }));
+        }
+        return Err(format!("cargo metadata failed: {}", output.stderr.trim()));
+    }
+    if output.overflow {
+        return Err("cargo metadata output exceeds the gate's limit".to_owned());
+    }
+    serde_json::from_slice(&output.stdout)
+        .map(Ok)
+        .map_err(|error| format!("Cargo metadata is not JSON: {error}"))
+}
+
+struct CargoOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    overflow: bool,
+    stderr: String,
+}
+
+/// Run one Cargo call, bounded in output and lifetime.
+fn run_cargo(mut command: Command, stdout_cap: u64) -> Result<CargoOutput, String> {
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -577,7 +684,7 @@ fn cargo_metadata(checkout: &Path, resolution: &[OsString]) -> Result<serde_json
         .map_err(|error| format!("could not start Cargo: {error}"))?;
     let stdout = child.stdout.take().ok_or("Cargo stdout was not captured")?;
     let stderr = child.stderr.take().ok_or("Cargo stderr was not captured")?;
-    let out = std::thread::spawn(move || read_capped(stdout, MAX_METADATA_BYTES));
+    let out = std::thread::spawn(move || read_capped(stdout, stdout_cap));
     let err = std::thread::spawn(move || read_capped(stderr, MAX_METADATA_ERROR_BYTES));
     let deadline = Instant::now() + METADATA_TIME;
     let status = loop {
@@ -587,7 +694,7 @@ fn cargo_metadata(checkout: &Path, resolution: &[OsString]) -> Result<serde_json
                 // Our own child; reaping it closes the pipes.
                 let _ = child.kill();
                 let _ = child.wait();
-                break Err("cargo metadata did not finish in time".to_owned());
+                break Err("Cargo did not finish in time".to_owned());
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
             Err(error) => break Err(format!("could not wait for Cargo: {error}")),
@@ -597,24 +704,13 @@ fn cargo_metadata(checkout: &Path, resolution: &[OsString]) -> Result<serde_json
     let err = err.join().map_err(|_| "Cargo error reader panicked")?;
     let status = status?;
     let (stdout, overflow) = out.map_err(|error| format!("cannot read Cargo output: {error}"))?;
-    if !status.success() {
-        let stderr = err.map(|(bytes, _)| bytes).unwrap_or_default();
-        let message = String::from_utf8_lossy(&stderr).into_owned();
-        if status.code().is_some() && message.contains(LOCK_REFUSAL) {
-            return Err(Refusal::Lock {
-                code: crate::process::exit_code(status),
-                message,
-            });
-        }
-        return Err(format!("cargo metadata failed: {}", message.trim()).into());
-    }
-    if overflow {
-        return Err("cargo metadata output exceeds the gate's limit"
-            .to_owned()
-            .into());
-    }
-    serde_json::from_slice(&stdout)
-        .map_err(|error| format!("Cargo metadata is not JSON: {error}").into())
+    let stderr = err.map(|(bytes, _)| bytes).unwrap_or_default();
+    Ok(CargoOutput {
+        status,
+        stdout,
+        overflow,
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
 }
 
 /// Up to `cap` bytes, then drain the rest so the writer never blocks.
@@ -804,22 +900,43 @@ mod tests {
     }
 
     #[test]
-    fn metadata_runs_in_the_guarded_context_with_its_flags() {
-        let resolution: Vec<OsString> = ["--frozen", "--config", "net.offline=false"]
-            .into_iter()
-            .map(OsString::from)
-            .collect();
-        let command = metadata_command(Path::new("/w"), &resolution);
-        let args: Vec<_> = command.get_args().collect();
+    fn metadata_runs_in_the_guarded_context_and_never_writes_or_downloads() {
+        let request = |values: &[&str]| Resolution {
+            args: values.iter().map(OsString::from).collect(),
+            help: false,
+        };
+        let probe = |values: &[&str]| -> Vec<String> {
+            probe_args(&request(values))
+                .into_iter()
+                .map(|value| value.into_string().expect("UTF-8"))
+                .collect()
+        };
+        assert_eq!(probe(&[]), ["--offline", "--locked"]);
+        assert_eq!(probe(&["--locked"]), ["--locked", "--offline"]);
+        assert_eq!(probe(&["--offline"]), ["--offline", "--locked"]);
         assert_eq!(
-            args,
+            probe(&["--frozen", "--config", "net.offline=false"]),
+            ["--frozen", "--config", "net.offline=false"]
+        );
+        assert_eq!(
+            probe(&["--config=net.offline=true", "-Zx"]),
+            ["--config=net.offline=true", "-Zx", "--offline", "--locked"]
+        );
+        let command = cargo_command(
+            Path::new("/w"),
+            &["metadata", "--format-version", "1"],
+            &probe_args(&request(&["--config", "net.offline=false"])),
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
             [
                 "metadata",
                 "--format-version",
                 "1",
-                "--frozen",
                 "--config",
                 "net.offline=false",
+                "--offline",
+                "--locked",
                 "--manifest-path",
                 "/w/Cargo.toml",
             ]
@@ -828,13 +945,17 @@ mod tests {
         // Cargo resolves config files, `CARGO_NET_OFFLINE` and precedence.
         assert_eq!(command.get_current_dir(), None);
         assert_eq!(command.get_envs().count(), 0);
-        let plain = metadata_command(Path::new("/w"), &[]);
+        // The lock is generated with the command's own arguments only.
+        let generate = cargo_command(
+            Path::new("/w"),
+            &["generate-lockfile"],
+            &request(&["--offline"]).args,
+        );
         assert_eq!(
-            plain.get_args().collect::<Vec<_>>(),
+            generate.get_args().collect::<Vec<_>>(),
             [
-                "metadata",
-                "--format-version",
-                "1",
+                "generate-lockfile",
+                "--offline",
                 "--manifest-path",
                 "/w/Cargo.toml"
             ]
@@ -979,11 +1100,12 @@ mod tests {
 
     #[test]
     fn untrusted_or_foreign_affine_slots_refuse_the_gate() {
-        assert!(prepare(Path::new("/b"), &Prior::Unknown, &[]).is_err());
+        assert!(prepare(Path::new("/b"), &Prior::Unknown, &Resolution::default()).is_err());
         let affine = Prior::Known(Built::Affine(PathBuf::from("/a")));
-        assert!(prepare(Path::new("/b"), &affine, &[]).is_err());
+        assert!(prepare(Path::new("/b"), &affine, &Resolution::default()).is_err());
         assert_eq!(affine.foreign(Path::new("/b")), Some(PathBuf::from("/a")));
-        let own = prepare(Path::new("/a"), &affine, &[]).expect("own affine slot");
+        let own =
+            prepare(Path::new("/a"), &affine, &Resolution::default()).expect("own affine slot");
         assert!(!own.cross && own.describe().is_none());
         assert!(
             matches!(own.finish(Path::new("/a")), Some(Built::Affine(path)) if path == Path::new("/a"))

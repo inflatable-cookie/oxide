@@ -160,16 +160,24 @@ slot has a recorded origin:
    `--offline`, `--config`, `-Z` and `--lockfile-path` arguments before any
    `--`, unchanged. Cargo merges them with `net.offline` and
    `CARGO_NET_OFFLINE` under its own precedence; `--frozen` stays locked and
-   offline. Without `--locked` or `--frozen`, metadata may create or update
-   the checkout's `Cargo.lock` exactly as the guarded command would; that is
-   how a fresh worktree of a repository with an ignored or stale lock gets
-   warm dependency reuse. Oxide edits nothing else. Unrestricted metadata
-   resolves the whole workspace for all platforms, so on a cold Cargo home
-   it may fetch the index and package sources the narrower guarded command
-   would not; those land only in Cargo's own home. When `--locked` or
-   `--frozen` makes Cargo refuse to create or update the lock, the command
-   ends there with Cargo's message and exit code, as plain Cargo would; the
-   slot goes back unchanged and nothing builds cold.
+   offline. The gate adds `--offline` and `--locked` where the command lacks
+   them, so metadata itself never downloads a package or writes the lock.
+   When Cargo then refuses because the lock is missing or stale:
+   - A command allowed to write a missing `Cargo.lock` gets it from
+     `cargo generate-lockfile` with the command's own arguments: Cargo's
+     resolution with no previous lock, as its build would do, with no
+     package download. Metadata is then read again. A fresh worktree of a
+     repository with an ignored lock gets warm dependency reuse this way.
+   - `--locked` or `--frozen` with a missing lock, or with `--frozen` or
+     `--offline`, is the command's own refusal under plain Cargo: the
+     command ends with Cargo's message and exit code, the slot goes back
+     unchanged and nothing builds cold.
+   - Anything else refuses the slot: a stale lock the command may update, a
+     `--locked` online command whose offline answer is not certain, or a
+     help request (`-h`, `--help`), which resolves nothing. The cold build's
+     own Cargo then updates, refuses or prints help as usual, and a later
+     command from another checkout warms.
+   Oxide edits nothing else.
    Every tracked and untracked non-ignored file in the checkout gets the
    same mtime treatment unless its deepest package directory belongs to a
    registry or Git package (vendored sources), so every local unit rebuilds,

@@ -147,7 +147,7 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     process::install_signal_handlers()?;
     let store = Store::open_or_create()?;
     let started = Instant::now();
-    let resolution = cli::resolution_args(&invocation.cargo_args);
+    let resolution = cli::resolution(&invocation.cargo_args);
     let (held, gate) = match lease_with_gate(&store, &key, invocation.profile, &resolution)? {
         Ok(leased) => leased,
         Err(Stop::Signal(signal)) => return Ok(process::signal_exit_code(signal)),
@@ -235,7 +235,7 @@ fn lease_with_gate(
     store: &Store,
     key: &SlotKey,
     profile: cli::Profile,
-    resolution: &[OsString],
+    resolution: &cli::Resolution,
 ) -> Result<Result<(store::Lease, Gate), Stop>, String> {
     let mut share = true;
     // A refusal leaves this checkout without a record, so the next lease is

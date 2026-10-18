@@ -311,33 +311,68 @@ pub fn package_selection(args: &[OsString]) -> Option<String> {
     Some(spec.split('@').next().unwrap_or_default().to_owned())
 }
 
-/// The guarded command's arguments that decide lock and network behavior,
-/// in order, before any `--`: `--locked`, `--frozen`, `--offline`,
-/// `--config`, `-Z` and `--lockfile-path`. The freshness gate passes them to
-/// `cargo metadata` unchanged; Cargo itself merges them with inherited
-/// configuration and environment, so precedence stays Cargo's.
-pub fn resolution_args(cargo_args: &[OsString]) -> Vec<OsString> {
-    let mut kept = Vec::new();
+/// What the guarded command asks of Cargo's dependency resolution.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct Resolution {
+    /// Its `--locked`, `--frozen`, `--offline`, `--config`, `-Z` and
+    /// `--lockfile-path` arguments before any `--`, unchanged and in order.
+    /// Cargo merges them with inherited configuration and environment, so
+    /// precedence stays Cargo's.
+    pub args: Vec<OsString>,
+    /// `-h` or `--help`: Cargo prints help and resolves nothing.
+    pub help: bool,
+}
+
+impl Resolution {
+    fn has(&self, flag: &str) -> bool {
+        self.args.iter().any(|argument| argument == flag)
+    }
+
+    /// `--locked` or `--frozen`: Cargo must not write the lock file.
+    pub fn locked(&self) -> bool {
+        self.has("--locked") || self.has("--frozen")
+    }
+
+    /// `--offline` or `--frozen`: offline whatever config or environment say.
+    pub fn offline(&self) -> bool {
+        self.has("--offline") || self.has("--frozen")
+    }
+
+    /// `--lockfile-path`: the lock file is not the workspace's `Cargo.lock`.
+    pub fn moves_lockfile(&self) -> bool {
+        self.args.iter().any(|argument| {
+            argument == "--lockfile-path"
+                || argument
+                    .to_str()
+                    .is_some_and(|text| text.starts_with("--lockfile-path="))
+        })
+    }
+}
+
+/// The resolution request in a leased command's Cargo arguments.
+pub fn resolution(cargo_args: &[OsString]) -> Resolution {
+    let mut request = Resolution::default();
     let mut iter = cargo_args.iter().skip(1);
     while let Some(argument) = iter.next() {
         let text = argument.to_str().unwrap_or_default();
         match text {
             "--" => break,
-            "--locked" | "--frozen" | "--offline" => kept.push(argument.clone()),
+            "-h" | "--help" => request.help = true,
+            "--locked" | "--frozen" | "--offline" => request.args.push(argument.clone()),
             "--config" | "-Z" | "--lockfile-path" => {
-                kept.push(argument.clone());
-                kept.extend(iter.next().cloned());
+                request.args.push(argument.clone());
+                request.args.extend(iter.next().cloned());
             }
             _ if text.starts_with("--config=")
                 || text.starts_with("--lockfile-path=")
                 || text.starts_with("-Z") =>
             {
-                kept.push(argument.clone());
+                request.args.push(argument.clone());
             }
             _ => {}
         }
     }
-    kept
+    request
 }
 
 /// `run`: the `--bin`/`--example` name the caller selected, if any.
@@ -507,7 +542,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolution_args(&parsed.cargo_args),
+            resolution(&parsed.cargo_args).args,
             args(&[
                 "--locked",
                 "--frozen",
@@ -522,12 +557,34 @@ mod tests {
                 "/w/other.lock",
             ])
         );
-        // No restriction requested: plain metadata, Cargo's own defaults.
+        let request = resolution(&parsed.cargo_args);
+        assert!(request.locked() && request.offline() && request.moves_lockfile());
+        assert!(!request.help);
+        // No restriction requested: Cargo's own defaults.
         let plain = parse_leased("check", &args(&["-p", "app"])).unwrap();
-        assert!(resolution_args(&plain.cargo_args).is_empty());
+        assert_eq!(resolution(&plain.cargo_args), Resolution::default());
+        let locked = resolution(
+            &parse_leased("test", &args(&["--locked"]))
+                .unwrap()
+                .cargo_args,
+        );
+        assert!(locked.locked() && !locked.offline() && !locked.moves_lockfile());
+        let offline = resolution(
+            &parse_leased("test", &args(&["--offline"]))
+                .unwrap()
+                .cargo_args,
+        );
+        assert!(!offline.locked() && offline.offline());
+        // Help resolves nothing; after `--` it is the test binary's.
+        let help = parse_leased("test", &args(&["--locked", "--help"])).unwrap();
+        assert!(resolution(&help.cargo_args).help);
+        let short = parse_leased("build", &args(&["-h"])).unwrap();
+        assert!(resolution(&short.cargo_args).help);
+        let passed = parse_leased("test", &args(&["--", "--help"])).unwrap();
+        assert!(!resolution(&passed.cargo_args).help);
         // External subcommands are scanned after their name too.
         let external = parse_leased("nextest", &args(&["run", "--frozen"])).unwrap();
-        assert_eq!(resolution_args(&external.cargo_args), args(&["--frozen"]));
+        assert_eq!(resolution(&external.cargo_args).args, args(&["--frozen"]));
     }
 
     #[test]
