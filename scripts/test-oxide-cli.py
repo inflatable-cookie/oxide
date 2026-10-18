@@ -1638,7 +1638,7 @@ def prove_run_skip(runner: Runner) -> None:
         fail("a successful run published no skip record")
     skip_times = [skips(f"skip repeat {n}", ["--", "b"], "skip v1 - b") for n in range(3)]
     skips("skip program --rebuild", ["--", "--rebuild"], "skip v1 - --rebuild")
-    no_op_time = builds("skip --rebuild", ["--rebuild", "--", "b"], "skip v1 - b")
+    leased_times = [builds(f"skip --rebuild {n}", ["--rebuild", "--", "b"], "skip v1 - b") for n in range(3)]
     # The brief's baseline: plain Cargo's own no-op build of the same fixture,
     # with no shim and a private target directory warmed first.
     plain_env = {**runner.environment(None), "CARGO_TARGET_DIR": os.path.join(runner.parent, "skip-plain")}
@@ -1657,18 +1657,12 @@ def prove_run_skip(runner: Runner) -> None:
         if n:
             plain_times.append(time.monotonic() - started)
     shutil.rmtree(os.path.join(runner.parent, "skip-plain"))
-    skip_time, plain_time = min(skip_times), min(plain_times)
-    print(
-        f"oxide run skip timings (best of 3, fixture only): skip {skip_time * 1000:.0f} ms "
-        f"(includes executing the program), plain cargo build no-op {plain_time * 1000:.0f} ms, "
-        f"oxide run --rebuild (leased, Cargo no-op) {no_op_time * 1000:.0f} ms"
-    )
-    if skip_time >= plain_time:
+    verdict = timing_verdict(skip_times, leased_times, plain_times)
+    print(f"oxide run skip timings (fixture only, no real-world claim): {verdict['report']}")
+    if verdict["failures"]:
         # The brief's stop condition. Recorded here and failed after every
         # other case has run, so the remaining evidence is kept.
-        NO_GO.append(
-            f"skip {skip_time * 1000:.0f} ms did not beat plain cargo build no-op {plain_time * 1000:.0f} ms"
-        )
+        NO_GO.extend(verdict["failures"])
     skips("skip after --rebuild re-recorded", [], "skip v1 -")
     builds("skip OXIDE_NO_SKIP", [], "skip v1 -", extra={"OXIDE_NO_SKIP": "1"})
 
@@ -1743,6 +1737,52 @@ def prove_run_skip(runner: Runner) -> None:
     with open(os.path.join(ignored, "helper", "Cargo.toml"), "w", encoding="utf-8") as handle:
         handle.write(SKIP_IGNORED_FIXTURE["helper/Cargo.toml"].replace('default = ["old"]', 'default = ["new"]'))
     builds("skip ignored manifest edit", [], "ignored new", cwd=ignored)
+
+
+def timing_verdict(skip: list, leased: list, plain: list) -> dict:
+    """The brief's two-part performance gate, fixed before validation.
+
+    Skip and leased samples are `oxide run` wall times that both execute the
+    program; plain samples are warmed `cargo build` no-ops. Part 1, materially
+    faster than the leased path: the slowest skip takes at most half the
+    fastest leased run. Part 2, no slower than the plain no-op beyond noise:
+    the fastest skip is at most the fastest plain no-op plus the noise, where
+    noise is the larger observed spread (max - min) of the skip and plain
+    samples. Fewer than three samples on any side is insufficient."""
+    failures = []
+    if min(len(skip), len(leased), len(plain)) < 3:
+        failures.append("insufficient timing samples")
+        return {"failures": failures, "report": "insufficient samples"}
+    noise = max(max(skip) - min(skip), max(plain) - min(plain))
+    if max(skip) > min(leased) / 2:
+        failures.append(
+            f"skip is not materially faster than leased oxide run: slowest skip {max(skip) * 1000:.3f} ms > half of fastest leased {min(leased) * 1000:.3f} ms"
+        )
+    if min(skip) > min(plain) + noise:
+        failures.append(
+            f"skip is slower than plain cargo build no-op beyond noise: {min(skip) * 1000:.3f} ms > {min(plain) * 1000:.3f} + {noise * 1000:.3f} ms"
+        )
+    samples = lambda values: ", ".join(f"{value * 1000:.3f}" for value in values)
+    report = (
+        f"skip [{samples(skip)}] ms; leased oxide run --rebuild [{samples(leased)}] ms; "
+        f"plain cargo build no-op [{samples(plain)}] ms; noise {noise * 1000:.3f} ms; "
+        f"part 1 {'pass' if not any('materially' in f for f in failures) else 'fail'}, "
+        f"part 2 {'pass' if not any('beyond noise' in f for f in failures) else 'fail'}"
+    )
+    return {"failures": failures, "report": report}
+
+
+def prove_timing_verdict() -> None:
+    """Pure checks of the gate on synthetic samples, before any native work."""
+    ms = lambda *values: [value / 1000 for value in values]
+    if timing_verdict(ms(16, 17, 18), ms(430, 440, 450), ms(16, 16.5, 17))["failures"]:
+        fail("timing gate refused a tie within noise")
+    if len(timing_verdict(ms(16, 17, 18), ms(30, 31, 32), ms(16, 16.5, 17))["failures"]) != 1:
+        fail("timing gate accepted a skip not materially faster than leased")
+    if len(timing_verdict(ms(30, 30.5, 31), ms(430, 440, 450), ms(16, 16.5, 17))["failures"]) != 1:
+        fail("timing gate accepted a skip slower than plain beyond noise")
+    if timing_verdict(ms(16, 17), ms(430, 440, 450), ms(16, 16.5, 17))["failures"] != ["insufficient timing samples"]:
+        fail("timing gate accepted too few samples")
 
 
 def prove_waiting(runner: Runner, app: str, app2: str) -> None:
@@ -2185,6 +2225,7 @@ def main() -> int:
     parent = os.path.join(scratch_root(), "oxide-cli")
     os.makedirs(parent, mode=0o700, exist_ok=False)
     prove_wait_lines()
+    prove_timing_verdict()
     # The proof phase includes staging the product binaries, which uses the
     # host Cargo home and this repository's cached dependencies.
     STARTED = time.monotonic()

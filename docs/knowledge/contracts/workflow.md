@@ -347,9 +347,15 @@ linker or system library changing in place. The binary is checked by cheap
 attributes only: cooperative same-user scope, not content attestation. The
 skip never needs intermediates in a slot, so it holds after release and
 eviction; [debug path limits](#cross-checkout-freshness) are unchanged.
-The proof fails as a no-go unless the skip (best of three, including the
-program's own run) beats plain `cargo build`'s no-op on the fixture. Fixture
-timings are not a real-world speed claim.
+The proof's two-part performance gate (architect ruling, 2026-10-19,
+replacing the earlier strict beat-bare-Cargo criterion) takes three samples
+of each path and prints them raw at microsecond precision. Part 1: the
+slowest skip takes at most half the fastest leased `oxide run --rebuild` on
+the same fixture; both execute the program. Part 2: the fastest skip is no
+slower than the fastest plain `cargo build` no-op plus noise, the larger
+max-minus-min spread of the skip and plain samples. A failure or fewer than
+three samples ends the proof as a no-go. Fixture timings are not a
+real-world speed claim, and the skip is not claimed to beat bare Cargo.
 
 ## Crash recovery
 
