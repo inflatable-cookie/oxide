@@ -68,6 +68,19 @@ source-directory ancestry alone cannot establish manifest coverage. A Git
 snapshot assembled across a changing HEAD/index must be refused. The repaired
 path must still meet the two-part timing gate and independent correctness review.
 
+The attempted implementation did not meet that timing gate after the snapshot
+repair and is not adopted. Its conservative registry/git exclusion also rested
+on an incomplete source trace: pinned Cargo's
+[dep-info translation](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/compiler/fingerprint/dep_info.rs#L262-L267)
+skips package-relative files when `allow_package` is false, and the
+[compiler call site](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/compiler/mod.rs#L454-L465)
+passes the unit's local-source classification. Merely observing `CheckDepInfo`
+is insufficient to conclude that all downloaded source files are followed.
+Retained correctness fixes are research material, not an accepted fast path.
+A successor combining supported source eligibility and profiling of skip and
+ordinary command costs is a separate proposal requiring Tom's approval; the
+failed performance threshold is not relaxed again.
+
 Tom's ruling, 2026-10-18: draw a line under the mechanism experiments and design a proper user workflow. Oxide should provide a replacement build service: instead of `cargo build` / `cargo run`, the user requests `oxide build …` / `oxide run …` against a named profile (quickest dev loop, light debug, full debug, release and similar). Oxide then handles storage/space management, worktree reuse, building and running where needed. The build location and system are abstracted from the user, so the same request could execute locally, on CI, in the cloud or on another machine on the local network. Tom asked whether `cargo build` and `cargo run` can be redirected to these commands.
 
 Tom's follow-up ruling, 2026-10-18: Oxide must be very easy to use and set up — no intricate install procedures or transparent interception. `oxide build` and `oxide run` are the explicit commands; the design problem is how they integrate into projects and workflows. Do not pursue rustup toolchain shims, `PATH` shims or shell aliases that make `cargo build` reach Oxide for now. Agents tend to fall back to familiar Cargo defaults, so adoption needs an Oxide agent skill and clear per-project agent documentation that direct them to the Oxide commands.
