@@ -329,14 +329,28 @@ fn run_clean(args: &[OsString]) -> Result<u8, String> {
     let mut cargo = Command::new(CARGO);
     cargo.arg("clean").args(args);
     apply_storage(&mut cargo, &scratch.join("build"), &workspace);
-    let status = cargo.status();
+    // The clean barrier must outlive this process if Cargo does: the child
+    // inherits the clean lock and runs as a recorded group whose end is
+    // awaited before the barrier lifts.
+    if let Some(guard) = &guard {
+        guard.share_with_children()?;
+    }
+    let status = process::spawn_group(&mut cargo).and_then(|mut group| {
+        let recorded = match (&store, &guard) {
+            (Some(store), Some(guard)) => store.clean_running(guard, group.id),
+            _ => Ok(()),
+        };
+        let status = process::wait_leader(&mut group);
+        process::wait_group_empty(group.id);
+        recorded.and(status)
+    });
     let _ = std::fs::remove_dir(scratch.join("build"));
     let _ = std::fs::remove_dir(&scratch);
     let detached = match (&store, guard) {
         (Some(store), Some(guard)) => store.finish_clean(guard, &workspace)?,
         _ => 0,
     };
-    let status = status.map_err(|error| format!("could not start Cargo: {error}"))?;
+    let status = status?;
     if detached > 0 {
         eprintln!(
             "oxide: dropped this checkout's slot affinity; {detached} slot(s) kept until evicted"
@@ -381,6 +395,9 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
                 report.slots.len(),
                 report.waiting
             );
+            for checkout in &report.cleaning {
+                println!("  cleaning {}", checkout.display());
+            }
             for slot in &report.slots {
                 let state = match (slot.state, slot.interrupted) {
                     (SlotOccupancy::Held, true) => "held by an interrupted command",

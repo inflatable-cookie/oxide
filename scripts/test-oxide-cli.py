@@ -8,7 +8,7 @@ never touched. Offline std-only fixture crates prove command routing, the
 quick/debug profile flags (including an external subcommand's `$CARGO`
 call), storage-override refusals, `clean`, checkout-affine reuse, FIFO
 waiting and the host limit, clean waiting for active commands, `default-run`
-selection, Ctrl-C forwarding, own-command crash recovery,
+selection (package and virtual workspace roots), Ctrl-C forwarding, own-command crash recovery,
 `status` stray detection and Cargo-equal exit codes. The image is detached
 and the scratch removed only after positive completion. Not a benchmark and
 not full QA.
@@ -92,6 +92,18 @@ version = "0.1.0"
 edition = "2021"
 """,
     "helper/src/lib.rs": "pub fn double(value: u32) -> u32 {\n    value * 2\n}\n",
+}
+
+# Virtual workspace: `default-members = ["app"]`, whose `default-run` picks
+# `app` over its second binary; `tool` is another member with a binary.
+VIRTUAL = {
+    "Cargo.toml": '[workspace]\nmembers = ["app", "tool"]\ndefault-members = ["app"]\nresolver = "2"\n',
+    "rust-toolchain.toml": '[toolchain]\nchannel = "1.97.1"\n',
+    "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\ndefault-run = "app"\n',
+    "app/src/main.rs": 'fn main() {\n    println!("virtual app");\n}\n',
+    "app/src/bin/other.rs": 'fn main() {\n    println!("virtual other");\n}\n',
+    "tool/Cargo.toml": '[package]\nname = "tool"\nversion = "0.1.0"\nedition = "2021"\n',
+    "tool/src/main.rs": 'fn main() {\n    println!("virtual tool");\n}\n',
 }
 
 # External subcommand: reports the injected build dir and runs `$CARGO`.
@@ -301,8 +313,8 @@ def read_log(log) -> str:
     return log.read()
 
 
-def write_fixture(root: str) -> None:
-    for relative, text in FIXTURE.items():
+def write_fixture(root: str, files: dict = FIXTURE) -> None:
+    for relative, text in files.items():
         path = os.path.join(root, relative)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as handle:
@@ -543,6 +555,18 @@ def prove_routing(runner: Runner, app: str, quick_slot: str, debug_slot: str) ->
     prove_clean_waits(runner, app)
     prove_interrupt(runner, app)
     prove_recovery(runner, app)
+
+    # `run` from a virtual workspace root follows Cargo's default members.
+    virtual = os.path.join(runner.parent, "checkouts", "virtual")
+    write_fixture(virtual, VIRTUAL)
+    code, stdout, stderr = runner.run(virtual, ["run"])
+    expect(code, 0, "virtual workspace run", stderr)
+    if stdout.strip() != "virtual app":
+        fail(f"virtual workspace run output {stdout!r}")
+    code, stdout, stderr = runner.run(os.path.join(virtual, "tool"), ["run"])
+    expect(code, 0, "member run", stderr)
+    if stdout.strip() != "virtual tool":
+        fail(f"member run output {stdout!r}")
 
     status = runner.lease_status()
     if status.get("coverage") != "complete" or any(slot["state"] != "idle" for slot in status["slots"]):

@@ -426,9 +426,11 @@ has run against no real project.
   `CARGO_TARGET_DIR=<workspace>/target`. SIGINT, SIGTERM and SIGHUP are
   forwarded to the group; Oxide releases only after the group is empty. `test`
   holds the slot through execution. `run` resolves the binary as `cargo run`
-  does (`--bin` / `--example`, else the package's `default-run`, else its only
-  binary; several binaries without `default-run` refuse with Cargo's error and
-  exit 101 before any lease), builds only that target, releases, then replaces
+  does: `--bin` / `--example`; else, over the `-p` package or the workspace
+  default members for the current directory (the current package, a virtual
+  root's `default-members`, or every member), the single `default-run`, else
+  the only binary. Several binaries refuse with Cargo's error and exit 101
+  before any lease. `run` builds only that target, releases, then replaces
   Oxide with the program. It sets `CARGO_MANIFEST_DIR` only; other `cargo run`
   environment (`CARGO_PKG_*`, dylib paths) is not set. Exit codes are Cargo's,
   or the program's for `run`.
@@ -439,12 +441,15 @@ has run against no real project.
   runs `cargo clean` against the private target directory and an empty
   private build directory. It then drops the checkout's idle affinity. Slots
   stay intact until evicted, so the next build is cold. Ctrl-C cancels the
-  wait.
+  wait. `cargo clean` runs as a recorded process group and inherits the clean
+  lock, so if `oxide clean` dies the barrier stays until that lock is free and
+  the group is empty.
 - **Crash recovery.** Per [Crash recovery](#crash-recovery), for Oxide's own
   commands only. A follower in the same checkout waits while the crashed
   command's group survives, then recovers and continues.
 - **`status`.** Pool path or "not created", cap, payload use, slot accounting
-  coverage, each slot's state, profile and checkout, waiting commands, and
+  coverage, each slot's state, profile and checkout, waiting commands,
+  checkouts being cleaned, and
   whether the current workspace's `target/` holds plain-Cargo `deps/` or
   `incremental/`. It never creates the pool.
 

@@ -81,17 +81,22 @@ pub fn locate_workspace(cargo: &str, manifest_path: Option<&Path>) -> Result<Pat
 /// Which binary `cargo run` would pick without `--bin` or `--example`.
 #[derive(Debug, Eq, PartialEq)]
 pub enum RunPick {
-    /// The package's `default-run`, or its only binary.
+    /// The single `default-run` among the selected packages, or their only
+    /// binary.
     Bin(String),
-    /// Several binaries and no `default-run`: Cargo refuses before building.
+    /// Several binaries and no single `default-run`: Cargo refuses before
+    /// building.
     Ambiguous(Vec<String>),
-    /// No single package resolved (for example a virtual manifest); the
-    /// build reports what it produced.
+    /// No selected workspace package or binary resolved; the build reports
+    /// what it produced.
     Unresolved,
 }
 
-/// Resolve `cargo run`'s target from `cargo metadata --no-deps`: the named
-/// package, else the package whose manifest is nearest the current directory.
+/// Resolve `cargo run`'s target as Cargo does: the selected packages are the
+/// `-p` package, else the workspace default members for the current
+/// directory (the current package, a virtual root's `default-members`, or
+/// every member). One `default-run` among them wins; otherwise exactly one
+/// binary must exist.
 pub fn run_pick(
     cargo: &str,
     manifest_path: Option<&Path>,
@@ -113,57 +118,31 @@ pub fn run_pick(
     }
     let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("Cargo metadata is not JSON: {error}"))?;
-    let current = match package {
-        Some(_) => None,
-        None => Some(nearest_manifest(cargo, manifest_path)?),
-    };
-    Ok(select_run(&metadata, package, current.as_deref()))
+    Ok(select_run(&metadata, package))
 }
 
-fn nearest_manifest(cargo: &str, manifest_path: Option<&Path>) -> Result<PathBuf, String> {
-    let mut command = Command::new(cargo);
-    command.args(["locate-project", "--message-format", "plain"]);
-    if let Some(manifest) = manifest_path {
-        command.arg("--manifest-path").arg(manifest);
-    }
-    let output = command
-        .output()
-        .map_err(|error| format!("could not start Cargo: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "could not locate the package: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let manifest = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    fs::canonicalize(&manifest).map_err(|error| format!("cannot resolve the manifest: {error}"))
-}
-
-fn select_run(
-    metadata: &serde_json::Value,
-    package: Option<&str>,
-    current_manifest: Option<&Path>,
-) -> RunPick {
+fn select_run(metadata: &serde_json::Value, package: Option<&str>) -> RunPick {
     let Some(packages) = metadata["packages"].as_array() else {
         return RunPick::Unresolved;
     };
-    let selected = packages.iter().find(|candidate| match package {
-        Some(name) => candidate["name"].as_str() == Some(name),
-        None => candidate["manifest_path"]
-            .as_str()
-            .and_then(|path| fs::canonicalize(path).ok())
-            .is_some_and(|path| Some(path.as_path()) == current_manifest),
-    });
-    let Some(selected) = selected else {
-        return RunPick::Unresolved;
-    };
-    if let Some(default_run) = selected["default_run"].as_str() {
-        return RunPick::Bin(default_run.to_owned());
+    let defaults = metadata["workspace_default_members"].as_array();
+    let selected: Vec<&serde_json::Value> = packages
+        .iter()
+        .filter(|candidate| match package {
+            Some(name) => candidate["name"].as_str() == Some(name),
+            None => defaults.is_some_and(|ids| ids.contains(&candidate["id"])),
+        })
+        .collect();
+    let default_runs: Vec<&str> = selected
+        .iter()
+        .filter_map(|candidate| candidate["default_run"].as_str())
+        .collect();
+    if let [only] = default_runs.as_slice() {
+        return RunPick::Bin((*only).to_owned());
     }
-    let mut bins: Vec<String> = selected["targets"]
-        .as_array()
-        .into_iter()
-        .flatten()
+    let mut bins: Vec<String> = selected
+        .iter()
+        .flat_map(|candidate| candidate["targets"].as_array().into_iter().flatten())
         .filter(|target| {
             target["kind"]
                 .as_array()
@@ -279,44 +258,43 @@ mod tests {
 
     #[test]
     fn run_pick_follows_cargo_run_selection() {
-        let metadata = serde_json::json!({"packages": [
-            {"name": "app", "manifest_path": "/nonexistent/app/Cargo.toml", "default_run": "app",
-             "targets": [{"name": "app", "kind": ["bin"]}, {"name": "other", "kind": ["bin"]}]},
-            {"name": "tool", "manifest_path": "/nonexistent/tool/Cargo.toml", "default_run": null,
-             "targets": [{"name": "tool", "kind": ["bin"]}, {"name": "tool", "kind": ["lib"]}]},
-            {"name": "pair", "manifest_path": "/nonexistent/pair/Cargo.toml", "default_run": null,
-             "targets": [{"name": "a", "kind": ["bin"]}, {"name": "b", "kind": ["bin"]}]},
-            {"name": "lib", "manifest_path": "/nonexistent/lib/Cargo.toml", "default_run": null,
-             "targets": [{"name": "lib", "kind": ["lib"]}]}
-        ]});
+        let package = |id: &str, default_run: Option<&str>, bins: &[&str]| {
+            let mut targets: Vec<serde_json::Value> = bins
+                .iter()
+                .map(|name| serde_json::json!({"name": name, "kind": ["bin"]}))
+                .collect();
+            targets.push(serde_json::json!({"name": id, "kind": ["lib"]}));
+            serde_json::json!({"id": id, "name": id, "default_run": default_run, "targets": targets})
+        };
+        let metadata = |defaults: &[&str]| {
+            serde_json::json!({
+                "packages": [
+                    package("app", Some("app"), &["app", "other"]),
+                    package("tool", None, &["tool"]),
+                    package("pair", None, &["a", "b"]),
+                    package("lib", None, &[]),
+                ],
+                "workspace_default_members": defaults,
+            })
+        };
+        let pick =
+            |defaults: &[&str], package: Option<&str>| select_run(&metadata(defaults), package);
+        let bin = |name: &str| RunPick::Bin(name.to_owned());
+        // A virtual root's default member with default-run, and a package root.
+        assert_eq!(pick(&["app"], None), bin("app"));
+        assert_eq!(pick(&["tool"], None), bin("tool"));
+        // Several default members: one default-run wins; else one binary.
+        assert_eq!(pick(&["app", "tool", "pair"], None), bin("app"));
+        assert_eq!(pick(&["tool", "lib"], None), bin("tool"));
         assert_eq!(
-            select_run(&metadata, Some("app"), None),
-            RunPick::Bin("app".to_owned())
+            pick(&["tool", "pair"], None),
+            RunPick::Ambiguous(vec!["a".to_owned(), "b".to_owned(), "tool".to_owned()])
         );
-        assert_eq!(
-            select_run(&metadata, Some("tool"), None),
-            RunPick::Bin("tool".to_owned())
-        );
-        assert_eq!(
-            select_run(&metadata, Some("pair"), None),
-            RunPick::Ambiguous(vec!["a".to_owned(), "b".to_owned()])
-        );
-        assert_eq!(
-            select_run(&metadata, Some("lib"), None),
-            RunPick::Unresolved
-        );
-        assert_eq!(
-            select_run(&metadata, Some("missing"), None),
-            RunPick::Unresolved
-        );
-        assert_eq!(
-            select_run(
-                &metadata,
-                None,
-                Some(Path::new("/nonexistent/app/Cargo.toml"))
-            ),
-            RunPick::Unresolved
-        );
+        // `-p` overrides the default members.
+        assert_eq!(pick(&["pair"], Some("app")), bin("app"));
+        assert_eq!(pick(&["app"], Some("lib")), RunPick::Unresolved);
+        assert_eq!(pick(&["app"], Some("missing")), RunPick::Unresolved);
+        assert_eq!(pick(&[], None), RunPick::Unresolved);
     }
 
     #[test]

@@ -72,13 +72,17 @@ struct Ticket {
     pid: u32,
 }
 
-/// A running `oxide clean`. Its lock (in `waiters/`) proves it is live;
-/// commands for the same checkout wait while it exists.
+/// A running `oxide clean`; commands for the same checkout wait while it
+/// exists. Its lock (in `waiters/`) is shared with the `cargo clean` child, so
+/// it stays held while either lives. The mark is dropped only when the lock is
+/// free and the recorded Cargo group, if any, is empty.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Clean {
     id: u64,
     checkout: PathBuf,
+    #[serde(default)]
+    process_group: Option<i32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -174,7 +178,24 @@ pub enum Acquired {
 /// until [`Store::finish_clean`].
 pub struct CleanGuard {
     id: u64,
-    _lock: File,
+    lock: File,
+}
+
+impl CleanGuard {
+    /// Let the next spawned child inherit the clean lock, so the barrier
+    /// holds until that child and everything sharing the descriptor ends.
+    pub fn share_with_children(&self) -> Result<(), String> {
+        // SAFETY: the descriptor is open; F_SETFD with 0 only clears
+        // FD_CLOEXEC on it.
+        if unsafe { libc::fcntl(self.lock.as_raw_fd(), libc::F_SETFD, 0) } == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "cannot share the clean lock with Cargo: {}",
+                std::io::Error::last_os_error()
+            ))
+        }
+    }
 }
 
 pub enum Cleaning {
@@ -186,6 +207,7 @@ pub enum Cleaning {
 pub struct Report {
     pub pool: PoolStatus,
     pub waiting: usize,
+    pub cleaning: Vec<PathBuf>,
     pub slots: Vec<SlotView>,
 }
 
@@ -365,9 +387,10 @@ impl Store {
                     state.cleans.push(Clean {
                         id,
                         checkout: checkout.to_path_buf(),
+                        process_group: None,
                     });
                     self.save(&state)?;
-                    return Ok(Cleaning::Guard(CleanGuard { id, _lock: lock }));
+                    return Ok(Cleaning::Guard(CleanGuard { id, lock }));
                 }
                 self.save(&state)?;
             }
@@ -379,6 +402,16 @@ impl Store {
             }
             std::thread::sleep(WAIT_POLL);
         }
+    }
+
+    /// Record the `cargo clean` process group for crash checks.
+    pub fn clean_running(&self, guard: &CleanGuard, group: i32) -> Result<(), String> {
+        let _admission = self.admission()?;
+        let mut state = self.load()?;
+        if let Some(clean) = state.cleans.iter_mut().find(|clean| clean.id == guard.id) {
+            clean.process_group = Some(group);
+        }
+        self.save(&state)
     }
 
     /// Drop this checkout's slot affinity and end the clean. Slots stay intact.
@@ -434,6 +467,11 @@ impl Store {
         Ok(Report {
             pool,
             waiting: state.tickets.len(),
+            cleaning: state
+                .cleans
+                .iter()
+                .map(|clean| clean.checkout.clone())
+                .collect(),
             slots,
         })
     }
@@ -749,6 +787,13 @@ impl Store {
             let path = self.ticket_path(clean.id);
             match probe_lock(&path, false)? {
                 Probe::Held => live.push(clean),
+                Probe::Free(_)
+                    if clean
+                        .process_group
+                        .is_some_and(|group| !process::group_empty(group)) =>
+                {
+                    live.push(clean)
+                }
                 Probe::Free(_) => {
                     let _ = fs::remove_file(path);
                 }
