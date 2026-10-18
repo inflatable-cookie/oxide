@@ -979,11 +979,11 @@ mod tests {
 
     #[test]
     fn untrusted_or_foreign_affine_slots_refuse_the_gate() {
-        assert!(prepare(Path::new("/b"), &Prior::Unknown).is_err());
+        assert!(prepare(Path::new("/b"), &Prior::Unknown, &[]).is_err());
         let affine = Prior::Known(Built::Affine(PathBuf::from("/a")));
-        assert!(prepare(Path::new("/b"), &affine).is_err());
+        assert!(prepare(Path::new("/b"), &affine, &[]).is_err());
         assert_eq!(affine.foreign(Path::new("/b")), Some(PathBuf::from("/a")));
-        let own = prepare(Path::new("/a"), &affine).expect("own affine slot");
+        let own = prepare(Path::new("/a"), &affine, &[]).expect("own affine slot");
         assert!(!own.cross && own.describe().is_none());
         assert!(
             matches!(own.finish(Path::new("/a")), Some(Built::Affine(path)) if path == Path::new("/a"))
