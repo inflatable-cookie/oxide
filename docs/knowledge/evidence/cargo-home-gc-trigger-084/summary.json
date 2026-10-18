@@ -13,6 +13,12 @@
       "method": "raw.githubusercontent.com reads of all 257 src/cargo and src/bin .rs files at the pinned commit (3,844,012 bytes; cumulative fetched source about 4.2 MB, under the 8 MiB cap), listed from the pinned git tree; hashes in cargo-source-full-sha256.txt",
       "purpose": "complete auto_gc / compile_ws / ops::fetch caller grep and orphan-removal reading (review 6255341560)",
       "cargo_invocations": 0
+    },
+    "revision_3": {
+      "date": "2026-10-18T21:38:14Z",
+      "method": "re-fetched 25 pinned command/ops files (310,057 bytes; cumulative fetched source about 4.5 MB, under the 8 MiB cap) to inspect every return/bail!/Ok(None) between each entry point and the GC call",
+      "purpose": "review 6255453679: install --list, publish nothing-to-publish, -Zfix-edition skip",
+      "cargo_invocations": 0
     }
   },
   "toolchain": "cargo 1.97.1 (c980f4866 2026-06-30), invoked by absolute path from the installed 1.97.1 toolchain with env -i; RUSTUP_HOME read-only",
