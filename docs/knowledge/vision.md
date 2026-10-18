@@ -193,12 +193,28 @@ pool, 300 seconds including proof setup, 512 MiB scratch and 8 MiB source. The
 previous pool must be positively settled, ordinarily detached and removed before
 another starts. No successful unrelated native proof is repeated.
 
-The correction covers Cargo build-script classification, including TOML escaped
-quoted keys, plus a tiny cross-checkout custom-script control. Semantic parsing
-or a conservative path-sensitive/cold disposition is acceptable; unsupported or
-undecoded syntax must never grant unchecked warm reuse. It must not become a
-sequence of new narrow text-pattern exceptions. Existing source-content,
-fingerprint, standalone-lease and process-closure invariants remain unchanged.
+The product architect subsequently replaced path-sensitivity detection entirely
+on the same day. On a checkout-path change, all local packages whose canonical
+manifest lies under the canonical checkout root are path-sensitive: workspace
+members and in-repo path dependencies. The authoritative package set comes from
+`cargo metadata --format-version 1 --offline --locked`, selecting packages with
+no registry/git source under that root. Refresh all their tracked and untracked
+non-ignored inputs past the anchor. Do not scan manifest/source text or maintain
+a TOML detector. Registry, Git and outside-root path dependencies are untouched
+by this path-change rule. Metadata failure or ambiguity falls cold/checkout-affine;
+same-path content differences keep the existing diff rule. The accepted trade-off
+is dependency reuse across checkout paths, with local units rebuilt for correctness.
+PR73 must update the workflow's step 3 in the same implementation change.
+
+The former semantic-parser alternative is superseded, not an additional delivery.
+Escaped-key, default build.rs, custom current_dir() script and (where tiny offline
+fixtures permit) macro-style caller-directory reads become regression controls
+for this blanket rule. Existing source-content, fingerprint, standalone-lease
+and process-closure invariants remain unchanged. This refinement adds no time,
+proof run, pool or consumer authority. Supported Queue active-run rerouting may
+replace an author instance to deliver the revised brief, preserving the workspace,
+branch, PR, partial work, effects and cumulative allowance. The author continuation
+started at 18:44:14.566Z; its unchanged 45-minute cutoff is 19:29:14.566Z.
 Complete current-head compile, format, Rust and documentation receipts may be
 retained only for unchanged inputs; changed source needs its targeted checks.
 A final independent exact-head native proof remains required. This allowance is
