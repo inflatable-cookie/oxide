@@ -149,18 +149,24 @@ slot has a recorded origin:
    the anchor gets its mtime set to now, so Cargo's own invalidation rebuilds
    it. Content stays untouched; only the checkout's own files change; Cargo
    fingerprints and the slot are never edited.
-3. On a checkout-path change, every repository package that can embed the
-   path gets the same treatment: one with `build.rs`, one whose manifest may
-   declare a build script, or one whose sources mention `CARGO_MANIFEST_DIR`.
-   The manifest check is a conservative boundary, not a TOML parser. A key
-   can spell `build` without that literal text only through a basic-string
-   escape, and every escape needs a backslash. So a manifest counts if it is
-   not UTF-8, contains any backslash, or has a literal `build` key token
-   (bare, quoted, dotted or inline) followed by `=`, `.` or `]`. Comments and
-   values that look like that also count; that only refreshes more. A file belongs to the
-   package with the deepest `Cargo.toml` above it. Registry, Git and
-   outside-repository path dependencies keep their paths and stay warm. They
-   are the bulk of the reuse benefit.
+3. On a checkout-path change, every local package under the checkout is
+   path-sensitive, with no detection. `cargo metadata --format-version 1
+   --offline --locked` names the packages: each one with no registry or Git
+   source whose canonical manifest lies under the canonical checkout root
+   (component-aware), workspace members and in-repo path dependencies alike.
+   Every tracked and untracked non-ignored file under such a package's
+   directory gets the same mtime treatment, so every local unit rebuilds,
+   including build scripts that read `current_dir()` and proc macros that
+   expand to the caller's manifest dir. Manifests and sources are never read
+   to decide this. Metadata failure, a missing lock file, output over 64 MiB
+   or 60 s, two packages in one directory, or a package manifest Git cannot
+   see refuses sharing (cold, checkout-affine). Registry, Git and
+   outside-checkout path dependencies are not refreshed by this rule; they
+   keep their paths and stay warm.
+
+   Accepted trade-off: local workspace and in-checkout path units never
+   warm-reuse across checkout paths. The cross-checkout benefit is dependency
+   reuse. Same-path origins with different content use step 2 only.
 4. A command need not rebuild every unit, so the slot also carries an
    uncertain set: every path that differed at an earlier command or changed
    while Cargo ran. Another checkout taking the slot refreshes those too. The
@@ -450,7 +456,7 @@ example Nucleus) is a separate, owner-coordinated second stage.
 | # | Action | Must hold |
 | --- | --- | --- |
 | Q1 | `oxide test` in A | Cold; tests run and pass. |
-| Q2 | `oxide test` in B (worktree created before Q1) | Registry dependency units fresh; the gate rebuilds the path-embedding units; B's marker test sees B's paths and content. |
+| Q2 | `oxide test` in B (worktree created before Q1) | Registry dependency units fresh; the gate rebuilds every in-checkout package; B's marker test sees B's paths and content. |
 | Q3 | Edit the marker fixture in A, `oxide test` in A, then `oxide test` in B without touching B | The stale-mtime scenario: B rebuilds the affected units and its marker test sees B's unchanged content, not A's edit. |
 | Q4 | Repeat `oxide test` in B | Nothing rebuilt; tests run. |
 | Q5 | SIGKILL `oxide` during a build in A, then `oxide test` in A | The next command auto-recovers the slot; the build completes; tests pass. |
@@ -648,11 +654,17 @@ Rules:
 - **W-8 Freshness gate.** Implemented (see
   [Cross-checkout freshness](#cross-checkout-freshness)). The fixture proof
   covers two Git worktrees: the stale-mtime scenario rebuilds and the test sees
-  its own checkout's content; a `CARGO_MANIFEST_DIR` package and a package
-  whose build script is declared through an escaped key (`"b\u0075ild"`, no
-  `build.rs`, embedding its working directory) rebuild on a path change; a path dependency outside the repository stays fresh; an
+  its own checkout's content; on a path change every in-checkout package
+  rebuilds and observes the new path, covering a `CARGO_MANIFEST_DIR`
+  member, a build script declared through an escaped key (`"b\u0075ild"`, no
+  `build.rs`, embedding `current_dir()`), and in-repo non-member path
+  dependencies with a default `build.rs` and a proc macro reading its
+  caller's manifest dir; a path dependency outside the repository stays fresh; an
   unchanged repeat rebuilds nothing; a clone lacking the slot's tree is
   refused and builds cold; an `oxide` killed inside the gate after taking
   the slot leaves the retry to recover the slot and run the gate again. Warm-path cost is one `git status` and
-  `rev-parse` before and after Cargo, about 25 ms on this repository.
+  `rev-parse` before and after Cargo, about 25 ms on this repository; a
+  path change adds one `cargo metadata` call. The metadata-membership rule
+  has not yet passed the native fixture run: its first run refused a clone
+  without a committed lock file (correct refusal, fixture defect, fixed).
   Real-project qualification (Q2–Q4) remains.

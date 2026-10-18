@@ -962,6 +962,20 @@ def unit_freshness(stdout: str) -> dict:
     return units
 
 
+def commit_lock(runner: Runner, cwd: str) -> None:
+    """Write the fixture's lock file before its first commit: the gate reads
+    `cargo metadata --locked`, so a checkout without one is refused."""
+    lock = subprocess.run(
+        ["cargo", "generate-lockfile", "--offline"],
+        cwd=cwd,
+        env=runner.environment(None),
+        capture_output=True,
+        text=True,
+        timeout=min(60, remaining()),
+    )
+    expect(lock.returncode, 0, "fixture lock file", lock.stderr)
+
+
 def prove_freshness(runner: Runner) -> None:
     """Two worktrees of one scratch repository share a slot through the
     freshness gate; a clone missing the slot's tree is refused and builds
@@ -970,16 +984,7 @@ def prove_freshness(runner: Runner) -> None:
     a, b, c = (os.path.join(root, name) for name in ("a", "b", "c"))
     write_fixture(os.path.join(root, "outside"), OUTSIDE)
     write_fixture(a, GATED)
-    # The gate reads `cargo metadata --locked`, so the lock file is committed.
-    lock = subprocess.run(
-        ["cargo", "generate-lockfile", "--offline"],
-        cwd=a,
-        env=runner.environment(None),
-        capture_output=True,
-        text=True,
-        timeout=min(60, remaining()),
-    )
-    expect(lock.returncode, 0, "fixture lock file", lock.stderr)
+    commit_lock(runner, a)
     git(a, "init", "--quiet")
     git(a, "add", "-A")
     git(a, "commit", "--quiet", "-m", "gated fixture")
@@ -1350,6 +1355,7 @@ def main() -> int:
     free = host_free_bytes(parent)
     if free < HOST_RESERVE_BYTES:
         fail(f"host free {free} is below the 20 GiB reserve")
+    commit_lock(runner, app)
     git(app, "init", "--quiet")
     git(app, "add", "-A")
     git(app, "commit", "--quiet", "-m", "fixture")
