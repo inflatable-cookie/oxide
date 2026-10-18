@@ -8,14 +8,15 @@
 //! file whose content may differ from what the slot compiled and that is not
 //! newer than the build anchor. On a checkout-path change it does the same
 //! for every file of every local package under the checkout, as Cargo's
-//! metadata names them. File contents, Cargo fingerprints
+//! metadata names them under the guarded command's own lock, network and
+//! config arguments. File contents, Cargo fingerprints
 //! and the slot are never touched. Inputs outside Git or ignored by it are
 //! not covered.
 
 use crate::MIB;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -35,6 +36,33 @@ const MAX_METADATA_ERROR_BYTES: u64 = 64 * 1024;
 const METADATA_TIME: Duration = Duration::from_secs(60);
 const DELETED: &str = "deleted";
 pub const LIMIT_NOTE: &str = "inputs outside Git or ignored by it are not checked";
+/// Cargo's wording when `--locked` or `--frozen` stops it creating or
+/// updating the lock file.
+const LOCK_REFUSAL: &str = "was passed to prevent this";
+
+/// Why the gate did not vouch for a slot.
+#[derive(Debug)]
+pub enum Refusal {
+    /// The slot's history cannot be reconciled with this checkout: the
+    /// command builds cold.
+    Unvouched(String),
+    /// Cargo refused the command's own `--locked` or `--frozen` request.
+    /// Plain Cargo fails the same way, so the command ends with Cargo's
+    /// message and exit code instead of building cold.
+    Lock { code: u8, message: String },
+}
+
+impl From<String> for Refusal {
+    fn from(reason: String) -> Self {
+        Self::Unvouched(reason)
+    }
+}
+
+impl From<&str> for Refusal {
+    fn from(reason: &str) -> Self {
+        Self::Unvouched(reason.to_owned())
+    }
+}
 
 /// One checkout's content: HEAD's tree plus the Git blob digest of every
 /// file that differs from it (tracked changes and untracked files Git does
@@ -175,16 +203,18 @@ impl Gate {
     }
 }
 
-/// Run the gate for `checkout` before Cargo. An error means the slot's
-/// history cannot be reconciled with this checkout: the caller must not run
-/// Cargo on it.
-pub fn prepare(checkout: &Path, prior: &Prior) -> Result<Gate, String> {
+/// Run the gate for `checkout` before Cargo. `resolution` holds the guarded
+/// command's lock, network and config arguments (`cli::resolution_args`).
+/// An error means the caller must not run Cargo on the slot.
+pub fn prepare(checkout: &Path, prior: &Prior, resolution: &[OsString]) -> Result<Gate, Refusal> {
     match prior {
-        Prior::Unknown => Err("the slot has no trusted build record".to_owned()),
+        Prior::Unknown => Err(Refusal::Unvouched(
+            "the slot has no trusted build record".to_owned(),
+        )),
         Prior::Known(Built::Affine(owner)) if owner == checkout => Ok(Gate::affine()),
-        Prior::Known(Built::Affine(_)) => {
-            Err("the slot holds another checkout's build without Git content".to_owned())
-        }
+        Prior::Known(Built::Affine(_)) => Err(Refusal::Unvouched(
+            "the slot holds another checkout's build without Git content".to_owned(),
+        )),
         // Nothing compiled yet: a checkout without Git content stays affine.
         Prior::Fresh => Ok(match snapshot(checkout) {
             Ok(before) => Gate {
@@ -204,7 +234,8 @@ pub fn prepare(checkout: &Path, prior: &Prior) -> Result<Gate, String> {
             let mut refreshed = refresh(&top, stale, origin.anchor_ns)?;
             let mut packages = 0;
             if cross {
-                let (count, files) = local_package_files(checkout, &top)?;
+                let metadata = cargo_metadata(checkout, resolution)?;
+                let (count, files) = local_package_files(&top, &metadata)?;
                 packages = count;
                 refreshed += refresh(&top, files.iter(), origin.anchor_ns)?;
             }
@@ -466,8 +497,11 @@ fn touch(path: &Path) -> Result<(), String> {
 /// whatever it reads, inside or outside its own directory. A local target or
 /// a followed symlink inside a vendored package is ambiguous and refused.
 /// Returns the local package count and the files.
-fn local_package_files(checkout: &Path, top: &Path) -> Result<(usize, Vec<String>), String> {
-    let graph = resolve_graph(&cargo_metadata(checkout)?)?;
+fn local_package_files(
+    top: &Path,
+    metadata: &serde_json::Value,
+) -> Result<(usize, Vec<String>), String> {
+    let graph = resolve_graph(metadata)?;
     let canonical = |paths: &[PathBuf]| {
         paths
             .iter()
@@ -518,19 +552,24 @@ fn local_package_files(checkout: &Path, top: &Path) -> Result<(usize, Vec<String
     Ok((local.len(), files))
 }
 
+/// `cargo metadata` for the workspace in the guarded command's context: the
+/// same Cargo, working directory (so the same config files) and inherited
+/// environment, plus its lock, network and config arguments. Without
+/// `--locked` or `--frozen` it may create or update the lock file exactly
+/// as the guarded command would.
+fn metadata_command(checkout: &Path, resolution: &[OsString]) -> Command {
+    let mut command = Command::new(crate::CARGO);
+    command
+        .args(["metadata", "--format-version", "1"])
+        .args(resolution)
+        .arg("--manifest-path")
+        .arg(checkout.join("Cargo.toml"));
+    command
+}
+
 /// Run `cargo metadata` for the workspace, bounded in output and lifetime.
-fn cargo_metadata(checkout: &Path) -> Result<serde_json::Value, String> {
-    let mut child = Command::new(crate::CARGO)
-        .args([
-            "metadata",
-            "--format-version",
-            "1",
-            "--offline",
-            "--locked",
-            "--manifest-path",
-        ])
-        .arg(checkout.join("Cargo.toml"))
-        .current_dir(checkout)
+fn cargo_metadata(checkout: &Path, resolution: &[OsString]) -> Result<serde_json::Value, Refusal> {
+    let mut child = metadata_command(checkout, resolution)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -560,15 +599,22 @@ fn cargo_metadata(checkout: &Path) -> Result<serde_json::Value, String> {
     let (stdout, overflow) = out.map_err(|error| format!("cannot read Cargo output: {error}"))?;
     if !status.success() {
         let stderr = err.map(|(bytes, _)| bytes).unwrap_or_default();
-        return Err(format!(
-            "cargo metadata failed: {}",
-            String::from_utf8_lossy(&stderr).trim()
-        ));
+        let message = String::from_utf8_lossy(&stderr).into_owned();
+        if status.code().is_some() && message.contains(LOCK_REFUSAL) {
+            return Err(Refusal::Lock {
+                code: crate::process::exit_code(status),
+                message,
+            });
+        }
+        return Err(format!("cargo metadata failed: {}", message.trim()).into());
     }
     if overflow {
-        return Err("cargo metadata output exceeds the gate's limit".to_owned());
+        return Err("cargo metadata output exceeds the gate's limit"
+            .to_owned()
+            .into());
     }
-    serde_json::from_slice(&stdout).map_err(|error| format!("Cargo metadata is not JSON: {error}"))
+    serde_json::from_slice(&stdout)
+        .map_err(|error| format!("Cargo metadata is not JSON: {error}").into())
 }
 
 /// Up to `cap` bytes, then drain the rest so the writer never blocks.
@@ -755,6 +801,44 @@ mod tests {
 
     fn set(items: &[&str]) -> BTreeSet<String> {
         items.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    #[test]
+    fn metadata_runs_in_the_guarded_context_with_its_flags() {
+        let resolution: Vec<OsString> = ["--frozen", "--config", "net.offline=false"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        let command = metadata_command(Path::new("/w"), &resolution);
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                "metadata",
+                "--format-version",
+                "1",
+                "--frozen",
+                "--config",
+                "net.offline=false",
+                "--manifest-path",
+                "/w/Cargo.toml",
+            ]
+        );
+        // Same working directory and environment as the guarded command:
+        // Cargo resolves config files, `CARGO_NET_OFFLINE` and precedence.
+        assert_eq!(command.get_current_dir(), None);
+        assert_eq!(command.get_envs().count(), 0);
+        let plain = metadata_command(Path::new("/w"), &[]);
+        assert_eq!(
+            plain.get_args().collect::<Vec<_>>(),
+            [
+                "metadata",
+                "--format-version",
+                "1",
+                "--manifest-path",
+                "/w/Cargo.toml"
+            ]
+        );
     }
 
     #[test]

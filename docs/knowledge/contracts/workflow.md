@@ -150,16 +150,32 @@ slot has a recorded origin:
    it. Content stays untouched; only the checkout's own files change; Cargo
    fingerprints and the slot are never edited.
 3. On a checkout-path change, every local package under the checkout is
-   path-sensitive, with no detection. `cargo metadata --format-version 1
-   --offline --locked` names the packages: each one with no registry or Git
+   path-sensitive, with no detection. `cargo metadata --format-version 1`
+   names the packages: each one with no registry or Git
    source whose canonical manifest lies under the canonical checkout root
    (component-aware), workspace members and in-repo path dependencies alike.
+   Metadata runs in the guarded command's context: the same Cargo, working
+   directory (so the same config files, member-local ones included) and
+   inherited environment, plus the command's own `--locked`, `--frozen`,
+   `--offline`, `--config`, `-Z` and `--lockfile-path` arguments before any
+   `--`, unchanged. Cargo merges them with `net.offline` and
+   `CARGO_NET_OFFLINE` under its own precedence; `--frozen` stays locked and
+   offline. Without `--locked` or `--frozen`, metadata may create or update
+   the checkout's `Cargo.lock` exactly as the guarded command would; that is
+   how a fresh worktree of a repository with an ignored or stale lock gets
+   warm dependency reuse. Oxide edits nothing else. Unrestricted metadata
+   resolves the whole workspace for all platforms, so on a cold Cargo home
+   it may fetch the index and package sources the narrower guarded command
+   would not; those land only in Cargo's own home. When `--locked` or
+   `--frozen` makes Cargo refuse to create or update the lock, the command
+   ends there with Cargo's message and exit code, as plain Cargo would; the
+   slot goes back unchanged and nothing builds cold.
    Every tracked and untracked non-ignored file in the checkout gets the
    same mtime treatment unless its deepest package directory belongs to a
    registry or Git package (vendored sources), so every local unit rebuilds,
    including build scripts that read `current_dir()` and proc macros that
    expand to the caller's manifest dir. Manifests and sources are never read
-   to decide this. Metadata failure, a missing lock file, output over 64 MiB
+   to decide this. Any other metadata failure, output over 64 MiB
    or 60 s, two packages in one directory, a local manifest or target
    source Git cannot see, or a local target or symlink inside a vendored
    package refuses sharing (cold, checkout-affine). Registry, Git and

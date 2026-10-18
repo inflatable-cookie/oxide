@@ -12,7 +12,11 @@ scenario rebuilds, every package under the checkout (members and in-repo
 path dependencies, from `cargo metadata`) rebuilds on a path change,
 a path dependency outside the repository stays fresh, an unchanged repeat
 rebuilds nothing, a refused gate builds cold, and a crash inside the gate
-leaves the retry gated), FIFO waiting and the host
+leaves the retry gated; the gate's metadata call mirrors the command's lock,
+network and config arguments: a fresh worktree with an ignored lock warms
+its outside path dependency, `--locked`/`--frozen` lock refusals end with
+Cargo's own error, a stale lock updates as the build would and `--offline`
+is mirrored), FIFO waiting and the host
 limit, clean waiting for active commands, `default-run`
 selection (package and virtual workspace roots), Ctrl-C forwarding, own-command crash recovery
 (a killed oxide whose Cargo group survives stays held; one whose group is gone
@@ -279,6 +283,50 @@ if [ -n "$OXIDE_FIXTURE_GIT_HOLD" ] && [ "$1 $2" = "rev-parse --show-toplevel" ]
     while [ ! -e "$OXIDE_FIXTURE_GIT_HOLD.release" ]; do sleep 0.1; done
 fi
 exec "REAL_GIT" "$@"
+"""
+
+# Lockless fixture: `Cargo.lock` is ignored, so every fresh worktree starts
+# without one. `far` is a path dependency outside the repository.
+LOCKLESS = {
+    "Cargo.toml": """[package]
+name = "lockless"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+far = { path = "../far" }
+""",
+    "rust-toolchain.toml": '[toolchain]\nchannel = "1.97.1"\n',
+    ".gitignore": "/target\n/Cargo.lock\n",
+    "src/lib.rs": """pub fn value() -> u32 {
+    far::value() + 1
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn reads_far() {
+        assert_eq!(super::value(), 8);
+    }
+}
+""",
+}
+
+FAR = {
+    "Cargo.toml": '[package]\nname = "far"\nversion = "0.1.0"\nedition = "2021"\n',
+    "src/lib.rs": "pub fn value() -> u32 {\n    7\n}\n",
+}
+
+# Logs every `cargo metadata` call that is not `--no-deps`: working
+# directory, CARGO_NET_OFFLINE and arguments, then runs the real Cargo.
+CARGO_LOG = """#!/bin/sh
+if [ -n "$OXIDE_FIXTURE_CARGO_LOG" ] && [ "$1" = "metadata" ]; then
+    case " $* " in
+    *" --no-deps "*) ;;
+    *) printf '%s|%s|%s\\n' "$(pwd -P)" "${CARGO_NET_OFFLINE-unset}" "$*" >> "$OXIDE_FIXTURE_CARGO_LOG" ;;
+    esac
+fi
+exec "REAL_CARGO" "$@"
 """
 
 # External subcommand: reports the injected build dir and runs `$CARGO`.
@@ -988,6 +1036,7 @@ def prove_routing(runner: Runner, app: str, quick_slot: str, debug_slot: str) ->
     prove_group_gone(runner, app)
     keep_standalone_lease(runner, app, standalone)
     prove_freshness(runner)
+    prove_lockless(runner)
 
     # `run` from a virtual workspace root follows Cargo's default members.
     virtual = os.path.join(runner.parent, "checkouts", "virtual")
@@ -1026,8 +1075,8 @@ def unit_freshness(stdout: str) -> dict:
 
 
 def commit_lock(runner: Runner, cwd: str) -> None:
-    """Write the fixture's lock file before its first commit: the gate reads
-    `cargo metadata --locked`, so a checkout without one is refused."""
+    """Write the fixture's lock file before its first commit, so the
+    checkouts share one resolved graph."""
     lock = subprocess.run(
         ["cargo", "generate-lockfile", "--offline"],
         cwd=cwd,
@@ -1129,6 +1178,151 @@ def prove_freshness(runner: Runner) -> None:
     # slot and runs the gate again. Unchecked reuse would keep A's marker
     # unit and fail B's content test.
     prove_gate_crash(runner, b, slot, test)
+
+
+def prove_lockless(runner: Runner) -> None:
+    """The gate's metadata call mirrors the guarded command's lock, network
+    and config arguments. A fresh worktree without a lock file reuses the
+    outside path dependency warm; `--locked` and `--frozen` lock refusals
+    end the command with Cargo's own error, slot and lock untouched."""
+    root = os.path.join(runner.parent, "lockless")
+    a, b, c, d = (os.path.join(root, name) for name in ("a", "b", "c", "d"))
+    write_fixture(os.path.join(root, "far"), FAR)
+    write_fixture(a, LOCKLESS)
+    git(a, "init", "--quiet")
+    git(a, "add", "-A")
+    git(a, "commit", "--quiet", "-m", "lockless fixture")
+    for worktree in (b, c, d):
+        git(a, "worktree", "add", "--quiet", worktree)
+    log_path = os.path.join(runner.parent, "metadata-calls.log")
+    wrapper = os.path.join(runner.bin, "cargo")
+    real_cargo = shutil.which("cargo", path=runner.env["PATH"])
+    if not real_cargo or os.path.dirname(real_cargo) == runner.bin:
+        fail("real cargo not found for the metadata-log wrapper")
+    with open(wrapper, "w", encoding="utf-8") as handle:
+        handle.write(CARGO_LOG.replace("REAL_CARGO", real_cargo))
+    os.chmod(wrapper, 0o700)
+
+    def lock(cwd: str):
+        path = os.path.join(cwd, "Cargo.lock")
+        return read_text(path) if os.path.exists(path) else None
+
+    def calls() -> list:
+        if not os.path.exists(log_path):
+            return []
+        with open(log_path, encoding="utf-8") as handle:
+            rows = [line.rstrip("\n").split("|", 2) for line in handle]
+        os.remove(log_path)
+        return rows
+
+    def oxide(cwd: str, args: list, label: str, offline: str = "true"):
+        before = lock(cwd)
+        extra = {"OXIDE_FIXTURE_CARGO_LOG": log_path, "CARGO_NET_OFFLINE": offline}
+        code, stdout, stderr = runner.run(cwd, ["test", "--message-format=json", *args], extra)
+        made = calls()
+        after = lock(cwd)
+        print(
+            f"lockless {label}: exit {code}, CARGO_NET_OFFLINE={offline}, "
+            f"lock {'present' if before else 'absent'} -> {'present' if after else 'absent'}, "
+            f"metadata calls {[(os.path.basename(row[0]), row[1], row[2]) for row in made]}"
+        )
+        return code, unit_freshness(stdout), stderr, made, before, after
+
+    def mirrored(made: list, cwd: str, offline: str, flags: str, label: str) -> None:
+        wanted = f"metadata --format-version 1 {flags}--manifest-path {os.path.realpath(cwd)}/Cargo.toml"
+        rows = [(os.path.realpath(row[0]), row[1], row[2]) for row in made]
+        if rows != [(os.path.realpath(cwd), offline, wanted)]:
+            fail(f"{label}: metadata calls {made}, wanted one {wanted!r} from {cwd}")
+
+    def warm(units: dict, stderr: str, label: str) -> None:
+        result = summary(stderr, label)
+        if result["slot"] != slot or result["warmth"] != "warm":
+            fail(f"{label} did not reuse slot {slot} warm: {result}")
+        if units.get("far:build") is not True:
+            fail(f"{label}: outside path dependency did not stay fresh: {units}")
+        if units.get("lockless:build") is not False or units.get("lockless:test") is not False:
+            fail(f"{label}: local units did not rebuild on the path change: {units}")
+
+    def refused(code: int, stderr: str, cargo_error: str, label: str) -> None:
+        expect(code, 101, label, stderr)
+        if cargo_error not in stderr:
+            fail(f"{label}: Cargo's refusal {cargo_error!r} missing from {stderr[-800:]!r}")
+        if "building cold" in stderr or "oxide: quick profile" in stderr:
+            fail(f"{label}: the refusal was masked as a cold build: {stderr[-800:]!r}")
+        holders = [record["checkout"] for record in runner.state()["records"]]
+        if os.path.realpath(c) in holders or os.path.realpath(b) not in holders:
+            fail(f"{label}: the slot did not go back to worktree B unchanged: {holders}")
+
+    try:
+        code, _, stderr, made, _, after = oxide(a, [], "worktree A cold")
+        expect(code, 0, "lockless A", stderr)
+        slot = summary(stderr, "lockless A")["slot"]
+        if made or after is None:
+            fail(f"lockless A ran metadata or left no lock: {made}")
+
+        # Plain mode: no lock flags, network allowed (a path-only graph).
+        code, units, stderr, made, before, after = oxide(b, [], "fresh worktree B", "false")
+        expect(code, 0, "lockless B", stderr)
+        mirrored(made, b, "false", "", "lockless B")
+        warm(units, stderr, "lockless B")
+        if before is not None or after != lock(a):
+            fail("worktree B's metadata did not create the lock file the build uses")
+
+        # `--locked` with no lock file: Oxide ends exactly as plain Cargo.
+        plain = subprocess.run(
+            ["cargo", "test", "--locked"],
+            cwd=c,
+            env=runner.environment({"CARGO_TARGET_DIR": os.path.join(runner.tmp, "plain-target")}),
+            capture_output=True,
+            text=True,
+            timeout=min(60, remaining()),
+        )
+        cargo_error = next(
+            (line for line in plain.stderr.splitlines() if "--locked was passed" in line), None
+        )
+        if plain.returncode != 101 or not cargo_error or lock(c) is not None:
+            fail(f"plain cargo --locked did not refuse the missing lock: {plain.stderr}")
+        code, _, stderr, made, before, after = oxide(c, ["--locked"], "missing lock --locked")
+        mirrored(made, c, "true", "--locked ", "missing lock --locked")
+        refused(code, stderr, cargo_error, "missing lock --locked")
+        if before is not None or after is not None:
+            fail("--locked with a missing lock created one")
+
+        # Stale lock: B's lock with the wrong `far` version.
+        stale = lock(b).replace('name = "far"\nversion = "0.1.0"', 'name = "far"\nversion = "0.0.1"')
+        if stale == lock(b):
+            fail("could not write a stale lock")
+        with open(os.path.join(c, "Cargo.lock"), "w", encoding="utf-8") as handle:
+            handle.write(stale)
+        code, _, stderr, made, _, after = oxide(c, ["--locked"], "stale lock --locked")
+        mirrored(made, c, "true", "--locked ", "stale lock --locked")
+        refused(code, stderr, "cannot update the lock file", "stale lock --locked")
+        # `--frozen` stays locked and offline under a contradictory config.
+        code, _, stderr, made, _, after = oxide(
+            c, ["--frozen", "--config", "net.offline=false"], "stale lock --frozen", "false"
+        )
+        mirrored(made, c, "false", "--frozen --config net.offline=false ", "stale lock --frozen")
+        refused(code, stderr, "--frozen was passed to prevent this", "stale lock --frozen")
+        if after != stale:
+            fail("a lock refusal changed the stale lock")
+        # Plain mode with CARGO_NET_OFFLINE=true: metadata updates the stale
+        # lock offline, as the build would.
+        code, units, stderr, made, _, after = oxide(c, [], "stale lock plain")
+        expect(code, 0, "stale lock plain", stderr)
+        mirrored(made, c, "true", "", "stale lock plain")
+        warm(units, stderr, "stale lock plain")
+        if after != lock(a):
+            fail("the stale lock was not updated as the build would")
+
+        # `--offline` is mirrored even when the environment says online.
+        code, units, stderr, made, before, after = oxide(d, ["--offline"], "fresh worktree D --offline", "false")
+        expect(code, 0, "lockless D", stderr)
+        mirrored(made, d, "false", "--offline ", "lockless D")
+        warm(units, stderr, "lockless D")
+        if before is not None or after != lock(a):
+            fail("worktree D's offline metadata did not create the lock file")
+    finally:
+        os.remove(wrapper)
 
 
 def prove_gate_crash(runner: Runner, b: str, slot: str, test) -> None:

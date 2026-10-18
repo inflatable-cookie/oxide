@@ -311,6 +311,35 @@ pub fn package_selection(args: &[OsString]) -> Option<String> {
     Some(spec.split('@').next().unwrap_or_default().to_owned())
 }
 
+/// The guarded command's arguments that decide lock and network behavior,
+/// in order, before any `--`: `--locked`, `--frozen`, `--offline`,
+/// `--config`, `-Z` and `--lockfile-path`. The freshness gate passes them to
+/// `cargo metadata` unchanged; Cargo itself merges them with inherited
+/// configuration and environment, so precedence stays Cargo's.
+pub fn resolution_args(cargo_args: &[OsString]) -> Vec<OsString> {
+    let mut kept = Vec::new();
+    let mut iter = cargo_args.iter().skip(1);
+    while let Some(argument) = iter.next() {
+        let text = argument.to_str().unwrap_or_default();
+        match text {
+            "--" => break,
+            "--locked" | "--frozen" | "--offline" => kept.push(argument.clone()),
+            "--config" | "-Z" | "--lockfile-path" => {
+                kept.push(argument.clone());
+                kept.extend(iter.next().cloned());
+            }
+            _ if text.starts_with("--config=")
+                || text.starts_with("--lockfile-path=")
+                || text.starts_with("-Z") =>
+            {
+                kept.push(argument.clone());
+            }
+            _ => {}
+        }
+    }
+    kept
+}
+
 /// `run`: the `--bin`/`--example` name the caller selected, if any.
 pub fn run_selection(cargo_args: &[OsString]) -> Option<String> {
     flag_value(cargo_args, "--bin").or_else(|| flag_value(cargo_args, "--example"))
@@ -450,6 +479,55 @@ mod tests {
             Some("app")
         );
         assert_eq!(package_selection(&args(&["--", "-p", "app"])), None);
+    }
+
+    #[test]
+    fn resolution_args_mirror_lock_network_and_config_flags() {
+        let parsed = parse_leased(
+            "test",
+            &args(&[
+                "--locked",
+                "-p",
+                "app",
+                "--frozen",
+                "--offline",
+                "--config",
+                "net.offline=false",
+                "--config=net.offline=true",
+                "-Z",
+                "unstable-options",
+                "-Zno-index-update",
+                "--lockfile-path",
+                "/w/other.lock",
+                "--features=locked",
+                "--",
+                "--locked",
+                "--offline",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            resolution_args(&parsed.cargo_args),
+            args(&[
+                "--locked",
+                "--frozen",
+                "--offline",
+                "--config",
+                "net.offline=false",
+                "--config=net.offline=true",
+                "-Z",
+                "unstable-options",
+                "-Zno-index-update",
+                "--lockfile-path",
+                "/w/other.lock",
+            ])
+        );
+        // No restriction requested: plain metadata, Cargo's own defaults.
+        let plain = parse_leased("check", &args(&["-p", "app"])).unwrap();
+        assert!(resolution_args(&plain.cargo_args).is_empty());
+        // External subcommands are scanned after their name too.
+        let external = parse_leased("nextest", &args(&["run", "--frozen"])).unwrap();
+        assert_eq!(resolution_args(&external.cargo_args), args(&["--frozen"]));
     }
 
     #[test]

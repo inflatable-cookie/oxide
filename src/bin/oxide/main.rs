@@ -14,7 +14,7 @@ mod process;
 mod store;
 
 use cli::{Class, Invocation, PROFILE_ENVIRONMENT};
-use freshness::Gate;
+use freshness::{Gate, Refusal};
 use identity::{RunPick, SlotKey};
 use oxide_storage::inventory::{inventory_directory, Category, InventoryLimits};
 use oxide_storage::lease::SlotOccupancy;
@@ -147,9 +147,11 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     process::install_signal_handlers()?;
     let store = Store::open_or_create()?;
     let started = Instant::now();
-    let (held, gate) = match lease_with_gate(&store, &key, invocation.profile)? {
+    let resolution = cli::resolution_args(&invocation.cargo_args);
+    let (held, gate) = match lease_with_gate(&store, &key, invocation.profile, &resolution)? {
         Ok(leased) => leased,
-        Err(signal) => return Ok(process::signal_exit_code(signal)),
+        Err(Stop::Signal(signal)) => return Ok(process::signal_exit_code(signal)),
+        Err(Stop::Cargo(code)) => return Ok(code),
     };
     if let Some(signal) = process::received_signal() {
         let origin = held.prior.unchanged();
@@ -213,32 +215,59 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     }
 }
 
+/// Why a leased command ends before its Cargo runs.
+enum Stop {
+    /// A signal received while waiting.
+    Signal(i32),
+    /// The gate's metadata call hit the command's own lock refusal; Cargo's
+    /// message is printed and this is its exit code.
+    Cargo(u8),
+}
+
 /// Lease a slot and run the freshness gate. Cargo never runs on a slot the
 /// gate cannot vouch for: a slot holding another checkout's content goes back
 /// to that checkout unchanged; this checkout's own untrusted or unreadable
 /// slot is evicted. Either way the command leases again without sharing and
-/// builds cold. `Err` is a signal received while waiting.
+/// builds cold. A `--locked` or `--frozen` lock refusal is the command's own
+/// failure: the slot goes back unchanged and the command ends as plain Cargo
+/// would.
 fn lease_with_gate(
     store: &Store,
     key: &SlotKey,
     profile: cli::Profile,
-) -> Result<Result<(store::Lease, Gate), i32>, String> {
+    resolution: &[OsString],
+) -> Result<Result<(store::Lease, Gate), Stop>, String> {
     let mut share = true;
     // A refusal leaves this checkout without a record, so the next lease is
     // a new or evicted slot; the bound only guards against a defect.
     for _ in 0..4 {
         let mut held = match store.acquire(key, profile, share)? {
             Acquired::Lease(held) => held,
-            Acquired::Interrupted(signal) => return Ok(Err(signal)),
+            Acquired::Interrupted(signal) => return Ok(Err(Stop::Signal(signal))),
         };
-        let reason = match freshness::prepare(&key.checkout, &held.prior) {
-            Ok(gate) => return Ok(Ok((held, gate))),
-            Err(reason) => reason,
-        };
-        share = false;
+        let refusal = freshness::prepare(&key.checkout, &held.prior, resolution);
         // Taken just now, or left on this checkout's record by a command
         // that died before Cargo.
         let foreign = held.prior.foreign(&key.checkout);
+        let reason = match refusal {
+            Ok(gate) => return Ok(Ok((held, gate))),
+            Err(Refusal::Unvouched(reason)) => reason,
+            Err(Refusal::Lock { code, message }) => {
+                eprint!("{message}");
+                if held.shared_from.is_none() && foreign.is_some() {
+                    held.shared_from = foreign;
+                }
+                // Metadata runs only for another checkout's slot.
+                if held.shared_from.is_some() {
+                    store.unshare(held)?;
+                } else {
+                    let origin = held.prior.unchanged();
+                    store.release(held, origin)?;
+                }
+                return Ok(Err(Stop::Cargo(code)));
+            }
+        };
+        share = false;
         if held.shared_from.is_some() || foreign.is_some() {
             eprintln!(
                 "oxide: freshness gate refused another checkout's slot ({reason}); building cold"
