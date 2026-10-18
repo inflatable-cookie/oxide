@@ -14,6 +14,10 @@ pub enum Class {
     Plain,
     /// `clean`: private outputs and slot affinity; never a slot.
     Clean,
+    /// `init`: `cargo init` when no manifest exists, then adoption.
+    Init,
+    /// `new`: `cargo new`, then adoption.
+    New,
     /// `status`: Oxide-owned.
     Status,
 }
@@ -23,11 +27,12 @@ pub fn classify(command: &str) -> Class {
         "check" | "test" | "clippy" | "build" | "run" => Class::Modelled,
         "clean" => Class::Clean,
         "status" => Class::Status,
-        // init and new stay plain until Oxide adoption lands.
-        "init" | "new" | "fmt" | "tree" | "metadata" | "add" | "remove" | "update" | "info"
-        | "search" | "install" | "uninstall" | "publish" | "login" | "logout" | "owner"
-        | "yank" | "vendor" | "fetch" | "generate-lockfile" | "locate-project" | "pkgid"
-        | "version" | "help" | "report" | "config" | "package" | "verify-project" => Class::Plain,
+        "init" => Class::Init,
+        "new" => Class::New,
+        "fmt" | "tree" | "metadata" | "add" | "remove" | "update" | "info" | "search"
+        | "install" | "uninstall" | "publish" | "login" | "logout" | "owner" | "yank"
+        | "vendor" | "fetch" | "generate-lockfile" | "locate-project" | "pkgid" | "version"
+        | "help" | "report" | "config" | "package" | "verify-project" => Class::Plain,
         _ => Class::Building,
     }
 }
@@ -329,11 +334,13 @@ mod tests {
         ] {
             assert_eq!(classify(command), Class::Building, "{command}");
         }
-        for command in ["fmt", "tree", "metadata", "version", "init", "new", "fetch"] {
+        for command in ["fmt", "tree", "metadata", "version", "fetch"] {
             assert_eq!(classify(command), Class::Plain, "{command}");
         }
         assert_eq!(classify("clean"), Class::Clean);
         assert_eq!(classify("status"), Class::Status);
+        assert_eq!(classify("init"), Class::Init);
+        assert_eq!(classify("new"), Class::New);
     }
 
     #[test]

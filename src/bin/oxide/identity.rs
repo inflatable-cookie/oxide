@@ -28,7 +28,7 @@ impl SlotKey {
         target: Option<&str>,
     ) -> Result<Self, String> {
         let checkout = locate_workspace(cargo, manifest_path)?;
-        let identity = digest(&project_identity(&checkout));
+        let identity = digest(&Identity::infer(&checkout).key());
         let rustc = rustc_version(&checkout)?;
         let target = match target {
             Some(target) => target.to_owned(),
@@ -160,7 +160,7 @@ fn select_run(metadata: &serde_json::Value, package: Option<&str>) -> RunPick {
 
 /// `rustc -vV` as rustup resolves it for the workspace. Oxide never selects
 /// or pins the toolchain.
-fn rustc_version(workspace: &Path) -> Result<String, String> {
+pub fn rustc_version(workspace: &Path) -> Result<String, String> {
     let rustc = std::env::var_os("RUSTC")
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| OsString::from("rustc"));
@@ -178,26 +178,71 @@ fn rustc_version(workspace: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Git root commits plus the workspace path within the repository; shallow
-/// clones fall back to the normalised `origin` URL; otherwise the path.
-fn project_identity(workspace: &Path) -> String {
-    let path_identity = || format!("path:{}", workspace.display());
-    let shallow = git(workspace, &["rev-parse", "--is-shallow-repository"])
-        .is_some_and(|value| value == "true");
-    if shallow {
-        return git(workspace, &["config", "--get", "remote.origin.url"])
-            .map(|origin| format!("origin:{}", normalize_origin(&origin)))
-            .unwrap_or_else(path_identity);
+/// Inferred repository identity: Git root commits plus the workspace path
+/// within the repository; shallow clones fall back to the normalised
+/// `origin` URL; otherwise the canonical path.
+pub enum Identity {
+    Git { roots: Vec<String>, prefix: String },
+    Origin(String),
+    Path(PathBuf),
+}
+
+impl Identity {
+    pub fn infer(workspace: &Path) -> Self {
+        let path_identity = || Self::Path(workspace.to_path_buf());
+        let shallow = git(workspace, &["rev-parse", "--is-shallow-repository"])
+            .is_some_and(|value| value == "true");
+        if shallow {
+            return git(workspace, &["config", "--get", "remote.origin.url"])
+                .map(|origin| Self::Origin(normalize_origin(&origin)))
+                .unwrap_or_else(path_identity);
+        }
+        let Some(roots) = git(workspace, &["rev-list", "--max-parents=0", "HEAD"])
+            .filter(|roots| !roots.is_empty())
+        else {
+            return path_identity();
+        };
+        let prefix = git(workspace, &["rev-parse", "--show-prefix"]).unwrap_or_default();
+        let mut roots: Vec<String> = roots.lines().map(|root| root.trim().to_owned()).collect();
+        roots.sort_unstable();
+        Self::Git { roots, prefix }
     }
-    let Some(roots) =
-        git(workspace, &["rev-list", "--max-parents=0", "HEAD"]).filter(|roots| !roots.is_empty())
-    else {
-        return path_identity();
-    };
-    let prefix = git(workspace, &["rev-parse", "--show-prefix"]).unwrap_or_default();
-    let mut commits: Vec<&str> = roots.lines().map(str::trim).collect();
-    commits.sort_unstable();
-    format!("git:{}:{prefix}", commits.join(","))
+
+    /// The string the slot key digests. Its format must not change: existing
+    /// pool records hold digests of it.
+    fn key(&self) -> String {
+        match self {
+            Self::Git { roots, prefix } => format!("git:{}:{prefix}", roots.join(",")),
+            Self::Origin(origin) => format!("origin:{origin}"),
+            Self::Path(path) => format!("path:{}", path.display()),
+        }
+    }
+
+    /// One line for `oxide init` readiness.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Git { roots, prefix } => {
+                let short: Vec<&str> = roots
+                    .iter()
+                    .map(|root| root.get(..12).unwrap_or(root))
+                    .collect();
+                let place = if prefix.is_empty() {
+                    "the repository root".to_owned()
+                } else {
+                    format!("`{}`", prefix.trim_end_matches('/'))
+                };
+                format!(
+                    "Git root commit {} at {place}; worktrees and clones of this repository match",
+                    short.join(", ")
+                )
+            }
+            Self::Origin(origin) => format!("shallow clone of {origin}"),
+            Self::Path(path) => format!(
+                "the path {} (no Git commit yet), so other checkouts do not match",
+                path.display()
+            ),
+        }
+    }
 }
 
 fn git(workspace: &Path, args: &[&str]) -> Option<String> {
@@ -295,6 +340,21 @@ mod tests {
         assert_eq!(pick(&["app"], Some("lib")), RunPick::Unresolved);
         assert_eq!(pick(&["app"], Some("missing")), RunPick::Unresolved);
         assert_eq!(pick(&[], None), RunPick::Unresolved);
+    }
+
+    #[test]
+    fn identity_key_format_is_stable() {
+        let git = Identity::Git {
+            roots: vec!["a1".to_owned(), "b2".to_owned()],
+            prefix: "crates/app/".to_owned(),
+        };
+        assert_eq!(git.key(), "git:a1,b2:crates/app/");
+        assert_eq!(
+            Identity::Origin("github.com:acme/demo".to_owned()).key(),
+            "origin:github.com:acme/demo"
+        );
+        assert_eq!(Identity::Path(PathBuf::from("/w")).key(), "path:/w");
+        assert!(git.describe().contains("`crates/app`"));
     }
 
     #[test]

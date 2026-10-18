@@ -39,8 +39,9 @@ admission = "heavy"
 run = "python3 scripts/test-storage-lease-cli.py"
 
 # Builds the unpublished `oxide` front door and, on macOS, proves it on tiny
-# offline fixtures over one fresh 128 MiB APFS pool. Heavy admission owns the
-# image provisioning. Not a benchmark and not full QA.
+# offline fixtures over one fresh 128 MiB APFS pool, after proving init/new
+# adoption on tiny scratch directories without a pool. Heavy admission owns
+# the image provisioning. Not a benchmark and not full QA.
 [tasks."rust:oxide-cli"]
 admission = "heavy"
 run = "python3 scripts/test-oxide-cli.py"
