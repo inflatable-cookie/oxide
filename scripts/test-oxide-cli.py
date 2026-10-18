@@ -8,7 +8,8 @@ never touched. Offline std-only fixture crates prove command routing, the
 quick/debug profile flags (including an external subcommand's `$CARGO`
 call), storage-override refusals, `clean`, cross-checkout reuse through the
 freshness gate (two Git worktrees of a scratch repository: the stale-mtime
-scenario rebuilds, a `CARGO_MANIFEST_DIR` package rebuilds on a path change,
+scenario rebuilds, every package under the checkout (members and in-repo
+path dependencies, from `cargo metadata`) rebuilds on a path change,
 a path dependency outside the repository stays fresh, an unchanged repeat
 rebuilds nothing, a refused gate builds cold, and a crash inside the gate
 leaves the retry gated), FIFO waiting and the host
@@ -138,11 +139,15 @@ VIRTUAL = {
 # Freshness gate fixture: a Git workspace whose `marker` package embeds a
 # data file at compile time and whose `embed` member embeds its own
 # `CARGO_MANIFEST_DIR`; both tests compare the compiled value with this
-# checkout's. `outside` is a path dependency outside the repository.
+# checkout's. `outside` is a path dependency outside the repository. The
+# in-repo non-member path dependencies `buildrs` (default build.rs, no
+# declaration, embeds current_dir()) and `pathmac` (a proc macro that
+# expands to its caller's manifest dir) are checked through marker's test.
 GATED = {
     "Cargo.toml": """[workspace]
 members = [".", "embed", "codegen"]
 default-members = [".", "embed", "codegen"]
+exclude = ["vendor"]
 
 [package]
 name = "marker"
@@ -151,6 +156,8 @@ edition = "2021"
 
 [dependencies]
 outside = { path = "../outside" }
+buildrs = { path = "vendor/buildrs" }
+pathmac = { path = "vendor/pathmac" }
 """,
     "rust-toolchain.toml": '[toolchain]\nchannel = "1.97.1"\n',
     ".gitignore": "/target\n",
@@ -160,12 +167,23 @@ outside = { path = "../outside" }
 pub fn outside_value() -> u32 {
     outside::value()
 }
+
+pub fn buildrs_dir() -> &'static str {
+    buildrs::dir()
+}
+
+pub fn caller_dir() -> &'static str {
+    pathmac::caller_dir!()
+}
 """,
     "tests/content.rs": """#[test]
 fn compiled_marker_is_this_checkouts() {
     let here = std::fs::read_to_string("data/marker.txt").expect("marker");
     assert_eq!(marker::MARKER, here);
     assert_eq!(marker::outside_value(), 5);
+    let canonical = |path: &str| std::fs::canonicalize(path).expect("dir");
+    assert_eq!(canonical(marker::buildrs_dir()), canonical("vendor/buildrs"));
+    assert_eq!(canonical(marker::caller_dir()), canonical("."));
 }
 """,
     "embed/Cargo.toml": '[package]\nname = "embed"\nversion = "0.1.0"\nedition = "2021"\n',
@@ -209,6 +227,44 @@ mod tests {
     }
 }
 """
+
+GATED["vendor/buildrs/Cargo.toml"] = (
+    '[package]\nname = "buildrs"\nversion = "0.1.0"\nedition = "2021"\n'
+)
+GATED["vendor/buildrs/build.rs"] = """fn main() {
+    let here = std::env::current_dir().expect("build script cwd");
+    println!("cargo:rustc-env=BUILDRS_DIR={}", here.display());
+}
+"""
+GATED["vendor/buildrs/src/lib.rs"] = """pub fn dir() -> &'static str {
+    env!("BUILDRS_DIR")
+}
+"""
+GATED["vendor/pathmac/Cargo.toml"] = (
+    '[package]\nname = "pathmac"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\nproc-macro = true\n'
+)
+GATED["vendor/pathmac/src/lib.rs"] = """use proc_macro::TokenStream;
+
+#[proc_macro]
+pub fn caller_dir(_input: TokenStream) -> TokenStream {
+    let dir = std::env::var("CARGO_MANIFEST_DIR").expect("caller manifest dir");
+    format!("{dir:?}").parse().expect("string literal")
+}
+"""
+
+# Every unit the gate must rebuild on a checkout-path change: all packages
+# under the checkout, members and in-repo path dependencies alike.
+LOCAL_UNITS = (
+    "marker:build",
+    "marker:test",
+    "content:test",
+    "embed:build",
+    "embed:test",
+    "codegen:build",
+    "codegen:test",
+    "buildrs:build",
+    "pathmac:build",
+)
 
 OUTSIDE = {
     "Cargo.toml": '[package]\nname = "outside"\nversion = "0.1.0"\nedition = "2021"\n',
@@ -914,6 +970,16 @@ def prove_freshness(runner: Runner) -> None:
     a, b, c = (os.path.join(root, name) for name in ("a", "b", "c"))
     write_fixture(os.path.join(root, "outside"), OUTSIDE)
     write_fixture(a, GATED)
+    # The gate reads `cargo metadata --locked`, so the lock file is committed.
+    lock = subprocess.run(
+        ["cargo", "generate-lockfile", "--offline"],
+        cwd=a,
+        env=runner.environment(None),
+        capture_output=True,
+        text=True,
+        timeout=min(60, remaining()),
+    )
+    expect(lock.returncode, 0, "fixture lock file", lock.stderr)
     git(a, "init", "--quiet")
     git(a, "add", "-A")
     git(a, "commit", "--quiet", "-m", "gated fixture")
@@ -936,18 +1002,17 @@ def prove_freshness(runner: Runner) -> None:
         if result["slot"] != slot or result["warmth"] != "warm":
             fail(f"{label} did not reuse slot {slot} warm: {result}")
 
-    # Path change, same content: the CARGO_MANIFEST_DIR package rebuilds and
-    # its test sees B's path; the outside path dependency stays fresh.
+    # Path change, same content: every package under the checkout rebuilds
+    # and its test sees B's path; the outside path dependency stays fresh.
     result, units, stderr = test(b, "worktree B path change")
     shared(result, "worktree B")
     if "freshness gate refreshed" not in stderr or "inputs outside Git or ignored by it are not checked" not in stderr:
         fail(f"worktree B summary lacks the gate and its limit: {stderr[-800:]}")
-    if units.get("embed:build") is not False or units.get("embed:test") is not False:
-        fail(f"embed did not rebuild on the path change: {units}")
-    # The escaped custom build declaration is path-sensitive: its script reran
-    # and B's test saw B's path (the test passing proves the value).
-    if units.get("codegen:build") is not False or units.get("codegen:test") is not False:
-        fail(f"escaped custom build package did not rebuild on the path change: {units}")
+    # Includes the escaped build key, default build.rs, current_dir() script
+    # and proc-macro caller; the tests passing prove they saw B's path.
+    kept = [unit for unit in LOCAL_UNITS if units.get(unit) is not False]
+    if kept:
+        fail(f"local units did not rebuild on the path change: {kept} of {units}")
     if units.get("outside:build") is not True:
         fail(f"outside path dependency did not stay fresh: {units}")
 

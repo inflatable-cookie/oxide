@@ -7,7 +7,8 @@
 //! origin; before Cargo runs, the gate sets mtime to now on every checkout
 //! file whose content may differ from what the slot compiled and that is not
 //! newer than the build anchor. On a checkout-path change it does the same
-//! for packages that can embed the path. File contents, Cargo fingerprints
+//! for every file of every local package under the checkout, as Cargo's
+//! metadata names them. File contents, Cargo fingerprints
 //! and the slot are never touched. Inputs outside Git or ignored by it are
 //! not covered.
 
@@ -21,15 +22,17 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Dirty files in one checkout and uncertain paths per slot. Beyond this the
 /// gate refuses and the slot stays checkout-affine.
 pub const MAX_PATHS: usize = 4096;
 /// Files listed for the path-change step.
 const MAX_LISTED: usize = 200_000;
-/// Source bytes read looking for `CARGO_MANIFEST_DIR`.
-const MAX_SCAN_BYTES: u64 = 64 * MIB;
+/// `cargo metadata` output and lifetime for the path-change step.
+const MAX_METADATA_BYTES: u64 = 64 * MIB;
+const MAX_METADATA_ERROR_BYTES: u64 = 64 * 1024;
+const METADATA_TIME: Duration = Duration::from_secs(60);
 const DELETED: &str = "deleted";
 pub const LIMIT_NOTE: &str = "inputs outside Git or ignored by it are not checked";
 
@@ -201,7 +204,7 @@ pub fn prepare(checkout: &Path, prior: &Prior) -> Result<Gate, String> {
             let mut refreshed = refresh(&top, stale, origin.anchor_ns)?;
             let mut packages = 0;
             if cross {
-                let (count, files) = embedding_files(&top)?;
+                let (count, files) = local_package_files(checkout, &top)?;
                 packages = count;
                 refreshed += refresh(&top, files.iter(), origin.anchor_ns)?;
             }
@@ -455,11 +458,21 @@ fn touch(path: &Path) -> Result<(), String> {
     }
 }
 
-/// Files of every repository package that can embed its checkout path: one
-/// with a build script, or whose sources mention `CARGO_MANIFEST_DIR`. A file
-/// belongs to the package with the deepest `Cargo.toml` above it. Returns the
-/// package count and their files.
-fn embedding_files(top: &Path) -> Result<(usize, Vec<String>), String> {
+/// Files of every local package under the checkout, for a checkout-path
+/// change. Cargo's resolved graph names the packages: each one with no
+/// registry or Git source whose canonical manifest lies under `top`, workspace
+/// members and in-repo path dependencies alike. Every Git-listed file under
+/// such a package's directory is returned, so each local unit rebuilds
+/// whatever it reads there. Returns the package count and the files.
+fn local_package_files(checkout: &Path, top: &Path) -> Result<(usize, Vec<String>), String> {
+    let manifests = local_manifests(&cargo_metadata(checkout)?)?
+        .iter()
+        .map(|manifest| {
+            fs::canonicalize(manifest)
+                .map_err(|error| format!("cannot resolve {}: {error}", manifest.display()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let dirs = package_dirs(top, &manifests)?;
     let listed = nul_separated(git(
         top,
         &[
@@ -473,142 +486,135 @@ fn embedding_files(top: &Path) -> Result<(usize, Vec<String>), String> {
     if listed.len() > MAX_LISTED {
         return Err(format!("more than {MAX_LISTED} repository files"));
     }
-    let packages = package_files(&listed);
-    let mut budget = MAX_SCAN_BYTES;
-    let mut count = 0;
-    let mut files = Vec::new();
-    for (dir, owned) in packages {
-        if embeds_path(top, &dir, &owned, &mut budget)? {
-            count += 1;
-            files.extend(owned);
-        }
-    }
-    Ok((count, files))
+    Ok((dirs.len(), owned_files(&dirs, &listed)?))
 }
 
-/// Group listed files by owning package directory (`""` is the top level).
-fn package_files(listed: &[String]) -> BTreeMap<String, Vec<String>> {
-    let dirs: BTreeSet<&str> = listed
-        .iter()
-        .filter_map(|path| match path.rsplit_once('/') {
-            Some((dir, "Cargo.toml")) => Some(dir),
-            None if path == "Cargo.toml" => Some(""),
-            _ => None,
-        })
-        .collect();
-    let mut packages: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for path in listed {
-        let mut dir = path.as_str();
-        let owner = loop {
-            dir = dir.rsplit_once('/').map_or("", |(parent, _)| parent);
-            if dirs.contains(dir) {
-                break Some(dir);
+/// Run `cargo metadata` for the workspace, bounded in output and lifetime.
+fn cargo_metadata(checkout: &Path) -> Result<serde_json::Value, String> {
+    let mut child = Command::new(crate::CARGO)
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--offline",
+            "--locked",
+            "--manifest-path",
+        ])
+        .arg(checkout.join("Cargo.toml"))
+        .current_dir(checkout)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not start Cargo: {error}"))?;
+    let stdout = child.stdout.take().ok_or("Cargo stdout was not captured")?;
+    let stderr = child.stderr.take().ok_or("Cargo stderr was not captured")?;
+    let out = std::thread::spawn(move || read_capped(stdout, MAX_METADATA_BYTES));
+    let err = std::thread::spawn(move || read_capped(stderr, MAX_METADATA_ERROR_BYTES));
+    let deadline = Instant::now() + METADATA_TIME;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() >= deadline => {
+                // Our own child; reaping it closes the pipes.
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err("cargo metadata did not finish in time".to_owned());
             }
-            if dir.is_empty() {
-                break None;
-            }
-        };
-        if let Some(owner) = owner {
-            packages
-                .entry(owner.to_owned())
-                .or_default()
-                .push(path.clone());
-        }
-    }
-    packages
-}
-
-fn embeds_path(top: &Path, dir: &str, owned: &[String], budget: &mut u64) -> Result<bool, String> {
-    let join = |name: &str| {
-        if dir.is_empty() {
-            name.to_owned()
-        } else {
-            format!("{dir}/{name}")
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => break Err(format!("could not wait for Cargo: {error}")),
         }
     };
-    let build_rs = join("build.rs");
-    if owned.contains(&build_rs) {
-        return Ok(true);
+    let out = out.join().map_err(|_| "Cargo output reader panicked")?;
+    let err = err.join().map_err(|_| "Cargo error reader panicked")?;
+    let status = status?;
+    let (stdout, overflow) = out.map_err(|error| format!("cannot read Cargo output: {error}"))?;
+    if !status.success() {
+        let stderr = err.map(|(bytes, _)| bytes).unwrap_or_default();
+        return Err(format!(
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        ));
     }
-    if let Some(manifest) = read_bounded(top, &join("Cargo.toml"), budget)? {
-        if may_declare_build(&manifest) {
-            return Ok(true);
-        }
+    if overflow {
+        return Err("cargo metadata output exceeds the gate's limit".to_owned());
     }
-    for path in owned.iter().filter(|path| path.ends_with(".rs")) {
-        if let Some(source) = read_bounded(top, path, budget)? {
-            if source
-                .windows(b"CARGO_MANIFEST_DIR".len())
-                .any(|window| window == b"CARGO_MANIFEST_DIR")
-            {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+    serde_json::from_slice(&stdout).map_err(|error| format!("Cargo metadata is not JSON: {error}"))
 }
 
-/// Whether the manifest may name a build script outside `build.rs`. This is
-/// a conservative boundary, not a TOML parser. A TOML key can spell `build`
-/// without containing that literal text only through a basic-string escape
-/// (`"b\u0075ild"`), and every escape needs a backslash. So the answer is
-/// "maybe" for a manifest that is not UTF-8, contains any backslash, or has a
-/// `build` key token (bare, `"build"`, `'build'`, dotted or inline) followed
-/// by `=`, `.` or `]`. Comments and string values that look like that also
-/// count; that only refreshes more files. Only "no" lets the package skip
-/// the path-change refresh.
-fn may_declare_build(manifest: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(manifest) else {
-        return true;
-    };
-    text.contains('\\') || has_build_key(text)
-}
-
-/// A literal `build` key token followed by `=`, `.` or `]`.
-fn has_build_key(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    let key_char = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_';
-    text.match_indices("build").any(|(start, _)| {
-        let end = start + "build".len();
-        // Opening quote, if any, must close right after the key.
-        let quote = start
-            .checked_sub(1)
-            .map(|before| bytes[before])
-            .filter(|byte| matches!(byte, b'"' | b'\''));
-        if start > 0 && quote.is_none() && key_char(bytes[start - 1]) {
-            return false;
-        }
-        let mut rest = &bytes[end..];
-        match quote {
-            Some(quote) => match rest.split_first() {
-                Some((&next, after)) if next == quote => rest = after,
-                _ => return false,
-            },
-            None if rest.first().is_some_and(|&byte| key_char(byte)) => return false,
-            None => {}
-        }
-        rest.iter()
-            .find(|byte| !matches!(byte, b' ' | b'\t'))
-            .is_some_and(|byte| matches!(byte, b'=' | b'.' | b']'))
-    })
-}
-
-fn read_bounded(top: &Path, path: &str, budget: &mut u64) -> Result<Option<Vec<u8>>, String> {
-    let file = match fs::File::open(top.join(path)) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("cannot read {path}: {error}")),
-        Ok(file) => file,
-    };
+/// Up to `cap` bytes, then drain the rest so the writer never blocks.
+/// `true` when the stream was longer.
+fn read_capped(reader: impl Read, cap: u64) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut reader = reader;
     let mut bytes = Vec::new();
-    file.take(budget.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("cannot read {path}: {error}"))?;
-    let used = bytes.len() as u64;
-    if used > *budget {
-        return Err("repository sources exceed the path-change scan limit".to_owned());
+    (&mut reader).take(cap).read_to_end(&mut bytes)?;
+    let rest = std::io::copy(&mut reader, &mut std::io::sink())?;
+    Ok((bytes, rest > 0))
+}
+
+/// Manifest paths of every package Cargo resolved without a registry or Git
+/// source. A package whose source is neither is refused.
+fn local_manifests(metadata: &serde_json::Value) -> Result<Vec<PathBuf>, String> {
+    let packages = metadata
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("Cargo metadata lists no packages")?;
+    let mut manifests = Vec::new();
+    for package in packages {
+        match package.get("source") {
+            Some(serde_json::Value::String(_)) => continue,
+            Some(serde_json::Value::Null) => {}
+            _ => return Err("Cargo metadata has a package with an unreadable source".to_owned()),
+        }
+        let manifest = package
+            .get("manifest_path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("Cargo metadata has a local package without a manifest path")?;
+        manifests.push(PathBuf::from(manifest));
     }
-    *budget -= used;
-    Ok(Some(bytes))
+    Ok(manifests)
+}
+
+/// Directories, relative to `top`, of the canonical manifests under it.
+/// Component-aware: `/repo-other` is not under `/repo`. Two packages in one
+/// directory are refused as ambiguous.
+fn package_dirs(top: &Path, manifests: &[PathBuf]) -> Result<BTreeSet<String>, String> {
+    let mut dirs = BTreeSet::new();
+    for manifest in manifests {
+        let dir = manifest
+            .parent()
+            .ok_or_else(|| format!("{} has no directory", manifest.display()))?;
+        let Ok(relative) = dir.strip_prefix(top) else {
+            continue;
+        };
+        let relative = relative
+            .to_str()
+            .ok_or_else(|| format!("{} is not UTF-8", dir.display()))?;
+        if !dirs.insert(relative.to_owned()) {
+            return Err(format!("two packages claim {}", dir.display()));
+        }
+    }
+    Ok(dirs)
+}
+
+/// Listed files under any package directory. Each package's manifest must be
+/// listed: a package Git cannot see would be silently skipped.
+fn owned_files(dirs: &BTreeSet<String>, listed: &[String]) -> Result<Vec<String>, String> {
+    let visible: BTreeSet<&str> = listed.iter().map(String::as_str).collect();
+    for dir in dirs {
+        let manifest = Path::new(dir).join("Cargo.toml");
+        if !manifest.to_str().is_some_and(|path| visible.contains(path)) {
+            return Err(format!(
+                "{} is not visible to Git; the gate cannot cover its package",
+                manifest.display()
+            ));
+        }
+    }
+    Ok(listed
+        .iter()
+        .filter(|path| dirs.iter().any(|dir| Path::new(path).starts_with(dir)))
+        .cloned()
+        .collect())
 }
 
 #[cfg(test)]
@@ -649,76 +655,96 @@ mod tests {
     }
 
     #[test]
-    fn files_belong_to_the_deepest_package() {
-        let listed = [
-            "Cargo.toml",
-            "build.rs",
-            "src/lib.rs",
-            "helper/Cargo.toml",
-            "helper/src/lib.rs",
-            "helper/nested/data.txt",
-            "docs/notes.md",
-        ]
-        .map(str::to_owned);
-        let packages = package_files(&listed);
+    fn local_packages_are_every_package_without_a_source() {
+        let metadata = serde_json::json!({"packages": [
+            {"name": "app", "source": null, "manifest_path": "/repo/Cargo.toml"},
+            {"name": "vendored", "source": null, "manifest_path": "/repo/vendor/v/Cargo.toml"},
+            {"name": "outside", "source": null, "manifest_path": "/outside/Cargo.toml"},
+            {"name": "serde", "source": "registry+https://github.com/rust-lang/crates.io-index",
+             "manifest_path": "/repo/vendor/registry/serde/Cargo.toml"},
+            {"name": "dep", "source": "git+https://example.invalid/dep#abc",
+             "manifest_path": "/repo/git/dep/Cargo.toml"},
+        ]});
+        let manifests = local_manifests(&metadata).expect("reads");
         assert_eq!(
-            packages[""],
-            ["Cargo.toml", "build.rs", "src/lib.rs", "docs/notes.md"]
-        );
-        assert_eq!(
-            packages["helper"],
+            manifests,
             [
-                "helper/Cargo.toml",
-                "helper/src/lib.rs",
-                "helper/nested/data.txt"
+                "/repo/Cargo.toml",
+                "/repo/vendor/v/Cargo.toml",
+                "/outside/Cargo.toml"
             ]
+            .map(PathBuf::from)
         );
-        let outside = package_files(&["crates/a/x.rs".to_owned()]);
-        assert!(outside.is_empty());
+        for broken in [
+            serde_json::json!({}),
+            serde_json::json!({"packages": [{"name": "x", "manifest_path": "/repo/Cargo.toml"}]}),
+            serde_json::json!({"packages": [{"name": "x", "source": 1, "manifest_path": "/r/Cargo.toml"}]}),
+            serde_json::json!({"packages": [{"name": "x", "source": null}]}),
+        ] {
+            assert!(local_manifests(&broken).is_err(), "{broken}");
+        }
     }
 
     #[test]
-    fn manifest_build_classification_is_conservative() {
-        let maybe = |text: &str| may_declare_build(text.as_bytes());
-        // Literal key forms.
-        for manifest in [
-            "[package]\nbuild = \"gen.rs\"\n",
-            "  build=false",
-            "[package]\n\"build\" = \"codegen.rs\"\n",
-            "[package]\n'build'\t= 'codegen.rs'\n",
-            "package.build = \"codegen.rs\"\n",
-            "package . \"build\" = \"codegen.rs\"\n",
-            "package = { name = \"x\", build = \"gen.rs\" }\n",
-            "[package.build]\n",
-        ] {
-            assert!(maybe(manifest), "{manifest:?}");
-        }
-        // Escaped basic-string keys never decode here: any backslash is a
-        // maybe, whatever it spells.
-        for manifest in [
-            "[package]\n\"b\\u0075ild\" = \"codegen.rs\"\n",
-            "[package]\n\"\\U00000062uild\" = \"codegen.rs\"\n",
-            "[package]\n\"b\\u0075\\u0069ld\" = \"codegen.rs\"\n",
-            "package.\"bu\\u0069ld\" = \"codegen.rs\"\n",
-            "package = { \"\\u0062\\u0075\\u0069\\u006c\\u0064\" = \"gen.rs\" }\n",
-            "description = \"C:\\\\path\"\n",
-        ] {
-            assert!(maybe(manifest), "{manifest:?}");
-        }
-        // Comments and values that look like a key over-refresh by design.
-        assert!(maybe("# build = \"old.rs\"\n"));
-        assert!(maybe("description = \"how to build = fast\"\n"));
-        // Non-UTF-8 is not decoded either.
-        assert!(may_declare_build(b"[package]\nname = \"\xff\"\n"));
-        // Provably no build key.
-        for manifest in [
-            "[package]\nname = \"x\"\n",
-            "[build-dependencies]\nbuild-helper = \"1\"\nrebuild = 1\nname = \"build\"\n",
-            "[target.'cfg(unix)'.build-dependencies]\n\"buildx\" = 1\n",
-            "[package]\nname = 'build'\n",
-        ] {
-            assert!(!maybe(manifest), "{manifest:?}");
-        }
+    fn only_packages_under_the_checkout_count() {
+        let top = Path::new("/repo");
+        let manifests = [
+            "/repo/Cargo.toml",
+            "/repo/codegen/Cargo.toml",
+            "/repo/vendor/pathmac/Cargo.toml",
+            "/repo-other/Cargo.toml",
+            "/outside/Cargo.toml",
+        ]
+        .map(PathBuf::from);
+        let dirs = package_dirs(top, &manifests).expect("dirs");
+        assert_eq!(
+            dirs.into_iter().collect::<Vec<_>>(),
+            ["", "codegen", "vendor/pathmac"]
+        );
+        let twice = ["/repo/a/Cargo.toml", "/repo/a/Cargo.toml"].map(PathBuf::from);
+        assert!(package_dirs(top, &twice).is_err());
+    }
+
+    #[test]
+    fn every_file_of_every_local_package_refreshes() {
+        // Classification never reads manifests or sources: an escaped build
+        // key, a default build.rs, a current_dir() script and a proc-macro
+        // caller all refresh like any other local package's files.
+        let listed = [
+            "Cargo.toml",
+            "Cargo.lock",
+            "src/lib.rs",
+            "codegen/Cargo.toml",
+            "codegen/gen.rs",
+            "plain/Cargo.toml",
+            "plain/src/lib.rs",
+            "plain/data/table.txt",
+            "docs/notes.md",
+        ]
+        .map(str::to_owned);
+        let only_plain = BTreeSet::from(["codegen".to_owned(), "plain".to_owned()]);
+        assert_eq!(
+            owned_files(&only_plain, &listed).expect("covered"),
+            [
+                "codegen/Cargo.toml",
+                "codegen/gen.rs",
+                "plain/Cargo.toml",
+                "plain/src/lib.rs",
+                "plain/data/table.txt"
+            ]
+        );
+        let with_root = BTreeSet::from(["".to_owned(), "plain".to_owned()]);
+        assert_eq!(owned_files(&with_root, &listed).expect("covered"), listed);
+        // A prefix is not a parent directory.
+        let prefix = BTreeSet::from(["pla".to_owned()]);
+        let mut with_prefix = listed.to_vec();
+        with_prefix.push("pla/Cargo.toml".to_owned());
+        assert_eq!(
+            owned_files(&prefix, &with_prefix).expect("covered"),
+            ["pla/Cargo.toml"]
+        );
+        let hidden = BTreeSet::from(["ignored".to_owned()]);
+        assert!(owned_files(&hidden, &listed).is_err());
     }
 
     #[test]
