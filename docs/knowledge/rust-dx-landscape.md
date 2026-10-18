@@ -159,8 +159,27 @@ candidate is Cranelift for workspace crates. It needs a bounded measurement on a
 real edit-to-run loop that counts the separate nightly dependency set and the
 abort-on-panic compromise. Until then, measure where quick-run time goes
 (frontend, codegen, link) before choosing a strategy. The installed
-nightly-2026-08-05 has no Cranelift component; installing one needs scoped
-approval.
+nightly-2026-08-05 has no Cranelift component; Tom approved installing it for
+the bounded measurement on 2026-10-18 ([vision](vision.md#product-workflow-direction)).
+
+### Other run-path levers
+
+Any rustc-based JIT or interpreter still runs parsing, macro expansion and
+type/borrow checking. Those only remove code generation and linking, so
+`check` time is the floor. The measurement should report check, build and link
+time separately before any backend is credited.
+
+| Lever | Finding | Fit |
+| --- | --- | --- |
+| No-op fast path | Oxide can record the last successful build's content identity per checkout and binary (the freshness gate records it). If unchanged, it executes without invoking Cargo, skipping Cargo's fingerprint walk. | In Oxide's control; small, safe; after the gate. |
+| Optimized dependencies in `quick` | `package."*".opt-level` makes heavy dependencies run faster. Shared slots pay that compile cost once across worktrees. It needs `--config`, because the environment cannot express `package."*"`. | Candidate; measure. Every modelled command must use the same recipe, or the slot holds two dependency sets. |
+| Workspace feature unification | Selecting different packages builds dependency variants with different features: churn and extra storage. A 2026-10-18 probe on 1.97.1 showed `resolver.feature-unification` is ignored without `-Zfeature-unification` ([RFC 3692](https://rust-lang.github.io/rfcs/3692-feature-unification.html)). The stable route is a workspace-hack crate, which is a project change. | `oxide status` could report duplicate dependency variants; the fix stays per project. |
+| Faster linkers | macOS uses Apple's linker. [Wild](https://github.com/davidlattimore/wild) is Linux-only, has no incremental linking yet, and its Mach-O port is not ready. | Linux: LLD default already; wild later. macOS: nothing to add. |
+| Dynamic dependency linking | A dylib wrapper crate re-exporting dependencies cuts link time for large graphs, but changes linking and runtime loading. | Per-project opt-in only. |
+| Parallel frontend (`-Zthreads`) | Nightly; speeds frontend work on large crates. | Same nightly dependency-set cost as Cranelift; a possible extra arm of that measurement. |
+| Watch mode | Rebuilds and restarts on save; cuts latency, not work. | Human loop; low value for agents. |
+| [danluu/rust-interpreter](https://github.com/danluu/rust-interpreter) | rustc checks the code, then selected MIR is lowered to bytecode and run in an interpreter or AArch64 JIT. Self-described as "extremely vibe coded"; "cannot yet replace `cargo test`"; no unwinding, threads, FFI or `should_panic`; "no fallback" for unsupported code. Its results are mixed: 20% faster on one five-edit pilot, 2.7x slower on a compute-heavy target. Needs pinned nightly with `rustc-dev`; no license stated. | Not usable or adoptable. It shows the approach can work, and its ceiling is still the check time. |
+| Miri / [Cranelift JIT](https://github.com/rust-lang/rustc_codegen_cranelift/blob/main/docs/usage.md) | Miri is a UB checker that runs far slower than native code. Cranelift JIT is covered above. | Not speed tools. |
 
 ## Product assessment
 

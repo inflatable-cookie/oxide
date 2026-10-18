@@ -94,6 +94,8 @@ still apply, with only the explicit own-command recovery ruling above supersedin
 the older abandonment rule. Earlier experimental results remain evidence; the
 failed comparison and unqualified readings are not upgraded by this direction.
 
+Tom approved two follow-ups on 2026-10-18 with "Approve" each. First, the [foundation qualification](contracts/workflow.md#foundation-qualification-proposed) on Oxide's own repository, to run only after the front-door, crash-recovery and freshness-gate tasks merge, with bounds confirmed against what the foundation ships. Second, a bounded quick-run measurement of Cranelift for workspace crates after the foundation, including installation of the nightly `rustc-codegen-cranelift-preview` component on the existing nightly toolchain. Neither grants consumer changes, default-pool creation, other host changes or adoption of a strategy; adoption follows the measured result.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
