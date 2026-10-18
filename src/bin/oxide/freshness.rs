@@ -583,17 +583,19 @@ fn probe_args(request: &Resolution) -> Vec<OsString> {
 /// The workspace graph from `cargo metadata`. The call itself has no
 /// effects. When Cargo refuses because the lock file is missing or stale:
 /// - a help request resolves nothing, so the slot is only refused;
-/// - a `--locked` or `--frozen` command fails the same way under plain Cargo
-///   when the lock is missing, or when it is offline in any case: the
-///   refusal is the command's own;
-/// - a built-in Cargo build command allowed to write a missing lock, whose
-///   arguments Cargo accepts, gets it from `cargo generate-lockfile` with
-///   its own arguments: Cargo's resolution with no previous lock, as its
-///   build would do; no package is downloaded. External and unknown
-///   commands, and arguments Cargo rejects, never resolve under plain
-///   Cargo, so they only refuse the slot;
+/// - a `--locked` or `--frozen` command fails under plain Cargo when the
+///   lock is missing, or when it is offline in any case: the refusal is the
+///   command's own and ends it;
+/// - a command allowed to write a missing lock gets it from `cargo
+///   generate-lockfile` with its own arguments: Cargo's resolution with no
+///   previous lock, as its build would do; no package is downloaded;
 /// - anything else refuses the slot, and the cold build does Cargo's own
 ///   lock work.
+///
+/// Ending the command or writing its lock acts for Cargo, so both need a
+/// built-in Cargo build command whose arguments Cargo accepts. External and
+/// unknown commands, and arguments Cargo rejects, never resolve under plain
+/// Cargo: they only refuse the slot, and Cargo then runs them as usual.
 fn cargo_metadata(checkout: &Path, request: &Resolution) -> Result<serde_json::Value, Refusal> {
     let refused = match probe(checkout, request)? {
         Ok(metadata) => return Ok(metadata),
@@ -602,35 +604,24 @@ fn cargo_metadata(checkout: &Path, request: &Resolution) -> Result<serde_json::V
     let missing = !request.moves_lockfile() && !checkout.join("Cargo.lock").exists();
     let reason =
         |message: &str| -> Refusal { format!("cargo metadata failed: {}", message.trim()).into() };
-    if request.help {
-        return Err(reason(&refused.message));
-    }
-    if request.locked() {
-        return Err(if missing || request.offline() {
-            Refusal::Lock {
-                code: refused.code,
-                message: refused.message,
-            }
-        } else {
-            reason(&refused.message)
-        });
-    }
-    if !missing {
-        return Err(Refusal::Unvouched(
-            "the lock file needs updating; this command's Cargo updates it".to_owned(),
-        ));
-    }
-    let Some(check) = &request.parse_check else {
-        return Err(Refusal::Unvouched(
-            "only a built-in Cargo build command writes the missing lock file".to_owned(),
-        ));
+    let (terminal, check) = match lock_step(request, missing) {
+        LockStep::Refuse(None) => return Err(reason(&refused.message)),
+        LockStep::Refuse(Some(why)) => return Err(Refusal::Unvouched(why.to_owned())),
+        LockStep::End(check) => (true, check),
+        LockStep::Generate(check) => (false, check),
     };
     let mut parse = Command::new(crate::CARGO);
     parse.args(check);
     if !cargo_accepts(parse)? {
         return Err(Refusal::Unvouched(
-            "Cargo rejects this command's arguments, so it writes no lock file".to_owned(),
+            "Cargo rejects this command's arguments, so it never resolves the lock file".to_owned(),
         ));
+    }
+    if terminal {
+        return Err(Refusal::Lock {
+            code: refused.code,
+            message: refused.message,
+        });
     }
     let generated = run_cargo(
         cargo_command(checkout, &["generate-lockfile"], &request.args),
@@ -644,6 +635,39 @@ fn cargo_metadata(checkout: &Path, request: &Resolution) -> Result<serde_json::V
         .into());
     }
     probe(checkout, request)?.map_err(|refused| reason(&refused.message))
+}
+
+/// What the gate does about Cargo's lock refusal, before the parse check.
+#[derive(Debug, Eq, PartialEq)]
+enum LockStep<'a> {
+    /// Refuse the slot, with this reason or Cargo's own message.
+    Refuse(Option<&'static str>),
+    /// End the command with Cargo's refusal if Cargo accepts these arguments.
+    End(&'a [OsString]),
+    /// Write the missing lock if Cargo accepts these arguments.
+    Generate(&'a [OsString]),
+}
+
+fn lock_step(request: &Resolution, missing: bool) -> LockStep<'_> {
+    if request.help {
+        return LockStep::Refuse(None);
+    }
+    let terminal = request.locked() && (missing || request.offline());
+    if request.locked() && !terminal {
+        return LockStep::Refuse(None);
+    }
+    if !request.locked() && !missing {
+        return LockStep::Refuse(Some(
+            "the lock file needs updating; this command's Cargo updates it",
+        ));
+    }
+    match &request.parse_check {
+        None => LockStep::Refuse(Some(
+            "only a built-in Cargo build command resolves the lock file",
+        )),
+        Some(check) if terminal => LockStep::End(check),
+        Some(check) => LockStep::Generate(check),
+    }
 }
 
 /// Run the parse check (`Resolution::parse_check`): Cargo accepts the
@@ -988,6 +1012,44 @@ mod tests {
                 "/w/Cargo.toml"
             ]
         );
+    }
+
+    #[test]
+    fn only_accepted_built_in_commands_end_or_write_the_lock() {
+        let request = |values: &[&str]| {
+            let values: Vec<OsString> = values.iter().map(OsString::from).collect();
+            let invocation =
+                crate::cli::parse_leased(values[0].to_str().expect("UTF-8"), &values[1..])
+                    .expect("parses");
+            crate::cli::resolution(&invocation.cargo_args)
+        };
+        let step = |values: &[&str], missing: bool| match lock_step(&request(values), missing) {
+            LockStep::Refuse(_) => "refuse",
+            LockStep::End(_) => "end",
+            LockStep::Generate(_) => "generate",
+        };
+        // Built-in build commands: Cargo's own outcome.
+        assert_eq!(step(&["test", "--locked"], true), "end");
+        assert_eq!(step(&["test", "--frozen"], false), "end");
+        assert_eq!(step(&["build", "--locked", "--offline"], false), "end");
+        assert_eq!(step(&["test"], true), "generate");
+        assert_eq!(step(&["test", "--offline"], true), "generate");
+        // Uncertain or stale: the cold build's Cargo decides.
+        assert_eq!(step(&["test", "--locked"], false), "refuse");
+        assert_eq!(step(&["test"], false), "refuse");
+        // Help, external and unknown commands, and own `-Z`: never ended
+        // or given a lock by the gate.
+        assert_eq!(step(&["test", "--locked", "--help"], true), "refuse");
+        assert_eq!(step(&["test", "--help"], true), "refuse");
+        assert_eq!(step(&["foo", "--locked"], true), "refuse");
+        assert_eq!(step(&["nextest", "run", "--frozen"], false), "refuse");
+        assert_eq!(step(&["clippy", "--locked"], true), "refuse");
+        assert_eq!(step(&["foo"], true), "refuse");
+        assert_eq!(
+            step(&["test", "--locked", "-Zunstable-options"], true),
+            "refuse"
+        );
+        assert_eq!(step(&["test", "-Zunstable-options"], true), "refuse");
     }
 
     /// Real Cargo in an empty scratch directory: accepted arguments reach the

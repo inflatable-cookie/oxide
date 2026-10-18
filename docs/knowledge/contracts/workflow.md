@@ -179,7 +179,9 @@ slot has a recorded origin:
    - `--locked` or `--frozen` with a missing lock, or with `--frozen` or
      `--offline`, is the command's own refusal under plain Cargo: the
      command ends with Cargo's message and exit code, the slot goes back
-     unchanged and nothing builds cold.
+     unchanged and nothing builds cold. This needs the same built-in
+     command and parse check as lock generation below; otherwise the slot
+     is refused and Cargo runs the command as usual.
    - Anything else refuses the slot: a stale lock the command may update, a
      `--locked` online command whose offline answer is not certain, or a
      help request (`-h`, `--help`), which resolves nothing. The cold build's
