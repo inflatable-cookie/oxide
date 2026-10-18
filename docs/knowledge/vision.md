@@ -46,6 +46,17 @@ Assess shipped behavior and supported pinned toolchains, not promised completion
 
 ## Product workflow direction
 
+The appointed product architect refined the approved `oxide run` no-op fast-path
+acceptance on 2026-10-19: compare the skip with the normal leased `oxide run`
+on the same fixture. It must be materially faster and no slower than a bare
+`cargo build` no-op beyond measured noise. This replaces the architect's earlier
+strict requirement to beat bare Cargo. A reported fixture tie does not establish
+a bare-Cargo speedup or a result on larger repositories. All correctness,
+conservative-eligibility and independent exact-head review requirements remain.
+This is the architect's disposition within the approved feature scope, not a
+new answer attributed to Tom. Profiling ordinary command overhead is a separate,
+unapproved proposal.
+
 Tom's ruling, 2026-10-18: draw a line under the mechanism experiments and design a proper user workflow. Oxide should provide a replacement build service: instead of `cargo build` / `cargo run`, the user requests `oxide build …` / `oxide run …` against a named profile (quickest dev loop, light debug, full debug, release and similar). Oxide then handles storage/space management, worktree reuse, building and running where needed. The build location and system are abstracted from the user, so the same request could execute locally, on CI, in the cloud or on another machine on the local network. Tom asked whether `cargo build` and `cargo run` can be redirected to these commands.
 
 Tom's follow-up ruling, 2026-10-18: Oxide must be very easy to use and set up — no intricate install procedures or transparent interception. `oxide build` and `oxide run` are the explicit commands; the design problem is how they integrate into projects and workflows. Do not pursue rustup toolchain shims, `PATH` shims or shell aliases that make `cargo build` reach Oxide for now. Agents tend to fall back to familiar Cargo defaults, so adoption needs an Oxide agent skill and clear per-project agent documentation that direct them to the Oxide commands.
