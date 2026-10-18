@@ -46,6 +46,9 @@ ownership or eviction authority and never recommends deletion.
   cooperative caller's explicit writer-closed release; TTL or holder loss alone
   does not establish closure.
 - The inventory CLI reads one explicitly selected target directory.
+- A bounded decoder for Cargo's encoded dep-info (`oxide_storage::dep_info`)
+  is kept as input for the cross-checkout freshness gate. No command calls it
+  yet, and decoding alone establishes no freshness.
 - The stable Cargo profile proofs remain opt-in and do not change default
   development or consumer profiles.
 

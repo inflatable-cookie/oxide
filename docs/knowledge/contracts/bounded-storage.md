@@ -8,38 +8,46 @@ former daemon lifecycle and protocol have been retired.
 ## Boundary
 
 The supported hard-bound shape is a fixed-size private APFS volume inside a
-sparse disk image. The lease CLI provisions and opens it through the shared
-`BoundedBacking` capability. The operating system refuses allocation beyond
-the volume capacity, while the ledger separately reserves against its
-configured ceiling.
+sparse disk image. The lease CLI provisions and opens it and mints the
+`BoundedBacking` capability only after live verification. The operating system
+refuses allocation beyond the verified volume capacity. The declared pool cap
+must equal the image size; a smaller declared cap on a larger volume refuses,
+because admission accounting alone is not a quota.
 
 The bound is aggregate, not per-slot. All owned slots share one finite payload
-filesystem. Reservation accounting is an acquire-time estimate: a fully
-written payload can use more than its reservation while remaining within the
-verified volume capacity. Growth either uses settled idle capacity or refuses
-with a known or unknown accounting result. ENOSPC during a lease is not writer
-closure or release; uncertain ownership remains held.
+filesystem. There is no per-lease reservation: lease-time admission compares
+the owned slots' measured unique allocated bytes with the pinned cap, evicts
+only known idle whole slots, and refuses on held occupancy or unknown
+accounting. A lease does not constrain writes after it is granted; a build can
+still hit ENOSPC, which is not writer closure or release, and the lease stays
+held. [Local lease](local-lease.md#capacity-and-eviction) owns the exact
+admission, half-cap recycling and eviction rules.
 
-The lease ledger and capacity receipt stay outside a payload that can become
-full. The bounded payload contains only owned slot directories; unknown entries
-refuse.
+Pool config, ledger and capacity receipt stay outside a payload that can become
+full. The payload holds the owned `slots` directory plus the known
+macOS-created metadata directories (`.fseventsd`, `.Spotlight-V100`,
+`.Trashes`, `.TemporaryItems`); any other entry, a symlink or a foreign-volume
+entry refuses.
 
 ## Retained capability
 
 - `BoundedBacking` and `BoundedBackendDescriptor` represent the verified
   capability and the `apfs-sparse-image-v1` backend. Construction is
   crate-private, so caller input cannot turn a directory into a hard-bound
-  claim.
-- The lease ledger records the backend tag, canonical payload root, image
-  identity and verified capacity. Reopen refuses a mismatch instead of
-  reinterpreting the pool.
-- Finite control-history limits refuse new records at exhaustion instead of
-  pruning ownership evidence or growing the ledger indefinitely.
+  claim. Structural checks refuse an unknown backend, zero capacity, a
+  non-hex or oversized identity, and a relative, unreadable, non-private,
+  symlinked or non-canonical payload root.
+- The pool config records the backend tag, store ID, cap and image size. The
+  version-2 capacity receipt records the image path, mount point, image size,
+  payload ceiling, verified capacity and image identity. Reopen refuses a
+  mismatch instead of reinterpreting the pool.
+- Control state is finite (`MAX_LEDGER_BYTES` 256 KiB, `MAX_SLOTS` 32); new
+  slots refuse at exhaustion rather than dropping recorded ownership.
 - Provisioning creates and attaches a fresh image, makes the volume root
-  owner-only, verifies APFS at the exact mount point, and records a capacity
-  receipt bound to image identity and capacity. Opening rechecks those facts.
-- Directory-only roots are budgeted but are not a product mode of the lease
-  CLI. Unsupported platforms and unknown backend tags refuse without fallback.
+  owner-only, verifies APFS at the exact mount point and writes the receipt.
+  Opening rechecks those facts and never attaches a replacement.
+- Directory-only roots are not a product mode of the lease CLI. Unsupported
+  platforms and unknown backend tags refuse without fallback.
 
 ## Historical filesystem-full proof
 

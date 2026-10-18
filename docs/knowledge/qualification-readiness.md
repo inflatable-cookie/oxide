@@ -51,6 +51,9 @@ Consequence for W-8: before reusing a slot across checkouts, Oxide must
 account for source content, mtimes against the slot's build anchor, Cargo's
 named inputs, build-script environment and the physical root. Incomplete
 evidence refuses or falls back to a checkout-affine slot.
+The bounded `EncodedDepInfo` v1 decoder kept in `oxide_storage::dep_info`
+reads those per-unit file references and environment entries; decoding alone
+does not establish freshness.
 
 ## Compiler and behavior paths
 

@@ -290,6 +290,7 @@ Assessment:
 | [Stable profiles](stable-cargo-profiles.md) knowledge | Source of the `quick` / `debug` recipes. |
 | Cargo freshness, path-embedding, containment and capacity findings in [qualification readiness](../qualification-readiness.md) | Ground the freshness gate, debug-path limit and crash-recovery design. Kept as evidence; the narrative is condensed. |
 | [Build-context policy](build-context-policy.md) | Candidate input for per-command incremental/debug defaults; stays proposed. |
+| Bounded dep-info decoder (`src/dep_info.rs`) | Per-unit Cargo input lists for the W-8 gate; separable from the retired conversion. |
 
 | Retired | Why it has no distinct value now |
 | --- | --- |
@@ -299,14 +300,18 @@ Assessment:
 | Registry archive verifier/acquisition (`oxide-registry-acquisition`) | Registry deps sit at shared paths; Cargo already verifies archives. |
 | Source-map qualifier and probes | Their finding (no cheap stable remap) is recorded above; the code serves no remaining route. |
 
-The mtime-stale content-gate implementation (`src/project/freshness.rs`) and
-the dep-info decoder (`src/registered/dep_info.rs`) did not separate from the
-retired adapter: the gate was bound to the fixed source-map fixture, the
-resolver and the daemon codec, and the decoder to the registered input-root
-types. Both were removed. W-8 reimplements the gate from the retained
-[Cargo freshness findings](../qualification-readiness.md#cargo-freshness); its
-per-unit input boundary is designed afresh there. The retired code stays in Git
-history.
+The mtime-stale content-gate implementation (`src/project/freshness.rs`) did
+not separate from the retired adapter: it was bound to the fixed source-map
+fixture, the resolver and the daemon codec. It was removed; W-8 reimplements
+the gate from the retained [Cargo freshness findings](../qualification-readiness.md#cargo-freshness).
+
+The bounded Cargo dep-info decoder did separate. Its `decode` and plain decoded
+types never depended on the registered route; only the `into_registered`
+conversion did. The decoder now lives at `src/dep_info.rs` with its
+hand-annotated upstream-bytes and refusal tests, unchanged limits (16 MiB
+input, 32768 references, 2048-byte strings) and its own two-variant refusal.
+The conversion was retired. It is not called by any command yet; W-8 may use
+its per-unit file and environment lists to find inputs outside Git.
 
 ## Foundation slice
 
