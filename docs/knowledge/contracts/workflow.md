@@ -159,16 +159,50 @@ slot has a recorded origin:
    it. Content stays untouched; only the checkout's own files change; Cargo
    fingerprints and the slot are never edited.
 3. On a checkout-path change, every local package under the checkout is
-   path-sensitive, with no detection. `cargo metadata --format-version 1
-   --offline --locked` names the packages: each one with no registry or Git
+   path-sensitive, with no detection. `cargo metadata --format-version 1`
+   names the packages: each one with no registry or Git
    source whose canonical manifest lies under the canonical checkout root
    (component-aware), workspace members and in-repo path dependencies alike.
+   Metadata runs in the guarded command's context: the same Cargo, working
+   directory (so the same config files, member-local ones included) and
+   inherited environment, plus the command's own `--locked`, `--frozen`,
+   `--offline`, `--config`, `-Z` and `--lockfile-path` arguments before any
+   `--`, unchanged. Cargo merges them with `net.offline` and
+   `CARGO_NET_OFFLINE` under its own precedence; `--frozen` stays locked and
+   offline. The gate adds `--offline` and `--locked` where the command lacks
+   them, so metadata itself never downloads a package or writes the lock.
+   When Cargo then refuses because the lock is missing or stale:
+   - A built-in Cargo build command (`build`, `check`, `test`, `bench`,
+     `doc`, `rustc`, `rustdoc`; `run` builds through `build`) allowed to
+     write a missing `Cargo.lock` gets it from `cargo generate-lockfile`
+     with the command's own arguments: Cargo's resolution with no previous
+     lock, as its build would do, with no package download. Metadata is
+     then read again. A fresh worktree of a repository with an ignored lock
+     gets warm dependency reuse this way. First Cargo parses the command's
+     own arguments with an extra unknown `-Z` before any `--`; it refuses
+     that flag before loading the workspace. Unless that refusal is Cargo's
+     first error, Cargo would reject the command without resolving, so no
+     lock is written and the slot is refused. External and unknown
+     commands (including `clippy`), and commands passing their own `-Z`,
+     never get a lock from the gate.
+   - `--locked` or `--frozen` with a missing lock, or with `--frozen` or
+     `--offline`, is the command's own refusal under plain Cargo: the
+     command ends with Cargo's message and exit code, the slot goes back
+     unchanged and nothing builds cold. This needs the same built-in
+     command and parse check as lock generation below; otherwise the slot
+     is refused and Cargo runs the command as usual.
+   - Anything else refuses the slot: a stale lock the command may update, a
+     `--locked` online command whose offline answer is not certain, or a
+     help request (`-h`, `--help`), which resolves nothing. The cold build's
+     own Cargo then updates, refuses or prints help as usual, and a later
+     command from another checkout warms.
+   Oxide edits nothing else.
    Every tracked and untracked non-ignored file in the checkout gets the
    same mtime treatment unless its deepest package directory belongs to a
    registry or Git package (vendored sources), so every local unit rebuilds,
    including build scripts that read `current_dir()` and proc macros that
    expand to the caller's manifest dir. Manifests and sources are never read
-   to decide this. Metadata failure, a missing lock file, output over 64 MiB
+   to decide this. Any other metadata failure, output over 64 MiB
    or 60 s, two packages in one directory, a local manifest or target
    source Git cannot see, or a local target or symlink inside a vendored
    package refuses sharing (cold, checkout-affine). Registry, Git and

@@ -311,6 +311,101 @@ pub fn package_selection(args: &[OsString]) -> Option<String> {
     Some(spec.split('@').next().unwrap_or_default().to_owned())
 }
 
+/// What the guarded command asks of Cargo's dependency resolution.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct Resolution {
+    /// Its `--locked`, `--frozen`, `--offline`, `--config`, `-Z` and
+    /// `--lockfile-path` arguments before any `--`, unchanged and in order.
+    /// Cargo merges them with inherited configuration and environment, so
+    /// precedence stays Cargo's.
+    pub args: Vec<OsString>,
+    /// `-h` or `--help`: Cargo prints help and resolves nothing.
+    pub help: bool,
+    /// For a built-in Cargo command that resolves the workspace, and only
+    /// when it passes no `-Z` of its own: its Cargo arguments with
+    /// `-Z oxide-parse-check` before any `--`. Cargo parses every argument,
+    /// then refuses the unknown `-Z` before it loads the workspace, so the
+    /// call has no effects and tells whether Cargo accepts the command.
+    pub parse_check: Option<Vec<OsString>>,
+}
+
+/// Built-in Cargo commands whose run resolves the workspace and writes a
+/// missing lock file (`run` builds through `build`).
+const RESOLVING: [&str; 7] = ["build", "check", "test", "bench", "doc", "rustc", "rustdoc"];
+pub const PARSE_CHECK: &str = "oxide-parse-check";
+
+impl Resolution {
+    fn has(&self, flag: &str) -> bool {
+        self.args.iter().any(|argument| argument == flag)
+    }
+
+    /// `--locked` or `--frozen`: Cargo must not write the lock file.
+    pub fn locked(&self) -> bool {
+        self.has("--locked") || self.has("--frozen")
+    }
+
+    /// `--offline` or `--frozen`: offline whatever config or environment say.
+    pub fn offline(&self) -> bool {
+        self.has("--offline") || self.has("--frozen")
+    }
+
+    /// `--lockfile-path`: the lock file is not the workspace's `Cargo.lock`.
+    pub fn moves_lockfile(&self) -> bool {
+        self.args.iter().any(|argument| {
+            argument == "--lockfile-path"
+                || argument
+                    .to_str()
+                    .is_some_and(|text| text.starts_with("--lockfile-path="))
+        })
+    }
+}
+
+/// The resolution request in a leased command's Cargo arguments.
+pub fn resolution(cargo_args: &[OsString]) -> Resolution {
+    let mut request = Resolution::default();
+    let mut iter = cargo_args.iter().skip(1);
+    while let Some(argument) = iter.next() {
+        let text = argument.to_str().unwrap_or_default();
+        match text {
+            "--" => break,
+            "-h" | "--help" => request.help = true,
+            "--locked" | "--frozen" | "--offline" => request.args.push(argument.clone()),
+            "--config" | "-Z" | "--lockfile-path" => {
+                request.args.push(argument.clone());
+                request.args.extend(iter.next().cloned());
+            }
+            _ if text.starts_with("--config=")
+                || text.starts_with("--lockfile-path=")
+                || text.starts_with("-Z") =>
+            {
+                request.args.push(argument.clone());
+            }
+            _ => {}
+        }
+    }
+    let resolving = cargo_args
+        .first()
+        .and_then(|command| command.to_str())
+        .is_some_and(|command| RESOLVING.contains(&command));
+    let own_unstable = request
+        .args
+        .iter()
+        .any(|argument| argument.to_str().is_some_and(|text| text.starts_with("-Z")));
+    if resolving && !own_unstable {
+        let position = cargo_args
+            .iter()
+            .position(|argument| argument == "--")
+            .unwrap_or(cargo_args.len());
+        let mut check = cargo_args.to_vec();
+        check.splice(
+            position..position,
+            [OsString::from("-Z"), OsString::from(PARSE_CHECK)],
+        );
+        request.parse_check = Some(check);
+    }
+    request
+}
+
 /// `run`: the `--bin`/`--example` name the caller selected, if any.
 pub fn run_selection(cargo_args: &[OsString]) -> Option<String> {
     flag_value(cargo_args, "--bin").or_else(|| flag_value(cargo_args, "--example"))
@@ -450,6 +545,108 @@ mod tests {
             Some("app")
         );
         assert_eq!(package_selection(&args(&["--", "-p", "app"])), None);
+    }
+
+    #[test]
+    fn resolution_args_mirror_lock_network_and_config_flags() {
+        let parsed = parse_leased(
+            "test",
+            &args(&[
+                "--locked",
+                "-p",
+                "app",
+                "--frozen",
+                "--offline",
+                "--config",
+                "net.offline=false",
+                "--config=net.offline=true",
+                "-Z",
+                "unstable-options",
+                "-Zno-index-update",
+                "--lockfile-path",
+                "/w/other.lock",
+                "--features=locked",
+                "--",
+                "--locked",
+                "--offline",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            resolution(&parsed.cargo_args).args,
+            args(&[
+                "--locked",
+                "--frozen",
+                "--offline",
+                "--config",
+                "net.offline=false",
+                "--config=net.offline=true",
+                "-Z",
+                "unstable-options",
+                "-Zno-index-update",
+                "--lockfile-path",
+                "/w/other.lock",
+            ])
+        );
+        let request = resolution(&parsed.cargo_args);
+        assert!(request.locked() && request.offline() && request.moves_lockfile());
+        assert!(!request.help);
+        assert_eq!(request.parse_check, None, "the command passes its own -Z");
+        // No restriction requested: Cargo's own defaults.
+        let plain = parse_leased("check", &args(&["-p", "app"])).unwrap();
+        let plain = resolution(&plain.cargo_args);
+        assert!(plain.args.is_empty() && !plain.help);
+        assert_eq!(
+            plain.parse_check,
+            Some(args(&[
+                "check",
+                "-p",
+                "app",
+                "--profile",
+                "oxide-quick",
+                "-Z",
+                PARSE_CHECK
+            ]))
+        );
+        let locked = resolution(
+            &parse_leased("test", &args(&["--locked"]))
+                .unwrap()
+                .cargo_args,
+        );
+        assert!(locked.locked() && !locked.offline() && !locked.moves_lockfile());
+        let offline = resolution(
+            &parse_leased("test", &args(&["--offline"]))
+                .unwrap()
+                .cargo_args,
+        );
+        assert!(!offline.locked() && offline.offline());
+        // Help resolves nothing; after `--` it is the test binary's.
+        let help = parse_leased("test", &args(&["--locked", "--help"])).unwrap();
+        assert!(resolution(&help.cargo_args).help);
+        let short = parse_leased("build", &args(&["-h"])).unwrap();
+        assert!(resolution(&short.cargo_args).help);
+        let passed = parse_leased("test", &args(&["--", "--help"])).unwrap();
+        assert!(!resolution(&passed.cargo_args).help);
+        // The parse check goes before `--`, so it never reaches a test binary.
+        assert_eq!(
+            resolution(&passed.cargo_args).parse_check,
+            Some(args(&[
+                "test",
+                "--profile",
+                "oxide-quick",
+                "-Z",
+                PARSE_CHECK,
+                "--",
+                "--help"
+            ]))
+        );
+        // External subcommands are scanned after their name too, and have no
+        // parse check: Cargo does not parse their arguments.
+        let external = parse_leased("nextest", &args(&["run", "--frozen"])).unwrap();
+        assert_eq!(resolution(&external.cargo_args).args, args(&["--frozen"]));
+        assert_eq!(resolution(&external.cargo_args).parse_check, None);
+        let clippy = parse_leased("clippy", &args(&[])).unwrap();
+        assert_eq!(resolution(&clippy.cargo_args).parse_check, None);
     }
 
     #[test]

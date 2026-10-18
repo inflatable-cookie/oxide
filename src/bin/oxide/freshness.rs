@@ -8,14 +8,16 @@
 //! file whose content may differ from what the slot compiled and that is not
 //! newer than the build anchor. On a checkout-path change it does the same
 //! for every file of every local package under the checkout, as Cargo's
-//! metadata names them. File contents, Cargo fingerprints
+//! effect-free metadata names them under the guarded command's own lock,
+//! network and config arguments. File contents, Cargo fingerprints
 //! and the slot are never touched. Inputs outside Git or ignored by it are
 //! not covered.
 
+use crate::cli::Resolution;
 use crate::MIB;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -35,6 +37,33 @@ const MAX_METADATA_ERROR_BYTES: u64 = 64 * 1024;
 const METADATA_TIME: Duration = Duration::from_secs(60);
 const DELETED: &str = "deleted";
 pub const LIMIT_NOTE: &str = "inputs outside Git or ignored by it are not checked";
+/// Cargo's wording when `--locked` or `--frozen` stops it creating or
+/// updating the lock file.
+const LOCK_REFUSAL: &str = "was passed to prevent this";
+
+/// Why the gate did not vouch for a slot.
+#[derive(Debug)]
+pub enum Refusal {
+    /// The slot's history cannot be reconciled with this checkout: the
+    /// command builds cold.
+    Unvouched(String),
+    /// Cargo refused the command's own `--locked` or `--frozen` request.
+    /// Plain Cargo fails the same way, so the command ends with Cargo's
+    /// message and exit code instead of building cold.
+    Lock { code: u8, message: String },
+}
+
+impl From<String> for Refusal {
+    fn from(reason: String) -> Self {
+        Self::Unvouched(reason)
+    }
+}
+
+impl From<&str> for Refusal {
+    fn from(reason: &str) -> Self {
+        Self::Unvouched(reason.to_owned())
+    }
+}
 
 /// One checkout's content: HEAD's tree plus the Git blob digest of every
 /// file that differs from it (tracked changes and untracked files Git does
@@ -175,16 +204,18 @@ impl Gate {
     }
 }
 
-/// Run the gate for `checkout` before Cargo. An error means the slot's
-/// history cannot be reconciled with this checkout: the caller must not run
-/// Cargo on it.
-pub fn prepare(checkout: &Path, prior: &Prior) -> Result<Gate, String> {
+/// Run the gate for `checkout` before Cargo. `request` is the guarded
+/// command's resolution request (`cli::resolution`). An error means the
+/// caller must not run Cargo on the slot.
+pub fn prepare(checkout: &Path, prior: &Prior, request: &Resolution) -> Result<Gate, Refusal> {
     match prior {
-        Prior::Unknown => Err("the slot has no trusted build record".to_owned()),
+        Prior::Unknown => Err(Refusal::Unvouched(
+            "the slot has no trusted build record".to_owned(),
+        )),
         Prior::Known(Built::Affine(owner)) if owner == checkout => Ok(Gate::affine()),
-        Prior::Known(Built::Affine(_)) => {
-            Err("the slot holds another checkout's build without Git content".to_owned())
-        }
+        Prior::Known(Built::Affine(_)) => Err(Refusal::Unvouched(
+            "the slot holds another checkout's build without Git content".to_owned(),
+        )),
         // Nothing compiled yet: a checkout without Git content stays affine.
         Prior::Fresh => Ok(match snapshot(checkout) {
             Ok(before) => Gate {
@@ -204,7 +235,8 @@ pub fn prepare(checkout: &Path, prior: &Prior) -> Result<Gate, String> {
             let mut refreshed = refresh(&top, stale, origin.anchor_ns)?;
             let mut packages = 0;
             if cross {
-                let (count, files) = local_package_files(checkout, &top)?;
+                let metadata = cargo_metadata(checkout, request)?;
+                let (count, files) = local_package_files(&top, &metadata)?;
                 packages = count;
                 refreshed += refresh(&top, files.iter(), origin.anchor_ns)?;
             }
@@ -466,8 +498,11 @@ fn touch(path: &Path) -> Result<(), String> {
 /// whatever it reads, inside or outside its own directory. A local target or
 /// a followed symlink inside a vendored package is ambiguous and refused.
 /// Returns the local package count and the files.
-fn local_package_files(checkout: &Path, top: &Path) -> Result<(usize, Vec<String>), String> {
-    let graph = resolve_graph(&cargo_metadata(checkout)?)?;
+fn local_package_files(
+    top: &Path,
+    metadata: &serde_json::Value,
+) -> Result<(usize, Vec<String>), String> {
+    let graph = resolve_graph(metadata)?;
     let canonical = |paths: &[PathBuf]| {
         paths
             .iter()
@@ -518,19 +553,181 @@ fn local_package_files(checkout: &Path, top: &Path) -> Result<(usize, Vec<String
     Ok((local.len(), files))
 }
 
-/// Run `cargo metadata` for the workspace, bounded in output and lifetime.
-fn cargo_metadata(checkout: &Path) -> Result<serde_json::Value, String> {
-    let mut child = Command::new(crate::CARGO)
-        .args([
-            "metadata",
-            "--format-version",
-            "1",
-            "--offline",
-            "--locked",
-            "--manifest-path",
-        ])
-        .arg(checkout.join("Cargo.toml"))
-        .current_dir(checkout)
+/// A Cargo call in the guarded command's context: the same Cargo, working
+/// directory (so the same config files) and inherited environment, plus
+/// `args` and the workspace manifest.
+fn cargo_command(checkout: &Path, leading: &[&str], args: &[OsString]) -> Command {
+    let mut command = Command::new(crate::CARGO);
+    command
+        .args(leading)
+        .args(args)
+        .arg("--manifest-path")
+        .arg(checkout.join("Cargo.toml"));
+    command
+}
+
+/// The gate's metadata arguments: the guarded command's own, plus
+/// `--offline` and `--locked` where it lacks them. Metadata then never
+/// downloads a package or writes the lock file, whatever the request.
+fn probe_args(request: &Resolution) -> Vec<OsString> {
+    let mut args = request.args.clone();
+    if !request.offline() {
+        args.push(OsString::from("--offline"));
+    }
+    if !request.locked() {
+        args.push(OsString::from("--locked"));
+    }
+    args
+}
+
+/// The workspace graph from `cargo metadata`. The call itself has no
+/// effects. When Cargo refuses because the lock file is missing or stale:
+/// - a help request resolves nothing, so the slot is only refused;
+/// - a `--locked` or `--frozen` command fails under plain Cargo when the
+///   lock is missing, or when it is offline in any case: the refusal is the
+///   command's own and ends it;
+/// - a command allowed to write a missing lock gets it from `cargo
+///   generate-lockfile` with its own arguments: Cargo's resolution with no
+///   previous lock, as its build would do; no package is downloaded;
+/// - anything else refuses the slot, and the cold build does Cargo's own
+///   lock work.
+///
+/// Ending the command or writing its lock acts for Cargo, so both need a
+/// built-in Cargo build command whose arguments Cargo accepts. External and
+/// unknown commands, and arguments Cargo rejects, never resolve under plain
+/// Cargo: they only refuse the slot, and Cargo then runs them as usual.
+fn cargo_metadata(checkout: &Path, request: &Resolution) -> Result<serde_json::Value, Refusal> {
+    let refused = match probe(checkout, request)? {
+        Ok(metadata) => return Ok(metadata),
+        Err(refused) => refused,
+    };
+    let missing = !request.moves_lockfile() && !checkout.join("Cargo.lock").exists();
+    let reason =
+        |message: &str| -> Refusal { format!("cargo metadata failed: {}", message.trim()).into() };
+    let (terminal, check) = match lock_step(request, missing) {
+        LockStep::Refuse(None) => return Err(reason(&refused.message)),
+        LockStep::Refuse(Some(why)) => return Err(Refusal::Unvouched(why.to_owned())),
+        LockStep::End(check) => (true, check),
+        LockStep::Generate(check) => (false, check),
+    };
+    let mut parse = Command::new(crate::CARGO);
+    parse.args(check);
+    if !cargo_accepts(parse)? {
+        return Err(Refusal::Unvouched(
+            "Cargo rejects this command's arguments, so it never resolves the lock file".to_owned(),
+        ));
+    }
+    if terminal {
+        return Err(Refusal::Lock {
+            code: refused.code,
+            message: refused.message,
+        });
+    }
+    let generated = run_cargo(
+        cargo_command(checkout, &["generate-lockfile"], &request.args),
+        MAX_METADATA_ERROR_BYTES,
+    )?;
+    if !generated.status.success() {
+        return Err(format!(
+            "cargo generate-lockfile failed: {}",
+            generated.stderr.trim()
+        )
+        .into());
+    }
+    probe(checkout, request)?.map_err(|refused| reason(&refused.message))
+}
+
+/// What the gate does about Cargo's lock refusal, before the parse check.
+#[derive(Debug, Eq, PartialEq)]
+enum LockStep<'a> {
+    /// Refuse the slot, with this reason or Cargo's own message.
+    Refuse(Option<&'static str>),
+    /// End the command with Cargo's refusal if Cargo accepts these arguments.
+    End(&'a [OsString]),
+    /// Write the missing lock if Cargo accepts these arguments.
+    Generate(&'a [OsString]),
+}
+
+fn lock_step(request: &Resolution, missing: bool) -> LockStep<'_> {
+    if request.help {
+        return LockStep::Refuse(None);
+    }
+    let terminal = request.locked() && (missing || request.offline());
+    if request.locked() && !terminal {
+        return LockStep::Refuse(None);
+    }
+    if !request.locked() && !missing {
+        return LockStep::Refuse(Some(
+            "the lock file needs updating; this command's Cargo updates it",
+        ));
+    }
+    match &request.parse_check {
+        None => LockStep::Refuse(Some(
+            "only a built-in Cargo build command resolves the lock file",
+        )),
+        Some(check) if terminal => LockStep::End(check),
+        Some(check) => LockStep::Generate(check),
+    }
+}
+
+/// Run the parse check (`Resolution::parse_check`): Cargo accepts the
+/// arguments when its first error is the refusal of the unknown `-Z`.
+fn cargo_accepts(command: Command) -> Result<bool, String> {
+    let output = run_cargo(command, MAX_METADATA_ERROR_BYTES)?;
+    let first_error = output
+        .stderr
+        .lines()
+        .find(|line| line.starts_with("error:"));
+    Ok(output.status.code() == Some(101)
+        && first_error.is_some_and(|line| line.contains("`-Z` flag")))
+}
+
+/// Cargo's refusal to create or update the lock file.
+struct LockRefused {
+    code: u8,
+    message: String,
+}
+
+/// One effect-free metadata call. `Ok(Err(_))` is Cargo's lock refusal.
+fn probe(
+    checkout: &Path,
+    request: &Resolution,
+) -> Result<Result<serde_json::Value, LockRefused>, String> {
+    let output = run_cargo(
+        cargo_command(
+            checkout,
+            &["metadata", "--format-version", "1"],
+            &probe_args(request),
+        ),
+        MAX_METADATA_BYTES,
+    )?;
+    if !output.status.success() {
+        if output.status.code().is_some() && output.stderr.contains(LOCK_REFUSAL) {
+            return Ok(Err(LockRefused {
+                code: crate::process::exit_code(output.status),
+                message: output.stderr,
+            }));
+        }
+        return Err(format!("cargo metadata failed: {}", output.stderr.trim()));
+    }
+    if output.overflow {
+        return Err("cargo metadata output exceeds the gate's limit".to_owned());
+    }
+    serde_json::from_slice(&output.stdout)
+        .map(Ok)
+        .map_err(|error| format!("Cargo metadata is not JSON: {error}"))
+}
+
+struct CargoOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    overflow: bool,
+    stderr: String,
+}
+
+/// Run one Cargo call, bounded in output and lifetime.
+fn run_cargo(mut command: Command, stdout_cap: u64) -> Result<CargoOutput, String> {
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -538,7 +735,7 @@ fn cargo_metadata(checkout: &Path) -> Result<serde_json::Value, String> {
         .map_err(|error| format!("could not start Cargo: {error}"))?;
     let stdout = child.stdout.take().ok_or("Cargo stdout was not captured")?;
     let stderr = child.stderr.take().ok_or("Cargo stderr was not captured")?;
-    let out = std::thread::spawn(move || read_capped(stdout, MAX_METADATA_BYTES));
+    let out = std::thread::spawn(move || read_capped(stdout, stdout_cap));
     let err = std::thread::spawn(move || read_capped(stderr, MAX_METADATA_ERROR_BYTES));
     let deadline = Instant::now() + METADATA_TIME;
     let status = loop {
@@ -548,7 +745,7 @@ fn cargo_metadata(checkout: &Path) -> Result<serde_json::Value, String> {
                 // Our own child; reaping it closes the pipes.
                 let _ = child.kill();
                 let _ = child.wait();
-                break Err("cargo metadata did not finish in time".to_owned());
+                break Err("Cargo did not finish in time".to_owned());
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
             Err(error) => break Err(format!("could not wait for Cargo: {error}")),
@@ -558,17 +755,13 @@ fn cargo_metadata(checkout: &Path) -> Result<serde_json::Value, String> {
     let err = err.join().map_err(|_| "Cargo error reader panicked")?;
     let status = status?;
     let (stdout, overflow) = out.map_err(|error| format!("cannot read Cargo output: {error}"))?;
-    if !status.success() {
-        let stderr = err.map(|(bytes, _)| bytes).unwrap_or_default();
-        return Err(format!(
-            "cargo metadata failed: {}",
-            String::from_utf8_lossy(&stderr).trim()
-        ));
-    }
-    if overflow {
-        return Err("cargo metadata output exceeds the gate's limit".to_owned());
-    }
-    serde_json::from_slice(&stdout).map_err(|error| format!("Cargo metadata is not JSON: {error}"))
+    let stderr = err.map(|(bytes, _)| bytes).unwrap_or_default();
+    Ok(CargoOutput {
+        status,
+        stdout,
+        overflow,
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    })
 }
 
 /// Up to `cap` bytes, then drain the rest so the writer never blocks.
@@ -758,6 +951,147 @@ mod tests {
     }
 
     #[test]
+    fn metadata_runs_in_the_guarded_context_and_never_writes_or_downloads() {
+        let request = |values: &[&str]| Resolution {
+            args: values.iter().map(OsString::from).collect(),
+            help: false,
+            parse_check: None,
+        };
+        let probe = |values: &[&str]| -> Vec<String> {
+            probe_args(&request(values))
+                .into_iter()
+                .map(|value| value.into_string().expect("UTF-8"))
+                .collect()
+        };
+        assert_eq!(probe(&[]), ["--offline", "--locked"]);
+        assert_eq!(probe(&["--locked"]), ["--locked", "--offline"]);
+        assert_eq!(probe(&["--offline"]), ["--offline", "--locked"]);
+        assert_eq!(
+            probe(&["--frozen", "--config", "net.offline=false"]),
+            ["--frozen", "--config", "net.offline=false"]
+        );
+        assert_eq!(
+            probe(&["--config=net.offline=true", "-Zx"]),
+            ["--config=net.offline=true", "-Zx", "--offline", "--locked"]
+        );
+        let command = cargo_command(
+            Path::new("/w"),
+            &["metadata", "--format-version", "1"],
+            &probe_args(&request(&["--config", "net.offline=false"])),
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "metadata",
+                "--format-version",
+                "1",
+                "--config",
+                "net.offline=false",
+                "--offline",
+                "--locked",
+                "--manifest-path",
+                "/w/Cargo.toml",
+            ]
+        );
+        // Same working directory and environment as the guarded command:
+        // Cargo resolves config files, `CARGO_NET_OFFLINE` and precedence.
+        assert_eq!(command.get_current_dir(), None);
+        assert_eq!(command.get_envs().count(), 0);
+        // The lock is generated with the command's own arguments only.
+        let generate = cargo_command(
+            Path::new("/w"),
+            &["generate-lockfile"],
+            &request(&["--offline"]).args,
+        );
+        assert_eq!(
+            generate.get_args().collect::<Vec<_>>(),
+            [
+                "generate-lockfile",
+                "--offline",
+                "--manifest-path",
+                "/w/Cargo.toml"
+            ]
+        );
+    }
+
+    #[test]
+    fn only_accepted_built_in_commands_end_or_write_the_lock() {
+        let request = |values: &[&str]| {
+            let values: Vec<OsString> = values.iter().map(OsString::from).collect();
+            let invocation =
+                crate::cli::parse_leased(values[0].to_str().expect("UTF-8"), &values[1..])
+                    .expect("parses");
+            crate::cli::resolution(&invocation.cargo_args)
+        };
+        let step = |values: &[&str], missing: bool| match lock_step(&request(values), missing) {
+            LockStep::Refuse(_) => "refuse",
+            LockStep::End(_) => "end",
+            LockStep::Generate(_) => "generate",
+        };
+        // Built-in build commands: Cargo's own outcome.
+        assert_eq!(step(&["test", "--locked"], true), "end");
+        assert_eq!(step(&["test", "--frozen"], false), "end");
+        assert_eq!(step(&["build", "--locked", "--offline"], false), "end");
+        assert_eq!(step(&["test"], true), "generate");
+        assert_eq!(step(&["test", "--offline"], true), "generate");
+        // Uncertain or stale: the cold build's Cargo decides.
+        assert_eq!(step(&["test", "--locked"], false), "refuse");
+        assert_eq!(step(&["test"], false), "refuse");
+        // Help, external and unknown commands, and own `-Z`: never ended
+        // or given a lock by the gate.
+        assert_eq!(step(&["test", "--locked", "--help"], true), "refuse");
+        assert_eq!(step(&["test", "--help"], true), "refuse");
+        assert_eq!(step(&["foo", "--locked"], true), "refuse");
+        assert_eq!(step(&["nextest", "run", "--frozen"], false), "refuse");
+        assert_eq!(step(&["clippy", "--locked"], true), "refuse");
+        assert_eq!(step(&["foo"], true), "refuse");
+        assert_eq!(
+            step(&["test", "--locked", "-Zunstable-options"], true),
+            "refuse"
+        );
+        assert_eq!(step(&["test", "-Zunstable-options"], true), "refuse");
+    }
+
+    /// Real Cargo in an empty scratch directory: accepted arguments reach the
+    /// `-Z` refusal; anything else, including a check placed after `--`,
+    /// would hit Cargo's argument error or its missing manifest instead.
+    #[test]
+    fn parse_check_asks_cargo_without_effects() {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("parse-check-{:x}", std::process::id()));
+        fs::create_dir(&dir).expect("scratch dir");
+        let accepts = |values: &[&str]| -> Option<bool> {
+            let values: Vec<OsString> = values.iter().map(OsString::from).collect();
+            let invocation =
+                crate::cli::parse_leased(values[0].to_str().expect("UTF-8"), &values[1..])
+                    .expect("parses");
+            let check = crate::cli::resolution(&invocation.cargo_args).parse_check?;
+            let mut command = Command::new(crate::CARGO);
+            command.args(check).current_dir(&dir);
+            Some(cargo_accepts(command).expect("Cargo ran"))
+        };
+        assert_eq!(accepts(&["test", "--locked"]), Some(true));
+        assert_eq!(
+            accepts(&["build", "--offline", "--config", "net.offline=false"]),
+            Some(true)
+        );
+        assert_eq!(
+            accepts(&["test", "--message-format=json", "--", "--bogus"]),
+            Some(true)
+        );
+        assert_eq!(accepts(&["test", "--bogus"]), Some(false));
+        assert_eq!(accepts(&["check", "--message-format=bogus"]), Some(false));
+        assert_eq!(accepts(&["build", "--release", "--features"]), Some(false));
+        assert_eq!(accepts(&["nextest", "run"]), None);
+        assert_eq!(accepts(&["test", "-Zunstable-options"]), None);
+        let left: Vec<_> = fs::read_dir(&dir).expect("scratch").collect();
+        fs::remove_dir(&dir).expect("parse check left no files");
+        assert!(left.is_empty());
+    }
+
+    #[test]
     fn metadata_splits_packages_by_source() {
         let metadata = serde_json::json!({"packages": [
             {"name": "app", "source": null, "manifest_path": "/repo/pkg/Cargo.toml",
@@ -895,11 +1229,12 @@ mod tests {
 
     #[test]
     fn untrusted_or_foreign_affine_slots_refuse_the_gate() {
-        assert!(prepare(Path::new("/b"), &Prior::Unknown).is_err());
+        assert!(prepare(Path::new("/b"), &Prior::Unknown, &Resolution::default()).is_err());
         let affine = Prior::Known(Built::Affine(PathBuf::from("/a")));
-        assert!(prepare(Path::new("/b"), &affine).is_err());
+        assert!(prepare(Path::new("/b"), &affine, &Resolution::default()).is_err());
         assert_eq!(affine.foreign(Path::new("/b")), Some(PathBuf::from("/a")));
-        let own = prepare(Path::new("/a"), &affine).expect("own affine slot");
+        let own =
+            prepare(Path::new("/a"), &affine, &Resolution::default()).expect("own affine slot");
         assert!(!own.cross && own.describe().is_none());
         assert!(
             matches!(own.finish(Path::new("/a")), Some(Built::Affine(path)) if path == Path::new("/a"))
