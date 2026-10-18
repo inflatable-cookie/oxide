@@ -1,0 +1,15 @@
+    Updating crates.io index
+   0.134095958s TRACE gc: saving last-use data
+   0.134144208s TRACE gc: insert registry_index RegistryIndex { encoded_registry_name: "index.crates.io-1949cf8c6b5b557f" } 1792358423
+   0.134670583s TRACE gc: last-use save complete
+     Locking 1 package to latest compatible version
+      Adding cfg-if v1.0.0 (available: v1.0.5)
+ Downloading crates ...
+  Downloaded cfg-if v1.0.0
+   0.275544125s TRACE gc: saving last-use data
+   0.275564291s TRACE gc: insert registry_index RegistryIndex { encoded_registry_name: "index.crates.io-1949cf8c6b5b557f" } 1792358423
+   0.275592666s TRACE gc: insert registry crate RegistryCrate { encoded_registry_name: "index.crates.io-1949cf8c6b5b557f", crate_filename: "cfg-if-1.0.0.crate", size: 7934 } 1792358423
+   0.275841833s TRACE gc: insert registry src RegistrySrc { encoded_registry_name: "index.crates.io-1949cf8c6b5b557f", package_dir: "cfg-if-1.0.0", size: Some(21921) } 1792358423
+   0.276091958s TRACE gc: last-use save complete
+   0.276165833s TRACE gc: should_run_auto_gc
+   0.276193625s TRACE gc: last auto gc was 1792358423, skipping

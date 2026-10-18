@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""Disposable oxide#075 Cranelift quick-run measurement recipe.
+
+Runs inside one heavy-admitted Effigy run. Not an Oxide product, not a reusable
+launcher. One session: component install, two version calls, four arms
+(cold build, then three edit -> check -> build -> direct run cycles) and one
+arm-C `cargo test`. Caps: 29 measured Cargo calls + 2 version/setup calls, the
+original 50-minute clock started by the submission recipe, 8 GiB owned scratch,
+20 GiB host reserve, 32 MiB raw logs. Never retries a call.
+"""
+import ctypes, errno, hashlib, json, os, pathlib, re, signal, subprocess, threading, time
+
+ROOT = pathlib.Path(__file__).resolve().parent
+RAW = ROOT / 'raw'
+SRC = ROOT / 'src'
+cfg = json.loads((ROOT / 'packet.json').read_text())
+PIN = cfg['pin']
+GIB = 1024 ** 3
+
+lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib')
+lib.mach_continuous_time.restype = ctypes.c_uint64
+class Scale(ctypes.Structure):
+    _fields_ = [('numer', ctypes.c_uint32), ('denom', ctypes.c_uint32)]
+scale = Scale(); assert lib.mach_timebase_info(ctypes.byref(scale)) == 0
+def now(): return lib.mach_continuous_time() * scale.numer // scale.denom
+START = cfg['start_ns']; DEADLINE = cfg['deadline_ns']
+def offset(): return round((now() - START) / 1e9, 3)
+
+def free_bytes(path='/private/tmp'):
+    v = os.statvfs(path); return v.f_bavail * v.f_frsize
+
+class Stop(Exception):
+    pass
+
+counts = {'measured': 0, 'setup': 0}
+result = {'attempt': 2 if (ROOT / 'attempt-1-result.json').exists() else 1, 'packet': cfg, 'calls': [], 'arms': {}, 'storage': {}, 'outcome': 'running',
+          'stop_reason': None, 'counts': counts, 'notes': []}
+scratch_reference = {'free': free_bytes()}
+
+def save():
+    tmp = ROOT / 'result.json.tmp'
+    tmp.write_text(json.dumps(result, indent=2) + '\n'); tmp.replace(ROOT / 'result.json')
+
+def raw_bytes():
+    return sum(p.stat().st_size for p in RAW.iterdir() if p.is_file())
+
+def bounds():
+    if now() >= DEADLINE - 10_000_000_000:
+        raise Stop('original 50-minute deadline reached (10 s margin)')
+    free = free_bytes()
+    if free < 21 * GIB:
+        raise Stop('host free space %d below 20 GiB reserve + 1 GiB margin' % free)
+    # Conservative owned-scratch guard while a call runs: any host free-space
+    # drop since the post-install reference counts as owned.
+    if scratch_reference['free'] - free > int(7.5 * GIB):
+        raise Stop('host free space dropped more than 7.5 GiB since the scratch reference')
+    if raw_bytes() > 32 * 1024 ** 2:
+        raise Stop('32 MiB raw log cap reached')
+
+def group_settled(pgid, limit=10.0):
+    end = time.time() + limit
+    while time.time() < end:
+        try:
+            os.killpg(pgid, 0)
+        except OSError as error:
+            if error.errno == errno.ESRCH:
+                return 'ESRCH'
+            if error.errno != errno.EPERM:
+                return 'errno %d' % error.errno
+        time.sleep(0.1)
+    return None
+
+def run(name, argv, env, kind, cwd=None, timeout=300, expect_zero=True):
+    """kind: measured | setup | other. Counted calls increment before start."""
+    bounds()
+    if kind == 'measured':
+        if counts['measured'] + 1 > cfg['measured_cargo_cap']:
+            raise Stop('measured Cargo cap would be exceeded by ' + name)
+        counts['measured'] += 1
+    elif kind == 'setup':
+        if counts['setup'] + 1 > cfg['setup_cargo_cap']:
+            raise Stop('setup Cargo cap would be exceeded by ' + name)
+        counts['setup'] += 1
+    out = RAW / (name + '.stdout'); err = RAW / (name + '.stderr')
+    rec = {'name': name, 'kind': kind, 'argv': [str(a) for a in argv], 'cwd': str(cwd or ROOT),
+           'env': env, 'start_offset_s': offset(), 'loadavg_before': os.getloadavg(),
+           'free_before': free_bytes(), 'counts_after_start': dict(counts)}
+    result['calls'].append(rec); save()
+    print(name, 'START', rec['start_offset_s'], flush=True)
+    t0 = now(); stop = None; exited = {}
+    with out.open('wb') as o, err.open('wb') as e:
+        child = subprocess.Popen([str(a) for a in argv], cwd=str(cwd or ROOT), env=env,
+                                 stdin=subprocess.DEVNULL, stdout=o, stderr=e,
+                                 start_new_session=True)
+        rec['pgid'] = child.pid
+        done = threading.Event()
+        def wait_child():
+            child.wait(); exited['ns'] = now(); done.set()
+        threading.Thread(target=wait_child, daemon=True).start()
+        try:
+            while not done.wait(0.25):
+                if (now() - t0) / 1e9 > timeout:
+                    raise Stop('%s exceeded its %d s call bound' % (name, timeout))
+                bounds()
+        except Stop as reason:
+            stop = reason
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+                if not done.wait(5):
+                    os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            done.wait()
+    rec['wall_s'] = round((exited['ns'] - t0) / 1e9, 4)
+    rec['exit'] = child.returncode
+    rec['group_settled'] = group_settled(child.pid)
+    rec['end_offset_s'] = offset(); rec['loadavg_after'] = os.getloadavg()
+    rec['free_after'] = free_bytes()
+    rec['stdout'] = str(out.relative_to(ROOT)); rec['stderr'] = str(err.relative_to(ROOT))
+    save()
+    print(name, 'EXIT', child.returncode, rec['wall_s'], flush=True)
+    if stop is not None:
+        rec['stopped'] = str(stop); save(); raise stop
+    if rec['group_settled'] != 'ESRCH':
+        raise Stop('%s process group not positively empty: %s' % (name, rec['group_settled']))
+    if expect_zero and child.returncode != 0:
+        raise Stop('%s exited %s; see retained raw logs' % (name, child.returncode))
+    return rec
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 20), b''):
+            h.update(block)
+    return h.hexdigest()
+
+def tree_bytes(path):
+    """Apparent and allocated bytes with hardlink union, split workspace/dependency.
+
+    Attribution is by Cargo unit file/directory name below the profile
+    directory (a name heuristic, not a unit graph).
+    """
+    seen = set(); totals = {'files': 0, 'apparent': 0, 'allocated': 0,
+                           'workspace_allocated': 0, 'dependency_allocated': 0, 'other_allocated': 0}
+    for base, dirs, names in os.walk(path):
+        dirs.sort(); rel = pathlib.Path(base).relative_to(path).parts
+        for n in sorted(names):
+            st = os.lstat(os.path.join(base, n))
+            if (st.st_dev, st.st_ino) in seen:
+                continue
+            seen.add((st.st_dev, st.st_ino))
+            alloc = st.st_blocks * 512
+            totals['files'] += 1; totals['apparent'] += st.st_size; totals['allocated'] += alloc
+            parts = rel[1:]
+            if not rel or rel[0] != 'oxide-quick':
+                crate = None
+            elif not parts:
+                crate = n
+            elif parts[0] == 'deps':
+                crate = re.sub(r'^lib', '', n)
+            elif parts[0] in ('incremental', '.fingerprint', 'build'):
+                crate = parts[1] if len(parts) >= 2 else n
+            else:
+                crate = None
+            if crate is None:
+                totals['other_allocated'] += alloc
+            elif re.split(r'[-.]', crate)[0] in ('oxide_storage', 'oxide'):
+                totals['workspace_allocated'] += alloc
+            else:
+                totals['dependency_allocated'] += alloc
+    return totals
+
+def du_k(path):
+    out = subprocess.run(['/usr/bin/du', '-sk', str(path)], capture_output=True, text=True)
+    return int(out.stdout.split()[0]) * 1024 if out.returncode == 0 else None
+
+def owned_check(label):
+    owned = du_k(ROOT)
+    result['storage'].setdefault('owned_boundaries', []).append(
+        {'label': label, 'offset_s': offset(), 'owned_allocated_bytes': owned, 'host_free': free_bytes()})
+    save()
+    if owned is not None and owned > 8 * GIB:
+        raise Stop('owned scratch %d exceeds 8 GiB at %s' % (owned, label))
+
+def parse_cargo(rec):
+    stdout = (ROOT / rec['stdout']).read_text(errors='replace')
+    stderr = (ROOT / rec['stderr']).read_text(errors='replace')
+    artifacts = []; finished = None; tests = []
+    for line in stdout.splitlines():
+        if line.startswith('{'):
+            try:
+                m = json.loads(line)
+            except ValueError:
+                continue
+            if m.get('reason') == 'compiler-artifact':
+                artifacts.append({'package_id': m['package_id'], 'target': m['target']['name'],
+                                  'kinds': m['target']['kind'], 'fresh': m['fresh'],
+                                  'profile': m.get('profile')})
+            elif m.get('reason') == 'build-finished':
+                finished = m.get('success')
+        elif line.startswith('test result:'):
+            tests.append(line)
+    units = []
+    for line in stderr.splitlines():
+        s = line.strip()
+        if not s.startswith('Running `') or ' --crate-name ' not in s:
+            continue
+        crate = s.split(' --crate-name ', 1)[1].split()[0]
+        units.append({'crate': crate,
+                      'cranelift': '-Z codegen-backend=cranelift' in s or '-Zcodegen-backend=cranelift' in s,
+                      'codegen_backend_any': 'codegen-backend' in s,
+                      'threads_8': '-Zthreads=8' in s,
+                      'debuginfo': re.findall(r'-C debuginfo=(\S+)', s),
+                      'incremental': '-C incremental=' in s,
+                      'panic': re.findall(r'-C panic=(\S+)', s)})
+    rec['finished_line'] = [l.strip() for l in stderr.splitlines() if l.strip().startswith('Finished ')]
+    rec['build_finished_success'] = finished
+    rec['rebuilt'] = sorted({a['target'] + ':' + a['package_id'].split('#')[-1] for a in artifacts if not a['fresh']})
+    rec['fresh_count'] = sum(1 for a in artifacts if a['fresh'])
+    rec['rebuilt_count'] = sum(1 for a in artifacts if not a['fresh'])
+    rec['rustc_units'] = units
+    if tests:
+        rec['test_results'] = tests
+    save()
+
+def base_env(tc_bin, arm):
+    return {'HOME': '/Users/tom', 'USER': 'tom', 'LOGNAME': 'tom', 'LANG': 'C',
+            'PATH': tc_bin + ':/usr/bin:/bin:/usr/sbin:/sbin',
+            'RUSTC': tc_bin + '/rustc', 'RUSTDOC': tc_bin + '/rustdoc',
+            'CARGO_HOME': cfg['host_cargo_home'], 'CARGO_TERM_COLOR': 'never',
+            'TMPDIR': str(ROOT / 'tmp') + '/',
+            'CARGO_TARGET_DIR': str(ROOT / ('target-' + arm)),
+            'CARGO_PROFILE_OXIDE_QUICK_INHERITS': 'dev',
+            'CARGO_PROFILE_OXIDE_QUICK_DEBUG': 'line-tables-only'}
+
+ARMS = cfg['arms']
+EDIT_FILE = SRC / 'src/bin/oxide/main.rs'
+BASE_LINE = 'oxide: Cargo with managed build storage and profiles\n'
+
+def edit(n):
+    text = EDIT_FILE.read_text()
+    old = BASE_LINE if n == 1 else BASE_LINE.replace('\n', ' (075 edit %d)\n' % (n - 1))
+    new = BASE_LINE.replace('\n', ' (075 edit %d)\n' % n)
+    assert text.count(old) == 1, 'edit %d anchor not unique' % n
+    EDIT_FILE.write_text(text.replace(old, new))
+    return {'edit': n, 'file': 'src/bin/oxide/main.rs', 'old': old.rstrip('\n'),
+            'new': new.rstrip('\n'), 'sha256_after': sha256(EDIT_FILE), 'offset_s': offset()}
+
+def direct_run(arm, label, expected_first_line):
+    binary = ROOT / ('target-' + arm) / 'oxide-quick' / 'oxide'
+    rec = run('%s-%s-run' % (arm, label), [binary, '--help'],
+              {'PATH': '/usr/bin:/bin', 'HOME': '/Users/tom'}, 'other', timeout=30)
+    first = (ROOT / rec['stdout']).read_text().splitlines()[0]
+    rec['first_line'] = first; rec['binary_sha256'] = sha256(binary)
+    rec['matches_source'] = first == expected_first_line.rstrip('\n'); save()
+    if not rec['matches_source']:
+        raise Stop('%s ran a binary whose --help does not match the edited source' % rec['name'])
+
+def git(*args, name):
+    return run(name, ['/usr/bin/git', '-C', SRC] + list(args), {'PATH': '/usr/bin:/bin', 'HOME': '/Users/tom'},
+               'other', timeout=60)
+
+def measure_arm(arm):
+    spec = ARMS[arm]; tc_bin = cfg['toolchains'][spec['toolchain']]['bin']
+    env = base_env(tc_bin, arm); env.update(spec.get('env', {}))
+    pre = [tc_bin + '/cargo'] + spec.get('global_args', [])
+    common = ['--locked', '--offline', '--profile', 'oxide-quick', '-v', '--message-format=json-render-diagnostics']
+    arm_rec = {'spec': spec, 'env': env, 'steps': []}; result['arms'][arm] = arm_rec
+    # Reset the same disposable source to the pinned baseline.
+    git('reset', '--quiet', '--hard', PIN, name=arm + '-reset')
+    git('clean', '-fdq', name=arm + '-clean')
+    status = git('status', '--porcelain', name=arm + '-status')
+    assert (ROOT / status['stdout']).read_text() == '', 'source not clean after reset'
+    arm_rec['baseline_main_rs_sha256'] = sha256(EDIT_FILE)
+    rec = run(arm + '-cold-build', pre + ['build'] + common + ['--bin', 'oxide'], env, 'measured',
+              cwd=SRC, timeout=600, expect_zero=False)
+    parse_cargo(rec); arm_rec['steps'].append(rec['name'])
+    if rec['exit'] != 0:
+        if arm == 'C':
+            result['outcome'] = 'no-go'
+        raise Stop('%s cold build failed (exit %s)' % (arm, rec['exit']))
+    direct_run(arm, 'cold', BASE_LINE); arm_rec['steps'].append(arm + '-cold-run')
+    arm_rec['storage_after_cold'] = tree_bytes(ROOT / ('target-' + arm)); save()
+    owned_check(arm + ' after cold')
+    for n in (1, 2, 3):
+        arm_rec.setdefault('edits', []).append(edit(n)); save()
+        for sub in ('check', 'build'):
+            rec = run('%s-e%d-%s' % (arm, n, sub), pre + [sub] + common + ['--bin', 'oxide'], env,
+                      'measured', cwd=SRC, timeout=300)
+            parse_cargo(rec); arm_rec['steps'].append(rec['name'])
+        direct_run(arm, 'e%d' % n, BASE_LINE.replace('\n', ' (075 edit %d)\n' % n))
+        arm_rec['steps'].append('%s-e%d-run' % (arm, n))
+    if spec.get('test'):
+        tmp = ROOT / 't'; tmp.mkdir(mode=0o700, exist_ok=True)
+        tenv = dict(env); tenv.update({'OXIDE_TASK_SCRATCH_ROOT': str(tmp), 'TMPDIR': str(tmp),
+                                       'TMP': str(tmp), 'TEMP': str(tmp)})
+        rec = run(arm + '-test', pre + ['test'] + common + ['--no-fail-fast'], tenv, 'measured',
+                  cwd=SRC, timeout=300, expect_zero=False)
+        parse_cargo(rec); arm_rec['steps'].append(rec['name'])
+    arm_rec['storage_final'] = tree_bytes(ROOT / ('target-' + arm)); save()
+    owned_check(arm + ' final')
+
+def main():
+    result['session'] = {'start_ns': START, 'deadline_ns': DEADLINE, 'clock': cfg['clock'],
+                         'admitted_offset_s': offset(), 'admitted_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+    (ROOT / 'tmp').mkdir(mode=0o700, exist_ok=True)
+    save()
+    try:
+        nightly = cfg['toolchains']['nightly']['bin'].rsplit('/bin', 1)[0]
+        rup = {'PATH': '/Users/tom/.cargo/bin:/usr/bin:/bin', 'HOME': '/Users/tom',
+               'RUSTUP_HOME': '/Users/tom/.rustup', 'CARGO_HOME': cfg['host_cargo_home']}
+        prior = ROOT / 'attempt-1-result.json'
+        if prior.exists():
+            # Same session continued after a harness defect: same root, clock
+            # and counters; the completed install is never repeated.
+            before = json.loads(prior.read_text())
+            install = [c for c in before['calls'] if c['name'] == 'component-install']
+            assert len(install) == 1 and install[0]['exit'] == 0, 'attempt 1 install not positively complete'
+            for key in counts:
+                counts[key] = before['counts'][key]
+            result['prior_attempts'] = [{'result': prior.name, 'outcome': before['outcome'],
+                                         'stop_reason': before['stop_reason'], 'counts': before['counts'],
+                                         'calls': [c['name'] for c in before['calls']]}]
+            result['calls'] = before['calls']
+        else:
+            run('components-before', ['/Users/tom/.cargo/bin/rustup', 'component', 'list', '--installed',
+                                      '--toolchain', 'nightly-2026-08-05'], rup, 'other', timeout=60)
+            rec = run('component-install', ['/Users/tom/.cargo/bin/rustup', 'component', 'add',
+                                            'rustc-codegen-cranelift-preview', '--toolchain', 'nightly-2026-08-05'],
+                      rup, 'other', timeout=600, expect_zero=False)
+            if rec['exit'] != 0:
+                result['outcome'] = 'no-go'
+                raise Stop('component install failed (exit %s)' % rec['exit'])
+            run('components-after', ['/Users/tom/.cargo/bin/rustup', 'component', 'list', '--installed',
+                                     '--toolchain', 'nightly-2026-08-05'], rup, 'other', timeout=60)
+        manifest = pathlib.Path(nightly) / 'lib/rustlib/manifest-rustc-codegen-cranelift-preview-aarch64-apple-darwin'
+        files = [l.split(':', 1)[1] for l in manifest.read_text().splitlines() if l.startswith('file:')]
+        component = {'manifest': str(manifest), 'files': []}
+        for f in files:
+            p = pathlib.Path(nightly) / f; st = p.stat()
+            component['files'].append({'path': f, 'bytes': st.st_size, 'allocated': st.st_blocks * 512,
+                                       'sha256': sha256(p)})
+        component['total_allocated'] = sum(f['allocated'] for f in component['files'])
+        result['component'] = component
+        scratch_reference['free'] = free_bytes(); result['storage']['scratch_reference_free'] = scratch_reference['free']
+        save()
+        # Toolchain identities: two counted Cargo version calls, rustc -vV, hashes.
+        idents = {}
+        for key in ('stable', 'nightly'):
+            b = cfg['toolchains'][key]['bin']; env = {'PATH': b + ':/usr/bin:/bin', 'HOME': '/Users/tom',
+                                                    'CARGO_HOME': cfg['host_cargo_home']}
+            run(key + '-cargo-version', [b + '/cargo', '-vV'], env, 'setup', timeout=60)
+            run(key + '-rustc-version', [b + '/rustc', '-vV'], env, 'other', timeout=60)
+            libdir = pathlib.Path(b).parent / 'lib'
+            driver = sorted(libdir.glob('librustc_driver-*.dylib'))
+            idents[key] = {'cargo_sha256': sha256(b + '/cargo'), 'rustc_sha256': sha256(b + '/rustc'),
+                           'rustc_driver': {str(d.name): sha256(d) for d in driver}}
+        result['toolchain_identity'] = idents; save()
+        run('clone', ['/usr/bin/git', 'clone', '--quiet', '--no-hardlinks', '--no-checkout',
+                      cfg['source_repository'], SRC], {'PATH': '/usr/bin:/bin', 'HOME': '/Users/tom'}, 'other',
+            timeout=120)
+        git('checkout', '--quiet', '--detach', PIN, name='checkout')
+        head = git('rev-parse', 'HEAD', 'HEAD^{tree}', name='rev-parse')
+        result['source'] = {'head_and_tree': (ROOT / head['stdout']).read_text().split(),
+                            'lock_sha256': sha256(SRC / 'Cargo.lock')}
+        assert result['source']['head_and_tree'][0] == PIN, 'clone HEAD is not the pin'
+        owned_check('after setup')
+        for arm in cfg['arm_order']:
+            measure_arm(arm)
+        result['outcome'] = 'complete'
+    except Stop as reason:
+        result['stop_reason'] = str(reason)
+        if result['outcome'] == 'running':
+            result['outcome'] = 'partial'
+    except Exception as error:  # preserve partial result on harness failure
+        result['stop_reason'] = 'harness error: %r' % (error,)
+        result['outcome'] = 'partial'
+    result['session']['end_offset_s'] = offset()
+    result['raw_log_bytes'] = raw_bytes()
+    save()
+    print('OUTCOME', result['outcome'], result['stop_reason'], 'counts', counts, flush=True)
+    return 0 if result['outcome'] == 'complete' else 2
+
+if __name__ == '__main__':
+    raise SystemExit(main())

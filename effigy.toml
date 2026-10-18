@@ -4,6 +4,10 @@ minimum_effigy_version = "0.14.0"
 [tasks]
 "rust:compile" = "cargo check --workspace --all-targets --locked"
 "rust:format" = "cargo fmt --all -- --check"
+# Compile-only check of the crate for the already-installed Linux target
+# (oxide#077). It never installs a target, links or runs anything, so it is
+# not Linux runtime validation.
+"rust:compile-linux" = "cargo check --locked --offline --target x86_64-unknown-linux-gnu"
 # Opt-in stable-Cargo profile proofs (oxide#068). Each verifies the resolved
 # rustc debug settings Cargo actually passed for workspace, dependency and
 # build-time units, then runs the focused native backtrace/unwind probe under

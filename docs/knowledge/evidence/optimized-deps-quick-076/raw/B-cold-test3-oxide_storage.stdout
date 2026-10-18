@@ -1,0 +1,57 @@
+
+running 52 tests
+test dep_info::tests::refuses_duplicate_keys_and_files_and_preserves_checksums ... ok
+test dep_info::tests::hand_annotated_upstream_bytes_preserve_tags_and_environment_presence ... ok
+test dep_info::tests::refuses_truncation_version_marker_tag_bool_trailing_and_oversize ... ok
+test inventory::tests::missing_and_nondirectory_roots_are_refused ... ok
+test inventory::tests::sparse_files_report_logical_and_allocated_separately ... ok
+test inventory::tests::notes_avoid_stale_and_savings_claims ... ok
+test inventory::tests::default_output_cap_is_honored_for_complete_reports ... ok
+test inventory::tests::tiny_output_cap_holds_with_long_multibyte_root_and_notes ... ok
+test inventory::tests::rendering_is_bounded_and_reports_truncation ... ok
+test inventory::tests::depth_limit_truncates_with_partial_coverage ... ok
+test inventory::tests::invalid_limits_are_refused ... ok
+test inventory::tests::filesystem_capacity_is_a_distinct_measured_value ... ok
+test inventory::tests::cooperative_deadline_truncates_with_partial_coverage ... ok
+test inventory::tests::hardlink_overlap_is_counted_once_globally ... ok
+test inventory::tests::symlinks_are_counted_but_never_followed ... ok
+test inventory::tests::unreadable_directory_yields_partial_coverage ... ok
+test lease::tests::capacity_rendering_is_utf8_valid_and_obeys_64_byte_and_normal_caps ... ok
+test lease::tests::budget_pool_refuses_image_files_foreign_payload_entries_and_a_zero_budget ... ok
+test inventory::tests::categories_group_known_target_subdirectories ... ok
+test lease::tests::failed_init_lock_only_retry_succeeds ... ok
+test lease::tests::hard_bound_entry_points_refuse_a_budget_pool ... ok
+test lease::tests::injected_capacity_samples_keep_zero_unknown_and_partial_distinct ... ok
+test lease::tests::concurrent_acquire_serializes_one_winner ... ok
+test lease::tests::duplicate_holder_reconciles_same_lease ... ok
+test inventory::tests::entry_limit_truncates_with_partial_coverage ... ok
+test lease::tests::holder_conflict_and_unknown_lease ... ok
+test lease::tests::held_oversized_compatible_slot_keeps_same_holder_replay_and_other_holder_busy ... ok
+test lease::tests::injected_capacity_keeps_hardlink_and_metadata_accounting_separate ... ok
+test lease::tests::full_debug_is_a_distinct_profile ... ok
+test lease::tests::recycle_threshold_is_the_overflow_safe_ceiling_of_half_the_cap ... ok
+test lease::tests::managed_entry_points_still_open_the_injected_apfs_shape_only_through_the_hard_bound_path ... ok
+test lease::tests::known_macos_metadata_added_after_init_is_outside_slot_accounting ... ok
+test lease::tests::idle_slot_keeps_workspace_observation_on_reuse ... ok
+test lease::tests::lost_reply_preserves_held_lease ... ok
+test lease::tests::product_open_refuses_directory_injection ... ok
+test lease::tests::eviction_removes_only_idle_owned_slots ... ok
+test storage::bounded::tests::verified_backing_refuses_structurally_impossible_descriptors ... ok
+test lease::tests::symlink_pool_and_foreign_entry_refuse ... ok
+test lease::tests::other_holder_is_busy_and_release_is_idempotent ... ok
+test lease::tests::injected_capacity_status_preserves_held_and_evicting_bytes ... ok
+test lease::tests::budget_pool_admits_against_the_budget_and_evicts_whole_idle_slots ... ok
+test lease::tests::status_json_stays_bounded ... ok
+test lease::tests::managed_eviction_retires_only_idle_slots_and_tolerates_managed_control ... ok
+test lease::tests::recover_closes_held_occupancy ... ok
+test lease::tests::interrupted_idle_eviction_resumes_after_partial_removal ... ok
+test lease::tests::oversized_compatible_idle_slot_is_replaced_then_fresh_slot_is_warm ... ok
+test lease::tests::unknown_or_non_directory_macos_metadata_entries_refuse ... ok
+test lease::tests::unsafe_evicting_slot_root_stays_unavailable_without_blocking_status_or_release ... ok
+test lease::tests::oversized_recycling_targets_only_the_selected_project_and_profile ... ok
+test lease::tests::partial_accounting_and_unsafe_slot_root_refuse_compatible_reuse ... ok
+test inventory::tests::concurrent_mutation_never_panics ... ok
+test lease::tests::idle_eviction_unlinks_direct_dangling_and_nested_symlinks ... ok
+
+test result: ok. 52 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.05s
+

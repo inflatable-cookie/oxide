@@ -90,6 +90,15 @@ checkout's own slot, or another checkout's idle slot only through the
 automatic crash recovery touches only leases whose ID or holder string its
 own control record names.
 
+Oxide calls the library's `managed` entry points (`lease`, `release`,
+`recover`, `status`, `evict_idle_slot`, `init_budget_pool`). They behave as
+the functions below on an APFS pool and also open the budget-only
+`directory-budget-v1` pool ([workflow](workflow.md#directory-budget-v1-as-shipped)).
+The CLI and the plain library functions keep refusing a directory pool as
+`backing_mismatch` (exit 4), so Nucleus and other CLI consumers see no
+change. A directory pool's config records `backend: directory-budget-v1`,
+the budget as `cap_bytes` and `image_bytes: 0`; an older build refuses it.
+
 The library also exports `evict_idle_slot` for Oxide's per-project slot cap.
 It retires one recorded idle slot whole through the same durable eviction path
 as capacity eviction, and returns busy for a held slot. The CLI does not

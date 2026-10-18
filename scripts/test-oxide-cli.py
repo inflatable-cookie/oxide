@@ -18,8 +18,14 @@ selection (package and virtual workspace roots), Ctrl-C forwarding, own-command 
 (a killed oxide whose Cargo group survives stays held; one whose group is gone
 is recovered by the next command and logged; a standalone-CLI lease is never
 recovered; a `setsid` escapee is shown as the documented limit),
-`status` stray detection and Cargo-equal exit codes. The image is detached
-and the scratch removed only after positive completion. Before any pool
+`status` stray detection and Cargo-equal exit codes. After the image is
+detached, two scratch `directory-budget` pools prove budget-only labelling,
+the standalone CLI's refusal, a reserve stop on injected watchdog readings
+(a bounded writer that ignores TERM is killed, the group closes and the slot
+is released; an unreaped group member keeps closure unconfirmed and the slot
+held until the next command recovers it) and admission that evicts a whole
+idle slot on a 1 MiB budget. The scratch is removed only after positive
+completion. Before any pool
 exists, `init` / `new` adoption runs on tiny scratch directories (90 s,
 64 MiB scratch) and must leave the pool uncreated. Not a benchmark and not
 full QA.
@@ -44,6 +50,12 @@ HOST_RESERVE_BYTES = 20 * 1024 * 1024 * 1024
 PROOF_SECONDS = 300
 ADOPTION_SECONDS = 90
 ADOPTION_SCRATCH_BYTES = 64 * 1024 * 1024
+BUDGET_ONLY = "budget-only: admission estimate plus best-effort reserve watchdog, no hard ceiling"
+# The watchdog trigger: 20 GiB reserve plus 2 GiB margin. The budget case
+# injects readings around it and never consumes host space.
+TRIGGER_BYTES = 22 * 1024 * 1024 * 1024
+WRITER_HEADROOM_BYTES = 8 * 1024 * 1024
+WRITER_BOUND_BYTES = 48 * 1024 * 1024
 BEGIN = "<!-- oxide:begin -->"
 END = "<!-- oxide:end -->"
 # Set after the oxide binaries compile; ordinary compiler artifacts are
@@ -114,7 +126,39 @@ fn optional_hold() {
     panic!("hold timed out");
 }
 
+#[test]
+fn optional_writer() {
+    // A bounded writer that ignores TERM, for the budget pool watchdog.
+    let Some(python) = std::env::var_os("OXIDE_FIXTURE_WRITER") else {
+        return;
+    };
+    let status = std::process::Command::new(python)
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/writer.py"))
+        .status()
+        .expect("writer");
+    assert!(status.success(), "writer {status}");
+}
+
 const ESCAPE: &str = "import os, sys, time\\nos.setsid()\\ntemp = sys.argv[1] + '.tmp'\\nopen(temp, 'w').write(str(os.getpid()))\\nos.rename(temp, sys.argv[1])\\ntime.sleep(60)\\n";
+""",
+    "tests/writer.py": """import os, signal, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+readings = os.environ["OXIDE_FIXTURE_WRITER_READINGS"]
+base = int(os.environ["OXIDE_FIXTURE_WRITER_BASE"])
+bound = int(os.environ["OXIDE_FIXTURE_WRITER_BOUND"])
+chunk = b"x" * (1 << 20)
+written = 0
+with open(os.environ["OXIDE_FIXTURE_WRITER_OUT"], "wb") as handle:
+    while written < bound:
+        handle.write(chunk)
+        handle.flush()
+        os.fsync(handle.fileno())
+        written += len(chunk)
+        with open(readings + ".tmp", "w") as reading:
+            reading.write(str(base - written))
+        os.rename(readings + ".tmp", readings)
+        time.sleep(0.05)
+time.sleep(60)
 """,
     "helper/Cargo.toml": """[package]
 name = "helper"
@@ -364,11 +408,11 @@ def build_binaries() -> dict:
 
 
 class Runner:
-    def __init__(self, oxide: str, lease: str, parent: str):
+    def __init__(self, oxide: str, lease: str, parent: str, pool: str = "pool", extra: dict | None = None):
         self.oxide = oxide
         self.lease = lease
         self.parent = parent
-        self.pool = os.path.join(parent, "pool")
+        self.pool = os.path.join(parent, pool)
         self.bin = os.path.join(parent, "bin")
         self.tmp = os.path.join(parent, "tmp")
         # Every fixture Cargo call, Oxide's and its descendants included, uses
@@ -400,6 +444,8 @@ class Runner:
                 "TEMP": self.tmp,
             }
         )
+        env.pop("OXIDE_POOL_BACKEND", None)
+        env.update(extra or {})
         self.env = env
 
     def environment(self, extra: dict | None) -> dict:
@@ -624,6 +670,14 @@ def prove_usage(runner: Runner, cwd: str) -> None:
     expect(code, 0, "status without a pool")
     if "not created" not in stdout:
         fail(f"status without a pool: {stdout!r}")
+    if sys.platform == "darwin" and "(apfs-sparse-image-v1: OS-enforced ceiling)" not in stdout:
+        fail(f"the macOS default backend changed: {stdout!r}")
+    code, stdout, _ = runner.run(cwd, ["status"], {"OXIDE_POOL_BACKEND": "directory-budget"})
+    expect(code, 0, "status for a budget pool to be")
+    if f"(directory-budget-v1: {BUDGET_ONLY})" not in stdout:
+        fail(f"status did not name the requested budget backend: {stdout!r}")
+    code, _, stderr = runner.run(cwd, ["status"], {"OXIDE_POOL_BACKEND": "zfs"})
+    expect(code, 1, "unknown backend tag", stderr)
     if os.path.lexists(runner.pool):
         fail("usage, refusals or status created the pool")
 
@@ -927,6 +981,7 @@ def prove_routing(runner: Runner, app: str, quick_slot: str, debug_slot: str) ->
     expect(code, 0, "status", stderr)
     for needle in (
         f"pool: {runner.pool}",
+        "  backend apfs-sparse-image-v1: OS-enforced ceiling",
         f"slot {quick_slot} idle quick {app}",
         f"slot {debug_slot} idle debug {app}",
         "waiting commands 0",
@@ -934,6 +989,17 @@ def prove_routing(runner: Runner, app: str, quick_slot: str, debug_slot: str) ->
     ):
         if needle not in stdout:
             fail(f"status missing {needle!r}: {stdout}")
+
+    # The APFS pool keeps its backend: a request for another refuses before
+    # any lease, and summaries name the hard-bound backend.
+    code, _, stderr = runner.run(app, ["build"], {"OXIDE_POOL_BACKEND": "directory-budget"})
+    expect(code, 1, "backend mismatch on the APFS pool", stderr)
+    if "uses apfs-sparse-image-v1; OXIDE_POOL_BACKEND applies only when a pool is created" not in stderr:
+        fail(f"backend mismatch gave no explanation: {stderr!r}")
+    code, _, stderr = runner.run(app, ["build"])
+    expect(code, 0, "APFS summary", stderr)
+    if "MiB used (apfs-sparse-image-v1)" not in stderr or "budget" in stderr:
+        fail(f"APFS summary does not name its backend: {stderr[-800:]!r}")
 
     # Clean removes private outputs and affinity; slots stay intact.
     slots_before = sorted(os.listdir(slots_root))
@@ -1379,6 +1445,195 @@ def prove_group_gone(runner: Runner, app: str) -> None:
             pass
 
 
+def budget_summary(stderr: str, label: str) -> dict:
+    found = summary(stderr, label)
+    if not re.search(r"pool \d+ MiB allocated of \d+ MiB budget \(directory-budget-v1, budget-only\)", stderr):
+        fail(f"{label}: summary does not label the budget-only pool: {stderr[-1200:]!r}")
+    if "MiB used" in stderr or "ceiling" in stderr.replace("no hard ceiling", ""):
+        fail(f"{label}: a budget-only pool claimed a ceiling: {stderr[-1200:]!r}")
+    return found
+
+
+def write_reading(path: str, value: int) -> None:
+    with open(path + ".tmp", "w", encoding="utf-8") as handle:
+        handle.write(str(value))
+    os.rename(path + ".tmp", path)
+
+
+RESERVE_STOP = re.compile(
+    r"oxide: reserve stop \(injected test readings\): pool filesystem available (\d+) bytes fell below "
+    r"the (\d+) byte trigger \(20 GiB reserve \+ 2 GiB margin\); Cargo group (\d+): (TERM(?:, then KILL after (\d+) ms)?); "
+    r"sampled minimum (\d+) bytes, overshoot past trigger (\d+) bytes, stop latency (\d+ ms|closure not confirmed); "
+    r"budget-only pool: best-effort stop, no guarantee against faster writers or other processes"
+)
+
+
+def reserve_stop(stderr: str, label: str) -> dict:
+    match = RESERVE_STOP.search(stderr)
+    if not match:
+        fail(f"{label}: no reserve stop line in {stderr[-2000:]!r}")
+    return {
+        "triggering_sample": int(match.group(1)),
+        "trigger": int(match.group(2)),
+        "group": int(match.group(3)),
+        "signals": match.group(4),
+        "kill_after_ms": int(match.group(5)) if match.group(5) else None,
+        "sampled_minimum": int(match.group(6)),
+        "overshoot": int(match.group(7)),
+        "latency": match.group(8),
+    }
+
+
+def running_group(runner: Runner) -> tuple:
+    running = [record for record in runner.state()["records"] if record["phase"] == "running"]
+    if len(running) != 1 or not running[0]["process_group"]:
+        fail(f"running record: {runner.state()['records']}")
+    return running[0]["process_group"], running[0]
+
+
+def prove_budget(runner: Runner, tiny: Runner, app: str) -> None:
+    """Budget-only directory pools: labelling, the injected-reading watchdog
+    (stop, positive closure then release; unconfirmed closure holds) and
+    budget admission with whole-idle-slot eviction. The standalone CLI keeps
+    refusing the directory pool."""
+    readings = os.path.join(runner.parent, "watchdog.readings")
+    write_reading(readings, TRIGGER_BYTES + WRITER_HEADROOM_BYTES)
+    watched = {"OXIDE_TEST_WATCHDOG_READINGS": readings}
+    code, _, stderr = runner.run(app, ["test"], watched)
+    expect(code, 0, "budget pool first test", stderr)
+    if f"oxide: creating the build pool at {runner.pool} (24576 MiB budget, directory-budget-v1, {BUDGET_ONLY})" not in stderr:
+        fail(f"budget pool creation was not labelled: {stderr[-1200:]!r}")
+    if os.path.exists(os.path.join(runner.pool, "image.sparseimage")) or os.path.ismount(os.path.join(runner.pool, "payload")):
+        fail("the budget pool created an image or a mount")
+    first = budget_summary(stderr, "budget first test")
+    if first["warmth"] != "cold":
+        fail(f"budget first test {first}")
+    code, stdout, stderr = runner.run(app, ["status"])
+    expect(code, 0, "budget status", stderr)
+    for needle in (
+        f"  backend directory-budget-v1: {BUDGET_ONLY}",
+        "  budget 24576 MiB, ",
+        "  reserve watchdog: stops a build below 22 GiB available (20 GiB reserve + 2 GiB margin), best effort",
+        f"slot {first['slot']} idle quick {app}",
+    ):
+        if needle not in stdout:
+            fail(f"budget status missing {needle!r}: {stdout}")
+    if "  cap " in stdout or "MiB used" in stdout:
+        fail(f"budget status claimed a cap: {stdout}")
+    code, _, stderr = runner.run(
+        runner.parent, ["--pool", runner.pool, "status", "--json"], program=runner.lease
+    )
+    expect(code, 4, "standalone CLI on a budget pool", stderr)
+    if "backing_mismatch" not in stderr:
+        fail(f"standalone CLI refusal reason: {stderr!r}")
+
+    # Reserve stop: a bounded writer ignores TERM; injected readings fall
+    # with its own writes below the trigger. KILL closes the group, then the
+    # slot is released normally.
+    out = os.path.join(runner.parent, "writer.bin")
+    writer = {
+        **watched,
+        "OXIDE_FIXTURE_WRITER": sys.executable,
+        "OXIDE_FIXTURE_WRITER_OUT": out,
+        "OXIDE_FIXTURE_WRITER_READINGS": readings,
+        "OXIDE_FIXTURE_WRITER_BASE": str(TRIGGER_BYTES + WRITER_HEADROOM_BYTES),
+        "OXIDE_FIXTURE_WRITER_BOUND": str(WRITER_BOUND_BYTES),
+    }
+    started = time.monotonic()
+    code, _, stderr = runner.run(app, ["test"], writer)
+    elapsed = time.monotonic() - started
+    if code == 0:
+        fail(f"a reserve stop reported success: {stderr[-1200:]!r}")
+    stop = reserve_stop(stderr, "reserve stop")
+    if stop["trigger"] != TRIGGER_BYTES or stop["triggering_sample"] >= TRIGGER_BYTES:
+        fail(f"reserve stop trigger {stop}")
+    if stop["kill_after_ms"] is None or not stop["latency"].endswith(" ms"):
+        fail(f"a writer ignoring TERM was not killed and closed: {stop}")
+    if stop["overshoot"] != TRIGGER_BYTES - stop["sampled_minimum"]:
+        fail(f"overshoot arithmetic {stop}")
+    if "could not confirm" in stderr:
+        fail(f"closure was confirmed but the slot was held: {stderr[-1200:]!r}")
+    if probe(os.killpg, stop["group"]) != "ESRCH":
+        fail(f"the stopped group survived: {probe(os.killpg, stop['group'])}")
+    budget_summary(stderr, "reserve stop")
+    written = os.path.getsize(out)
+    os.remove(out)
+    print(
+        "oxide budget watchdog (injected readings): triggering sample "
+        f"{stop['triggering_sample']} bytes, at-detection overshoot {TRIGGER_BYTES - stop['triggering_sample']} bytes, "
+        f"sampled minimum {stop['sampled_minimum']} bytes, overshoot past trigger {stop['overshoot']} bytes "
+        f"({stop['overshoot'] // (1024 * 1024)} MiB), {stop['signals']}, stop latency {stop['latency']}, "
+        f"writer wrote {written // (1024 * 1024)} MiB, command {elapsed:.1f} s"
+    )
+    code, stdout, _ = runner.run(app, ["status"])
+    if f"slot {first['slot']} idle quick {app}" not in stdout or "interrupted" in stdout:
+        fail(f"slot not released after positive closure: {stdout}")
+
+    # Unconfirmed closure: a group member this script never reaps stays a
+    # zombie, so killpg never reports ESRCH. The lease and slot stay held
+    # until the group empties, then the next command recovers it.
+    write_reading(readings, TRIGGER_BYTES + WRITER_HEADROOM_BYTES)
+    pidfile = os.path.join(runner.parent, "hold-reserve.pid")
+    child, log = runner.start(app, ["test"], "reserve-hold", {**watched, "OXIDE_FIXTURE_HOLD": pidfile})
+    wait_for(lambda: os.path.exists(pidfile), "reserve hold test")
+    group, record = running_group(runner)
+    member = subprocess.Popen(
+        ["/bin/sleep", "60"], preexec_fn=lambda: os.setpgid(0, group)
+    )
+    try:
+        if os.getpgid(member.pid) != group:
+            fail("the unreaped member did not join Cargo's group")
+        write_reading(readings, TRIGGER_BYTES - 1)
+        code = child.wait(timeout=min(60, remaining()))
+        stderr = read_log(log)
+        log.close()
+        expect(code, 1, "unconfirmed closure", stderr)
+        held_stop = reserve_stop(stderr, "unconfirmed closure")
+        if held_stop["latency"] != "closure not confirmed" or held_stop["group"] != group:
+            fail(f"unconfirmed closure report {held_stop}")
+        if f"could not confirm Cargo group {group} closed after the reserve stop; slot {first['slot']} stays held" not in stderr:
+            fail(f"unconfirmed closure did not hold the slot: {stderr[-1200:]!r}")
+        code, stdout, _ = runner.run(app, ["status"])
+        if f"held by an interrupted command (oxide pid {child.pid}, Cargo group {group}; recovered once the group is empty)" not in stdout:
+            fail(f"status did not show the held slot: {stdout}")
+    finally:
+        member.kill()
+        member.wait(timeout=20)
+    wait_gone(os.killpg, group, "reserve-stopped group after reaping")
+    write_reading(readings, TRIGGER_BYTES + WRITER_HEADROOM_BYTES)
+    code, _, stderr = runner.run(app, ["build"], watched)
+    expect(code, 0, "build after the held reserve stop", stderr)
+    if f"recovered slot {first['slot']} after oxide pid {child.pid} died (Cargo group {group} empty)" not in stderr:
+        fail(f"held slot was not recovered once the group emptied: {stderr[-1200:]!r}")
+    if not any(entry["lease_id"] == record["lease_id"] for entry in runner.state().get("recoveries", [])):
+        fail("the held reserve-stop slot recovery was not logged")
+    print(f"oxide budget watchdog held unconfirmed closure: {held_stop['signals']}, slot {first['slot']} held until group {group} emptied")
+
+    # Admission and eviction on a tiny budget: nothing stops a build past
+    # it, and the next new slot evicts the idle one whole.
+    code, _, stderr = tiny.run(app, ["build"], watched)
+    expect(code, 0, "tiny budget build", stderr)
+    if f"oxide: creating the build pool at {tiny.pool} (1 MiB budget, directory-budget-v1, {BUDGET_ONLY})" not in stderr:
+        fail(f"tiny budget creation: {stderr[-1200:]!r}")
+    quick = budget_summary(stderr, "tiny quick build")
+    code, stdout, _ = tiny.run(app, ["status"])
+    if f"slot {quick['slot']} idle quick {app}" not in stdout or "  budget 1 MiB, " not in stdout:
+        fail(f"tiny budget status: {stdout}")
+    slots_root = os.path.join(tiny.pool, "payload", "slots")
+    if not os.listdir(os.path.join(slots_root, quick["slot"], "build")):
+        fail("tiny budget slot is empty")
+    code, _, stderr = tiny.run(app, ["check", "--profile", "debug"], watched)
+    expect(code, 0, "tiny budget second key", stderr)
+    debug = budget_summary(stderr, "tiny debug check")
+    if debug["slot"] == quick["slot"] or debug["warmth"] != "cold":
+        fail(f"tiny budget second key {debug} vs {quick}")
+    if os.path.exists(os.path.join(slots_root, quick["slot"])):
+        fail("the idle slot over budget was not evicted whole")
+    if sorted(os.listdir(slots_root)) != [debug["slot"]]:
+        fail(f"tiny budget slots {os.listdir(slots_root)}")
+    print(f"oxide budget admission: slot {quick['slot']} over the 1 MiB budget evicted whole for slot {debug['slot']}")
+
+
 def take_standalone_lease(runner: Runner) -> dict:
     """A lease from the standalone CLI has no oxide record or lock holder."""
     project = os.path.join(runner.parent, "standalone", "project")
@@ -1453,6 +1708,24 @@ def main() -> int:
     )
     if detach.returncode:
         fail(f"detach failed after positive completion: {detach.stderr}")
+    # Budget-only directory pools on the same scratch filesystem, after the
+    # APFS image is detached: never two owned images attached.
+    budget = Runner(runner.oxide, runner.lease, parent, "budget-pool", {"OXIDE_POOL_BACKEND": "directory-budget"})
+    tiny = Runner(
+        runner.oxide,
+        runner.lease,
+        parent,
+        "budget-tiny",
+        {"OXIDE_POOL_BACKEND": "directory-budget", "OXIDE_TEST_BUDGET_BYTES": str(1024 * 1024)},
+    )
+    try:
+        prove_budget(budget, tiny, app)
+    except Exception:
+        print(f"oxide budget proof retained its owned scratch at {parent}", file=sys.stderr)
+        raise
+    owned = max(owned, tree_bytes(parent, True))
+    if owned > SCRATCH_LIMIT_BYTES:
+        fail(f"owned fixture scratch {owned} exceeds 512 MiB")
     elapsed = time.monotonic() - STARTED
     shutil.rmtree(parent)
     print(

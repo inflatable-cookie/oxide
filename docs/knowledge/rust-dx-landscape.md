@@ -139,7 +139,7 @@ for the current unwind-dependent test loop. A narrower run-only or another
 platform experiment remains possible; JIT is not retired. The local toolchain
 list includes nightly-2026-08-05, but its installed-component list contains no
 Cranelift backend; no component, compiler or global override was installed or
-changed during this check. Merely having nightly does not qualify the backend.
+changed during this check. Merely having nightly does not qualify the backend. The component was installed on 2026-10-18 for the [quick-run measurement](#cranelift-measurement-2026-10-18).
 
 ## Quick-run strategies
 
@@ -150,17 +150,91 @@ replace "quick build, then execute" as the default.
 | Strategy | State | Fit for `oxide run --profile quick` |
 | --- | --- | --- |
 | Quick build + execute (stable LLVM, opt-level 0, line tables, incremental) | Shipped. On Linux, [Rust 1.90 made LLD the default linker](https://blog.rust-lang.org/2025/09/18/Rust-1.90.0/) for `x86_64-unknown-linux-gnu`; the [preview post](https://blog.rust-lang.org/2025/09/01/rust-lld-on-1.90.0-stable) reports 7x faster linking and 40% less end-to-end time on a ripgrep incremental rebuild. | Default and fallback. |
-| [Cranelift AOT](https://github.com/rust-lang/rustc_codegen_cranelift) | Nightly-only preview component `rustc-codegen-cranelift-preview`; aarch64 macOS supported; unwinding unsupported on macOS (`panic=abort` by default), experimental on Linux. Cargo's [`codegen-backend`](https://doc.rust-lang.org/cargo/reference/unstable.html#codegen-backend) can be set per package, so dependencies can stay on LLVM. | Candidate for `run` only. One build cannot mix rustc versions, so a nightly strategy needs its own slot and a second dependency set, costing storage. It also needs a nightly toolchain plus component install, which is a host change. Not for `test` on macOS. |
+| [Cranelift AOT](https://github.com/rust-lang/rustc_codegen_cranelift) | Nightly-only preview component `rustc-codegen-cranelift-preview`; aarch64 macOS supported; unwinding unsupported on macOS (`panic=abort` by default), experimental on Linux. Cargo's [`codegen-backend`](https://doc.rust-lang.org/cargo/reference/unstable.html#codegen-backend) can be set per package, so dependencies can stay on LLVM. | Measured 2026-10-18: no warm edit-loop gain on Oxide's workspace, and `catch_unwind` in Cranelift code stops working ([measurement](#cranelift-measurement-2026-10-18)). Not recommended for `run` on small workspaces; a heavy project needs its own reading. A nightly strategy needs its own slot and a second dependency set, plus a nightly toolchain and component. Not for `test`. |
 | [Cranelift JIT](https://github.com/rust-lang/rustc_codegen_cranelift/blob/main/docs/usage.md) | "Highly experimental"; every dependency must be a dynamic library; no incremental compilation, so it may be slower than AOT. | Not a near-term candidate. |
 | Hot patching ([Subsecond](https://docs.rs/subsecond/)) | Experimental. It patches only code wrapped in `subsecond::call` and only the tip crate, and needs the Dioxus CLI (`dx serve --hotpatch`) ([Dioxus 0.7](https://dioxuslabs.com/blog/release-070)). | Not a generic strategy: it requires source changes. Possible later opt-in for long-running apps. |
 
-Implications: the foundation ships quick build + execute. The only near
-candidate is Cranelift for workspace crates. It needs a bounded measurement on a
-real edit-to-run loop that counts the separate nightly dependency set and the
-abort-on-panic compromise. Until then, measure where quick-run time goes
-(frontend, codegen, link) before choosing a strategy. The installed
-nightly-2026-08-05 has no Cranelift component; Tom approved installing it for
-the bounded measurement on 2026-10-18 ([vision](vision.md#product-workflow-direction)).
+Implications: the foundation ships quick build + execute. Cranelift for
+workspace crates was the only near candidate; the
+[measurement below](#cranelift-measurement-2026-10-18) found no edit-loop gain
+on Oxide's own workspace.
+
+### Cranelift measurement (2026-10-18)
+
+One bounded session (oxide#075) on Oxide's repository at `dc84d03`, macOS
+aarch64, under Effigy heavy admission. Raw evidence:
+[`evidence/cranelift-quick-run-075/`](evidence/cranelift-quick-run-075/summary.json).
+Tom approved the session and the one component install
+([vision](vision.md#product-workflow-direction)). `rustup component add
+rustc-codegen-cranelift-preview --toolchain nightly-2026-08-05` succeeded
+(11.4 MB installed into that toolchain); no other host change was made.
+
+Loop per arm: a cold `cargo build --bin oxide`, then three edits to the
+`--help` text in `src/bin/oxide/main.rs`. Each edit was followed by `check`,
+`build`, and a direct `oxide --help` that confirmed the edited text. Every
+call used the quick recipe, `--locked --offline`, a private target directory
+and an explicit environment. The host's `CARGO_INCREMENTAL=0` was removed, so
+workspace units built incrementally.
+
+| Arm | Toolchain and backend | Cold build | Warm check | Warm build | Direct run | Target after loop |
+| --- | --- | --- | --- | --- | --- | --- |
+| A | stable 1.97.1, LLVM | 9.26 s | 0.100 s | 0.307 s | 0.290 s | 167.0 MiB |
+| B | nightly-2026-08-05, LLVM | 5.91 s | 0.093 s | 0.310 s | 0.299 s | 155.0 MiB |
+| C | nightly, Cranelift for `oxide-storage` only | 4.46 s | 0.096 s | 0.318 s | 0.304 s | 206.5 MiB (with test targets) |
+| D | nightly, LLVM, `RUSTFLAGS=-Zthreads=8` | 2.95 s | 0.112 s | 0.341 s | 0.289 s | 155.1 MiB |
+
+Warm figures are means of edits 2 and 3. Every warm step rebuilt exactly one
+unit, the `oxide` bin. The first check after a cold build also builds 16
+additional check units, including the workspace library: 1.58 / 1.47 / 1.46 / 0.97 s for A–D.
+
+Receipts:
+- Arm C's verbose rustc lines show `-Z codegen-backend=cranelift` only on the
+  `oxide_storage` and `oxide` units. The cold-build log records 29 other
+  compiler invocations for dependencies and build scripts, all on LLVM.
+- Arm D shows `-Zthreads=8` on every unit.
+- No unit received a `-C panic` flag.
+
+Findings:
+- **Warm builds cost more than checking.** A warm check takes about 0.10 s
+  and a warm build about 0.31 s. Their roughly 0.21 s difference does not
+  isolate frontend, codegen or link costs. Cranelift saved nothing in the
+  observed edit loop: C's warm build was 0.01 s slower than B's.
+- **Panic semantics change even with `panic=unwind`.** Arm C's `cargo test`
+  ran 79 unit tests and all passed. The unwind probe
+  (`tests/profile_backtrace.rs`) failed: a `catch_unwind` inside
+  Cranelift-compiled code did not catch an overflow panic. The panic instead
+  reached libtest's LLVM-compiled harness, which reported the test failed. The
+  process did not abort. Exit 101.
+- **A second dependency set costs storage.** Each nightly arm holds its own
+  dependency units: 63.5 MiB beside stable's 67.2 MiB on this small graph. A
+  Cranelift strategy needs that set in its own slot, plus the component and a
+  nightly toolchain.
+- **`-Zthreads=8` showed no warm gain.** D's warm build was 0.03 s slower than
+  B's. Its cold build and first check were faster, but those single readings
+  are confounded by run order.
+- **The run step is as large as the build step.** Every direct run executed a
+  freshly linked binary, and `--help` took 0.28–0.32 s. The cause was not
+  isolated.
+
+Recommendation: do not implement a Cranelift-for-workspace `quick` run
+strategy on this evidence. On this small workspace warm build time did not
+improve, while the strategy costs nightly, a second dependency set and changed
+panic semantics. A heavy, codegen-bound project could differ. That needs its own
+owner-coordinated, approved reading, and this result does not predict it.
+
+Limits:
+- One small subject (31 units) and one sample per reading, on macOS aarch64
+  only.
+- No write-volume or SSD claim.
+- Arms ran in order A, B, C, D, and cold times fall in that order: A paid for
+  cold sources and a cold compiler. Cold readings therefore credit neither
+  backend nor flag.
+- The nightly Cargo already uses the build-dir layout v2 (`build/<package>/<hash>/out`),
+  so its byte split by unit name is not identical in layout to stable's.
+- The session continued once after a harness defect. It stopped before any
+  Cargo call, after the install, and resumed on the same clock, root and
+  counters: 29 measured plus 2 version Cargo calls, about 110 s of the 50
+  minutes, 0.7 GiB peak owned scratch.
 
 ### Other run-path levers
 
@@ -172,14 +246,85 @@ time separately before any backend is credited.
 | Lever | Finding | Fit |
 | --- | --- | --- |
 | No-op fast path | Oxide can record the last successful build's content identity per checkout and binary (the freshness gate records it). If unchanged, it executes without invoking Cargo, skipping Cargo's fingerprint walk. | In Oxide's control; small, safe; after the gate. |
-| Optimized dependencies in `quick` | `package."*".opt-level` makes heavy dependencies run faster. Shared slots pay that compile cost once across worktrees. It needs `--config`, because the environment cannot express `package."*"`. | Candidate; measure. Every modelled command must use the same recipe, or the slot holds two dependency sets. |
+| Optimized dependencies in `quick` | `package."*".opt-level` can make heavy dependencies run faster. Shared slots would pay that compile cost once across worktrees. It needs `--config`, because the environment cannot express `package."*"`. Measured 2026-10-18 on Oxide's workspace: about 3.3 s extra cold build and no test-runtime gain ([measurement](#optimized-dependency-measurement-2026-10-18)). | Not for the default recipe. A dependency-compute-bound project needs its own reading. Every modelled command must use the same recipe, or the slot holds two dependency sets. |
 | Workspace feature unification | Selecting different packages builds dependency variants with different features: churn and extra storage. A 2026-10-18 probe on 1.97.1 showed `resolver.feature-unification` is ignored without `-Zfeature-unification` ([RFC 3692](https://rust-lang.github.io/rfcs/3692-feature-unification.html)). The stable route is a workspace-hack crate, which is a project change. | `oxide status` could report duplicate dependency variants; the fix stays per project. |
 | Faster linkers | macOS uses Apple's linker. [Wild](https://github.com/davidlattimore/wild) is Linux-only, has no incremental linking yet, and its Mach-O port is not ready. | Linux: LLD default already; wild later. macOS: nothing to add. |
 | Dynamic dependency linking | A dylib wrapper crate re-exporting dependencies cuts link time for large graphs, but changes linking and runtime loading. | Per-project opt-in only. |
-| Parallel frontend (`-Zthreads`) | Nightly; speeds frontend work on large crates. | Same nightly dependency-set cost as Cranelift; a possible extra arm of that measurement. |
+| Parallel frontend (`-Zthreads`) | Nightly; speeds frontend work on large crates. Measured 2026-10-18 as arm D: no warm edit gain on Oxide's workspace ([measurement](#cranelift-measurement-2026-10-18)). | Same nightly dependency-set cost as Cranelift; not worth it for small workspaces. |
 | Watch mode | Rebuilds and restarts on save; cuts latency, not work. | Human loop; low value for agents. |
 | [danluu/rust-interpreter](https://github.com/danluu/rust-interpreter) | rustc checks the code, then selected MIR is lowered to bytecode and run in an interpreter or AArch64 JIT. Self-described as "extremely vibe coded"; "cannot yet replace `cargo test`"; no unwinding, threads, FFI or `should_panic`; "no fallback" for unsupported code. Its results are mixed: 20% faster on one five-edit pilot, 2.7x slower on a compute-heavy target. Needs pinned nightly with `rustc-dev`; no license stated. | Not usable or adoptable. It shows the approach can work, and its ceiling is still the check time. |
 | Miri / [Cranelift JIT](https://github.com/rust-lang/rustc_codegen_cranelift/blob/main/docs/usage.md) | Miri is a UB checker that runs far slower than native code. Cranelift JIT is covered above. | Not speed tools. |
+
+### Optimized-dependency measurement (2026-10-18)
+
+One bounded session (oxide#076) on Oxide's repository at `22d2f77`, stable
+1.97.1, macOS aarch64, under Effigy heavy admission. Raw evidence:
+[`evidence/optimized-deps-quick-076/`](evidence/optimized-deps-quick-076/summary.json).
+Tom approved the session ([vision](vision.md#product-workflow-direction)).
+
+Arms, each in its own target directory: A is the `quick` recipe; B adds
+`--config 'profile.oxide-quick.package."*".opt-level=1'`; C uses `opt-level=2`.
+Loop per arm: a cold `cargo test --workspace --all-targets --no-run`, then three
+edits to `MAX_REFERENCES` in `src/dep_info.rs`, each followed by the same
+`--no-run`. Every call used `--locked --offline` and an explicit environment;
+the source was reset to the pin between arms. After every build the reported
+test executables (`profile.test` artifacts only) ran directly with default
+membership. All four macOS scratch variables pointed at one root.
+
+| Arm | Dependency opt-level | Cold `--no-run` | Warm `--no-run` | Library suite (libtest) | `oxide` bin suite | Target after cold / after loop |
+| --- | --- | --- | --- | --- | --- | --- |
+| A | 0 | 4.24 s | 0.80 s | 2.11 s | 0.33–0.35 s | 190.3 / 264.7 MiB |
+| B | 1 | 7.58 s | 0.82 s | 2.22 s | 0.34–0.35 s | 187.5 / 262.6 MiB |
+| C | 2 | 7.45 s | 0.89 s | 2.20 s | 0.33–0.37 s | 191.7 / 266.4 MiB |
+
+Warm figures are means of the three edits. Library-suite figures are libtest's
+own `finished in` times, means of those edits. Every edit rebuilt the same 9
+workspace units and left 29 fresh.
+
+Receipts:
+- Tests passed in every cycle of every arm: 52 library, 36 `oxide` bin and 1
+  profile probe; 0 ignored, 0 failed. The two storage bins have no tests.
+- Workspace units had identical rustc settings in all arms. All 29 dependency
+  units (20 libraries, 8 build scripts, `serde_derive`) carried the arm's
+  `-C opt-level`. B and C also got an explicit `-C debug-assertions=on`, which
+  keeps the debug assertions that A has implicitly at opt-level 0. No other
+  flag differed.
+
+Findings:
+- **No test-runtime gain.** The library suite averaged 2.1–2.2 s in every arm;
+  B and C were not faster than A. The `oxide` bin suite was unchanged.
+  Oxide's tests are not bound by dependency compute.
+- **Cold cost rises by 3.2–3.3 s per slot (+76–79%).** A ran first, with cold
+  sources and compiler, so the real gap may be larger.
+- **`package."*"` also optimizes build-time units.** It took precedence over
+  `build-override` for build scripts and the proc-macro, which adds compile
+  cost with no runtime return.
+- **Storage did not change measurably** (within 4.2 MiB after cold, 3.8 MiB
+  after the loop).
+- **Process start dominates the noise.** Seven of 60 test-binary runs took
+  2.0–3.6 s more than libtest reported, including zero-test binaries. All
+  arms were affected; the cause was not isolated. Harness wall totals per
+  cycle (3.5–7.0 s) therefore do not compare arms.
+
+Recommendation: do not add dependency optimization to the default `quick`
+recipe. On this workspace it costs about 3.3 s per cold slot and returns
+nothing. A dependency-compute-bound project (heavy hashing, compression or
+parsing in tests) could differ. That needs its own approved reading, and an
+override would have to exclude build-time units.
+
+Cross-worktree amortization was not observed; this session used one
+checkout. Estimate, assumptions only: if every modelled command in a shared
+slot uses the same recipe, a slot pays the extra cold cost once. A per-run
+saving of *g* seconds then breaks even after about 3.3 / *g* runs in that slot.
+Here *g* was not positive, so no number of worktrees recovers the cost.
+
+Limits:
+- One small subject (38 units), three warm samples per arm, macOS aarch64
+  only, on a shared host (one-minute load 7.6–10.9).
+- Arms ran in order A, B, C.
+- No write-volume or SSD claim.
+- Session: 12 measured plus 1 version Cargo call, 93 s of the 30 minutes,
+  811 MiB peak owned scratch, 0.7 MiB raw logs.
 
 ## Upstream churn and disk developments (2026-10-18)
 
@@ -188,16 +333,243 @@ time separately before any backend is credited.
 - `debug = false` left none;
 - `split-debuginfo = "packed"` left none and produced one `.dSYM`.
 
-Implication: the `quick` recipe accumulates stale objects in long-lived shared slots, in proportion to workspace rebuilds. That costs disk and possibly build speed. The choice between packed debug info (extra `dsymutil` link time), debug off for rebuilt units, and slot recycling needs a measurement. Do not delete files inside a slot; the build-dir layout is Cargo-internal.
+Implication: the `quick` recipe accumulates stale objects in long-lived shared slots, in proportion to workspace rebuilds. The [2026-10-18 measurement](#stale-debug-object-measurement-2026-10-18) found the growth is mostly hardlinked names, not bytes, and recommends packed debug info if a fix is adopted. Do not delete files inside a slot; the build-dir layout is Cargo-internal.
 
 | Development | State | Relevance |
 | --- | --- | --- |
-| [Build-dir layout v2](https://blog.rust-lang.org/2026/03/13/call-for-testing-build-dir-layout-v2) | Per-unit `build/<package>/<hash>/` directories; scheduled stable in Cargo 1.100 (2026-11-12, per the beta changelog). | Unblocks Cargo's stale-unit cleanup ([cargo#5026](https://github.com/rust-lang/cargo/issues/5026)) and finer locking. It changes intermediate paths, so Oxide's plain-Cargo stray detection (`deps/`, `incremental/`) must be re-qualified at the upgrade. |
+| [Build-dir layout v2](https://blog.rust-lang.org/2026/03/13/call-for-testing-build-dir-layout-v2) | Per-unit `build/<package>/<hash>/` directories; scheduled stable in Cargo 1.100 (2026-11-12, per the beta changelog). Cargo 1.99.0-nightly (2026-07-29) already uses it by default ([measurement](#cranelift-measurement-2026-10-18)). | Unblocks Cargo's stale-unit cleanup ([cargo#5026](https://github.com/rust-lang/cargo/issues/5026)) and finer locking. It changes intermediate paths, so Oxide's plain-Cargo stray detection (`deps/`, `incremental/`) must be re-qualified at the upgrade. |
 | [Cross-workspace cache goal](https://rust-lang.github.io/rust-project-goals/2026/cargo-cross-workspace-cache.html) | 2026 goal: design and a nightly prototype; conservative at first. | The upstream replacement for Oxide's per-project slots ([Cargo relationship ruling](vision.md#relationship-with-cargo)). Not available yet. |
 | [Relink, don't rebuild](https://rust-lang.github.io/goals/2026/roadmap-fast-builds.html) | Did not complete in 2025H2; on the 2026 fast-builds roadmap; claims 5–10× fewer downstream rebuilds for body-only edits. | The largest future edit-loop win; nothing for Oxide to emulate safely. |
 | [`hint-mostly-unused`](https://blog.rust-lang.org/inside-rust/2025/07/15/call-for-testing-hint-mostly-unused/) | Nightly; per-dependency hint that defers code generation for unused items; regresses if applied globally. | Narrow, profile-guided; only helps when the dependency is built. |
-| Cargo home GC ([1.88](https://blog.rust-lang.org/2025/06/26/Rust-1.88.0/)) | Stable automatic cleanup of downloaded/cached files (3 months / 1 month unused). Never runs with `--offline` or `--frozen`. The target dir is not covered. | Agent and Oxide proofs often run `--offline`, so their Cargo home may never be cleaned. Worth surfacing in `oxide status`. |
+| Cargo home GC ([1.88](https://blog.rust-lang.org/2025/06/26/Rust-1.88.0/)) | Stable automatic cleanup of downloaded/cached files (3 months / 1 month unused). Never runs with `--offline` or `--frozen`. The target dir is not covered. | Agent and Oxide proofs often run `--offline`, so their Cargo home may never be cleaned. Trigger rules and an `oxide` recommendation: [Cargo home cleanup triggers](#cargo-home-cleanup-triggers-2026-10-18-probe). |
 | [Cargo script](https://rust-lang.github.io/goals/2026/cargo-script.html) | Frontmatter stabilization in progress; not stable on 1.97.1. | Single-file scripts; each script otherwise gets its own target dir. |
+
+## Stale debug-object measurement (2026-10-18)
+
+One bounded session (oxide#080) on Oxide's repository at `669fd1e`, stable
+1.97.1, macOS aarch64, under Effigy heavy admission. Raw evidence:
+[`evidence/stale-debug-objects-quick-080/`](evidence/stale-debug-objects-quick-080/summary.json).
+Tom approved the session ([vision](vision.md#product-workflow-direction)).
+
+Arms, each in its own target directory, all on the `quick` recipe
+(`oxide-quick` inherits `dev`, `debug = "line-tables-only"`):
+- U: as-is, with the default unpacked split debug info.
+- P: plus `CARGO_PROFILE_OXIDE_QUICK_SPLIT_DEBUGINFO=packed`.
+- N: plus `--config 'profile.oxide-quick.package.oxide-storage.debug=false'`;
+  `oxide-storage` is the only workspace package.
+
+Loop per arm: a cold `cargo build --workspace --timings`, then ten edits to
+`MAX_REFERENCES` in `src/dep_info.rs`, each followed by the same build. Every
+call used `--locked --offline -v` and an explicit environment. The target was
+observed read-only after every build. Then a scratch-only integration test,
+one uncaught panic through two `#[inline(never)]` helpers, was built with
+`cargo test --no-run` and run directly with `RUST_BACKTRACE=1`.
+
+| Arm | `*.rcgu.o` in `deps/`, cold → 10 edits | `deps/` entries after 10 | Target unique allocated, cold / 10 edits | Cold build | Warm build median (range) | `oxide` bin unit, warm median | Probe frames with file:line |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| U | 430 → 4,540 (+411 per edit) | 4,611 | 133.1 / 171.2 MiB | 4.27 s | 0.59 s (0.58–0.77) | 0.34 s | 3 of 3 |
+| P | 0 → 0 | 74, plus 3 `.dSYM` | 147.6 / 186.7 MiB | 5.33 s | 0.75 s (0.70–0.81) | 0.49 s | 3 of 3 |
+| N | 19 → 19 (dependencies only) | 90 | 119.4 / 156.3 MiB | 4.79 s | 0.62 s (0.58–1.31) | 0.35 s | 0 of 3 |
+
+Unit times are Cargo's own `--timings` durations. Unique allocated counts
+`st_blocks` once per inode. Every arm's `incremental/` roughly doubled on the
+first edit and then held steady.
+
+Receipts:
+- Arm control: each cold build had the same 33 units, and no rustc setting
+  other than the debug flags differed; the recipe would have stopped
+  otherwise.
+  - U: the 4 workspace units and 15 dependency libraries had
+    `-C debuginfo=line-tables-only -C split-debuginfo=unpacked`. Build scripts
+    and the 6 build-time units had no debug flags.
+  - P: the same, with `packed`.
+  - N: the 4 workspace units (library, 3 bins) had no debug flags. Every
+    dependency unit kept U's flags. Cargo added no `-C strip`.
+- Every edit rebuilt the same 4 workspace units and left 29 fresh.
+- Panic: every arm exited 101 and printed the correct location,
+  `tests/oxide_080_panic_probe.rs:5:5`.
+  - U and P resolved all 8 short-backtrace frames to file:line, including the
+    3 probe frames at their exact lines. P read the `.dSYM` beside the test
+    binary.
+  - N named all 8 frames but resolved only 3 standard-library frames; the 3
+    probe frames had no file:line.
+
+Findings:
+- **U accumulates names, not bytes, on this edit.** Each rebuild added 411
+  `*.rcgu.o` names, one per codegen unit of the rebuilt incremental workspace
+  units.
+  - After ten edits and the panic build, 4,561 names pointed at 461 inodes
+    (14.1 MiB allocated). Summed per name they claim 121 MiB apparent.
+  - 433 of those inodes are also named in `incremental/`: rustc hardlinks
+    reused work products into `deps/` under per-invocation names.
+  - Only 28 inodes (2.5 MiB) were held by `deps/` names alone, and 19 of them
+    are dependency objects that every arm keeps.
+  - Unique target allocation grew about 0.1 MiB per edit after the first.
+  - The current binaries' debug maps referenced 260 `deps/` objects in every
+    cycle. The rest were not referenced by those binaries; that does not make
+    them unreferenced elsewhere or safe to delete.
+- **Accumulation did not slow builds within ten cycles.** U's warm builds
+  stayed at 0.58–0.77 s up to 4,611 `deps/` entries.
+- **P stops accumulation for about 0.16 s per rebuild.** The median warm build
+  rose 0.16 s (+26%) and the cold build 1.07 s.
+  - The three bin units each took 0.09–0.15 s longer; the library did not.
+    Those durations cover codegen, link and, in P, `dsymutil`. The tool output
+    does not separate them, so no link-only figure is claimed.
+  - P's target was the largest, 15.5 MiB above U after ten edits: 18 MiB of
+    `.dSYM`, more `incremental/`, fewer `deps/` bytes.
+- **N loses the backtrace lines `quick` exists to keep.** It stops
+  accumulation at no measurable time cost: median within 0.03 s of U. Edits
+  8–10 took 0.91–1.31 s while the one-minute load rose to 7.6. But workspace
+  frames lose file:line. The panic location survives because it is compiled
+  into the panic, not read from debug info.
+
+Recommendation: keep `quick`'s line tables.
+- If a fix is adopted, use `split-debuginfo = "packed"` (P). It leaves no
+  stale objects and keeps backtrace quality, for about 0.16 s per rebuild and
+  15 MiB per slot here.
+- Reject N for `quick`: it removes required debugging behaviour.
+- U remains acceptable on this evidence. Its growth is mostly hardlinked
+  names, which Oxide's inventory, deduplicating by `(dev, ino)`, counts once.
+- Whole-slot recycling stays with the existing ownership policy; this
+  session did not test it.
+
+Adoption needs a separate decision; no recipe changed.
+
+Limits:
+- One small subject (33 units), one edit shape (a constant in one file,
+  touching few codegen units), ten cycles per arm, macOS aarch64, shared host
+  (one-minute load 4.3–7.6).
+- A larger edit changes more codegen units, and each changed unit's old object
+  can then be held by a stale name alone. U's byte growth here is a lower
+  bound. The [cargo#16665](https://github.com/rust-lang/cargo/issues/16665)
+  reports come from large long-lived projects; this session neither confirms
+  nor refutes them.
+- Arms ran in order U, P, N; U ran first, with cold caches.
+- `st_blocks` cannot see APFS clone sharing. No write-volume, SSD or debugger
+  claim.
+- Session: 36 measured plus 2 version Cargo calls, 162 s of the 40 minutes,
+  549 MiB peak owned scratch, 3.3 MiB raw logs.
+- The recipe continued once after a harness defect: its debug-map observer
+  read `.pid` from a finished `CompletedProcess`. Attempt 1 had run both
+  version calls and U's cold build. The continuation reused the same root,
+  packet, clock and counters. It re-verified U's source and re-observed U's
+  target (identical) before going on.
+
+## Cargo home cleanup triggers (2026-10-18 probe)
+
+oxide#084 read Cargo 1.97.1's automatic cleanup at the pinned commit `c980f4866141969fab6254a680546a277789d6f0` and ran one confirming session on a fresh scratch `CARGO_HOME`. Source hashes, the recipe, the session log and per-call traces are in [cargo-home-gc-trigger-084](evidence/cargo-home-gc-trigger-084/session.log).
+
+**Source-proven rules** (links are to the pinned commit):
+- **Call sites.** A grep of every `src/cargo` and `src/bin` Rust file at the pinned commit (257 files, 3.8 MB; [hashes](evidence/cargo-home-gc-trigger-084/cargo-source-full-sha256.txt)) finds exactly two `auto_gc` calls: at the end of [`compile_ws`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/ops/cargo_compile/mod.rs#L192) — after the build context is created (resolution and downloads), before compilation, so a build that later fails still cleans — and at the end of [`ops::fetch`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/ops/cargo_fetch.rs#L81).
+- **Commands that reach it** (all `compile_ws` / `ops::fetch` callers in that grep):
+
+  | Command | Path | Returns before GC when |
+  | --- | --- | --- |
+  | `build` | [`ops::compile`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/bin/cargo/commands/build.rs#L68) | resolution or download fails; `--unit-graph` ([returns first](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/ops/cargo_compile/mod.rs#L188-L191), nightly) |
+  | `check` (and `cargo clippy`, which runs `cargo check`; Clippy's source was not read) | [`ops::compile`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/bin/cargo/commands/check.rs#L57) | same |
+  | `rustc` | [`ops::compile`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/bin/cargo/commands/rustc.rs#L110) | `--print` ([returns first](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/bin/cargo/commands/rustc.rs#L86-L90), nightly) |
+  | `run` | [`ops::run`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/bin/cargo/commands/run.rs#L87) → [`ops::compile`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/ops/cargo_run.rs#L94); scripts via [`exec_manifest_command`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/bin/cargo/commands/run.rs#L96-L196) need `-Zscript` | same as `build` |
+  | `test`, `bench` | [`run_tests`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/bin/cargo/commands/test.rs#L113) / [`run_benches`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/bin/cargo/commands/bench.rs#L78) → [`compile_tests`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/ops/cargo_test.rs#L104-L105) | same (`--no-run` still compiles) |
+  | `doc`, `rustdoc` | [`doc`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/bin/cargo/commands/doc.rs#L63) / [`rustdoc`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/bin/cargo/commands/rustdoc.rs#L86) → [`ops::compile`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/ops/cargo_doc.rs#L59) | same |
+  | `fix` | [`ops::fix`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/bin/cargo/commands/fix.rs#L104-L108) → [`ops::compile`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/ops/fix/mod.rs#L218); `-Zfix-edition` via [`fix_edition`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/ops/fix/fix_edition.rs#L41) | same; with nightly `-Zfix-edition`, packages not all at the start edition are [skipped with `Ok(())`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/ops/fix/fix_edition.rs#L19-L48) |
+  | `install` | [`install_one`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/ops/cargo_install.rs#L335) → [`compile_ws`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/ops/cargo_install.rs#L393) | `--list` ([prints installed packages instead](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/bin/cargo/commands/install.rs#L235-L238)); every requested package already installed and up to date ([`Ok(None)`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/ops/cargo_install.rs#L190-L202), [also](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/ops/cargo_install.rs#L296-L304)) |
+  | `package`, `publish` | [`do_package`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/ops/cargo_package/mod.rs#L344-L347) → [`run_verify`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/ops/cargo_package/verify.rs#L95) → `compile_with_exec`; publish passes [`verify`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/ops/registry/publish.rs#L163-L167) through | `--no-verify`; `package --list` ([prints the file list instead of adding any output](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/ops/cargo_package/mod.rs#L302-L339), so the verify loop has nothing to compile); `publish` when every selected member is `publish = false` and the selection allows that (`--workspace`, `--exclude` or a virtual-workspace default): [warns "nothing to publish" and returns](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/ops/registry/publish.rs#L85-L123) |
+  | `fetch` | [`ops::fetch`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/bin/cargo/commands/fetch.rs#L24) | resolution or download fails |
+
+  No other command calls either function, so `metadata`, `tree`, `update`, `generate-lockfile`, `vendor`, `clean`, `add`/`remove`, `uninstall`, `search`, `login`, `owner` and `yank` never trigger automatic cleanup. Any error before the call (resolution, download, argument or manifest failures) also skips it. The "returns before GC" column comes from inspecting every `return`, `bail!` and `Ok(None)` between each listed entry point and the GC call in the pinned files.
+- **Offline skip.** `auto_gc` [returns immediately](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/gc.rs#L51-L58) when `network_allowed()` is false. [`network_allowed`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/util/context/mod.rs#L1250-L1262) is false under `--frozen` or offline; [offline](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/util/context/mod.rs#L1206-L1212) is `--offline` or `net.offline` config (so `CARGO_NET_OFFLINE=true` too). `--locked` alone does not skip.
+- **Lock skip.** It also returns silently when the package cache's mutate-exclusive lock [is already held](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/gc.rs#L73-L80), for example by a concurrent Cargo.
+- **Frequency gate.** [`cache.auto-clean-frequency`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/gc.rs#L279-L301) defaults to [`1 day`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/gc.rs#L37). [`always`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/gc.rs#L347-L360) is 0 s; `never` disables; otherwise `N seconds/minutes/hours/days/weeks/months` ([month = 2,629,746 s](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/gc.rs#L379-L397)). The gate is [`last_auto_gc + frequency < now`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/global_cache_tracker.rs#L517-L533) in whole seconds, checked once per process. A successful non-dry-run pass [writes `last_auto_gc`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/global_cache_tracker.rs#L537-L541).
+- **New homes wait a day.** Creating the database [primes `last_auto_gc` with the current time](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/global_cache_tracker.rs#L291-L305), so a fresh home's first default cleanup is at least a day later. `last_auto_gc` therefore means "last automatic pass, or database creation": the value alone cannot show a cleanup ever ran (call 2 below primed it and skipped).
+- **Age thresholds.** Extracted sources (`registry/src`, git checkouts) [1 month](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/gc.rs#L30-L32); downloaded data (`.crate` archives, index cache, git databases) [3 months](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/gc.rs#L33-L35). Overriding them via `cache.global-clean` [needs `-Zgc`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/gc.rs#L177-L244); stable always uses the defaults.
+- **Orphan removal ignores age.** Each automatic pass [syncs the database with disk](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/global_cache_tracker.rs#L566-L578) first. A registry index or git database that is tracked but [missing from disk](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/global_cache_tracker.rs#L748-L762) has its whole child trees queued for deletion [without an age test](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/global_cache_tracker.rs#L866-L893): `registry/cache/<registry>` and `registry/src/<registry>` for an index, `git/checkouts/<name>` for a git database. Deleting `registry/index/<registry>` by hand therefore makes the next pass remove that registry's recent `.crate` files and sources too. Tracked child rows missing on disk are [dropped from the database](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/global_cache_tracker.rs#L727-L746) without touching files.
+- **What is tracked.** A SQLite database at [`$CARGO_HOME/.global-cache`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/global_cache_tracker.rs#L134) records last use and size for registry indexes, `.crate` files, extracted sources, git databases and git checkouts ([tables](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/global_cache_tracker.rs#L136-L140)). Cleaning first [adds untracked files](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/global_cache_tracker.rs#L713-L808) with the current time, so files from an older Cargo are not eligible for at least a month. Database open or read-only failures are [silent](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/global_cache_tracker.rs#L1812-L1822) unless `-vv`. The target directory and `~/.cargo/bin` are not covered.
+- **No-network online runs.** A sparse registry only revalidates index files when [an update was requested](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/sources/registry/http_remote.rs#L291-L298); otherwise [the local copy is used](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/sources/registry/http_remote.rs#L460-L474). An online command whose lockfile and cache are complete therefore needs no network and still reaches `auto_gc`.
+- **Manual cleanup is nightly.** [`cargo clean gc`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/bin/cargo/commands/clean.rs#L172-L179) fails on stable without `-Zgc`.
+
+**Confirming session** (21:20:23–21:20:27Z; 6 of 6 Cargo calls, all exit 0; Effigy heavy admission; one download, `cfg-if` 1.0.0, 7,934 bytes, sha256 `baf1de43…a40fd`, matching the lockfile checksum). Each call traced with `CARGO_LOG=gc=trace`; `last_auto_gc` was read read-only after each. Calls 4–6 set `CARGO_HTTP_PROXY=http://127.0.0.1:9` (closed port) so any network attempt would fail.
+
+| Call | Command | `gc` trace | `last_auto_gc` |
+| --- | --- | --- | --- |
+| 1 | `cargo -V` | — | no database |
+| 2 | `fetch` (online, default frequency) | `last auto gc was 1792358423, skipping` | primed 1792358423 |
+| 3 | `fetch --offline`, `always` | `running offline, auto gc disabled` | unchanged |
+| 4 | `check --frozen`, `always`, closed proxy | `running offline, auto gc disabled` | unchanged |
+| 5 | `fetch`, `always`, closed proxy | `last auto gc was 1792358423, running`; db sync; cleaning thresholds 1 / 3 months | 1792358425 |
+| 6 | `check`, `always`, closed proxy | `last auto gc was 1792358425, running` | 1792358427 |
+
+Observed: the skip and run rules above, the day-long priming, and that an online `fetch` or `check` with a complete lockfile ran cleanup through a closed proxy without error. Nothing was age-eligible and no tracked parent was missing, so no file was deleted; deletion behaviour rests on source alone.
+
+**Recommendation** (not implemented):
+- `oxide status` should report the Cargo home's size (`du` of `CARGO_HOME`, default `~/.cargo`), split into `registry/` and `git/`. Do not report a "last cleanup" time: Cargo's only record, `global_data.last_auto_gc`, is set at database creation as well as after a pass, and reading it means opening Cargo's internal database. At most, a strictly read-only read could be shown as "Cargo's GC baseline (last automatic pass or database creation)"; the simpler default is to omit it.
+- `oxide clean --cargo-cache` can trigger Cargo's own stable cleanup without network or database access: run `cargo fetch --config 'cache.auto-clean-frequency="always"'` without `--offline` / `--frozen` in a workspace whose lockfile is complete. A dependency-free scratch package should need no registry read at all; that variant was not run. Cleanup removes entries past the fixed 1 / 3-month thresholds plus any orphaned registry or git child trees (see above), and it skips silently when another Cargo holds the cache lock — `oxide` cannot confirm it ran without reading the database or Cargo's `gc` trace.
+- Any command run with `--offline`, `--frozen` or `net.offline` never cleans, so agents and proofs that always pass them never clean that home. (`cargo metadata`, which Oxide's freshness gate runs offline, never triggers cleanup in any mode.) Any ordinary online build or fetch past the daily gate still cleans.
+
+## Cloning a warm build directory (2026-10-18 probe)
+
+oxide#081 tested whether a warm build directory still works after an APFS clone to a new path. It ran one heavy-admitted 32-second session using 13 of 14 experimental Cargo calls and both setup calls. Raw evidence is in [apfs-clone-relocation-20261018](evidence/apfs-clone-relocation-20261018/summary.json).
+
+Setup:
+- Injection matched `oxide`'s: `CARGO_BUILD_BUILD_DIR` pointed at the slot and one private `CARGO_TARGET_DIR` stayed fixed.
+- `clonefile(2)` copied build dir A to B. A was then renamed away so any dangling reference would fail loudly.
+- The same checkout was then built against B.
+- Fixture: a build script that writes `include!`d code and a static library into `OUT_DIR`, emits `rustc-link-search` into it, a path proc-macro and one integration test.
+
+| Subject | Verdict | Evidence |
+| --- | --- | --- |
+| Fixture, Cargo 1.97.1 layout | Relocatable | After the clone, all 8 units were fresh and the binaries passed. A source-only edit rebuilt only `probe-app` and linked the static library from B. A build-input edit reran the build script. A final no-op was fresh. |
+| Fixture, nightly-2026-08-05 `-Z build-dir-new-layout` (layout v2) | Relocatable | Same sequence and results. |
+| Oxide repository at `dc84d03`, stable, default dev profile | Relocatable for Cargo | After the clone, all 38 units were fresh in 0.25 s. A `src/lib.rs` edit rebuilt only the 9 `oxide-storage` units in 1.7 s; the cold build took 5.0 s. |
+
+How the paths behave:
+- Cargo stays correct because it does not keep A's path in the files it checks:
+  - no `.fingerprint` file in any arm named A;
+  - B's cloned build-script `output` and `root-output` still named A's `OUT_DIR`, but Cargo rewrote the replayed link-search path to B.
+- A's path survives elsewhere:
+  - rustc's make-style `.d` files of unchanged units;
+  - unrerun dependency `root-output` files;
+  - `serde`/`serde_core` metadata source maps that name A's generated `private.rs`;
+  - proc-macro dylib install names.
+- Debug info is the open condition. Until a binary is relinked, its macOS debug map (`N_OSO`) points at A's `deps/*.o`. That includes the `target/debug/*` outputs Cargo uplifts from B (on macOS APFS these are clones, not hard links; see the [final-output placement probe](#final-output-placement-probe-2026-10-18)).
+  - It harms nothing while A still exists unchanged, as a clone source would.
+  - Once A is gone or rebuilt, debugging an unchanged binary can lose its debug info.
+  - The probe did not run a debugger.
+
+Clone cost (Oxide repository, 2,126 files; source `st_blocks` sum 244 MiB, which counts allocated blocks, not apparent size, and cannot see clone sharing):
+- `clonefile` took 12.6 ms. Host free space fell 1.1 MiB from before the clone to after the rename.
+- All 300 sampled files kept the same first physical extent (`F_LOG2PHYS_EXT`). A plain-copy control file moved to a new extent, which is direct evidence of copy-on-write sharing. Inodes differed; sizes, modes and mtimes matched.
+- Host free space fell another 152 MB over the edit-rebuild interval. The host is shared, so this is not attributed to the rebuild or to clone divergence.
+- Host free space is shared and noisy. These figures are not exact clone allocation or SSD writes.
+
+Implication: on this host and toolchain, cloning a slot per worktree, or warm-starting from main's slot, is mechanically sound for Cargo freshness and rebuild correctness on both layouts. A product design still has to settle the debug-map condition: keep the source slot unchanged while clones exist, or accept relinking. One fixture and one repository do not prove universal portability, debugger behaviour or savings. Two recipe slips are corrected in the summary:
+- the layout v2 build script is named `build_script_build`, so the recipe's run counter missed it;
+- the hit classifier mislabels v2 unit outputs under `build/<pkg>/<hash>/out/`.
+
+## Final-output placement probe (2026-10-18)
+
+Question: when the target directory shares a volume with the build directory, does Cargo hard-link final outputs instead of copying them, and how many bytes per worktree does that save over the current layout (build directory on the pool, target directory in the checkout; [workflow](contracts/workflow.md#what-one-command-does-local-executor))?
+
+Subject: Oxide at `22d2f77`, stable 1.97.1, `--offline`, default `dev`/`test` profiles, no edits. One fresh 4 GiB APFS sparse image, two layouts built sequentially into disjoint directories:
+- X (cross-volume): build directory on the image, target directory on the host volume.
+- S (same volume): both on the image.
+
+Per layout: one cold `cargo build` and one `cargo test --no-run`. The recorded data per final file: device, inode, `st_nlink`, size, allocation, APFS private size and clone ID (`getattrlist`), plus its content-equal build-directory peer.
+
+| | X (cross-volume) | S (same volume) |
+| --- | --- | --- |
+| Hard links | None: `st_nlink` 1; no target file shares device and inode with a build file | None, same evidence |
+| Uplifted lib and three bins | Independent copies; private bytes equal allocation | APFS clones of the `deps/` files: private size 0, shared clone ID, refcount 2 |
+| Target-dir bytes not shared with build dir | 15,589,376 | 20,480 (`.d` files and `CACHEDIR.TAG`) |
+| Test binaries | Five built; all stay in the build directory; none uplifted | Same |
+| Image-use delta | 212,426,752 (build dir only) | 212,029,440 (build and target dirs) |
+
+Result: in this run, Cargo hard-linked no uplifted output in either layout. On the same APFS volume it cloned them, which cost almost nothing. Cargo's own source at the measured commit explains the observation: on macOS, `cargo-util` `_link_or_copy` removes the destination and then calls `fs::copy`, which uses `fclonefileat` on APFS. If that copy fails with `EAGAIN`, it falls back to `hard_link`, so hard links remain possible on macOS; this run never hit that path. The source comment cites a Gatekeeper race with hard-linked binaries ([cargo#7821](https://github.com/rust-lang/cargo/issues/7821), [cargo#10060](https://github.com/rust-lang/cargo/issues/10060)). Other Unix systems take the `hard_link` path; Linux was not measured.
+
+Per-worktree saving for this subject: 15,568,896 bytes (about 14.8 MiB), or 6.7% of the 231 MB clone-aware total. The image deltas agree: S's target directory added no measurable image use (S − X = −397,312 bytes, within APFS accounting noise). The saving should grow with final binary size and debug info; only this subject was measured. Here, all five test-harness executables stayed in the build directory and none was uplifted, so this subject's test path saved nothing; only its `build`/`run` outputs benefited.
+
+`cargo test --no-run` re-uplifted the three fresh bins (new inodes) because integration tests need them. In X that means a fresh full copy on the host volume. In S it means a new clone. No write volume was measured.
+
+Limits: one subject on one host, one cold build plus one `test --no-run` per layout, APFS only. No repeat, edit or branch-switch builds; no test execution; no Linux run. Clones share blocks only until either side is rewritten. Placement, lease and default behavior are unchanged. A same-volume target directory would also move final outputs off the checkout and into the pool, which affects the privacy and lifetime rules in [workflow](contracts/workflow.md#what-one-command-does-local-executor). Evidence: [final-output-links-082](evidence/final-output-links-082/summary.json).
 
 ## Product assessment
 

@@ -1,0 +1,5 @@
+[manifest]
+minimum_effigy_version = "0.14.0"
+[tasks.measurement]
+admission = "heavy"
+run = "exec /Applications/Xcode.app/Contents/Developer/usr/bin/python3 /private/tmp/oxide-080-debugobj.jkog1ebm/measure.py"

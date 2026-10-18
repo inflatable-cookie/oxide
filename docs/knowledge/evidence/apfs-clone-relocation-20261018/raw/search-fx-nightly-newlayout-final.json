@@ -1,0 +1,72 @@
+{
+ "needle": "/private/tmp/oxide-clone-probe.mbj4vjda/fx-nightly-newlayout/buildA",
+ "bases": [
+  "/private/tmp/oxide-clone-probe.mbj4vjda/fx-nightly-newlayout/buildB",
+  "/private/tmp/oxide-clone-probe.mbj4vjda/fx-nightly-newlayout/target"
+ ],
+ "scanned_files": 487,
+ "scanned_bytes": 10731357,
+ "uncovered_files": 0,
+ "uncovered_examples": [],
+ "hit_files": 5,
+ "hit_list_truncated": false,
+ "by_category": {
+  "build-script-OUT_DIR-content": {
+   "files": 5,
+   "occurrences": 12
+  }
+ },
+ "hits": [
+  {
+   "rel": "buildB/debug/build/probe-app/18db41763900fe11/out/build_script_build.d",
+   "category": "build-script-OUT_DIR-content",
+   "size": 306,
+   "occurrences": 2,
+   "first": {
+    "offset": 0,
+    "context": "/private/tmp/oxide-clone-probe.mbj4vjda/fx-nightly-newlayout/buildA/debug/build/probe-app/18db41763900fe11/out/build_script_build.d"
+   }
+  },
+  {
+   "rel": "buildB/debug/build/probe-pm/187ce2493f2fbac5/out/libprobe_pm-187ce2493f2fbac5.dylib",
+   "category": "build-script-OUT_DIR-content",
+   "size": 460176,
+   "occurrences": 1,
+   "first": {
+    "offset": 1784,
+    "context": "\ufffdE\u0002\u0000\u0000\u0000\u0000\u0000\u0001\u0000\u0000\u0000\u0001\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\r\u0000\u0000\u0000\ufffd\u0000\u0000\u0000\u0018\u0000\u0000\u0000\u0001\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000/private/tmp/oxide-clone-probe.mbj4vjda/fx-nightly-newlayout/buildA/debug/build/probe-pm/187ce2493f2fbac5/out/libprobe_pm-187ce2493"
+   }
+  },
+  {
+   "rel": "buildB/debug/build/probe-pm/187ce2493f2fbac5/out/probe_pm-187ce2493f2fbac5.d",
+   "category": "build-script-OUT_DIR-content",
+   "size": 330,
+   "occurrences": 2,
+   "first": {
+    "offset": 0,
+    "context": "/private/tmp/oxide-clone-probe.mbj4vjda/fx-nightly-newlayout/buildA/debug/build/probe-pm/187ce2493f2fbac5/out/probe_pm-187ce2493f2f"
+   }
+  },
+  {
+   "rel": "buildB/debug/build/probe-pm/ab72a110175a7d26/out/probe_pm-ab72a110175a7d26",
+   "category": "build-script-OUT_DIR-content",
+   "size": 505080,
+   "occurrences": 5,
+   "first": {
+    "offset": 499008,
+    "context": "/src/pm/src/lib.rs/@/\u00002sbhqjd922mt72o7ilz8rr3px\u0000/private/tmp/oxide-clone-probe.mbj4vjda/fx-nightly-newlayout/buildA/debug/build/probe-pm/ab72a110175a7d26/out/probe_pm-ab72a110175a"
+   }
+  },
+  {
+   "rel": "buildB/debug/build/probe-pm/ab72a110175a7d26/out/probe_pm-ab72a110175a7d26.d",
+   "category": "build-script-OUT_DIR-content",
+   "size": 321,
+   "occurrences": 2,
+   "first": {
+    "offset": 0,
+    "context": "/private/tmp/oxide-clone-probe.mbj4vjda/fx-nightly-newlayout/buildA/debug/build/probe-pm/ab72a110175a7d26/out/probe_pm-ab72a110175a"
+   }
+  }
+ ],
+ "wall_seconds": 0.026491333
+}

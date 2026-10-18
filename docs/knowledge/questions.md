@@ -133,7 +133,7 @@ consumer implementation or everyday benefit is established by this design.
 
 ## Q-013 — How can a healthy macOS workflow safely return its slot for reuse?
 
-Current answer for Oxide's own commands, 2026-10-18: a slot returns for reuse on normal release after Cargo's process group is empty, or by automatic recovery when the dead command's record lock is free and `killpg(pgid, 0)` reports `ESRCH` ([workflow crash recovery](contracts/workflow.md#crash-recovery)). A surviving or reused group keeps it held; a `setsid` escapee is the documented residual risk. Standalone and consumer leases keep explicit `recover`. Fixture-proven, and held once on Oxide's own repository in [foundation qualification](contracts/workflow.md#qualification-result) Q5.
+Current answer for Oxide's own commands, 2026-10-18: a slot returns for reuse on normal release after Cargo's process group is empty, or by automatic recovery when the dead command's record lock is free and `killpg(pgid, 0)` reports `ESRCH` ([workflow crash recovery](contracts/workflow.md#crash-recovery)). A surviving or reused group keeps it held; a `setsid` escapee is the documented residual risk. Standalone and consumer leases keep explicit `recover`. Fixture-proven, and held once on Oxide's own repository in the partial (not passed) [foundation qualification](contracts/workflow.md#qualification-result) record, Q5.
 
 Pointer, 2026-10-18: the native fixture runner was retired; its result is condensed in [qualification findings](qualification-readiness.md#process-containment). The text below is the original answer.
 

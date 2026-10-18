@@ -1,6 +1,7 @@
 //! Cargo as leader of its own process group, with Ctrl-C and termination
 //! forwarded to the whole group.
 
+use crate::watchdog::Watchdog;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -105,6 +106,52 @@ pub fn wait_leader(group: &mut Group) -> Result<ExitStatus, String> {
             .map_err(|error| format!("could not wait for Cargo: {error}"))?
         {
             return Ok(status);
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Wait for the leader while the watchdog samples. `None`: the watchdog
+/// sent KILL and the leader still had not exited within its bound.
+pub fn wait_leader_watched(
+    group: &mut Group,
+    watchdog: &mut Watchdog,
+) -> Result<Option<ExitStatus>, String> {
+    loop {
+        forward_pending(group.id);
+        if let Some(status) = group
+            .child
+            .try_wait()
+            .map_err(|error| format!("could not wait for Cargo: {error}"))?
+        {
+            return Ok(Some(status));
+        }
+        watchdog.poll(group.id);
+        if watchdog.gave_up() {
+            return Ok(None);
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Wait until the group is empty while the watchdog samples. Returns when
+/// it is observed empty, or `None` once a stopped group outlives the
+/// watchdog's bound after KILL.
+pub fn wait_group_empty_watched(group: i32, watchdog: &mut Watchdog) -> Option<Instant> {
+    let started = Instant::now();
+    let mut noticed = false;
+    loop {
+        if group_empty(group) {
+            return Some(Instant::now());
+        }
+        forward_pending(group);
+        watchdog.poll(group);
+        if watchdog.gave_up() {
+            return None;
+        }
+        if !noticed && !watchdog.stopped() && started.elapsed() >= LINGER_NOTICE {
+            eprintln!("oxide: waiting for processes left in Cargo's process group {group} to exit");
+            noticed = true;
         }
         std::thread::sleep(POLL);
     }

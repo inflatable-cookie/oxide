@@ -1,0 +1,7 @@
+rustc 1.99.0-nightly (1ed2df61a 2026-08-04)
+binary: rustc
+commit-hash: 1ed2df61a19042f231709eb05d032ae9e2cb2084
+commit-date: 2026-08-04
+host: aarch64-apple-darwin
+release: 1.99.0-nightly
+LLVM version: 22.1.8
