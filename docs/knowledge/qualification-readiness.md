@@ -127,6 +127,12 @@ Read-only readiness review, native arm64 macOS 26.6.2, 2026-10-09:
 - A dedicated process group (`POSIX_SPAWN_SETPGROUP` / `setpgid`, then
   `killpg`) is supported. `ESRCH` from `kill(-pgid, 0)` means no member is
   currently visible. A descendant can leave with `setsid` or a new spawn group.
+- Probe, 2026-10-18: `kill(-pgid, 0)` returns `EPERM` when every remaining
+  member is an unreaped zombie, and `ESRCH` once they are reaped. A group whose
+  leader exited while another member lives reports members visible. So `EPERM`
+  is not proof of a live writer, and not proof of absence either. A recovering
+  command treats it as held and retries later. A test harness must reap its own
+  children before probing.
 - A start-identity environment marker plus PID and start time detects PID
   reuse. A process can drop the marker; whole-second start times accept a
   same-second reuse.
