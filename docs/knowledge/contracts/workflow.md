@@ -84,7 +84,8 @@ comparison stands as a no-go.
 **Run strategies.** A quick run means "execute the current source as soon as
 possible". Candidates are a Cranelift ahead-of-time backend, Cranelift JIT and
 hot patching of a running process. Each is qualified per platform and project
-shape before Oxide may select it
+shape before Oxide may select it; current state is in the
+[landscape](../rust-dx-landscape.md#quick-run-strategies)
 ([Q-009](../questions.md#q-009--which-alternative-execution-modes-improve-the-daily-loop)).
 Rules:
 

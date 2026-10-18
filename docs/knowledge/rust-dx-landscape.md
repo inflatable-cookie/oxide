@@ -141,6 +141,27 @@ list includes nightly-2026-08-05, but its installed-component list contains no
 Cranelift backend; no component, compiler or global override was installed or
 changed during this check. Merely having nightly does not qualify the backend.
 
+## Quick-run strategies
+
+Read-only research, 2026-10-18, for the `quick` run strategies in the
+[workflow](contracts/workflow.md#profiles-and-strategies). None is ready to
+replace "quick build, then execute" as the default.
+
+| Strategy | State | Fit for `oxide run --profile quick` |
+| --- | --- | --- |
+| Quick build + execute (stable LLVM, opt-level 0, line tables, incremental) | Shipped. On Linux, [Rust 1.90 made LLD the default linker](https://blog.rust-lang.org/2025/09/18/Rust-1.90.0/) for `x86_64-unknown-linux-gnu`; the [preview post](https://blog.rust-lang.org/2025/09/01/rust-lld-on-1.90.0-stable) reports 7x faster linking and 40% less end-to-end time on a ripgrep incremental rebuild. | Default and fallback. |
+| [Cranelift AOT](https://github.com/rust-lang/rustc_codegen_cranelift) | Nightly-only preview component `rustc-codegen-cranelift-preview`; aarch64 macOS supported; unwinding unsupported on macOS (`panic=abort` by default), experimental on Linux. Cargo's [`codegen-backend`](https://doc.rust-lang.org/cargo/reference/unstable.html#codegen-backend) can be set per package, so dependencies can stay on LLVM. | Candidate for `run` only. One build cannot mix rustc versions, so a nightly strategy needs its own slot and a second dependency set, costing storage. It also needs a nightly toolchain plus component install, which is a host change. Not for `test` on macOS. |
+| [Cranelift JIT](https://github.com/rust-lang/rustc_codegen_cranelift/blob/main/docs/usage.md) | "Highly experimental"; every dependency must be a dynamic library; no incremental compilation, so it may be slower than AOT. | Not a near-term candidate. |
+| Hot patching ([Subsecond](https://docs.rs/subsecond/)) | Experimental. It patches only code wrapped in `subsecond::call` and only the tip crate, and needs the Dioxus CLI (`dx serve --hotpatch`) ([Dioxus 0.7](https://dioxuslabs.com/blog/release-070)). | Not a generic strategy: it requires source changes. Possible later opt-in for long-running apps. |
+
+Implications: the foundation ships quick build + execute. The only near
+candidate is Cranelift for workspace crates. It needs a bounded measurement on a
+real edit-to-run loop that counts the separate nightly dependency set and the
+abort-on-panic compromise. Until then, measure where quick-run time goes
+(frontend, codegen, link) before choosing a strategy. The installed
+nightly-2026-08-05 has no Cranelift component; installing one needs scoped
+approval.
+
 ## Product assessment
 
 Planner recommendation: a small coherent entry point over evidence-backed mechanisms, with three capabilities: see and explain costs, bound and reuse owned storage, and apply qualified improvements with clear trade-offs. The reusable storage core must work for ordinary developers as well as orchestrators. A daemon, editor surface or UI is still an open choice; Tom's [workflow direction](vision.md#product-workflow-direction) sets an `oxide build` / `oxide run` front door as the design target.
