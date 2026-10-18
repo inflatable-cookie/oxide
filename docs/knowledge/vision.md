@@ -128,6 +128,13 @@ their own original invocation, time and resource caps; the three-run fixture
 allowance does not apply to them. The earlier five-pool author overrun remains
 unauthorized historical use, not retroactively permitted by this correction.
 
+Tom's further approvals, 2026-10-18 ("Yes please", "Yes", "Yes"):
+- Add a nightly parallel-frontend (`-Zthreads`) arm to the Cranelift quick-run measurement, with its bounds scaled for the extra arm.
+- A separate bounded measurement of optimized dependencies in the `quick` recipe.
+- An implementation brief for the [platform backends](contracts/workflow.md#platform-backends-proposed) design, starting with the budget-only directory backend and host-reserve watchdog.
+
+None of these grants strategy or recipe adoption, consumer changes, default-pool changes outside tests, or the privileged Linux image backend.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
