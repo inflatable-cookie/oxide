@@ -221,6 +221,29 @@ A final independent exact-head native proof remains required. This allowance is
 for ordinary tiny correctness fixtures, not another real-project experiment,
 host change or a reset of the separate qualification/performance sessions.
 
+### Guarded-command metadata mode correction
+
+The product architect specified a follow-up on 2026-10-18, separately from the
+ongoing cross-checkout gate review: metadata must mirror the guarded command's
+lock and network mode, including `--locked`, `--frozen`, `--offline` and their
+effective Cargo config/environment equivalents. Otherwise it is plain
+`cargo metadata --format-version 1` in the same command context. Hard-coded
+`--offline --locked` is safe but conservatively loses reuse when a lockfile is
+missing or stale. The gate under review keeps that rule and may merge on its
+own evidence; do not change its scope or acceptance for this follow-up.
+
+Standing routine-correction authority covers this separate Oxide-only delivery
+through the checked Queue lead `4975da6e-e614-49ff-af9c-290e321fd4db`, after the
+cross-checkout task merges and closes. Metadata may make only the lock/network
+changes the guarded command itself permits; never relax caller restrictions.
+Path sensitivity, content-diff, fingerprints, source contents and recovery rules
+stay unchanged. Bounds are 30 minutes author and 20 minutes independent review,
+at most two sequential focused correctness proofs per side, each 300 seconds
+including setup, 512 MiB scratch and one fresh 128 MiB pool. No real-project run,
+consumer change, install or network-dependent fixture is authorized. This is an
+architect correction under existing authority, not a new operator quotation or
+reset of another task's time, proof or experimental allowance.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
