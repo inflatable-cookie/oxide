@@ -21,7 +21,7 @@
 //! and are never recovered here.
 
 use crate::cli::Profile;
-use crate::freshness::{Origin, Prior};
+use crate::freshness::{Built, Prior};
 use crate::identity::SlotKey;
 use crate::process;
 use oxide_storage::lease::{
@@ -104,15 +104,17 @@ struct Holder {
     lease_holder: String,
 }
 
-/// A slot's last compile origin. `mark` is the record's use counter when it
-/// was written; any later command advances the counter, so a mismatch means
-/// an unrecorded command ran. `origin: None` is an untrusted slot.
+/// A slot's last recorded build. `mark` is the record's use counter when it
+/// was written; leasing re-stamps it and Cargo's start advances the counter,
+/// so a mismatch means Cargo may have run unrecorded. `origin: None` is an
+/// untrusted slot. An untrusted slot is never reused: the next command evicts
+/// it and builds cold.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OriginFile {
     version: u32,
     mark: u64,
-    origin: Option<Origin>,
+    origin: Option<Built>,
 }
 
 /// One automatic recovery, kept for `oxide status`.
@@ -513,7 +515,7 @@ impl Store {
 
     /// Release after every writer in the group has exited, recording the
     /// slot's compile origin (`None`: untrusted from now on).
-    pub fn release(&self, held: Lease, origin: Option<Origin>) -> Result<(), String> {
+    pub fn release(&self, held: Lease, origin: Option<Built>) -> Result<(), String> {
         let _admission = self.admission()?;
         release(&self.pool, &held.lease_id)
             .map_err(|error| lease_error("could not release the slot", &error))?;
@@ -544,12 +546,23 @@ impl Store {
         {
             state.settle_idle(index);
             state.records[index].checkout = held.shared_from.clone();
-            let origin = match &held.prior {
-                Prior::Known(origin) => Some(origin.clone()),
-                Prior::Fresh | Prior::Unknown => None,
-            };
+            let origin = held.prior.unchanged();
             self.write_origin(held.record, state.records[index].last_used, origin)?;
         }
+        self.save(&state)
+    }
+
+    /// The gate cannot vouch for this checkout's own slot (no trusted record,
+    /// or its history cannot be read): release it before Cargo and evict it
+    /// whole, so the command builds cold instead of reusing it unchecked.
+    pub fn discard(&self, held: Lease) -> Result<(), String> {
+        let _admission = self.admission()?;
+        release(&self.pool, &held.lease_id)
+            .map_err(|error| lease_error("could not release the slot", &error))?;
+        evict_idle_slot(&self.pool, &held.slot_id)
+            .map_err(|error| lease_error("cannot evict an untrusted slot", &error))?;
+        let mut state = self.load()?;
+        self.forget_record(&mut state, held.record);
         self.save(&state)
     }
 
@@ -1018,7 +1031,7 @@ impl Store {
         state: &State,
         key: &SlotKey,
         status: &PoolStatus,
-    ) -> Result<Option<(u64, File, Origin)>, String> {
+    ) -> Result<Option<(u64, File, Built)>, String> {
         let mut candidates: Vec<&Record> = state
             .records
             .iter()
@@ -1041,7 +1054,7 @@ impl Store {
             .collect();
         candidates.sort_by_key(|record| std::cmp::Reverse(record.last_used));
         for record in candidates {
-            let Some(origin) = self.trusted_origin(record) else {
+            let Some(origin @ Built::Content(_)) = self.trusted_origin(record) else {
                 continue;
             };
             if let Probe::Free(file) = probe_lock(&self.lock_path(record.id), true)? {
@@ -1053,7 +1066,7 @@ impl Store {
 
     /// The record's origin if the last command on it recorded one and no
     /// command ran since.
-    fn trusted_origin(&self, record: &Record) -> Option<Origin> {
+    fn trusted_origin(&self, record: &Record) -> Option<Built> {
         let file = private_file(&self.origin_path(record.id), false).ok()??;
         let mut bytes = Vec::new();
         file.take(MAX_ORIGIN_BYTES + 1)
@@ -1068,7 +1081,7 @@ impl Store {
             .flatten()
     }
 
-    fn write_origin(&self, id: u64, mark: u64, origin: Option<Origin>) -> Result<(), String> {
+    fn write_origin(&self, id: u64, mark: u64, origin: Option<Built>) -> Result<(), String> {
         ensure_private_dir(&self.control.join("origins"))?;
         let bytes = serde_json::to_vec(&OriginFile {
             version: ORIGIN_VERSION,

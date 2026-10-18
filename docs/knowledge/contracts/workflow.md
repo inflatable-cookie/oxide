@@ -171,15 +171,18 @@ value stamped when it was written. Leasing re-stamps a trusted origin before
 the slot moves to the new checkout. Cargo's start advances the counter, so the
 origin stays trusted until Cargo starts. A command that dies before Cargo,
 even mid-gate after taking another checkout's slot, therefore leaves the
-retry to run the gate again. A command that dies after Cargo started, a failed
-snapshot, a legacy slot from an earlier Oxide build or an older Oxide build
-using the slot leaves it untrusted, and an untrusted slot is never shared
-again until it is evicted. Its own checkout keeps using it under Cargo's
-checks: the gate had already refreshed that checkout's differing files before
-Cargo started. A gate that fails or cannot read the history (for example a
-clone lacking the slot's tree object) hands a slot holding another checkout's
-content back to that checkout unchanged. The command then builds cold in its
-own slot, never with unchecked reuse.
+retry to run the gate again. The slot becomes untrusted if a command dies
+after Cargo started, a snapshot fails, a crash splits the re-stamp from the
+state change, it is a legacy slot from an earlier Oxide build, or an older
+Oxide build used it. Cargo never runs on an untrusted slot: the next command
+to lease it releases and evicts it whole, then builds cold. If the gate fails
+or cannot read the history, for example in a clone lacking the slot's tree
+object, Cargo does not run on that slot either. A slot holding another
+checkout's content goes back to that checkout unchanged; this checkout's own
+slot is evicted. The command then builds cold, never with unchecked reuse.
+A checkout without Git content (no repository or no commit) records an
+affine build instead: only that checkout reuses it, under Cargo's own
+checks, and it is never shared.
 
 This revives the qualification work's rejected "source touching" fix as a
 deliberate product mechanism. Real-project qualification (Q2–Q4 below) is
@@ -542,7 +545,10 @@ has run against no real project.
   the group is empty.
 - **Crash recovery.** Per [Crash recovery](#crash-recovery), for Oxide's own
   commands only. A follower in the same checkout waits while the crashed
-  command's group survives, then recovers and continues. The fixture proof
+  command's group survives, then recovers. If the crashed command's Cargo had
+  started, the recovered slot has no trusted build record, so the follower
+  evicts it and builds cold; if Cargo never started, the follower reuses it
+  through the freshness gate. The fixture proof
   covers: a killed holder whose group survives stays held; a killed holder
   whose whole group is gone is recovered by the next command without waiting
   and logged; clean exit and Ctrl-C release without recovery; a standalone

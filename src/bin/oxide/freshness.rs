@@ -61,25 +61,59 @@ pub struct Origin {
     pub uncertain: BTreeSet<String>,
 }
 
+/// What a slot's last command recorded.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum Built {
+    /// Git content the gate can reconcile with another checkout.
+    Content(Origin),
+    /// Every build since the slot was created came from this checkout, which
+    /// has no Git content to record. Only this checkout reuses it, under
+    /// Cargo's own checks; it is never shared.
+    Affine(PathBuf),
+}
+
 /// The slot's history as the leasing command found it.
 #[derive(Clone, Debug)]
 pub enum Prior {
     /// A new slot: nothing compiled yet.
     Fresh,
-    /// The last command recorded this origin and nothing ran since.
-    Known(Origin),
-    /// A command crashed, could not record its origin, or predates the gate.
-    /// The slot is never shared across checkouts again.
+    /// The last command recorded this and nothing ran since.
+    Known(Built),
+    /// A command died after Cargo started or could not record its build, or
+    /// the slot predates the gate. Nothing says what it holds, so it is never
+    /// reused: the command evicts it and builds cold.
     Unknown,
+}
+
+impl Prior {
+    /// The other checkout whose content this slot holds, if any.
+    pub fn foreign(&self, checkout: &Path) -> Option<PathBuf> {
+        match self {
+            Self::Known(Built::Content(origin)) if origin.checkout != checkout => {
+                Some(origin.checkout.clone())
+            }
+            Self::Known(Built::Affine(owner)) if owner != checkout => Some(owner.clone()),
+            _ => None,
+        }
+    }
+
+    /// What the slot keeps when Cargo never ran.
+    pub fn unchanged(&self) -> Option<Built> {
+        match self {
+            Self::Known(built) => Some(built.clone()),
+            Self::Fresh | Self::Unknown => None,
+        }
+    }
 }
 
 /// The gate's work before Cargo, kept to record the new origin afterwards.
 pub struct Gate {
+    /// `None`: a checkout without Git content; the slot stays affine.
     before: Option<(PathBuf, Content)>,
     /// Paths that differed from the prior origin.
     changed: BTreeSet<String>,
-    /// `None` when the new origin cannot be trusted.
-    carried: Option<BTreeSet<String>>,
+    carried: BTreeSet<String>,
     /// The slot was last compiled by another checkout.
     pub cross: bool,
     pub refreshed: usize,
@@ -87,13 +121,11 @@ pub struct Gate {
 }
 
 impl Gate {
-    /// No usable snapshot: the command builds as a checkout-affine slot would
-    /// and its slot is never shared afterwards.
-    pub fn untrusted() -> Self {
+    fn affine() -> Self {
         Self {
             before: None,
             changed: BTreeSet::new(),
-            carried: None,
+            carried: BTreeSet::new(),
             cross: false,
             refreshed: 0,
             packages: 0,
@@ -117,41 +149,48 @@ impl Gate {
         }
     }
 
-    /// The origin to record once Cargo's group is empty, or `None` when it
-    /// cannot be trusted (the slot then stays checkout-affine).
-    pub fn finish(self, checkout: &Path) -> Option<Origin> {
+    /// What to record once Cargo's group is empty, or `None` when nothing
+    /// can be trusted (the next command then evicts the slot).
+    pub fn finish(self, checkout: &Path) -> Option<Built> {
         let anchor_ns = now_ns();
-        let (top, before) = self.before?;
-        let mut uncertain = self.carried?;
+        let Some((top, before)) = self.before else {
+            return Some(Built::Affine(checkout.to_path_buf()));
+        };
         let (_, after) = snapshot(&top).ok()?;
+        let mut uncertain = self.carried;
         uncertain.extend(self.changed);
         uncertain.extend(differing(&top, &before, &after).ok()?);
         if uncertain.len() > MAX_PATHS {
             return None;
         }
-        Some(Origin {
+        Some(Built::Content(Origin {
             checkout: checkout.to_path_buf(),
             content: after,
             anchor_ns,
             uncertain,
-        })
+        }))
     }
 }
 
 /// Run the gate for `checkout` before Cargo. An error means the slot's
-/// history cannot be reconciled with this checkout.
+/// history cannot be reconciled with this checkout: the caller must not run
+/// Cargo on it.
 pub fn prepare(checkout: &Path, prior: &Prior) -> Result<Gate, String> {
     match prior {
-        Prior::Unknown => Ok(Gate::untrusted()),
+        Prior::Unknown => Err("the slot has no trusted build record".to_owned()),
+        Prior::Known(Built::Affine(owner)) if owner == checkout => Ok(Gate::affine()),
+        Prior::Known(Built::Affine(_)) => {
+            Err("the slot holds another checkout's build without Git content".to_owned())
+        }
+        // Nothing compiled yet: a checkout without Git content stays affine.
         Prior::Fresh => Ok(match snapshot(checkout) {
             Ok(before) => Gate {
                 before: Some(before),
-                carried: Some(BTreeSet::new()),
-                ..Gate::untrusted()
+                ..Gate::affine()
             },
-            Err(_) => Gate::untrusted(),
+            Err(_) => Gate::affine(),
         }),
-        Prior::Known(origin) => {
+        Prior::Known(Built::Content(origin)) => {
             let (top, content) = snapshot(checkout)?;
             let changed = differing(&top, &origin.content, &content)?;
             let cross = origin.checkout != checkout;
@@ -169,7 +208,7 @@ pub fn prepare(checkout: &Path, prior: &Prior) -> Result<Gate, String> {
             Ok(Gate {
                 before: Some((top, content)),
                 changed,
-                carried: Some(origin.uncertain.clone()),
+                carried: origin.uncertain.clone(),
                 cross,
                 refreshed,
                 packages,
@@ -609,6 +648,20 @@ mod tests {
         assert!(!declares_build(
             "[build-dependencies]\nbuild-helper = \"1\"\n"
         ));
+    }
+
+    #[test]
+    fn untrusted_or_foreign_affine_slots_refuse_the_gate() {
+        assert!(prepare(Path::new("/b"), &Prior::Unknown).is_err());
+        let affine = Prior::Known(Built::Affine(PathBuf::from("/a")));
+        assert!(prepare(Path::new("/b"), &affine).is_err());
+        assert_eq!(affine.foreign(Path::new("/b")), Some(PathBuf::from("/a")));
+        let own = prepare(Path::new("/a"), &affine).expect("own affine slot");
+        assert!(!own.cross && own.describe().is_none());
+        assert!(
+            matches!(own.finish(Path::new("/a")), Some(Built::Affine(path)) if path == Path::new("/a"))
+        );
+        assert!(Prior::Unknown.unchanged().is_none() && Prior::Fresh.unchanged().is_none());
     }
 
     #[test]

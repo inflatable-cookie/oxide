@@ -14,7 +14,7 @@ mod process;
 mod store;
 
 use cli::{Class, Invocation, PROFILE_ENVIRONMENT};
-use freshness::{Gate, Prior};
+use freshness::Gate;
 use identity::{RunPick, SlotKey};
 use oxide_storage::inventory::{inventory_directory, Category, InventoryLimits};
 use oxide_storage::lease::SlotOccupancy;
@@ -152,7 +152,7 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
         Err(signal) => return Ok(process::signal_exit_code(signal)),
     };
     if let Some(signal) = process::received_signal() {
-        let origin = unchanged_origin(&held.prior);
+        let origin = held.prior.unchanged();
         store.release(held, origin)?;
         return Ok(process::signal_exit_code(signal));
     }
@@ -169,7 +169,7 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     {
         Ok(group) => group,
         Err(error) => {
-            let origin = unchanged_origin(&held.prior);
+            let origin = held.prior.unchanged();
             store.release(held, origin)?;
             return Err(error);
         }
@@ -213,56 +213,49 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     }
 }
 
-/// Lease a slot and run the freshness gate. A slot taken from another
-/// checkout whose gate refuses is given back, and the command leases again
-/// without sharing, so it builds cold rather than unchecked. `Err` is a
-/// signal received while waiting.
+/// Lease a slot and run the freshness gate. Cargo never runs on a slot the
+/// gate cannot vouch for: a slot holding another checkout's content goes back
+/// to that checkout unchanged; this checkout's own untrusted or unreadable
+/// slot is evicted. Either way the command leases again without sharing and
+/// builds cold. `Err` is a signal received while waiting.
 fn lease_with_gate(
     store: &Store,
     key: &SlotKey,
     profile: cli::Profile,
 ) -> Result<Result<(store::Lease, Gate), i32>, String> {
     let mut share = true;
-    loop {
-        let held = match store.acquire(key, profile, share)? {
+    // A refusal leaves this checkout without a record, so the next lease is
+    // a new or evicted slot; the bound only guards against a defect.
+    for _ in 0..4 {
+        let mut held = match store.acquire(key, profile, share)? {
             Acquired::Lease(held) => held,
             Acquired::Interrupted(signal) => return Ok(Err(signal)),
         };
-        // The slot's content came from another checkout: taken just now, or
-        // left on this checkout's record by a command that died before Cargo.
-        let foreign = match &held.prior {
-            Prior::Known(origin) if origin.checkout != key.checkout => {
-                Some(origin.checkout.clone())
-            }
-            _ => None,
-        };
-        match freshness::prepare(&key.checkout, &held.prior) {
+        let reason = match freshness::prepare(&key.checkout, &held.prior) {
             Ok(gate) => return Ok(Ok((held, gate))),
-            Err(reason) if foreign.is_some() || held.shared_from.is_some() => {
-                eprintln!(
-                    "oxide: freshness gate refused another checkout's slot ({reason}); building cold"
-                );
-                let mut held = held;
-                // Hand the slot back to the checkout whose content it holds.
-                if held.shared_from.is_none() {
-                    held.shared_from = foreign;
-                }
-                store.unshare(held)?;
-                share = false;
+            Err(reason) => reason,
+        };
+        share = false;
+        // Taken just now, or left on this checkout's record by a command
+        // that died before Cargo.
+        let foreign = held.prior.foreign(&key.checkout);
+        if held.shared_from.is_some() || foreign.is_some() {
+            eprintln!(
+                "oxide: freshness gate refused another checkout's slot ({reason}); building cold"
+            );
+            if held.shared_from.is_none() {
+                held.shared_from = foreign;
             }
-            // This checkout's own build history: Cargo's own mtime checks hold
-            // as before, but the slot is not shared afterwards.
-            Err(_) => return Ok(Ok((held, Gate::untrusted()))),
+            store.unshare(held)?;
+        } else {
+            eprintln!(
+                "oxide: freshness gate cannot vouch for slot {} ({reason}); evicting it and building cold",
+                held.slot_id
+            );
+            store.discard(held)?;
         }
     }
-}
-
-/// Cargo never ran: the slot keeps the origin it had.
-fn unchanged_origin(prior: &Prior) -> Option<freshness::Origin> {
-    match prior {
-        Prior::Known(origin) => Some(origin.clone()),
-        Prior::Fresh | Prior::Unknown => None,
-    }
+    Err("the freshness gate kept refusing slots".to_owned())
 }
 
 type RunTarget = Result<(PathBuf, PathBuf), String>;
