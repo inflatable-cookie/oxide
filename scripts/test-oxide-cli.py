@@ -70,6 +70,8 @@ END = "<!-- oxide:end -->"
 # Set after the oxide binaries compile; ordinary compiler artifacts are
 # outside the proof-phase bound.
 STARTED = 0.0
+# Stop conditions found during the proof, failed at the end.
+NO_GO: list = []
 
 SKIP_FIXTURE = {
     "repo/Cargo.toml": """[package]
@@ -112,6 +114,41 @@ fn main() {
 """,
     "repo/tool/Cargo.toml": '[package]\nname = "tool"\nversion = "0.1.0"\nedition = "2021"\n',
     "repo/tool/src/main.rs": 'fn main() {\n    println!("tool {}", std::env::args().skip(1).collect::<Vec<_>>().join(" "));\n}\n',
+}
+
+# A path dependency inside the checkout whose manifest Git ignores.
+SKIP_IGNORED_FIXTURE = {
+    "Cargo.toml": """[package]
+name = "ignoredapp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+helper = { path = "helper" }
+
+[workspace]
+""",
+    "rust-toolchain.toml": '[toolchain]\nchannel = "1.97.1"\n',
+    ".gitignore": "/target\n/helper/Cargo.toml\n",
+    "src/main.rs": 'fn main() {\n    println!("ignored {}", helper::flavor());\n}\n',
+    "helper/Cargo.toml": """[package]
+name = "helper"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["old"]
+old = []
+new = []
+""",
+    "helper/src/lib.rs": """pub fn flavor() -> &'static str {
+    if cfg!(feature = "new") {
+        "new"
+    } else {
+        "old"
+    }
+}
+""",
 }
 
 # A counting `cargo` for the skip case: logs each call, then hands it to the
@@ -1599,34 +1636,39 @@ def prove_run_skip(runner: Runner) -> None:
     builds("skip first run", ["--", "a"], "skip v1 - a")
     if not os.path.isfile(record(repo, [])):
         fail("a successful run published no skip record")
-    skip_time = skips("skip repeat", ["--", "b"], "skip v1 - b")
+    skip_times = [skips(f"skip repeat {n}", ["--", "b"], "skip v1 - b") for n in range(3)]
     skips("skip program --rebuild", ["--", "--rebuild"], "skip v1 - --rebuild")
     no_op_time = builds("skip --rebuild", ["--rebuild", "--", "b"], "skip v1 - b")
-    plain = subprocess.run(
-        ["cargo", "build", "--offline", "-q"],
-        cwd=repo,
-        env={**runner.environment(base), "CARGO_TARGET_DIR": os.path.join(runner.parent, "skip-plain")},
-        capture_output=True,
-        timeout=min(120, remaining()),
-    )
-    started = time.monotonic()
-    subprocess.run(
-        ["cargo", "build", "--offline", "-q"],
-        cwd=repo,
-        env={**runner.environment(base), "CARGO_TARGET_DIR": os.path.join(runner.parent, "skip-plain")},
-        capture_output=True,
-        timeout=min(120, remaining()),
-    )
-    plain_time = time.monotonic() - started
+    # The brief's baseline: plain Cargo's own no-op build of the same fixture,
+    # with no shim and a private target directory warmed first.
+    plain_env = {**runner.environment(None), "CARGO_TARGET_DIR": os.path.join(runner.parent, "skip-plain")}
+    plain_times = []
+    for n in range(4):
+        started = time.monotonic()
+        plain = subprocess.run(
+            ["cargo", "build", "--offline", "-q"],
+            cwd=repo,
+            env=plain_env,
+            capture_output=True,
+            text=True,
+            timeout=min(120, remaining()),
+        )
+        expect(plain.returncode, 0, f"plain cargo build {n}", plain.stderr)
+        if n:
+            plain_times.append(time.monotonic() - started)
     shutil.rmtree(os.path.join(runner.parent, "skip-plain"))
-    if plain.returncode:
-        fail("plain cargo build of the skip fixture failed")
+    skip_time, plain_time = min(skip_times), min(plain_times)
     print(
-        f"oxide run skip timings: skip {skip_time * 1000:.0f} ms, oxide run --rebuild (Cargo no-op) "
-        f"{no_op_time * 1000:.0f} ms, plain cargo build no-op {plain_time * 1000:.0f} ms (fixture only)"
+        f"oxide run skip timings (best of 3, fixture only): skip {skip_time * 1000:.0f} ms "
+        f"(includes executing the program), plain cargo build no-op {plain_time * 1000:.0f} ms, "
+        f"oxide run --rebuild (leased, Cargo no-op) {no_op_time * 1000:.0f} ms"
     )
-    if skip_time >= no_op_time:
-        fail("the skip path did not beat the Cargo no-op path")
+    if skip_time >= plain_time:
+        # The brief's stop condition. Recorded here and failed after every
+        # other case has run, so the remaining evidence is kept.
+        NO_GO.append(
+            f"skip {skip_time * 1000:.0f} ms did not beat plain cargo build no-op {plain_time * 1000:.0f} ms"
+        )
     skips("skip after --rebuild re-recorded", [], "skip v1 -")
     builds("skip OXIDE_NO_SKIP", [], "skip v1 -", extra={"OXIDE_NO_SKIP": "1"})
 
@@ -1684,6 +1726,23 @@ def prove_run_skip(runner: Runner) -> None:
     skips("skip final repeat", [], "skip v3 cfg")
     if any(slot["state"] != "idle" for slot in runner.lease_status()["slots"]):
         fail("the skip case left a slot held")
+
+    # An in-checkout dependency whose manifest Git ignores publishes no
+    # record: its default features could change with the key unchanged.
+    ignored = os.path.join(runner.parent, "checkouts", "skipignored")
+    write_fixture(ignored, SKIP_IGNORED_FIXTURE)
+    commit_lock(runner, ignored)
+    git(ignored, "init", "--quiet")
+    git(ignored, "add", "-A")
+    git(ignored, "commit", "--quiet", "-m", "ignored manifest fixture")
+    builds("skip ignored manifest", [], "ignored old", cwd=ignored)
+    if os.path.isdir(os.path.join(ignored, "target", "oxide-run-skip")) and os.listdir(
+        os.path.join(ignored, "target", "oxide-run-skip")
+    ):
+        fail("a build with an ignored dependency manifest published a skip record")
+    with open(os.path.join(ignored, "helper", "Cargo.toml"), "w", encoding="utf-8") as handle:
+        handle.write(SKIP_IGNORED_FIXTURE["helper/Cargo.toml"].replace('default = ["old"]', 'default = ["new"]'))
+    builds("skip ignored manifest edit", [], "ignored new", cwd=ignored)
 
 
 def prove_waiting(runner: Runner, app: str, app2: str) -> None:
@@ -2181,6 +2240,8 @@ def main() -> int:
     if owned > SCRATCH_LIMIT_BYTES:
         fail(f"owned fixture scratch {owned} exceeds 512 MiB")
     elapsed = time.monotonic() - STARTED
+    if NO_GO:
+        fail(f"no-go: {'; '.join(NO_GO)}; scratch retained at {parent}")
     shutil.rmtree(parent)
     print(
         f"oxide CLI proof held: {elapsed:.0f} s, owned scratch {owned // (1024 * 1024)} MiB "

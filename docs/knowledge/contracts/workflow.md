@@ -317,9 +317,11 @@ records again on success.
   content unchanged afterwards, and the build not on a slot reconciled from
   another checkout. The binary's documented Cargo dep-info (`<binary>.d`)
   must list only regular files inside the Git checkout that Git does not
-  ignore. A path dependency outside the checkout, a generated source in the
-  build directory, an ignored file or a declared `rerun-if-changed` input
-  elsewhere publishes nothing. A missing, older-version, partial or corrupt
+  ignore. So must every `Cargo.toml` between each listed source and the
+  repository top (each local package's manifest) and the workspace root's.
+  A path dependency outside the checkout, a generated source in the build
+  directory, an ignored source or manifest or a declared `rerun-if-changed`
+  input elsewhere publishes nothing. A missing, older-version, partial or corrupt
   record never skips.
 - **Ineligible.** Any other argument before `--` (including `-v`,
   `--manifest-path`, `--message-format`, `--config`, `--locked`); a working
@@ -330,7 +332,7 @@ records again on success.
 - **Skip.** Only on an exact match, with the binary present as a regular
   file of the recorded identity. The check reads files and runs Git only:
   no Cargo, rustc, metadata or `locate-project` call and no pool, lease or
-  slot read. It prints `oxide: <profile> profile, build+execute strategy,
+  slot read; the Git tree and status reads run concurrently. It prints `oxide: <profile> profile, build+execute strategy,
   unchanged — skipped Cargo, …`, then replaces Oxide with the program, as
   the normal path does. A program failure is the program's exit code, never
   a rebuild.
@@ -345,7 +347,9 @@ linker or system library changing in place. The binary is checked by cheap
 attributes only: cooperative same-user scope, not content attestation. The
 skip never needs intermediates in a slot, so it holds after release and
 eviction; [debug path limits](#cross-checkout-freshness) are unchanged.
-Fixture timings in the proof are not a real-world speed claim.
+The proof fails as a no-go unless the skip (best of three, including the
+program's own run) beats plain `cargo build`'s no-op on the fixture. Fixture
+timings are not a real-world speed claim.
 
 ## Crash recovery
 

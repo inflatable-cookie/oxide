@@ -13,6 +13,7 @@ use crate::cli::{Profile, PROFILE_ENVIRONMENT};
 use crate::freshness::{self, Content};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
@@ -322,7 +323,7 @@ impl Pending {
         if !metadata.is_file() {
             return Err("the binary is not a regular file".to_owned());
         }
-        covered_dependencies(&binary, &self.top)?;
+        covered_dependencies(&binary, &self.top, &self.checkout)?;
         let record = Record {
             version: RECORD_VERSION,
             cwd: self.cwd,
@@ -483,10 +484,12 @@ fn digest_file(hasher: &mut Sha256, path: &Path, config: bool) -> Result<(), Str
 
 /// Every file in the binary's Cargo dep-info (`<binary>.d`, documented next
 /// to each artifact) must be a file the checkout's Git content covers: under
-/// the repository and not ignored. A path dependency outside the checkout,
-/// a generated source in the build directory, an ignored file or a declared
-/// build-script input elsewhere refuses the record.
-fn covered_dependencies(binary: &Path, top: &Path) -> Result<(), String> {
+/// the repository and not ignored. So must every `Cargo.toml` between each
+/// listed source and the repository top (each local package's manifest) and
+/// the workspace root's. A path dependency outside the checkout, a generated
+/// source in the build directory, an ignored source or manifest, or a
+/// declared build-script input elsewhere refuses the record.
+fn covered_dependencies(binary: &Path, top: &Path, checkout: &Path) -> Result<(), String> {
     let mut dep_info = binary.as_os_str().to_owned();
     dep_info.push(".d");
     let file = fs::File::open(&dep_info).map_err(|error| format!("no dep-info: {error}"))?;
@@ -497,27 +500,51 @@ fn covered_dependencies(binary: &Path, top: &Path) -> Result<(), String> {
     if text.len() as u64 > MAX_DEP_INFO_BYTES {
         return Err("dep-info exceeds its size bound".to_owned());
     }
-    let mut relative = Vec::new();
+    let mut sources = BTreeSet::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         let (_, dependencies) = split_rule(line).ok_or("unexpected dep-info line")?;
         for dependency in dependencies {
             let path = fs::canonicalize(&dependency)
                 .map_err(|error| format!("dep-info names {dependency}: {error}"))?;
-            if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
-                return Err(format!("{} is not a regular file", path.display()));
+            if !path.starts_with(top) {
+                return Err(format!("{} is outside the checkout", path.display()));
             }
-            let inside = path
-                .strip_prefix(top)
-                .map_err(|_| format!("{} is outside the checkout", path.display()))?;
-            let inside = inside.to_str().ok_or("a dependency path is not UTF-8")?;
-            if inside.contains('\0') {
-                return Err("a dependency path contains NUL".to_owned());
-            }
-            relative.push(inside.to_owned());
-            if relative.len() > MAX_DEPENDENCIES {
+            sources.insert(path);
+            if sources.len() > MAX_DEPENDENCIES {
                 return Err("dep-info lists too many files".to_owned());
             }
         }
+    }
+    if sources.is_empty() {
+        return Err("dep-info lists no files".to_owned());
+    }
+    let mut covered = sources.clone();
+    covered.insert(checkout.join("Cargo.toml"));
+    for source in &sources {
+        for dir in source
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| dir.starts_with(top))
+        {
+            let manifest = dir.join("Cargo.toml");
+            if fs::symlink_metadata(&manifest).is_ok() {
+                covered.insert(manifest);
+            }
+        }
+    }
+    let mut relative = Vec::with_capacity(covered.len());
+    for path in &covered {
+        if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+            return Err(format!("{} is not a regular file", path.display()));
+        }
+        let inside = path
+            .strip_prefix(top)
+            .map_err(|_| format!("{} is outside the checkout", path.display()))?;
+        let inside = inside.to_str().ok_or("a dependency path is not UTF-8")?;
+        if inside.contains('\0') {
+            return Err("a dependency path contains NUL".to_owned());
+        }
+        relative.push(inside.to_owned());
     }
     if relative.is_empty() {
         return Err("dep-info lists no files".to_owned());

@@ -280,6 +280,33 @@ fn git(top: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     }
 }
 
+fn spawn_git(cwd: &Path, args: &[&str]) -> Result<std::process::Child, String> {
+    Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        // Status must not rewrite the index while reading it.
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not start git: {error}"))
+}
+
+fn finish_git(child: std::process::Child, name: &str) -> Result<Vec<u8>, String> {
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("could not wait for git: {error}"))?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(format!(
+            "git {name} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
 fn utf8(bytes: Vec<u8>) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "git printed a non-UTF-8 path".to_owned())
 }
@@ -295,14 +322,11 @@ fn nul_separated(bytes: Vec<u8>) -> Result<Vec<String>, String> {
 
 /// Repository top level and content for the checkout containing `path`.
 pub fn snapshot(path: &Path) -> Result<(PathBuf, Content), String> {
-    let top = utf8(git(path, &["rev-parse", "--show-toplevel"])?)?;
-    let top = fs::canonicalize(top.trim())
-        .map_err(|error| format!("cannot resolve the repository: {error}"))?;
-    let tree = utf8(git(&top, &["rev-parse", "--verify", "HEAD^{tree}"])?)?
-        .trim()
-        .to_owned();
-    let status = git(
-        &top,
+    // Both reads start together; porcelain status paths are relative to the
+    // top level wherever it runs.
+    let head = spawn_git(path, &["rev-parse", "--show-toplevel", "HEAD^{tree}"])?;
+    let status = spawn_git(
+        path,
         &[
             "status",
             "--porcelain=v1",
@@ -312,6 +336,16 @@ pub fn snapshot(path: &Path) -> Result<(PathBuf, Content), String> {
             "--ignore-submodules=none",
         ],
     )?;
+    let head = utf8(finish_git(head, "rev-parse")?)?;
+    let status = finish_git(status, "status")?;
+    let (top, tree) = match head.lines().collect::<Vec<_>>()[..] {
+        [top, tree] if !tree.is_empty() && tree.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
+            (top, tree.to_owned())
+        }
+        _ => return Err("git rev-parse printed an unexpected top level or tree".to_owned()),
+    };
+    let top =
+        fs::canonicalize(top).map_err(|error| format!("cannot resolve the repository: {error}"))?;
     let paths = status_paths(&nul_separated(status)?)?;
     let mut dirty = BTreeMap::new();
     let mut present = Vec::new();
