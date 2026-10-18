@@ -477,14 +477,19 @@ def debuginfo(stderr: str) -> dict:
     return units
 
 
-# Every wait line Oxide emits: `acquire` and `clean` in store.rs, the group
-# wait in process.rs. Cargo's "Blocking waiting for file lock on package
+# Every wait line Oxide emits: each `Wait::describe` form printed by
+# `acquire` and the `clean` wait in store.rs, and the group wait in
+# process.rs. Cargo's "Blocking waiting for file lock on package
 # cache" and other tools' lines never match.
 OXIDE_WAIT = re.compile(
     r"oxide: waiting for (?:"
     r"earlier oxide commands \(position \d+\)"
     r"|a build slot \(\d+ of \d+ host-wide in use\)"
     r"|another oxide command in this checkout"
+    r"|oxide clean in this checkout"
+    r"|an idle slot of this project \(cap \d+ slots\)"
+    r"|a slot held by an interrupted command whose Cargo may still run"
+    r"|pool capacity held by running builds"
     r"|active oxide commands in this checkout"
     r"); Ctrl-C cancels"
     r"|oxide: waiting for processes left in Cargo's process group \d+ to exit"
@@ -515,12 +520,20 @@ def prove_wait_lines() -> None:
         "oxide: waiting for earlier oxide commands (position 2); Ctrl-C cancels",
         "oxide: waiting for a build slot (1 of 1 host-wide in use); Ctrl-C cancels",
         "oxide: waiting for another oxide command in this checkout; Ctrl-C cancels",
+        "oxide: waiting for oxide clean in this checkout; Ctrl-C cancels",
+        "oxide: waiting for an idle slot of this project (cap 2 slots); Ctrl-C cancels",
+        "oxide: waiting for a slot held by an interrupted command whose Cargo may still run; Ctrl-C cancels",
+        "oxide: waiting for pool capacity held by running builds; Ctrl-C cancels",
         "oxide: waiting for active oxide commands in this checkout; Ctrl-C cancels",
         "oxide: waiting for processes left in Cargo's process group 4242 to exit",
     )
     mixed = "\n".join(others + own)
     if oxide_waits(mixed) != list(own):
         fail(f"wait predicate missed Oxide lines: {oxide_waits(mixed)}")
+    # A real Oxide wait in otherwise ordinary stderr still fails a no-wait check.
+    for line in own:
+        if not oxide_waits(f"   Compiling app v0.1.0\n{line}\n    Finished `dev`"):
+            fail(f"no-wait check would accept an Oxide wait: {line!r}")
 
 
 def wait_for(predicate, label: str, seconds: float = 60) -> None:
