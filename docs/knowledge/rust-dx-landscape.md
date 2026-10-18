@@ -333,7 +333,7 @@ Limits:
 - `debug = false` left none;
 - `split-debuginfo = "packed"` left none and produced one `.dSYM`.
 
-Implication: the `quick` recipe accumulates stale objects in long-lived shared slots, in proportion to workspace rebuilds. That costs disk and possibly build speed. The choice between packed debug info (extra `dsymutil` link time), debug off for rebuilt units, and slot recycling needs a measurement. Do not delete files inside a slot; the build-dir layout is Cargo-internal.
+Implication: the `quick` recipe accumulates stale objects in long-lived shared slots, in proportion to workspace rebuilds. The [2026-10-18 measurement](#stale-debug-object-measurement-2026-10-18) found the growth is mostly hardlinked names, not bytes, and recommends packed debug info if a fix is adopted. Do not delete files inside a slot; the build-dir layout is Cargo-internal.
 
 | Development | State | Relevance |
 | --- | --- | --- |
@@ -343,6 +343,117 @@ Implication: the `quick` recipe accumulates stale objects in long-lived shared s
 | [`hint-mostly-unused`](https://blog.rust-lang.org/inside-rust/2025/07/15/call-for-testing-hint-mostly-unused/) | Nightly; per-dependency hint that defers code generation for unused items; regresses if applied globally. | Narrow, profile-guided; only helps when the dependency is built. |
 | Cargo home GC ([1.88](https://blog.rust-lang.org/2025/06/26/Rust-1.88.0/)) | Stable automatic cleanup of downloaded/cached files (3 months / 1 month unused). Never runs with `--offline` or `--frozen`. The target dir is not covered. | Agent and Oxide proofs often run `--offline`, so their Cargo home may never be cleaned. Trigger rules and an `oxide` recommendation: [Cargo home cleanup triggers](#cargo-home-cleanup-triggers-2026-10-18-probe). |
 | [Cargo script](https://rust-lang.github.io/goals/2026/cargo-script.html) | Frontmatter stabilization in progress; not stable on 1.97.1. | Single-file scripts; each script otherwise gets its own target dir. |
+
+## Stale debug-object measurement (2026-10-18)
+
+One bounded session (oxide#080) on Oxide's repository at `669fd1e`, stable
+1.97.1, macOS aarch64, under Effigy heavy admission. Raw evidence:
+[`evidence/stale-debug-objects-quick-080/`](evidence/stale-debug-objects-quick-080/summary.json).
+Tom approved the session ([vision](vision.md#product-workflow-direction)).
+
+Arms, each in its own target directory, all on the `quick` recipe
+(`oxide-quick` inherits `dev`, `debug = "line-tables-only"`):
+- U: as-is, with the default unpacked split debug info.
+- P: plus `CARGO_PROFILE_OXIDE_QUICK_SPLIT_DEBUGINFO=packed`.
+- N: plus `--config 'profile.oxide-quick.package.oxide-storage.debug=false'`;
+  `oxide-storage` is the only workspace package.
+
+Loop per arm: a cold `cargo build --workspace --timings`, then ten edits to
+`MAX_REFERENCES` in `src/dep_info.rs`, each followed by the same build. Every
+call used `--locked --offline -v` and an explicit environment. The target was
+observed read-only after every build. Then a scratch-only integration test,
+one uncaught panic through two `#[inline(never)]` helpers, was built with
+`cargo test --no-run` and run directly with `RUST_BACKTRACE=1`.
+
+| Arm | `*.rcgu.o` in `deps/`, cold → 10 edits | `deps/` entries after 10 | Target unique allocated, cold / 10 edits | Cold build | Warm build median (range) | `oxide` bin unit, warm median | Probe frames with file:line |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| U | 430 → 4,540 (+411 per edit) | 4,611 | 133.1 / 171.2 MiB | 4.27 s | 0.59 s (0.58–0.77) | 0.34 s | 3 of 3 |
+| P | 0 → 0 | 74, plus 3 `.dSYM` | 147.6 / 186.7 MiB | 5.33 s | 0.75 s (0.70–0.81) | 0.49 s | 3 of 3 |
+| N | 19 → 19 (dependencies only) | 90 | 119.4 / 156.3 MiB | 4.79 s | 0.62 s (0.58–1.31) | 0.35 s | 0 of 3 |
+
+Unit times are Cargo's own `--timings` durations. Unique allocated counts
+`st_blocks` once per inode. Every arm's `incremental/` roughly doubled on the
+first edit and then held steady.
+
+Receipts:
+- Arm control: each cold build had the same 33 units, and no rustc setting
+  other than the debug flags differed; the recipe would have stopped
+  otherwise.
+  - U: the 4 workspace units and 15 dependency libraries had
+    `-C debuginfo=line-tables-only -C split-debuginfo=unpacked`. Build scripts
+    and the 6 build-time units had no debug flags.
+  - P: the same, with `packed`.
+  - N: the 4 workspace units (library, 3 bins) had no debug flags. Every
+    dependency unit kept U's flags. Cargo added no `-C strip`.
+- Every edit rebuilt the same 4 workspace units and left 29 fresh.
+- Panic: every arm exited 101 and printed the correct location,
+  `tests/oxide_080_panic_probe.rs:5:5`.
+  - U and P resolved all 8 short-backtrace frames to file:line, including the
+    3 probe frames at their exact lines. P read the `.dSYM` beside the test
+    binary.
+  - N named all 8 frames but resolved only 3 standard-library frames; the 3
+    probe frames had no file:line.
+
+Findings:
+- **U accumulates names, not bytes, on this edit.** Each rebuild added 411
+  `*.rcgu.o` names, one per codegen unit of the rebuilt incremental workspace
+  units.
+  - After ten edits and the panic build, 4,561 names pointed at 461 inodes
+    (14.1 MiB allocated). Summed per name they claim 121 MiB apparent.
+  - 433 of those inodes are also named in `incremental/`: rustc hardlinks
+    reused work products into `deps/` under per-invocation names.
+  - Only 28 inodes (2.5 MiB) were held by `deps/` names alone, and 19 of them
+    are dependency objects that every arm keeps.
+  - Unique target allocation grew about 0.1 MiB per edit after the first.
+  - The current binaries' debug maps referenced 260 `deps/` objects in every
+    cycle. The rest were not referenced by those binaries; that does not make
+    them unreferenced elsewhere or safe to delete.
+- **Accumulation did not slow builds within ten cycles.** U's warm builds
+  stayed at 0.58–0.77 s up to 4,611 `deps/` entries.
+- **P stops accumulation for about 0.16 s per rebuild.** The median warm build
+  rose 0.16 s (+26%) and the cold build 1.07 s.
+  - The three bin units each took 0.09–0.15 s longer; the library did not.
+    Those durations cover codegen, link and, in P, `dsymutil`. The tool output
+    does not separate them, so no link-only figure is claimed.
+  - P's target was the largest, 15.5 MiB above U after ten edits: 18 MiB of
+    `.dSYM`, more `incremental/`, fewer `deps/` bytes.
+- **N loses the backtrace lines `quick` exists to keep.** It stops
+  accumulation at no measurable time cost: median within 0.03 s of U. Edits
+  8–10 took 0.91–1.31 s while the one-minute load rose to 7.6. But workspace
+  frames lose file:line. The panic location survives because it is compiled
+  into the panic, not read from debug info.
+
+Recommendation: keep `quick`'s line tables.
+- If a fix is adopted, use `split-debuginfo = "packed"` (P). It leaves no
+  stale objects and keeps backtrace quality, for about 0.16 s per rebuild and
+  15 MiB per slot here.
+- Reject N for `quick`: it removes required debugging behaviour.
+- U remains acceptable on this evidence. Its growth is mostly hardlinked
+  names, which Oxide's inventory, deduplicating by `(dev, ino)`, counts once.
+- Whole-slot recycling stays with the existing ownership policy; this
+  session did not test it.
+
+Adoption needs a separate decision; no recipe changed.
+
+Limits:
+- One small subject (33 units), one edit shape (a constant in one file,
+  touching few codegen units), ten cycles per arm, macOS aarch64, shared host
+  (one-minute load 4.3–7.6).
+- A larger edit changes more codegen units, and each changed unit's old object
+  can then be held by a stale name alone. U's byte growth here is a lower
+  bound. The [cargo#16665](https://github.com/rust-lang/cargo/issues/16665)
+  reports come from large long-lived projects; this session neither confirms
+  nor refutes them.
+- Arms ran in order U, P, N; U ran first, with cold caches.
+- `st_blocks` cannot see APFS clone sharing. No write-volume, SSD or debugger
+  claim.
+- Session: 36 measured plus 2 version Cargo calls, 162 s of the 40 minutes,
+  549 MiB peak owned scratch, 3.3 MiB raw logs.
+- The recipe continued once after a harness defect: its debug-map observer
+  read `.pid` from a finished `CompletedProcess`. Attempt 1 had run both
+  version calls and U's cold build. The continuation reused the same root,
+  packet, clock and counters. It re-verified U's source and re-observed U's
+  target (identical) before going on.
 
 ## Cargo home cleanup triggers (2026-10-18 probe)
 

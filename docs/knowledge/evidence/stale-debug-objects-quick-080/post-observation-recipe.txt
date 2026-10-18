@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Disposable oxide#080 post-run read-only inode observation of the final arm targets.
+
+No Cargo call, no write inside any target. Classifies deps/*.rcgu.o inodes:
+shared with a file elsewhere in the same target (for example incremental/),
+or held only by deps/ names. st_blocks cannot see APFS clone sharing.
+"""
+import ctypes, json, os, pathlib, sys, time
+root = pathlib.Path(sys.argv[1])
+packet = json.loads((root / 'packet.json').read_text())
+lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib'); lib.mach_continuous_time.restype = ctypes.c_uint64
+class Scale(ctypes.Structure):
+    _fields_ = [('numer', ctypes.c_uint32), ('denom', ctypes.c_uint32)]
+scale = Scale(); assert lib.mach_timebase_info(ctypes.byref(scale)) == 0
+def offset(): return round((lib.mach_continuous_time() * scale.numer // scale.denom - packet['start_ns']) / 1e9, 3)
+out = {'start_offset_s': offset(), 'utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+       'loadavg': os.getloadavg(), 'arms': {}}
+for arm in packet['arm_order']:
+    target = root / ('target-' + arm); deps = target / 'oxide-quick' / 'deps'
+    where = {}  # inode -> set of areas holding a name in this target
+    for base, dirs, names in os.walk(target):
+        dirs.sort()
+        for n in names:
+            p = os.path.join(base, n); st = os.lstat(p)
+            rel = os.path.relpath(p, target)
+            area = 'deps-rcgu' if os.path.dirname(rel) == 'oxide-quick/deps' and n.endswith('.rcgu.o') else \
+                ('incremental' if rel.startswith('oxide-quick/incremental/') else 'other')
+            w = where.setdefault((st.st_dev, st.st_ino), {'areas': set(), 'names': 0, 'nlink': st.st_nlink,
+                                                          'alloc': st.st_blocks * 512, 'size': st.st_size})
+            w['areas'].add(area); w['names'] += 1
+    rc = {k: v for k, v in where.items() if 'deps-rcgu' in v['areas']}
+    only = {k: v for k, v in rc.items() if v['areas'] == {'deps-rcgu'}}
+    with_inc = {k: v for k, v in rc.items() if 'incremental' in v['areas']}
+    out['arms'][arm] = {
+        'deps_rcgu_names': sum(1 for n in os.listdir(deps) if n.endswith('.rcgu.o')),
+        'deps_rcgu_unique_inodes': len(rc),
+        'deps_rcgu_unique_allocated': sum(v['alloc'] for v in rc.values()),
+        'deps_rcgu_apparent_sum_over_names': sum(os.lstat(deps / n).st_size for n in os.listdir(deps)
+                                                 if n.endswith('.rcgu.o')),
+        'inodes_also_named_in_incremental': len(with_inc),
+        'allocated_of_inodes_also_named_in_incremental': sum(v['alloc'] for v in with_inc.values()),
+        'inodes_named_only_by_deps_rcgu': len(only),
+        'allocated_of_inodes_named_only_by_deps_rcgu': sum(v['alloc'] for v in only.values()),
+        'max_names_per_rcgu_inode_in_deps': max([v['names'] for v in rc.values()] or [0]),
+        'inodes_with_nlink_above_in_tree_names': sum(1 for v in where.values() if v['nlink'] > v['names']),
+        'target_unique_allocated': sum(v['alloc'] for v in where.values()),
+    }
+out['end_offset_s'] = offset()
+(root / 'post-run-observation.json').write_text(json.dumps(out, indent=2) + '\n')
+print(json.dumps(out, indent=1))

@@ -77,6 +77,11 @@ project's own `[profile.dev]` settings:
   recipe keeps dependency line tables, unlike the `oxide-light` recipe in
   [stable Cargo profiles](stable-cargo-profiles.md). Whether dependency debug-off
   is worth a config file is part of [W-3](#open-decisions).
+  On macOS its default unpacked split debug info leaves per-rebuild
+  `*.rcgu.o` names in `deps/`. A 2026-10-18 measurement recommends
+  `split-debuginfo = "packed"` if a fix is adopted and rejects workspace
+  debug-off for `quick` ([landscape](../rust-dx-landscape.md#stale-debug-object-measurement-2026-10-18)).
+  The recipe is unchanged pending that decision.
 - `oxide-debug`: inherits `dev`, full debug for every unit, including build-time
   units through `CARGO_PROFILE_OXIDE_DEBUG_BUILD_OVERRIDE_DEBUG`.
 - `release`: untouched.

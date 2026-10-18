@@ -181,6 +181,9 @@ this sequence, not unbounded growth or proof that any object is stale.
 Hardlinks matter: a post-run scan found 968 shared inodes between the on
 mode's `deps` and `incremental`, representing 368,418,816 allocated bytes.
 The union row counts those once. Separate directory totals must not be added.
+oxide#080 later measured ten edits per arm on Oxide's workspace: unpacked
+added 411 names per rebuild, almost all hardlinks to live incremental work
+products; packed and workspace debug-off added none ([landscape](rust-dx-landscape.md#stale-debug-object-measurement-2026-10-18)).
 Allocated observations can also differ between reads: the off-mode `deps`
 scan after settlement reported 1,345,179,648 allocated bytes, versus
 1,376,321,536 at the unchanged-step sample, with no further build. The cause

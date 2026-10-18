@@ -1,0 +1,2305 @@
+{
+  "packet": {
+    "root": "/private/tmp/oxide-080-debugobj.jkog1ebm",
+    "request_id": "c0758b2a-decd-4f01-9d5b-d3f86de92363",
+    "caller": "oxide:worker:080-stale-debug-objects",
+    "pin": "669fd1e8ef4a6860de280ed0c0044d3415f30e02",
+    "source_repository": "/Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-778f3b5f-1906-4125-9dfc-99413f97737c",
+    "start_ns": 310548195305208,
+    "deadline_ns": 312948195305208,
+    "clock": "raw mach_continuous_time via mach_timebase_info, started in submit.py before pin check, root creation, admission wait and setup",
+    "utc_start": "2026-10-18T21:36:06Z",
+    "start_loadavg": [
+      6.1796875,
+      5.80517578125,
+      6.068359375
+    ],
+    "measured_cargo_cap": 36,
+    "setup_cargo_cap": 2,
+    "session_seconds_cap": 2400,
+    "owned_scratch_cap_bytes": 6442450944,
+    "host_reserve_bytes": 21474836480,
+    "raw_log_cap_bytes": 33554432,
+    "host_cargo_home": "/Users/tom/.cargo",
+    "host_shell_note": "every Cargo call and executable uses an explicit environment allowlist; the submitting shell environment (including any CARGO_INCREMENTAL) is not inherited",
+    "toolchain": {
+      "name": "1.97.1-aarch64-apple-darwin",
+      "bin": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin"
+    },
+    "arm_order": [
+      "U",
+      "P",
+      "N"
+    ],
+    "arms": {
+      "U": {
+        "what": "quick recipe as-is: oxide-quick inherits dev, debug = \"line-tables-only\", default (unpacked) split debug info"
+      },
+      "P": {
+        "what": "U plus split-debuginfo = \"packed\" for the oxide-quick profile",
+        "env": {
+          "CARGO_PROFILE_OXIDE_QUICK_SPLIT_DEBUGINFO": "packed"
+        }
+      },
+      "N": {
+        "what": "U plus debug = false for the single workspace package oxide-storage only, through a --config package override; dependency units unchanged",
+        "global_args": [
+          "--config",
+          "profile.oxide-quick.package.oxide-storage.debug=false"
+        ]
+      }
+    },
+    "workload": "per arm: cargo build --workspace --timings (cold) then ten edit -> cargo build --workspace --timings cycles, all --locked --offline --profile oxide-quick -v; then cargo test --no-run --test oxide_080_panic_probe and that executable run directly with RUST_BACKTRACE=1",
+    "recipe_sha256": "9a4688afb5cac7118b2f678f7fc5ec1e43b9ea7d7cd668e01071d34a498ab93f",
+    "submit_sha256": "9529acf78d76e39dc240b3db3f1f7ec46397bf0b66f25758531c12813c78509d"
+  },
+  "calls": [
+    {
+      "name": "cargo-version",
+      "kind": "setup",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo",
+        "-vV"
+      ],
+      "cwd": "/private/tmp/oxide-080-debugobj.jkog1ebm",
+      "env": {
+        "PATH": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:/usr/bin:/bin",
+        "HOME": "/Users/tom",
+        "CARGO_HOME": "/Users/tom/.cargo"
+      },
+      "start_offset_s": 0.492,
+      "loadavg_before": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "free_before": 775411892224,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 1
+      },
+      "pgid": 29445,
+      "wall_s": 0.009,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 0.501,
+      "loadavg_after": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "free_after": 775411879936,
+      "stdout": "raw/cargo-version.stdout",
+      "stderr": "raw/cargo-version.stderr"
+    },
+    {
+      "name": "rustc-version",
+      "kind": "setup",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc",
+        "-vV"
+      ],
+      "cwd": "/private/tmp/oxide-080-debugobj.jkog1ebm",
+      "env": {
+        "PATH": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:/usr/bin:/bin",
+        "HOME": "/Users/tom",
+        "CARGO_HOME": "/Users/tom/.cargo"
+      },
+      "start_offset_s": 0.502,
+      "loadavg_before": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "free_before": 775411871744,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 2
+      },
+      "pgid": 29460,
+      "wall_s": 0.0112,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 0.513,
+      "loadavg_after": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "free_after": 775411863552,
+      "stdout": "raw/rustc-version.stdout",
+      "stderr": "raw/rustc-version.stderr"
+    },
+    {
+      "name": "clone",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-hardlinks",
+        "--no-checkout",
+        "/Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-778f3b5f-1906-4125-9dfc-99413f97737c",
+        "/private/tmp/oxide-080-debugobj.jkog1ebm/src"
+      ],
+      "cwd": "/private/tmp/oxide-080-debugobj.jkog1ebm",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 0.614,
+      "loadavg_before": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "free_before": 775411843072,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 2
+      },
+      "pgid": 29489,
+      "wall_s": 0.3488,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 0.963,
+      "loadavg_after": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "free_after": 775399260160,
+      "stdout": "raw/clone.stdout",
+      "stderr": "raw/clone.stderr"
+    },
+    {
+      "name": "checkout",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "-C",
+        "/private/tmp/oxide-080-debugobj.jkog1ebm/src",
+        "checkout",
+        "--quiet",
+        "--detach",
+        "669fd1e8ef4a6860de280ed0c0044d3415f30e02"
+      ],
+      "cwd": "/private/tmp/oxide-080-debugobj.jkog1ebm",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 0.964,
+      "loadavg_before": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "free_before": 775399247872,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 2
+      },
+      "pgid": 29575,
+      "wall_s": 0.0598,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 1.024,
+      "loadavg_after": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "free_after": 775390760960,
+      "stdout": "raw/checkout.stdout",
+      "stderr": "raw/checkout.stderr"
+    },
+    {
+      "name": "rev-parse",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "-C",
+        "/private/tmp/oxide-080-debugobj.jkog1ebm/src",
+        "rev-parse",
+        "HEAD",
+        "HEAD^{tree}"
+      ],
+      "cwd": "/private/tmp/oxide-080-debugobj.jkog1ebm",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 1.025,
+      "loadavg_before": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "free_before": 775390752768,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 2
+      },
+      "pgid": 29598,
+      "wall_s": 0.0111,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 1.036,
+      "loadavg_after": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "free_after": 775390728192,
+      "stdout": "raw/rev-parse.stdout",
+      "stderr": "raw/rev-parse.stderr"
+    },
+    {
+      "name": "U-reset",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "-C",
+        "/private/tmp/oxide-080-debugobj.jkog1ebm/src",
+        "reset",
+        "--quiet",
+        "--hard",
+        "669fd1e8ef4a6860de280ed0c0044d3415f30e02"
+      ],
+      "cwd": "/private/tmp/oxide-080-debugobj.jkog1ebm",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 1.047,
+      "loadavg_before": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "free_before": 775390707712,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 2
+      },
+      "pgid": 29601,
+      "wall_s": 0.0486,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 1.096,
+      "loadavg_after": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "free_after": 775390683136,
+      "stdout": "raw/U-reset.stdout",
+      "stderr": "raw/U-reset.stderr"
+    },
+    {
+      "name": "U-clean",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "-C",
+        "/private/tmp/oxide-080-debugobj.jkog1ebm/src",
+        "clean",
+        "-fdq"
+      ],
+      "cwd": "/private/tmp/oxide-080-debugobj.jkog1ebm",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 1.097,
+      "loadavg_before": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "free_before": 775390670848,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 2
+      },
+      "pgid": 29622,
+      "wall_s": 0.0129,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 1.11,
+      "loadavg_after": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "free_after": 775390662656,
+      "stdout": "raw/U-clean.stdout",
+      "stderr": "raw/U-clean.stderr"
+    },
+    {
+      "name": "U-status",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "-C",
+        "/private/tmp/oxide-080-debugobj.jkog1ebm/src",
+        "status",
+        "--porcelain"
+      ],
+      "cwd": "/private/tmp/oxide-080-debugobj.jkog1ebm",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 1.111,
+      "loadavg_before": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "free_before": 775390658560,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 2
+      },
+      "pgid": 29626,
+      "wall_s": 0.03,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 1.141,
+      "loadavg_after": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "free_after": 775390650368,
+      "stdout": "raw/U-status.stdout",
+      "stderr": "raw/U-status.stderr"
+    },
+    {
+      "name": "U-cold-build",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo",
+        "build",
+        "--workspace",
+        "--timings",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics"
+      ],
+      "cwd": "/private/tmp/oxide-080-debugobj.jkog1ebm/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "OXIDE_TASK_SCRATCH_ROOT": "/private/tmp/oxide-080-debugobj.jkog1ebm/t",
+        "TMPDIR": "/private/tmp/oxide-080-debugobj.jkog1ebm/t",
+        "TMP": "/private/tmp/oxide-080-debugobj.jkog1ebm/t",
+        "TEMP": "/private/tmp/oxide-080-debugobj.jkog1ebm/t",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-080-debugobj.jkog1ebm/target-U"
+      },
+      "start_offset_s": 1.143,
+      "loadavg_before": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "free_before": 775390638080,
+      "counts_after_start": {
+        "measured": 1,
+        "setup": 2
+      },
+      "pgid": 29629,
+      "wall_s": 4.2673,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 5.411,
+      "loadavg_after": [
+        6.2451171875,
+        5.82470703125,
+        6.07373046875
+      ],
+      "free_after": 775267397632,
+      "stdout": "raw/U-cold-build.stdout",
+      "stderr": "raw/U-cold-build.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 4.25s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "block_buffer:lib:False",
+        "build-script-build:custom-build:False",
+        "cfg_if:lib:False",
+        "cpufeatures:lib:False",
+        "crypto_common:lib:False",
+        "digest:lib:False",
+        "generic_array:lib:False",
+        "itoa:lib:False",
+        "libc:lib:False",
+        "memchr:lib:False",
+        "oxide-storage-inventory:bin:False",
+        "oxide-storage-lease:bin:False",
+        "oxide:bin:False",
+        "oxide_storage:lib:False",
+        "proc_macro2:lib:False",
+        "quote:lib:False",
+        "serde:lib:False",
+        "serde_core:lib:False",
+        "serde_derive:proc-macro:False",
+        "serde_json:lib:False",
+        "sha2:lib:False",
+        "syn:lib:False",
+        "typenum:lib:False",
+        "unicode_ident:lib:False",
+        "version_check:lib:False",
+        "zmij:lib:False"
+      ],
+      "fresh_count": 0,
+      "rebuilt_count": 33,
+      "artifact_profiles": [
+        {
+          "package_id": "cfg-if@1.0.5",
+          "workspace_member": false,
+          "target": "cfg_if",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": "line-tables-only",
+          "test": false
+        },
+        {
+          "package_id": "unicode-ident@1.0.26",
+          "workspace_member": false,
+          "target": "unicode_ident",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": 0,
+          "test": false
+        },
+        {
+          "package_id": "itoa@1.0.18",
+          "workspace_member": false,
+          "target": "itoa",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": "line-tables-only",
+          "test": false
+        },
+        {
+          "package_id": "serde_json@1.0.151",
+          "workspace_member": false,
+          "target": "build-script-build",
+          "kinds": [
+            "custom-build"
+          ],
+          "fresh": false,
+          "debuginfo": 0,
+          "test": false
+        },
+        {
+          "package_id": "version_check@0.9.5",
+          "workspace_member": false,
+          "target": "version_check",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": 0,
+          "test": false
+        },
+        {
+          "package_id": "quote@1.0.47",
+          "workspace_member": false,
+          "target": "build-script-build",
+          "kinds": [
+            "custom-build"
+          ],
+          "fresh": false,
+          "debuginfo": 0,
+          "test": false
+        },
+        {
+          "package_id": "zmij@1.0.23",
+          "workspace_member": false,
+          "target": "build-script-build",
+          "kinds": [
+            "custom-build"
+          ],
+          "fresh": false,
+          "debuginfo": 0,
+          "test": false
+        },
+        {
+          "package_id": "proc-macro2@1.0.107",
+          "workspace_member": false,
+          "target": "build-script-build",
+          "kinds": [
+            "custom-build"
+          ],
+          "fresh": false,
+          "debuginfo": 0,
+          "test": false
+        },
+        {
+          "package_id": "serde@1.0.229",
+          "workspace_member": false,
+          "target": "build-script-build",
+          "kinds": [
+            "custom-build"
+          ],
+          "fresh": false,
+          "debuginfo": 0,
+          "test": false
+        },
+        {
+          "package_id": "serde_core@1.0.229",
+          "workspace_member": false,
+          "target": "build-script-build",
+          "kinds": [
+            "custom-build"
+          ],
+          "fresh": false,
+          "debuginfo": 0,
+          "test": false
+        },
+        {
+          "package_id": "libc@0.2.190",
+          "workspace_member": false,
+          "target": "build-script-build",
+          "kinds": [
+            "custom-build"
+          ],
+          "fresh": false,
+          "debuginfo": 0,
+          "test": false
+        },
+        {
+          "package_id": "generic-array@0.14.7",
+          "workspace_member": false,
+          "target": "build-script-build",
+          "kinds": [
+            "custom-build"
+          ],
+          "fresh": false,
+          "debuginfo": 0,
+          "test": false
+        },
+        {
+          "package_id": "memchr@2.8.3",
+          "workspace_member": false,
+          "target": "memchr",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": "line-tables-only",
+          "test": false
+        },
+        {
+          "package_id": "typenum@1.20.1",
+          "workspace_member": false,
+          "target": "typenum",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": "line-tables-only",
+          "test": false
+        },
+        {
+          "package_id": "zmij@1.0.23",
+          "workspace_member": false,
+          "target": "zmij",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": "line-tables-only",
+          "test": false
+        },
+        {
+          "package_id": "proc-macro2@1.0.107",
+          "workspace_member": false,
+          "target": "proc_macro2",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": 0,
+          "test": false
+        },
+        {
+          "package_id": "quote@1.0.47",
+          "workspace_member": false,
+          "target": "quote",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": 0,
+          "test": false
+        },
+        {
+          "package_id": "syn@3.0.7",
+          "workspace_member": false,
+          "target": "syn",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": 0,
+          "test": false
+        },
+        {
+          "package_id": "cpufeatures@0.2.17",
+          "workspace_member": false,
+          "target": "cpufeatures",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": "line-tables-only",
+          "test": false
+        },
+        {
+          "package_id": "libc@0.2.190",
+          "workspace_member": false,
+          "target": "libc",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": "line-tables-only",
+          "test": false
+        },
+        {
+          "package_id": "generic-array@0.14.7",
+          "workspace_member": false,
+          "target": "generic_array",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": "line-tables-only",
+          "test": false
+        },
+        {
+          "package_id": "crypto-common@0.1.7",
+          "workspace_member": false,
+          "target": "crypto_common",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": "line-tables-only",
+          "test": false
+        },
+        {
+          "package_id": "block-buffer@0.10.4",
+          "workspace_member": false,
+          "target": "block_buffer",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": "line-tables-only",
+          "test": false
+        },
+        {
+          "package_id": "digest@0.10.7",
+          "workspace_member": false,
+          "target": "digest",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": "line-tables-only",
+          "test": false
+        },
+        {
+          "package_id": "serde_core@1.0.229",
+          "workspace_member": false,
+          "target": "serde_core",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": "line-tables-only",
+          "test": false
+        },
+        {
+          "package_id": "sha2@0.10.9",
+          "workspace_member": false,
+          "target": "sha2",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": "line-tables-only",
+          "test": false
+        },
+        {
+          "package_id": "serde_derive@1.0.229",
+          "workspace_member": false,
+          "target": "serde_derive",
+          "kinds": [
+            "proc-macro"
+          ],
+          "fresh": false,
+          "debuginfo": 0,
+          "test": false
+        },
+        {
+          "package_id": "serde_json@1.0.151",
+          "workspace_member": false,
+          "target": "serde_json",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": "line-tables-only",
+          "test": false
+        },
+        {
+          "package_id": "serde@1.0.229",
+          "workspace_member": false,
+          "target": "serde",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": "line-tables-only",
+          "test": false
+        },
+        {
+          "package_id": "oxide-storage@0.1.0",
+          "workspace_member": true,
+          "target": "oxide_storage",
+          "kinds": [
+            "lib"
+          ],
+          "fresh": false,
+          "debuginfo": "line-tables-only",
+          "test": false
+        },
+        {
+          "package_id": "oxide-storage@0.1.0",
+          "workspace_member": true,
+          "target": "oxide-storage-inventory",
+          "kinds": [
+            "bin"
+          ],
+          "fresh": false,
+          "debuginfo": "line-tables-only",
+          "test": false
+        },
+        {
+          "package_id": "oxide-storage@0.1.0",
+          "workspace_member": true,
+          "target": "oxide-storage-lease",
+          "kinds": [
+            "bin"
+          ],
+          "fresh": false,
+          "debuginfo": "line-tables-only",
+          "test": false
+        },
+        {
+          "package_id": "oxide-storage@0.1.0",
+          "workspace_member": true,
+          "target": "oxide",
+          "kinds": [
+            "bin"
+          ],
+          "fresh": false,
+          "debuginfo": "line-tables-only",
+          "test": false
+        }
+      ],
+      "rustc_units": [
+        {
+          "key": "version_check|lib|<registry>/index.crates.io-1949cf8c6b5b557f/version_check-0.9.5/src/lib.rs",
+          "crate": "version_check",
+          "workspace": false,
+          "debug_flags": {},
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "64814881cd38220b1e48ea5a4b179fff4442bc4d7837dc4068fa07daad709df8"
+        },
+        {
+          "key": "build_script_build|bin|<registry>/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107/build.rs",
+          "crate": "build_script_build",
+          "workspace": false,
+          "debug_flags": {},
+          "incremental": false,
+          "build_script": true,
+          "settings_except_debug_sha256": "965424eea6f5f4b13839ae0abbf6a9cf69ea01f3c27e45ce378b4224629df045"
+        },
+        {
+          "key": "typenum|lib|<registry>/index.crates.io-1949cf8c6b5b557f/typenum-1.20.1/src/lib.rs",
+          "crate": "typenum",
+          "workspace": false,
+          "debug_flags": {
+            "debuginfo": "line-tables-only",
+            "split-debuginfo": "unpacked"
+          },
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "dabd1540787296d03466219bb5383ae3a0ba2c36fe144f711f4292d3ccc59044"
+        },
+        {
+          "key": "unicode_ident|lib|<registry>/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.26/src/lib.rs",
+          "crate": "unicode_ident",
+          "workspace": false,
+          "debug_flags": {},
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "2ff921e61f5d13ff6a236c62c75643c5595e01ebf0a4ad9670794832bf8a666e"
+        },
+        {
+          "key": "build_script_build|bin|<registry>/index.crates.io-1949cf8c6b5b557f/quote-1.0.47/build.rs",
+          "crate": "build_script_build",
+          "workspace": false,
+          "debug_flags": {},
+          "incremental": false,
+          "build_script": true,
+          "settings_except_debug_sha256": "c440189c47bebf65c8a3759f3071bf8dc40b66ff9bdd641ddd6f141e672527a3"
+        },
+        {
+          "key": "itoa|lib|<registry>/index.crates.io-1949cf8c6b5b557f/itoa-1.0.18/src/lib.rs",
+          "crate": "itoa",
+          "workspace": false,
+          "debug_flags": {
+            "debuginfo": "line-tables-only",
+            "split-debuginfo": "unpacked"
+          },
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "806476edc8d9700342620b9c1aafde5df87eabb1630860675677ea5ce2e687bf"
+        },
+        {
+          "key": "build_script_build|bin|<registry>/index.crates.io-1949cf8c6b5b557f/libc-0.2.190/build.rs",
+          "crate": "build_script_build",
+          "workspace": false,
+          "debug_flags": {},
+          "incremental": false,
+          "build_script": true,
+          "settings_except_debug_sha256": "2a628b5e7e03ce0c54b35e37bc8acfa9ea79678933b25ae4b4a979b5546958e4"
+        },
+        {
+          "key": "build_script_build|bin|<registry>/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/build.rs",
+          "crate": "build_script_build",
+          "workspace": false,
+          "debug_flags": {},
+          "incremental": false,
+          "build_script": true,
+          "settings_except_debug_sha256": "0787a01c6bf7b6a5edb7b5afdfcb4a503b18753adcdeb69a2790db33a8f9603b"
+        },
+        {
+          "key": "build_script_build|bin|<registry>/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23/build.rs",
+          "crate": "build_script_build",
+          "workspace": false,
+          "debug_flags": {},
+          "incremental": false,
+          "build_script": true,
+          "settings_except_debug_sha256": "a8d7fc525abd49a6f46d027138c6cec22b5234f8bd2738bc7cc47b5dbf96e203"
+        },
+        {
+          "key": "build_script_build|bin|<registry>/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229/build.rs",
+          "crate": "build_script_build",
+          "workspace": false,
+          "debug_flags": {},
+          "incremental": false,
+          "build_script": true,
+          "settings_except_debug_sha256": "3fdacd524660aa066ea53e89ece0d9b1704d8bd2c28a2b83cf3881ee2de0e699"
+        },
+        {
+          "key": "build_script_build|bin|<registry>/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/build.rs",
+          "crate": "build_script_build",
+          "workspace": false,
+          "debug_flags": {},
+          "incremental": false,
+          "build_script": true,
+          "settings_except_debug_sha256": "6fa890285b83e6d0e6d90590615148ec32173511de5eba0bae71ae4695a92092"
+        },
+        {
+          "key": "memchr|lib|<registry>/index.crates.io-1949cf8c6b5b557f/memchr-2.8.3/src/lib.rs",
+          "crate": "memchr",
+          "workspace": false,
+          "debug_flags": {
+            "debuginfo": "line-tables-only",
+            "split-debuginfo": "unpacked"
+          },
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "ad42a9a3020e1b3a51066b7b84de5637c2718f6b47de4fe6b0475e4b1570e11a"
+        },
+        {
+          "key": "cfg_if|lib|<registry>/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.5/src/lib.rs",
+          "crate": "cfg_if",
+          "workspace": false,
+          "debug_flags": {
+            "debuginfo": "line-tables-only",
+            "split-debuginfo": "unpacked"
+          },
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "a307394fe7764f9839f9862c8b5bff0df089d9a984d7114baa7af50650483c2d"
+        },
+        {
+          "key": "build_script_build|bin|<registry>/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7/build.rs",
+          "crate": "build_script_build",
+          "workspace": false,
+          "debug_flags": {},
+          "incremental": false,
+          "build_script": true,
+          "settings_except_debug_sha256": "ef27ac02353fa105addaf3bb30c6a7fac9ee70debbcc56f301b773cdc561d6cb"
+        },
+        {
+          "key": "zmij|lib|<registry>/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23/src/lib.rs",
+          "crate": "zmij",
+          "workspace": false,
+          "debug_flags": {
+            "debuginfo": "line-tables-only",
+            "split-debuginfo": "unpacked"
+          },
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "112c24c7e33cd384d22a754d55e5b7aaf45138218d949e21466d72d2877b4640"
+        },
+        {
+          "key": "proc_macro2|lib|<registry>/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107/src/lib.rs",
+          "crate": "proc_macro2",
+          "workspace": false,
+          "debug_flags": {},
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "42c72262a34c20f73c29595f20003dc301677422c152dc0739eb958b8fd547ec"
+        },
+        {
+          "key": "quote|lib|<registry>/index.crates.io-1949cf8c6b5b557f/quote-1.0.47/src/lib.rs",
+          "crate": "quote",
+          "workspace": false,
+          "debug_flags": {},
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "e2cb354d63d823dc472933f20156c294c16ef9cbac7b6d44fef2b4062e8e1acb"
+        },
+        {
+          "key": "syn|lib|<registry>/index.crates.io-1949cf8c6b5b557f/syn-3.0.7/src/lib.rs",
+          "crate": "syn",
+          "workspace": false,
+          "debug_flags": {},
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "74e9f3f30f00fbe6634be7f423fa8811ad26d622e44d1be90754588297d7b5f9"
+        },
+        {
+          "key": "serde_core|lib|<registry>/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229/src/lib.rs",
+          "crate": "serde_core",
+          "workspace": false,
+          "debug_flags": {
+            "debuginfo": "line-tables-only",
+            "split-debuginfo": "unpacked"
+          },
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "42690a98d1df300b9d31ed4eb971f29890f3d5a3cf334e91d6ffde7f3e1db2a4"
+        },
+        {
+          "key": "libc|lib|<registry>/index.crates.io-1949cf8c6b5b557f/libc-0.2.190/src/lib.rs",
+          "crate": "libc",
+          "workspace": false,
+          "debug_flags": {
+            "debuginfo": "line-tables-only",
+            "split-debuginfo": "unpacked"
+          },
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "b00987d4206d6212761583303a7bf44778508b234398be4c3215d583c289b9d4"
+        },
+        {
+          "key": "serde_derive|proc-macro|<registry>/index.crates.io-1949cf8c6b5b557f/serde_derive-1.0.229/src/lib.rs",
+          "crate": "serde_derive",
+          "workspace": false,
+          "debug_flags": {},
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "4a6b578e2065787839f48017f4832817f895ed5cbbc7aad8b88d8c2b5168486f"
+        },
+        {
+          "key": "generic_array|lib|<registry>/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7/src/lib.rs",
+          "crate": "generic_array",
+          "workspace": false,
+          "debug_flags": {
+            "debuginfo": "line-tables-only",
+            "split-debuginfo": "unpacked"
+          },
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "7f0326ddf96991d4f47db545f181066f24458aa22b800c2635fc29e992c4f02a"
+        },
+        {
+          "key": "cpufeatures|lib|<registry>/index.crates.io-1949cf8c6b5b557f/cpufeatures-0.2.17/src/lib.rs",
+          "crate": "cpufeatures",
+          "workspace": false,
+          "debug_flags": {
+            "debuginfo": "line-tables-only",
+            "split-debuginfo": "unpacked"
+          },
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "b19f369830bacdd48a0bef5134e6be36edc583359a16ebbcee527ae2bc635396"
+        },
+        {
+          "key": "block_buffer|lib|<registry>/index.crates.io-1949cf8c6b5b557f/block-buffer-0.10.4/src/lib.rs",
+          "crate": "block_buffer",
+          "workspace": false,
+          "debug_flags": {
+            "debuginfo": "line-tables-only",
+            "split-debuginfo": "unpacked"
+          },
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "960d54367463264d015f0f843a985192864c146c6c51012127adf500e8eca1e7"
+        },
+        {
+          "key": "crypto_common|lib|<registry>/index.crates.io-1949cf8c6b5b557f/crypto-common-0.1.7/src/lib.rs",
+          "crate": "crypto_common",
+          "workspace": false,
+          "debug_flags": {
+            "debuginfo": "line-tables-only",
+            "split-debuginfo": "unpacked"
+          },
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "389d0c286d4ba643bcfc7ed9c8a37db87b47257f78616c0f4e9cb8828938154c"
+        },
+        {
+          "key": "digest|lib|<registry>/index.crates.io-1949cf8c6b5b557f/digest-0.10.7/src/lib.rs",
+          "crate": "digest",
+          "workspace": false,
+          "debug_flags": {
+            "debuginfo": "line-tables-only",
+            "split-debuginfo": "unpacked"
+          },
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "c02b9ce512375f8306202fb81b5089422eff4b76ef65572daa0b526f995aed99"
+        },
+        {
+          "key": "serde_json|lib|<registry>/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/src/lib.rs",
+          "crate": "serde_json",
+          "workspace": false,
+          "debug_flags": {
+            "debuginfo": "line-tables-only",
+            "split-debuginfo": "unpacked"
+          },
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "1fc2d6add460d763fd5100d6b06e325f7ad5e696c346d99eb7d5a618db1d7726"
+        },
+        {
+          "key": "sha2|lib|<registry>/index.crates.io-1949cf8c6b5b557f/sha2-0.10.9/src/lib.rs",
+          "crate": "sha2",
+          "workspace": false,
+          "debug_flags": {
+            "debuginfo": "line-tables-only",
+            "split-debuginfo": "unpacked"
+          },
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "cbc6efb113c03fed458578903191d770d351f5f7eba11b23b9b73dce2f251e90"
+        },
+        {
+          "key": "serde|lib|<registry>/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs",
+          "crate": "serde",
+          "workspace": false,
+          "debug_flags": {
+            "debuginfo": "line-tables-only",
+            "split-debuginfo": "unpacked"
+          },
+          "incremental": false,
+          "build_script": false,
+          "settings_except_debug_sha256": "f02a05646d57049c22dc29681f4e1caa806299c0e4d568ed9e3c116c6d7d96bd"
+        },
+        {
+          "key": "oxide_storage|lib|src/lib.rs",
+          "crate": "oxide_storage",
+          "workspace": true,
+          "debug_flags": {
+            "debuginfo": "line-tables-only",
+            "split-debuginfo": "unpacked"
+          },
+          "incremental": true,
+          "build_script": false,
+          "settings_except_debug_sha256": "24776f0ecb93774832acb1ee2a2df012fa905f37fcf697e8ebcfcbe202f2f274"
+        },
+        {
+          "key": "oxide_storage_inventory|bin|src/bin/storage_inventory.rs",
+          "crate": "oxide_storage_inventory",
+          "workspace": true,
+          "debug_flags": {
+            "debuginfo": "line-tables-only",
+            "split-debuginfo": "unpacked"
+          },
+          "incremental": true,
+          "build_script": false,
+          "settings_except_debug_sha256": "b9a0d6794145ba560d4ae8e63ab75d96987c556edc1daaa3a973eac837c62bf6"
+        },
+        {
+          "key": "oxide_storage_lease|bin|src/bin/storage_lease.rs",
+          "crate": "oxide_storage_lease",
+          "workspace": true,
+          "debug_flags": {
+            "debuginfo": "line-tables-only",
+            "split-debuginfo": "unpacked"
+          },
+          "incremental": true,
+          "build_script": false,
+          "settings_except_debug_sha256": "28ad8877b5372c1f1e6e4f438f60811d70796e6fd9e129e5f47461a94517f59e"
+        },
+        {
+          "key": "oxide|bin|src/bin/oxide/main.rs",
+          "crate": "oxide",
+          "workspace": true,
+          "debug_flags": {
+            "debuginfo": "line-tables-only",
+            "split-debuginfo": "unpacked"
+          },
+          "incremental": true,
+          "build_script": false,
+          "settings_except_debug_sha256": "d4405da202c620a4bd96d232b8f2d66416aebb033f4113091f775bfd94bc430b"
+        }
+      ],
+      "test_executables": [],
+      "timings": {
+        "found": true,
+        "report": "/private/tmp/oxide-080-debugobj.jkog1ebm/target-U/cargo-timings/cargo-timing-20261018T213607391Z-b51b3546d1a7f487.html",
+        "copy": "raw/U-cold-cargo-timing.html",
+        "units": [
+          {
+            "name": "serde",
+            "version": "1.0.229",
+            "mode": "todo",
+            "target": " build-script",
+            "start": 0.05,
+            "duration": 0.14,
+            "rmeta_time": null
+          },
+          {
+            "name": "memchr",
+            "version": "2.8.3",
+            "mode": "todo",
+            "target": "",
+            "start": 0.05,
+            "duration": 0.21,
+            "rmeta_time": null
+          },
+          {
+            "name": "quote",
+            "version": "1.0.47",
+            "mode": "todo",
+            "target": " build-script",
+            "start": 0.05,
+            "duration": 0.13,
+            "rmeta_time": null
+          },
+          {
+            "name": "zmij",
+            "version": "1.0.23",
+            "mode": "todo",
+            "target": " build-script",
+            "start": 0.05,
+            "duration": 0.12,
+            "rmeta_time": null
+          },
+          {
+            "name": "serde_core",
+            "version": "1.0.229",
+            "mode": "todo",
+            "target": " build-script",
+            "start": 0.05,
+            "duration": 0.14,
+            "rmeta_time": null
+          },
+          {
+            "name": "version_check",
+            "version": "0.9.5",
+            "mode": "todo",
+            "target": "",
+            "start": 0.05,
+            "duration": 0.1,
+            "rmeta_time": null
+          },
+          {
+            "name": "proc-macro2",
+            "version": "1.0.107",
+            "mode": "todo",
+            "target": " build-script",
+            "start": 0.05,
+            "duration": 0.14,
+            "rmeta_time": null
+          },
+          {
+            "name": "serde_json",
+            "version": "1.0.151",
+            "mode": "todo",
+            "target": " build-script",
+            "start": 0.05,
+            "duration": 0.08,
+            "rmeta_time": null
+          },
+          {
+            "name": "itoa",
+            "version": "1.0.18",
+            "mode": "todo",
+            "target": "",
+            "start": 0.05,
+            "duration": 0.07,
+            "rmeta_time": null
+          },
+          {
+            "name": "cfg-if",
+            "version": "1.0.5",
+            "mode": "todo",
+            "target": "",
+            "start": 0.05,
+            "duration": 0.02,
+            "rmeta_time": null
+          },
+          {
+            "name": "libc",
+            "version": "0.2.190",
+            "mode": "todo",
+            "target": " build-script",
+            "start": 0.05,
+            "duration": 0.15,
+            "rmeta_time": null
+          },
+          {
+            "name": "typenum",
+            "version": "1.20.1",
+            "mode": "todo",
+            "target": "",
+            "start": 0.05,
+            "duration": 0.26,
+            "rmeta_time": null
+          },
+          {
+            "name": "unicode-ident",
+            "version": "1.0.26",
+            "mode": "todo",
+            "target": "",
+            "start": 0.05,
+            "duration": 0.04,
+            "rmeta_time": null
+          },
+          {
+            "name": "serde_json",
+            "version": "1.0.151",
+            "mode": "run-custom-build",
+            "target": " build-script (run)",
+            "start": 0.13,
+            "duration": 0.14,
+            "rmeta_time": null
+          },
+          {
+            "name": "generic-array",
+            "version": "0.14.7",
+            "mode": "todo",
+            "target": " build-script",
+            "start": 0.15,
+            "duration": 0.09,
+            "rmeta_time": null
+          },
+          {
+            "name": "zmij",
+            "version": "1.0.23",
+            "mode": "run-custom-build",
+            "target": " build-script (run)",
+            "start": 0.18,
+            "duration": 0.46,
+            "rmeta_time": null
+          },
+          {
+            "name": "quote",
+            "version": "1.0.47",
+            "mode": "run-custom-build",
+            "target": " build-script (run)",
+            "start": 0.18,
+            "duration": 0.34,
+            "rmeta_time": null
+          },
+          {
+            "name": "serde_core",
+            "version": "1.0.229",
+            "mode": "run-custom-build",
+            "target": " build-script (run)",
+            "start": 0.19,
+            "duration": 1.1,
+            "rmeta_time": null
+          },
+          {
+            "name": "proc-macro2",
+            "version": "1.0.107",
+            "mode": "run-custom-build",
+            "target": " build-script (run)",
+            "start": 0.19,
+            "duration": 0.72,
+            "rmeta_time": null
+          },
+          {
+            "name": "serde",
+            "version": "1.0.229",
+            "mode": "run-custom-build",
+            "target": " build-script (run)",
+            "start": 0.19,
+            "duration": 0.89,
+            "rmeta_time": null
+          },
+          {
+            "name": "libc",
+            "version": "0.2.190",
+            "mode": "run-custom-build",
+            "target": " build-script (run)",
+            "start": 0.2,
+            "duration": 1.33,
+            "rmeta_time": null
+          },
+          {
+            "name": "generic-array",
+            "version": "0.14.7",
+            "mode": "run-custom-build",
+            "target": " build-script (run)",
+            "start": 0.24,
+            "duration": 1.52,
+            "rmeta_time": null
+          },
+          {
+            "name": "zmij",
+            "version": "1.0.23",
+            "mode": "todo",
+            "target": "",
+            "start": 0.64,
+            "duration": 0.11,
+            "rmeta_time": null
+          },
+          {
+            "name": "proc-macro2",
+            "version": "1.0.107",
+            "mode": "todo",
+            "target": "",
+            "start": 0.91,
+            "duration": 0.15,
+            "rmeta_time": null
+          },
+          {
+            "name": "quote",
+            "version": "1.0.47",
+            "mode": "todo",
+            "target": "",
+            "start": 1.03,
+            "duration": 0.08,
+            "rmeta_time": null
+          },
+          {
+            "name": "syn",
+            "version": "3.0.7",
+            "mode": "todo",
+            "target": "",
+            "start": 1.08,
+            "duration": 0.53,
+            "rmeta_time": null
+          },
+          {
+            "name": "serde_core",
+            "version": "1.0.229",
+            "mode": "todo",
+            "target": "",
+            "start": 1.3,
+            "duration": 0.74,
+            "rmeta_time": null
+          },
+          {
+            "name": "libc",
+            "version": "0.2.190",
+            "mode": "todo",
+            "target": "",
+            "start": 1.53,
+            "duration": 0.3,
+            "rmeta_time": null
+          },
+          {
+            "name": "serde_derive",
+            "version": "1.0.229",
+            "mode": "todo",
+            "target": "",
+            "start": 1.61,
+            "duration": 0.72,
+            "rmeta_time": null
+          },
+          {
+            "name": "generic-array",
+            "version": "0.14.7",
+            "mode": "todo",
+            "target": "",
+            "start": 1.76,
+            "duration": 0.19,
+            "rmeta_time": null
+          },
+          {
+            "name": "cpufeatures",
+            "version": "0.2.17",
+            "mode": "todo",
+            "target": "",
+            "start": 1.8,
+            "duration": 0.03,
+            "rmeta_time": null
+          },
+          {
+            "name": "block-buffer",
+            "version": "0.10.4",
+            "mode": "todo",
+            "target": "",
+            "start": 1.94,
+            "duration": 0.03,
+            "rmeta_time": null
+          },
+          {
+            "name": "crypto-common",
+            "version": "0.1.7",
+            "mode": "todo",
+            "target": "",
+            "start": 1.94,
+            "duration": 0.03,
+            "rmeta_time": null
+          },
+          {
+            "name": "digest",
+            "version": "0.10.7",
+            "mode": "todo",
+            "target": "",
+            "start": 1.97,
+            "duration": 0.06,
+            "rmeta_time": null
+          },
+          {
+            "name": "serde_json",
+            "version": "1.0.151",
+            "mode": "todo",
+            "target": "",
+            "start": 2.01,
+            "duration": 0.34,
+            "rmeta_time": null
+          },
+          {
+            "name": "sha2",
+            "version": "0.10.9",
+            "mode": "todo",
+            "target": "",
+            "start": 2.02,
+            "duration": 0.08,
+            "rmeta_time": null
+          },
+          {
+            "name": "serde",
+            "version": "1.0.229",
+            "mode": "todo",
+            "target": "",
+            "start": 2.34,
+            "duration": 0.42,
+            "rmeta_time": null
+          },
+          {
+            "name": "oxide-storage",
+            "version": "0.1.0",
+            "mode": "todo",
+            "target": "",
+            "start": 2.74,
+            "duration": 0.64,
+            "rmeta_time": null
+          },
+          {
+            "name": "oxide-storage",
+            "version": "0.1.0",
+            "mode": "todo",
+            "target": " oxide-storage-lease \"bin\"",
+            "start": 3.37,
+            "duration": 0.13,
+            "rmeta_time": null
+          },
+          {
+            "name": "oxide-storage",
+            "version": "0.1.0",
+            "mode": "todo",
+            "target": " oxide-storage-inventory \"bin\"",
+            "start": 3.37,
+            "duration": 0.12,
+            "rmeta_time": null
+          },
+          {
+            "name": "oxide-storage",
+            "version": "0.1.0",
+            "mode": "todo",
+            "target": " oxide \"bin\"",
+            "start": 3.37,
+            "duration": 0.88,
+            "rmeta_time": null
+          }
+        ]
+      }
+    }
+  ],
+  "arms": {
+    "U": {
+      "spec": {
+        "what": "quick recipe as-is: oxide-quick inherits dev, debug = \"line-tables-only\", default (unpacked) split debug info"
+      },
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "OXIDE_TASK_SCRATCH_ROOT": "/private/tmp/oxide-080-debugobj.jkog1ebm/t",
+        "TMPDIR": "/private/tmp/oxide-080-debugobj.jkog1ebm/t",
+        "TMP": "/private/tmp/oxide-080-debugobj.jkog1ebm/t",
+        "TEMP": "/private/tmp/oxide-080-debugobj.jkog1ebm/t",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-080-debugobj.jkog1ebm/target-U"
+      },
+      "builds": [
+        {
+          "label": "cold",
+          "name": "U-cold-build",
+          "wall_s": 4.2673,
+          "exit": 0,
+          "fresh_count": 0,
+          "rebuilt_count": 33,
+          "rebuilt": [
+            "block_buffer:lib:False",
+            "build-script-build:custom-build:False",
+            "cfg_if:lib:False",
+            "cpufeatures:lib:False",
+            "crypto_common:lib:False",
+            "digest:lib:False",
+            "generic_array:lib:False",
+            "itoa:lib:False",
+            "libc:lib:False",
+            "memchr:lib:False",
+            "oxide-storage-inventory:bin:False",
+            "oxide-storage-lease:bin:False",
+            "oxide:bin:False",
+            "oxide_storage:lib:False",
+            "proc_macro2:lib:False",
+            "quote:lib:False",
+            "serde:lib:False",
+            "serde_core:lib:False",
+            "serde_derive:proc-macro:False",
+            "serde_json:lib:False",
+            "sha2:lib:False",
+            "syn:lib:False",
+            "typenum:lib:False",
+            "unicode_ident:lib:False",
+            "version_check:lib:False",
+            "zmij:lib:False"
+          ],
+          "finished_line": [
+            "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 4.25s"
+          ],
+          "loadavg_before": [
+            6.1796875,
+            5.80517578125,
+            6.068359375
+          ],
+          "loadavg_after": [
+            6.2451171875,
+            5.82470703125,
+            6.07373046875
+          ]
+        }
+      ],
+      "census": [
+        {
+          "offset_s": 5.445,
+          "target": {
+            "files": 1150,
+            "dirs": 80,
+            "apparent": 150649226,
+            "allocated_unique": 139558912
+          },
+          "by_area": {
+            ".": {
+              "files": 2,
+              "apparent": 2140,
+              "allocated_unique": 8192
+            },
+            "cargo-timings": {
+              "files": 2,
+              "apparent": 110116,
+              "allocated_unique": 114688
+            },
+            "oxide-quick": {
+              "files": 11,
+              "apparent": 12914981,
+              "allocated_unique": 12935168
+            },
+            "oxide-quick/.fingerprint": {
+              "files": 148,
+              "apparent": 23664,
+              "allocated_unique": 606208
+            },
+            "oxide-quick/build": {
+              "files": 58,
+              "apparent": 9546912,
+              "allocated_unique": 9707520
+            },
+            "oxide-quick/deps": {
+              "files": 501,
+              "apparent": 74443190,
+              "allocated_unique": 75407360
+            },
+            "oxide-quick/incremental": {
+              "files": 428,
+              "apparent": 53608223,
+              "allocated_unique": 40779776
+            }
+          },
+          "deps_entries": 501,
+          "deps_files": 501,
+          "deps_dsym_dirs": [],
+          "rcgu": {
+            "count": 430,
+            "apparent": 13617792,
+            "allocated": 14426112,
+            "nlink_gt1": 411,
+            "same_inode_as_incremental": 411,
+            "by_crate": {
+              "block_buffer": 1,
+              "cfg_if": 1,
+              "cpufeatures": 1,
+              "crypto_common": 1,
+              "digest": 1,
+              "generic_array": 1,
+              "itoa": 1,
+              "libc": 1,
+              "memchr": 1,
+              "oxide": 207,
+              "oxide_storage": 146,
+              "oxide_storage_inventory": 30,
+              "oxide_storage_lease": 28,
+              "serde": 1,
+              "serde_core": 1,
+              "serde_json": 5,
+              "sha2": 1,
+              "typenum": 1,
+              "zmij": 1
+            }
+          },
+          "rcgu_names": [
+            "block_buffer-8b81efb12f8976d9.block_buffer.fc3c802d686d88d8-cgu.0.rcgu.o",
+            "cfg_if-d63f21e84d5b7dbb.cfg_if.cd8b164f1134a683-cgu.0.rcgu.o",
+            "cpufeatures-2b19d2100232abd9.cpufeatures.2f25cdb20a1010c3-cgu.0.rcgu.o",
+            "crypto_common-92312289f20cabb0.crypto_common.9e4b93a887396364-cgu.0.rcgu.o",
+            "digest-1f50792a71c6644f.digest.32bca37edec156a1-cgu.0.rcgu.o",
+            "generic_array-fec1a7b2978e84ae.generic_array.9afc9f2a1dcb86ab-cgu.0.rcgu.o",
+            "itoa-5d32fcc56ca00a70.itoa.6a09a7c5622b28f8-cgu.0.rcgu.o",
+            "libc-73d1c43ed140e9cc.libc.52e57387e81c88df-cgu.0.rcgu.o",
+            "memchr-de038eb13db74a04.memchr.8dad64cd037b098e-cgu.0.rcgu.o",
+            "oxide-39101cac0fcdeaec.06lwofxsk1hww9pqv6mkya48v.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.07qpiqem2hv3qqdyu15mcepte.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.093mr6wwyzhgg5gmpsqxnf1z6.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.09peg1ym75qmd6jiv4pnf9wgj.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.0ar4sjra3t4uq7hqbqgnufl33.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.0czy9y67vc7qzbx783t6f7hag.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.0f1q3ee5h3o6jzvd6ghvr0blr.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.0gms53al76wbumbpt3mf84rjh.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.0jproqn6z0z2tvsohz4tf6sw4.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.0mu90ofn50kj9n23bze2xhi11.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.0nuwjmo6dykeylyd9y99nx9qg.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.0t1381g5qtpa25vw0cvpj6jgg.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.0tm71xiqblb58iy4v72x1cfax.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.0xov7psijmjbklprds78lrs52.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.0ycmd8ci0exf9zaccrx1aqe56.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.0zlt3ny6g0y3fj2s3cx8oczcg.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.13bqyvlydy59oyyr3b1z34xq5.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.15o50fquep71jfbyqmwleu7sr.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.16tiwv5bqr8vnb0tl2fi0jo41.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.1868ygc231cufo14mamltp3id.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.18o1ardfrxjay8n8lyabf62yn.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.18vhdg4yst7og6tjoapbf92lt.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.1hdos1k20vecode8mk91bz3sx.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.1jlea0ahc5y0nuwjsbnnfqak6.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.1kf3bfngs7mav4qb0bxw13ubv.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.1kg8hv0e1ddt6dhodbxpkd08u.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.1px947g79s1kpuqihkcshfv5w.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.1pxrv7pjjyltvd2f5371jdpbk.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.1sspkx6kl736ro2x4o2hjlswf.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.1vt4muh1nmj55efv1wzk74nqs.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.1y902elj826c13v8ee65a9y5t.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.1zok7ymkp6l2ze6bout6x6d5c.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.20yuwc0orhd2068kg9y1rz2ha.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.21m27gofjw3o8vj89ws10lab4.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.21oyffd9rjvtxaa0yj0exriuh.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.21ucc3fyg5e496grpbqfgrmqa.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.23hljm4mqshe30bes4vgmo5vl.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.26cif2w6n8clwoy4zu5jyaxuw.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.2ansrin9vi3aealik2zl2m1vt.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.2b2wgpbgee21rokh7nffzatmy.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.2et5x3vlm9fntmwahexxh3sj7.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.2g712ahv54jg7fqdtodmbt3d1.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.2gsoppmjvgh6nmworazr3cs39.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.2k1bkts42pk9rntwoioqhn6p6.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.2loqfdzg10zssgmuh12qtdff3.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.2o9q1zcuff1opjnloe3v4mwdr.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.2u30s6slqr01va3sv8bbnj7hq.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.2uoutd3k0ghuy74dl1digoz45.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.2v1rmeg75xlnsih6j39nmpq5b.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.2vhnzpn526q07g7sjnnt1f0ee.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.363tq9dafp5n9i8tmm24o470u.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.37jt7n2g8wdhnjym7aw4s83qg.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.3bwnhzm2u7m0o98dd96svb1ty.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.3cp09c7li9vlkhaj2av9dr2r0.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.3g53zfmjr0zhtg72xb02jn63r.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.3hez72cgcz40eolr4l2d2s2k6.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.3myho88jd2340ns2ntbcy2fra.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.3ri4uvalx6u36g2ifxz1z4c2l.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.3u42g777isxmkow5np1me9s78.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.3ycz26sy7m9b5ojwdk2xvwx42.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.40964t09ulnx7feyn8twv5rup.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.44iqm5smzp5hgz4a73kda8jt6.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.44s1gomy8stubj5oyyj7bcfpn.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.4507fur387ualweg1ff90lb7a.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.47l3insaw46hqyqa8q8yvc3bw.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.483ssv7s19bum6ihpavjn0xpm.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.4gu5xamx43vrmst0sk0otsz4q.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.4lkgioy7lc1e2w50mke08vmsl.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.4m50qfgy573j2sv9gyjg0ufln.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.4r4011r7vgytufvnna803xir1.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.4snwahx9prmhql2cv534cf6q0.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.4umw95e8d4izr03dd0fguw80i.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.4urgu44q19i82u14mcdt0lb3u.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.4wnb1qxx09txteqd8soy6c88n.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.4yrt29i4149hbfdvkcgczzgd0.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.50axldmaayel2243mpy77zb7p.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.50ultfc9dat2zouh9ymbds7xg.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.54tym5qrst8zuei580zd8l95s.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.57p8tqe1am2hmdqrua7zixmlh.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.58q9xv2eisiq6poerwyu98rmj.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.596f1wcyrgxusj92bitk6f6k5.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.5f20udwszsv6o97axnf63z0pw.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.5fgm29pmdmbmf4q0tjnha1ju2.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.5jgioo73s7yjnhbqdjtqf9p3p.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.5oz6lhdfps963nq678zumqvyb.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.5r91op5bmkj6tgt4b358pgkye.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.5s25geqjzdonceaaehy78ud12.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.5s29nqk9kudtvd4xl40a0q71m.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.5s8jz0jyr0ozu3l53nicc1w5r.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.5tv45n7d95v1g3udu6nb0z7jm.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.5u1s4m7tu9az1lqpcpvx42wrr.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.5vdgjvm7jrd9044o2ej7rl6fy.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.5xzvjvrndy0qgg1iz3ms55lhd.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.60qa2scltbcqoyxohu78zc5hq.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.64ulkh8immwsgmktfdh8pkp2e.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.65xq9u0d9ppjg5ax5w7khfcz1.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.68heu8i2i8g5t9do60ifgxx3d.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.69421z3kfv9b783ag53d2gyh7.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.6awb06ihylat5jitlbl3v8qhe.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.6bq02ryv3lk0dqj2n2m464n2k.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.6dwd4cjwaa6abe1b4y90jmnoi.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.6k5rktpvoundukhlsfypc02gb.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.6kszve0qso1ct8t7lgezyytln.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.6nl8vettzxecceqwtxtowzzpe.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.6rp1qlzdku4g2h8hec7gatmba.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.6v3577bgt7rb2rkk86up0gw7o.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.6wbnwl3tyc78t9skc2s2mnryj.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.6wgeiayu8h73u9y00h4988j3v.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.6wu2amramkk4fhfqof8qqjl76.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.6yvsgzwi67foq73r72nmjncf2.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.6zfbv9jol8np7cnrj6wl57hyn.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.715l9k68yldn78niavmqg15ad.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.78mhenqjbvgyo2x6eekt86cek.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.7c7hv7rncdisd4lqdoggz9miz.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.7clg0616p9mqqigzwdzp74xcq.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.7dscnynlozqb21w0lvzo47x7a.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.7f4ve1repndb4iyouyblifvfs.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.7fmv3dtb0110e3heet2rj0nl8.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.7nm8bfvw1firssltzvhuigv3o.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.7rma1i5dixnwejiyfanw7gwx9.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.7s7g9aqq2mu454axjxv3cf8jd.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.7up92tlbpi50y6k278m2acvyb.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.83dqytudy3pieubd6ob85fimz.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.841itoe9z3qhqan7bwxddpgbi.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.86zm1c1rkfopv433b1cuxog5h.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.8b7isy4to0yim2me86ja9xf53.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.8cg4851cyx089qq1kqefbcryb.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.8eyv864egp4wu6yhh46iqx896.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.8iffrjux6wryxlc39834mhmo9.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.8lloqwpjrbydl5rih3kzb5b2r.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.8z9f63qhikbzsbfaqquz05tnf.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.91e461oqmeo5tp5654ptdvxdb.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.936f1it2pmljjnrk61gpg6662.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.96k92dv9laepbmgozqkh9oluc.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.98s8j7q8m69c41dpyedkfzidb.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.9a8bu8yn2j3wgo9hs3a1p7j2s.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.9dxkqnxbfbjrhmes5b78vd0c4.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.9grg4ntvkd0q78j9ohugr93oz.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.9kdtxtia170terljpxwvfnhx8.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.9kms6wp8vdo11jbnv05mt1sed.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.9kzn67y95liqp23l7b3qjc1aj.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.9mks5ikg18ck8xsc6d8v5qit1.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.9n8v47obh67nt41tfn4tjhu8o.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.9t3ousilxe7361gj0h2c1j8gt.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.9u46r27fgb5ohxq777d7tjj2d.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.9y5fvb8eju18tbqaf1pwectah.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.a0cb7p87y8bjw4exph3mzdzbn.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.a7e49jluhq26czqg5i5cdjvjl.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.a960437ervjg1bo7ftnxewq99.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.aby7301vozffqmtji6cv9y61m.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.ahikgrhwqvz6tz7z3br0jewhe.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.an391r76t357y73exti3mr3ur.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.aoh1cbu5ioifmn556v19m7mf4.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.asu6rnaea4267qdxxklod6koe.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.atay9ydeq1ju0vymck5vywr4s.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.avg12z4n1vchm45gc0n4q000r.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.aw12ih35bve92ufm31d09x9x5.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.ay2cti8232z397k57iayfzyhs.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.ay5naz8ugkiqr65f50y5q2mtj.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.az4cqnry313mp2mwt284l6oqn.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.b6rtmfil0hhpp2yqnoyn0dg51.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.bkz7butmcbrqbuwqxfbkq312q.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.blelqhsd0kejddkqwippydlro.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.boybjjosw6du27u4dry3v9gc2.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.bxrhyp0of7ozio4hll48itt5p.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.c0b9bdvvgtegk0tey528ntgi6.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.c419x2tki5tpkma8p1l1bopbp.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.cdflodvfzn7ljoyttx1jijkua.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.cirrhy631vgv7bghiotam66v6.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.cqp75w3zpkww3rntwkv1ycvdl.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.cs86xxwxo9gixatdixhygcda8.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.ctrr0gigu9qzvufp3egff2ooz.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.cwacnfccf8dypufgk4e48hhqx.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.cxq46ru80vv42kw1kagjiensp.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.d00uuxk7dn2hxwvjzlb7q5nwk.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.d8owg998wuwtbbqbisw1dk70p.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.dd662mvsk7f7haufr3bvlv37y.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.df3mjan907aht4db214jv90o7.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.df7lnjgzx7kqnft9d6enq37ib.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.dgjg7icuargj9x4t3bcycjela.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.dh65wht6pga9d0xop5c4uetp7.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.diut23o00o84istl4f4g839us.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.dj914cazjknuj7cssqol4j5be.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.dj9bmuh2cuy34s0hq0cs4oc9p.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.dl5mo2wd36cu578q9mrrs201y.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.dlmtfch22iavsrbkkmcwb8685.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.dxgn927xbnb7mtkmd9ukxkib0.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.e01fnfeyucyrwpdr5kjtoc4i5.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.e7etvmvmrgeff41rtegxxwiaz.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.e8r818djltproc1k3uuwdr4x9.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.ebceq30gdp8zony1h2yau5vd6.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.edilsy5mg6zt04t3dplg9hn7g.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.ejeljof60fqbkwy3baekunfx4.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.ekbwf4phf54cfh5ejuxy2w5x5.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.emrcy2izklox6vb72j4tn0yox.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.enpox9fcots9mk64oqeuv3r0d.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.eocpjsoqeynkjzrkx03y2e81e.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.eqgw6ajq465yuflp2ic7541yk.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.eqzs65wzi3e3pcprbzd3l5vjq.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.etps97bztte469x5npdaf6lsi.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.eu1hzdv82l7zfnp1ir80vntil.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.euik830txiptkg9d0enxrxh2a.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.euu9rfz8th555b8xo7nud9jof.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.ev8ac7n56t38mr8d3kiwcz964.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.exjw1p6m9nhn7n7lu9ghbpj61.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.ezw67yfabsuwzonapfrndl3rf.0ay2rcr.rcgu.o",
+            "oxide-39101cac0fcdeaec.f4mbx5k1m7em1u122ec5s5vqa.0ay2rcr.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.02oh9vypq7f2fyswlktxfkovj.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.05smnwz1gloz0t34r4mhg9a8w.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.09klg0i4piq58530gj1h8ibew.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.0c43bcy244mmz4yhma4ojgzkl.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.0hlgvpb2x0epg8au3tj113oif.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.0kfmj01aa63xkyskdk4t41wqq.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.0khqw8g75mp90dijm3lfpz10l.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.0nxo8jwhifu1o5u448nr88363.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.0q1r5v7xo3q0a4jeh3tpol4vd.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.0q4f6px1ngnkqsys7iv33p6or.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.13119rdg899o606allmr90me7.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.1inh38zw94t40smhhdtf8osef.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.1o4799mw951wrdfidcp5vkalz.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.1tqi1v07z2klod802im13pwsy.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.1xf7ft57kwmasi90c1h9txsc4.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.21cwt576dqfc1rnbw802r6lmv.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.21u2xsvqsgjcboyh0b2nh7896.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.230tewj1dofm5wf9rq94n6ag4.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.265ih5gixh2x1eaforq2r4mho.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.266z0k00ntwn9ljb3wnp8b3zg.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.273mox4sxg7e7awm5kv8ifc1j.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.28u9p39mdgm7rcxnt3gjctx8y.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.2b6pd6fa6vkvm21ze18jvq13r.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.2gno7hf3f3iuk82h4knckvwvr.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.2gq3p8cb6cqoeetac738tztbe.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.2hd56803xjdc29e2fhgrqng3k.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.2hgm76xigkhajt9omqnewh8w6.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.2iel7ohhcg1em50duflk65wjh.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.2ljcxua5cnm78p609wvq3ounv.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.2op70l6cmqew0hbvl037jkgs1.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.2pskmf1w572fbquh9k1pboyw4.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.2uwtr84vrbkwkcbqcxnl4y89o.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.36zarp25hy6rpxcevdoap54gn.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.3bh6w937kz4g7piko7w1pbo46.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.3dzp60frsqxavturq9ishle80.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.3fdb180di1514l8a6j3ejwhmj.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.3mvwp8ds4c5qorahw5nldfgap.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.3s34sxn7cqg4w5mqby3knlykc.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.3si272syqrnfn2nylopp2100q.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.3tdnrm8opmdyl6snr7fsuxh74.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.40km2e30ptt5uq0wbvaig0bpe.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.418mtisvb301q7n3crvztvrlk.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.440suzmzdmgp2nyzkbfl5u9qa.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.4evw7ik2ofaspfrinz36afroy.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.4inj5hz2rfsagcarfb7mw4o6f.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.4lx3lvsvmqaw4pbj9zvtierr9.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.4m0tuo06dj8lckhfc4k6mvkiz.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.4nxaf5zg9yvvt8w2jk45w5tor.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.4okzihl47m8hj4u27e5pib0t6.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.4px3uvukn73stzzeky3njs2qg.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.4rz1dint69rdnuhyc8h4uk26q.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.4s6tgmv3ff1lmaqp6jmmnebfs.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.53z3roho1s275b0pui3i9yyn9.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.55e04a9hb3bo8vqy247g1ki77.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.5ex3toms9ysxtbwberlm283j5.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.5lr2tf1m19qt6aiwno7x91a7k.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.5ode52s3k092z3z1hwjv5qo1j.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.5wyv5h2kj1ds9gsekjltwepzl.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.5ymybm0mkm7sq2o1obdr5g6jk.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.60pyh3t1jj3b8r9401cru9ar2.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.63qzfdcalftj3hko7lnn162pp.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.678b57yudyotnhab07kp1j9zm.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.6aal7vpxgrw9o19fd89wtgvfc.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.6b6x9vq6sn1dkc8yz82tl7ihl.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.6c83snulqnjaeob3lyky4nv50.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.6f6s94dgeu5337kj6h24h21iq.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.6j53zgdao7wb4ymgu49o9m3g2.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.6spox1b7snqotlceriq143rvn.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.6wso7bitxkxvusnjlrbqozsa1.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.751jrmomk548t99smrn0xnpt8.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.75my3oq51qp3gxtow81ltcgcu.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.76s21mpejj1k85zhm3nb4e7eb.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.7cn0yeao3h78dpsynjtukp3sl.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.7evhlony3ko1s01zkaqmm4ne2.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.7hfdm96j8yrx2lscs4ug0vn3v.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.7i5ofc6qr7rcnd6r6ky3lr7tx.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.7l6j5qc53kr6cku0a5nawkdi9.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.81ejc2gchsyx6tq1chufu7a98.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.81jvryg9p7hxymv8lr0rt9iz7.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.8h9psnhrlpezistudk6j522uj.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.8nzck2yn86999agbg72s05orb.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.8r8aywqtvgc3l84h18r3wibzd.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.8rc4ylbdp3jzma33klwpioyub.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.8th37wtu7o4byvoa9ntx7u8i6.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.8w7fedslkv7deg61v4p93g46n.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.8wvpmz4d39zlp2xlw75eim7td.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.8y7s5a60b4j53yseev24pfcvq.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.9bbsekji5j0beij2ruls19k1y.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.9dp0txnafmpxats7cttuhmbcu.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.9gsdngff72yd84fg7xqea27bv.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.9h8y6k412t6eosrv1381peq44.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.9p8jvm72oeztaqgzqnsqas1pi.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.9pbj71hlnzgewt47mnu1fao7y.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.9zkl3fxh4t4jj7r1ywn2sbs46.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.a7v7ervhgmy4bqxyljcawo5x6.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.aci5v759m91zeq1hcs1num142.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.aqh9s3qdsv2l2bspagjeq3aab.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.at96pnsobg4l9t3cxhll044nw.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.auaodsy8isdgyza60g4kd4vyj.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.aufywkhfnvf1ulwacje190zl2.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.aunue6px5x6wf943jqd3timmk.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.axokwqa4pae00jfh8390w5tl0.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.b0vbln15ta0ww3vqyf4zvn6ul.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.b2lvuro6uiino87n5lq93qqwd.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.b6e291gi5hdtytoh9enuugzyr.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.b89lfclrzd5s6s381kucdp35a.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.boi9vvh4bmj044rvqkb3qonml.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.bosvpn0kbfqoetuw292emxuec.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.c2shfltq1pucvwqb7wol4wilq.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.c2xbydhmxt3jt2ud9vr1rjooh.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.c3lsvgqgqadmkchvn22kztkmd.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.c4h4grfkheql31m75anovl1ti.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.c601nemscwm6fscr1pdaepmn9.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.c7xhas6drvnblji2k553ydppa.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.cf6zf6bdheruj9a8gurxm4smq.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.cfblyywmrhss5cja28p0h00pg.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.cfn0gsbehh11xxf80t9pfj9x7.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.chk5akuzekgw383odzktx7w7u.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.cm4tda19cranpeqt3eqogtqrv.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.comds5qrl6jznvfpa9gfc0v3s.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.cr13k3uxzl1u7hxpnf9rlmxu6.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.cv80z4n6m10lql6x5zvai72ji.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.cxbqtagsib5gnfidzc3344ono.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.d6nqhzapt2jq9sobssvvz01im.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.di58b0rbwjyi632cw3bkvjsqy.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.dmw9s23uahfiz7307ur0e8urt.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.dob3084t4rwenemdb9vcoh4mw.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.dosvaz0i9p63m490um5da8c51.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.dpnbttku3kmqpz7r6cu1ap6pg.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.dsaxvza14fdhjntnbtt83mggi.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.dwfo8jf8euo9h6wcjpuaa5mr8.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.e2snn5669ff1f62dl0n3jy1o1.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.e3sjr3zzykqjcn6e5rhavipq6.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.e47n4csz35opg8b65ka2cpkhh.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.e7c3bhgade6kmh3sccgpwdq4p.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.eatkue5hhpksuaclv14u9k0p1.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.egcz77dj20v9dvjkta0o7zcp3.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.egza2ws2iw3w1i64add8t5qwj.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.eh9h6ztqjrhue66w6e7kexxa6.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.eidwr52suzt9mzbr44rumapuo.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.enzk5t50hnht61ixjkspiijx7.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.eq5i9019j55s1wy0w7kttkx2u.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.eymggv33jsegxds7pwrm9ysc9.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.f0pyw5krxw5ety7uuonszhsa4.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.f1n7j40jiwddhrtcqpn62pwld.1w91kkk.rcgu.o",
+            "oxide_storage-0edd2087e5138e3c.f4dkzkjj7r5n1wsq56aks6pyq.1w91kkk.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.0b1wwaynmd5qsix6e8e1zjddu.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.0g3co36gio4v5j0w7jxg2uofe.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.0n38bpwteqjm0oymhpejdto1f.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.0svlln7vkbig4x4mn7kkp63te.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.1klia6pxswe6wc9hrul6c1k57.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.2ve0agu8zkszwwwzi6ueob6ix.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.3e8qnbkeia61z99c819xi14yc.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.42gamxppfbbz3zrq1eeku4rnv.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.52dla0zytjogy608sgo4wbsxp.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.56f7lbxy2m2niq533oaiugi8f.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.5e0xlrv8felxpgeawohpd5emx.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.5iclx3aea4khj2hz9l4h5jwyc.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.5jb8wrf9bc8hvjitv6fkigqwr.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.5yqo3eamzoqesp9xedyqoo7ga.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.644vvhzllv5dkkjfkwacud84n.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.672rj5p4t6f5mj2bgjloofj4x.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.6fovxi2cr6bfvc0288m87vvy3.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.7efls3n2a0hx36e8yt50ea0cj.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.7tc58coup59gbjp6owzphddd4.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.90mz5fl0dkntibcz9n2zbvul6.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.9297xkf7is7j8nkshxawottil.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.9cywav07e6lve4z62zuaxprb7.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.9u5zehnzdr11p61810quq0vwt.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.ah7qcssuokxkm2lt6nw4iugmx.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.axjxo8riag4x5k6l7ouhvz9ap.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.b7vowqdx372sppqus1a5bdax9.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.cr151lx9t68cfsmjgbx4jwatk.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.d6qffo9hjfx5m8q9ep6nwg82u.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.dgc7gng7hg6uduzf4errado9p.12m6hgp.rcgu.o",
+            "oxide_storage_inventory-acf5594d15de2c6c.dm861gu04x1vnlurecnfb95qu.12m6hgp.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.0714h4x8rg5i9pw5h43owtvgz.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.0a1huhuql6ym3f21t14wuatic.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.1fupkgt1xr6xsvx0fawmfe3ft.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.2194bcu12awon2aw7pq3krw0u.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.21nrrbtrg9h2deop9pzimcrgw.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.2rupvoynbvy7efd1qcbgz4hr3.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.3h8omp2lengqbxrf9rcasaqif.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.3iqxec7jrzpxxq3g5dl0cwmwk.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.40w2sw7qsxpfxnkv6hde96y8m.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.4264hjg4uds4onta155y77c18.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.4kec3gjpilstgvsdomhtvc84i.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.54hjdfptra3skkvyvwcnmppag.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.5kb3r1rrgve287ejglu8ck8ex.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.5ukiphvq7utkg9mu8r3d72ave.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.6544yqbwpnuk0k5n5rbdg1z21.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.7hud9ruol1hqnz5ulfvb9cwjw.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.80cohxosoeolju01ug3r603ym.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.8btuddw4k1enwy1366x3m1bok.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.8c8cu1m6x8fa2boakf4lcjjkj.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.8vfnqpfvfch8ra8gnd8asv4em.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.a3d16q4un3eqcg8ehzlcnl1w7.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.a4akgcu1ej4c85sw80nty166v.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.aswspa8nsrzi1xei2rtq25g63.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.b25fvi5bnuih1sbs1wtfzak2p.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.bvkj72u3vwakcjeglrvphcqgc.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.djtkd9xk146bpcx5ol0pv6xq1.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.dk8v173gnh6kxyquujkblbood.05mlc7k.rcgu.o",
+            "oxide_storage_lease-291a063992870ab5.engyu2p4q9huhhpjv0uga6g5y.05mlc7k.rcgu.o",
+            "serde-c1a441160a14721b.serde.38011db218143265-cgu.0.rcgu.o",
+            "serde_core-fd356e6e84788fbd.serde_core.f6306591f7c76d16-cgu.0.rcgu.o",
+            "serde_json-5492dc7b7e163fbc.serde_json.93bfc697e916970d-cgu.0.rcgu.o",
+            "serde_json-5492dc7b7e163fbc.serde_json.93bfc697e916970d-cgu.1.rcgu.o",
+            "serde_json-5492dc7b7e163fbc.serde_json.93bfc697e916970d-cgu.2.rcgu.o",
+            "serde_json-5492dc7b7e163fbc.serde_json.93bfc697e916970d-cgu.3.rcgu.o",
+            "serde_json-5492dc7b7e163fbc.serde_json.93bfc697e916970d-cgu.4.rcgu.o",
+            "sha2-ce2128fff905d1cf.sha2.16a01a11b3363512-cgu.0.rcgu.o",
+            "typenum-a7841238aad5d726.typenum.63b895480e6d874f-cgu.0.rcgu.o",
+            "zmij-43a4217360118dfb.zmij.2b81bc624c2e0c04-cgu.0.rcgu.o"
+          ],
+          "inodes_linked_twice_or_more_in_tree": 412,
+          "label": "cold"
+        }
+      ],
+      "debug_map": [],
+      "probe_sha256": "678449b213714f712b12f761d717baaf5f0d09f70df14b40692afc35527f3c6e",
+      "baseline_edit_file_sha256": "1a8b304d634a7f6fcb80195f3b0f7f622de469879de09d0f8f1f21f8c9fe3d7a"
+    }
+  },
+  "storage": {
+    "scratch_reference_free": 775390720000,
+    "owned_boundaries": [
+      {
+        "label": "after setup",
+        "offset_s": 1.046,
+        "owned_allocated_bytes": 20246528,
+        "host_free": 775390715904,
+        "raw_log_bytes": 609
+      },
+      {
+        "label": "end",
+        "offset_s": 5.505,
+        "owned_allocated_bytes": 160022528,
+        "host_free": 775267205120,
+        "raw_log_bytes": 121514
+      }
+    ]
+  },
+  "boundaries": [
+    {
+      "label": "admitted",
+      "offset_s": 0.491,
+      "loadavg": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "host_free": 775411896320
+    },
+    {
+      "label": "U start",
+      "offset_s": 1.047,
+      "loadavg": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "host_free": 775390711808
+    },
+    {
+      "label": "end",
+      "offset_s": 5.491,
+      "loadavg": [
+        6.2451171875,
+        5.82470703125,
+        6.07373046875
+      ],
+      "host_free": 775267209216
+    }
+  ],
+  "outcome": "partial",
+  "stop_reason": "harness error: AttributeError(\"'CompletedProcess' object has no attribute 'pid'\")",
+  "counts": {
+    "measured": 1,
+    "setup": 2
+  },
+  "notes": [],
+  "session": {
+    "start_ns": 310548195305208,
+    "deadline_ns": 312948195305208,
+    "clock": "raw mach_continuous_time via mach_timebase_info, started in submit.py before pin check, root creation, admission wait and setup",
+    "admitted_offset_s": 0.491,
+    "admitted_utc": "2026-10-18T21:36:06Z",
+    "end_offset_s": 5.507
+  },
+  "toolchain_identity": {
+    "cargo_sha256": "7672ead309d505577c018fff2cafb3433601f073e38cbe87359ac1f7b944bbf5",
+    "rustc_sha256": "210df6794001b73ec3d453878707fa1e0bdcb63c427024a6e6574bbe5615a4da",
+    "rustc_driver": {
+      "librustc_driver-e03ed1db822dfa4c.dylib": "57f6b5280f218ed25ba6b7e4bc1d74da3ac8e4fd85bee1b8982ad4114d757c11"
+    }
+  },
+  "source": {
+    "head_and_tree": [
+      "669fd1e8ef4a6860de280ed0c0044d3415f30e02",
+      "2fc0ef522ebb4f03a084b288206685903f0b7feb"
+    ],
+    "lock_sha256": "0b076df97006905e1eb44d0dfc0e3919ab854dc6278969b89625ed33c40d3305",
+    "manifest_sha256": "b571222981b3732e9f4606a75bdb4e9f52c75b4a3ed74011e14174f7b01704da",
+    "manifest_has_workspace_table": false,
+    "manifest_package_name": "oxide-storage"
+  },
+  "settings_comparison": {
+    "U": {
+      "unit_count": 33,
+      "debug_flags_by_class": {
+        "dependency": {
+          "{}": [
+            "proc_macro2:lib",
+            "quote:lib",
+            "serde_derive:proc-macro",
+            "syn:lib",
+            "unicode_ident:lib",
+            "version_check:lib"
+          ],
+          "{\"debuginfo\": \"line-tables-only\", \"split-debuginfo\": \"unpacked\"}": [
+            "block_buffer:lib",
+            "cfg_if:lib",
+            "cpufeatures:lib",
+            "crypto_common:lib",
+            "digest:lib",
+            "generic_array:lib",
+            "itoa:lib",
+            "libc:lib",
+            "memchr:lib",
+            "serde:lib",
+            "serde_core:lib",
+            "serde_json:lib",
+            "sha2:lib",
+            "typenum:lib",
+            "zmij:lib"
+          ]
+        },
+        "dependency build script": {
+          "{}": [
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin"
+          ]
+        },
+        "workspace": {
+          "{\"debuginfo\": \"line-tables-only\", \"split-debuginfo\": \"unpacked\"}": [
+            "oxide:bin",
+            "oxide_storage:lib",
+            "oxide_storage_inventory:bin",
+            "oxide_storage_lease:bin"
+          ]
+        }
+      },
+      "workspace_member_artifacts": [
+        "oxide-storage@0.1.0"
+      ]
+    }
+  },
+  "raw_log_bytes": 121514
+}
