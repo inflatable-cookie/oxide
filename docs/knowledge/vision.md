@@ -180,6 +180,31 @@ and exact ownership checks. Unknown closure preserves them and prevents a new
 proof pool. Reuse already-green unrelated checks; no repeated standalone proof,
 real project, install, consumer effect or new experiment is authorized.
 
+### Scoped freshness-classification completion
+
+On 2026-10-18 operations applied standing routine-correction authority to the
+stopped cross-checkout gate after its three-run author/reviewer allowances were
+consumed. Previous runs, deadlines, review findings and failed/blocked judgments
+remain historical; no earlier cap is reset or retrospectively enlarged. The new
+continuation has at most 45 minutes author work and 30 minutes independent
+exact-head review, including validation and admission waiting. Each side may run
+at most two sequential focused correctness proofs, each with one fresh 128 MiB
+pool, 300 seconds including proof setup, 512 MiB scratch and 8 MiB source. The
+previous pool must be positively settled, ordinarily detached and removed before
+another starts. No successful unrelated native proof is repeated.
+
+The correction covers Cargo build-script classification, including TOML escaped
+quoted keys, plus a tiny cross-checkout custom-script control. Semantic parsing
+or a conservative path-sensitive/cold disposition is acceptable; unsupported or
+undecoded syntax must never grant unchecked warm reuse. It must not become a
+sequence of new narrow text-pattern exceptions. Existing source-content,
+fingerprint, standalone-lease and process-closure invariants remain unchanged.
+Complete current-head compile, format, Rust and documentation receipts may be
+retained only for unchanged inputs; changed source needs its targeted checks.
+A final independent exact-head native proof remains required. This allowance is
+for ordinary tiny correctness fixtures, not another real-project experiment,
+host change or a reset of the separate qualification/performance sessions.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
