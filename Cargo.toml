@@ -19,6 +19,10 @@ path = "src/bin/storage_inventory.rs"
 name = "oxide-storage-lease"
 path = "src/bin/storage_lease.rs"
 
+[[bin]]
+name = "oxide"
+path = "src/bin/oxide/main.rs"
+
 [lib]
 path = "src/lib.rs"
 

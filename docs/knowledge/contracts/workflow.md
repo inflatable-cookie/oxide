@@ -1,12 +1,14 @@
-# Oxide workflow (proposed)
+# Oxide workflow
 
 Status: product design under Tom's
 [2026-10-18 workflow direction and bounded implementation authority](../vision.md#product-workflow-direction).
-The command family is not implemented or installed yet. Checked Queue briefs
-may implement the foundation in the authorized sequence using tiny owned
-fixtures; this is not real-project qualification, default-pool creation outside
-tests, installation or consumer-adoption authority. The sections below state
-the target behavior and remaining decisions, not shipped capabilities.
+The foundation core is implemented as the unpublished, uninstalled `oxide`
+binary; [Implemented foundation core](#implemented-foundation-core) states
+exactly what ships. `init` / `new` adoption, the freshness gate, the agent
+skill, non-build run strategies and a Linux backend are not implemented.
+Fixture proofs are not real-project qualification, default-pool creation
+outside tests, installation or consumer-adoption authority. Other sections
+state the target design.
 
 ## Shape
 
@@ -192,9 +194,9 @@ Tom ruled on 2026-10-18 that Oxide must manage crash recovery itself
 ([vision](../vision.md#product-workflow-direction)). Proposed mechanism:
 
 - While a command holds a lease, it also holds an exclusive `flock` on a
-  per-lease lock file. The kernel drops that lock when the process dies for any
-  reason. The ledger records the holder PID, its start time and the Cargo
-  process-group ID.
+  per-slot lock file. The kernel drops that lock when the process dies for any
+  reason. Oxide's control state records the command phase and the Cargo
+  process-group ID; the lease ledger is unchanged.
 - Ctrl-C and termination signals are forwarded to the group. Oxide waits for
   the group to exit, then releases normally.
 - A later command that finds the lease held checks two things: whether the lock
@@ -205,6 +207,10 @@ Tom ruled on 2026-10-18 that Oxide must manage crash recovery itself
 - A surviving group member, or a reused group ID, keeps the slot held. Those
   failures are conservative. A descendant that escaped the group with `setsid`
   is the accepted residual risk.
+- A command that dies after recording "Cargo starting" but before recording
+  its group cannot prove the group empty. That slot stays held, `oxide status`
+  marks it interrupted, and `oxide-storage-lease recover` is the explicit
+  release.
 
 This replaces the local lease's "never infer abandonment" rule for Oxide's
 own commands. Consumers that lease per task, such as Nucleus, keep their
@@ -377,18 +383,96 @@ installation or host configuration change.
 keeps slots checkout-affine. A failure in another scenario is reported with its
 evidence and does not reset bounds.
 
+## Implemented foundation core
+
+The unpublished `oxide` binary (`src/bin/oxide/`, `publish = false`) runs the
+local executor on macOS. Its covering proof is `effigy rust:oxide-cli`: tiny
+offline fixture crates on one fresh 128 MiB APFS pool. It is not installed and
+has run against no real project.
+
+- **Classes.** As in [Shape](#shape), except `init` / `new` stay plain
+  passthrough until adoption lands. Plain passthrough replaces Oxide with
+  Cargo, so output and exit codes are Cargo's. Unknown commands are building
+  passthrough. A leading `+toolchain` or Cargo flag before the command
+  refuses; `--version`, `-V` and `--list` pass through.
+- **Profiles.** `quick` (default) and `debug` translate to `oxide-quick` and
+  `oxide-debug`; `release` and `--release` use the project's `release`. Both
+  recipes are always defined in the environment, so external tools can name
+  either. Building built-ins translate `--profile` only when given; external
+  subcommands receive arguments untouched.
+- **Refusals.** `--target-dir`, `--config` keys `build.build-dir` /
+  `build.target-dir` (any quoting or `build = {…}` form) and every `--config`
+  file path refuse, because a file could set either key.
+- **Identity and key.** Git root commits plus the workspace prefix; shallow
+  clones use the normalised `origin`; otherwise the canonical path. The slot
+  key adds the Oxide profile, the `rustc -vV` digest, the target (`--target`,
+  then `CARGO_BUILD_TARGET`, then host) and the default backend. Building
+  passthrough uses the quick key unless a built-in names another profile;
+  Cargo's per-profile subdirectories keep profiles apart inside one slot.
+- **Checkout affinity.** A slot is reused only by the same canonical checkout
+  with the same key. Cross-checkout reuse waits for the freshness gate (W-8).
+- **Pool.** `OXIDE_POOL`, else `~/Library/Caches/oxide/pool`, created on first
+  building command with a 24 GiB cap equal to its sparse image. Creation
+  refuses below 20 GiB host free space. An existing pool from
+  `oxide-storage-lease init` opens unchanged.
+- **Slots and waiting.** Per-project cap 2: a new checkout or key at the cap
+  evicts the project's least recently used idle slot whole and builds cold.
+  Host-wide limit 2 commands holding slots (`OXIDE_MAX_ACTIVE`, 1–32). Excess
+  commands wait in FIFO order, print one `oxide: waiting for …` line on stderr
+  and cancel on Ctrl-C with exit 130. Another command in the same checkout
+  and key waits too.
+- **Execution.** Cargo runs from the caller's directory as leader of a new
+  process group, with `CARGO_BUILD_BUILD_DIR` on the slot and
+  `CARGO_TARGET_DIR=<workspace>/target`. SIGINT, SIGTERM and SIGHUP are
+  forwarded to the group; Oxide releases only after the group is empty. `test`
+  holds the slot through execution. `run` resolves the binary as `cargo run`
+  does: `--bin` / `--example`; else, over the `-p` package or the workspace
+  default members for the current directory (the current package, a virtual
+  root's `default-members`, or every member), the single `default-run`, else
+  the only binary. Several binaries refuse with Cargo's error and exit 101
+  before any lease. `run` builds only that target, releases, then replaces
+  Oxide with the program. It sets `CARGO_MANIFEST_DIR` only; other `cargo run`
+  environment (`CARGO_PKG_*`, dylib paths) is not set. Exit codes are Cargo's,
+  or the program's for `run`.
+- **Summary.** One stderr line per leased command: profile, strategy (`build`
+  or `build+execute`), slot, warm/cold, elapsed time and payload volume use.
+- **`clean`.** Waits until no live or interrupted-but-running command holds a
+  slot for this checkout, then blocks new commands in the checkout while it
+  runs `cargo clean` against the private target directory and an empty
+  private build directory. It then drops the checkout's idle affinity. Slots
+  stay intact until evicted, so the next build is cold. Ctrl-C cancels the
+  wait. `cargo clean` runs as a recorded process group and inherits the clean
+  lock, so if `oxide clean` dies the barrier stays until that lock is free and
+  the group is empty.
+- **Crash recovery.** Per [Crash recovery](#crash-recovery), for Oxide's own
+  commands only. A follower in the same checkout waits while the crashed
+  command's group survives, then recovers and continues.
+- **`status`.** Pool path or "not created", cap, payload use, slot accounting
+  coverage, each slot's state, profile and checkout, waiting commands,
+  checkouts being cleaned, and
+  whether the current workspace's `target/` holds plain-Cargo `deps/` or
+  `incremental/`. It never creates the pool.
+
+Control state lives in `<pool>/oxide-managed/` (owner-only): records mapping
+each checkout and key to a private lease project directory, FIFO wait
+tickets, an admission lock and one lock per record. The lease ledger,
+receipt and standalone CLI contract are unchanged; see
+[local lease](local-lease.md#oxide-front-door-control-directory).
+
 ## Open decisions
 
-- **W-1 Default pool.** Location, default cap and the host-reserve rule for
-  automatic creation. Recommendation: per-user cache directory, sparse image,
-  modest default cap, refuse below the monitored host reserve.
-- **W-2 Waiting and concurrency.** Per-project slot cap, host-wide concurrent
-  Cargo limit, wait versus cold-slot preference. Coordinates with
+- **W-1 Default pool.** Foundation choice above: per-user cache directory,
+  24 GiB sparse image, refuse below the 20 GiB host reserve. Revisit with real
+  use.
+- **W-2 Waiting and concurrency.** Foundation choice above: per-project cap
+  2, host-wide limit 2, strict FIFO waiting, idle-slot eviction before
+  waiting. Coordinates with
   [Q-011](../questions.md#q-011--how-should-slot-waiting-coordinate-with-host-admission).
 - **W-3 Project file.** Needed only for per-project profile overrides or
   dependency debug-off. Recommendation: none until a real project needs it.
-- **W-4 Crash recovery.** Direction ruled; the mechanism above needs
-  qualification, including a group-escape test.
+- **W-4 Crash recovery.** Direction ruled and implemented for Oxide's own
+  commands; the fixture proof covers a killed command whose group survives.
+  Qualification, including a group-escape test, remains.
 - **W-5 Retirement execution.** Done in oxide#070; see
   [retirements](../retired.toml).
 - **W-6 Linux backend.** CI, LAN boxes and Colima need a pool backend without
@@ -396,6 +480,6 @@ evidence and does not reset bounds.
 - **W-7 Command name.** `oxide` collides with Oxide Computer Company's CLI
   ([Q-005](../questions.md#q-005--what-names-are-safe-to-publish)). The design
   is name-independent.
-- **W-8 Freshness gate.** Qualify the cross-checkout gate above, or ship
-  checkout-affine slots first. Recommendation: build the gate in the foundation.
-  Without it the main worktree benefit is unsafe.
+- **W-8 Freshness gate.** The foundation core ships checkout-affine slots.
+  Recommendation: build and qualify the gate next. Without it the main
+  worktree benefit is unavailable.

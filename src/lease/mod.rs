@@ -18,7 +18,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-pub use pool::{capacity_status, lease, recover, release, status, LeaseRequest};
+pub use pool::{capacity_status, evict_idle_slot, lease, recover, release, status, LeaseRequest};
 
 #[cfg(test)]
 mod tests;
@@ -61,6 +61,9 @@ const IMAGE_NAME: &str = "image.sparseimage";
 const RECEIPT_NAME: &str = "receipt.json";
 const PAYLOAD_NAME: &str = "payload";
 const SLOTS_NAME: &str = "slots";
+/// Private control directory owned by the `oxide` front door. The lease CLI
+/// tolerates it as a real directory and never reads or writes it.
+pub const MANAGED_NAME: &str = "oxide-managed";
 
 /// Caller-selected Cargo profile label. The CLI records it and returns it; it
 /// does not force incremental, debug or feature flags.

@@ -162,6 +162,13 @@ pub fn capacity_status(pool: &Path) -> Result<CapacityStatus, LeaseError> {
     opened.capacity_status(sample)
 }
 
+/// Retire one recorded idle slot by ID after rechecking its durable scope.
+/// The `oxide` front door uses this for its per-project slot-cap eviction;
+/// the standalone lease CLI does not expose it.
+pub fn evict_idle_slot(pool: &Path, slot_id: &str) -> Result<(), LeaseError> {
+    Pool::open(pool)?.evict_idle(slot_id)
+}
+
 #[cfg(test)]
 pub(super) fn create_injected(pool: &Path, cap_bytes: u64) -> Result<PoolInfo, LeaseError> {
     let pool = prepare_new_pool(pool)?;
@@ -212,6 +219,11 @@ pub(super) fn release_injected(pool: &Path, lease_id: &str) -> Result<ReleaseRec
 pub(super) fn recover_injected(pool: &Path, lease_id: &str) -> Result<ReleaseReceipt, LeaseError> {
     let mut opened = Pool::open_with(pool, true)?;
     opened.release_or_recover(lease_id, true)
+}
+
+#[cfg(test)]
+pub(super) fn evict_idle_slot_injected(pool: &Path, slot_id: &str) -> Result<(), LeaseError> {
+    Pool::open_with(pool, true)?.evict_idle(slot_id)
 }
 
 #[cfg(test)]
@@ -426,6 +438,25 @@ impl Pool {
             return self.take_idle(idle, incarnation, project, workspace, request);
         }
         self.allocate(project, workspace, request)
+    }
+
+    fn evict_idle(&mut self, slot_id: &str) -> Result<(), LeaseError> {
+        let id =
+            slot_id
+                .parse::<u64>()
+                .ok()
+                .filter(|id| *id != 0)
+                .ok_or(LeaseError::InvalidInput(
+                    "slot ID must be a positive integer",
+                ))?;
+        let Some((incarnation, project, profile)) = self
+            .slot(id)
+            .filter(|slot| slot.state == SlotPersistState::Idle && slot.lease_id.is_none())
+            .map(|slot| (slot.incarnation, slot.project.clone(), slot.profile))
+        else {
+            return Err(LeaseError::Busy);
+        };
+        self.retire_idle_slot(id, incarnation, &project, profile)
     }
 
     fn take_idle(
@@ -1141,6 +1172,7 @@ fn refuse_foreign_pool_entries(pool: &Path) -> Result<(), LeaseError> {
                 | super::IMAGE_NAME
                 | super::RECEIPT_NAME
                 | super::PAYLOAD_NAME
+                | super::MANAGED_NAME
         ) || name.starts_with("ledger.tmp-");
         if !allowed {
             return Err(LeaseError::UnknownAccounting);

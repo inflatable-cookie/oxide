@@ -17,7 +17,7 @@ The unpublished root package uses Rust edition 2021 and declares
 `rust-version = "1.97.1"`. Its internal name is `oxide-storage`; publication
 names remain subject to [Q-005](questions.md#q-005--what-names-are-safe-to-publish).
 It contains a Unix-only local storage prototype, the unpublished
-`oxide-storage-lease` binary, and pins `sha2` 0.10.9 for
+`oxide-storage-lease` and `oxide` binaries, and pins `sha2` 0.10.9 for
 persisted lease-token hashes. This does not establish production host support.
 
 The reviewed design selects Cargo build-dir redirection as the smallest

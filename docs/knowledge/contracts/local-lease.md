@@ -77,6 +77,22 @@ system may own it. The pool does not recurse into or inventory these entries,
 and every other payload-root entry refuses. Their writes still consume the
 APFS volume's enforced capacity.
 
+## Oxide front door control directory
+
+The unpublished [`oxide`](workflow.md#implemented-foundation-core) command
+leases through this library. It keeps its own state in `<pool>/oxide-managed/`,
+an owner-only real directory. Pool opens accept that one extra entry; a
+symlink there refuses like any other. The CLI never reads or writes it, and a
+pool without it opens as before. Oxide passes one private directory under it
+as each lease's `--project`, so library reuse stays checkout-affine.
+
+The library also exports `evict_idle_slot` for Oxide's per-project slot cap.
+It retires one recorded idle slot whole through the same durable eviction path
+as capacity eviction, and returns busy for a held slot. The CLI does not
+expose it. Ledger v1, receipt v2, JSON and exits are unchanged. An earlier
+`oxide-storage-lease` build refuses a pool that has `oxide-managed` as an
+unknown entry; use the current build against pools the front door touched.
+
 ## Commands
 
 **init** checks cap and image size, and refuses unsupported platforms, before
