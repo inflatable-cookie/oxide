@@ -625,7 +625,9 @@ fn cargo_metadata(checkout: &Path, request: &Resolution) -> Result<serde_json::V
             "only a built-in Cargo build command writes the missing lock file".to_owned(),
         ));
     };
-    if !cargo_accepts(Command::new(crate::CARGO).args(check))? {
+    let mut parse = Command::new(crate::CARGO);
+    parse.args(check);
+    if !cargo_accepts(parse)? {
         return Err(Refusal::Unvouched(
             "Cargo rejects this command's arguments, so it writes no lock file".to_owned(),
         ));
@@ -929,6 +931,7 @@ mod tests {
         let request = |values: &[&str]| Resolution {
             args: values.iter().map(OsString::from).collect(),
             help: false,
+            parse_check: None,
         };
         let probe = |values: &[&str]| -> Vec<String> {
             probe_args(&request(values))
