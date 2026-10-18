@@ -143,7 +143,7 @@ Tom's further approvals, 2026-10-18, were the exact bundled reply
   setup/version calls, 30 minutes, 6 GiB scratch. Its one-worktree timings cannot
   establish cross-worktree amortization; that remains conditional. Queue decision
   `96889d44-8fe6-4e91-a97c-f3e6f5c96a42` v2 records "Yes".
-- Implement the [platform backends](contracts/workflow.md#platform-backends-proposed)
+- Implement the [platform backends](contracts/workflow.md#platform-backends)
   budget-only directory backend and host-reserve watchdog, with macOS fixtures
   and an installed-target Linux compile check. Queue decision
   `51d259de-b630-400a-bc18-fd135dae6b42` v2 records "Yes". This is bounded

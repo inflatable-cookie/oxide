@@ -200,9 +200,9 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     // the stopped group closed leaves the lease held and the record naming
     // the group, so a later command recovers it once the group is empty.
     let closed = match (watchdog.as_mut(), &outcome) {
-        (Some(watchdog), Ok((Some(_), _))) => process::wait_group_empty_watched(group.id, watchdog),
         (Some(_), Ok((None, _))) => None,
-        (_, _) => {
+        (Some(watchdog), _) => process::wait_group_empty_watched(group.id, watchdog),
+        (None, _) => {
             process::wait_group_empty(group.id);
             Some(Instant::now())
         }

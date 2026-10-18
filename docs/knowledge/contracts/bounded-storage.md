@@ -48,6 +48,13 @@ entry refuses.
   Opening rechecks those facts and never attaches a replacement.
 - Directory-only roots are not a product mode of the lease CLI. Unsupported
   platforms and unknown backend tags refuse without fallback.
+- The `oxide` front door's `directory-budget-v1` pool is not a bounded
+  backend. It is opened only through the library's `managed` entry points,
+  never mints `BoundedBacking`, and claims no ceiling: admission and
+  whole-idle-slot eviction against a recorded budget plus a best-effort
+  host-reserve watchdog
+  ([workflow](workflow.md#directory-budget-v1-as-shipped)). The CLI and the
+  hard-bound library functions refuse it as a backing mismatch.
 
 ## Historical filesystem-full proof
 
@@ -69,6 +76,6 @@ records its bounds and evidence.
 
 Failed or uncertain task-owned fixtures are retained rather than force-cleared.
 No consumer activation, installation, global host settings, live cache cleanup,
-per-slot quota isolation, or Linux backend follows from this contract. The
+per-slot quota isolation, or hard-bounded Linux backend follows from this contract. The
 image backing file's host write attribution remains unavailable. Real managed
 builds, adoption and production capacity policy stay separately gated.
