@@ -1,8 +1,11 @@
 # Foundation qualification, 2026-10-18 (oxide#074)
 
 One session of [workflow Q1–Q7](../../contracts/workflow.md#foundation-qualification)
-on Oxide's own repository. Verdict: **pass**. This is correctness and
-lifecycle evidence. It makes no speed, storage-saving or SSD claim.
+on Oxide's own repository. Verdict: **partial**. All seven scenarios held,
+but the bounds evidence is insufficient: there was no continuous monotonic
+session clock, and two pre-session `cargo -V` probes exceed the cumulative
+Cargo cap. See [Disclosures](#disclosures). This is correctness and lifecycle
+evidence. It makes no speed, storage-saving or SSD claim.
 
 ## Files
 
@@ -24,8 +27,10 @@ lifecycle evidence. It makes no speed, storage-saving or SSD claim.
 - Start (wall) `1792356980090771000` ns, before the scratch root existed.
   Deadline +30 min. Heavy admission granted at 297.3 s. Session ended at
   356.8 s, after teardown.
-- Counts, each against a cap of the same size: setup Cargo build 1, lease init
-  1, `oxide` 9, plain `cargo check` 1. Nothing failed and nothing was retried.
+- Session counts: setup Cargo build 1, lease init 1, `oxide` 9, plain
+  `cargo check` 1. Nothing failed and nothing was retried. The cumulative
+  Cargo count also includes the two pre-session probes under
+  [Disclosures](#disclosures).
 - Pin `dc84d039cd397c8292f37f4201e3916fa2ecd1d3`, tree
   `448bed9adba200dc4489060637a3bdb05addaddf`, in a pristine `--no-local`
   scratch clone. Setup: `cargo build --release --locked --offline --bin oxide
@@ -109,15 +114,32 @@ Marker mtimes (ns) show the stale-mtime shape in Q3:
 
 ## Disclosures
 
-- **Clock source.** Python 3.9's monotonic clock is process-relative on macOS,
-  so the first recipe draft would have measured the deadline from admission.
-  The recipe was corrected to the caller's wall-clock start while it was still
-  waiting for admission and had made no effects. The recorded SHA-256 is the
-  corrected file (`8dc6b15`).
-- **Pre-session probes.** Before this session, the blocked preflight under the
-  previous brief version ran `cargo -V` and `rustc -V` twice each. Those runs
-  happened before any task-owned effect, built nothing and do not count
-  against the session caps. This resumed session ran no other probes.
+- **No continuous monotonic clock (gate shortfall).**
+  - The launcher took its start stamp with `time.monotonic_ns()` and
+    `time.time_ns()` before creating the scratch root. Python 3.9's monotonic
+    clock on macOS is process-relative: the launcher read 7626375 ns
+    (`launch.txt`), so it cannot be compared with any other process.
+  - The recipe was then changed to use the wall-clock start while it was still
+    waiting for admission and had made no effects (`8dc6b15`; the recorded
+    SHA-256 is that file).
+  - A monotonic clock therefore covers only the recipe process, from admission
+    at 297.3 s to the end at 356.8 s. In that span each call's monotonic and
+    wall durations agree within 1 ms (`calls.jsonl`).
+  - The 297.3 s before admission, covering the scratch root, the manifest and
+    the admission wait, has wall-clock evidence only.
+  - The brief requires one original monotonic clock, so this falls short of
+    it. It is not something to explain away.
+- **Pre-session Cargo probes (cumulative cap exceeded).**
+  - The blocked preflight under brief version 3 ran `rustc -V; cargo -V` in
+    the task worktree, then `rustc -V && cargo -V` from `/private/var/tmp`.
+  - Each printed `rustc 1.97.1 (8bab26f4f 2026-07-14)` and
+    `cargo 1.97.1 (c980f4866 2026-06-30)`. They ran before any task-owned
+    effect and built nothing.
+  - The brief counts version probes inside the caps. Cumulatively that is 4
+    Cargo calls against a cap of 2 (one setup build, one Q6 check).
+  - These receipts come from the author's session transcript only; no
+    retained log independently records them.
+  - The resumed session ran no other Cargo, `rustc` or `oxide` probes.
 - **Gate path in Q3.** Every slot move here was also a checkout-path change.
   The gate therefore refreshed every in-checkout package file, which already
   covered B's unchanged marker. The content-only stale-mtime refresh, without
@@ -125,3 +147,8 @@ Marker mtimes (ns) show the stale-mtime shape in Q3:
   still met.
 - Host free space stayed near 716 GiB, so the 20 GiB reserve check was never
   close to binding.
+- **Consequence.** The scenario results stand as observed. Qualification is
+  partial until an operator rules: either accept these two deviations, or
+  authorize a new session. A future recipe should read one system-wide
+  monotonic source (for example `time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)`)
+  in both the launcher and the recipe, and run no probes outside the caps.

@@ -433,7 +433,8 @@ Re-evaluate interception and run strategies after that.
 
 Authorized as a bounded follow-up under Tom's
 [2026-10-18 ruling](../vision.md#product-workflow-direction) and run once on
-2026-10-18 (oxide#074). **Verdict: pass**; see [Result](#qualification-result).
+2026-10-18 (oxide#074). **Verdict: partial.** All seven scenarios held, but
+the session's bounds evidence falls short; see [Result](#qualification-result).
 It was the gated real-project step after the foundation tasks merged and closed
 out. The checked Queue brief owned the fixed resource, invocation and deadline
 limits. Its job was to prove correctness and lifecycle on Oxide's own
@@ -496,21 +497,41 @@ evidence and does not reset bounds.
 
 Run 2026-10-18 at main `dc84d039` under Effigy heavy admission. Raw evidence:
 [foundation-qualification-20261018](../evidence/foundation-qualification-20261018/README.md).
-- Every count was used exactly once up to its cap, with no failures or retries:
-  one setup build, one lease init, nine `oxide` calls, one plain check.
-- Time: 356.8 s of the 30-minute clock, 297.3 s of it waiting for admission.
+- Session calls: one setup build, one lease init, nine `oxide` calls, one
+  plain check. None failed and none was retried.
+- Time: 356.8 s of the 30-minute window by wall clock, 297.3 s of it waiting
+  for admission.
 - Pool: 4 GiB. Peak payload 354 MiB; backing file 501 MiB at the end.
 - Host free space stayed about 716 GiB.
 
-| # | Verdict | Observed |
+| # | Scenario | Observed |
 | --- | --- | --- |
-| Q1 | Pass | Cold: 10 local and 29 registry units built; 81 tests passed; marker saw A. |
-| Q2 | Pass | Slot 1 warm. All 29 registry units fresh; the gate refreshed 149 files and all 10 local units rebuilt. B's marker matched compiled and runtime: B's path and content. |
-| Q3 | Pass | B's unchanged marker was older than A's edit and the slot's build. B rebuilt all 10 local units, and its marker saw `original marker`, not `edited in A`. No stale success. |
-| Q4 | Pass | All 39 units fresh; 81 tests passed. |
-| Q5 | Pass | `oxide` was SIGKILLed after Cargo started; Cargo's group survived and finished. The retry waited, logged the recovery once the group was empty, evicted the untrusted slot, built cold in slot 2 and passed. |
-| Q6 | Pass | Plain `cargo check` wrote `B/target`. `oxide status` reported `deps/` or `incremental/` with 72 files and 41 MiB. |
-| Q7 | Pass | 197 of 3895 MiB used. One idle slot, 0 waiting, accounting complete, recovery logged. Afterwards the pool was detached without force and removed. |
+| Q1 | Held | Cold: 10 local and 29 registry units built; 81 tests passed; marker saw A. |
+| Q2 | Held | Slot 1 warm. All 29 registry units fresh; the gate refreshed 149 files and all 10 local units rebuilt. B's marker matched compiled and runtime: B's path and content. |
+| Q3 | Held | B's unchanged marker was older than A's edit and the slot's build. B rebuilt all 10 local units, and its marker saw `original marker`, not `edited in A`. No stale success. |
+| Q4 | Held | All 39 units fresh; 81 tests passed. |
+| Q5 | Held | `oxide` was SIGKILLed after Cargo started; Cargo's group survived and finished. The retry waited, logged the recovery once the group was empty, evicted the untrusted slot, built cold in slot 2 and passed. |
+| Q6 | Held | Plain `cargo check` wrote `B/target`. `oxide status` reported `deps/` or `incremental/` with 72 files and 41 MiB. |
+| Q7 | Held | 197 of 3895 MiB used. One idle slot, 0 waiting, accounting complete, recovery logged. Afterwards the pool was detached without force and removed. |
+
+**Why partial, not pass.** The pass rule requires bounded evidence as well
+as the scenarios, and the independent review found that evidence insufficient
+on two points:
+- **No continuous monotonic clock.** The session clock was a wall-clock
+  start taken before the scratch root existed. Python 3.9's monotonic clock
+  restarts in each process on macOS, so it could not be carried across. A
+  monotonic clock covers only the recipe process: per-call monotonic and wall
+  durations agree within 1 ms. The 297 s before admission has wall-clock
+  evidence only.
+- **Cumulative Cargo count exceeded.** During the earlier blocked preflight,
+  `cargo -V` ran twice. The brief counts version probes inside the caps, so
+  cumulatively there were 4 Cargo calls against a cap of 2 (one setup build,
+  one Q6 check). Only the author's transcript records those probes.
+
+The scenario results stand as observations. A clean pass needs an operator
+ruling: either accept these two deviations, or authorize a new session. Before
+any new session, take the clock from one system-wide monotonic source (for
+example `CLOCK_UPTIME_RAW`) and run no probes outside the caps.
 
 Limits:
 - Every slot move in this session was also a checkout-path change, so the

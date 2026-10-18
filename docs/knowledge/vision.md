@@ -114,8 +114,10 @@ routine-correction authority (`e75d12a9`), without a new operator answer. The
 front door always creates a 24 GiB pool. So the same single setup build also
 stages `oxide-storage-lease` (`--bin oxide --bin oxide-storage-lease`), and
 one counted `oxide-storage-lease init` creates the approved 4 GiB pool before
-Q1. All other caps stayed the same. The session ran once and
-[passed](contracts/workflow.md#qualification-result).
+Q1. All other caps stayed the same. The session ran once. Its scenarios held,
+but the result is [partial](contracts/workflow.md#qualification-result): there
+was no continuous monotonic clock, and pre-session `cargo -V` probes exceeded
+the cumulative Cargo cap. A clean pass needs an operator ruling.
 
 The appointed product architect corrected the focused fixture allowance on
 2026-10-18 for implementation briefs not yet dispatched. Each author side and
