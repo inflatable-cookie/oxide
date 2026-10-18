@@ -246,7 +246,7 @@ time separately before any backend is credited.
 | Lever | Finding | Fit |
 | --- | --- | --- |
 | No-op fast path | Oxide can record the last successful build's content identity per checkout and binary (the freshness gate records it). If unchanged, it executes without invoking Cargo, skipping Cargo's fingerprint walk. | In Oxide's control; small, safe; after the gate. |
-| Optimized dependencies in `quick` | `package."*".opt-level` makes heavy dependencies run faster. Shared slots pay that compile cost once across worktrees. It needs `--config`, because the environment cannot express `package."*"`. | Candidate; measure. Every modelled command must use the same recipe, or the slot holds two dependency sets. |
+| Optimized dependencies in `quick` | `package."*".opt-level` can make heavy dependencies run faster. Shared slots would pay that compile cost once across worktrees. It needs `--config`, because the environment cannot express `package."*"`. Measured 2026-10-18 on Oxide's workspace: about 3.3 s extra cold build and no test-runtime gain ([measurement](#optimized-dependency-measurement-2026-10-18)). | Not for the default recipe. A dependency-compute-bound project needs its own reading. Every modelled command must use the same recipe, or the slot holds two dependency sets. |
 | Workspace feature unification | Selecting different packages builds dependency variants with different features: churn and extra storage. A 2026-10-18 probe on 1.97.1 showed `resolver.feature-unification` is ignored without `-Zfeature-unification` ([RFC 3692](https://rust-lang.github.io/rfcs/3692-feature-unification.html)). The stable route is a workspace-hack crate, which is a project change. | `oxide status` could report duplicate dependency variants; the fix stays per project. |
 | Faster linkers | macOS uses Apple's linker. [Wild](https://github.com/davidlattimore/wild) is Linux-only, has no incremental linking yet, and its Mach-O port is not ready. | Linux: LLD default already; wild later. macOS: nothing to add. |
 | Dynamic dependency linking | A dylib wrapper crate re-exporting dependencies cuts link time for large graphs, but changes linking and runtime loading. | Per-project opt-in only. |
@@ -254,6 +254,77 @@ time separately before any backend is credited.
 | Watch mode | Rebuilds and restarts on save; cuts latency, not work. | Human loop; low value for agents. |
 | [danluu/rust-interpreter](https://github.com/danluu/rust-interpreter) | rustc checks the code, then selected MIR is lowered to bytecode and run in an interpreter or AArch64 JIT. Self-described as "extremely vibe coded"; "cannot yet replace `cargo test`"; no unwinding, threads, FFI or `should_panic`; "no fallback" for unsupported code. Its results are mixed: 20% faster on one five-edit pilot, 2.7x slower on a compute-heavy target. Needs pinned nightly with `rustc-dev`; no license stated. | Not usable or adoptable. It shows the approach can work, and its ceiling is still the check time. |
 | Miri / [Cranelift JIT](https://github.com/rust-lang/rustc_codegen_cranelift/blob/main/docs/usage.md) | Miri is a UB checker that runs far slower than native code. Cranelift JIT is covered above. | Not speed tools. |
+
+### Optimized-dependency measurement (2026-10-18)
+
+One bounded session (oxide#076) on Oxide's repository at `22d2f77`, stable
+1.97.1, macOS aarch64, under Effigy heavy admission. Raw evidence:
+[`evidence/optimized-deps-quick-076/`](evidence/optimized-deps-quick-076/summary.json).
+Tom approved the session ([vision](vision.md#product-workflow-direction)).
+
+Arms, each in its own target directory: A is the `quick` recipe; B adds
+`--config 'profile.oxide-quick.package."*".opt-level=1'`; C uses `opt-level=2`.
+Loop per arm: a cold `cargo test --workspace --all-targets --no-run`, then three
+edits to `MAX_REFERENCES` in `src/dep_info.rs`, each followed by the same
+`--no-run`. Every call used `--locked --offline` and an explicit environment;
+the source was reset to the pin between arms. After every build the reported
+test executables (`profile.test` artifacts only) ran directly with default
+membership. All four macOS scratch variables pointed at one root.
+
+| Arm | Dependency opt-level | Cold `--no-run` | Warm `--no-run` | Library suite (libtest) | `oxide` bin suite | Target after cold / after loop |
+| --- | --- | --- | --- | --- | --- | --- |
+| A | 0 | 4.24 s | 0.80 s | 2.11 s | 0.33–0.35 s | 190.3 / 264.7 MiB |
+| B | 1 | 7.58 s | 0.82 s | 2.22 s | 0.34–0.35 s | 187.5 / 262.6 MiB |
+| C | 2 | 7.45 s | 0.89 s | 2.20 s | 0.33–0.37 s | 191.7 / 266.4 MiB |
+
+Warm figures are means of the three edits. Library-suite figures are libtest's
+own `finished in` times, means of those edits. Every edit rebuilt the same 9
+workspace units and left 29 fresh.
+
+Receipts:
+- Tests passed in every cycle of every arm: 52 library, 36 `oxide` bin and 1
+  profile probe; 0 ignored, 0 failed. The two storage bins have no tests.
+- Workspace units had identical rustc settings in all arms. All 29 dependency
+  units (20 libraries, 8 build scripts, `serde_derive`) carried the arm's
+  `-C opt-level`. B and C also got an explicit `-C debug-assertions=on`, which
+  keeps the debug assertions that A has implicitly at opt-level 0. No other
+  flag differed.
+
+Findings:
+- **No test-runtime gain.** The library suite averaged 2.1–2.2 s in every arm;
+  B and C were not faster than A. The `oxide` bin suite was unchanged.
+  Oxide's tests are not bound by dependency compute.
+- **Cold cost rises by 3.2–3.3 s per slot (+76–79%).** A ran first, with cold
+  sources and compiler, so the real gap may be larger.
+- **`package."*"` also optimizes build-time units.** It took precedence over
+  `build-override` for build scripts and the proc-macro, which adds compile
+  cost with no runtime return.
+- **Storage did not change measurably** (within 4.2 MiB after cold, 3.8 MiB
+  after the loop).
+- **Process start dominates the noise.** Seven of 60 test-binary runs took
+  2.0–3.6 s more than libtest reported, including zero-test binaries. All
+  arms were affected; the cause was not isolated. Harness wall totals per
+  cycle (3.5–7.0 s) therefore do not compare arms.
+
+Recommendation: do not add dependency optimization to the default `quick`
+recipe. On this workspace it costs about 3.3 s per cold slot and returns
+nothing. A dependency-compute-bound project (heavy hashing, compression or
+parsing in tests) could differ. That needs its own approved reading, and an
+override would have to exclude build-time units.
+
+Cross-worktree amortization was not observed; this session used one
+checkout. Estimate, assumptions only: if every modelled command in a shared
+slot uses the same recipe, a slot pays the extra cold cost once. A per-run
+saving of *g* seconds then breaks even after about 3.3 / *g* runs in that slot.
+Here *g* was not positive, so no number of worktrees recovers the cost.
+
+Limits:
+- One small subject (38 units), three warm samples per arm, macOS aarch64
+  only, on a shared host (one-minute load 7.6–10.9).
+- Arms ran in order A, B, C.
+- No write-volume or SSD claim.
+- Session: 12 measured plus 1 version Cargo call, 93 s of the 30 minutes,
+  811 MiB peak owned scratch, 0.7 MiB raw logs.
 
 ## Upstream churn and disk developments (2026-10-18)
 

@@ -1,0 +1,41 @@
+
+running 36 tests
+test adopt::tests::absent_or_empty_files_get_only_the_block ... ok
+test adopt::tests::appending_separates_with_one_blank_line_and_keeps_existing_bytes ... ok
+test adopt::tests::parse_separates_the_directory_from_cargo_options ... ok
+test cli::tests::classes_follow_the_workflow_table ... ok
+test adopt::tests::malformed_markers_refuse_instead_of_guessing ... ok
+test adopt::tests::refresh_replaces_only_the_marked_span_and_is_idempotent ... ok
+test cli::tests::package_selection_reads_every_form ... ok
+test adopt::tests::effigy_scan_reports_command_words_only ... ok
+test cli::tests::external_subcommands_are_untouched_and_builtins_translate_only_when_asked ... ok
+test cli::tests::modelled_commands_default_to_quick_and_translate_profiles ... ok
+test cli::tests::run_builds_then_keeps_program_arguments ... ok
+test cli::tests::manifest_path_and_target_are_observed ... ok
+test freshness::tests::dirty_paths_differ_unless_both_sides_match ... ok
+test freshness::tests::only_paths_under_the_checkout_count ... ok
+test cli::tests::storage_placement_overrides_refuse ... ok
+test freshness::tests::metadata_splits_packages_by_source ... ok
+test freshness::tests::every_local_input_refreshes_and_vendored_sources_do_not ... ok
+test freshness::tests::origin_round_trips_and_refuses_unknown_fields ... ok
+test freshness::tests::untrusted_or_foreign_affine_slots_refuse_the_gate ... ok
+test identity::tests::digest_is_lowercase_sha256_hex ... ok
+test identity::tests::identity_key_format_is_stable ... ok
+test identity::tests::origin_forms_normalise_to_one_identity ... ok
+test freshness::tests::status_entries_yield_repository_paths ... ok
+test store::tests::cargo_that_never_started_leaves_no_group ... ok
+test store::tests::never_recovers_a_lease_the_record_did_not_take ... ok
+test store::tests::recovers_only_an_empty_recorded_group ... ok
+test store::tests::pending_recovery_survives_a_crash_after_the_ledger_change ... ok
+test store::tests::recovery_log_keeps_the_newest ... ok
+test store::tests::state_without_holder_or_recoveries_still_loads ... ok
+test store::tests::status_path_matches_the_rule ... ok
+test identity::tests::run_pick_follows_cargo_run_selection ... ok
+test watchdog::tests::trigger_is_reserve_plus_margin ... ok
+test watchdog::tests::statfs_samples_the_scratch_filesystem ... ok
+test watchdog::tests::readings_above_the_trigger_never_stop ... ok
+test watchdog::tests::a_failed_sample_stops_the_build ... ok
+test watchdog::tests::term_then_kill_closes_a_group_that_ignores_term ... ok
+
+test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
