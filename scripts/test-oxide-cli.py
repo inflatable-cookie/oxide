@@ -6,8 +6,12 @@ reserve, the script provisions exactly one fresh 128 MiB APFS pool through
 proof phase including setup) and points OXIDE_POOL at it; the default pool is
 never touched. Offline std-only fixture crates prove command routing, the
 quick/debug profile flags (including an external subcommand's `$CARGO`
-call), storage-override refusals, `clean`, checkout-affine reuse, FIFO
-waiting and the host limit, clean waiting for active commands, `default-run`
+call), storage-override refusals, `clean`, cross-checkout reuse through the
+freshness gate (two Git worktrees of a scratch repository: the stale-mtime
+scenario rebuilds, a `CARGO_MANIFEST_DIR` package rebuilds on a path change,
+a path dependency outside the repository stays fresh, an unchanged repeat
+rebuilds nothing, and a refused gate builds cold), FIFO waiting and the host
+limit, clean waiting for active commands, `default-run`
 selection (package and virtual workspace roots), Ctrl-C forwarding, own-command crash recovery
 (a killed oxide whose Cargo group survives stays held; one whose group is gone
 is recovered by the next command and logged; a standalone-CLI lease is never
@@ -128,6 +132,58 @@ VIRTUAL = {
     "app/src/bin/other.rs": 'fn main() {\n    println!("virtual other");\n}\n',
     "tool/Cargo.toml": '[package]\nname = "tool"\nversion = "0.1.0"\nedition = "2021"\n',
     "tool/src/main.rs": 'fn main() {\n    println!("virtual tool");\n}\n',
+}
+
+# Freshness gate fixture: a Git workspace whose `marker` package embeds a
+# data file at compile time and whose `embed` member embeds its own
+# `CARGO_MANIFEST_DIR`; both tests compare the compiled value with this
+# checkout's. `outside` is a path dependency outside the repository.
+GATED = {
+    "Cargo.toml": """[workspace]
+members = [".", "embed"]
+
+[package]
+name = "marker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+outside = { path = "../outside" }
+""",
+    "rust-toolchain.toml": '[toolchain]\nchannel = "1.97.1"\n',
+    ".gitignore": "/target\n",
+    "data/marker.txt": "one\n",
+    "src/lib.rs": """pub const MARKER: &str = include_str!("../data/marker.txt");
+
+pub fn outside_value() -> u32 {
+    outside::value()
+}
+""",
+    "tests/content.rs": """#[test]
+fn compiled_marker_is_this_checkouts() {
+    let here = std::fs::read_to_string("data/marker.txt").expect("marker");
+    assert_eq!(marker::MARKER, here);
+    assert_eq!(marker::outside_value(), 5);
+}
+""",
+    "embed/Cargo.toml": '[package]\nname = "embed"\nversion = "0.1.0"\nedition = "2021"\n',
+    "embed/src/lib.rs": """pub fn dir() -> &'static str {
+    env!("CARGO_MANIFEST_DIR")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn compiled_path_is_this_checkouts() {
+        assert_eq!(super::dir(), std::env::var("CARGO_MANIFEST_DIR").expect("set by cargo test"));
+    }
+}
+""",
+}
+
+OUTSIDE = {
+    "Cargo.toml": '[package]\nname = "outside"\nversion = "0.1.0"\nedition = "2021"\n',
+    "src/lib.rs": "pub fn value() -> u32 {\n    5\n}\n",
 }
 
 # External subcommand: reports the injected build dir and runs `$CARGO`.
@@ -740,23 +796,27 @@ def prove_routing(runner: Runner, app: str, quick_slot: str, debug_slot: str) ->
     if rebuilt["warmth"] != "cold" or "evicted idle slot" not in stderr:
         fail(f"build after clean was not a cold evicting build: {stderr[-800:]}")
 
-    # Checkout affinity: a second checkout of the same repository builds cold
-    # on its own slot; each checkout then reuses only its own slot.
+    # Cross-checkout reuse: a second checkout of the same repository takes
+    # the idle compatible slot through the freshness gate instead of
+    # evicting; the first checkout takes it back the same way, then reuses
+    # it as its own. A detached slot (after clean) is never shared.
     app2 = os.path.join(runner.parent, "checkouts", "app2")
     git(os.path.dirname(app2), "clone", "--quiet", "--no-hardlinks", app, app2)
     code, _, stderr = runner.run(app2, ["build"])
     expect(code, 0, "second checkout build", stderr)
     second = summary(stderr, "second checkout")
-    if second["warmth"] != "cold" or second["slot"] == rebuilt["slot"]:
-        fail(f"second checkout reused another checkout's slot: {second} vs {rebuilt}")
-    if "evicted idle slot" not in stderr:
-        fail("second checkout at the project cap did not evict an idle slot")
-    for cwd, wanted in ((app, rebuilt), (app2, second)):
-        code, _, stderr = runner.run(cwd, ["build"])
-        expect(code, 0, "affine rebuild", stderr)
-        again = summary(stderr, "affine rebuild")
-        if again["slot"] != wanted["slot"] or again["warmth"] != "warm":
-            fail(f"checkout {cwd} did not reuse its own slot: {again} vs {wanted}")
+    if second["warmth"] != "warm" or second["slot"] != rebuilt["slot"]:
+        fail(f"second checkout did not take the idle compatible slot: {second} vs {rebuilt}")
+    if "evicted idle slot" in stderr or "freshness gate refreshed" not in stderr:
+        fail(f"second checkout evicted or skipped the gate: {stderr[-800:]}")
+    for label, gated in (("first checkout takes it back", True), ("own slot again", False)):
+        code, _, stderr = runner.run(app, ["build"])
+        expect(code, 0, label, stderr)
+        again = summary(stderr, label)
+        if again["slot"] != rebuilt["slot"] or again["warmth"] != "warm":
+            fail(f"{label}: {again} vs {rebuilt}")
+        if ("freshness gate refreshed" in stderr) != gated:
+            fail(f"{label}: gate note {'missing' if gated else 'unexpected'}: {stderr[-800:]}")
     if len(runner.lease_status()["slots"]) != 2:
         fail("project slot cap of 2 was not kept")
 
@@ -769,6 +829,7 @@ def prove_routing(runner: Runner, app: str, quick_slot: str, debug_slot: str) ->
     prove_recovery(runner, app)
     prove_group_gone(runner, app)
     keep_standalone_lease(runner, app, standalone)
+    prove_freshness(runner)
 
     # `run` from a virtual workspace root follows Cargo's default members.
     virtual = os.path.join(runner.parent, "checkouts", "virtual")
@@ -788,6 +849,105 @@ def prove_routing(runner: Runner, app: str, quick_slot: str, debug_slot: str) ->
     code, stdout, _ = runner.run(app, ["status"])
     if "waiting commands 0" not in stdout or "stray Cargo output: none" not in stdout:
         fail(f"final status: {stdout}")
+
+
+def unit_freshness(stdout: str) -> dict:
+    """Cargo JSON `compiler-artifact` rows: `name:build|test` to `fresh`."""
+    units = {}
+    for line in stdout.splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if message.get("reason") == "compiler-artifact":
+            role = "test" if message["profile"]["test"] else "build"
+            units[f"{message['target']['name']}:{role}"] = message["fresh"]
+    return units
+
+
+def prove_freshness(runner: Runner) -> None:
+    """Two worktrees of one scratch repository share a slot through the
+    freshness gate; a clone missing the slot's tree is refused and builds
+    cold. Each test compares compiled values with its own checkout."""
+    root = os.path.join(runner.parent, "gated")
+    a, b, c = (os.path.join(root, name) for name in ("a", "b", "c"))
+    write_fixture(os.path.join(root, "outside"), OUTSIDE)
+    write_fixture(a, GATED)
+    git(a, "init", "--quiet")
+    git(a, "add", "-A")
+    git(a, "commit", "--quiet", "-m", "gated fixture")
+    # Both worktrees exist before any build.
+    git(a, "worktree", "add", "--quiet", b)
+
+    def test(cwd: str, label: str):
+        code, stdout, stderr = runner.run(cwd, ["test", "--message-format=json"])
+        expect(code, 0, label, stderr)
+        units = unit_freshness(stdout)
+        print(f"freshness {label}: {summary(stderr, label)} units {units}")
+        return summary(stderr, label), units, stderr
+
+    first, _, _ = test(a, "worktree A cold")
+    if first["warmth"] != "cold":
+        fail(f"first gated build was not cold: {first}")
+    slot = first["slot"]
+
+    def shared(result: dict, label: str) -> None:
+        if result["slot"] != slot or result["warmth"] != "warm":
+            fail(f"{label} did not reuse slot {slot} warm: {result}")
+
+    # Path change, same content: the CARGO_MANIFEST_DIR package rebuilds and
+    # its test sees B's path; the outside path dependency stays fresh.
+    result, units, stderr = test(b, "worktree B path change")
+    shared(result, "worktree B")
+    if "freshness gate refreshed" not in stderr or "inputs outside Git or ignored by it are not checked" not in stderr:
+        fail(f"worktree B summary lacks the gate and its limit: {stderr[-800:]}")
+    if units.get("embed:build") is not False or units.get("embed:test") is not False:
+        fail(f"embed did not rebuild on the path change: {units}")
+    if units.get("outside:build") is not True:
+        fail(f"outside path dependency did not stay fresh: {units}")
+
+    # Stale-mtime scenario: A edits and builds; B's differing file is older
+    # than that build, yet B rebuilds and observes its own content.
+    a_marker, b_marker = (os.path.join(path, "data", "marker.txt") for path in (a, b))
+    with open(a_marker, "w", encoding="utf-8") as handle:
+        handle.write("two from A\n")
+    result, _, _ = test(a, "worktree A edit")
+    shared(result, "worktree A edit")
+    b_mtime = os.stat(b_marker).st_mtime_ns
+    if b_mtime >= os.stat(a_marker).st_mtime_ns:
+        fail("B's marker is not older than A's edit; the stale precondition does not hold")
+    result, units, _ = test(b, "stale scenario B")
+    shared(result, "stale scenario B")
+    if units.get("marker:build") is not False or units.get("content:test") is not False:
+        fail(f"stale scenario did not rebuild the affected units: {units}")
+    if units.get("outside:build") is not True:
+        fail(f"outside path dependency rebuilt in the stale scenario: {units}")
+    if read_text(b_marker) != "one\n" or os.stat(b_marker).st_mtime_ns <= b_mtime:
+        fail("the gate changed B's content or did not refresh its mtime")
+
+    # Unchanged repeat: nothing rebuilds.
+    result, units, stderr = test(b, "unchanged repeat")
+    shared(result, "unchanged repeat")
+    if not units or not all(units.values()) or "freshness gate refreshed" in stderr:
+        fail(f"unchanged repeat rebuilt units or ran the gate: {units}")
+
+    # Refused gate: a clone lacking A's newer tree falls back cold to its own
+    # slot; A's slot is given back intact.
+    git(root, "clone", "--quiet", "--no-hardlinks", a, c)
+    git(a, "commit", "--quiet", "-am", "A moves on")
+    result, _, _ = test(a, "worktree A after commit")
+    shared(result, "worktree A after commit")
+    result, _, stderr = test(c, "refused gate")
+    if "freshness gate refused another checkout's slot" not in stderr:
+        fail(f"clone was not refused by the gate: {stderr[-800:]}")
+    if result["warmth"] != "cold" or result["slot"] == slot:
+        fail(f"refused gate did not build cold on another slot: {result}")
+    result, units, _ = test(a, "worktree A keeps its slot")
+    shared(result, "worktree A keeps its slot")
+    if not units or not all(units.values()):
+        fail(f"A's slot was disturbed by the refused gate: {units}")
 
 
 def prove_waiting(runner: Runner, app: str, app2: str) -> None:
@@ -827,6 +987,7 @@ def prove_clean_waits(runner: Runner, app: str) -> None:
     """Clean waits for an active command in its checkout, then removes the
     private outputs and drops only idle affinity."""
     pidfile = os.path.join(runner.parent, "hold-clean.pid")
+    detached = {record["id"] for record in runner.state()["records"] if record["checkout"] is None}
     holder, holder_log = runner.start(app, ["test"], "hold-clean", {"OXIDE_FIXTURE_HOLD": pidfile})
     wait_for(lambda: os.path.exists(pidfile), "test held during clean")
     cleaner, clean_log = runner.start(app, ["clean"], "clean-wait")
@@ -836,7 +997,7 @@ def prove_clean_waits(runner: Runner, app: str) -> None:
     )
     if cleaner.poll() is not None or not os.path.isdir(os.path.join(app, "target")):
         fail("clean ran while a command in its checkout was active")
-    if any(record["checkout"] is None for record in runner.state()["records"]):
+    if any(record["checkout"] is None and record["id"] not in detached for record in runner.state()["records"]):
         fail("clean detached affinity while a command was active")
     with open(pidfile.replace(".pid", ".release"), "w", encoding="utf-8"):
         pass

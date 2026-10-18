@@ -3,15 +3,18 @@
 //! Owning contract: `docs/knowledge/contracts/workflow.md`. Storage is the
 //! existing lease pool; Oxide adds checkout affinity, FIFO waiting, a
 //! host-wide limit and own-command crash recovery in a private control
-//! directory. Plain `cargo` behavior is untouched.
+//! directory. A checkout may take another checkout's idle compatible slot
+//! only through the freshness gate. Plain `cargo` behavior is untouched.
 
 mod adopt;
 mod cli;
+mod freshness;
 mod identity;
 mod process;
 mod store;
 
 use cli::{Class, Invocation, PROFILE_ENVIRONMENT};
+use freshness::{Gate, Prior};
 use identity::{RunPick, SlotKey};
 use oxide_storage::inventory::{inventory_directory, Category, InventoryLimits};
 use oxide_storage::lease::SlotOccupancy;
@@ -144,12 +147,13 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     process::install_signal_handlers()?;
     let store = Store::open_or_create()?;
     let started = Instant::now();
-    let held = match store.acquire(&key, invocation.profile)? {
-        Acquired::Lease(held) => held,
-        Acquired::Interrupted(signal) => return Ok(process::signal_exit_code(signal)),
+    let (held, gate) = match lease_with_gate(&store, &key, invocation.profile)? {
+        Ok(leased) => leased,
+        Err(signal) => return Ok(process::signal_exit_code(signal)),
     };
     if let Some(signal) = process::received_signal() {
-        store.release(held)?;
+        let origin = unchanged_origin(&held.prior);
+        store.release(held, origin)?;
         return Ok(process::signal_exit_code(signal));
     }
     let run = command == "run";
@@ -165,7 +169,8 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     {
         Ok(group) => group,
         Err(error) => {
-            store.release(held)?;
+            let origin = unchanged_origin(&held.prior);
+            store.release(held, origin)?;
             return Err(error);
         }
     };
@@ -184,9 +189,11 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     process::wait_group_empty(group.id);
     let slot = held.slot_id.clone();
     let warm = held.reused;
-    store.release(held)?;
+    let note = gate.describe();
+    let origin = gate.finish(&key.checkout);
+    store.release(held, origin)?;
     let (status, executable) = outcome?;
-    print_summary(&store, &invocation, &slot, warm, started);
+    print_summary(&store, &invocation, &slot, warm, started, note.as_deref());
     if !run || !status.success() {
         return Ok(process::exit_code(status));
     }
@@ -203,6 +210,45 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
             eprintln!("oxide: error: {message}");
             Ok(101)
         }
+    }
+}
+
+/// Lease a slot and run the freshness gate. A slot taken from another
+/// checkout whose gate refuses is given back, and the command leases again
+/// without sharing, so it builds cold rather than unchecked. `Err` is a
+/// signal received while waiting.
+fn lease_with_gate(
+    store: &Store,
+    key: &SlotKey,
+    profile: cli::Profile,
+) -> Result<Result<(store::Lease, Gate), i32>, String> {
+    let mut share = true;
+    loop {
+        let held = match store.acquire(key, profile, share)? {
+            Acquired::Lease(held) => held,
+            Acquired::Interrupted(signal) => return Ok(Err(signal)),
+        };
+        match freshness::prepare(&key.checkout, &held.prior) {
+            Ok(gate) => return Ok(Ok((held, gate))),
+            Err(reason) if held.shared_from.is_some() => {
+                eprintln!(
+                    "oxide: freshness gate refused another checkout's slot ({reason}); building cold"
+                );
+                store.unshare(held)?;
+                share = false;
+            }
+            // This checkout's own slot: Cargo's own mtime checks hold as
+            // before, but the slot is not shared afterwards.
+            Err(_) => return Ok(Ok((held, Gate::untrusted()))),
+        }
+    }
+}
+
+/// Cargo never ran: the slot keeps the origin it had.
+fn unchanged_origin(prior: &Prior) -> Option<freshness::Origin> {
+    match prior {
+        Prior::Known(origin) => Some(origin.clone()),
+        Prior::Fresh | Prior::Unknown => None,
     }
 }
 
@@ -298,7 +344,14 @@ fn run_artifact(line: &str, selection: Option<&str>) -> Option<(String, PathBuf,
 }
 
 /// One line: profile, strategy, slot warmth, elapsed time and pool use.
-fn print_summary(store: &Store, invocation: &Invocation, slot: &str, warm: bool, started: Instant) {
+fn print_summary(
+    store: &Store,
+    invocation: &Invocation,
+    slot: &str,
+    warm: bool,
+    started: Instant,
+    note: Option<&str>,
+) {
     let strategy = match invocation.command.as_str() {
         "run" | "test" => "build+execute",
         _ => "build",
@@ -307,8 +360,9 @@ fn print_summary(store: &Store, invocation: &Invocation, slot: &str, warm: bool,
         .payload_use()
         .map(|(used, total)| format!("pool {} of {} MiB used", used / MIB, total / MIB))
         .unwrap_or_else(|| "pool use unknown".to_owned());
+    let note = note.map(|note| format!(", {note}")).unwrap_or_default();
     eprintln!(
-        "oxide: {} profile, {strategy} strategy, slot {slot} {}, {:.1}s, {pool}",
+        "oxide: {} profile, {strategy} strategy, slot {slot} {}, {:.1}s, {pool}{note}",
         invocation.profile.label(),
         if warm { "warm" } else { "cold" },
         started.elapsed().as_secs_f64()
