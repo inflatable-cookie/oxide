@@ -3,7 +3,7 @@
 Oxide aims to make Rust development easy and light: predictable storage, less build churn and a fast, understandable feedback loop. Bounded reusable build storage is its first foothold. Queue and Nucleus should consume the same reusable facility; a daemon is one candidate architecture.
 
 - [Vision and operator ruling](knowledge/vision.md)
-- [Oxide workflow (proposed)](knowledge/contracts/workflow.md)
+- [Oxide workflow (foundation core implemented)](knowledge/contracts/workflow.md)
 - [Storage invariants and authority boundaries](knowledge/architecture.md)
 - [Optimization adoption policy](knowledge/contracts/optimization-adoption.md)
 - [Project adoption boundary](knowledge/contracts/project-adoption.md)
