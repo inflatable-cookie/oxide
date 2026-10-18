@@ -1,10 +1,12 @@
 # Oxide workflow (proposed)
 
-Status: proposed product design under Tom's
-[2026-10-18 workflow direction](../vision.md#product-workflow-direction). Nothing
-here is implemented, installed or authorized for implementation. It sets the
-target shape that future Queue briefs build toward and names the decisions it
-still needs.
+Status: product design under Tom's
+[2026-10-18 workflow direction and bounded implementation authority](../vision.md#product-workflow-direction).
+The command family is not implemented or installed yet. Checked Queue briefs
+may implement the foundation in the authorized sequence using tiny owned
+fixtures; this is not real-project qualification, default-pool creation outside
+tests, installation or consumer-adoption authority. The sections below state
+the target behavior and remaining decisions, not shipped capabilities.
 
 ## Shape
 

@@ -54,7 +54,37 @@ Tom's further rulings, 2026-10-18: Oxide covers the full agent command suite —
 
 Tom's rulings later on 2026-10-18: Oxide must manage crash recovery itself rather than leave abandoned leases for manual recovery; this relaxes the local lease's never-infer-abandonment rule for Oxide's own commands, subject to qualification of the mechanism. Retire the earlier protected-route, declared-workflow and source-map machinery provided nothing of distinct value is lost; the [workflow assessment](contracts/workflow.md#relationship-to-existing-work) names what to keep. The profile names `quick`, `debug` and `release` are accepted. Commands Oxide does not model should pass straight to Cargo as `oxide <command>` instead of through a separate `oxide cargo` verb. A quick run means the fastest route to running the current source — JIT, Cranelift or another qualified option where one works — and may fall back to a quick build. `oxide init` should run `cargo init` when needed and then perform Oxide adoption, so one command does both.
 
-This is design direction for the core product concept, not implementation, installation, host-configuration or consumer-adoption authority. Existing Queue/Nucleus scheduling and admission ownership, Effigy's language-neutral role and the storage invariants in [architecture](architecture.md) still apply. Earlier experimental results remain evidence; the failed comparison and unqualified readings are not upgraded by this direction.
+The direction alone did not grant execution authority. Tom subsequently answered
+"Otherwise, continue" to the appointed Oxide product architect's foundation
+implementation and parallel retirement proposal, relayed on 2026-10-18 and
+recorded as Queue decision `e123a54e-4041-4602-ae45-1957a5a19f53` v2. This
+authorizes the five prepared Oxide-only implementation scopes through checked
+Queue briefs and independent exact-head review: command front door with
+checkout-affine slots; automatic recovery for Oxide-held leases; a qualified
+cross-checkout freshness gate; init/new adoption and repository-owned agent
+skill source; and retirement of superseded machinery. Foundation and retirement
+are the first wave; recovery and adoption follow foundation; freshness follows
+foundation and recovery. Tiny task-owned fixtures and a scratch 128 MiB APFS
+pool are the only new execution scope. Each brief retains its author/reviewer
+budget. No real-project qualification, host or skill installation, default-pool
+creation outside tests, consumer mutation, settings or release change is granted.
+
+The conditional retirement answer is recorded verbatim as "Yes, as long as
+there's nothing of distinct value there?" (decision
+`ab9bb8ac-fa91-4c0c-9e46-2bd18bf9f824` v2). Preserve distinct value and findings;
+report a newly discovered live dependency instead of deleting it. The crash
+recovery answer is "Yes, we need to manage crash recovery" (decision
+`4cfdd4cf-d675-41dd-8f54-065aaeeddc81` v2); it applies to the new command's
+qualified holder/group mechanism, not automatic recovery of standalone consumer
+leases. The existing live lease CLI's formats and pool-reopen behavior remain
+compatible. Product architecture belongs to the appointed Oxide Supervisor;
+project ownership and routine Queue controls remain with the operations planner.
+
+Existing Queue/Nucleus scheduling and admission ownership, Effigy's
+language-neutral role and the storage invariants in [architecture](architecture.md)
+still apply, with only the explicit own-command recovery ruling above superseding
+the older abandonment rule. Earlier experimental results remain evidence; the
+failed comparison and unqualified readings are not upgraded by this direction.
 
 ## Authority boundaries
 
