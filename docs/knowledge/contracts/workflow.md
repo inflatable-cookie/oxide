@@ -180,7 +180,7 @@ fingerprint churn. The retired source-map work found no cheap general fix.
 6. When the process group exits, record the compile origin, release the lease
    and print one line: profile, strategy, warm/cold, elapsed time, pool use.
 
-The [qualified cross-worktree result](project-adoption.md#current-nucleus-integration-boundary)
+The [qualified cross-worktree result](project-adoption.md#focused-cross-worktree-result)
 supports this shape for one workflow: a different-path checkout on a shared
 slot rebuilt only its changed unit, and tests ran every time. It did not isolate
 the mtime hazard above.
@@ -279,18 +279,20 @@ writes.
 ## Relationship to existing work
 
 Tom approved retiring the earlier machinery on 2026-10-18, on the condition
-that nothing of distinct value is lost. Assessment:
+that nothing of distinct value is lost. oxide#070 executed it;
+[retirements](../retired.toml) lists the removed terms, paths and features.
+Assessment:
 
 | Keep | Why |
 | --- | --- |
 | [Local lease](local-lease.md), pool, APFS backing and [bounded storage](bounded-storage.md) | The storage layer of every `oxide` command; live with Nucleus. |
 | [Storage inventory](storage-inventory.md) | Backs `oxide status` and stray detection. |
 | [Stable profiles](stable-cargo-profiles.md) knowledge | Source of the `quick` / `debug` recipes. |
-| Cargo freshness, path-embedding, containment and capacity findings in [qualification readiness](../qualification-readiness.md) | Ground the freshness gate, debug-path limit and crash-recovery design. Keep them as evidence; the narrative can be condensed. |
-| Mtime-stale content gate concept (`src/project/freshness.rs`) and the dep-info decoder (`src/registered/dep_info.rs`) | The gate is reimplemented for W-8. Per-unit input lists from dep-info may tell the gate which files outside Git each unit read. Keep until W-8 settles. |
+| Cargo freshness, path-embedding, containment and capacity findings in [qualification readiness](../qualification-readiness.md) | Ground the freshness gate, debug-path limit and crash-recovery design. Kept as evidence; the narrative is condensed. |
 | [Build-context policy](build-context-policy.md) | Candidate input for per-command incremental/debug defaults; stays proposed. |
+| Bounded dep-info decoder (`src/dep_info.rs`) | Per-unit Cargo input lists for the W-8 gate; separable from the retired conversion. |
 
-| Retire | Why it has no distinct value now |
+| Retired | Why it has no distinct value now |
 | --- | --- |
 | Protected ordinary-Cargo route, storage daemon, transport/codec, HMAC attempts and handoff, `oxide-storage-runtime`, `oxide-qualified-runner`, `oxide-ordinary-cargo-attempt` | Nucleus rejected the signed callback shape; the lean lease replaced it. |
 | Declared-workflow front end (`oxide-declared-workflow`) | Superseded by zero-config identity and the `oxide` commands. |
@@ -298,10 +300,18 @@ that nothing of distinct value is lost. Assessment:
 | Registry archive verifier/acquisition (`oxide-registry-acquisition`) | Registry deps sit at shared paths; Cargo already verifies archives. |
 | Source-map qualifier and probes | Their finding (no cheap stable remap) is recorded above; the code serves no remaining route. |
 
-Code and knowledge removal is product work. It goes through a scoped Queue
-brief with independent review and keeps the evidence files. Formal
-`retired.toml` entries land with that cleanup so the retired-concept check
-stays meaningful.
+The mtime-stale content-gate implementation (`src/project/freshness.rs`) did
+not separate from the retired adapter: it was bound to the fixed source-map
+fixture, the resolver and the daemon codec. It was removed; W-8 reimplements
+the gate from the retained [Cargo freshness findings](../qualification-readiness.md#cargo-freshness).
+
+The bounded Cargo dep-info decoder did separate. Its `decode` and plain decoded
+types never depended on the registered route; only the `into_registered`
+conversion did. The decoder now lives at `src/dep_info.rs` with its
+hand-annotated upstream-bytes and refusal tests, unchanged limits (16 MiB
+input, 32768 references, 2048-byte strings) and its own two-variant refusal.
+The conversion was retired. It is not called by any command yet; W-8 may use
+its per-unit file and environment lists to find inputs outside Git.
 
 ## Foundation slice
 
@@ -378,7 +388,8 @@ evidence and does not reset bounds.
   dependency debug-off. Recommendation: none until a real project needs it.
 - **W-4 Crash recovery.** Direction ruled; the mechanism above needs
   qualification, including a group-escape test.
-- **W-5 Retirement execution.** Scope and sequencing of the cleanup brief.
+- **W-5 Retirement execution.** Done in oxide#070; see
+  [retirements](../retired.toml).
 - **W-6 Linux backend.** CI, LAN boxes and Colima need a pool backend without
   APFS. A directory budget-only mode must say so honestly.
 - **W-7 Command name.** `oxide` collides with Oxide Computer Company's CLI

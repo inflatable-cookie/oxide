@@ -4,11 +4,10 @@ Status: proposed context-resolution design, approved as design direction on
 2026-10-15 in [vision](../vision.md#authority-boundaries). No automatic context
 resolver is activated by this document. The current [lean local CLI](local-lease.md)
 does enforce a bounded payload and retire known idle slots; its profile label
-does not set Cargo debug or incremental values. The ordinary-Cargo
-[protected route](ordinary-cargo-storage.md) and [reuse identity](ordinary-cargo-reuse-identity.md)
-below are separate historical design/implementation context. Do not infer that
-the lean route requires their signing machinery or that storage bounds are
-still unimplemented.
+does not set Cargo debug or incremental values. Earlier qualification
+mechanisms are retired; their historical findings remain in
+[qualification readiness](../qualification-readiness.md). This policy does not
+require those mechanisms, and the bounded storage capability remains in use.
 
 Consumer policy remains consumer-owned. Tom adopted incremental-on for Nucleus managed agents and incremental-off for one-shot validation in Nucleus `ff43e69701f08e5a9ddf84d424a381dea8d033de`, superseding its `fb2bd04` agent stopgap. [Storage efficiency](../storage-efficiency.md#nucleus-consumer-adoption-2026-10-15) owns that adoption receipt and its limits. This does not activate Oxide slots or imply a Queue policy change.
 
@@ -26,15 +25,15 @@ Human and agent workflows both fit these contexts. A supervised human loop can b
 
 ## Resolution order
 
-Context resolution runs before partition selection, signing or acquire. The resolved effective tuple is fixed at acquire.
+Context resolution runs before slot selection and lease. The resolved effective tuple is fixed for the lease.
 
-1. **Consumer workflow declaration.** A consumer-authorized selector or workflow names its context. This is proposed. No shipped CLI, protocol or accepting issuer exists for it.
-2. **Explicit evidence request.** `evidence` / `full-debug` is requested per invocation through the same authorized route. It is never a fallback or a side effect of another context.
+1. **Workflow declaration.** The `oxide` command class and profile ([workflow](workflow.md)), or a consumer's own workflow declaration, names its context. This is proposed. No shipped resolver or CLI flag exists for it.
+2. **Explicit evidence request.** `evidence` / `full-debug` is requested explicitly per invocation, for example through the `debug` profile. It is never a fallback or a side effect of another context.
 3. **Effective inputs.** Oxide resolves what Cargo and rustc will actually see: profile values, `CARGO_PROFILE_*` and `CARGO_INCREMENTAL` environment, Cargo configuration and `rustflags`, feature set, toolchain provenance, allowlisted environment.
 4. **Conflict rule.** An explicit effective input beats a context default. If an explicit input conflicts with the declared context (for example `CARGO_INCREMENTAL=1` in a `one-shot` declaration), the request refuses. Oxide does not silently pick a winner. Silent override of a consumer stopgap is forbidden.
 5. **Partition selection.** The resolved tuple chooses the slot. No adaptive switching by history, size or time.
 
-Unknown or ambiguous inputs fail closed, as in the current adapter's validation boundary.
+Unknown or ambiguous inputs fail closed.
 
 ## Exact compatibility
 
@@ -77,12 +76,12 @@ Caveats:
 - **Idle retention.** Only released, idle slots are candidates for retention decisions. Leased, uncertain or evidence-bearing storage is never a candidate.
 - **Evidence outranks budget.** Budget pressure refuses or reports. It never deletes evidence or consumer-retained output.
 
-Current behavior is non-evicting. Adding budget enforcement or generation retirement is a candidate implementation that needs its own brief.
+The [local lease](local-lease.md#capacity-and-eviction) already evicts known idle whole slots at lease time and recycles a compatible idle slot at half the cap. Context-aware budgets or retirement policy beyond that is a candidate implementation that needs its own brief.
 
 ## Ownership, liveness and release
 
-- Oxide releases a slot only on authenticated settlement under the existing lease contract.
-- Unknown ownership, crash, PID absence, age, compiler `.lock` files or process disappearance never authorize release or evidence removal. This matches [vision](../vision.md#authority-boundaries) and [architecture](../architecture.md#storage-and-ownership).
+- Oxide releases a slot only on the writer-closed `release` or `recover` rules of the [local lease](local-lease.md), or, for Oxide's own commands, the qualified recovery mechanism proposed in [workflow](workflow.md#crash-recovery).
+- Unknown ownership, crash, PID absence, age, compiler `.lock` files or process disappearance never authorize release or evidence removal. This matches [vision](../vision.md#authority-boundaries) and [architecture](../architecture.md#storage-invariants).
 - Budget pressure returns an actionable refusal with an inventory. It does not clean up.
 
 ## Upstream garbage collection
@@ -100,14 +99,14 @@ Consequences:
 
 - The everyday line-table default keeps backtrace file:line. Assertions and test execution are not changed by context.
 - `full-debug` is explicit. It is required for debugger variable/type inspection and for native evidence claims. It is not required to measure ordinary Cargo cost.
-- **Packed-at-capture / dSYM** is a candidate, not a default. It has real costs: dsymutil time, extra bytes, native identity binding between executable and dSYM, and source custody of referenced paths. It is not proof of the current fixture issuer.
+- **Packed-at-capture / dSYM** is a candidate, not a default. It has real costs: dsymutil time, extra bytes, native identity binding between executable and dSYM, and source custody of referenced paths. No retained Oxide mechanism provides that binding.
 
 ## Not claimed
 
 - No shipped context resolver, CLI or protocol.
-- No shared warm slot, automatic generation retirement or selective object deletion.
+- No shared warm slot or generation retirement beyond the local lease's existing idle-slot rules, and no selective object deletion.
 - No global Cargo or rustc configuration change.
-- No Effigy change. Effigy stays language-neutral. Oxide's adapter resolves Rust context and passes selector and env only.
+- No Effigy change. Effigy stays language-neutral. Oxide resolves Rust context and passes selector and env only.
 - No change to frozen Contract010.
 - No consumer source, task, admission or settlement ownership.
 

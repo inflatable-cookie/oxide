@@ -1,322 +1,115 @@
 # Build storage boundaries
 
-These are the production ownership constraints agreed by Tom on 2026-10-09. The local daemon candidate described below and in [the prototype boundary](#local-storage-prototype) implements only a bounded core; it does not establish production deployment, portability, process containment or pilot authority.
+These are the production ownership constraints agreed by Tom on 2026-10-09,
+applied to the facilities that remain after the 2026-10-18 retirement
+([retirements](retired.toml)). The proposed user workflow lives in
+[workflow](contracts/workflow.md); the unpublished CLI semantics live in
+[local lease](contracts/local-lease.md) and
+[storage inventory](contracts/storage-inventory.md).
 
 ## Storage and ownership
 
-Persistent bounded cache slots partition by project/component identity, exact toolchain, host/target platform, and resolved configuration/profile/features/relevant environment. One exclusive durable lease covers compile through test and artifact capture. Unknown crash outcomes, lost replies, age and PID disappearance do not imply release. Reconciliation must prove safe ownership settlement before reuse or eviction.
-
-Exact-run final binaries, logs, QA receipts and evidence remain independently owned and preserved. Cargo intermediates are internal and may contain test executables; separating output directories alone cannot prove isolation. Cache reuse never counts as validation success.
-
-Proposed: effective build context (incremental, debug, split-debuginfo) would be a partition input. Its lifetime and diagnostics rules are in the [build-context policy](contracts/build-context-policy.md); it is not active.
-
-Prepare only requested components lazily. No eager copying of all targets and no full-copy fallback. Evict idle slots only, within explicit budgets; occupied space and actual disk writes must be measured separately. Inventory/acquire/reconcile/finalize/budget describe interface semantics, not an existing CLI.
-
-A separate read-only [storage inventory](contracts/storage-inventory.md) command reports what occupies space in one explicitly selected target directory. It is a diagnostic only: it is not the daemon `inventory` operation above, grants no ownership or eviction authority and never recommends deletion.
-
-## Qualification boundaries
-
-Cargo's `build.build-dir` / `CARGO_BUILD_BUILD_DIR` is stable starting in Rust 1.91 and is separate from `target-dir`. It is the smallest useful mechanism to qualify: direct Cargo to an Oxide-owned intermediate directory and let Cargo retain its own unit invalidation. It supplies no Oxide ownership, whole-workflow lease, budget, or run-evidence semantics. The exact pinned toolchain and different-path portability still need a controlled qualification. If portability fails, use path-isolated partitions and report the reduced benefit. Do not blindly adopt sccache: Acow's measured trial rejected it.
-
-Nucleus Contract002 prohibits mutable target sharing. An exclusive-intermediate design requires narrow qualification before adoption and cannot weaken that contract. Frozen Contract010 remains unchanged. Queue/Nucleus own admission, source and run identities, authenticated settlement, retention and artifact capture; Oxide owns only its bounded storage semantics. See [scope](vision.md).
-
-## Lean local consumer direction
-
-Tom's 2026-10-16 Nucleus ruling selects a same-user local lease CLI in place
-of the protected policy-3/callback integration. The current interface
-assessment and remaining source-path, release/expiry and hard-cap boundaries
-live in [project adoption](contracts/project-adoption.md#current-nucleus-integration-boundary).
-A resident daemon, signatures and consumer callback service are not required
-for that proposed route. The earlier implementations below remain separate
-upstream mechanisms, not activation prerequisites. UID trust permits a
-cooperative caller's explicit writer-closed release; TTL or holder loss alone
-still does not establish closure. The unpublished
-[local lease CLI](contracts/local-lease.md) is the implemented lean surface;
-cross-worktree usefulness remains a dependent qualification and is not claimed
-here.
-
-## Preferred daemon hub to qualify
-
-Tom's direction, 2026-10-09: a central daemon could normalize project workflows, own reusable storage and provide a consistent place to measure real-world use. It remains the preferred candidate, not a production deployment choice.
-
-The inactive `registered` library route adds versioned audited-input and literal
-argv seams, with separate trusted registration, immutable-input and execution/
-capture owners. No Nucleus issuer, scheduler implementation or eligible workflow
-is installed. Its independent authenticated map and pre-spawn barrier preserve
-the same strict-physical and success-only publication model; the
-[first Nucleus contract](contracts/nucleus-core-reuse.md#implemented-registered-library-boundary)
-owns supported classes, finite budgets and remaining activation gates.
-
-The consumer contract defines a minimal opt-in project adapter: resolve build identity, obtain consumer authorization, acquire a slot, execute the declared workflow, preserve/capture run outputs under consumer policy and finalize ownership with authenticated evidence. The Oxide crate now implements a fixture-only slice of that flow. Every actor touching an adopted slot must follow the lease contract; direct Cargo access cannot silently bypass it. Commands outside the adapter have no claim to Oxide-managed coverage.
-
-The production candidate would own the storage ledger and observations keyed by project/component, source/run identity, resolved toolchain/configuration and backend. The current fixture adapter keeps a bounded in-process observation ring; it is not durable daemon telemetry. Observation is not authenticated run settlement or a validation verdict. Queue/Nucleus remain authoritative for admission, managed source/run identities, settlement and evidence/retention policy. Daemon failure/restart must reconcile durable leases conservatively; loss of connection cannot grant reuse. Consumer cancellation and process lifetime must have explicit owners.
-
-Start with bounded local events for acquisition/refusal, timing, rebuild/reuse observations, storage growth and finalization. Account for measurement overhead and unavailable write attribution. General tracing, dashboards and experiment scheduling are not requirements for first relief. Ordinary-use telemetry can reveal contention and trends after adoption; controlled qualification is still needed for cache correctness and failure cases. Future experiments are explicit opt-ins, use isolated declared resources and do not silently alter everyday flags or source.
-
-Keep storage/execution adapters replaceable and consumer-facing semantics stable as Cargo catches up. The design task specified daemon availability, project adoption and recovery semantics; it did not install or wire a service.
-
-## Minimum safe cross-worktree reuse design
-
-### Recommendation and alternatives
-
-Prefer one opt-in, per-user local daemon as the storage hub for Queue, Nucleus and later developer workflows. It owns the slot directory, durable lease ledger, budget accounting and bounded observations. Each adapter supplies the effective build identity and the consumer-authenticated run envelope. The daemon has no selector scheduler, task admission, Git source management, run settlement, validation verdict, artifact-retention or capture-policy authority.
-
-The minimal alternative is a per-invocation wrapper using a shared OS lock and durable journal. It can serialize one command and avoid a background service, but every wrapper must implement crash reconciliation and communicate through the same journal. A dead wrapper can release an OS lock while a compiler or test descendant is still alive; a journal alone cannot prove the slot is idle. Making this alternative safe therefore needs a durable process guardian and the same ledger/reconcile protocol. It remains viable if daemon lifecycle cost outweighs the value of a common hub, but it is not simpler for multiple consumers or normalized observations. Neither model is proven until the pilot's failure cases pass.
-
-The daemon is a single local-user service, not a remote cache or a scheduler. Its data root is private to that user and on a filesystem whose locking, atomic replacement and durability behavior is qualified. A daemon-wide OS singleton lock prevents two service instances from owning the ledger. The slot ledger is durable and transitions are committed before replies. That singleton lock is not a slot lease: an in-flight slot stays unavailable after a daemon restart until reconciliation proves it safe. If the selected host cannot keep or establish proof of process containment after daemon failure, ambiguous slots remain quarantined and cannot be reused or evicted.
-
-### Adoption and execution boundary
-
-Adoption is explicit per project and per declared workflow/selector. The adapter resolves the project and component IDs, exact source identity, exact Cargo/rustc toolchain, host and target, profile, features, effective Cargo configuration and relevant environment before requesting storage. Secret values are never recorded; only an allowlisted effective input set or its digest is used. If a relevant input cannot be resolved, the adapter uses a private isolated build directory or refuses managed reuse.
-
-Queue/Nucleus admission happens before `acquire`. An admitted consumer passes an authenticated envelope containing its project, workflow, task/workspace/run/attempt identity, source tree and admission reference. For developer workflows without a scheduler, the adapter creates a local run identity but does not claim Queue/Nucleus authority. The daemon validates the envelope or a consumer-issued capability, binds it to the lease and returns an opaque lease token. It never creates or changes the consumer's identity.
-
-Under a lease, the adapter sets `CARGO_BUILD_BUILD_DIR` to the selected Oxide intermediate slot. It keeps `CARGO_TARGET_DIR` and captured outputs private to the checkout/run. The fixture prototype passes both Cargo directory overrides to an injected boundary but does not spawn Cargo. Direct Cargo access to the shared build directory is a bypass and is unsupported. An invocation that cannot reach the daemon may run only with a consumer-approved private isolated directory; otherwise it refuses. Private fallback and unmanaged commands make no Oxide reuse or observation claim.
-
-Effigy continues to launch the declared language-neutral selector and own selector/process/env lifecycle. The project adapter carries the Rust-specific identity and lease context. Queue/Nucleus (or the local developer) owns the cancellation decision; the adapter passes it to the process guardian. Before release, the completion boundary must establish writing completion within the supported workflow contract below, together with exact-run terminal and capture evidence. The daemon's service lifetime does not define the workflow's lifetime.
-
-**macOS completion gate:** the read-only [macOS readiness review](qualification-readiness.md#public-macos-fencing-candidates-reviewed) found no public mechanism proving release against arbitrary descendants, transferred handles and unrelated same-user writers. Tom subsequently approved the narrower supported workflow contract below. Oxide's unpublished native fixture boundary and six task-owned scenarios passed independent exact-head review within that fixed scope. The standalone Cargo pilot also qualified cooperative completion and release/reacquire for S1–S3 of its exact registered workflow; [qualification readiness](qualification-readiness.md) owns both receipts and limits. Broader Cargo workflows and actual consumer integration remain unqualified. Interrupted, cancelled, crashed, restarted or lost-reply runs remain `uncertain`. No permanent-held-session design is accepted.
-
-### Supported writer model
-
-Tom's ruling, 2026-10-09: initially support explicitly registered, trusted foreground workflows. Every participating command must wait for its writing children and close writing handles/mappings before declaring completion; it must not daemonize, transfer a slot write handle outside the owned workflow, or leave background slot writers. Workflows unable to satisfy that promise must use private storage or refuse managed execution.
-
-Unrelated same-user processes and commands accessing managed storage outside the adapter are unsupported bypasses. Hidden violations of the workflow promise are not guaranteed detectable or fenced; this contract coordinates participating writers and supplies no OS security boundary against arbitrary same-user programs. Known leftover writers, unexpected process behavior, missing completion/capture evidence and ambiguous crash/cancel/restart/reply outcomes keep storage unavailable. Leader exit, PID absence, age and quiet scans alone do not establish completion.
-
-Healthy release requires completion evidence bound to the registered supported workflow and exact attempt, an authenticated terminal record, independently bound capture evidence and the durable idle transition. Fixed fixtures and S1–S3 of the standalone Cargo pilot qualify only their limited cooperative boundaries. Broader Cargo/consumer workflow eligibility, cross-path reuse, production resource enforcement and adoption remain separately gated.
-
-The native fixture boundary runs only a fixed test-harness entry point with an
-environment cleared and `TMPDIR`, `TMP` and `TEMP` forced under the fresh task
-scratch root. It holds the direct child handle, checks the child's PID and
-per-spawn marker, waits for normal exit, and bounds fixture children, files,
-file size and captured output before accepting completion. It records the
-repository head, fixture source/definition digests, lease and slot paths,
-host-run/run/attempt identities, process marker, exit result, free-space
-samples, and stdout/stderr/capture digests. The consumer capture receipt must
-match that exact run and local capture bundle; storage verifies a
-lease-token-bound completion MAC before making the durable transition to idle.
-The fixture protocol refuses an unknown free-space reading or less than 20 GiB,
-samples before and after work and during waits at 30-second intervals, and
-keeps its task-owned disposable footprint below 10 GiB. Those bounds cover the
-fixed fixture construction only; they do not impose a filesystem quota or cap
-arbitrary Cargo output.
-
-Whenever a caller requests a writer rendezvous, the fixture reports exactly one
-bounded readiness outcome: either the held child, proved by its per-spawn marker
-and a still-active owned handle, or a typed, non-secret refusal. An early
-fixture refusal is therefore explicit and fail-closed; it never appears as a
-channel timeout or as a started writer. The task-wide disposable-byte
-accounting walk counts non-regular sibling entries (for example a FIFO created
-by another isolated test under the shared scratch root) without following them,
-while the active scenario's own walk still rejects any non-regular entry in its
-tree.
-
-This evidence means the registered, trusted foreground fixture honored its
-promise to wait for its writing child and close its write handle before
-completion. It does not discover or fence an unregistered same-user writer,
-an undisclosed child, or a workflow that breaks the promise while hiding that
-departure. Such behavior is an unsupported bypass, not a passed negative
-control or an OS security boundary. A caller-supplied `FixtureCompletionProof`,
-leader exit, quiet scan or capture receipt alone cannot mint native completion.
-Cancellation, incomplete execution, missing/mismatched capture and ambiguous
-daemon/client outcomes remain unavailable even if a known fixture child is
-later reaped.
-
-The first-use path should be one explicit project/workflow opt-in, with the adapter resolving Cargo settings and toolchain identity instead of asking users to edit global Cargo configuration. Explain a valid miss by category (source, configuration, toolchain, path partition or unknown) and show the effective non-secret identity. Under pressure, explain measured/reserved bytes, the cap/reserve, the active or uncertain owner and the safe next action; never suggest deleting evidence or forcibly clearing an uncertain slot. Reconnect should retry the same operation identity and reconcile when proof is available. If proof is unavailable, report that the slot is being held and why, then fail closed. These are ease-of-use acceptance criteria, not new user-facing command names.
-
-### Identity and slot key
-
-Use two identities for different purposes:
-
-- **Compatibility partition key:** stable project ID and component/workflow ID; exact Cargo and rustc provenance; host and target triples; resolved profile, feature set and Cargo/rustc configuration; and relevant compiler, linker, SDK and environment inputs. Include an input in full or by a stable digest. Include checkout-path identity until different-path portability has passed. A failed path test requires path-isolated partitions.
-- **Run binding:** consumer, task/workspace/run/attempt IDs when present, exact Git commit and source-tree state (including submodules and any permitted disposable source patch), resolved partition-key digest, and operation ID. Compute `source_tree_digest` from the requested tree before acquire and record it on this binding. A source revision does not automatically create an unbounded partition.
-- **Idle-slot compile root (proposed for consumer adoption; fixture admission implemented):** last successful compile-through-capture binds `requested_root_id` (the canonical checkout path already in a strict-physical partition) onto that idle slot. Acquire matches `partition`, hence that root. A later task with a different `source_tree_digest` at the same root reuses the idle slot; Cargo invalidates changed units and can keep unmodified dependency work. Cross-root is a different partition and a miss. Before spawn, the [mtime-stale content gate](qualification-readiness.md#task-019-useful-bounded-reuse-across-changing-tasks-design-only-2026-10-10) refuses execution when fingerprint-named inputs changed without a newer mtime. Declared directories expand recursively into that map under the cap, or the acquire refuses (`input_unknown`); named dep-info/rerun-if paths outside the requested tree and the exclusive slot also refuse. The digest map is bound to the admitted pre-acquire tree digest and persisted only after successful compile-through-test-and-capture with that digest unchanged. A lease that spawned Cargo and did not reach that finalize, including Uncertain later reconciled to Idle, invalidates the map so the next reuse is `input_unknown`. Missing reuse evidence does not grant eviction authority: only a proven-Idle, known owned generation may undergo explicitly authorized, budgeted whole-slot eviction/replacement. Deletion/emptiness is proved before releasing its reservation or allocating its cold successor; uncertainty preserves bytes and accounting. Cold admission has full root/source/config/toolchain/environment/input/path checks but needs no prior map in a proven-empty generation. Successful unchanged-tree compile/test/capture alone rebinds it; no untrusted bytes are reused. See the linked design for the transition table and per-unit reference checks. Workspace `Cargo.toml`, `Cargo.lock`, in-tree `rust-toolchain(.toml)` and `.cargo/config.toml` are in the map. A slot whose in-scope build-script `output` has no `rerun-if-changed` and no `rerun-if-env-changed` refuses reuse (`input_unknown`). The first slice excludes rustdoc and old-style scripts: their Cargo `Precalculated` mode can mtime manifests/lockfiles, unlike the allowed dep-info/rerun-if modes. Metadata env-dependencies and newer-mtime changes rely on Cargo's named coverage, not the conditional old/equal-mtime map. `make_room` evicts proven-idle slots only; leased or uncertain state is never evicted; budget exhaustion refuses a new slot. Store count is registered roots times a configured finite retained-partition allowance, independent of task count. Private fallback is outside that count and requires separate consumer-approved count/byte limits or refusal.
-- **Cross-root safety fallback (not useful reuse):** if logical mapped mode shares a partition across roots, acquire must not select a different-root idle slot. Task 018's `partition + requested_root_id + source_tree_digest` match is that fail-closed rule and yields only same-root+same-tree retry or a new slot per head. Do not ship it as the useful-reuse admission; see [task 018](qualification-readiness.md#task-018-stale-source-diagnosis-and-proposed-compile-origin-admission-2026-10-10) and [task 019](qualification-readiness.md#task-019-useful-bounded-reuse-across-changing-tasks-design-only-2026-10-10).
-
-An unknown, changing or path-sensitive input is not silently omitted to improve hit rate. It forces a separate partition or a refusal. A change to toolchain or effective build configuration cannot use the old partition. The partition key is not a substitute for Cargo's dependency/build-unit invalidation.
-
-The ordinary-Cargo storage API keeps exact attempt authentication separate
-from stable generation eligibility; its versioned identity and ledger rules
-are defined in the [ordinary Cargo reuse identity contract](contracts/ordinary-cargo-reuse-identity.md).
-
-Production keys remain checkout-isolated until different-path portability passes an operator-approved source-path contract. The experimental local adapter now resolves an explicit ordered map of authorized roots, binds each root ID to its canonical path, and includes the complete map and effective Rust-flag vector in its compatibility identity. A changed root set or flag vector creates a different partition. A disposable storage root also has its own identity bound to its declared canonical path. Logical mode currently omits the requested root ID from that identity, so A and B share a partition; mapped reuse then depends on Cargo freshness, which v4 showed is unsafe across compile origins. Useful reuse uses strict-physical partitions and same-root slot reuse; the Task 018 origin+tree match is only the fail-closed correction if mapped logical mode is used at all, and it does not satisfy useful reuse. Cross-root hits stay unqualified. Mapped reuse still refuses before slot resolution unless source, configuration and toolchain miss controls are complete. Logical mode requires Tom's accepted policy ID and full-debug intent; strict physical mode keeps each requested root in its own partition. These are adapter semantics, not Cargo portability evidence. The map does not normalize manifest, generated or runtime paths. The [design and pass predicates](qualification-readiness.md#portable-source-identity-proposal-design-only-2026-10-09) remain the qualification authority; [vision](vision.md#authority-boundaries) owns the ruling and experimental implementation scope.
-
-The collector binds the accepted policy, complete source map and full build-partition identity (including configuration, environment and toolchain) to the requested tree, producer-declared compile origins, lease, run/attempt/host-run IDs, owned completion proof and private capture. It recomputes captured binary and log digests, rejects unsafe references and symlink escapes, and records declared path classes plus a bounded missing-class report. The plain hook file's identity rows are checked against this run, but the collector does not authenticate the process that wrote it or independently attest scanner, source, origin or behavior-path claims. Qualification checks declared full-debug sections, compiler-debug, `file!()` and panic paths separately, then requires declarations for every in-scope manifest, include, build-script, `OUT_DIR`, generated, proc-macro and runtime-resource path. It validates their declared identities and path containment; it cannot establish that a unit compiled from a claimed origin or that a workflow actually read or generated a claimed path. Missing or unresolved proof is insufficient; a concrete mismatch fails, including a logical-mode path outside its prefix. Apple OSO requires an explicit producer result: emitted paths are checked without rewrite, `not emitted` is accepted only as an explicit declaration, and an absent declaration remains insufficient. Task-owned fixture provenance is explicit and cannot qualify outside tests. The registered Cargo runner currently has no binary scanner or workflow path hooks; it records those missing classes and remains uncertain. The schema and limits are in [qualification readiness](qualification-readiness.md#registered-cargo-source-map-evidence-schema). No real Cargo portability, adoption, performance or storage-saving result is established.
-
-### Consumer-owned stable source roots
-
-The logical remapping candidate needs a finite, pre-registered source-root set. Queue or Nucleus must own that set because it owns task workspaces, managed Git checkouts, task admission and source retention. The smallest proposal is a consumer-managed pool of a fixed number of task-worktree paths per opted-in repository/component and workflow. A root path is assigned exclusively to one task workspace at a time and can be assigned again only after the consumer's ordinary workspace archive and source/evidence-preservation checks pass. A new task receives a new workspace and task identity even when the consumer later reuses the same physical path. Oxide never creates, refreshes, selects, retains or cleans these source checkouts.
-
-Keep two identities separate:
-
-- **Root-set identity** is the complete ordered set of stable consumer root IDs, canonical paths, logical compiler prefixes and source-map policy. The complete set is registered before the first mapped build and contributes to the compatibility partition and effective Rust flags. Every task using the set resolves to the same root-set digest and flag vector, whichever registered root it occupies. Adding, removing, moving or reordering roots changes that identity and causes a cold partition; do not grow the map opportunistically or discard the cold partition and call it reuse.
-- **Run source identity** records the assigned root ID plus that task attempt's exact commit/tree, tracked and untracked source state where allowed, submodules, relevant generated inputs, and source-tree digest. It is bound to the task/workspace/run/attempt, partition digest, lease and independent capture receipt. The checkout path remains stable while these source revisions change. Useful-reuse acquire matches the compile root / strict-physical partition and reuses that slot across tree digests; the mtime-stale content gate refuses before execution when Cargo would keep changed inputs. Cross-root remains a miss. The map only changes compiler source names; it does not normalize behavior-bearing manifest, generated or runtime paths.
-
-The pool path is the task's actual managed worktree, not a second compilation copy. Queue/Nucleus can create a worktree at an available registered path using its existing managed Git source, without eagerly cloning or seeding every slot. Every source root that can affect the opted-in selector, including any used sibling checkout, must be in the complete stable map; an unregistered relevant source root requires a private path or refusal. A task with an unmerged, failed, cancelled or uncertain source remains retained under consumer policy and keeps its root unavailable; the pool may shrink and wait. A root is reusable only after the exact source revision and per-run evidence remain available under consumer retention policy and ordinary closeout proves the path safe to archive. If a dirty/untracked source revision is not retained exactly, that invocation cannot use mapped reuse. A full root set or changed registration is never a reason to clear evidence, force cleanup or silently expand the map.
-
-This proposal does not qualify remapping. The registered full-debug partition size is unmeasured, root working trees and caches both count against bounded storage, and no everyday reduction is established. Production keys remain checkout-isolated until the operator-approved source-path contract and exact-run qualification pass. Consumer ownership and detailed lifecycle are in [project adoption](contracts/project-adoption.md#stable-source-path-lifecycle).
-
-Queue's ad hoc worktrees normally have unique roots, so adding each new root changes that map and starts a cold partition. A stable checkout-path pool is a Queue-owned prerequisite: Queue would need to retain a finite set of worktree paths and assign later runs back to them under a separate Queue brief. No such pool is established. The only cited size, about 2.3 GiB for the planning+diagnostics artifacts, used the line-tables profile; the proposed full-debug profile's partition size is unmeasured. Old partitions occupy storage until safe eviction, and eviction discards their reuse value. Root churn therefore spends capacity on superseded and newly cold partitions without demonstrated reduction in duplicate work; measure the full-debug partition in an authorized pilot before claiming its size or savings. If Queue cannot maintain a stable pool, stop remapping for this workflow and state that worktree duplication remains unsolved. Useful physical-root reuse also needs that pool for Queue/Nucleus everyday relief; an Oxide fixture can still prove same-root different-tree retention without it. Keep consumer-facing source-identity, miss and refusal semantics independent of rustc flags and map encoding. Reassess at each supported Cargo/rustc upgrade. Retire remapping only when shipped Cargo support and a fresh exact-path qualification pass the same full-debug/source-lookup, behavior-path, source/config/toolchain miss, exact-run receipt, ownership and bounded-capacity gates without a per-root map. A roadmap is not enough. The portability proposal records the strict/logical pass predicates and limits; the accepted logical-path contract and fixture-tested qualifier do not establish portability or solve daily duplication.
-
-### Semantic operations
-
-These operation names describe a future protocol, not an existing command or API.
-
-| Operation | Required behavior and retry identity | Refusal or result |
-| --- | --- | --- |
-| `inventory` | Read-only snapshot of configured cap/reserve, measured bytes, slot key, and `idle`, `leased`, `uncertain` or `evictable` state. A request ID correlates the read; safe retries may return a newer snapshot. | Report unknown size/state as unknown; never infer idle from missing metadata. |
-| `acquire` | Require admission/authenticated run envelope first. Persist the lease and owner binding before returning its opaque token. Deduplicate on `(consumer, run_id, attempt_id, acquire_id)`; identical retry returns the same result, changed payload with the same ID is rejected. Proposed useful reuse matches the strict-physical partition (compile root) and reuses that idle slot across source-tree digests; a different root is a miss. After acquire and before spawn, refuse `source_stale` / `input_unknown` without writing when the mtime-stale content gate fails. The Task 018 origin+tree match remains the mapped-logical safety fallback only. | Refuse a different claimant while leased/uncertain, an incompatible key, unresolved input, stale mtime-content, insufficient bounded capacity or failed admission. No automatic wait/retry that expands the operation. |
-| `reconcile` | Reconcile one durable lease using a stable `(lease_id, reconcile_id)` and authenticated consumer evidence. Confirm completion within the supported writer model and capture state, not just a reported PID or terminal task state. Repeating identical evidence returns the same result. | If ownership, a known/unexplained writer, supported-workflow completion, capture or reply outcome is uncertain, keep the lease `uncertain`, reserve its bytes, and refuse reuse and eviction. Conflicting evidence is rejected. |
-| `finalize` | Accept an authenticated terminal run record plus capture receipt/digests only after attempt-bound completion evidence establishes writing completion within the registered supported workflow. Deduplicate on `(lease_id, finalize_id)`; a repeated identical finalize returns the prior receipt. | Do not release on age, vanished PID, daemon crash, lost reply, cancellation request, or test outcome alone. Missing proof leaves the slot uncertain. A failed test may release only after safe writer completion and evidence capture; it never becomes a validation success. |
-| `budget` | Read configured cap/reserve and current measured/reserved bytes using a caller request ID; safe retries may return a newer snapshot. Limit policy is supplied by explicit owner-approved configuration, not changed by a consumer. If a future authorized policy update exists, use stable `(policy_revision, update_id)` and reject changed payload under the same ID. | Refuse acquisition when a hard cap or declared guaranteed reserve cannot be enforced or would be exceeded. The owner-approved pilot's monitored host threshold follows the policy below; unknown/breached readings refuse. Evict only proven-idle slots and never captured run evidence. |
-
-Each attempt has a new attempt ID; retries of the same logical operation reuse its operation ID and byte-identical payload. A new attempt cannot inherit an earlier lease. An identical acquire retry returns the original lease identity and current durable state; it never revives a finalized lease. The consumer adapter must single-flight execution for one attempt so a retry cannot launch a second workflow. A lease token is scoped to one run binding and one partition. Successful finalization is the only ordinary transition from `leased` to `idle`; restart recovery enters `uncertain` until reconciliation succeeds.
-
-### Durable ownership and recovery
-
-The ledger records the slot key, lease token hash, owner/run binding, acquire/finalize operation IDs, state, reserved/measured bytes and capture receipt reference. Durable transitions must be flushed before acknowledging them. The daemon serializes ledger mutation and atomically publishes completed metadata. A durable record is necessary but not sufficient: storage stays unavailable while a participating writer may still write or the supported workflow's completion remains unknown, even if the daemon or client disconnects. This is subject to the supported writer model, not a universal same-user write fence.
-
-Each ledger also persists a random 256-bit `storage_instance_id`. A slot's
-`slot-<16 lowercase hex digits>` ID contains its positive monotonic ordinal;
-`AcquireResult.generation` exposes that ordinal as canonical positive u64
-decimal text and returns the instance ID beside `slot_id`. The pair remains
-stable across sequential leases and source revisions on the same slot. A new
-slot receives the next ordinal; ledger recreation receives a new instance ID,
-so old maps and receipts cannot bind to the recreated ledger by ordinal alone.
-The counter is never reset by slot eviction.
-
-The local ledger format is version 6, which records the durable backend
-mode plus ordinary-retirement intents and tombstones. Version-5 and other
-unsupported ledgers are refused without migration or reinterpretation. The local socket protocol
-prefixes each request and response with `OXSTOR01` and protocol version 2;
-unversioned or unsupported peers are refused before request dispatch. The
-ordinary-Cargo request/response shapes and inventory additions cannot be
-decoded by version-1 clients.
-
-`Client::lookup_acquire` authenticates the original admission envelope and
-checks the exact acquire body digest. `Client::lookup_finalize` authenticates
-the settlement evidence and checks the accepted operation's exact body digest.
-They return absent, present or uncertain results without changing the ledger.
-The lookup identity carries no slot path or lease token. An uncertain lease
-stays held, and lookup does not allocate, evict, settle or mint access. This is
-an Oxide API only; no Nucleus consumer binding is installed.
-
-The ordinary-Cargo storage seam uses a separate versioned API and durable
-per-generation `empty`, `pending`, `reusable`, or `cold-only` eligibility,
-independent of slot occupancy. Its configured authority hooks reject by
-default. It admits at most one `ordinary-test` and one `full-debug` generation
-for each authenticated strict physical root allocation, uses checked bounded
-capacity accounting, and never invokes generic eviction. Generic acquire,
-settlement, lookup, and eviction cannot operate on those protected records.
-A proven-idle `reusable` or `cold-only` generation may be retired only by an
-owner-authenticated ordinary retirement carrying the exact storage
-instance/slot/generation scope and an independent source/artifact/debug
-retention acknowledgment; the persisted intent precedes any deletion, an
-interrupted deletion resumes only the recorded scope, and the durable
-tombstone receipt precedes any fresh-ordinal replacement under enforced
-capacity. This API does not execute Cargo or install a consumer workflow;
-its signatures
-and limits are owned by [ordinary-Cargo storage](contracts/ordinary-cargo-storage.md).
-
-On daemon restart, every persisted `leased` record without a matching durable completion receipt becomes `uncertain`. The daemon queries the owning consumer for authenticated task/source/terminal/capture evidence and checks the workflow completion record. PID plus start-time or a lock-file state may help locate a job, but absence alone proves nothing. If completion/capture authority is unavailable or a known/unexplained writer persists, preserve the slot and refuse acquisition/eviction. Recovery may be retried with the same reconciliation ID; lost replies do not create new leases. Operator cleanup is outside this first protocol and must not be inferred from age.
-
-### Local storage prototype
-
-The unpublished `oxide-storage` crate contains a Unix-only daemon candidate with a versioned local request protocol and one serialized ledger writer. The endpoint is a Unix-domain socket beneath an existing canonical directory with private permissions; the socket is owner-only. A daemon-wide bound socket prevents a second live instance. Startup removes a stale socket only after a connection fails and the socket inode still matches. No service, launch agent or user installation is provided.
-
-The ledger is atomically replaced through a private temporary file, file sync and root-directory sync before an operation reply. A 256-bit random lease token is SHA-256 hashed in the ledger. Consumer credentials are verified at the adapter boundary and stripped before persistence. If an acquire reply is lost while the daemon remains alive, the same run-attempt request returns its original lease. After daemon restart, every active lease becomes `uncertain`; retry returns no slot path. A client that lost the token can settle an uncertain lease only with authenticated reconciliation evidence.
-
-Slots partition by project/component, workflow, Cargo and rustc provenance, host/target, profile, features, configuration and environment digests, and checkout-path identity. Source and run identity are recorded on the lease. An exclusive lease remains held until authenticated terminal, capture and completion evidence under the registered supported workflow is accepted. The current native fixture evidence applies only to its fixed cooperative child; it does not prove that arbitrary descendants or same-user writers ended. PID absence, age, socket ownership and daemon restart never release a slot. Eviction first persists an `evicting` state and only removes a known owned slot whose ledger state is idle; interrupted eviction resumes only that recorded deletion. Unknown root entries, corrupt records, unsafe paths or unknown accounting fail closed.
-
-The prototype refuses a new attempt while any slot for its partition is leased or uncertain, even when the configured budget could hold another slot. A compatible partition permits sequential reuse only after authenticated settlement; it never permits parallel mutable sharing.
-
-This remains a scratch-state prototype. It requires injected consumer evidence verification and a free-space probe; no Queue/Nucleus authenticator or host probe is included. Its cap accounts for measured slot bytes and requested reservations, but there is no filesystem quota to constrain growth while a client writes. Consumer-owned checkout and capture roots are outside its accounting. The storage core does not launch or contain build/test descendants, and the project adapter below does not spawn Cargo or prove path portability. No host filesystem is qualified. Real managed builds and adoption remain blocked.
-
-An opt-in hard-bounded payload backend now exists for this prototype: one fixed-size private APFS volume in a sparse disk image, provisioned and opened by the protected runtime under a verified capability, with the enforced aggregate-store ceiling owned by [bounded storage](contracts/bounded-storage.md). It is the first OS-enforced capacity bound; directory-only roots remain explicitly budget-only, and neither mode claims consumer adoption or a production deployment.
-
-### Project adapter fixture prototype
-
-The Unix-only `ProjectAdapter` accepts an exact workflow/selector opt-in and
-explicit resolved inputs. It validates Cargo 1.91 or newer, tool executable
-digests, host/target, profile/features, complete allowlisted Cargo configuration
-and environment entries, source identity and canonical paths. It hashes config
-and environment values without logging them, and includes checkout-path identity
-in the partition. Unknown or ambiguous inputs fail closed. This is a validation
-boundary for injected fixture data, not an automatic Cargo/toolchain/config
-scanner.
-
-The adapter gives an injected host boundary `CARGO_BUILD_BUILD_DIR` for the
-exclusive slot and a separate `CARGO_TARGET_DIR` for private final outputs. A
-non-reserving inventory check may register one cancellable wait and consume one
-wake; it never polls or loops. Consumer authorization supplies the run envelope
-and acquire ID. The adapter acquires before host-run submission and reports a
-busy/full refusal to the fixture consumer before any command runner is called.
-Task/attempt identity and host-run identity are separate types. This split is a
-fixture model only; it does not solve Q-012 or implement a Queue/Nucleus binding.
-
-The unpublished implementation includes injected fake/lightweight runners and
-a fixed native test-fixture runner; it does not launch Cargo or establish a
-production workflow. An injected fixture completion proof cannot establish
-native completion. The native runner may mint its private completion
-certificate only for its owned child, exact attempt, slot and output bundle.
-The adapter still requires a matching consumer capture receipt before
-finalizing to idle. Cancellation, failed capture, mismatched run identity,
-daemon uncertainty or a lost finalization reply without a confirmed retry leave
-storage unavailable. It never starts a direct-Cargo fallback in managed state.
-
-The adapter holds at most 12 fixed-schema events per run, each at most 1 KiB,
-inside a 16 MiB in-process ring. It drops the oldest settled records first.
-Records are keyed by consumer, run and attempt identity and retain workflow, selector,
-commit, source-tree digest and partition/configuration digests. Events include
-bounded timing, reuse/rebuild summaries when supplied, storage bytes, capture
-references and finalization state. Write attribution is explicitly unavailable.
-The ring is not persisted, is not broad tracing, and does not issue QA verdicts
-or control consumer retention.
-
-### Budget and observations
-
-Capacity covers the dedicated disposable footprint, including checkout roots, intermediates, redirected temporary output and pilot run captures. The proposed pilot ceiling remains 10 GiB total. Before execution, read-only preflight must establish the measurement method and an enforceable disposable-footprint cap for the selected host and filesystem. Sampling alone does not establish that hard cap; an unknown or unenforceable cap blocks a build.
-
-Tom's ruling, 2026-10-09: treat 20 GiB host free space as a monitored start/abort threshold, not a guarantee against other host writers. Refuse a start when measured free space is below the threshold or unknown; monitor during execution and abort/report on a detected breach or unavailable measurement. The execution brief must name the sampling interval, measurement and abort behavior, including overshoot and unrelated-writer races. This ruling does not authorize volume creation, weaken the separate disposable-footprint cap, change uncertain lease release, or release the pilot hold. Capacity pressure produces an actionable refusal and inventory. Do not delete active or uncertain storage or consumer-retained evidence to make room.
-
-The semantic ceiling is one normalized run record and at most 12 fixed-schema events per run, each capped at 1 KiB. Events cover request/result, compile completion, test completion, capture completion, finalization and any uncertainty/reconciliation transitions. Repeated identical RPCs update a retry counter rather than append an event. Record durations, reuse/rebuild summaries, occupied/reserved bytes and available write counters; omit raw environment values, secrets, compiler command lines and per-file traces. Cap the observation ring at 16 MiB and drop oldest settled observations first. Lease ledger and consumer run evidence are outside this ring and cannot be evicted by it. The daemon is not a general tracing service.
-
-Observations correlate through project/component ID, consumer task/workspace/run/attempt ID, host-run ID when submitted, workflow/selector, exact commit/source-tree digest, partition/configuration digest and event sequence. They explain storage behavior but are not authenticated settlement, a test verdict or a replacement for controlled correctness/failure qualification. If actual write attribution is unavailable, record it as unavailable; do not treat occupied-space deltas as disk-write counts or infer SSD lifetime.
-
-### Exact-run evidence and Cargo boundary
-
-Queue/Nucleus continue to preserve run outputs under their own policy. Each run's binaries, logs, test output, receipts and evidence live in its independently owned capture area, not in the reusable slot. The consumer receipt binds their digests to its authenticated run ID, exact source/tree, selector, toolchain/configuration and test result. The daemon may retain a receipt reference and digest but cannot mint the consumer's authenticated receipt. Cargo's intermediate directory is disposable internal state and may contain test-related executables; none of its contents alone establishes that a run's tests executed or passed.
-
-Run `cargo test` and the selected Effigy tests on every build scenario. A cache hit skips compilation only; it cannot skip tests, create a successful receipt or satisfy validation. Target-directory separation alone does not reuse compiler intermediates across worktrees. Sharing `CARGO_TARGET_DIR` would also mix final outputs and cleanup scope, violating the mutable-target boundary. The replaceable initial mechanism is stable Cargo build-dir redirection plus Oxide's exclusive lease, project adapter, ledger and budget—not a second Cargo fingerprint engine, eager directory copier, full-copy fallback or `sccache` assumption.
-
-Retire or replace the redirection mechanism only when an actually supported Cargo release supplies the needed cross-workspace unit reuse and lifecycle behavior for the selected workflows, including build scripts/proc macros as required, and controlled tests show the same ownership, path correctness, capacity and evidence guarantees. Keep the adapter, authority boundaries, run binding, budgets and consumer API semantics independent of that mechanism. Reassess at each supported Cargo upgrade; upstream roadmap acceptance alone is not a replacement trigger.
-
-Experimental state, 2026-10-09: the standalone pilot's registered Cargo runner keeps the Cargo build directory in the slot and binds per-run capture under the exact run. Test binaries land under the slot's build directory, not in the final target directory. A warm checkout-B run on the same slot executed tests with zero rebuilt units, yet its binaries still embedded checkout-A absolute paths. Partition identity is checkout-isolated in production. The trial-only key may omit checkout identity for declared disposable roots, but that is a qualification-only key. Portability is not qualified; see [qualification readiness](qualification-readiness.md#pilot-execution-record-run-5-2026-10-09-partial).
-
-### Original standalone Cargo pilot protocol (oxide#005, closed)
-
-The original oxide#005 brief selected one native Nucleus core-test Effigy selector, one exact pinned head in two disposable checkout paths, and one exclusive intermediate slot. Its partial execution and reviewed evidence are recorded in [qualification readiness](qualification-readiness.md#pilot-execution-record-run-5-2026-10-09-partial). This historical protocol is closed. The separate portability proposal is documented there; it has no implementation or experiment authority.
-
-Tom separately approved the exact standalone oxide#005 protocol recorded in [vision](vision.md#authority-boundaries) and its Queue brief. It used a local qualification binding and preceded consumer integration; it did not solve Q-012 or authorize Queue/Nucleus authenticated settlement, live adoption or a deployed service. That approval ended with the partial run and does not carry forward.
-
-The macOS completion gate was later qualified for S1–S3 under the cooperative workflow. Run 5 completed healthy release and reacquire for its slot runs, but this does not qualify broader Cargo process trees. Cross-path correctness and source/configuration/toolchain invalidation remain unqualified; see [the reviewed result](qualification-readiness.md#pilot-execution-record-run-5-2026-10-09-partial).
-
-Any new experiment requires a separate Queue brief, fresh source-owner approval, exact selector/source/toolchain/paths, new task-owned resources, and a renewed time and storage scope. Consumer adoption remains a separate decision after independent evidence review.
-
-Worker scenarios are capped at six, with 90 minutes for the worker and 30 minutes for independent reviewer replay, two hours total. No automatic retries or expansion. Stops are the worker/reviewer time limits, the 10 GiB total disposable cap and a detected breach of the monitored 20 GiB host-free-space threshold. The host threshold is not a continuous guarantee; any separate cumulative-write limit must be named in the execution approval. Suggested scenarios:
-
-1. isolated cold reference in a private build directory;
-2. shared-slot cold run at checkout A;
-3. same-head warm run at checkout B;
-4. controlled tracked-source change in one disposable checkout, with a recorded new tree digest and evidence that affected units rebuild;
-5. effective configuration change, which must change the partition or be refused while incompatible state is present;
-6. toolchain control using an already-installed alternative, or a key-separation/refusal proof without another compiler build.
-
-Every scenario that actually builds runs the tests in that same lease. A configuration/toolchain scenario that only proves key separation/refusal does not claim a build result. Do not install a toolchain to fill the matrix. Measure elapsed time, independently sampled actual write bytes, and occupied/reserved space separately. Count the checkouts and captures within the cap. State unavailable write attribution plainly; never infer SSD lifetime. At each predeclared time, space or write threshold, stop and report rather than retry or expand.
-
-Correctness/failure proofs within the same bounded session: generated-code and proc-macro behavior; path-sensitive build output at both roots; exact-head/source receipt and artifact binding; tests run on every real build; a simultaneous second claimant is refused without touching the slot; idempotent acquire/finalize retries after deliberately lost replies; daemon crash during an in-flight build with restart still refusing while any descendant/capture outcome is uncertain; and budget pressure evicts only a reconciled idle slot while active/uncertain state remains unavailable. Age, vanished PID or restart alone must not make a slot available. Independent reviewer replays at most one warm and one meaningful miss, within the 30-minute reviewer cap.
-
-Disposition is one of: proceed to an adoption decision if all ownership/correctness gates pass and measured benefit is useful; path-isolated partitions with explicitly reduced benefit if cross-path correctness fails but isolated use is safe; or a named blocking failure and smallest next action. Path isolation does not meet the cross-worktree objective. Failed ownership or correctness blocks adoption. No outcome authorizes implementation or consumer rollout.
+Persistent bounded cache slots partition by project/component identity, exact
+toolchain, host/target platform, and resolved configuration/profile/features/relevant
+environment. One exclusive durable lease covers compile through test and
+artifact capture. Unknown crash outcomes, lost replies, age and PID
+disappearance do not imply release. Reconciliation must prove safe ownership
+settlement before reuse or eviction. The one exception is Tom's 2026-10-18
+ruling that lets Oxide's own commands recover through a qualified holder/group
+mechanism ([vision](vision.md#product-workflow-direction)).
+
+Exact-run final binaries, logs, QA receipts and evidence remain independently
+owned and preserved. Cargo intermediates are internal and may contain test
+executables; separating output directories alone cannot prove isolation. Cache
+reuse never counts as validation success.
+
+Proposed: effective build context (incremental, debug, split-debuginfo) would
+be a partition input. Its lifetime and diagnostics rules are in the
+[build-context policy](contracts/build-context-policy.md); it is not active.
+
+Prepare only requested components lazily. No eager copying of all targets and
+no full-copy fallback. Evict idle slots only, within explicit budgets; occupied
+space and actual disk writes must be measured separately.
+
+The read-only [storage inventory](contracts/storage-inventory.md) reports what
+occupies space in one explicitly selected target directory. It grants no
+ownership or eviction authority and never recommends deletion.
+
+## Current facilities
+
+- The root library keeps the verified bounded APFS backing capability
+  ([bounded storage](contracts/bounded-storage.md)) used by the local lease
+  CLI. There is no background storage service or project adapter.
+- The local lease CLI provides explicit same-user pool, lease, release,
+  recovery and status operations. Tom's 2026-10-16 Nucleus ruling selected it
+  in place of the protected callback integration. UID trust permits a
+  cooperative caller's explicit writer-closed release; TTL or holder loss alone
+  does not establish closure.
+- The inventory CLI reads one explicitly selected target directory.
+- A bounded decoder for Cargo's encoded dep-info (`oxide_storage::dep_info`)
+  is kept as input for the cross-checkout freshness gate. No command calls it
+  yet, and decoding alone establishes no freshness.
+- The stable Cargo profile proofs remain opt-in and do not change default
+  development or consumer profiles.
+
+## Storage invariants
+
+1. **Bound ownership.** A hard capacity claim requires a verified backing
+   descriptor for the canonical APFS payload. A directory-only root is a
+   budgeted directory, not a hard filesystem bound.
+2. **Exclusive use.** A lease names one owned slot generation. A second claim
+   cannot use it while ownership is active or uncertain.
+3. **Conservative recovery.** Unknown or uncertain writer state preserves bytes
+   and accounting. Age, a missing reply, or a PID observation is not release
+   evidence. Reclaim requires the proof defined by the lease contract.
+4. **Finite capacity.** Admission respects the configured payload ceiling and
+   refuses when capacity or ownership cannot be established. Capacity pressure
+   produces an actionable refusal and inventory; never delete active or
+   uncertain storage or consumer-retained evidence to make room.
+5. **Private final outputs.** Reusing Cargo intermediates must not share
+   `CARGO_TARGET_DIR`, test outputs or cleanup scope between runs. Requested
+   tests still execute and their results remain bound to their run.
+6. **Freshness before reuse.** Cargo remains responsible for unit invalidation.
+   Oxide must establish compatible inputs and path identity before reuse; it
+   must not rewrite Cargo fingerprints or infer a hit from file counts.
+
+Tom's ruling, 2026-10-09: treat 20 GiB host free space as a monitored
+start/abort threshold, not a guarantee against other host writers. Refuse a
+start when measured free space is below the threshold or unknown; monitor
+during execution and abort/report on a detected breach or unavailable
+measurement. This ruling does not authorize volume creation or change
+uncertain lease release. If write attribution is unavailable, record it as
+unavailable; occupied-space deltas are not disk-write counts or SSD lifetime.
+
+## Cargo boundary
+
+Cargo's `build.build-dir` / `CARGO_BUILD_BUILD_DIR` is stable starting in Rust
+1.91 and is separate from `target-dir`. It is the smallest useful mechanism:
+direct Cargo to an Oxide-owned intermediate directory and let Cargo retain its
+own unit invalidation. It supplies no ownership, lease, budget or run-evidence
+semantics, and test binaries land in the build directory. Do not blindly adopt
+sccache: Acow's measured trial rejected it. Oxide is not a second Cargo
+fingerprint engine, eager directory copier or full-copy fallback.
+
+Retire or replace the redirection only when a supported Cargo release supplies
+the needed cross-workspace unit reuse and lifecycle behavior for the selected
+workflows, and controlled tests show the same ownership, path correctness,
+capacity and evidence guarantees. Reassess at each supported Cargo upgrade;
+roadmap acceptance alone is not a trigger.
+
+Nucleus Contract 002 prohibits mutable target sharing; Frozen Contract 010
+remains unchanged. Queue and Nucleus own task admission, scheduling, host
+execution, source and run identities, settlement, retention and artifact
+capture. Effigy remains language-neutral. Oxide's command front door is an
+explicit opt-in design; local lease use does not install a service, create a
+default pool, modify a consumer or inspect live project state.
+
+Cross-worktree source freshness, compiler path embedding, process containment
+and capacity remain proof obligations. The retained findings, including the
+narrow reviewed #064 ordinary-Cargo cross-path result, are in
+[qualification findings](qualification-readiness.md). No general cross-path
+correctness, real-project benefit or production capacity policy is
+established.
 
 ## Existing facilities and source context
 
@@ -328,38 +121,3 @@ These sources inform qualification; they are not Oxide implementation or portabi
 - Effigy task-result fingerprint caches and container cache lifecycle are not a central Rust slot facility.
 
 Existing Nucleus integration preparation, backup root locking/crash reconciliation, retention cleanup, managed Git worktrees and smaller debug artifacts have their own owners. Consult their Queue records when authorized coordination is needed; do not duplicate their authority or rewrite their work from Oxide.
-
-
-## Opt-in same-root fixture admission
-
-The fixed strict-physical Cargo fixture now has a bounded pre-execution input
-map and durable pending barrier. Its current scope, read/evidence caps,
-publication rules and ignored proof are owned by
-[qualification readiness](qualification-readiness.md#same-root-fixture-freshness-admission-opt-in-implementation).
-The requested tree is freshly computed run identity; root/configuration remains
-the partition identity. This fixture store admits one retained partition and
-refuses capacity/config/root changes without automatic eviction. It does not
-implement a consumer path pool or alter production/mapped-source admission.
-
-The Oxide-local settlement encoding additionally supports `NotSpawned`, a
-crate-issued, token-bound proof that the adapter never called the runner for
-that active lease. It binds lease, slot/path, run and attempt; no capture is
-invented and it cannot reconcile an Uncertain lease. Consumer authentication
-remains required. This releases only a no-writer lease, not a successful test
-verdict. Ordinary process-absence claims remain insufficient. Frozen Nucleus
-Contract 010 and all consumer wire formats are unchanged.
-
-## Proposed first Nucleus workflow extension
-
-The [first Nucleus core-test contract](contracts/nucleus-core-reuse.md) selects
-one existing selector for a proposed versioned input collector and consumer-owned
-physical root pool. It keeps strict-physical per-root partitions, per-run source
-binding, exclusive compile/test/capture and the pending-map failure barrier.
-The implemented fixture remains fixed; registry/native/opaque input coverage,
-external immutable input receipts, consumer authentication and path/lifecycle
-fields described there are proposals, not current admission support.
-No production activation or cross-root reuse follows from this design.
-The separate proposed cooperative, graph-free same-root qualification route is
-defined in [ordinary-Cargo storage](contracts/ordinary-cargo-storage.md); it
-does not change the registered Runner's input requirements or authorize
-consumer activation.

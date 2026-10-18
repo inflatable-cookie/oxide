@@ -1,111 +1,74 @@
 # Bounded payload storage backend
 
-Status: the opt-in hard-bounded macOS payload backend is implemented behind an
-explicit verified capability. One real filesystem-full proof ran under its
-recorded fixture bounds; synthetic fixtures cover the refusal and accounting
-surface. No consumer activation, installation, detach/cleanup facility, or
-production deployment follows from this contract. This document owns the
-supported semantics; [architecture](../architecture.md) owns the storage
-invariants and [ordinary-Cargo storage](ordinary-cargo-storage.md) owns the
-versioned seam that this ledger change touches.
+The hard-bounded APFS payload capability remains in use by the unpublished
+[local lease CLI](local-lease.md). This contract records its retained storage
+semantics; [architecture](../architecture.md) owns the wider invariants. The
+former daemon lifecycle and protocol have been retired.
 
-## Decision and boundary
+## Boundary
 
-The directory-only daemon checks admission against a caller-supplied budget
-but nothing constrains a writer after acquire. The bounded backend closes that
-gap with one supported shape: a fixed-size private APFS volume inside a sparse
-disk image, provisioned and attached by the protected storage runtime. The
-volume's finite size is the enforced aggregate-store ceiling — the operating
-system refuses allocation beyond it while a cooperative writer holds an open
-lease — and admission still reserves against the recorded ceiling so a
-partition cannot silently consume the remaining pool.
+The supported hard-bound shape is a fixed-size private APFS volume inside a
+sparse disk image. The lease CLI provisions and opens it and mints the
+`BoundedBacking` capability only after live verification. The operating system
+refuses allocation beyond the verified volume capacity. The declared pool cap
+must equal the image size; a smaller declared cap on a larger volume refuses,
+because admission accounting alone is not a quota.
 
-The enforced bound is aggregate-store, never per-slot. Every owned slot shares
-one finite payload filesystem and there is no per-slot isolation. Reservation
-accounting is an acquire-time estimate: because the OS bound sits at the
-verified volume capacity, a fully written payload can measure more than its
-reservation. Reuse of an existing settled generation adds no bytes and stays
-admissible; any real growth evicts proven-idle slots first or refuses with an
-actionable known/unknown accounting result. ENOSPC during a leased workflow is
-not writer closure or release: pending/uncertain state and the existing
-authenticated settlement rules are unchanged.
+The bound is aggregate, not per-slot. All owned slots share one finite payload
+filesystem. There is no per-lease reservation: lease-time admission compares
+the owned slots' measured unique allocated bytes with the pinned cap, evicts
+only known idle whole slots, and refuses on held occupancy or unknown
+accounting. A lease does not constrain writes after it is granted; a build can
+still hit ENOSPC, which is not writer closure or release, and the lease stays
+held. [Local lease](local-lease.md#capacity-and-eviction) owns the exact
+admission, half-cap recycling and eviction rules.
 
-Control state (ledger, socket, temporary files) and the capacity receipt stay
-on the host filesystem, outside a payload that can become full, so a full
-payload can never wedge durable ownership updates. The payload holds only the
-slot directories; unknown entries refuse.
+Pool config, ledger and capacity receipt stay outside a payload that can become
+full. The payload holds the owned `slots` directory plus the known
+macOS-created metadata directories (`.fseventsd`, `.Spotlight-V100`,
+`.Trashes`, `.TemporaryItems`); any other entry, a symlink or a foreign-volume
+entry refuses.
 
-## What exists
+## Retained capability
 
-- `oxide_storage::bounded` owns the verified capability
-  (`BoundedBacking`, `BoundedBackendDescriptor`) and the backend tag
-  `apfs-sparse-image-v1`. Construction is crate-private: only code that
-  provisioned or opened the backing and verified it can mint one, and caller
-  JSON cannot upgrade a directory root to a hard-bound claim. Old
-  directory-only roots remain explicitly budget-only.
-- The durable ledger is version 6 and records the backend mode: budget-only
-  directory, or the bounded descriptor (backend tag, canonical payload root,
-  recorded image identity, verified capacity). Restart refuses any mismatch
-  between the configured backing and the recorded descriptor instead of
-  reinterpreting the store. Version-5 ledgers refuse without migration.
-- Finite control-history limits refuse new slots, leases, settlement, or
-  retirement records at exhaustion instead of pruning required evidence or
-  growing the ledger indefinitely; recorded ownership state is preserved.
-- The protected runtime accepts an optional `bounded` bootstrap section
-  (backend tag, image, receipt, mount point, nominal image bytes, ceiling).
-  The ceiling must equal the bootstrap budget cap, so every bounded ceiling is
-  bound to startup. Unsupported platforms and unknown backend tags refuse
-  before any host effect; there is no unbounded fallback.
-- Provisioning creates one fresh image, attaches it at the declared mount
-  point, makes the volume root owner-only, samples the mounted filesystem
-  (APFS at the exact mount point), records a capacity proof (image identity by
-  device/inode, verified capacity, ceiling), and supplies the verified
-  capability to the actual store. Opening re-derives the same identity and
-  refuses a replaced image, a foreign or non-private volume, or a mismatched
-  receipt. An image without its receipt, or a receipt without its image,
-  refuses.
-- If the daemon crashes, loses a reply, restarts, or disappears, existing
-  ordinary ownership semantics are untouched: startup turns active leases
-  `uncertain`, and nothing frees or replaces storage. This backend adds no
-  eviction, no automatic detach, no source manager, and no run executor.
+- `BoundedBacking` and `BoundedBackendDescriptor` represent the verified
+  capability and the `apfs-sparse-image-v1` backend. Construction is
+  crate-private, so caller input cannot turn a directory into a hard-bound
+  claim. Structural checks refuse an unknown backend, zero capacity, a
+  non-hex or oversized identity, and a relative, unreadable, non-private,
+  symlinked or non-canonical payload root.
+- The pool config records the backend tag, store ID, cap and image size. The
+  version-2 capacity receipt records the image path, mount point, image size,
+  payload ceiling, verified capacity and image identity. Reopen refuses a
+  mismatch instead of reinterpreting the pool.
+- Control state is finite (`MAX_LEDGER_BYTES` 256 KiB, `MAX_SLOTS` 32); new
+  slots refuse at exhaustion rather than dropping recorded ownership.
+- Provisioning creates and attaches a fresh image, makes the volume root
+  owner-only, verifies APFS at the exact mount point and writes the receipt.
+  Opening rechecks those facts and never attaches a replacement.
+- Directory-only roots are not a product mode of the lease CLI. Unsupported
+  platforms and unknown backend tags refuse without fallback.
 
-## Verified property and fixture record
+## Historical filesystem-full proof
 
-The opt-in Effigy selector `rust:bounded-native-proof` (heavy admission,
-`scripts/test-bounded-native.py`) runs one actual macOS filesystem-full proof
-per participant: exactly one fresh owned 128 MiB APFS sparse image, a writer
-payload bounded by 128 MiB with 1 MiB IO buffers, 512 MiB owned scratch, a
-20 GiB host reserve, and a 120-second native fixture phase. It proves a
-genuine OS allocation refusal (ENOSPC) under an open lease, control-ledger
-durability with the payload full, authenticated settlement, daemon restart
-reopening the same backing, and warm reuse. Ordinary detach and cleanup run
-only after positive owned-writer completion; a failed run retains every
-resource and prints its path. This is a real quota proof on a real volume; the
-repository's synthetic suite exercises injected-backend refusals and
-accounting separately and never claims quota enforcement. The selector is not
-part of ordinary validation and is not an alias for full QA.
+oxide#055 ran one real macOS filesystem-full proof through the since-retired
+storage daemon: one fresh owned 128 MiB APFS sparse image, a writer bounded by
+128 MiB with 1 MiB IO buffers, 512 MiB owned scratch, the 20 GiB host reserve
+and a 120-second native phase. It observed genuine ENOSPC under an open lease,
+control-ledger durability with the payload full, settlement, restart reopening
+the same backing and warm reuse. The `BoundedBacking` structural checks it
+relied on are unchanged and keep a unit test; the daemon-side ledger binding
+and its selector were retired.
 
-## Handover to retirement
+## Validation and limits
 
-The supported backend lifecycle operations are: provision (create, attach,
-verify, receipt), open (verify against the receipt and live volume), and the
-daemon bind that places slots on the verified payload. There is intentionally
-no detach or cleanup API: teardown of a settled owned backing is the
-dependent retirement task's authority, and until then an owner may perform an
-ordinary `hdiutil detach` of a positively settled test-owned fixture only.
-Failed or uncertain resources are retained, never force-cleared.
+`effigy rust:storage-lease-cli` owns the current fresh 128 MiB APFS pool proof
+for lease, release, recovery and status. It does not fill the filesystem or
+repeat the historical daemon proof. The [local lease contract](local-lease.md)
+records its bounds and evidence.
 
-## Non-goals and limits
-
-No consumer activation, no installation or service, no global host settings,
-no per-slot quota isolation, no live cache cleanup of prior Oxide roots, and
-no Linux or non-APFS support (explicit refusal, no fallback). The write
-attribution of the image backing file remains unavailable, as everywhere else
-in Oxide. Real managed builds, adoption, and production capacity policy stay
-separately gated.
-
-The unpublished [local lease CLI](local-lease.md) reuses this verified APFS
-backend for its aggregate payload ceiling. It factors provision/open into
-the ordinary crate so the lean command does not go through the private
-storage runtime. Directory-only roots remain budget-only and are not a
-product mode of that CLI. The CLI does not repeat the filesystem-full proof.
+Failed or uncertain task-owned fixtures are retained rather than force-cleared.
+No consumer activation, installation, global host settings, live cache cleanup,
+per-slot quota isolation, or Linux backend follows from this contract. The
+image backing file's host write attribution remains unavailable. Real managed
+builds, adoption and production capacity policy stay separately gated.

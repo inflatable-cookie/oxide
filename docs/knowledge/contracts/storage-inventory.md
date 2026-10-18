@@ -8,9 +8,8 @@ recommend deleting anything. Product distribution naming remains unchosen under
 [Q-005](../questions.md#q-005--what-names-are-safe-to-publish), and the package
 stays `publish = false`.
 
-This is distinct from the daemon `inventory` operation described in
-[architecture](../architecture.md#semantic-operations), which reads managed
-slot cap, reserve, state and lease identity. The target-directory inventory has
+This is distinct from the [local lease](local-lease.md) `status` command, which
+reads managed slot cap, state and lease identity. The target-directory inventory has
 no lease, slot key or ownership semantics and is not a claim on Oxide-managed
 storage.
 
@@ -168,6 +167,8 @@ without predicting benefit:
 - compiled dependencies dominate: [project adoption](project-adoption.md)
   reusable intermediate slots require authenticated consumer integration;
 - build-script output or fingerprints dominate: these are Cargo-managed inputs;
+  the fingerprint hint points at the retained
+  [Cargo freshness findings](../qualification-readiness.md#cargo-freshness);
 - always: this diagnostic is read-only and makes no cleanup recommendation. The
   general policy for adopting a project optimization is in
   [optimization adoption](optimization-adoption.md).
