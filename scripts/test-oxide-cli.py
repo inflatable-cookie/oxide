@@ -93,8 +93,9 @@ edition = "2021"
 
 # External subcommand: reports the injected build dir and runs `$CARGO`.
 PROBE = """#!/bin/sh
+# Cargo passes the subcommand name first.
 echo "BUILD_DIR=$CARGO_BUILD_BUILD_DIR"
-exec "$CARGO" check --profile "$1" -v
+exec "$CARGO" check --profile "$2" -v
 """
 
 
@@ -412,6 +413,11 @@ def prove_native(runner: Runner, app: str) -> None:
         if units.get(crate) != "2":
             fail(f"debug {crate} debuginfo {units.get(crate)!r}; units {units}")
 
+    prove_routing(runner, app, quick_slot, debug["slot"])
+
+
+def prove_routing(runner: Runner, app: str, quick_slot: str, debug_slot: str) -> None:
+    slots_root = os.path.join(runner.pool, "payload", "slots")
     # Building passthrough: an external subcommand's $CARGO sees the
     # environment-only profile definitions and the injected build dir.
     probe = os.path.join(runner.bin, "cargo-oxprobe")
@@ -479,7 +485,7 @@ def prove_native(runner: Runner, app: str) -> None:
     for needle in (
         f"pool: {runner.pool}",
         f"slot {quick_slot} idle quick {app}",
-        f"slot {debug['slot']} idle debug {app}",
+        f"slot {debug_slot} idle debug {app}",
         "waiting commands 0",
         "holds plain-Cargo deps/ or incremental/",
     ):
