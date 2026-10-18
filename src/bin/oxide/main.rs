@@ -7,6 +7,7 @@
 //! only through the freshness gate. Plain `cargo` behavior is untouched.
 
 mod adopt;
+mod cargo_home;
 mod cli;
 mod freshness;
 mod identity;
@@ -41,7 +42,8 @@ USAGE:
     oxide <check|test|clippy|build|run> [--profile quick|debug|release] [cargo args] [-- args]
     oxide <other cargo command> [args]   passed to Cargo; leased when it can build
     oxide clean [cargo clean args]       private outputs and slot affinity; slots stay
-    oxide status                         pool, slots, waits and stray Cargo output
+    oxide clean --cargo-cache            one pass of Cargo's own home cleanup, no network
+    oxide status                         pool, slots, waits, stray output and Cargo home
     oxide init [cargo init args] [path]  cargo init if no Cargo.toml, then adopt Oxide
     oxide new <path> [cargo new args]    cargo new, then adopt Oxide
 
@@ -50,6 +52,8 @@ project's own). Oxide places build output, so --target-dir and --config
 build.build-dir/target-dir are refused. Adoption writes one marked block in the
 workspace-root AGENTS.md and prints readiness; there is no Oxide config file.
 OXIDE_POOL selects the pool; OXIDE_MAX_ACTIVE the host-wide build limit (2).
+OXIDE_POOL_CAP sets a new pool's cap (bytes, KiB, MiB, GiB or TiB; default
+24 GiB); an existing pool keeps its recorded cap.
 OXIDE_POOL_BACKEND=directory-budget creates a budget-only directory pool (the
 Linux default; macOS defaults to a hard-capped APFS image).
 ";
@@ -462,6 +466,14 @@ fn print_summary(
 /// `cargo clean` would delete an injected slot build directory. It waits for
 /// active commands in the checkout and blocks new ones until it finishes.
 fn run_clean(args: &[OsString]) -> Result<u8, String> {
+    if args.first().is_some_and(|first| first == "--cargo-cache") {
+        return cargo_home::run_cache_clean(&args[1..]);
+    }
+    if args.iter().any(|argument| argument == "--cargo-cache") {
+        return Err(
+            "--cargo-cache must come first and alone: `oxide clean --cargo-cache`".to_owned(),
+        );
+    }
     cli::refuse_storage_overrides(args)?;
     let manifest = cli::manifest_path(args);
     let workspace = identity::locate_workspace(CARGO, manifest.as_deref())?;
@@ -530,7 +542,8 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
         None => {
             let backend = store::creation_backend()?;
             println!(
-                "  not created; the first building oxide command creates it ({}: {})",
+                "  not created; the first building oxide command creates it ({} MiB, {}: {})",
+                store::creation_cap(backend)? / MIB,
                 backend.tag(),
                 backend.bound()
             );
@@ -617,10 +630,7 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
                     (None, true) => "no checkout affinity".to_owned(),
                     (None, false) => "not managed by oxide".to_owned(),
                 };
-                let bytes = slot
-                    .bytes
-                    .map(|bytes| format!("{} KiB", bytes / 1024))
-                    .unwrap_or_else(|| "size unknown".to_owned());
+                let bytes = slot_size(&store.pool, &slot.slot_id);
                 println!(
                     "  slot {} {state} {} {owner} {bytes}",
                     slot.slot_id,
@@ -650,7 +660,29 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
         Ok(workspace) => report_stray(&workspace),
         Err(_) => println!("stray Cargo output: no Cargo workspace here"),
     }
+    cargo_home::report_status();
     Ok(0)
+}
+
+/// File names, distinct inodes and allocation counted once per inode for
+/// one slot. Reporting only: nothing inside a slot is ever deleted. The
+/// slot must resolve to itself under the canonical pool, so a link never
+/// leads the walk elsewhere.
+fn slot_size(pool: &Path, slot_id: &str) -> String {
+    if slot_id.is_empty() || !slot_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return "size unknown".to_owned();
+    }
+    let slot = pool.join("payload").join("slots").join(slot_id);
+    match std::fs::canonicalize(&slot) {
+        Ok(resolved) if resolved == slot => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return "empty".to_owned(),
+        _ => return "size unknown (the slot path does not resolve to itself)".to_owned(),
+    }
+    match cargo_home::measure(&slot) {
+        Ok(Some(measure)) => measure.describe(),
+        Ok(None) => "empty".to_owned(),
+        Err(error) => format!("size unknown ({error})"),
+    }
 }
 
 /// Plain Cargo leaves `deps/` or `incremental/` in the checkout's `target/`;

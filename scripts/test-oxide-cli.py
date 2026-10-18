@@ -925,6 +925,14 @@ def prove_native(runner: Runner, app: str) -> None:
     )
     expect(code, 0, "pool init", stderr)
     slots_root = os.path.join(runner.pool, "payload", "slots")
+    # OXIDE_POOL_CAP never resizes an existing pool; a conflict is reported.
+    code, stdout, stderr = runner.run(app, ["status"], {"OXIDE_POOL_CAP": "256MiB"})
+    expect(code, 0, "status with a conflicting OXIDE_POOL_CAP", stderr)
+    if (
+        f"oxide: OXIDE_POOL_CAP 256 MiB not applied: the pool at {runner.pool} keeps its recorded 128 MiB cap" not in stderr
+        or "  cap 128 MiB, " not in stdout
+    ):
+        fail(f"APFS cap conflict was not reported or the cap changed: {stderr!r} {stdout!r}")
 
     # Modelled build: quick profile flags reach rustc for every unit.
     code, _, stderr = runner.run(app, ["build", "-v"])
@@ -1872,6 +1880,312 @@ def prove_budget(runner: Runner, tiny: Runner, app: str) -> None:
     print(f"oxide budget admission: slot {quick['slot']} over the 1 MiB budget evicted whole for slot {debug['slot']}")
 
 
+LINKED_FIXTURE = {
+    "Cargo.toml": '[package]\nname = "linked"\nversion = "0.1.0"\nedition = "2021"\n',
+    "rust-toolchain.toml": '[toolchain]\nchannel = "1.97.1"\n',
+    # The build script writes one 64 KiB file into its OUT_DIR, inside the
+    # slot, and gives it a second hard-linked name.
+    "build.rs": """use std::path::Path;
+fn main() {
+    let out = std::env::var("OUT_DIR").unwrap();
+    let first = Path::new(&out).join("pair-a.bin");
+    let second = Path::new(&out).join("pair-b.bin");
+    std::fs::write(&first, vec![7u8; 65536]).unwrap();
+    let _ = std::fs::remove_file(&second);
+    std::fs::hard_link(&first, &second).unwrap();
+    println!("cargo:rerun-if-changed=build.rs");
+}
+""",
+    "src/lib.rs": "pub fn linked() -> u8 {\n    7\n}\n",
+}
+SIZE_LINE = re.compile(
+    r"(\d+) (KiB|MiB) allocated \(hard links counted once\), (\d+) files \((\d+) distinct\)(, partial)?"
+)
+
+
+def own_walk(root: str) -> dict:
+    """Read-only reference walk: file names, distinct inodes, allocation
+    once per inode and per name."""
+    names = 0
+    inodes = {}
+    by_name = 0
+    pairs = {}
+    for current, dirs, files in os.walk(root, followlinks=False):
+        for name in files:
+            metadata = os.lstat(os.path.join(current, name))
+            if not os.path.isfile(os.path.join(current, name)) or os.path.islink(os.path.join(current, name)):
+                continue
+            names += 1
+            by_name += metadata.st_blocks * 512
+            key = (metadata.st_dev, metadata.st_ino)
+            inodes[key] = metadata.st_blocks * 512
+            if name in ("pair-a.bin", "pair-b.bin"):
+                pairs[name] = (key, metadata.st_nlink)
+    return {"files": names, "distinct": len(inodes), "allocated": sum(inodes.values()), "by_name": by_name, "pairs": pairs}
+
+
+def check_size(line: str, walk: dict, label: str) -> None:
+    match = SIZE_LINE.search(line)
+    if not match or match.group(5):
+        fail(f"{label}: no complete size report in {line!r}")
+    unit = 1024 if match.group(2) == "KiB" else 1024 * 1024
+    reported = (int(match.group(1)), int(match.group(3)), int(match.group(4)))
+    wanted = (walk["allocated"] // unit, walk["files"], walk["distinct"])
+    if reported != wanted:
+        fail(f"{label}: reported {reported}, own walk {wanted} ({line!r})")
+
+
+def safe_readings(runner: Runner) -> dict:
+    """Injected watchdog readings well above the trigger, so a host with
+    little free space never stops these directory-pool builds."""
+    readings = os.path.join(runner.parent, f"{os.path.basename(runner.pool)}.readings")
+    write_reading(readings, TRIGGER_BYTES + WRITER_HEADROOM_BYTES)
+    return {"OXIDE_TEST_WATCHDOG_READINGS": readings}
+
+
+def prove_slot_files(runner: Runner) -> None:
+    """`status` reports each slot's file names, distinct inodes and
+    allocation counted once per inode; a hard-linked pair counts once."""
+    linked = os.path.join(runner.parent, "checkouts", "linked")
+    write_fixture(linked, LINKED_FIXTURE)
+    commit_lock(runner, linked)
+    code, _, stderr = runner.run(linked, ["build"], safe_readings(runner))
+    expect(code, 0, "linked build", stderr)
+    slot = budget_summary(stderr, "linked build")["slot"]
+    walk = own_walk(os.path.join(runner.pool, "payload", "slots", slot))
+    pairs = walk["pairs"]
+    if len(pairs) != 2 or pairs["pair-a.bin"][0] != pairs["pair-b.bin"][0] or pairs["pair-a.bin"][1] != 2:
+        fail(f"the hard-linked pair was not built in the slot: {pairs}")
+    if walk["files"] <= walk["distinct"] or walk["allocated"] >= walk["by_name"]:
+        fail(f"the slot walk shows no shared inode: {walk}")
+    code, stdout, stderr = runner.run(linked, ["status"])
+    expect(code, 0, "linked status", stderr)
+    line = next((entry for entry in stdout.splitlines() if entry.startswith(f"  slot {slot} idle quick {linked} ")), None)
+    if line is None:
+        fail(f"status has no line for slot {slot}: {stdout}")
+    check_size(line, walk, "slot size")
+    print(
+        f"oxide slot accounting: slot {slot} {walk['files']} files, {walk['distinct']} distinct, "
+        f"{walk['allocated']} bytes allocated once per inode ({walk['by_name']} per name)"
+    )
+
+
+def prove_pool_cap(runner: Runner, app: str) -> None:
+    """OXIDE_POOL_CAP: validated before effects, applied at creation only,
+    a conflicting value reported for an existing pool."""
+    watched = safe_readings(runner)
+    code, _, stderr = runner.run(app, ["build"], {**watched, "OXIDE_POOL_CAP": "64MB"})
+    expect(code, 1, "invalid OXIDE_POOL_CAP", stderr)
+    if "OXIDE_POOL_CAP=64MB is not a byte count" not in stderr or os.path.lexists(runner.pool):
+        fail(f"invalid OXIDE_POOL_CAP was not refused before creation: {stderr!r}")
+    code, _, stderr = runner.run(app, ["build"], {**watched, "OXIDE_POOL_CAP": "64MiB"})
+    expect(code, 0, "OXIDE_POOL_CAP create", stderr)
+    if f"oxide: creating the build pool at {runner.pool} (64 MiB budget, directory-budget-v1, {BUDGET_ONLY})" not in stderr:
+        fail(f"OXIDE_POOL_CAP was not used on creation: {stderr[-1200:]!r}")
+    code, _, stderr = runner.run(app, ["build"], {**watched, "OXIDE_POOL_CAP": "128MiB"})
+    expect(code, 0, "OXIDE_POOL_CAP existing pool", stderr)
+    if f"oxide: OXIDE_POOL_CAP 128 MiB not applied: the pool at {runner.pool} keeps its recorded 64 MiB budget" not in stderr:
+        fail(f"conflicting OXIDE_POOL_CAP was not reported: {stderr[-1200:]!r}")
+    code, stdout, _ = runner.run(app, ["status"])
+    if "  budget 64 MiB, " not in stdout:
+        fail(f"the existing pool's budget changed: {stdout}")
+    print("oxide pool cap: 64 MiB applied on creation; 128 MiB reported and not applied to the existing pool")
+
+
+CFG_IF_CHECKSUM = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
+CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
+
+
+def cache_fixture(root: str, name: str, dependencies: str, lock: str | None, files: dict | None = None) -> str:
+    path = os.path.join(root, name)
+    write_fixture(path, {
+        "Cargo.toml": f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n{dependencies}',
+        "rust-toolchain.toml": '[toolchain]\nchannel = "1.97.1"\n',
+        "src/lib.rs": "",
+        **(files or {}),
+    })
+    if lock is not None:
+        write_fixture(path, {"Cargo.lock": f"version = 4\n\n{lock}"})
+    return path
+
+
+def lock_package(name: str, version: str, source: str | None = None, checksum: str | None = None, deps: list | None = None) -> str:
+    text = f'[[package]]\nname = "{name}"\nversion = "{version}"\n'
+    if source:
+        text += f'source = "{source}"\n'
+    if checksum:
+        text += f'checksum = "{checksum}"\n'
+    if deps:
+        text += "dependencies = [\n" + "".join(f' "{dep}",\n' for dep in deps) + "]\n"
+    return text + "\n"
+
+
+class Listener:
+    """A tiny owned TCP control: counts every connection and closes it."""
+
+    def __init__(self):
+        import socket
+        import threading
+        self.server = socket.socket()
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen(16)
+        self.port = self.server.getsockname()[1]
+        self.connections = 0
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def serve(self) -> None:
+        while True:
+            try:
+                peer, _ = self.server.accept()
+            except OSError:
+                return
+            self.connections += 1
+            peer.close()
+
+    def close(self) -> None:
+        self.server.close()
+
+
+def prove_cargo_cache(runner: Runner) -> None:
+    """Cargo home reporting and `clean --cargo-cache` on one fresh private
+    CARGO_HOME. Setup downloads exactly one tiny archive (cfg-if 1.0.0);
+    every later Cargo HTTP request goes through Oxide's closed proxy."""
+    root = os.path.join(runner.parent, "cache")
+    home = os.path.join(root, "cargo-home")
+    os.makedirs(home, mode=0o700)
+    os.chmod(root, 0o700)
+    home = os.path.realpath(home)
+    no_pool = os.path.join(root, "never-created-pool")
+    env = dict(runner.env)
+    for name in list(env):
+        if name.startswith(("CARGO_NET_", "CARGO_REGISTR", "CARGO_SOURCE_", "CARGO_UNSTABLE_", "CARGO_HTTP_")) or name.lower().endswith("_proxy"):
+            env.pop(name)
+    env.update({"CARGO_HOME": home, "OXIDE_POOL": no_pool})
+
+    def call(cwd: str, args: list, extra: dict | None = None, program=None, timeout: float = 60):
+        result = subprocess.run(
+            [program or runner.oxide, *args],
+            cwd=cwd,
+            env={**env, **(extra or {})},
+            capture_output=True,
+            text=True,
+            timeout=min(timeout, remaining()),
+        )
+        return result.returncode, result.stdout, result.stderr
+
+    offline = {"CARGO_NET_OFFLINE": "true"}
+    cfg_if = lock_package("cfg-if", "1.0.0", CRATES_IO_SOURCE, CFG_IF_CHECKSUM)
+    good = cache_fixture(root, "cache-good", 'cfg-if = "=1.0.0"\n', None)
+    deny = cache_fixture(
+        root, "cache-deny", 'cfg-if = "=1.0.0"\nitoa = "=1.0.11"\n',
+        cfg_if + lock_package("cache-deny", "0.1.0", deps=["cfg-if", "itoa"])
+        + lock_package("itoa", "1.0.11", CRATES_IO_SOURCE, "0" * 64),
+    )
+    ssh = cache_fixture(
+        root, "cache-ssh", 'remote = { git = "ssh://git@example.invalid/remote.git" }\n',
+        lock_package("cache-ssh", "0.1.0", deps=["remote"])
+        + lock_package("remote", "0.1.0", "git+ssh://git@example.invalid/remote.git#" + "1" * 40),
+    )
+    custom = cache_fixture(
+        root, "cache-custom", 'cfg-if = "=1.0.0"\n',
+        cfg_if + lock_package("cache-custom", "0.1.0", deps=["cfg-if"]),
+        {".cargo/config.toml": '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "sparse+https://mirror.invalid/index/"\n'},
+    )
+    for path in (good, deny, ssh, custom):
+        code, _, stderr = call(path, ["init"], offline)
+        expect(code, 0, f"adopt {os.path.basename(path)}", stderr)
+
+    def refused(cwd: str, reason: str, label: str, extra: dict | None = None) -> None:
+        code, _, stderr = call(cwd, ["clean", "--cargo-cache"], extra)
+        expect(code, 1, label, stderr)
+        if "oxide: clean --cargo-cache refused: " not in stderr or reason not in stderr or "asking Cargo to clean" in stderr:
+            fail(f"{label}: refusal did not name {reason!r}: {stderr!r}")
+
+    refused(good, "Cargo.lock is missing", "missing lockfile")
+    refused(ssh, "SSH and other non-HTTP git transports cannot be contained", "SSH git source")
+    refused(custom, f"Cargo config file {custom}/.cargo/config.toml exists", "custom source")
+
+    # Setup: the one allowed download into the private home.
+    write_fixture(good, {"Cargo.lock": "version = 4\n\n" + cfg_if + lock_package("cache-good", "0.1.0", deps=["cfg-if"])})
+    fetched = subprocess.run(
+        ["cargo", "fetch", "--locked"], cwd=good, env=env, capture_output=True, text=True, timeout=min(90, remaining())
+    )
+    expect(fetched.returncode, 0, "setup fetch (cfg-if 1.0.0)", fetched.stderr)
+    archives = []
+    for current, _, files in os.walk(os.path.join(home, "registry", "cache")):
+        archives += [os.path.join(current, name) for name in files if name.endswith(".crate")]
+    if [os.path.basename(path) for path in archives] != ["cfg-if-1.0.0.crate"]:
+        fail(f"setup downloaded {archives}")
+    import hashlib
+    with open(archives[0], "rb") as handle:
+        digest = hashlib.sha256(handle.read()).hexdigest()
+    if digest != CFG_IF_CHECKSUM:
+        fail(f"cfg-if archive sha256 {digest}")
+    print(f"oxide cargo-cache setup: 1 archive, cfg-if 1.0.0 from crates.io, {os.path.getsize(archives[0])} bytes, sha256 {digest}")
+
+    refused(good, "CARGO_NET_GIT_FETCH_WITH_CLI=true is set: net.git-fetch-with-cli", "git-fetch-with-cli", {"CARGO_NET_GIT_FETCH_WITH_CLI": "true"})
+    write_fixture(ssh, {"Cargo.lock": "version = 4\n\n" + cfg_if + lock_package("cache-ssh", "0.1.0", deps=["cfg-if"])
+                        + lock_package("mine", "0.1.0", "sparse+https://registry.invalid/index/")})
+    refused(ssh, "a custom registry the closed proxy is not proven to cover", "custom registry")
+
+    code, stdout, stderr = call(good, ["status"])
+    expect(code, 0, "cargo home status", stderr)
+    line = next((entry for entry in stdout.splitlines() if entry.startswith(f"cargo home: {home} ")), None)
+    if line is None or "Cargo cleans it itself only at the end of an online build or fetch" not in stdout:
+        fail(f"status did not report the Cargo home: {stdout}")
+    check_size(line, own_walk(home), "cargo home size")
+    if re.search(r"last (clean|gc|auto)", stdout, re.IGNORECASE):
+        fail(f"status claimed a last-cleanup time: {stdout}")
+
+    # The fresh database primed its last pass at setup; the gate needs a
+    # later whole second.
+    time.sleep(1.2)
+    code, _, stderr = call(good, ["clean", "--cargo-cache"])
+    expect(code, 0, "cargo cleanup", stderr)
+    for needle in ("every HTTP request through closed proxy 127.0.0.1:", "oxide: Cargo cleanup ran (", "oxide: cargo home before: ", "oxide: cargo home after: "):
+        if needle not in stderr:
+            fail(f"cargo cleanup output missing {needle!r}: {stderr!r}")
+    if " TRACE gc:" in stderr:
+        fail("Cargo's gc trace leaked to the caller")
+
+    # Cargo's own lock-contention skip: hold the mutate lock shared, as a
+    # concurrent Cargo reading the cache would.
+    import fcntl
+    time.sleep(1.2)
+    with open(os.path.join(home, ".package-cache-mutate"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_SH)
+        code, _, stderr = call(good, ["clean", "--cargo-cache"], timeout=45)
+    expect(code, 75, "cargo cleanup under a held cache lock", stderr)
+    if "oxide: Cargo skipped cleanup: another Cargo holds the package cache lock" not in stderr or "cleanup ran" in stderr:
+        fail(f"lock skip was not labelled: {stderr!r}")
+
+    # Enforced denial: an uncached crate needs the network. A Cargo proxy
+    # and the libcurl proxy variables point at an owned listener; Oxide's
+    # closed port must win and the listener must see nothing.
+    listener = Listener()
+    control = f"http://127.0.0.1:{listener.port}"
+    try:
+        code, _, stderr = call(deny, ["clean", "--cargo-cache"], {
+            "CARGO_HTTP_PROXY": control, "http_proxy": control, "HTTPS_PROXY": control,
+            "https_proxy": control, "ALL_PROXY": control, "CARGO_NET_RETRY": "0",
+        })
+    finally:
+        listener.close()
+    closed = re.search(r"closed proxy 127\.0\.0\.1:(\d+)", stderr)
+    if code in (0, 75) or not closed or "oxide: Cargo cleanup failed: cargo fetch exited" not in stderr:
+        fail(f"uncached fetch was not a labelled failure: exit {code} {stderr!r}")
+    if not re.search(rf"127\.0\.0\.1(:| port ){closed.group(1)}\b", stderr.split("closed proxy", 1)[1]):
+        fail(f"Cargo's error did not come from the closed proxy: {stderr!r}")
+    if listener.connections:
+        fail(f"the owned control listener saw {listener.connections} connection(s)")
+    if any(name.startswith("itoa") for _, _, files in os.walk(home) for name in files):
+        fail("the denied crate reached the Cargo home")
+    if os.path.lexists(no_pool):
+        fail("Cargo home commands created a pool")
+    print("oxide cargo-cache: refusals named, cleanup ran, lock skip labelled, closed proxy denied an uncached fetch (owned control saw 0 connections)")
+
+
 def take_standalone_lease(runner: Runner) -> dict:
     """A lease from the standalone CLI has no oxide record or lock holder."""
     project = os.path.join(runner.parent, "standalone", "project")
@@ -1956,8 +2270,12 @@ def main() -> int:
         "budget-tiny",
         {"OXIDE_POOL_BACKEND": "directory-budget", "OXIDE_TEST_BUDGET_BYTES": str(1024 * 1024)},
     )
+    capped = Runner(runner.oxide, runner.lease, parent, "cap-pool", {"OXIDE_POOL_BACKEND": "directory-budget"})
     try:
         prove_budget(budget, tiny, app)
+        prove_slot_files(budget)
+        prove_pool_cap(capped, app)
+        prove_cargo_cache(runner)
     except Exception:
         print(f"oxide budget proof retained its owned scratch at {parent}", file=sys.stderr)
         raise
