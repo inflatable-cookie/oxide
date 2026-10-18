@@ -160,6 +160,26 @@ writers or other processes. Unknown process-group closure keeps the lease held.
 None of these grants strategy or recipe adoption, consumer changes, default-pool
 changes outside tests, or the privileged Linux image backend.
 
+### Scoped recovery-fixture continuation
+
+On 2026-10-18 operations applied the existing routine-correction authority to a
+stopped crash-recovery implementation and its incomplete exact-head native
+proof. This is a separate allowance: at most 25 minutes author work (including
+retained-fixture disposition) and 20 minutes independent exact-head review,
+with one fresh focused 128 MiB proof per side, each at most 300 seconds including
+setup and 512 MiB scratch. Previously consumed budgets, failed proof and held
+fixture records remain unchanged; this does not retrospectively extend them.
+
+The product architect's [macOS observation](qualification-readiness.md#process-containment)
+in `d590fba` informs diagnosis: zombie-only groups may produce EPERM until reaped.
+The correction is fixture child reaping or observation of real reparent-and-reap,
+plus precise failure diagnostics. Recovery stays ESRCH-only; EPERM remains held.
+No libproc/all-zombie recovery rule is authorized here. Retained task-owned
+fixtures may settle and detach only after positive lock/group/writer closure
+and exact ownership checks. Unknown closure preserves them and prevents a new
+proof pool. Reuse already-green unrelated checks; no repeated standalone proof,
+real project, install, consumer effect or new experiment is authorized.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
