@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
-const RECORD_VERSION: u32 = 1;
+/// Version 2: package manifests from the build's own messages are covered.
+/// Records of any other version never skip.
+const RECORD_VERSION: u32 = 2;
 /// Records live in the checkout's private target directory, so `oxide clean`
 /// drops them with the binaries they describe.
 const RECORD_DIR: &str = "target/oxide-run-skip";
@@ -310,7 +312,16 @@ impl Pending {
     /// Record the key for a successful build of `binary`. Publishes nothing
     /// when an input changed while Cargo ran or the binary's dependencies
     /// reach outside what the key observes.
-    pub fn publish(self, binary: &Path, manifest_dir: &Path) -> Result<(), String> {
+    pub fn publish(
+        self,
+        binary: &Path,
+        manifest_dir: &Path,
+        packages: &Option<BTreeSet<(String, PathBuf)>>,
+    ) -> Result<(), String> {
+        let packages = packages
+            .as_ref()
+            .filter(|packages| !packages.is_empty())
+            .ok_or("the build's package list is missing or incomplete")?;
         if inputs(&self.cwd, &self.checkout, &self.sysroot)? != self.inputs {
             return Err("an input changed while Cargo ran".to_owned());
         }
@@ -323,7 +334,7 @@ impl Pending {
         if !metadata.is_file() {
             return Err("the binary is not a regular file".to_owned());
         }
-        covered_dependencies(&binary, &self.top, &self.checkout)?;
+        covered_dependencies(&binary, &self.top, &self.checkout, packages)?;
         let record = Record {
             version: RECORD_VERSION,
             cwd: self.cwd,
@@ -482,14 +493,43 @@ fn digest_file(hasher: &mut Sha256, path: &Path, config: bool) -> Result<(), Str
     Ok(())
 }
 
+/// The manifest of every package the successful build reported. Only path
+/// packages qualify. Cargo 1.97.1 (c980f4866) checks every ordinary unit,
+/// registry and Git ones included, through its own dep-info mtimes
+/// (`calculate_normal`, `LocalFingerprint::CheckDepInfo`), while the final
+/// artifact's `.d` lists only local units' files (`output_depinfo`
+/// `add_deps_for_unit` recurses through `is_local()` deps). The key cannot
+/// see a registry or Git package's source files without Cargo's internal
+/// dep-info, so such a build publishes nothing.
+fn package_manifests(packages: &BTreeSet<(String, PathBuf)>) -> Result<Vec<PathBuf>, String> {
+    packages
+        .iter()
+        .map(|(id, manifest)| {
+            if !id.starts_with("path+file://") {
+                return Err(format!(
+                    "{id} is not a path package; Cargo checks its sources through dep-info the key does not observe"
+                ));
+            }
+            fs::canonicalize(manifest)
+                .map_err(|error| format!("cannot resolve {}: {error}", manifest.display()))
+        })
+        .collect()
+}
+
 /// Every file in the binary's Cargo dep-info (`<binary>.d`, documented next
 /// to each artifact) must be a file the checkout's Git content covers: under
 /// the repository and not ignored. So must every `Cargo.toml` between each
-/// listed source and the repository top (each local package's manifest) and
-/// the workspace root's. A path dependency outside the checkout, a generated
+/// listed source and the repository top, the workspace root's and every
+/// package manifest the build itself reported (a `[lib] path` outside the
+/// package directory leaves its manifest off the source ancestry). A path dependency outside the checkout, a generated
 /// source in the build directory, an ignored source or manifest, or a
 /// declared build-script input elsewhere refuses the record.
-fn covered_dependencies(binary: &Path, top: &Path, checkout: &Path) -> Result<(), String> {
+fn covered_dependencies(
+    binary: &Path,
+    top: &Path,
+    checkout: &Path,
+    packages: &BTreeSet<(String, PathBuf)>,
+) -> Result<(), String> {
     let mut dep_info = binary.as_os_str().to_owned();
     dep_info.push(".d");
     let file = fs::File::open(&dep_info).map_err(|error| format!("no dep-info: {error}"))?;
@@ -520,6 +560,7 @@ fn covered_dependencies(binary: &Path, top: &Path, checkout: &Path) -> Result<()
     }
     let mut covered = sources.clone();
     covered.insert(checkout.join("Cargo.toml"));
+    covered.extend(package_manifests(packages)?);
     for source in &sources {
         for dir in source
             .ancestors()

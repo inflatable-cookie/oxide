@@ -20,6 +20,7 @@ use freshness::{Gate, Refusal};
 use identity::{RunPick, SlotKey};
 use oxide_storage::inventory::{inventory_directory, Category, InventoryLimits};
 use oxide_storage::lease::SlotOccupancy;
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::DirBuilderExt;
@@ -254,11 +255,11 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
         return Ok(process::exit_code(status));
     }
     match executable.unwrap_or_else(|| Err("no run target was recorded".to_owned())) {
-        Ok((program, manifest_dir)) => {
+        Ok((program, manifest_dir, packages)) => {
             if let Some(pending) = pending.filter(|_| process::received_signal().is_none()) {
                 // A record that cannot be published only costs the next
                 // command its skip.
-                let _ = pending.publish(&program, &manifest_dir);
+                let _ = pending.publish(&program, &manifest_dir, &packages);
             }
             // Lease released: the program runs from the private target dir.
             let error = Command::new(&program)
@@ -346,7 +347,12 @@ fn lease_with_gate(
     Err("the freshness gate kept refusing slots".to_owned())
 }
 
-type RunTarget = Result<(PathBuf, PathBuf), String>;
+/// The executable, its manifest directory and every package the build
+/// reported (`package_id`, `manifest_path` of each `compiler-artifact`,
+/// fresh units included); `None` when that list could not be read whole.
+type RunTarget = Result<(PathBuf, PathBuf, Option<BTreeSet<(String, PathBuf)>>), String>;
+/// Package entries kept from one build's messages.
+const MAX_PACKAGES: usize = 32_768;
 
 /// `run`: wait for the build while reading Cargo's JSON for the executable.
 fn collect_run(
@@ -370,6 +376,7 @@ fn collect_run(
     });
     let selection = cli::run_selection(&invocation.cargo_args);
     let mut found: Vec<(String, PathBuf, PathBuf)> = Vec::new();
+    let mut packages: Option<BTreeSet<(String, PathBuf)>> = Some(BTreeSet::new());
     let mut status = None;
     let mut closed = false;
     while status.is_none() || !closed {
@@ -385,6 +392,7 @@ fn collect_run(
                 if invocation.json_messages {
                     println!("{line}");
                 }
+                record_package(&mut packages, &line);
                 if let Some(artifact) = run_artifact(&line, selection.as_deref()) {
                     if !found.iter().any(|known| known.1 == artifact.1) {
                         found.push(artifact);
@@ -406,7 +414,7 @@ fn collect_run(
     let target = match found.len() {
         1 => {
             let (_, program, manifest_dir) = found.remove(0);
-            Ok((program, manifest_dir))
+            Ok((program, manifest_dir, packages))
         }
         0 => Err("the build produced no binary to run; pass --bin or --example".to_owned()),
         _ => {
@@ -418,6 +426,29 @@ fn collect_run(
         }
     };
     Ok((status, Some(target)))
+}
+
+/// Add a `compiler-artifact` message's package to `packages`. A JSON line
+/// without the expected fields, or too many entries, drops the whole list.
+fn record_package(packages: &mut Option<BTreeSet<(String, PathBuf)>>, line: &str) {
+    let Some(list) = packages.as_mut() else {
+        return;
+    };
+    let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+    if message["reason"] != "compiler-artifact" {
+        return;
+    }
+    match (
+        message["package_id"].as_str(),
+        message["manifest_path"].as_str(),
+    ) {
+        (Some(id), Some(manifest)) if list.len() < MAX_PACKAGES => {
+            list.insert((id.to_owned(), PathBuf::from(manifest)));
+        }
+        _ => *packages = None,
+    }
 }
 
 /// A bin or example artifact with an executable, matching any selection.

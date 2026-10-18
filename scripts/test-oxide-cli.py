@@ -151,6 +151,26 @@ new = []
 """,
 }
 
+# A dependency whose `[lib] path` leaves its directory: its ignored manifest
+# is not an ancestor of any source the binary's dep-info lists.
+SKIP_CUSTOM_LIB_FIXTURE = {
+    "Cargo.toml": SKIP_IGNORED_FIXTURE["Cargo.toml"].replace("ignoredapp", "customlib"),
+    "rust-toolchain.toml": SKIP_IGNORED_FIXTURE["rust-toolchain.toml"],
+    ".gitignore": SKIP_IGNORED_FIXTURE[".gitignore"],
+    "src/main.rs": 'fn main() {\n    println!("custom {}", helper::flavor());\n}\n',
+    "helper/Cargo.toml": SKIP_IGNORED_FIXTURE["helper/Cargo.toml"] + '\n[lib]\npath = "../shared/lib.rs"\n',
+    "shared/lib.rs": SKIP_IGNORED_FIXTURE["helper/src/lib.rs"],
+}
+
+# Proof-only snapshot hook: commits whatever is dirty between the snapshot's
+# first HEAD/index observation and its status read.
+SNAPSHOT_HOOK = """#!/bin/sh
+export GIT_OPTIONAL_LOCKS=0
+git diff --quiet HEAD -- && exit 0
+git -c user.name=fixture -c user.email=fixture@oxide.invalid -c commit.gpgsign=false commit -qam hook >/dev/null 2>&1
+exit 0
+"""
+
 # A counting `cargo` for the skip case: logs each call, then hands it to the
 # real installed Cargo unchanged.
 CARGO_SHIM = """#!/bin/sh
@@ -1718,6 +1738,20 @@ def prove_run_skip(runner: Runner) -> None:
         fail(f"interrupted build exit {interrupted} or left a skip record")
     builds("skip after interrupt", [], "skip v3 cfg")
     skips("skip final repeat", [], "skip v3 cfg")
+
+    # A commit landing between the snapshot's first HEAD/index observation
+    # and its status read: without the bracket the skip would assemble the
+    # old clean tree and run the old binary. The hook is deterministic.
+    hook = os.path.join(shim_dir, "snapshot-hook")
+    with open(hook, "w", encoding="utf-8") as handle:
+        handle.write(SNAPSHOT_HOOK)
+    os.chmod(hook, 0o700)
+    hooked = {"OXIDE_TEST_SNAPSHOT_HOOK": hook}
+    builds("skip hook record", [], "skip v3 cfg", extra=hooked)
+    skips("skip hook clean repeat", [], "skip v3 cfg", extra=hooked)
+    edit("src/msg.rs", 'pub const VERSION: &str = "v4";\n')
+    builds("skip commit between snapshot reads", [], "skip v4 cfg", extra=hooked)
+    skips("skip after the mid-snapshot commit", [], "skip v4 cfg", extra=hooked)
     if any(slot["state"] != "idle" for slot in runner.lease_status()["slots"]):
         fail("the skip case left a slot held")
 
@@ -1737,6 +1771,21 @@ def prove_run_skip(runner: Runner) -> None:
     with open(os.path.join(ignored, "helper", "Cargo.toml"), "w", encoding="utf-8") as handle:
         handle.write(SKIP_IGNORED_FIXTURE["helper/Cargo.toml"].replace('default = ["old"]', 'default = ["new"]'))
     builds("skip ignored manifest edit", [], "ignored new", cwd=ignored)
+
+    custom = os.path.join(runner.parent, "checkouts", "skipcustomlib")
+    write_fixture(custom, SKIP_CUSTOM_LIB_FIXTURE)
+    commit_lock(runner, custom)
+    git(custom, "init", "--quiet")
+    git(custom, "add", "-A")
+    git(custom, "commit", "--quiet", "-m", "custom lib path fixture")
+    builds("skip custom lib path", [], "custom old", cwd=custom)
+    if os.path.isdir(os.path.join(custom, "target", "oxide-run-skip")) and os.listdir(
+        os.path.join(custom, "target", "oxide-run-skip")
+    ):
+        fail("a build whose dependency manifest sits outside its source ancestry published a skip record")
+    with open(os.path.join(custom, "helper", "Cargo.toml"), "w", encoding="utf-8") as handle:
+        handle.write(SKIP_CUSTOM_LIB_FIXTURE["helper/Cargo.toml"].replace('default = ["old"]', 'default = ["new"]'))
+    builds("skip custom lib path manifest edit", [], "custom new", cwd=custom)
 
 
 def timing_verdict(skip: list, leased: list, plain: list) -> dict:

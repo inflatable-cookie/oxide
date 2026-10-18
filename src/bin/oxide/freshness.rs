@@ -280,33 +280,6 @@ fn git(top: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     }
 }
 
-fn spawn_git(cwd: &Path, args: &[&str]) -> Result<std::process::Child, String> {
-    Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        // Status must not rewrite the index while reading it.
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("could not start git: {error}"))
-}
-
-fn finish_git(child: std::process::Child, name: &str) -> Result<Vec<u8>, String> {
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("could not wait for git: {error}"))?;
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        Err(format!(
-            "git {name} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
-}
-
 fn utf8(bytes: Vec<u8>) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| "git printed a non-UTF-8 path".to_owned())
 }
@@ -320,13 +293,82 @@ fn nul_separated(bytes: Vec<u8>) -> Result<Vec<String>, String> {
     })
 }
 
+/// HEAD's tree and the index file's identity, observed on each side of a
+/// snapshot's status and content reads.
+#[derive(Debug, Eq, PartialEq)]
+struct Generation {
+    tree: String,
+    /// Size, mtime (ns), inode and device; `None` when there is no index.
+    index: Option<(u64, i128, u64, u64)>,
+}
+
+fn index_identity(index: &Path) -> Result<Option<(u64, i128, u64, u64)>, String> {
+    match fs::symlink_metadata(index) {
+        Ok(metadata) => Ok(Some((
+            metadata.len(),
+            i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec()),
+            metadata.ino(),
+            metadata.dev(),
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot read the index: {error}")),
+    }
+}
+
+/// A snapshot holds only if HEAD and the index were the same before and
+/// after its reads; otherwise its tree and status may come from different
+/// commits.
+fn same_generation(before: &Generation, after: &Generation) -> Result<(), String> {
+    if before == after {
+        Ok(())
+    } else {
+        Err("HEAD or the index changed while the checkout was read".to_owned())
+    }
+}
+
+fn hex_object(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// Repository top level and content for the checkout containing `path`.
+/// The status and content reads are bracketed by HEAD-tree and index
+/// observations; any change between them refuses.
 pub fn snapshot(path: &Path) -> Result<(PathBuf, Content), String> {
-    // Both reads start together; porcelain status paths are relative to the
-    // top level wherever it runs.
-    let head = spawn_git(path, &["rev-parse", "--show-toplevel", "HEAD^{tree}"])?;
-    let status = spawn_git(
+    let head = utf8(git(
         path,
+        &[
+            "rev-parse",
+            "--show-toplevel",
+            "--git-path",
+            "index",
+            "HEAD^{tree}",
+        ],
+    )?)?;
+    let (top, index, tree) = match head.lines().collect::<Vec<_>>()[..] {
+        [top, index, tree] if !index.is_empty() && hex_object(tree) => (top, index, tree),
+        _ => return Err("git rev-parse printed an unexpected top level, index or tree".to_owned()),
+    };
+    let top =
+        fs::canonicalize(top).map_err(|error| format!("cannot resolve the repository: {error}"))?;
+    // `--git-path` is relative to the directory git ran in; it names the
+    // real index for linked worktrees and `GIT_INDEX_FILE`.
+    let index = path.join(index);
+    let before = Generation {
+        tree: tree.to_owned(),
+        index: index_identity(&index)?,
+    };
+    if let Some(hook) = std::env::var_os("OXIDE_TEST_SNAPSHOT_HOOK") {
+        // Proof-only: run a fixture command between the first observation
+        // and the status read.
+        let _ = Command::new(hook)
+            .current_dir(&top)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let status = git(
+        &top,
         &[
             "status",
             "--porcelain=v1",
@@ -336,16 +378,6 @@ pub fn snapshot(path: &Path) -> Result<(PathBuf, Content), String> {
             "--ignore-submodules=none",
         ],
     )?;
-    let head = utf8(finish_git(head, "rev-parse")?)?;
-    let status = finish_git(status, "status")?;
-    let (top, tree) = match head.lines().collect::<Vec<_>>()[..] {
-        [top, tree] if !tree.is_empty() && tree.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
-            (top, tree.to_owned())
-        }
-        _ => return Err("git rev-parse printed an unexpected top level or tree".to_owned()),
-    };
-    let top =
-        fs::canonicalize(top).map_err(|error| format!("cannot resolve the repository: {error}"))?;
     let paths = status_paths(&nul_separated(status)?)?;
     let mut dirty = BTreeMap::new();
     let mut present = Vec::new();
@@ -366,7 +398,21 @@ pub fn snapshot(path: &Path) -> Result<(PathBuf, Content), String> {
     for (path, digest) in present.iter().zip(hash_objects(&top, &present)?) {
         dirty.insert(path.clone(), digest);
     }
-    Ok((top, Content { tree, dirty }))
+    let after_tree = utf8(git(&top, &["rev-parse", "--verify", "HEAD^{tree}"])?)?;
+    same_generation(
+        &before,
+        &Generation {
+            tree: after_tree.trim().to_owned(),
+            index: index_identity(&index)?,
+        },
+    )?;
+    Ok((
+        top,
+        Content {
+            tree: before.tree,
+            dirty,
+        },
+    ))
 }
 
 /// Paths from `git status --porcelain=v1 -z --no-renames` entries.
@@ -946,6 +992,43 @@ fn deepest_owner<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_snapshot_refuses_when_head_or_index_moved_across_its_reads() {
+        let tree_a = "a".repeat(40);
+        let stable = Generation {
+            tree: tree_a.clone(),
+            index: Some((10, 5, 7, 1)),
+        };
+        assert!(same_generation(
+            &stable,
+            &Generation {
+                tree: tree_a.clone(),
+                index: Some((10, 5, 7, 1)),
+            }
+        )
+        .is_ok());
+        // A commit between the reads: tree A before, tree B after.
+        assert!(same_generation(
+            &stable,
+            &Generation {
+                tree: "b".repeat(40),
+                index: Some((10, 5, 7, 1)),
+            }
+        )
+        .is_err());
+        // The index rewritten (new inode or mtime) with HEAD unchanged.
+        for index in [Some((10, 5, 8, 1)), Some((10, 6, 7, 1)), None] {
+            assert!(same_generation(
+                &stable,
+                &Generation {
+                    tree: tree_a.clone(),
+                    index,
+                }
+            )
+            .is_err());
+        }
+    }
 
     fn content(tree: &str, dirty: &[(&str, &str)]) -> Content {
         Content {

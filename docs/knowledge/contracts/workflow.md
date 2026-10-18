@@ -318,11 +318,25 @@ records again on success.
   another checkout. The binary's documented Cargo dep-info (`<binary>.d`)
   must list only regular files inside the Git checkout that Git does not
   ignore. So must every `Cargo.toml` between each listed source and the
-  repository top (each local package's manifest) and the workspace root's.
-  A path dependency outside the checkout, a generated source in the build
-  directory, an ignored source or manifest or a declared `rerun-if-changed`
-  input elsewhere publishes nothing. A missing, older-version, partial or corrupt
-  record never skips.
+  repository top, the workspace root's, and the manifest of every package
+  the build's own `compiler-artifact` messages report (fresh units included),
+  so a `[lib] path` outside its package directory cannot hide an ignored
+  manifest. A path dependency outside the checkout, a generated source in
+  the build directory, an ignored source or manifest or a declared
+  `rerun-if-changed` input elsewhere publishes nothing. So does any registry
+  or Git package: Cargo 1.97.1 checks every ordinary unit's sources through
+  its own dep-info mtimes (`calculate_normal` uses `CheckDepInfo` for all
+  sources), while the artifact's `.d` lists only local units' files
+  (`output_depinfo` recurses through `is_local()` deps), so the key cannot
+  observe them without Cargo's internal dep-info. A missing or incomplete
+  package list publishes nothing. Records are version 2; a missing, other-version,
+  partial or corrupt record never skips.
+- **Consistent snapshot.** The checkout content read brackets the status and
+  blob-digest reads with two observations of HEAD's tree and the index
+  file's identity (the real index from `git rev-parse --git-path index`, so
+  linked worktrees and `GIT_INDEX_FILE` work). Any difference refuses: the
+  skip falls through and nothing publishes. The freshness gate uses the same
+  read, so it refuses the same way.
 - **Ineligible.** Any other argument before `--` (including `-v`,
   `--manifest-path`, `--message-format`, `--config`, `--locked`); a working
   directory outside the workspace or Git; `RUSTC`, `RUSTC_WRAPPER`,
@@ -332,7 +346,7 @@ records again on success.
 - **Skip.** Only on an exact match, with the binary present as a regular
   file of the recorded identity. The check reads files and runs Git only:
   no Cargo, rustc, metadata or `locate-project` call and no pool, lease or
-  slot read; the Git tree and status reads run concurrently. It prints `oxide: <profile> profile, build+execute strategy,
+  slot read. It prints `oxide: <profile> profile, build+execute strategy,
   unchanged — skipped Cargo, …`, then replaces Oxide with the program, as
   the normal path does. A program failure is the program's exit code, never
   a rebuild.
