@@ -181,6 +181,24 @@ time separately before any backend is credited.
 | [danluu/rust-interpreter](https://github.com/danluu/rust-interpreter) | rustc checks the code, then selected MIR is lowered to bytecode and run in an interpreter or AArch64 JIT. Self-described as "extremely vibe coded"; "cannot yet replace `cargo test`"; no unwinding, threads, FFI or `should_panic`; "no fallback" for unsupported code. Its results are mixed: 20% faster on one five-edit pilot, 2.7x slower on a compute-heavy target. Needs pinned nightly with `rustc-dev`; no license stated. | Not usable or adoptable. It shows the approach can work, and its ceiling is still the check time. |
 | Miri / [Cranelift JIT](https://github.com/rust-lang/rustc_codegen_cranelift/blob/main/docs/usage.md) | Miri is a UB checker that runs far slower than native code. Cranelift JIT is covered above. | Not speed tools. |
 
+## Upstream churn and disk developments (2026-10-18)
+
+**Stale debug objects on macOS.** [cargo#16665](https://github.com/rust-lang/cargo/issues/16665) (open) reports `deps/` growth from old artifacts making incremental builds about 6× slower, and one `cargo clean` removing 345 GiB. Commenters attribute much of it to macOS unpacked debug info. Since 1.88, preserved `*.rcgu.o` objects get per-invocation names and are never overwritten. That root cause is a user claim, not a maintainer confirmation. A 2026-10-18 probe on 1.97.1 (tiny crate, four rebuilds) found:
+- `debug = "line-tables-only"` with the default unpacked split debug info left 24 `*.rcgu.o` files in `deps/`;
+- `debug = false` left none;
+- `split-debuginfo = "packed"` left none and produced one `.dSYM`.
+
+Implication: the `quick` recipe accumulates stale objects in long-lived shared slots, in proportion to workspace rebuilds. That costs disk and possibly build speed. The choice between packed debug info (extra `dsymutil` link time), debug off for rebuilt units, and slot recycling needs a measurement. Do not delete files inside a slot; the build-dir layout is Cargo-internal.
+
+| Development | State | Relevance |
+| --- | --- | --- |
+| [Build-dir layout v2](https://blog.rust-lang.org/2026/03/13/call-for-testing-build-dir-layout-v2) | Per-unit `build/<package>/<hash>/` directories; scheduled stable in Cargo 1.100 (2026-11-12, per the beta changelog). | Unblocks Cargo's stale-unit cleanup ([cargo#5026](https://github.com/rust-lang/cargo/issues/5026)) and finer locking. It changes intermediate paths, so Oxide's plain-Cargo stray detection (`deps/`, `incremental/`) must be re-qualified at the upgrade. |
+| [Cross-workspace cache goal](https://rust-lang.github.io/rust-project-goals/2026/cargo-cross-workspace-cache.html) | 2026 goal: design and a nightly prototype; conservative at first. | The upstream replacement for Oxide's per-project slots ([Cargo relationship ruling](vision.md#relationship-with-cargo)). Not available yet. |
+| [Relink, don't rebuild](https://rust-lang.github.io/goals/2026/roadmap-fast-builds.html) | Did not complete in 2025H2; on the 2026 fast-builds roadmap; claims 5–10× fewer downstream rebuilds for body-only edits. | The largest future edit-loop win; nothing for Oxide to emulate safely. |
+| [`hint-mostly-unused`](https://blog.rust-lang.org/inside-rust/2025/07/15/call-for-testing-hint-mostly-unused/) | Nightly; per-dependency hint that defers code generation for unused items; regresses if applied globally. | Narrow, profile-guided; only helps when the dependency is built. |
+| Cargo home GC ([1.88](https://blog.rust-lang.org/2025/06/26/Rust-1.88.0/)) | Stable automatic cleanup of downloaded/cached files (3 months / 1 month unused). Never runs with `--offline` or `--frozen`. The target dir is not covered. | Agent and Oxide proofs often run `--offline`, so their Cargo home may never be cleaned. Worth surfacing in `oxide status`. |
+| [Cargo script](https://rust-lang.github.io/goals/2026/cargo-script.html) | Frontmatter stabilization in progress; not stable on 1.97.1. | Single-file scripts; each script otherwise gets its own target dir. |
+
 ## Product assessment
 
 Planner recommendation: a small coherent entry point over evidence-backed mechanisms, with three capabilities: see and explain costs, bound and reuse owned storage, and apply qualified improvements with clear trade-offs. The reusable storage core must work for ordinary developers as well as orchestrators. A daemon, editor surface or UI is still an open choice; Tom's [workflow direction](vision.md#product-workflow-direction) sets an `oxide build` / `oxide run` front door as the design target.
