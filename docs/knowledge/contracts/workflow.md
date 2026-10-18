@@ -425,15 +425,21 @@ has run against no real project.
   process group, with `CARGO_BUILD_BUILD_DIR` on the slot and
   `CARGO_TARGET_DIR=<workspace>/target`. SIGINT, SIGTERM and SIGHUP are
   forwarded to the group; Oxide releases only after the group is empty. `test`
-  holds the slot through execution. `run` builds, releases, then replaces
-  Oxide with the program, setting `CARGO_MANIFEST_DIR` only; other `cargo run`
-  environment (`CARGO_PKG_*`, dylib paths) is not set, and several built
-  binaries need `--bin`. Exit codes are Cargo's, or the program's for `run`.
+  holds the slot through execution. `run` resolves the binary as `cargo run`
+  does (`--bin` / `--example`, else the package's `default-run`, else its only
+  binary; several binaries without `default-run` refuse with Cargo's error and
+  exit 101 before any lease), builds only that target, releases, then replaces
+  Oxide with the program. It sets `CARGO_MANIFEST_DIR` only; other `cargo run`
+  environment (`CARGO_PKG_*`, dylib paths) is not set. Exit codes are Cargo's,
+  or the program's for `run`.
 - **Summary.** One stderr line per leased command: profile, strategy (`build`
   or `build+execute`), slot, warm/cold, elapsed time and payload volume use.
-- **`clean`.** Runs `cargo clean` against the private target directory and an
-  empty private build directory, then drops this checkout's affinity. Slots
-  stay intact until evicted, so the next build is cold.
+- **`clean`.** Waits until no live or interrupted-but-running command holds a
+  slot for this checkout, then blocks new commands in the checkout while it
+  runs `cargo clean` against the private target directory and an empty
+  private build directory. It then drops the checkout's idle affinity. Slots
+  stay intact until evicted, so the next build is cold. Ctrl-C cancels the
+  wait.
 - **Crash recovery.** Per [Crash recovery](#crash-recovery), for Oxide's own
   commands only. A follower in the same checkout waits while the crashed
   command's group survives, then recovers and continues.

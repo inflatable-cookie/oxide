@@ -11,7 +11,7 @@ mod process;
 mod store;
 
 use cli::{Class, Invocation, PROFILE_ENVIRONMENT};
-use identity::SlotKey;
+use identity::{RunPick, SlotKey};
 use oxide_storage::inventory::{inventory_directory, Category, InventoryLimits};
 use oxide_storage::lease::SlotOccupancy;
 use std::ffi::OsString;
@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use store::{Acquired, Store};
+use store::{Acquired, Cleaning, Store};
 
 /// The `cargo` rustup resolves for the current directory. Oxide never selects
 /// a toolchain.
@@ -104,7 +104,30 @@ fn apply_storage(command: &mut Command, build_dir: &Path, checkout: &Path) {
 }
 
 fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
-    let invocation = cli::parse_leased(command, args)?;
+    let mut invocation = cli::parse_leased(command, args)?;
+    if command == "run" && cli::run_selection(&invocation.cargo_args).is_none() {
+        // Build only what `cargo run` would run: `default-run`, else the
+        // package's only binary.
+        match identity::run_pick(
+            CARGO,
+            invocation.manifest_path.as_deref(),
+            cli::package_selection(args).as_deref(),
+        )? {
+            RunPick::Bin(name) => {
+                invocation
+                    .cargo_args
+                    .splice(1..1, [OsString::from("--bin"), OsString::from(name)]);
+            }
+            RunPick::Ambiguous(names) => {
+                eprintln!(
+                    "error: `cargo run` could not determine which binary to run. Use the `--bin` option to specify a binary, or the `default-run` manifest key.\navailable binaries: {}",
+                    names.join(", ")
+                );
+                return Ok(101);
+            }
+            RunPick::Unresolved => {}
+        }
+    }
     let key = SlotKey::resolve(
         CARGO,
         invocation.manifest_path.as_deref(),
@@ -287,11 +310,21 @@ fn print_summary(store: &Store, invocation: &Invocation, slot: &str, warm: bool,
 
 /// `cargo clean` against the private target directory and an empty private
 /// build directory, then drop this checkout's slot affinity. Plain
-/// `cargo clean` would delete an injected slot build directory.
+/// `cargo clean` would delete an injected slot build directory. It waits for
+/// active commands in the checkout and blocks new ones until it finishes.
 fn run_clean(args: &[OsString]) -> Result<u8, String> {
     cli::refuse_storage_overrides(args)?;
     let manifest = cli::manifest_path(args);
     let workspace = identity::locate_workspace(CARGO, manifest.as_deref())?;
+    process::install_signal_handlers()?;
+    let store = Store::open_existing()?;
+    let guard = match &store {
+        Some(store) => match store.begin_clean(&workspace)? {
+            Cleaning::Guard(guard) => Some(guard),
+            Cleaning::Interrupted(signal) => return Ok(process::signal_exit_code(signal)),
+        },
+        None => None,
+    };
     let scratch = private_scratch()?;
     let mut cargo = Command::new(CARGO);
     cargo.arg("clean").args(args);
@@ -299,11 +332,11 @@ fn run_clean(args: &[OsString]) -> Result<u8, String> {
     let status = cargo.status();
     let _ = std::fs::remove_dir(scratch.join("build"));
     let _ = std::fs::remove_dir(&scratch);
-    let status = status.map_err(|error| format!("could not start Cargo: {error}"))?;
-    let detached = match Store::open_existing()? {
-        Some(store) => store.detach_checkout(&workspace)?,
-        None => 0,
+    let detached = match (&store, guard) {
+        (Some(store), Some(guard)) => store.finish_clean(guard, &workspace)?,
+        _ => 0,
     };
+    let status = status.map_err(|error| format!("could not start Cargo: {error}"))?;
     if detached > 0 {
         eprintln!(
             "oxide: dropped this checkout's slot affinity; {detached} slot(s) kept until evicted"

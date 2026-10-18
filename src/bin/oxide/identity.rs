@@ -78,6 +78,107 @@ pub fn locate_workspace(cargo: &str, manifest_path: Option<&Path>) -> Result<Pat
     fs::canonicalize(root).map_err(|error| format!("cannot resolve the workspace root: {error}"))
 }
 
+/// Which binary `cargo run` would pick without `--bin` or `--example`.
+#[derive(Debug, Eq, PartialEq)]
+pub enum RunPick {
+    /// The package's `default-run`, or its only binary.
+    Bin(String),
+    /// Several binaries and no `default-run`: Cargo refuses before building.
+    Ambiguous(Vec<String>),
+    /// No single package resolved (for example a virtual manifest); the
+    /// build reports what it produced.
+    Unresolved,
+}
+
+/// Resolve `cargo run`'s target from `cargo metadata --no-deps`: the named
+/// package, else the package whose manifest is nearest the current directory.
+pub fn run_pick(
+    cargo: &str,
+    manifest_path: Option<&Path>,
+    package: Option<&str>,
+) -> Result<RunPick, String> {
+    let mut command = Command::new(cargo);
+    command.args(["metadata", "--no-deps", "--format-version", "1"]);
+    if let Some(manifest) = manifest_path {
+        command.arg("--manifest-path").arg(manifest);
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("could not start Cargo: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not read package metadata: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("Cargo metadata is not JSON: {error}"))?;
+    let current = match package {
+        Some(_) => None,
+        None => Some(nearest_manifest(cargo, manifest_path)?),
+    };
+    Ok(select_run(&metadata, package, current.as_deref()))
+}
+
+fn nearest_manifest(cargo: &str, manifest_path: Option<&Path>) -> Result<PathBuf, String> {
+    let mut command = Command::new(cargo);
+    command.args(["locate-project", "--message-format", "plain"]);
+    if let Some(manifest) = manifest_path {
+        command.arg("--manifest-path").arg(manifest);
+    }
+    let output = command
+        .output()
+        .map_err(|error| format!("could not start Cargo: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not locate the package: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let manifest = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    fs::canonicalize(&manifest).map_err(|error| format!("cannot resolve the manifest: {error}"))
+}
+
+fn select_run(
+    metadata: &serde_json::Value,
+    package: Option<&str>,
+    current_manifest: Option<&Path>,
+) -> RunPick {
+    let Some(packages) = metadata["packages"].as_array() else {
+        return RunPick::Unresolved;
+    };
+    let selected = packages.iter().find(|candidate| match package {
+        Some(name) => candidate["name"].as_str() == Some(name),
+        None => candidate["manifest_path"]
+            .as_str()
+            .and_then(|path| fs::canonicalize(path).ok())
+            .is_some_and(|path| Some(path.as_path()) == current_manifest),
+    });
+    let Some(selected) = selected else {
+        return RunPick::Unresolved;
+    };
+    if let Some(default_run) = selected["default_run"].as_str() {
+        return RunPick::Bin(default_run.to_owned());
+    }
+    let mut bins: Vec<String> = selected["targets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|target| {
+            target["kind"]
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
+        })
+        .filter_map(|target| target["name"].as_str().map(str::to_owned))
+        .collect();
+    bins.sort();
+    match bins.len() {
+        0 => RunPick::Unresolved,
+        1 => RunPick::Bin(bins.remove(0)),
+        _ => RunPick::Ambiguous(bins),
+    }
+}
+
 /// `rustc -vV` as rustup resolves it for the workspace. Oxide never selects
 /// or pins the toolchain.
 fn rustc_version(workspace: &Path) -> Result<String, String> {
@@ -174,6 +275,48 @@ mod tests {
             "github.com:acme/demo"
         );
         assert_eq!(normalize_origin("/srv/demo.git"), "/srv/demo");
+    }
+
+    #[test]
+    fn run_pick_follows_cargo_run_selection() {
+        let metadata = serde_json::json!({"packages": [
+            {"name": "app", "manifest_path": "/nonexistent/app/Cargo.toml", "default_run": "app",
+             "targets": [{"name": "app", "kind": ["bin"]}, {"name": "other", "kind": ["bin"]}]},
+            {"name": "tool", "manifest_path": "/nonexistent/tool/Cargo.toml", "default_run": null,
+             "targets": [{"name": "tool", "kind": ["bin"]}, {"name": "tool", "kind": ["lib"]}]},
+            {"name": "pair", "manifest_path": "/nonexistent/pair/Cargo.toml", "default_run": null,
+             "targets": [{"name": "a", "kind": ["bin"]}, {"name": "b", "kind": ["bin"]}]},
+            {"name": "lib", "manifest_path": "/nonexistent/lib/Cargo.toml", "default_run": null,
+             "targets": [{"name": "lib", "kind": ["lib"]}]}
+        ]});
+        assert_eq!(
+            select_run(&metadata, Some("app"), None),
+            RunPick::Bin("app".to_owned())
+        );
+        assert_eq!(
+            select_run(&metadata, Some("tool"), None),
+            RunPick::Bin("tool".to_owned())
+        );
+        assert_eq!(
+            select_run(&metadata, Some("pair"), None),
+            RunPick::Ambiguous(vec!["a".to_owned(), "b".to_owned()])
+        );
+        assert_eq!(
+            select_run(&metadata, Some("lib"), None),
+            RunPick::Unresolved
+        );
+        assert_eq!(
+            select_run(&metadata, Some("missing"), None),
+            RunPick::Unresolved
+        );
+        assert_eq!(
+            select_run(
+                &metadata,
+                None,
+                Some(Path::new("/nonexistent/app/Cargo.toml"))
+            ),
+            RunPick::Unresolved
+        );
     }
 
     #[test]

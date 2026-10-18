@@ -72,6 +72,15 @@ struct Ticket {
     pid: u32,
 }
 
+/// A running `oxide clean`. Its lock (in `waiters/`) proves it is live;
+/// commands for the same checkout wait while it exists.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Clean {
+    id: u64,
+    checkout: PathBuf,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct State {
@@ -79,6 +88,8 @@ struct State {
     next_id: u64,
     next_use: u64,
     tickets: Vec<Ticket>,
+    #[serde(default)]
+    cleans: Vec<Clean>,
     records: Vec<Record>,
 }
 
@@ -89,6 +100,7 @@ impl Default for State {
             next_id: 1,
             next_use: 1,
             tickets: Vec::new(),
+            cleans: Vec::new(),
             records: Vec::new(),
         }
     }
@@ -116,6 +128,7 @@ enum Wait {
     Queue(usize),
     HostLimit(usize),
     Checkout,
+    Clean,
     ProjectCap,
     Uncertain,
     Capacity,
@@ -129,6 +142,7 @@ impl Wait {
                 format!("a build slot ({active} of {max_active} host-wide in use)")
             }
             Self::Checkout => "another oxide command in this checkout".to_owned(),
+            Self::Clean => "oxide clean in this checkout".to_owned(),
             Self::ProjectCap => {
                 format!("an idle slot of this project (cap {PROJECT_SLOT_CAP} slots)")
             }
@@ -153,6 +167,18 @@ pub struct Lease {
 
 pub enum Acquired {
     Lease(Lease),
+    Interrupted(i32),
+}
+
+/// Exclusive clean of one checkout: no command for it holds or takes a slot
+/// until [`Store::finish_clean`].
+pub struct CleanGuard {
+    id: u64,
+    _lock: File,
+}
+
+pub enum Cleaning {
+    Guard(CleanGuard),
     Interrupted(i32),
 }
 
@@ -309,23 +335,66 @@ impl Store {
         self.save(&state)
     }
 
-    /// Drop this checkout's slot affinity. Slots stay intact.
-    pub fn detach_checkout(&self, checkout: &Path) -> Result<usize, String> {
-        if !self.control.exists() {
-            return Ok(0);
+    /// Wait until no live or unsettled command for this checkout holds a
+    /// record, then mark the checkout as cleaning. Ctrl-C while waiting
+    /// cancels.
+    pub fn begin_clean(&self, checkout: &Path) -> Result<Cleaning, String> {
+        self.ensure_control()?;
+        let mut announced = false;
+        loop {
+            if let Some(signal) = process::received_signal() {
+                return Ok(Cleaning::Interrupted(signal));
+            }
+            {
+                let _admission = self.admission()?;
+                let mut state = self.load()?;
+                self.drop_dead_tickets(&mut state)?;
+                self.recover_settled(&mut state)?;
+                let busy = state.cleans.iter().any(|clean| clean.checkout == checkout)
+                    || state.records.iter().any(|record| {
+                        record.checkout.as_deref() == Some(checkout) && record.phase != Phase::Idle
+                    });
+                if !busy {
+                    if state.cleans.len() >= MAX_TICKETS {
+                        return Err(format!("too many concurrent oxide cleans ({MAX_TICKETS})"));
+                    }
+                    let id = state.take_id()?;
+                    let Probe::Free(lock) = probe_lock(&self.ticket_path(id), true)? else {
+                        return Err("a new Oxide clean lock is unexpectedly held".to_owned());
+                    };
+                    state.cleans.push(Clean {
+                        id,
+                        checkout: checkout.to_path_buf(),
+                    });
+                    self.save(&state)?;
+                    return Ok(Cleaning::Guard(CleanGuard { id, _lock: lock }));
+                }
+                self.save(&state)?;
+            }
+            if !announced {
+                eprintln!(
+                    "oxide: waiting for active oxide commands in this checkout; Ctrl-C cancels"
+                );
+                announced = true;
+            }
+            std::thread::sleep(WAIT_POLL);
         }
+    }
+
+    /// Drop this checkout's slot affinity and end the clean. Slots stay intact.
+    pub fn finish_clean(&self, guard: CleanGuard, checkout: &Path) -> Result<usize, String> {
         let _admission = self.admission()?;
         let mut state = self.load()?;
         let mut detached = 0;
         for record in &mut state.records {
-            if record.checkout.as_deref() == Some(checkout) {
+            if record.checkout.as_deref() == Some(checkout) && record.phase == Phase::Idle {
                 record.checkout = None;
                 detached += 1;
             }
         }
-        if detached > 0 {
-            self.save(&state)?;
-        }
+        state.cleans.retain(|clean| clean.id != guard.id);
+        self.save(&state)?;
+        let _ = fs::remove_file(self.ticket_path(guard.id));
         Ok(detached)
     }
 
@@ -396,6 +465,14 @@ impl Store {
         if position != 0 {
             self.save(&state)?;
             return Ok(Err(Wait::Queue(position + 1)));
+        }
+        if state
+            .cleans
+            .iter()
+            .any(|clean| clean.checkout == key.checkout)
+        {
+            self.save(&state)?;
+            return Ok(Err(Wait::Clean));
         }
         self.recover_settled(&mut state)?;
         let active = state
@@ -653,7 +730,7 @@ impl Store {
         }
     }
 
-    /// A ticket whose lock is free belongs to a command that ended.
+    /// A ticket or clean mark whose lock is free belongs to a command that ended.
     fn drop_dead_tickets(&self, state: &mut State) -> Result<(), String> {
         let mut live = Vec::with_capacity(state.tickets.len());
         for ticket in state.tickets.drain(..) {
@@ -667,6 +744,18 @@ impl Store {
             }
         }
         state.tickets = live;
+        let mut live = Vec::with_capacity(state.cleans.len());
+        for clean in state.cleans.drain(..) {
+            let path = self.ticket_path(clean.id);
+            match probe_lock(&path, false)? {
+                Probe::Held => live.push(clean),
+                Probe::Free(_) => {
+                    let _ = fs::remove_file(path);
+                }
+                Probe::Missing => {}
+            }
+        }
+        state.cleans = live;
         Ok(())
     }
 
@@ -711,6 +800,7 @@ impl Store {
             .map_err(|error| format!("Oxide state is invalid: {error}"))?;
         if state.version != STATE_VERSION
             || state.tickets.len() > MAX_TICKETS
+            || state.cleans.len() > MAX_TICKETS
             || state.records.len() > MAX_RECORDS
         {
             return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());

@@ -7,7 +7,8 @@ proof phase including setup) and points OXIDE_POOL at it; the default pool is
 never touched. Offline std-only fixture crates prove command routing, the
 quick/debug profile flags (including an external subcommand's `$CARGO`
 call), storage-override refusals, `clean`, checkout-affine reuse, FIFO
-waiting and the host limit, Ctrl-C forwarding, own-command crash recovery,
+waiting and the host limit, clean waiting for active commands, `default-run`
+selection, Ctrl-C forwarding, own-command crash recovery,
 `status` stray detection and Cargo-equal exit codes. The image is detached
 and the scratch removed only after positive completion. Not a benchmark and
 not full QA.
@@ -37,6 +38,7 @@ FIXTURE = {
 name = "app"
 version = "0.1.0"
 edition = "2021"
+default-run = "app"
 
 [dependencies]
 helper = { path = "helper" }
@@ -52,6 +54,7 @@ helper = { path = "helper" }
     }
 }
 """,
+    "src/bin/other.rs": "fn main() {\n    println!(\"other {}\", helper::double(1));\n}\n",
     "tests/basic.rs": """use std::path::PathBuf;
 use std::time::Duration;
 
@@ -456,10 +459,15 @@ def prove_routing(runner: Runner, app: str, quick_slot: str, debug_slot: str) ->
         fail(f"failing test exit oxide={oxide_code} cargo={plain.returncode}")
 
     # Run releases before executing; the program's exit code is returned.
+    # With two binaries, `default-run` picks `app` as Cargo would.
     code, stdout, stderr = runner.run(app, ["run", "--", "exit:7", "hello"])
     expect(code, 7, "run exit code", stderr)
     if "app 42 exit:7 hello" not in stdout:
         fail(f"run output {stdout!r}")
+    code, stdout, stderr = runner.run(app, ["run", "--bin", "other"])
+    expect(code, 0, "run --bin other", stderr)
+    if stdout.strip() != "other 2":
+        fail(f"run --bin other output {stdout!r}")
     if any(slot["state"] != "idle" for slot in runner.lease_status()["slots"]):
         fail("run left a slot held after executing the program")
 
@@ -532,6 +540,7 @@ def prove_routing(runner: Runner, app: str, quick_slot: str, debug_slot: str) ->
         fail("project slot cap of 2 was not kept")
 
     prove_waiting(runner, app, app2)
+    prove_clean_waits(runner, app)
     prove_interrupt(runner, app)
     prove_recovery(runner, app)
 
@@ -573,6 +582,35 @@ def prove_waiting(runner: Runner, app: str, app2: str) -> None:
     if runner.state()["tickets"]:
         fail("wait tickets remained after the queue drained")
     for log in (holder_log, waiter_log, queued_log):
+        log.close()
+
+
+def prove_clean_waits(runner: Runner, app: str) -> None:
+    """Clean waits for an active command in its checkout, then removes the
+    private outputs and drops only idle affinity."""
+    pidfile = os.path.join(runner.parent, "hold-clean.pid")
+    holder, holder_log = runner.start(app, ["test"], "hold-clean", {"OXIDE_FIXTURE_HOLD": pidfile})
+    wait_for(lambda: os.path.exists(pidfile), "test held during clean")
+    cleaner, clean_log = runner.start(app, ["clean"], "clean-wait")
+    wait_for(
+        lambda: "waiting for active oxide commands in this checkout" in read_log(clean_log),
+        "clean wait line",
+    )
+    if cleaner.poll() is not None or not os.path.isdir(os.path.join(app, "target")):
+        fail("clean ran while a command in its checkout was active")
+    if any(record["checkout"] is None for record in runner.state()["records"]):
+        fail("clean detached affinity while a command was active")
+    with open(pidfile.replace(".pid", ".release"), "w", encoding="utf-8"):
+        pass
+    expect(holder.wait(timeout=min(60, remaining())), 0, "test held during clean", read_log(holder_log))
+    expect(cleaner.wait(timeout=min(60, remaining())), 0, "waiting clean", read_log(clean_log))
+    if os.path.exists(os.path.join(app, "target")):
+        fail("waiting clean left the private target dir")
+    if "dropped this checkout's slot affinity" not in read_log(clean_log):
+        fail("waiting clean did not drop the idle affinity")
+    if runner.state()["cleans"]:
+        fail("clean mark remained after clean finished")
+    for log in (holder_log, clean_log):
         log.close()
 
 

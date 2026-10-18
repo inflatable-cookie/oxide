@@ -293,6 +293,19 @@ pub fn manifest_path(args: &[OsString]) -> Option<PathBuf> {
     flag_value(args, "--manifest-path").map(PathBuf::from)
 }
 
+/// `-p`/`--package` without any `@version` suffix, before any `--`.
+pub fn package_selection(args: &[OsString]) -> Option<String> {
+    let compact = args
+        .iter()
+        .take_while(|argument| *argument != "--")
+        .filter_map(|argument| argument.to_str())
+        .find_map(|text| text.strip_prefix("-p").filter(|rest| !rest.is_empty()));
+    let spec = flag_value(args, "--package")
+        .or_else(|| flag_value(args, "-p"))
+        .or_else(|| compact.map(str::to_owned))?;
+    Some(spec.split('@').next().unwrap_or_default().to_owned())
+}
+
 /// `run`: the `--bin`/`--example` name the caller selected, if any.
 pub fn run_selection(cargo_args: &[OsString]) -> Option<String> {
     flag_value(cargo_args, "--bin").or_else(|| flag_value(cargo_args, "--example"))
@@ -416,6 +429,20 @@ mod tests {
         }
         assert!(refuse_storage_overrides(&args(&["--config", "net.offline=true"])).is_ok());
         assert!(refuse_storage_overrides(&args(&["--", "--target-dir", "x"])).is_ok());
+    }
+
+    #[test]
+    fn package_selection_reads_every_form() {
+        assert_eq!(
+            package_selection(&args(&["-p", "app"])).as_deref(),
+            Some("app")
+        );
+        assert_eq!(package_selection(&args(&["-papp"])).as_deref(), Some("app"));
+        assert_eq!(
+            package_selection(&args(&["--package=app@0.1.0"])).as_deref(),
+            Some("app")
+        );
+        assert_eq!(package_selection(&args(&["--", "-p", "app"])), None);
     }
 
     #[test]
