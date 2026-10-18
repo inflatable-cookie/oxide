@@ -37,7 +37,10 @@ After each building command, one stderr line:
 `oxide: quick profile, build strategy, slot 3 warm, 4.2s, pool 210 of 24576 MiB used`.
 The strategy is how Oxide met the profile (`build`, or `build+execute` for
 `run` and `test`). Cold means the slot was rebuilt; that is normal after
-`oxide clean` or for a new checkout.
+`oxide clean`. A new worktree of the same repository usually starts warm on
+another checkout's idle slot: the line then adds what the freshness gate
+refreshed and that inputs outside Git or ignored by it are not checked. If
+Oxide says the gate refused a slot, it builds cold instead; that is safe.
 
 ## Waits and refusals
 

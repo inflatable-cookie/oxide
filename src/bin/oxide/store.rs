@@ -7,6 +7,13 @@
 //! directory `<pool>/oxide-managed` holds the records, FIFO wait tickets, the
 //! admission lock and one `flock` per record held for the life of a command.
 //!
+//! Cross-checkout reuse: a checkout with no slot of its own may take an
+//! idle compatible slot last used by another checkout of the same
+//! repository when that slot's recorded compile origin is trusted; the
+//! freshness gate then runs before Cargo. The origin lives in
+//! `origins/<record>.json`, stamped with the record's use counter, so a
+//! command that crashed or an older Oxide build leaves it untrusted.
+//!
 //! Own-command crash recovery: a record that is not idle names the holder
 //! (PID, start time, lease holder and lease ID) and Cargo's process group.
 //! Another command recovers its held lease only when the record lock is free
@@ -14,6 +21,7 @@
 //! and are never recovered here.
 
 use crate::cli::Profile;
+use crate::freshness::{Built, Prior};
 use crate::identity::SlotKey;
 use crate::process;
 use oxide_storage::lease::{
@@ -45,6 +53,8 @@ const MAX_RECORDS: usize = 64;
 const MAX_RECOVERIES: usize = 16;
 const MAX_STATE_BYTES: u64 = 256 * 1024;
 const STATE_VERSION: u32 = 1;
+const MAX_ORIGIN_BYTES: u64 = 8 * 1024 * 1024;
+const ORIGIN_VERSION: u32 = 1;
 const WAIT_POLL: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -92,6 +102,19 @@ struct Holder {
     /// Wall-clock start of the holder process, milliseconds since the epoch.
     started_ms: u64,
     lease_holder: String,
+}
+
+/// A slot's last recorded build. `mark` is the record's use counter when it
+/// was written; leasing re-stamps it and Cargo's start advances the counter,
+/// so a mismatch means Cargo may have run unrecorded. `origin: None` is an
+/// untrusted slot. An untrusted slot is never reused: the next command evicts
+/// it and builds cold.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginFile {
+    version: u32,
+    mark: u64,
+    origin: Option<Built>,
 }
 
 /// One automatic recovery, kept for `oxide status`.
@@ -286,6 +309,11 @@ pub struct Lease {
     pub slot_id: String,
     pub reused: bool,
     pub build_dir: PathBuf,
+    /// The slot's history for the freshness gate.
+    pub prior: Prior,
+    /// Checkout whose idle slot this command took; restored if the gate
+    /// refuses.
+    pub shared_from: Option<PathBuf>,
     lease_id: String,
     record: u64,
     _lock: File,
@@ -424,7 +452,13 @@ impl Store {
 
     /// Lease this checkout's slot, waiting in FIFO order. Ctrl-C while waiting
     /// cancels without touching any slot.
-    pub fn acquire(&self, key: &SlotKey, profile: Profile) -> Result<Acquired, String> {
+    /// `share` allows taking another checkout's idle compatible slot.
+    pub fn acquire(
+        &self,
+        key: &SlotKey,
+        profile: Profile,
+        share: bool,
+    ) -> Result<Acquired, String> {
         let max_active = max_active()?;
         let ticket = self.register_ticket()?;
         let mut announced = false;
@@ -433,7 +467,7 @@ impl Store {
                 self.remove_ticket(ticket.0)?;
                 return Ok(Acquired::Interrupted(signal));
             }
-            match self.attempt(ticket.0, key, profile, max_active)? {
+            match self.attempt(ticket.0, key, profile, max_active, share)? {
                 Ok(lease) => {
                     self.remove_ticket(ticket.0)?;
                     return Ok(Acquired::Lease(lease));
@@ -454,12 +488,22 @@ impl Store {
 
     /// Record that Cargo is about to start. A crash from here until
     /// [`Store::mark_running`] leaves the slot held for explicit recovery:
-    /// Cargo's group may exist but is not recorded.
+    /// Cargo's group may exist but is not recorded. Advancing the use counter
+    /// untrusts the slot's origin until release records a new one; the gate
+    /// has already refreshed this checkout's differing files, so a retry here
+    /// is safe under Cargo's own checks.
     pub fn mark_spawning(&self, lease: &Lease) -> Result<(), String> {
-        self.update_record(lease.record, |record| {
-            record.phase = Phase::Spawning;
-            record.process_group = None;
-        })
+        let _admission = self.admission()?;
+        let mut state = self.load()?;
+        let index = state
+            .records
+            .iter()
+            .position(|record| record.id == lease.record)
+            .ok_or("Oxide slot record disappeared")?;
+        state.records[index].phase = Phase::Spawning;
+        state.records[index].process_group = None;
+        state.touch(index)?;
+        self.save(&state)
     }
 
     pub fn mark_running(&self, lease: &Lease, group: i32) -> Result<(), String> {
@@ -469,8 +513,9 @@ impl Store {
         })
     }
 
-    /// Release after every writer in the group has exited.
-    pub fn release(&self, held: Lease) -> Result<(), String> {
+    /// Release after every writer in the group has exited, recording the
+    /// slot's compile origin (`None`: untrusted from now on).
+    pub fn release(&self, held: Lease, origin: Option<Built>) -> Result<(), String> {
         let _admission = self.admission()?;
         release(&self.pool, &held.lease_id)
             .map_err(|error| lease_error("could not release the slot", &error))?;
@@ -482,7 +527,42 @@ impl Store {
         {
             state.settle_idle(index);
             state.touch(index)?;
+            self.write_origin(held.record, state.records[index].last_used, origin)?;
         }
+        self.save(&state)
+    }
+
+    /// The gate refused a slot taken from another checkout before Cargo ran:
+    /// release it and give it back, origin unchanged.
+    pub fn unshare(&self, held: Lease) -> Result<(), String> {
+        let _admission = self.admission()?;
+        release(&self.pool, &held.lease_id)
+            .map_err(|error| lease_error("could not release the slot", &error))?;
+        let mut state = self.load()?;
+        if let Some(index) = state
+            .records
+            .iter()
+            .position(|record| record.id == held.record)
+        {
+            state.settle_idle(index);
+            state.records[index].checkout = held.shared_from.clone();
+            let origin = held.prior.unchanged();
+            self.write_origin(held.record, state.records[index].last_used, origin)?;
+        }
+        self.save(&state)
+    }
+
+    /// The gate cannot vouch for this checkout's own slot (no trusted record,
+    /// or its history cannot be read): release it before Cargo and evict it
+    /// whole, so the command builds cold instead of reusing it unchecked.
+    pub fn discard(&self, held: Lease) -> Result<(), String> {
+        let _admission = self.admission()?;
+        release(&self.pool, &held.lease_id)
+            .map_err(|error| lease_error("could not release the slot", &error))?;
+        evict_idle_slot(&self.pool, &held.slot_id)
+            .map_err(|error| lease_error("cannot evict an untrusted slot", &error))?;
+        let mut state = self.load()?;
+        self.forget_record(&mut state, held.record);
         self.save(&state)
     }
 
@@ -626,6 +706,7 @@ impl Store {
         key: &SlotKey,
         profile: Profile,
         max_active: usize,
+        share: bool,
     ) -> Result<Result<Lease, Wait>, String> {
         let _admission = self.admission()?;
         let mut state = self.load()?;
@@ -692,7 +773,28 @@ impl Store {
                 }
             }
         }
-        if !existing.is_some_and(|index| has_slot(&state.records[index])) {
+        let mut shared_from = None;
+        let mut shared_origin = None;
+        let shared = if share && !existing.is_some_and(|index| has_slot(&state.records[index])) {
+            self.shared_candidate(&state, key, &status)?
+        } else {
+            None
+        };
+        if let Some((id, file, origin)) = shared {
+            // This checkout's slotless record is replaced by the taken one.
+            if let Some(own) = existing.map(|index| state.records[index].id) {
+                self.forget_record(&mut state, own);
+            }
+            let index = state
+                .records
+                .iter()
+                .position(|record| record.id == id)
+                .ok_or("the shared slot record disappeared")?;
+            shared_from = state.records[index].checkout.replace(key.checkout.clone());
+            shared_origin = Some(origin);
+            lock = Some(file);
+            existing = Some(index);
+        } else if !existing.is_some_and(|index| has_slot(&state.records[index])) {
             let mut candidates: Vec<(u64, u64, String)> = state
                 .records
                 .iter()
@@ -768,6 +870,11 @@ impl Store {
         };
         let lock = lock.ok_or("Oxide record lock was not taken")?;
         let record = state.records[index].id;
+        // Read before this command advances the use counter.
+        let recorded = match shared_origin {
+            Some(origin) => Some(origin),
+            None => self.trusted_origin(&state.records[index]),
+        };
         let lease_holder = format!("oxide-{}-{ticket}", std::process::id());
         state.records[index].phase = Phase::Acquiring;
         state.records[index].process_group = None;
@@ -778,6 +885,13 @@ impl Store {
             lease_holder: lease_holder.clone(),
         });
         state.touch(index)?;
+        // Keep a trusted origin trusted until Cargo starts: written before
+        // the state that advances the counter, so a crash before Cargo (even
+        // mid-gate, after this record moved to this checkout) leaves the
+        // gate to run again on retry.
+        if let Some(origin) = &recorded {
+            self.write_origin(record, state.records[index].last_used, Some(origin.clone()))?;
+        }
         self.save(&state)?;
 
         let request = LeaseRequest {
@@ -795,6 +909,9 @@ impl Store {
             Ok(grant) => grant,
             Err(error) => {
                 state.settle_idle(index);
+                if shared_from.is_some() {
+                    state.records[index].checkout = shared_from;
+                }
                 self.save(&state)?;
                 return match error {
                     LeaseError::Busy => Ok(Err(Wait::Uncertain)),
@@ -805,10 +922,17 @@ impl Store {
         };
         state.records[index].lease_id = Some(grant.lease_id.clone());
         self.save(&state)?;
+        let prior = match (grant.reused_slot, recorded) {
+            (false, _) => Prior::Fresh,
+            (true, Some(origin)) => Prior::Known(origin),
+            (true, None) => Prior::Unknown,
+        };
         Ok(Ok(Lease {
             slot_id: grant.slot_id,
             reused: grant.reused_slot,
             build_dir: grant.env.cargo_build_build_dir,
+            prior,
+            shared_from,
             lease_id: grant.lease_id,
             record,
             _lock: lock,
@@ -896,6 +1020,98 @@ impl Store {
         state.records.retain(|record| record.id != id);
         let _ = fs::remove_dir(self.affinity_dir(id));
         let _ = fs::remove_file(self.lock_path(id));
+        let _ = fs::remove_file(self.origin_path(id));
+    }
+
+    /// The most recently used idle slot of the same repository and key whose
+    /// last checkout is another live affinity and whose origin is trusted.
+    /// Detached records (after `oxide clean`) are never shared.
+    fn shared_candidate(
+        &self,
+        state: &State,
+        key: &SlotKey,
+        status: &PoolStatus,
+    ) -> Result<Option<(u64, File, Built)>, String> {
+        let mut candidates: Vec<&Record> = state
+            .records
+            .iter()
+            .filter(|record| {
+                record.phase == Phase::Idle
+                    && record.identity == key.identity
+                    && record.compatibility == key.compatibility
+                    && record
+                        .checkout
+                        .as_ref()
+                        .is_some_and(|checkout| *checkout != key.checkout)
+            })
+            .filter(|record| {
+                let project = self.affinity_dir(record.id);
+                status
+                    .slots
+                    .iter()
+                    .any(|slot| slot.project == project && slot.state == SlotOccupancy::Idle)
+            })
+            .collect();
+        candidates.sort_by_key(|record| std::cmp::Reverse(record.last_used));
+        for record in candidates {
+            let Some(origin @ Built::Content(_)) = self.trusted_origin(record) else {
+                continue;
+            };
+            if let Probe::Free(file) = probe_lock(&self.lock_path(record.id), true)? {
+                return Ok(Some((record.id, file, origin)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The record's origin if the last command on it recorded one and no
+    /// command ran since.
+    fn trusted_origin(&self, record: &Record) -> Option<Built> {
+        let file = private_file(&self.origin_path(record.id), false).ok()??;
+        let mut bytes = Vec::new();
+        file.take(MAX_ORIGIN_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 > MAX_ORIGIN_BYTES {
+            return None;
+        }
+        let stored: OriginFile = serde_json::from_slice(&bytes).ok()?;
+        (stored.version == ORIGIN_VERSION && stored.mark == record.last_used)
+            .then_some(stored.origin)
+            .flatten()
+    }
+
+    fn write_origin(&self, id: u64, mark: u64, origin: Option<Built>) -> Result<(), String> {
+        ensure_private_dir(&self.control.join("origins"))?;
+        let bytes = serde_json::to_vec(&OriginFile {
+            version: ORIGIN_VERSION,
+            mark,
+            origin,
+        })
+        .map_err(|error| error.to_string())?;
+        let path = self.origin_path(id);
+        if bytes.len() as u64 > MAX_ORIGIN_BYTES {
+            // Too large to record: leave the slot untrusted.
+            return match fs::remove_file(&path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    Err(format!("cannot clear a slot origin: {error}"))
+                }
+                _ => Ok(()),
+            };
+        }
+        let temp = path.with_extension("json.tmp");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temp)
+            .map_err(|error| format!("cannot write a slot origin: {error}"))?;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| fs::rename(&temp, &path))
+            .map_err(|error| format!("cannot write a slot origin: {error}"))
     }
 
     fn update_record(&self, id: u64, change: impl FnOnce(&mut Record)) -> Result<(), String> {
@@ -987,6 +1203,10 @@ impl Store {
 
     fn affinity_dir(&self, id: u64) -> PathBuf {
         self.control.join("affinity").join(id.to_string())
+    }
+
+    fn origin_path(&self, id: u64) -> PathBuf {
+        self.control.join("origins").join(format!("{id}.json"))
     }
 
     fn lock_path(&self, id: u64) -> PathBuf {

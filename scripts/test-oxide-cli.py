@@ -6,8 +6,14 @@ reserve, the script provisions exactly one fresh 128 MiB APFS pool through
 proof phase including setup) and points OXIDE_POOL at it; the default pool is
 never touched. Offline std-only fixture crates prove command routing, the
 quick/debug profile flags (including an external subcommand's `$CARGO`
-call), storage-override refusals, `clean`, checkout-affine reuse, FIFO
-waiting and the host limit, clean waiting for active commands, `default-run`
+call), storage-override refusals, `clean`, cross-checkout reuse through the
+freshness gate (two Git worktrees of a scratch repository: the stale-mtime
+scenario rebuilds, every package under the checkout (members and in-repo
+path dependencies, from `cargo metadata`) rebuilds on a path change,
+a path dependency outside the repository stays fresh, an unchanged repeat
+rebuilds nothing, a refused gate builds cold, and a crash inside the gate
+leaves the retry gated), FIFO waiting and the host
+limit, clean waiting for active commands, `default-run`
 selection (package and virtual workspace roots), Ctrl-C forwarding, own-command crash recovery
 (a killed oxide whose Cargo group survives stays held; one whose group is gone
 is recovered by the next command and logged; a standalone-CLI lease is never
@@ -130,6 +136,151 @@ VIRTUAL = {
     "tool/src/main.rs": 'fn main() {\n    println!("virtual tool");\n}\n',
 }
 
+# Freshness gate fixture: a Git workspace whose `marker` package embeds a
+# data file at compile time and whose `embed` member embeds its own
+# `CARGO_MANIFEST_DIR`; both tests compare the compiled value with this
+# checkout's. `outside` is a path dependency outside the repository. The
+# in-repo non-member path dependencies `buildrs` (default build.rs, no
+# declaration, embeds current_dir()) and `pathmac` (a proc macro that
+# expands to its caller's manifest dir) are checked through marker's test.
+GATED = {
+    "Cargo.toml": """[workspace]
+members = [".", "embed", "codegen"]
+default-members = [".", "embed", "codegen"]
+exclude = ["vendor"]
+
+[package]
+name = "marker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+outside = { path = "../outside" }
+buildrs = { path = "vendor/buildrs" }
+pathmac = { path = "vendor/pathmac" }
+""",
+    "rust-toolchain.toml": '[toolchain]\nchannel = "1.97.1"\n',
+    ".gitignore": "/target\n",
+    "data/marker.txt": "one\n",
+    "src/lib.rs": """pub const MARKER: &str = include_str!("../data/marker.txt");
+
+pub fn outside_value() -> u32 {
+    outside::value()
+}
+
+pub fn buildrs_dir() -> &'static str {
+    buildrs::dir()
+}
+
+pub fn caller_dir() -> &'static str {
+    pathmac::caller_dir!()
+}
+""",
+    "tests/content.rs": """#[test]
+fn compiled_marker_is_this_checkouts() {
+    let here = std::fs::read_to_string("data/marker.txt").expect("marker");
+    assert_eq!(marker::MARKER, here);
+    assert_eq!(marker::outside_value(), 5);
+    let canonical = |path: &str| std::fs::canonicalize(path).expect("dir");
+    assert_eq!(canonical(marker::buildrs_dir()), canonical("vendor/buildrs"));
+    assert_eq!(canonical(marker::caller_dir()), canonical("."));
+}
+""",
+    "embed/Cargo.toml": '[package]\nname = "embed"\nversion = "0.1.0"\nedition = "2021"\n',
+    "embed/src/lib.rs": """pub fn dir() -> &'static str {
+    env!("CARGO_MANIFEST_DIR")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn compiled_path_is_this_checkouts() {
+        assert_eq!(super::dir(), std::env::var("CARGO_MANIFEST_DIR").expect("set by cargo test"));
+    }
+}
+""",
+}
+
+# `codegen` names its build script through an escaped TOML key (`build`
+# spelled with \u0075) and has no default build.rs. The script embeds its
+# working directory, the package root, without the literal
+# CARGO_MANIFEST_DIR; the test compares it with this checkout's.
+GATED["codegen/Cargo.toml"] = (
+    '[package]\nname = "codegen"\nversion = "0.1.0"\nedition = "2021"\n"b\\u0075ild" = "gen.rs"\n'
+)
+GATED["codegen/gen.rs"] = """fn main() {
+    let here = std::env::current_dir().expect("build script cwd");
+    println!("cargo:rustc-env=CODEGEN_DIR={}", here.display());
+}
+"""
+GATED["codegen/src/lib.rs"] = """pub fn dir() -> &'static str {
+    env!("CODEGEN_DIR")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn generated_path_is_this_checkouts() {
+        let compiled = std::fs::canonicalize(super::dir()).expect("compiled dir");
+        let here = std::fs::canonicalize(std::env::current_dir().expect("cwd")).expect("cwd");
+        assert_eq!(compiled, here);
+    }
+}
+"""
+
+GATED["vendor/buildrs/Cargo.toml"] = (
+    '[package]\nname = "buildrs"\nversion = "0.1.0"\nedition = "2021"\n'
+)
+GATED["vendor/buildrs/build.rs"] = """fn main() {
+    let here = std::env::current_dir().expect("build script cwd");
+    println!("cargo:rustc-env=BUILDRS_DIR={}", here.display());
+}
+"""
+GATED["vendor/buildrs/src/lib.rs"] = """pub fn dir() -> &'static str {
+    env!("BUILDRS_DIR")
+}
+"""
+GATED["vendor/pathmac/Cargo.toml"] = (
+    '[package]\nname = "pathmac"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\nproc-macro = true\n'
+)
+GATED["vendor/pathmac/src/lib.rs"] = """use proc_macro::TokenStream;
+
+#[proc_macro]
+pub fn caller_dir(_input: TokenStream) -> TokenStream {
+    let dir = std::env::var("CARGO_MANIFEST_DIR").expect("caller manifest dir");
+    format!("{dir:?}").parse().expect("string literal")
+}
+"""
+
+# Every unit the gate must rebuild on a checkout-path change: all packages
+# under the checkout, members and in-repo path dependencies alike.
+LOCAL_UNITS = (
+    "marker:build",
+    "marker:test",
+    "content:test",
+    "embed:build",
+    "embed:test",
+    "codegen:build",
+    "codegen:test",
+    "buildrs:build",
+    "pathmac:build",
+)
+
+OUTSIDE = {
+    "Cargo.toml": '[package]\nname = "outside"\nversion = "0.1.0"\nedition = "2021"\n',
+    "src/lib.rs": "pub fn value() -> u32 {\n    5\n}\n",
+}
+
+# Holds oxide inside the freshness gate: the gate's first git call is
+# `rev-parse --show-toplevel`; identity resolution never makes it.
+GIT_HOLD = """#!/bin/sh
+if [ -n "$OXIDE_FIXTURE_GIT_HOLD" ] && [ "$1 $2" = "rev-parse --show-toplevel" ]; then
+    echo $$ > "$OXIDE_FIXTURE_GIT_HOLD.tmp" && mv "$OXIDE_FIXTURE_GIT_HOLD.tmp" "$OXIDE_FIXTURE_GIT_HOLD"
+    while [ ! -e "$OXIDE_FIXTURE_GIT_HOLD.release" ]; do sleep 0.1; done
+fi
+exec "REAL_GIT" "$@"
+"""
+
 # External subcommand: reports the injected build dir and runs `$CARGO`.
 PROBE = """#!/bin/sh
 # Cargo passes the subcommand name first.
@@ -193,7 +344,7 @@ def build_binaries() -> dict:
         ],
         stdout=subprocess.PIPE,
         text=True,
-        timeout=300,
+        timeout=remaining(),
     )
     if build.returncode:
         sys.exit(build.returncode)
@@ -220,7 +371,10 @@ class Runner:
         self.pool = os.path.join(parent, "pool")
         self.bin = os.path.join(parent, "bin")
         self.tmp = os.path.join(parent, "tmp")
-        for path in (self.bin, self.tmp):
+        # Every fixture Cargo call, Oxide's and its descendants included, uses
+        # this private home; product staging used the host's.
+        self.cargo_home = os.path.join(parent, "cargo-home")
+        for path in (self.bin, self.tmp, self.cargo_home):
             os.makedirs(path, mode=0o700, exist_ok=True)
         env = dict(os.environ)
         for name in (
@@ -237,6 +391,7 @@ class Runner:
         env.update(
             {
                 "OXIDE_POOL": self.pool,
+                "CARGO_HOME": self.cargo_home,
                 "PATH": self.bin + os.pathsep + env.get("PATH", ""),
                 "CARGO_NET_OFFLINE": "true",
                 "CARGO_TERM_COLOR": "never",
@@ -320,6 +475,65 @@ def debuginfo(stderr: str) -> dict:
         else:
             units[crate] = value.group(1) if value else "missing"
     return units
+
+
+# Every wait line Oxide emits: each `Wait::describe` form printed by
+# `acquire` and the `clean` wait in store.rs, and the group wait in
+# process.rs. Cargo's "Blocking waiting for file lock on package
+# cache" and other tools' lines never match.
+OXIDE_WAIT = re.compile(
+    r"oxide: waiting for (?:"
+    r"earlier oxide commands \(position \d+\)"
+    r"|a build slot \(\d+ of \d+ host-wide in use\)"
+    r"|another oxide command in this checkout"
+    r"|oxide clean in this checkout"
+    r"|an idle slot of this project \(cap \d+ slots\)"
+    r"|a slot held by an interrupted command whose Cargo may still run"
+    r"|pool capacity held by running builds"
+    r"|active oxide commands in this checkout"
+    r"); Ctrl-C cancels"
+    r"|oxide: waiting for processes left in Cargo's process group \d+ to exit"
+)
+
+
+def oxide_waits(text: str) -> list:
+    """Oxide's own wait lines in `text`, whole lines only."""
+    return [line for line in text.splitlines() if OXIDE_WAIT.fullmatch(line)]
+
+
+def prove_wait_lines() -> None:
+    """The wait predicate classifies only Oxide's exact lines."""
+    others = (
+        "    Blocking waiting for file lock on package cache",
+        "Blocking waiting for file lock on build directory",
+        "info: waiting for rustup lock",
+        "oxide:waiting for a build slot (1 of 1 host-wide in use); Ctrl-C cancels",
+        "xoxide: waiting for another oxide command in this checkout; Ctrl-C cancels",
+        "  oxide: waiting for another oxide command in this checkout; Ctrl-C cancels",
+        "oxide: waiting for something else; Ctrl-C cancels",
+        "oxide: waiting for a build slot (1 of 1 host-wide in use)",
+    )
+    for line in others:
+        if oxide_waits(line):
+            fail(f"wait predicate classified a non-Oxide line: {line!r}")
+    own = (
+        "oxide: waiting for earlier oxide commands (position 2); Ctrl-C cancels",
+        "oxide: waiting for a build slot (1 of 1 host-wide in use); Ctrl-C cancels",
+        "oxide: waiting for another oxide command in this checkout; Ctrl-C cancels",
+        "oxide: waiting for oxide clean in this checkout; Ctrl-C cancels",
+        "oxide: waiting for an idle slot of this project (cap 2 slots); Ctrl-C cancels",
+        "oxide: waiting for a slot held by an interrupted command whose Cargo may still run; Ctrl-C cancels",
+        "oxide: waiting for pool capacity held by running builds; Ctrl-C cancels",
+        "oxide: waiting for active oxide commands in this checkout; Ctrl-C cancels",
+        "oxide: waiting for processes left in Cargo's process group 4242 to exit",
+    )
+    mixed = "\n".join(others + own)
+    if oxide_waits(mixed) != list(own):
+        fail(f"wait predicate missed Oxide lines: {oxide_waits(mixed)}")
+    # A real Oxide wait in otherwise ordinary stderr still fails a no-wait check.
+    for line in own:
+        if not oxide_waits(f"   Compiling app v0.1.0\n{line}\n    Finished `dev`"):
+            fail(f"no-wait check would accept an Oxide wait: {line!r}")
 
 
 def wait_for(predicate, label: str, seconds: float = 60) -> None:
@@ -740,23 +954,27 @@ def prove_routing(runner: Runner, app: str, quick_slot: str, debug_slot: str) ->
     if rebuilt["warmth"] != "cold" or "evicted idle slot" not in stderr:
         fail(f"build after clean was not a cold evicting build: {stderr[-800:]}")
 
-    # Checkout affinity: a second checkout of the same repository builds cold
-    # on its own slot; each checkout then reuses only its own slot.
+    # Cross-checkout reuse: a second checkout of the same repository takes
+    # the idle compatible slot through the freshness gate instead of
+    # evicting; the first checkout takes it back the same way, then reuses
+    # it as its own. A detached slot (after clean) is never shared.
     app2 = os.path.join(runner.parent, "checkouts", "app2")
     git(os.path.dirname(app2), "clone", "--quiet", "--no-hardlinks", app, app2)
     code, _, stderr = runner.run(app2, ["build"])
     expect(code, 0, "second checkout build", stderr)
     second = summary(stderr, "second checkout")
-    if second["warmth"] != "cold" or second["slot"] == rebuilt["slot"]:
-        fail(f"second checkout reused another checkout's slot: {second} vs {rebuilt}")
-    if "evicted idle slot" not in stderr:
-        fail("second checkout at the project cap did not evict an idle slot")
-    for cwd, wanted in ((app, rebuilt), (app2, second)):
-        code, _, stderr = runner.run(cwd, ["build"])
-        expect(code, 0, "affine rebuild", stderr)
-        again = summary(stderr, "affine rebuild")
-        if again["slot"] != wanted["slot"] or again["warmth"] != "warm":
-            fail(f"checkout {cwd} did not reuse its own slot: {again} vs {wanted}")
+    if second["warmth"] != "warm" or second["slot"] != rebuilt["slot"]:
+        fail(f"second checkout did not take the idle compatible slot: {second} vs {rebuilt}")
+    if "evicted idle slot" in stderr or "freshness gate refreshed" not in stderr:
+        fail(f"second checkout evicted or skipped the gate: {stderr[-800:]}")
+    for label, gated in (("first checkout takes it back", True), ("own slot again", False)):
+        code, _, stderr = runner.run(app, ["build"])
+        expect(code, 0, label, stderr)
+        again = summary(stderr, label)
+        if again["slot"] != rebuilt["slot"] or again["warmth"] != "warm":
+            fail(f"{label}: {again} vs {rebuilt}")
+        if ("freshness gate refreshed" in stderr) != gated:
+            fail(f"{label}: gate note {'missing' if gated else 'unexpected'}: {stderr[-800:]}")
     if len(runner.lease_status()["slots"]) != 2:
         fail("project slot cap of 2 was not kept")
 
@@ -769,6 +987,7 @@ def prove_routing(runner: Runner, app: str, quick_slot: str, debug_slot: str) ->
     prove_recovery(runner, app)
     prove_group_gone(runner, app)
     keep_standalone_lease(runner, app, standalone)
+    prove_freshness(runner)
 
     # `run` from a virtual workspace root follows Cargo's default members.
     virtual = os.path.join(runner.parent, "checkouts", "virtual")
@@ -790,6 +1009,163 @@ def prove_routing(runner: Runner, app: str, quick_slot: str, debug_slot: str) ->
         fail(f"final status: {stdout}")
 
 
+def unit_freshness(stdout: str) -> dict:
+    """Cargo JSON `compiler-artifact` rows: `name:build|test` to `fresh`."""
+    units = {}
+    for line in stdout.splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if message.get("reason") == "compiler-artifact":
+            role = "test" if message["profile"]["test"] else "build"
+            units[f"{message['target']['name']}:{role}"] = message["fresh"]
+    return units
+
+
+def commit_lock(runner: Runner, cwd: str) -> None:
+    """Write the fixture's lock file before its first commit: the gate reads
+    `cargo metadata --locked`, so a checkout without one is refused."""
+    lock = subprocess.run(
+        ["cargo", "generate-lockfile", "--offline"],
+        cwd=cwd,
+        env=runner.environment(None),
+        capture_output=True,
+        text=True,
+        timeout=min(60, remaining()),
+    )
+    expect(lock.returncode, 0, "fixture lock file", lock.stderr)
+
+
+def prove_freshness(runner: Runner) -> None:
+    """Two worktrees of one scratch repository share a slot through the
+    freshness gate; a clone missing the slot's tree is refused and builds
+    cold. Each test compares compiled values with its own checkout."""
+    root = os.path.join(runner.parent, "gated")
+    a, b, c = (os.path.join(root, name) for name in ("a", "b", "c"))
+    write_fixture(os.path.join(root, "outside"), OUTSIDE)
+    write_fixture(a, GATED)
+    commit_lock(runner, a)
+    git(a, "init", "--quiet")
+    git(a, "add", "-A")
+    git(a, "commit", "--quiet", "-m", "gated fixture")
+    # Both worktrees exist before any build.
+    git(a, "worktree", "add", "--quiet", b)
+
+    def test(cwd: str, label: str):
+        code, stdout, stderr = runner.run(cwd, ["test", "--message-format=json"])
+        expect(code, 0, label, stderr)
+        units = unit_freshness(stdout)
+        print(f"freshness {label}: {summary(stderr, label)} units {units}")
+        return summary(stderr, label), units, stderr
+
+    first, _, _ = test(a, "worktree A cold")
+    if first["warmth"] != "cold":
+        fail(f"first gated build was not cold: {first}")
+    slot = first["slot"]
+
+    def shared(result: dict, label: str) -> None:
+        if result["slot"] != slot or result["warmth"] != "warm":
+            fail(f"{label} did not reuse slot {slot} warm: {result}")
+
+    # Path change, same content: every package under the checkout rebuilds
+    # and its test sees B's path; the outside path dependency stays fresh.
+    result, units, stderr = test(b, "worktree B path change")
+    shared(result, "worktree B")
+    if "freshness gate refreshed" not in stderr or "inputs outside Git or ignored by it are not checked" not in stderr:
+        fail(f"worktree B summary lacks the gate and its limit: {stderr[-800:]}")
+    # Includes the escaped build key, default build.rs, current_dir() script
+    # and proc-macro caller; the tests passing prove they saw B's path.
+    kept = [unit for unit in LOCAL_UNITS if units.get(unit) is not False]
+    if kept:
+        fail(f"local units did not rebuild on the path change: {kept} of {units}")
+    if units.get("outside:build") is not True:
+        fail(f"outside path dependency did not stay fresh: {units}")
+
+    # Stale-mtime scenario: A edits and builds; B's differing file is older
+    # than that build, yet B rebuilds and observes its own content.
+    a_marker, b_marker = (os.path.join(path, "data", "marker.txt") for path in (a, b))
+    with open(a_marker, "w", encoding="utf-8") as handle:
+        handle.write("two from A\n")
+    result, _, _ = test(a, "worktree A edit")
+    shared(result, "worktree A edit")
+    b_mtime = os.stat(b_marker).st_mtime_ns
+    if b_mtime >= os.stat(a_marker).st_mtime_ns:
+        fail("B's marker is not older than A's edit; the stale precondition does not hold")
+    result, units, _ = test(b, "stale scenario B")
+    shared(result, "stale scenario B")
+    if units.get("marker:build") is not False or units.get("content:test") is not False:
+        fail(f"stale scenario did not rebuild the affected units: {units}")
+    if units.get("outside:build") is not True:
+        fail(f"outside path dependency rebuilt in the stale scenario: {units}")
+    if read_text(b_marker) != "one\n" or os.stat(b_marker).st_mtime_ns <= b_mtime:
+        fail("the gate changed B's content or did not refresh its mtime")
+
+    # Unchanged repeat: nothing rebuilds.
+    result, units, stderr = test(b, "unchanged repeat")
+    shared(result, "unchanged repeat")
+    if not units or not all(units.values()) or "freshness gate refreshed" in stderr:
+        fail(f"unchanged repeat rebuilt units or ran the gate: {units}")
+
+    # Refused gate: a clone lacking A's newer tree falls back cold to its own
+    # slot; A's slot is given back intact.
+    git(root, "clone", "--quiet", "--no-hardlinks", a, c)
+    git(a, "commit", "--quiet", "-am", "A moves on")
+    result, _, _ = test(a, "worktree A after commit")
+    shared(result, "worktree A after commit")
+    result, _, stderr = test(c, "refused gate")
+    if "freshness gate refused another checkout's slot" not in stderr:
+        fail(f"clone was not refused by the gate: {stderr[-800:]}")
+    if result["warmth"] != "cold" or result["slot"] == slot:
+        fail(f"refused gate did not build cold on another slot: {result}")
+    result, units, _ = test(a, "worktree A keeps its slot")
+    shared(result, "worktree A keeps its slot")
+    if not units or not all(units.values()):
+        fail(f"A's slot was disturbed by the refused gate: {units}")
+
+    # Crash inside the gate after A's slot moved to B: the retry recovers the
+    # slot and runs the gate again. Unchecked reuse would keep A's marker
+    # unit and fail B's content test.
+    prove_gate_crash(runner, b, slot, test)
+
+
+def prove_gate_crash(runner: Runner, b: str, slot: str, test) -> None:
+    hold = os.path.join(runner.parent, "gate-hold.pid")
+    wrapper = os.path.join(runner.bin, "git")
+    real_git = shutil.which("git")
+    if not real_git:
+        fail("git not found for the gate-hold wrapper")
+    with open(wrapper, "w", encoding="utf-8") as handle:
+        handle.write(GIT_HOLD.replace("REAL_GIT", real_git))
+    os.chmod(wrapper, 0o700)
+    try:
+        child, log = runner.start(b, ["test"], "gate-crash", {"OXIDE_FIXTURE_GIT_HOLD": hold})
+        wait_for(lambda: os.path.exists(hold), "oxide held inside the freshness gate")
+        git_pid = int(read_text(hold))
+        moved = [record for record in runner.state()["records"] if record["checkout"] == b]
+        if len(moved) != 1 or moved[0]["phase"] != "acquiring":
+            fail(f"slot was not moved to B before the gate: {runner.state()['records']}")
+        child.kill()
+        child.wait(timeout=20)
+        log.close()
+        # The held wrapper is this proof's own orphaned process.
+        os.kill(git_pid, signal.SIGKILL)
+        wait_gone(os.kill, git_pid, "gate-hold git wrapper")
+    finally:
+        os.remove(wrapper)
+    result, units, stderr = test(b, "retry after a crash in the gate")
+    if result["slot"] != slot or result["warmth"] != "warm":
+        fail(f"retry did not reuse slot {slot} warm: {result}")
+    if f"recovered slot {slot} after oxide pid {child.pid} died (Cargo never started)" not in stderr:
+        fail(f"retry did not recover the crashed gate's slot: {stderr[-800:]}")
+    if "freshness gate refreshed" not in stderr:
+        fail(f"retry skipped the freshness gate: {stderr[-800:]}")
+    if units.get("marker:build") is not False or units.get("content:test") is not False:
+        fail(f"retry did not rebuild the stale units: {units}")
+
+
 def prove_waiting(runner: Runner, app: str, app2: str) -> None:
     """Host limit 1: a second command waits, a third queues behind it and
     Ctrl-C cancels it; releasing the holder lets the waiter finish."""
@@ -800,13 +1176,20 @@ def prove_waiting(runner: Runner, app: str, app2: str) -> None:
     )
     wait_for(lambda: os.path.exists(pidfile), "holding test")
     waiter, waiter_log = runner.start(app2, ["build"], "waiter", limit)
-    wait_for(lambda: "waiting for a build slot (1 of 1" in read_log(waiter_log), "host-limit wait line")
+    wait_for(
+        lambda: any(
+            line.startswith("oxide: waiting for a build slot (1 of 1 ")
+            for line in oxide_waits(read_log(waiter_log))
+        ),
+        "host-limit wait line",
+    )
     queued, queued_log = runner.start(app2, ["check"], "queued", limit)
     wait_for(
-        lambda: "waiting for earlier oxide commands (position 2)" in read_log(queued_log),
+        lambda: "oxide: waiting for earlier oxide commands (position 2); Ctrl-C cancels"
+        in oxide_waits(read_log(queued_log)),
         "FIFO wait line",
     )
-    if read_log(waiter_log).count("waiting for") != 1:
+    if len(oxide_waits(read_log(waiter_log))) != 1:
         fail("waiter printed more than one waiting line")
     queued.send_signal(signal.SIGINT)
     expect(queued.wait(timeout=15), 130, "cancelled waiter", read_log(queued_log))
@@ -827,16 +1210,18 @@ def prove_clean_waits(runner: Runner, app: str) -> None:
     """Clean waits for an active command in its checkout, then removes the
     private outputs and drops only idle affinity."""
     pidfile = os.path.join(runner.parent, "hold-clean.pid")
+    detached = {record["id"] for record in runner.state()["records"] if record["checkout"] is None}
     holder, holder_log = runner.start(app, ["test"], "hold-clean", {"OXIDE_FIXTURE_HOLD": pidfile})
     wait_for(lambda: os.path.exists(pidfile), "test held during clean")
     cleaner, clean_log = runner.start(app, ["clean"], "clean-wait")
     wait_for(
-        lambda: "waiting for active oxide commands in this checkout" in read_log(clean_log),
+        lambda: "oxide: waiting for active oxide commands in this checkout; Ctrl-C cancels"
+        in oxide_waits(read_log(clean_log)),
         "clean wait line",
     )
     if cleaner.poll() is not None or not os.path.isdir(os.path.join(app, "target")):
         fail("clean ran while a command in its checkout was active")
-    if any(record["checkout"] is None for record in runner.state()["records"]):
+    if any(record["checkout"] is None and record["id"] not in detached for record in runner.state()["records"]):
         fail("clean detached affinity while a command was active")
     with open(pidfile.replace(".pid", ".release"), "w", encoding="utf-8"):
         pass
@@ -924,7 +1309,11 @@ def prove_recovery(runner: Runner, app: str) -> None:
     if runner.state().get("recoveries"):
         fail("a slot was recovered while Cargo's group survived")
     follower, follower_log = runner.start(app, ["build"], "follower")
-    wait_for(lambda: "waiting for another oxide command in this checkout" in read_log(follower_log), "follower wait")
+    wait_for(
+        lambda: "oxide: waiting for another oxide command in this checkout; Ctrl-C cancels"
+        in oxide_waits(read_log(follower_log)),
+        "follower wait",
+    )
     if follower.poll() is not None:
         fail("follower took a slot while Cargo's group survived")
     with open(pidfile.replace(".pid", ".release"), "w", encoding="utf-8"):
@@ -970,7 +1359,7 @@ def prove_group_gone(runner: Runner, app: str) -> None:
             fail(f"the setsid escapee did not leave Cargo's group alive: kill({escapee}, 0) {probe(os.kill, escapee)}")
         code, _, stderr = runner.run(app, ["build"])
         expect(code, 0, "build after a dead group", stderr)
-        if "waiting for" in stderr:
+        if oxide_waits(stderr):
             fail(f"build after a dead group waited: {stderr}")
         if f"after oxide pid {child.pid} died (Cargo group {group} empty)" not in stderr:
             fail(f"build after a dead group did not recover: {stderr}")
@@ -1027,8 +1416,12 @@ def main() -> int:
     global STARTED
     parent = os.path.join(scratch_root(), "oxide-cli")
     os.makedirs(parent, mode=0o700, exist_ok=False)
-    executables = build_binaries()
+    prove_wait_lines()
+    # The proof phase includes staging the product binaries, which uses the
+    # host Cargo home and this repository's cached dependencies.
     STARTED = time.monotonic()
+    executables = build_binaries()
+    print(f"oxide product staging: {time.monotonic() - STARTED:.0f} s (host Cargo home)")
     runner = Runner(executables["oxide"], executables["oxide-storage-lease"], parent)
     app = os.path.join(parent, "checkouts", "app")
     write_fixture(app)
@@ -1041,6 +1434,7 @@ def main() -> int:
     free = host_free_bytes(parent)
     if free < HOST_RESERVE_BYTES:
         fail(f"host free {free} is below the 20 GiB reserve")
+    commit_lock(runner, app)
     git(app, "init", "--quiet")
     git(app, "add", "-A")
     git(app, "commit", "--quiet", "-m", "fixture")
