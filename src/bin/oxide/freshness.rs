@@ -531,7 +531,7 @@ fn embeds_path(top: &Path, dir: &str, owned: &[String], budget: &mut u64) -> Res
         return Ok(true);
     }
     if let Some(manifest) = read_bounded(top, &join("Cargo.toml"), budget)? {
-        if declares_build(&String::from_utf8_lossy(&manifest)) {
+        if may_declare_build(&manifest) {
             return Ok(true);
         }
     }
@@ -548,14 +548,27 @@ fn embeds_path(top: &Path, dir: &str, owned: &[String], budget: &mut u64) -> Res
     Ok(false)
 }
 
-/// The manifest may name a build script outside `build.rs`: some `build` key,
-/// bare, quoted or dotted (`build`, `"build"`, `package.build`, an inline
-/// table), followed by `=`. Textual and conservative: a comment or string
-/// that looks like one also counts, which only refreshes more.
-fn declares_build(manifest: &str) -> bool {
-    let bytes = manifest.as_bytes();
+/// Whether the manifest may name a build script outside `build.rs`. This is
+/// a conservative boundary, not a TOML parser. A TOML key can spell `build`
+/// without containing that literal text only through a basic-string escape
+/// (`"b\u0075ild"`), and every escape needs a backslash. So the answer is
+/// "maybe" for a manifest that is not UTF-8, contains any backslash, or has a
+/// `build` key token (bare, `"build"`, `'build'`, dotted or inline) followed
+/// by `=`, `.` or `]`. Comments and string values that look like that also
+/// count; that only refreshes more files. Only "no" lets the package skip
+/// the path-change refresh.
+fn may_declare_build(manifest: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(manifest) else {
+        return true;
+    };
+    text.contains('\\') || has_build_key(text)
+}
+
+/// A literal `build` key token followed by `=`, `.` or `]`.
+fn has_build_key(text: &str) -> bool {
+    let bytes = text.as_bytes();
     let key_char = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_';
-    manifest.match_indices("build").any(|(start, _)| {
+    text.match_indices("build").any(|(start, _)| {
         let end = start + "build".len();
         // Opening quote, if any, must close right after the key.
         let quote = start
@@ -576,7 +589,7 @@ fn declares_build(manifest: &str) -> bool {
         }
         rest.iter()
             .find(|byte| !matches!(byte, b' ' | b'\t'))
-            .is_some_and(|&byte| byte == b'=')
+            .is_some_and(|byte| matches!(byte, b'=' | b'.' | b']'))
     })
 }
 
@@ -665,23 +678,47 @@ mod tests {
     }
 
     #[test]
-    fn manifest_build_key_is_detected() {
-        assert!(declares_build("[package]\nbuild = \"gen.rs\"\n"));
-        assert!(declares_build("  build=false"));
-        // Quoted, dotted and inline-table keys are valid TOML too.
-        assert!(declares_build("[package]\n\"build\" = \"codegen.rs\"\n"));
-        assert!(declares_build("[package]\n'build'\t= 'codegen.rs'\n"));
-        assert!(declares_build("package.build = \"codegen.rs\"\n"));
-        assert!(declares_build("package . \"build\" = \"codegen.rs\"\n"));
-        assert!(declares_build(
-            "package = { name = \"x\", build = \"gen.rs\" }\n"
-        ));
-        assert!(!declares_build(
-            "[build-dependencies]\nbuild-helper = \"1\"\nrebuild = 1\nname = \"build\"\n"
-        ));
-        assert!(!declares_build(
-            "[target.'cfg(unix)'.build-dependencies]\n\"buildx\" = 1\n"
-        ));
+    fn manifest_build_classification_is_conservative() {
+        let maybe = |text: &str| may_declare_build(text.as_bytes());
+        // Literal key forms.
+        for manifest in [
+            "[package]\nbuild = \"gen.rs\"\n",
+            "  build=false",
+            "[package]\n\"build\" = \"codegen.rs\"\n",
+            "[package]\n'build'\t= 'codegen.rs'\n",
+            "package.build = \"codegen.rs\"\n",
+            "package . \"build\" = \"codegen.rs\"\n",
+            "package = { name = \"x\", build = \"gen.rs\" }\n",
+            "[package.build]\n",
+        ] {
+            assert!(maybe(manifest), "{manifest:?}");
+        }
+        // Escaped basic-string keys never decode here: any backslash is a
+        // maybe, whatever it spells.
+        for manifest in [
+            "[package]\n\"b\\u0075ild\" = \"codegen.rs\"\n",
+            "[package]\n\"\\U00000062uild\" = \"codegen.rs\"\n",
+            "[package]\n\"b\\u0075\\u0069ld\" = \"codegen.rs\"\n",
+            "package.\"bu\\u0069ld\" = \"codegen.rs\"\n",
+            "package = { \"\\u0062\\u0075\\u0069\\u006c\\u0064\" = \"gen.rs\" }\n",
+            "description = \"C:\\\\path\"\n",
+        ] {
+            assert!(maybe(manifest), "{manifest:?}");
+        }
+        // Comments and values that look like a key over-refresh by design.
+        assert!(maybe("# build = \"old.rs\"\n"));
+        assert!(maybe("description = \"how to build = fast\"\n"));
+        // Non-UTF-8 is not decoded either.
+        assert!(may_declare_build(b"[package]\nname = \"\xff\"\n"));
+        // Provably no build key.
+        for manifest in [
+            "[package]\nname = \"x\"\n",
+            "[build-dependencies]\nbuild-helper = \"1\"\nrebuild = 1\nname = \"build\"\n",
+            "[target.'cfg(unix)'.build-dependencies]\n\"buildx\" = 1\n",
+            "[package]\nname = 'build'\n",
+        ] {
+            assert!(!maybe(manifest), "{manifest:?}");
+        }
     }
 
     #[test]

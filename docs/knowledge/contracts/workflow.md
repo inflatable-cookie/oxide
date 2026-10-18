@@ -150,10 +150,14 @@ slot has a recorded origin:
    it. Content stays untouched; only the checkout's own files change; Cargo
    fingerprints and the slot are never edited.
 3. On a checkout-path change, every repository package that can embed the
-   path gets the same treatment: one with `build.rs` or a manifest `build`
-   key in any TOML key form (bare, quoted, dotted or inline; matched
-   textually, so look-alikes in comments also count), or whose sources
-   mention `CARGO_MANIFEST_DIR`. A file belongs to the
+   path gets the same treatment: one with `build.rs`, one whose manifest may
+   declare a build script, or one whose sources mention `CARGO_MANIFEST_DIR`.
+   The manifest check is a conservative boundary, not a TOML parser. A key
+   can spell `build` without that literal text only through a basic-string
+   escape, and every escape needs a backslash. So a manifest counts if it is
+   not UTF-8, contains any backslash, or has a literal `build` key token
+   (bare, quoted, dotted or inline) followed by `=`, `.` or `]`. Comments and
+   values that look like that also count; that only refreshes more. A file belongs to the
    package with the deepest `Cargo.toml` above it. Registry, Git and
    outside-repository path dependencies keep their paths and stay warm. They
    are the bulk of the reuse benefit.
@@ -644,8 +648,9 @@ Rules:
 - **W-8 Freshness gate.** Implemented (see
   [Cross-checkout freshness](#cross-checkout-freshness)). The fixture proof
   covers two Git worktrees: the stale-mtime scenario rebuilds and the test sees
-  its own checkout's content; a `CARGO_MANIFEST_DIR` package rebuilds on a
-  path change; a path dependency outside the repository stays fresh; an
+  its own checkout's content; a `CARGO_MANIFEST_DIR` package and a package
+  whose build script is declared through an escaped key (`"b\u0075ild"`, no
+  `build.rs`, embedding its working directory) rebuild on a path change; a path dependency outside the repository stays fresh; an
   unchanged repeat rebuilds nothing; a clone lacking the slot's tree is
   refused and builds cold; an `oxide` killed inside the gate after taking
   the slot leaves the retry to recover the slot and run the gate again. Warm-path cost is one `git status` and

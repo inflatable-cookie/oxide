@@ -141,8 +141,8 @@ VIRTUAL = {
 # checkout's. `outside` is a path dependency outside the repository.
 GATED = {
     "Cargo.toml": """[workspace]
-members = [".", "embed"]
-default-members = [".", "embed"]
+members = [".", "embed", "codegen"]
+default-members = [".", "embed", "codegen"]
 
 [package]
 name = "marker"
@@ -182,6 +182,33 @@ mod tests {
 }
 """,
 }
+
+# `codegen` names its build script through an escaped TOML key (`build`
+# spelled with \u0075) and has no default build.rs. The script embeds its
+# working directory, the package root, without the literal
+# CARGO_MANIFEST_DIR; the test compares it with this checkout's.
+GATED["codegen/Cargo.toml"] = (
+    '[package]\nname = "codegen"\nversion = "0.1.0"\nedition = "2021"\n"b\\u0075ild" = "gen.rs"\n'
+)
+GATED["codegen/gen.rs"] = """fn main() {
+    let here = std::env::current_dir().expect("build script cwd");
+    println!("cargo:rustc-env=CODEGEN_DIR={}", here.display());
+}
+"""
+GATED["codegen/src/lib.rs"] = """pub fn dir() -> &'static str {
+    env!("CODEGEN_DIR")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn generated_path_is_this_checkouts() {
+        let compiled = std::fs::canonicalize(super::dir()).expect("compiled dir");
+        let here = std::fs::canonicalize(std::env::current_dir().expect("cwd")).expect("cwd");
+        assert_eq!(compiled, here);
+    }
+}
+"""
 
 OUTSIDE = {
     "Cargo.toml": '[package]\nname = "outside"\nversion = "0.1.0"\nedition = "2021"\n',
@@ -917,6 +944,10 @@ def prove_freshness(runner: Runner) -> None:
         fail(f"worktree B summary lacks the gate and its limit: {stderr[-800:]}")
     if units.get("embed:build") is not False or units.get("embed:test") is not False:
         fail(f"embed did not rebuild on the path change: {units}")
+    # The escaped custom build declaration is path-sensitive: its script reran
+    # and B's test saw B's path (the test passing proves the value).
+    if units.get("codegen:build") is not False or units.get("codegen:test") is not False:
+        fail(f"escaped custom build package did not rebuild on the path change: {units}")
     if units.get("outside:build") is not True:
         fail(f"outside path dependency did not stay fresh: {units}")
 
