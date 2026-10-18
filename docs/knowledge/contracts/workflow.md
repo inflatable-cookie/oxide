@@ -19,7 +19,8 @@ until this foundation works consistently.
 oxide <check|test|clippy|build|run> [--profile <name>] [cargo args] [-- program args]
 oxide <any other cargo command> [args]   # passed to Cargo, with storage where it builds
 oxide status                             # pool, slots, waits, stray Cargo output
-oxide setup                              # write the agent guidance block
+oxide init [cargo init args]             # make this a Cargo project if needed, then adopt Oxide
+oxide new <path> [cargo new args]        # cargo new, then adopt Oxide
 ```
 
 Commands fall into four classes:
@@ -28,11 +29,12 @@ Commands fall into four classes:
 | --- | --- | --- |
 | Modelled | `check`, `test`, `clippy`, `build`, `run` | Profile-aware, leased, strategy-selected (see [profiles](#profiles-and-strategies)). |
 | Building passthrough | Other built-ins that compile (`doc`, `bench`, `rustc`, `rustdoc`, `fix`) and every unknown or external subcommand (`nextest`, `llvm-cov`, `miri`) | Passed to Cargo unchanged, under a lease with storage and profile definitions injected. Unknown commands are treated as building, which is the conservative choice. |
-| Plain passthrough | Non-building built-ins (`fmt`, `tree`, `metadata`, `add`, `remove`, `update`, `new`, `init`, `info`, `search`, `install`, `publish`, `login`, `vendor`, `fetch`, `generate-lockfile`, `locate-project`, `pkgid`, `version`, `help`) | Run as plain Cargo; no lease. |
-| Oxide-owned | `status`, `setup`, `clean` | Oxide semantics. `clean` removes the checkout's private outputs and slot affinity and never deletes a shared slot: plain `cargo clean` would also delete the injected build directory. |
+| Plain passthrough | Non-building built-ins (`fmt`, `tree`, `metadata`, `add`, `remove`, `update`, `info`, `search`, `install`, `publish`, `login`, `vendor`, `fetch`, `generate-lockfile`, `locate-project`, `pkgid`, `version`, `help`) | Run as plain Cargo; no lease. |
+| Extended built-ins | `init`, `new`, `clean` | Cargo's command plus Oxide's step (see [adoption](#adoption-oxide-init)). `clean` removes the checkout's private outputs and slot affinity and never deletes a shared slot: a 2026-10-18 probe showed plain `cargo clean` also deletes the injected build directory. |
+| Oxide-owned | `status` | Oxide semantics. |
 
-- Oxide's own verbs must never shadow a Cargo built-in. That is why
-  `setup` replaces the earlier `init` proposal (`cargo init` exists).
+- A built-in Oxide extends keeps Cargo's meaning and adds to it. Purely
+  Oxide verbs never reuse a Cargo built-in name.
 - Arguments pass through unchanged. `--release` means `--profile release`.
   Oxide owns storage placement, so `--target-dir`, and `--config` keys that set
   `build.build-dir` or `build.target-dir`, are refused with an explanation.
@@ -240,7 +242,7 @@ must not become required infrastructure for the core experience
 1. **Oxide agent skill.** The rule is "`oxide` wherever you would write
    `cargo`". The skill also covers profiles, the reported strategy, waits and
    refusals, and `oxide status`.
-2. **Project guidance block.** `oxide setup` writes one marked section in the
+2. **Project guidance block.** `oxide init` writes one marked section in the
    project's `AGENTS.md`, a few lines long. The block is the opt-in marker; no
    config file exists.
 3. **Effigy selectors** in Effigy projects call `oxide …`. Effigy stays
@@ -250,6 +252,27 @@ Plain Cargo stays harmless: it builds privately, as today. `oxide status` makes
 drift visible. rust-analyzer keeps its own private check target unless the user
 routes `check.overrideCommand` to `oxide check --message-format=json`; editor
 routing is outside the foundation.
+
+## Adoption: `oxide init`
+
+`oxide init` is a superset of `cargo init`, so one command takes a directory
+to an Oxide-adopted Rust project:
+
+1. If the target directory has no `Cargo.toml`, run `cargo init` with the
+   supplied arguments (`--lib`, `--name`, `--edition`, `--vcs`). Inside an
+   existing workspace, Cargo adds the new member as it normally does.
+2. If a `Cargo.toml` already exists, skip Cargo. Cargo-only arguments then
+   refuse with an explanation instead of being silently ignored.
+3. Resolve the workspace root and write or refresh the marked Oxide block in
+   the root `AGENTS.md`, creating the file if absent. Re-running is
+   idempotent and never touches text outside the markers.
+4. Print readiness: resolved toolchain, inferred project identity, pool state,
+   and any Effigy Rust selectors that still call plain `cargo`. Oxide reports
+   those; it does not edit them.
+
+`oxide new <path>` is `cargo new` followed by steps 3 and 4. Neither command
+creates an Oxide config file or changes `Cargo.toml` beyond what Cargo itself
+writes.
 
 ## Relationship to existing work
 
@@ -284,7 +307,7 @@ The local executor on macOS, with: the command classes above; the three
 profiles and the build fallback for every strategy; inferred identity;
 per-command leasing with waits and crash recovery; the freshness gate (or
 checkout affinity until it qualifies); automatic pool creation; `oxide status`
-with stray detection; the skill and `oxide setup`. It is working consistently
+with stray detection; the skill and `oxide init` / `oxide new`. It is working consistently
 when a second worktree's first `oxide test` on a real project reuses dependency
 units. Tests must run, the stale-mtime scenario must rebuild, the pool must
 stay under its ceiling, and normal use must leave no plain-Cargo intermediates.
