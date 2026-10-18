@@ -1,12 +1,12 @@
 use super::backing::CapacitySample;
 use super::pool::{
-    capacity_status_injected, create_injected, lease_injected, mark_evicting_for_test,
-    recover_injected, release_injected, status_injected,
+    capacity_status_injected, create_injected, evict_idle_slot_injected, lease_injected,
+    mark_evicting_for_test, recover_injected, release_injected, status_injected,
 };
 use super::{
     init_pool, render_capacity_status_human, render_capacity_status_json, render_status_json,
     AccountingCoverage, ByteObservation, LeaseError, LeaseRequest, ObservationUnknownReason,
-    Profile, SlotOccupancy,
+    Profile, SlotOccupancy, MANAGED_NAME,
 };
 use std::fs::{self, File};
 use std::io::Write;
@@ -1055,4 +1055,38 @@ fn full_debug_is_a_distinct_profile() {
     debug.profile = Profile::FullDebug;
     let debug = lease_injected(debug).expect("debug");
     assert_ne!(dev.slot_id, debug.slot_id);
+}
+
+#[test]
+fn managed_eviction_retires_only_idle_slots_and_tolerates_managed_control() {
+    let fx = Fixture::new("managed-evict");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    let managed = pool.join(MANAGED_NAME);
+    fs::create_dir(&managed).expect("managed control");
+    fs::set_permissions(&managed, fs::Permissions::from_mode(0o700)).expect("private control");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let granted = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
+    let slot_path = pool.join("payload").join("slots").join(&granted.slot_id);
+    assert!(matches!(
+        evict_idle_slot_injected(&pool, &granted.slot_id),
+        Err(LeaseError::Busy)
+    ));
+    assert!(matches!(
+        evict_idle_slot_injected(&pool, "0"),
+        Err(LeaseError::InvalidInput(_))
+    ));
+    release_injected(&pool, &granted.lease_id).expect("release");
+    evict_idle_slot_injected(&pool, &granted.slot_id).expect("evict idle");
+    assert!(!slot_path.exists());
+    assert!(status_injected(&pool).expect("status").slots.is_empty());
+    assert!(managed.is_dir());
+
+    fs::remove_dir(&managed).expect("remove control");
+    symlink(&project, &managed).expect("managed symlink");
+    assert!(matches!(
+        status_injected(&pool),
+        Err(LeaseError::UnsafePath(_))
+    ));
 }
