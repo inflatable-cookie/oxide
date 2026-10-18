@@ -1,0 +1,1 @@
+start_mono_ns=7626375 start_wall_ns=1792356980090771000 root=/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx

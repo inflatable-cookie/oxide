@@ -1,0 +1,6 @@
+pool: /private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool
+  cap 4096 MiB, 197 of 3895 MiB used, slot accounting Complete
+  slots 1, waiting commands 0
+  slot 2 idle quick /private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A 189784 KiB
+  recovered slot 1 13s ago: oxide pid 80373 died (Cargo group 80444 empty), /private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A
+stray Cargo output: none in /private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/target

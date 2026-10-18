@@ -1,0 +1,375 @@
+{
+ "artifacts": [
+  {
+   "fresh": true,
+   "kind": [
+    "lib"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#version_check@0.9.5",
+   "target": "version_check",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "custom-build"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#generic-array@0.14.7",
+   "target": "build-script-build",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "custom-build"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#proc-macro2@1.0.107",
+   "target": "build-script-build",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "custom-build"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#quote@1.0.47",
+   "target": "build-script-build",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "lib"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#unicode-ident@1.0.26",
+   "target": "unicode_ident",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "lib"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#typenum@1.20.1",
+   "target": "typenum",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "custom-build"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#libc@0.2.190",
+   "target": "build-script-build",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "custom-build"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#serde_core@1.0.229",
+   "target": "build-script-build",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "custom-build"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#zmij@1.0.23",
+   "target": "build-script-build",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "custom-build"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.229",
+   "target": "build-script-build",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "custom-build"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#serde_json@1.0.151",
+   "target": "build-script-build",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "lib"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#cfg-if@1.0.5",
+   "target": "cfg_if",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "lib"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#itoa@1.0.18",
+   "target": "itoa",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "lib"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#memchr@2.8.3",
+   "target": "memchr",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "lib"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#generic-array@0.14.7",
+   "target": "generic_array",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "lib"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#proc-macro2@1.0.107",
+   "target": "proc_macro2",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "lib"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#serde_core@1.0.229",
+   "target": "serde_core",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "lib"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#libc@0.2.190",
+   "target": "libc",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "lib"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#zmij@1.0.23",
+   "target": "zmij",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "lib"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#quote@1.0.47",
+   "target": "quote",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "lib"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#block-buffer@0.10.4",
+   "target": "block_buffer",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "lib"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#crypto-common@0.1.7",
+   "target": "crypto_common",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "lib"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#cpufeatures@0.2.17",
+   "target": "cpufeatures",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "lib"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#serde_json@1.0.151",
+   "target": "serde_json",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "lib"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#syn@3.0.7",
+   "target": "syn",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "lib"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#digest@0.10.7",
+   "target": "digest",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "proc-macro"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#serde_derive@1.0.229",
+   "target": "serde_derive",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "lib"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#sha2@0.10.9",
+   "target": "sha2",
+   "test": false
+  },
+  {
+   "fresh": true,
+   "kind": [
+    "lib"
+   ],
+   "package": "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.229",
+   "target": "serde",
+   "test": false
+  },
+  {
+   "fresh": false,
+   "kind": [
+    "lib"
+   ],
+   "package": "path+file:///private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A#oxide-storage@0.1.0",
+   "target": "oxide_storage",
+   "test": false
+  },
+  {
+   "fresh": false,
+   "kind": [
+    "bin"
+   ],
+   "package": "path+file:///private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A#oxide-storage@0.1.0",
+   "target": "oxide-storage-inventory",
+   "test": true
+  },
+  {
+   "fresh": false,
+   "kind": [
+    "bin"
+   ],
+   "package": "path+file:///private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A#oxide-storage@0.1.0",
+   "target": "oxide-storage-lease",
+   "test": true
+  },
+  {
+   "fresh": false,
+   "kind": [
+    "bin"
+   ],
+   "package": "path+file:///private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A#oxide-storage@0.1.0",
+   "target": "oxide-storage-lease",
+   "test": false
+  },
+  {
+   "fresh": false,
+   "kind": [
+    "test"
+   ],
+   "package": "path+file:///private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A#oxide-storage@0.1.0",
+   "target": "foundation_marker",
+   "test": true
+  },
+  {
+   "fresh": false,
+   "kind": [
+    "bin"
+   ],
+   "package": "path+file:///private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A#oxide-storage@0.1.0",
+   "target": "oxide-storage-inventory",
+   "test": false
+  },
+  {
+   "fresh": false,
+   "kind": [
+    "test"
+   ],
+   "package": "path+file:///private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A#oxide-storage@0.1.0",
+   "target": "profile_backtrace",
+   "test": true
+  },
+  {
+   "fresh": false,
+   "kind": [
+    "lib"
+   ],
+   "package": "path+file:///private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A#oxide-storage@0.1.0",
+   "target": "oxide_storage",
+   "test": true
+  },
+  {
+   "fresh": false,
+   "kind": [
+    "bin"
+   ],
+   "package": "path+file:///private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A#oxide-storage@0.1.0",
+   "target": "oxide",
+   "test": true
+  },
+  {
+   "fresh": false,
+   "kind": [
+    "bin"
+   ],
+   "package": "path+file:///private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A#oxide-storage@0.1.0",
+   "target": "oxide",
+   "test": false
+  }
+ ],
+ "exit": 0,
+ "local_fresh": 0,
+ "local_rebuilt": 10,
+ "markers": [
+  "FOUNDATION-MARKER compiled_dir=/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A runtime_dir=/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A cwd=/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A compiled=\"edited in A\" runtime=\"edited in A\""
+ ],
+ "oxide_lines": [
+  "oxide: quick profile, build+execute strategy, slot 1 warm, 6.6s, pool 328 of 3895 MiB used, freshness gate refreshed 148 file(s) from another checkout's build (1 package(s) for the path change); inputs outside Git or ignored by it are not checked"
+ ],
+ "registry_fresh": 29,
+ "registry_rebuilt": 0,
+ "test_results": [
+  "test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.95s",
+  "test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+  "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+  "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+  "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+  "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+  "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+ ]
+}
