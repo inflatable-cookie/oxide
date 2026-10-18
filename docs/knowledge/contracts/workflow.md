@@ -698,7 +698,12 @@ Rules:
   sampled minimum, overshoot and latency it observed. Readings are
   injected: this shows the stop and closure semantics and the overshoot of
   that one writer at the sampling interval, not margin adequacy for real
-  write rates. Rust tests cover the real `statfs` sample, TERM-then-KILL on
+  write rates. The authoring run at the oxide#077 head observed: triggering
+  sample 10 MiB below the trigger, sampled minimum 40 MiB below it (the
+  writer reached its 48 MiB bound during the 2 s grace), KILL after 2017 ms,
+  closure 2042 ms after the triggering sample; the held case confirmed no
+  closure after KILL plus 10 s and was recovered once its member was
+  reaped. Rust tests cover the real `statfs` sample, TERM-then-KILL on
   a group that ignores TERM, a failed sample, and budget admission and
   refusals in the library. `effigy rust:compile-linux` checks that the crate
   compiles for the installed `x86_64-unknown-linux-gnu` target; no Linux
