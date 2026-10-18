@@ -276,6 +276,13 @@ hold is released only after actual Sol acceptance; no model substitution or old
 Opus verdict supplies automatic gate credit. Other scopes, bounds and
 dependencies are unchanged.
 
+Tom approved three bounded probes on 2026-10-18 with "Let's do all three":
+- **A.** A stale-debug-object hygiene measurement of the `quick` recipe: unpacked versus packed split debug info versus debug off.
+- **B.** Whether a Cargo build directory stays correct after an APFS copy-on-write clone to a new path.
+- **C.** Whether final outputs on the pool's volume are hard-linked by Cargo instead of copied.
+
+They are research probes on disposable fixtures and Oxide's own repository. They grant no recipe, default, consumer or host change, and no adoption.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
