@@ -109,6 +109,25 @@ resolves prerequisite output removal at closeout without requiring a published
 artifact, installation, another build or another session. Other approved caps,
 dependencies and evidence-only review remain unchanged.
 
+The appointed product architect corrected the focused fixture allowance on
+2026-10-18 for implementation briefs not yet dispatched. Each author side and
+independent reviewer side may run the focused `oxide` proof up to three times
+sequentially, cumulative across replacement threads. Each run retains its fresh
+128 MiB pool, original 300-second phase including setup and 512 MiB scratch
+ceiling. Positively detach and remove that run's pool before another starts;
+never keep two of those pools attached at once. A fourth run or a pool left
+attached is outside the allowance. Uncertain writers still require preserving
+resources and reporting the unsettled result, not forced cleanup to enable a
+rerun. Original total author/reviewer work budgets do not reset.
+
+This is bounded corrective fixture validation after a failing case is fixed,
+not authority to repeat successful unrelated checks, inflate timeouts or rerun
+until green. Already dispatched briefs retain their issued limits. The separate
+foundation qualification and Cranelift measurement remain single sessions under
+their own original invocation, time and resource caps; the three-run fixture
+allowance does not apply to them. The earlier five-pool author overrun remains
+unauthorized historical use, not retroactively permitted by this correction.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
