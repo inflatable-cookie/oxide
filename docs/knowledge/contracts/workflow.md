@@ -199,8 +199,9 @@ affine build instead: only that checkout reuses it, under Cargo's own
 checks, and it is never shared.
 
 This revives the qualification work's rejected "source touching" fix as a
-deliberate product mechanism. Real-project qualification (Q2–Q4 below) is
-still required before the benefit is claimed.
+deliberate product mechanism. Q2–Q4 of the
+[foundation qualification](#qualification-result) held on Oxide's own
+repository; a benefit claim still needs a heavy project.
 
 Debug paths are a separate, known limit. Reused workspace units carry the
 compiling checkout's absolute paths in debug info. That is tolerable for
@@ -428,15 +429,15 @@ units. Tests must run, the stale-mtime scenario must rebuild, the pool must
 stay under its ceiling, and normal use must leave no plain-Cargo intermediates.
 Re-evaluate interception and run strategies after that.
 
-## Foundation qualification (proposed)
+## Foundation qualification
 
 Authorized as a bounded follow-up under Tom's
-[2026-10-18 ruling](../vision.md#product-workflow-direction), not executed or
-qualified yet. This is the gated real-project step after the foundation tasks
-merge and close out. The checked Queue brief owns the final fixed resource,
-invocation and deadline limits and requires confirming scenarios against the
-shipped API before effects. Its job is to prove correctness and lifecycle on
-Oxide's own workspace. A benefit claim is not part of it.
+[2026-10-18 ruling](../vision.md#product-workflow-direction) and run once on
+2026-10-18 (oxide#074). **Verdict: pass**; see [Result](#qualification-result).
+It was the gated real-project step after the foundation tasks merged and closed
+out. The checked Queue brief owned the fixed resource, invocation and deadline
+limits. Its job was to prove correctness and lifecycle on Oxide's own
+workspace. A benefit claim is not part of it.
 
 **Subject.** Oxide's own repository at a pinned post-foundation commit, so no
 consumer coordination is needed. It is a real Cargo workspace with registry
@@ -476,10 +477,12 @@ Raw output is preserved. Readings are observations, not speed or SSD claims.
 
 **Authorized bounds.** At most nine `oxide` invocations plus the single
 plain `cargo check` in Q6, and one counted staging build:
-`cargo build --release --locked --offline --bin oxide` (or a focused Effigy
-build-only equivalent). Stage at the pinned commit in a separate pristine
-scratch checkout, with target output outside the dedicated pool and A/B;
-record the commit, binary path and SHA-256. A failed setup build is a no-go.
+`cargo build --release --locked --offline --bin oxide --bin oxide-storage-lease`.
+Stage at the pinned commit in a separate pristine scratch checkout, with target
+output outside the dedicated pool and A/B; record the commit, binary paths and
+SHA-256s. One counted `oxide-storage-lease --pool <pool> init --cap-bytes
+4294967296 --image-bytes 4294967296` before Q1 creates the pool, because the
+front door always creates 24 GiB. A failed setup build or init is a no-go.
 The one fresh 4 GiB APFS pool, original 30-minute clock including all setup,
 raw 20 GiB host reserve, and 20-minute evidence-only review stay unchanged.
 No second build/session, consumer, default pool, installation or host
@@ -489,12 +492,42 @@ configuration change.
 keeps slots checkout-affine. A failure in another scenario is reported with its
 evidence and does not reset bounds.
 
+### Qualification result
+
+Run 2026-10-18 at main `dc84d039` under Effigy heavy admission. Raw evidence:
+[foundation-qualification-20261018](../evidence/foundation-qualification-20261018/README.md).
+- Every count was used exactly once up to its cap, with no failures or retries:
+  one setup build, one lease init, nine `oxide` calls, one plain check.
+- Time: 356.8 s of the 30-minute clock, 297.3 s of it waiting for admission.
+- Pool: 4 GiB. Peak payload 354 MiB; backing file 501 MiB at the end.
+- Host free space stayed about 716 GiB.
+
+| # | Verdict | Observed |
+| --- | --- | --- |
+| Q1 | Pass | Cold: 10 local and 29 registry units built; 81 tests passed; marker saw A. |
+| Q2 | Pass | Slot 1 warm. All 29 registry units fresh; the gate refreshed 149 files and all 10 local units rebuilt. B's marker matched compiled and runtime: B's path and content. |
+| Q3 | Pass | B's unchanged marker was older than A's edit and the slot's build. B rebuilt all 10 local units, and its marker saw `original marker`, not `edited in A`. No stale success. |
+| Q4 | Pass | All 39 units fresh; 81 tests passed. |
+| Q5 | Pass | `oxide` was SIGKILLed after Cargo started; Cargo's group survived and finished. The retry waited, logged the recovery once the group was empty, evicted the untrusted slot, built cold in slot 2 and passed. |
+| Q6 | Pass | Plain `cargo check` wrote `B/target`. `oxide status` reported `deps/` or `incremental/` with 72 files and 41 MiB. |
+| Q7 | Pass | 197 of 3895 MiB used. One idle slot, 0 waiting, accounting complete, recovery logged. Afterwards the pool was detached without force and removed. |
+
+Limits:
+- Every slot move in this session was also a checkout-path change, so the
+  gate refreshed whole packages. The content-only refresh without a path
+  change is covered only by the fixture proof.
+- The subject has a small graph, so the run says nothing about benefit on a
+  heavy project.
+- The front door can only create 24 GiB pools, so a small pool still needs
+  `oxide-storage-lease init`.
+
 ## Implemented foundation core
 
 The unpublished `oxide` binary (`src/bin/oxide/`, `publish = false`) runs the
 local executor on macOS. Its covering proof is `effigy rust:oxide-cli`: tiny
-offline fixture crates on one fresh 128 MiB APFS pool. It is not installed and
-has run against no real project.
+offline fixture crates on one fresh 128 MiB APFS pool. It is not installed. Its
+one real-project run is the [foundation qualification](#qualification-result)
+on Oxide's own repository.
 
 - **Classes.** As in [Shape](#shape). Plain passthrough replaces Oxide with
   Cargo, so output and exit codes are Cargo's. Unknown commands are building
@@ -643,7 +676,8 @@ Rules:
   dependency debug-off. Recommendation: none until a real project needs it.
 - **W-4 Crash recovery.** Ruled and implemented for Oxide's own commands
   ([Crash recovery](#crash-recovery)); fixture-proven, including the
-  `setsid` escape limit. Real-project qualification (Q5) remains.
+  `setsid` escape limit. Held on Oxide's own repository in the
+  [foundation qualification](#qualification-result) (Q5).
 - **W-5 Retirement execution.** Done in oxide#070; see
   [retirements](../retired.toml).
 - **W-6 Linux backend.** Proposed in [platform backends](#platform-backends-proposed):
@@ -677,4 +711,6 @@ Rules:
   matches only Oxide's exact wait lines (self-checked before the pool exists)
   and runs every fixture Cargo call with a private scratch `CARGO_HOME`;
   product staging alone uses the host Cargo home, inside the 300 s phase.
-  Real-project qualification (Q2–Q4) remains.
+  Q2–Q4 held on Oxide's own repository in the
+  [foundation qualification](#qualification-result); a heavy-project benefit
+  reading remains a separate stage.

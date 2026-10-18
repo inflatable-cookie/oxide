@@ -94,7 +94,7 @@ still apply, with only the explicit own-command recovery ruling above supersedin
 the older abandonment rule. Earlier experimental results remain evidence; the
 failed comparison and unqualified readings are not upgraded by this direction.
 
-Tom approved two follow-ups on 2026-10-18 with the bundled reply "1. Approve 2. Approve" (Queue decisions `7be5f39c-a51f-423e-b417-30377242220f` v2 and `87779d3b-f406-4fe8-863e-bb62bcb05e2a` v2, relayed by the appointed product architect). First, the [foundation qualification](contracts/workflow.md#foundation-qualification-proposed) on Oxide's own repository, to run only after the front-door, crash-recovery and freshness-gate tasks merge, with bounds confirmed against what the foundation ships. Second, a bounded quick-run measurement of Cranelift for workspace crates after the foundation, including installation of the nightly `rustc-codegen-cranelift-preview` component on the existing nightly toolchain. Neither grants consumer changes, default-pool creation, other host changes or adoption of a strategy; adoption follows the measured result.
+Tom approved two follow-ups on 2026-10-18 with the bundled reply "1. Approve 2. Approve" (Queue decisions `7be5f39c-a51f-423e-b417-30377242220f` v2 and `87779d3b-f406-4fe8-863e-bb62bcb05e2a` v2, relayed by the appointed product architect). First, the [foundation qualification](contracts/workflow.md#foundation-qualification) on Oxide's own repository, to run only after the front-door, crash-recovery and freshness-gate tasks merge, with bounds confirmed against what the foundation ships. Second, a bounded quick-run measurement of Cranelift for workspace crates after the foundation, including installation of the nightly `rustc-codegen-cranelift-preview` component on the existing nightly toolchain. Neither grants consumer changes, default-pool creation, other host changes or adoption of a strategy; adoption follows the measured result.
 
 The appointed product architect clarified foundation qualification staging on
 2026-10-18: one `cargo build --release --locked --offline --bin oxide` (or
@@ -108,6 +108,14 @@ a failed setup build is a concrete no-go, not permission to restart. This
 resolves prerequisite output removal at closeout without requiring a published
 artifact, installation, another build or another session. Other approved caps,
 dependencies and evidence-only review remain unchanged.
+
+Operations corrected that staging on 2026-10-18 under Tom's standing
+routine-correction authority (`e75d12a9`), without a new operator answer. The
+front door always creates a 24 GiB pool. So the same single setup build also
+stages `oxide-storage-lease` (`--bin oxide --bin oxide-storage-lease`), and
+one counted `oxide-storage-lease init` creates the approved 4 GiB pool before
+Q1. All other caps stayed the same. The session ran once and
+[passed](contracts/workflow.md#qualification-result).
 
 The appointed product architect corrected the focused fixture allowance on
 2026-10-18 for implementation briefs not yet dispatched. Each author side and

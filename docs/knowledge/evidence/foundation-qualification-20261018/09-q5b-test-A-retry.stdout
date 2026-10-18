@@ -1,0 +1,284 @@
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#cfg-if@1.0.5","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.5/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"cfg_if","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.5/src/lib.rs","edition":"2018","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libcfg_if-d63f21e84d5b7dbb.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libcfg_if-d63f21e84d5b7dbb.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#unicode-ident@1.0.26","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.26/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"unicode_ident","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.26/src/lib.rs","edition":"2021","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libunicode_ident-84f85fbd2dcf77d9.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libunicode_ident-84f85fbd2dcf77d9.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#itoa@1.0.18","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/itoa-1.0.18/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"itoa","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/itoa-1.0.18/src/lib.rs","edition":"2021","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libitoa-5d32fcc56ca00a70.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libitoa-5d32fcc56ca00a70.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#serde_json@1.0.151","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/Cargo.toml","target":{"kind":["custom-build"],"crate_types":["bin"],"name":"build-script-build","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/build.rs","edition":"2021","doc":false,"doctest":false,"test":false},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":["default","std"],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/build/serde_json-a61a122092c34638/build-script-build"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#version_check@0.9.5","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/version_check-0.9.5/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"version_check","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/version_check-0.9.5/src/lib.rs","edition":"2015","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libversion_check-188de0cca3df455f.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libversion_check-188de0cca3df455f.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#quote@1.0.47","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.47/Cargo.toml","target":{"kind":["custom-build"],"crate_types":["bin"],"name":"build-script-build","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.47/build.rs","edition":"2021","doc":false,"doctest":false,"test":false},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":["proc-macro"],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/build/quote-cf52e05274c3e1ef/build-script-build"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#zmij@1.0.23","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23/Cargo.toml","target":{"kind":["custom-build"],"crate_types":["bin"],"name":"build-script-build","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23/build.rs","edition":"2021","doc":false,"doctest":false,"test":false},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/build/zmij-fe6fdbeb265cfe25/build-script-build"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#serde@1.0.229","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/Cargo.toml","target":{"kind":["custom-build"],"crate_types":["bin"],"name":"build-script-build","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/build.rs","edition":"2021","doc":false,"doctest":false,"test":false},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":["default","derive","serde_derive","std"],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/build/serde-1cc8b9bce0c2ef93/build-script-build"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#serde_core@1.0.229","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229/Cargo.toml","target":{"kind":["custom-build"],"crate_types":["bin"],"name":"build-script-build","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229/build.rs","edition":"2021","doc":false,"doctest":false,"test":false},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":["result","std"],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/build/serde_core-e857ddc99d146c18/build-script-build"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#proc-macro2@1.0.107","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107/Cargo.toml","target":{"kind":["custom-build"],"crate_types":["bin"],"name":"build-script-build","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107/build.rs","edition":"2021","doc":false,"doctest":false,"test":false},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":["proc-macro"],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/build/proc-macro2-8c22403066ea8fb7/build-script-build"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#libc@0.2.190","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.190/Cargo.toml","target":{"kind":["custom-build"],"crate_types":["bin"],"name":"build-script-build","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.190/build.rs","edition":"2021","doc":false,"doctest":false,"test":false},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":["default","std"],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/build/libc-c1963ecba694eb99/build-script-build"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#generic-array@0.14.7","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7/Cargo.toml","target":{"kind":["custom-build"],"crate_types":["bin"],"name":"build-script-build","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7/build.rs","edition":"2015","doc":false,"doctest":false,"test":false},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":["more_lengths"],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/build/generic-array-84d93dc2463ba7f0/build-script-build"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#memchr@2.8.3","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.8.3/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"memchr","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/memchr-2.8.3/src/lib.rs","edition":"2021","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":["alloc","std"],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libmemchr-de038eb13db74a04.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libmemchr-de038eb13db74a04.rmeta"],"executable":null,"fresh":false}
+{"reason":"build-script-executed","package_id":"registry+https://github.com/rust-lang/crates.io-index#serde_json@1.0.151","linked_libs":[],"linked_paths":[],"cfgs":["fast_arithmetic=\"64\""],"env":[],"out_dir":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/build/serde_json-7499d28bf2f984c6/out"}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#typenum@1.20.1","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/typenum-1.20.1/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"typenum","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/typenum-1.20.1/src/lib.rs","edition":"2018","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libtypenum-a7841238aad5d726.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libtypenum-a7841238aad5d726.rmeta"],"executable":null,"fresh":false}
+{"reason":"build-script-executed","package_id":"registry+https://github.com/rust-lang/crates.io-index#quote@1.0.47","linked_libs":[],"linked_paths":[],"cfgs":[],"env":[],"out_dir":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/build/quote-dc2f1ea78bdd636e/out"}
+{"reason":"build-script-executed","package_id":"registry+https://github.com/rust-lang/crates.io-index#zmij@1.0.23","linked_libs":[],"linked_paths":[],"cfgs":[],"env":[],"out_dir":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/build/zmij-66165fad2d26b545/out"}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#zmij@1.0.23","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"zmij","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23/src/lib.rs","edition":"2021","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libzmij-43a4217360118dfb.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libzmij-43a4217360118dfb.rmeta"],"executable":null,"fresh":false}
+{"reason":"build-script-executed","package_id":"registry+https://github.com/rust-lang/crates.io-index#serde@1.0.229","linked_libs":[],"linked_paths":[],"cfgs":["if_docsrs_then_no_serde_core"],"env":[],"out_dir":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/build/serde-aef8b4aa63a0b7bc/out"}
+{"reason":"build-script-executed","package_id":"registry+https://github.com/rust-lang/crates.io-index#serde_core@1.0.229","linked_libs":[],"linked_paths":[],"cfgs":[],"env":[],"out_dir":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/build/serde_core-b0547e1225cf3274/out"}
+{"reason":"build-script-executed","package_id":"registry+https://github.com/rust-lang/crates.io-index#proc-macro2@1.0.107","linked_libs":[],"linked_paths":[],"cfgs":["wrap_proc_macro","proc_macro_span_location","proc_macro_span_file"],"env":[],"out_dir":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/build/proc-macro2-ae941593e3aa4c45/out"}
+{"reason":"build-script-executed","package_id":"registry+https://github.com/rust-lang/crates.io-index#libc@0.2.190","linked_libs":[],"linked_paths":[],"cfgs":[],"env":[],"out_dir":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/build/libc-83cc74e3a43edecb/out"}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#proc-macro2@1.0.107","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"proc_macro2","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107/src/lib.rs","edition":"2021","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":["proc-macro"],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libproc_macro2-30d67efad41da2a6.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libproc_macro2-30d67efad41da2a6.rmeta"],"executable":null,"fresh":false}
+{"reason":"build-script-executed","package_id":"registry+https://github.com/rust-lang/crates.io-index#generic-array@0.14.7","linked_libs":[],"linked_paths":[],"cfgs":["relaxed_coherence"],"env":[],"out_dir":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/build/generic-array-b4cddd1ee37e8467/out"}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#quote@1.0.47","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.47/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"quote","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quote-1.0.47/src/lib.rs","edition":"2021","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":["proc-macro"],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libquote-d36962a3b5244b98.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libquote-d36962a3b5244b98.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#libc@0.2.190","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.190/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"libc","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libc-0.2.190/src/lib.rs","edition":"2021","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":["default","std"],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/liblibc-73d1c43ed140e9cc.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/liblibc-73d1c43ed140e9cc.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#cpufeatures@0.2.17","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cpufeatures-0.2.17/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"cpufeatures","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cpufeatures-0.2.17/src/lib.rs","edition":"2018","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libcpufeatures-2b19d2100232abd9.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libcpufeatures-2b19d2100232abd9.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#generic-array@0.14.7","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"generic_array","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7/src/lib.rs","edition":"2015","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":["more_lengths"],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libgeneric_array-fec1a7b2978e84ae.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libgeneric_array-fec1a7b2978e84ae.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#crypto-common@0.1.7","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crypto-common-0.1.7/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"crypto_common","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/crypto-common-0.1.7/src/lib.rs","edition":"2018","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":["std"],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libcrypto_common-92312289f20cabb0.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libcrypto_common-92312289f20cabb0.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#block-buffer@0.10.4","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/block-buffer-0.10.4/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"block_buffer","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/block-buffer-0.10.4/src/lib.rs","edition":"2018","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libblock_buffer-8b81efb12f8976d9.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libblock_buffer-8b81efb12f8976d9.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#digest@0.10.7","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/digest-0.10.7/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"digest","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/digest-0.10.7/src/lib.rs","edition":"2018","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":["alloc","block-buffer","core-api","default","std"],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libdigest-1f50792a71c6644f.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libdigest-1f50792a71c6644f.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#sha2@0.10.9","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sha2-0.10.9/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"sha2","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/sha2-0.10.9/src/lib.rs","edition":"2018","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":["default","std"],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libsha2-ce2128fff905d1cf.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libsha2-ce2128fff905d1cf.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#serde_core@1.0.229","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"serde_core","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229/src/lib.rs","edition":"2021","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":["result","std"],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libserde_core-fd356e6e84788fbd.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libserde_core-fd356e6e84788fbd.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#syn@3.0.7","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/syn-3.0.7/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"syn","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/syn-3.0.7/src/lib.rs","edition":"2021","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":["clone-impls","derive","parsing","printing","proc-macro"],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libsyn-6b92d109deaf9c00.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libsyn-6b92d109deaf9c00.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#serde_json@1.0.151","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"serde_json","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/src/lib.rs","edition":"2021","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":["default","std"],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libserde_json-5492dc7b7e163fbc.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libserde_json-5492dc7b7e163fbc.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#serde_derive@1.0.229","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_derive-1.0.229/Cargo.toml","target":{"kind":["proc-macro"],"crate_types":["proc-macro"],"name":"serde_derive","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_derive-1.0.229/src/lib.rs","edition":"2021","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":["default"],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libserde_derive-457fd6d01567d226.dylib"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#serde@1.0.229","manifest_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"serde","src_path":"/Users/tom/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs","edition":"2021","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":["default","derive","serde_derive","std"],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libserde-c1a441160a14721b.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/libserde-c1a441160a14721b.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"path+file:///private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A#oxide-storage@0.1.0","manifest_path":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"oxide_storage","src_path":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/src/lib.rs","edition":"2021","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/liboxide_storage-0edd2087e5138e3c.rlib","/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/liboxide_storage-0edd2087e5138e3c.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"path+file:///private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A#oxide-storage@0.1.0","manifest_path":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/Cargo.toml","target":{"kind":["bin"],"crate_types":["bin"],"name":"oxide-storage-inventory","src_path":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/src/bin/storage_inventory.rs","edition":"2021","doc":true,"doctest":false,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":true},"features":[],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/oxide_storage_inventory-311f9aa3006f0a2a"],"executable":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/oxide_storage_inventory-311f9aa3006f0a2a","fresh":false}
+{"reason":"compiler-artifact","package_id":"path+file:///private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A#oxide-storage@0.1.0","manifest_path":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/Cargo.toml","target":{"kind":["bin"],"crate_types":["bin"],"name":"oxide-storage-lease","src_path":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/src/bin/storage_lease.rs","edition":"2021","doc":true,"doctest":false,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":true},"features":[],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/oxide_storage_lease-5e79458557f90748"],"executable":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/oxide_storage_lease-5e79458557f90748","fresh":false}
+{"reason":"compiler-artifact","package_id":"path+file:///private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A#oxide-storage@0.1.0","manifest_path":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/Cargo.toml","target":{"kind":["bin"],"crate_types":["bin"],"name":"oxide-storage-inventory","src_path":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/src/bin/storage_inventory.rs","edition":"2021","doc":true,"doctest":false,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/target/oxide-quick/oxide-storage-inventory"],"executable":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/target/oxide-quick/oxide-storage-inventory","fresh":false}
+{"reason":"compiler-artifact","package_id":"path+file:///private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A#oxide-storage@0.1.0","manifest_path":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/Cargo.toml","target":{"kind":["bin"],"crate_types":["bin"],"name":"oxide-storage-lease","src_path":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/src/bin/storage_lease.rs","edition":"2021","doc":true,"doctest":false,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/target/oxide-quick/oxide-storage-lease"],"executable":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/target/oxide-quick/oxide-storage-lease","fresh":false}
+{"reason":"compiler-artifact","package_id":"path+file:///private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A#oxide-storage@0.1.0","manifest_path":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/Cargo.toml","target":{"kind":["test"],"crate_types":["bin"],"name":"foundation_marker","src_path":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/tests/foundation_marker.rs","edition":"2021","doc":false,"doctest":false,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":true},"features":[],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/foundation_marker-cc0ebc522edf0c22"],"executable":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/foundation_marker-cc0ebc522edf0c22","fresh":false}
+{"reason":"compiler-artifact","package_id":"path+file:///private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A#oxide-storage@0.1.0","manifest_path":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/Cargo.toml","target":{"kind":["test"],"crate_types":["bin"],"name":"profile_backtrace","src_path":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/tests/profile_backtrace.rs","edition":"2021","doc":false,"doctest":false,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":true},"features":[],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/profile_backtrace-ed274509634807f4"],"executable":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/profile_backtrace-ed274509634807f4","fresh":false}
+{"reason":"compiler-artifact","package_id":"path+file:///private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A#oxide-storage@0.1.0","manifest_path":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"oxide_storage","src_path":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/src/lib.rs","edition":"2021","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":true},"features":[],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/oxide_storage-65852eee887d285b"],"executable":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/oxide_storage-65852eee887d285b","fresh":false}
+{"reason":"compiler-artifact","package_id":"path+file:///private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A#oxide-storage@0.1.0","manifest_path":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/Cargo.toml","target":{"kind":["bin"],"crate_types":["bin"],"name":"oxide","src_path":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/src/bin/oxide/main.rs","edition":"2021","doc":true,"doctest":false,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":true},"features":[],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/oxide-46acfc33de7cde33"],"executable":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/pool/payload/slots/2/build/oxide-quick/deps/oxide-46acfc33de7cde33","fresh":false}
+{"reason":"compiler-artifact","package_id":"path+file:///private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A#oxide-storage@0.1.0","manifest_path":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/Cargo.toml","target":{"kind":["bin"],"crate_types":["bin"],"name":"oxide","src_path":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/src/bin/oxide/main.rs","edition":"2021","doc":true,"doctest":false,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/target/oxide-quick/oxide"],"executable":"/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A/target/oxide-quick/oxide","fresh":false}
+{"reason":"build-finished","success":true}
+
+running 48 tests
+test dep_info::tests::refuses_duplicate_keys_and_files_and_preserves_checksums ... ok
+test dep_info::tests::hand_annotated_upstream_bytes_preserve_tags_and_environment_presence ... ok
+test dep_info::tests::refuses_truncation_version_marker_tag_bool_trailing_and_oversize ... ok
+test inventory::tests::tiny_output_cap_holds_with_long_multibyte_root_and_notes ... ok
+test inventory::tests::missing_and_nondirectory_roots_are_refused ... ok
+test inventory::tests::default_output_cap_is_honored_for_complete_reports ... ok
+test inventory::tests::filesystem_capacity_is_a_distinct_measured_value ... ok
+test inventory::tests::notes_avoid_stale_and_savings_claims ... ok
+test inventory::tests::sparse_files_report_logical_and_allocated_separately ... ok
+test inventory::tests::rendering_is_bounded_and_reports_truncation ... ok
+test inventory::tests::invalid_limits_are_refused ... ok
+test inventory::tests::cooperative_deadline_truncates_with_partial_coverage ... ok
+test inventory::tests::depth_limit_truncates_with_partial_coverage ... ok
+test inventory::tests::hardlink_overlap_is_counted_once_globally ... ok
+test inventory::tests::unreadable_directory_yields_partial_coverage ... ok
+test inventory::tests::symlinks_are_counted_but_never_followed ... ok
+test lease::tests::capacity_rendering_is_utf8_valid_and_obeys_64_byte_and_normal_caps ... ok
+test inventory::tests::categories_group_known_target_subdirectories ... ok
+test lease::tests::failed_init_lock_only_retry_succeeds ... ok
+test lease::tests::injected_capacity_samples_keep_zero_unknown_and_partial_distinct ... ok
+test lease::tests::concurrent_acquire_serializes_one_winner ... ok
+test lease::tests::duplicate_holder_reconciles_same_lease ... ok
+test lease::tests::held_oversized_compatible_slot_keeps_same_holder_replay_and_other_holder_busy ... ok
+test lease::tests::holder_conflict_and_unknown_lease ... ok
+test lease::tests::injected_capacity_keeps_hardlink_and_metadata_accounting_separate ... ok
+test lease::tests::recycle_threshold_is_the_overflow_safe_ceiling_of_half_the_cap ... ok
+test lease::tests::full_debug_is_a_distinct_profile ... ok
+test lease::tests::known_macos_metadata_added_after_init_is_outside_slot_accounting ... ok
+test inventory::tests::entry_limit_truncates_with_partial_coverage ... ok
+test lease::tests::idle_slot_keeps_workspace_observation_on_reuse ... ok
+test lease::tests::lost_reply_preserves_held_lease ... ok
+test storage::bounded::tests::verified_backing_refuses_structurally_impossible_descriptors ... ok
+test lease::tests::product_open_refuses_directory_injection ... ok
+test lease::tests::other_holder_is_busy_and_release_is_idempotent ... ok
+test lease::tests::injected_capacity_status_preserves_held_and_evicting_bytes ... ok
+test lease::tests::eviction_removes_only_idle_owned_slots ... ok
+test lease::tests::symlink_pool_and_foreign_entry_refuse ... ok
+test lease::tests::managed_eviction_retires_only_idle_slots_and_tolerates_managed_control ... ok
+test lease::tests::recover_closes_held_occupancy ... ok
+test lease::tests::status_json_stays_bounded ... ok
+test lease::tests::interrupted_idle_eviction_resumes_after_partial_removal ... ok
+test lease::tests::oversized_compatible_idle_slot_is_replaced_then_fresh_slot_is_warm ... ok
+test lease::tests::unknown_or_non_directory_macos_metadata_entries_refuse ... ok
+test lease::tests::unsafe_evicting_slot_root_stays_unavailable_without_blocking_status_or_release ... ok
+test lease::tests::oversized_recycling_targets_only_the_selected_project_and_profile ... ok
+test lease::tests::partial_accounting_and_unsafe_slot_root_refuse_compatible_reuse ... ok
+test inventory::tests::concurrent_mutation_never_panics ... ok
+test lease::tests::idle_eviction_unlinks_direct_dangling_and_nested_symlinks ... ok
+
+successes:
+
+successes:
+    dep_info::tests::hand_annotated_upstream_bytes_preserve_tags_and_environment_presence
+    dep_info::tests::refuses_duplicate_keys_and_files_and_preserves_checksums
+    dep_info::tests::refuses_truncation_version_marker_tag_bool_trailing_and_oversize
+    inventory::tests::categories_group_known_target_subdirectories
+    inventory::tests::concurrent_mutation_never_panics
+    inventory::tests::cooperative_deadline_truncates_with_partial_coverage
+    inventory::tests::default_output_cap_is_honored_for_complete_reports
+    inventory::tests::depth_limit_truncates_with_partial_coverage
+    inventory::tests::entry_limit_truncates_with_partial_coverage
+    inventory::tests::filesystem_capacity_is_a_distinct_measured_value
+    inventory::tests::hardlink_overlap_is_counted_once_globally
+    inventory::tests::invalid_limits_are_refused
+    inventory::tests::missing_and_nondirectory_roots_are_refused
+    inventory::tests::notes_avoid_stale_and_savings_claims
+    inventory::tests::rendering_is_bounded_and_reports_truncation
+    inventory::tests::sparse_files_report_logical_and_allocated_separately
+    inventory::tests::symlinks_are_counted_but_never_followed
+    inventory::tests::tiny_output_cap_holds_with_long_multibyte_root_and_notes
+    inventory::tests::unreadable_directory_yields_partial_coverage
+    lease::tests::capacity_rendering_is_utf8_valid_and_obeys_64_byte_and_normal_caps
+    lease::tests::concurrent_acquire_serializes_one_winner
+    lease::tests::duplicate_holder_reconciles_same_lease
+    lease::tests::eviction_removes_only_idle_owned_slots
+    lease::tests::failed_init_lock_only_retry_succeeds
+    lease::tests::full_debug_is_a_distinct_profile
+    lease::tests::held_oversized_compatible_slot_keeps_same_holder_replay_and_other_holder_busy
+    lease::tests::holder_conflict_and_unknown_lease
+    lease::tests::idle_eviction_unlinks_direct_dangling_and_nested_symlinks
+    lease::tests::idle_slot_keeps_workspace_observation_on_reuse
+    lease::tests::injected_capacity_keeps_hardlink_and_metadata_accounting_separate
+    lease::tests::injected_capacity_samples_keep_zero_unknown_and_partial_distinct
+    lease::tests::injected_capacity_status_preserves_held_and_evicting_bytes
+    lease::tests::interrupted_idle_eviction_resumes_after_partial_removal
+    lease::tests::known_macos_metadata_added_after_init_is_outside_slot_accounting
+    lease::tests::lost_reply_preserves_held_lease
+    lease::tests::managed_eviction_retires_only_idle_slots_and_tolerates_managed_control
+    lease::tests::other_holder_is_busy_and_release_is_idempotent
+    lease::tests::oversized_compatible_idle_slot_is_replaced_then_fresh_slot_is_warm
+    lease::tests::oversized_recycling_targets_only_the_selected_project_and_profile
+    lease::tests::partial_accounting_and_unsafe_slot_root_refuse_compatible_reuse
+    lease::tests::product_open_refuses_directory_injection
+    lease::tests::recover_closes_held_occupancy
+    lease::tests::recycle_threshold_is_the_overflow_safe_ceiling_of_half_the_cap
+    lease::tests::status_json_stays_bounded
+    lease::tests::symlink_pool_and_foreign_entry_refuse
+    lease::tests::unknown_or_non_directory_macos_metadata_entries_refuse
+    lease::tests::unsafe_evicting_slot_root_stays_unavailable_without_blocking_status_or_release
+    storage::bounded::tests::verified_backing_refuses_structurally_impossible_descriptors
+
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.86s
+
+
+running 31 tests
+test cli::tests::classes_follow_the_workflow_table ... ok
+test adopt::tests::absent_or_empty_files_get_only_the_block ... ok
+test adopt::tests::appending_separates_with_one_blank_line_and_keeps_existing_bytes ... ok
+test adopt::tests::effigy_scan_reports_command_words_only ... ok
+test adopt::tests::malformed_markers_refuse_instead_of_guessing ... ok
+test adopt::tests::refresh_replaces_only_the_marked_span_and_is_idempotent ... ok
+test cli::tests::package_selection_reads_every_form ... ok
+test cli::tests::manifest_path_and_target_are_observed ... ok
+test adopt::tests::parse_separates_the_directory_from_cargo_options ... ok
+test cli::tests::run_builds_then_keeps_program_arguments ... ok
+test freshness::tests::only_paths_under_the_checkout_count ... ok
+test cli::tests::external_subcommands_are_untouched_and_builtins_translate_only_when_asked ... ok
+test freshness::tests::origin_round_trips_and_refuses_unknown_fields ... ok
+test freshness::tests::dirty_paths_differ_unless_both_sides_match ... ok
+test cli::tests::storage_placement_overrides_refuse ... ok
+test freshness::tests::metadata_splits_packages_by_source ... ok
+test cli::tests::modelled_commands_default_to_quick_and_translate_profiles ... ok
+test freshness::tests::every_local_input_refreshes_and_vendored_sources_do_not ... ok
+test freshness::tests::untrusted_or_foreign_affine_slots_refuse_the_gate ... ok
+test identity::tests::digest_is_lowercase_sha256_hex ... ok
+test identity::tests::identity_key_format_is_stable ... ok
+test identity::tests::origin_forms_normalise_to_one_identity ... ok
+test freshness::tests::status_entries_yield_repository_paths ... ok
+test store::tests::cargo_that_never_started_leaves_no_group ... ok
+test store::tests::never_recovers_a_lease_the_record_did_not_take ... ok
+test store::tests::recovers_only_an_empty_recorded_group ... ok
+test store::tests::pending_recovery_survives_a_crash_after_the_ledger_change ... ok
+test store::tests::state_without_holder_or_recoveries_still_loads ... ok
+test store::tests::recovery_log_keeps_the_newest ... ok
+test store::tests::status_path_matches_the_rule ... ok
+test identity::tests::run_pick_follows_cargo_run_selection ... ok
+
+successes:
+
+successes:
+    adopt::tests::absent_or_empty_files_get_only_the_block
+    adopt::tests::appending_separates_with_one_blank_line_and_keeps_existing_bytes
+    adopt::tests::effigy_scan_reports_command_words_only
+    adopt::tests::malformed_markers_refuse_instead_of_guessing
+    adopt::tests::parse_separates_the_directory_from_cargo_options
+    adopt::tests::refresh_replaces_only_the_marked_span_and_is_idempotent
+    cli::tests::classes_follow_the_workflow_table
+    cli::tests::external_subcommands_are_untouched_and_builtins_translate_only_when_asked
+    cli::tests::manifest_path_and_target_are_observed
+    cli::tests::modelled_commands_default_to_quick_and_translate_profiles
+    cli::tests::package_selection_reads_every_form
+    cli::tests::run_builds_then_keeps_program_arguments
+    cli::tests::storage_placement_overrides_refuse
+    freshness::tests::dirty_paths_differ_unless_both_sides_match
+    freshness::tests::every_local_input_refreshes_and_vendored_sources_do_not
+    freshness::tests::metadata_splits_packages_by_source
+    freshness::tests::only_paths_under_the_checkout_count
+    freshness::tests::origin_round_trips_and_refuses_unknown_fields
+    freshness::tests::status_entries_yield_repository_paths
+    freshness::tests::untrusted_or_foreign_affine_slots_refuse_the_gate
+    identity::tests::digest_is_lowercase_sha256_hex
+    identity::tests::identity_key_format_is_stable
+    identity::tests::origin_forms_normalise_to_one_identity
+    identity::tests::run_pick_follows_cargo_run_selection
+    store::tests::cargo_that_never_started_leaves_no_group
+    store::tests::never_recovers_a_lease_the_record_did_not_take
+    store::tests::pending_recovery_survives_a_crash_after_the_ledger_change
+    store::tests::recovers_only_an_empty_recorded_group
+    store::tests::recovery_log_keeps_the_newest
+    store::tests::state_without_holder_or_recoveries_still_loads
+    store::tests::status_path_matches_the_rule
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+successes:
+
+successes:
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+successes:
+
+successes:
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test foundation_marker_matches_this_checkout ... ok
+
+successes:
+
+---- foundation_marker_matches_this_checkout stdout ----
+FOUNDATION-MARKER compiled_dir=/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A runtime_dir=/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A cwd=/private/var/tmp/oxide-foundation-qual-20261018.5uv9sx/A compiled="edited in A" runtime="edited in A"
+
+
+successes:
+    foundation_marker_matches_this_checkout
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 1 test
+test profile_probe_keeps_workspace_frames_and_unwind ... ok
+
+successes:
+
+---- profile_probe_keeps_workspace_frames_and_unwind stdout ----
+
+thread 'profile_probe_keeps_workspace_frames_and_unwind' (159301481) panicked at tests/profile_backtrace.rs:45:5:
+attempt to add with overflow
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+successes:
+    profile_probe_keeps_workspace_frames_and_unwind
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 0 tests
+
+successes:
+
+successes:
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
