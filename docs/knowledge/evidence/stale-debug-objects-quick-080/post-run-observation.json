@@ -1,0 +1,51 @@
+{
+  "start_offset_s": 231.397,
+  "utc": "2026-10-18T21:39:57Z",
+  "loadavg": [
+    8.634765625,
+    6.70166015625,
+    6.3193359375
+  ],
+  "arms": {
+    "U": {
+      "deps_rcgu_names": 4561,
+      "deps_rcgu_unique_inodes": 461,
+      "deps_rcgu_unique_allocated": 14835712,
+      "deps_rcgu_apparent_sum_over_names": 126793192,
+      "inodes_also_named_in_incremental": 433,
+      "allocated_of_inodes_also_named_in_incremental": 12226560,
+      "inodes_named_only_by_deps_rcgu": 28,
+      "allocated_of_inodes_named_only_by_deps_rcgu": 2609152,
+      "max_names_per_rcgu_inode_in_deps": 13,
+      "inodes_with_nlink_above_in_tree_names": 0,
+      "target_unique_allocated": 181059584
+    },
+    "P": {
+      "deps_rcgu_names": 0,
+      "deps_rcgu_unique_inodes": 0,
+      "deps_rcgu_unique_allocated": 0,
+      "deps_rcgu_apparent_sum_over_names": 0,
+      "inodes_also_named_in_incremental": 0,
+      "allocated_of_inodes_also_named_in_incremental": 0,
+      "inodes_named_only_by_deps_rcgu": 0,
+      "allocated_of_inodes_named_only_by_deps_rcgu": 0,
+      "max_names_per_rcgu_inode_in_deps": 0,
+      "inodes_with_nlink_above_in_tree_names": 0,
+      "target_unique_allocated": 201740288
+    },
+    "N": {
+      "deps_rcgu_names": 19,
+      "deps_rcgu_unique_inodes": 19,
+      "deps_rcgu_unique_allocated": 2351104,
+      "deps_rcgu_apparent_sum_over_names": 2308328,
+      "inodes_also_named_in_incremental": 0,
+      "allocated_of_inodes_also_named_in_incremental": 0,
+      "inodes_named_only_by_deps_rcgu": 19,
+      "allocated_of_inodes_named_only_by_deps_rcgu": 2351104,
+      "max_names_per_rcgu_inode_in_deps": 1,
+      "inodes_with_nlink_above_in_tree_names": 0,
+      "target_unique_allocated": 165343232
+    }
+  },
+  "end_offset_s": 231.665
+}
