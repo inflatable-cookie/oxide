@@ -287,6 +287,14 @@ Tom approved two further leads on 2026-10-18 with "Yes please":
 - A qualification of the `oxide` foundation on Cargo/Rust 1.100 after its stable release, scheduled for 2026-11-12. It includes installing the pinned `1.100.0` toolchain side by side without changing the default `stable` toolchain or Oxide's declared `rust-version`.
 - A probe of what triggers Cargo's automatic home-cache cleanup. It uses only a scratch `CARGO_HOME`, never the live one.
 
+Tom approved the storage-hygiene bundle on 2026-10-18 with "Approve": one Oxide-only PR adding:
+- Cargo home reporting in `oxide status`;
+- an explicit `oxide clean --cargo-cache` with an enforced no-network boundary that refuses routes it cannot contain;
+- `OXIDE_POOL_CAP` for new pools;
+- per-slot file-count and deduplicated-byte reporting.
+
+It is bounded to tiny fixtures and a private Cargo home. It grants no recipe change, no deletion inside slots, no live Cargo home cleanup and no consumer change.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
