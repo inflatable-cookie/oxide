@@ -20,6 +20,7 @@ full QA.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -28,6 +29,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 
 IMAGE_BYTES = 128 * 1024 * 1024
 SCRATCH_LIMIT_BYTES = 512 * 1024 * 1024
@@ -850,12 +852,32 @@ def prove_clean_waits(runner: Runner, app: str) -> None:
         log.close()
 
 
-def process_alive(pid: int) -> bool:
+def probe(call, target: int) -> str:
+    """`present`, or the errno name that `call(target, 0)` failed with.
+    macOS `kill(-pgid, 0)` reports EPERM while a group holds only unreaped
+    zombies and ESRCH once they are reaped, so only ESRCH means gone."""
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
+        call(target, 0)
+    except OSError as error:
+        return errno.errorcode.get(error.errno, str(error.errno))
+    return "present"
+
+
+def process_alive(pid: int) -> bool:
+    return probe(os.kill, pid) == "present"
+
+
+def wait_gone(call, target: int, label: str, seconds: float = 20) -> None:
+    """Wait, within a finite bound, for ESRCH. The killed processes are
+    reparented to launchd, which reaps them; EPERM (zombie-only or a real
+    denial) and `present` both count as not gone."""
+    deadline = time.monotonic() + min(seconds, remaining())
+    last = probe(call, target)
+    while last != "ESRCH" and time.monotonic() < deadline:
+        time.sleep(0.1)
+        last = probe(call, target)
+    if last != "ESRCH":
+        fail(f"{label}: {call.__name__}({target}, 0) still {last} after {seconds:.0f} s, not ESRCH")
 
 
 def prove_interrupt(runner: Runner, app: str) -> None:
@@ -867,8 +889,7 @@ def prove_interrupt(runner: Runner, app: str) -> None:
         test_pid = int(handle.read())
     child.send_signal(signal.SIGINT)
     expect(child.wait(timeout=20), 130, "interrupted test", read_log(log))
-    if process_alive(test_pid):
-        fail("the test process survived Ctrl-C forwarding")
+    wait_gone(os.kill, test_pid, "test process after Ctrl-C forwarding")
     if any(slot["state"] != "idle" for slot in runner.lease_status()["slots"]):
         fail("interrupted command did not release its slot")
     log.close()
@@ -886,7 +907,7 @@ def prove_recovery(runner: Runner, app: str) -> None:
     child.wait(timeout=20)
     log.close()
     if not process_alive(test_pid):
-        fail("Cargo's group did not survive the killed oxide")
+        fail(f"Cargo's group did not survive the killed oxide: kill({test_pid}, 0) {probe(os.kill, test_pid)}")
     running = [record for record in runner.state()["records"] if record["phase"] == "running"]
     if len(running) != 1 or not running[0]["process_group"]:
         fail(f"crashed record: {runner.state()['records']}")
@@ -911,8 +932,9 @@ def prove_recovery(runner: Runner, app: str) -> None:
     expect(follower.wait(timeout=min(60, remaining())), 0, "follower", read_log(follower_log))
     if f"recovered slot {held[0]['slot_id']} after oxide pid {child.pid} died (Cargo group {group} empty)" not in read_log(follower_log):
         fail(f"follower did not report the recovery: {read_log(follower_log)}")
-    if process_alive(test_pid):
-        fail("crash test process outlived recovery")
+    # Recovery itself required killpg ESRCH, so the test process is reaped.
+    if probe(os.kill, test_pid) != "ESRCH":
+        fail(f"crash test process outlived recovery: kill({test_pid}, 0) {probe(os.kill, test_pid)}")
     recoveries = runner.state().get("recoveries", [])
     if len(recoveries) != 1 or recoveries[0]["lease_id"] != running[0]["lease_id"] or recoveries[0]["process_group"] != group:
         fail(f"recovery log: {recoveries}")
@@ -939,18 +961,13 @@ def prove_group_gone(runner: Runner, app: str) -> None:
         if len(running) != 1:
             fail(f"group-gone record: {runner.state()['records']}")
         group = running[0]["process_group"]
-        os.killpg(group, signal.SIGKILL)
-
-        def group_gone() -> bool:
-            try:
-                os.killpg(group, 0)
-            except ProcessLookupError:
-                return True
-            return False
-
-        wait_for(group_gone, "killed Cargo group to empty", 20)
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except OSError as error:
+            fail(f"killpg({group}, SIGKILL) on the live Cargo group failed: {errno.errorcode.get(error.errno)}")
+        wait_gone(os.killpg, group, "killed Cargo group")
         if not process_alive(escapee) or os.getpgid(escapee) == group:
-            fail("the setsid escapee did not leave Cargo's group alive")
+            fail(f"the setsid escapee did not leave Cargo's group alive: kill({escapee}, 0) {probe(os.kill, escapee)}")
         code, _, stderr = runner.run(app, ["build"])
         expect(code, 0, "build after a dead group", stderr)
         if "waiting for" in stderr:
@@ -1054,6 +1071,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except Exception as error:
-        sys.stderr.write(f"{error}\n")
+    except Exception:
+        traceback.print_exc()
         sys.exit(1)

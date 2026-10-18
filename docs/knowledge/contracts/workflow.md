@@ -211,7 +211,11 @@ leases taken by `oxide` commands only:
   `killpg(pgid, 0)` returns `ESRCH`. Cargo already tolerates interrupted
   builds: a unit whose fingerprint was not written is rebuilt.
 - A surviving group member, a reused group ID or any error other than
-  `ESRCH` keeps the slot held. No PID age, TTL or start-time comparison is
+  `ESRCH` keeps the slot held. On macOS `EPERM` also means a group of only
+  unreaped zombies ([probe](../qualification-readiness.md#process-containment));
+  it stays held until they are reaped and `ESRCH` follows. The fixture proof
+  waits for that reap within its existing bound instead of reading `EPERM`
+  as gone. No PID age, TTL or start-time comparison is
   used to decide. A follower in the same checkout waits; other commands go
   on with other slots.
 - A command that dies after recording "Cargo starting" but before recording
