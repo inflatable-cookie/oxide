@@ -1,0 +1,25 @@
+       Fresh version_check v0.9.5
+       Fresh unicode-ident v1.0.26
+       Fresh typenum v1.20.1
+       Fresh memchr v2.8.3
+       Fresh itoa v1.0.18
+       Fresh cfg-if v1.0.5
+       Fresh proc-macro2 v1.0.107
+       Fresh generic-array v0.14.7
+       Fresh serde_core v1.0.229
+       Fresh libc v0.2.190
+       Fresh zmij v1.0.23
+       Fresh quote v1.0.47
+       Fresh crypto-common v0.1.7
+       Fresh block-buffer v0.10.4
+       Fresh cpufeatures v0.2.17
+       Fresh serde_json v1.0.151
+       Fresh syn v3.0.7
+       Fresh digest v0.10.7
+       Fresh serde_derive v1.0.229
+       Fresh sha2 v0.10.9
+       Fresh serde v1.0.229
+       Dirty oxide-storage v0.1.0 (/private/tmp/oxide-075-cranelift.q8a2kl_b/src): the file `src/bin/oxide/main.rs` has changed (1792356393.710897278s, 634230984ns after last build at 1792356393.076666294s)
+   Compiling oxide-storage v0.1.0 (/private/tmp/oxide-075-cranelift.q8a2kl_b/src)
+     Running `/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc --crate-name oxide --edition=2021 src/bin/oxide/main.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type bin --emit=dep-info,link -C embed-bitcode=no -C debuginfo=line-tables-only -C split-debuginfo=unpacked --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=7ec04051a873b92a --out-dir /private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/oxide-storage/443c8d91593d14e7/out -C incremental=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/incremental -L dependency=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/block-buffer/d19e8bb5ebbea99e/out -L dependency=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/cfg-if/eb31147b8ff472a6/out -L dependency=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/cpufeatures/749ee26613ff0edb/out -L dependency=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/crypto-common/5a408eac25a510bb/out -L dependency=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/digest/67b6a8c645580429/out -L dependency=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/generic-array/16b6d0c00bb4f8d4/out -L dependency=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/itoa/3ddbcc3821bd7594/out -L dependency=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/libc/de959eab7cf7ebeb/out -L dependency=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/memchr/89eb8f837560fce2/out -L dependency=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/oxide-storage/24edcf7df52231eb/out -L dependency=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/serde/f2f900407a6b20a8/out -L dependency=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/serde_core/c146b163449b0d2c/out -L dependency=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/serde_derive/cff1eefcf564c395/out -L dependency=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/serde_json/c1e445e3bcadc893/out -L dependency=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/sha2/2f908a97588b28d8/out -L dependency=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/typenum/636fdf8c32502f6a/out -L dependency=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/zmij/612b0cb85aa8ea26/out --extern libc=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/libc/de959eab7cf7ebeb/out/liblibc-de959eab7cf7ebeb.rlib --extern oxide_storage=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/oxide-storage/24edcf7df52231eb/out/liboxide_storage-24edcf7df52231eb.rlib --extern serde=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/serde/f2f900407a6b20a8/out/libserde-f2f900407a6b20a8.rlib --extern serde_json=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/serde_json/c1e445e3bcadc893/out/libserde_json-c1e445e3bcadc893.rlib --extern sha2=/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/build/sha2/2f908a97588b28d8/out/libsha2-2f908a97588b28d8.rlib -Zthreads=8 --verbose`
+    Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.32s

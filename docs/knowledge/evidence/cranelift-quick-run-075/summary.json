@@ -1,0 +1,297 @@
+{
+  "task": "oxide#075",
+  "outcome": "complete",
+  "pin": "dc84d039cd397c8292f37f4201e3916fa2ecd1d3",
+  "session": {
+    "utc_start": "2026-10-18T20:44:44Z",
+    "cap_s": 3000,
+    "end_offset_s": 110.449,
+    "attempts": "attempt 1 stopped on a harness defect after the component install and before any Cargo call; attempt 2 continued the same root, clock and counters (continuation.json)",
+    "measured_cargo_calls": 29,
+    "setup_cargo_calls": 2,
+    "cargo_calls_total": 31,
+    "owned_peak_allocated_mib": 697.5,
+    "host_free_min_gib": 722.9,
+    "raw_log_bytes": 1200123,
+    "process_groups": "every call ended with killpg ESRCH; Effigy settlements list no escaped descendants",
+    "pool_or_lease": "none: arms use plain Cargo with a private CARGO_TARGET_DIR per arm; no Oxide pool, slot or lease",
+    "cleanup": "after both Effigy runs settled (attempt 2 passed, no escaped descendants), every call group ESRCH and lsof +D found no open file, the owned scratch root (714280 KiB: clone, four target dirs, temp dirs) and the stage directory were removed at 2026-10-18T20:50:35Z; evidence was copied first. The installed component stays (authorized persistent change)."
+  },
+  "install": {
+    "command": "rustup component add rustc-codegen-cranelift-preview --toolchain nightly-2026-08-05",
+    "exit": 0,
+    "wall_s": 1.841,
+    "component_allocated_mib": 10.9,
+    "backend_dylib": {
+      "path": "lib/rustlib/aarch64-apple-darwin/codegen-backends/librustc_codegen_cranelift-1.99.0-nightly.dylib",
+      "bytes": 11406288,
+      "allocated": 11407360,
+      "sha256": "2e89fd5fa23ebaf01f276bcaa3dbb68553e7fede15326aceaadbd2a8a2e2977e"
+    }
+  },
+  "toolchains": {
+    "stable": "rustc 1.97.1 (8bab26f4f 2026-07-14), cargo 1.97.1 (c980f4866 2026-06-30)",
+    "nightly": "rustc 1.99.0-nightly (1ed2df61a 2026-08-04), cargo 1.99.0-nightly (7c83d4cc0 2026-07-29)",
+    "identity": {
+      "stable": {
+        "cargo_sha256": "7672ead309d505577c018fff2cafb3433601f073e38cbe87359ac1f7b944bbf5",
+        "rustc_sha256": "210df6794001b73ec3d453878707fa1e0bdcb63c427024a6e6574bbe5615a4da",
+        "rustc_driver": {
+          "librustc_driver-e03ed1db822dfa4c.dylib": "57f6b5280f218ed25ba6b7e4bc1d74da3ac8e4fd85bee1b8982ad4114d757c11"
+        }
+      },
+      "nightly": {
+        "cargo_sha256": "d562a22fc8185e98267eee377da55b67b3e9b6c3658ad2b0ac51685fc0a7a069",
+        "rustc_sha256": "dc58c37f6dc27c143b69983dc0d4ec777b41123add686deefff507e72116742f",
+        "rustc_driver": {
+          "librustc_driver-2ee8092297dfc859.dylib": "843ab43f9a242ddd735af05da825dc26b0a1e4413b364076255afab25d61c20e"
+        }
+      }
+    }
+  },
+  "arms": {
+    "A": {
+      "what": "stable 1.97.1, quick recipe, LLVM",
+      "cold_build_s": 9.2604,
+      "cold_run_s": 0.3106,
+      "edits": [
+        {
+          "edit": 1,
+          "check_s": 1.5838,
+          "build_s": 0.3456,
+          "run_s": 0.2815,
+          "check_rebuilt": 17,
+          "build_rebuilt": 1,
+          "run_first_line": "oxide: Cargo with managed build storage and profiles (075 edit 1)"
+        },
+        {
+          "edit": 2,
+          "check_s": 0.0944,
+          "build_s": 0.2941,
+          "run_s": 0.2776,
+          "check_rebuilt": 1,
+          "build_rebuilt": 1,
+          "run_first_line": "oxide: Cargo with managed build storage and profiles (075 edit 2)"
+        },
+        {
+          "edit": 3,
+          "check_s": 0.1051,
+          "build_s": 0.3207,
+          "run_s": 0.303,
+          "check_rebuilt": 1,
+          "build_rebuilt": 1,
+          "run_first_line": "oxide: Cargo with managed build storage and profiles (075 edit 3)"
+        }
+      ],
+      "cold_rebuilt": 31,
+      "target_after_cold_mib": {
+        "apparent": 115.39,
+        "allocated": 116.89,
+        "workspace_allocated": 60.52,
+        "dependency_allocated": 56.36,
+        "other_allocated": 0.01
+      },
+      "target_final_mib": {
+        "apparent": 165.14,
+        "allocated": 167.0,
+        "workspace_allocated": 99.82,
+        "dependency_allocated": 67.18,
+        "other_allocated": 0.01
+      },
+      "warm_edits_2_3": {
+        "check_mean_s": 0.0998,
+        "build_mean_s": 0.3074,
+        "run_mean_s": 0.2903,
+        "build_minus_check_mean_s": 0.2077
+      }
+    },
+    "B": {
+      "what": "nightly-2026-08-05, quick recipe, LLVM (toolchain control)",
+      "cold_build_s": 5.9059,
+      "cold_run_s": 0.2994,
+      "edits": [
+        {
+          "edit": 1,
+          "check_s": 1.467,
+          "build_s": 0.3081,
+          "run_s": 0.3002,
+          "check_rebuilt": 17,
+          "build_rebuilt": 1,
+          "run_first_line": "oxide: Cargo with managed build storage and profiles (075 edit 1)"
+        },
+        {
+          "edit": 2,
+          "check_s": 0.0907,
+          "build_s": 0.3112,
+          "run_s": 0.2944,
+          "check_rebuilt": 1,
+          "build_rebuilt": 1,
+          "run_first_line": "oxide: Cargo with managed build storage and profiles (075 edit 2)"
+        },
+        {
+          "edit": 3,
+          "check_s": 0.0946,
+          "build_s": 0.3088,
+          "run_s": 0.304,
+          "check_rebuilt": 1,
+          "build_rebuilt": 1,
+          "run_first_line": "oxide: Cargo with managed build storage and profiles (075 edit 3)"
+        }
+      ],
+      "cold_rebuilt": 31,
+      "target_after_cold_mib": {
+        "apparent": 108.8,
+        "allocated": 110.31,
+        "workspace_allocated": 57.88,
+        "dependency_allocated": 52.42,
+        "other_allocated": 0.01
+      },
+      "target_final_mib": {
+        "apparent": 153.15,
+        "allocated": 155.03,
+        "workspace_allocated": 91.54,
+        "dependency_allocated": 63.48,
+        "other_allocated": 0.01
+      },
+      "warm_edits_2_3": {
+        "check_mean_s": 0.0927,
+        "build_mean_s": 0.31,
+        "run_mean_s": 0.2992,
+        "build_minus_check_mean_s": 0.2173
+      }
+    },
+    "C": {
+      "what": "nightly-2026-08-05, quick recipe, Cranelift for package oxide-storage only",
+      "cold_build_s": 4.4553,
+      "cold_run_s": 0.3092,
+      "edits": [
+        {
+          "edit": 1,
+          "check_s": 1.4623,
+          "build_s": 0.3077,
+          "run_s": 0.2902,
+          "check_rebuilt": 17,
+          "build_rebuilt": 1,
+          "run_first_line": "oxide: Cargo with managed build storage and profiles (075 edit 1)"
+        },
+        {
+          "edit": 2,
+          "check_s": 0.0969,
+          "build_s": 0.3181,
+          "run_s": 0.2901,
+          "check_rebuilt": 1,
+          "build_rebuilt": 1,
+          "run_first_line": "oxide: Cargo with managed build storage and profiles (075 edit 2)"
+        },
+        {
+          "edit": 3,
+          "check_s": 0.0951,
+          "build_s": 0.3183,
+          "run_s": 0.3184,
+          "check_rebuilt": 1,
+          "build_rebuilt": 1,
+          "run_first_line": "oxide: Cargo with managed build storage and profiles (075 edit 3)"
+        }
+      ],
+      "cold_rebuilt": 31,
+      "target_after_cold_mib": {
+        "apparent": 101.6,
+        "allocated": 103.14,
+        "workspace_allocated": 50.71,
+        "dependency_allocated": 52.42,
+        "other_allocated": 0.01
+      },
+      "target_final_mib": {
+        "apparent": 203.43,
+        "allocated": 206.51,
+        "workspace_allocated": 139.34,
+        "dependency_allocated": 67.16,
+        "other_allocated": 0.01
+      },
+      "warm_edits_2_3": {
+        "check_mean_s": 0.096,
+        "build_mean_s": 0.3182,
+        "run_mean_s": 0.3043,
+        "build_minus_check_mean_s": 0.2222
+      }
+    },
+    "D": {
+      "what": "nightly-2026-08-05, quick recipe, LLVM, RUSTFLAGS=-Zthreads=8",
+      "cold_build_s": 2.9452,
+      "cold_run_s": 0.2978,
+      "edits": [
+        {
+          "edit": 1,
+          "check_s": 0.9693,
+          "build_s": 0.3562,
+          "run_s": 0.2863,
+          "check_rebuilt": 17,
+          "build_rebuilt": 1,
+          "run_first_line": "oxide: Cargo with managed build storage and profiles (075 edit 1)"
+        },
+        {
+          "edit": 2,
+          "check_s": 0.1022,
+          "build_s": 0.3366,
+          "run_s": 0.2773,
+          "check_rebuilt": 1,
+          "build_rebuilt": 1,
+          "run_first_line": "oxide: Cargo with managed build storage and profiles (075 edit 2)"
+        },
+        {
+          "edit": 3,
+          "check_s": 0.1219,
+          "build_s": 0.3461,
+          "run_s": 0.3002,
+          "check_rebuilt": 1,
+          "build_rebuilt": 1,
+          "run_first_line": "oxide: Cargo with managed build storage and profiles (075 edit 3)"
+        }
+      ],
+      "cold_rebuilt": 31,
+      "target_after_cold_mib": {
+        "apparent": 108.81,
+        "allocated": 110.32,
+        "workspace_allocated": 57.89,
+        "dependency_allocated": 52.42,
+        "other_allocated": 0.01
+      },
+      "target_final_mib": {
+        "apparent": 153.18,
+        "allocated": 155.05,
+        "workspace_allocated": 91.57,
+        "dependency_allocated": 63.48,
+        "other_allocated": 0.01
+      },
+      "warm_edits_2_3": {
+        "check_mean_s": 0.112,
+        "build_mean_s": 0.3414,
+        "run_mean_s": 0.2888,
+        "build_minus_check_mean_s": 0.2293
+      }
+    }
+  },
+  "arm_c_receipt": "verbose rustc lines: -Z codegen-backend=cranelift on oxide_storage and oxide units only; all 22 dependency/build-script units LLVM (no backend flag); no -C panic flag on any unit (profile default unwind)",
+  "arm_d_receipt": "verbose rustc lines: -Zthreads=8 on every rustc unit (31/31 cold, 17/17 first check, 1/1 per edit)",
+  "arm_c_test": {
+    "exit": 101,
+    "wall_s": 4.207,
+    "results": [
+      "test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.91s",
+      "test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    ],
+    "failure": "tests/profile_backtrace.rs profile_probe_keeps_workspace_frames_and_unwind: the overflow panic inside catch_unwind at line 54 was not caught; it surfaced as \"panicked at tests/profile_backtrace.rs:45:5: attempt to add with overflow\" and libtest reported the test FAILED. The process did not abort; the other 79 unit tests passed; the lib doctest pass ran with rustdoc and no backend flag (0 doctests)."
+  },
+  "limits": [
+    "one small subject (Oxide, 31 units, 4.6k-line bin crate) at one pin; one sample per reading",
+    "macOS aarch64 only; no SSD-lifetime or write-volume claim",
+    "arms ran in order A,B,C,D: cold builds fall monotonically with order (A also loaded cold sources/compiler), so cold readings attribute nothing to a backend or flag",
+    "edit 1 check includes 16 first-time dependency check-mode units after the cold build; warm floor uses edits 2-3",
+    "nightly Cargo uses the build-dir layout v2 (build/<package>/<hash>/out); stable uses deps/. Workspace/dependency byte split is by unit name",
+    "each direct run is the first exec of a freshly linked binary; its ~0.3 s was not decomposed"
+  ]
+}
