@@ -462,10 +462,10 @@ fn touch(path: &Path) -> Result<(), String> {
 /// names the packages: local ones have no registry or Git source, workspace
 /// members and in-repo path dependencies alike. Every Git-listed file under
 /// the checkout is refreshed unless its deepest package directory belongs to
-/// a registry or Git package (vendored sources), and every local target's
-/// source is refreshed wherever it lies in the checkout. So a local unit
-/// rebuilds whatever it reads, inside or outside its own directory. Returns
-/// the local package count and the files.
+/// a registry or Git package (vendored sources). So a local unit rebuilds
+/// whatever it reads, inside or outside its own directory. A local target or
+/// a followed symlink inside a vendored package is ambiguous and refused.
+/// Returns the local package count and the files.
 fn local_package_files(checkout: &Path, top: &Path) -> Result<(usize, Vec<String>), String> {
     let graph = resolve_graph(&cargo_metadata(checkout)?)?;
     let canonical = |paths: &[PathBuf]| {
@@ -496,10 +496,26 @@ fn local_package_files(checkout: &Path, top: &Path) -> Result<(usize, Vec<String
     if listed.len() > MAX_LISTED {
         return Err(format!("more than {MAX_LISTED} repository files"));
     }
-    Ok((
-        local.len(),
-        owned_files(&local, &foreign, &targets, &listed)?,
-    ))
+    let files = owned_files(&local, &foreign, &targets, &listed)?;
+    // A followed symlink must not reach a registry or Git package's file.
+    for path in &files {
+        let full = top.join(path);
+        let is_link = fs::symlink_metadata(&full)
+            .map_err(|error| format!("cannot read {path}: {error}"))?
+            .file_type()
+            .is_symlink();
+        if !is_link {
+            continue;
+        }
+        let target =
+            fs::canonicalize(&full).map_err(|error| format!("cannot resolve {path}: {error}"))?;
+        for relative in contained(top, &[target])? {
+            if deepest_owner(&local, &foreign, &relative).is_some_and(|dir| foreign.contains(dir)) {
+                return Err(format!("{path} links into a registry or Git package"));
+            }
+        }
+    }
+    Ok((local.len(), files))
 }
 
 /// Run `cargo metadata` for the workspace, bounded in output and lifetime.
@@ -647,7 +663,7 @@ fn contained(top: &Path, paths: &[PathBuf]) -> Result<BTreeSet<String>, String> 
 }
 
 /// Listed files whose deepest package directory is not a registry or Git
-/// package's, plus every local target source. Each local manifest and target
+/// package's. A local target inside such a package is ambiguous and refused. Each local manifest and target
 /// source must be listed: a file Git cannot see would be silently skipped.
 fn owned_files(
     local: &BTreeSet<String>,
@@ -673,20 +689,31 @@ fn owned_files(
             None => return Err("a package path is not UTF-8".to_owned()),
         }
     }
-    let owner = |path: &str| {
-        local
-            .iter()
-            .chain(foreign)
-            .filter(|dir| Path::new(path).starts_with(dir))
-            .max_by_key(|dir| Path::new(dir).components().count())
-    };
+    let foreign_owned =
+        |path: &str| deepest_owner(local, foreign, path).is_some_and(|dir| foreign.contains(dir));
+    if let Some(target) = targets.iter().find(|target| foreign_owned(target)) {
+        return Err(format!(
+            "local target {target} lies in a registry or Git package"
+        ));
+    }
     Ok(listed
         .iter()
-        .filter(|path| {
-            targets.contains(*path) || owner(path).is_none_or(|dir| !foreign.contains(dir))
-        })
+        .filter(|path| !foreign_owned(path))
         .cloned()
         .collect())
+}
+
+/// The deepest local or foreign package directory containing `path`.
+fn deepest_owner<'a>(
+    local: &'a BTreeSet<String>,
+    foreign: &'a BTreeSet<String>,
+    path: &str,
+) -> Option<&'a String> {
+    local
+        .iter()
+        .chain(foreign)
+        .filter(|dir| Path::new(path).starts_with(dir))
+        .max_by_key(|dir| Path::new(dir).components().count())
 }
 
 #[cfg(test)]
@@ -861,6 +888,9 @@ mod tests {
         // A manifest or target source Git cannot see refuses.
         assert!(owned_files(&set(&["ignored"]), &set(&[]), &set(&[]), &listed).is_err());
         assert!(owned_files(&set(&[""]), &set(&[]), &set(&["gen/out.rs"]), &listed).is_err());
+        // A local target inside a registry or Git package is ambiguous.
+        let vendored_target = set(&["vendor/serde/src/lib.rs"]);
+        assert!(owned_files(&local, &foreign, &vendored_target, &listed).is_err());
     }
 
     #[test]

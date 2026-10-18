@@ -156,13 +156,13 @@ slot has a recorded origin:
    (component-aware), workspace members and in-repo path dependencies alike.
    Every tracked and untracked non-ignored file in the checkout gets the
    same mtime treatment unless its deepest package directory belongs to a
-   registry or Git package (vendored sources), and every local target's
-   source in the checkout is included, so every local unit rebuilds,
+   registry or Git package (vendored sources), so every local unit rebuilds,
    including build scripts that read `current_dir()` and proc macros that
    expand to the caller's manifest dir. Manifests and sources are never read
    to decide this. Metadata failure, a missing lock file, output over 64 MiB
-   or 60 s, two packages in one directory, or a local manifest or target
-   source Git cannot see refuses sharing (cold, checkout-affine). Registry, Git and
+   or 60 s, two packages in one directory, a local manifest or target
+   source Git cannot see, or a local target or symlink inside a vendored
+   package refuses sharing (cold, checkout-affine). Registry, Git and
    outside-checkout path dependencies are not refreshed by this rule; they
    keep their paths and stay warm.
 
@@ -668,7 +668,8 @@ Rules:
   `rev-parse` before and after Cargo, about 25 ms on this repository; a
   path change adds one `cargo metadata` call. The metadata-membership rule
   passed the independent native fixture run at `c0867bb`; the later
-  file-ownership correction (unowned files and target sources outside
-  package directories refresh, vendored registry/Git sources do not) is
-  unit-tested, not natively re-run.
+  file-ownership corrections (unowned files and target sources outside
+  package directories refresh; vendored registry/Git sources do not, and a
+  local target or symlink into them refuses) passed the reviewer's native
+  run at `69db6fe` or are unit-tested after it.
   Real-project qualification (Q2–Q4) remains.
