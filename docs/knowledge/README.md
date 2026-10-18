@@ -2,6 +2,8 @@
 
 [Vision](vision.md) owns scope, Tom's ruling and authorization. [Architecture](architecture.md) owns storage invariants and integration boundaries. [Rust DX landscape](rust-dx-landscape.md) owns sourced research findings, candidate remedies and evidence limits. [Questions](questions.md) owns unresolved design decisions. [Release](contracts/release.md) owns publication restrictions. [Retirements](retired.toml) records removed concepts.
 
+[Workflow](contracts/workflow.md) owns the proposed `oxide` command suite, profiles, inferred project identity, local executor, execution-location seam, agent integration and the foundation slice's open decisions.
+
 [Storage-efficiency findings](storage-efficiency.md) records current component preparation, profile and disposable-output behavior across the inspected projects, with limits on what the source evidence establishes.
 
 [Build-context policy](contracts/build-context-policy.md) owns the proposed lifecycle-aware incremental/debug context semantics, the frozen one-shot comparison recipe, and the private opt-in launcher that enforces deadline and owned-footprint limits. Production policy stays inert. The [direct incremental comparison](storage-efficiency.md#direct-incremental-comparison-2026-10-15) supplies real timing, storage and selected backtrace evidence with raw output attached; production adoption and shared-slot reuse remain unqualified.

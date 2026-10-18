@@ -91,9 +91,10 @@ Implications for design:
   than where it was built. Cargo itself has no remote-build facility; remote
   builds mean running Cargo elsewhere or distributing rustc units.
 
-Tom's [2026-10-18 follow-up](vision.md#product-workflow-direction) rejects
-transparent interception (toolchain shim, `PATH` shim, shell alias) in favour of
-explicit `oxide build` / `oxide run` plus agent guidance. The inner hooks remain
+Tom's [2026-10-18 follow-up](vision.md#product-workflow-direction) defers
+transparent interception (toolchain shim, `PATH` shim, shell alias) until the
+foundation works consistently, in favour of explicit `oxide` commands plus
+agent guidance ([workflow](contracts/workflow.md)). The inner hooks remain
 the execution mechanism behind those commands. No mechanism is installed or
 configured by this research.
 

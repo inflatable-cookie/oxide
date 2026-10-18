@@ -85,6 +85,8 @@ JIT, Cranelift and other code generation/execution solutions are confirmed resea
 
 ## Q-010 — Which integration surface best preserves familiar development loops?
 
+Tom's [2026-10-18 direction](vision.md#product-workflow-direction) selects explicit `oxide check|test|clippy|build|run` commands with agent guidance as the product surface; interception is deferred. The proposed [workflow](contracts/workflow.md) owns the shape. The text below records the earlier consumer-route answers.
+
 Tom's 2026-10-16 Nucleus ruling replaces its planned protected-route adoption
 with a same-user local lease CLI. The unpublished command is owned by
 [local lease](contracts/local-lease.md). The [current consumer boundary](contracts/project-adoption.md#current-nucleus-integration-boundary)
@@ -126,3 +128,7 @@ The reviewed [macOS completion/fencing disposition](qualification-readiness.md#w
 ## Q-014 — Is 20 GiB host free space a guarantee or a start/abort threshold?
 
 Settled by Tom on 2026-10-09: use 20 GiB as a monitored start/abort threshold, not a guarantee against unrelated host writers. [Architecture](architecture.md#budget-and-observations) owns the policy and required execution-protocol details. Tom separately approved one fixed task-owned image for the standalone pilot; its capacity and monitored host-threshold controls passed review for S1–S3. This grants no general volume creation or production budget authority; [vision](vision.md#authority-boundaries) owns that exact scope.
+
+## Q-015 — What does the foundation workflow need settled before implementation?
+
+The proposed [workflow](contracts/workflow.md#open-decisions) lists W-1 to W-7: default pool, waiting and concurrency, project file, crash recovery, parking versus retiring the protected route, Linux backend and command naming. W-4 and W-5 need operator rulings; the rest have recommendations. Owner: [workflow](contracts/workflow.md).
