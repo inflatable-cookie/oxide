@@ -1,0 +1,65 @@
+{
+  "task": "oxide#081 probe whether a Cargo build directory survives an APFS clone to a new path",
+  "session": {
+    "host_run_request_id": "618527ad-f312-4526-8425-533d809177f2",
+    "caller": "oxide:worker:081-apfs-clone-relocation",
+    "outcome": "complete",
+    "utc_start": "2026-10-18T20:49:01Z",
+    "session_seconds": 31.59,
+    "submission_and_admission_wait_seconds": 0.42,
+    "cargo_calls": {"experiment": 13, "experiment_cap": 14, "setup": 2, "setup_cap": 2},
+    "non_cargo_invocations": "2 rustc -vV toolchain inspections; 20 direct runs of already-built fixture binaries (bin + integration test per step); git archive | tar staging",
+    "raw_log_bytes": 337953,
+    "owned_bytes_peak_conservative": 669642752,
+    "host_free_min_bytes": 775731281920,
+    "writer_closure": "every owned process group returned ESRCH after exit; no stop, kill or forced cleanup",
+    "scratch_removed_after_closure": "root /private/tmp/oxide-clone-probe.mbj4vjda removed by ordinary rm -rf after the session; raw evidence copied first"
+  },
+  "pinned": {
+    "source_head": "dc84d039cd397c8292f37f4201e3916fa2ecd1d3",
+    "source_tree": "448bed9adba200dc4489060637a3bdb05addaddf",
+    "stable": "cargo 1.97.1 (c980f4866 2026-06-30), rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "nightly": "nightly-2026-08-05 toolchain, rustc 1.99.0-nightly (1ed2df61a 2026-08-04); its cargo version was not separately queried",
+    "nightly_flag": "-Z build-dir-new-layout (sole match in cargo -Z help)",
+    "profile": "default dev profile (debuginfo=2, split-debuginfo=unpacked, incremental), no RUSTFLAGS, no wrapper",
+    "layout": "CARGO_BUILD_BUILD_DIR = buildA then buildB (the cloned slot); CARGO_TARGET_DIR = one unchanged private target dir, as the oxide front door injects them"
+  },
+  "verdicts": {
+    "fx-stable (Cargo 1.97.1 layout)": "relocatable",
+    "fx-nightly-newlayout (build-dir layout v2)": "relocatable",
+    "oxide-real (Oxide repository, stable)": "relocatable for Cargo freshness and rebuilds; debug maps of not-yet-relinked binaries still point at A"
+  },
+  "findings": {
+    "clone_is_cow": "clonefile(2) rc 0 on all three directories; every file got a new inode with equal size, mode and mtime_ns; F_LOG2PHYS_EXT first-extent device offsets equal for 294/294, 287/287 and 300/300 sampled files, while a plain read/write copy control got a different offset each time",
+    "after_clone_unchanged": "F2/O2 with A renamed away: every compiler artifact fresh (8/8, 8/8, 38/38), no Dirty line, no build-script run, binaries pass",
+    "link_search_replay": "Cargo rewrote the replayed rustc-link-search from A's OUT_DIR to B's (build-script-executed linked_paths) although B's cloned output/root-output files still name A; the source-only edit (F3) recompiled and linked libprobe_native.a from B with A absent",
+    "rebuilds": "source edit rebuilt exactly the edited package's units; build-input edit reran the build script and regenerated code; following no-op fresh; all expected values observed",
+    "no_fingerprint_hits": "no occurrence of A's path in any .fingerprint file in any arm",
+    "remaining_original_paths": "after the final step: rustc make-style .d files of unchanged units; root-output files of unchanged dependency build scripts; serde/serde_core rlib/rmeta source maps naming A's OUT_DIR private.rs; proc-macro dylib install names (LC_ID_DYLIB); N_OSO debug-map entries in proc-macro test binaries that were not relinked. Before relink (F2/O2) every binary, including target/debug/* final outputs, carried N_OSO entries naming A's deps/*.o. None changed Cargo or test behaviour here; debugger use of not-relinked binaries was not tested"
+  },
+  "clone_cost": {
+    "fx-stable": {"files": 304, "logical_bytes": 11173888, "clonefile_seconds": 0.00208},
+    "fx-nightly-newlayout": {"files": 297, "logical_bytes": 8957952, "clonefile_seconds": 0.00303},
+    "oxide-real": {
+      "files": 2126,
+      "dirs": 95,
+      "logical_bytes": 256073728,
+      "clonefile_seconds": 0.01256,
+      "host_free_drop_at_clone_bytes": 1757184,
+      "host_free_drop_3s_bytes": 901120,
+      "host_free_drop_before_clone_to_after_rename_bytes": 1101824,
+      "host_free_drop_O2_to_O3_rebuild_bytes": 151998464,
+      "build_b_after_O3": {"files": 3923, "logical_bytes": 423129088},
+      "o1_cold_seconds": 4.99,
+      "o2_noop_seconds": 0.25,
+      "o3_lib_edit_seconds": 1.69,
+      "note": "host free space is shared with other tasks and noisy; it is not an exact clone allocation or SSD-write figure. src file nlink=2 for 1762 files because the private target dir hard-links uplifted outputs; clones have nlink=1"
+    }
+  },
+  "recipe_corrections": [
+    "build_script_runs in result.json matches only `build-script-build`; layout v2 names the binary `build_script_build`, so nightly F1 and F4 show 0 although raw stderr shows one run each. Nightly freshness above was re-read from raw stderr (F2/F5: 0 runs, 0 rustc, 0 Dirty).",
+    "The search classifier labels every file under build/<pkg>/<hash>/out/ as build-script-OUT_DIR-content; in layout v2 that directory also holds unit outputs (.rlib, .rmeta, .d, executables). Read the nightly hit file names, not the category.",
+    "Call wall_seconds are quantised by the 0.2 s poll loop; they are not timings of tiny commands."
+  ],
+  "not_claimed": "No universal portability, debugger correctness, per-task savings, SSD-write or production-readiness claim; one fixture, one repository, one host, one volume."
+}
