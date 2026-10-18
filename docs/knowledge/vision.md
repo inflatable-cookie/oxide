@@ -256,6 +256,26 @@ or a lease. Uncertainty falls through to normal Cargo; explicit rebuild controls
 remain. It grants no consumer, host or strategy change beyond the scoped run
 fast path, and no benefit claim beyond fixture behavior.
 
+### Reviewer model ruling superseding the Astra assignment
+
+Tom's exact 2026-10-18 ruling, relayed by the product architect: "I narrowed it -
+we don't need to use Astra for review, it's a waste. Use Sol" (Queue decision
+`346e04e8-f7ca-4bb5-9fea-39c7f73e7dd6` v2). This authenticates the worker-only Astra pool
+narrowing as Tom's intentional act; do not restore Astra reviewer/coordinator
+roles. It supersedes only the Astra-review assignment in decision
+`3a025584-9dd7-415d-8e07-0f37242f894c` / the earlier model-selection ruling.
+Reviews of #073 and #074–#079 use Sol at high reasoning. Opus High authoring is
+unchanged; no broader profile, capacity or shared-role mutation is authorized.
+
+For #073 the merge requires Sol acceptance of all four gates. Sol may assess
+preserved Opus proof evidence alongside the frozen source within the existing
+one-proof continuation; this ruling adds no proof attempt, time, source or
+resource allowance. The Opus proof failed before the freshness scenarios, so
+that failure remains explicit evidence, not a passing native result. The merge
+hold is released only after actual Sol acceptance; no model substitution or old
+Opus verdict supplies automatic gate credit. Other scopes, bounds and
+dependencies are unchanged.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
