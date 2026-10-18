@@ -464,6 +464,38 @@ tickets, an admission lock and one lock per record. The lease ledger,
 receipt and standalone CLI contract are unchanged; see
 [local lease](local-lease.md#oxide-front-door-control-directory).
 
+## Platform backends (proposed)
+
+The pool needs a backend on every host where builds run. On macOS, the APFS
+sparse image gives an unprivileged hard ceiling. Linux has no unprivileged
+equivalent: loop mounts, XFS/ext4 project quotas and btrfs qgroup limits all
+need root, and the filesystems an unprivileged user namespace may mount
+(`tmpfs`, overlay, FUSE) are RAM-backed or slow. The default must still need
+no setup, per Tom's ease-of-use ruling.
+
+| Backend | Where | Bound | Setup |
+| --- | --- | --- | --- |
+| `apfs-sparse-image-v1` (shipped) | macOS | OS-enforced aggregate ceiling | None; created automatically |
+| `directory-budget-v1` | Any host, the Linux default | Budget only: admission plus whole-idle-slot eviction against a recorded budget, with no OS ceiling. A supervised build also watches host free space through `statfs` and terminates its own process group before the host reserve is breached. A cheap check; no directory walk during the build. | None |
+| `linux-image-v1` | Long-lived Linux hosts (LAN build box) | OS-enforced ceiling on an ext4/XFS image or project-quota directory | One optional privileged provisioning step, then unprivileged use |
+
+Rules:
+
+- `status` and every summary line name the backend. A budget-only pool never
+  claims a hard ceiling.
+- A watchdog stop is an ordinary failed command. Its lease releases through
+  the normal process-group path, and the slot stays reusable because Cargo
+  tolerates interrupted builds.
+- CI runners are ephemeral: `directory-budget-v1` on the runner disk. A
+  persistent cache across runs means saving and restoring whole idle slots
+  through the CI cache, keyed like slots. That is a later executor feature.
+- Colima and other containers: run Oxide inside the Linux VM or container with
+  its own pool on the VM disk. Never share the host APFS pool over virtiofs
+  or sshfs: `flock`, mtime and capacity behaviour across that boundary are
+  unqualified.
+- A remote executor uses the remote host's own pool. Pools are never shared
+  across hosts.
+
 ## Open decisions
 
 - **W-1 Default pool.** Foundation choice above: per-user cache directory,
@@ -480,8 +512,10 @@ receipt and standalone CLI contract are unchanged; see
   Qualification, including a group-escape test, remains.
 - **W-5 Retirement execution.** Done in oxide#070; see
   [retirements](../retired.toml).
-- **W-6 Linux backend.** CI, LAN boxes and Colima need a pool backend without
-  APFS. A directory budget-only mode must say so honestly.
+- **W-6 Linux backend.** Proposed in [platform backends](#platform-backends-proposed):
+  budget-only directory pools with a host-reserve watchdog by default, and an
+  optional privileged image backend for long-lived hosts. The watchdog and the
+  Linux lease path need implementation and a Linux fixture proof.
 - **W-7 Command name.** `oxide` collides with Oxide Computer Company's CLI
   ([Q-005](../questions.md#q-005--what-names-are-safe-to-publish)). The design
   is name-independent.
