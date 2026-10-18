@@ -15,8 +15,10 @@ environment. One exclusive durable lease covers compile through test and
 artifact capture. Unknown crash outcomes, lost replies, age and PID
 disappearance do not imply release. Reconciliation must prove safe ownership
 settlement before reuse or eviction. The one exception is Tom's 2026-10-18
-ruling that lets Oxide's own commands recover through a qualified holder/group
-mechanism ([vision](vision.md#product-workflow-direction)).
+ruling that lets Oxide's own commands recover a lease whose holder lock is
+free and whose Cargo process group is empty
+([vision](vision.md#product-workflow-direction),
+[workflow](contracts/workflow.md#crash-recovery)); standalone leases never are.
 
 Exact-run final binaries, logs, QA receipts and evidence remain independently
 owned and preserved. Cargo intermediates are internal and may contain test

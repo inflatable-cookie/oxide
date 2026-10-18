@@ -4,7 +4,8 @@
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const FORWARDED: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 const POLL: Duration = Duration::from_millis(20);
@@ -14,6 +15,22 @@ const LINGER_NOTICE: Duration = Duration::from_secs(2);
 static PENDING: AtomicI32 = AtomicI32::new(0);
 /// Last signal received, kept for the exit status.
 static RECEIVED: AtomicI32 = AtomicI32::new(0);
+/// Wall-clock start of this process, set first thing in `main`.
+static STARTED_MS: OnceLock<u64> = OnceLock::new();
+
+/// Milliseconds since the epoch; 0 if the clock is before it.
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// This process's start time, recorded with its PID as a lease holder.
+pub fn started_ms() -> u64 {
+    *STARTED_MS.get_or_init(now_ms)
+}
 
 extern "C" fn record_signal(signal: libc::c_int) {
     PENDING.store(signal, Ordering::SeqCst);
