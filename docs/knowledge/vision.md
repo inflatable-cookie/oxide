@@ -96,6 +96,19 @@ failed comparison and unqualified readings are not upgraded by this direction.
 
 Tom approved two follow-ups on 2026-10-18 with the bundled reply "1. Approve 2. Approve" (Queue decisions `7be5f39c-a51f-423e-b417-30377242220f` v2 and `87779d3b-f406-4fe8-863e-bb62bcb05e2a` v2, relayed by the appointed product architect). First, the [foundation qualification](contracts/workflow.md#foundation-qualification-proposed) on Oxide's own repository, to run only after the front-door, crash-recovery and freshness-gate tasks merge, with bounds confirmed against what the foundation ships. Second, a bounded quick-run measurement of Cranelift for workspace crates after the foundation, including installation of the nightly `rustc-codegen-cranelift-preview` component on the existing nightly toolchain. Neither grants consumer changes, default-pool creation, other host changes or adoption of a strategy; adoption follows the measured result.
 
+The appointed product architect clarified foundation qualification staging on
+2026-10-18: one `cargo build --release --locked --offline --bin oxide` (or
+an equivalent focused Effigy build-only step) may prepare the exact-source
+binary. It runs at the pinned post-foundation main commit in a separate pristine
+scratch checkout, with build/target output outside both the dedicated pool and
+scenario worktrees A/B. It is one expressly counted setup invocation in addition
+to the nine Oxide scenario invocations and Q6's plain Cargo check, inside the
+unchanged original 30-minute clock. Record the commit, binary path and SHA-256;
+a failed setup build is a concrete no-go, not permission to restart. This
+resolves prerequisite output removal at closeout without requiring a published
+artifact, installation, another build or another session. Other approved caps,
+dependencies and evidence-only review remain unchanged.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus

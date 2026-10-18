@@ -379,10 +379,15 @@ example Nucleus) is a separate, owner-coordinated second stage.
 Raw output is preserved. Readings are observations, not speed or SSD claims.
 
 **Authorized bounds.** At most nine `oxide` invocations plus the single
-plain `cargo check` in Q6; one fresh dedicated 4 GiB APFS pool; an original
-30 minutes including setup; raw 20 GiB host reserve; and 20 minutes of
-independent review of retained evidence without repeating the session. No
-consumer, default pool, installation or host configuration change.
+plain `cargo check` in Q6, and one counted staging build:
+`cargo build --release --locked --offline --bin oxide` (or a focused Effigy
+build-only equivalent). Stage at the pinned commit in a separate pristine
+scratch checkout, with target output outside the dedicated pool and A/B;
+record the commit, binary path and SHA-256. A failed setup build is a no-go.
+The one fresh 4 GiB APFS pool, original 30-minute clock including all setup,
+raw 20 GiB host reserve, and 20-minute evidence-only review stay unchanged.
+No second build/session, consumer, default pool, installation or host
+configuration change.
 
 **Pass.** Q1–Q7 all hold. Any stale success in Q2 or Q3 is a hard fail and
 keeps slots checkout-affine. A failure in another scenario is reported with its
