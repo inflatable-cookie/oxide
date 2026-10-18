@@ -586,9 +586,12 @@ fn probe_args(request: &Resolution) -> Vec<OsString> {
 /// - a `--locked` or `--frozen` command fails the same way under plain Cargo
 ///   when the lock is missing, or when it is offline in any case: the
 ///   refusal is the command's own;
-/// - a command allowed to write a missing lock gets it from `cargo
-///   generate-lockfile` with its own arguments, Cargo's resolution with no
-///   previous lock, as its build would do; no package is downloaded;
+/// - a built-in Cargo build command allowed to write a missing lock, whose
+///   arguments Cargo accepts, gets it from `cargo generate-lockfile` with
+///   its own arguments: Cargo's resolution with no previous lock, as its
+///   build would do; no package is downloaded. External and unknown
+///   commands, and arguments Cargo rejects, never resolve under plain
+///   Cargo, so they only refuse the slot;
 /// - anything else refuses the slot, and the cold build does Cargo's own
 ///   lock work.
 fn cargo_metadata(checkout: &Path, request: &Resolution) -> Result<serde_json::Value, Refusal> {
@@ -617,6 +620,16 @@ fn cargo_metadata(checkout: &Path, request: &Resolution) -> Result<serde_json::V
             "the lock file needs updating; this command's Cargo updates it".to_owned(),
         ));
     }
+    let Some(check) = &request.parse_check else {
+        return Err(Refusal::Unvouched(
+            "only a built-in Cargo build command writes the missing lock file".to_owned(),
+        ));
+    };
+    if !cargo_accepts(Command::new(crate::CARGO).args(check))? {
+        return Err(Refusal::Unvouched(
+            "Cargo rejects this command's arguments, so it writes no lock file".to_owned(),
+        ));
+    }
     let generated = run_cargo(
         cargo_command(checkout, &["generate-lockfile"], &request.args),
         MAX_METADATA_ERROR_BYTES,
@@ -629,6 +642,18 @@ fn cargo_metadata(checkout: &Path, request: &Resolution) -> Result<serde_json::V
         .into());
     }
     probe(checkout, request)?.map_err(|refused| reason(&refused.message))
+}
+
+/// Run the parse check (`Resolution::parse_check`): Cargo accepts the
+/// arguments when its first error is the refusal of the unknown `-Z`.
+fn cargo_accepts(command: Command) -> Result<bool, String> {
+    let output = run_cargo(command, MAX_METADATA_ERROR_BYTES)?;
+    let first_error = output
+        .stderr
+        .lines()
+        .find(|line| line.starts_with("error:"));
+    Ok(output.status.code() == Some(101)
+        && first_error.is_some_and(|line| line.contains("`-Z` flag")))
 }
 
 /// Cargo's refusal to create or update the lock file.
@@ -960,6 +985,45 @@ mod tests {
                 "/w/Cargo.toml"
             ]
         );
+    }
+
+    /// Real Cargo in an empty scratch directory: accepted arguments reach the
+    /// `-Z` refusal; anything else, including a check placed after `--`,
+    /// would hit Cargo's argument error or its missing manifest instead.
+    #[test]
+    fn parse_check_asks_cargo_without_effects() {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("parse-check-{:x}", std::process::id()));
+        fs::create_dir(&dir).expect("scratch dir");
+        let accepts = |values: &[&str]| -> Option<bool> {
+            let values: Vec<OsString> = values.iter().map(OsString::from).collect();
+            let invocation =
+                crate::cli::parse_leased(values[0].to_str().expect("UTF-8"), &values[1..])
+                    .expect("parses");
+            let check = crate::cli::resolution(&invocation.cargo_args).parse_check?;
+            let mut command = Command::new(crate::CARGO);
+            command.args(check).current_dir(&dir);
+            Some(cargo_accepts(command).expect("Cargo ran"))
+        };
+        assert_eq!(accepts(&["test", "--locked"]), Some(true));
+        assert_eq!(
+            accepts(&["build", "--offline", "--config", "net.offline=false"]),
+            Some(true)
+        );
+        assert_eq!(
+            accepts(&["test", "--message-format=json", "--", "--bogus"]),
+            Some(true)
+        );
+        assert_eq!(accepts(&["test", "--bogus"]), Some(false));
+        assert_eq!(accepts(&["check", "--message-format=bogus"]), Some(false));
+        assert_eq!(accepts(&["build", "--release", "--features"]), Some(false));
+        assert_eq!(accepts(&["nextest", "run"]), None);
+        assert_eq!(accepts(&["test", "-Zunstable-options"]), None);
+        let left: Vec<_> = fs::read_dir(&dir).expect("scratch").collect();
+        fs::remove_dir(&dir).expect("parse check left no files");
+        assert!(left.is_empty());
     }
 
     #[test]

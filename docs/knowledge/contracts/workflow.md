@@ -163,11 +163,19 @@ slot has a recorded origin:
    offline. The gate adds `--offline` and `--locked` where the command lacks
    them, so metadata itself never downloads a package or writes the lock.
    When Cargo then refuses because the lock is missing or stale:
-   - A command allowed to write a missing `Cargo.lock` gets it from
-     `cargo generate-lockfile` with the command's own arguments: Cargo's
-     resolution with no previous lock, as its build would do, with no
-     package download. Metadata is then read again. A fresh worktree of a
-     repository with an ignored lock gets warm dependency reuse this way.
+   - A built-in Cargo build command (`build`, `check`, `test`, `bench`,
+     `doc`, `rustc`, `rustdoc`; `run` builds through `build`) allowed to
+     write a missing `Cargo.lock` gets it from `cargo generate-lockfile`
+     with the command's own arguments: Cargo's resolution with no previous
+     lock, as its build would do, with no package download. Metadata is
+     then read again. A fresh worktree of a repository with an ignored lock
+     gets warm dependency reuse this way. First Cargo parses the command's
+     own arguments with an extra unknown `-Z` before any `--`; it refuses
+     that flag before loading the workspace. Unless that refusal is Cargo's
+     first error, Cargo would reject the command without resolving, so no
+     lock is written and the slot is refused. External and unknown
+     commands (including `clippy`), and commands passing their own `-Z`,
+     never get a lock from the gate.
    - `--locked` or `--frozen` with a missing lock, or with `--frozen` or
      `--offline`, is the command's own refusal under plain Cargo: the
      command ends with Cargo's message and exit code, the slot goes back

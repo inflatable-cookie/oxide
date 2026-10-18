@@ -321,7 +321,18 @@ pub struct Resolution {
     pub args: Vec<OsString>,
     /// `-h` or `--help`: Cargo prints help and resolves nothing.
     pub help: bool,
+    /// For a built-in Cargo command that resolves the workspace, and only
+    /// when it passes no `-Z` of its own: its Cargo arguments with
+    /// `-Z oxide-parse-check` before any `--`. Cargo parses every argument,
+    /// then refuses the unknown `-Z` before it loads the workspace, so the
+    /// call has no effects and tells whether Cargo accepts the command.
+    pub parse_check: Option<Vec<OsString>>,
 }
+
+/// Built-in Cargo commands whose run resolves the workspace and writes a
+/// missing lock file (`run` builds through `build`).
+const RESOLVING: [&str; 7] = ["build", "check", "test", "bench", "doc", "rustc", "rustdoc"];
+pub const PARSE_CHECK: &str = "oxide-parse-check";
 
 impl Resolution {
     fn has(&self, flag: &str) -> bool {
@@ -371,6 +382,26 @@ pub fn resolution(cargo_args: &[OsString]) -> Resolution {
             }
             _ => {}
         }
+    }
+    let resolving = cargo_args
+        .first()
+        .and_then(|command| command.to_str())
+        .is_some_and(|command| RESOLVING.contains(&command));
+    let own_unstable = request
+        .args
+        .iter()
+        .any(|argument| argument.to_str().is_some_and(|text| text.starts_with("-Z")));
+    if resolving && !own_unstable {
+        let position = cargo_args
+            .iter()
+            .position(|argument| argument == "--")
+            .unwrap_or(cargo_args.len());
+        let mut check = cargo_args.to_vec();
+        check.splice(
+            position..position,
+            [OsString::from("-Z"), OsString::from(PARSE_CHECK)],
+        );
+        request.parse_check = Some(check);
     }
     request
 }
@@ -560,9 +591,23 @@ mod tests {
         let request = resolution(&parsed.cargo_args);
         assert!(request.locked() && request.offline() && request.moves_lockfile());
         assert!(!request.help);
+        assert_eq!(request.parse_check, None, "the command passes its own -Z");
         // No restriction requested: Cargo's own defaults.
         let plain = parse_leased("check", &args(&["-p", "app"])).unwrap();
-        assert_eq!(resolution(&plain.cargo_args), Resolution::default());
+        let plain = resolution(&plain.cargo_args);
+        assert!(plain.args.is_empty() && !plain.help);
+        assert_eq!(
+            plain.parse_check,
+            Some(args(&[
+                "check",
+                "-p",
+                "app",
+                "--profile",
+                "oxide-quick",
+                "-Z",
+                PARSE_CHECK
+            ]))
+        );
         let locked = resolution(
             &parse_leased("test", &args(&["--locked"]))
                 .unwrap()
@@ -582,9 +627,26 @@ mod tests {
         assert!(resolution(&short.cargo_args).help);
         let passed = parse_leased("test", &args(&["--", "--help"])).unwrap();
         assert!(!resolution(&passed.cargo_args).help);
-        // External subcommands are scanned after their name too.
+        // The parse check goes before `--`, so it never reaches a test binary.
+        assert_eq!(
+            resolution(&passed.cargo_args).parse_check,
+            Some(args(&[
+                "test",
+                "--profile",
+                "oxide-quick",
+                "-Z",
+                PARSE_CHECK,
+                "--",
+                "--help"
+            ]))
+        );
+        // External subcommands are scanned after their name too, and have no
+        // parse check: Cargo does not parse their arguments.
         let external = parse_leased("nextest", &args(&["run", "--frozen"])).unwrap();
         assert_eq!(resolution(&external.cargo_args).args, args(&["--frozen"]));
+        assert_eq!(resolution(&external.cargo_args).parse_check, None);
+        let clippy = parse_leased("clippy", &args(&[])).unwrap();
+        assert_eq!(resolution(&clippy.cargo_args).parse_check, None);
     }
 
     #[test]
