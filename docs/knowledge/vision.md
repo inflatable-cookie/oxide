@@ -244,7 +244,17 @@ consumer change, install or network-dependent fixture is authorized. This is an
 architect correction under existing authority, not a new operator quotation or
 reset of another task's time, proof or experimental allowance.
 
-Tom approved the `oxide run` unchanged-source fast path on 2026-10-18 with "Yes please": one Oxide-only PR after the freshness gate and its metadata-mode correction. It is bounded to tiny task-owned fixtures. If the source and build inputs match the last successful build of that binary in the same checkout, Oxide executes the existing binary without invoking Cargo. It grants no consumer, default or host change and no benefit claim beyond fixture behavior.
+Tom approved the `oxide run` unchanged-source fast path on 2026-10-18 with
+"Yes please", replying to the product architect's "Shall I go ahead?" (Queue
+decision `e652a41b-cc8b-4a15-9a01-92dfa4409c83` v2, relayed). One Oxide-only
+PR follows the freshness gate and its metadata-mode correction through normal
+merge and closeout. The scope is 60 minutes author, 20 minutes independent review,
+at most two sequential focused proof runs per side and tiny offline task-owned
+fixtures. If source and build inputs match the last successful build of that
+binary in the same checkout, Oxide executes the existing binary without Cargo
+or a lease. Uncertainty falls through to normal Cargo; explicit rebuild controls
+remain. It grants no consumer, host or strategy change beyond the scoped run
+fast path, and no benefit claim beyond fixture behavior.
 
 ## Authority boundaries
 
