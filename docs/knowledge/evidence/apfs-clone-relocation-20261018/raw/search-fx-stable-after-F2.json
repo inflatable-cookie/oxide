@@ -1,0 +1,238 @@
+{
+ "needle": "/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA",
+ "bases": [
+  "/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildB",
+  "/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/target"
+ ],
+ "scanned_files": 308,
+ "scanned_bytes": 10967674,
+ "uncovered_files": 0,
+ "uncovered_examples": [],
+ "hit_files": 20,
+ "hit_list_truncated": false,
+ "by_category": {
+  "rustc-or-cargo-dep-info-d": {
+   "files": 8,
+   "occurrences": 26
+  },
+  "build-script-record": {
+   "files": 2,
+   "occurrences": 2
+  },
+  "mach-o-binary": {
+   "files": 7,
+   "occurrences": 100
+  },
+  "rust-library": {
+   "files": 2,
+   "occurrences": 4
+  },
+  "rustc-incremental": {
+   "files": 1,
+   "occurrences": 2
+  }
+ },
+ "hits": [
+  {
+   "rel": "buildB/debug/build/probe-app-ae39c072ba323818/build_script_build-ae39c072ba323818.d",
+   "category": "rustc-or-cargo-dep-info-d",
+   "size": 310,
+   "occurrences": 2,
+   "first": {
+    "offset": 0,
+    "context": "/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA/debug/build/probe-app-ae39c072ba323818/build_script_build-ae39c"
+   }
+  },
+  {
+   "rel": "buildB/debug/build/probe-app-c2102be9b7e51ffe/output",
+   "category": "build-script-record",
+   "size": 241,
+   "occurrences": 1,
+   "first": {
+    "offset": 100,
+    "context": "changed=native.c\ncargo:rustc-link-search=native=/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA/debug/build/probe-app-c2102be9b7e51ffe/out\ncargo:rustc-link-lib"
+   }
+  },
+  {
+   "rel": "buildB/debug/build/probe-app-c2102be9b7e51ffe/root-output",
+   "category": "build-script-record",
+   "size": 99,
+   "occurrences": 1,
+   "first": {
+    "offset": 0,
+    "context": "/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA/debug/build/probe-app-c2102be9b7e51ffe/out"
+   }
+  },
+  {
+   "rel": "buildB/debug/deps/it-037a820593003287",
+   "category": "mach-o-binary",
+   "size": 1040096,
+   "occurrences": 36,
+   "first": {
+    "offset": 1020997,
+    "context": "rc/app/tests/it.rs/@/\u0000049fzqxfoynl1jducw3hu6a1n\u0000/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA/debug/deps/it-037a820593003287.049fzqxfoynl1jducw3hu6a1n.00d55b"
+   }
+  },
+  {
+   "rel": "buildB/debug/deps/it-037a820593003287.d",
+   "category": "rustc-or-cargo-dep-info-d",
+   "size": 231,
+   "occurrences": 2,
+   "first": {
+    "offset": 0,
+    "context": "/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA/debug/deps/it-037a820593003287.d: app/tests/it.rs\n\n/private/tmp"
+   }
+  },
+  {
+   "rel": "buildB/debug/deps/libprobe_app-a060f3df5ed1602e.rlib",
+   "category": "rust-library",
+   "size": 118064,
+   "occurrences": 2,
+   "first": {
+    "offset": 5166,
+    "context": "\u0003\ufffd\u0003\u0016\u00015\u0001 \u0001\r$\u0002\u0001\u001fP$\u0002\u0001\u001e\r,\u0013\u0015\u0018\"\u0006\u0000`\ufffd$H.\ufffd\u0005m\ufffd\ufffd\ufffd\u0018u\ufffd\ufffd%\u0000\u0000\u0000\u0000p/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA/debug/build/probe-app-c2102be9b7e51ffe/out/generated.rs\ufffd5/priva"
+   }
+  },
+  {
+   "rel": "buildB/debug/deps/libprobe_app-a060f3df5ed1602e.rmeta",
+   "category": "rust-library",
+   "size": 3489,
+   "occurrences": 2,
+   "first": {
+    "offset": 2742,
+    "context": "\u0003\ufffd\u0003\u0016\u00015\u0001 \u0001\r$\u0002\u0001\u001fP$\u0002\u0001\u001e\r,\u0013\u0015\u0018\"\u0006\u0000`\ufffd$H.\ufffd\u0005m\ufffd\ufffd\ufffd\u0018u\ufffd\ufffd%\u0000\u0000\u0000\u0000p/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA/debug/build/probe-app-c2102be9b7e51ffe/out/generated.rs\ufffd5/priva"
+   }
+  },
+  {
+   "rel": "buildB/debug/deps/libprobe_pm-1feb53c9d5ca6337.dylib",
+   "category": "mach-o-binary",
+   "size": 475664,
+   "occurrences": 1,
+   "first": {
+    "offset": 1784,
+    "context": "\u0010B\u0002\u0000\u0000\u0000\u0000\u0000\u0001\u0000\u0000\u0000\u0001\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\r\u0000\u0000\u0000\ufffd\u0000\u0000\u0000\u0018\u0000\u0000\u0000\u0001\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000\u0000/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA/debug/deps/libprobe_pm-1feb53c9d5ca6337.dylib\u0000\u0000\"\u0000\u0000\ufffd0\u0000\u0000\u0000\u0000\u0000\u0005\u0000\ufffd\u0000\u0000\u0000"
+   }
+  },
+  {
+   "rel": "buildB/debug/deps/probe_app-0a7ce5dc26e4e985",
+   "category": "mach-o-binary",
+   "size": 1004936,
+   "occurrences": 5,
+   "first": {
+    "offset": 993868,
+    "context": "src/app/src/lib.rs/@/\u00005ej69dh2knwhh900qw9s6jxfn\u0000/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA/debug/deps/probe_app-0a7ce5dc26e4e985.5ej69dh2knwhh900qw9s6jxfn"
+   }
+  },
+  {
+   "rel": "buildB/debug/deps/probe_app-0a7ce5dc26e4e985.d",
+   "category": "rustc-or-cargo-dep-info-d",
+   "size": 701,
+   "occurrences": 6,
+   "first": {
+    "offset": 0,
+    "context": "/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA/debug/deps/probe_app-0a7ce5dc26e4e985.d: app/src/lib.rs /privat"
+   }
+  },
+  {
+   "rel": "buildB/debug/deps/probe_app-83cde64c251c1eec",
+   "category": "mach-o-binary",
+   "size": 1004968,
+   "occurrences": 5,
+   "first": {
+    "offset": 993871,
+    "context": "rc/app/src/main.rs/@/\u00000odsyk9cqbnuiz5h9dyk7ej4r\u0000/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA/debug/deps/probe_app-83cde64c251c1eec.0odsyk9cqbnuiz5h9dyk7ej4r"
+   }
+  },
+  {
+   "rel": "buildB/debug/deps/probe_app-83cde64c251c1eec.d",
+   "category": "rustc-or-cargo-dep-info-d",
+   "size": 245,
+   "occurrences": 2,
+   "first": {
+    "offset": 0,
+    "context": "/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA/debug/deps/probe_app-83cde64c251c1eec.d: app/src/main.rs\n\n/priv"
+   }
+  },
+  {
+   "rel": "buildB/debug/deps/probe_app-9490ea9340484564",
+   "category": "mach-o-binary",
+   "size": 497672,
+   "occurrences": 24,
+   "first": {
+    "offset": 486346,
+    "context": "rc/app/src/main.rs/@/\u000026zlxd2gfsap15u74ptv8mbln\u0000/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA/debug/deps/probe_app-9490ea9340484564.26zlxd2gfsap15u74ptv8mbln"
+   }
+  },
+  {
+   "rel": "buildB/debug/deps/probe_app-9490ea9340484564.d",
+   "category": "rustc-or-cargo-dep-info-d",
+   "size": 245,
+   "occurrences": 2,
+   "first": {
+    "offset": 0,
+    "context": "/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA/debug/deps/probe_app-9490ea9340484564.d: app/src/main.rs\n\n/priv"
+   }
+  },
+  {
+   "rel": "buildB/debug/deps/probe_app-a060f3df5ed1602e.d",
+   "category": "rustc-or-cargo-dep-info-d",
+   "size": 943,
+   "occurrences": 8,
+   "first": {
+    "offset": 0,
+    "context": "/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA/debug/deps/probe_app-a060f3df5ed1602e.d: app/src/lib.rs /privat"
+   }
+  },
+  {
+   "rel": "buildB/debug/deps/probe_pm-1feb53c9d5ca6337.d",
+   "category": "rustc-or-cargo-dep-info-d",
+   "size": 246,
+   "occurrences": 2,
+   "first": {
+    "offset": 0,
+    "context": "/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA/debug/deps/probe_pm-1feb53c9d5ca6337.d: pm/src/lib.rs\n\n/private"
+   }
+  },
+  {
+   "rel": "buildB/debug/deps/probe_pm-39ed37776728de98",
+   "category": "mach-o-binary",
+   "size": 486280,
+   "occurrences": 5,
+   "first": {
+    "offset": 480686,
+    "context": "/src/pm/src/lib.rs/@/\u00004w1qyzngazid0f0xs7max6nrn\u0000/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA/debug/deps/probe_pm-39ed37776728de98.4w1qyzngazid0f0xs7max6nrn."
+   }
+  },
+  {
+   "rel": "buildB/debug/deps/probe_pm-39ed37776728de98.d",
+   "category": "rustc-or-cargo-dep-info-d",
+   "size": 237,
+   "occurrences": 2,
+   "first": {
+    "offset": 0,
+    "context": "/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA/debug/deps/probe_pm-39ed37776728de98.d: pm/src/lib.rs\n\n/private"
+   }
+  },
+  {
+   "rel": "buildB/debug/incremental/probe_app-38qblwvyctu6w/s-hnc588d3w8-09alcg3-8mpd4yr6vs0pgv509hozhre0s/metadata.rmeta",
+   "category": "rustc-incremental",
+   "size": 3489,
+   "occurrences": 2,
+   "first": {
+    "offset": 2742,
+    "context": "\u0003\ufffd\u0003\u0016\u00015\u0001 \u0001\r$\u0002\u0001\u001fP$\u0002\u0001\u001e\r,\u0013\u0015\u0018\"\u0006\u0000`\ufffd$H.\ufffd\u0005m\ufffd\ufffd\ufffd\u0018u\ufffd\ufffd%\u0000\u0000\u0000\u0000p/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA/debug/build/probe-app-c2102be9b7e51ffe/out/generated.rs\ufffd5/priva"
+   }
+  },
+  {
+   "rel": "target/debug/probe-app",
+   "category": "mach-o-binary",
+   "size": 497672,
+   "occurrences": 24,
+   "first": {
+    "offset": 486346,
+    "context": "rc/app/src/main.rs/@/\u000026zlxd2gfsap15u74ptv8mbln\u0000/private/tmp/oxide-clone-probe.mbj4vjda/fx-stable/buildA/debug/deps/probe_app-9490ea9340484564.26zlxd2gfsap15u74ptv8mbln"
+   }
+  }
+ ],
+ "wall_seconds": 0.038537708
+}

@@ -1,0 +1,54 @@
+Available unstable (nightly-only) flags:
+
+    -Z allow-features              Allow *only* the listed unstable features
+    -Z embed-metadata              Avoid embedding metadata in library artifacts
+    -Z any-build-script-metadata   Allow any build script to specify env vars via cargo::metadata=key=value
+    -Z asymmetric-token            Allows authenticating with asymmetric tokens
+    -Z avoid-dev-deps              Avoid installing dev-dependencies if possible
+    -Z binary-dep-depinfo          Track changes to dependency artifacts
+    -Z bindeps                     Allow Cargo packages to depend on bin, cdylib, and staticlib crates, and use the artifacts built by those crates
+    -Z build-analysis              Record and persist build metrics across runs, with commands to query past builds.
+    -Z build-dir-new-layout        Use the new build-dir filesystem layout
+    -Z build-std                   Enable Cargo to compile the standard library itself as part of a crate graph compilation
+    -Z build-std-features          Configure features enabled for the standard library itself when building the standard library
+    -Z cargo-lints                 Enable the `[lints.cargo]` table
+    -Z checksum-freshness          Use a checksum to determine if output is fresh rather than filesystem mtime
+    -Z codegen-backend             Enable the `codegen-backend` option in profiles in .cargo/config.toml file
+    -Z direct-minimal-versions     Resolve minimal dependency versions instead of maximum (direct dependencies only)
+    -Z dual-proc-macros            Build proc-macros for both the host and the target
+    -Z feature-unification         Enable new feature unification modes in workspaces
+    -Z fine-grain-locking          Use fine grain locking instead of locking the entire build cache
+    -Z fix-edition                 Permanently unstable edition migration helper
+    -Z gc                          Track cache usage and "garbage collect" unused files
+    -Z git                         Enable support for shallow git fetch operations
+    -Z gitoxide                    Use gitoxide for the given git interactions, or all of them if no argument is given
+    -Z hint-msrv                   Enable passing `package.rust-version` to rustc for lints
+    -Z host-config                 Enable the `[host]` section in the .cargo/config.toml file
+    -Z json-target-spec            Enable `.json` target spec files
+    -Z min-publish-age             Enable the `min-publish-age` configuration for dependency version age filtering
+    -Z minimal-versions            Resolve minimal dependency versions instead of maximum
+    -Z msrv-policy                 Enable rust-version aware policy within cargo
+    -Z mtime-on-use                Configure Cargo to update the mtime of used files
+    -Z no-index-update             Do not update the registry index even if the cache is outdated
+    -Z panic-abort-tests           Enable support to run tests with -Cpanic=abort
+    -Z panic-immediate-abort       Enable setting `panic = "immediate-abort"` in profiles
+    -Z profile-hint-mostly-unused  Enable the `hint-mostly-unused` setting in profiles to mark a crate as mostly unused.
+    -Z profile-rustflags           Enable the `rustflags` option in profiles in .cargo/config.toml file
+    -Z public-dependency           Respect a dependency's `public` field in Cargo.toml to control public/private dependencies
+    -Z publish-timeout             Enable the `publish.timeout` key in .cargo/config.toml file
+    -Z root-dir                    Set the root directory relative to which paths are printed (defaults to workspace root)
+    -Z rustc-unicode               Enable `rustc`'s unicode error format in Cargo's error messages
+    -Z rustdoc-depinfo             Use dep-info files in rustdoc rebuild detection
+    -Z rustdoc-map                 Allow passing external documentation mappings to rustdoc
+    -Z rustdoc-mergeable-info      Use rustdoc mergeable cross-crate-info files
+    -Z rustdoc-scrape-examples     Allows Rustdoc to scrape code examples from reverse-dependencies
+    -Z sbom                        Enable the `sbom` option in build config in .cargo/config.toml file
+    -Z script                      Enable support for single-file, `.rs` packages
+    -Z section-timings             Enable support for extended compilation sections in --timings output
+    -Z target-applies-to-host      Enable the `target-applies-to-host` key in the .cargo/config.toml file
+    -Z trim-paths                  Enable the `trim-paths` option in profiles
+    -Z unstable-options            Allow the usage of unstable options
+
+Run with `cargo -Z [FLAG] [COMMAND]`
+
+See https://doc.rust-lang.org/nightly/cargo/reference/unstable.html for more information about these flags.

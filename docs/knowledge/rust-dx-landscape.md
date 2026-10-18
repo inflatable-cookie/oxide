@@ -246,7 +246,7 @@ time separately before any backend is credited.
 | Lever | Finding | Fit |
 | --- | --- | --- |
 | No-op fast path | Oxide can record the last successful build's content identity per checkout and binary (the freshness gate records it). If unchanged, it executes without invoking Cargo, skipping Cargo's fingerprint walk. | In Oxide's control; small, safe; after the gate. |
-| Optimized dependencies in `quick` | `package."*".opt-level` makes heavy dependencies run faster. Shared slots pay that compile cost once across worktrees. It needs `--config`, because the environment cannot express `package."*"`. | Candidate; measure. Every modelled command must use the same recipe, or the slot holds two dependency sets. |
+| Optimized dependencies in `quick` | `package."*".opt-level` can make heavy dependencies run faster. Shared slots would pay that compile cost once across worktrees. It needs `--config`, because the environment cannot express `package."*"`. Measured 2026-10-18 on Oxide's workspace: about 3.3 s extra cold build and no test-runtime gain ([measurement](#optimized-dependency-measurement-2026-10-18)). | Not for the default recipe. A dependency-compute-bound project needs its own reading. Every modelled command must use the same recipe, or the slot holds two dependency sets. |
 | Workspace feature unification | Selecting different packages builds dependency variants with different features: churn and extra storage. A 2026-10-18 probe on 1.97.1 showed `resolver.feature-unification` is ignored without `-Zfeature-unification` ([RFC 3692](https://rust-lang.github.io/rfcs/3692-feature-unification.html)). The stable route is a workspace-hack crate, which is a project change. | `oxide status` could report duplicate dependency variants; the fix stays per project. |
 | Faster linkers | macOS uses Apple's linker. [Wild](https://github.com/davidlattimore/wild) is Linux-only, has no incremental linking yet, and its Mach-O port is not ready. | Linux: LLD default already; wild later. macOS: nothing to add. |
 | Dynamic dependency linking | A dylib wrapper crate re-exporting dependencies cuts link time for large graphs, but changes linking and runtime loading. | Per-project opt-in only. |
@@ -254,6 +254,77 @@ time separately before any backend is credited.
 | Watch mode | Rebuilds and restarts on save; cuts latency, not work. | Human loop; low value for agents. |
 | [danluu/rust-interpreter](https://github.com/danluu/rust-interpreter) | rustc checks the code, then selected MIR is lowered to bytecode and run in an interpreter or AArch64 JIT. Self-described as "extremely vibe coded"; "cannot yet replace `cargo test`"; no unwinding, threads, FFI or `should_panic`; "no fallback" for unsupported code. Its results are mixed: 20% faster on one five-edit pilot, 2.7x slower on a compute-heavy target. Needs pinned nightly with `rustc-dev`; no license stated. | Not usable or adoptable. It shows the approach can work, and its ceiling is still the check time. |
 | Miri / [Cranelift JIT](https://github.com/rust-lang/rustc_codegen_cranelift/blob/main/docs/usage.md) | Miri is a UB checker that runs far slower than native code. Cranelift JIT is covered above. | Not speed tools. |
+
+### Optimized-dependency measurement (2026-10-18)
+
+One bounded session (oxide#076) on Oxide's repository at `22d2f77`, stable
+1.97.1, macOS aarch64, under Effigy heavy admission. Raw evidence:
+[`evidence/optimized-deps-quick-076/`](evidence/optimized-deps-quick-076/summary.json).
+Tom approved the session ([vision](vision.md#product-workflow-direction)).
+
+Arms, each in its own target directory: A is the `quick` recipe; B adds
+`--config 'profile.oxide-quick.package."*".opt-level=1'`; C uses `opt-level=2`.
+Loop per arm: a cold `cargo test --workspace --all-targets --no-run`, then three
+edits to `MAX_REFERENCES` in `src/dep_info.rs`, each followed by the same
+`--no-run`. Every call used `--locked --offline` and an explicit environment;
+the source was reset to the pin between arms. After every build the reported
+test executables (`profile.test` artifacts only) ran directly with default
+membership. All four macOS scratch variables pointed at one root.
+
+| Arm | Dependency opt-level | Cold `--no-run` | Warm `--no-run` | Library suite (libtest) | `oxide` bin suite | Target after cold / after loop |
+| --- | --- | --- | --- | --- | --- | --- |
+| A | 0 | 4.24 s | 0.80 s | 2.11 s | 0.33–0.35 s | 190.3 / 264.7 MiB |
+| B | 1 | 7.58 s | 0.82 s | 2.22 s | 0.34–0.35 s | 187.5 / 262.6 MiB |
+| C | 2 | 7.45 s | 0.89 s | 2.20 s | 0.33–0.37 s | 191.7 / 266.4 MiB |
+
+Warm figures are means of the three edits. Library-suite figures are libtest's
+own `finished in` times, means of those edits. Every edit rebuilt the same 9
+workspace units and left 29 fresh.
+
+Receipts:
+- Tests passed in every cycle of every arm: 52 library, 36 `oxide` bin and 1
+  profile probe; 0 ignored, 0 failed. The two storage bins have no tests.
+- Workspace units had identical rustc settings in all arms. All 29 dependency
+  units (20 libraries, 8 build scripts, `serde_derive`) carried the arm's
+  `-C opt-level`. B and C also got an explicit `-C debug-assertions=on`, which
+  keeps the debug assertions that A has implicitly at opt-level 0. No other
+  flag differed.
+
+Findings:
+- **No test-runtime gain.** The library suite averaged 2.1–2.2 s in every arm;
+  B and C were not faster than A. The `oxide` bin suite was unchanged.
+  Oxide's tests are not bound by dependency compute.
+- **Cold cost rises by 3.2–3.3 s per slot (+76–79%).** A ran first, with cold
+  sources and compiler, so the real gap may be larger.
+- **`package."*"` also optimizes build-time units.** It took precedence over
+  `build-override` for build scripts and the proc-macro, which adds compile
+  cost with no runtime return.
+- **Storage did not change measurably** (within 4.2 MiB after cold, 3.8 MiB
+  after the loop).
+- **Process start dominates the noise.** Seven of 60 test-binary runs took
+  2.0–3.6 s more than libtest reported, including zero-test binaries. All
+  arms were affected; the cause was not isolated. Harness wall totals per
+  cycle (3.5–7.0 s) therefore do not compare arms.
+
+Recommendation: do not add dependency optimization to the default `quick`
+recipe. On this workspace it costs about 3.3 s per cold slot and returns
+nothing. A dependency-compute-bound project (heavy hashing, compression or
+parsing in tests) could differ. That needs its own approved reading, and an
+override would have to exclude build-time units.
+
+Cross-worktree amortization was not observed; this session used one
+checkout. Estimate, assumptions only: if every modelled command in a shared
+slot uses the same recipe, a slot pays the extra cold cost once. A per-run
+saving of *g* seconds then breaks even after about 3.3 / *g* runs in that slot.
+Here *g* was not positive, so no number of worktrees recovers the cost.
+
+Limits:
+- One small subject (38 units), three warm samples per arm, macOS aarch64
+  only, on a shared host (one-minute load 7.6–10.9).
+- Arms ran in order A, B, C.
+- No write-volume or SSD claim.
+- Session: 12 measured plus 1 version Cargo call, 93 s of the 30 minutes,
+  811 MiB peak owned scratch, 0.7 MiB raw logs.
 
 ## Upstream churn and disk developments (2026-10-18)
 
@@ -272,6 +343,46 @@ Implication: the `quick` recipe accumulates stale objects in long-lived shared s
 | [`hint-mostly-unused`](https://blog.rust-lang.org/inside-rust/2025/07/15/call-for-testing-hint-mostly-unused/) | Nightly; per-dependency hint that defers code generation for unused items; regresses if applied globally. | Narrow, profile-guided; only helps when the dependency is built. |
 | Cargo home GC ([1.88](https://blog.rust-lang.org/2025/06/26/Rust-1.88.0/)) | Stable automatic cleanup of downloaded/cached files (3 months / 1 month unused). Never runs with `--offline` or `--frozen`. The target dir is not covered. | Agent and Oxide proofs often run `--offline`, so their Cargo home may never be cleaned. Worth surfacing in `oxide status`. |
 | [Cargo script](https://rust-lang.github.io/goals/2026/cargo-script.html) | Frontmatter stabilization in progress; not stable on 1.97.1. | Single-file scripts; each script otherwise gets its own target dir. |
+
+## Cloning a warm build directory (2026-10-18 probe)
+
+oxide#081 tested whether a warm build directory still works after an APFS clone to a new path. It ran one heavy-admitted 32-second session using 13 of 14 experimental Cargo calls and both setup calls. Raw evidence is in [apfs-clone-relocation-20261018](evidence/apfs-clone-relocation-20261018/summary.json).
+
+Setup:
+- Injection matched `oxide`'s: `CARGO_BUILD_BUILD_DIR` pointed at the slot and one private `CARGO_TARGET_DIR` stayed fixed.
+- `clonefile(2)` copied build dir A to B. A was then renamed away so any dangling reference would fail loudly.
+- The same checkout was then built against B.
+- Fixture: a build script that writes `include!`d code and a static library into `OUT_DIR`, emits `rustc-link-search` into it, a path proc-macro and one integration test.
+
+| Subject | Verdict | Evidence |
+| --- | --- | --- |
+| Fixture, Cargo 1.97.1 layout | Relocatable | After the clone, all 8 units were fresh and the binaries passed. A source-only edit rebuilt only `probe-app` and linked the static library from B. A build-input edit reran the build script. A final no-op was fresh. |
+| Fixture, nightly-2026-08-05 `-Z build-dir-new-layout` (layout v2) | Relocatable | Same sequence and results. |
+| Oxide repository at `dc84d03`, stable, default dev profile | Relocatable for Cargo | After the clone, all 38 units were fresh in 0.25 s. A `src/lib.rs` edit rebuilt only the 9 `oxide-storage` units in 1.7 s; the cold build took 5.0 s. |
+
+How the paths behave:
+- Cargo stays correct because it does not keep A's path in the files it checks:
+  - no `.fingerprint` file in any arm named A;
+  - B's cloned build-script `output` and `root-output` still named A's `OUT_DIR`, but Cargo rewrote the replayed link-search path to B.
+- A's path survives elsewhere:
+  - rustc's make-style `.d` files of unchanged units;
+  - unrerun dependency `root-output` files;
+  - `serde`/`serde_core` metadata source maps that name A's generated `private.rs`;
+  - proc-macro dylib install names.
+- Debug info is the open condition. Until a binary is relinked, its macOS debug map (`N_OSO`) points at A's `deps/*.o`. That includes the `target/debug/*` outputs Cargo uplifts from B (on macOS APFS these are clones, not hard links; see the [final-output placement probe](#final-output-placement-probe-2026-10-18)).
+  - It harms nothing while A still exists unchanged, as a clone source would.
+  - Once A is gone or rebuilt, debugging an unchanged binary can lose its debug info.
+  - The probe did not run a debugger.
+
+Clone cost (Oxide repository, 2,126 files; source `st_blocks` sum 244 MiB, which counts allocated blocks, not apparent size, and cannot see clone sharing):
+- `clonefile` took 12.6 ms. Host free space fell 1.1 MiB from before the clone to after the rename.
+- All 300 sampled files kept the same first physical extent (`F_LOG2PHYS_EXT`). A plain-copy control file moved to a new extent, which is direct evidence of copy-on-write sharing. Inodes differed; sizes, modes and mtimes matched.
+- Host free space fell another 152 MB over the edit-rebuild interval. The host is shared, so this is not attributed to the rebuild or to clone divergence.
+- Host free space is shared and noisy. These figures are not exact clone allocation or SSD writes.
+
+Implication: on this host and toolchain, cloning a slot per worktree, or warm-starting from main's slot, is mechanically sound for Cargo freshness and rebuild correctness on both layouts. A product design still has to settle the debug-map condition: keep the source slot unchanged while clones exist, or accept relinking. One fixture and one repository do not prove universal portability, debugger behaviour or savings. Two recipe slips are corrected in the summary:
+- the layout v2 build script is named `build_script_build`, so the recipe's run counter missed it;
+- the hit classifier mislabels v2 unit outputs under `build/<pkg>/<hash>/out/`.
 
 ## Final-output placement probe (2026-10-18)
 

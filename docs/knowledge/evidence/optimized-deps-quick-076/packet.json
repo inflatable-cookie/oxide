@@ -1,0 +1,50 @@
+{
+  "root": "/private/tmp/oxide-076-optdeps.mjmez95a",
+  "request_id": "40f34b8d-8215-43f7-b49c-292e85e376dd",
+  "caller": "oxide:worker:076-optimized-deps-quick",
+  "pin": "22d2f7709b9d3e9e826b0ce64f893292f8f6fda7",
+  "source_repository": "/Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-664cd639-9e75-4807-bdf2-d35c5cf3edae",
+  "start_ns": 309618161998333,
+  "deadline_ns": 311418161998333,
+  "clock": "raw mach_continuous_time via mach_timebase_info, started in submit.py before pin check, root creation, admission wait and setup",
+  "utc_start": "2026-10-18T21:20:36Z",
+  "measured_cargo_cap": 12,
+  "setup_cargo_cap": 2,
+  "session_seconds_cap": 1800,
+  "owned_scratch_cap_bytes": 6442450944,
+  "host_reserve_bytes": 21474836480,
+  "raw_log_cap_bytes": 33554432,
+  "host_cargo_home": "/Users/tom/.cargo",
+  "host_shell_note": "every Cargo call and test executable uses an explicit environment allowlist; the submitting shell environment (including any CARGO_INCREMENTAL) is not inherited",
+  "toolchain": {
+    "name": "1.97.1-aarch64-apple-darwin",
+    "bin": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin"
+  },
+  "arm_order": [
+    "A",
+    "B",
+    "C"
+  ],
+  "arms": {
+    "A": {
+      "what": "stable 1.97.1, quick recipe (env-defined oxide-quick profile)"
+    },
+    "B": {
+      "what": "A plus profile.oxide-quick.package.\"*\".opt-level = 1",
+      "global_args": [
+        "--config",
+        "profile.oxide-quick.package.\"*\".opt-level=1"
+      ]
+    },
+    "C": {
+      "what": "A plus profile.oxide-quick.package.\"*\".opt-level = 2",
+      "global_args": [
+        "--config",
+        "profile.oxide-quick.package.\"*\".opt-level=2"
+      ]
+    }
+  },
+  "workload": "cargo test --workspace --all-targets --locked --offline --profile oxide-quick --no-run, then each reported profile.test executable run directly with default membership",
+  "recipe_sha256": "29cd1e2d9abad1edfefefa6ed11382a568e12636937c71b552c4f939dc6a7789",
+  "submit_sha256": "72dc48de42474654757d677999b9592ab06b4e87b1328a728f96c65355dfea29"
+}
