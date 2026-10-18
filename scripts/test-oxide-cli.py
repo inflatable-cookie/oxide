@@ -12,6 +12,8 @@ waiting and the host limit, Ctrl-C forwarding, own-command crash recovery,
 and the scratch removed only after positive completion. Not a benchmark and
 not full QA.
 """
+from __future__ import annotations
+
 import json
 import os
 import re
