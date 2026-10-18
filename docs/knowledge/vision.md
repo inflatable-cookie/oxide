@@ -283,6 +283,10 @@ Tom approved three bounded probes on 2026-10-18 with "Let's do all three":
 
 They are research probes on disposable fixtures and Oxide's own repository. They grant no recipe, default, consumer or host change, and no adoption.
 
+Tom approved two further leads on 2026-10-18 with "Yes please":
+- A qualification of the `oxide` foundation on Cargo/Rust 1.100 after its stable release, scheduled for 2026-11-12. It includes installing the pinned `1.100.0` toolchain side by side without changing the default `stable` toolchain or Oxide's declared `rust-version`.
+- A probe of what triggers Cargo's automatic home-cache cleanup. It uses only a scratch `CARGO_HOME`, never the live one.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
