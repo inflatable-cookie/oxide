@@ -77,6 +77,10 @@ struct Record {
     /// Lease ID once the library granted it.
     #[serde(default)]
     lease_id: Option<String>,
+    /// Written before the ledger recovery, so the event survives a crash
+    /// between that recovery and moving it into the log.
+    #[serde(default)]
+    pending_recovery: Option<Recovery>,
 }
 
 /// The `oxide` process holding a record, and the lease holder string it
@@ -175,6 +179,7 @@ impl State {
         record.process_group = None;
         record.holder = None;
         record.lease_id = None;
+        record.pending_recovery = None;
     }
 
     fn log_recovery(&mut self, recovery: Recovery) {
@@ -200,27 +205,47 @@ enum Settle {
     Keep,
 }
 
-/// The own-command recovery rule. `held` is the held slot on the record's
-/// private project, if any. The held lease must be the record's own: its
-/// lease ID, or before that was saved, its unique lease holder string.
-/// `group_empty` is `killpg(pgid, 0)` reporting `ESRCH`; a surviving member
-/// or a reused group keeps the slot held.
-fn settle(record: &Record, held: Option<&SlotStatus>, group_empty: impl Fn(i32) -> bool) -> Settle {
-    let Some(slot) = held else {
-        return Settle::Reset;
-    };
+/// How a held lease left by a dead command can return to the pool.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Return {
+    /// Cargo never started: the next command recovers it.
+    NeverStarted,
+    /// The next command recovers it once this process group is empty.
+    GroupEmpty(i32),
+    /// Cargo's group was never recorded: only an explicit recover.
+    GroupUnrecorded,
+    /// The held lease is not provably the record's own (for example a record
+    /// from an earlier build without a holder): only an explicit recover.
+    NotOwn,
+}
+
+/// The held lease must be the record's own: its lease ID, or before that was
+/// saved, its unique lease holder string.
+fn return_path(record: &Record, slot: &SlotStatus) -> Return {
     let own = match (&record.lease_id, &record.holder) {
         (Some(lease_id), _) => slot.lease_id.as_ref() == Some(lease_id),
         (None, Some(holder)) => slot.holder.as_ref() == Some(&holder.lease_holder),
         (None, None) => false,
     };
-    if !own {
-        return Settle::Keep;
+    match (own, record.phase, record.process_group) {
+        (false, _, _) => Return::NotOwn,
+        (true, Phase::Acquiring, _) => Return::NeverStarted,
+        (true, Phase::Running, Some(group)) => Return::GroupEmpty(group),
+        (true, Phase::Running | Phase::Spawning | Phase::Idle, _) => Return::GroupUnrecorded,
     }
-    match record.phase {
-        Phase::Acquiring => Settle::Recover,
-        Phase::Running if record.process_group.is_some_and(group_empty) => Settle::Recover,
-        Phase::Running | Phase::Spawning | Phase::Idle => Settle::Keep,
+}
+
+/// The own-command recovery rule. `held` is the held slot on the record's
+/// private project, if any. `group_empty` is `killpg(pgid, 0)` reporting
+/// `ESRCH`; a surviving member or a reused group keeps the slot held.
+fn settle(record: &Record, held: Option<&SlotStatus>, group_empty: impl Fn(i32) -> bool) -> Settle {
+    let Some(slot) = held else {
+        return Settle::Reset;
+    };
+    match return_path(record, slot) {
+        Return::NeverStarted => Settle::Recover,
+        Return::GroupEmpty(group) if group_empty(group) => Settle::Recover,
+        Return::GroupEmpty(_) | Return::GroupUnrecorded | Return::NotOwn => Settle::Keep,
     }
 }
 
@@ -324,8 +349,7 @@ pub struct SlotView {
 
 pub struct Interrupted {
     pub holder_pid: Option<u32>,
-    /// `None` when the command died before recording Cargo's group.
-    pub process_group: Option<i32>,
+    pub path: Return,
 }
 
 pub struct Store {
@@ -568,7 +592,7 @@ impl Store {
                         })
                         .map(|record| Interrupted {
                             holder_pid: record.holder.as_ref().map(|holder| holder.pid),
-                            process_group: record.process_group,
+                            path: return_path(record, slot),
                         }),
                     bytes: slot.unique_allocated_bytes,
                 }
@@ -737,6 +761,7 @@ impl Store {
                     last_used: 0,
                     holder: None,
                     lease_id: None,
+                    pending_recovery: None,
                 });
                 state.records.len() - 1
             }
@@ -815,12 +840,17 @@ impl Store {
             });
             match settle(record, held, process::group_empty) {
                 Settle::Keep => continue,
-                Settle::Reset => {}
+                Settle::Reset => {
+                    // A crash after the ledger recovery but before the log
+                    // update left the event pending; the slot is no longer
+                    // held, so the recovery took effect.
+                    if let Some(recovery) = state.records[index].pending_recovery.take() {
+                        state.log_recovery(recovery);
+                    }
+                }
                 Settle::Recover => {
                     let slot = held.ok_or("a recovered record has no held slot")?;
                     let lease_id = slot.lease_id.clone().ok_or("held slot has no lease ID")?;
-                    recover(&self.pool, &lease_id)
-                        .map_err(|error| lease_error("cannot recover a settled slot", &error))?;
                     let holder = record
                         .holder
                         .as_ref()
@@ -835,6 +865,12 @@ impl Store {
                         recovered_ms: process::now_ms(),
                         recovered_by: std::process::id(),
                     };
+                    // Write ahead: callers hold the admission lock, and the
+                    // event is durable before the ledger changes.
+                    state.records[index].pending_recovery = Some(recovery.clone());
+                    self.save(state)?;
+                    recover(&self.pool, &recovery.lease_id)
+                        .map_err(|error| lease_error("cannot recover a settled slot", &error))?;
                     eprintln!(
                         "oxide: recovered slot {} after oxide pid {} died ({})",
                         recovery.slot_id,
@@ -846,8 +882,6 @@ impl Store {
                     );
                     state.log_recovery(recovery);
                     state.settle_idle(index);
-                    // Callers hold the admission lock; keep the log durable
-                    // even if their later step fails.
                     self.save(state)?;
                     status = None;
                     continue;
@@ -1182,6 +1216,7 @@ mod tests {
                 lease_holder: "oxide-41-3".to_owned(),
             }),
             lease_id: lease_id.map(str::to_owned),
+            pending_recovery: None,
         }
     }
 
@@ -1251,6 +1286,48 @@ mod tests {
         // Without a holder or lease ID the held lease cannot be proven its own.
         let slot = held("oxide-41-3", "v1.a.1.1.1");
         assert_eq!(settle(record, Some(&slot), |_| true), Settle::Keep);
+        // Status must not promise automatic recovery for it.
+        assert_eq!(return_path(record, &slot), Return::NotOwn);
+    }
+
+    #[test]
+    fn status_path_matches_the_rule() {
+        let slot = held("oxide-41-3", "v1.a.1.1.1");
+        let running = record(Phase::Running, Some(900), Some("v1.a.1.1.1"));
+        assert_eq!(return_path(&running, &slot), Return::GroupEmpty(900));
+        let spawning = record(Phase::Spawning, None, Some("v1.a.1.1.1"));
+        assert_eq!(return_path(&spawning, &slot), Return::GroupUnrecorded);
+        let acquiring = record(Phase::Acquiring, None, None);
+        assert_eq!(return_path(&acquiring, &slot), Return::NeverStarted);
+        let other = held("nucleus-task", "v1.a.1.2.5");
+        assert_eq!(return_path(&running, &other), Return::NotOwn);
+    }
+
+    #[test]
+    fn pending_recovery_survives_a_crash_after_the_ledger_change() {
+        let mut state = State::default();
+        let mut crashed = record(Phase::Running, Some(900), Some("v1.a.1.1.1"));
+        crashed.pending_recovery = Some(Recovery {
+            slot_id: "1".to_owned(),
+            lease_id: "v1.a.1.1.1".to_owned(),
+            checkout: None,
+            holder_pid: 41,
+            holder_started_ms: 7,
+            process_group: Some(900),
+            recovered_ms: 9,
+            recovered_by: 42,
+        });
+        let bytes = serde_json::to_vec(&crashed).expect("serialise");
+        state
+            .records
+            .push(serde_json::from_slice(&bytes).expect("pending reloads"));
+        // The ledger recovery committed, so the slot is no longer held.
+        assert_eq!(settle(&state.records[0], None, |_| false), Settle::Reset);
+        let pending = state.records[0].pending_recovery.take().expect("pending");
+        state.log_recovery(pending);
+        state.settle_idle(0);
+        assert_eq!(state.recoveries.len(), 1);
+        assert!(state.records[0].pending_recovery.is_none());
     }
 
     #[test]

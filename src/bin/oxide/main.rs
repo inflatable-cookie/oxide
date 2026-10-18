@@ -411,14 +411,23 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
                         let holder = interrupted
                             .holder_pid
                             .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string());
-                        match interrupted.process_group {
-                            Some(group) => format!(
-                                "held by an interrupted command (oxide pid {holder}, Cargo group {group}; recovered once the group is empty)"
+                        let path = match interrupted.path {
+                            store::Return::NeverStarted => {
+                                "Cargo never started; the next command recovers it".to_owned()
+                            }
+                            store::Return::GroupEmpty(group) => format!(
+                                "Cargo group {group}; recovered once the group is empty"
                             ),
-                            None => format!(
-                                "held by an interrupted command (oxide pid {holder}, Cargo group not recorded; `oxide-storage-lease recover` releases it)"
-                            ),
-                        }
+                            store::Return::GroupUnrecorded => {
+                                "Cargo group not recorded; `oxide-storage-lease recover` releases it"
+                                    .to_owned()
+                            }
+                            store::Return::NotOwn => {
+                                "lease not provably this command's; `oxide-storage-lease recover` releases it"
+                                    .to_owned()
+                            }
+                        };
+                        format!("held by an interrupted command (oxide pid {holder}, {path})")
                     }
                     (SlotOccupancy::Held, None) => "held".to_owned(),
                     _ => "idle".to_owned(),

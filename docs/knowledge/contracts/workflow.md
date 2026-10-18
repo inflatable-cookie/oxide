@@ -219,9 +219,13 @@ leases taken by `oxide` commands only:
   status` marks it interrupted with no recorded group, and
   `oxide-storage-lease recover` is the explicit release. A record written by
   an earlier front-door build has no holder, so it is kept the same way.
+  `oxide status` names which of these applies to each interrupted slot and
+  promises automatic recovery only where the rule allows it.
 - Each automatic recovery is logged in the control state (slot, lease,
-  checkout, holder PID and start time, group, time, recovering PID). `oxide
-  status` shows the newest 16.
+  checkout, holder PID and start time, group, time, recovering PID). The
+  event is written to the record before the ledger recovery and moved into
+  the log after it, so a crash between the two still logs it on the next
+  sweep. `oxide status` shows the newest 16.
 - Leases taken through the standalone `oxide-storage-lease` CLI have no
   control record and no lock holder, so they are never auto-recovered.
 
