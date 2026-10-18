@@ -4,8 +4,8 @@ One-shot, disposable recipe for the single approved session. It runs under a
 task-owned scratch Effigy manifest with heavy admission. It is evidence, not
 a product launcher or harness.
 
-Arguments: scratch root, evidence directory, session start (monotonic ns),
-session start (wall ns). The caller takes the start before creating the
+Arguments: scratch root, evidence directory, caller monotonic ns (process-relative on
+this Python, recorded only), session start (wall ns). The caller takes the start before creating the
 scratch root, so the 30-minute clock covers every task-owned effect.
 
 Hard counts: one setup Cargo build (both binaries), one lease init, nine
@@ -35,7 +35,7 @@ TOOLCHAIN = os.path.expanduser("~/.rustup/toolchains/1.97.1-aarch64-apple-darwin
 
 ROOT, EVID = sys.argv[1], sys.argv[2]
 START_MONO, START_WALL = int(sys.argv[3]), int(sys.argv[4])
-DEADLINE = START_MONO + SESSION_NS
+DEADLINE_WALL = START_WALL + SESSION_NS
 STAGING = os.path.join(ROOT, "staging")
 A = os.path.join(ROOT, "A")
 B = os.path.join(ROOT, "B")
@@ -50,12 +50,14 @@ class Stop(Exception):
     pass
 
 
+# Python 3.9's monotonic clock is process-relative on macOS, so the session
+# clock is the caller's wall-clock start; per-call durations stay monotonic.
 def elapsed_s():
-    return round((time.monotonic_ns() - START_MONO) / 1e9, 3)
+    return round((time.time_ns() - START_WALL) / 1e9, 3)
 
 
 def remaining_s():
-    return (DEADLINE - time.monotonic_ns()) / 1e9
+    return (DEADLINE_WALL - time.time_ns()) / 1e9
 
 
 def record(name, entry):
@@ -408,7 +410,7 @@ def q5(results):
 def main():
     global OXIDE, LEASE
     os.makedirs(EVID, exist_ok=True)
-    record("session.jsonl", {"event": "start", "start_wall_ns": START_WALL, "deadline_wall_ns": START_WALL + SESSION_NS, "root": ROOT, "test_tmp": TESTTMP, "recipe_sha256": sha256(__file__), "pin": PIN, "source": SOURCE, "caps": CAPS})
+    record("session.jsonl", {"event": "start", "start_wall_ns": START_WALL, "deadline_wall_ns": START_WALL + SESSION_NS, "root": ROOT, "test_tmp": TESTTMP, "recipe_sha256": sha256(__file__), "admitted_at_s": elapsed_s(), "pin": PIN, "source": SOURCE, "caps": CAPS})
     results = {}
     try:
         boundary("preflight")
