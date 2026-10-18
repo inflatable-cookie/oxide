@@ -334,9 +334,13 @@ Re-evaluate interception and run strategies after that.
 
 ## Foundation qualification (proposed)
 
-Proposed and not authorized. This is the gated real-project step after the
-foundation tasks merge. Its job is to prove correctness and lifecycle on a real
-workspace. A benefit claim is not part of it.
+Authorized as a bounded follow-up under Tom's
+[2026-10-18 ruling](../vision.md#product-workflow-direction), not executed or
+qualified yet. This is the gated real-project step after the foundation tasks
+merge and close out. The checked Queue brief owns the final fixed resource,
+invocation and deadline limits and requires confirming scenarios against the
+shipped API before effects. Its job is to prove correctness and lifecycle on
+Oxide's own workspace. A benefit claim is not part of it.
 
 **Subject.** Oxide's own repository at a pinned post-foundation commit, so no
 consumer coordination is needed. It is a real Cargo workspace with registry
@@ -374,10 +378,11 @@ example Nucleus) is a separate, owner-coordinated second stage.
 
 Raw output is preserved. Readings are observations, not speed or SSD claims.
 
-**Bounds to propose with the brief.** About nine `oxide` invocations, 30
-minutes including setup, and 20 minutes of independent review that checks the
-raw evidence instead of repeating the run. No consumer, default pool,
-installation or host configuration change.
+**Authorized bounds.** At most nine `oxide` invocations plus the single
+plain `cargo check` in Q6; one fresh dedicated 4 GiB APFS pool; an original
+30 minutes including setup; raw 20 GiB host reserve; and 20 minutes of
+independent review of retained evidence without repeating the session. No
+consumer, default pool, installation or host configuration change.
 
 **Pass.** Q1–Q7 all hold. Any stale success in Q2 or Q3 is a hard fail and
 keeps slots checkout-affine. A failure in another scenario is reported with its
