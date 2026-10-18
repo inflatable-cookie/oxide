@@ -1,0 +1,6546 @@
+{
+  "attempt": 2,
+  "packet": {
+    "root": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+    "request_id": "4e0e43e9-f916-4c9d-adf3-85abf67b2c48",
+    "caller": "oxide:worker:075-cranelift-quick-run",
+    "pin": "dc84d039cd397c8292f37f4201e3916fa2ecd1d3",
+    "source_repository": "/Users/tom/Dev/projects/oxide",
+    "start_ns": 307466845946083,
+    "deadline_ns": 310466845946083,
+    "clock": "raw mach_continuous_time via mach_timebase_info, started in submit.py before root creation, admission wait, install and setup",
+    "utc_start": "2026-10-18T20:44:44Z",
+    "measured_cargo_cap": 29,
+    "setup_cargo_cap": 2,
+    "session_seconds_cap": 3000,
+    "owned_scratch_cap_bytes": 8589934592,
+    "host_reserve_bytes": 21474836480,
+    "raw_log_cap_bytes": 33554432,
+    "host_cargo_home": "/Users/tom/.cargo",
+    "host_shell_note": "the submitting shell exports CARGO_INCREMENTAL=0; every Cargo call uses an explicit environment allowlist without it, so the dev-profile incremental default applies",
+    "toolchains": {
+      "stable": {
+        "name": "1.97.1-aarch64-apple-darwin",
+        "bin": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin"
+      },
+      "nightly": {
+        "name": "nightly-2026-08-05-aarch64-apple-darwin",
+        "bin": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin"
+      }
+    },
+    "arm_order": [
+      "A",
+      "B",
+      "C",
+      "D"
+    ],
+    "arms": {
+      "A": {
+        "toolchain": "stable",
+        "what": "stable 1.97.1, quick recipe, LLVM"
+      },
+      "B": {
+        "toolchain": "nightly",
+        "what": "nightly-2026-08-05, quick recipe, LLVM (toolchain control)"
+      },
+      "C": {
+        "toolchain": "nightly",
+        "test": true,
+        "what": "nightly-2026-08-05, quick recipe, Cranelift for package oxide-storage only",
+        "global_args": [
+          "-Zcodegen-backend",
+          "--config",
+          "profile.oxide-quick.package.oxide-storage.codegen-backend=\"cranelift\""
+        ]
+      },
+      "D": {
+        "toolchain": "nightly",
+        "env": {
+          "RUSTFLAGS": "-Zthreads=8"
+        },
+        "what": "nightly-2026-08-05, quick recipe, LLVM, RUSTFLAGS=-Zthreads=8"
+      }
+    },
+    "recipe_sha256": "6b76d8785db5839fc3126889dfb9f19959e7188d7cee5b2931fea7f6d3a21f28",
+    "submit_sha256": "e10dfb74d2ded09692548961a05dd49e7e121be5132e47cd624bbff4f6a9a2ea"
+  },
+  "calls": [
+    {
+      "name": "components-before",
+      "kind": "other",
+      "argv": [
+        "/Users/tom/.cargo/bin/rustup",
+        "component",
+        "list",
+        "--installed",
+        "--toolchain",
+        "nightly-2026-08-05"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/Users/tom/.cargo/bin:/usr/bin:/bin",
+        "HOME": "/Users/tom",
+        "RUSTUP_HOME": "/Users/tom/.rustup",
+        "CARGO_HOME": "/Users/tom/.cargo"
+      },
+      "start_offset_s": 0.426,
+      "loadavg_before": [
+        4.06103515625,
+        5.24658203125,
+        7.19189453125
+      ],
+      "free_before": 777124102144,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 0
+      },
+      "pgid": 5535,
+      "wall_s": 0.0338,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 0.46,
+      "loadavg_after": [
+        4.06103515625,
+        5.24658203125,
+        7.19189453125
+      ],
+      "free_after": 777124093952,
+      "stdout": "raw/components-before.stdout",
+      "stderr": "raw/components-before.stderr"
+    },
+    {
+      "name": "component-install",
+      "kind": "other",
+      "argv": [
+        "/Users/tom/.cargo/bin/rustup",
+        "component",
+        "add",
+        "rustc-codegen-cranelift-preview",
+        "--toolchain",
+        "nightly-2026-08-05"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/Users/tom/.cargo/bin:/usr/bin:/bin",
+        "HOME": "/Users/tom",
+        "RUSTUP_HOME": "/Users/tom/.rustup",
+        "CARGO_HOME": "/Users/tom/.cargo"
+      },
+      "start_offset_s": 0.461,
+      "loadavg_before": [
+        4.06103515625,
+        5.24658203125,
+        7.19189453125
+      ],
+      "free_before": 777124089856,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 0
+      },
+      "pgid": 5538,
+      "wall_s": 1.841,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 2.303,
+      "loadavg_after": [
+        4.1357421875,
+        5.2421875,
+        7.1787109375
+      ],
+      "free_after": 777111941120,
+      "stdout": "raw/component-install.stdout",
+      "stderr": "raw/component-install.stderr"
+    },
+    {
+      "name": "components-after",
+      "kind": "other",
+      "argv": [
+        "/Users/tom/.cargo/bin/rustup",
+        "component",
+        "list",
+        "--installed",
+        "--toolchain",
+        "nightly-2026-08-05"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/Users/tom/.cargo/bin:/usr/bin:/bin",
+        "HOME": "/Users/tom",
+        "RUSTUP_HOME": "/Users/tom/.rustup",
+        "CARGO_HOME": "/Users/tom/.cargo"
+      },
+      "start_offset_s": 2.303,
+      "loadavg_before": [
+        4.1357421875,
+        5.2421875,
+        7.1787109375
+      ],
+      "free_before": 777111928832,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 0
+      },
+      "pgid": 5871,
+      "wall_s": 0.0165,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 2.32,
+      "loadavg_after": [
+        4.1357421875,
+        5.2421875,
+        7.1787109375
+      ],
+      "free_after": 777111908352,
+      "stdout": "raw/components-after.stdout",
+      "stderr": "raw/components-after.stderr"
+    },
+    {
+      "name": "stable-cargo-version",
+      "kind": "setup",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo",
+        "-vV"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:/usr/bin:/bin",
+        "HOME": "/Users/tom",
+        "CARGO_HOME": "/Users/tom/.cargo"
+      },
+      "start_offset_s": 67.175,
+      "loadavg_before": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_before": 776994115584,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 1
+      },
+      "pgid": 16092,
+      "wall_s": 0.0152,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 67.191,
+      "loadavg_after": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_after": 776994103296,
+      "stdout": "raw/stable-cargo-version.stdout",
+      "stderr": "raw/stable-cargo-version.stderr"
+    },
+    {
+      "name": "stable-rustc-version",
+      "kind": "other",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc",
+        "-vV"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:/usr/bin:/bin",
+        "HOME": "/Users/tom",
+        "CARGO_HOME": "/Users/tom/.cargo"
+      },
+      "start_offset_s": 67.192,
+      "loadavg_before": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_before": 776994099200,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 1
+      },
+      "pgid": 16108,
+      "wall_s": 0.0118,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 67.204,
+      "loadavg_after": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_after": 776994054144,
+      "stdout": "raw/stable-rustc-version.stdout",
+      "stderr": "raw/stable-rustc-version.stderr"
+    },
+    {
+      "name": "nightly-cargo-version",
+      "kind": "setup",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "-vV"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin",
+        "HOME": "/Users/tom",
+        "CARGO_HOME": "/Users/tom/.cargo"
+      },
+      "start_offset_s": 67.307,
+      "loadavg_before": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_before": 776993681408,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 2
+      },
+      "pgid": 16175,
+      "wall_s": 0.0274,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 67.335,
+      "loadavg_after": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_after": 776993222656,
+      "stdout": "raw/nightly-cargo-version.stdout",
+      "stderr": "raw/nightly-cargo-version.stderr"
+    },
+    {
+      "name": "nightly-rustc-version",
+      "kind": "other",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "-vV"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin",
+        "HOME": "/Users/tom",
+        "CARGO_HOME": "/Users/tom/.cargo"
+      },
+      "start_offset_s": 67.336,
+      "loadavg_before": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_before": 776993218560,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 2
+      },
+      "pgid": 16181,
+      "wall_s": 0.1036,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 67.44,
+      "loadavg_after": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_after": 776992784384,
+      "stdout": "raw/nightly-rustc-version.stdout",
+      "stderr": "raw/nightly-rustc-version.stderr"
+    },
+    {
+      "name": "clone",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "clone",
+        "--quiet",
+        "--no-hardlinks",
+        "--no-checkout",
+        "/Users/tom/Dev/projects/oxide",
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/src"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 67.487,
+      "loadavg_before": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_before": 776991158272,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 2
+      },
+      "pgid": 16230,
+      "wall_s": 0.2449,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 67.733,
+      "loadavg_after": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_after": 776981753856,
+      "stdout": "raw/clone.stdout",
+      "stderr": "raw/clone.stderr"
+    },
+    {
+      "name": "checkout",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "-C",
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+        "checkout",
+        "--quiet",
+        "--detach",
+        "dc84d039cd397c8292f37f4201e3916fa2ecd1d3"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 67.733,
+      "loadavg_before": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_before": 776981749760,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 2
+      },
+      "pgid": 16267,
+      "wall_s": 0.0306,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 67.764,
+      "loadavg_after": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_after": 776977543168,
+      "stdout": "raw/checkout.stdout",
+      "stderr": "raw/checkout.stderr"
+    },
+    {
+      "name": "rev-parse",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "-C",
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+        "rev-parse",
+        "HEAD",
+        "HEAD^{tree}"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 67.765,
+      "loadavg_before": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_before": 776977539072,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 2
+      },
+      "pgid": 16272,
+      "wall_s": 0.013,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 67.779,
+      "loadavg_after": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_after": 776977530880,
+      "stdout": "raw/rev-parse.stdout",
+      "stderr": "raw/rev-parse.stderr"
+    },
+    {
+      "name": "A-reset",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "-C",
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+        "reset",
+        "--quiet",
+        "--hard",
+        "dc84d039cd397c8292f37f4201e3916fa2ecd1d3"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 67.789,
+      "loadavg_before": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_before": 776977522688,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 2
+      },
+      "pgid": 16290,
+      "wall_s": 0.0293,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 67.819,
+      "loadavg_after": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_after": 776977502208,
+      "stdout": "raw/A-reset.stdout",
+      "stderr": "raw/A-reset.stderr"
+    },
+    {
+      "name": "A-clean",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "-C",
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+        "clean",
+        "-fdq"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 67.82,
+      "loadavg_before": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_before": 776977498112,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 2
+      },
+      "pgid": 16295,
+      "wall_s": 0.0132,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 67.833,
+      "loadavg_after": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_after": 776977494016,
+      "stdout": "raw/A-clean.stdout",
+      "stderr": "raw/A-clean.stderr"
+    },
+    {
+      "name": "A-status",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "-C",
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+        "status",
+        "--porcelain"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 67.834,
+      "loadavg_before": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_before": 776977485824,
+      "counts_after_start": {
+        "measured": 0,
+        "setup": 2
+      },
+      "pgid": 16297,
+      "wall_s": 0.0215,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 67.856,
+      "loadavg_after": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_after": 776977477632,
+      "stdout": "raw/A-status.stdout",
+      "stderr": "raw/A-status.stderr"
+    },
+    {
+      "name": "A-cold-build",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo",
+        "build",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-A",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 67.857,
+      "loadavg_before": [
+        3.95947265625,
+        4.96728515625,
+        6.93017578125
+      ],
+      "free_before": 776977473536,
+      "counts_after_start": {
+        "measured": 1,
+        "setup": 2
+      },
+      "pgid": 16300,
+      "wall_s": 9.2604,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 77.118,
+      "loadavg_after": [
+        3.7314453125,
+        4.8857421875,
+        6.8779296875
+      ],
+      "free_after": 776859750400,
+      "stdout": "raw/A-cold-build.stdout",
+      "stderr": "raw/A-cold-build.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 9.25s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "block_buffer:block-buffer@0.10.4",
+        "build-script-build:generic-array@0.14.7",
+        "build-script-build:libc@0.2.190",
+        "build-script-build:proc-macro2@1.0.107",
+        "build-script-build:quote@1.0.47",
+        "build-script-build:serde@1.0.229",
+        "build-script-build:serde_core@1.0.229",
+        "build-script-build:serde_json@1.0.151",
+        "build-script-build:zmij@1.0.23",
+        "cfg_if:cfg-if@1.0.5",
+        "cpufeatures:cpufeatures@0.2.17",
+        "crypto_common:crypto-common@0.1.7",
+        "digest:digest@0.10.7",
+        "generic_array:generic-array@0.14.7",
+        "itoa:itoa@1.0.18",
+        "libc:libc@0.2.190",
+        "memchr:memchr@2.8.3",
+        "oxide:oxide-storage@0.1.0",
+        "oxide_storage:oxide-storage@0.1.0",
+        "proc_macro2:proc-macro2@1.0.107",
+        "quote:quote@1.0.47",
+        "serde:serde@1.0.229",
+        "serde_core:serde_core@1.0.229",
+        "serde_derive:serde_derive@1.0.229",
+        "serde_json:serde_json@1.0.151",
+        "sha2:sha2@0.10.9",
+        "syn:syn@3.0.7",
+        "typenum:typenum@1.20.1",
+        "unicode_ident:unicode-ident@1.0.26",
+        "version_check:version_check@0.9.5",
+        "zmij:zmij@1.0.23"
+      ],
+      "fresh_count": 0,
+      "rebuilt_count": 31,
+      "rustc_units": [
+        {
+          "crate": "version_check",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "unicode_ident",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "typenum",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "itoa",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "cfg_if",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "memchr",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "zmij",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "proc_macro2",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde_core",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "quote",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "syn",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "libc",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "generic_array",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "cpufeatures",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "block_buffer",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "crypto_common",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "digest",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "sha2",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde_derive",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde_json",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "oxide_storage",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        },
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "A-cold-run",
+      "kind": "other",
+      "argv": [
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-A/oxide-quick/oxide",
+        "--help"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 77.121,
+      "loadavg_before": [
+        3.7314453125,
+        4.8857421875,
+        6.8779296875
+      ],
+      "free_before": 776859725824,
+      "counts_after_start": {
+        "measured": 1,
+        "setup": 2
+      },
+      "pgid": 19294,
+      "wall_s": 0.3106,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 77.432,
+      "loadavg_after": [
+        3.7314453125,
+        4.8857421875,
+        6.8779296875
+      ],
+      "free_after": 776858845184,
+      "stdout": "raw/A-cold-run.stdout",
+      "stderr": "raw/A-cold-run.stderr",
+      "first_line": "oxide: Cargo with managed build storage and profiles",
+      "binary_sha256": "c16e212c0300dd1008d5bb72cb31ae80a603fc30563e12508775bafbf4f0f6fb",
+      "matches_source": true
+    },
+    {
+      "name": "A-e1-check",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo",
+        "check",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-A",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 77.488,
+      "loadavg_before": [
+        3.7314453125,
+        4.8857421875,
+        6.8779296875
+      ],
+      "free_before": 776861028352,
+      "counts_after_start": {
+        "measured": 2,
+        "setup": 2
+      },
+      "pgid": 19644,
+      "wall_s": 1.5838,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 79.074,
+      "loadavg_after": [
+        3.7314453125,
+        4.8857421875,
+        6.8779296875
+      ],
+      "free_after": 776830603264,
+      "stdout": "raw/A-e1-check.stdout",
+      "stderr": "raw/A-e1-check.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 1.57s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "block_buffer:block-buffer@0.10.4",
+        "cfg_if:cfg-if@1.0.5",
+        "cpufeatures:cpufeatures@0.2.17",
+        "crypto_common:crypto-common@0.1.7",
+        "digest:digest@0.10.7",
+        "generic_array:generic-array@0.14.7",
+        "itoa:itoa@1.0.18",
+        "libc:libc@0.2.190",
+        "memchr:memchr@2.8.3",
+        "oxide:oxide-storage@0.1.0",
+        "oxide_storage:oxide-storage@0.1.0",
+        "serde:serde@1.0.229",
+        "serde_core:serde_core@1.0.229",
+        "serde_json:serde_json@1.0.151",
+        "sha2:sha2@0.10.9",
+        "typenum:typenum@1.20.1",
+        "zmij:zmij@1.0.23"
+      ],
+      "fresh_count": 14,
+      "rebuilt_count": 17,
+      "rustc_units": [
+        {
+          "crate": "typenum",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "itoa",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "memchr",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "cfg_if",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde_core",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "libc",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "zmij",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "generic_array",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "cpufeatures",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "block_buffer",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "crypto_common",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "digest",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "sha2",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde_json",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "oxide_storage",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        },
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "A-e1-build",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo",
+        "build",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-A",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 79.076,
+      "loadavg_before": [
+        3.7314453125,
+        4.8857421875,
+        6.8779296875
+      ],
+      "free_before": 776830582784,
+      "counts_after_start": {
+        "measured": 3,
+        "setup": 2
+      },
+      "pgid": 20291,
+      "wall_s": 0.3456,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 79.422,
+      "loadavg_after": [
+        3.7314453125,
+        4.8857421875,
+        6.8779296875
+      ],
+      "free_after": 776812531712,
+      "stdout": "raw/A-e1-build.stdout",
+      "stderr": "raw/A-e1-build.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.33s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 30,
+      "rebuilt_count": 1,
+      "rustc_units": [
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "A-e1-run",
+      "kind": "other",
+      "argv": [
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-A/oxide-quick/oxide",
+        "--help"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 79.425,
+      "loadavg_before": [
+        3.7314453125,
+        4.8857421875,
+        6.8779296875
+      ],
+      "free_before": 776812515328,
+      "counts_after_start": {
+        "measured": 3,
+        "setup": 2
+      },
+      "pgid": 20398,
+      "wall_s": 0.2815,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 79.707,
+      "loadavg_after": [
+        3.7314453125,
+        4.8857421875,
+        6.8779296875
+      ],
+      "free_after": 776812388352,
+      "stdout": "raw/A-e1-run.stdout",
+      "stderr": "raw/A-e1-run.stderr",
+      "first_line": "oxide: Cargo with managed build storage and profiles (075 edit 1)",
+      "binary_sha256": "a826ef639b7a7fa2047896c62bca23aa2917645ee870118ffb19e11f1f7b97d2",
+      "matches_source": true
+    },
+    {
+      "name": "A-e2-check",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo",
+        "check",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-A",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 79.712,
+      "loadavg_before": [
+        3.7314453125,
+        4.8857421875,
+        6.8779296875
+      ],
+      "free_before": 776812371968,
+      "counts_after_start": {
+        "measured": 4,
+        "setup": 2
+      },
+      "pgid": 20458,
+      "wall_s": 0.0944,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 79.808,
+      "loadavg_after": [
+        3.7314453125,
+        4.8857421875,
+        6.8779296875
+      ],
+      "free_after": 776805269504,
+      "stdout": "raw/A-e2-check.stdout",
+      "stderr": "raw/A-e2-check.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.08s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 30,
+      "rebuilt_count": 1,
+      "rustc_units": [
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "A-e2-build",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo",
+        "build",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-A",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 79.81,
+      "loadavg_before": [
+        3.7314453125,
+        4.8857421875,
+        6.8779296875
+      ],
+      "free_before": 776805261312,
+      "counts_after_start": {
+        "measured": 5,
+        "setup": 2
+      },
+      "pgid": 20476,
+      "wall_s": 0.2941,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 80.106,
+      "loadavg_after": [
+        3.7314453125,
+        4.8857421875,
+        6.8779296875
+      ],
+      "free_after": 776805986304,
+      "stdout": "raw/A-e2-build.stdout",
+      "stderr": "raw/A-e2-build.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.28s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 30,
+      "rebuilt_count": 1,
+      "rustc_units": [
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "A-e2-run",
+      "kind": "other",
+      "argv": [
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-A/oxide-quick/oxide",
+        "--help"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 80.108,
+      "loadavg_before": [
+        3.7314453125,
+        4.8857421875,
+        6.8779296875
+      ],
+      "free_before": 776805974016,
+      "counts_after_start": {
+        "measured": 5,
+        "setup": 2
+      },
+      "pgid": 20532,
+      "wall_s": 0.2776,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 80.386,
+      "loadavg_after": [
+        3.7314453125,
+        4.8857421875,
+        6.8779296875
+      ],
+      "free_after": 776805892096,
+      "stdout": "raw/A-e2-run.stdout",
+      "stderr": "raw/A-e2-run.stderr",
+      "first_line": "oxide: Cargo with managed build storage and profiles (075 edit 2)",
+      "binary_sha256": "c64021c4a340eac9233399689c810b93933be714d638e72151c537cb2241aab8",
+      "matches_source": true
+    },
+    {
+      "name": "A-e3-check",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo",
+        "check",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-A",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 80.392,
+      "loadavg_before": [
+        3.7314453125,
+        4.8857421875,
+        6.8779296875
+      ],
+      "free_before": 776805879808,
+      "counts_after_start": {
+        "measured": 6,
+        "setup": 2
+      },
+      "pgid": 20749,
+      "wall_s": 0.1051,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 80.498,
+      "loadavg_after": [
+        3.7314453125,
+        4.8857421875,
+        6.8779296875
+      ],
+      "free_after": 776805847040,
+      "stdout": "raw/A-e3-check.stdout",
+      "stderr": "raw/A-e3-check.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.09s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 30,
+      "rebuilt_count": 1,
+      "rustc_units": [
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "A-e3-build",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo",
+        "build",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-A",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 80.501,
+      "loadavg_before": [
+        3.7314453125,
+        4.8857421875,
+        6.8779296875
+      ],
+      "free_before": 776805834752,
+      "counts_after_start": {
+        "measured": 7,
+        "setup": 2
+      },
+      "pgid": 20772,
+      "wall_s": 0.3207,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 80.823,
+      "loadavg_after": [
+        3.7314453125,
+        4.8857421875,
+        6.8779296875
+      ],
+      "free_after": 776805466112,
+      "stdout": "raw/A-e3-build.stdout",
+      "stderr": "raw/A-e3-build.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.30s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 30,
+      "rebuilt_count": 1,
+      "rustc_units": [
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "A-e3-run",
+      "kind": "other",
+      "argv": [
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-A/oxide-quick/oxide",
+        "--help"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 80.826,
+      "loadavg_before": [
+        3.7314453125,
+        4.8857421875,
+        6.8779296875
+      ],
+      "free_before": 776805457920,
+      "counts_after_start": {
+        "measured": 7,
+        "setup": 2
+      },
+      "pgid": 20831,
+      "wall_s": 0.303,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 81.13,
+      "loadavg_after": [
+        3.7529296875,
+        4.87060546875,
+        6.86083984375
+      ],
+      "free_after": 776805298176,
+      "stdout": "raw/A-e3-run.stdout",
+      "stderr": "raw/A-e3-run.stderr",
+      "first_line": "oxide: Cargo with managed build storage and profiles (075 edit 3)",
+      "binary_sha256": "2e9936a778d6b525b059666d6592abedb76a4b4b898d405d30ff16d13f2839c9",
+      "matches_source": true
+    },
+    {
+      "name": "B-reset",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "-C",
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+        "reset",
+        "--quiet",
+        "--hard",
+        "dc84d039cd397c8292f37f4201e3916fa2ecd1d3"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 81.161,
+      "loadavg_before": [
+        3.7529296875,
+        4.87060546875,
+        6.86083984375
+      ],
+      "free_before": 776805281792,
+      "counts_after_start": {
+        "measured": 7,
+        "setup": 2
+      },
+      "pgid": 20906,
+      "wall_s": 0.0295,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 81.192,
+      "loadavg_after": [
+        3.7529296875,
+        4.87060546875,
+        6.86083984375
+      ],
+      "free_after": 776805261312,
+      "stdout": "raw/B-reset.stdout",
+      "stderr": "raw/B-reset.stderr"
+    },
+    {
+      "name": "B-clean",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "-C",
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+        "clean",
+        "-fdq"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 81.193,
+      "loadavg_before": [
+        3.7529296875,
+        4.87060546875,
+        6.86083984375
+      ],
+      "free_before": 776805253120,
+      "counts_after_start": {
+        "measured": 7,
+        "setup": 2
+      },
+      "pgid": 20910,
+      "wall_s": 0.013,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 81.208,
+      "loadavg_after": [
+        3.7529296875,
+        4.87060546875,
+        6.86083984375
+      ],
+      "free_after": 776805228544,
+      "stdout": "raw/B-clean.stdout",
+      "stderr": "raw/B-clean.stderr"
+    },
+    {
+      "name": "B-status",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "-C",
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+        "status",
+        "--porcelain"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 81.209,
+      "loadavg_before": [
+        3.7529296875,
+        4.87060546875,
+        6.86083984375
+      ],
+      "free_before": 776805224448,
+      "counts_after_start": {
+        "measured": 7,
+        "setup": 2
+      },
+      "pgid": 20929,
+      "wall_s": 0.0144,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 81.225,
+      "loadavg_after": [
+        3.7529296875,
+        4.87060546875,
+        6.86083984375
+      ],
+      "free_after": 776805208064,
+      "stdout": "raw/B-status.stdout",
+      "stderr": "raw/B-status.stderr"
+    },
+    {
+      "name": "B-cold-build",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "build",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-B",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 81.227,
+      "loadavg_before": [
+        3.7529296875,
+        4.87060546875,
+        6.86083984375
+      ],
+      "free_before": 776805203968,
+      "counts_after_start": {
+        "measured": 8,
+        "setup": 2
+      },
+      "pgid": 20957,
+      "wall_s": 5.9059,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 87.134,
+      "loadavg_after": [
+        4.0927734375,
+        4.92236328125,
+        6.8671875
+      ],
+      "free_after": 776590282752,
+      "stdout": "raw/B-cold-build.stdout",
+      "stderr": "raw/B-cold-build.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 5.89s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "block_buffer:block-buffer@0.10.4",
+        "build-script-build:generic-array@0.14.7",
+        "build-script-build:libc@0.2.190",
+        "build-script-build:proc-macro2@1.0.107",
+        "build-script-build:quote@1.0.47",
+        "build-script-build:serde@1.0.229",
+        "build-script-build:serde_core@1.0.229",
+        "build-script-build:serde_json@1.0.151",
+        "build-script-build:zmij@1.0.23",
+        "cfg_if:cfg-if@1.0.5",
+        "cpufeatures:cpufeatures@0.2.17",
+        "crypto_common:crypto-common@0.1.7",
+        "digest:digest@0.10.7",
+        "generic_array:generic-array@0.14.7",
+        "itoa:itoa@1.0.18",
+        "libc:libc@0.2.190",
+        "memchr:memchr@2.8.3",
+        "oxide:oxide-storage@0.1.0",
+        "oxide_storage:oxide-storage@0.1.0",
+        "proc_macro2:proc-macro2@1.0.107",
+        "quote:quote@1.0.47",
+        "serde:serde@1.0.229",
+        "serde_core:serde_core@1.0.229",
+        "serde_derive:serde_derive@1.0.229",
+        "serde_json:serde_json@1.0.151",
+        "sha2:sha2@0.10.9",
+        "syn:syn@3.0.7",
+        "typenum:typenum@1.20.1",
+        "unicode_ident:unicode-ident@1.0.26",
+        "version_check:version_check@0.9.5",
+        "zmij:zmij@1.0.23"
+      ],
+      "fresh_count": 0,
+      "rebuilt_count": 31,
+      "rustc_units": [
+        {
+          "crate": "version_check",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "typenum",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "unicode_ident",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "cfg_if",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "memchr",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "itoa",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "zmij",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde_core",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "proc_macro2",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "quote",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "libc",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "syn",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "generic_array",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "cpufeatures",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde_json",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "block_buffer",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "crypto_common",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "digest",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "sha2",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde_derive",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "oxide_storage",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        },
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "B-cold-run",
+      "kind": "other",
+      "argv": [
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-B/oxide-quick/oxide",
+        "--help"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 87.137,
+      "loadavg_before": [
+        4.0927734375,
+        4.92236328125,
+        6.8671875
+      ],
+      "free_before": 776590254080,
+      "counts_after_start": {
+        "measured": 8,
+        "setup": 2
+      },
+      "pgid": 22636,
+      "wall_s": 0.2994,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 87.438,
+      "loadavg_after": [
+        4.0927734375,
+        4.92236328125,
+        6.8671875
+      ],
+      "free_after": 776590475264,
+      "stdout": "raw/B-cold-run.stdout",
+      "stderr": "raw/B-cold-run.stderr",
+      "first_line": "oxide: Cargo with managed build storage and profiles",
+      "binary_sha256": "8d0cc37e5c7fc26ade3862187d4d90e535db2f66e13e783832e5e8bc5c13df94",
+      "matches_source": true
+    },
+    {
+      "name": "B-e1-check",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "check",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-B",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 87.48,
+      "loadavg_before": [
+        4.0927734375,
+        4.92236328125,
+        6.8671875
+      ],
+      "free_before": 776590475264,
+      "counts_after_start": {
+        "measured": 9,
+        "setup": 2
+      },
+      "pgid": 22869,
+      "wall_s": 1.467,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 88.949,
+      "loadavg_after": [
+        4.0927734375,
+        4.92236328125,
+        6.8671875
+      ],
+      "free_after": 776564256768,
+      "stdout": "raw/B-e1-check.stdout",
+      "stderr": "raw/B-e1-check.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 1.45s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "block_buffer:block-buffer@0.10.4",
+        "cfg_if:cfg-if@1.0.5",
+        "cpufeatures:cpufeatures@0.2.17",
+        "crypto_common:crypto-common@0.1.7",
+        "digest:digest@0.10.7",
+        "generic_array:generic-array@0.14.7",
+        "itoa:itoa@1.0.18",
+        "libc:libc@0.2.190",
+        "memchr:memchr@2.8.3",
+        "oxide:oxide-storage@0.1.0",
+        "oxide_storage:oxide-storage@0.1.0",
+        "serde:serde@1.0.229",
+        "serde_core:serde_core@1.0.229",
+        "serde_json:serde_json@1.0.151",
+        "sha2:sha2@0.10.9",
+        "typenum:typenum@1.20.1",
+        "zmij:zmij@1.0.23"
+      ],
+      "fresh_count": 14,
+      "rebuilt_count": 17,
+      "rustc_units": [
+        {
+          "crate": "typenum",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "cfg_if",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "memchr",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "itoa",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "libc",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde_core",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "zmij",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "generic_array",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "cpufeatures",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "crypto_common",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "block_buffer",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "digest",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "sha2",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde_json",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "oxide_storage",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        },
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "B-e1-build",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "build",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-B",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 88.953,
+      "loadavg_before": [
+        4.0927734375,
+        4.92236328125,
+        6.8671875
+      ],
+      "free_before": 776564232192,
+      "counts_after_start": {
+        "measured": 10,
+        "setup": 2
+      },
+      "pgid": 23443,
+      "wall_s": 0.3081,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 89.262,
+      "loadavg_after": [
+        4.0927734375,
+        4.92236328125,
+        6.8671875
+      ],
+      "free_after": 776547487744,
+      "stdout": "raw/B-e1-build.stdout",
+      "stderr": "raw/B-e1-build.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.29s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 30,
+      "rebuilt_count": 1,
+      "rustc_units": [
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "B-e1-run",
+      "kind": "other",
+      "argv": [
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-B/oxide-quick/oxide",
+        "--help"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 89.266,
+      "loadavg_before": [
+        4.0927734375,
+        4.92236328125,
+        6.8671875
+      ],
+      "free_before": 776547454976,
+      "counts_after_start": {
+        "measured": 10,
+        "setup": 2
+      },
+      "pgid": 23502,
+      "wall_s": 0.3002,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 89.568,
+      "loadavg_after": [
+        4.0927734375,
+        4.92236328125,
+        6.8671875
+      ],
+      "free_after": 776547504128,
+      "stdout": "raw/B-e1-run.stdout",
+      "stderr": "raw/B-e1-run.stderr",
+      "first_line": "oxide: Cargo with managed build storage and profiles (075 edit 1)",
+      "binary_sha256": "13a169ed6c0638054bbf1669e751eaf1a337cdc9308bbcff04e6222be70256c7",
+      "matches_source": true
+    },
+    {
+      "name": "B-e2-check",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "check",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-B",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 89.575,
+      "loadavg_before": [
+        4.0927734375,
+        4.92236328125,
+        6.8671875
+      ],
+      "free_before": 776547471360,
+      "counts_after_start": {
+        "measured": 11,
+        "setup": 2
+      },
+      "pgid": 23620,
+      "wall_s": 0.0907,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 89.667,
+      "loadavg_after": [
+        4.0927734375,
+        4.92236328125,
+        6.8671875
+      ],
+      "free_after": 776542019584,
+      "stdout": "raw/B-e2-check.stdout",
+      "stderr": "raw/B-e2-check.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.08s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 30,
+      "rebuilt_count": 1,
+      "rustc_units": [
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "B-e2-build",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "build",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-B",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 89.671,
+      "loadavg_before": [
+        4.0927734375,
+        4.92236328125,
+        6.8671875
+      ],
+      "free_before": 776542011392,
+      "counts_after_start": {
+        "measured": 12,
+        "setup": 2
+      },
+      "pgid": 23638,
+      "wall_s": 0.3112,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 89.984,
+      "loadavg_after": [
+        4.0927734375,
+        4.92236328125,
+        6.8671875
+      ],
+      "free_after": 776542404608,
+      "stdout": "raw/B-e2-build.stdout",
+      "stderr": "raw/B-e2-build.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.30s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 30,
+      "rebuilt_count": 1,
+      "rustc_units": [
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "B-e2-run",
+      "kind": "other",
+      "argv": [
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-B/oxide-quick/oxide",
+        "--help"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 89.988,
+      "loadavg_before": [
+        4.0927734375,
+        4.92236328125,
+        6.8671875
+      ],
+      "free_before": 776542388224,
+      "counts_after_start": {
+        "measured": 12,
+        "setup": 2
+      },
+      "pgid": 23699,
+      "wall_s": 0.2944,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 90.284,
+      "loadavg_after": [
+        4.0927734375,
+        4.92236328125,
+        6.8671875
+      ],
+      "free_after": 776542375936,
+      "stdout": "raw/B-e2-run.stdout",
+      "stderr": "raw/B-e2-run.stderr",
+      "first_line": "oxide: Cargo with managed build storage and profiles (075 edit 2)",
+      "binary_sha256": "c9851f6f9fa0d9f0763bad0df60646003d83464ce012ebd5d967875321fe28c8",
+      "matches_source": true
+    },
+    {
+      "name": "B-e3-check",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "check",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-B",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 90.29,
+      "loadavg_before": [
+        4.0927734375,
+        4.92236328125,
+        6.8671875
+      ],
+      "free_before": 776542363648,
+      "counts_after_start": {
+        "measured": 13,
+        "setup": 2
+      },
+      "pgid": 23752,
+      "wall_s": 0.0946,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 90.386,
+      "loadavg_after": [
+        4.0927734375,
+        4.92236328125,
+        6.8671875
+      ],
+      "free_after": 776542318592,
+      "stdout": "raw/B-e3-check.stdout",
+      "stderr": "raw/B-e3-check.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.08s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 30,
+      "rebuilt_count": 1,
+      "rustc_units": [
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "B-e3-build",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "build",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-B",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 90.39,
+      "loadavg_before": [
+        4.0927734375,
+        4.92236328125,
+        6.8671875
+      ],
+      "free_before": 776542306304,
+      "counts_after_start": {
+        "measured": 14,
+        "setup": 2
+      },
+      "pgid": 23771,
+      "wall_s": 0.3088,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 90.701,
+      "loadavg_after": [
+        4.0927734375,
+        4.92236328125,
+        6.8671875
+      ],
+      "free_after": 776542150656,
+      "stdout": "raw/B-e3-build.stdout",
+      "stderr": "raw/B-e3-build.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.29s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 30,
+      "rebuilt_count": 1,
+      "rustc_units": [
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "B-e3-run",
+      "kind": "other",
+      "argv": [
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-B/oxide-quick/oxide",
+        "--help"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 90.705,
+      "loadavg_before": [
+        4.0927734375,
+        4.92236328125,
+        6.8671875
+      ],
+      "free_before": 776542142464,
+      "counts_after_start": {
+        "measured": 14,
+        "setup": 2
+      },
+      "pgid": 23831,
+      "wall_s": 0.304,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 91.011,
+      "loadavg_after": [
+        4.0849609375,
+        4.90673828125,
+        6.85009765625
+      ],
+      "free_after": 776542085120,
+      "stdout": "raw/B-e3-run.stdout",
+      "stderr": "raw/B-e3-run.stderr",
+      "first_line": "oxide: Cargo with managed build storage and profiles (075 edit 3)",
+      "binary_sha256": "1b63999e7bf204f762acd4c4dba364586b77a21927122eba426ab8e49b23eda8",
+      "matches_source": true
+    },
+    {
+      "name": "C-reset",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "-C",
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+        "reset",
+        "--quiet",
+        "--hard",
+        "dc84d039cd397c8292f37f4201e3916fa2ecd1d3"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 91.064,
+      "loadavg_before": [
+        4.0849609375,
+        4.90673828125,
+        6.85009765625
+      ],
+      "free_before": 776546783232,
+      "counts_after_start": {
+        "measured": 14,
+        "setup": 2
+      },
+      "pgid": 23888,
+      "wall_s": 0.0165,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 91.082,
+      "loadavg_after": [
+        4.0849609375,
+        4.90673828125,
+        6.85009765625
+      ],
+      "free_after": 776546738176,
+      "stdout": "raw/C-reset.stdout",
+      "stderr": "raw/C-reset.stderr"
+    },
+    {
+      "name": "C-clean",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "-C",
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+        "clean",
+        "-fdq"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 91.084,
+      "loadavg_before": [
+        4.0849609375,
+        4.90673828125,
+        6.85009765625
+      ],
+      "free_before": 776546734080,
+      "counts_after_start": {
+        "measured": 14,
+        "setup": 2
+      },
+      "pgid": 23905,
+      "wall_s": 0.0129,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 91.099,
+      "loadavg_after": [
+        4.0849609375,
+        4.90673828125,
+        6.85009765625
+      ],
+      "free_after": 776546713600,
+      "stdout": "raw/C-clean.stdout",
+      "stderr": "raw/C-clean.stderr"
+    },
+    {
+      "name": "C-status",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "-C",
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+        "status",
+        "--porcelain"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 91.101,
+      "loadavg_before": [
+        4.0849609375,
+        4.90673828125,
+        6.85009765625
+      ],
+      "free_before": 776546709504,
+      "counts_after_start": {
+        "measured": 14,
+        "setup": 2
+      },
+      "pgid": 23906,
+      "wall_s": 0.0137,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 91.117,
+      "loadavg_after": [
+        4.0849609375,
+        4.90673828125,
+        6.85009765625
+      ],
+      "free_after": 776546693120,
+      "stdout": "raw/C-status.stdout",
+      "stderr": "raw/C-status.stderr"
+    },
+    {
+      "name": "C-cold-build",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "-Zcodegen-backend",
+        "--config",
+        "profile.oxide-quick.package.oxide-storage.codegen-backend=\"cranelift\"",
+        "build",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-C",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 91.119,
+      "loadavg_before": [
+        4.0849609375,
+        4.90673828125,
+        6.85009765625
+      ],
+      "free_before": 776546684928,
+      "counts_after_start": {
+        "measured": 15,
+        "setup": 2
+      },
+      "pgid": 23907,
+      "wall_s": 4.4553,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 95.576,
+      "loadavg_after": [
+        4.0849609375,
+        4.90673828125,
+        6.85009765625
+      ],
+      "free_after": 776441217024,
+      "stdout": "raw/C-cold-build.stdout",
+      "stderr": "raw/C-cold-build.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 4.44s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "block_buffer:block-buffer@0.10.4",
+        "build-script-build:generic-array@0.14.7",
+        "build-script-build:libc@0.2.190",
+        "build-script-build:proc-macro2@1.0.107",
+        "build-script-build:quote@1.0.47",
+        "build-script-build:serde@1.0.229",
+        "build-script-build:serde_core@1.0.229",
+        "build-script-build:serde_json@1.0.151",
+        "build-script-build:zmij@1.0.23",
+        "cfg_if:cfg-if@1.0.5",
+        "cpufeatures:cpufeatures@0.2.17",
+        "crypto_common:crypto-common@0.1.7",
+        "digest:digest@0.10.7",
+        "generic_array:generic-array@0.14.7",
+        "itoa:itoa@1.0.18",
+        "libc:libc@0.2.190",
+        "memchr:memchr@2.8.3",
+        "oxide:oxide-storage@0.1.0",
+        "oxide_storage:oxide-storage@0.1.0",
+        "proc_macro2:proc-macro2@1.0.107",
+        "quote:quote@1.0.47",
+        "serde:serde@1.0.229",
+        "serde_core:serde_core@1.0.229",
+        "serde_derive:serde_derive@1.0.229",
+        "serde_json:serde_json@1.0.151",
+        "sha2:sha2@0.10.9",
+        "syn:syn@3.0.7",
+        "typenum:typenum@1.20.1",
+        "unicode_ident:unicode-ident@1.0.26",
+        "version_check:version_check@0.9.5",
+        "zmij:zmij@1.0.23"
+      ],
+      "fresh_count": 0,
+      "rebuilt_count": 31,
+      "rustc_units": [
+        {
+          "crate": "version_check",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "typenum",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "unicode_ident",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "cfg_if",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "memchr",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "itoa",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "zmij",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde_core",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "proc_macro2",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "quote",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "syn",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "libc",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "generic_array",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "cpufeatures",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde_json",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "block_buffer",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "crypto_common",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "digest",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "sha2",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde_derive",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "oxide_storage",
+          "cranelift": true,
+          "codegen_backend_any": true,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        },
+        {
+          "crate": "oxide",
+          "cranelift": true,
+          "codegen_backend_any": true,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "C-cold-run",
+      "kind": "other",
+      "argv": [
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-C/oxide-quick/oxide",
+        "--help"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 95.581,
+      "loadavg_before": [
+        4.0849609375,
+        4.90673828125,
+        6.85009765625
+      ],
+      "free_before": 776441180160,
+      "counts_after_start": {
+        "measured": 15,
+        "setup": 2
+      },
+      "pgid": 25222,
+      "wall_s": 0.3092,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 95.892,
+      "loadavg_after": [
+        4.0849609375,
+        4.90673828125,
+        6.85009765625
+      ],
+      "free_after": 776441253888,
+      "stdout": "raw/C-cold-run.stdout",
+      "stderr": "raw/C-cold-run.stderr",
+      "first_line": "oxide: Cargo with managed build storage and profiles",
+      "binary_sha256": "8468d64319ca2806d12cbca1e1c68bc7c91580fb81825c290af11149f488112f",
+      "matches_source": true
+    },
+    {
+      "name": "C-e1-check",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "-Zcodegen-backend",
+        "--config",
+        "profile.oxide-quick.package.oxide-storage.codegen-backend=\"cranelift\"",
+        "check",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-C",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 95.938,
+      "loadavg_before": [
+        4.0849609375,
+        4.90673828125,
+        6.85009765625
+      ],
+      "free_before": 776441208832,
+      "counts_after_start": {
+        "measured": 16,
+        "setup": 2
+      },
+      "pgid": 25327,
+      "wall_s": 1.4623,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 97.402,
+      "loadavg_after": [
+        4.478515625,
+        4.974609375,
+        6.8623046875
+      ],
+      "free_after": 776415121408,
+      "stdout": "raw/C-e1-check.stdout",
+      "stderr": "raw/C-e1-check.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 1.45s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "block_buffer:block-buffer@0.10.4",
+        "cfg_if:cfg-if@1.0.5",
+        "cpufeatures:cpufeatures@0.2.17",
+        "crypto_common:crypto-common@0.1.7",
+        "digest:digest@0.10.7",
+        "generic_array:generic-array@0.14.7",
+        "itoa:itoa@1.0.18",
+        "libc:libc@0.2.190",
+        "memchr:memchr@2.8.3",
+        "oxide:oxide-storage@0.1.0",
+        "oxide_storage:oxide-storage@0.1.0",
+        "serde:serde@1.0.229",
+        "serde_core:serde_core@1.0.229",
+        "serde_json:serde_json@1.0.151",
+        "sha2:sha2@0.10.9",
+        "typenum:typenum@1.20.1",
+        "zmij:zmij@1.0.23"
+      ],
+      "fresh_count": 14,
+      "rebuilt_count": 17,
+      "rustc_units": [
+        {
+          "crate": "typenum",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "memchr",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "itoa",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "cfg_if",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "libc",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "zmij",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde_core",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "generic_array",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "cpufeatures",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "crypto_common",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "block_buffer",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "digest",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "sha2",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde_json",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "oxide_storage",
+          "cranelift": true,
+          "codegen_backend_any": true,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        },
+        {
+          "crate": "oxide",
+          "cranelift": true,
+          "codegen_backend_any": true,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "C-e1-build",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "-Zcodegen-backend",
+        "--config",
+        "profile.oxide-quick.package.oxide-storage.codegen-backend=\"cranelift\"",
+        "build",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-C",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 97.407,
+      "loadavg_before": [
+        4.478515625,
+        4.974609375,
+        6.8623046875
+      ],
+      "free_before": 776415096832,
+      "counts_after_start": {
+        "measured": 17,
+        "setup": 2
+      },
+      "pgid": 25656,
+      "wall_s": 0.3077,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 97.717,
+      "loadavg_after": [
+        4.478515625,
+        4.974609375,
+        6.8623046875
+      ],
+      "free_after": 776399745024,
+      "stdout": "raw/C-e1-build.stdout",
+      "stderr": "raw/C-e1-build.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.29s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 30,
+      "rebuilt_count": 1,
+      "rustc_units": [
+        {
+          "crate": "oxide",
+          "cranelift": true,
+          "codegen_backend_any": true,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "C-e1-run",
+      "kind": "other",
+      "argv": [
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-C/oxide-quick/oxide",
+        "--help"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 97.722,
+      "loadavg_before": [
+        4.478515625,
+        4.974609375,
+        6.8623046875
+      ],
+      "free_before": 776399720448,
+      "counts_after_start": {
+        "measured": 17,
+        "setup": 2
+      },
+      "pgid": 25716,
+      "wall_s": 0.2902,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 98.014,
+      "loadavg_after": [
+        4.478515625,
+        4.974609375,
+        6.8623046875
+      ],
+      "free_after": 776399691776,
+      "stdout": "raw/C-e1-run.stdout",
+      "stderr": "raw/C-e1-run.stderr",
+      "first_line": "oxide: Cargo with managed build storage and profiles (075 edit 1)",
+      "binary_sha256": "2ee5eb4ecc3304fac224b3b49044881a040062783c83aa1c0889b4ad14e4f165",
+      "matches_source": true
+    },
+    {
+      "name": "C-e2-check",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "-Zcodegen-backend",
+        "--config",
+        "profile.oxide-quick.package.oxide-storage.codegen-backend=\"cranelift\"",
+        "check",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-C",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 98.023,
+      "loadavg_before": [
+        4.478515625,
+        4.974609375,
+        6.8623046875
+      ],
+      "free_before": 776399671296,
+      "counts_after_start": {
+        "measured": 18,
+        "setup": 2
+      },
+      "pgid": 25768,
+      "wall_s": 0.0969,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 98.122,
+      "loadavg_after": [
+        4.478515625,
+        4.974609375,
+        6.8623046875
+      ],
+      "free_after": 776394256384,
+      "stdout": "raw/C-e2-check.stdout",
+      "stderr": "raw/C-e2-check.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.08s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 30,
+      "rebuilt_count": 1,
+      "rustc_units": [
+        {
+          "crate": "oxide",
+          "cranelift": true,
+          "codegen_backend_any": true,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "C-e2-build",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "-Zcodegen-backend",
+        "--config",
+        "profile.oxide-quick.package.oxide-storage.codegen-backend=\"cranelift\"",
+        "build",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-C",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 98.13,
+      "loadavg_before": [
+        4.478515625,
+        4.974609375,
+        6.8623046875
+      ],
+      "free_before": 776394248192,
+      "counts_after_start": {
+        "measured": 19,
+        "setup": 2
+      },
+      "pgid": 25786,
+      "wall_s": 0.3181,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 98.45,
+      "loadavg_after": [
+        4.478515625,
+        4.974609375,
+        6.8623046875
+      ],
+      "free_after": 776394149888,
+      "stdout": "raw/C-e2-build.stdout",
+      "stderr": "raw/C-e2-build.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.30s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 30,
+      "rebuilt_count": 1,
+      "rustc_units": [
+        {
+          "crate": "oxide",
+          "cranelift": true,
+          "codegen_backend_any": true,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "C-e2-run",
+      "kind": "other",
+      "argv": [
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-C/oxide-quick/oxide",
+        "--help"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 98.455,
+      "loadavg_before": [
+        4.478515625,
+        4.974609375,
+        6.8623046875
+      ],
+      "free_before": 776394141696,
+      "counts_after_start": {
+        "measured": 19,
+        "setup": 2
+      },
+      "pgid": 25845,
+      "wall_s": 0.2901,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 98.747,
+      "loadavg_after": [
+        4.478515625,
+        4.974609375,
+        6.8623046875
+      ],
+      "free_after": 776394121216,
+      "stdout": "raw/C-e2-run.stdout",
+      "stderr": "raw/C-e2-run.stderr",
+      "first_line": "oxide: Cargo with managed build storage and profiles (075 edit 2)",
+      "binary_sha256": "a289ca91b19fc20f75f7fe5c0bf52b00734fb8eef9de2dadc5b66d7ae505d7fb",
+      "matches_source": true
+    },
+    {
+      "name": "C-e3-check",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "-Zcodegen-backend",
+        "--config",
+        "profile.oxide-quick.package.oxide-storage.codegen-backend=\"cranelift\"",
+        "check",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-C",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 98.756,
+      "loadavg_before": [
+        4.478515625,
+        4.974609375,
+        6.8623046875
+      ],
+      "free_before": 776394108928,
+      "counts_after_start": {
+        "measured": 20,
+        "setup": 2
+      },
+      "pgid": 25899,
+      "wall_s": 0.0951,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 98.853,
+      "loadavg_after": [
+        4.478515625,
+        4.974609375,
+        6.8623046875
+      ],
+      "free_after": 776394051584,
+      "stdout": "raw/C-e3-check.stdout",
+      "stderr": "raw/C-e3-check.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.08s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 30,
+      "rebuilt_count": 1,
+      "rustc_units": [
+        {
+          "crate": "oxide",
+          "cranelift": true,
+          "codegen_backend_any": true,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "C-e3-build",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "-Zcodegen-backend",
+        "--config",
+        "profile.oxide-quick.package.oxide-storage.codegen-backend=\"cranelift\"",
+        "build",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-C",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "start_offset_s": 98.858,
+      "loadavg_before": [
+        4.478515625,
+        4.974609375,
+        6.8623046875
+      ],
+      "free_before": 776394043392,
+      "counts_after_start": {
+        "measured": 21,
+        "setup": 2
+      },
+      "pgid": 25918,
+      "wall_s": 0.3183,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 99.179,
+      "loadavg_after": [
+        4.478515625,
+        4.974609375,
+        6.8623046875
+      ],
+      "free_after": 776393789440,
+      "stdout": "raw/C-e3-build.stdout",
+      "stderr": "raw/C-e3-build.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.30s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 30,
+      "rebuilt_count": 1,
+      "rustc_units": [
+        {
+          "crate": "oxide",
+          "cranelift": true,
+          "codegen_backend_any": true,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "C-e3-run",
+      "kind": "other",
+      "argv": [
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-C/oxide-quick/oxide",
+        "--help"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 99.184,
+      "loadavg_before": [
+        4.478515625,
+        4.974609375,
+        6.8623046875
+      ],
+      "free_before": 776393777152,
+      "counts_after_start": {
+        "measured": 21,
+        "setup": 2
+      },
+      "pgid": 26009,
+      "wall_s": 0.3184,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 99.505,
+      "loadavg_after": [
+        4.478515625,
+        4.974609375,
+        6.8623046875
+      ],
+      "free_after": 776394203136,
+      "stdout": "raw/C-e3-run.stdout",
+      "stderr": "raw/C-e3-run.stderr",
+      "first_line": "oxide: Cargo with managed build storage and profiles (075 edit 3)",
+      "binary_sha256": "70c910300265d2908f9051c0f1e985e75badedc2e7d1e81b14433cb8f5c08ffc",
+      "matches_source": true
+    },
+    {
+      "name": "C-test",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "-Zcodegen-backend",
+        "--config",
+        "profile.oxide-quick.package.oxide-storage.codegen-backend=\"cranelift\"",
+        "test",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--no-fail-fast"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/t",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-C",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only",
+        "OXIDE_TASK_SCRATCH_ROOT": "/private/tmp/oxide-075-cranelift.q8a2kl_b/t",
+        "TMP": "/private/tmp/oxide-075-cranelift.q8a2kl_b/t",
+        "TEMP": "/private/tmp/oxide-075-cranelift.q8a2kl_b/t"
+      },
+      "start_offset_s": 99.513,
+      "loadavg_before": [
+        4.478515625,
+        4.974609375,
+        6.8623046875
+      ],
+      "free_before": 776394186752,
+      "counts_after_start": {
+        "measured": 22,
+        "setup": 2
+      },
+      "pgid": 26065,
+      "wall_s": 4.207,
+      "exit": 101,
+      "group_settled": "ESRCH",
+      "end_offset_s": 103.722,
+      "loadavg_after": [
+        4.35986328125,
+        4.94140625,
+        6.83935546875
+      ],
+      "free_after": 776338034688,
+      "stdout": "raw/C-test.stdout",
+      "stderr": "raw/C-test.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.94s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide-storage-inventory:oxide-storage@0.1.0",
+        "oxide-storage-lease:oxide-storage@0.1.0",
+        "oxide:oxide-storage@0.1.0",
+        "oxide_storage:oxide-storage@0.1.0",
+        "profile_backtrace:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 31,
+      "rebuilt_count": 7,
+      "rustc_units": [
+        {
+          "crate": "oxide_storage",
+          "cranelift": true,
+          "codegen_backend_any": true,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        },
+        {
+          "crate": "oxide_storage_lease",
+          "cranelift": true,
+          "codegen_backend_any": true,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        },
+        {
+          "crate": "profile_backtrace",
+          "cranelift": true,
+          "codegen_backend_any": true,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        },
+        {
+          "crate": "oxide_storage_inventory",
+          "cranelift": true,
+          "codegen_backend_any": true,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        },
+        {
+          "crate": "oxide_storage_inventory",
+          "cranelift": true,
+          "codegen_backend_any": true,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        },
+        {
+          "crate": "oxide_storage_lease",
+          "cranelift": true,
+          "codegen_backend_any": true,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        },
+        {
+          "crate": "oxide",
+          "cranelift": true,
+          "codegen_backend_any": true,
+          "threads_8": false,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        },
+        {
+          "crate": "oxide_storage",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": false,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        }
+      ],
+      "test_results": [
+        "test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.91s",
+        "test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ]
+    },
+    {
+      "name": "D-reset",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "-C",
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+        "reset",
+        "--quiet",
+        "--hard",
+        "dc84d039cd397c8292f37f4201e3916fa2ecd1d3"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 103.808,
+      "loadavg_before": [
+        4.35986328125,
+        4.94140625,
+        6.83935546875
+      ],
+      "free_before": 776337989632,
+      "counts_after_start": {
+        "measured": 22,
+        "setup": 2
+      },
+      "pgid": 27068,
+      "wall_s": 0.0167,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 103.827,
+      "loadavg_after": [
+        4.35986328125,
+        4.94140625,
+        6.83935546875
+      ],
+      "free_after": 776337948672,
+      "stdout": "raw/D-reset.stdout",
+      "stderr": "raw/D-reset.stderr"
+    },
+    {
+      "name": "D-clean",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "-C",
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+        "clean",
+        "-fdq"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 103.83,
+      "loadavg_before": [
+        4.35986328125,
+        4.94140625,
+        6.83935546875
+      ],
+      "free_before": 776337940480,
+      "counts_after_start": {
+        "measured": 22,
+        "setup": 2
+      },
+      "pgid": 27070,
+      "wall_s": 0.0128,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 103.845,
+      "loadavg_after": [
+        4.35986328125,
+        4.94140625,
+        6.83935546875
+      ],
+      "free_after": 776337932288,
+      "stdout": "raw/D-clean.stdout",
+      "stderr": "raw/D-clean.stderr"
+    },
+    {
+      "name": "D-status",
+      "kind": "other",
+      "argv": [
+        "/usr/bin/git",
+        "-C",
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+        "status",
+        "--porcelain"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 103.848,
+      "loadavg_before": [
+        4.35986328125,
+        4.94140625,
+        6.83935546875
+      ],
+      "free_before": 776337924096,
+      "counts_after_start": {
+        "measured": 22,
+        "setup": 2
+      },
+      "pgid": 27071,
+      "wall_s": 0.0136,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 103.864,
+      "loadavg_after": [
+        4.35986328125,
+        4.94140625,
+        6.83935546875
+      ],
+      "free_after": 776337907712,
+      "stdout": "raw/D-status.stdout",
+      "stderr": "raw/D-status.stderr"
+    },
+    {
+      "name": "D-cold-build",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "build",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only",
+        "RUSTFLAGS": "-Zthreads=8"
+      },
+      "start_offset_s": 103.867,
+      "loadavg_before": [
+        4.35986328125,
+        4.94140625,
+        6.83935546875
+      ],
+      "free_before": 776337903616,
+      "counts_after_start": {
+        "measured": 23,
+        "setup": 2
+      },
+      "pgid": 27074,
+      "wall_s": 2.9452,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 106.815,
+      "loadavg_after": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_after": 776225079296,
+      "stdout": "raw/D-cold-build.stdout",
+      "stderr": "raw/D-cold-build.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 2.93s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "block_buffer:block-buffer@0.10.4",
+        "build-script-build:generic-array@0.14.7",
+        "build-script-build:libc@0.2.190",
+        "build-script-build:proc-macro2@1.0.107",
+        "build-script-build:quote@1.0.47",
+        "build-script-build:serde@1.0.229",
+        "build-script-build:serde_core@1.0.229",
+        "build-script-build:serde_json@1.0.151",
+        "build-script-build:zmij@1.0.23",
+        "cfg_if:cfg-if@1.0.5",
+        "cpufeatures:cpufeatures@0.2.17",
+        "crypto_common:crypto-common@0.1.7",
+        "digest:digest@0.10.7",
+        "generic_array:generic-array@0.14.7",
+        "itoa:itoa@1.0.18",
+        "libc:libc@0.2.190",
+        "memchr:memchr@2.8.3",
+        "oxide:oxide-storage@0.1.0",
+        "oxide_storage:oxide-storage@0.1.0",
+        "proc_macro2:proc-macro2@1.0.107",
+        "quote:quote@1.0.47",
+        "serde:serde@1.0.229",
+        "serde_core:serde_core@1.0.229",
+        "serde_derive:serde_derive@1.0.229",
+        "serde_json:serde_json@1.0.151",
+        "sha2:sha2@0.10.9",
+        "syn:syn@3.0.7",
+        "typenum:typenum@1.20.1",
+        "unicode_ident:unicode-ident@1.0.26",
+        "version_check:version_check@0.9.5",
+        "zmij:zmij@1.0.23"
+      ],
+      "fresh_count": 0,
+      "rebuilt_count": 31,
+      "rustc_units": [
+        {
+          "crate": "version_check",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "typenum",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "unicode_ident",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "memchr",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "cfg_if",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "itoa",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "build_script_build",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "zmij",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "proc_macro2",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "quote",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "syn",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde_core",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "libc",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde_derive",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "generic_array",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde_json",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "crypto_common",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "block_buffer",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "cpufeatures",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "digest",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "sha2",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "oxide_storage",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        },
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "D-cold-run",
+      "kind": "other",
+      "argv": [
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/oxide",
+        "--help"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 106.821,
+      "loadavg_before": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_before": 776225046528,
+      "counts_after_start": {
+        "measured": 23,
+        "setup": 2
+      },
+      "pgid": 27829,
+      "wall_s": 0.2978,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 107.121,
+      "loadavg_after": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_after": 776224927744,
+      "stdout": "raw/D-cold-run.stdout",
+      "stderr": "raw/D-cold-run.stderr",
+      "first_line": "oxide: Cargo with managed build storage and profiles",
+      "binary_sha256": "71bc7cd434e97f8d9952086085324d8404c6b62c838a3e30228c25deda388a4e",
+      "matches_source": true
+    },
+    {
+      "name": "D-e1-check",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "check",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only",
+        "RUSTFLAGS": "-Zthreads=8"
+      },
+      "start_offset_s": 107.182,
+      "loadavg_before": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_before": 776224890880,
+      "counts_after_start": {
+        "measured": 24,
+        "setup": 2
+      },
+      "pgid": 27908,
+      "wall_s": 0.9693,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 108.155,
+      "loadavg_after": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_after": 776198975488,
+      "stdout": "raw/D-e1-check.stdout",
+      "stderr": "raw/D-e1-check.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.95s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "block_buffer:block-buffer@0.10.4",
+        "cfg_if:cfg-if@1.0.5",
+        "cpufeatures:cpufeatures@0.2.17",
+        "crypto_common:crypto-common@0.1.7",
+        "digest:digest@0.10.7",
+        "generic_array:generic-array@0.14.7",
+        "itoa:itoa@1.0.18",
+        "libc:libc@0.2.190",
+        "memchr:memchr@2.8.3",
+        "oxide:oxide-storage@0.1.0",
+        "oxide_storage:oxide-storage@0.1.0",
+        "serde:serde@1.0.229",
+        "serde_core:serde_core@1.0.229",
+        "serde_json:serde_json@1.0.151",
+        "sha2:sha2@0.10.9",
+        "typenum:typenum@1.20.1",
+        "zmij:zmij@1.0.23"
+      ],
+      "fresh_count": 14,
+      "rebuilt_count": 17,
+      "rustc_units": [
+        {
+          "crate": "typenum",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "cfg_if",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "itoa",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "memchr",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "zmij",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde_core",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "libc",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "generic_array",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "cpufeatures",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "crypto_common",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "block_buffer",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "digest",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde_json",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "serde",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "sha2",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": false,
+          "panic": []
+        },
+        {
+          "crate": "oxide_storage",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        },
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "D-e1-build",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "build",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only",
+        "RUSTFLAGS": "-Zthreads=8"
+      },
+      "start_offset_s": 108.162,
+      "loadavg_before": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_before": 776198950912,
+      "counts_after_start": {
+        "measured": 25,
+        "setup": 2
+      },
+      "pgid": 28261,
+      "wall_s": 0.3562,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 108.521,
+      "loadavg_after": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_after": 776180056064,
+      "stdout": "raw/D-e1-build.stdout",
+      "stderr": "raw/D-e1-build.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.34s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 30,
+      "rebuilt_count": 1,
+      "rustc_units": [
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "D-e1-run",
+      "kind": "other",
+      "argv": [
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/oxide",
+        "--help"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 108.528,
+      "loadavg_before": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_before": 776180047872,
+      "counts_after_start": {
+        "measured": 25,
+        "setup": 2
+      },
+      "pgid": 28341,
+      "wall_s": 0.2863,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 108.817,
+      "loadavg_after": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_after": 776179904512,
+      "stdout": "raw/D-e1-run.stdout",
+      "stderr": "raw/D-e1-run.stderr",
+      "first_line": "oxide: Cargo with managed build storage and profiles (075 edit 1)",
+      "binary_sha256": "47b1b70067964af9070a0ad210c0370bcc0826edccec48c9a2340c96215014d4",
+      "matches_source": true
+    },
+    {
+      "name": "D-e2-check",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "check",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only",
+        "RUSTFLAGS": "-Zthreads=8"
+      },
+      "start_offset_s": 108.829,
+      "loadavg_before": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_before": 776179892224,
+      "counts_after_start": {
+        "measured": 26,
+        "setup": 2
+      },
+      "pgid": 28465,
+      "wall_s": 0.1022,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 108.934,
+      "loadavg_after": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_after": 776174489600,
+      "stdout": "raw/D-e2-check.stdout",
+      "stderr": "raw/D-e2-check.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.09s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 30,
+      "rebuilt_count": 1,
+      "rustc_units": [
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "D-e2-build",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "build",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only",
+        "RUSTFLAGS": "-Zthreads=8"
+      },
+      "start_offset_s": 108.941,
+      "loadavg_before": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_before": 776174481408,
+      "counts_after_start": {
+        "measured": 27,
+        "setup": 2
+      },
+      "pgid": 28487,
+      "wall_s": 0.3366,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 109.28,
+      "loadavg_after": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_after": 776175726592,
+      "stdout": "raw/D-e2-build.stdout",
+      "stderr": "raw/D-e2-build.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.32s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 30,
+      "rebuilt_count": 1,
+      "rustc_units": [
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "D-e2-run",
+      "kind": "other",
+      "argv": [
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/oxide",
+        "--help"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 109.287,
+      "loadavg_before": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_before": 776175702016,
+      "counts_after_start": {
+        "measured": 27,
+        "setup": 2
+      },
+      "pgid": 28545,
+      "wall_s": 0.2773,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 109.567,
+      "loadavg_after": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_after": 776175808512,
+      "stdout": "raw/D-e2-run.stdout",
+      "stderr": "raw/D-e2-run.stderr",
+      "first_line": "oxide: Cargo with managed build storage and profiles (075 edit 2)",
+      "binary_sha256": "bb69d44b8fdbec75ab63af2c7b1a1bb65653c8ae525053ac853b53245c16e5c8",
+      "matches_source": true
+    },
+    {
+      "name": "D-e3-check",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "check",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only",
+        "RUSTFLAGS": "-Zthreads=8"
+      },
+      "start_offset_s": 109.581,
+      "loadavg_before": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_before": 776175763456,
+      "counts_after_start": {
+        "measured": 28,
+        "setup": 2
+      },
+      "pgid": 28645,
+      "wall_s": 0.1219,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 109.706,
+      "loadavg_after": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_after": 776175681536,
+      "stdout": "raw/D-e3-check.stdout",
+      "stderr": "raw/D-e3-check.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.10s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 30,
+      "rebuilt_count": 1,
+      "rustc_units": [
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "D-e3-build",
+      "kind": "measured",
+      "argv": [
+        "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/cargo",
+        "build",
+        "--locked",
+        "--offline",
+        "--profile",
+        "oxide-quick",
+        "-v",
+        "--message-format=json-render-diagnostics",
+        "--bin",
+        "oxide"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b/src",
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only",
+        "RUSTFLAGS": "-Zthreads=8"
+      },
+      "start_offset_s": 109.715,
+      "loadavg_before": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_before": 776175669248,
+      "counts_after_start": {
+        "measured": 29,
+        "setup": 2
+      },
+      "pgid": 28680,
+      "wall_s": 0.3461,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 110.064,
+      "loadavg_after": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_after": 776174993408,
+      "stdout": "raw/D-e3-build.stdout",
+      "stderr": "raw/D-e3-build.stderr",
+      "finished_line": [
+        "Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.33s"
+      ],
+      "build_finished_success": true,
+      "rebuilt": [
+        "oxide:oxide-storage@0.1.0"
+      ],
+      "fresh_count": 30,
+      "rebuilt_count": 1,
+      "rustc_units": [
+        {
+          "crate": "oxide",
+          "cranelift": false,
+          "codegen_backend_any": false,
+          "threads_8": true,
+          "debuginfo": [
+            "line-tables-only"
+          ],
+          "incremental": true,
+          "panic": []
+        }
+      ]
+    },
+    {
+      "name": "D-e3-run",
+      "kind": "other",
+      "argv": [
+        "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D/oxide-quick/oxide",
+        "--help"
+      ],
+      "cwd": "/private/tmp/oxide-075-cranelift.q8a2kl_b",
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/tom"
+      },
+      "start_offset_s": 110.07,
+      "loadavg_before": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_before": 776174985216,
+      "counts_after_start": {
+        "measured": 29,
+        "setup": 2
+      },
+      "pgid": 28950,
+      "wall_s": 0.3002,
+      "exit": 0,
+      "group_settled": "ESRCH",
+      "end_offset_s": 110.373,
+      "loadavg_after": [
+        4.25048828125,
+        4.90869140625,
+        6.81640625
+      ],
+      "free_after": 776174972928,
+      "stdout": "raw/D-e3-run.stdout",
+      "stderr": "raw/D-e3-run.stderr",
+      "first_line": "oxide: Cargo with managed build storage and profiles (075 edit 3)",
+      "binary_sha256": "1e8238cd9eb3fd206c9d69d753d90a45ca59dcdb5bad1aef3f0b817efa2b4fc1",
+      "matches_source": true
+    }
+  ],
+  "arms": {
+    "A": {
+      "spec": {
+        "toolchain": "stable",
+        "what": "stable 1.97.1, quick recipe, LLVM"
+      },
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-A",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "steps": [
+        "A-cold-build",
+        "A-cold-run",
+        "A-e1-check",
+        "A-e1-build",
+        "A-e1-run",
+        "A-e2-check",
+        "A-e2-build",
+        "A-e2-run",
+        "A-e3-check",
+        "A-e3-build",
+        "A-e3-run"
+      ],
+      "baseline_main_rs_sha256": "59066d634550d8520f378b90882fc49703f82b202857c3fb9caed05966a02e0f",
+      "storage_after_cold": {
+        "files": 649,
+        "apparent": 120990999,
+        "allocated": 122564608,
+        "workspace_allocated": 63455232,
+        "dependency_allocated": 59101184,
+        "other_allocated": 8192
+      },
+      "edits": [
+        {
+          "edit": 1,
+          "file": "src/bin/oxide/main.rs",
+          "old": "oxide: Cargo with managed build storage and profiles",
+          "new": "oxide: Cargo with managed build storage and profiles (075 edit 1)",
+          "sha256_after": "83d70447cd067649f999ad5b953b0edda60003127231a8c546518291ea9cece5",
+          "offset_s": 77.487
+        },
+        {
+          "edit": 2,
+          "file": "src/bin/oxide/main.rs",
+          "old": "oxide: Cargo with managed build storage and profiles (075 edit 1)",
+          "new": "oxide: Cargo with managed build storage and profiles (075 edit 2)",
+          "sha256_after": "26c294d86bb286788efe8a153c79ea2db368d084114d3fdb35f422dd18b01629",
+          "offset_s": 79.711
+        },
+        {
+          "edit": 3,
+          "file": "src/bin/oxide/main.rs",
+          "old": "oxide: Cargo with managed build storage and profiles (075 edit 2)",
+          "new": "oxide: Cargo with managed build storage and profiles (075 edit 3)",
+          "sha256_after": "20d50997db14794ac9b3293144d28bf0fd0e9e4e2978b244d769e79d3c8f26ea",
+          "offset_s": 80.391
+        }
+      ],
+      "storage_final": {
+        "files": 770,
+        "apparent": 173160994,
+        "allocated": 175112192,
+        "workspace_allocated": 104665088,
+        "dependency_allocated": 70438912,
+        "other_allocated": 8192
+      }
+    },
+    "B": {
+      "spec": {
+        "toolchain": "nightly",
+        "what": "nightly-2026-08-05, quick recipe, LLVM (toolchain control)"
+      },
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-B",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "steps": [
+        "B-cold-build",
+        "B-cold-run",
+        "B-e1-check",
+        "B-e1-build",
+        "B-e1-run",
+        "B-e2-check",
+        "B-e2-build",
+        "B-e2-run",
+        "B-e3-check",
+        "B-e3-build",
+        "B-e3-run"
+      ],
+      "baseline_main_rs_sha256": "59066d634550d8520f378b90882fc49703f82b202857c3fb9caed05966a02e0f",
+      "storage_after_cold": {
+        "files": 645,
+        "apparent": 114085201,
+        "allocated": 115666944,
+        "workspace_allocated": 60690432,
+        "dependency_allocated": 54968320,
+        "other_allocated": 8192
+      },
+      "edits": [
+        {
+          "edit": 1,
+          "file": "src/bin/oxide/main.rs",
+          "old": "oxide: Cargo with managed build storage and profiles",
+          "new": "oxide: Cargo with managed build storage and profiles (075 edit 1)",
+          "sha256_after": "83d70447cd067649f999ad5b953b0edda60003127231a8c546518291ea9cece5",
+          "offset_s": 87.479
+        },
+        {
+          "edit": 2,
+          "file": "src/bin/oxide/main.rs",
+          "old": "oxide: Cargo with managed build storage and profiles (075 edit 1)",
+          "new": "oxide: Cargo with managed build storage and profiles (075 edit 2)",
+          "sha256_after": "26c294d86bb286788efe8a153c79ea2db368d084114d3fdb35f422dd18b01629",
+          "offset_s": 89.573
+        },
+        {
+          "edit": 3,
+          "file": "src/bin/oxide/main.rs",
+          "old": "oxide: Cargo with managed build storage and profiles (075 edit 2)",
+          "new": "oxide: Cargo with managed build storage and profiles (075 edit 3)",
+          "sha256_after": "20d50997db14794ac9b3293144d28bf0fd0e9e4e2978b244d769e79d3c8f26ea",
+          "offset_s": 90.289
+        }
+      ],
+      "storage_final": {
+        "files": 766,
+        "apparent": 160592947,
+        "allocated": 162562048,
+        "workspace_allocated": 95989760,
+        "dependency_allocated": 66564096,
+        "other_allocated": 8192
+      }
+    },
+    "C": {
+      "spec": {
+        "toolchain": "nightly",
+        "test": true,
+        "what": "nightly-2026-08-05, quick recipe, Cranelift for package oxide-storage only",
+        "global_args": [
+          "-Zcodegen-backend",
+          "--config",
+          "profile.oxide-quick.package.oxide-storage.codegen-backend=\"cranelift\""
+        ]
+      },
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-C",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only"
+      },
+      "steps": [
+        "C-cold-build",
+        "C-cold-run",
+        "C-e1-check",
+        "C-e1-build",
+        "C-e1-run",
+        "C-e2-check",
+        "C-e2-build",
+        "C-e2-run",
+        "C-e3-check",
+        "C-e3-build",
+        "C-e3-run",
+        "C-test"
+      ],
+      "baseline_main_rs_sha256": "59066d634550d8520f378b90882fc49703f82b202857c3fb9caed05966a02e0f",
+      "storage_after_cold": {
+        "files": 646,
+        "apparent": 106540071,
+        "allocated": 108154880,
+        "workspace_allocated": 53178368,
+        "dependency_allocated": 54968320,
+        "other_allocated": 8192
+      },
+      "edits": [
+        {
+          "edit": 1,
+          "file": "src/bin/oxide/main.rs",
+          "old": "oxide: Cargo with managed build storage and profiles",
+          "new": "oxide: Cargo with managed build storage and profiles (075 edit 1)",
+          "sha256_after": "83d70447cd067649f999ad5b953b0edda60003127231a8c546518291ea9cece5",
+          "offset_s": 95.936
+        },
+        {
+          "edit": 2,
+          "file": "src/bin/oxide/main.rs",
+          "old": "oxide: Cargo with managed build storage and profiles (075 edit 1)",
+          "new": "oxide: Cargo with managed build storage and profiles (075 edit 2)",
+          "sha256_after": "26c294d86bb286788efe8a153c79ea2db368d084114d3fdb35f422dd18b01629",
+          "offset_s": 98.021
+        },
+        {
+          "edit": 3,
+          "file": "src/bin/oxide/main.rs",
+          "old": "oxide: Cargo with managed build storage and profiles (075 edit 2)",
+          "new": "oxide: Cargo with managed build storage and profiles (075 edit 3)",
+          "sha256_after": "20d50997db14794ac9b3293144d28bf0fd0e9e4e2978b244d769e79d3c8f26ea",
+          "offset_s": 98.754
+        }
+      ],
+      "storage_final": {
+        "files": 1370,
+        "apparent": 213310359,
+        "allocated": 216543232,
+        "workspace_allocated": 146108416,
+        "dependency_allocated": 70426624,
+        "other_allocated": 8192
+      }
+    },
+    "D": {
+      "spec": {
+        "toolchain": "nightly",
+        "env": {
+          "RUSTFLAGS": "-Zthreads=8"
+        },
+        "what": "nightly-2026-08-05, quick recipe, LLVM, RUSTFLAGS=-Zthreads=8"
+      },
+      "env": {
+        "HOME": "/Users/tom",
+        "USER": "tom",
+        "LOGNAME": "tom",
+        "LANG": "C",
+        "PATH": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "RUSTC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustc",
+        "RUSTDOC": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/bin/rustdoc",
+        "CARGO_HOME": "/Users/tom/.cargo",
+        "CARGO_TERM_COLOR": "never",
+        "TMPDIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/tmp/",
+        "CARGO_TARGET_DIR": "/private/tmp/oxide-075-cranelift.q8a2kl_b/target-D",
+        "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+        "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only",
+        "RUSTFLAGS": "-Zthreads=8"
+      },
+      "steps": [
+        "D-cold-build",
+        "D-cold-run",
+        "D-e1-check",
+        "D-e1-build",
+        "D-e1-run",
+        "D-e2-check",
+        "D-e2-build",
+        "D-e2-run",
+        "D-e3-check",
+        "D-e3-build",
+        "D-e3-run"
+      ],
+      "baseline_main_rs_sha256": "59066d634550d8520f378b90882fc49703f82b202857c3fb9caed05966a02e0f",
+      "storage_after_cold": {
+        "files": 645,
+        "apparent": 114093328,
+        "allocated": 115675136,
+        "workspace_allocated": 60698624,
+        "dependency_allocated": 54968320,
+        "other_allocated": 8192
+      },
+      "edits": [
+        {
+          "edit": 1,
+          "file": "src/bin/oxide/main.rs",
+          "old": "oxide: Cargo with managed build storage and profiles",
+          "new": "oxide: Cargo with managed build storage and profiles (075 edit 1)",
+          "sha256_after": "83d70447cd067649f999ad5b953b0edda60003127231a8c546518291ea9cece5",
+          "offset_s": 107.179
+        },
+        {
+          "edit": 2,
+          "file": "src/bin/oxide/main.rs",
+          "old": "oxide: Cargo with managed build storage and profiles (075 edit 1)",
+          "new": "oxide: Cargo with managed build storage and profiles (075 edit 2)",
+          "sha256_after": "26c294d86bb286788efe8a153c79ea2db368d084114d3fdb35f422dd18b01629",
+          "offset_s": 108.826
+        },
+        {
+          "edit": 3,
+          "file": "src/bin/oxide/main.rs",
+          "old": "oxide: Cargo with managed build storage and profiles (075 edit 2)",
+          "new": "oxide: Cargo with managed build storage and profiles (075 edit 3)",
+          "sha256_after": "20d50997db14794ac9b3293144d28bf0fd0e9e4e2978b244d769e79d3c8f26ea",
+          "offset_s": 109.576
+        }
+      ],
+      "storage_final": {
+        "files": 766,
+        "apparent": 160621322,
+        "allocated": 162586624,
+        "workspace_allocated": 96014336,
+        "dependency_allocated": 66564096,
+        "other_allocated": 8192
+      }
+    }
+  },
+  "storage": {
+    "scratch_reference_free": 776994140160,
+    "owned_boundaries": [
+      {
+        "label": "after setup",
+        "offset_s": 67.788,
+        "owned_allocated_bytes": 13041664,
+        "host_free": 776977526784
+      },
+      {
+        "label": "A after cold",
+        "offset_s": 77.472,
+        "owned_allocated_bytes": 135700480,
+        "host_free": 776858746880
+      },
+      {
+        "label": "A final",
+        "offset_s": 81.16,
+        "owned_allocated_bytes": 188493824,
+        "host_free": 776805285888
+      },
+      {
+        "label": "B after cold",
+        "offset_s": 87.477,
+        "owned_allocated_bytes": 304259072,
+        "host_free": 776590503936
+      },
+      {
+        "label": "B final",
+        "offset_s": 91.062,
+        "owned_allocated_bytes": 351444992,
+        "host_free": 776546799616
+      },
+      {
+        "label": "C after cold",
+        "offset_s": 95.934,
+        "owned_allocated_bytes": 459694080,
+        "host_free": 776441221120
+      },
+      {
+        "label": "C final",
+        "offset_s": 103.805,
+        "owned_allocated_bytes": 568451072,
+        "host_free": 776337993728
+      },
+      {
+        "label": "D after cold",
+        "offset_s": 107.176,
+        "owned_allocated_bytes": 684220416,
+        "host_free": 776224903168
+      },
+      {
+        "label": "D final",
+        "offset_s": 110.445,
+        "owned_allocated_bytes": 731422720,
+        "host_free": 776174956544
+      }
+    ]
+  },
+  "outcome": "complete",
+  "stop_reason": null,
+  "counts": {
+    "measured": 29,
+    "setup": 2
+  },
+  "notes": [],
+  "session": {
+    "start_ns": 307466845946083,
+    "deadline_ns": 310466845946083,
+    "clock": "raw mach_continuous_time via mach_timebase_info, started in submit.py before root creation, admission wait, install and setup",
+    "admitted_offset_s": 67.17,
+    "admitted_utc": "2026-10-18T20:45:52Z",
+    "end_offset_s": 110.449
+  },
+  "prior_attempts": [
+    {
+      "result": "attempt-1-result.json",
+      "outcome": "partial",
+      "stop_reason": "harness error: FileNotFoundError(2, 'No such file or directory')",
+      "counts": {
+        "measured": 0,
+        "setup": 0
+      },
+      "calls": [
+        "components-before",
+        "component-install",
+        "components-after"
+      ]
+    }
+  ],
+  "component": {
+    "manifest": "/Users/tom/.rustup/toolchains/nightly-2026-08-05-aarch64-apple-darwin/lib/rustlib/manifest-rustc-codegen-cranelift-preview-aarch64-apple-darwin",
+    "files": [
+      {
+        "path": "lib/rustlib/aarch64-apple-darwin/codegen-backends/librustc_codegen_cranelift-1.99.0-nightly.dylib",
+        "bytes": 11406288,
+        "allocated": 11407360,
+        "sha256": "2e89fd5fa23ebaf01f276bcaa3dbb68553e7fede15326aceaadbd2a8a2e2977e"
+      },
+      {
+        "path": "share/doc/rustc_codegen_cranelift/LICENSE-APACHE",
+        "bytes": 11357,
+        "allocated": 12288,
+        "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+      },
+      {
+        "path": "share/doc/rustc_codegen_cranelift/LICENSE-MIT",
+        "bytes": 1023,
+        "allocated": 4096,
+        "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+      },
+      {
+        "path": "share/doc/rustc_codegen_cranelift/Readme.md",
+        "bytes": 4721,
+        "allocated": 8192,
+        "sha256": "2a4cd6ccfc49aabb9c8e471ae27b9c97599aeff8a5fdd77275f6cf87233b42d9"
+      }
+    ],
+    "total_allocated": 11431936
+  },
+  "toolchain_identity": {
+    "stable": {
+      "cargo_sha256": "7672ead309d505577c018fff2cafb3433601f073e38cbe87359ac1f7b944bbf5",
+      "rustc_sha256": "210df6794001b73ec3d453878707fa1e0bdcb63c427024a6e6574bbe5615a4da",
+      "rustc_driver": {
+        "librustc_driver-e03ed1db822dfa4c.dylib": "57f6b5280f218ed25ba6b7e4bc1d74da3ac8e4fd85bee1b8982ad4114d757c11"
+      }
+    },
+    "nightly": {
+      "cargo_sha256": "d562a22fc8185e98267eee377da55b67b3e9b6c3658ad2b0ac51685fc0a7a069",
+      "rustc_sha256": "dc58c37f6dc27c143b69983dc0d4ec777b41123add686deefff507e72116742f",
+      "rustc_driver": {
+        "librustc_driver-2ee8092297dfc859.dylib": "843ab43f9a242ddd735af05da825dc26b0a1e4413b364076255afab25d61c20e"
+      }
+    }
+  },
+  "source": {
+    "head_and_tree": [
+      "dc84d039cd397c8292f37f4201e3916fa2ecd1d3",
+      "448bed9adba200dc4489060637a3bdb05addaddf"
+    ],
+    "lock_sha256": "0b076df97006905e1eb44d0dfc0e3919ab854dc6278969b89625ed33c40d3305"
+  },
+  "raw_log_bytes": 1200123
+}

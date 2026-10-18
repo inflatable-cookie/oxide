@@ -139,7 +139,7 @@ for the current unwind-dependent test loop. A narrower run-only or another
 platform experiment remains possible; JIT is not retired. The local toolchain
 list includes nightly-2026-08-05, but its installed-component list contains no
 Cranelift backend; no component, compiler or global override was installed or
-changed during this check. Merely having nightly does not qualify the backend.
+changed during this check. Merely having nightly does not qualify the backend. The component was installed on 2026-10-18 for the [quick-run measurement](#cranelift-measurement-2026-10-18).
 
 ## Quick-run strategies
 
@@ -150,17 +150,91 @@ replace "quick build, then execute" as the default.
 | Strategy | State | Fit for `oxide run --profile quick` |
 | --- | --- | --- |
 | Quick build + execute (stable LLVM, opt-level 0, line tables, incremental) | Shipped. On Linux, [Rust 1.90 made LLD the default linker](https://blog.rust-lang.org/2025/09/18/Rust-1.90.0/) for `x86_64-unknown-linux-gnu`; the [preview post](https://blog.rust-lang.org/2025/09/01/rust-lld-on-1.90.0-stable) reports 7x faster linking and 40% less end-to-end time on a ripgrep incremental rebuild. | Default and fallback. |
-| [Cranelift AOT](https://github.com/rust-lang/rustc_codegen_cranelift) | Nightly-only preview component `rustc-codegen-cranelift-preview`; aarch64 macOS supported; unwinding unsupported on macOS (`panic=abort` by default), experimental on Linux. Cargo's [`codegen-backend`](https://doc.rust-lang.org/cargo/reference/unstable.html#codegen-backend) can be set per package, so dependencies can stay on LLVM. | Candidate for `run` only. One build cannot mix rustc versions, so a nightly strategy needs its own slot and a second dependency set, costing storage. It also needs a nightly toolchain plus component install, which is a host change. Not for `test` on macOS. |
+| [Cranelift AOT](https://github.com/rust-lang/rustc_codegen_cranelift) | Nightly-only preview component `rustc-codegen-cranelift-preview`; aarch64 macOS supported; unwinding unsupported on macOS (`panic=abort` by default), experimental on Linux. Cargo's [`codegen-backend`](https://doc.rust-lang.org/cargo/reference/unstable.html#codegen-backend) can be set per package, so dependencies can stay on LLVM. | Measured 2026-10-18: no warm edit-loop gain on Oxide's workspace, and `catch_unwind` in Cranelift code stops working ([measurement](#cranelift-measurement-2026-10-18)). Not recommended for `run` on small workspaces; a heavy project needs its own reading. A nightly strategy needs its own slot and a second dependency set, plus a nightly toolchain and component. Not for `test`. |
 | [Cranelift JIT](https://github.com/rust-lang/rustc_codegen_cranelift/blob/main/docs/usage.md) | "Highly experimental"; every dependency must be a dynamic library; no incremental compilation, so it may be slower than AOT. | Not a near-term candidate. |
 | Hot patching ([Subsecond](https://docs.rs/subsecond/)) | Experimental. It patches only code wrapped in `subsecond::call` and only the tip crate, and needs the Dioxus CLI (`dx serve --hotpatch`) ([Dioxus 0.7](https://dioxuslabs.com/blog/release-070)). | Not a generic strategy: it requires source changes. Possible later opt-in for long-running apps. |
 
-Implications: the foundation ships quick build + execute. The only near
-candidate is Cranelift for workspace crates. It needs a bounded measurement on a
-real edit-to-run loop that counts the separate nightly dependency set and the
-abort-on-panic compromise. Until then, measure where quick-run time goes
-(frontend, codegen, link) before choosing a strategy. The installed
-nightly-2026-08-05 has no Cranelift component; Tom approved installing it for
-the bounded measurement on 2026-10-18 ([vision](vision.md#product-workflow-direction)).
+Implications: the foundation ships quick build + execute. Cranelift for
+workspace crates was the only near candidate; the
+[measurement below](#cranelift-measurement-2026-10-18) found no edit-loop gain
+on Oxide's own workspace.
+
+### Cranelift measurement (2026-10-18)
+
+One bounded session (oxide#075) on Oxide's repository at `dc84d03`, macOS
+aarch64, under Effigy heavy admission. Raw evidence:
+[`evidence/cranelift-quick-run-075/`](evidence/cranelift-quick-run-075/summary.json).
+Tom approved the session and the one component install
+([vision](vision.md#product-workflow-direction)). `rustup component add
+rustc-codegen-cranelift-preview --toolchain nightly-2026-08-05` succeeded
+(11.4 MB installed into that toolchain); no other host change was made.
+
+Loop per arm: a cold `cargo build --bin oxide`, then three edits to the
+`--help` text in `src/bin/oxide/main.rs`. Each edit was followed by `check`,
+`build`, and a direct `oxide --help` that confirmed the edited text. Every
+call used the quick recipe, `--locked --offline`, a private target directory
+and an explicit environment. The host's `CARGO_INCREMENTAL=0` was removed, so
+workspace units built incrementally.
+
+| Arm | Toolchain and backend | Cold build | Warm check | Warm build | Direct run | Target after loop |
+| --- | --- | --- | --- | --- | --- | --- |
+| A | stable 1.97.1, LLVM | 9.26 s | 0.100 s | 0.307 s | 0.290 s | 167.0 MiB |
+| B | nightly-2026-08-05, LLVM | 5.91 s | 0.093 s | 0.310 s | 0.299 s | 155.0 MiB |
+| C | nightly, Cranelift for `oxide-storage` only | 4.46 s | 0.096 s | 0.318 s | 0.304 s | 206.5 MiB (with test targets) |
+| D | nightly, LLVM, `RUSTFLAGS=-Zthreads=8` | 2.95 s | 0.112 s | 0.341 s | 0.289 s | 155.1 MiB |
+
+Warm figures are means of edits 2 and 3. Every warm step rebuilt exactly one
+unit, the `oxide` bin. The first check after a cold build also builds 16
+dependency check units: 1.58 / 1.47 / 1.46 / 0.97 s for A–D.
+
+Receipts:
+- Arm C's verbose rustc lines show `-Z codegen-backend=cranelift` only on the
+  `oxide_storage` and `oxide` units. The 22 dependency and build-script units
+  stayed on LLVM.
+- Arm D shows `-Zthreads=8` on every unit.
+- No unit received a `-C panic` flag.
+
+Findings:
+- **Check is the floor, and it is almost the whole frontend.** A warm build
+  costs about 0.21 s more than a warm check, and that gap holds codegen and
+  link. No backend can save more than that per edit on this subject.
+  Cranelift saved nothing: C's warm build was 0.01 s slower than B's.
+- **Panic semantics change even with `panic=unwind`.** Arm C's `cargo test`
+  ran 79 unit tests and all passed. The unwind probe
+  (`tests/profile_backtrace.rs`) failed: a `catch_unwind` inside
+  Cranelift-compiled code did not catch an overflow panic. The panic instead
+  reached libtest's LLVM-compiled harness, which reported the test failed. The
+  process did not abort. Exit 101.
+- **A second dependency set costs storage.** Each nightly arm holds its own
+  dependency units: 63.5 MiB beside stable's 67.2 MiB on this small graph. A
+  Cranelift strategy needs that set in its own slot, plus the component and a
+  nightly toolchain.
+- **`-Zthreads=8` showed no warm gain.** D's warm build was 0.03 s slower than
+  B's. Its cold build and first check were faster, but those single readings
+  are confounded by run order.
+- **The run step is as large as the build step.** Every direct run executed a
+  freshly linked binary, and `--help` took 0.28–0.32 s. The cause was not
+  isolated.
+
+Recommendation: do not implement a Cranelift-for-workspace `quick` run
+strategy on this evidence. On a small workspace the edit loop is already
+check-bound, and the strategy costs nightly, a second dependency set and changed
+panic semantics. A heavy, codegen-bound project could differ. That needs its own
+owner-coordinated, approved reading, and this result does not predict it.
+
+Limits:
+- One small subject (31 units) and one sample per reading, on macOS aarch64
+  only.
+- No write-volume or SSD claim.
+- Arms ran in order A, B, C, D, and cold times fall in that order: A paid for
+  cold sources and a cold compiler. Cold readings therefore credit neither
+  backend nor flag.
+- The nightly Cargo already uses the build-dir layout v2 (`build/<package>/<hash>/out`),
+  so its byte split by unit name is not identical in layout to stable's.
+- The session continued once after a harness defect. It stopped before any
+  Cargo call, after the install, and resumed on the same clock, root and
+  counters: 29 measured plus 2 version Cargo calls, about 110 s of the 50
+  minutes, 0.7 GiB peak owned scratch.
 
 ### Other run-path levers
 
@@ -176,7 +250,7 @@ time separately before any backend is credited.
 | Workspace feature unification | Selecting different packages builds dependency variants with different features: churn and extra storage. A 2026-10-18 probe on 1.97.1 showed `resolver.feature-unification` is ignored without `-Zfeature-unification` ([RFC 3692](https://rust-lang.github.io/rfcs/3692-feature-unification.html)). The stable route is a workspace-hack crate, which is a project change. | `oxide status` could report duplicate dependency variants; the fix stays per project. |
 | Faster linkers | macOS uses Apple's linker. [Wild](https://github.com/davidlattimore/wild) is Linux-only, has no incremental linking yet, and its Mach-O port is not ready. | Linux: LLD default already; wild later. macOS: nothing to add. |
 | Dynamic dependency linking | A dylib wrapper crate re-exporting dependencies cuts link time for large graphs, but changes linking and runtime loading. | Per-project opt-in only. |
-| Parallel frontend (`-Zthreads`) | Nightly; speeds frontend work on large crates. | Same nightly dependency-set cost as Cranelift; a possible extra arm of that measurement. |
+| Parallel frontend (`-Zthreads`) | Nightly; speeds frontend work on large crates. Measured 2026-10-18 as arm D: no warm edit gain on Oxide's workspace ([measurement](#cranelift-measurement-2026-10-18)). | Same nightly dependency-set cost as Cranelift; not worth it for small workspaces. |
 | Watch mode | Rebuilds and restarts on save; cuts latency, not work. | Human loop; low value for agents. |
 | [danluu/rust-interpreter](https://github.com/danluu/rust-interpreter) | rustc checks the code, then selected MIR is lowered to bytecode and run in an interpreter or AArch64 JIT. Self-described as "extremely vibe coded"; "cannot yet replace `cargo test`"; no unwinding, threads, FFI or `should_panic`; "no fallback" for unsupported code. Its results are mixed: 20% faster on one five-edit pilot, 2.7x slower on a compute-heavy target. Needs pinned nightly with `rustc-dev`; no license stated. | Not usable or adoptable. It shows the approach can work, and its ceiling is still the check time. |
 | Miri / [Cranelift JIT](https://github.com/rust-lang/rustc_codegen_cranelift/blob/main/docs/usage.md) | Miri is a UB checker that runs far slower than native code. Cranelift JIT is covered above. | Not speed tools. |
@@ -192,7 +266,7 @@ Implication: the `quick` recipe accumulates stale objects in long-lived shared s
 
 | Development | State | Relevance |
 | --- | --- | --- |
-| [Build-dir layout v2](https://blog.rust-lang.org/2026/03/13/call-for-testing-build-dir-layout-v2) | Per-unit `build/<package>/<hash>/` directories; scheduled stable in Cargo 1.100 (2026-11-12, per the beta changelog). | Unblocks Cargo's stale-unit cleanup ([cargo#5026](https://github.com/rust-lang/cargo/issues/5026)) and finer locking. It changes intermediate paths, so Oxide's plain-Cargo stray detection (`deps/`, `incremental/`) must be re-qualified at the upgrade. |
+| [Build-dir layout v2](https://blog.rust-lang.org/2026/03/13/call-for-testing-build-dir-layout-v2) | Per-unit `build/<package>/<hash>/` directories; scheduled stable in Cargo 1.100 (2026-11-12, per the beta changelog). Cargo 1.99.0-nightly (2026-07-29) already uses it by default ([measurement](#cranelift-measurement-2026-10-18)). | Unblocks Cargo's stale-unit cleanup ([cargo#5026](https://github.com/rust-lang/cargo/issues/5026)) and finer locking. It changes intermediate paths, so Oxide's plain-Cargo stray detection (`deps/`, `incremental/`) must be re-qualified at the upgrade. |
 | [Cross-workspace cache goal](https://rust-lang.github.io/rust-project-goals/2026/cargo-cross-workspace-cache.html) | 2026 goal: design and a nightly prototype; conservative at first. | The upstream replacement for Oxide's per-project slots ([Cargo relationship ruling](vision.md#relationship-with-cargo)). Not available yet. |
 | [Relink, don't rebuild](https://rust-lang.github.io/goals/2026/roadmap-fast-builds.html) | Did not complete in 2025H2; on the 2026 fast-builds roadmap; claims 5–10× fewer downstream rebuilds for body-only edits. | The largest future edit-loop win; nothing for Oxide to emulate safely. |
 | [`hint-mostly-unused`](https://blog.rust-lang.org/inside-rust/2025/07/15/call-for-testing-hint-mostly-unused/) | Nightly; per-dependency hint that defers code generation for unused items; regresses if applied globally. | Narrow, profile-guided; only helps when the dependency is built. |

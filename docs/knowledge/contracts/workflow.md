@@ -90,10 +90,12 @@ hot patching of a running process. Each is qualified per platform and project
 shape before Oxide may select it; current state is in the
 [landscape](../rust-dx-landscape.md#quick-run-strategies)
 ([Q-009](../questions.md#q-009--which-alternative-execution-modes-improve-the-daily-loop)).
+The 2026-10-18 [Cranelift measurement](../rust-dx-landscape.md#cranelift-measurement-2026-10-18)
+found no edit-loop gain on Oxide's own workspace, so no strategy is selected.
 Rules:
 
 - Oxide prints the strategy it used and any semantic compromise, for example
-  panic-abort under Cranelift on macOS.
+  `catch_unwind` not catching inside Cranelift-compiled code on macOS.
 - If a strategy cannot build or start the program, Oxide falls back to quick
   build plus execute. A program failure is reported, never retried under
   another strategy.
