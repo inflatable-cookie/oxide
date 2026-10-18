@@ -1,0 +1,5 @@
+[manifest]
+minimum_effigy_version = "0.14.0"
+[tasks.gc-probe]
+admission = "heavy"
+run = "exec /bin/bash /private/tmp/oxide-084.Df89lF/recipe/probe.sh"

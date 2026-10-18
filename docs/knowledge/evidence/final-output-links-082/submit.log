@@ -1,0 +1,40 @@
+SUBMIT root /private/tmp/oxide-082-links.cl42af8i request b868b9f1-7c6b-4c59-8242-ac8184671c66
+
+╭───────────────────────────────────────────────╮
+│ EFFIGY  /private/tmp/oxide-082-links.cl42af8i │
+╰──────────────────────── v0.14.1+local.3113774 ╯
+
+waiting for QA capacity, position 1
+
+╭───────────git-clone START
+git-clone EXIT 0 0.504
+git-checkout START
+git-checkout EXIT 0 0.252
+git-tree START
+git-tree EXIT 0 0.255
+git-status START
+git-status EXIT 0 0.255
+image-create START
+image-create EXIT 0 1.271
+image-attach START
+image-attach EXIT 0 0.257
+setup-cargo-version START
+setup-cargo-version EXIT 0 0.257
+setup-rustc-version START
+setup-rustc-version EXIT 0 0.256
+X-build START
+X-build EXIT 0 5.113
+X-test-no-run START
+X-test-no-run EXIT 0 1.29
+S-build START
+S-build EXIT 0 4.356
+S-test-no-run START
+S-test-no-run EXIT 0 1.27
+image-detach START
+image-detach EXIT 0 0.509
+{"outcome": "complete", "counts": {"setup": 2, "cargo": 4, "tool": 7}, "end_s": 37.996510584, "error": null}
+────────────────────────────────────╮
+│ EFFIGY  /private/tmp/oxide-082-links.cl42af8i │
+╰──────────────────────── v0.14.1+local.3113774 ╯
+
+exit=0
