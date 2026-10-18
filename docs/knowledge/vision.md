@@ -57,6 +57,17 @@ This is the architect's disposition within the approved feature scope, not a
 new answer attributed to Tom. Profiling ordinary command overhead is a separate,
 unapproved proposal.
 
+The architect clarified the same fast-path boundary on 2026-10-19: Cargo's
+ordinary freshness semantics are the reference, rather than absolute input
+immutability. Registry/git dependencies are not categorically ineligible.
+Confirm their package/source/revision treatment against pinned Cargo source;
+retain its applicable identity in the key, and include any additional inputs
+Cargo actually follows or fall through. For path packages, the documented
+final-artifact dep-info and actual participating manifests must cover the inputs;
+source-directory ancestry alone cannot establish manifest coverage. A Git
+snapshot assembled across a changing HEAD/index must be refused. The repaired
+path must still meet the two-part timing gate and independent correctness review.
+
 Tom's ruling, 2026-10-18: draw a line under the mechanism experiments and design a proper user workflow. Oxide should provide a replacement build service: instead of `cargo build` / `cargo run`, the user requests `oxide build …` / `oxide run …` against a named profile (quickest dev loop, light debug, full debug, release and similar). Oxide then handles storage/space management, worktree reuse, building and running where needed. The build location and system are abstracted from the user, so the same request could execute locally, on CI, in the cloud or on another machine on the local network. Tom asked whether `cargo build` and `cargo run` can be redirected to these commands.
 
 Tom's follow-up ruling, 2026-10-18: Oxide must be very easy to use and set up — no intricate install procedures or transparent interception. `oxide build` and `oxide run` are the explicit commands; the design problem is how they integrate into projects and workflows. Do not pursue rustup toolchain shims, `PATH` shims or shell aliases that make `cargo build` reach Oxide for now. Agents tend to fall back to familiar Cargo defaults, so adoption needs an Oxide agent skill and clear per-project agent documentation that direct them to the Oxide commands.
