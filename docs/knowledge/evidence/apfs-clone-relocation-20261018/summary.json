@@ -38,22 +38,22 @@
     "remaining_original_paths": "after the final step: rustc make-style .d files of unchanged units; root-output files of unchanged dependency build scripts; serde/serde_core rlib/rmeta source maps naming A's OUT_DIR private.rs; proc-macro dylib install names (LC_ID_DYLIB); N_OSO debug-map entries in proc-macro test binaries that were not relinked. Before relink (F2/O2) every binary, including target/debug/* final outputs, carried N_OSO entries naming A's deps/*.o. None changed Cargo or test behaviour here; debugger use of not-relinked binaries was not tested"
   },
   "clone_cost": {
-    "fx-stable": {"files": 304, "logical_bytes": 11173888, "clonefile_seconds": 0.00208},
-    "fx-nightly-newlayout": {"files": 297, "logical_bytes": 8957952, "clonefile_seconds": 0.00303},
+    "fx-stable": {"files": 304, "st_blocks_allocated_bytes": 11173888, "clonefile_seconds": 0.00208},
+    "fx-nightly-newlayout": {"files": 297, "st_blocks_allocated_bytes": 8957952, "clonefile_seconds": 0.00303},
     "oxide-real": {
       "files": 2126,
       "dirs": 95,
-      "logical_bytes": 256073728,
+      "st_blocks_allocated_bytes": 256073728,
       "clonefile_seconds": 0.01256,
       "host_free_drop_at_clone_bytes": 1757184,
       "host_free_drop_3s_bytes": 901120,
       "host_free_drop_before_clone_to_after_rename_bytes": 1101824,
       "host_free_drop_O2_to_O3_rebuild_bytes": 151998464,
-      "build_b_after_O3": {"files": 3923, "logical_bytes": 423129088},
+      "build_b_after_O3": {"files": 3923, "st_blocks_allocated_bytes": 423129088},
       "o1_cold_seconds": 4.99,
       "o2_noop_seconds": 0.25,
       "o3_lib_edit_seconds": 1.69,
-      "note": "host free space is shared with other tasks and noisy; it is not an exact clone allocation or SSD-write figure. src file nlink=2 for 1762 files because the private target dir hard-links uplifted outputs; clones have nlink=1"
+      "note": "st_blocks_allocated_bytes is the st_blocks*512 sum over every file and directory entry (the raw result.json key src_logical_allocated_bytes / logical_allocated_bytes is a recipe misnomer); it is allocated blocks, not apparent size, and does not see APFS clone sharing. Host free space is shared with other tasks and noisy; it is not an exact clone allocation or SSD-write figure. src file nlink=2 for 1762 files because the private target dir hard-links uplifted outputs; clones have nlink=1"
     }
   },
   "recipe_corrections": [

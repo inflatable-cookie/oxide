@@ -229,10 +229,10 @@ How the paths behave:
   - Once A is gone or rebuilt, debugging an unchanged binary can lose its debug info.
   - The probe did not run a debugger.
 
-Clone cost (Oxide repository, 2,126 files, 244 MiB logical):
+Clone cost (Oxide repository, 2,126 files; source `st_blocks` sum 244 MiB, which counts allocated blocks, not apparent size, and cannot see clone sharing):
 - `clonefile` took 12.6 ms. Host free space fell 1.1 MiB from before the clone to after the rename.
 - All 300 sampled files kept the same first physical extent (`F_LOG2PHYS_EXT`). A plain-copy control file moved to a new extent, which is direct evidence of copy-on-write sharing. Inodes differed; sizes, modes and mtimes matched.
-- Host free space fell another 152 MB during the edit rebuild: the clone diverges by roughly what the rebuild writes.
+- Host free space fell another 152 MB over the edit-rebuild interval. The host is shared, so this is not attributed to the rebuild or to clone divergence.
 - Host free space is shared and noisy. These figures are not exact clone allocation or SSD writes.
 
 Implication: on this host and toolchain, cloning a slot per worktree, or warm-starting from main's slot, is mechanically sound for Cargo freshness and rebuild correctness on both layouts. A product design still has to settle the debug-map condition: keep the source slot unchanged while clones exist, or accept relinking. One fixture and one repository do not prove universal portability, debugger behaviour or savings. Two recipe slips are corrected in the summary:
