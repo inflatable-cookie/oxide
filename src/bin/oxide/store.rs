@@ -486,12 +486,22 @@ impl Store {
 
     /// Record that Cargo is about to start. A crash from here until
     /// [`Store::mark_running`] leaves the slot held for explicit recovery:
-    /// Cargo's group may exist but is not recorded.
+    /// Cargo's group may exist but is not recorded. Advancing the use counter
+    /// untrusts the slot's origin until release records a new one; the gate
+    /// has already refreshed this checkout's differing files, so a retry here
+    /// is safe under Cargo's own checks.
     pub fn mark_spawning(&self, lease: &Lease) -> Result<(), String> {
-        self.update_record(lease.record, |record| {
-            record.phase = Phase::Spawning;
-            record.process_group = None;
-        })
+        let _admission = self.admission()?;
+        let mut state = self.load()?;
+        let index = state
+            .records
+            .iter()
+            .position(|record| record.id == lease.record)
+            .ok_or("Oxide slot record disappeared")?;
+        state.records[index].phase = Phase::Spawning;
+        state.records[index].process_group = None;
+        state.touch(index)?;
+        self.save(&state)
     }
 
     pub fn mark_running(&self, lease: &Lease, group: i32) -> Result<(), String> {
@@ -862,6 +872,13 @@ impl Store {
             lease_holder: lease_holder.clone(),
         });
         state.touch(index)?;
+        // Keep a trusted origin trusted until Cargo starts: written before
+        // the state that advances the counter, so a crash before Cargo (even
+        // mid-gate, after this record moved to this checkout) leaves the
+        // gate to run again on retry.
+        if let Some(origin) = &recorded {
+            self.write_origin(record, state.records[index].last_used, Some(origin.clone()))?;
+        }
         self.save(&state)?;
 
         let request = LeaseRequest {

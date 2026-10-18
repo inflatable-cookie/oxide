@@ -167,12 +167,19 @@ slot has a recorded origin:
    checkout's build. A differing submodule refuses the gate.
 
 The origin is trusted only when the record's use counter still equals the
-value stamped when it was written. A crashed command, a failed snapshot, a
-legacy slot from an earlier Oxide build or an older Oxide build using the slot
-leaves it untrusted, and an untrusted slot is never shared again until it is
-evicted. A gate that fails or cannot read the history (for example a clone
-lacking the slot's tree object) gives the taken slot back unchanged and the
-command builds cold in its own slot, never with unchecked reuse.
+value stamped when it was written. Leasing re-stamps a trusted origin before
+the slot moves to the new checkout. Cargo's start advances the counter, so the
+origin stays trusted until Cargo starts. A command that dies before Cargo,
+even mid-gate after taking another checkout's slot, therefore leaves the
+retry to run the gate again. A command that dies after Cargo started, a failed
+snapshot, a legacy slot from an earlier Oxide build or an older Oxide build
+using the slot leaves it untrusted, and an untrusted slot is never shared
+again until it is evicted. Its own checkout keeps using it under Cargo's
+checks: the gate had already refreshed that checkout's differing files before
+Cargo started. A gate that fails or cannot read the history (for example a
+clone lacking the slot's tree object) hands a slot holding another checkout's
+content back to that checkout unchanged. The command then builds cold in its
+own slot, never with unchecked reuse.
 
 This revives the qualification work's rejected "source touching" fix as a
 deliberate product mechanism. Real-project qualification (Q2–Q4 below) is
@@ -632,6 +639,7 @@ Rules:
   its own checkout's content; a `CARGO_MANIFEST_DIR` package rebuilds on a
   path change; a path dependency outside the repository stays fresh; an
   unchanged repeat rebuilds nothing; a clone lacking the slot's tree is
-  refused and builds cold. Warm-path cost is one `git status` and
+  refused and builds cold; an `oxide` killed inside the gate after taking
+  the slot leaves the retry to recover the slot and run the gate again. Warm-path cost is one `git status` and
   `rev-parse` before and after Cargo, about 25 ms on this repository.
   Real-project qualification (Q2–Q4) remains.

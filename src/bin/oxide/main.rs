@@ -228,17 +228,30 @@ fn lease_with_gate(
             Acquired::Lease(held) => held,
             Acquired::Interrupted(signal) => return Ok(Err(signal)),
         };
+        // The slot's content came from another checkout: taken just now, or
+        // left on this checkout's record by a command that died before Cargo.
+        let foreign = match &held.prior {
+            Prior::Known(origin) if origin.checkout != key.checkout => {
+                Some(origin.checkout.clone())
+            }
+            _ => None,
+        };
         match freshness::prepare(&key.checkout, &held.prior) {
             Ok(gate) => return Ok(Ok((held, gate))),
-            Err(reason) if held.shared_from.is_some() => {
+            Err(reason) if foreign.is_some() || held.shared_from.is_some() => {
                 eprintln!(
                     "oxide: freshness gate refused another checkout's slot ({reason}); building cold"
                 );
+                let mut held = held;
+                // Hand the slot back to the checkout whose content it holds.
+                if held.shared_from.is_none() {
+                    held.shared_from = foreign;
+                }
                 store.unshare(held)?;
                 share = false;
             }
-            // This checkout's own slot: Cargo's own mtime checks hold as
-            // before, but the slot is not shared afterwards.
+            // This checkout's own build history: Cargo's own mtime checks hold
+            // as before, but the slot is not shared afterwards.
             Err(_) => return Ok(Ok((held, Gate::untrusted()))),
         }
     }

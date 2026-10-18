@@ -10,7 +10,8 @@ call), storage-override refusals, `clean`, cross-checkout reuse through the
 freshness gate (two Git worktrees of a scratch repository: the stale-mtime
 scenario rebuilds, a `CARGO_MANIFEST_DIR` package rebuilds on a path change,
 a path dependency outside the repository stays fresh, an unchanged repeat
-rebuilds nothing, and a refused gate builds cold), FIFO waiting and the host
+rebuilds nothing, a refused gate builds cold, and a crash inside the gate
+leaves the retry gated), FIFO waiting and the host
 limit, clean waiting for active commands, `default-run`
 selection (package and virtual workspace roots), Ctrl-C forwarding, own-command crash recovery
 (a killed oxide whose Cargo group survives stays held; one whose group is gone
@@ -186,6 +187,16 @@ OUTSIDE = {
     "Cargo.toml": '[package]\nname = "outside"\nversion = "0.1.0"\nedition = "2021"\n',
     "src/lib.rs": "pub fn value() -> u32 {\n    5\n}\n",
 }
+
+# Holds oxide inside the freshness gate: the gate's first git call is
+# `rev-parse --show-toplevel`; identity resolution never makes it.
+GIT_HOLD = """#!/bin/sh
+if [ -n "$OXIDE_FIXTURE_GIT_HOLD" ] && [ "$1 $2" = "rev-parse --show-toplevel" ]; then
+    echo $$ > "$OXIDE_FIXTURE_GIT_HOLD.tmp" && mv "$OXIDE_FIXTURE_GIT_HOLD.tmp" "$OXIDE_FIXTURE_GIT_HOLD"
+    while [ ! -e "$OXIDE_FIXTURE_GIT_HOLD.release" ]; do sleep 0.1; done
+fi
+exec "REAL_GIT" "$@"
+"""
 
 # External subcommand: reports the injected build dir and runs `$CARGO`.
 PROBE = """#!/bin/sh
@@ -949,6 +960,46 @@ def prove_freshness(runner: Runner) -> None:
     shared(result, "worktree A keeps its slot")
     if not units or not all(units.values()):
         fail(f"A's slot was disturbed by the refused gate: {units}")
+
+    # Crash inside the gate after A's slot moved to B: the retry recovers the
+    # slot and runs the gate again. Unchecked reuse would keep A's marker
+    # unit and fail B's content test.
+    prove_gate_crash(runner, b, slot, test)
+
+
+def prove_gate_crash(runner: Runner, b: str, slot: str, test) -> None:
+    hold = os.path.join(runner.parent, "gate-hold.pid")
+    wrapper = os.path.join(runner.bin, "git")
+    real_git = shutil.which("git")
+    if not real_git:
+        fail("git not found for the gate-hold wrapper")
+    with open(wrapper, "w", encoding="utf-8") as handle:
+        handle.write(GIT_HOLD.replace("REAL_GIT", real_git))
+    os.chmod(wrapper, 0o700)
+    try:
+        child, log = runner.start(b, ["test"], "gate-crash", {"OXIDE_FIXTURE_GIT_HOLD": hold})
+        wait_for(lambda: os.path.exists(hold), "oxide held inside the freshness gate")
+        git_pid = int(read_text(hold))
+        moved = [record for record in runner.state()["records"] if record["checkout"] == b]
+        if len(moved) != 1 or moved[0]["phase"] != "acquiring":
+            fail(f"slot was not moved to B before the gate: {runner.state()['records']}")
+        child.kill()
+        child.wait(timeout=20)
+        log.close()
+        # The held wrapper is this proof's own orphaned process.
+        os.kill(git_pid, signal.SIGKILL)
+        wait_gone(os.kill, git_pid, "gate-hold git wrapper")
+    finally:
+        os.remove(wrapper)
+    result, units, stderr = test(b, "retry after a crash in the gate")
+    if result["slot"] != slot or result["warmth"] != "warm":
+        fail(f"retry did not reuse slot {slot} warm: {result}")
+    if f"recovered slot {slot} after oxide pid {child.pid} died (Cargo never started)" not in stderr:
+        fail(f"retry did not recover the crashed gate's slot: {stderr[-800:]}")
+    if "freshness gate refreshed" not in stderr:
+        fail(f"retry skipped the freshness gate: {stderr[-800:]}")
+    if units.get("marker:build") is not False or units.get("content:test") is not False:
+        fail(f"retry did not rebuild the stale units: {units}")
 
 
 def prove_waiting(runner: Runner, app: str, app2: str) -> None:
