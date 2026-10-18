@@ -244,6 +244,8 @@ consumer change, install or network-dependent fixture is authorized. This is an
 architect correction under existing authority, not a new operator quotation or
 reset of another task's time, proof or experimental allowance.
 
+Tom approved the `oxide run` unchanged-source fast path on 2026-10-18 with "Yes please": one Oxide-only PR after the freshness gate and its metadata-mode correction. It is bounded to tiny task-owned fixtures. If the source and build inputs match the last successful build of that binary in the same checkout, Oxide executes the existing binary without invoking Cargo. It grants no consumer, default or host change and no benefit claim beyond fixture behavior.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
