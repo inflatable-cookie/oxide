@@ -5,6 +5,7 @@
 //! host-wide limit and own-command crash recovery in a private control
 //! directory. Plain `cargo` behavior is untouched.
 
+mod adopt;
 mod cli;
 mod identity;
 mod process;
@@ -26,8 +27,8 @@ use store::{Acquired, Cleaning, Store};
 
 /// The `cargo` rustup resolves for the current directory. Oxide never selects
 /// a toolchain.
-const CARGO: &str = "cargo";
-const MIB: u64 = 1024 * 1024;
+pub(crate) const CARGO: &str = "cargo";
+pub(crate) const MIB: u64 = 1024 * 1024;
 const USAGE: &str = "\
 oxide: Cargo with managed build storage and profiles
 
@@ -36,10 +37,13 @@ USAGE:
     oxide <other cargo command> [args]   passed to Cargo; leased when it can build
     oxide clean [cargo clean args]       private outputs and slot affinity; slots stay
     oxide status                         pool, slots, waits and stray Cargo output
+    oxide init [cargo init args] [path]  cargo init if no Cargo.toml, then adopt Oxide
+    oxide new <path> [cargo new args]    cargo new, then adopt Oxide
 
 Profiles: quick (default, line tables), debug (full debug info), release (the
 project's own). Oxide places build output, so --target-dir and --config
-build.build-dir/target-dir are refused. init and new are plain Cargo for now.
+build.build-dir/target-dir are refused. Adoption writes one marked block in the
+workspace-root AGENTS.md and prints readiness; there is no Oxide config file.
 OXIDE_POOL selects the pool; OXIDE_MAX_ACTIVE the host-wide build limit (2).
 ";
 
@@ -83,6 +87,8 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
         Class::Plain => Err(exec_cargo(&args)),
         Class::Status => run_status(rest),
         Class::Clean => run_clean(rest),
+        Class::Init => adopt::run_init(rest),
+        Class::New => adopt::run_new(rest),
         Class::Modelled | Class::Building => run_leased(command, rest),
     }
 }

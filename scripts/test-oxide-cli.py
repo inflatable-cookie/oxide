@@ -10,8 +10,10 @@ call), storage-override refusals, `clean`, checkout-affine reuse, FIFO
 waiting and the host limit, clean waiting for active commands, `default-run`
 selection (package and virtual workspace roots), Ctrl-C forwarding, own-command crash recovery,
 `status` stray detection and Cargo-equal exit codes. The image is detached
-and the scratch removed only after positive completion. Not a benchmark and
-not full QA.
+and the scratch removed only after positive completion. Before any pool
+exists, `init` / `new` adoption runs on tiny scratch directories (90 s,
+64 MiB scratch) and must leave the pool uncreated. Not a benchmark and not
+full QA.
 """
 from __future__ import annotations
 
@@ -29,6 +31,10 @@ SCRATCH_LIMIT_BYTES = 512 * 1024 * 1024
 SOURCE_LIMIT_BYTES = 8 * 1024 * 1024
 HOST_RESERVE_BYTES = 20 * 1024 * 1024 * 1024
 PROOF_SECONDS = 300
+ADOPTION_SECONDS = 90
+ADOPTION_SCRATCH_BYTES = 64 * 1024 * 1024
+BEGIN = "<!-- oxide:begin -->"
+END = "<!-- oxide:end -->"
 # Set after the oxide binaries compile; ordinary compiler artifacts are
 # outside the proof-phase bound.
 STARTED = 0.0
@@ -390,6 +396,191 @@ def prove_usage(runner: Runner, cwd: str) -> None:
         fail("usage, refusals or status created the pool")
 
 
+def snapshot(root: str) -> dict:
+    """Relative path to bytes for every file under root."""
+    files = {}
+    for current, _, names in os.walk(root):
+        for name in names:
+            path = os.path.join(current, name)
+            with open(path, "rb") as handle:
+                files[os.path.relpath(path, root)] = handle.read()
+    return files
+
+
+def read_text(path: str) -> str:
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def managed_block(text: str) -> str:
+    start = text.find(BEGIN + "\n")
+    end = text.find(END + "\n")
+    if start < 0 or end < start or text.count(BEGIN) != 1 or text.count(END) != 1:
+        fail(f"no single managed block in {text!r}")
+    block = text[start : end + len(END) + 1]
+    if "`oxide` wherever you would write `cargo`" not in block:
+        fail(f"block lacks the command rule: {block!r}")
+    return block
+
+
+def prove_adoption(runner: Runner, root: str) -> None:
+    """`init` / `new` adopt in one command: Cargo only when needed, one
+    marked AGENTS.md block at the workspace root, readiness printed and no
+    pool created."""
+    started = time.monotonic()
+    os.makedirs(root, mode=0o700)
+    # rustup reads this for every fixture below: the pinned toolchain.
+    with open(os.path.join(root, "rust-toolchain.toml"), "w", encoding="utf-8") as handle:
+        handle.write('[toolchain]\nchannel = "1.97.1"\n')
+
+    # Empty directory: Cargo package plus block; Cargo.toml is Cargo's own.
+    code, stdout, stderr = runner.run(root, ["init", "--vcs", "none", "--name", "demo", "empty"])
+    expect(code, 0, "init empty", stderr)
+    plain = subprocess.run(
+        ["cargo", "init", "--vcs", "none", "--name", "demo", "plain"],
+        cwd=root,
+        env=runner.env,
+        capture_output=True,
+        text=True,
+        timeout=min(60, remaining()),
+    )
+    expect(plain.returncode, 0, "plain cargo init", plain.stderr)
+    empty = os.path.join(root, "empty")
+    adopted = snapshot(empty)
+    block = managed_block(adopted.pop("AGENTS.md").decode())
+    if adopted != snapshot(os.path.join(root, "plain")) or read_text(os.path.join(empty, "AGENTS.md")) != block:
+        fail("init in an empty directory wrote more than Cargo's package and the block")
+    for needle in (
+        f"created the Oxide block in {empty}/AGENTS.md",
+        "toolchain: rustc 1.97.1",
+        "identity: the path",
+        f"pool: {runner.pool} not created",
+        "effigy: no effigy.toml",
+    ):
+        if needle not in stdout:
+            fail(f"init readiness missing {needle!r}: {stdout}")
+
+    # Re-run: byte-identical tree, file not rewritten.
+    agents = os.path.join(empty, "AGENTS.md")
+    before, mtime = snapshot(empty), os.stat(agents).st_mtime_ns
+    code, stdout, stderr = runner.run(empty, ["init"])
+    expect(code, 0, "init re-run", stderr)
+    if snapshot(empty) != before or os.stat(agents).st_mtime_ns != mtime or "already current" not in stdout:
+        fail(f"init re-run changed the tree: {stdout}")
+
+    # Existing package: block only; Cargo-only arguments refuse untouched.
+    existing = os.path.join(root, "existing")
+    write_fixture(
+        existing,
+        {
+            "Cargo.toml": '[package]\nname = "existing"\nversion = "0.1.0"\nedition = "2021"\n',
+            "src/lib.rs": "pub fn value() -> u32 {\n    1\n}\n",
+            "AGENTS.md": "# Existing guidance\n\nKeep this line.",
+            "effigy.toml": '[tasks]\n"rust:compile" = "cargo check --workspace"\n"rust:test" = "oxide test"\n# "old" = "cargo build"\n',
+        },
+    )
+    git(existing, "init", "--quiet")
+    git(existing, "add", "-A")
+    git(existing, "commit", "--quiet", "-m", "fixture")
+    before = snapshot(existing)
+    for args in (["init", "--lib"], ["init", "--name", "other", "."], ["init", "--vcs=git"]):
+        code, _, stderr = runner.run(existing, args)
+        expect(code, 1, f"refusal {args}", stderr)
+        if "Refused Cargo-only arguments" not in stderr:
+            fail(f"{args} refusal gave no explanation: {stderr!r}")
+    if snapshot(existing) != before:
+        fail("a refused init changed the existing package")
+    code, stdout, stderr = runner.run(existing, ["init"])
+    expect(code, 0, "init existing", stderr)
+    after = snapshot(existing)
+    text = after.pop("AGENTS.md").decode()
+    del before["AGENTS.md"]
+    if after != before or text != "# Existing guidance\n\nKeep this line.\n\n" + managed_block(text):
+        fail(f"init on an existing package changed more than the appended block: {text!r}")
+    for needle in (
+        "added the Oxide block to",
+        "identity: Git root commit",
+        "still calls plain cargo (reported, not edited",
+        'line 2: "rust:compile" = "cargo check --workspace"',
+    ):
+        if needle not in stdout:
+            fail(f"existing-package readiness missing {needle!r}: {stdout}")
+    if "line 3" in stdout or "line 4" in stdout:
+        fail(f"effigy report named an oxide selector or a comment: {stdout}")
+
+    # Text outside the markers is preserved; a stale block is refreshed.
+    stale = "# Head\r\nintro\n" + BEGIN + "\nstale words\n" + END + "\nafter the block\n"
+    with open(os.path.join(existing, "AGENTS.md"), "w", encoding="utf-8", newline="") as handle:
+        handle.write(stale)
+    code, stdout, stderr = runner.run(existing, ["init"])
+    expect(code, 0, "init refresh", stderr)
+    text = read_text(os.path.join(existing, "AGENTS.md"))
+    with open(os.path.join(existing, "AGENTS.md"), "rb") as handle:
+        raw = handle.read().decode()
+    if "refreshed the Oxide block" not in stdout or raw != "# Head\r\nintro\n" + managed_block(text) + "after the block\n":
+        fail(f"refresh changed text outside the markers: {raw!r}")
+    broken = raw + BEGIN + "\n"
+    with open(os.path.join(existing, "AGENTS.md"), "w", encoding="utf-8", newline="") as handle:
+        handle.write(broken)
+    code, _, stderr = runner.run(existing, ["init"])
+    expect(code, 1, "init with malformed markers", stderr)
+    with open(os.path.join(existing, "AGENTS.md"), "rb") as handle:
+        if handle.read().decode() != broken or "fix the markers by hand" not in stderr:
+            fail(f"malformed markers were edited or unexplained: {stderr!r}")
+
+    # A new member inside a workspace: Cargo adds it; the block goes to the
+    # workspace root, never the member.
+    workspace = os.path.join(root, "ws")
+    write_fixture(
+        workspace,
+        {
+            "Cargo.toml": '[workspace]\nmembers = ["core"]\nresolver = "2"\n',
+            "core/Cargo.toml": '[package]\nname = "core"\nversion = "0.1.0"\nedition = "2021"\n',
+            "core/src/lib.rs": "",
+        },
+    )
+    member = os.path.join(workspace, "member")
+    os.makedirs(member)
+    code, stdout, stderr = runner.run(member, ["init", "--vcs", "none"])
+    expect(code, 0, "init workspace member", stderr)
+    if os.path.lexists(os.path.join(member, "AGENTS.md")):
+        fail("init wrote the block into the member instead of the workspace root")
+    managed_block(read_text(os.path.join(workspace, "AGENTS.md")))
+    if '"member"' not in read_text(os.path.join(workspace, "Cargo.toml")):
+        fail("Cargo did not add the member to the workspace")
+    if f"created the Oxide block in {workspace}/AGENTS.md" not in stdout:
+        fail(f"member init reported another location: {stdout}")
+
+    # `new`: Cargo's package then adoption, including inside the workspace;
+    # a failing `cargo new` returns Cargo's exit and adopts nothing.
+    code, stdout, stderr = runner.run(root, ["new", "--vcs", "none", "--lib", "fresh"])
+    expect(code, 0, "new", stderr)
+    fresh = os.path.join(root, "fresh")
+    if not os.path.isfile(os.path.join(fresh, "src", "lib.rs")):
+        fail("new did not create Cargo's library package")
+    managed_block(read_text(os.path.join(fresh, "AGENTS.md")))
+    before = snapshot(workspace)
+    code, stdout, stderr = runner.run(workspace, ["new", "--vcs", "none", "tools"])
+    expect(code, 0, "new workspace member", stderr)
+    if os.path.lexists(os.path.join(workspace, "tools", "AGENTS.md")):
+        fail("new wrote the block into the member")
+    if snapshot(workspace)["AGENTS.md"] != before["AGENTS.md"] or "already current" not in stdout:
+        fail("new in a workspace did not keep the root block current")
+    before = snapshot(fresh)
+    code, _, stderr = runner.run(root, ["new", "--vcs", "none", "fresh"])
+    expect(code, 101, "new over an existing directory", stderr)
+    if snapshot(fresh) != before:
+        fail("a failed new changed the existing directory")
+
+    if os.path.lexists(runner.pool):
+        fail("adoption created the pool")
+    elapsed = time.monotonic() - started
+    scratch = tree_bytes(root, False)
+    if elapsed > ADOPTION_SECONDS or scratch > ADOPTION_SCRATCH_BYTES:
+        fail(f"adoption proof exceeded its bounds: {elapsed:.0f} s, {scratch} bytes")
+    print(f"oxide adoption proof held: {elapsed:.0f} s, scratch {scratch // 1024} KiB")
+
+
 def prove_native(runner: Runner, app: str) -> None:
     code, stdout, stderr = runner.run(
         runner.parent,
@@ -707,6 +898,7 @@ def main() -> int:
     if tree_bytes(app, False) > SOURCE_LIMIT_BYTES:
         fail("fixture source exceeds 8 MiB")
     prove_usage(runner, app)
+    prove_adoption(runner, os.path.join(parent, "adoption"))
     if sys.platform != "darwin":
         fail("the bounded APFS oxide proof requires macOS")
     free = host_free_bytes(parent)

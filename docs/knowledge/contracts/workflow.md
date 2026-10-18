@@ -2,12 +2,13 @@
 
 Status: product design under Tom's
 [2026-10-18 workflow direction and bounded implementation authority](../vision.md#product-workflow-direction).
-The foundation core is implemented as the unpublished, uninstalled `oxide`
-binary; [Implemented foundation core](#implemented-foundation-core) states
-exactly what ships. `init` / `new` adoption, the freshness gate, the agent
-skill, non-build run strategies and a Linux backend are not implemented.
-Fixture proofs are not real-project qualification, default-pool creation
-outside tests, installation or consumer-adoption authority. Other sections
+The foundation core and `init` / `new` adoption are implemented as the
+unpublished, uninstalled `oxide` binary; the agent skill exists as repository
+source only. [Implemented foundation core](#implemented-foundation-core)
+states exactly what ships. The freshness gate, non-build run strategies and a
+Linux backend are not implemented. Fixture proofs are not real-project
+qualification, default-pool creation outside tests, installation (binary or
+skill) or consumer-adoption authority. Other sections
 state the target design.
 
 ## Shape
@@ -248,9 +249,12 @@ must not become required infrastructure for the core experience
 
 ## Agent integration
 
-1. **Oxide agent skill.** The rule is "`oxide` wherever you would write
-   `cargo`". The skill also covers profiles, the reported strategy, waits and
-   refusals, and `oxide status`.
+1. **Oxide agent skill.** Source at
+   [`skills/oxide/SKILL.md`](../../../skills/oxide/SKILL.md). The rule is
+   "`oxide` wherever you would write `cargo`". The skill also covers profiles,
+   the reported strategy, waits and refusals, `oxide status`, and `oxide clean`
+   versus plain `cargo clean`. Installing it into an agent skill root is not
+   authorized.
 2. **Project guidance block.** `oxide init` writes one marked section in the
    project's `AGENTS.md`, a few lines long. The block is the opt-in marker; no
    config file exists.
@@ -282,6 +286,27 @@ to an Oxide-adopted Rust project:
 `oxide new <path>` is `cargo new` followed by steps 3 and 4. Neither command
 creates an Oxide config file or changes `Cargo.toml` beyond what Cargo itself
 writes.
+
+Block rules, as implemented:
+
+- The block sits between whole lines `<!-- oxide:begin -->` and
+  `<!-- oxide:end -->` and is replaced whole on refresh. With no markers it is
+  appended after one blank line. A marker inside a line is prose. Any other
+  marker count or order refuses with nothing written.
+- An unchanged block leaves the file untouched. A change is written through a
+  sibling temporary file and a rename that keeps the file's permissions. An
+  `AGENTS.md` that is a link or directory refuses and prints the block.
+- The location is the workspace root `cargo locate-project --workspace`
+  reports for the target's manifest, so a new member lands the block at its
+  workspace root. When Cargo cannot resolve a workspace, for example a package
+  inside a workspace that does not list it, Oxide refuses and writes nothing;
+  Cargo's own init result stands.
+- With a manifest present, every argument other than the directory refuses as
+  Cargo-only. `--help` passes to Cargo.
+- Readiness never creates the pool or edits a file. The Effigy report scans
+  each `effigy.toml` from the workspace root up to the Git top level, line by
+  line, and names lines that run `cargo` as a command word; comments,
+  `cargo-*` binaries and `$CARGO` do not count.
 
 ## Relationship to existing work
 
@@ -400,8 +425,7 @@ local executor on macOS. Its covering proof is `effigy rust:oxide-cli`: tiny
 offline fixture crates on one fresh 128 MiB APFS pool. It is not installed and
 has run against no real project.
 
-- **Classes.** As in [Shape](#shape), except `init` / `new` stay plain
-  passthrough until adoption lands. Plain passthrough replaces Oxide with
+- **Classes.** As in [Shape](#shape). Plain passthrough replaces Oxide with
   Cargo, so output and exit codes are Cargo's. Unknown commands are building
   passthrough. A leading `+toolchain` or Cargo flag before the command
   refuses; `--version`, `-V` and `--list` pass through.
@@ -457,6 +481,10 @@ has run against no real project.
 - **Crash recovery.** Per [Crash recovery](#crash-recovery), for Oxide's own
   commands only. A follower in the same checkout waits while the crashed
   command's group survives, then recovers and continues.
+- **`init` / `new`.** As in [Adoption](#adoption-oxide-init). Cargo runs as
+  an ordinary child with inherited output; a Cargo failure returns Cargo's
+  exit and adopts nothing. A refusal exits 1. The covering proof runs before
+  any pool exists and checks that adoption never creates one.
 - **`status`.** Pool path or "not created", cap, payload use, slot accounting
   coverage, each slot's state, profile and checkout, waiting commands,
   checkouts being cleaned, and
