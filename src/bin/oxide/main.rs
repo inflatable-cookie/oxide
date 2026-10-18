@@ -542,10 +542,10 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
         None => {
             let backend = store::creation_backend()?;
             println!(
-                "  not created; the first building oxide command creates it ({} MiB, {}: {})",
-                store::creation_cap(backend)? / MIB,
+                "  not created; the first building oxide command creates it ({}: {}), cap {} MiB",
                 backend.tag(),
-                backend.bound()
+                backend.bound(),
+                store::creation_cap(backend)? / MIB
             );
         }
         Some(store) => {
