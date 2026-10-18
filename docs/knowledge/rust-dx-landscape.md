@@ -54,6 +54,49 @@ Unrecognized, mixed, malformed or truncated input needs explicit coverage
 limits rather than guessed success, cache-hit rates or rebuild causes. No
 settings change, new build or host scan is necessary to analyze a named log.
 
+## Cargo command interception
+
+Read-only research plus a disposable `/private/tmp` dispatch probe on pinned
+Cargo 1.97.1 / rustup 1.29.1, 2026-10-18, for the
+[workflow direction](vision.md#product-workflow-direction). Cargo offers no
+supported way to replace its own built-in commands; interception must happen
+before Cargo (front door) or through Cargo's documented execution hooks (inner).
+
+| Mechanism | Catches literal `cargo build`? | Observed / documented behavior |
+| --- | --- | --- |
+| `[alias] build = …` | No | Cargo warns ``user-defined alias `build` is ignored, because it is shadowed by a built-in command``. |
+| `cargo-build` on `PATH` | No | Built-in wins silently. |
+| `cargo-oxide` on `PATH` | Only `cargo oxide …` | Cargo passes `oxide` plus the remaining arguments and sets `CARGO` to the real toolchain cargo ([external tools](https://doc.rust-lang.org/cargo/reference/external-tools.html#custom-subcommands)). |
+| `[alias] b = "oxide build"`, `r = "oxide run"` | Only `cargo b` / `cargo r` | User aliases override Cargo's built-in short aliases; both dispatched to `cargo-oxide`. |
+| rustup toolchain whose `bin/cargo` is an Oxide shim | Yes | A `rust-toolchain.toml` `path` toolchain made `cargo build` and `cargo run` reach the shim; `cargo +stable` bypassed it. rustup sets `RUSTUP_TOOLCHAIN` to the shim toolchain, so nested proxy calls re-enter it. `components`, `targets` and `profile` have no effect on path toolchains ([overrides](https://rust-lang.github.io/rustup/overrides.html)); every tool (`cargo-clippy`, `rustfmt`, `rustdoc`, `rust-analyzer`) must be provided. |
+| `cargo` earlier on `PATH`, or a shell alias/function | Yes, for that environment | Depends on each agent, editor and CI shell inheriting it; shell functions do not reach non-interactive processes. |
+| `build.build-dir`, `build.target-dir`, `build.rustc-wrapper`, `target.<triple>.runner`, `[env]` (config or `CARGO_*` env) | Inner hooks only | One probe received every rustc invocation via `RUSTC_WRAPPER` and the built binary plus arguments via the runner; intermediates and final outputs landed in separately injected directories. These settings propagate to nested Cargo calls from tools such as nextest. |
+
+Implications for design:
+
+- A front door handles user experience; inner hooks keep execution inside
+  Oxide-owned storage. Child tools call the real cargo through `CARGO` and
+  bypass any shim, so coverage depends on environment/config injection, not on
+  intercepting every process.
+- A shim must call the real cargo by absolute path and mark re-entry, otherwise
+  `RUSTUP_TOOLCHAIN` causes recursion. It must also resolve the toolchain the
+  project would otherwise select; a committed `path` toolchain or custom
+  toolchain name is machine-specific and would break machines without Oxide.
+- rust-analyzer resolves cargo from `CARGO`, `PATH` or `$CARGO_HOME/bin`
+  through the rustup proxy, so a toolchain shim also receives editor
+  `cargo check` and `cargo metadata` calls unless `check.overrideCommand` and
+  `cargo.buildScripts.overrideCommand` route them deliberately.
+- The runner hook separates "build" from "execute" for `cargo run` and
+  `cargo test`, which is the natural seam for running a binary somewhere other
+  than where it was built. Cargo itself has no remote-build facility; remote
+  builds mean running Cargo elsewhere or distributing rustc units.
+
+Tom's [2026-10-18 follow-up](vision.md#product-workflow-direction) rejects
+transparent interception (toolchain shim, `PATH` shim, shell alias) in favour of
+explicit `oxide build` / `oxide run` plus agent guidance. The inner hooks remain
+the execution mechanism behind those commands. No mechanism is installed or
+configured by this research.
+
 ## Experimental frontier
 
 The Cargo performance guide also describes nightly parallel frontend and feature-unification experiments. [Cranelift's backend](https://github.com/rust-lang/rustc_codegen_cranelift) offers a faster-codegen candidate but has platform/feature limits; its documentation warns about unwinding support on macOS/Windows. These require opt-in qualification and cannot silently change test/runtime semantics. Hot reload, incremental linking and compiler-level invalidation improvements need targeted upstream/tool research rather than a universal promise.
@@ -99,8 +142,8 @@ changed during this check. Merely having nightly does not qualify the backend.
 
 ## Product assessment
 
-Planner recommendation: a small coherent entry point over evidence-backed mechanisms, with three capabilities: see and explain costs, bound and reuse owned storage, and apply qualified improvements with clear trade-offs. The reusable storage core must work for ordinary developers as well as orchestrators. A daemon, CLI, editor surface or UI is still an open choice.
+Planner recommendation: a small coherent entry point over evidence-backed mechanisms, with three capabilities: see and explain costs, bound and reuse owned storage, and apply qualified improvements with clear trade-offs. The reusable storage core must work for ordinary developers as well as orchestrators. A daemon, editor surface or UI is still an open choice; Tom's [workflow direction](vision.md#product-workflow-direction) sets an `oxide build` / `oxide run` front door as the design target.
 
 The broad product goal is confirmed; detailed numeric targets and mechanism choices are not. For every candidate, compare cold/new-worktree/small-edit/branch-switch/test cycles and longer-lived use. Track feedback latency, peak/retained disk space, actual observed write volume, memory/swap, contention and manual interventions. Bound measurement overhead and preserve evidence. Do not infer SSD lifetime from those metrics.
 
-Ease-of-use evaluation should include setup steps, configuration burden, diagnostic clarity, predictable behavior under capacity pressure and recovery effort. Prefer fewer developer decisions over exposing every compiler knob. Required source/test/release behavior stays visible and preserved. No new command names or installed behavior are implied by this research.
+Ease-of-use evaluation should include setup steps, configuration burden, diagnostic clarity, predictable behavior under capacity pressure and recovery effort. Prefer fewer developer decisions over exposing every compiler knob. Required source/test/release behavior stays visible and preserved. No published command names or installed behavior are implied by this research; executable naming remains subject to [release](contracts/release.md) review.

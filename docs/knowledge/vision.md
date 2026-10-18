@@ -18,7 +18,7 @@ The desired outcomes are bounded and predictable storage, less repeated compilat
 
 Ease of use means a small coherent entry point, useful defaults, visible costs, actionable explanations and a way back from changes. Integrate effective existing tools and upstream improvements where possible. A new layer must reduce total management effort. Correctness, useful diagnostics, required checks and repository-owned policy remain constraints on convenience.
 
-Adoption should have minimal impact per project. Tom accepts necessary project changes and potentially tight integration, assessed case by case. Prefer integration into familiar development loops so agents and operators have less to learn, while preserving established development tools. The Cargo integration surface, separate Oxide surface or hybrid remains an open design choice; no transparent Cargo interception is selected.
+Adoption should have minimal impact per project. Tom accepts necessary project changes and potentially tight integration, assessed case by case. Prefer integration into familiar development loops so agents and operators have less to learn, while preserving established development tools. Tom's [2026-10-18 workflow direction](#product-workflow-direction) makes an Oxide build/run front door the design target; transparent `cargo` interception was researched in the [Rust DX landscape](rust-dx-landscape.md#cargo-command-interception) and rejected.
 
 Some waiting and queue reordering under load are acceptable: agents can wait cheaply for slots or responses. Prioritize fewer simultaneous builds to avoid overloading the system rather than starting every requested build immediately. Queue/Nucleus retain scheduler/admission authority; the slot-waiting mechanism, admission coordination and cancellation policy remain to be designed. Tom has not supplied numeric waiting limits or a new crash-release policy.
 
@@ -43,6 +43,14 @@ Tom's architecture direction, 2026-10-09: qualify a central daemon as the prefer
 Tom's ruling, 2026-10-09: reuse work within Cargo wherever it is available and meets the need; that is the ideal long-term mechanism. Oxide must also fill practical gaps until Cargo catches up. An upstream initiative or roadmap is not a reason to defer relief for today's development problems indefinitely.
 
 Assess shipped behavior and supported pinned toolchains, not promised completion dates. Build the smallest qualified gap-filling mechanism that delivers a useful experience now. Keep that mechanism replaceable so Cargo improvements can take over without making developers or Queue/Nucleus consumers reconstruct their workflows. Temporary mechanisms need explicit coverage limits and criteria for replacement or retirement; durable Oxide policy and experience may remain useful after a mechanism moves upstream. Upstream contributions are welcome when they help close the gap, but their acceptance or timing must not be assumed.
+
+## Product workflow direction
+
+Tom's ruling, 2026-10-18: draw a line under the mechanism experiments and design a proper user workflow. Oxide should provide a replacement build service: instead of `cargo build` / `cargo run`, the user requests `oxide build …` / `oxide run …` against a named profile (quickest dev loop, light debug, full debug, release and similar). Oxide then handles storage/space management, worktree reuse, building and running where needed. The build location and system are abstracted from the user, so the same request could execute locally, on CI, in the cloud or on another machine on the local network. Tom asked whether `cargo build` and `cargo run` can be redirected to these commands.
+
+Tom's follow-up ruling, 2026-10-18: Oxide must be very easy to use and set up — no intricate install procedures or transparent interception. `oxide build` and `oxide run` are the explicit commands; the design problem is how they integrate into projects and workflows. Do not pursue rustup toolchain shims, `PATH` shims or shell aliases that make `cargo build` reach Oxide. Agents tend to fall back to familiar Cargo defaults, so adoption needs an Oxide agent skill and clear per-project agent documentation that direct them to the Oxide commands.
+
+This is design direction for the core product concept, not implementation, installation, host-configuration or consumer-adoption authority. Existing Queue/Nucleus scheduling and admission ownership, Effigy's language-neutral role and the storage invariants in [architecture](architecture.md) still apply. Earlier experimental results remain evidence; the failed comparison and unqualified readings are not upgraded by this direction.
 
 ## Authority boundaries
 
