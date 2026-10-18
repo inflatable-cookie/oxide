@@ -344,7 +344,7 @@ def build_binaries() -> dict:
         ],
         stdout=subprocess.PIPE,
         text=True,
-        timeout=300,
+        timeout=remaining(),
     )
     if build.returncode:
         sys.exit(build.returncode)
@@ -371,7 +371,10 @@ class Runner:
         self.pool = os.path.join(parent, "pool")
         self.bin = os.path.join(parent, "bin")
         self.tmp = os.path.join(parent, "tmp")
-        for path in (self.bin, self.tmp):
+        # Every fixture Cargo call, Oxide's and its descendants included, uses
+        # this private home; product staging used the host's.
+        self.cargo_home = os.path.join(parent, "cargo-home")
+        for path in (self.bin, self.tmp, self.cargo_home):
             os.makedirs(path, mode=0o700, exist_ok=True)
         env = dict(os.environ)
         for name in (
@@ -388,6 +391,7 @@ class Runner:
         env.update(
             {
                 "OXIDE_POOL": self.pool,
+                "CARGO_HOME": self.cargo_home,
                 "PATH": self.bin + os.pathsep + env.get("PATH", ""),
                 "CARGO_NET_OFFLINE": "true",
                 "CARGO_TERM_COLOR": "never",
@@ -471,6 +475,52 @@ def debuginfo(stderr: str) -> dict:
         else:
             units[crate] = value.group(1) if value else "missing"
     return units
+
+
+# Every wait line Oxide emits: `acquire` and `clean` in store.rs, the group
+# wait in process.rs. Cargo's "Blocking waiting for file lock on package
+# cache" and other tools' lines never match.
+OXIDE_WAIT = re.compile(
+    r"oxide: waiting for (?:"
+    r"earlier oxide commands \(position \d+\)"
+    r"|a build slot \(\d+ of \d+ host-wide in use\)"
+    r"|another oxide command in this checkout"
+    r"|active oxide commands in this checkout"
+    r"); Ctrl-C cancels"
+    r"|oxide: waiting for processes left in Cargo's process group \d+ to exit"
+)
+
+
+def oxide_waits(text: str) -> list:
+    """Oxide's own wait lines in `text`, whole lines only."""
+    return [line for line in text.splitlines() if OXIDE_WAIT.fullmatch(line)]
+
+
+def prove_wait_lines() -> None:
+    """The wait predicate classifies only Oxide's exact lines."""
+    others = (
+        "    Blocking waiting for file lock on package cache",
+        "Blocking waiting for file lock on build directory",
+        "info: waiting for rustup lock",
+        "oxide:waiting for a build slot (1 of 1 host-wide in use); Ctrl-C cancels",
+        "xoxide: waiting for another oxide command in this checkout; Ctrl-C cancels",
+        "  oxide: waiting for another oxide command in this checkout; Ctrl-C cancels",
+        "oxide: waiting for something else; Ctrl-C cancels",
+        "oxide: waiting for a build slot (1 of 1 host-wide in use)",
+    )
+    for line in others:
+        if oxide_waits(line):
+            fail(f"wait predicate classified a non-Oxide line: {line!r}")
+    own = (
+        "oxide: waiting for earlier oxide commands (position 2); Ctrl-C cancels",
+        "oxide: waiting for a build slot (1 of 1 host-wide in use); Ctrl-C cancels",
+        "oxide: waiting for another oxide command in this checkout; Ctrl-C cancels",
+        "oxide: waiting for active oxide commands in this checkout; Ctrl-C cancels",
+        "oxide: waiting for processes left in Cargo's process group 4242 to exit",
+    )
+    mixed = "\n".join(others + own)
+    if oxide_waits(mixed) != list(own):
+        fail(f"wait predicate missed Oxide lines: {oxide_waits(mixed)}")
 
 
 def wait_for(predicate, label: str, seconds: float = 60) -> None:
@@ -1113,13 +1163,20 @@ def prove_waiting(runner: Runner, app: str, app2: str) -> None:
     )
     wait_for(lambda: os.path.exists(pidfile), "holding test")
     waiter, waiter_log = runner.start(app2, ["build"], "waiter", limit)
-    wait_for(lambda: "waiting for a build slot (1 of 1" in read_log(waiter_log), "host-limit wait line")
+    wait_for(
+        lambda: any(
+            line.startswith("oxide: waiting for a build slot (1 of 1 ")
+            for line in oxide_waits(read_log(waiter_log))
+        ),
+        "host-limit wait line",
+    )
     queued, queued_log = runner.start(app2, ["check"], "queued", limit)
     wait_for(
-        lambda: "waiting for earlier oxide commands (position 2)" in read_log(queued_log),
+        lambda: "oxide: waiting for earlier oxide commands (position 2); Ctrl-C cancels"
+        in oxide_waits(read_log(queued_log)),
         "FIFO wait line",
     )
-    if read_log(waiter_log).count("waiting for") != 1:
+    if len(oxide_waits(read_log(waiter_log))) != 1:
         fail("waiter printed more than one waiting line")
     queued.send_signal(signal.SIGINT)
     expect(queued.wait(timeout=15), 130, "cancelled waiter", read_log(queued_log))
@@ -1145,7 +1202,8 @@ def prove_clean_waits(runner: Runner, app: str) -> None:
     wait_for(lambda: os.path.exists(pidfile), "test held during clean")
     cleaner, clean_log = runner.start(app, ["clean"], "clean-wait")
     wait_for(
-        lambda: "waiting for active oxide commands in this checkout" in read_log(clean_log),
+        lambda: "oxide: waiting for active oxide commands in this checkout; Ctrl-C cancels"
+        in oxide_waits(read_log(clean_log)),
         "clean wait line",
     )
     if cleaner.poll() is not None or not os.path.isdir(os.path.join(app, "target")):
@@ -1238,7 +1296,11 @@ def prove_recovery(runner: Runner, app: str) -> None:
     if runner.state().get("recoveries"):
         fail("a slot was recovered while Cargo's group survived")
     follower, follower_log = runner.start(app, ["build"], "follower")
-    wait_for(lambda: "waiting for another oxide command in this checkout" in read_log(follower_log), "follower wait")
+    wait_for(
+        lambda: "oxide: waiting for another oxide command in this checkout; Ctrl-C cancels"
+        in oxide_waits(read_log(follower_log)),
+        "follower wait",
+    )
     if follower.poll() is not None:
         fail("follower took a slot while Cargo's group survived")
     with open(pidfile.replace(".pid", ".release"), "w", encoding="utf-8"):
@@ -1284,7 +1346,7 @@ def prove_group_gone(runner: Runner, app: str) -> None:
             fail(f"the setsid escapee did not leave Cargo's group alive: kill({escapee}, 0) {probe(os.kill, escapee)}")
         code, _, stderr = runner.run(app, ["build"])
         expect(code, 0, "build after a dead group", stderr)
-        if "waiting for" in stderr:
+        if oxide_waits(stderr):
             fail(f"build after a dead group waited: {stderr}")
         if f"after oxide pid {child.pid} died (Cargo group {group} empty)" not in stderr:
             fail(f"build after a dead group did not recover: {stderr}")
@@ -1341,8 +1403,12 @@ def main() -> int:
     global STARTED
     parent = os.path.join(scratch_root(), "oxide-cli")
     os.makedirs(parent, mode=0o700, exist_ok=False)
-    executables = build_binaries()
+    prove_wait_lines()
+    # The proof phase includes staging the product binaries, which uses the
+    # host Cargo home and this repository's cached dependencies.
     STARTED = time.monotonic()
+    executables = build_binaries()
+    print(f"oxide product staging: {time.monotonic() - STARTED:.0f} s (host Cargo home)")
     runner = Runner(executables["oxide"], executables["oxide-storage-lease"], parent)
     app = os.path.join(parent, "checkouts", "app")
     write_fixture(app)

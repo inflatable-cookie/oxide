@@ -671,5 +671,10 @@ Rules:
   file-ownership corrections (unowned files and target sources outside
   package directories refresh; vendored registry/Git sources do not, and a
   local target or symlink into them refuses) passed the reviewer's native
-  run at `69db6fe` or are unit-tested after it.
+  run at `69db6fe` or are unit-tested after it. The run at `d0fafd3` failed
+  before the freshness scenarios: a generic `waiting for` check matched
+  Cargo's "Blocking waiting for file lock on package cache". The fixture now
+  matches only Oxide's exact wait lines (self-checked before the pool exists)
+  and runs every fixture Cargo call with a private scratch `CARGO_HOME`;
+  product staging alone uses the host Cargo home, inside the 300 s phase.
   Real-project qualification (Q2–Q4) remains.
