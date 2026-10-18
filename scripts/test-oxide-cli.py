@@ -18,8 +18,14 @@ selection (package and virtual workspace roots), Ctrl-C forwarding, own-command 
 (a killed oxide whose Cargo group survives stays held; one whose group is gone
 is recovered by the next command and logged; a standalone-CLI lease is never
 recovered; a `setsid` escapee is shown as the documented limit),
-`status` stray detection and Cargo-equal exit codes. The image is detached
-and the scratch removed only after positive completion. Before any pool
+`status` stray detection and Cargo-equal exit codes. After the image is
+detached, two scratch `directory-budget` pools prove budget-only labelling,
+the standalone CLI's refusal, a reserve stop on injected watchdog readings
+(a bounded writer that ignores TERM is killed, the group closes and the slot
+is released; an unreaped group member keeps closure unconfirmed and the slot
+held until the next command recovers it) and admission that evicts a whole
+idle slot on a 1 MiB budget. The scratch is removed only after positive
+completion. Before any pool
 exists, `init` / `new` adoption runs on tiny scratch directories (90 s,
 64 MiB scratch) and must leave the pool uncreated. Not a benchmark and not
 full QA.
@@ -1594,6 +1600,7 @@ def prove_budget(runner: Runner, tiny: Runner, app: str) -> None:
         member.kill()
         member.wait(timeout=20)
     wait_gone(os.killpg, group, "reserve-stopped group after reaping")
+    write_reading(readings, TRIGGER_BYTES + WRITER_HEADROOM_BYTES)
     code, _, stderr = runner.run(app, ["build"], watched)
     expect(code, 0, "build after the held reserve stop", stderr)
     if f"recovered slot {first['slot']} after oxide pid {child.pid} died (Cargo group {group} empty)" not in stderr:
