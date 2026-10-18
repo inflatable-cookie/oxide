@@ -315,6 +315,57 @@ units. Tests must run, the stale-mtime scenario must rebuild, the pool must
 stay under its ceiling, and normal use must leave no plain-Cargo intermediates.
 Re-evaluate interception and run strategies after that.
 
+## Foundation qualification (proposed)
+
+Proposed and not authorized. This is the gated real-project step after the
+foundation tasks merge. Its job is to prove correctness and lifecycle on a real
+workspace. A benefit claim is not part of it.
+
+**Subject.** Oxide's own repository at a pinned post-foundation commit, so no
+consumer coordination is needed. It is a real Cargo workspace with registry
+dependencies but a small graph (about 39 lock entries), which makes it good for
+correctness and weak for benefit. A benefit reading on a heavy project (for
+example Nucleus) is a separate, owner-coordinated second stage.
+
+**Setup.**
+- Two disposable Git worktrees, A and B, of the pinned commit under one scratch
+  root.
+- One fresh dedicated pool, not the default path, small enough to keep the host
+  above its 20 GiB reserve.
+- Cargo runs `--offline` against the already-populated host registry.
+- One disposable patch adds a marker test that reads a checkout-local fixture
+  and `CARGO_MANIFEST_DIR`, so a stale result is observable.
+
+**Scenarios, in order, each through `oxide` only:**
+
+| # | Action | Must hold |
+| --- | --- | --- |
+| Q1 | `oxide test` in A | Cold; tests run and pass. |
+| Q2 | `oxide test` in B (worktree created before Q1) | Registry dependency units fresh; the gate rebuilds the path-embedding units; B's marker test sees B's paths and content. |
+| Q3 | Edit the marker fixture in A, `oxide test` in A, then `oxide test` in B without touching B | The stale-mtime scenario: B rebuilds the affected units and its marker test sees B's unchanged content, not A's edit. |
+| Q4 | Repeat `oxide test` in B | Nothing rebuilt; tests run. |
+| Q5 | SIGKILL `oxide` during a build in A, then `oxide test` in A | The next command auto-recovers the slot; the build completes; tests pass. |
+| Q6 | Plain `cargo check` in B, then `oxide status` | The stray `target/` intermediates are reported with their bytes. |
+| Q7 | `oxide status` at the end | Pool under its ceiling, every lease released, no held or uncertain slot. |
+
+**Evidence.**
+- Cargo JSON fresh/rebuilt rows per scenario.
+- Elapsed time.
+- Slot and pool bytes, checkout `target/` bytes and host free space at each
+  boundary.
+- The `oxide` summary lines.
+
+Raw output is preserved. Readings are observations, not speed or SSD claims.
+
+**Bounds to propose with the brief.** About nine `oxide` invocations, 30
+minutes including setup, and 20 minutes of independent review that checks the
+raw evidence instead of repeating the run. No consumer, default pool,
+installation or host configuration change.
+
+**Pass.** Q1–Q7 all hold. Any stale success in Q2 or Q3 is a hard fail and
+keeps slots checkout-affine. A failure in another scenario is reported with its
+evidence and does not reset bounds.
+
 ## Open decisions
 
 - **W-1 Default pool.** Location, default cap and the host-reserve rule for
