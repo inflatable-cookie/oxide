@@ -294,7 +294,7 @@ fn nul_separated(bytes: Vec<u8>) -> Result<Vec<String>, String> {
 }
 
 /// Repository top level and content for the checkout containing `path`.
-fn snapshot(path: &Path) -> Result<(PathBuf, Content), String> {
+pub fn snapshot(path: &Path) -> Result<(PathBuf, Content), String> {
     let top = utf8(git(path, &["rev-parse", "--show-toplevel"])?)?;
     let top = fs::canonicalize(top.trim())
         .map_err(|error| format!("cannot resolve the repository: {error}"))?;

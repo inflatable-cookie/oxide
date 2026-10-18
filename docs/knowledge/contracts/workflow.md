@@ -5,8 +5,8 @@ Status: product design under Tom's
 The foundation core and `init` / `new` adoption are implemented as the
 unpublished, uninstalled `oxide` binary; the agent skill exists as repository
 source only. [Implemented foundation core](#implemented-foundation-core)
-states exactly what ships, including the cross-checkout freshness gate and
-the budget-only directory backend. Non-build run strategies and the
+states exactly what ships, including the cross-checkout freshness gate, the
+`run` no-op fast path and the budget-only directory backend. Non-build run strategies and the
 privileged `linux-image-v1` backend are not implemented, and nothing has run
 on a real Linux host. Fixture proofs are not real-project
 qualification, default-pool creation outside tests, installation (binary or
@@ -255,6 +255,8 @@ fingerprint churn. The retired source-map work found no cheap general fix.
 
 ## What one command does (local executor)
 
+0. `run` only: if the [no-op fast path](#run-no-op-fast-path) key matches,
+   execute the recorded binary and stop. No Cargo, rustc, lease, slot or pool.
 1. Resolve the workspace (`cargo locate-project --workspace`), identity,
    profile, strategy and toolchain.
 2. Lease a slot from the host pool. Prefer this checkout's last slot, then any
@@ -277,6 +279,73 @@ The [qualified cross-worktree result](project-adoption.md#focused-cross-worktree
 supports this shape for one workflow: a different-path checkout on a shared
 slot rebuilt only its changed unit, and tests ran every time. It did not isolate
 the mtime hazard above.
+
+## `run` no-op fast path
+
+Implemented and fixture-proven, not real-project qualified. `oxide run`
+executes the binary from its last successful build directly when nothing
+the key observes has changed. Any doubt takes the normal leased path, which
+records again on success.
+
+- **Key.** One record per canonical working directory and modelled build
+  arguments (`--bin`, `--example`, `-p` / `--package`, `--features` / `-F`,
+  `--all-features`, `--no-default-features`, `--profile`, `--release` / `-r`,
+  `--target`, in the given order). The working directory is part of the key,
+  so a member directory never runs another member's binary. The record holds:
+  - a digest of the full environment (every variable, sorted; values are
+    never stored) plus Oxide's profile definitions;
+  - path and content digests of `.cargo/config`, `.cargo/config.toml`,
+    `Cargo.toml`, `rust-toolchain` and `rust-toolchain.toml` in the working
+    directory and every ancestor, `$CARGO_HOME/config(.toml)` and rustup's
+    `settings.toml`;
+  - the `Cargo.lock` digest;
+  - the toolchain: the sysroot from `rustc --print sysroot` at record time,
+    plus the size, mtime, inode and device of its `bin/rustc`, `bin/cargo`,
+    channel manifest and component list;
+  - the checkout content identity of the
+    [freshness gate](#cross-checkout-freshness): the Git tree of `HEAD` plus
+    blob digests of dirty and untracked non-ignored files;
+  - the binary's canonical path, size, mtime, inode and device, and its
+    manifest directory for `CARGO_MANIFEST_DIR`.
+  Program arguments after `--` are not part of the key and are forwarded
+  unchanged.
+- **Record.** Versioned JSON in `<workspace>/target/oxide-run-skip/`, at most
+  1 MiB each and 64 per checkout (the directory is cleared past that), so
+  `oxide clean` drops records with the binaries. The normal path deletes the
+  key's record before Cargo, takes every input before Cargo and publishes
+  atomically only after Cargo succeeds with no signal, every input and the
+  content unchanged afterwards, and the build not on a slot reconciled from
+  another checkout. The binary's documented Cargo dep-info (`<binary>.d`)
+  must list only regular files inside the Git checkout that Git does not
+  ignore. A path dependency outside the checkout, a generated source in the
+  build directory, an ignored file or a declared `rerun-if-changed` input
+  elsewhere publishes nothing. A missing, older-version, partial or corrupt
+  record never skips.
+- **Ineligible.** Any other argument before `--` (including `-v`,
+  `--manifest-path`, `--message-format`, `--config`, `--locked`); a working
+  directory outside the workspace or Git; `RUSTC`, `RUSTC_WRAPPER`,
+  `RUSTC_WORKSPACE_WRAPPER` or their `CARGO_BUILD_*` forms set; a Cargo
+  config containing `include`, `replace-with`, `paths` or `rustc`; any input
+  over 1 MiB or unreadable.
+- **Skip.** Only on an exact match, with the binary present as a regular
+  file of the recorded identity. The check reads files and runs Git only:
+  no Cargo, rustc, metadata or `locate-project` call and no pool, lease or
+  slot read. It prints `oxide: <profile> profile, build+execute strategy,
+  unchanged — skipped Cargo, …`, then replaces Oxide with the program, as
+  the normal path does. A program failure is the program's exit code, never
+  a rebuild.
+- **Overrides.** `oxide run --rebuild` (before `--`) or `OXIDE_NO_SKIP=1`
+  (any non-empty value) runs Cargo and records again. `--rebuild` after
+  `--` is a program argument. `test`, `check`, `build` and `clippy` always run
+  Cargo.
+
+**Limits.** A build script's undeclared reads (an outside file read without a
+`rerun-if-changed` line, a tool on the system) are not observed; nor is a
+linker or system library changing in place. The binary is checked by cheap
+attributes only: cooperative same-user scope, not content attestation. The
+skip never needs intermediates in a slot, so it holds after release and
+eviction; [debug path limits](#cross-checkout-freshness) are unchanged.
+Fixture timings in the proof are not a real-world speed claim.
 
 ## Crash recovery
 
@@ -649,7 +718,8 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
   before any lease. `run` builds only that target, releases, then replaces
   Oxide with the program. It sets `CARGO_MANIFEST_DIR` only; other `cargo run`
   environment (`CARGO_PKG_*`, dylib paths) is not set. Exit codes are Cargo's,
-  or the program's for `run`.
+  or the program's for `run`. Before any of this, `run` takes the
+  [no-op fast path](#run-no-op-fast-path) when its key matches.
 - **Summary.** One stderr line per leased command: profile, strategy (`build`
   or `build+execute`), slot, warm/cold, elapsed time, pool use and backend:
   `pool 3 of 128 MiB used (apfs-sparse-image-v1)` (payload volume use), or

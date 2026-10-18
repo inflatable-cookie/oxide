@@ -11,6 +11,7 @@ mod cli;
 mod freshness;
 mod identity;
 mod process;
+mod skip;
 mod store;
 mod watchdog;
 
@@ -46,7 +47,8 @@ USAGE:
     oxide new <path> [cargo new args]    cargo new, then adopt Oxide
 
 Profiles: quick (default, line tables), debug (full debug info), release (the
-project's own). Oxide places build output, so --target-dir and --config
+project's own). `run` skips Cargo when nothing it records has changed since its
+last successful build; `oxide run --rebuild` or OXIDE_NO_SKIP=1 forces Cargo. Oxide places build output, so --target-dir and --config
 build.build-dir/target-dir are refused. Adoption writes one marked block in the
 workspace-root AGENTS.md and prints readiness; there is no Oxide config file.
 OXIDE_POOL selects the pool; OXIDE_MAX_ACTIVE the host-wide build limit (2).
@@ -118,6 +120,16 @@ fn apply_storage(command: &mut Command, build_dir: &Path, checkout: &Path) {
 }
 
 fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
+    // `run` with an unchanged key executes the recorded binary before any
+    // Cargo, lease or pool access; otherwise it builds and records again.
+    let skip_request = if command == "run" {
+        skip::Request::parse(args)
+    } else {
+        None
+    };
+    if let Some(request) = &skip_request {
+        skip::try_skip(request)?;
+    }
     let mut invocation = cli::parse_leased(command, args)?;
     if command == "run" && cli::run_selection(&invocation.cargo_args).is_none() {
         // Build only what `cargo run` would run: `default-run`, else the
@@ -148,6 +160,9 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
         invocation.profile.label(),
         invocation.target.as_deref(),
     )?;
+    let pending = skip_request
+        .as_ref()
+        .and_then(|request| skip::Pending::capture(request, &key.checkout));
     process::install_signal_handlers()?;
     let store = Store::open_or_create()?;
     let started = Instant::now();
@@ -223,6 +238,9 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     let slot = held.slot_id.clone();
     let warm = held.reused;
     let note = gate.describe();
+    // A build on a slot reconciled from another checkout publishes no skip
+    // key: the gate's own coverage limit applies to it.
+    let pending = pending.filter(|_| !gate.cross);
     let origin = gate.finish(&key.checkout);
     store.release(held, origin)?;
     let (status, executable) = outcome?;
@@ -237,6 +255,11 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     }
     match executable.unwrap_or_else(|| Err("no run target was recorded".to_owned())) {
         Ok((program, manifest_dir)) => {
+            if let Some(pending) = pending.filter(|_| process::received_signal().is_none()) {
+                // A record that cannot be published only costs the next
+                // command its skip.
+                let _ = pending.publish(&program, &manifest_dir);
+            }
             // Lease released: the program runs from the private target dir.
             let error = Command::new(&program)
                 .args(&invocation.program_args)

@@ -17,7 +17,10 @@ command's lock, network and config arguments: a fresh worktree with an
 ignored lock gets it from `generate-lockfile` and warms its outside path
 dependency, certain `--locked`/`--frozen` refusals end with Cargo's own
 error, `--offline` is mirrored, and a stale lock or a help request falls
-back cold without the gate writing a lock), FIFO waiting and the host
+back cold without the gate writing a lock), the `run` no-op fast path (a
+counting Cargo shim and unchanged pool state prove the skip; every key input,
+override and unmodelled argument falls through; failed and interrupted builds
+record nothing), FIFO waiting and the host
 limit, clean waiting for active commands, `default-run`
 selection (package and virtual workspace roots), Ctrl-C forwarding, own-command crash recovery
 (a killed oxide whose Cargo group survives stays held; one whose group is gone
@@ -38,6 +41,7 @@ full QA.
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import re
@@ -66,6 +70,56 @@ END = "<!-- oxide:end -->"
 # Set after the oxide binaries compile; ordinary compiler artifacts are
 # outside the proof-phase bound.
 STARTED = 0.0
+
+SKIP_FIXTURE = {
+    "repo/Cargo.toml": """[package]
+name = "skipapp"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+loud = []
+
+[workspace]
+members = ["tool"]
+""",
+    "repo/rust-toolchain.toml": '[toolchain]\nchannel = "1.97.1"\n',
+    "repo/.gitignore": "/target\n",
+    "repo/build.rs": r"""use std::time::Duration;
+
+fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=SKIP_HOLD");
+    // The interrupted-build control: signal readiness, then wait to be killed.
+    if let Some(path) = std::env::var_os("SKIP_HOLD") {
+        std::fs::write(path, "held").expect("hold marker");
+        for _ in 0..600 {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("hold timed out");
+    }
+}
+""",
+    "repo/src/msg.rs": 'pub const VERSION: &str = "v1";\n',
+    "repo/src/main.rs": """mod msg;
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let loud = if cfg!(feature = "loud") { " loud" } else { "" };
+    let note = option_env!("SKIP_NOTE").unwrap_or("-");
+    println!("skip {}{loud} {note} {}", msg::VERSION, args.join(" "));
+}
+""",
+    "repo/tool/Cargo.toml": '[package]\nname = "tool"\nversion = "0.1.0"\nedition = "2021"\n',
+    "repo/tool/src/main.rs": 'fn main() {\n    println!("tool {}", std::env::args().skip(1).collect::<Vec<_>>().join(" "));\n}\n',
+}
+
+# A counting `cargo` for the skip case: logs each call, then hands it to the
+# real installed Cargo unchanged.
+CARGO_SHIM = """#!/bin/sh
+printf '%s\\n' "$*" >> "{log}"
+exec "{cargo}" "$@"
+"""
 
 FIXTURE = {
     "Cargo.toml": """[package]
@@ -1105,6 +1159,7 @@ def prove_routing(runner: Runner, app: str, quick_slot: str, debug_slot: str) ->
     keep_standalone_lease(runner, app, standalone)
     prove_freshness(runner)
     prove_lockless(runner)
+    prove_run_skip(runner)
 
     # `run` from a virtual workspace root follows Cargo's default members.
     virtual = os.path.join(runner.parent, "checkouts", "virtual")
@@ -1468,6 +1523,167 @@ def prove_gate_crash(runner: Runner, b: str, slot: str, test) -> None:
         fail(f"retry skipped the freshness gate: {stderr[-800:]}")
     if units.get("marker:build") is not False or units.get("content:test") is not False:
         fail(f"retry did not rebuild the stale units: {units}")
+
+
+def prove_run_skip(runner: Runner) -> None:
+    """`oxide run` skips Cargo, lease and pool when its key is unchanged; each
+    key input, override and unmodelled argument falls through to Cargo."""
+    nest = os.path.join(runner.parent, "checkouts", "skipnest")
+    repo = os.path.join(nest, "repo")
+    write_fixture(nest, SKIP_FIXTURE)
+    commit_lock(runner, repo)
+    git(repo, "init", "--quiet")
+    git(repo, "add", "-A")
+    git(repo, "commit", "--quiet", "-m", "skip fixture")
+    shim_dir = os.path.join(runner.parent, "skip-shim")
+    os.makedirs(shim_dir, mode=0o700)
+    calls = os.path.join(runner.parent, "skip-cargo-calls.log")
+    real = shutil.which("cargo", path=runner.env["PATH"])
+    if not real:
+        fail("no installed cargo for the counting shim")
+    shim = os.path.join(shim_dir, "cargo")
+    with open(shim, "w", encoding="utf-8") as handle:
+        handle.write(CARGO_SHIM.format(log=calls, cargo=real))
+    os.chmod(shim, 0o700)
+    base = {"PATH": shim_dir + os.pathsep + runner.env["PATH"]}
+    ledger = os.path.join(runner.pool, "ledger.json")
+    control = os.path.join(runner.pool, "oxide-managed", "state.json")
+
+    def pool_bytes() -> tuple:
+        with open(ledger, "rb") as one, open(control, "rb") as two:
+            return one.read(), two.read()
+
+    def count() -> int:
+        if not os.path.exists(calls):
+            return 0
+        with open(calls, encoding="utf-8") as handle:
+            return len(handle.read().splitlines())
+
+    def oxide_run(label: str, args: list, cwd: str = repo, extra: dict | None = None, code: int = 0):
+        before = count()
+        pool_before = pool_bytes()
+        started = time.monotonic()
+        got, stdout, stderr = runner.run(cwd, ["run", *args], {**base, **(extra or {})})
+        elapsed = time.monotonic() - started
+        expect(got, code, label, stderr)
+        skipped = "unchanged — skipped Cargo" in stderr
+        cargo_calls = count() - before
+        if skipped and (cargo_calls or pool_bytes() != pool_before):
+            fail(f"{label}: skip line with {cargo_calls} Cargo call(s) or a pool change")
+        if not skipped and cargo_calls == 0:
+            fail(f"{label}: neither skipped nor ran Cargo: {stderr[-800:]!r}")
+        return skipped, stdout.strip(), elapsed
+
+    def skips(label: str, args: list, wanted: str, cwd: str = repo, extra: dict | None = None) -> float:
+        skipped, stdout, elapsed = oxide_run(label, args, cwd, extra)
+        if not skipped or stdout != wanted:
+            fail(f"{label}: expected a skip printing {wanted!r}, got skipped={skipped} {stdout!r}")
+        return elapsed
+
+    def builds(label: str, args: list, wanted: str, cwd: str = repo, extra: dict | None = None) -> float:
+        skipped, stdout, elapsed = oxide_run(label, args, cwd, extra)
+        if skipped or stdout != wanted:
+            fail(f"{label}: expected Cargo printing {wanted!r}, got skipped={skipped} {stdout!r}")
+        return elapsed
+
+    def record(cwd: str, args: list) -> str:
+        digest = hashlib.sha256(os.path.realpath(cwd).encode())
+        for argument in args:
+            digest.update(b"\0" + argument.encode())
+        return os.path.join(repo, "target", "oxide-run-skip", digest.hexdigest() + ".json")
+
+    def edit(relative: str, text: str) -> None:
+        with open(os.path.join(repo, relative), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    builds("skip first run", ["--", "a"], "skip v1 - a")
+    if not os.path.isfile(record(repo, [])):
+        fail("a successful run published no skip record")
+    skip_time = skips("skip repeat", ["--", "b"], "skip v1 - b")
+    skips("skip program --rebuild", ["--", "--rebuild"], "skip v1 - --rebuild")
+    no_op_time = builds("skip --rebuild", ["--rebuild", "--", "b"], "skip v1 - b")
+    plain = subprocess.run(
+        ["cargo", "build", "--offline", "-q"],
+        cwd=repo,
+        env={**runner.environment(base), "CARGO_TARGET_DIR": os.path.join(runner.parent, "skip-plain")},
+        capture_output=True,
+        timeout=min(120, remaining()),
+    )
+    started = time.monotonic()
+    subprocess.run(
+        ["cargo", "build", "--offline", "-q"],
+        cwd=repo,
+        env={**runner.environment(base), "CARGO_TARGET_DIR": os.path.join(runner.parent, "skip-plain")},
+        capture_output=True,
+        timeout=min(120, remaining()),
+    )
+    plain_time = time.monotonic() - started
+    shutil.rmtree(os.path.join(runner.parent, "skip-plain"))
+    if plain.returncode:
+        fail("plain cargo build of the skip fixture failed")
+    print(
+        f"oxide run skip timings: skip {skip_time * 1000:.0f} ms, oxide run --rebuild (Cargo no-op) "
+        f"{no_op_time * 1000:.0f} ms, plain cargo build no-op {plain_time * 1000:.0f} ms (fixture only)"
+    )
+    if skip_time >= no_op_time:
+        fail("the skip path did not beat the Cargo no-op path")
+    skips("skip after --rebuild re-recorded", [], "skip v1 -")
+    builds("skip OXIDE_NO_SKIP", [], "skip v1 -", extra={"OXIDE_NO_SKIP": "1"})
+
+    # Each key input falls through to Cargo and runs the new result.
+    edit("src/msg.rs", 'pub const VERSION: &str = "v2";\n')
+    builds("skip dirty edit", [], "skip v2 -")
+    skips("skip dirty repeat", [], "skip v2 -")
+    edit("src/msg.rs", 'pub const VERSION: &str = "v3";\n')
+    git(repo, "commit", "--quiet", "-am", "v3")
+    builds("skip committed edit", [], "skip v3 -")
+    builds("skip environment", [], "skip v3 -", extra={"SKIP_FIXTURE_VAR": "1"})
+    skips("skip environment repeat", [], "skip v3 -", extra={"SKIP_FIXTURE_VAR": "1"})
+    with open(os.path.join(repo, "Cargo.lock"), "a", encoding="utf-8") as handle:
+        handle.write("\n")
+    builds("skip lock change", [], "skip v3 -")
+    git(repo, "checkout", "--", "Cargo.lock")
+    builds("skip lock restored", [], "skip v3 -")
+    config = os.path.join(nest, ".cargo", "config.toml")
+    os.makedirs(os.path.dirname(config))
+    with open(config, "w", encoding="utf-8") as handle:
+        handle.write('[env]\nSKIP_NOTE = "cfg"\n')
+    builds("skip outside config", [], "skip v3 cfg")
+    skips("skip config repeat", [], "skip v3 cfg")
+    builds("skip feature", ["--features", "loud"], "skip v3 loud cfg")
+    builds("skip profile", ["--profile", "debug"], "skip v3 cfg")
+    builds("skip quick after the feature build replaced its binary", [], "skip v3 cfg")
+    os.remove(os.path.join(repo, "target", "oxide-quick", "skipapp"))
+    builds("skip deleted binary", [], "skip v3 cfg")
+    builds("skip unmodelled argument", ["-q"], "skip v3 cfg")
+    with open(record(repo, []), "w", encoding="utf-8") as handle:
+        handle.write("{corrupt")
+    builds("skip corrupt record", [], "skip v3 cfg")
+
+    # A member working directory never runs another member's binary.
+    builds("skip member", [], "tool", cwd=os.path.join(repo, "tool"))
+    skips("skip member repeat", ["--", "x"], "tool x", cwd=os.path.join(repo, "tool"))
+    skips("skip root after member", [], "skip v3 cfg")
+
+    # A failed build records nothing; nor does an interrupted one.
+    edit("src/msg.rs", "pub const VERSION: &str = ;\n")
+    oxide_run("skip failed build", [], code=101)
+    if os.path.exists(record(repo, [])):
+        fail("a failed build left a skip record")
+    git(repo, "checkout", "--", "src/msg.rs")
+    builds("skip after failure", [], "skip v3 cfg")
+    marker = os.path.join(runner.parent, "skip-hold")
+    child, log = runner.start(repo, ["run"], "skip-interrupt", {**base, "SKIP_HOLD": marker})
+    wait_for(lambda: os.path.exists(marker), "skip interrupted build hold")
+    child.send_signal(signal.SIGINT)
+    interrupted = child.wait(timeout=min(60, remaining()))
+    log.close()
+    if interrupted == 0 or os.path.exists(record(repo, [])):
+        fail(f"interrupted build exit {interrupted} or left a skip record")
+    builds("skip after interrupt", [], "skip v3 cfg")
+    skips("skip final repeat", [], "skip v3 cfg")
+    if any(slot["state"] != "idle" for slot in runner.lease_status()["slots"]):
+        fail("the skip case left a slot held")
 
 
 def prove_waiting(runner: Runner, app: str, app2: str) -> None:
