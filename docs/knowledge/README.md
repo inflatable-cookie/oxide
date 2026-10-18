@@ -2,7 +2,7 @@
 
 [Vision](vision.md) owns scope, Tom's ruling and authorization. [Architecture](architecture.md) owns storage invariants and integration boundaries. [Rust DX landscape](rust-dx-landscape.md) owns sourced research findings, candidate remedies and evidence limits. [Questions](questions.md) owns unresolved design decisions. [Release](contracts/release.md) owns publication restrictions. [Retirements](retired.toml) records removed concepts.
 
-[Workflow](contracts/workflow.md) owns the proposed `oxide` command suite, profiles, inferred project identity, local executor, execution-location seam, agent integration and the foundation slice's open decisions.
+[Workflow](contracts/workflow.md) owns the proposed `oxide` command classes, profiles and run strategies, inferred project identity, cross-checkout freshness gate, crash recovery, local executor, execution-location seam, agent integration, the keep/retire assessment and the foundation slice's open decisions.
 
 [Storage-efficiency findings](storage-efficiency.md) records current component preparation, profile and disposable-output behavior across the inspected projects, with limits on what the source evidence establishes.
 

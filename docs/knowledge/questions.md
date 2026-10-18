@@ -131,4 +131,4 @@ Settled by Tom on 2026-10-09: use 20 GiB as a monitored start/abort threshold, n
 
 ## Q-015 — What does the foundation workflow need settled before implementation?
 
-The proposed [workflow](contracts/workflow.md#open-decisions) lists W-1 to W-7: default pool, waiting and concurrency, project file, crash recovery, parking versus retiring the protected route, Linux backend and command naming. W-4 and W-5 need operator rulings; the rest have recommendations. Owner: [workflow](contracts/workflow.md).
+The proposed [workflow](contracts/workflow.md#open-decisions) lists W-1 to W-8: default pool, waiting and concurrency, project file, crash-recovery qualification, retirement execution, Linux backend, command naming and the cross-checkout freshness gate. Crash-recovery and retirement direction are ruled; the rest have recommendations. Owner: [workflow](contracts/workflow.md).
