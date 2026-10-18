@@ -1,2 +1,57 @@
-# No retired concepts in this new repository.
-frozen = []
+# Historical receipts are immutable evidence and remain available for review.
+frozen = ["docs/knowledge/evidence/**"]
+
+[[retired]]
+id = "protected-storage-daemon-and-routes"
+retired = "2026-10-18"
+replacement = "The local lease CLI and verified bounded backing remain; future product commands are designed in docs/knowledge/contracts/workflow.md."
+owner = "docs/knowledge/contracts/workflow.md"
+terms = [
+  "private-qualification",
+  "oxide-storage-runtime",
+  "oxide-qualified-runner",
+  "oxide-ordinary-cargo-attempt",
+  "oxide-declared-workflow",
+  "oxide-registry-acquisition",
+  "rust:private-compile",
+  "rust:private-process",
+  "rust:test-ordinary-cargo-stable-reuse",
+  "rust:test-declared-workflow",
+  "rust:test-native-retained-writer",
+  "rust:bounded-native-proof",
+  "registry:acquire:nucleus",
+  "registry:stream:nucleus",
+]
+paths = [
+  "src/project/",
+  "src/registered/",
+  "src/registered.rs",
+  "src/storage/codec.rs",
+  "src/storage/store.rs",
+  "src/storage/transport.rs",
+  "src/storage/types.rs",
+  "src/storage/tests/",
+  "src/storage/tests.rs",
+  "src/bin/storage_runtime.rs",
+  "src/bin/qualified_runner.rs",
+  "src/bin/ordinary_cargo_attempt.rs",
+  "src/bin/declared_workflow.rs",
+  "src/bin/registry_acquisition.rs",
+  "fixtures/cargo-source-map-probe/",
+  "fixtures/ordinary-cargo-auth-v1.json",
+  "fixtures/ordinary-cargo-auth-v2.json",
+  "fixtures/ordinary-cargo-auth-v3.json",
+  "fixtures/ordinary-cargo-declaration-v1.json",
+  "fixtures/qualification-auth-v1.json",
+  "fixtures/qualification-graph-owner-v1.json",
+  "fixtures/storage-runtime-ready-v1.json",
+  "scripts/test-private-process.py",
+  "scripts/test-bounded-native.py",
+  "scripts/acquire-nucleus-registry.py",
+  "scripts/acquire-nucleus-registry-stream.py",
+  "scripts/qualification-vectors.mjs",
+  "docs/knowledge/contracts/declared-workflow-adoption.md",
+  "docs/knowledge/contracts/ordinary-cargo-storage.md",
+  "docs/knowledge/contracts/ordinary-cargo-reuse-identity.md",
+]
+config_keys = ["private-qualification", "private-qualification-fixture"]

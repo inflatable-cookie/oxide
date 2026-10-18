@@ -1,9 +1,9 @@
 //! Provision and open the verified APFS sparse-image payload backend.
 //!
-//! Logic matches the protected runtime's macOS backend (oxide#055): one fresh
-//! sparse image, attach at an owner-only mount point, record a capacity
-//! receipt, and mint `BoundedBacking` only after live verification. Caller JSON
-//! cannot upgrade a directory to a hard-bound claim.
+//! The verified macOS backend (oxide#055): one fresh sparse image, attach at an
+//! owner-only mount point, record a capacity receipt, and mint `BoundedBacking`
+//! only after live verification. Caller JSON cannot upgrade a directory to a
+//! hard-bound claim.
 
 #[cfg(target_os = "macos")]
 use super::ObservationUnknownReason;

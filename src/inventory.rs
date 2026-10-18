@@ -729,7 +729,7 @@ fn build_policy(dominant: Option<Category>) -> Vec<PolicyHint> {
         }),
         Some(Category::Fingerprints) => Some(PolicyHint {
             topic: "Cargo freshness state".to_owned(),
-            reference: "docs/knowledge/contracts/ordinary-cargo-storage.md".to_owned(),
+            reference: "docs/knowledge/qualification-readiness.md".to_owned(),
             note: "Fingerprint state dominates allocation here. It encodes Cargo freshness and \
                    must not be edited or removed to force or avoid rebuilds."
                 .to_owned(),

@@ -4,11 +4,10 @@ Status: proposed context-resolution design, approved as design direction on
 2026-10-15 in [vision](../vision.md#authority-boundaries). No automatic context
 resolver is activated by this document. The current [lean local CLI](local-lease.md)
 does enforce a bounded payload and retire known idle slots; its profile label
-does not set Cargo debug or incremental values. The ordinary-Cargo
-[protected route](ordinary-cargo-storage.md) and [reuse identity](ordinary-cargo-reuse-identity.md)
-below are separate historical design/implementation context. Do not infer that
-the lean route requires their signing machinery or that storage bounds are
-still unimplemented.
+does not set Cargo debug or incremental values. Earlier qualification
+mechanisms are retired; their historical findings remain in
+[qualification readiness](../qualification-readiness.md). This policy does not
+require those mechanisms, and the bounded storage capability remains in use.
 
 Consumer policy remains consumer-owned. Tom adopted incremental-on for Nucleus managed agents and incremental-off for one-shot validation in Nucleus `ff43e69701f08e5a9ddf84d424a381dea8d033de`, superseding its `fb2bd04` agent stopgap. [Storage efficiency](../storage-efficiency.md#nucleus-consumer-adoption-2026-10-15) owns that adoption receipt and its limits. This does not activate Oxide slots or imply a Queue policy change.
 
@@ -82,7 +81,7 @@ Current behavior is non-evicting. Adding budget enforcement or generation retire
 ## Ownership, liveness and release
 
 - Oxide releases a slot only on authenticated settlement under the existing lease contract.
-- Unknown ownership, crash, PID absence, age, compiler `.lock` files or process disappearance never authorize release or evidence removal. This matches [vision](../vision.md#authority-boundaries) and [architecture](../architecture.md#storage-and-ownership).
+- Unknown ownership, crash, PID absence, age, compiler `.lock` files or process disappearance never authorize release or evidence removal. This matches [vision](../vision.md#authority-boundaries) and [architecture](../architecture.md#storage-invariants).
 - Budget pressure returns an actionable refusal with an inventory. It does not clean up.
 
 ## Upstream garbage collection

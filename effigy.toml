@@ -11,12 +11,6 @@ minimum_effigy_version = "0.14.0"
 # for full QA.
 "rust:profile-light" = "python3 scripts/test-cargo-profiles.py --profile oxide-light"
 "rust:profile-full-debug" = "python3 scripts/test-cargo-profiles.py --profile oxide-full-debug"
-"rust:private-compile" = "cargo check --workspace --all-targets --locked --features private-qualification"
-"rust:test-ordinary-cargo-stable-reuse" = "python3 scripts/bounded-test.py cargo test --lib --locked --features private-qualification storage::tests::stable_reuse::ordinary_cargo_stable_reuse_identity_reuses_across_exact_attempts -- --exact"
-"rust:test-declared-workflow" = "python3 scripts/bounded-test.py cargo test --lib --locked project::workflow::tests -- --nocapture"
-# Focused retained-writer fixture proof (oxide#062): the native and source-map
-# retained-writer ownership scenarios plus their bounded readiness/error paths.
-"rust:test-native-retained-writer" = "python3 scripts/bounded-test.py cargo test --lib --locked retained_writer -- --nocapture"
 # Builds the unpublished oxide-storage-inventory binary and proves the
 # rendered output-byte ceiling on tiny synthetic fixtures. Not a QA alias
 # and not a real project-target scan.
@@ -26,9 +20,6 @@ minimum_effigy_version = "0.14.0"
 # Heavy admission owns the real image provisioning; it is not a
 # filesystem-fill benchmark and not full QA. Table lives at the end of this
 # file so later bare task entries stay under [tasks].
-"rust:private-process" = "python3 scripts/test-private-process.py"
-"registry:acquire:nucleus" = "python3 scripts/acquire-nucleus-registry.py"
-"registry:stream:nucleus" = "python3 scripts/acquire-nucleus-registry-stream.py"
 "build-context:comparison:test" = "python3 scripts/test_build_context_comparison.py"
 "docs:check" = [
   "effigy skill run northstar/check-links -- --frozen '^docs/knowledge/architecture[.]md$'",
@@ -39,13 +30,6 @@ minimum_effigy_version = "0.14.0"
 [test.suites.rust]
 run = "python3 scripts/bounded-test.py cargo test --workspace --all-targets --locked"
 default = false
-
-# One opt-in macOS filesystem-full proof (oxide#055). Heavy admission owns the
-# native effects; the selector is never part of ordinary validation and must
-# not become an alias for full QA.
-[tasks."rust:bounded-native-proof"]
-admission = "heavy"
-run = "python3 scripts/test-bounded-native.py"
 
 # Heavy admission owns the real image provisioning in
 # scripts/test-storage-lease-cli.py; it is not a filesystem-fill benchmark

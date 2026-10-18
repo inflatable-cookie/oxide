@@ -1,39 +1,29 @@
 //! Verified hard-bound payload storage (oxide#055).
 //!
-//! The directory-only daemon checks admission against a caller-supplied budget
-//! but nothing constrains a writer after acquire. This module defines the one
-//! supported opt-in backend that closes that gap on macOS: a fixed-size private
-//! APFS volume inside a sparse disk image. The volume's finite size is the
-//! enforced aggregate-store ceiling; the operating system refuses allocation
-//! beyond it while a cooperative writer holds an open lease. Admission still
-//! reserves against the recorded ceiling so a partition cannot silently consume
-//! the remaining pool.
-//!
-//! The enforced bound is aggregate-store, never per-slot: every owned slot on
-//! the backing shares one finite payload filesystem and there is no per-slot
-//! isolation. Control state (ledger, socket and receipt) intentionally stays
-//! outside the payload filesystem so a full payload can never wedge durable
-//! ownership updates; the payload holds only slot directories.
+//! The one supported opt-in backend on macOS is a fixed-size private APFS
+//! volume inside a sparse disk image. The volume's finite size is the enforced
+//! aggregate ceiling; the operating system refuses allocation beyond it while a
+//! cooperative writer holds an open lease. The bound is aggregate, never
+//! per-slot: every slot on the backing shares one finite payload filesystem.
+//! Control state stays outside the payload filesystem so a full payload cannot
+//! wedge durable ownership updates.
 //!
 //! The verified capability is constructed only by code that checked the live
-//! backing (the protected runtime on macOS, or synthetic fixtures inside this
+//! backing (the lease backend on macOS, or synthetic fixtures inside this
 //! crate). Caller JSON cannot upgrade a directory root to a hard-bound claim.
 
-use super::codec::{Decode, Encode, Reader, Writer};
-use super::types::StorageError;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// The only supported bounded backend: one fixed-size private APFS volume in a
-/// sparse disk image, provisioned and attached by the protected runtime.
+/// sparse disk image, provisioned and attached by the lease backend.
 pub const BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1: &str = "apfs-sparse-image-v1";
 
 const MAX_IDENTITY_BYTES: usize = 128;
 
-/// Durable identity of the owned bounded backing, recorded in the ledger and
-/// bound to daemon startup. Restart refuses any mismatch instead of
-/// reinterpreting the recorded store.
+/// Durable identity of the owned bounded backing. Reopen refuses any mismatch
+/// instead of reinterpreting the recorded store.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundedBackendDescriptor {
     /// Exactly `BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1`.
@@ -48,43 +38,25 @@ pub struct BoundedBackendDescriptor {
     pub verified_capacity_bytes: u64,
 }
 
-impl BoundedBackendDescriptor {
-    pub(crate) fn encode_into(&self, writer: &mut Writer) -> Result<(), StorageError> {
-        self.backend.encode(writer)?;
-        self.payload_root.encode(writer)?;
-        self.identity.encode(writer)?;
-        writer.u64(self.verified_capacity_bytes);
-        Ok(())
-    }
-
-    pub(crate) fn decode_from(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
-        Ok(Self {
-            backend: String::decode(reader)?,
-            payload_root: PathBuf::decode(reader)?,
-            identity: String::decode(reader)?,
-            verified_capacity_bytes: reader.u64()?,
-        })
-    }
-}
-
-impl Encode for BoundedBackendDescriptor {
-    fn encode(&self, writer: &mut Writer) -> Result<(), StorageError> {
-        self.encode_into(writer)
-    }
-}
-
-impl Decode for BoundedBackendDescriptor {
-    fn decode(reader: &mut Reader<'_>) -> Result<Self, StorageError> {
-        Self::decode_from(reader)
-    }
+/// Structural refusal while sealing a bounded capability. Callers map it to
+/// their own fail-closed error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BoundedRefusal {
+    UnsupportedBackend,
+    ZeroCapacity,
+    InvalidIdentity,
+    RelativePayloadRoot,
+    UnreadablePayloadRoot,
+    NonPrivatePayloadRoot,
+    NonCanonicalPayloadRoot,
 }
 
 /// Verified capability for the owned hard-bounded payload filesystem.
 ///
 /// Construction is crate-private: only code that provisioned or opened the
-/// backing and verified it against its capacity proof can mint one. The daemon
-/// treats the capability as the authority to place slots on the payload
-/// filesystem and binds its descriptor into the durable ledger.
+/// backing and verified it against its capacity proof can mint one. The lease
+/// backend treats the capability as the authority to place slots on the payload
+/// filesystem and binds its descriptor into its durable pool state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoundedBacking {
     descriptor: BoundedBackendDescriptor,
@@ -98,14 +70,12 @@ impl BoundedBacking {
     /// (mounted image, capacity proof and volume identity). This constructor
     /// refuses descriptors that are structurally impossible: unknown backend,
     /// non-canonical or non-private payload root, or unbounded metadata.
-    pub(crate) fn verified(descriptor: BoundedBackendDescriptor) -> Result<Self, StorageError> {
+    pub(crate) fn verified(descriptor: BoundedBackendDescriptor) -> Result<Self, BoundedRefusal> {
         if descriptor.backend != BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1 {
-            return Err(StorageError::InvalidInput("unsupported bounded backend"));
+            return Err(BoundedRefusal::UnsupportedBackend);
         }
         if descriptor.verified_capacity_bytes == 0 {
-            return Err(StorageError::InvalidInput(
-                "bounded payload must have a positive verified capacity",
-            ));
+            return Err(BoundedRefusal::ZeroCapacity);
         }
         if descriptor.identity.is_empty()
             || descriptor.identity.len() > MAX_IDENTITY_BYTES
@@ -114,9 +84,7 @@ impl BoundedBacking {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
-            return Err(StorageError::InvalidInput(
-                "bounded backend identity must be bounded lowercase hex",
-            ));
+            return Err(BoundedRefusal::InvalidIdentity);
         }
         verify_payload_root(&descriptor.payload_root)?;
         Ok(Self { descriptor })
@@ -135,40 +103,123 @@ impl BoundedBacking {
 
 /// Refuses anything but an existing, canonical, private directory as the
 /// payload root. A symlink, alias or shared directory never binds.
-pub(crate) fn verify_payload_root(path: &Path) -> Result<(), StorageError> {
+pub(crate) fn verify_payload_root(path: &Path) -> Result<(), BoundedRefusal> {
     if !path.is_absolute() {
-        return Err(StorageError::InvalidInput(
-            "bounded payload root must be absolute",
-        ));
+        return Err(BoundedRefusal::RelativePayloadRoot);
     }
-    let metadata = fs::symlink_metadata(path).map_err(super::store::io_error)?;
+    let metadata = fs::symlink_metadata(path).map_err(|_| BoundedRefusal::UnreadablePayloadRoot)?;
     if !metadata.file_type().is_dir() || metadata.permissions().mode() & 0o077 != 0 {
-        return Err(StorageError::InvalidInput(
-            "bounded payload root must be a private directory",
-        ));
+        return Err(BoundedRefusal::NonPrivatePayloadRoot);
     }
-    let canonical = fs::canonicalize(path).map_err(super::store::io_error)?;
+    let canonical = fs::canonicalize(path).map_err(|_| BoundedRefusal::UnreadablePayloadRoot)?;
     if canonical != path {
-        return Err(StorageError::InvalidInput(
-            "bounded payload root must be supplied by its canonical path",
-        ));
+        return Err(BoundedRefusal::NonCanonicalPayloadRoot);
     }
     Ok(())
 }
 
-/// The payload filesystem may hold only the owned slot directory. Unknown
-/// entries refuse so a foreign mount can never silently join the store.
-pub(crate) fn validate_payload_entries(payload_root: &Path) -> Result<(), StorageError> {
-    for entry in fs::read_dir(payload_root).map_err(super::store::io_error)? {
-        let entry = entry.map_err(super::store::io_error)?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name == super::store::SLOTS_NAME {
-            continue;
-        }
-        return Err(StorageError::Refused(
-            super::types::RefusalReason::UnknownAccounting,
-        ));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT: AtomicUsize = AtomicUsize::new(1);
+
+    struct Fixture {
+        path: PathBuf,
     }
-    Ok(())
+
+    impl Fixture {
+        fn new() -> Self {
+            let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let parent = fs::canonicalize(base)
+                .expect("canonical scratch")
+                .join("bounded");
+            fs::create_dir_all(&parent).expect("bounded fixture parent");
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!("{:x}-{id:x}", std::process::id()));
+            fs::create_dir(&path).expect("bounded fixture");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("private");
+            Self { path }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn descriptor(payload_root: PathBuf) -> BoundedBackendDescriptor {
+        BoundedBackendDescriptor {
+            backend: BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1.to_owned(),
+            payload_root,
+            identity: "a".repeat(16),
+            verified_capacity_bytes: 1024 * 1024,
+        }
+    }
+
+    fn refusal(descriptor: BoundedBackendDescriptor) -> BoundedRefusal {
+        BoundedBacking::verified(descriptor).expect_err("structural refusal")
+    }
+
+    #[test]
+    fn verified_backing_refuses_structurally_impossible_descriptors() {
+        let fixture = Fixture::new();
+        let payload = fixture.path.join("payload");
+        fs::create_dir(&payload).expect("payload");
+        fs::set_permissions(&payload, fs::Permissions::from_mode(0o700)).expect("private");
+        let backing = BoundedBacking::verified(descriptor(payload.clone())).expect("verified");
+        assert_eq!(backing.payload_root(), payload);
+
+        let mut unknown = descriptor(payload.clone());
+        unknown.backend = "directory".to_owned();
+        assert_eq!(refusal(unknown), BoundedRefusal::UnsupportedBackend);
+
+        let mut empty = descriptor(payload.clone());
+        empty.verified_capacity_bytes = 0;
+        assert_eq!(refusal(empty), BoundedRefusal::ZeroCapacity);
+
+        for identity in [
+            String::new(),
+            "A".repeat(16),
+            "a".repeat(MAX_IDENTITY_BYTES + 1),
+        ] {
+            let mut bad = descriptor(payload.clone());
+            bad.identity = identity;
+            assert_eq!(refusal(bad), BoundedRefusal::InvalidIdentity);
+        }
+
+        assert_eq!(
+            refusal(descriptor(PathBuf::from("payload"))),
+            BoundedRefusal::RelativePayloadRoot
+        );
+        assert_eq!(
+            refusal(descriptor(fixture.path.join("missing"))),
+            BoundedRefusal::UnreadablePayloadRoot
+        );
+
+        let alias = fixture.path.join("payload-alias");
+        symlink(&payload, &alias).expect("symlink fixture");
+        assert_eq!(
+            refusal(descriptor(alias)),
+            BoundedRefusal::NonPrivatePayloadRoot
+        );
+
+        assert_eq!(
+            refusal(descriptor(payload.join("..").join("payload"))),
+            BoundedRefusal::NonCanonicalPayloadRoot
+        );
+
+        let shared = fixture.path.join("shared");
+        fs::create_dir(&shared).expect("shared");
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).expect("shared mode");
+        assert_eq!(
+            refusal(descriptor(shared)),
+            BoundedRefusal::NonPrivatePayloadRoot
+        );
+    }
 }
