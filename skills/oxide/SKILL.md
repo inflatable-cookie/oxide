@@ -34,7 +34,10 @@ External tools name the Cargo profile themselves, for example
 ## What Oxide prints
 
 After each building command, one stderr line:
-`oxide: quick profile, build strategy, slot 3 warm, 4.2s, pool 210 of 24576 MiB used`.
+`oxide: quick profile, build strategy, slot 3 warm, 4.2s, pool 210 of 24576 MiB used (apfs-sparse-image-v1)`.
+On a budget-only directory pool (the Linux default) it reads
+`pool 210 MiB allocated of 24576 MiB budget (directory-budget-v1, budget-only)`:
+the budget steers admission and eviction but is not a ceiling.
 The strategy is how Oxide met the profile (`build`, or `build+execute` for
 `run` and `test`). Cold means the slot was rebuilt; that is normal after
 `oxide clean`. A new worktree of the same repository usually starts warm on
@@ -51,6 +54,10 @@ Oxide says the gate refused a slot, it builds cold instead; that is safe.
   `+toolchain`, `--config` keys for `build.build-dir` / `build.target-dir`, and
   `--config` file paths. Drop the flag; do not work around it.
 - Exit codes are Cargo's, or the program's for `oxide run`.
+- `oxide: reserve stop: …` on a directory pool means host free space fell
+  below about 22 GiB, so Oxide stopped the build to protect the 20 GiB
+  reserve. Free disk space before retrying; do not loop. If it says closure
+  is unconfirmed, the slot stays held until those processes exit.
 
 ## Status and cleaning
 

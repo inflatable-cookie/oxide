@@ -12,6 +12,7 @@ mod freshness;
 mod identity;
 mod process;
 mod store;
+mod watchdog;
 
 use cli::{Class, Invocation, PROFILE_ENVIRONMENT};
 use freshness::Gate;
@@ -26,7 +27,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use store::{Acquired, Cleaning, Store};
+use store::{Acquired, Backend, Cleaning, Store};
+use watchdog::Watchdog;
 
 /// The `cargo` rustup resolves for the current directory. Oxide never selects
 /// a toolchain.
@@ -48,6 +50,8 @@ project's own). Oxide places build output, so --target-dir and --config
 build.build-dir/target-dir are refused. Adoption writes one marked block in the
 workspace-root AGENTS.md and prints readiness; there is no Oxide config file.
 OXIDE_POOL selects the pool; OXIDE_MAX_ACTIVE the host-wide build limit (2).
+OXIDE_POOL_BACKEND=directory-budget creates a budget-only directory pool (the
+Linux default; macOS defaults to a hard-capped APFS image).
 ";
 
 fn main() -> ExitCode {
@@ -174,9 +178,15 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
             return Err(error);
         }
     };
+    let mut watchdog = store.watchdog();
     let outcome = match store.mark_running(&held, group.id) {
-        Ok(()) if run => collect_run(&mut group, &invocation),
-        Ok(()) => process::wait_leader(&mut group).map(|status| (status, None)),
+        Ok(()) if run => collect_run(&mut group, &invocation, watchdog.as_mut()),
+        Ok(()) => match watchdog.as_mut() {
+            Some(watchdog) => {
+                process::wait_leader_watched(&mut group, watchdog).map(|status| (status, None))
+            }
+            None => process::wait_leader(&mut group).map(|status| (Some(status), None)),
+        },
         Err(error) => {
             // SAFETY: the negative PID addresses the group this command created.
             unsafe {
@@ -186,14 +196,40 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
             Err(error)
         }
     };
-    process::wait_group_empty(group.id);
+    // Release only after positive closure. A watchdog that cannot confirm
+    // the stopped group closed leaves the lease held and the record naming
+    // the group, so a later command recovers it once the group is empty.
+    let closed = match (watchdog.as_mut(), &outcome) {
+        (Some(_), Ok((None, _))) => None,
+        (Some(watchdog), _) => process::wait_group_empty_watched(group.id, watchdog),
+        (None, _) => {
+            process::wait_group_empty(group.id);
+            Some(Instant::now())
+        }
+    };
+    let stopped = watchdog.as_ref().filter(|watchdog| watchdog.stopped());
+    if let Some(watchdog) = stopped {
+        eprintln!("{}", watchdog.report(group.id, closed));
+    }
+    if closed.is_none() {
+        eprintln!(
+            "oxide: could not confirm Cargo group {} closed after the reserve stop; slot {} stays held, and a later oxide command recovers it once the group is empty",
+            group.id, held.slot_id
+        );
+        return Ok(1);
+    }
     let slot = held.slot_id.clone();
     let warm = held.reused;
     let note = gate.describe();
     let origin = gate.finish(&key.checkout);
     store.release(held, origin)?;
     let (status, executable) = outcome?;
+    let status = status.ok_or("Cargo ended without a status")?;
     print_summary(&store, &invocation, &slot, warm, started, note.as_deref());
+    if stopped.is_some() {
+        // A reserve stop is an ordinary failed command, never a success.
+        return Ok(process::exit_code(status).max(1));
+    }
     if !run || !status.success() {
         return Ok(process::exit_code(status));
     }
@@ -264,7 +300,8 @@ type RunTarget = Result<(PathBuf, PathBuf), String>;
 fn collect_run(
     group: &mut process::Group,
     invocation: &Invocation,
-) -> Result<(ExitStatus, Option<RunTarget>), String> {
+    mut watchdog: Option<&mut Watchdog>,
+) -> Result<(Option<ExitStatus>, Option<RunTarget>), String> {
     let stdout = group
         .child
         .stdout
@@ -285,6 +322,12 @@ fn collect_run(
     let mut closed = false;
     while status.is_none() || !closed {
         process::forward_pending(group.id);
+        if let Some(watchdog) = watchdog.as_deref_mut() {
+            watchdog.poll(group.id);
+            if status.is_none() && watchdog.gave_up() {
+                return Ok((None, None));
+            }
+        }
         match receiver.recv_timeout(Duration::from_millis(20)) {
             Ok(line) => {
                 if invocation.json_messages {
@@ -308,7 +351,6 @@ fn collect_run(
     }
     let _ = reader.join();
     let _ = std::io::stdout().flush();
-    let status = status.ok_or("Cargo ended without a status")?;
     let target = match found.len() {
         1 => {
             let (_, program, manifest_dir) = found.remove(0);
@@ -362,13 +404,24 @@ fn print_summary(
         "run" | "test" => "build+execute",
         _ => "build",
     };
-    let pool = store
-        .payload_use()
-        .map(|(used, total)| format!("pool {} of {} MiB used", used / MIB, total / MIB))
-        .unwrap_or_else(|| "pool use unknown".to_owned());
+    let pool = match (store.backend, store.payload_use()) {
+        (Backend::ApfsImage, Some((used, total))) => {
+            format!("pool {} of {} MiB used", used / MIB, total / MIB)
+        }
+        (Backend::DirectoryBudget, Some((used, budget))) => format!(
+            "pool {} MiB allocated of {} MiB budget",
+            used / MIB,
+            budget / MIB
+        ),
+        (_, None) => "pool use unknown".to_owned(),
+    };
+    let backend = match store.backend {
+        Backend::ApfsImage => format!(" ({})", store.backend.tag()),
+        Backend::DirectoryBudget => format!(" ({}, budget-only)", store.backend.tag()),
+    };
     let note = note.map(|note| format!(", {note}")).unwrap_or_default();
     eprintln!(
-        "oxide: {} profile, {strategy} strategy, slot {slot} {}, {:.1}s, {pool}{note}",
+        "oxide: {} profile, {strategy} strategy, slot {slot} {}, {:.1}s, {pool}{backend}{note}",
         invocation.profile.label(),
         if warm { "warm" } else { "cold" },
         started.elapsed().as_secs_f64()
@@ -445,18 +498,56 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
     }
     println!("pool: {}", store::pool_path()?.display());
     match Store::open_existing()? {
-        None => println!("  not created; the first building oxide command creates it"),
+        None => {
+            let backend = store::creation_backend()?;
+            println!(
+                "  not created; the first building oxide command creates it ({}: {})",
+                backend.tag(),
+                backend.bound()
+            );
+        }
         Some(store) => {
             let report = store.report()?;
-            let used = store
-                .payload_use()
-                .map(|(used, total)| format!("{} of {} MiB used", used / MIB, total / MIB))
-                .unwrap_or_else(|| "use unknown".to_owned());
             println!(
-                "  cap {} MiB, {used}, slot accounting {:?}",
-                report.pool.cap_bytes / MIB,
-                report.pool.coverage
+                "  backend {}: {}",
+                store.backend.tag(),
+                store.backend.bound()
             );
+            match store.backend {
+                Backend::ApfsImage => {
+                    let used = store
+                        .payload_use()
+                        .map(|(used, total)| format!("{} of {} MiB used", used / MIB, total / MIB))
+                        .unwrap_or_else(|| "use unknown".to_owned());
+                    println!(
+                        "  cap {} MiB, {used}, slot accounting {:?}",
+                        report.pool.cap_bytes / MIB,
+                        report.pool.coverage
+                    );
+                }
+                Backend::DirectoryBudget => {
+                    let used = report.pool.payload_unique_allocated_bytes.map_or_else(
+                        || "slot allocation unknown".to_owned(),
+                        |used| format!("{} MiB allocated by slots", used / MIB),
+                    );
+                    let available = watchdog::available_bytes(&store.pool.join("payload"))
+                        .map_or_else(
+                            || "unknown".to_owned(),
+                            |bytes| format!("{} MiB", bytes / MIB),
+                        );
+                    println!(
+                        "  budget {} MiB, {used}, slot accounting {:?}",
+                        report.pool.cap_bytes / MIB,
+                        report.pool.coverage
+                    );
+                    println!(
+                        "  reserve watchdog: stops a build below {} GiB available ({} GiB reserve + {} GiB margin), best effort; pool filesystem available {available}",
+                        (store::HOST_RESERVE_BYTES + watchdog::MARGIN_BYTES) / store::GIB,
+                        store::HOST_RESERVE_BYTES / store::GIB,
+                        watchdog::MARGIN_BYTES / store::GIB
+                    );
+                }
+            }
             println!(
                 "  slots {}, waiting commands {}",
                 report.slots.len(),

@@ -18,7 +18,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-pub use pool::{capacity_status, evict_idle_slot, lease, recover, release, status, LeaseRequest};
+pub use pool::{
+    capacity_status, evict_idle_slot, lease, managed, recover, release, status, LeaseRequest,
+};
 
 #[cfg(test)]
 mod tests;
@@ -39,6 +41,10 @@ pub const CAPACITY_STATUS_NOTES: [&str; 4] = [
     "image st_blocks is host file allocation, not APFS unique extents or snapshot accounting",
     "private target/temp, control, OS and snapshot overhead are excluded; whole-host cost and Finder purgeable are unknown",
 ];
+/// Budget-only directory backend for the `oxide` front door: admission and
+/// whole-idle-slot eviction against a recorded budget, with no OS ceiling.
+/// Only [`managed`] opens it; the standalone CLI refuses it.
+pub const BUDGET_BACKEND_DIRECTORY_V1: &str = "directory-budget-v1";
 /// Finite slot count. Exhaustion refuses a new slot.
 pub const MAX_SLOTS: usize = 32;
 /// Finite ledger file size including the atomic temp.
