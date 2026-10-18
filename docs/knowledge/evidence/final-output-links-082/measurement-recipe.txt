@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+"""Disposable one-shot oxide#082 probe recipe. Not a product file.
+
+Runs inside one genuine Effigy heavy-admitted run started by submit.py, which
+started the single 20-minute session clock before creating the owned root.
+Creates exactly one fresh 4 GiB APFS sparse image and builds the pinned Oxide
+source in two layouts, sequentially, in disjoint directories:
+
+  X (cross-volume): build directory on the image, target directory on the host
+  S (same volume):  build and target directories both on the image
+
+Per layout it runs `cargo build` and `cargo test --no-run` and records, for
+every final file Cargo placed in the target directory, device, inode, link
+count, size, allocation and APFS clone-sharing attributes, and its build-
+directory peers. Errors or uncertain process closure preserve the image.
+"""
+import ctypes
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+ROOT = pathlib.Path(__file__).resolve().parent
+cfg = json.loads((ROOT / "packet.json").read_text())
+assert pathlib.Path(cfg["root"]) == ROOT
+MOUNT = ROOT / "m"
+RAW = ROOT / "raw"
+IMAGE = ROOT / "probe.sparseimage"
+SRC = ROOT / "src"
+CARGO_HOME = ROOT / "cargo-home"
+TMP = ROOT / "tmp"
+TC = pathlib.Path(cfg["toolchain_bin"])
+
+GiB = 1024 ** 3
+HOST_RESERVE = cfg["host_reserve_bytes"]
+OWNED_CAP = cfg["owned_scratch_cap_bytes"]
+RAW_LOG_CAP = cfg["raw_log_cap_bytes"]
+IMAGE_STOP = cfg["image_used_stop_bytes"]
+CARGO_CAP = cfg["experimental_cargo_cap"]
+SETUP_CAP = cfg["setup_call_cap"]
+REGISTRY_COPY_CAP = 512 * 1024 ** 2
+
+lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+lib.mach_continuous_time.restype = ctypes.c_uint64
+
+
+class Scale(ctypes.Structure):
+    _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+
+scale = Scale()
+assert lib.mach_timebase_info(ctypes.byref(scale)) == 0
+
+
+def now():
+    return lib.mach_continuous_time() * scale.numer // scale.denom
+
+
+class AttrList(ctypes.Structure):
+    _fields_ = [("bitmapcount", ctypes.c_ushort), ("reserved", ctypes.c_uint16),
+                ("commonattr", ctypes.c_uint32), ("volattr", ctypes.c_uint32),
+                ("dirattr", ctypes.c_uint32), ("fileattr", ctypes.c_uint32),
+                ("forkattr", ctypes.c_uint32)]
+
+
+ATTR_CMN_RETURNED_ATTRS = 0x80000000
+FSOPT_NOFOLLOW = 0x1
+FSOPT_ATTR_CMN_EXTENDED = 0x20
+CMNEXT = [("private_size", 0x8, "q"), ("clone_id", 0x100, "Q"),
+          ("ext_flags", 0x200, "Q"), ("clone_refcnt", 0x1000, "I")]
+
+
+def apfs_sharing(path):
+    """getattrlist ATTR_CMNEXT_{PRIVATESIZE,CLONEID,EXT_FLAGS,CLONE_REFCNT}."""
+    request = AttrList(5, 0, ATTR_CMN_RETURNED_ATTRS, 0, 0, 0, sum(bit for _, bit, _ in CMNEXT))
+    buf = ctypes.create_string_buffer(256)
+    rc = lib.getattrlist(os.fsencode(str(path)), ctypes.byref(request), buf, 256,
+                         FSOPT_NOFOLLOW | FSOPT_ATTR_CMN_EXTENDED)
+    if rc != 0:
+        return {"errno": ctypes.get_errno()}
+    returned = struct.unpack_from("<5I", buf.raw, 4)[4]
+    out = {"returned_cmnext_mask": returned}
+    offset = 24
+    for name, bit, fmt in CMNEXT:
+        if returned & bit:
+            out[name] = struct.unpack_from("<" + fmt, buf.raw, offset)[0]
+            offset += struct.calcsize(fmt)
+    if "ext_flags" in out:
+        out["may_share_blocks"] = bool(out["ext_flags"] & 0x1)
+        out["shares_all_blocks"] = bool(out["ext_flags"] & 0x40)
+    return out
+
+
+start_ns = cfg["start_ns"]
+deadline_ns = cfg["deadline_ns"]
+counts = {"setup": 0, "cargo": 0, "tool": 0}
+result = {
+    "packet": cfg,
+    "measure_started_ns": now(),
+    "clock": cfg["clock"],
+    "calls": [],
+    "samples": [],
+    "snapshots": [],
+    "outcome": "running",
+    "limits": "allocation from st_blocks and APFS private size; host-free deltas are noisy and are not SSD writes",
+}
+last_owned_check = [0]
+
+
+def save():
+    (ROOT / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+
+
+def raw_bytes():
+    return sum(p.stat().st_size for p in RAW.iterdir() if p.is_file())
+
+
+def owned_host_bytes():
+    seen = set()
+    total = 0
+    for base, dirs, names in os.walk(ROOT):
+        if pathlib.Path(base) == ROOT and "m" in dirs:
+            dirs.remove("m")
+        for name in names:
+            st = os.lstat(os.path.join(base, name))
+            if (st.st_dev, st.st_ino) not in seen:
+                seen.add((st.st_dev, st.st_ino))
+                total += st.st_blocks * 512
+    return total
+
+
+def image_used():
+    if not os.path.ismount(MOUNT):
+        return None
+    v = os.statvfs(MOUNT)
+    return (v.f_blocks - v.f_bfree) * v.f_frsize
+
+
+def host_free():
+    v = os.statvfs("/private/tmp")
+    return v.f_bavail * v.f_frsize
+
+
+def bounds(force_owned=False):
+    assert now() < deadline_ns - 10 * 10 ** 9, "original 20-minute session deadline reached"
+    assert host_free() >= HOST_RESERVE, "20 GiB raw host reserve reached"
+    used = image_used()
+    assert used is None or used < IMAGE_STOP, "image used-bytes stop reached"
+    assert raw_bytes() <= RAW_LOG_CAP, "32 MiB raw log cap reached"
+    if force_owned or now() - last_owned_check[0] > 2 * 10 ** 9:
+        last_owned_check[0] = now()
+        owned = owned_host_bytes()
+        assert owned <= OWNED_CAP, "6 GiB owned scratch ceiling reached"
+        return owned
+    return None
+
+
+def sample(phase):
+    owned = bounds(force_owned=True)
+    record = {
+        "phase": phase,
+        "t_s": (now() - start_ns) / 1e9,
+        "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "host_free_bytes": host_free(),
+        "image_used_bytes": image_used(),
+        "owned_host_allocated_bytes_incl_image_backing": owned,
+        "image_backing_allocated_bytes": IMAGE.stat().st_blocks * 512 if IMAGE.exists() else None,
+        "raw_log_bytes": raw_bytes(),
+        "loadavg": os.getloadavg(),
+    }
+    result["samples"].append(record)
+    save()
+    return record
+
+
+def group_settled(pgid, wait_s=30):
+    end = time.monotonic() + wait_s
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+        if time.monotonic() > end:
+            return False
+        time.sleep(0.25)
+
+
+def run(name, argv, kind, cwd=None, env=None, expected=0):
+    bounds()
+    assert kind in counts
+    if kind == "setup":
+        assert counts["setup"] < SETUP_CAP, "setup call cap reached"
+    if kind == "cargo":
+        assert counts["cargo"] < CARGO_CAP, "experimental Cargo call cap reached"
+    counts[kind] += 1
+    out_path = RAW / (name + ".stdout")
+    err_path = RAW / (name + ".stderr")
+    started = now()
+    record = {"name": name, "kind": kind, "argv": argv, "cwd": str(cwd) if cwd else None,
+              "start_s": (started - start_ns) / 1e9,
+              "utc_start": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    result["calls"].append(record)
+    save()
+    print(name, "START", flush=True)
+    with out_path.open("wb") as out, err_path.open("wb") as err:
+        child = subprocess.Popen(argv, cwd=cwd, env=env, stdout=out, stderr=err, start_new_session=True)
+        try:
+            while child.poll() is None:
+                bounds()
+                time.sleep(0.25)
+        except BaseException:
+            record["stopped_by_bound"] = True
+            os.killpg(child.pid, signal.SIGTERM)
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.wait()
+            record["group_settled"] = group_settled(child.pid)
+            result["preserve"] = True
+            save()
+            raise
+    record["group_settled"] = group_settled(child.pid)
+    record.update(exit=child.returncode, end_s=(now() - start_ns) / 1e9,
+                  wall_s=(now() - started) / 1e9,
+                  utc_end=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  stdout=str(out_path.relative_to(ROOT)), stderr=str(err_path.relative_to(ROOT)),
+                  stdout_bytes=out_path.stat().st_size, stderr_bytes=err_path.stat().st_size)
+    save()
+    print(name, "EXIT", child.returncode, round(record["wall_s"], 3), flush=True)
+    assert record["group_settled"], name + " process group did not settle"
+    assert child.returncode == expected, name + " unexpected exit; see raw logs"
+    return out_path.read_text(errors="replace")
+
+
+def registry_inputs(lock_text, cargo_source):
+    packages, current = [], {}
+    for line in lock_text.splitlines():
+        if line.startswith("[[package]]"):
+            if current:
+                packages.append(current)
+            current = {}
+        for key in ("name", "version", "source"):
+            prefix = key + ' = "'
+            if line.startswith(prefix):
+                current[key] = line[len(prefix):-1]
+    if current:
+        packages.append(current)
+    cache_root = cargo_source / "registry" / "cache"
+    src_root = cargo_source / "registry" / "src"
+    index_root = cargo_source / "registry" / "index"
+    items = []
+    for config in sorted(index_root.glob("*/config.json")):
+        items.append((config, "registry/index/%s/config.json" % config.parent.name))
+    for package in packages:
+        name, version = package.get("name"), package.get("version")
+        if not name or not version or "registry" not in package.get("source", ""):
+            continue
+        crate = sorted(cache_root.glob("*/%s-%s.crate" % (name, version)))
+        source_dir = sorted(src_root.glob("*/%s-%s" % (name, version)))
+        index_cache = sorted(index_root.glob("*/.cache/**/%s" % name))
+        if crate:
+            items.append((crate[0], "registry/cache/%s/%s" % (crate[0].parent.name, crate[0].name)))
+        if source_dir:
+            items.append((source_dir[0], "registry/src/%s/%s" % (source_dir[0].parent.name, source_dir[0].name)))
+        for cached in index_cache:
+            items.append((cached, "registry/index/%s" % cached.relative_to(index_root)))
+    return items
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def walk(base):
+    files = []
+    if not base.is_dir():
+        return files
+    for current, _, names in os.walk(base):
+        for name in names:
+            path = pathlib.Path(current) / name
+            st = path.lstat()
+            files.append((path, st))
+            if len(files) % 1024 == 0:
+                bounds()
+            assert len(files) <= 200000, "walk file cap"
+    return files
+
+
+def file_record(path, st, base):
+    return {"path": str(path.relative_to(base)), "dev": st.st_dev, "ino": st.st_ino,
+            "nlink": st.st_nlink, "size": st.st_size, "allocated": st.st_blocks * 512,
+            "symlink": os.path.islink(path)}
+
+
+def snapshot(layout, step, target, build):
+    target_files = walk(target)
+    build_files = walk(build)
+    by_inode, by_size = {}, {}
+    build_alloc, build_seen = 0, set()
+    for path, st in build_files:
+        key = (st.st_dev, st.st_ino)
+        by_inode.setdefault(key, []).append(path)
+        if key not in build_seen:
+            build_seen.add(key)
+            build_alloc += st.st_blocks * 512
+        if not os.path.islink(path) and st.st_size > 0:
+            by_size.setdefault(st.st_size, []).append((path, st))
+    records = []
+    target_alloc, target_private, target_extra = 0, 0, 0
+    union_seen = set(build_seen)
+    union_alloc = build_alloc
+    target_seen = set()
+    for path, st in sorted(target_files, key=lambda item: str(item[0])):
+        rec = file_record(path, st, target)
+        key = (st.st_dev, st.st_ino)
+        if os.path.islink(path):
+            rec["link_target"] = os.readlink(path)
+            records.append(rec)
+            continue
+        rec["apfs"] = apfs_sharing(path)
+        rec["same_inode_peers_in_build_dir"] = [str(p.relative_to(build)) for p in by_inode.get(key, [])]
+        content = sha256(path) if st.st_size > 0 else None
+        rec["sha256"] = content
+        peers = []
+        for peer, peer_st in by_size.get(st.st_size, []):
+            if (peer_st.st_dev, peer_st.st_ino) == key or sha256(peer) != content:
+                continue
+            peers.append({"path": str(peer.relative_to(build)), "dev": peer_st.st_dev,
+                          "ino": peer_st.st_ino, "nlink": peer_st.st_nlink,
+                          "allocated": peer_st.st_blocks * 512, "apfs": apfs_sharing(peer)})
+        rec["content_equal_peers_in_build_dir"] = peers
+        records.append(rec)
+        if key in target_seen:
+            continue
+        target_seen.add(key)
+        target_alloc += st.st_blocks * 512
+        private = rec["apfs"].get("private_size")
+        if private is not None:
+            target_private += private
+        if key not in union_seen:
+            union_seen.add(key)
+            union_alloc += st.st_blocks * 512
+            target_extra += private if private is not None else st.st_blocks * 512
+    snap = {
+        "layout": layout,
+        "step": step,
+        "t_s": (now() - start_ns) / 1e9,
+        "target_dir": str(target),
+        "build_dir": str(build),
+        "target_dev": os.stat(target).st_dev if target.exists() else None,
+        "build_dev": os.stat(build).st_dev if build.exists() else None,
+        "target_file_count": len(target_files),
+        "build_file_count": len(build_files),
+        "target_unique_inode_allocated_bytes": target_alloc,
+        "target_apfs_private_bytes": target_private,
+        "build_unique_inode_allocated_bytes": build_alloc,
+        "union_unique_inode_allocated_bytes": union_alloc,
+        "target_bytes_not_shared_with_build": target_extra,
+        "target_files": records,
+        "image_used_bytes": image_used(),
+        "host_free_bytes": host_free(),
+    }
+    result["snapshots"].append(snap)
+    save()
+
+
+def artifacts(text, target, build):
+    rows = []
+    finished = None
+    for line in text.splitlines():
+        if not line.startswith("{"):
+            continue
+        message = json.loads(line)
+        if message.get("reason") == "build-finished":
+            finished = message.get("success")
+        if message.get("reason") != "compiler-artifact":
+            continue
+        if not message["package_id"].startswith("path+file://"):
+            continue
+
+        def where(path):
+            if path is None:
+                return None
+            if path.startswith(str(target) + "/"):
+                return "target"
+            if path.startswith(str(build) + "/"):
+                return "build"
+            return "other"
+
+        rows.append({
+            "target_name": message["target"]["name"],
+            "kind": message["target"]["kind"],
+            "test_profile": message["profile"]["test"],
+            "fresh": message["fresh"],
+            "filenames": message["filenames"],
+            "filename_locations": [where(p) for p in message["filenames"]],
+            "executable": message.get("executable"),
+            "executable_location": where(message.get("executable")),
+        })
+    return {"build_finished_success": finished, "workspace_artifacts": rows}
+
+
+exit_code = 1
+try:
+    assert os.environ.get("HOST_RUN_TOKEN") and os.environ.get("HOST_RUN_ID"), "missing genuine Effigy admission"
+    assert pathlib.Path.cwd().resolve() == ROOT, "incorrect genuine run root"
+    result["host_run_id"] = os.environ["HOST_RUN_ID"]
+    result["admission_start_s"] = (now() - start_ns) / 1e9
+    result["effigy_executable"] = shutil.which("effigy")
+    RAW.mkdir(exist_ok=True)
+    TMP.mkdir(exist_ok=True)
+    sample("admitted")
+
+    run("git-clone", ["/usr/bin/git", "clone", "--no-local", "--no-checkout", cfg["source_repository"], str(SRC)], "tool")
+    run("git-checkout", ["/usr/bin/git", "checkout", "--detach", cfg["pin"]], "tool", cwd=SRC)
+    tree = run("git-tree", ["/usr/bin/git", "rev-parse", "HEAD^{tree}"], "tool", cwd=SRC).strip()
+    assert tree == cfg["pin_tree"], "cloned tree mismatch"
+    status = run("git-status", ["/usr/bin/git", "status", "--porcelain"], "tool", cwd=SRC)
+    assert status == "", "clone is not clean"
+    result["source"] = {"pin": cfg["pin"], "tree": tree, "edits": "none",
+                        "cargo_lock_sha256": sha256(SRC / "Cargo.lock"),
+                        "cargo_toml_sha256": sha256(SRC / "Cargo.toml")}
+
+    CARGO_HOME.mkdir()
+    copied = 0
+    crate_digests = {}
+    for source, rel in registry_inputs((SRC / "Cargo.lock").read_text(), pathlib.Path(cfg["host_cargo_home"])):
+        bounds()
+        assert not source.is_symlink(), "registry input is a symlink"
+        if source.is_file():
+            copied += source.stat().st_size
+            if source.suffix == ".crate":
+                crate_digests[rel] = sha256(source)
+            destination = CARGO_HOME / rel
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
+        else:
+            for base, _, names in os.walk(source):
+                for name in names:
+                    item = pathlib.Path(base) / name
+                    assert not item.is_symlink(), "registry input tree contains a symlink"
+                    copied += item.stat().st_size
+                    destination = CARGO_HOME / rel / item.relative_to(source)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(item, destination)
+        assert copied <= REGISTRY_COPY_CAP, "registry copy cap reached"
+    result["registry_copy"] = {"copied_bytes": copied, "crate_sha256": dict(sorted(crate_digests.items()))}
+
+    config_paths = []
+    for base in (SRC, ROOT, ROOT.parent, ROOT.parent.parent, pathlib.Path("/"), CARGO_HOME):
+        for name in (".cargo/config", ".cargo/config.toml"):
+            config_paths.append(base / name)
+    config_paths += [CARGO_HOME / "config", CARGO_HOME / "config.toml"]
+    present = [str(p) for p in config_paths if p.exists()]
+    assert not present, "unexpected Cargo config: %s" % present
+    result["cargo_config_checked_absent"] = [str(p) for p in config_paths]
+    sample("source-and-registry-staged")
+
+    run("image-create", ["/usr/bin/hdiutil", "create", "-size", cfg["image_size"], "-type", "SPARSE",
+                         "-fs", "APFS", "-volname", "Oxide082", str(IMAGE)], "tool")
+    MOUNT.mkdir()
+    run("image-attach", ["/usr/bin/hdiutil", "attach", "-nobrowse", "-mountpoint", str(MOUNT), str(IMAGE)], "tool")
+    assert os.path.ismount(MOUNT), "image did not mount"
+    volume = os.statvfs(MOUNT)
+    result["volume"] = {"declared_size": cfg["image_size"], "mount_total_bytes": volume.f_blocks * volume.f_frsize,
+                        "mount_dev": os.stat(MOUNT).st_dev, "host_root_dev": os.stat(ROOT).st_dev}
+    assert result["volume"]["mount_dev"] != result["volume"]["host_root_dev"], "image shares the host device"
+    sample("image-attached")
+
+    env = {"HOME": "/Users/tom", "USER": "tom", "LOGNAME": "tom", "LANG": "C",
+           "PATH": str(TC) + ":/usr/bin:/bin:/usr/sbin:/sbin",
+           "RUSTC": str(TC / "rustc"), "RUSTDOC": str(TC / "rustdoc"),
+           "CARGO_HOME": str(CARGO_HOME), "CARGO_TERM_COLOR": "never", "CARGO_NET_OFFLINE": "true",
+           "OXIDE_TASK_SCRATCH_ROOT": str(TMP), "TMPDIR": str(TMP), "TMP": str(TMP), "TEMP": str(TMP)}
+    result["environment"] = env
+    cargo = str(TC / "cargo")
+    cargo_version = run("setup-cargo-version", [cargo, "-vV"], "setup", cwd=SRC, env=env)
+    rustc_version = run("setup-rustc-version", [str(TC / "rustc"), "-vV"], "setup", cwd=SRC, env=env)
+    assert "cargo 1.97.1" in cargo_version, "unexpected Cargo version"
+    assert "release: 1.97.1" in rustc_version, "unexpected rustc version"
+    result["toolchain_versions"] = {"cargo": cargo_version.strip().splitlines(),
+                                    "rustc": rustc_version.strip().splitlines()}
+    save()
+
+    layouts = {
+        "X": {"build": MOUNT / "build-X", "target": ROOT / "target-X"},
+        "S": {"build": MOUNT / "build-S", "target": MOUNT / "target-S"},
+    }
+    result["layouts"] = {k: {kk: str(vv) for kk, vv in v.items()} for k, v in layouts.items()}
+    result["cargo_messages"] = {}
+    for layout in ("X", "S"):
+        build, target = layouts[layout]["build"], layouts[layout]["target"]
+        assert not build.exists() and not target.exists(), "layout directories must start absent"
+        local = dict(env, CARGO_BUILD_BUILD_DIR=str(build), CARGO_TARGET_DIR=str(target))
+        sample(layout + "-start")
+        for step, args in (("build", ["build"]), ("test-no-run", ["test", "--no-run"])):
+            name = layout + "-" + step
+            text = run(name, [cargo] + args + ["--locked", "--offline", "--message-format=json-render-diagnostics"],
+                       "cargo", cwd=SRC, env=local)
+            result["cargo_messages"][name] = artifacts(text, target, build)
+            assert result["cargo_messages"][name]["build_finished_success"] is True, name + " did not finish"
+            save()
+            snapshot(layout, step, target, build)
+        sample(layout + "-end")
+
+    result["counts_before_close"] = dict(counts)
+    result["all_owned_groups_settled"] = all(c.get("group_settled") for c in result["calls"])
+    assert result["all_owned_groups_settled"], "an owned process group did not settle"
+    sample("before-detach")
+    run("image-detach", ["/usr/bin/hdiutil", "detach", str(MOUNT)], "tool")
+    assert not os.path.ismount(MOUNT), "image still mounted after detach"
+    for path in (IMAGE, ROOT / "target-X", SRC, CARGO_HOME):
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    MOUNT.rmdir()
+    result["removed_after_detach"] = ["probe.sparseimage", "target-X", "src", "cargo-home", "m (empty mountpoint)"]
+    sample("after-removal")
+    result["outcome"] = "complete"
+    exit_code = 0
+except BaseException as exc:
+    result["outcome"] = "partial"
+    result["error"] = "%s: %s" % (type(exc).__name__, exc)
+    result["preserve"] = True
+finally:
+    result["counts"] = dict(counts)
+    result["end_s"] = (now() - start_ns) / 1e9
+    result["utc_end"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        save()
+    except BaseException as save_error:
+        print("result save failed: %s" % save_error, flush=True)
+    print(json.dumps({"outcome": result["outcome"], "counts": counts, "end_s": result["end_s"],
+                      "error": result.get("error")}), flush=True)
+
+sys.exit(exit_code)

@@ -1,0 +1,76 @@
+{
+  "task": "oxide#084",
+  "author_clock": {
+    "start": "2026-10-18T21:17:58Z",
+    "deadline": "2026-10-18T21:47:58Z",
+    "revision_1_start": "2026-10-18T21:26:14Z"
+  },
+  "cargo_source": {
+    "commit": "c980f4866141969fab6254a680546a277789d6f0",
+    "method": "raw.githubusercontent.com reads of 9 named files (316 KiB total); hashes in cargo-source-sha256.txt; call-site discovery via GitHub code search on the default branch, then confirmed in the pinned files",
+    "revision_1": {
+      "date": "2026-10-18T21:26:49Z",
+      "method": "raw.githubusercontent.com reads of all 257 src/cargo and src/bin .rs files at the pinned commit (3,844,012 bytes; cumulative fetched source about 4.2 MB, under the 8 MiB cap), listed from the pinned git tree; hashes in cargo-source-full-sha256.txt",
+      "purpose": "complete auto_gc / compile_ws / ops::fetch caller grep and orphan-removal reading (review 6255341560)",
+      "cargo_invocations": 0
+    },
+    "revision_3": {
+      "date": "2026-10-18T21:38:14Z",
+      "method": "re-fetched 25 pinned command/ops files (310,057 bytes; cumulative fetched source about 4.5 MB, under the 8 MiB cap) to inspect every return/bail!/Ok(None) between each entry point and the GC call",
+      "purpose": "review 6255453679: install --list, publish nothing-to-publish, -Zfix-edition skip",
+      "cargo_invocations": 0
+    }
+  },
+  "toolchain": "cargo 1.97.1 (c980f4866 2026-06-30), invoked by absolute path from the installed 1.97.1 toolchain with env -i; RUSTUP_HOME read-only",
+  "scratch": {
+    "root": "/private/tmp/oxide-084.Df89lF (mode 0700, fresh mktemp)",
+    "cargo_home": "/private/tmp/oxide-084.Df89lF/run/home (mode 0700, fresh, never seeded)",
+    "ancestor_cargo_config": "none at /.cargo, /private/.cargo, /private/tmp/.cargo",
+    "peak_home_kib": 136,
+    "host_free_gib_min": 721,
+    "removed_after_session": true
+  },
+  "session": {
+    "count": 1,
+    "admission": "effigy heavy via task-owned effigy.toml (retained)",
+    "start": "2026-10-18T21:20:23Z",
+    "end": "2026-10-18T21:20:27Z",
+    "effigy_exit": 0,
+    "cargo_calls": 6,
+    "cargo_call_cap": 6,
+    "exits": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  "downloads": [
+    {
+      "registry": "crates.io sparse index",
+      "crate": "cfg-if",
+      "version": "1.0.0",
+      "bytes": 7934,
+      "sha256": "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd",
+      "lockfile_checksum_match": true,
+      "receipt": "raw/2-fetch-online-default.log: Downloaded cfg-if v1.0.0"
+    }
+  ],
+  "index_reads": "sparse index config and the cfg-if index file only (call 2)",
+  "observed": {
+    "call2_fetch_online_default": "last auto gc was 1792358423, skipping (database primed at creation)",
+    "call3_fetch_offline_always": "running offline, auto gc disabled",
+    "call4_check_frozen_always": "running offline, auto gc disabled",
+    "call5_fetch_online_always_closed_proxy": "last auto gc was 1792358423, running; last_auto_gc -> 1792358425; exit 0",
+    "call6_check_online_always_closed_proxy": "last auto gc was 1792358425, running; last_auto_gc -> 1792358427; exit 0",
+    "deletions": "none; no entry was age-eligible in a fresh home"
+  },
+  "database_access": "sqlite3 -readonly SELECTs only; never edited",
+  "not_proven": [
+    "cargo clippy reaching auto_gc: Clippy's own source was not read (it runs cargo check)",
+    "actual deletion of age-eligible or orphaned entries (source only)",
+    "fetch in a dependency-free package (not run)"
+  ]
+}

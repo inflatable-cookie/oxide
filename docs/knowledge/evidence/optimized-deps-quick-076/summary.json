@@ -1,0 +1,942 @@
+{
+  "outcome": "complete",
+  "stop_reason": null,
+  "counts": {
+    "measured": 12,
+    "setup": 1
+  },
+  "pin": "22d2f7709b9d3e9e826b0ce64f893292f8f6fda7",
+  "toolchain": "1.97.1-aarch64-apple-darwin",
+  "utc_start": "2026-10-18T21:20:36Z",
+  "session": {
+    "start_ns": 309618161998333,
+    "deadline_ns": 311418161998333,
+    "clock": "raw mach_continuous_time via mach_timebase_info, started in submit.py before pin check, root creation, admission wait and setup",
+    "admitted_offset_s": 0.425,
+    "admitted_utc": "2026-10-18T21:20:36Z",
+    "end_offset_s": 93.47
+  },
+  "raw_log_bytes": 726311,
+  "arms": {
+    "A": {
+      "what": "stable 1.97.1, quick recipe (env-defined oxide-quick profile)",
+      "builds": [
+        {
+          "label": "cold",
+          "wall_s": 4.2396,
+          "exit": 0,
+          "fresh_count": 0,
+          "rebuilt_count": 38
+        },
+        {
+          "label": "e1",
+          "wall_s": 0.7709,
+          "exit": 0,
+          "fresh_count": 29,
+          "rebuilt_count": 9
+        },
+        {
+          "label": "e2",
+          "wall_s": 0.8166,
+          "exit": 0,
+          "fresh_count": 29,
+          "rebuilt_count": 9
+        },
+        {
+          "label": "e3",
+          "wall_s": 0.8253,
+          "exit": 0,
+          "fresh_count": 29,
+          "rebuilt_count": 9
+        }
+      ],
+      "cold_build_s": 4.2396,
+      "warm_build_mean_s": 0.8043,
+      "test_cycles": [
+        {
+          "label": "cold",
+          "harness_total_s": 6.9677,
+          "per_binary_s": {
+            "oxide-storage-inventory:bin": 0.2523,
+            "oxide-storage-lease:bin": 0.2255,
+            "profile_backtrace:test": 0.2373,
+            "oxide_storage:lib": 5.6345,
+            "oxide:bin": 0.6181
+          }
+        },
+        {
+          "label": "e1",
+          "harness_total_s": 3.7936,
+          "per_binary_s": {
+            "oxide_storage:lib": 2.439,
+            "oxide-storage-inventory:bin": 0.2754,
+            "oxide-storage-lease:bin": 0.2239,
+            "profile_backtrace:test": 0.2409,
+            "oxide:bin": 0.6144
+          }
+        },
+        {
+          "label": "e2",
+          "harness_total_s": 6.1571,
+          "per_binary_s": {
+            "oxide_storage:lib": 2.3611,
+            "oxide-storage-inventory:bin": 2.7589,
+            "oxide-storage-lease:bin": 0.2272,
+            "profile_backtrace:test": 0.2344,
+            "oxide:bin": 0.5755
+          }
+        },
+        {
+          "label": "e3",
+          "harness_total_s": 3.6041,
+          "per_binary_s": {
+            "oxide-storage-inventory:bin": 0.244,
+            "oxide_storage:lib": 2.3075,
+            "oxide-storage-lease:bin": 0.2425,
+            "profile_backtrace:test": 0.2344,
+            "oxide:bin": 0.5757
+          }
+        }
+      ],
+      "warm_harness_mean_s": 4.5183,
+      "membership_passed_ignored_failed": {
+        "oxide-storage-inventory:bin": [
+          [
+            0,
+            0,
+            0
+          ]
+        ],
+        "oxide-storage-lease:bin": [
+          [
+            0,
+            0,
+            0
+          ]
+        ],
+        "profile_backtrace:test": [
+          [
+            1,
+            0,
+            0
+          ]
+        ],
+        "oxide_storage:lib": [
+          [
+            52,
+            0,
+            0
+          ]
+        ],
+        "oxide:bin": [
+          [
+            36,
+            0,
+            0
+          ]
+        ]
+      },
+      "target_after_cold_mib": 190.3,
+      "target_final": {
+        "files": 1304,
+        "apparent": 262.0,
+        "allocated": 264.7,
+        "workspace_allocated": 55.1,
+        "dependency_allocated": 209.5,
+        "other_allocated": 0.0
+      },
+      "edits": [
+        {
+          "edit": 1,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32768;",
+          "new": "pub const MAX_REFERENCES: usize = 32769;"
+        },
+        {
+          "edit": 2,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32769;",
+          "new": "pub const MAX_REFERENCES: usize = 32770;"
+        },
+        {
+          "edit": 3,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32770;",
+          "new": "pub const MAX_REFERENCES: usize = 32771;"
+        }
+      ]
+    },
+    "B": {
+      "what": "A plus profile.oxide-quick.package.\"*\".opt-level = 1",
+      "builds": [
+        {
+          "label": "cold",
+          "wall_s": 7.5835,
+          "exit": 0,
+          "fresh_count": 0,
+          "rebuilt_count": 38
+        },
+        {
+          "label": "e1",
+          "wall_s": 0.7789,
+          "exit": 0,
+          "fresh_count": 29,
+          "rebuilt_count": 9
+        },
+        {
+          "label": "e2",
+          "wall_s": 0.8099,
+          "exit": 0,
+          "fresh_count": 29,
+          "rebuilt_count": 9
+        },
+        {
+          "label": "e3",
+          "wall_s": 0.875,
+          "exit": 0,
+          "fresh_count": 29,
+          "rebuilt_count": 9
+        }
+      ],
+      "cold_build_s": 7.5835,
+      "warm_build_mean_s": 0.8213,
+      "test_cycles": [
+        {
+          "label": "cold",
+          "harness_total_s": 5.8533,
+          "per_binary_s": {
+            "oxide-storage-inventory:bin": 2.4835,
+            "oxide-storage-lease:bin": 0.2291,
+            "profile_backtrace:test": 0.2357,
+            "oxide_storage:lib": 2.2924,
+            "oxide:bin": 0.6126
+          }
+        },
+        {
+          "label": "e1",
+          "harness_total_s": 3.67,
+          "per_binary_s": {
+            "oxide-storage-inventory:bin": 0.2501,
+            "oxide_storage:lib": 2.3404,
+            "oxide-storage-lease:bin": 0.2564,
+            "profile_backtrace:test": 0.244,
+            "oxide:bin": 0.5791
+          }
+        },
+        {
+          "label": "e2",
+          "harness_total_s": 6.8024,
+          "per_binary_s": {
+            "oxide_storage:lib": 2.5082,
+            "oxide-storage-lease:bin": 3.2033,
+            "oxide-storage-inventory:bin": 0.2206,
+            "profile_backtrace:test": 0.2767,
+            "oxide:bin": 0.5936
+          }
+        },
+        {
+          "label": "e3",
+          "harness_total_s": 5.8878,
+          "per_binary_s": {
+            "oxide_storage:lib": 2.5786,
+            "oxide-storage-inventory:bin": 0.4899,
+            "oxide-storage-lease:bin": 1.9965,
+            "profile_backtrace:test": 0.2439,
+            "oxide:bin": 0.5789
+          }
+        }
+      ],
+      "warm_harness_mean_s": 5.4534,
+      "membership_passed_ignored_failed": {
+        "oxide-storage-inventory:bin": [
+          [
+            0,
+            0,
+            0
+          ]
+        ],
+        "oxide-storage-lease:bin": [
+          [
+            0,
+            0,
+            0
+          ]
+        ],
+        "profile_backtrace:test": [
+          [
+            1,
+            0,
+            0
+          ]
+        ],
+        "oxide_storage:lib": [
+          [
+            52,
+            0,
+            0
+          ]
+        ],
+        "oxide:bin": [
+          [
+            36,
+            0,
+            0
+          ]
+        ]
+      },
+      "target_after_cold_mib": 187.5,
+      "target_final": {
+        "files": 1343,
+        "apparent": 259.8,
+        "allocated": 262.6,
+        "workspace_allocated": 54.5,
+        "dependency_allocated": 208.1,
+        "other_allocated": 0.0
+      },
+      "edits": [
+        {
+          "edit": 1,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32768;",
+          "new": "pub const MAX_REFERENCES: usize = 32769;"
+        },
+        {
+          "edit": 2,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32769;",
+          "new": "pub const MAX_REFERENCES: usize = 32770;"
+        },
+        {
+          "edit": 3,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32770;",
+          "new": "pub const MAX_REFERENCES: usize = 32771;"
+        }
+      ]
+    },
+    "C": {
+      "what": "A plus profile.oxide-quick.package.\"*\".opt-level = 2",
+      "builds": [
+        {
+          "label": "cold",
+          "wall_s": 7.4501,
+          "exit": 0,
+          "fresh_count": 0,
+          "rebuilt_count": 38
+        },
+        {
+          "label": "e1",
+          "wall_s": 0.8196,
+          "exit": 0,
+          "fresh_count": 29,
+          "rebuilt_count": 9
+        },
+        {
+          "label": "e2",
+          "wall_s": 1.0098,
+          "exit": 0,
+          "fresh_count": 29,
+          "rebuilt_count": 9
+        },
+        {
+          "label": "e3",
+          "wall_s": 0.8377,
+          "exit": 0,
+          "fresh_count": 29,
+          "rebuilt_count": 9
+        }
+      ],
+      "cold_build_s": 7.4501,
+      "warm_build_mean_s": 0.889,
+      "test_cycles": [
+        {
+          "label": "cold",
+          "harness_total_s": 3.5221,
+          "per_binary_s": {
+            "oxide-storage-inventory:bin": 0.2425,
+            "oxide-storage-lease:bin": 0.2291,
+            "profile_backtrace:test": 0.2335,
+            "oxide_storage:lib": 2.215,
+            "oxide:bin": 0.602
+          }
+        },
+        {
+          "label": "e1",
+          "harness_total_s": 6.1792,
+          "per_binary_s": {
+            "oxide_storage:lib": 2.9268,
+            "oxide-storage-lease:bin": 2.2037,
+            "oxide-storage-inventory:bin": 0.2312,
+            "profile_backtrace:test": 0.2367,
+            "oxide:bin": 0.5808
+          }
+        },
+        {
+          "label": "e2",
+          "harness_total_s": 3.5149,
+          "per_binary_s": {
+            "oxide_storage:lib": 2.2122,
+            "oxide-storage-inventory:bin": 0.2485,
+            "oxide-storage-lease:bin": 0.243,
+            "profile_backtrace:test": 0.2302,
+            "oxide:bin": 0.581
+          }
+        },
+        {
+          "label": "e3",
+          "harness_total_s": 6.9172,
+          "per_binary_s": {
+            "oxide_storage:lib": 2.4511,
+            "oxide-storage-lease:bin": 3.0846,
+            "oxide-storage-inventory:bin": 0.2337,
+            "profile_backtrace:test": 0.2409,
+            "oxide:bin": 0.9069
+          }
+        }
+      ],
+      "warm_harness_mean_s": 5.5371,
+      "membership_passed_ignored_failed": {
+        "oxide-storage-inventory:bin": [
+          [
+            0,
+            0,
+            0
+          ]
+        ],
+        "oxide-storage-lease:bin": [
+          [
+            0,
+            0,
+            0
+          ]
+        ],
+        "profile_backtrace:test": [
+          [
+            1,
+            0,
+            0
+          ]
+        ],
+        "oxide_storage:lib": [
+          [
+            52,
+            0,
+            0
+          ]
+        ],
+        "oxide:bin": [
+          [
+            36,
+            0,
+            0
+          ]
+        ]
+      },
+      "target_after_cold_mib": 191.7,
+      "target_final": {
+        "files": 1329,
+        "apparent": 263.7,
+        "allocated": 266.4,
+        "workspace_allocated": 55.5,
+        "dependency_allocated": 210.9,
+        "other_allocated": 0.0
+      },
+      "edits": [
+        {
+          "edit": 1,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32768;",
+          "new": "pub const MAX_REFERENCES: usize = 32769;"
+        },
+        {
+          "edit": 2,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32769;",
+          "new": "pub const MAX_REFERENCES: usize = 32770;"
+        },
+        {
+          "edit": 3,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32770;",
+          "new": "pub const MAX_REFERENCES: usize = 32771;"
+        }
+      ]
+    }
+  },
+  "boundaries": [
+    {
+      "label": "admitted",
+      "offset_s": 0.425,
+      "loadavg": [
+        9.18994140625,
+        6.01416015625,
+        6.60107421875
+      ],
+      "host_free": 775250747392
+    },
+    {
+      "label": "A start",
+      "offset_s": 0.933,
+      "loadavg": [
+        9.18994140625,
+        6.01416015625,
+        6.60107421875
+      ],
+      "host_free": 775233150976
+    },
+    {
+      "label": "A after cold",
+      "offset_s": 12.27,
+      "loadavg": [
+        9.35107421875,
+        6.22119140625,
+        6.66455078125
+      ],
+      "host_free": 775038377984
+    },
+    {
+      "label": "A after e1",
+      "offset_s": 16.944,
+      "loadavg": [
+        8.68212890625,
+        6.13427734375,
+        6.63134765625
+      ],
+      "host_free": 774953390080
+    },
+    {
+      "label": "A after e2",
+      "offset_s": 23.981,
+      "loadavg": [
+        8.14697265625,
+        6.0654296875,
+        6.60400390625
+      ],
+      "host_free": 774953975808
+    },
+    {
+      "label": "A after e3",
+      "offset_s": 28.484,
+      "loadavg": [
+        7.654296875,
+        5.99755859375,
+        6.57666015625
+      ],
+      "host_free": 774953095168
+    },
+    {
+      "label": "B start",
+      "offset_s": 28.567,
+      "loadavg": [
+        7.654296875,
+        5.99755859375,
+        6.57666015625
+      ],
+      "host_free": 774953082880
+    },
+    {
+      "label": "B after cold",
+      "offset_s": 42.197,
+      "loadavg": [
+        8.5634765625,
+        6.314453125,
+        6.681640625
+      ],
+      "host_free": 774764371968
+    },
+    {
+      "label": "B after e1",
+      "offset_s": 46.84,
+      "loadavg": [
+        8.03759765625,
+        6.24267578125,
+        6.65380859375
+      ],
+      "host_free": 774681612288
+    },
+    {
+      "label": "B after e2",
+      "offset_s": 54.578,
+      "loadavg": [
+        7.6337890625,
+        6.1884765625,
+        6.63232421875
+      ],
+      "host_free": 774617399296
+    },
+    {
+      "label": "B after e3",
+      "offset_s": 61.478,
+      "loadavg": [
+        7.77001953125,
+        6.26416015625,
+        6.65380859375
+      ],
+      "host_free": 774503575552
+    },
+    {
+      "label": "C start",
+      "offset_s": 61.603,
+      "loadavg": [
+        7.77001953125,
+        6.26416015625,
+        6.65380859375
+      ],
+      "host_free": 774502645760
+    },
+    {
+      "label": "C after cold",
+      "offset_s": 72.817,
+      "loadavg": [
+        9.23974609375,
+        6.64599609375,
+        6.78564453125
+      ],
+      "host_free": 774311964672
+    },
+    {
+      "label": "C after e1",
+      "offset_s": 80.091,
+      "loadavg": [
+        8.73974609375,
+        6.58544921875,
+        6.76318359375
+      ],
+      "host_free": 774226903040
+    },
+    {
+      "label": "C after e2",
+      "offset_s": 84.801,
+      "loadavg": [
+        10.92236328125,
+        7.07373046875,
+        6.93408203125
+      ],
+      "host_free": 774229688320
+    },
+    {
+      "label": "C after e3",
+      "offset_s": 92.962,
+      "loadavg": [
+        10.373046875,
+        7.08642578125,
+        6.93994140625
+      ],
+      "host_free": 774132162560
+    },
+    {
+      "label": "end",
+      "offset_s": 93.355,
+      "loadavg": [
+        10.373046875,
+        7.08642578125,
+        6.93994140625
+      ],
+      "host_free": 774131339264
+    }
+  ],
+  "owned_boundaries": [
+    {
+      "label": "after setup",
+      "offset_s": 0.933,
+      "owned_allocated_bytes": 16723968,
+      "host_free": 775233155072,
+      "raw_log_bytes": 609
+    },
+    {
+      "label": "A after cold",
+      "offset_s": 12.316,
+      "owned_allocated_bytes": 216391680,
+      "host_free": 775038369792,
+      "raw_log_bytes": 83633
+    },
+    {
+      "label": "A final",
+      "offset_s": 28.564,
+      "owned_allocated_bytes": 294801408,
+      "host_free": 774953086976,
+      "raw_log_bytes": 241775
+    },
+    {
+      "label": "B after cold",
+      "offset_s": 42.285,
+      "owned_allocated_bytes": 491528192,
+      "host_free": 774764310528,
+      "raw_log_bytes": 325901
+    },
+    {
+      "label": "B final",
+      "offset_s": 61.597,
+      "owned_allocated_bytes": 570650624,
+      "host_free": 774502649856,
+      "raw_log_bytes": 484043
+    },
+    {
+      "label": "C after cold",
+      "offset_s": 72.927,
+      "owned_allocated_bytes": 771837952,
+      "host_free": 774312177664,
+      "raw_log_bytes": 568169
+    },
+    {
+      "label": "C final",
+      "offset_s": 93.262,
+      "owned_allocated_bytes": 850501632,
+      "host_free": 774126710784,
+      "raw_log_bytes": 726311
+    },
+    {
+      "label": "end",
+      "offset_s": 93.436,
+      "owned_allocated_bytes": 850513920,
+      "host_free": 774130589696,
+      "raw_log_bytes": 726311
+    }
+  ],
+  "settings_comparison": {
+    "A": {
+      "unit_count": 38,
+      "same_unit_keys_as_first_arm": true,
+      "units_with_other_setting_differences": [],
+      "opt_level_by_class": {
+        "dependency": {
+          "0 (absent)": [
+            "block_buffer",
+            "cfg_if",
+            "cpufeatures",
+            "crypto_common",
+            "digest",
+            "generic_array",
+            "itoa",
+            "libc",
+            "memchr",
+            "proc_macro2",
+            "quote",
+            "serde",
+            "serde_core",
+            "serde_json",
+            "sha2",
+            "syn",
+            "typenum",
+            "unicode_ident",
+            "version_check",
+            "zmij"
+          ]
+        },
+        "dependency build script": {
+          "0 (absent)": [
+            "build_script_build",
+            "build_script_build",
+            "build_script_build",
+            "build_script_build",
+            "build_script_build",
+            "build_script_build",
+            "build_script_build",
+            "build_script_build"
+          ]
+        },
+        "dependency proc-macro": {
+          "0 (absent)": [
+            "serde_derive"
+          ]
+        },
+        "workspace": {
+          "0 (absent)": [
+            "oxide",
+            "oxide",
+            "oxide_storage",
+            "oxide_storage",
+            "oxide_storage_inventory",
+            "oxide_storage_inventory",
+            "oxide_storage_lease",
+            "oxide_storage_lease",
+            "profile_backtrace"
+          ]
+        }
+      }
+    },
+    "B": {
+      "unit_count": 38,
+      "same_unit_keys_as_first_arm": true,
+      "units_with_other_setting_differences": [
+        "block_buffer|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/block-buffer-0.10.4/src/lib.rs|debuginfo=line-tables-only",
+        "build_script_build|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7/build.rs|debuginfo=absent",
+        "build_script_build|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/libc-0.2.190/build.rs|debuginfo=absent",
+        "build_script_build|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107/build.rs|debuginfo=absent",
+        "build_script_build|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/quote-1.0.47/build.rs|debuginfo=absent",
+        "build_script_build|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/build.rs|debuginfo=absent",
+        "build_script_build|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229/build.rs|debuginfo=absent",
+        "build_script_build|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/build.rs|debuginfo=absent",
+        "build_script_build|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23/build.rs|debuginfo=absent",
+        "cfg_if|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.5/src/lib.rs|debuginfo=line-tables-only",
+        "cpufeatures|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/cpufeatures-0.2.17/src/lib.rs|debuginfo=line-tables-only",
+        "crypto_common|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/crypto-common-0.1.7/src/lib.rs|debuginfo=line-tables-only",
+        "digest|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/digest-0.10.7/src/lib.rs|debuginfo=line-tables-only",
+        "generic_array|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7/src/lib.rs|debuginfo=line-tables-only",
+        "itoa|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/itoa-1.0.18/src/lib.rs|debuginfo=line-tables-only",
+        "libc|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/libc-0.2.190/src/lib.rs|debuginfo=line-tables-only",
+        "memchr|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/memchr-2.8.3/src/lib.rs|debuginfo=line-tables-only",
+        "proc_macro2|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107/src/lib.rs|debuginfo=absent",
+        "quote|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/quote-1.0.47/src/lib.rs|debuginfo=absent",
+        "serde_core|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229/src/lib.rs|debuginfo=line-tables-only",
+        "serde_derive|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/serde_derive-1.0.229/src/lib.rs|debuginfo=absent",
+        "serde_json|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/src/lib.rs|debuginfo=line-tables-only",
+        "serde|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs|debuginfo=line-tables-only",
+        "sha2|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/sha2-0.10.9/src/lib.rs|debuginfo=line-tables-only",
+        "syn|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/syn-3.0.7/src/lib.rs|debuginfo=absent",
+        "typenum|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/typenum-1.20.1/src/lib.rs|debuginfo=line-tables-only",
+        "unicode_ident|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.26/src/lib.rs|debuginfo=absent",
+        "version_check|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/version_check-0.9.5/src/lib.rs|debuginfo=absent",
+        "zmij|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23/src/lib.rs|debuginfo=line-tables-only"
+      ],
+      "opt_level_by_class": {
+        "dependency": {
+          "1": [
+            "block_buffer",
+            "cfg_if",
+            "cpufeatures",
+            "crypto_common",
+            "digest",
+            "generic_array",
+            "itoa",
+            "libc",
+            "memchr",
+            "proc_macro2",
+            "quote",
+            "serde",
+            "serde_core",
+            "serde_json",
+            "sha2",
+            "syn",
+            "typenum",
+            "unicode_ident",
+            "version_check",
+            "zmij"
+          ]
+        },
+        "dependency build script": {
+          "1": [
+            "build_script_build",
+            "build_script_build",
+            "build_script_build",
+            "build_script_build",
+            "build_script_build",
+            "build_script_build",
+            "build_script_build",
+            "build_script_build"
+          ]
+        },
+        "dependency proc-macro": {
+          "1": [
+            "serde_derive"
+          ]
+        },
+        "workspace": {
+          "0 (absent)": [
+            "oxide",
+            "oxide",
+            "oxide_storage",
+            "oxide_storage",
+            "oxide_storage_inventory",
+            "oxide_storage_inventory",
+            "oxide_storage_lease",
+            "oxide_storage_lease",
+            "profile_backtrace"
+          ]
+        }
+      }
+    },
+    "C": {
+      "unit_count": 38,
+      "same_unit_keys_as_first_arm": true,
+      "units_with_other_setting_differences": [
+        "block_buffer|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/block-buffer-0.10.4/src/lib.rs|debuginfo=line-tables-only",
+        "build_script_build|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7/build.rs|debuginfo=absent",
+        "build_script_build|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/libc-0.2.190/build.rs|debuginfo=absent",
+        "build_script_build|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107/build.rs|debuginfo=absent",
+        "build_script_build|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/quote-1.0.47/build.rs|debuginfo=absent",
+        "build_script_build|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/build.rs|debuginfo=absent",
+        "build_script_build|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229/build.rs|debuginfo=absent",
+        "build_script_build|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/build.rs|debuginfo=absent",
+        "build_script_build|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23/build.rs|debuginfo=absent",
+        "cfg_if|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.5/src/lib.rs|debuginfo=line-tables-only",
+        "cpufeatures|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/cpufeatures-0.2.17/src/lib.rs|debuginfo=line-tables-only",
+        "crypto_common|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/crypto-common-0.1.7/src/lib.rs|debuginfo=line-tables-only",
+        "digest|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/digest-0.10.7/src/lib.rs|debuginfo=line-tables-only",
+        "generic_array|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/generic-array-0.14.7/src/lib.rs|debuginfo=line-tables-only",
+        "itoa|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/itoa-1.0.18/src/lib.rs|debuginfo=line-tables-only",
+        "libc|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/libc-0.2.190/src/lib.rs|debuginfo=line-tables-only",
+        "memchr|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/memchr-2.8.3/src/lib.rs|debuginfo=line-tables-only",
+        "proc_macro2|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/proc-macro2-1.0.107/src/lib.rs|debuginfo=absent",
+        "quote|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/quote-1.0.47/src/lib.rs|debuginfo=absent",
+        "serde_core|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/serde_core-1.0.229/src/lib.rs|debuginfo=line-tables-only",
+        "serde_derive|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/serde_derive-1.0.229/src/lib.rs|debuginfo=absent",
+        "serde_json|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/src/lib.rs|debuginfo=line-tables-only",
+        "serde|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs|debuginfo=line-tables-only",
+        "sha2|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/sha2-0.10.9/src/lib.rs|debuginfo=line-tables-only",
+        "syn|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/syn-3.0.7/src/lib.rs|debuginfo=absent",
+        "typenum|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/typenum-1.20.1/src/lib.rs|debuginfo=line-tables-only",
+        "unicode_ident|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.26/src/lib.rs|debuginfo=absent",
+        "version_check|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/version_check-0.9.5/src/lib.rs|debuginfo=absent",
+        "zmij|lib/bin|<registry>/index.crates.io-1949cf8c6b5b557f/zmij-1.0.23/src/lib.rs|debuginfo=line-tables-only"
+      ],
+      "opt_level_by_class": {
+        "dependency": {
+          "2": [
+            "block_buffer",
+            "cfg_if",
+            "cpufeatures",
+            "crypto_common",
+            "digest",
+            "generic_array",
+            "itoa",
+            "libc",
+            "memchr",
+            "proc_macro2",
+            "quote",
+            "serde",
+            "serde_core",
+            "serde_json",
+            "sha2",
+            "syn",
+            "typenum",
+            "unicode_ident",
+            "version_check",
+            "zmij"
+          ]
+        },
+        "dependency build script": {
+          "2": [
+            "build_script_build",
+            "build_script_build",
+            "build_script_build",
+            "build_script_build",
+            "build_script_build",
+            "build_script_build",
+            "build_script_build",
+            "build_script_build"
+          ]
+        },
+        "dependency proc-macro": {
+          "2": [
+            "serde_derive"
+          ]
+        },
+        "workspace": {
+          "0 (absent)": [
+            "oxide",
+            "oxide",
+            "oxide_storage",
+            "oxide_storage",
+            "oxide_storage_inventory",
+            "oxide_storage_inventory",
+            "oxide_storage_lease",
+            "oxide_storage_lease",
+            "profile_backtrace"
+          ]
+        }
+      }
+    }
+  },
+  "notes": []
+}

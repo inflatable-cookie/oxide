@@ -5,8 +5,10 @@ Status: product design under Tom's
 The foundation core and `init` / `new` adoption are implemented as the
 unpublished, uninstalled `oxide` binary; the agent skill exists as repository
 source only. [Implemented foundation core](#implemented-foundation-core)
-states exactly what ships, including the cross-checkout freshness gate.
-Non-build run strategies and a Linux backend are not implemented. Fixture proofs are not real-project
+states exactly what ships, including the cross-checkout freshness gate and
+the budget-only directory backend. Non-build run strategies and the
+privileged `linux-image-v1` backend are not implemented, and nothing has run
+on a real Linux host. Fixture proofs are not real-project
 qualification, default-pool creation outside tests, installation (binary or
 skill) or consumer-adoption authority. Other sections
 state the target design.
@@ -75,6 +77,11 @@ project's own `[profile.dev]` settings:
   recipe keeps dependency line tables, unlike the `oxide-light` recipe in
   [stable Cargo profiles](stable-cargo-profiles.md). Whether dependency debug-off
   is worth a config file is part of [W-3](#open-decisions).
+  On macOS its default unpacked split debug info leaves per-rebuild
+  `*.rcgu.o` names in `deps/`. A 2026-10-18 measurement recommends
+  `split-debuginfo = "packed"` if a fix is adopted and rejects workspace
+  debug-off for `quick` ([landscape](../rust-dx-landscape.md#stale-debug-object-measurement-2026-10-18)).
+  The recipe is unchanged pending that decision.
 - `oxide-debug`: inherits `dev`, full debug for every unit, including build-time
   units through `CARGO_PROFILE_OXIDE_DEBUG_BUILD_OVERRIDE_DEBUG`.
 - `release`: untouched.
@@ -90,10 +97,12 @@ hot patching of a running process. Each is qualified per platform and project
 shape before Oxide may select it; current state is in the
 [landscape](../rust-dx-landscape.md#quick-run-strategies)
 ([Q-009](../questions.md#q-009--which-alternative-execution-modes-improve-the-daily-loop)).
+The 2026-10-18 [Cranelift measurement](../rust-dx-landscape.md#cranelift-measurement-2026-10-18)
+found no edit-loop gain on Oxide's own workspace, so no strategy is selected.
 Rules:
 
 - Oxide prints the strategy it used and any semantic compromise, for example
-  panic-abort under Cranelift on macOS.
+  `catch_unwind` not catching inside Cranelift-compiled code on macOS.
 - If a strategy cannot build or start the program, Oxide falls back to quick
   build plus execute. A program failure is reported, never retried under
   another strategy.
@@ -324,8 +333,9 @@ explicit `recover` unless they adopt it.
 ## Storage and space management
 
 - One per-user host pool: the existing [bounded APFS backend](bounded-storage.md)
-  on macOS. The volume size is the hard aggregate ceiling. Only whole idle slots
-  are evicted.
+  on macOS, where the volume size is the hard aggregate ceiling; the
+  budget-only [directory backend](#platform-backends) elsewhere or by explicit
+  setting. Only whole idle slots are evicted.
 - The first command creates the pool automatically ([W-1](#open-decisions)).
 - Per-project slot cap, recommended 2 to start, plus a host-wide limit on
   concurrent Cargo invocations ([W-2](#open-decisions)). Queue/Nucleus still
@@ -555,10 +565,17 @@ has run against no real project.
   runs before Cargo. A slot detached by `oxide clean` is never shared. If the
   gate refuses, the slot goes back unchanged and the command takes a new or
   evicted slot cold.
-- **Pool.** `OXIDE_POOL`, else `~/Library/Caches/oxide/pool`, created on first
-  building command with a 24 GiB cap equal to its sparse image. Creation
-  refuses below 20 GiB host free space. An existing pool from
-  `oxide-storage-lease init` opens unchanged.
+- **Pool.** `OXIDE_POOL`, else `~/Library/Caches/oxide/pool` on macOS and
+  `$XDG_CACHE_HOME/oxide/pool` or `~/.cache/oxide/pool` elsewhere, created on
+  first building command. Creation refuses below 20 GiB host free space. On
+  macOS the default is `apfs-sparse-image-v1` with a 24 GiB cap equal to its
+  sparse image. `OXIDE_POOL_BACKEND=directory-budget` selects
+  `directory-budget-v1` instead, with a recorded 24 GiB budget; it is the
+  default on other platforms, where `apfs-sparse-image` refuses. Any other
+  value refuses. The variable applies only at creation: naming a backend
+  other than an existing pool's refuses, so an existing pool from
+  `oxide-storage-lease init` opens unchanged. See
+  [Platform backends](#platform-backends).
 - **Slots and waiting.** Per-project cap 2: a new checkout or key at the cap
   evicts the project's least recently used idle slot whole and builds cold.
   Host-wide limit 2 commands holding slots (`OXIDE_MAX_ACTIVE`, 1–32). Excess
@@ -579,7 +596,10 @@ has run against no real project.
   environment (`CARGO_PKG_*`, dylib paths) is not set. Exit codes are Cargo's,
   or the program's for `run`.
 - **Summary.** One stderr line per leased command: profile, strategy (`build`
-  or `build+execute`), slot, warm/cold, elapsed time and payload volume use.
+  or `build+execute`), slot, warm/cold, elapsed time, pool use and backend:
+  `pool 3 of 128 MiB used (apfs-sparse-image-v1)` (payload volume use), or
+  `pool 12 MiB allocated of 24576 MiB budget (directory-budget-v1, budget-only)`
+  (slot allocation against the budget).
   When the gate refreshed files, or reconciled another checkout's build, it
   appends the count and the outside-Git limit. A refused gate prints its
   reason on its own line before the cold build.
@@ -606,7 +626,10 @@ has run against no real project.
   an ordinary child with inherited output; a Cargo failure returns Cargo's
   exit and adopts nothing. A refusal exits 1. The covering proof runs before
   any pool exists and checks that adoption never creates one.
-- **`status`.** Pool path or "not created", cap, payload use, slot accounting
+- **`status`.** Pool path or "not created" with the backend a building
+  command would create; the backend and what bounds it; for APFS the cap and
+  payload use, for a directory pool the budget, slot allocation and the
+  watchdog trigger with the sampled pool-filesystem available bytes; slot accounting
   coverage, each slot's state, profile and checkout (an interrupted slot
   names the dead holder's PID and Cargo group), waiting commands, checkouts
   being cleaned, the newest automatic recoveries, and
@@ -624,9 +647,11 @@ refuses state that has them. The lease ledger, receipt and standalone CLI
 contract are unchanged; see
 [local lease](local-lease.md#oxide-front-door-control-directory).
 
-## Platform backends (proposed)
+## Platform backends
 
-The pool needs a backend on every host where builds run. On macOS, the APFS
+`directory-budget-v1` is implemented (see [below](#directory-budget-v1-as-shipped));
+`linux-image-v1`, CI cache save/restore and container execution are proposed
+only. The pool needs a backend on every host where builds run. On macOS, the APFS
 sparse image gives an unprivileged hard ceiling. Linux has no unprivileged
 equivalent: loop mounts, XFS/ext4 project quotas and btrfs qgroup limits all
 need root, and the filesystems an unprivileged user namespace may mount
@@ -664,6 +689,67 @@ Rules:
 - A remote executor uses the remote host's own pool. Pools are never shared
   across hosts.
 
+### `directory-budget-v1` as shipped
+
+- **Shape.** `<pool>/payload/slots/` is a plain owner-only directory on the
+  pool's own device; config, ledger and lock sit beside it as for APFS, with
+  no image or receipt. The config records the backend, store ID and budget
+  (`cap_bytes`, default 24 GiB; `image_bytes` 0). An image or receipt file,
+  any payload entry but `slots`, or a payload on another device refuses.
+  The library never mints a `BoundedBacking` for it.
+- **Admission.** The ledger's existing rules with the budget as the cap:
+  owned slots' unique allocated bytes at lease time, whole-idle-slot
+  eviction until under budget, `Full` when only held slots remain, and
+  half-budget idle recycling. Nothing enforces the budget while a build
+  writes; a build can pass it, and the next new slot evicts.
+- **Watchdog.** Only on a directory pool, only while Oxide supervises a
+  leased Cargo group (build and `run` build, `test` execution, building
+  passthrough). It samples `statfs` `f_bavail` of the payload directory
+  (`f_bsize` on macOS, `f_frsize` elsewhere) at the first poll and then
+  once a second, with no slot walk. Below 22 GiB, or when a sample fails, it
+  sends TERM to the group, then KILL after 2 s, and keeps sampling on every
+  20 ms poll so the minimum is recorded. It prints one `oxide: reserve stop`
+  line: the triggering sample, trigger, signals and KILL delay, sampled
+  minimum, overshoot past the trigger and stop latency (triggering sample to
+  observed group closure). The command fails with Cargo's code, never 0. It
+  samples only the pool filesystem; `<checkout>/target` elsewhere is not
+  watched.
+- **Closure.** After a stop the slot is released through the normal path
+  only once `killpg(pgid, 0)` reports `ESRCH`. If the leader or the group
+  outlives KILL by 10 s, Oxide prints that closure is unconfirmed and exits
+  1 without releasing: the ledger lease stays held, the record keeps
+  Cargo's group, and [crash recovery](#crash-recovery) releases it once the
+  group is empty.
+- **Test hooks.** Debug builds only: `OXIDE_TEST_WATCHDOG_READINGS` names a
+  file holding the available-bytes reading, and `OXIDE_TEST_BUDGET_BYTES`
+  sets a new pool's budget. Release builds ignore both. The reserve and
+  margin have no override.
+- **Standalone CLI.** `oxide-storage-lease` refuses a directory pool
+  (`backing_mismatch`, exit 4); see
+  [local lease](local-lease.md#oxide-front-door-control-directory).
+- **Proof.** `effigy rust:oxide-cli` adds a macOS case on two scratch
+  directory pools after the APFS image is detached: creation, summary and
+  `status` labelling; standalone refusal; a reserve stop on injected
+  readings where a bounded writer that ignores TERM lowers the reading by
+  its own fsynced writes (1 MiB per ~50 ms, at most 48 MiB, starting 8 MiB
+  above the trigger), with KILL, positive closure and normal release; an
+  unreaped group member that keeps closure unconfirmed, so the slot stays
+  held until it is reaped and the next command recovers it; and a 1 MiB
+  budget whose idle slot is evicted whole for a new key. The proof prints the
+  sampled minimum, overshoot and latency it observed. Readings are
+  injected: this shows the stop and closure semantics and the overshoot of
+  that one writer at the sampling interval, not margin adequacy for real
+  write rates. The authoring run at the oxide#077 head observed: triggering
+  sample 10 MiB below the trigger, sampled minimum 40 MiB below it (the
+  writer reached its 48 MiB bound during the 2 s grace), KILL after 2017 ms,
+  closure 2042 ms after the triggering sample; the held case confirmed no
+  closure after KILL plus 10 s and was recovered once its member was
+  reaped. Rust tests cover the real `statfs` sample, TERM-then-KILL on
+  a group that ignores TERM, a failed sample, and budget admission and
+  refusals in the library. `effigy rust:compile-linux` checks that the crate
+  compiles for the installed `x86_64-unknown-linux-gnu` target; no Linux
+  runtime behaviour is validated.
+
 ## Open decisions
 
 - **W-1 Default pool.** Foundation choice above: per-user cache directory,
@@ -680,10 +766,11 @@ Rules:
   `setsid` escape limit. Real-project qualification (Q5) remains.
 - **W-5 Retirement execution.** Done in oxide#070; see
   [retirements](../retired.toml).
-- **W-6 Linux backend.** Proposed in [platform backends](#platform-backends-proposed):
-  budget-only directory pools with a host-reserve watchdog by default, and an
-  optional privileged image backend for long-lived hosts. The watchdog and the
-  Linux lease path need implementation and a Linux fixture proof.
+- **W-6 Linux backend.** [Platform backends](#platform-backends):
+  budget-only directory pools with a host-reserve watchdog are implemented,
+  the Linux default and opt-in on macOS, fixture-proven on macOS and
+  compile-checked for Linux. A Linux runtime proof, real write-rate margin
+  evidence and the optional privileged image backend remain.
 - **W-7 Command name.** `oxide` collides with Oxide Computer Company's CLI
   ([Q-005](../questions.md#q-005--what-names-are-safe-to-publish)). The design
   is name-independent.

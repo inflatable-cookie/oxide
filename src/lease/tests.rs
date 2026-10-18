@@ -1,4 +1,5 @@
 use super::backing::CapacitySample;
+use super::managed;
 use super::pool::{
     capacity_status_injected, create_injected, evict_idle_slot_injected, lease_injected,
     mark_evicting_for_test, recover_injected, release_injected, status_injected,
@@ -6,7 +7,7 @@ use super::pool::{
 use super::{
     init_pool, render_capacity_status_human, render_capacity_status_json, render_status_json,
     AccountingCoverage, ByteObservation, LeaseError, LeaseRequest, ObservationUnknownReason,
-    Profile, SlotOccupancy, MANAGED_NAME,
+    Profile, SlotOccupancy, BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME,
 };
 use std::fs::{self, File};
 use std::io::Write;
@@ -1089,4 +1090,112 @@ fn managed_eviction_retires_only_idle_slots_and_tolerates_managed_control() {
         status_injected(&pool),
         Err(LeaseError::UnsafePath(_))
     ));
+}
+
+#[test]
+fn budget_pool_admits_against_the_budget_and_evicts_whole_idle_slots() {
+    let fx = Fixture::new("budget");
+    let pool = fx.dir("pool");
+    let budget = 64 * 1024;
+    let info = managed::init_budget_pool(&pool, budget).expect("init budget pool");
+    assert_eq!(info.backend, BUDGET_BACKEND_DIRECTORY_V1);
+    assert_eq!(info.cap_bytes, budget);
+    assert!(!pool.join("image.sparseimage").exists());
+    let project_a = fx.dir("project-a");
+    let project_b = fx.dir("project-b");
+    let project_c = fx.dir("project-c");
+    let workspace = fx.dir("workspace");
+
+    let first =
+        managed::lease(request(&pool, &project_a, &workspace, "holder-a")).expect("first lease");
+    // Nothing enforces the budget while a lease writes.
+    let blob = first.env.cargo_build_build_dir.join("blob");
+    fs::write(&blob, vec![b'x'; 256 * 1024]).expect("write past the budget");
+    let status = managed::status(&pool).expect("status");
+    assert_eq!(status.backend, BUDGET_BACKEND_DIRECTORY_V1);
+    assert_eq!(status.full, Some(true));
+
+    // Over budget with the only slot held: admission refuses a new slot.
+    assert!(matches!(
+        managed::lease(request(&pool, &project_b, &workspace, "holder-b")),
+        Err(LeaseError::Full)
+    ));
+    managed::release(&pool, &first.lease_id).expect("release");
+
+    // Over budget with an idle slot: it is evicted whole, then admitted.
+    let second = managed::lease(request(&pool, &project_b, &workspace, "holder-b"))
+        .expect("evict then admit");
+    assert_ne!(second.slot_id, first.slot_id);
+    assert!(!blob.exists());
+    assert!(!pool.join("payload/slots").join(&first.slot_id).exists());
+    managed::release(&pool, &second.lease_id).expect("release second");
+    let third =
+        managed::lease(request(&pool, &project_c, &workspace, "holder-c")).expect("under budget");
+    assert_ne!(third.slot_id, second.slot_id);
+    assert_eq!(managed::status(&pool).expect("status").slots.len(), 2);
+}
+
+#[test]
+fn hard_bound_entry_points_refuse_a_budget_pool() {
+    let fx = Fixture::new("budget-cli");
+    let pool = fx.dir("pool");
+    managed::init_budget_pool(&pool, 1024 * 1024).expect("init budget pool");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    assert!(matches!(
+        super::lease(request(&pool, &project, &workspace, "holder-a")),
+        Err(LeaseError::BackingMismatch)
+    ));
+    assert!(matches!(
+        super::status(&pool),
+        Err(LeaseError::BackingMismatch)
+    ));
+    assert!(matches!(
+        super::capacity_status(&pool),
+        Err(LeaseError::BackingMismatch)
+    ));
+    assert!(matches!(
+        super::release(&pool, "v1.x.1.1.1"),
+        Err(LeaseError::BackingMismatch)
+    ));
+}
+
+#[test]
+fn budget_pool_refuses_image_files_foreign_payload_entries_and_a_zero_budget() {
+    let fx = Fixture::new("budget-shape");
+    assert!(matches!(
+        managed::init_budget_pool(&fx.path().join("zero"), 0),
+        Err(LeaseError::InvalidInput(_))
+    ));
+    let pool = fx.dir("pool");
+    managed::init_budget_pool(&pool, 1024 * 1024).expect("init budget pool");
+    managed::status(&pool).expect("opens");
+    let image = pool.join("image.sparseimage");
+    fs::write(&image, b"").expect("stray image");
+    assert!(matches!(
+        managed::status(&pool),
+        Err(LeaseError::BackingMismatch)
+    ));
+    fs::remove_file(&image).expect("remove image");
+    let foreign = pool.join("payload/foreign");
+    fs::create_dir(&foreign).expect("foreign entry");
+    assert!(matches!(
+        managed::status(&pool),
+        Err(LeaseError::UnknownAccounting)
+    ));
+    fs::remove_dir(&foreign).expect("remove foreign");
+    assert!(matches!(
+        managed::init_budget_pool(&pool, 1024 * 1024),
+        Err(LeaseError::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn managed_entry_points_still_open_the_injected_apfs_shape_only_through_the_hard_bound_path() {
+    // The injected directory poses as the APFS backend for ledger tests; the
+    // managed path opens real backings only, so it refuses the injection.
+    let fx = Fixture::new("managed-injected");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    assert!(managed::status(&pool).is_err());
 }

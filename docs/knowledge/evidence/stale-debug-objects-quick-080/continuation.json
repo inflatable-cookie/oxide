@@ -1,0 +1,16 @@
+{
+  "attempt": 2,
+  "request_id": "42978fa1-382f-454e-9d3a-65a0503a010f",
+  "caller": "oxide:worker:080-stale-debug-objects",
+  "utc_submitted": "2026-10-18T21:38:02Z",
+  "reason": "attempt 1 stopped on AttributeError: the debug-map observer read .pid from a subprocess.CompletedProcess. Both version calls and U-cold-build (exit 0) had run, and the U cold census was recorded; the observer ran before any edit.",
+  "attempt_1_counts": {
+    "measured": 1,
+    "setup": 2
+  },
+  "attempt_1_stop_reason": "harness error: AttributeError(\"'CompletedProcess' object has no attribute 'pid'\")",
+  "measure_sha256": "a945da366f2c34ba9d4409c21eb6bee85aa41c9aea4287fb5de9504a1c987033",
+  "attempt_1_measure_sha256": "9a4688afb5cac7118b2f678f7fc5ec1e43b9ea7d7cd668e01071d34a498ab93f",
+  "continue_sha256": "7a12c5e16e2ceb8e89e49e4d99f3d3d1978789db3a85584acbc16c31bbfb14ef",
+  "unchanged": "packet.json start_ns/deadline_ns, caps, root, counters, source checkout and target-U"
+}

@@ -24,10 +24,15 @@ use crate::cli::Profile;
 use crate::freshness::{Built, Prior};
 use crate::identity::SlotKey;
 use crate::process;
-use oxide_storage::lease::{
-    evict_idle_slot, init_pool, lease, recover, release, status as pool_status, LeaseError,
-    LeaseRequest, PoolStatus, Profile as LeaseProfile, SlotOccupancy, SlotStatus, MANAGED_NAME,
+use crate::watchdog::Watchdog;
+use oxide_storage::lease::managed::{
+    evict_idle_slot, init_budget_pool, lease, recover, release, status as pool_status,
 };
+use oxide_storage::lease::{
+    init_pool, LeaseError, LeaseRequest, PoolStatus, Profile as LeaseProfile, SlotOccupancy,
+    SlotStatus, BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME,
+};
+use oxide_storage::BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -37,11 +42,12 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const GIB: u64 = 1024 * 1024 * 1024;
+pub const GIB: u64 = 1024 * 1024 * 1024;
 /// Cap of an automatically created pool; the sparse image is the same size.
+/// A directory pool records the same value as its budget.
 const DEFAULT_CAP_BYTES: u64 = 24 * GIB;
 /// Automatic creation refuses below this host free space.
-const HOST_RESERVE_BYTES: u64 = 20 * GIB;
+pub const HOST_RESERVE_BYTES: u64 = 20 * GIB;
 const DEFAULT_MAX_ACTIVE: usize = 2;
 const MAX_ACTIVE_LIMIT: usize = 32;
 /// Slots one project identity may keep; a new checkout at the cap evicts the
@@ -382,18 +388,95 @@ pub struct Interrupted {
 
 pub struct Store {
     pub pool: PathBuf,
+    pub backend: Backend,
     control: PathBuf,
 }
 
-/// `OXIDE_POOL`, else `~/Library/Caches/oxide/pool`.
+/// The pool's recorded backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Backend {
+    /// macOS sparse image: the volume size is an OS-enforced ceiling.
+    ApfsImage,
+    /// Plain directory: admission and idle eviction against a recorded
+    /// budget, plus the best-effort host-reserve watchdog. No ceiling.
+    DirectoryBudget,
+}
+
+impl Backend {
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::ApfsImage => BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1,
+            Self::DirectoryBudget => BUDGET_BACKEND_DIRECTORY_V1,
+        }
+    }
+
+    /// What bounds the pool, as `status` and every summary line say it.
+    pub fn bound(self) -> &'static str {
+        match self {
+            Self::ApfsImage => "OS-enforced ceiling",
+            Self::DirectoryBudget => {
+                "budget-only: admission estimate plus best-effort reserve watchdog, no hard ceiling"
+            }
+        }
+    }
+
+    fn recorded(tag: &str) -> Result<Self, String> {
+        match tag {
+            BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1 => Ok(Self::ApfsImage),
+            BUDGET_BACKEND_DIRECTORY_V1 => Ok(Self::DirectoryBudget),
+            other => Err(format!("the pool records an unknown backend {other:?}")),
+        }
+    }
+}
+
+/// `OXIDE_POOL_BACKEND`: `directory-budget` or `apfs-sparse-image`. Unset
+/// means the platform default; any other value refuses.
+fn requested_backend() -> Result<Option<Backend>, String> {
+    let Some(value) = std::env::var_os("OXIDE_POOL_BACKEND") else {
+        return Ok(None);
+    };
+    match value.to_str() {
+        Some("directory-budget") => Ok(Some(Backend::DirectoryBudget)),
+        Some("apfs-sparse-image") => Ok(Some(Backend::ApfsImage)),
+        _ => Err("OXIDE_POOL_BACKEND must be directory-budget or apfs-sparse-image".to_owned()),
+    }
+}
+
+/// The backend a new pool gets: the APFS image on macOS unless the caller
+/// asks for a directory, and the directory everywhere else.
+pub fn creation_backend() -> Result<Backend, String> {
+    match requested_backend()? {
+        Some(Backend::ApfsImage) if !cfg!(target_os = "macos") => {
+            Err("the apfs-sparse-image backend is macOS-only".to_owned())
+        }
+        Some(backend) => Ok(backend),
+        None if cfg!(target_os = "macos") => Ok(Backend::ApfsImage),
+        None => Ok(Backend::DirectoryBudget),
+    }
+}
+
+/// `OXIDE_POOL`, else the per-user cache: `~/Library/Caches/oxide/pool` on
+/// macOS, `$XDG_CACHE_HOME/oxide/pool` or `~/.cache/oxide/pool` elsewhere.
 pub fn pool_path() -> Result<PathBuf, String> {
     let configured = match std::env::var_os("OXIDE_POOL").filter(|value| !value.is_empty()) {
         Some(path) => PathBuf::from(path),
         None => {
-            let home = std::env::var_os("HOME")
-                .filter(|value| !value.is_empty())
-                .ok_or("HOME is unset; set OXIDE_POOL to choose the pool")?;
-            Path::new(&home).join("Library/Caches/oxide/pool")
+            let xdg = std::env::var_os("XDG_CACHE_HOME")
+                .filter(|value| !cfg!(target_os = "macos") && Path::new(value).is_absolute());
+            match xdg {
+                Some(cache) => Path::new(&cache).join("oxide/pool"),
+                None => {
+                    let home = std::env::var_os("HOME")
+                        .filter(|value| !value.is_empty())
+                        .ok_or("HOME is unset; set OXIDE_POOL to choose the pool")?;
+                    let cache = if cfg!(target_os = "macos") {
+                        "Library/Caches"
+                    } else {
+                        ".cache"
+                    };
+                    Path::new(&home).join(cache).join("oxide/pool")
+                }
+            }
         }
     };
     if configured.is_absolute() {
@@ -422,7 +505,7 @@ impl Store {
     pub fn open_or_create() -> Result<Self, String> {
         let path = pool_path()?;
         if fs::symlink_metadata(&path).is_err() {
-            create_pool(&path)?;
+            create_pool(&path, creation_backend()?)?;
         }
         let store = Self::open_at(&path)?;
         store.ensure_control()?;
@@ -441,9 +524,33 @@ impl Store {
     fn open_at(path: &Path) -> Result<Self, String> {
         let pool =
             fs::canonicalize(path).map_err(|error| format!("cannot open the pool: {error}"))?;
-        pool_status(&pool).map_err(|error| lease_error("cannot open the pool", &error))?;
+        let status =
+            pool_status(&pool).map_err(|error| lease_error("cannot open the pool", &error))?;
+        let backend = Backend::recorded(&status.backend)?;
+        if let Some(requested) = requested_backend()? {
+            if requested != backend {
+                return Err(format!(
+                    "the pool at {} uses {}; OXIDE_POOL_BACKEND applies only when a pool is created (unset it or choose another OXIDE_POOL)",
+                    pool.display(),
+                    backend.tag()
+                ));
+            }
+        }
         let control = pool.join(MANAGED_NAME);
-        Ok(Self { pool, control })
+        Ok(Self {
+            pool,
+            backend,
+            control,
+        })
+    }
+
+    /// The best-effort host-reserve watchdog for a supervised build. Only a
+    /// budget-only pool has one; the APFS image's ceiling is the OS's.
+    pub fn watchdog(&self) -> Option<Watchdog> {
+        match self.backend {
+            Backend::ApfsImage => None,
+            Backend::DirectoryBudget => Some(Watchdog::for_pool(&self.pool.join("payload"))),
+        }
     }
 
     pub fn status(&self) -> Result<PoolStatus, String> {
@@ -691,8 +798,13 @@ impl Store {
         })
     }
 
-    /// Used and total bytes of the mounted payload volume.
+    /// Used and total bytes of the mounted payload volume; for a budget-only
+    /// pool, slot allocation and the recorded budget.
     pub fn payload_use(&self) -> Option<(u64, u64)> {
+        if self.backend == Backend::DirectoryBudget {
+            let status = self.status().ok()?;
+            return Some((status.payload_unique_allocated_bytes?, status.cap_bytes));
+        }
         let sample = statfs(&self.pool.join("payload"))?;
         let block = u64::try_from(sample.f_bsize).ok()?;
         let total = sample.f_blocks.checked_mul(block)?;
@@ -1272,7 +1384,7 @@ impl Store {
     }
 }
 
-fn create_pool(path: &Path) -> Result<(), String> {
+fn create_pool(path: &Path, backend: Backend) -> Result<(), String> {
     let parent = path.parent().ok_or("the pool path has no parent")?;
     let name = path
         .file_name()
@@ -1292,17 +1404,50 @@ fn create_pool(path: &Path) -> Result<(), String> {
         ));
     }
     let pool = parent.join(name);
-    eprintln!(
-        "oxide: creating the build pool at {} ({} GiB cap)",
-        pool.display(),
-        DEFAULT_CAP_BYTES / GIB
-    );
-    match init_pool(&pool, DEFAULT_CAP_BYTES, DEFAULT_CAP_BYTES) {
+    let created = match backend {
+        Backend::ApfsImage => {
+            eprintln!(
+                "oxide: creating the build pool at {} ({} GiB cap, {}, {})",
+                pool.display(),
+                DEFAULT_CAP_BYTES / GIB,
+                backend.tag(),
+                backend.bound()
+            );
+            init_pool(&pool, DEFAULT_CAP_BYTES, DEFAULT_CAP_BYTES)
+        }
+        Backend::DirectoryBudget => {
+            let budget = budget_bytes();
+            eprintln!(
+                "oxide: creating the build pool at {} ({} MiB budget, {}, {})",
+                pool.display(),
+                budget / (1024 * 1024),
+                backend.tag(),
+                backend.bound()
+            );
+            init_budget_pool(&pool, budget)
+        }
+    };
+    match created {
         Ok(_) => Ok(()),
         // Another command created it first.
         Err(_) if pool.join("config.json").is_file() => Ok(()),
         Err(error) => Err(lease_error("could not create the pool", &error)),
     }
+}
+
+/// The recorded budget of a new directory pool. Debug builds accept
+/// `OXIDE_TEST_BUDGET_BYTES` so the fixture proof can exercise admission on
+/// a tiny budget; release builds always record the default.
+fn budget_bytes() -> u64 {
+    #[cfg(debug_assertions)]
+    if let Some(bytes) = std::env::var("OXIDE_TEST_BUDGET_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+    {
+        return bytes;
+    }
+    DEFAULT_CAP_BYTES
 }
 
 /// Create missing ancestors owner-only; existing ones are left as they are.
@@ -1402,7 +1547,7 @@ fn flock(file: &File, operation: libc::c_int) -> Result<(), String> {
     }
 }
 
-fn statfs(path: &Path) -> Option<libc::statfs> {
+pub(crate) fn statfs(path: &Path) -> Option<libc::statfs> {
     let mut bytes = path.as_os_str().as_bytes().to_vec();
     bytes.push(0);
     let mut sample = std::mem::MaybeUninit::<libc::statfs>::uninit();

@@ -143,7 +143,7 @@ Tom's further approvals, 2026-10-18, were the exact bundled reply
   setup/version calls, 30 minutes, 6 GiB scratch. Its one-worktree timings cannot
   establish cross-worktree amortization; that remains conditional. Queue decision
   `96889d44-8fe6-4e91-a97c-f3e6f5c96a42` v2 records "Yes".
-- Implement the [platform backends](contracts/workflow.md#platform-backends-proposed)
+- Implement the [platform backends](contracts/workflow.md#platform-backends)
   budget-only directory backend and host-reserve watchdog, with macOS fixtures
   and an installed-target Linux compile check. Queue decision
   `51d259de-b630-400a-bc18-fd135dae6b42` v2 records "Yes". This is bounded
@@ -282,6 +282,18 @@ Tom approved three bounded probes on 2026-10-18 with "Let's do all three":
 - **C.** Whether final outputs on the pool's volume are hard-linked by Cargo instead of copied.
 
 They are research probes on disposable fixtures and Oxide's own repository. They grant no recipe, default, consumer or host change, and no adoption.
+
+Tom approved two further leads on 2026-10-18 with "Yes please":
+- A qualification of the `oxide` foundation on Cargo/Rust 1.100 after its stable release, scheduled for 2026-11-12. It includes installing the pinned `1.100.0` toolchain side by side without changing the default `stable` toolchain or Oxide's declared `rust-version`.
+- A probe of what triggers Cargo's automatic home-cache cleanup. It uses only a scratch `CARGO_HOME`, never the live one.
+
+Tom approved the storage-hygiene bundle on 2026-10-18 with "Approve": one Oxide-only PR adding:
+- Cargo home reporting in `oxide status`;
+- an explicit `oxide clean --cargo-cache` with an enforced no-network boundary that refuses routes it cannot contain;
+- `OXIDE_POOL_CAP` for new pools;
+- per-slot file-count and deduplicated-byte reporting.
+
+It is bounded to tiny fixtures and a private Cargo home. It grants no recipe change, no deletion inside slots, no live Cargo home cleanup and no consumer change.
 
 ## Authority boundaries
 

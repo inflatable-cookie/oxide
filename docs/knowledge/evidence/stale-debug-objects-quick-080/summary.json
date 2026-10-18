@@ -1,0 +1,2665 @@
+{
+  "outcome": "complete",
+  "stop_reason": null,
+  "counts": {
+    "measured": 36,
+    "setup": 2
+  },
+  "attempts": [
+    {
+      "attempt": 1,
+      "session": {
+        "start_ns": 310548195305208,
+        "deadline_ns": 312948195305208,
+        "clock": "raw mach_continuous_time via mach_timebase_info, started in submit.py before pin check, root creation, admission wait and setup",
+        "admitted_offset_s": 0.491,
+        "admitted_utc": "2026-10-18T21:36:06Z",
+        "end_offset_s": 5.507
+      },
+      "outcome": "partial",
+      "stop_reason": "harness error: AttributeError(\"'CompletedProcess' object has no attribute 'pid'\")",
+      "counts": {
+        "measured": 1,
+        "setup": 2
+      },
+      "raw_log_bytes": 121514
+    }
+  ],
+  "pin": "669fd1e8ef4a6860de280ed0c0044d3415f30e02",
+  "source": {
+    "head_and_tree": [
+      "669fd1e8ef4a6860de280ed0c0044d3415f30e02",
+      "2fc0ef522ebb4f03a084b288206685903f0b7feb"
+    ],
+    "lock_sha256": "0b076df97006905e1eb44d0dfc0e3919ab854dc6278969b89625ed33c40d3305",
+    "manifest_sha256": "b571222981b3732e9f4606a75bdb4e9f52c75b4a3ed74011e14174f7b01704da",
+    "manifest_has_workspace_table": false,
+    "manifest_package_name": "oxide-storage"
+  },
+  "toolchain": "1.97.1-aarch64-apple-darwin",
+  "toolchain_identity": {
+    "cargo_sha256": "7672ead309d505577c018fff2cafb3433601f073e38cbe87359ac1f7b944bbf5",
+    "rustc_sha256": "210df6794001b73ec3d453878707fa1e0bdcb63c427024a6e6574bbe5615a4da",
+    "rustc_driver": {
+      "librustc_driver-e03ed1db822dfa4c.dylib": "57f6b5280f218ed25ba6b7e4bc1d74da3ac8e4fd85bee1b8982ad4114d757c11"
+    }
+  },
+  "versions": {
+    "cargo-version": "cargo 1.97.1 (c980f4866 2026-06-30)\nrelease: 1.97.1\ncommit-hash: c980f4866141969fab6254a680546a277789d6f0\ncommit-date: 2026-06-30\nhost: aarch64-apple-darwin\nlibgit2: 1.9.2 (sys:0.20.4 vendored)\nlibcurl: 8.7.1 (sys:0.4.88+curl-8.20.0 system ssl:(SecureTransport) LibreSSL/3.3.6)\nssl: OpenSSL 3.6.2 7 Apr 2026\nos: Mac OS 26.6.2 [64-bit]\n",
+    "rustc-version": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: aarch64-apple-darwin\nrelease: 1.97.1\nLLVM version: 22.1.6\n"
+  },
+  "utc_start": "2026-10-18T21:36:06Z",
+  "session": {
+    "start_ns": 310548195305208,
+    "deadline_ns": 312948195305208,
+    "clock": "raw mach_continuous_time via mach_timebase_info, started in submit.py before pin check, root creation, admission wait and setup",
+    "admitted_offset_s": 0.491,
+    "admitted_utc": "2026-10-18T21:36:06Z",
+    "end_offset_s": 161.521,
+    "attempt_2_admitted_offset_s": 116.364,
+    "attempt_2_admitted_utc": "2026-10-18T21:38:02Z"
+  },
+  "raw_log_bytes": 3442523,
+  "boundaries": [
+    {
+      "label": "admitted",
+      "offset_s": 0.491,
+      "loadavg": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "host_free": 775411896320
+    },
+    {
+      "label": "U start",
+      "offset_s": 1.047,
+      "loadavg": [
+        6.1796875,
+        5.80517578125,
+        6.068359375
+      ],
+      "host_free": 775390711808
+    },
+    {
+      "label": "end",
+      "offset_s": 5.491,
+      "loadavg": [
+        6.2451171875,
+        5.82470703125,
+        6.07373046875
+      ],
+      "host_free": 775267209216
+    },
+    {
+      "label": "attempt 2 admitted",
+      "offset_s": 116.364,
+      "loadavg": [
+        4.33203125,
+        5.2177734375,
+        5.8017578125
+      ],
+      "host_free": 774998315008
+    },
+    {
+      "label": "U resume",
+      "offset_s": 116.365,
+      "loadavg": [
+        4.33203125,
+        5.2177734375,
+        5.8017578125
+      ],
+      "host_free": 774998216704
+    },
+    {
+      "label": "U after cold",
+      "offset_s": 116.538,
+      "loadavg": [
+        4.33203125,
+        5.2177734375,
+        5.8017578125
+      ],
+      "host_free": 774998061056
+    },
+    {
+      "label": "U after e1",
+      "offset_s": 117.356,
+      "loadavg": [
+        4.30517578125,
+        5.197265625,
+        5.791015625
+      ],
+      "host_free": 774964989952
+    },
+    {
+      "label": "U after e2",
+      "offset_s": 118.099,
+      "loadavg": [
+        4.30517578125,
+        5.197265625,
+        5.791015625
+      ],
+      "host_free": 774966923264
+    },
+    {
+      "label": "U after e3",
+      "offset_s": 118.875,
+      "loadavg": [
+        4.30517578125,
+        5.197265625,
+        5.791015625
+      ],
+      "host_free": 774964240384
+    },
+    {
+      "label": "U after e4",
+      "offset_s": 119.619,
+      "loadavg": [
+        4.30517578125,
+        5.197265625,
+        5.791015625
+      ],
+      "host_free": 774963625984
+    },
+    {
+      "label": "U after e5",
+      "offset_s": 120.44,
+      "loadavg": [
+        4.30517578125,
+        5.197265625,
+        5.791015625
+      ],
+      "host_free": 774963253248
+    },
+    {
+      "label": "U after e6",
+      "offset_s": 121.233,
+      "loadavg": [
+        4.30517578125,
+        5.197265625,
+        5.791015625
+      ],
+      "host_free": 774962425856
+    },
+    {
+      "label": "U after e7",
+      "offset_s": 122.041,
+      "loadavg": [
+        4.3603515625,
+        5.19384765625,
+        5.7861328125
+      ],
+      "host_free": 774962696192
+    },
+    {
+      "label": "U after e8",
+      "offset_s": 123.062,
+      "loadavg": [
+        4.3603515625,
+        5.19384765625,
+        5.7861328125
+      ],
+      "host_free": 774960087040
+    },
+    {
+      "label": "U after e9",
+      "offset_s": 123.906,
+      "loadavg": [
+        4.3603515625,
+        5.19384765625,
+        5.7861328125
+      ],
+      "host_free": 774959935488
+    },
+    {
+      "label": "U after e10",
+      "offset_s": 124.802,
+      "loadavg": [
+        4.3603515625,
+        5.19384765625,
+        5.7861328125
+      ],
+      "host_free": 774957264896
+    },
+    {
+      "label": "U end",
+      "offset_s": 125.443,
+      "loadavg": [
+        4.3603515625,
+        5.19384765625,
+        5.7861328125
+      ],
+      "host_free": 774955044864
+    },
+    {
+      "label": "P start",
+      "offset_s": 125.488,
+      "loadavg": [
+        4.3603515625,
+        5.19384765625,
+        5.7861328125
+      ],
+      "host_free": 774955036672
+    },
+    {
+      "label": "P after cold",
+      "offset_s": 131.213,
+      "loadavg": [
+        4.4111328125,
+        5.1904296875,
+        5.78125
+      ],
+      "host_free": 774818680832
+    },
+    {
+      "label": "P after e1",
+      "offset_s": 132.136,
+      "loadavg": [
+        6.2197265625,
+        5.55224609375,
+        5.9052734375
+      ],
+      "host_free": 774776651776
+    },
+    {
+      "label": "P after e2",
+      "offset_s": 133.129,
+      "loadavg": [
+        6.2197265625,
+        5.55224609375,
+        5.9052734375
+      ],
+      "host_free": 774777765888
+    },
+    {
+      "label": "P after e3",
+      "offset_s": 134.068,
+      "loadavg": [
+        6.2197265625,
+        5.55224609375,
+        5.9052734375
+      ],
+      "host_free": 774777765888
+    },
+    {
+      "label": "P after e4",
+      "offset_s": 135.111,
+      "loadavg": [
+        6.2197265625,
+        5.55224609375,
+        5.9052734375
+      ],
+      "host_free": 774777053184
+    },
+    {
+      "label": "P after e5",
+      "offset_s": 136.179,
+      "loadavg": [
+        6.2197265625,
+        5.55224609375,
+        5.9052734375
+      ],
+      "host_free": 774777421824
+    },
+    {
+      "label": "P after e6",
+      "offset_s": 137.171,
+      "loadavg": [
+        6.20166015625,
+        5.5595703125,
+        5.90576171875
+      ],
+      "host_free": 774776381440
+    },
+    {
+      "label": "P after e7",
+      "offset_s": 138.168,
+      "loadavg": [
+        6.20166015625,
+        5.5595703125,
+        5.90576171875
+      ],
+      "host_free": 774776664064
+    },
+    {
+      "label": "P after e8",
+      "offset_s": 139.215,
+      "loadavg": [
+        6.20166015625,
+        5.5595703125,
+        5.90576171875
+      ],
+      "host_free": 774775685120
+    },
+    {
+      "label": "P after e9",
+      "offset_s": 140.212,
+      "loadavg": [
+        6.20166015625,
+        5.5595703125,
+        5.90576171875
+      ],
+      "host_free": 774776119296
+    },
+    {
+      "label": "P after e10",
+      "offset_s": 141.245,
+      "loadavg": [
+        6.20166015625,
+        5.5595703125,
+        5.90576171875
+      ],
+      "host_free": 774775476224
+    },
+    {
+      "label": "P end",
+      "offset_s": 141.942,
+      "loadavg": [
+        6.18505859375,
+        5.56640625,
+        5.90625
+      ],
+      "host_free": 774767947776
+    },
+    {
+      "label": "N start",
+      "offset_s": 142.006,
+      "loadavg": [
+        6.18505859375,
+        5.56640625,
+        5.90625
+      ],
+      "host_free": 774767939584
+    },
+    {
+      "label": "N after cold",
+      "offset_s": 147.348,
+      "loadavg": [
+        6.08984375,
+        5.556640625,
+        5.90087890625
+      ],
+      "host_free": 774684639232
+    },
+    {
+      "label": "N after e1",
+      "offset_s": 148.231,
+      "loadavg": [
+        6.08984375,
+        5.556640625,
+        5.90087890625
+      ],
+      "host_free": 774645858304
+    },
+    {
+      "label": "N after e2",
+      "offset_s": 149.221,
+      "loadavg": [
+        6.08984375,
+        5.556640625,
+        5.90087890625
+      ],
+      "host_free": 774643875840
+    },
+    {
+      "label": "N after e3",
+      "offset_s": 150.096,
+      "loadavg": [
+        6.08984375,
+        5.556640625,
+        5.90087890625
+      ],
+      "host_free": 774643630080
+    },
+    {
+      "label": "N after e4",
+      "offset_s": 151.018,
+      "loadavg": [
+        6.08984375,
+        5.556640625,
+        5.90087890625
+      ],
+      "host_free": 774644637696
+    },
+    {
+      "label": "N after e5",
+      "offset_s": 151.889,
+      "loadavg": [
+        6.00244140625,
+        5.54736328125,
+        5.8955078125
+      ],
+      "host_free": 774643728384
+    },
+    {
+      "label": "N after e6",
+      "offset_s": 152.742,
+      "loadavg": [
+        6.00244140625,
+        5.54736328125,
+        5.8955078125
+      ],
+      "host_free": 774643789824
+    },
+    {
+      "label": "N after e7",
+      "offset_s": 153.741,
+      "loadavg": [
+        6.00244140625,
+        5.54736328125,
+        5.8955078125
+      ],
+      "host_free": 774629171200
+    },
+    {
+      "label": "N after e8",
+      "offset_s": 155.066,
+      "loadavg": [
+        6.00244140625,
+        5.54736328125,
+        5.8955078125
+      ],
+      "host_free": 774558117888
+    },
+    {
+      "label": "N after e9",
+      "offset_s": 156.777,
+      "loadavg": [
+        7.603515625,
+        5.88671875,
+        6.01318359375
+      ],
+      "host_free": 774405459968
+    },
+    {
+      "label": "N after e10",
+      "offset_s": 158.533,
+      "loadavg": [
+        7.603515625,
+        5.88671875,
+        6.01318359375
+      ],
+      "host_free": 774243430400
+    },
+    {
+      "label": "N end",
+      "offset_s": 161.274,
+      "loadavg": [
+        7.603515625,
+        5.88671875,
+        6.01318359375
+      ],
+      "host_free": 774089904128
+    },
+    {
+      "label": "end",
+      "offset_s": 161.417,
+      "loadavg": [
+        7.603515625,
+        5.88671875,
+        6.01318359375
+      ],
+      "host_free": 774087409664
+    }
+  ],
+  "owned_boundaries": [
+    {
+      "label": "after setup",
+      "offset_s": 1.046,
+      "owned_allocated_bytes": 20246528,
+      "host_free": 775390715904,
+      "raw_log_bytes": 609
+    },
+    {
+      "label": "end",
+      "offset_s": 5.505,
+      "owned_allocated_bytes": 160022528,
+      "host_free": 775267205120,
+      "raw_log_bytes": 121514
+    },
+    {
+      "label": "U after cold",
+      "offset_s": 116.536,
+      "owned_allocated_bytes": 160309248,
+      "host_free": 774998065152,
+      "raw_log_bytes": 252033
+    },
+    {
+      "label": "U after cycles",
+      "offset_s": 124.831,
+      "owned_allocated_bytes": 203874304,
+      "host_free": 774957260800,
+      "raw_log_bytes": 1195106
+    },
+    {
+      "label": "U final",
+      "offset_s": 125.474,
+      "owned_allocated_bytes": 205840384,
+      "host_free": 774955040768,
+      "raw_log_bytes": 1228727
+    },
+    {
+      "label": "P after cold",
+      "offset_s": 131.198,
+      "owned_allocated_bytes": 360931328,
+      "host_free": 774818684928,
+      "raw_log_bytes": 1480200
+    },
+    {
+      "label": "P after cycles",
+      "offset_s": 141.286,
+      "owned_allocated_bytes": 403263488,
+      "host_free": 774775472128,
+      "raw_log_bytes": 2425863
+    },
+    {
+      "label": "P final",
+      "offset_s": 141.985,
+      "owned_allocated_bytes": 410550272,
+      "host_free": 774767943680,
+      "raw_log_bytes": 2459852
+    },
+    {
+      "label": "N after cold",
+      "offset_s": 147.325,
+      "owned_allocated_bytes": 534605824,
+      "host_free": 774684643328,
+      "raw_log_bytes": 2590254
+    },
+    {
+      "label": "N after cycles",
+      "offset_s": 158.619,
+      "owned_allocated_bytes": 574578688,
+      "host_free": 774236143616,
+      "raw_log_bytes": 3409246
+    },
+    {
+      "label": "N final",
+      "offset_s": 161.349,
+      "owned_allocated_bytes": 576069632,
+      "host_free": 774088949760,
+      "raw_log_bytes": 3442523
+    },
+    {
+      "label": "end",
+      "offset_s": 161.486,
+      "owned_allocated_bytes": 576073728,
+      "host_free": 774079475712,
+      "raw_log_bytes": 3442523
+    }
+  ],
+  "peak_owned_allocated_mib": 549.4,
+  "min_host_free_gib": 720.9,
+  "settings_comparison": {
+    "U": {
+      "unit_count": 33,
+      "debug_flags_by_class": {
+        "dependency": {
+          "{}": [
+            "proc_macro2:lib",
+            "quote:lib",
+            "serde_derive:proc-macro",
+            "syn:lib",
+            "unicode_ident:lib",
+            "version_check:lib"
+          ],
+          "{\"debuginfo\": \"line-tables-only\", \"split-debuginfo\": \"unpacked\"}": [
+            "block_buffer:lib",
+            "cfg_if:lib",
+            "cpufeatures:lib",
+            "crypto_common:lib",
+            "digest:lib",
+            "generic_array:lib",
+            "itoa:lib",
+            "libc:lib",
+            "memchr:lib",
+            "serde:lib",
+            "serde_core:lib",
+            "serde_json:lib",
+            "sha2:lib",
+            "typenum:lib",
+            "zmij:lib"
+          ]
+        },
+        "dependency build script": {
+          "{}": [
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin"
+          ]
+        },
+        "workspace": {
+          "{\"debuginfo\": \"line-tables-only\", \"split-debuginfo\": \"unpacked\"}": [
+            "oxide:bin",
+            "oxide_storage:lib",
+            "oxide_storage_inventory:bin",
+            "oxide_storage_lease:bin"
+          ]
+        }
+      },
+      "workspace_member_artifacts": [
+        "oxide-storage@0.1.0"
+      ]
+    },
+    "P": {
+      "unit_count": 33,
+      "debug_flags_by_class": {
+        "dependency": {
+          "{}": [
+            "proc_macro2:lib",
+            "quote:lib",
+            "serde_derive:proc-macro",
+            "syn:lib",
+            "unicode_ident:lib",
+            "version_check:lib"
+          ],
+          "{\"debuginfo\": \"line-tables-only\", \"split-debuginfo\": \"packed\"}": [
+            "block_buffer:lib",
+            "cfg_if:lib",
+            "cpufeatures:lib",
+            "crypto_common:lib",
+            "digest:lib",
+            "generic_array:lib",
+            "itoa:lib",
+            "libc:lib",
+            "memchr:lib",
+            "serde:lib",
+            "serde_core:lib",
+            "serde_json:lib",
+            "sha2:lib",
+            "typenum:lib",
+            "zmij:lib"
+          ]
+        },
+        "dependency build script": {
+          "{}": [
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin"
+          ]
+        },
+        "workspace": {
+          "{\"debuginfo\": \"line-tables-only\", \"split-debuginfo\": \"packed\"}": [
+            "oxide:bin",
+            "oxide_storage:lib",
+            "oxide_storage_inventory:bin",
+            "oxide_storage_lease:bin"
+          ]
+        }
+      },
+      "workspace_member_artifacts": [
+        "oxide-storage@0.1.0"
+      ]
+    },
+    "N": {
+      "unit_count": 33,
+      "debug_flags_by_class": {
+        "dependency": {
+          "{}": [
+            "proc_macro2:lib",
+            "quote:lib",
+            "serde_derive:proc-macro",
+            "syn:lib",
+            "unicode_ident:lib",
+            "version_check:lib"
+          ],
+          "{\"debuginfo\": \"line-tables-only\", \"split-debuginfo\": \"unpacked\"}": [
+            "block_buffer:lib",
+            "cfg_if:lib",
+            "cpufeatures:lib",
+            "crypto_common:lib",
+            "digest:lib",
+            "generic_array:lib",
+            "itoa:lib",
+            "libc:lib",
+            "memchr:lib",
+            "serde:lib",
+            "serde_core:lib",
+            "serde_json:lib",
+            "sha2:lib",
+            "typenum:lib",
+            "zmij:lib"
+          ]
+        },
+        "dependency build script": {
+          "{}": [
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin",
+            "build_script_build:bin"
+          ]
+        },
+        "workspace": {
+          "{}": [
+            "oxide:bin",
+            "oxide_storage:lib",
+            "oxide_storage_inventory:bin",
+            "oxide_storage_lease:bin"
+          ]
+        }
+      },
+      "workspace_member_artifacts": [
+        "oxide-storage@0.1.0"
+      ]
+    }
+  },
+  "post_run_observation": {
+    "U": {
+      "deps_rcgu_names": 4561,
+      "deps_rcgu_unique_inodes": 461,
+      "deps_rcgu_unique_allocated": 14835712,
+      "deps_rcgu_apparent_sum_over_names": 126793192,
+      "inodes_also_named_in_incremental": 433,
+      "allocated_of_inodes_also_named_in_incremental": 12226560,
+      "inodes_named_only_by_deps_rcgu": 28,
+      "allocated_of_inodes_named_only_by_deps_rcgu": 2609152,
+      "max_names_per_rcgu_inode_in_deps": 13,
+      "inodes_with_nlink_above_in_tree_names": 0,
+      "target_unique_allocated": 181059584
+    },
+    "P": {
+      "deps_rcgu_names": 0,
+      "deps_rcgu_unique_inodes": 0,
+      "deps_rcgu_unique_allocated": 0,
+      "deps_rcgu_apparent_sum_over_names": 0,
+      "inodes_also_named_in_incremental": 0,
+      "allocated_of_inodes_also_named_in_incremental": 0,
+      "inodes_named_only_by_deps_rcgu": 0,
+      "allocated_of_inodes_named_only_by_deps_rcgu": 0,
+      "max_names_per_rcgu_inode_in_deps": 0,
+      "inodes_with_nlink_above_in_tree_names": 0,
+      "target_unique_allocated": 201740288
+    },
+    "N": {
+      "deps_rcgu_names": 19,
+      "deps_rcgu_unique_inodes": 19,
+      "deps_rcgu_unique_allocated": 2351104,
+      "deps_rcgu_apparent_sum_over_names": 2308328,
+      "inodes_also_named_in_incremental": 0,
+      "allocated_of_inodes_also_named_in_incremental": 0,
+      "inodes_named_only_by_deps_rcgu": 19,
+      "allocated_of_inodes_named_only_by_deps_rcgu": 2351104,
+      "max_names_per_rcgu_inode_in_deps": 1,
+      "inodes_with_nlink_above_in_tree_names": 0,
+      "target_unique_allocated": 165343232
+    }
+  },
+  "arms": {
+    "U": {
+      "what": "quick recipe as-is: oxide-quick inherits dev, debug = \"line-tables-only\", default (unpacked) split debug info",
+      "resumed": {
+        "offset_s": 116.408,
+        "source_verified": true,
+        "cold_census_offset_s": 5.445,
+        "cold_recensus": {
+          "offset_s": 116.431,
+          "matches_attempt_1": true
+        }
+      },
+      "cycles": [
+        {
+          "label": "cold",
+          "wall_s": 4.2673,
+          "exit": 0,
+          "rebuilt_count": 33,
+          "fresh_count": 0,
+          "loadavg_before": [
+            6.18,
+            5.81,
+            6.07
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.64,
+            "oxide-storage-lease \"bin\"": 0.13,
+            "oxide-storage-inventory \"bin\"": 0.12,
+            "oxide \"bin\"": 0.88
+          },
+          "deps_entries": 501,
+          "deps_files": 501,
+          "rcgu_count": 430,
+          "rcgu_apparent_mib": 12.99,
+          "rcgu_allocated_sum_over_names_mib": 13.76,
+          "rcgu_nlink_gt1": 411,
+          "rcgu_same_inode_as_incremental": 411,
+          "target_allocated_unique_mib": 133.09,
+          "target_apparent_mib": 143.67,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.11,
+            "oxide-quick": 12.34,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 71.91,
+            "oxide-quick/incremental": 38.89
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 260,
+          "rcgu_not_referenced_by_current_binaries": 170
+        },
+        {
+          "label": "e1",
+          "wall_s": 0.6885,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            4.33,
+            5.22,
+            5.8
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.27,
+            "oxide-storage-lease \"bin\"": 0.15,
+            "oxide-storage-inventory \"bin\"": 0.15,
+            "oxide \"bin\"": 0.37
+          },
+          "deps_entries": 912,
+          "deps_files": 912,
+          "rcgu_count": 841,
+          "rcgu_apparent_mib": 23.77,
+          "rcgu_allocated_sum_over_names_mib": 25.27,
+          "rcgu_nlink_gt1": 822,
+          "rcgu_same_inode_as_incremental": 822,
+          "target_allocated_unique_mib": 172.04,
+          "target_apparent_mib": 204.12,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.15,
+            "oxide-quick": 12.34,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 71.94,
+            "oxide-quick/incremental": 77.77
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 260,
+          "rcgu_not_referenced_by_current_binaries": 581
+        },
+        {
+          "label": "e2",
+          "wall_s": 0.5817,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            4.31,
+            5.2,
+            5.79
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.22,
+            "oxide-storage-lease \"bin\"": 0.12,
+            "oxide-storage-inventory \"bin\"": 0.12,
+            "oxide \"bin\"": 0.34
+          },
+          "deps_entries": 1323,
+          "deps_files": 1323,
+          "rcgu_count": 1252,
+          "rcgu_apparent_mib": 34.56,
+          "rcgu_allocated_sum_over_names_mib": 36.79,
+          "rcgu_nlink_gt1": 1232,
+          "rcgu_same_inode_as_incremental": 1232,
+          "target_allocated_unique_mib": 170.62,
+          "target_apparent_mib": 213.46,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.2,
+            "oxide-quick": 12.34,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 71.97,
+            "oxide-quick/incremental": 76.28
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 260,
+          "rcgu_not_referenced_by_current_binaries": 992
+        },
+        {
+          "label": "e3",
+          "wall_s": 0.5884,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            4.31,
+            5.2,
+            5.79
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.23,
+            "oxide-storage-lease \"bin\"": 0.12,
+            "oxide-storage-inventory \"bin\"": 0.12,
+            "oxide \"bin\"": 0.33
+          },
+          "deps_entries": 1734,
+          "deps_files": 1734,
+          "rcgu_count": 1663,
+          "rcgu_apparent_mib": 45.34,
+          "rcgu_allocated_sum_over_names_mib": 48.3,
+          "rcgu_nlink_gt1": 1642,
+          "rcgu_same_inode_as_incremental": 1642,
+          "target_allocated_unique_mib": 170.7,
+          "target_apparent_mib": 224.3,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.24,
+            "oxide-quick": 12.34,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 72.0,
+            "oxide-quick/incremental": 76.29
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 260,
+          "rcgu_not_referenced_by_current_binaries": 1403
+        },
+        {
+          "label": "e4",
+          "wall_s": 0.5771,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            4.31,
+            5.2,
+            5.79
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.22,
+            "oxide-storage-lease \"bin\"": 0.12,
+            "oxide-storage-inventory \"bin\"": 0.12,
+            "oxide \"bin\"": 0.33
+          },
+          "deps_entries": 2145,
+          "deps_files": 2145,
+          "rcgu_count": 2074,
+          "rcgu_apparent_mib": 56.13,
+          "rcgu_allocated_sum_over_names_mib": 59.82,
+          "rcgu_nlink_gt1": 2052,
+          "rcgu_same_inode_as_incremental": 2052,
+          "target_allocated_unique_mib": 170.78,
+          "target_apparent_mib": 235.13,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.29,
+            "oxide-quick": 12.34,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 72.02,
+            "oxide-quick/incremental": 76.29
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 260,
+          "rcgu_not_referenced_by_current_binaries": 1814
+        },
+        {
+          "label": "e5",
+          "wall_s": 0.626,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            4.31,
+            5.2,
+            5.79
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.23,
+            "oxide-storage-lease \"bin\"": 0.12,
+            "oxide-storage-inventory \"bin\"": 0.12,
+            "oxide \"bin\"": 0.37
+          },
+          "deps_entries": 2556,
+          "deps_files": 2556,
+          "rcgu_count": 2485,
+          "rcgu_apparent_mib": 66.91,
+          "rcgu_allocated_sum_over_names_mib": 71.34,
+          "rcgu_nlink_gt1": 2462,
+          "rcgu_same_inode_as_incremental": 2462,
+          "target_allocated_unique_mib": 170.85,
+          "target_apparent_mib": 245.95,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.34,
+            "oxide-quick": 12.34,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 72.05,
+            "oxide-quick/incremental": 76.29
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 260,
+          "rcgu_not_referenced_by_current_binaries": 2225
+        },
+        {
+          "label": "e6",
+          "wall_s": 0.595,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            4.31,
+            5.2,
+            5.79
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.22,
+            "oxide-storage-lease \"bin\"": 0.13,
+            "oxide-storage-inventory \"bin\"": 0.12,
+            "oxide \"bin\"": 0.35
+          },
+          "deps_entries": 2967,
+          "deps_files": 2967,
+          "rcgu_count": 2896,
+          "rcgu_apparent_mib": 77.7,
+          "rcgu_allocated_sum_over_names_mib": 82.85,
+          "rcgu_nlink_gt1": 2872,
+          "rcgu_same_inode_as_incremental": 2872,
+          "target_allocated_unique_mib": 170.93,
+          "target_apparent_mib": 256.78,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.38,
+            "oxide-quick": 12.34,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 72.08,
+            "oxide-quick/incremental": 76.29
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 260,
+          "rcgu_not_referenced_by_current_binaries": 2636
+        },
+        {
+          "label": "e7",
+          "wall_s": 0.5818,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            4.31,
+            5.2,
+            5.79
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.22,
+            "oxide-storage-lease \"bin\"": 0.12,
+            "oxide-storage-inventory \"bin\"": 0.12,
+            "oxide \"bin\"": 0.34
+          },
+          "deps_entries": 3378,
+          "deps_files": 3378,
+          "rcgu_count": 3307,
+          "rcgu_apparent_mib": 88.49,
+          "rcgu_allocated_sum_over_names_mib": 94.37,
+          "rcgu_nlink_gt1": 3282,
+          "rcgu_same_inode_as_incremental": 3282,
+          "target_allocated_unique_mib": 171.0,
+          "target_apparent_mib": 267.61,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.43,
+            "oxide-quick": 12.34,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 72.11,
+            "oxide-quick/incremental": 76.29
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 260,
+          "rcgu_not_referenced_by_current_binaries": 3047
+        },
+        {
+          "label": "e8",
+          "wall_s": 0.7698,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            4.36,
+            5.19,
+            5.79
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.24,
+            "oxide-storage-lease \"bin\"": 0.23,
+            "oxide-storage-inventory \"bin\"": 0.21,
+            "oxide \"bin\"": 0.5
+          },
+          "deps_entries": 3789,
+          "deps_files": 3789,
+          "rcgu_count": 3718,
+          "rcgu_apparent_mib": 99.27,
+          "rcgu_allocated_sum_over_names_mib": 105.88,
+          "rcgu_nlink_gt1": 3692,
+          "rcgu_same_inode_as_incremental": 3692,
+          "target_allocated_unique_mib": 171.07,
+          "target_apparent_mib": 278.44,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.48,
+            "oxide-quick": 12.34,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 72.13,
+            "oxide-quick/incremental": 76.29
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 260,
+          "rcgu_not_referenced_by_current_binaries": 3458
+        },
+        {
+          "label": "e9",
+          "wall_s": 0.5845,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            4.36,
+            5.19,
+            5.79
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.23,
+            "oxide-storage-lease \"bin\"": 0.12,
+            "oxide-storage-inventory \"bin\"": 0.12,
+            "oxide \"bin\"": 0.33
+          },
+          "deps_entries": 4200,
+          "deps_files": 4200,
+          "rcgu_count": 4129,
+          "rcgu_apparent_mib": 110.06,
+          "rcgu_allocated_sum_over_names_mib": 117.4,
+          "rcgu_nlink_gt1": 4102,
+          "rcgu_same_inode_as_incremental": 4102,
+          "target_allocated_unique_mib": 171.15,
+          "target_apparent_mib": 289.27,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.52,
+            "oxide-quick": 12.34,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 72.16,
+            "oxide-quick/incremental": 76.29
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 260,
+          "rcgu_not_referenced_by_current_binaries": 3869
+        },
+        {
+          "label": "e10",
+          "wall_s": 0.6103,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            4.36,
+            5.19,
+            5.79
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.24,
+            "oxide-storage-lease \"bin\"": 0.13,
+            "oxide-storage-inventory \"bin\"": 0.13,
+            "oxide \"bin\"": 0.34
+          },
+          "deps_entries": 4611,
+          "deps_files": 4611,
+          "rcgu_count": 4540,
+          "rcgu_apparent_mib": 120.84,
+          "rcgu_allocated_sum_over_names_mib": 128.91,
+          "rcgu_nlink_gt1": 4512,
+          "rcgu_same_inode_as_incremental": 4512,
+          "target_allocated_unique_mib": 171.22,
+          "target_apparent_mib": 300.1,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.57,
+            "oxide-quick": 12.34,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 72.19,
+            "oxide-quick/incremental": 76.29
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 260,
+          "rcgu_not_referenced_by_current_binaries": 4280
+        }
+      ],
+      "cold_build_s": 4.2673,
+      "warm_build_s": {
+        "mean": 0.6203,
+        "median": 0.5917,
+        "min": 0.5771,
+        "max": 0.7698
+      },
+      "warm_cargo_timing_unit_median_s": {
+        "lib": 0.23,
+        "oxide-storage-lease \"bin\"": 0.12,
+        "oxide-storage-inventory \"bin\"": 0.12,
+        "oxide \"bin\"": 0.34
+      },
+      "rcgu_added_per_edit_cycle": [
+        411
+      ],
+      "after_panic_build": {
+        "deps_entries": 4634,
+        "rcgu_count": 4561
+      },
+      "panic_build": {
+        "wall_s": 0.099,
+        "exit": 0,
+        "rebuilt": [
+          "oxide_080_panic_probe:test:True"
+        ]
+      },
+      "backtrace": {
+        "exit": 101,
+        "expected_exit": 101,
+        "panic_location": "tests/oxide_080_panic_probe.rs:5:5",
+        "panic_location_matches": true,
+        "frame_count": 8,
+        "frames_with_file_line": 8,
+        "probe_frames": {
+          "probe_panic_site": {
+            "frame_present": true,
+            "has_file_line": true,
+            "file_line": "./tests/oxide_080_panic_probe.rs:5",
+            "matches_expected_line": true
+          },
+          "probe_caller": {
+            "frame_present": true,
+            "has_file_line": true,
+            "file_line": "./tests/oxide_080_panic_probe.rs:10",
+            "matches_expected_line": true
+          },
+          "oxide_080_deliberate_panic": {
+            "frame_present": true,
+            "has_file_line": true,
+            "file_line": "./tests/oxide_080_panic_probe.rs:15",
+            "matches_expected_line": true
+          }
+        },
+        "dsym_next_to_executable": false,
+        "frames": [
+          {
+            "index": 0,
+            "symbol": "__rustc::rust_begin_unwind",
+            "at": {
+              "file": "/rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/panicking.rs",
+              "line": 689
+            }
+          },
+          {
+            "index": 1,
+            "symbol": "core::panicking::panic_fmt",
+            "at": {
+              "file": "/rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/panicking.rs",
+              "line": 80
+            }
+          },
+          {
+            "index": 2,
+            "symbol": "probe_panic_site",
+            "at": {
+              "file": "./tests/oxide_080_panic_probe.rs",
+              "line": 5
+            }
+          },
+          {
+            "index": 3,
+            "symbol": "probe_caller",
+            "at": {
+              "file": "./tests/oxide_080_panic_probe.rs",
+              "line": 10
+            }
+          },
+          {
+            "index": 4,
+            "symbol": "oxide_080_deliberate_panic",
+            "at": {
+              "file": "./tests/oxide_080_panic_probe.rs",
+              "line": 15
+            }
+          },
+          {
+            "index": 5,
+            "symbol": "{closure#0}",
+            "at": {
+              "file": "./tests/oxide_080_panic_probe.rs",
+              "line": 14
+            }
+          },
+          {
+            "index": 6,
+            "symbol": "call_once<oxide_080_panic_probe::oxide_080_deliberate_panic::{closure_env#0}, ()>",
+            "at": {
+              "file": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ops/function.rs",
+              "line": 250
+            }
+          },
+          {
+            "index": 7,
+            "symbol": "<fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once",
+            "at": {
+              "file": "/rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs",
+              "line": 250
+            }
+          }
+        ]
+      },
+      "edits": [
+        {
+          "edit": 1,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32768;",
+          "new": "pub const MAX_REFERENCES: usize = 32769;"
+        },
+        {
+          "edit": 2,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32769;",
+          "new": "pub const MAX_REFERENCES: usize = 32770;"
+        },
+        {
+          "edit": 3,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32770;",
+          "new": "pub const MAX_REFERENCES: usize = 32771;"
+        },
+        {
+          "edit": 4,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32771;",
+          "new": "pub const MAX_REFERENCES: usize = 32772;"
+        },
+        {
+          "edit": 5,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32772;",
+          "new": "pub const MAX_REFERENCES: usize = 32773;"
+        },
+        {
+          "edit": 6,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32773;",
+          "new": "pub const MAX_REFERENCES: usize = 32774;"
+        },
+        {
+          "edit": 7,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32774;",
+          "new": "pub const MAX_REFERENCES: usize = 32775;"
+        },
+        {
+          "edit": 8,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32775;",
+          "new": "pub const MAX_REFERENCES: usize = 32776;"
+        },
+        {
+          "edit": 9,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32776;",
+          "new": "pub const MAX_REFERENCES: usize = 32777;"
+        },
+        {
+          "edit": 10,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32777;",
+          "new": "pub const MAX_REFERENCES: usize = 32778;"
+        }
+      ]
+    },
+    "P": {
+      "what": "U plus split-debuginfo = \"packed\" for the oxide-quick profile",
+      "resumed": null,
+      "cycles": [
+        {
+          "label": "cold",
+          "wall_s": 5.3324,
+          "exit": 0,
+          "rebuilt_count": 33,
+          "fresh_count": 0,
+          "loadavg_before": [
+            4.36,
+            5.19,
+            5.79
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.8,
+            "oxide-storage-lease \"bin\"": 0.27,
+            "oxide-storage-inventory \"bin\"": 0.27,
+            "oxide \"bin\"": 0.97
+          },
+          "deps_entries": 74,
+          "deps_files": 71,
+          "rcgu_count": 0,
+          "rcgu_apparent_mib": 0.0,
+          "rcgu_allocated_sum_over_names_mib": 0.0,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 147.62,
+          "target_apparent_mib": 147.43,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.11,
+            "oxide-quick": 12.33,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 58.18,
+            "oxide-quick/deps/<subdirectories>": 16.75,
+            "oxide-quick/incremental": 50.4
+          },
+          "deps_dsym_dirs": 3,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 0
+        },
+        {
+          "label": "e1",
+          "wall_s": 0.7001,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            4.41,
+            5.19,
+            5.78
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.21,
+            "oxide-storage-lease \"bin\"": 0.2,
+            "oxide-storage-inventory \"bin\"": 0.19,
+            "oxide \"bin\"": 0.47
+          },
+          "deps_entries": 74,
+          "deps_files": 71,
+          "rcgu_count": 0,
+          "rcgu_apparent_mib": 0.0,
+          "rcgu_allocated_sum_over_names_mib": 0.0,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 187.76,
+          "target_apparent_mib": 197.1,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.15,
+            "oxide-quick": 12.33,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 58.18,
+            "oxide-quick/deps/<subdirectories>": 17.96,
+            "oxide-quick/incremental": 89.3
+          },
+          "deps_dsym_dirs": 3,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 0
+        },
+        {
+          "label": "e2",
+          "wall_s": 0.7635,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            6.22,
+            5.55,
+            5.91
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.26,
+            "oxide-storage-lease \"bin\"": 0.22,
+            "oxide-storage-inventory \"bin\"": 0.21,
+            "oxide \"bin\"": 0.48
+          },
+          "deps_entries": 74,
+          "deps_files": 71,
+          "rcgu_count": 0,
+          "rcgu_apparent_mib": 0.0,
+          "rcgu_allocated_sum_over_names_mib": 0.0,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 186.35,
+          "target_apparent_mib": 195.65,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.2,
+            "oxide-quick": 12.33,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 58.18,
+            "oxide-quick/deps/<subdirectories>": 17.98,
+            "oxide-quick/incremental": 87.82
+          },
+          "deps_dsym_dirs": 3,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 0
+        },
+        {
+          "label": "e3",
+          "wall_s": 0.711,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            6.22,
+            5.55,
+            5.91
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.23,
+            "oxide-storage-lease \"bin\"": 0.22,
+            "oxide-storage-inventory \"bin\"": 0.19,
+            "oxide \"bin\"": 0.46
+          },
+          "deps_entries": 74,
+          "deps_files": 71,
+          "rcgu_count": 0,
+          "rcgu_apparent_mib": 0.0,
+          "rcgu_allocated_sum_over_names_mib": 0.0,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 186.4,
+          "target_apparent_mib": 195.7,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.24,
+            "oxide-quick": 12.33,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 58.18,
+            "oxide-quick/deps/<subdirectories>": 17.98,
+            "oxide-quick/incremental": 87.83
+          },
+          "deps_dsym_dirs": 3,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 0
+        },
+        {
+          "label": "e4",
+          "wall_s": 0.7838,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            6.22,
+            5.55,
+            5.91
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.24,
+            "oxide-storage-lease \"bin\"": 0.24,
+            "oxide-storage-inventory \"bin\"": 0.21,
+            "oxide \"bin\"": 0.51
+          },
+          "deps_entries": 74,
+          "deps_files": 71,
+          "rcgu_count": 0,
+          "rcgu_apparent_mib": 0.0,
+          "rcgu_allocated_sum_over_names_mib": 0.0,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 186.45,
+          "target_apparent_mib": 195.74,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.29,
+            "oxide-quick": 12.33,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 58.18,
+            "oxide-quick/deps/<subdirectories>": 17.98,
+            "oxide-quick/incremental": 87.83
+          },
+          "deps_dsym_dirs": 3,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 0
+        },
+        {
+          "label": "e5",
+          "wall_s": 0.8076,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            6.22,
+            5.55,
+            5.91
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.27,
+            "oxide-storage-lease \"bin\"": 0.25,
+            "oxide-storage-inventory \"bin\"": 0.23,
+            "oxide \"bin\"": 0.51
+          },
+          "deps_entries": 74,
+          "deps_files": 71,
+          "rcgu_count": 0,
+          "rcgu_apparent_mib": 0.0,
+          "rcgu_allocated_sum_over_names_mib": 0.0,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 186.5,
+          "target_apparent_mib": 195.79,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.34,
+            "oxide-quick": 12.33,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 58.18,
+            "oxide-quick/deps/<subdirectories>": 17.98,
+            "oxide-quick/incremental": 87.83
+          },
+          "deps_dsym_dirs": 3,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 0
+        },
+        {
+          "label": "e6",
+          "wall_s": 0.7294,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            6.22,
+            5.55,
+            5.91
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.24,
+            "oxide-storage-lease \"bin\"": 0.22,
+            "oxide-storage-inventory \"bin\"": 0.21,
+            "oxide \"bin\"": 0.46
+          },
+          "deps_entries": 74,
+          "deps_files": 71,
+          "rcgu_count": 0,
+          "rcgu_apparent_mib": 0.0,
+          "rcgu_allocated_sum_over_names_mib": 0.0,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 186.54,
+          "target_apparent_mib": 195.83,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.38,
+            "oxide-quick": 12.33,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 58.18,
+            "oxide-quick/deps/<subdirectories>": 17.98,
+            "oxide-quick/incremental": 87.83
+          },
+          "deps_dsym_dirs": 3,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 0
+        },
+        {
+          "label": "e7",
+          "wall_s": 0.7471,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            6.2,
+            5.56,
+            5.91
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.24,
+            "oxide-storage-lease \"bin\"": 0.23,
+            "oxide-storage-inventory \"bin\"": 0.21,
+            "oxide \"bin\"": 0.49
+          },
+          "deps_entries": 74,
+          "deps_files": 71,
+          "rcgu_count": 0,
+          "rcgu_apparent_mib": 0.0,
+          "rcgu_allocated_sum_over_names_mib": 0.0,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 186.59,
+          "target_apparent_mib": 195.87,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.43,
+            "oxide-quick": 12.33,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 58.18,
+            "oxide-quick/deps/<subdirectories>": 17.98,
+            "oxide-quick/incremental": 87.83
+          },
+          "deps_dsym_dirs": 3,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 0
+        },
+        {
+          "label": "e8",
+          "wall_s": 0.7814,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            6.2,
+            5.56,
+            5.91
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.23,
+            "oxide-storage-lease \"bin\"": 0.24,
+            "oxide-storage-inventory \"bin\"": 0.22,
+            "oxide \"bin\"": 0.51
+          },
+          "deps_entries": 74,
+          "deps_files": 71,
+          "rcgu_count": 0,
+          "rcgu_apparent_mib": 0.0,
+          "rcgu_allocated_sum_over_names_mib": 0.0,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 186.64,
+          "target_apparent_mib": 195.92,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.48,
+            "oxide-quick": 12.33,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 58.18,
+            "oxide-quick/deps/<subdirectories>": 17.98,
+            "oxide-quick/incremental": 87.83
+          },
+          "deps_dsym_dirs": 3,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 0
+        },
+        {
+          "label": "e9",
+          "wall_s": 0.7461,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            6.2,
+            5.56,
+            5.91
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.23,
+            "oxide-storage-lease \"bin\"": 0.22,
+            "oxide-storage-inventory \"bin\"": 0.2,
+            "oxide \"bin\"": 0.49
+          },
+          "deps_entries": 74,
+          "deps_files": 71,
+          "rcgu_count": 0,
+          "rcgu_apparent_mib": 0.0,
+          "rcgu_allocated_sum_over_names_mib": 0.0,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 186.68,
+          "target_apparent_mib": 195.96,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.52,
+            "oxide-quick": 12.33,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 58.18,
+            "oxide-quick/deps/<subdirectories>": 17.98,
+            "oxide-quick/incremental": 87.83
+          },
+          "deps_dsym_dirs": 3,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 0
+        },
+        {
+          "label": "e10",
+          "wall_s": 0.7498,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            6.2,
+            5.56,
+            5.91
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.22,
+            "oxide-storage-lease \"bin\"": 0.23,
+            "oxide-storage-inventory \"bin\"": 0.21,
+            "oxide \"bin\"": 0.5
+          },
+          "deps_entries": 74,
+          "deps_files": 71,
+          "rcgu_count": 0,
+          "rcgu_apparent_mib": 0.0,
+          "rcgu_allocated_sum_over_names_mib": 0.0,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 186.73,
+          "target_apparent_mib": 196.01,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.57,
+            "oxide-quick": 12.33,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 58.18,
+            "oxide-quick/deps/<subdirectories>": 17.98,
+            "oxide-quick/incremental": 87.83
+          },
+          "deps_dsym_dirs": 3,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 0
+        }
+      ],
+      "cold_build_s": 5.3324,
+      "warm_build_s": {
+        "mean": 0.752,
+        "median": 0.7485,
+        "min": 0.7001,
+        "max": 0.8076
+      },
+      "warm_cargo_timing_unit_median_s": {
+        "lib": 0.235,
+        "oxide-storage-lease \"bin\"": 0.225,
+        "oxide-storage-inventory \"bin\"": 0.21,
+        "oxide \"bin\"": 0.49
+      },
+      "rcgu_added_per_edit_cycle": [
+        0
+      ],
+      "after_panic_build": {
+        "deps_entries": 77,
+        "rcgu_count": 0
+      },
+      "panic_build": {
+        "wall_s": 0.2166,
+        "exit": 0,
+        "rebuilt": [
+          "oxide_080_panic_probe:test:True"
+        ]
+      },
+      "backtrace": {
+        "exit": 101,
+        "expected_exit": 101,
+        "panic_location": "tests/oxide_080_panic_probe.rs:5:5",
+        "panic_location_matches": true,
+        "frame_count": 8,
+        "frames_with_file_line": 8,
+        "probe_frames": {
+          "probe_panic_site": {
+            "frame_present": true,
+            "has_file_line": true,
+            "file_line": "./tests/oxide_080_panic_probe.rs:5",
+            "matches_expected_line": true
+          },
+          "probe_caller": {
+            "frame_present": true,
+            "has_file_line": true,
+            "file_line": "./tests/oxide_080_panic_probe.rs:10",
+            "matches_expected_line": true
+          },
+          "oxide_080_deliberate_panic": {
+            "frame_present": true,
+            "has_file_line": true,
+            "file_line": "./tests/oxide_080_panic_probe.rs:15",
+            "matches_expected_line": true
+          }
+        },
+        "dsym_next_to_executable": true,
+        "frames": [
+          {
+            "index": 0,
+            "symbol": "__rustc::rust_begin_unwind",
+            "at": {
+              "file": "/rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/panicking.rs",
+              "line": 689
+            }
+          },
+          {
+            "index": 1,
+            "symbol": "core::panicking::panic_fmt",
+            "at": {
+              "file": "/rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/panicking.rs",
+              "line": 80
+            }
+          },
+          {
+            "index": 2,
+            "symbol": "probe_panic_site",
+            "at": {
+              "file": "./tests/oxide_080_panic_probe.rs",
+              "line": 5
+            }
+          },
+          {
+            "index": 3,
+            "symbol": "probe_caller",
+            "at": {
+              "file": "./tests/oxide_080_panic_probe.rs",
+              "line": 10
+            }
+          },
+          {
+            "index": 4,
+            "symbol": "oxide_080_deliberate_panic",
+            "at": {
+              "file": "./tests/oxide_080_panic_probe.rs",
+              "line": 15
+            }
+          },
+          {
+            "index": 5,
+            "symbol": "{closure#0}",
+            "at": {
+              "file": "./tests/oxide_080_panic_probe.rs",
+              "line": 14
+            }
+          },
+          {
+            "index": 6,
+            "symbol": "call_once<oxide_080_panic_probe::oxide_080_deliberate_panic::{closure_env#0}, ()>",
+            "at": {
+              "file": "/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ops/function.rs",
+              "line": 250
+            }
+          },
+          {
+            "index": 7,
+            "symbol": "<fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once",
+            "at": {
+              "file": "/rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs",
+              "line": 250
+            }
+          }
+        ]
+      },
+      "edits": [
+        {
+          "edit": 1,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32768;",
+          "new": "pub const MAX_REFERENCES: usize = 32769;"
+        },
+        {
+          "edit": 2,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32769;",
+          "new": "pub const MAX_REFERENCES: usize = 32770;"
+        },
+        {
+          "edit": 3,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32770;",
+          "new": "pub const MAX_REFERENCES: usize = 32771;"
+        },
+        {
+          "edit": 4,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32771;",
+          "new": "pub const MAX_REFERENCES: usize = 32772;"
+        },
+        {
+          "edit": 5,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32772;",
+          "new": "pub const MAX_REFERENCES: usize = 32773;"
+        },
+        {
+          "edit": 6,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32773;",
+          "new": "pub const MAX_REFERENCES: usize = 32774;"
+        },
+        {
+          "edit": 7,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32774;",
+          "new": "pub const MAX_REFERENCES: usize = 32775;"
+        },
+        {
+          "edit": 8,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32775;",
+          "new": "pub const MAX_REFERENCES: usize = 32776;"
+        },
+        {
+          "edit": 9,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32776;",
+          "new": "pub const MAX_REFERENCES: usize = 32777;"
+        },
+        {
+          "edit": 10,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32777;",
+          "new": "pub const MAX_REFERENCES: usize = 32778;"
+        }
+      ]
+    },
+    "N": {
+      "what": "U plus debug = false for the single workspace package oxide-storage only, through a --config package override; dependency units unchanged",
+      "resumed": null,
+      "cycles": [
+        {
+          "label": "cold",
+          "wall_s": 4.7898,
+          "exit": 0,
+          "rebuilt_count": 33,
+          "fresh_count": 0,
+          "loadavg_before": [
+            6.19,
+            5.57,
+            5.91
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.65,
+            "oxide-storage-lease \"bin\"": 0.15,
+            "oxide-storage-inventory \"bin\"": 0.14,
+            "oxide \"bin\"": 0.89
+          },
+          "deps_entries": 90,
+          "deps_files": 90,
+          "rcgu_count": 19,
+          "rcgu_apparent_mib": 2.2,
+          "rcgu_allocated_sum_over_names_mib": 2.24,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 119.36,
+          "target_apparent_mib": 119.02,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.11,
+            "oxide-quick": 9.93,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 57.99,
+            "oxide-quick/incremental": 41.49
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 19
+        },
+        {
+          "label": "e1",
+          "wall_s": 0.6078,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            6.09,
+            5.56,
+            5.9
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.23,
+            "oxide-storage-lease \"bin\"": 0.12,
+            "oxide-storage-inventory \"bin\"": 0.11,
+            "oxide \"bin\"": 0.33
+          },
+          "deps_entries": 90,
+          "deps_files": 90,
+          "rcgu_count": 19,
+          "rcgu_apparent_mib": 2.2,
+          "rcgu_allocated_sum_over_names_mib": 2.24,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 156.11,
+          "target_apparent_mib": 160.89,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.15,
+            "oxide-quick": 9.93,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 57.99,
+            "oxide-quick/incremental": 78.21
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 19
+        },
+        {
+          "label": "e2",
+          "wall_s": 0.7257,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            6.09,
+            5.56,
+            5.9
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.29,
+            "oxide-storage-lease \"bin\"": 0.15,
+            "oxide-storage-inventory \"bin\"": 0.15,
+            "oxide \"bin\"": 0.41
+          },
+          "deps_entries": 90,
+          "deps_files": 90,
+          "rcgu_count": 19,
+          "rcgu_apparent_mib": 2.2,
+          "rcgu_allocated_sum_over_names_mib": 2.24,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 155.95,
+          "target_apparent_mib": 160.71,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.2,
+            "oxide-quick": 9.93,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 57.99,
+            "oxide-quick/incremental": 77.99
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 19
+        },
+        {
+          "label": "e3",
+          "wall_s": 0.5989,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            6.09,
+            5.56,
+            5.9
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.23,
+            "oxide-storage-lease \"bin\"": 0.12,
+            "oxide-storage-inventory \"bin\"": 0.12,
+            "oxide \"bin\"": 0.34
+          },
+          "deps_entries": 90,
+          "deps_files": 90,
+          "rcgu_count": 19,
+          "rcgu_apparent_mib": 2.2,
+          "rcgu_allocated_sum_over_names_mib": 2.24,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 155.99,
+          "target_apparent_mib": 160.76,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.24,
+            "oxide-quick": 9.93,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 57.99,
+            "oxide-quick/incremental": 77.99
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 19
+        },
+        {
+          "label": "e4",
+          "wall_s": 0.6312,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            6.09,
+            5.56,
+            5.9
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.27,
+            "oxide-storage-lease \"bin\"": 0.12,
+            "oxide-storage-inventory \"bin\"": 0.12,
+            "oxide \"bin\"": 0.33
+          },
+          "deps_entries": 90,
+          "deps_files": 90,
+          "rcgu_count": 19,
+          "rcgu_apparent_mib": 2.2,
+          "rcgu_allocated_sum_over_names_mib": 2.24,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 156.04,
+          "target_apparent_mib": 160.8,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.29,
+            "oxide-quick": 9.93,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 57.99,
+            "oxide-quick/incremental": 77.99
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 19
+        },
+        {
+          "label": "e5",
+          "wall_s": 0.591,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            6.09,
+            5.56,
+            5.9
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.24,
+            "oxide-storage-lease \"bin\"": 0.12,
+            "oxide-storage-inventory \"bin\"": 0.11,
+            "oxide \"bin\"": 0.32
+          },
+          "deps_entries": 90,
+          "deps_files": 90,
+          "rcgu_count": 19,
+          "rcgu_apparent_mib": 2.2,
+          "rcgu_allocated_sum_over_names_mib": 2.24,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 156.09,
+          "target_apparent_mib": 160.85,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.34,
+            "oxide-quick": 9.93,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 57.99,
+            "oxide-quick/incremental": 77.99
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 19
+        },
+        {
+          "label": "e6",
+          "wall_s": 0.5798,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            6.0,
+            5.55,
+            5.9
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.22,
+            "oxide-storage-lease \"bin\"": 0.12,
+            "oxide-storage-inventory \"bin\"": 0.12,
+            "oxide \"bin\"": 0.33
+          },
+          "deps_entries": 90,
+          "deps_files": 90,
+          "rcgu_count": 19,
+          "rcgu_apparent_mib": 2.2,
+          "rcgu_allocated_sum_over_names_mib": 2.24,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 156.13,
+          "target_apparent_mib": 160.89,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.38,
+            "oxide-quick": 9.93,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 57.99,
+            "oxide-quick/incremental": 77.99
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 19
+        },
+        {
+          "label": "e7",
+          "wall_s": 0.6033,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            6.0,
+            5.55,
+            5.9
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.22,
+            "oxide-storage-lease \"bin\"": 0.12,
+            "oxide-storage-inventory \"bin\"": 0.12,
+            "oxide \"bin\"": 0.36
+          },
+          "deps_entries": 90,
+          "deps_files": 90,
+          "rcgu_count": 19,
+          "rcgu_apparent_mib": 2.2,
+          "rcgu_allocated_sum_over_names_mib": 2.24,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 156.18,
+          "target_apparent_mib": 160.94,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.43,
+            "oxide-quick": 9.93,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 57.99,
+            "oxide-quick/incremental": 77.99
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 19
+        },
+        {
+          "label": "e8",
+          "wall_s": 0.9061,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            6.0,
+            5.55,
+            5.9
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.35,
+            "oxide-storage-lease \"bin\"": 0.18,
+            "oxide-storage-inventory \"bin\"": 0.19,
+            "oxide \"bin\"": 0.52
+          },
+          "deps_entries": 90,
+          "deps_files": 90,
+          "rcgu_count": 19,
+          "rcgu_apparent_mib": 2.2,
+          "rcgu_allocated_sum_over_names_mib": 2.24,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 156.23,
+          "target_apparent_mib": 160.98,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.48,
+            "oxide-quick": 9.93,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 57.99,
+            "oxide-quick/incremental": 77.99
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 19
+        },
+        {
+          "label": "e9",
+          "wall_s": 1.1323,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            6.0,
+            5.55,
+            5.9
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.42,
+            "oxide-storage-lease \"bin\"": 0.18,
+            "oxide-storage-inventory \"bin\"": 0.18,
+            "oxide \"bin\"": 0.66
+          },
+          "deps_entries": 90,
+          "deps_files": 90,
+          "rcgu_count": 19,
+          "rcgu_apparent_mib": 2.2,
+          "rcgu_allocated_sum_over_names_mib": 2.24,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 156.27,
+          "target_apparent_mib": 161.02,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.52,
+            "oxide-quick": 9.93,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 57.99,
+            "oxide-quick/incremental": 77.99
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 19
+        },
+        {
+          "label": "e10",
+          "wall_s": 1.3108,
+          "exit": 0,
+          "rebuilt_count": 4,
+          "fresh_count": 29,
+          "loadavg_before": [
+            7.6,
+            5.89,
+            6.01
+          ],
+          "cargo_timing_unit_s": {
+            "lib": 0.67,
+            "oxide-storage-lease \"bin\"": 0.21,
+            "oxide-storage-inventory \"bin\"": 0.2,
+            "oxide \"bin\"": 0.57
+          },
+          "deps_entries": 90,
+          "deps_files": 90,
+          "rcgu_count": 19,
+          "rcgu_apparent_mib": 2.2,
+          "rcgu_allocated_sum_over_names_mib": 2.24,
+          "rcgu_nlink_gt1": 0,
+          "rcgu_same_inode_as_incremental": 0,
+          "target_allocated_unique_mib": 156.32,
+          "target_apparent_mib": 161.07,
+          "by_area_allocated_unique_mib": {
+            ".": 0.01,
+            "cargo-timings": 0.57,
+            "oxide-quick": 9.93,
+            "oxide-quick/.fingerprint": 0.58,
+            "oxide-quick/build": 9.26,
+            "oxide-quick/deps": 57.99,
+            "oxide-quick/incremental": 77.99
+          },
+          "deps_dsym_dirs": 0,
+          "rcgu_referenced_by_current_binaries": 0,
+          "rcgu_not_referenced_by_current_binaries": 19
+        }
+      ],
+      "cold_build_s": 4.7898,
+      "warm_build_s": {
+        "mean": 0.7687,
+        "median": 0.6195,
+        "min": 0.5798,
+        "max": 1.3108
+      },
+      "warm_cargo_timing_unit_median_s": {
+        "lib": 0.255,
+        "oxide-storage-lease \"bin\"": 0.12,
+        "oxide-storage-inventory \"bin\"": 0.12,
+        "oxide \"bin\"": 0.35
+      },
+      "rcgu_added_per_edit_cycle": [
+        0
+      ],
+      "after_panic_build": {
+        "deps_entries": 92,
+        "rcgu_count": 19
+      },
+      "panic_build": {
+        "wall_s": 0.148,
+        "exit": 0,
+        "rebuilt": [
+          "oxide_080_panic_probe:test:True"
+        ]
+      },
+      "backtrace": {
+        "exit": 101,
+        "expected_exit": 101,
+        "panic_location": "tests/oxide_080_panic_probe.rs:5:5",
+        "panic_location_matches": true,
+        "frame_count": 8,
+        "frames_with_file_line": 3,
+        "probe_frames": {
+          "probe_panic_site": {
+            "frame_present": true,
+            "has_file_line": false,
+            "file_line": null,
+            "matches_expected_line": false
+          },
+          "probe_caller": {
+            "frame_present": true,
+            "has_file_line": false,
+            "file_line": null,
+            "matches_expected_line": false
+          },
+          "oxide_080_deliberate_panic": {
+            "frame_present": true,
+            "has_file_line": false,
+            "file_line": null,
+            "matches_expected_line": false
+          }
+        },
+        "dsym_next_to_executable": false,
+        "frames": [
+          {
+            "index": 0,
+            "symbol": "__rustc::rust_begin_unwind",
+            "at": {
+              "file": "/rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/panicking.rs",
+              "line": 689
+            }
+          },
+          {
+            "index": 1,
+            "symbol": "core::panicking::panic_fmt",
+            "at": {
+              "file": "/rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/panicking.rs",
+              "line": 80
+            }
+          },
+          {
+            "index": 2,
+            "symbol": "oxide_080_panic_probe::probe_panic_site",
+            "at": null
+          },
+          {
+            "index": 3,
+            "symbol": "oxide_080_panic_probe::probe_caller",
+            "at": null
+          },
+          {
+            "index": 4,
+            "symbol": "oxide_080_panic_probe::oxide_080_deliberate_panic",
+            "at": null
+          },
+          {
+            "index": 5,
+            "symbol": "oxide_080_panic_probe::oxide_080_deliberate_panic::{closure#0}",
+            "at": null
+          },
+          {
+            "index": 6,
+            "symbol": "<oxide_080_panic_probe::oxide_080_deliberate_panic::{closure#0} as core::ops::function::FnOnce<()>>::call_once",
+            "at": null
+          },
+          {
+            "index": 7,
+            "symbol": "<fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once",
+            "at": {
+              "file": "/rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/ops/function.rs",
+              "line": 250
+            }
+          }
+        ]
+      },
+      "edits": [
+        {
+          "edit": 1,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32768;",
+          "new": "pub const MAX_REFERENCES: usize = 32769;"
+        },
+        {
+          "edit": 2,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32769;",
+          "new": "pub const MAX_REFERENCES: usize = 32770;"
+        },
+        {
+          "edit": 3,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32770;",
+          "new": "pub const MAX_REFERENCES: usize = 32771;"
+        },
+        {
+          "edit": 4,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32771;",
+          "new": "pub const MAX_REFERENCES: usize = 32772;"
+        },
+        {
+          "edit": 5,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32772;",
+          "new": "pub const MAX_REFERENCES: usize = 32773;"
+        },
+        {
+          "edit": 6,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32773;",
+          "new": "pub const MAX_REFERENCES: usize = 32774;"
+        },
+        {
+          "edit": 7,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32774;",
+          "new": "pub const MAX_REFERENCES: usize = 32775;"
+        },
+        {
+          "edit": 8,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32775;",
+          "new": "pub const MAX_REFERENCES: usize = 32776;"
+        },
+        {
+          "edit": 9,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32776;",
+          "new": "pub const MAX_REFERENCES: usize = 32777;"
+        },
+        {
+          "edit": 10,
+          "file": "src/dep_info.rs",
+          "old": "pub const MAX_REFERENCES: usize = 32777;",
+          "new": "pub const MAX_REFERENCES: usize = 32778;"
+        }
+      ]
+    }
+  },
+  "notes": []
+}
