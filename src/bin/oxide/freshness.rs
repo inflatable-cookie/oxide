@@ -458,21 +458,31 @@ fn touch(path: &Path) -> Result<(), String> {
     }
 }
 
-/// Files of every local package under the checkout, for a checkout-path
-/// change. Cargo's resolved graph names the packages: each one with no
-/// registry or Git source whose canonical manifest lies under `top`, workspace
+/// Files to refresh for a checkout-path change. Cargo's resolved graph
+/// names the packages: local ones have no registry or Git source, workspace
 /// members and in-repo path dependencies alike. Every Git-listed file under
-/// such a package's directory is returned, so each local unit rebuilds
-/// whatever it reads there. Returns the package count and the files.
+/// the checkout is refreshed unless its deepest package directory belongs to
+/// a registry or Git package (vendored sources), and every local target's
+/// source is refreshed wherever it lies in the checkout. So a local unit
+/// rebuilds whatever it reads, inside or outside its own directory. Returns
+/// the local package count and the files.
 fn local_package_files(checkout: &Path, top: &Path) -> Result<(usize, Vec<String>), String> {
-    let manifests = local_manifests(&cargo_metadata(checkout)?)?
-        .iter()
-        .map(|manifest| {
-            fs::canonicalize(manifest)
-                .map_err(|error| format!("cannot resolve {}: {error}", manifest.display()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let dirs = package_dirs(top, &manifests)?;
+    let graph = resolve_graph(&cargo_metadata(checkout)?)?;
+    let canonical = |paths: &[PathBuf]| {
+        paths
+            .iter()
+            .map(|path| {
+                fs::canonicalize(path)
+                    .map_err(|error| format!("cannot resolve {}: {error}", path.display()))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let local = package_dirs(top, &canonical(&graph.local)?)?;
+    let foreign = package_dirs(top, &canonical(&graph.foreign)?)?;
+    if let Some(dir) = local.intersection(&foreign).next() {
+        return Err(format!("two packages claim {dir:?}"));
+    }
+    let targets = contained(top, &canonical(&graph.targets)?)?;
     let listed = nul_separated(git(
         top,
         &[
@@ -486,7 +496,10 @@ fn local_package_files(checkout: &Path, top: &Path) -> Result<(usize, Vec<String
     if listed.len() > MAX_LISTED {
         return Err(format!("more than {MAX_LISTED} repository files"));
     }
-    Ok((dirs.len(), owned_files(&dirs, &listed)?))
+    Ok((
+        local.len(),
+        owned_files(&local, &foreign, &targets, &listed)?,
+    ))
 }
 
 /// Run `cargo metadata` for the workspace, bounded in output and lifetime.
@@ -552,27 +565,52 @@ fn read_capped(reader: impl Read, cap: u64) -> std::io::Result<(Vec<u8>, bool)> 
     Ok((bytes, rest > 0))
 }
 
-/// Manifest paths of every package Cargo resolved without a registry or Git
-/// source. A package whose source is neither is refused.
-fn local_manifests(metadata: &serde_json::Value) -> Result<Vec<PathBuf>, String> {
+/// Package manifests and local target sources from `cargo metadata`.
+#[derive(Debug, Default)]
+struct Graph {
+    /// Packages with no registry or Git source.
+    local: Vec<PathBuf>,
+    /// Registry and Git packages.
+    foreign: Vec<PathBuf>,
+    /// Every target source of a local package, build scripts included.
+    targets: Vec<PathBuf>,
+}
+
+/// Split Cargo's resolved packages by source. A package whose source,
+/// manifest or targets cannot be read is refused.
+fn resolve_graph(metadata: &serde_json::Value) -> Result<Graph, String> {
     let packages = metadata
         .get("packages")
         .and_then(serde_json::Value::as_array)
         .ok_or("Cargo metadata lists no packages")?;
-    let mut manifests = Vec::new();
+    let mut graph = Graph::default();
     for package in packages {
-        match package.get("source") {
-            Some(serde_json::Value::String(_)) => continue,
-            Some(serde_json::Value::Null) => {}
-            _ => return Err("Cargo metadata has a package with an unreadable source".to_owned()),
-        }
         let manifest = package
             .get("manifest_path")
             .and_then(serde_json::Value::as_str)
-            .ok_or("Cargo metadata has a local package without a manifest path")?;
-        manifests.push(PathBuf::from(manifest));
+            .map(PathBuf::from)
+            .ok_or("Cargo metadata has a package without a manifest path")?;
+        match package.get("source") {
+            Some(serde_json::Value::String(_)) => {
+                graph.foreign.push(manifest);
+                continue;
+            }
+            Some(serde_json::Value::Null) => graph.local.push(manifest),
+            _ => return Err("Cargo metadata has a package with an unreadable source".to_owned()),
+        }
+        let targets = package
+            .get("targets")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("Cargo metadata has a local package without targets")?;
+        for target in targets {
+            let source = target
+                .get("src_path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("Cargo metadata has a local target without a source path")?;
+            graph.targets.push(PathBuf::from(source));
+        }
     }
-    Ok(manifests)
+    Ok(graph)
 }
 
 /// Directories, relative to `top`, of the canonical manifests under it.
@@ -584,35 +622,69 @@ fn package_dirs(top: &Path, manifests: &[PathBuf]) -> Result<BTreeSet<String>, S
         let dir = manifest
             .parent()
             .ok_or_else(|| format!("{} has no directory", manifest.display()))?;
-        let Ok(relative) = dir.strip_prefix(top) else {
-            continue;
-        };
-        let relative = relative
-            .to_str()
-            .ok_or_else(|| format!("{} is not UTF-8", dir.display()))?;
-        if !dirs.insert(relative.to_owned()) {
-            return Err(format!("two packages claim {}", dir.display()));
+        for relative in contained(top, &[dir.to_path_buf()])? {
+            if !dirs.insert(relative) {
+                return Err(format!("two packages claim {}", dir.display()));
+            }
         }
     }
     Ok(dirs)
 }
 
-/// Listed files under any package directory. Each package's manifest must be
-/// listed: a package Git cannot see would be silently skipped.
-fn owned_files(dirs: &BTreeSet<String>, listed: &[String]) -> Result<Vec<String>, String> {
+/// The canonical paths under `top`, relative to it; others are dropped.
+fn contained(top: &Path, paths: &[PathBuf]) -> Result<BTreeSet<String>, String> {
+    let mut inside = BTreeSet::new();
+    for path in paths {
+        let Ok(relative) = path.strip_prefix(top) else {
+            continue;
+        };
+        let relative = relative
+            .to_str()
+            .ok_or_else(|| format!("{} is not UTF-8", path.display()))?;
+        inside.insert(relative.to_owned());
+    }
+    Ok(inside)
+}
+
+/// Listed files whose deepest package directory is not a registry or Git
+/// package's, plus every local target source. Each local manifest and target
+/// source must be listed: a file Git cannot see would be silently skipped.
+fn owned_files(
+    local: &BTreeSet<String>,
+    foreign: &BTreeSet<String>,
+    targets: &BTreeSet<String>,
+    listed: &[String],
+) -> Result<Vec<String>, String> {
     let visible: BTreeSet<&str> = listed.iter().map(String::as_str).collect();
-    for dir in dirs {
-        let manifest = Path::new(dir).join("Cargo.toml");
-        if !manifest.to_str().is_some_and(|path| visible.contains(path)) {
-            return Err(format!(
-                "{} is not visible to Git; the gate cannot cover its package",
-                manifest.display()
-            ));
+    let manifests = local.iter().map(|dir| {
+        Path::new(dir)
+            .join("Cargo.toml")
+            .to_str()
+            .map(str::to_owned)
+    });
+    for required in manifests.chain(targets.iter().cloned().map(Some)) {
+        match required {
+            Some(path) if visible.contains(path.as_str()) => {}
+            Some(path) => {
+                return Err(format!(
+                    "{path} is not visible to Git; the gate cannot cover its package"
+                ))
+            }
+            None => return Err("a package path is not UTF-8".to_owned()),
         }
     }
+    let owner = |path: &str| {
+        local
+            .iter()
+            .chain(foreign)
+            .filter(|dir| Path::new(path).starts_with(dir))
+            .max_by_key(|dir| Path::new(dir).components().count())
+    };
     Ok(listed
         .iter()
-        .filter(|path| dirs.iter().any(|dir| Path::new(path).starts_with(dir)))
+        .filter(|path| {
+            targets.contains(*path) || owner(path).is_none_or(|dir| !foreign.contains(dir))
+        })
         .cloned()
         .collect())
 }
@@ -654,39 +726,53 @@ mod tests {
         assert!(status_paths(&vec![" M a".to_owned(); MAX_PATHS + 1]).is_err());
     }
 
+    fn set(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|item| (*item).to_owned()).collect()
+    }
+
     #[test]
-    fn local_packages_are_every_package_without_a_source() {
+    fn metadata_splits_packages_by_source() {
         let metadata = serde_json::json!({"packages": [
-            {"name": "app", "source": null, "manifest_path": "/repo/Cargo.toml"},
-            {"name": "vendored", "source": null, "manifest_path": "/repo/vendor/v/Cargo.toml"},
-            {"name": "outside", "source": null, "manifest_path": "/outside/Cargo.toml"},
+            {"name": "app", "source": null, "manifest_path": "/repo/pkg/Cargo.toml",
+             "targets": [{"src_path": "/repo/shared/lib.rs"}, {"src_path": "/repo/pkg/build.rs"}]},
+            {"name": "outside", "source": null, "manifest_path": "/outside/Cargo.toml", "targets": []},
             {"name": "serde", "source": "registry+https://github.com/rust-lang/crates.io-index",
-             "manifest_path": "/repo/vendor/registry/serde/Cargo.toml"},
+             "manifest_path": "/repo/vendor/serde/Cargo.toml"},
             {"name": "dep", "source": "git+https://example.invalid/dep#abc",
-             "manifest_path": "/repo/git/dep/Cargo.toml"},
+             "manifest_path": "/repo/vendor/dep/Cargo.toml"},
         ]});
-        let manifests = local_manifests(&metadata).expect("reads");
+        let graph = resolve_graph(&metadata).expect("reads");
+        let paths = |items: &[&str]| items.iter().map(PathBuf::from).collect::<Vec<_>>();
         assert_eq!(
-            manifests,
-            [
-                "/repo/Cargo.toml",
-                "/repo/vendor/v/Cargo.toml",
-                "/outside/Cargo.toml"
-            ]
-            .map(PathBuf::from)
+            graph.local,
+            paths(&["/repo/pkg/Cargo.toml", "/outside/Cargo.toml"])
+        );
+        assert_eq!(
+            graph.foreign,
+            paths(&[
+                "/repo/vendor/serde/Cargo.toml",
+                "/repo/vendor/dep/Cargo.toml"
+            ])
+        );
+        assert_eq!(
+            graph.targets,
+            paths(&["/repo/shared/lib.rs", "/repo/pkg/build.rs"])
         );
         for broken in [
             serde_json::json!({}),
-            serde_json::json!({"packages": [{"name": "x", "manifest_path": "/repo/Cargo.toml"}]}),
+            serde_json::json!({"packages": [{"name": "x", "manifest_path": "/r/Cargo.toml", "targets": []}]}),
             serde_json::json!({"packages": [{"name": "x", "source": 1, "manifest_path": "/r/Cargo.toml"}]}),
-            serde_json::json!({"packages": [{"name": "x", "source": null}]}),
+            serde_json::json!({"packages": [{"name": "x", "source": null, "targets": []}]}),
+            serde_json::json!({"packages": [{"name": "x", "source": null, "manifest_path": "/r/Cargo.toml"}]}),
+            serde_json::json!({"packages": [{"name": "x", "source": null, "manifest_path": "/r/Cargo.toml",
+                                             "targets": [{"name": "x"}]}]}),
         ] {
-            assert!(local_manifests(&broken).is_err(), "{broken}");
+            assert!(resolve_graph(&broken).is_err(), "{broken}");
         }
     }
 
     #[test]
-    fn only_packages_under_the_checkout_count() {
+    fn only_paths_under_the_checkout_count() {
         let top = Path::new("/repo");
         let manifests = [
             "/repo/Cargo.toml",
@@ -697,54 +783,84 @@ mod tests {
         ]
         .map(PathBuf::from);
         let dirs = package_dirs(top, &manifests).expect("dirs");
-        assert_eq!(
-            dirs.into_iter().collect::<Vec<_>>(),
-            ["", "codegen", "vendor/pathmac"]
-        );
+        assert_eq!(dirs, set(&["", "codegen", "vendor/pathmac"]));
         let twice = ["/repo/a/Cargo.toml", "/repo/a/Cargo.toml"].map(PathBuf::from);
         assert!(package_dirs(top, &twice).is_err());
+        let sources = ["/repo/shared/lib.rs", "/repo-other/lib.rs"].map(PathBuf::from);
+        assert_eq!(
+            contained(top, &sources).expect("contained"),
+            set(&["shared/lib.rs"])
+        );
     }
 
     #[test]
-    fn every_file_of_every_local_package_refreshes() {
+    fn every_local_input_refreshes_and_vendored_sources_do_not() {
         // Classification never reads manifests or sources: an escaped build
         // key, a default build.rs, a current_dir() script and a proc-macro
-        // caller all refresh like any other local package's files.
+        // caller refresh like any other local package's files.
         let listed = [
             "Cargo.toml",
             "Cargo.lock",
             "src/lib.rs",
             "codegen/Cargo.toml",
             "codegen/gen.rs",
-            "plain/Cargo.toml",
-            "plain/src/lib.rs",
-            "plain/data/table.txt",
             "docs/notes.md",
+            "vendor/serde/Cargo.toml",
+            "vendor/serde/src/lib.rs",
+            "vendor/serde/local/Cargo.toml",
+            "vendor/serde/local/src/lib.rs",
         ]
         .map(str::to_owned);
-        let only_plain = BTreeSet::from(["codegen".to_owned(), "plain".to_owned()]);
+        let local = set(&["", "codegen", "vendor/serde/local"]);
+        let foreign = set(&["vendor/serde"]);
         assert_eq!(
-            owned_files(&only_plain, &listed).expect("covered"),
+            owned_files(&local, &foreign, &set(&[]), &listed).expect("covered"),
             [
+                "Cargo.toml",
+                "Cargo.lock",
+                "src/lib.rs",
                 "codegen/Cargo.toml",
                 "codegen/gen.rs",
-                "plain/Cargo.toml",
-                "plain/src/lib.rs",
-                "plain/data/table.txt"
+                "docs/notes.md",
+                "vendor/serde/local/Cargo.toml",
+                "vendor/serde/local/src/lib.rs"
             ]
         );
-        let with_root = BTreeSet::from(["".to_owned(), "plain".to_owned()]);
-        assert_eq!(owned_files(&with_root, &listed).expect("covered"), listed);
-        // A prefix is not a parent directory.
-        let prefix = BTreeSet::from(["pla".to_owned()]);
-        let mut with_prefix = listed.to_vec();
-        with_prefix.push("pla/Cargo.toml".to_owned());
+        // A virtual workspace: the member's target lies outside its
+        // directory, and unowned files refresh too.
+        let virtual_listed = [
+            "Cargo.toml",
+            "pkg/Cargo.toml",
+            "pkg/src/main.rs",
+            "shared/lib.rs",
+            "vendor/dep/Cargo.toml",
+            "vendor/dep/lib.rs",
+        ]
+        .map(str::to_owned);
         assert_eq!(
-            owned_files(&prefix, &with_prefix).expect("covered"),
+            owned_files(
+                &set(&["pkg"]),
+                &set(&["vendor/dep"]),
+                &set(&["shared/lib.rs"]),
+                &virtual_listed
+            )
+            .expect("covered"),
+            [
+                "Cargo.toml",
+                "pkg/Cargo.toml",
+                "pkg/src/main.rs",
+                "shared/lib.rs"
+            ]
+        );
+        // A prefix is not a parent directory.
+        let prefix = ["pla/Cargo.toml", "plain/lib.rs"].map(str::to_owned);
+        assert_eq!(
+            owned_files(&set(&["pla"]), &set(&["plain"]), &set(&[]), &prefix).expect("covered"),
             ["pla/Cargo.toml"]
         );
-        let hidden = BTreeSet::from(["ignored".to_owned()]);
-        assert!(owned_files(&hidden, &listed).is_err());
+        // A manifest or target source Git cannot see refuses.
+        assert!(owned_files(&set(&["ignored"]), &set(&[]), &set(&[]), &listed).is_err());
+        assert!(owned_files(&set(&[""]), &set(&[]), &set(&["gen/out.rs"]), &listed).is_err());
     }
 
     #[test]

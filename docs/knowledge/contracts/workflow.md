@@ -154,13 +154,15 @@ slot has a recorded origin:
    --offline --locked` names the packages: each one with no registry or Git
    source whose canonical manifest lies under the canonical checkout root
    (component-aware), workspace members and in-repo path dependencies alike.
-   Every tracked and untracked non-ignored file under such a package's
-   directory gets the same mtime treatment, so every local unit rebuilds,
+   Every tracked and untracked non-ignored file in the checkout gets the
+   same mtime treatment unless its deepest package directory belongs to a
+   registry or Git package (vendored sources), and every local target's
+   source in the checkout is included, so every local unit rebuilds,
    including build scripts that read `current_dir()` and proc macros that
    expand to the caller's manifest dir. Manifests and sources are never read
    to decide this. Metadata failure, a missing lock file, output over 64 MiB
-   or 60 s, two packages in one directory, or a package manifest Git cannot
-   see refuses sharing (cold, checkout-affine). Registry, Git and
+   or 60 s, two packages in one directory, or a local manifest or target
+   source Git cannot see refuses sharing (cold, checkout-affine). Registry, Git and
    outside-checkout path dependencies are not refreshed by this rule; they
    keep their paths and stay warm.
 
@@ -665,6 +667,8 @@ Rules:
   the slot leaves the retry to recover the slot and run the gate again. Warm-path cost is one `git status` and
   `rev-parse` before and after Cargo, about 25 ms on this repository; a
   path change adds one `cargo metadata` call. The metadata-membership rule
-  has not yet passed the native fixture run: its first run refused a clone
-  without a committed lock file (correct refusal, fixture defect, fixed).
+  passed the independent native fixture run at `c0867bb`; the later
+  file-ownership correction (unowned files and target sources outside
+  package directories refresh, vendored registry/Git sources do not) is
+  unit-tested, not natively re-run.
   Real-project qualification (Q2–Q4) remains.
