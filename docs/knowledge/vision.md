@@ -88,6 +88,20 @@ failed comparison and unqualified readings are not upgraded by this direction.
 
 ## Authority boundaries
 
+Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
+High** for the current Oxide product work rather than cheap worker routing.
+He cited his 22 October Code/Claude resets and prioritized implementation and
+review quality for the intervening days (Queue decision `3a025584-9dd7-415d-8e07-0f37242f894c` v2).
+Operations may replace active cheaper-model runs through supported Queue controls,
+preserving the same workspaces, branches, work and evidence. Pin substantive
+workers and independent reviews explicitly to the requested frontier models and
+high effort; do not silently substitute Luna or another cheaper model. Use
+actual provider/model identities, not renamed profiles. Scope, prerequisites,
+original author/review time and fixture caps do not reset during a handoff.
+This authorizes scoped model routing, not unrelated admission/capacity changes.
+Reassess the temporary allocation preference around the stated reset rather
+than assuming an automatic downgrade.
+
 Tom approved the prepared opt-in stable-Cargo light/full-debug profile qualification
 on 2026-10-16 with "Yes" (Queue decision
 `a1dd9a16-5b5f-4b88-a0d5-b92dc0313f66`, prepared lead
