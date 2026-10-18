@@ -1,0 +1,503 @@
+{
+  "task": "oxide#082",
+  "outcome": "complete",
+  "pin": "22d2f7709b9d3e9e826b0ce64f893292f8f6fda7",
+  "pin_tree": "7eb7502b8fe0c2809697c18d49158833d4267f18",
+  "toolchain": {
+    "cargo": [
+      "cargo 1.97.1 (c980f4866 2026-06-30)",
+      "release: 1.97.1",
+      "commit-hash: c980f4866141969fab6254a680546a277789d6f0",
+      "commit-date: 2026-06-30",
+      "host: aarch64-apple-darwin",
+      "libgit2: 1.9.2 (sys:0.20.4 vendored)",
+      "libcurl: 8.7.1 (sys:0.4.88+curl-8.20.0 system ssl:(SecureTransport) LibreSSL/3.3.6)",
+      "ssl: OpenSSL 3.6.2 7 Apr 2026",
+      "os: Mac OS 26.6.2 [64-bit]"
+    ],
+    "rustc": [
+      "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+      "binary: rustc",
+      "commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452",
+      "commit-date: 2026-07-14",
+      "host: aarch64-apple-darwin",
+      "release: 1.97.1",
+      "LLVM version: 22.1.6"
+    ]
+  },
+  "profile": "default dev and test profiles; no source, profile or flag edits",
+  "session": {
+    "utc_start": "2026-10-18T21:21:50Z",
+    "utc_end": "2026-10-18T21:22:28Z",
+    "seconds_used": 37.997,
+    "seconds_cap": 1200,
+    "admission_wait_and_submit_seconds": 20.529
+  },
+  "calls": {
+    "setup": 2,
+    "setup_cap": 2,
+    "experimental_cargo": 4,
+    "experimental_cargo_cap": 8,
+    "non_cargo_tools": 7,
+    "list": [
+      {
+        "name": "git-clone",
+        "kind": "tool",
+        "exit": 0,
+        "start_s": 20.534,
+        "end_s": 21.038,
+        "group_settled": true
+      },
+      {
+        "name": "git-checkout",
+        "kind": "tool",
+        "exit": 0,
+        "start_s": 21.039,
+        "end_s": 21.291,
+        "group_settled": true
+      },
+      {
+        "name": "git-tree",
+        "kind": "tool",
+        "exit": 0,
+        "start_s": 21.291,
+        "end_s": 21.546,
+        "group_settled": true
+      },
+      {
+        "name": "git-status",
+        "kind": "tool",
+        "exit": 0,
+        "start_s": 21.547,
+        "end_s": 21.802,
+        "group_settled": true
+      },
+      {
+        "name": "image-create",
+        "kind": "tool",
+        "exit": 0,
+        "start_s": 22.936,
+        "end_s": 24.208,
+        "group_settled": true
+      },
+      {
+        "name": "image-attach",
+        "kind": "tool",
+        "exit": 0,
+        "start_s": 24.208,
+        "end_s": 24.466,
+        "group_settled": true
+      },
+      {
+        "name": "setup-cargo-version",
+        "kind": "setup",
+        "exit": 0,
+        "start_s": 24.487,
+        "end_s": 24.745,
+        "group_settled": true
+      },
+      {
+        "name": "setup-rustc-version",
+        "kind": "setup",
+        "exit": 0,
+        "start_s": 24.746,
+        "end_s": 25.002,
+        "group_settled": true
+      },
+      {
+        "name": "X-build",
+        "kind": "cargo",
+        "exit": 0,
+        "start_s": 25.02,
+        "end_s": 30.133,
+        "group_settled": true
+      },
+      {
+        "name": "X-test-no-run",
+        "kind": "cargo",
+        "exit": 0,
+        "start_s": 30.168,
+        "end_s": 31.458,
+        "group_settled": true
+      },
+      {
+        "name": "S-build",
+        "kind": "cargo",
+        "exit": 0,
+        "start_s": 31.542,
+        "end_s": 35.898,
+        "group_settled": true
+      },
+      {
+        "name": "S-test-no-run",
+        "kind": "cargo",
+        "exit": 0,
+        "start_s": 35.941,
+        "end_s": 37.211,
+        "group_settled": true
+      },
+      {
+        "name": "image-detach",
+        "kind": "tool",
+        "exit": 0,
+        "start_s": 37.307,
+        "end_s": 37.816,
+        "group_settled": true
+      }
+    ]
+  },
+  "resources": {
+    "image_declared": "4g",
+    "image_count": 1,
+    "peak_image_used_bytes": 440782848,
+    "peak_owned_host_allocated_bytes_incl_image_backing": 537407488,
+    "owned_cap_bytes": 6442450944,
+    "min_host_free_bytes": 773592027136,
+    "host_reserve_bytes": 21474836480,
+    "raw_log_bytes": 130958,
+    "raw_log_cap_bytes": 33554432,
+    "loadavg_range_1m": [
+      8.70458984375,
+      10.373046875
+    ],
+    "closure": "every owned process group positively settled (killpg 0 -> ESRCH) before ordinary hdiutil detach (exit 0, not forced); image and bulky scratch removed only after detach"
+  },
+  "layouts": {
+    "X": {
+      "build_dir": "/private/tmp/oxide-082-links.cl42af8i/m/build-X",
+      "target_dir": "/private/tmp/oxide-082-links.cl42af8i/target-X",
+      "build_dev": 16777240,
+      "target_dev": 16777234,
+      "hard_links_observed": false,
+      "uplifted_after_build": [
+        {
+          "target_file": "CACHEDIR.TAG",
+          "size": 177,
+          "allocated": 4096,
+          "dev": 16777234,
+          "ino": 1828403717,
+          "nlink": 1,
+          "same_inode_peer_in_build_dir": false,
+          "build_peer": "CACHEDIR.TAG",
+          "build_peer_dev": 16777240,
+          "build_peer_ino": 17,
+          "build_peer_nlink": 1,
+          "apfs_private_size": 4096,
+          "clone_id": 1828403717,
+          "build_peer_clone_id": 17,
+          "clone_refcnt": 1,
+          "ext_flags": 0
+        },
+        {
+          "target_file": "debug/liboxide_storage.rlib",
+          "size": 7801912,
+          "allocated": 7802880,
+          "dev": 16777234,
+          "ino": 1828403762,
+          "nlink": 1,
+          "same_inode_peer_in_build_dir": false,
+          "build_peer": "debug/deps/liboxide_storage-b2aed09fec63ba23.rlib",
+          "build_peer_dev": 16777240,
+          "build_peer_ino": 1024,
+          "build_peer_nlink": 1,
+          "apfs_private_size": 7802880,
+          "clone_id": 1828403762,
+          "build_peer_clone_id": 1024,
+          "clone_refcnt": 1,
+          "ext_flags": 0
+        },
+        {
+          "target_file": "debug/oxide",
+          "size": 4577560,
+          "allocated": 4579328,
+          "dev": 16777234,
+          "ino": 1828403810,
+          "nlink": 1,
+          "same_inode_peer_in_build_dir": false,
+          "build_peer": "debug/deps/oxide-a76c087a736bc800",
+          "build_peer_dev": 16777240,
+          "build_peer_ino": 1870,
+          "build_peer_nlink": 1,
+          "apfs_private_size": 4579328,
+          "clone_id": 1828403810,
+          "build_peer_clone_id": 1870,
+          "clone_refcnt": 1,
+          "ext_flags": 0
+        },
+        {
+          "target_file": "debug/oxide-storage-inventory",
+          "size": 1139016,
+          "allocated": 1142784,
+          "dev": 16777234,
+          "ino": 1828403768,
+          "nlink": 1,
+          "same_inode_peer_in_build_dir": false,
+          "build_peer": "debug/deps/oxide_storage_inventory-35bdc8aedbe655d8",
+          "build_peer_dev": 16777240,
+          "build_peer_ino": 1234,
+          "build_peer_nlink": 1,
+          "apfs_private_size": 1142784,
+          "clone_id": 1828403768,
+          "build_peer_clone_id": 1234,
+          "clone_refcnt": 1,
+          "ext_flags": 0
+        },
+        {
+          "target_file": "debug/oxide-storage-lease",
+          "size": 2043320,
+          "allocated": 2043904,
+          "dev": 16777234,
+          "ino": 1828403769,
+          "nlink": 1,
+          "same_inode_peer_in_build_dir": false,
+          "build_peer": "debug/deps/oxide_storage_lease-963690e4a27f2be5",
+          "build_peer_dev": 16777240,
+          "build_peer_ino": 1236,
+          "build_peer_nlink": 1,
+          "apfs_private_size": 2043904,
+          "clone_id": 1828403769,
+          "build_peer_clone_id": 1236,
+          "clone_refcnt": 1,
+          "ext_flags": 0
+        }
+      ],
+      "test_binaries": [
+        {
+          "target": "oxide-storage-inventory",
+          "kind": [
+            "bin"
+          ],
+          "executable_location": "build",
+          "executable": "oxide_storage_inventory-5bff3f7d6f256fc9"
+        },
+        {
+          "target": "oxide-storage-lease",
+          "kind": [
+            "bin"
+          ],
+          "executable_location": "build",
+          "executable": "oxide_storage_lease-99c8ae4d3ca94584"
+        },
+        {
+          "target": "profile_backtrace",
+          "kind": [
+            "test"
+          ],
+          "executable_location": "build",
+          "executable": "profile_backtrace-d30fe8b4e47d30ca"
+        },
+        {
+          "target": "oxide",
+          "kind": [
+            "bin"
+          ],
+          "executable_location": "build",
+          "executable": "oxide-882dfe2f466b5ab2"
+        },
+        {
+          "target": "oxide_storage",
+          "kind": [
+            "lib"
+          ],
+          "executable_location": "build",
+          "executable": "oxide_storage-9c1186fcf20833bd"
+        }
+      ],
+      "test_binaries_uplifted": false,
+      "target_file_count_build_then_test": [
+        11,
+        11
+      ],
+      "target_files_replaced_by_test_no_run_new_inode": [
+        "debug/oxide",
+        "debug/oxide-storage-inventory",
+        "debug/oxide-storage-lease"
+      ],
+      "after_test_no_run": {
+        "target_unique_inode_allocated_bytes": 15589376,
+        "target_apfs_private_bytes": 15589376,
+        "build_unique_inode_allocated_bytes": 215470080,
+        "union_unique_inode_allocated_bytes": 231059456,
+        "target_bytes_not_shared_with_build": 15589376
+      },
+      "image_used_delta_bytes": 212426752
+    },
+    "S": {
+      "build_dir": "/private/tmp/oxide-082-links.cl42af8i/m/build-S",
+      "target_dir": "/private/tmp/oxide-082-links.cl42af8i/m/target-S",
+      "build_dev": 16777240,
+      "target_dev": 16777240,
+      "hard_links_observed": false,
+      "uplifted_after_build": [
+        {
+          "target_file": "CACHEDIR.TAG",
+          "size": 177,
+          "allocated": 4096,
+          "dev": 16777240,
+          "ino": 3415,
+          "nlink": 1,
+          "same_inode_peer_in_build_dir": false,
+          "build_peer": "CACHEDIR.TAG",
+          "build_peer_dev": 16777240,
+          "build_peer_ino": 3417,
+          "build_peer_nlink": 1,
+          "apfs_private_size": 4096,
+          "clone_id": 3415,
+          "build_peer_clone_id": 3417,
+          "clone_refcnt": 1,
+          "ext_flags": 0
+        },
+        {
+          "target_file": "debug/liboxide_storage.rlib",
+          "size": 7801912,
+          "allocated": 7802880,
+          "dev": 16777240,
+          "ino": 4430,
+          "nlink": 1,
+          "same_inode_peer_in_build_dir": false,
+          "build_peer": "debug/deps/liboxide_storage-b2aed09fec63ba23.rlib",
+          "build_peer_dev": 16777240,
+          "build_peer_ino": 4428,
+          "build_peer_nlink": 1,
+          "apfs_private_size": 0,
+          "clone_id": 4428,
+          "build_peer_clone_id": 4428,
+          "clone_refcnt": 2,
+          "ext_flags": 65
+        },
+        {
+          "target_file": "debug/oxide",
+          "size": 4577560,
+          "allocated": 4579328,
+          "dev": 16777240,
+          "ino": 5279,
+          "nlink": 1,
+          "same_inode_peer_in_build_dir": false,
+          "build_peer": "debug/deps/oxide-a76c087a736bc800",
+          "build_peer_dev": 16777240,
+          "build_peer_ino": 5277,
+          "build_peer_nlink": 1,
+          "apfs_private_size": 0,
+          "clone_id": 5277,
+          "build_peer_clone_id": 5277,
+          "clone_refcnt": 2,
+          "ext_flags": 65
+        },
+        {
+          "target_file": "debug/oxide-storage-inventory",
+          "size": 1139016,
+          "allocated": 1142784,
+          "dev": 16777240,
+          "ino": 4641,
+          "nlink": 1,
+          "same_inode_peer_in_build_dir": false,
+          "build_peer": "debug/deps/oxide_storage_inventory-35bdc8aedbe655d8",
+          "build_peer_dev": 16777240,
+          "build_peer_ino": 4639,
+          "build_peer_nlink": 1,
+          "apfs_private_size": 0,
+          "clone_id": 4639,
+          "build_peer_clone_id": 4639,
+          "clone_refcnt": 2,
+          "ext_flags": 65
+        },
+        {
+          "target_file": "debug/oxide-storage-lease",
+          "size": 2043320,
+          "allocated": 2043904,
+          "dev": 16777240,
+          "ino": 4646,
+          "nlink": 1,
+          "same_inode_peer_in_build_dir": false,
+          "build_peer": "debug/deps/oxide_storage_lease-963690e4a27f2be5",
+          "build_peer_dev": 16777240,
+          "build_peer_ino": 4644,
+          "build_peer_nlink": 1,
+          "apfs_private_size": 0,
+          "clone_id": 4644,
+          "build_peer_clone_id": 4644,
+          "clone_refcnt": 2,
+          "ext_flags": 65
+        }
+      ],
+      "test_binaries": [
+        {
+          "target": "oxide-storage-inventory",
+          "kind": [
+            "bin"
+          ],
+          "executable_location": "build",
+          "executable": "oxide_storage_inventory-5bff3f7d6f256fc9"
+        },
+        {
+          "target": "oxide-storage-lease",
+          "kind": [
+            "bin"
+          ],
+          "executable_location": "build",
+          "executable": "oxide_storage_lease-99c8ae4d3ca94584"
+        },
+        {
+          "target": "profile_backtrace",
+          "kind": [
+            "test"
+          ],
+          "executable_location": "build",
+          "executable": "profile_backtrace-d30fe8b4e47d30ca"
+        },
+        {
+          "target": "oxide",
+          "kind": [
+            "bin"
+          ],
+          "executable_location": "build",
+          "executable": "oxide-882dfe2f466b5ab2"
+        },
+        {
+          "target": "oxide_storage",
+          "kind": [
+            "lib"
+          ],
+          "executable_location": "build",
+          "executable": "oxide_storage-9c1186fcf20833bd"
+        }
+      ],
+      "test_binaries_uplifted": false,
+      "target_file_count_build_then_test": [
+        11,
+        11
+      ],
+      "target_files_replaced_by_test_no_run_new_inode": [
+        "debug/oxide",
+        "debug/oxide-storage-inventory",
+        "debug/oxide-storage-lease"
+      ],
+      "after_test_no_run": {
+        "target_unique_inode_allocated_bytes": 15589376,
+        "target_apfs_private_bytes": 20480,
+        "build_unique_inode_allocated_bytes": 215470080,
+        "union_unique_inode_allocated_bytes": 231059456,
+        "target_bytes_not_shared_with_build": 20480
+      },
+      "image_used_delta_bytes": 212029440
+    }
+  },
+  "per_worktree_saving": {
+    "definition": "target-directory bytes not shared with the build directory, cross-volume minus same-volume, after build + test --no-run",
+    "cross_volume_target_private_bytes": 15589376,
+    "same_volume_target_private_bytes": 20480,
+    "saved_bytes": 15568896,
+    "clone_aware_union_bytes": {
+      "X": 231059456,
+      "S": 215490560
+    },
+    "image_used_cross_check": "X image delta covers build-X only; S image delta covers build-S and target-S; S - X = -397312 bytes"
+  },
+  "cargo_source": "cargo-util paths.rs _link_or_copy at Cargo commit c980f4866141969fab6254a680546a277789d6f0: on macOS removes the destination, then fs::copy (fclonefileat on APFS); hard_link only as an EAGAIN fallback; other Unix uses hard_link",
+  "limits": [
+    "one subject, one host, APFS, cold build plus one test --no-run per layout",
+    "no repeat or edit builds; no Linux or other filesystem",
+    "host-free and image deltas are noisy and not SSD writes",
+    "test binaries were not executed"
+  ]
+}

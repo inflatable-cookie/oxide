@@ -273,6 +273,32 @@ Implication: the `quick` recipe accumulates stale objects in long-lived shared s
 | Cargo home GC ([1.88](https://blog.rust-lang.org/2025/06/26/Rust-1.88.0/)) | Stable automatic cleanup of downloaded/cached files (3 months / 1 month unused). Never runs with `--offline` or `--frozen`. The target dir is not covered. | Agent and Oxide proofs often run `--offline`, so their Cargo home may never be cleaned. Worth surfacing in `oxide status`. |
 | [Cargo script](https://rust-lang.github.io/goals/2026/cargo-script.html) | Frontmatter stabilization in progress; not stable on 1.97.1. | Single-file scripts; each script otherwise gets its own target dir. |
 
+## Final-output placement probe (2026-10-18)
+
+Question: when the target directory shares a volume with the build directory, does Cargo hard-link final outputs instead of copying them, and how many bytes per worktree does that save over the current layout (build directory on the pool, target directory in the checkout; [workflow](contracts/workflow.md#what-one-command-does-local-executor))?
+
+Subject: Oxide at `22d2f77`, stable 1.97.1, `--offline`, default `dev`/`test` profiles, no edits. One fresh 4 GiB APFS sparse image, two layouts built sequentially into disjoint directories:
+- X (cross-volume): build directory on the image, target directory on the host volume.
+- S (same volume): both on the image.
+
+Per layout: one cold `cargo build` and one `cargo test --no-run`. The recorded data per final file: device, inode, `st_nlink`, size, allocation, APFS private size and clone ID (`getattrlist`), plus its content-equal build-directory peer.
+
+| | X (cross-volume) | S (same volume) |
+| --- | --- | --- |
+| Hard links | None: `st_nlink` 1; no target file shares device and inode with a build file | None, same evidence |
+| Uplifted lib and three bins | Independent copies; private bytes equal allocation | APFS clones of the `deps/` files: private size 0, shared clone ID, refcount 2 |
+| Target-dir bytes not shared with build dir | 15,589,376 | 20,480 (`.d` files and `CACHEDIR.TAG`) |
+| Test binaries | Five built; all stay in the build directory; none uplifted | Same |
+| Image-use delta | 212,426,752 (build dir only) | 212,029,440 (build and target dirs) |
+
+Result: on macOS, Cargo never hard-links uplifted outputs. On the same APFS volume it clones them, which costs almost nothing. Cargo's own source at the measured commit confirms the mechanism: `cargo-util` `_link_or_copy` removes the destination and then calls `fs::copy`, which uses `fclonefileat` on APFS. It falls back to `hard_link` only on `EAGAIN`. The source comment cites a Gatekeeper race with hard-linked binaries ([cargo#7821](https://github.com/rust-lang/cargo/issues/7821), [cargo#10060](https://github.com/rust-lang/cargo/issues/10060)). Other Unix systems take the `hard_link` path; Linux was not measured.
+
+Per-worktree saving for this subject: 15,568,896 bytes (about 14.8 MiB), or 6.7% of the 231 MB clone-aware total. The image deltas agree: S's target directory added no measurable image use (S − X = −397,312 bytes, within APFS accounting noise). The saving grows with final binary size and debug info. Test binaries are never uplifted, so the test path saves nothing; only `build`/`run` outputs benefit.
+
+`cargo test --no-run` re-uplifted the three fresh bins (new inodes) because integration tests need them. In X that means a fresh full copy on the host volume. In S it means a new clone. No write volume was measured.
+
+Limits: one subject on one host, one cold build plus one `test --no-run` per layout, APFS only. No repeat, edit or branch-switch builds; no test execution; no Linux run. Clones share blocks only until either side is rewritten. Placement, lease and default behavior are unchanged. A same-volume target directory would also move final outputs off the checkout and into the pool, which affects the privacy and lifetime rules in [workflow](contracts/workflow.md#what-one-command-does-local-executor). Evidence: [final-output-links-082](evidence/final-output-links-082/summary.json).
+
 ## Product assessment
 
 Planner recommendation: a small coherent entry point over evidence-backed mechanisms, with three capabilities: see and explain costs, bound and reuse owned storage, and apply qualified improvements with clear trade-offs. The reusable storage core must work for ordinary developers as well as orchestrators. A daemon, editor surface or UI is still an open choice; Tom's [workflow direction](vision.md#product-workflow-direction) sets an `oxide build` / `oxide run` front door as the design target.
