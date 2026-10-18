@@ -273,6 +273,46 @@ Implication: the `quick` recipe accumulates stale objects in long-lived shared s
 | Cargo home GC ([1.88](https://blog.rust-lang.org/2025/06/26/Rust-1.88.0/)) | Stable automatic cleanup of downloaded/cached files (3 months / 1 month unused). Never runs with `--offline` or `--frozen`. The target dir is not covered. | Agent and Oxide proofs often run `--offline`, so their Cargo home may never be cleaned. Worth surfacing in `oxide status`. |
 | [Cargo script](https://rust-lang.github.io/goals/2026/cargo-script.html) | Frontmatter stabilization in progress; not stable on 1.97.1. | Single-file scripts; each script otherwise gets its own target dir. |
 
+## Cloning a warm build directory (2026-10-18 probe)
+
+oxide#081 tested whether a warm build directory still works after an APFS clone to a new path. It ran one heavy-admitted 32-second session using 13 of 14 experimental Cargo calls and both setup calls. Raw evidence is in [apfs-clone-relocation-20261018](evidence/apfs-clone-relocation-20261018/summary.json).
+
+Setup:
+- Injection matched `oxide`'s: `CARGO_BUILD_BUILD_DIR` pointed at the slot and one private `CARGO_TARGET_DIR` stayed fixed.
+- `clonefile(2)` copied build dir A to B. A was then renamed away so any dangling reference would fail loudly.
+- The same checkout was then built against B.
+- Fixture: a build script that writes `include!`d code and a static library into `OUT_DIR`, emits `rustc-link-search` into it, a path proc-macro and one integration test.
+
+| Subject | Verdict | Evidence |
+| --- | --- | --- |
+| Fixture, Cargo 1.97.1 layout | Relocatable | After the clone, all 8 units were fresh and the binaries passed. A source-only edit rebuilt only `probe-app` and linked the static library from B. A build-input edit reran the build script. A final no-op was fresh. |
+| Fixture, nightly-2026-08-05 `-Z build-dir-new-layout` (layout v2) | Relocatable | Same sequence and results. |
+| Oxide repository at `dc84d03`, stable, default dev profile | Relocatable for Cargo | After the clone, all 38 units were fresh in 0.25 s. A `src/lib.rs` edit rebuilt only the 9 `oxide-storage` units in 1.7 s; the cold build took 5.0 s. |
+
+How the paths behave:
+- Cargo stays correct because it does not keep A's path in the files it checks:
+  - no `.fingerprint` file in any arm named A;
+  - B's cloned build-script `output` and `root-output` still named A's `OUT_DIR`, but Cargo rewrote the replayed link-search path to B.
+- A's path survives elsewhere:
+  - rustc's make-style `.d` files of unchanged units;
+  - unrerun dependency `root-output` files;
+  - `serde`/`serde_core` metadata source maps that name A's generated `private.rs`;
+  - proc-macro dylib install names.
+- Debug info is the open condition. Until a binary is relinked, its macOS debug map (`N_OSO`) points at A's `deps/*.o`. That includes the `target/debug/*` outputs Cargo hard-links into place from B.
+  - It harms nothing while A still exists unchanged, as a clone source would.
+  - Once A is gone or rebuilt, debugging an unchanged binary can lose its debug info.
+  - The probe did not run a debugger.
+
+Clone cost (Oxide repository, 2,126 files; source `st_blocks` sum 244 MiB, which counts allocated blocks, not apparent size, and cannot see clone sharing):
+- `clonefile` took 12.6 ms. Host free space fell 1.1 MiB from before the clone to after the rename.
+- All 300 sampled files kept the same first physical extent (`F_LOG2PHYS_EXT`). A plain-copy control file moved to a new extent, which is direct evidence of copy-on-write sharing. Inodes differed; sizes, modes and mtimes matched.
+- Host free space fell another 152 MB over the edit-rebuild interval. The host is shared, so this is not attributed to the rebuild or to clone divergence.
+- Host free space is shared and noisy. These figures are not exact clone allocation or SSD writes.
+
+Implication: on this host and toolchain, cloning a slot per worktree, or warm-starting from main's slot, is mechanically sound for Cargo freshness and rebuild correctness on both layouts. A product design still has to settle the debug-map condition: keep the source slot unchanged while clones exist, or accept relinking. One fixture and one repository do not prove universal portability, debugger behaviour or savings. Two recipe slips are corrected in the summary:
+- the layout v2 build script is named `build_script_build`, so the recipe's run counter missed it;
+- the hit classifier mislabels v2 unit outputs under `build/<pkg>/<hash>/out/`.
+
 ## Product assessment
 
 Planner recommendation: a small coherent entry point over evidence-backed mechanisms, with three capabilities: see and explain costs, bound and reuse owned storage, and apply qualified improvements with clear trade-offs. The reusable storage core must work for ordinary developers as well as orchestrators. A daemon, editor surface or UI is still an open choice; Tom's [workflow direction](vision.md#product-workflow-direction) sets an `oxide build` / `oxide run` front door as the design target.
