@@ -141,6 +141,7 @@ VIRTUAL = {
 GATED = {
     "Cargo.toml": """[workspace]
 members = [".", "embed"]
+default-members = [".", "embed"]
 
 [package]
 name = "marker"
