@@ -5,8 +5,8 @@ Status: product design under Tom's
 The foundation core and `init` / `new` adoption are implemented as the
 unpublished, uninstalled `oxide` binary; the agent skill exists as repository
 source only. [Implemented foundation core](#implemented-foundation-core)
-states exactly what ships. The freshness gate, non-build run strategies and a
-Linux backend are not implemented. Fixture proofs are not real-project
+states exactly what ships, including the cross-checkout freshness gate.
+Non-build run strategies and a Linux backend are not implemented. Fixture proofs are not real-project
 qualification, default-pool creation outside tests, installation (binary or
 skill) or consumer-adoption authority. Other sections
 state the target design.
@@ -136,27 +136,47 @@ current lease-at-placement model mostly avoids this by construction: a
 worktree is created after the slot's last release, so its files are newer.
 That is an inference from its lifecycle, not a qualification.
 
-Proposed freshness gate (W-8), run before Cargo whenever the slot's last
-compile origin differs from this checkout:
+Freshness gate (W-8), implemented and fixture-proven, not yet
+real-project qualified. It runs before Cargo on every leased command whose
+slot has a recorded origin:
 
-1. The slot records its last compile origin: checkout path, Git tree, dirty and
-   untracked file digests, and the build anchor time.
-2. Oxide diffs the two content sets with Git. Each differing file whose mtime is
-   not newer than the anchor gets its mtime set to now, so Cargo's own
-   invalidation rebuilds it. Content stays untouched; only the checkout's own
-   files change.
-3. When the checkout path changes, workspace packages that can embed it get the
-   same treatment: those with a build script, or whose source mentions
-   `CARGO_MANIFEST_DIR`. Registry and Git dependencies live at shared paths and
-   stay warm. They are the bulk of the reuse benefit.
-4. Inputs outside the repository or ignored by Git are not covered; their
-   limits stay explicit.
+1. After each leased command whose Cargo ran, the slot records its last
+   compile origin: canonical checkout path, Git tree of `HEAD`, the Git blob
+   digest of every dirty or untracked non-ignored file, and the build anchor
+   (the time after Cargo's process group is empty).
+2. Oxide diffs the two content sets with Git (`git diff` of the trees plus the
+   dirty digests). Each differing checkout file whose mtime is not newer than
+   the anchor gets its mtime set to now, so Cargo's own invalidation rebuilds
+   it. Content stays untouched; only the checkout's own files change; Cargo
+   fingerprints and the slot are never edited.
+3. On a checkout-path change, every repository package that can embed the
+   path gets the same treatment: one with `build.rs` or a manifest `build`
+   key, or whose sources mention `CARGO_MANIFEST_DIR`. A file belongs to the
+   package with the deepest `Cargo.toml` above it. Registry, Git and
+   outside-repository path dependencies keep their paths and stay warm. They
+   are the bulk of the reuse benefit.
+4. A command need not rebuild every unit, so the slot also carries an
+   uncertain set: every path that differed at an earlier command or changed
+   while Cargo ran. Another checkout taking the slot refreshes those too. The
+   compiling checkout's own copies are already newer than any unit built
+   from other content, so a repeat in the same checkout refreshes nothing. The
+   set only resets when the slot is evicted; past 4096 paths the slot stops
+   being shared.
+5. Inputs outside Git or ignored by it, and submodule contents, are not
+   covered. The summary line says so whenever the gate reconciled another
+   checkout's build. A differing submodule refuses the gate.
+
+The origin is trusted only when the record's use counter still equals the
+value stamped when it was written. A crashed command, a failed snapshot, a
+legacy slot from an earlier Oxide build or an older Oxide build using the slot
+leaves it untrusted, and an untrusted slot is never shared again until it is
+evicted. A gate that fails or cannot read the history (for example a clone
+lacking the slot's tree object) gives the taken slot back unchanged and the
+command builds cold in its own slot, never with unchecked reuse.
 
 This revives the qualification work's rejected "source touching" fix as a
-deliberate product mechanism. It needs a fresh qualification before
-cross-checkout reuse is a default. Without the gate, Oxide must keep slots
-checkout-affine, which keeps correctness but loses most of the worktree
-benefit.
+deliberate product mechanism. Real-project qualification (Q2–Q4 below) is
+still required before the benefit is claimed.
 
 Debug paths are a separate, known limit. Reused workspace units carry the
 compiling checkout's absolute paths in debug info. That is tolerable for
@@ -348,7 +368,7 @@ Assessment:
 | [Stable profiles](stable-cargo-profiles.md) knowledge | Source of the `quick` / `debug` recipes. |
 | Cargo freshness, path-embedding, containment and capacity findings in [qualification readiness](../qualification-readiness.md) | Ground the freshness gate, debug-path limit and crash-recovery design. Kept as evidence; the narrative is condensed. |
 | [Build-context policy](build-context-policy.md) | Candidate input for per-command incremental/debug defaults; stays proposed. |
-| Bounded dep-info decoder (`src/dep_info.rs`) | Per-unit Cargo input lists for the W-8 gate; separable from the retired conversion. |
+| Bounded dep-info decoder (`src/dep_info.rs`) | Per-unit Cargo input lists, a candidate for reporting inputs outside Git; separable from the retired conversion. |
 
 | Retired | Why it has no distinct value now |
 | --- | --- |
@@ -368,8 +388,9 @@ types never depended on the registered route; only the `into_registered`
 conversion did. The decoder now lives at `src/dep_info.rs` with its
 hand-annotated upstream-bytes and refusal tests, unchanged limits (16 MiB
 input, 32768 references, 2048-byte strings) and its own two-variant refusal.
-The conversion was retired. It is not called by any command yet; W-8 may use
-its per-unit file and environment lists to find inputs outside Git.
+The conversion was retired. No command calls it: the W-8 gate works from Git
+content alone. Its per-unit file and environment lists could later name the
+inputs outside Git that the gate does not cover.
 
 ## Foundation slice
 
@@ -469,8 +490,13 @@ has run against no real project.
   then `CARGO_BUILD_TARGET`, then host) and the default backend. Building
   passthrough uses the quick key unless a built-in names another profile;
   Cargo's per-profile subdirectories keep profiles apart inside one slot.
-- **Checkout affinity.** A slot is reused only by the same canonical checkout
-  with the same key. Cross-checkout reuse waits for the freshness gate (W-8).
+- **Slot choice.** This checkout's own slot with the same key first. Without
+  one, the most recently used idle slot with the same key whose last checkout
+  is another live checkout of the repository, if its origin is trusted; the
+  slot moves to this checkout and the [freshness gate](#cross-checkout-freshness)
+  runs before Cargo. A slot detached by `oxide clean` is never shared. If the
+  gate refuses, the slot goes back unchanged and the command takes a new or
+  evicted slot cold.
 - **Pool.** `OXIDE_POOL`, else `~/Library/Caches/oxide/pool`, created on first
   building command with a 24 GiB cap equal to its sparse image. Creation
   refuses below 20 GiB host free space. An existing pool from
@@ -496,6 +522,9 @@ has run against no real project.
   or the program's for `run`.
 - **Summary.** One stderr line per leased command: profile, strategy (`build`
   or `build+execute`), slot, warm/cold, elapsed time and payload volume use.
+  When the gate refreshed files, or reconciled another checkout's build, it
+  appends the count and the outside-Git limit. A refused gate prints its
+  reason on its own line before the cold build.
 - **`clean`.** Waits until no live or interrupted-but-running command holds a
   slot for this checkout, then blocks new commands in the checkout while it
   runs `cargo clean` against the private target directory and an empty
@@ -526,7 +555,9 @@ has run against no real project.
 Control state lives in `<pool>/oxide-managed/` (owner-only): records mapping
 each checkout and key to a private lease project directory, FIFO wait
 tickets, an admission lock, one lock per record, each record's holder and
-lease ID, and the recovery log. New fields default when absent, so control
+lease ID, the recovery log, and `origins/<record>.json` with each slot's
+compile origin (at most 8 MiB, stamped with the record's use counter).
+`state.json` gains no field for the gate. New fields default when absent, so control
 state from the previous build opens without migration; an older build
 refuses state that has them. The lease ledger, receipt and standalone CLI
 contract are unchanged; see
@@ -595,6 +626,12 @@ Rules:
 - **W-7 Command name.** `oxide` collides with Oxide Computer Company's CLI
   ([Q-005](../questions.md#q-005--what-names-are-safe-to-publish)). The design
   is name-independent.
-- **W-8 Freshness gate.** The foundation core ships checkout-affine slots.
-  Recommendation: build and qualify the gate next. Without it the main
-  worktree benefit is unavailable.
+- **W-8 Freshness gate.** Implemented (see
+  [Cross-checkout freshness](#cross-checkout-freshness)). The fixture proof
+  covers two Git worktrees: the stale-mtime scenario rebuilds and the test sees
+  its own checkout's content; a `CARGO_MANIFEST_DIR` package rebuilds on a
+  path change; a path dependency outside the repository stays fresh; an
+  unchanged repeat rebuilds nothing; a clone lacking the slot's tree is
+  refused and builds cold. Warm-path cost is one `git status` and
+  `rev-parse` before and after Cargo, about 25 ms on this repository.
+  Real-project qualification (Q2–Q4) remains.

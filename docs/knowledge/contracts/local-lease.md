@@ -84,7 +84,9 @@ leases through this library. It keeps its own state in `<pool>/oxide-managed/`,
 an owner-only real directory. Pool opens accept that one extra entry; a
 symlink there refuses like any other. The CLI never reads or writes it, and a
 pool without it opens as before. Oxide passes one private directory under it
-as each lease's `--project`, so library reuse stays checkout-affine. Its
+as each lease's `--project`, so library reuse follows Oxide's records: a
+checkout's own slot, or another checkout's idle slot only through the
+[freshness gate](workflow.md#cross-checkout-freshness). Its
 automatic crash recovery touches only leases whose ID or holder string its
 own control record names.
 
