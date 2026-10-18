@@ -2148,6 +2148,8 @@ def prove_cargo_cache(runner: Runner) -> None:
             fail(f"cargo cleanup output missing {needle!r}: {stderr!r}")
     if " TRACE gc:" in stderr:
         fail("Cargo's gc trace leaked to the caller")
+    if not re.search(r"oxide: closed proxy 127\.0\.0\.1:\d+ closed 0 connection\(s\)", stderr):
+        fail(f"a complete cached lockfile still reached for the network: {stderr!r}")
 
     # Cargo's own lock-contention skip: hold the mutate lock shared, as a
     # concurrent Cargo reading the cache would.
@@ -2172,11 +2174,11 @@ def prove_cargo_cache(runner: Runner) -> None:
         })
     finally:
         listener.close()
-    closed = re.search(r"closed proxy 127\.0\.0\.1:(\d+)", stderr)
+    closed = re.search(r"oxide: closed proxy 127\.0\.0\.1:(\d+) closed (\d+) connection\(s\)", stderr)
     if code in (0, 75) or not closed or "oxide: Cargo cleanup failed: cargo fetch exited" not in stderr:
         fail(f"uncached fetch was not a labelled failure: exit {code} {stderr!r}")
-    if not re.search(rf"127\.0\.0\.1(:| port ){closed.group(1)}\b", stderr.split("closed proxy", 1)[1]):
-        fail(f"Cargo's error did not come from the closed proxy: {stderr!r}")
+    if int(closed.group(2)) < 1 or int(closed.group(1)) == listener.port:
+        fail(f"Cargo's request did not go to Oxide's closed proxy: {stderr!r}")
     if listener.connections:
         fail(f"the owned control listener saw {listener.connections} connection(s)")
     if any(name.startswith("itoa") for _, _, files in os.walk(home) for name in files):

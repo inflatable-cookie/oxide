@@ -11,9 +11,11 @@ use crate::{adopt, identity, process, CARGO, MIB};
 use oxide_storage::inventory::{inventory_directory, InventoryLimits};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// The only Cargo whose cleanup trigger and trace text were qualified
 /// (oxide#084, Cargo `c980f4866`).
@@ -221,61 +223,32 @@ fn config_files(cwd: &Path, home: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// A bound TCP socket on 127.0.0.1 that never listens: connections to its
-/// port are refused, and no other process can take the port while it is
-/// held.
-struct ClosedPort {
-    _socket: OwnedFd,
+/// Oxide's own proxy on 127.0.0.1: it accepts and closes every
+/// connection and forwards nothing, so no request reaches a network. A
+/// merely bound port is not enough: macOS drops connections to it until
+/// they time out. Holding the listener keeps another process off the port.
+struct ClosedProxy {
     port: u16,
+    connections: Arc<AtomicU64>,
 }
 
-fn closed_port() -> Result<ClosedPort, String> {
-    let error = |what: &str| {
-        format!(
-            "cannot reserve a closed loopback port ({what}): {}",
-            std::io::Error::last_os_error()
-        )
-    };
-    // SAFETY: plain socket creation; the result is checked before use.
-    let raw = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    if raw < 0 {
-        return Err(error("socket"));
-    }
-    // SAFETY: `raw` is a fresh descriptor this function owns.
-    let socket = unsafe { OwnedFd::from_raw_fd(raw) };
-    // SAFETY: zeroed `sockaddr_in` is a valid value to fill in.
-    let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-    address.sin_family = libc::AF_INET as libc::sa_family_t;
-    address.sin_port = 0;
-    address.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
-    let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_in>())
-        .map_err(|_| "sockaddr size")?;
-    // SAFETY: `address` and `length` describe one valid `sockaddr_in`.
-    let bound = unsafe {
-        libc::bind(
-            socket.as_raw_fd(),
-            std::ptr::addr_of!(address).cast(),
-            length,
-        )
-    };
-    if bound != 0 {
-        return Err(error("bind"));
-    }
-    // SAFETY: as above; the kernel writes back the bound address.
-    let named = unsafe {
-        libc::getsockname(
-            socket.as_raw_fd(),
-            std::ptr::addr_of_mut!(address).cast(),
-            &mut length,
-        )
-    };
-    if named != 0 {
-        return Err(error("getsockname"));
-    }
-    Ok(ClosedPort {
-        _socket: socket,
-        port: u16::from_be(address.sin_port),
-    })
+fn closed_proxy() -> Result<ClosedProxy, String> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .map_err(|error| format!("cannot open the closed loopback proxy: {error}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| format!("cannot read the closed proxy's port: {error}"))?
+        .port();
+    let connections = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&connections);
+    // The thread lives until the process exits, holding the port.
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            counted.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    Ok(ClosedProxy { port, connections })
 }
 
 /// What Cargo's `gc` trace showed for one run.
@@ -441,17 +414,17 @@ pub fn run_cache_clean(args: &[OsString]) -> Result<u8, String> {
     }
 
     let before = measure(&home).ok().flatten();
-    let port = closed_port()?;
+    let proxy = closed_proxy()?;
     eprintln!(
         "oxide: asking Cargo to clean {} (cargo fetch --locked, cleanup frequency \"always\", every HTTP request through closed proxy 127.0.0.1:{})",
         home.display(),
-        port.port
+        proxy.port
     );
     process::install_signal_handlers()?;
     let mut cargo = Command::new(CARGO);
     cargo
         .args(["fetch", "--locked", "--config", ALWAYS, "--config"])
-        .arg(format!("http.proxy=\"http://127.0.0.1:{}\"", port.port))
+        .arg(format!("http.proxy=\"http://127.0.0.1:{}\"", proxy.port))
         .env("CARGO_LOG", TRACE)
         .stderr(Stdio::piped());
     for name in PROXY_ENVIRONMENT {
@@ -489,7 +462,11 @@ pub fn run_cache_clean(args: &[OsString]) -> Result<u8, String> {
         .join()
         .map_err(|_| "the Cargo stderr reader panicked")?;
     let status = status?;
-    drop(port);
+    eprintln!(
+        "oxide: closed proxy 127.0.0.1:{} closed {} connection(s) and forwarded nothing",
+        proxy.port,
+        proxy.connections.load(Ordering::SeqCst)
+    );
     let after = measure(&home).ok().flatten();
 
     let outcome = classify(&signals, status.code());
@@ -666,9 +643,14 @@ mod tests {
     }
 
     #[test]
-    fn the_closed_port_refuses_connections() {
-        let port = closed_port().unwrap();
-        let refused = std::net::TcpStream::connect(("127.0.0.1", port.port)).unwrap_err();
-        assert_eq!(refused.kind(), std::io::ErrorKind::ConnectionRefused);
+    fn the_closed_proxy_closes_and_counts_connections() {
+        let proxy = closed_proxy().unwrap();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", proxy.port)).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(stream.read(&mut byte).unwrap(), 0);
+        assert_eq!(proxy.connections.load(Ordering::SeqCst), 1);
     }
 }
