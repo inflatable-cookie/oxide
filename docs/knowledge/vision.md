@@ -128,12 +128,37 @@ their own original invocation, time and resource caps; the three-run fixture
 allowance does not apply to them. The earlier five-pool author overrun remains
 unauthorized historical use, not retroactively permitted by this correction.
 
-Tom's further approvals, 2026-10-18 ("Yes please", "Yes", "Yes"):
-- Add a nightly parallel-frontend (`-Zthreads`) arm to the Cranelift quick-run measurement, with its bounds scaled for the extra arm.
-- A separate bounded measurement of optimized dependencies in the `quick` recipe.
-- An implementation brief for the [platform backends](contracts/workflow.md#platform-backends-proposed) design, starting with the budget-only directory backend and host-reserve watchdog.
+Tom's further approvals, 2026-10-18, were the exact bundled reply
+"1. Yes please 2. Yes 3. Yes", relayed by the appointed product architect:
 
-None of these grants strategy or recipe adoption, consumer changes, default-pool changes outside tests, or the privileged Linux image backend.
+- Add arm D to the Cranelift quick-run measurement: installed
+  `nightly-2026-08-05`, LLVM, quick recipe with `RUSTFLAGS="-Zthreads=8"`,
+  controlled against the same nightly without that flag. The amended single
+  session permits 29 measured Cargo calls plus at most two version/setup calls,
+  50 minutes including setup/install and 8 GiB owned scratch. The sole component
+  install, 20 GiB host reserve and 32 MiB logs remain unchanged. Queue decision
+  `daa6c336-4785-4f7e-ae33-14f11b6708fd` v2 records "Yes please".
+- A separate stable-only measurement of dependency opt-level 0/1/2 in `quick`,
+  after the Cranelift session closes: 12 measured Cargo calls plus at most two
+  setup/version calls, 30 minutes, 6 GiB scratch. Its one-worktree timings cannot
+  establish cross-worktree amortization; that remains conditional. Queue decision
+  `96889d44-8fe6-4e91-a97c-f3e6f5c96a42` v2 records "Yes".
+- Implement the [platform backends](contracts/workflow.md#platform-backends-proposed)
+  budget-only directory backend and host-reserve watchdog, with macOS fixtures
+  and an installed-target Linux compile check. Queue decision
+  `51d259de-b630-400a-bc18-fd135dae6b42` v2 records "Yes". This is bounded
+  implementation authority, not a real Linux execution or installation grant.
+
+The product architect clarified the watchdog on the same day: sampled free
+space below 20 GiB plus a 2 GiB safety margin triggers a best-effort stop. The
+20 GiB reserve is the floor being protected, not the trigger. Reserve/margin
+injection is for tests only. Proof records sampled minimum, stop latency and
+overshoot past the injected trigger. The margin is intended to cover normal
+write rates at the sampling interval; it gives no guarantee against faster
+writers or other processes. Unknown process-group closure keeps the lease held.
+
+None of these grants strategy or recipe adoption, consumer changes, default-pool
+changes outside tests, or the privileged Linux image backend.
 
 ## Authority boundaries
 

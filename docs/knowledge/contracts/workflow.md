@@ -509,16 +509,24 @@ no setup, per Tom's ease-of-use ruling.
 | Backend | Where | Bound | Setup |
 | --- | --- | --- | --- |
 | `apfs-sparse-image-v1` (shipped) | macOS | OS-enforced aggregate ceiling | None; created automatically |
-| `directory-budget-v1` | Any host, the Linux default | Budget only: admission plus whole-idle-slot eviction against a recorded budget, with no OS ceiling. A supervised build also watches host free space through `statfs` and terminates its own process group before the host reserve is breached. A cheap check; no directory walk during the build. | None |
+| `directory-budget-v1` | Any host, the Linux default | Budget only: admission plus whole-idle-slot eviction against a recorded budget, with no OS ceiling. A supervised build samples caller-available space through `statfs` and attempts to stop its own process group below the 22 GiB trigger (20 GiB protected reserve plus 2 GiB margin). Best effort, with no guarantee against faster writers or other processes; no directory walk during the build. | None |
 | `linux-image-v1` | Long-lived Linux hosts (LAN build box) | OS-enforced ceiling on an ext4/XFS image or project-quota directory | One optional privileged provisioning step, then unprivileged use |
 
 Rules:
 
 - `status` and every summary line name the backend. A budget-only pool never
   claims a hard ceiling.
-- A watchdog stop is an ordinary failed command. Its lease releases through
-  the normal process-group path, and the slot stays reusable because Cargo
-  tolerates interrupted builds.
+- The watchdog samples the pool filesystem about once per second. The 20 GiB
+  reserve is the protected floor; the 2 GiB safety margin moves the trigger to
+  22 GiB. The margin is intended to cover normal write rates at that interval,
+  with no guarantee against faster writers or other processes. Reserve/margin
+  overrides are test-only. The bounded proof records sampled minimum, stop
+  latency and overshoot past the injected trigger; it never fills the host to
+  its real reserve.
+- A watchdog stop is an ordinary failed command. TERM and bounded-grace KILL
+  apply only to the owned process group. Release follows positive normal group
+  closure; unknown closure or surviving writers leave the lease held. Cargo can
+  reuse an interrupted slot after that positive closure.
 - CI runners are ephemeral: `directory-budget-v1` on the runner disk. A
   persistent cache across runs means saving and restoring whole idle slots
   through the CI cache, keyed like slots. That is a later executor feature.
