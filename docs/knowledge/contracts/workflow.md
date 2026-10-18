@@ -192,29 +192,47 @@ the mtime hazard above.
 ## Crash recovery
 
 Tom ruled on 2026-10-18 that Oxide must manage crash recovery itself
-([vision](../vision.md#product-workflow-direction)). Proposed mechanism:
+([vision](../vision.md#product-workflow-direction)). Shipped rule, for
+leases taken by `oxide` commands only:
 
-- While a command holds a lease, it also holds an exclusive `flock` on a
-  per-slot lock file. The kernel drops that lock when the process dies for any
-  reason. Oxide's control state records the command phase and the Cargo
-  process-group ID; the lease ledger is unchanged.
+- While a command holds a lease, it holds an exclusive `flock` on the lock
+  file of its control record. The kernel drops that lock when the process
+  dies for any reason; the descriptor is close-on-exec, so Cargo does not
+  inherit it. The record names the holder (PID, process start time and the
+  unique lease holder string), the lease ID once granted, the command phase
+  and Cargo's process-group ID. The lease ledger is unchanged.
 - Ctrl-C and termination signals are forwarded to the group. Oxide waits for
-  the group to exit, then releases normally.
-- A later command that finds the lease held checks two things: whether the lock
-  can be taken, and whether the process group is empty (`killpg(pgid, 0)`
-  returns `ESRCH`). If both hold, it recovers the slot automatically, records
-  the recovery and continues. Cargo already tolerates interrupted builds: a
-  unit whose fingerprint was not written is rebuilt.
-- A surviving group member, or a reused group ID, keeps the slot held. Those
-  failures are conservative. A descendant that escaped the group with `setsid`
-  is the accepted residual risk.
+  the group to empty, then releases normally. A clean exit or Ctrl-C is
+  never logged as a recovery.
+- A later command recovers a non-idle record's held lease only when the
+  record lock can be taken **and** the held lease is the record's own (its
+  lease ID, or its holder string if it died before saving the ID) **and**
+  either Cargo never started (phase acquiring, so no group exists) or
+  `killpg(pgid, 0)` returns `ESRCH`. Cargo already tolerates interrupted
+  builds: a unit whose fingerprint was not written is rebuilt.
+- A surviving group member, a reused group ID or any error other than
+  `ESRCH` keeps the slot held. No PID age, TTL or start-time comparison is
+  used to decide. A follower in the same checkout waits; other commands go
+  on with other slots.
 - A command that dies after recording "Cargo starting" but before recording
-  its group cannot prove the group empty. That slot stays held, `oxide status`
-  marks it interrupted, and `oxide-storage-lease recover` is the explicit
-  release.
+  its group cannot prove the group empty. That slot stays held, `oxide
+  status` marks it interrupted with no recorded group, and
+  `oxide-storage-lease recover` is the explicit release. A record written by
+  an earlier front-door build has no holder, so it is kept the same way.
+- Each automatic recovery is logged in the control state (slot, lease,
+  checkout, holder PID and start time, group, time, recovering PID). `oxide
+  status` shows the newest 16.
+- Leases taken through the standalone `oxide-storage-lease` CLI have no
+  control record and no lock holder, so they are never auto-recovered.
+
+**Residual risk.** A descendant that leaves the group with `setsid` or a new
+spawn group is invisible to `killpg`. If it still writes in the slot when the
+group is otherwise empty, the slot can be recovered and reused under it.
+This is the accepted limit; the fixture proof shows such an escapee does not
+keep the slot held.
 
 This replaces the local lease's "never infer abandonment" rule for Oxide's
-own commands. Consumers that lease per task, such as Nucleus, keep their
+own commands only. Consumers that lease per task, such as Nucleus, keep their
 explicit `recover` unless they adopt it.
 
 ## Storage and space management
@@ -480,21 +498,30 @@ has run against no real project.
   the group is empty.
 - **Crash recovery.** Per [Crash recovery](#crash-recovery), for Oxide's own
   commands only. A follower in the same checkout waits while the crashed
-  command's group survives, then recovers and continues.
+  command's group survives, then recovers and continues. The fixture proof
+  covers: a killed holder whose group survives stays held; a killed holder
+  whose whole group is gone is recovered by the next command without waiting
+  and logged; clean exit and Ctrl-C release without recovery; a standalone
+  CLI lease stays held through every sweep; a `setsid` escapee does not keep
+  the slot held.
 - **`init` / `new`.** As in [Adoption](#adoption-oxide-init). Cargo runs as
   an ordinary child with inherited output; a Cargo failure returns Cargo's
   exit and adopts nothing. A refusal exits 1. The covering proof runs before
   any pool exists and checks that adoption never creates one.
 - **`status`.** Pool path or "not created", cap, payload use, slot accounting
-  coverage, each slot's state, profile and checkout, waiting commands,
-  checkouts being cleaned, and
+  coverage, each slot's state, profile and checkout (an interrupted slot
+  names the dead holder's PID and Cargo group), waiting commands, checkouts
+  being cleaned, the newest automatic recoveries, and
   whether the current workspace's `target/` holds plain-Cargo `deps/` or
   `incremental/`. It never creates the pool.
 
 Control state lives in `<pool>/oxide-managed/` (owner-only): records mapping
 each checkout and key to a private lease project directory, FIFO wait
-tickets, an admission lock and one lock per record. The lease ledger,
-receipt and standalone CLI contract are unchanged; see
+tickets, an admission lock, one lock per record, each record's holder and
+lease ID, and the recovery log. New fields default when absent, so control
+state from the previous build opens without migration; an older build
+refuses state that has them. The lease ledger, receipt and standalone CLI
+contract are unchanged; see
 [local lease](local-lease.md#oxide-front-door-control-directory).
 
 ## Platform backends (proposed)
@@ -548,9 +575,9 @@ Rules:
   [Q-011](../questions.md#q-011--how-should-slot-waiting-coordinate-with-host-admission).
 - **W-3 Project file.** Needed only for per-project profile overrides or
   dependency debug-off. Recommendation: none until a real project needs it.
-- **W-4 Crash recovery.** Direction ruled and implemented for Oxide's own
-  commands; the fixture proof covers a killed command whose group survives.
-  Qualification, including a group-escape test, remains.
+- **W-4 Crash recovery.** Ruled and implemented for Oxide's own commands
+  ([Crash recovery](#crash-recovery)); fixture-proven, including the
+  `setsid` escape limit. Real-project qualification (Q5) remains.
 - **W-5 Retirement execution.** Done in oxide#070; see
   [retirements](../retired.toml).
 - **W-6 Linux backend.** Proposed in [platform backends](#platform-backends-proposed):

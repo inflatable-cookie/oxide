@@ -8,7 +8,10 @@ never touched. Offline std-only fixture crates prove command routing, the
 quick/debug profile flags (including an external subcommand's `$CARGO`
 call), storage-override refusals, `clean`, checkout-affine reuse, FIFO
 waiting and the host limit, clean waiting for active commands, `default-run`
-selection (package and virtual workspace roots), Ctrl-C forwarding, own-command crash recovery,
+selection (package and virtual workspace roots), Ctrl-C forwarding, own-command crash recovery
+(a killed oxide whose Cargo group survives stays held; one whose group is gone
+is recovered by the next command and logged; a standalone-CLI lease is never
+recovered; a `setsid` escapee is shown as the documented limit),
 `status` stray detection and Cargo-equal exit codes. The image is detached
 and the scratch removed only after positive completion. Before any pool
 exists, `init` / `new` adoption runs on tiny scratch directories (90 s,
@@ -79,6 +82,17 @@ fn optional_hold() {
     let Some(pidfile) = std::env::var_os("OXIDE_FIXTURE_HOLD").map(PathBuf::from) else {
         return;
     };
+    // A descendant that leaves Cargo's process group with setsid.
+    if let Some(python) = std::env::var_os("OXIDE_FIXTURE_ESCAPE") {
+        std::process::Command::new(python)
+            .args(["-c", ESCAPE])
+            .arg(pidfile.with_extension("escape"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("escapee");
+    }
     let temp = pidfile.with_extension("tmp");
     std::fs::write(&temp, std::process::id().to_string()).expect("pid");
     std::fs::rename(&temp, &pidfile).expect("pid rename");
@@ -91,6 +105,8 @@ fn optional_hold() {
     }
     panic!("hold timed out");
 }
+
+const ESCAPE: &str = "import os, sys, time\\nos.setsid()\\ntemp = sys.argv[1] + '.tmp'\\nopen(temp, 'w').write(str(os.getpid()))\\nos.rename(temp, sys.argv[1])\\ntime.sleep(60)\\n";
 """,
     "helper/Cargo.toml": """[package]
 name = "helper"
@@ -745,7 +761,12 @@ def prove_routing(runner: Runner, app: str, quick_slot: str, debug_slot: str) ->
     prove_waiting(runner, app, app2)
     prove_clean_waits(runner, app)
     prove_interrupt(runner, app)
+    if runner.state().get("recoveries"):
+        fail(f"clean exits or Ctrl-C were logged as recoveries: {runner.state()['recoveries']}")
+    standalone = take_standalone_lease(runner)
     prove_recovery(runner, app)
+    prove_group_gone(runner, app)
+    keep_standalone_lease(runner, app, standalone)
 
     # `run` from a virtual workspace root follows Cargo's default members.
     virtual = os.path.join(runner.parent, "checkouts", "virtual")
@@ -869,9 +890,18 @@ def prove_recovery(runner: Runner, app: str) -> None:
     running = [record for record in runner.state()["records"] if record["phase"] == "running"]
     if len(running) != 1 or not running[0]["process_group"]:
         fail(f"crashed record: {runner.state()['records']}")
+    group = running[0]["process_group"]
+    holder = running[0].get("holder") or {}
+    if holder.get("pid") != child.pid or not holder.get("started_ms") or not running[0].get("lease_id"):
+        fail(f"crashed record lacks its holder or lease: {running[0]}")
+    held = [slot for slot in runner.lease_status()["slots"] if slot["lease_id"] == running[0]["lease_id"]]
+    if len(held) != 1 or held[0]["state"] != "held":
+        fail(f"crashed lease is not held in the ledger: {held}")
     code, stdout, _ = runner.run(app, ["status"])
-    if "held by an interrupted command" not in stdout:
+    if f"held by an interrupted command (oxide pid {child.pid}, Cargo group {group};" not in stdout:
         fail(f"status did not show the interrupted slot: {stdout}")
+    if runner.state().get("recoveries"):
+        fail("a slot was recovered while Cargo's group survived")
     follower, follower_log = runner.start(app, ["build"], "follower")
     wait_for(lambda: "waiting for another oxide command in this checkout" in read_log(follower_log), "follower wait")
     if follower.poll() is not None:
@@ -879,11 +909,101 @@ def prove_recovery(runner: Runner, app: str) -> None:
     with open(pidfile.replace(".pid", ".release"), "w", encoding="utf-8"):
         pass
     expect(follower.wait(timeout=min(60, remaining())), 0, "follower", read_log(follower_log))
-    if "recovered slot" not in read_log(follower_log):
-        fail("follower did not record the recovery")
+    if f"recovered slot {held[0]['slot_id']} after oxide pid {child.pid} died (Cargo group {group} empty)" not in read_log(follower_log):
+        fail(f"follower did not report the recovery: {read_log(follower_log)}")
     if process_alive(test_pid):
         fail("crash test process outlived recovery")
+    recoveries = runner.state().get("recoveries", [])
+    if len(recoveries) != 1 or recoveries[0]["lease_id"] != running[0]["lease_id"] or recoveries[0]["process_group"] != group:
+        fail(f"recovery log: {recoveries}")
     follower_log.close()
+
+
+def prove_group_gone(runner: Runner, app: str) -> None:
+    """SIGKILL of oxide and its whole Cargo group: the next command recovers
+    at once and status shows it. A `setsid` escapee is outside the group, so
+    it does not keep the slot held: the documented residual limit."""
+    pidfile = os.path.join(runner.parent, "hold-gone.pid")
+    child, log = runner.start(
+        app, ["test"], "gone", {"OXIDE_FIXTURE_HOLD": pidfile, "OXIDE_FIXTURE_ESCAPE": sys.executable}
+    )
+    escape_file = pidfile.replace(".pid", ".escape")
+    wait_for(lambda: os.path.exists(pidfile) and os.path.exists(escape_file), "group-gone test")
+    with open(escape_file, encoding="utf-8") as handle:
+        escapee = int(handle.read())
+    try:
+        child.kill()
+        child.wait(timeout=20)
+        log.close()
+        running = [record for record in runner.state()["records"] if record["phase"] == "running"]
+        if len(running) != 1:
+            fail(f"group-gone record: {runner.state()['records']}")
+        group = running[0]["process_group"]
+        os.killpg(group, signal.SIGKILL)
+
+        def group_gone() -> bool:
+            try:
+                os.killpg(group, 0)
+            except ProcessLookupError:
+                return True
+            return False
+
+        wait_for(group_gone, "killed Cargo group to empty", 20)
+        if not process_alive(escapee) or os.getpgid(escapee) == group:
+            fail("the setsid escapee did not leave Cargo's group alive")
+        code, _, stderr = runner.run(app, ["build"])
+        expect(code, 0, "build after a dead group", stderr)
+        if "waiting for" in stderr:
+            fail(f"build after a dead group waited: {stderr}")
+        if f"after oxide pid {child.pid} died (Cargo group {group} empty)" not in stderr:
+            fail(f"build after a dead group did not recover: {stderr}")
+        if not process_alive(escapee):
+            fail("escapee ended before recovery; the limit was not shown")
+        recoveries = runner.state().get("recoveries", [])
+        if len(recoveries) != 2 or recoveries[-1]["holder_pid"] != child.pid:
+            fail(f"recovery log after a dead group: {recoveries}")
+        code, stdout, _ = runner.run(app, ["status"])
+        if stdout.count("  recovered slot ") != 2 or f"oxide pid {child.pid} died (Cargo group {group} empty)" not in stdout:
+            fail(f"status did not show the recoveries: {stdout}")
+    finally:
+        # The escapee is this proof's own process; it holds nothing in the pool.
+        try:
+            os.kill(escapee, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def take_standalone_lease(runner: Runner) -> dict:
+    """A lease from the standalone CLI has no oxide record or lock holder."""
+    project = os.path.join(runner.parent, "standalone", "project")
+    workspace = os.path.join(runner.parent, "standalone", "workspace")
+    for path in (project, workspace):
+        os.makedirs(path, mode=0o700)
+    code, stdout, stderr = runner.run(
+        runner.parent,
+        ["--pool", runner.pool, "lease", "--project", project, "--workspace", workspace,
+         "--profile", "dev", "--holder", "standalone-fixture"],
+        program=runner.lease,
+    )
+    expect(code, 0, "standalone lease", stderr)
+    return json.loads(stdout)
+
+
+def keep_standalone_lease(runner: Runner, app: str, grant: dict) -> None:
+    """Crash sweeps ran several times; the standalone lease stays held until
+    its own explicit release."""
+    held = [slot for slot in runner.lease_status()["slots"] if slot["lease_id"] == grant["lease_id"]]
+    if len(held) != 1 or held[0]["state"] != "held" or held[0]["holder"] != "standalone-fixture":
+        fail(f"standalone lease was not kept held: {held}")
+    if any(entry["lease_id"] == grant["lease_id"] for entry in runner.state().get("recoveries", [])):
+        fail("standalone lease was logged as recovered")
+    code, stdout, _ = runner.run(app, ["status"])
+    if not re.search(rf"slot {held[0]['slot_id']} held \S+ not managed by oxide", stdout):
+        fail(f"status did not show the standalone lease as held: {stdout}")
+    code, _, stderr = runner.run(
+        runner.parent, ["--pool", runner.pool, "release", "--lease", grant["lease_id"]], program=runner.lease
+    )
+    expect(code, 0, "standalone release", stderr)
 
 
 def main() -> int:

@@ -84,7 +84,9 @@ leases through this library. It keeps its own state in `<pool>/oxide-managed/`,
 an owner-only real directory. Pool opens accept that one extra entry; a
 symlink there refuses like any other. The CLI never reads or writes it, and a
 pool without it opens as before. Oxide passes one private directory under it
-as each lease's `--project`, so library reuse stays checkout-affine.
+as each lease's `--project`, so library reuse stays checkout-affine. Its
+automatic crash recovery touches only leases whose ID or holder string its
+own control record names.
 
 The library also exports `evict_idle_slot` for Oxide's per-project slot cap.
 It retires one recorded idle slot whole through the same durable eviction path
@@ -130,9 +132,13 @@ ended. It is not QA success. Replay against an already-idle lease is
 access-free and idempotent.
 
 **recover** is the same writer-closed declaration for held occupancy the owner
-treats as abandoned or uncertain. This version never infers abandoned from
-TTL, PID, age or holder loss; status reports such occupancy as `held` until
-release or recover. Automatic TTL reuse is not implemented.
+treats as abandoned or uncertain. The CLI and library never infer abandoned
+from TTL, PID, age or holder loss; status reports such occupancy as `held`
+until release or recover. Automatic TTL reuse is not implemented. The one
+exception is outside this CLI: the `oxide` front door calls `recover` for a
+lease it took itself once that command's record lock is free and its Cargo
+process group is empty ([workflow crash recovery](workflow.md#crash-recovery)).
+A lease taken through this CLI is never recovered that way.
 
 **status** lists finite slots with holder, observed workspace, occupancy,
 logical and unique allocated bytes, pool cap, and full/unknown. Coverage is

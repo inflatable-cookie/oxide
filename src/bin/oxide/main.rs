@@ -48,6 +48,7 @@ OXIDE_POOL selects the pool; OXIDE_MAX_ACTIVE the host-wide build limit (2).
 ";
 
 fn main() -> ExitCode {
+    process::started_ms();
     match run(std::env::args_os().skip(1).collect()) {
         Ok(code) => ExitCode::from(code),
         Err(message) => {
@@ -405,10 +406,22 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
                 println!("  cleaning {}", checkout.display());
             }
             for slot in &report.slots {
-                let state = match (slot.state, slot.interrupted) {
-                    (SlotOccupancy::Held, true) => "held by an interrupted command",
-                    (SlotOccupancy::Held, false) => "held",
-                    _ => "idle",
+                let state = match (slot.state, &slot.interrupted) {
+                    (SlotOccupancy::Held, Some(interrupted)) => {
+                        let holder = interrupted
+                            .holder_pid
+                            .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string());
+                        match interrupted.process_group {
+                            Some(group) => format!(
+                                "held by an interrupted command (oxide pid {holder}, Cargo group {group}; recovered once the group is empty)"
+                            ),
+                            None => format!(
+                                "held by an interrupted command (oxide pid {holder}, Cargo group not recorded; `oxide-storage-lease recover` releases it)"
+                            ),
+                        }
+                    }
+                    (SlotOccupancy::Held, None) => "held".to_owned(),
+                    _ => "idle".to_owned(),
                 };
                 let owner = match (&slot.checkout, slot.managed) {
                     (Some(checkout), _) => checkout.display().to_string(),
@@ -423,6 +436,23 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
                     "  slot {} {state} {} {owner} {bytes}",
                     slot.slot_id,
                     slot.profile.as_deref().unwrap_or("-")
+                );
+            }
+            let now = process::now_ms();
+            for recovery in &report.recoveries {
+                let group = recovery.process_group.map_or_else(
+                    || "Cargo never started".to_owned(),
+                    |group| format!("Cargo group {group} empty"),
+                );
+                let checkout = recovery.checkout.as_deref().map_or_else(
+                    || "no checkout affinity".to_owned(),
+                    |checkout| checkout.display().to_string(),
+                );
+                println!(
+                    "  recovered slot {} {}s ago: oxide pid {} died ({group}), {checkout}",
+                    recovery.slot_id,
+                    now.saturating_sub(recovery.recovered_ms) / 1000,
+                    recovery.holder_pid
                 );
             }
         }
