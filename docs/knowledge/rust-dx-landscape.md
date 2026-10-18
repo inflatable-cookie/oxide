@@ -369,7 +369,7 @@ How the paths behave:
   - unrerun dependency `root-output` files;
   - `serde`/`serde_core` metadata source maps that name A's generated `private.rs`;
   - proc-macro dylib install names.
-- Debug info is the open condition. Until a binary is relinked, its macOS debug map (`N_OSO`) points at A's `deps/*.o`. That includes the `target/debug/*` outputs Cargo hard-links into place from B.
+- Debug info is the open condition. Until a binary is relinked, its macOS debug map (`N_OSO`) points at A's `deps/*.o`. That includes the `target/debug/*` outputs Cargo uplifts from B (on macOS APFS these are clones, not hard links; see the [final-output placement probe](#final-output-placement-probe-2026-10-18)).
   - It harms nothing while A still exists unchanged, as a clone source would.
   - Once A is gone or rebuilt, debugging an unchanged binary can lose its debug info.
   - The probe did not run a debugger.
@@ -383,6 +383,32 @@ Clone cost (Oxide repository, 2,126 files; source `st_blocks` sum 244 MiB, which
 Implication: on this host and toolchain, cloning a slot per worktree, or warm-starting from main's slot, is mechanically sound for Cargo freshness and rebuild correctness on both layouts. A product design still has to settle the debug-map condition: keep the source slot unchanged while clones exist, or accept relinking. One fixture and one repository do not prove universal portability, debugger behaviour or savings. Two recipe slips are corrected in the summary:
 - the layout v2 build script is named `build_script_build`, so the recipe's run counter missed it;
 - the hit classifier mislabels v2 unit outputs under `build/<pkg>/<hash>/out/`.
+
+## Final-output placement probe (2026-10-18)
+
+Question: when the target directory shares a volume with the build directory, does Cargo hard-link final outputs instead of copying them, and how many bytes per worktree does that save over the current layout (build directory on the pool, target directory in the checkout; [workflow](contracts/workflow.md#what-one-command-does-local-executor))?
+
+Subject: Oxide at `22d2f77`, stable 1.97.1, `--offline`, default `dev`/`test` profiles, no edits. One fresh 4 GiB APFS sparse image, two layouts built sequentially into disjoint directories:
+- X (cross-volume): build directory on the image, target directory on the host volume.
+- S (same volume): both on the image.
+
+Per layout: one cold `cargo build` and one `cargo test --no-run`. The recorded data per final file: device, inode, `st_nlink`, size, allocation, APFS private size and clone ID (`getattrlist`), plus its content-equal build-directory peer.
+
+| | X (cross-volume) | S (same volume) |
+| --- | --- | --- |
+| Hard links | None: `st_nlink` 1; no target file shares device and inode with a build file | None, same evidence |
+| Uplifted lib and three bins | Independent copies; private bytes equal allocation | APFS clones of the `deps/` files: private size 0, shared clone ID, refcount 2 |
+| Target-dir bytes not shared with build dir | 15,589,376 | 20,480 (`.d` files and `CACHEDIR.TAG`) |
+| Test binaries | Five built; all stay in the build directory; none uplifted | Same |
+| Image-use delta | 212,426,752 (build dir only) | 212,029,440 (build and target dirs) |
+
+Result: in this run, Cargo hard-linked no uplifted output in either layout. On the same APFS volume it cloned them, which cost almost nothing. Cargo's own source at the measured commit explains the observation: on macOS, `cargo-util` `_link_or_copy` removes the destination and then calls `fs::copy`, which uses `fclonefileat` on APFS. If that copy fails with `EAGAIN`, it falls back to `hard_link`, so hard links remain possible on macOS; this run never hit that path. The source comment cites a Gatekeeper race with hard-linked binaries ([cargo#7821](https://github.com/rust-lang/cargo/issues/7821), [cargo#10060](https://github.com/rust-lang/cargo/issues/10060)). Other Unix systems take the `hard_link` path; Linux was not measured.
+
+Per-worktree saving for this subject: 15,568,896 bytes (about 14.8 MiB), or 6.7% of the 231 MB clone-aware total. The image deltas agree: S's target directory added no measurable image use (S − X = −397,312 bytes, within APFS accounting noise). The saving should grow with final binary size and debug info; only this subject was measured. Here, all five test-harness executables stayed in the build directory and none was uplifted, so this subject's test path saved nothing; only its `build`/`run` outputs benefited.
+
+`cargo test --no-run` re-uplifted the three fresh bins (new inodes) because integration tests need them. In X that means a fresh full copy on the host volume. In S it means a new clone. No write volume was measured.
+
+Limits: one subject on one host, one cold build plus one `test --no-run` per layout, APFS only. No repeat, edit or branch-switch builds; no test execution; no Linux run. Clones share blocks only until either side is rewritten. Placement, lease and default behavior are unchanged. A same-volume target directory would also move final outputs off the checkout and into the pool, which affects the privacy and lifetime rules in [workflow](contracts/workflow.md#what-one-command-does-local-executor). Evidence: [final-output-links-082](evidence/final-output-links-082/summary.json).
 
 ## Product assessment
 
