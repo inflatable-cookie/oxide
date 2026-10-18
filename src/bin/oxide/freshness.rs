@@ -548,12 +548,35 @@ fn embeds_path(top: &Path, dir: &str, owned: &[String], budget: &mut u64) -> Res
     Ok(false)
 }
 
-/// A manifest line `build = ...` names a build script outside `build.rs`.
+/// The manifest may name a build script outside `build.rs`: some `build` key,
+/// bare, quoted or dotted (`build`, `"build"`, `package.build`, an inline
+/// table), followed by `=`. Textual and conservative: a comment or string
+/// that looks like one also counts, which only refreshes more.
 fn declares_build(manifest: &str) -> bool {
-    manifest.lines().any(|line| {
-        line.trim_start()
-            .strip_prefix("build")
-            .is_some_and(|rest| rest.trim_start().starts_with('='))
+    let bytes = manifest.as_bytes();
+    let key_char = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_';
+    manifest.match_indices("build").any(|(start, _)| {
+        let end = start + "build".len();
+        // Opening quote, if any, must close right after the key.
+        let quote = start
+            .checked_sub(1)
+            .map(|before| bytes[before])
+            .filter(|byte| matches!(byte, b'"' | b'\''));
+        if start > 0 && quote.is_none() && key_char(bytes[start - 1]) {
+            return false;
+        }
+        let mut rest = &bytes[end..];
+        match quote {
+            Some(quote) => match rest.split_first() {
+                Some((&next, after)) if next == quote => rest = after,
+                _ => return false,
+            },
+            None if rest.first().is_some_and(|&byte| key_char(byte)) => return false,
+            None => {}
+        }
+        rest.iter()
+            .find(|byte| !matches!(byte, b' ' | b'\t'))
+            .is_some_and(|&byte| byte == b'=')
     })
 }
 
@@ -645,8 +668,19 @@ mod tests {
     fn manifest_build_key_is_detected() {
         assert!(declares_build("[package]\nbuild = \"gen.rs\"\n"));
         assert!(declares_build("  build=false"));
+        // Quoted, dotted and inline-table keys are valid TOML too.
+        assert!(declares_build("[package]\n\"build\" = \"codegen.rs\"\n"));
+        assert!(declares_build("[package]\n'build'\t= 'codegen.rs'\n"));
+        assert!(declares_build("package.build = \"codegen.rs\"\n"));
+        assert!(declares_build("package . \"build\" = \"codegen.rs\"\n"));
+        assert!(declares_build(
+            "package = { name = \"x\", build = \"gen.rs\" }\n"
+        ));
         assert!(!declares_build(
-            "[build-dependencies]\nbuild-helper = \"1\"\n"
+            "[build-dependencies]\nbuild-helper = \"1\"\nrebuild = 1\nname = \"build\"\n"
+        ));
+        assert!(!declares_build(
+            "[target.'cfg(unix)'.build-dependencies]\n\"buildx\" = 1\n"
         ));
     }
 

@@ -151,7 +151,9 @@ slot has a recorded origin:
    fingerprints and the slot are never edited.
 3. On a checkout-path change, every repository package that can embed the
    path gets the same treatment: one with `build.rs` or a manifest `build`
-   key, or whose sources mention `CARGO_MANIFEST_DIR`. A file belongs to the
+   key in any TOML key form (bare, quoted, dotted or inline; matched
+   textually, so look-alikes in comments also count), or whose sources
+   mention `CARGO_MANIFEST_DIR`. A file belongs to the
    package with the deepest `Cargo.toml` above it. Registry, Git and
    outside-repository path dependencies keep their paths and stay warm. They
    are the bulk of the reuse benefit.
