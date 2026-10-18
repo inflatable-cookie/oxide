@@ -185,20 +185,20 @@ workspace units built incrementally.
 
 Warm figures are means of edits 2 and 3. Every warm step rebuilt exactly one
 unit, the `oxide` bin. The first check after a cold build also builds 16
-dependency check units: 1.58 / 1.47 / 1.46 / 0.97 s for A–D.
+additional check units, including the workspace library: 1.58 / 1.47 / 1.46 / 0.97 s for A–D.
 
 Receipts:
 - Arm C's verbose rustc lines show `-Z codegen-backend=cranelift` only on the
-  `oxide_storage` and `oxide` units. The 22 dependency and build-script units
-  stayed on LLVM.
+  `oxide_storage` and `oxide` units. The cold-build log records 29 other
+  compiler invocations for dependencies and build scripts, all on LLVM.
 - Arm D shows `-Zthreads=8` on every unit.
 - No unit received a `-C panic` flag.
 
 Findings:
-- **Check is the floor, and it is almost the whole frontend.** A warm build
-  costs about 0.21 s more than a warm check, and that gap holds codegen and
-  link. No backend can save more than that per edit on this subject.
-  Cranelift saved nothing: C's warm build was 0.01 s slower than B's.
+- **Warm builds cost more than checking.** A warm check takes about 0.10 s
+  and a warm build about 0.31 s. Their roughly 0.21 s difference does not
+  isolate frontend, codegen or link costs. Cranelift saved nothing in the
+  observed edit loop: C's warm build was 0.01 s slower than B's.
 - **Panic semantics change even with `panic=unwind`.** Arm C's `cargo test`
   ran 79 unit tests and all passed. The unwind probe
   (`tests/profile_backtrace.rs`) failed: a `catch_unwind` inside
@@ -217,8 +217,8 @@ Findings:
   isolated.
 
 Recommendation: do not implement a Cranelift-for-workspace `quick` run
-strategy on this evidence. On a small workspace the edit loop is already
-check-bound, and the strategy costs nightly, a second dependency set and changed
+strategy on this evidence. On this small workspace warm build time did not
+improve, while the strategy costs nightly, a second dependency set and changed
 panic semantics. A heavy, codegen-bound project could differ. That needs its own
 owner-coordinated, approved reading, and this result does not predict it.
 
