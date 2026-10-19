@@ -11,6 +11,7 @@ mod cargo_home;
 mod cli;
 mod freshness;
 mod identity;
+mod launch;
 mod process;
 mod store;
 mod watchdog;
@@ -44,6 +45,7 @@ USAGE:
     oxide clean [cargo clean args]       private outputs and slot affinity; slots stay
     oxide clean --cargo-cache            one pass of Cargo's own home cleanup, no network
     oxide status                         pool, slots, waits, stray output and Cargo home
+    oxide status --launch-check          macOS: time a new executable's first launch
     oxide init [cargo init args] [path]  cargo init if no Cargo.toml, then adopt Oxide
     oxide new <path> [cargo new args]    cargo new, then adopt Oxide
 
@@ -59,6 +61,11 @@ Linux default; macOS defaults to a hard-capped APFS image).
 ";
 
 fn main() -> ExitCode {
+    // The launch-check probe exits, and its measuring helper runs, before
+    // any other work.
+    if let Some(code) = launch::hidden() {
+        return ExitCode::from(code);
+    }
     process::started_ms();
     match run(std::env::args_os().skip(1).collect()) {
         Ok(code) => ExitCode::from(code),
@@ -534,8 +541,10 @@ fn private_scratch() -> Result<PathBuf, String> {
 }
 
 fn run_status(args: &[OsString]) -> Result<u8, String> {
-    if !args.is_empty() {
-        return Err("status takes no arguments".to_owned());
+    match args {
+        [] => {}
+        [flag] if flag == "--launch-check" => return launch::run_check(),
+        _ => return Err("status takes no arguments except --launch-check".to_owned()),
     }
     println!("pool: {}", store::pool_path()?.display());
     match Store::open_existing()? {

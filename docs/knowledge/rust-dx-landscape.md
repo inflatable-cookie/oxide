@@ -804,6 +804,18 @@ The documented mitigation is a host setting: add the app responsible for launchi
 
 Do not disable Gatekeeper globally. No host setting was changed by this probe.
 
+### oxide launch check runs (2026-10-19)
+
+oxide#093 ships this measurement as [`oxide status --launch-check`](contracts/workflow.md#launch-check). Author runs on this host, under the running Paseo, with a 4.6 MB quick-profile `oxide`:
+
+- Completed checks took 1.2–1.8 s. Same-file medians were 1.7–3.5 ms; fresh-copy medians 193–298 ms; differences 191–295 ms. The ancestry named `Paseo.app`, which Tom says is already listed in Developer Tools. The penalty persists with it listed and Paseo not restarted, consistent with the earlier re-probe.
+- Some checks hit the 3 s limit before five fresh copies ran and reported `inconclusive`: two of three right after one build, and the first of the two focused proof runs (`effigy rust:oxide-cli`, 2,750 ms reported) on its freshly built binary. One such warm-up measured 1,834 ms. Other fresh builds measured normally, including the second proof run: 1,201 ms, same-file median 1.6 ms, fresh-copy median 198.0 ms. The cause was not traced; host load average was about 11.
+- After the bounded-supervision revision, three dev checks took 919–987 ms: same-file medians 2.1–2.6 ms, fresh-copy medians 149.3–158.1 ms, differences 147.2–155.6 ms. With the measuring helper process, two took 995–1,051 ms with differences 155.8–164.4 ms. The author proof runs above used the first implementation. The review side's focused offline proof (`rust:oxide-cli:launch-check`, 5 s, 68 MiB staged) measured 1,053 ms with a material penalty on the bounded-supervision revision.
+- A newly written two-line `#!/bin/sh` script paid the same: about 155 ms on first launch, then 6–8 ms. The cost is not specific to Mach-O binaries.
+- Two freshly linked tiny `rustc -O` binaries first launched in 258–270 ms; a copy of each in 150–164 ms. A rebuilt binary has new code-signature content and a copy does not, so the check is likely a lower bound for a rebuild's cost. That is inferred from two samples.
+
+No setting was read or changed.
+
 ## Product assessment
 
 Planner recommendation: a small coherent entry point over evidence-backed mechanisms, with three capabilities: see and explain costs, bound and reuse owned storage, and apply qualified improvements with clear trade-offs. The reusable storage core must work for ordinary developers as well as orchestrators. A daemon, editor surface or UI is still an open choice; Tom's [workflow direction](vision.md#product-workflow-direction) sets an `oxide build` / `oxide run` front door as the design target.

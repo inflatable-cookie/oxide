@@ -27,6 +27,7 @@ until this foundation works consistently.
 oxide <check|test|clippy|build|run> [--profile <name>] [cargo args] [-- program args]
 oxide <any other cargo command> [args]   # passed to Cargo, with storage where it builds
 oxide status                             # pool, slots, waits, stray Cargo output, Cargo home
+oxide status --launch-check              # macOS: a new executable's first-launch penalty, advisory
 oxide clean --cargo-cache                # one pass of Cargo's own home cleanup, network refused
 oxide init [cargo init args]             # make this a Cargo project if needed, then adopt Oxide
 oxide new <path> [cargo new args]        # cargo new, then adopt Oxide
@@ -863,6 +864,8 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
   newest automatic recoveries, whether the current workspace's `target/`
   holds plain-Cargo `deps/` or `incremental/`, and the Cargo home (see
   [Cargo home hygiene](#cargo-home-hygiene)). It never creates the pool.
+  `status --launch-check` prints only the [launch check](#launch-check);
+  plain `status` does not run it. Status has no JSON output.
 
 Control state lives in `<pool>/oxide-managed/` (owner-only): records mapping
 each checkout and key to a private lease project directory, FIFO wait
@@ -977,6 +980,100 @@ it never deletes there itself.
   conflicting value reported and ignored there and on the APFS pool) and a
   slot whose build script hard-links a 64 KiB file: `status` matched the
   proof's walk, with the pair counted once.
+
+## Launch check
+
+Implemented in oxide#093 under Tom's
+[2026-10-19 ruling](../vision.md#product-workflow-direction), from the
+[launch-cost finding](../rust-dx-landscape.md#macos-new-executable-launch-cost-2026-10-19).
+`oxide status --launch-check` measures how much slower a newly written
+executable launches than a re-run of the same file. It is opt-in and
+advisory, exits 0 whenever it prints a result (an oversized binary refuses
+with exit 1), and reads or changes no setting.
+
+- **Off macOS.** One line: not applicable.
+- **Probe and helper.** Two hidden modes run as the first thing `main`
+  does, before argument parsing, toolchain, pool or lease work, and are
+  absent from usage. `oxide __oxide-launch-probe`, exactly that one
+  argument, exits 0 and prints and starts nothing.
+  `oxide __oxide-launch-measure` is the measuring helper the check starts;
+  it takes its directory, deadlines, delays and source as arguments.
+- **Measurement.** The check refuses a binary over 64 MiB, creates a fresh
+  owner-only directory under the temporary directory, and starts the helper
+  (the running `oxide`, with an empty environment) as the leader of a new
+  process group. The helper copies `oxide` in 1 MiB chunks into new
+  owner-only files (`create_new`). It runs one copy once as warm-up and five
+  more times; then five distinct fresh copies are each written, run once and
+  unlinked. At most one copy exists at a time. Each timing spans spawn to
+  reap of a probe with an empty environment and null standard streams,
+  polled every 250 µs; copy time is not timed. The helper reports samples
+  on a pipe, removes its own copies and directory, and stops at its
+  deadline.
+- **Bounds.** One 3 s monotonic limit covers copies, starts, waits and
+  cleanup:
+  - A sample counts only if its probe exited successfully by 2.75 s. At
+    2.75 s the check stops collecting.
+  - The check then kills the whole helper group with `SIGKILL`: the helper
+    and any probe, including one still starting. The group ID is signalled
+    only before the helper is reaped, so it names only this check's
+    processes. The check reaps the helper and waits until the group is
+    empty.
+  - With every writer gone, the check removes the helper's known copy names
+    and the directory itself.
+  - Nothing it started outlives it. The one exception is the kernel holding
+    a killed process past 3 s; the report then names the process group as
+    not confirmed closed. A removal failure is named too.
+  - Elapsed time over 3 s, or an unconfirmed group, makes the result
+    inconclusive.
+  - If the check itself is killed, the helper still stops at its own
+    deadline and removes its copies; only the empty directory can remain.
+- **Result.** Raw samples always print (warm-up, five same-file runs, five
+  fresh-copy runs), then the elapsed time and cleanup. With every sample, it
+  prints both medians and their signed difference (negative and small
+  differences as measured). A timeout, failed probe, copy failure or
+  incomplete set is `inconclusive` with the reason and no median; at the
+  limit it also says to run it again, since a newly built `oxide`'s first
+  launches can take longer. Copies share content and code signature, so the
+  result is likely a lower bound for a freshly linked binary
+  ([finding](../rust-dx-landscape.md#oxide-launch-check-runs-2026-10-19)).
+- **Advice.** Only when the difference exceeds 30 ms. It states the cause is
+  inferred, not measured, and names a best-effort launching app: the
+  outermost `.app` bundle on the executable paths of this process's
+  ancestors (`proc_pidpath`, same-user readable only, at most 64 hops). No
+  bundle, or several distinct ones, is `unknown` with manual guidance. It
+  points to System Settings → Privacy & Security → Developer Tools, says the
+  app may need a restart, says Oxide has not checked or changed any setting
+  and listing an app may not remove the penalty, and warns never to disable
+  Gatekeeper globally. The ancestry is not proof of which process macOS
+  holds responsible.
+- **Never.** No Cargo, pool, network, `spctl`, privileged call, TCC read,
+  settings change or restart.
+- **Proof.** `effigy rust:oxide-cli:launch-check` is the focused route. It
+  stages `oxide` offline with 1.97.1 into its own scratch (counted in the
+  512 MiB), from the host's cached registry, with no pool, image, Cargo home
+  setup or download. It logs its setup (two version calls, at most 30 s),
+  samples the 20 GiB reserve before writing anything and after staging and
+  the check, and stays within 300 s including cleanup. `effigy
+  rust:oxide-cli` runs the same case before any pool exists. The case puts
+  a `cargo` that records any call and exits 97 first on `PATH`. A
+  positive control shows that shim records `oxide version`. The hidden
+  probe exits 0 with no output and no Cargo call. `status --launch-check`
+  exits 0 within its bound (reported at most 3,000 ms, wall at most
+  4,000 ms), leaves nothing new in the temporary directory, starts no Cargo,
+  creates no pool and prints well-formed output: medians recomputed from the
+  raw samples, the advice lines when advised. No penalty size is asserted.
+  Unit tests cover the medians, the strict threshold, the bundle choice and
+  the report and advice text.
+- **Lifecycle tests.** `tests/launch_check.rs` runs the built `oxide` to
+  exit. Its probes are shell scripts named by `OXIDE_TEST_LAUNCH_SOURCE`
+  (test-only, like `OXIDE_TEST_LAUNCH_LIMIT_MS` and
+  `OXIDE_TEST_LAUNCH_DELAY=copy|start|remove:<ms>`, which pauses inside the
+  helper). With the CLI gone, each case checks at once that the temporary
+  directory is empty and no logged probe is alive:
+  - an ordinary run completes with medians (20 s limit, for loaded hosts);
+  - under a 5 s limit, a probe that never exits is killed;
+  - under a 600 ms limit, a copy, a probe start and a removal each paused
+    2 s return within 1.6 s, inconclusive.
 
 ## Platform backends
 
