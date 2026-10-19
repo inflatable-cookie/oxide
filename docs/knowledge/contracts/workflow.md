@@ -317,31 +317,35 @@ immutability ([vision](../vision.md#product-workflow-direction)).
   - every workspace member's manifest that metadata read for selection, built
     or not (an unbuilt sibling's `default-run` changes `run`'s pick); each
     must be strictly older than a time taken before that query;
-  - when the workspace root manifest declares `workspace.members`, every
-    directory under the workspace root except the root `target` and `.git`:
-    a member glob such as `crates/*/pkg` can match a package added at any
-    depth, including `crates/x/sub` under an existing `crates/x`, so an added
-    member changes a recorded directory. At record time only, the root
-    manifest is parsed as TOML (`basic-toml`); comments, quoted or escaped
-    keys and multi-line arrays are decoded, never scanned as text. A parse
-    error, a non-string or non-array `members`/`exclude`, or a decoded
-    `members` or `exclude` pattern the walk cannot cover records nothing:
-    absolute or `~`-prefixed (Cargo joins it to the root as-is; Oxide never
-    normalizes), a backslash (a glob escape), a first component after any
-    `./` that is `target` or `.git` or contains `*`, `?` or `[`, a `/../`
-    climb, or a leading `..` followed by a metacharacter or either name. Any
-    symlink the walk meets, judged by its own type and never its referent
-    (dangling, file or directory: a dangling link can later resolve to a new
-    member), or more than 4096 directories also records nothing. Outside
-    path-dependency inputs are unaffected and stay stat-recorded.
-    Without `members`, membership comes from the manifests already
-    recorded, so nothing is walked. Path dependencies, absolute or relative
-    such as `../outside`, keep their stat-recorded inputs. The skip compares
-    stats only and never parses;
+  - the literal workspace selection, with no discovery. At record time only,
+    the root manifest is parsed as TOML (`basic-toml`; comments, quoted or
+    escaped keys and multi-line arrays are decoded, never scanned as text)
+    and `workspace.members`, `workspace.exclude` and
+    `workspace.default-members` are read as string arrays. Every entry must
+    be a literal relative path: a `*`, `?`, `[`, `]`, `{` or `}`, a
+    backslash, an absolute or `~` path, a `..` component, an empty entry, a
+    parse error or a non-string entry records nothing, so a pattern
+    workspace such as `crates/*` never gets a skip record. For each entry
+    the workspace root and every path component down to it are recorded
+    without following links, absent ones included; a missing component or
+    a regular file ends the chain, so a later directory or package there
+    changes a recorded tuple. A symlink anywhere on the way (dangling, file
+    or directory) records nothing. There is no recursive walk. Without a
+    `[workspace]` table, membership comes from the manifests already
+    recorded, and the ancestor `Cargo.toml` tuples below cover Cargo's root
+    search. Path dependencies, absolute or relative such as `../outside`,
+    keep their stat-recorded inputs. The skip compares stats only and never
+    parses;
   - `Cargo.lock`;
   - `.cargo/config`, `.cargo/config.toml`, `Cargo.toml`, `rust-toolchain`
-    and `rust-toolchain.toml` in the working directory and every ancestor,
-    and `$CARGO_HOME/config(.toml)`, absent ones included. `CARGO_HOME` and
+    and `rust-toolchain.toml` in the working directory and every ancestor up
+    to `/`, absent ones included. Pinned Cargo's workspace-root search
+    ([`core/workspace.rs`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/workspace.rs)
+    `find_workspace_root` → `find_root_iter`) honours the package's own
+    `package.workspace` (a recorded manifest) and otherwise walks every
+    ancestor `Cargo.toml` through `paths::ancestors` with no limit outside
+    Cargo's test-only root, so a new ancestor manifest changes a tuple.
+    Also `$CARGO_HOME/config(.toml)`, absent ones included. `CARGO_HOME` and
     `RUSTUP_HOME` resolve as Cargo and rustup do: empty means unset, relative
     joins the working directory, unset falls back to the home directory;
   - toolchain resolution: rustup's `settings.toml`, every `PATH` candidate
@@ -410,7 +414,7 @@ immutability ([vision](../vision.md#product-workflow-direction)).
   escapes, so the screen never decodes TOML); a config over 1 MiB or not
   UTF-8. A configured compiler or wrapper therefore never records: the
   compiler the key binds is always the `PATH` one.
-- **Record.** Versioned JSON (version 4) in
+- **Record.** Versioned JSON (version 5; older versions never skip) in
   `<workspace>/target/oxide-run-skip/`, at most 4 MiB each and 64 per
   checkout (cleared past that), so `oxide clean` drops records with the
   binaries. A missing, other-version, partial or corrupt record never skips.

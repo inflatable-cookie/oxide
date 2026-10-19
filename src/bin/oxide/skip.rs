@@ -30,8 +30,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Version 4: file-metadata tuples. Records of any other version never skip.
-const RECORD_VERSION: u32 = 4;
+/// Version 5: file-metadata tuples with the literal workspace selection.
+/// Records of any other version never skip.
+const RECORD_VERSION: u32 = 5;
 /// Records live in the checkout's private target directory, so `oxide clean`
 /// drops them with the binaries they describe.
 const RECORD_DIR: &str = "target/oxide-run-skip";
@@ -47,8 +48,6 @@ const MAX_SCRIPT_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_INPUTS: usize = 32_768;
 const MAX_ANCESTORS: usize = 64;
 const MAX_PATH_ENTRIES: usize = 256;
-/// Directories recorded for workspace member globs; past this, no record.
-const MAX_WORKSPACE_DIRS: usize = 4096;
 const STRATEGY: &str = "build+execute";
 const NANOS: i128 = 1_000_000_000;
 /// Files Cargo or rustup read from each directory between the working
@@ -618,9 +617,9 @@ impl Pending {
         // Every member manifest the selection read, built or not: an
         // unbuilt sibling's `default-run` changes which binary `run` picks.
         inputs.extend(selection_manifests(&self.members, self.selection_ns)?);
-        for dir in workspace_dirs(&self.checkout)? {
-            let found = stat(&dir)?;
-            inputs.entry(dir).or_insert(found);
+        // The literal member selection; a glob workspace records nothing.
+        for (path, found) in workspace_literals(&self.checkout)? {
+            inputs.entry(path).or_insert(found);
         }
         for path in built {
             if inputs.contains_key(&path) {
@@ -817,15 +816,22 @@ fn path_candidates(
     Err(format!("{program} does not resolve on PATH"))
 }
 
-/// When the workspace root manifest declares `members`, a glob there can
-/// match a package added anywhere below the root, at any depth: every
-/// directory under the root is recorded (except the root `target` and
-/// `.git`), so an added member changes a recorded directory. Any symlink the
-/// walk meets refuses, judged by its own type: dangling, file or directory.
-/// A manifest whose
-/// patterns could reach those two, an escape, a directory symlink or more
-/// than [`MAX_WORKSPACE_DIRS`] directories refuses.
-fn workspace_dirs(checkout: &Path) -> Result<Vec<PathBuf>, String> {
+/// The workspace's literal member selection, recorded without discovery.
+///
+/// At record time only, the root manifest is parsed as TOML (`basic-toml`)
+/// and `workspace.members`, `workspace.exclude` and
+/// `workspace.default-members` are read as string arrays. Every entry must be
+/// a literal relative path: a glob or brace character (`*`, `?`, `[`, `{`),
+/// a backslash, an absolute or `~` path, a `..` component or an empty entry
+/// records nothing, so a pattern workspace never publishes a record. For
+/// each entry the workspace root and every path component down to the entry
+/// are stat-recorded, absent ones included, without following links; a
+/// symlink anywhere on the way refuses. A component that is missing or a
+/// regular file ends the chain, so a later directory there changes a
+/// recorded tuple. Without a `[workspace]` table the root's membership and
+/// root search come from the manifests and ancestor `Cargo.toml` tuples
+/// already recorded.
+fn workspace_literals(checkout: &Path) -> Result<BTreeMap<PathBuf, Option<Stat>>, String> {
     let manifest = checkout.join("Cargo.toml");
     let file = File::open(&manifest)
         .map_err(|error| format!("cannot read {}: {error}", manifest.display()))?;
@@ -836,99 +842,94 @@ fn workspace_dirs(checkout: &Path) -> Result<Vec<PathBuf>, String> {
     if text.len() as u64 > MAX_CONFIG_BYTES {
         return Err(format!("{} exceeds 1 MiB", manifest.display()));
     }
-    let patterns =
-        member_patterns(&text).map_err(|reason| format!("{}: {reason}", manifest.display()))?;
-    let Some(patterns) = patterns else {
-        return Ok(Vec::new());
-    };
-    if let Some(pattern) = patterns.iter().find(|pattern| reaches_skipped(pattern)) {
-        return Err(format!(
-            "{} has a member pattern `{pattern}` that may match under target or .git",
-            manifest.display()
-        ));
+    let entries =
+        member_entries(&text).map_err(|reason| format!("{}: {reason}", manifest.display()))?;
+    let mut recorded = BTreeMap::new();
+    if entries.is_empty() {
+        return Ok(recorded);
     }
-    let mut dirs = Vec::new();
-    let mut pending = vec![checkout.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        let entries = fs::read_dir(&dir)
-            .map_err(|error| format!("cannot list {}: {error}", dir.display()))?;
-        for entry in entries {
-            let entry = entry.map_err(|error| error.to_string())?;
-            let kind = entry.file_type().map_err(|error| error.to_string())?;
-            let path = entry.path();
-            if dir == checkout && (entry.file_name() == "target" || entry.file_name() == ".git") {
-                continue;
-            }
-            // Classified by the entry's own type, never its referent: a link
-            // that dangles now can resolve to a new member later, so any
-            // link refuses.
-            if kind.is_symlink() {
-                return Err(format!(
-                    "{} is a symlink under the workspace",
-                    path.display()
-                ));
-            }
-            if kind.is_dir() {
-                dirs.push(path.clone());
-                pending.push(path);
-                if dirs.len() > MAX_WORKSPACE_DIRS {
-                    return Err(format!(
-                        "the workspace has more than {MAX_WORKSPACE_DIRS} directories for member globs"
-                    ));
-                }
+    recorded.insert(checkout.to_path_buf(), unlinked(checkout)?);
+    for entry in &entries {
+        let components = literal_components(entry).ok_or_else(|| {
+            format!(
+                "{} has a non-literal workspace entry `{entry}`",
+                manifest.display()
+            )
+        })?;
+        let mut path = checkout.to_path_buf();
+        for component in components {
+            path.push(component);
+            let found = unlinked(&path)?;
+            recorded.insert(path.clone(), found);
+            if !found.is_some_and(|found| !found.regular) {
+                break;
             }
         }
+        if recorded.len() > MAX_INPUTS {
+            return Err("the workspace lists too many entries".to_owned());
+        }
     }
-    Ok(dirs)
+    Ok(recorded)
 }
 
-/// `workspace.members` and `workspace.exclude` of a root manifest, parsed as
-/// TOML at record time only. `None`: no `members`, so membership comes from
-/// the manifests already recorded. A parse error or a non-string entry
-/// refuses.
-fn member_patterns(text: &str) -> Result<Option<Vec<String>>, String> {
+/// A path's tuple without following a final symlink, which refuses.
+fn unlinked(path: &Path) -> Result<Option<Stat>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "{} is a symlink in the workspace selection",
+            path.display()
+        )),
+        Ok(metadata) => Ok(Some(Stat::of(&metadata))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot stat {}: {error}", path.display())),
+    }
+}
+
+/// The normal components of a literal relative workspace entry, or `None`
+/// when the entry is not one (see [`workspace_literals`]). `.` components
+/// drop, so `.` is the root itself.
+fn literal_components(entry: &str) -> Option<Vec<&str>> {
+    if entry.is_empty()
+        || entry.starts_with(['/', '~'])
+        || entry.contains(['*', '?', '[', ']', '{', '}', '\\'])
+    {
+        return None;
+    }
+    let mut components = Vec::new();
+    for component in entry.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => return None,
+            component => components.push(component),
+        }
+    }
+    Some(components)
+}
+
+/// `workspace.members`, `workspace.exclude` and `workspace.default-members`
+/// of a root manifest, parsed as TOML at record time only. Empty without a
+/// `[workspace]` table. A parse error or a non-string entry refuses.
+fn member_entries(text: &str) -> Result<Vec<String>, String> {
     #[derive(Deserialize)]
     struct Root {
         workspace: Option<Workspace>,
     }
     #[derive(Deserialize)]
+    #[serde(rename_all = "kebab-case")]
     struct Workspace {
         members: Option<Vec<String>>,
         exclude: Option<Vec<String>>,
+        default_members: Option<Vec<String>>,
     }
     let root: Root =
         basic_toml::from_str(text).map_err(|error| format!("cannot parse: {error}"))?;
     let Some(workspace) = root.workspace else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
-    let Some(mut patterns) = workspace.members else {
-        return Ok(None);
-    };
-    patterns.extend(workspace.exclude.unwrap_or_default());
-    Ok(Some(patterns))
-}
-
-/// A decoded member or exclude pattern the walk cannot cover: absolute or
-/// `~` (Cargo joins it to the root as-is; Oxide never normalizes), a
-/// backslash (a glob escape), a first component after any `./` that is
-/// `target` or `.git` or contains `*`, `?` or `[`, a `/../` climb, or a
-/// leading `..` followed by a metacharacter or either name.
-fn reaches_skipped(pattern: &str) -> bool {
-    let mut rest = pattern;
-    while let Some(stripped) = rest.strip_prefix("./") {
-        rest = stripped;
-    }
-    if rest.starts_with(['/', '~']) || pattern.contains('\\') {
-        return true;
-    }
-    let first = rest.split('/').next().unwrap_or_default();
-    let climbing = first == ".."
-        && (rest.contains(['*', '?', '[']) || rest.contains("target") || rest.contains(".git"));
-    first == "target"
-        || first == ".git"
-        || first.contains(['*', '?', '['])
-        || climbing
-        || pattern.contains("/../")
+    let mut entries = workspace.members.unwrap_or_default();
+    entries.extend(workspace.exclude.unwrap_or_default());
+    entries.extend(workspace.default_members.unwrap_or_default());
+    Ok(entries)
 }
 
 /// Each member manifest's tuple: a regular file strictly older than
@@ -1421,73 +1422,6 @@ mod tests {
     }
 
     #[test]
-    fn a_member_added_under_a_nested_glob_changes_a_recorded_directory() {
-        let root = scratch("nested-glob");
-        fs::write(
-            root.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"crates/*/pkg\"]\n",
-        )
-        .expect("root manifest");
-        fs::create_dir_all(root.join("crates/a/pkg/src")).expect("member a");
-        fs::create_dir_all(root.join("crates/b")).expect("unmatched b");
-        fs::create_dir_all(root.join("target/debug")).expect("target");
-        let dirs = workspace_dirs(&root).expect("dirs");
-        assert!(dirs.contains(&root.join("crates/b")));
-        assert!(!dirs.iter().any(|dir| dir.starts_with(root.join("target"))));
-        let recorded = tuples(&dirs);
-        fs::create_dir_all(root.join("crates/b/pkg/src")).expect("member b");
-        assert_ne!(tuples(&dirs), recorded, "a member added under crates/b");
-        // Patterns the walk cannot cover, as decoded by the TOML parse, and
-        // manifests that do not parse or hold non-strings, refuse.
-        for refused in [
-            "[workspace]\nmembers = [\"target/crates/*/pkg\"]\n",
-            "[workspace]\nmembers = [\"*/pkg\"]\n",
-            "[workspace]\nmembers = ['.*/pkg']\n",
-            "[workspace]\nmembers = [\"crates/../*\"]\n",
-            "[workspace]\nmembers = [\"./*/pkg\"]\n",
-            "[workspace]\nmembers = [\"targ[e]t/crates/*/pkg\"]\n",
-            "[workspace]\nmembers = ['t?rget/x']\n",
-            "[workspace]\nmembers = [\"../ws/targ*/pkg\"]\n",
-            "[workspace]\nmembers = [\"/private/tmp/ws/target/crates/*/pkg\"]\n",
-            "[workspace]\nmembers = [\"/private/tmp/ws/.git/crates/*/pkg\"]\n",
-            "[workspace]\nmembers = [\"//private/tmp/ws/target/crates/*/pkg\"]\n",
-            "[workspace]\nmembers = ['.//private/tmp/ws/target/crates/*/pkg']\n",
-            "[workspace]\nmembers = [\"~/ws/target/crates/*/pkg\"]\n",
-            "[workspace]\nmembers = [\"crates/a\"]\nexclude = [\"/abs/x\"]\n",
-            // The review counterexample: an apostrophe in a comment.
-            "[workspace]\nmembers = [ # don't\n  \"/private/tmp/ws/target/crates/*/pkg\",\n]\n",
-            "[workspace]\nmembers = [ # \"quoted\" and 'single'\n  \"~/x\",\n]\n",
-            // Escaped key decoded to `members`, escaped absolute value.
-            "[workspace]\n\"m\\u0065mbers\" = [\"\\u002Fabs/target/*\"]\n",
-            "[workspace]\nmembers = [\"crates\\\\x\"]\n",
-            // Malformed and non-string.
-            "[workspace]\nmembers = [\"crates/*\"\n",
-            "[workspace]\nmembers = [1]\n",
-            "[workspace]\nmembers = \"crates/*\"\n",
-        ] {
-            fs::write(root.join("Cargo.toml"), refused).expect("root manifest");
-            assert!(workspace_dirs(&root).is_err(), "{refused}");
-        }
-        // Parsed comments, quoted keys and multiline arrays stay eligible
-        // when the decoded patterns are safe.
-        for eligible in [
-            "[workspace]\n\"m\\u0065mbers\" = [\"crates/*/pkg\"]\n",
-            "[workspace]\nmembers = [ # don't \"stop\"\n  'crates/*/pkg', # it's fine\n]\nexclude = [\"crates/b\"]\n",
-            "[package]\nname = \"app\"\n\n[dependencies]\noutside = { path = \"../outside\" }\ndep = { path = \"/opt/dep\" }\n\n[workspace]\nmembers = [\"tool\"]\n",
-        ] {
-            fs::write(root.join("Cargo.toml"), eligible).expect("root manifest");
-            assert!(
-                workspace_dirs(&root).is_ok_and(|dirs| dirs.contains(&root.join("crates/b/pkg"))),
-                "{eligible}"
-            );
-        }
-        // Without `members`, membership is manifest-driven: nothing to walk.
-        fs::write(root.join("Cargo.toml"), "[workspace]\n").expect("plain root");
-        assert_eq!(workspace_dirs(&root), Ok(Vec::new()));
-        fs::remove_dir_all(root).expect("cleanup");
-    }
-
-    #[test]
     fn tool_homes_resolve_as_cargo_does() {
         let cwd = Path::new("/w");
         let home = Some(PathBuf::from("/h"));
@@ -1520,44 +1454,132 @@ mod tests {
         fs::remove_dir_all(root).expect("cleanup");
     }
 
+    fn literal_tuples(root: &Path) -> Result<Vec<(PathBuf, Option<Stat>)>, String> {
+        workspace_literals(root).map(|map| map.into_iter().collect())
+    }
+
+    fn manifest(root: &Path, text: &str) {
+        fs::write(root.join("Cargo.toml"), text).expect("root manifest");
+    }
+
     #[test]
-    fn any_symlink_in_the_member_walk_refuses() {
-        let root = scratch("member-links");
-        fs::write(
-            root.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"crates/*/pkg\"]\n",
-        )
-        .expect("root manifest");
-        fs::create_dir_all(root.join("crates/a/pkg")).expect("member a");
-        assert!(workspace_dirs(&root).is_ok(), "a real-directory workspace");
-        // A dangling link into the skipped target: refused before and after
-        // its referent appears.
-        let link = root.join("crates/b");
-        std::os::unix::fs::symlink("../target/new", &link).expect("dangling link");
-        assert!(workspace_dirs(&root).is_err(), "dangling link");
-        fs::create_dir_all(root.join("target/new/pkg")).expect("referent member");
-        assert!(
-            workspace_dirs(&root).is_err(),
-            "link now resolving to a member"
+    fn a_literal_candidate_file_replaced_by_a_package_changes_the_key() {
+        // Review 6268900990: members = ["nested/a", "candidate"], candidate a
+        // regular file, later a package directory.
+        let root = scratch("literal-candidate");
+        manifest(
+            &root,
+            "[workspace]\nmembers = [\"nested/a\", \"candidate\"]\n",
         );
+        fs::create_dir_all(root.join("nested/a")).expect("member a");
+        fs::write(root.join("candidate"), "x").expect("candidate file");
+        let before = literal_tuples(&root).expect("literal workspace");
+        let paths: Vec<&PathBuf> = before.iter().map(|(path, _)| path).collect();
+        for wanted in [
+            &root,
+            &root.join("nested"),
+            &root.join("nested/a"),
+            &root.join("candidate"),
+        ] {
+            assert!(paths.contains(&wanted), "{} recorded", wanted.display());
+        }
+        fs::remove_file(root.join("candidate")).expect("drop file");
+        fs::create_dir_all(root.join("candidate/src")).expect("package");
+        fs::write(
+            root.join("candidate/Cargo.toml"),
+            "[package]\nname = \"b\"\n",
+        )
+        .expect("b");
+        assert_ne!(literal_tuples(&root).expect("still literal"), before);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn absent_literal_entries_and_new_parents_change_the_key() {
+        let root = scratch("literal-absent");
+        manifest(
+            &root,
+            "[workspace]\nmembers = [\"x/y\", \".\"]\nexclude = [\"skip/me\"]\ndefault-members = [\"x/y\"]\n",
+        );
+        let before = literal_tuples(&root).expect("literal workspace");
+        assert!(
+            before.contains(&(root.join("x"), None)),
+            "absent parent recorded"
+        );
+        assert!(
+            before.contains(&(root.join("skip"), None)),
+            "absent exclude recorded"
+        );
+        fs::create_dir_all(root.join("x")).expect("parent");
+        let parent = literal_tuples(&root).expect("literal workspace");
+        assert_ne!(parent, before, "parent creation");
+        fs::create_dir_all(root.join("x/y")).expect("member");
+        assert_ne!(
+            literal_tuples(&root).expect("literal workspace"),
+            parent,
+            "member creation"
+        );
+        // Without a [workspace] table nothing is recorded here: the ancestor
+        // Cargo.toml tuples and manifests cover the root.
+        manifest(&root, "[package]\nname = \"solo\"\n");
+        assert_eq!(literal_tuples(&root), Ok(Vec::new()));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn non_literal_or_linked_workspace_entries_record_nothing() {
+        let root = scratch("literal-refusals");
+        for refused in [
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+            "[workspace]\nmembers = [\"crates/?\"]\n",
+            "[workspace]\nmembers = [\"crates/[ab]\"]\n",
+            "[workspace]\nmembers = [\"crates/{a,b}\"]\n",
+            "[workspace]\nmembers = [\"a\"]\nexclude = [\"b/*\"]\n",
+            "[workspace]\nmembers = [\"a\"]\ndefault-members = [\"*\"]\n",
+            "[workspace]\nmembers = [\"/abs/a\"]\n",
+            "[workspace]\nmembers = [\"~/a\"]\n",
+            "[workspace]\nmembers = [\"../a\"]\n",
+            "[workspace]\nmembers = [\"a/../b\"]\n",
+            "[workspace]\nmembers = [\"a\\\\b\"]\n",
+            "[workspace]\nmembers = [\"\"]\n",
+            "[workspace]\nmembers = [ # don't\n  \"\\u002Fabs/a\",\n]\n",
+            "[workspace]\nmembers = [\"a\"\n",
+            "[workspace]\nmembers = [1]\n",
+            "[workspace]\nmembers = \"a\"\n",
+        ] {
+            manifest(&root, refused);
+            assert!(workspace_literals(&root).is_err(), "{refused}");
+        }
+        // Valid comments, quoted keys and multi-line literal arrays parse.
+        for eligible in [
+            "[workspace]\n\"m\\u0065mbers\" = [\"a\"]\n",
+            "[workspace]\nmembers = [ # don't \"stop\"\n  'a', # it's fine\n  \"./b\",\n]\n",
+            "[package]\nname = \"app\"\n\n[dependencies]\noutside = { path = \"../outside\" }\n\n[workspace]\nmembers = [\"tool\"]\n",
+        ] {
+            manifest(&root, eligible);
+            assert!(workspace_literals(&root).is_ok(), "{eligible}");
+        }
+        // Symlinks, judged without following: dangling, directory, file and
+        // an intermediate component.
+        manifest(&root, "[workspace]\nmembers = [\"links/m\"]\n");
+        fs::create_dir_all(root.join("links")).expect("links");
+        let link = root.join("links/m");
+        std::os::unix::fs::symlink("../target/new", &link).expect("dangling");
+        assert!(workspace_literals(&root).is_err(), "dangling link");
+        fs::create_dir_all(root.join("target/new")).expect("referent");
+        assert!(workspace_literals(&root).is_err(), "resolving link");
         fs::remove_file(&link).expect("unlink");
-        // A link to an existing directory, and to a regular file that is
-        // later replaced by a directory.
-        fs::create_dir_all(root.join("elsewhere/pkg")).expect("directory referent");
-        std::os::unix::fs::symlink("../elsewhere", &link).expect("directory link");
-        assert!(workspace_dirs(&root).is_err(), "directory link");
-        fs::remove_file(&link).expect("unlink");
-        fs::write(root.join("file"), "x").expect("file referent");
+        fs::write(root.join("file"), "x").expect("file");
         std::os::unix::fs::symlink("../file", &link).expect("file link");
-        assert!(workspace_dirs(&root).is_err(), "file link");
-        fs::remove_file(root.join("file")).expect("drop file");
-        fs::create_dir_all(root.join("file/pkg")).expect("file replaced by directory");
-        assert!(workspace_dirs(&root).is_err(), "file link now a directory");
+        assert!(workspace_literals(&root).is_err(), "file link");
         fs::remove_file(&link).expect("unlink");
-        // Back to real directories, including a nested new member.
-        fs::create_dir_all(root.join("crates/b/pkg")).expect("real member b");
-        let dirs = workspace_dirs(&root).expect("real directories");
-        assert!(dirs.contains(&root.join("crates/b/pkg")));
+        fs::remove_dir_all(root.join("links")).expect("drop links");
+        fs::create_dir_all(root.join("real/m")).expect("real");
+        std::os::unix::fs::symlink("real", root.join("links")).expect("intermediate link");
+        assert!(workspace_literals(&root).is_err(), "intermediate link");
+        fs::remove_file(root.join("links")).expect("unlink");
+        fs::create_dir_all(root.join("links/m")).expect("real member");
+        assert!(workspace_literals(&root).is_ok(), "real directories");
         fs::remove_dir_all(root).expect("cleanup");
     }
 
