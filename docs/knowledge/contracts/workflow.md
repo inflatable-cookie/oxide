@@ -310,8 +310,12 @@ resolve the toolchain. A member's `rust-toolchain.toml` therefore counts.
   reads `unknown`, because another layout may keep them elsewhere.
 - **Dep-info decoder.** Any other marker or version is refused, as before.
 
-Slot compatibility already includes `rustc -vV`, so releases never share a
-slot. A new Cargo release needs this check before it joins the table.
+Slot compatibility includes `rustc -vV`. That query currently resolves from
+the canonical workspace root, while guarded Cargo inherits the invocation
+directory. Compiler separation therefore assumes both directories resolve the
+same toolchain; a member-local toolchain file can violate that assumption.
+The matrix fixtures explicitly set `RUSTUP_TOOLCHAIN` and do not qualify that
+case. A new Cargo release needs this check before it joins the table.
 
 ## What one command does (local executor)
 
