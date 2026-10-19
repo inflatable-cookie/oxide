@@ -475,8 +475,12 @@ pub struct Pending {
     /// Toolchain, config and lock: bound before Cargo and verified unchanged
     /// after it.
     observed: BTreeMap<PathBuf, Option<Stat>>,
-    /// Every workspace member's manifest, for target discovery.
+    /// Every workspace member's manifest, read for implicit selection and
+    /// target discovery.
     members: Vec<PathBuf>,
+    /// Taken before the selection metadata query: every member manifest
+    /// must be strictly older, so the recorded tuples are the ones it read.
+    selection_ns: i128,
     started_ns: i128,
 }
 
@@ -488,6 +492,7 @@ impl Pending {
         checkout: &Path,
         toolchain: Toolchain,
         members: Vec<PathBuf>,
+        selection_ns: i128,
     ) -> Result<Self, String> {
         let cwd = std::env::current_dir()
             .and_then(fs::canonicalize)
@@ -514,6 +519,7 @@ impl Pending {
             environment,
             observed,
             members,
+            selection_ns,
             started_ns: now_ns().ok_or("the clock is before 1970")?,
         })
     }
@@ -563,6 +569,9 @@ impl Pending {
                 inputs.entry(dir).or_insert(found);
             }
         }
+        // Every member manifest the selection read, built or not: an
+        // unbuilt sibling's `default-run` changes which binary `run` picks.
+        inputs.extend(selection_manifests(&self.members, self.selection_ns)?);
         for path in built {
             if inputs.contains_key(&path) {
                 continue;
@@ -642,7 +651,8 @@ fn write_record(path: &Path, record: &Record) -> Result<(), String> {
     Ok(())
 }
 
-fn now_ns() -> Option<i128> {
+/// The time before a selection query, for [`Pending::capture`].
+pub fn now_ns() -> Option<i128> {
     let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
     i128::try_from(elapsed.as_nanos()).ok()
 }
@@ -761,6 +771,31 @@ fn path_candidates(
     Err(format!("{program} does not resolve on PATH"))
 }
 
+/// Each member manifest's tuple: a regular file strictly older than
+/// `selection_ns`, the time before the metadata query read it.
+fn selection_manifests(
+    members: &[PathBuf],
+    selection_ns: i128,
+) -> Result<Vec<(PathBuf, Option<Stat>)>, String> {
+    let mut manifests = Vec::with_capacity(members.len());
+    for manifest in members {
+        let found = stat(manifest)?
+            .filter(|found| found.regular)
+            .ok_or_else(|| format!("{} is not a regular file", manifest.display()))?;
+        if !found.before(selection_ns) {
+            return Err(format!(
+                "{} changed around the selection query",
+                manifest.display()
+            ));
+        }
+        manifests.push((manifest.clone(), Some(found)));
+    }
+    Ok(manifests)
+}
+
+/// Refuse a config naming an unfollowed key. TOML quoted keys may spell a
+/// key with escapes (`"r\u0075stc"`), so any backslash refuses too: the
+/// screen never has to decode TOML.
 fn check_config(path: &Path) -> Result<(), String> {
     let file =
         File::open(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
@@ -771,7 +806,10 @@ fn check_config(path: &Path) -> Result<(), String> {
     if bytes.len() as u64 > MAX_CONFIG_BYTES {
         return Err(format!("{} exceeds 1 MiB", path.display()));
     }
-    let text = String::from_utf8_lossy(&bytes);
+    let text = String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", path.display()))?;
+    if text.contains('\\') {
+        return Err(format!("{} contains an escape", path.display()));
+    }
     match UNFOLLOWED_CONFIG.iter().find(|word| text.contains(*word)) {
         Some(word) => Err(format!("{} names `{word}`", path.display())),
         None => Ok(()),
@@ -1166,6 +1204,59 @@ mod tests {
         fs::write(wrappers.join("rustc"), "#!/bin/sh").expect("wrapper");
         fs::write(wrappers.join("rustup"), "rustup").expect("other rustup");
         assert!(actual_binary("rustc", &wrappers.join("rustc"), &sysroot, &toolchains).is_err());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn escaped_or_named_unfollowed_config_refuses() {
+        let root = scratch("config");
+        let config = root.join("config.toml");
+        for (text, refused) in [
+            ("[env]\nSKIP_NOTE = \"cfg\"\n", false),
+            ("[build]\nrustc = \"/fixture/compiler\"\n", true),
+            ("[build]\n\"r\\u0075stc\" = \"/fixture/compiler\"\n", true),
+            ("\"incl\\u0075de\" = [\"other.toml\"]\n", true),
+            ("[source.crates-io]\n'replace-with' = \"mirror\"\n", true),
+            ("p\\u0061ths = [\"../vendor\"]\n", true),
+        ] {
+            fs::write(&config, text).expect("config");
+            assert_eq!(check_config(&config).is_err(), refused, "{text}");
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn member_manifests_bind_to_the_selection_query() {
+        let root = scratch("members");
+        let built = root.join("a/Cargo.toml");
+        let sibling = root.join("b/Cargo.toml");
+        for manifest in [&built, &sibling] {
+            fs::create_dir_all(manifest.parent().expect("dir")).expect("member");
+            fs::write(manifest, "[package]\nname = \"m\"\n").expect("manifest");
+        }
+        let members = [built.clone(), sibling.clone()];
+        let selection = now_ns().expect("clock") + 1;
+        let recorded = selection_manifests(&members, selection).expect("older manifests");
+        assert_eq!(
+            recorded.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+            [&built, &sibling],
+            "an unbuilt sibling's manifest is recorded"
+        );
+        // An in-place `default-run` edit changes the sibling's tuple.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&sibling)
+            .expect("open");
+        file.write_all(b"default-run = \"b\"\n").expect("edit");
+        drop(file);
+        assert_ne!(
+            stat(&sibling).expect("stat"),
+            recorded[1].1,
+            "edit in place"
+        );
+        // A manifest edited after the selection time is refused.
+        assert!(selection_manifests(&members, selection).is_err());
         fs::remove_dir_all(root).expect("cleanup");
     }
 

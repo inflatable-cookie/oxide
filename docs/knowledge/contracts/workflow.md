@@ -314,6 +314,9 @@ immutability ([vision](../vision.md#product-workflow-direction)).
     `build.rs`), `src`, `src/bin`, `examples` and each subdirectory of the
     last two (added targets that change `run`'s selection), and the
     package's parent inside the workspace (glob members);
+  - every workspace member's manifest that metadata read for selection, built
+    or not (an unbuilt sibling's `default-run` changes `run`'s pick); each
+    must be strictly older than a time taken before that query;
   - `Cargo.lock`;
   - `.cargo/config`, `.cargo/config.toml`, `Cargo.toml`, `rust-toolchain`
     and `rust-toolchain.toml` in the working directory and every ancestor,
@@ -379,7 +382,10 @@ immutability ([vision](../vision.md#product-workflow-direction)).
   `--locked`); a working directory outside the workspace; `RUSTC`,
   `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER` or their `CARGO_BUILD_*` forms
   set; a Cargo config containing `include`, `replace-with`, `paths` or
-  `rustc`; a config over 1 MiB.
+  `rustc`, or any backslash (a TOML quoted key can spell those names with
+  escapes, so the screen never decodes TOML); a config over 1 MiB or not
+  UTF-8. A configured compiler or wrapper therefore never records: the
+  compiler the key binds is always the `PATH` one.
 - **Record.** Versioned JSON (version 4) in
   `<workspace>/target/oxide-run-skip/`, at most 4 MiB each and 64 per
   checkout (cleared past that), so `oxide clean` drops records with the

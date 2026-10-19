@@ -141,6 +141,8 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     let mut invocation = cli::parse_leased(command, args)?;
     let explicit = cli::run_selection(&invocation.cargo_args).is_some();
     let mut members = None;
+    // Member manifests the selection reads must predate it.
+    let selection_ns = skip::now_ns();
     if command == "run" && !(explicit && skip_request.is_none()) {
         let metadata = identity::run_pick(
             CARGO,
@@ -187,7 +189,8 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
         toolchain
             .and_then(|toolchain| {
                 let members = members.ok_or("the workspace members are unknown")?;
-                skip::Pending::capture(request, &key.checkout, toolchain, members)
+                let selection_ns = selection_ns.ok_or("the clock is before 1970")?;
+                skip::Pending::capture(request, &key.checkout, toolchain, members, selection_ns)
             })
             .map_err(|reason| eprintln!("oxide: run skip not recorded ({reason})"))
             .ok()
