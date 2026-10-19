@@ -41,10 +41,14 @@ network. The scratch is removed only after positive completion. Before any pool
 exists, `init` / `new` adoption runs on tiny scratch directories (90 s,
 64 MiB scratch) and must leave the pool uncreated. Not a benchmark and not
 full QA.
+
+`--cargo-matrix <release>` and `--toolchain-context` are separate focused
+proofs that run none of the above; see their functions.
 """
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import re
@@ -2447,12 +2451,314 @@ def matrix_main(tested: str) -> int:
     return 0
 
 
+# Toolchain-context fixture (oxide#094): a virtual workspace whose root
+# selects 1.97.1 and whose `member` selects 1.96.1. Each build script reports
+# the Cargo and the `rustc -vV` its build actually used.
+CONTEXT_PROBE = """use std::process::Command;
+
+fn main() {
+    let rustc = std::env::var("RUSTC").expect("RUSTC");
+    let output = Command::new(&rustc).arg("-vV").output().expect("rustc -vV");
+    assert!(output.status.success(), "rustc -vV failed");
+    let version = String::from_utf8(output.stdout).expect("UTF-8");
+    let lines: Vec<&str> = version.lines().collect();
+    println!("cargo:rustc-env=PROBE_RUSTC={}", lines.join("|"));
+    println!("cargo:rustc-env=PROBE_CARGO={}", std::env::var("CARGO").expect("CARGO"));
+    println!("cargo:rerun-if-changed=build.rs");
+}
+"""
+CONTEXT = {
+    "Cargo.toml": '[workspace]\nmembers = ["app", "member"]\nresolver = "2"\n',
+    "rust-toolchain.toml": '[toolchain]\nchannel = "1.97.1"\n',
+    "app/Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+    "app/build.rs": CONTEXT_PROBE,
+    "app/src/lib.rs": 'pub const RUSTC: &str = env!("PROBE_RUSTC");\n',
+    "member/Cargo.toml": '[package]\nname = "member"\nversion = "0.1.0"\nedition = "2021"\n',
+    "member/rust-toolchain.toml": '[toolchain]\nchannel = "1.96.1"\n',
+    "member/build.rs": CONTEXT_PROBE,
+    "member/src/lib.rs": 'pub const RUSTC: &str = env!("PROBE_RUSTC");\n',
+}
+# Logs every fixture Cargo process (Oxide's and plain), then runs the real one.
+CONTEXT_CARGO = """#!/bin/sh
+printf '%s|%s\\n' "$(pwd -P)" "$*" >> "LOG"
+exec "REAL_CARGO" "$@"
+"""
+CONTEXT_CARGO_LIMIT = 32
+CONTEXT_LOG_LIMIT_BYTES = 32 * 1024 * 1024
+
+
+class ContextLedger:
+    """Sampled host minimum, owned peak and output bytes for one proof."""
+
+    def __init__(self, parent: str):
+        self.parent = parent
+        self.free_min = None
+        self.owned_peak = 0
+        self.log_bytes = 0
+        # Library slot label to Oxide record id.
+        self.slots = {}
+
+    def sample(self, phase: str) -> None:
+        free = host_free_bytes(self.parent)
+        owned = tree_bytes(self.parent, True)
+        self.free_min = free if self.free_min is None else min(self.free_min, free)
+        self.owned_peak = max(self.owned_peak, owned)
+        print(f"context sample {phase}: host free {free // (1024 * 1024)} MiB, owned {owned // 1024} KiB")
+        if free < HOST_RESERVE_BYTES:
+            fail(f"host free {free} is below the 20 GiB reserve at {phase}")
+        if owned > SCRATCH_LIMIT_BYTES:
+            fail(f"owned scratch {owned} exceeds 512 MiB at {phase}")
+
+    def emit(self, label: str, stream: str, text: str) -> None:
+        self.log_bytes += len(text.encode())
+        if self.log_bytes > CONTEXT_LOG_LIMIT_BYTES:
+            fail("proof output exceeds 32 MiB")
+        print(f"----- {label} {stream} ({len(text.encode())} bytes) -----")
+        print(text, end="" if text.endswith("\n") or not text else "\n")
+
+
+def package_name(package_id: str) -> str:
+    """`path+file:///x/app#0.1.0` or `path+file:///x/dir#app@0.1.0`."""
+    location, _, fragment = package_id.rpartition("#")
+    return fragment.split("@")[0] if "@" in fragment else location.rstrip("/").rsplit("/", 1)[-1]
+
+
+def context_check(runner: Runner, ledger: ContextLedger, cwd: str, args: list, label: str, extra: dict | None = None) -> dict:
+    code, stdout, stderr = runner.run(cwd, ["check", "--message-format=json", *args], extra)
+    ledger.emit(label, "stdout", stdout)
+    ledger.emit(label, "stderr", stderr)
+    expect(code, 0, label, stderr)
+    result = summary(stderr, label)
+    result["fresh"] = unit_freshness(stdout)
+    result["probes"] = {}
+    for line in stdout.splitlines():
+        if not line.startswith("{"):
+            continue
+        message = json.loads(line)
+        if message.get("reason") == "build-script-executed":
+            env = dict(message.get("env", []))
+            if "PROBE_RUSTC" in env:
+                result["probes"][package_name(message["package_id"])] = (
+                    env["PROBE_CARGO"],
+                    "\n".join(env["PROBE_RUSTC"].split("|")) + "\n",
+                )
+    # Runs are sequential: the record this command used is the latest. Its
+    # `id` is Oxide's, not the library slot in the summary; the pairing must
+    # stay one-to-one.
+    record = max(runner.state()["records"], key=lambda record: record["last_used"])
+    paired = ledger.slots.setdefault(result["slot"], record["id"])
+    if paired != record["id"] or list(ledger.slots.values()).count(record["id"]) != 1:
+        fail(f"{label}: slot {result['slot']} and record {record['id']} do not pair: {ledger.slots}")
+    result["record"] = record
+    ledger.sample(label)
+    print(
+        f"context {label}: slot {result['slot']} {result['warmth']}, compatibility {record['compatibility'][:16]}, "
+        f"probes { {name: (cargo, rustc.splitlines()[0]) for name, (cargo, rustc) in result['probes'].items()} }"
+    )
+    return result
+
+
+def sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def expected_compatibility(identity: str, rustc: str) -> str:
+    """identity.rs `SlotKey::resolve` for the quick profile, host target."""
+    host = next(line[len("host: "):] for line in rustc.splitlines() if line.startswith("host: "))
+    return sha256_hex(f"{identity}\nquick\n{sha256_hex(rustc)}\n{host}\ndefault")
+
+
+def agree(result: dict, label: str, packages: set, cargo: str | None, rustc: str) -> str:
+    """Every probed build used `rustc` (and `cargo` when given), and the
+    slot's recorded compatibility digests that same `rustc -vV`. Returns it.
+    A fresh build script replays the output of the run that built it."""
+    probes = result["probes"]
+    if set(probes) != packages:
+        fail(f"{label}: probes {sorted(probes)}, expected {sorted(packages)}")
+    versions = {probe[1] for probe in probes.values()}
+    if len(versions) != 1:
+        fail(f"{label}: builds used different compilers: {versions}")
+    version = versions.pop()
+    for name, (used, _) in probes.items():
+        if cargo and f"/toolchains/{cargo}-" not in used:
+            fail(f"{label}: {name} built with Cargo {used}, expected {cargo}")
+    if version.splitlines()[0] != MATRIX[rustc][1]:
+        fail(f"{label}: built with {version.splitlines()[0]}, expected {MATRIX[rustc][1]}")
+    record = result["record"]
+    if record["compatibility"] != expected_compatibility(record["identity"], version):
+        fail(f"{label}: slot compatibility does not digest the rustc the build used")
+    return version
+
+
+def context_main() -> int:
+    """oxide#094: slot compatibility follows the compiler the guarded Cargo
+    uses in each caller context of one workspace."""
+    global STARTED
+    STARTED = time.monotonic()
+    if sys.platform != "darwin":
+        fail("the bounded APFS toolchain-context proof requires macOS")
+    rustup_home = os.environ.get("RUSTUP_HOME") or os.path.expanduser("~/.rustup")
+    host = "aarch64-apple-darwin" if os.uname().machine == "arm64" else "x86_64-apple-darwin"
+    for release in ("1.96.1", "1.97.1"):
+        if not os.path.isdir(os.path.join(rustup_home, "toolchains", f"{release}-{host}")):
+            fail(f"toolchain {release} is not installed; this proof never installs one")
+    real_cargo = shutil.which("cargo")
+    if not real_cargo:
+        fail("no cargo on PATH")
+    parent = os.path.join(scratch_root(), "toolchain-context")
+    os.makedirs(parent, mode=0o700, exist_ok=False)
+    ledger = ContextLedger(parent)
+    ledger.sample("admission")
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    stage = dict(os.environ)
+    for name in ("CARGO", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "RUSTC", "RUSTC_WRAPPER"):
+        stage.pop(name, None)
+    stage.update(
+        {
+            "RUSTUP_TOOLCHAIN": BUILDER,
+            "RUSTUP_AUTO_INSTALL": "0",
+            "CARGO_TARGET_DIR": os.path.join(parent, "stage-target"),
+            "CARGO_PROFILE_DEV_DEBUG": "0",
+        }
+    )
+    # Setup requests: the source commit and the builder's two versions.
+    source = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, timeout=30)
+    expect(source.returncode, 0, "source commit", source.stderr)
+    builder = toolchain_identity(stage, repo)
+    print(f"context run {os.getpid()} source {source.stdout.strip()} builder {builder[0]} | {builder[1]}")
+    if builder != MATRIX[BUILDER]:
+        fail(f"builder is not {BUILDER}: {builder}")
+    executables = build_binaries(("--offline",), stage)
+    print(f"context staging: {time.monotonic() - STARTED:.0f} s (host Cargo home, offline; 1 Cargo process)")
+    ledger.sample("after staging")
+    cargo_log = os.path.join(parent, "cargo.log")
+    runner = Runner(
+        executables["oxide"], executables["oxide-storage-lease"], parent, extra={"RUSTUP_AUTO_INSTALL": "0"}
+    )
+    wrapper = os.path.join(runner.bin, "cargo")
+    with open(wrapper, "w", encoding="utf-8") as handle:
+        handle.write(CONTEXT_CARGO.replace("LOG", cargo_log).replace("REAL_CARGO", real_cargo))
+    os.chmod(wrapper, 0o755)
+    root = os.path.join(parent, "workspace")
+    write_fixture(root, CONTEXT)
+    root = os.path.realpath(root)
+    member = os.path.join(root, "member")
+    inputs = sum(len(text.encode()) for text in CONTEXT.values())
+    print(f"context fixture inputs: {inputs} bytes")
+    if inputs > SOURCE_LIMIT_BYTES:
+        fail("fixture inputs exceed 8 MiB")
+    code, _, stderr = runner.run(
+        parent,
+        ["--pool", runner.pool, "init", "--cap-bytes", str(IMAGE_BYTES), "--image-bytes", str(IMAGE_BYTES)],
+        program=runner.lease,
+    )
+    expect(code, 0, "pool init", stderr)
+    both = {"app", "member"}
+    try:
+        first = context_check(runner, ledger, root, [], "root")
+        newer = agree(first, "root", both, "1.97.1", "1.97.1")
+        if first["warmth"] != "cold":
+            fail("root did not start cold")
+        record = first["record"]
+        identity = sha256_hex(f"path:{root}")
+        if record["checkout"] != root or record["identity"] != identity:
+            fail(f"root slot is not owned by the canonical workspace {root}: {record}")
+        repeat = context_check(runner, ledger, root, [], "root repeat")
+        if (repeat["slot"], repeat["warmth"]) != (first["slot"], "warm") or not all(repeat["fresh"].values()) or not repeat["fresh"]:
+            fail(f"root repeat was not a fresh warm reuse of slot {first['slot']}: {repeat['fresh']}")
+        inner = context_check(runner, ledger, member, [], "member")
+        older = agree(inner, "member", {"member"}, "1.96.1", "1.96.1")
+        if inner["slot"] == first["slot"] or inner["warmth"] != "cold":
+            fail(f"member context reused the root's slot {first['slot']}")
+        if (inner["record"]["checkout"], inner["record"]["identity"]) != (root, identity):
+            fail(f"member slot is not owned by the canonical workspace {root}: {inner['record']}")
+        if inner["record"]["compatibility"] == record["compatibility"]:
+            fail("different compilers produced one compatibility key")
+        again = context_check(runner, ledger, member, [], "member repeat")
+        if (again["slot"], again["warmth"]) != (inner["slot"], "warm") or not again["fresh"] or not all(again["fresh"].values()):
+            fail(f"member repeat was not a fresh warm reuse of slot {inner['slot']}: {again['fresh']}")
+        # rustup selects from the working directory; --manifest-path moves
+        # only the package Cargo builds.
+        pointed = context_check(runner, ledger, root, ["--manifest-path", "member/Cargo.toml"], "root --manifest-path member")
+        if (pointed["slot"], pointed["warmth"]) != (first["slot"], "warm") or not pointed["fresh"] or not all(pointed["fresh"].values()):
+            fail(f"--manifest-path from the root left slot {first['slot']} or rebuilt: {pointed['fresh']}")
+        if pointed["probes"]:
+            agree(pointed, "root --manifest-path member", {"member"}, "1.97.1", "1.97.1")
+        back = context_check(runner, ledger, member, ["--manifest-path", "../app/Cargo.toml"], "member --manifest-path app")
+        agree(back, "member --manifest-path app", {"app"}, "1.96.1", "1.96.1")
+        if (back["slot"], back["warmth"]) != (inner["slot"], "warm"):
+            fail(f"--manifest-path from the member left slot {inner['slot']}")
+        # Explicit environment: RUSTC wins over the directory's rustc, and
+        # RUSTUP_TOOLCHAIN over the directory's toolchain file.
+        cargo_path = inner["probes"]["member"][0]
+        older_rustc = os.path.join(os.path.dirname(cargo_path), "rustc")
+        forced = context_check(runner, ledger, root, [], "root RUSTC=1.96.1", {"RUSTC": older_rustc})
+        if agree(forced, "root RUSTC=1.96.1", both, None, "1.96.1") != older:
+            fail("RUSTC reported a different 1.96.1 rustc -vV")
+        if (forced["slot"], forced["warmth"]) != (inner["slot"], "warm"):
+            fail(f"RUSTC=1.96.1 from the root did not reuse slot {inner['slot']}")
+        pinned = context_check(runner, ledger, root, [], "root RUSTUP_TOOLCHAIN=1.96.1", {"RUSTUP_TOOLCHAIN": "1.96.1"})
+        if (pinned["slot"], pinned["warmth"]) != (inner["slot"], "warm"):
+            fail(f"RUSTUP_TOOLCHAIN=1.96.1 from the root did not reuse slot {inner['slot']}")
+        if pinned["probes"]:
+            agree(pinned, "root RUSTUP_TOOLCHAIN=1.96.1", set(pinned["probes"]), None, "1.96.1")
+        if newer == older:
+            fail("the two contexts reported one rustc")
+        # Refusal control: Oxide never takes a toolchain from its arguments.
+        before = runner.state()["records"]
+        code, stdout, stderr = runner.run(member, ["+1.97.1", "check"])
+        ledger.emit("+1.97.1 refusal", "stdout", stdout)
+        ledger.emit("+1.97.1 refusal", "stderr", stderr)
+        expect(code, 1, "+toolchain refusal", stderr)
+        if "toolchain overrides are refused" not in stderr or runner.state()["records"] != before:
+            fail("+toolchain was not refused before any effect")
+        records = runner.state()["records"]
+        print(f"context slots: {[(r['id'], r['compatibility'][:16], r['checkout']) for r in records]}")
+        if len(records) != 2:
+            fail(f"expected exactly two slots, found {len(records)}")
+    except Exception:
+        # Close the pool, keep the evidence.
+        detach = subprocess.run(
+            ["/usr/bin/hdiutil", "detach", os.path.join(runner.pool, "payload")],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        print(f"context proof detach exit {detach.returncode}; retained its owned scratch at {parent}", file=sys.stderr)
+        raise
+    with open(cargo_log, encoding="utf-8") as handle:
+        calls = handle.read().splitlines()
+    ledger.emit("fixture Cargo", "log", "\n".join(calls) + "\n")
+    total = len(calls) + 2
+    print(f"context Cargo processes: {total} (setup `cargo -V` 1, staging 1, fixture {len(calls)})")
+    if total > CONTEXT_CARGO_LIMIT:
+        fail(f"{total} Cargo processes exceed {CONTEXT_CARGO_LIMIT}")
+    payload = os.path.join(runner.pool, "payload")
+    detach = subprocess.run(["/usr/bin/hdiutil", "detach", payload], capture_output=True, text=True, timeout=60)
+    if detach.returncode:
+        fail(f"detach failed after positive completion: {detach.stderr}")
+    ledger.sample("after detach")
+    shutil.rmtree(parent)
+    elapsed = time.monotonic() - STARTED
+    print(
+        f"context proof held: {elapsed:.0f} s, owned peak {ledger.owned_peak // (1024 * 1024)} MiB, "
+        f"host free minimum {ledger.free_min // (1024 * 1024)} MiB, output {ledger.log_bytes} bytes, scratch removed"
+    )
+    if elapsed > PROOF_SECONDS:
+        fail(f"proof exceeded {PROOF_SECONDS} s including cleanup")
+    return 0
+
+
 def main() -> int:
     global STARTED
     if "--cargo-matrix" in sys.argv:
         if len(sys.argv) != 3 or sys.argv[1] != "--cargo-matrix":
             fail("usage: test-oxide-cli.py --cargo-matrix <exact version>")
         return matrix_main(sys.argv[2])
+    if "--toolchain-context" in sys.argv:
+        if sys.argv[1:] != ["--toolchain-context"]:
+            fail("usage: test-oxide-cli.py --toolchain-context")
+        return context_main()
     parent = os.path.join(scratch_root(), "oxide-cli")
     os.makedirs(parent, mode=0o700, exist_ok=False)
     prove_wait_lines()

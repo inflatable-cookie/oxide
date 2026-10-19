@@ -1,0 +1,64 @@
+
+╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ EFFIGY  /Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-53b43d7d-e8a7-4c9e-86e4-d7ed6aa1ed28 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── v0.14.1+local.3113774 ╯
+
+
+╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ EFFIGY  /Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-53b43d7d-e8a7-4c9e-86e4-d7ed6aa1ed28 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── v0.14.1+local.3113774 ╯
+
+   Compiling version_check v0.9.5
+   Compiling proc-macro2 v1.0.107
+   Compiling typenum v1.20.1
+   Compiling unicode-ident v1.0.26
+   Compiling quote v1.0.47
+   Compiling libc v0.2.190
+   Compiling serde_core v1.0.229
+   Compiling zmij v1.0.23
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling generic-array v0.14.7
+   Compiling itoa v1.0.18
+   Compiling memchr v2.8.3
+   Compiling cfg-if v1.0.5
+   Compiling syn v3.0.7
+   Compiling cpufecontext sample admission: host free 775331 MiB, owned 0 KiB
+context run 47865 source 0b30cc28aab4bf81450c03e6129eb562732348b8 builder cargo 1.97.1 (c980f4866 2026-06-30) | rustc 1.97.1 (8bab26f4f 2026-07-14)
+context staging: 7 s (host Cargo home, offline; 1 Cargo process)
+context sample after staging: host free 775272 MiB, owned 69872 KiB
+context fixture inputs: 1444 bytes
+----- root stdout (4220 bytes) -----
+{"reason":"compiler-artifact","package_id":"path+file:///private/tmp/oxide-cli.S4bCOu/toolchain-context/workspace/app#0.1.0","manifest_path":"/private/tmp/oxide-cli.S4bCOu/toolchain-context/workspace/app/Cargo.toml","target":{"kind":["custom-build"],"crate_types":["bin"],"name":"build-script-build","src_path":"/private/tmp/oxide-cli.S4bCOu/toolchain-context/workspace/app/build.rs","edition":"2021","doc":false,"doctest":false,"test":false},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/private/tmp/oxide-cli.S4bCOu/toolchain-context/pool/payload/slots/1/build/oxide-quick/build/app-e2713161f9b8aa49/build-script-build"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"path+file:///private/tmp/oxide-cli.S4bCOu/toolchain-context/workspace/member#0.1.0","manifest_path":"/private/tmp/oxide-cli.S4bCOu/toolchain-context/workspace/member/Cargo.toml","target":{"kind":["custom-build"],"crate_types":["bin"],"name":"build-script-build","src_path":"/private/tmp/oxide-cli.S4bCOu/toolchain-context/workspace/member/build.rs","edition":"2021","doc":false,"doctest":false,"test":false},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/private/tmp/oxide-cli.S4bCOu/toolchain-context/pool/payload/slots/1/build/oxide-quick/build/member-d4f07d6f493646e3/build-script-build"],"executable":null,"fresh":false}
+{"reason":"build-script-executed","package_id":"path+file:///private/tmp/oxide-cli.S4bCOu/toolchain-context/workspace/member#0.1.0","linked_libs":[],"linked_paths":[],"cfgs":[],"env":[["PROBE_RUSTC","rustc 1.97.1 (8bab26f4f 2026-07-14)|binary: rustc|commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452|commit-date: 2026-07-14|host: aarch64-apple-darwin|release: 1.97.1|LLVM version: 22.1.6"],["PROBE_CARGO","/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo"]],"out_dir":"/private/tmp/oxide-cli.S4bCOu/toolchain-context/pool/payload/slots/1/build/oxide-quick/build/member-a8e4a9006b434e82/out"}
+{"reason":"compiler-artifact","package_id":"path+file:///private/tmp/oxide-cli.S4bCOu/toolchain-context/workspace/member#0.1.0","manifest_path":"/private/tmp/oxide-cli.S4bCOu/toolchain-context/workspace/member/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"member","src_path":"/private/tmp/oxide-cli.S4bCOu/toolchain-context/workspace/member/src/lib.rs","edition":"2021","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/private/tmp/oxide-cli.S4bCOu/toolchain-context/pool/payload/slots/1/build/oxide-quick/deps/libmember-9fae892a1c114cac.rmeta"],"executable":null,"fresh":false}
+{"reason":"build-script-executed","package_id":"path+file:///private/tmp/oxide-cli.S4bCOu/toolchain-context/workspace/app#0.1.0","linked_libs":[],"linked_paths":[],"cfgs":[],"env":[["PROBE_RUSTC","rustc 1.97.1 (8bab26f4f 2026-07-14)|binary: rustc|commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452|commit-date: 2026-07-14|host: aarch64-apple-darwin|release: 1.97.1|LLVM version: 22.1.6"],["PROBE_CARGO","/Users/tom/.rustup/toolchains/1.97.1-aarch64-apple-darwin/bin/cargo"]],"out_dir":"/private/tmp/oxide-cli.S4bCOu/toolchain-context/pool/payload/slots/1/build/oxide-quick/build/app-be48970959c9761a/out"}
+{"reason":"compiler-artifact","package_id":"path+file:///private/tmp/oxide-cli.S4bCOu/toolchain-context/workspace/app#0.1.0","manifest_path":"/private/tmp/oxide-cli.S4bCOu/toolchain-context/workspace/app/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"app","src_path":"/private/tmp/oxide-cli.S4bCOu/toolchain-context/workspace/app/src/lib.rs","edition":"2021","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":"line-tables-only","debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/private/tmp/oxide-cli.S4bCOu/toolchain-context/pool/payload/slots/1/build/oxide-quick/deps/libapp-15da0667f39247d5.rmeta"],"executable":null,"fresh":false}
+{"reason":"build-finished"atures v0.2.17
+   Compiling serde_derive v1.0.229
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling oxide-storage v0.1.0 (/Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-53b43d7d-e8a7-4c9e-86e4-d7ed6aa1ed28)
+    Finished `dev` profile [unoptimized] target(s) in 6.61s
+context proof retained its owned scratch at /private/tmp/oxide-cli.S4bCOu/toolchain-context
+Traceback (most recent call last):
+  File "/Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-53b43d7d-e8a7-4c9e-86e4-d7ed6aa1ed28/scripts/test-oxide-cli.py", line 2819, in <module>
+    sys.exit(main())
+  File "/Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-53b43d7d-e8a7-4c9e-86e4-d7ed6aa1ed28/scripts/test-oxide-cli.py", line 2746, in main
+    return context_main()
+  File "/Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-53b43d7d-e8a7-4c9e-86e4-d7ed6aa1ed28/scripts/test-oxide-cli.py", line 2650, in context_main
+    first = context_check(runner, ledger, root, [], "root")
+  File "/Users/tom/.paseo/no,"success":true}
+----- root stderr (365 bytes) -----
+   Compiling app v0.1.0 (/private/tmp/oxide-cli.S4bCOu/toolchain-context/workspace/app)
+   Compiling member v0.1.0 (/private/tmp/oxide-cli.S4bCOu/toolchain-context/workspace/member)
+    Finished `oxide-quick` profile [unoptimized + debuginfo] target(s) in 0.73s
+oxide: quick profile, build strategy, slot 1 cold, 1.0s, pool 2 of 127 MiB used (apfs-sparse-image-v1)
+rthstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-53b43d7d-e8a7-4c9e-86e4-d7ed6aa1ed28/scripts/test-oxide-cli.py", line 2543, in context_check
+    record = next(record for record in runner.state()["records"] if str(record["id"]) == result["slot"])
+StopIteration
+[error] Task failed
+  task command failed `python3 scripts/test-oxide-cli.py --toolchain-context` (code=Some(1))
