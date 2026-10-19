@@ -360,7 +360,7 @@ Tom's ruling, 2026-10-19 ("Yes - if it works then we should verify coverage for 
 - The skip path continues with a file-metadata input identity (no Git spawns): stat records for the final binary's dep-info inputs, manifests, `Cargo.lock`, Cargo config and toolchain-resolution files, plus an environment digest.
 - A deliberate, bounded exception lets version-pinned, fail-closed readers of Cargo's internal build-script output and encoded dep-info supply non-local build-script and absolute inputs. An unknown Cargo version or format falls back to Cargo.
 - Once it works, Oxide's version-sensitive behaviour must be qualified for every stable Rust from 1.95 onward, with side-by-side toolchain installs for that matrix. Versions outside the qualified range disable version-sensitive features rather than guessing.
-- The normal-path overhead round and dogfooding on current main are still awaiting Tom's explicit answer; the Supervisor proposes running the overhead round before the skip path, which would consume its toolchain-identity work.
+- Tom approved the normal-path overhead round (like-for-like gate) and dogfooding on current main on 2026-10-19 with "Approve". Dogfooding no longer waits for the overhead work; later improvements reach the installed binary through its reinstall selector.
 
 ## Authority boundaries
 
