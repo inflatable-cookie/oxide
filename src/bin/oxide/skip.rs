@@ -332,7 +332,8 @@ pub struct Activity(File);
 
 impl Activity {
     /// Wait for any skip sweep or publishing `run`, then hold the lock
-    /// shared until the command's lease is released.
+    /// shared until the command's lease is released. Children inherit the
+    /// hold; the caller drops it before replacing itself with a program.
     pub fn hold(checkout: &Path) -> Result<Self, String> {
         let dir = checkout.join(RECORD_DIR);
         fs::create_dir_all(&dir)
@@ -344,6 +345,21 @@ impl Activity {
             .write(true)
             .open(&path)
             .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+        // Cargo's process group inherits the descriptor, so the shared hold
+        // outlives a killed Oxide for as long as any group member runs.
+        // SAFETY: the descriptor is open for the duration of the calls.
+        let inherited = unsafe {
+            let flags = libc::fcntl(file.as_raw_fd(), libc::F_GETFD);
+            flags >= 0
+                && libc::fcntl(file.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC) == 0
+        };
+        if !inherited {
+            return Err(format!(
+                "cannot share {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
         loop {
             // SAFETY: the descriptor is open for the duration of the call.
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } == 0 {
@@ -801,12 +817,12 @@ fn path_candidates(
     Err(format!("{program} does not resolve on PATH"))
 }
 
-/// When the workspace root manifest may declare `members` (the name, or any
-/// backslash that could escape it in a quoted key), a glob there can
+/// When the workspace root manifest declares `members`, a glob there can
 /// match a package added anywhere below the root, at any depth: every
 /// directory under the root is recorded (except the root `target` and
-/// `.git`), so an added member changes a recorded directory. A directory
-/// symlink or more than [`MAX_WORKSPACE_DIRS`] directories refuses.
+/// `.git`), so an added member changes a recorded directory. A manifest whose
+/// patterns could reach those two, an escape, a directory symlink or more
+/// than [`MAX_WORKSPACE_DIRS`] directories refuses.
 fn workspace_dirs(checkout: &Path) -> Result<Vec<PathBuf>, String> {
     let manifest = checkout.join("Cargo.toml");
     let file = File::open(&manifest)
@@ -818,10 +834,27 @@ fn workspace_dirs(checkout: &Path) -> Result<Vec<PathBuf>, String> {
     if text.len() as u64 > MAX_CONFIG_BYTES {
         return Err(format!("{} exceeds 1 MiB", manifest.display()));
     }
-    // A quoted TOML key can only spell `members` differently through an
-    // escape, so any backslash walks too.
-    if !text.contains("members") && !text.contains('\\') {
+    // A quoted TOML key or pattern can only be spelled differently through
+    // an escape: a backslash refuses rather than being decoded.
+    if text.contains('\\') {
+        return Err(format!("{} contains an escape", manifest.display()));
+    }
+    if !text.contains("members") {
         return Ok(Vec::new());
+    }
+    // The walk skips the root `target` (rewritten by every build) and
+    // `.git`, so a pattern that could reach them refuses: one naming them,
+    // or a wildcard at the root level (leading, after `./` or after `../`),
+    // including a dot-wildcard.
+    let reaching = [
+        "target", ".git", "\"*", "'*", "\"?", "'?", "\"[", "'[", "./*", "./?", "./[", "\".*",
+        "'.*", "\".?", "'.?", "\".[", "'.[",
+    ];
+    if let Some(found) = reaching.iter().find(|pattern| text.contains(*pattern)) {
+        return Err(format!(
+            "{} may match members under target or .git (`{found}`)",
+            manifest.display()
+        ));
     }
     let mut dirs = Vec::new();
     let mut pending = vec![checkout.to_path_buf()];
@@ -1361,15 +1394,26 @@ mod tests {
         let recorded = tuples(&dirs);
         fs::create_dir_all(root.join("crates/b/pkg/src")).expect("member b");
         assert_ne!(tuples(&dirs), recorded, "a member added under crates/b");
-        // An escaped quoted key still walks.
+        // Escapes, and patterns that could reach the skipped target or .git,
+        // refuse.
+        for refused in [
+            "[workspace]\n\"m\\u0065mbers\" = [\"crates/*/pkg\"]\n",
+            "[workspace]\nmembers = [\"target/crates/*/pkg\"]\n",
+            "[workspace]\nmembers = [\"*/pkg\"]\n",
+            "[workspace]\nmembers = ['.*/pkg']\n",
+            "[workspace]\nmembers = [\"crates/../*\"]\n",
+            "[workspace]\nmembers = [\"./*/pkg\"]\n",
+        ] {
+            fs::write(root.join("Cargo.toml"), refused).expect("root manifest");
+            assert!(workspace_dirs(&root).is_err(), "{refused}");
+        }
+        // The proof fixture's root: a member and an outside path dependency.
         fs::write(
             root.join("Cargo.toml"),
-            "[workspace]\n\"m\\u0065mbers\" = [\"crates/*/pkg\"]\n",
+            "[package]\nname = \"app\"\n\n[dependencies]\noutside = { path = \"../outside\" }\n\n[workspace]\nmembers = [\"tool\"]\n",
         )
-        .expect("escaped root manifest");
-        assert!(workspace_dirs(&root)
-            .expect("dirs")
-            .contains(&root.join("crates/b/pkg")));
+        .expect("fixture root");
+        assert!(workspace_dirs(&root).is_ok());
         // Without `members`, membership is manifest-driven: nothing to walk.
         fs::write(root.join("Cargo.toml"), "[workspace]\n").expect("plain root");
         assert_eq!(workspace_dirs(&root), Ok(Vec::new()));
@@ -1391,6 +1435,21 @@ mod tests {
         assert_eq!(resolve(Some("rel")), Some(PathBuf::from("/w/rel")));
         assert_eq!(resolve(Some("/abs")), Some(PathBuf::from("/abs")));
         assert_eq!(tool_home(None, ".cargo", cwd, None), None);
+    }
+
+    #[test]
+    fn the_activity_hold_is_inherited_by_children() {
+        let root = scratch("activity");
+        let activity = Activity::hold(&root).expect("hold");
+        // SAFETY: the descriptor is open while `activity` lives.
+        let flags = unsafe { libc::fcntl(activity.0.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC == 0);
+        // A second open description cannot take it exclusively meanwhile.
+        let other = File::open(root.join(RECORD_DIR).join(ACTIVITY_LOCK)).expect("open");
+        assert!(!try_exclusive(&other));
+        drop(activity);
+        assert!(try_exclusive(&other));
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

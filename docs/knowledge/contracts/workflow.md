@@ -317,12 +317,15 @@ immutability ([vision](../vision.md#product-workflow-direction)).
   - every workspace member's manifest that metadata read for selection, built
     or not (an unbuilt sibling's `default-run` changes `run`'s pick); each
     must be strictly older than a time taken before that query;
-  - when the workspace root manifest mentions `members` or contains any
-    backslash (a quoted key could escape the name), every directory
+  - when the workspace root manifest mentions `members`, every directory
     under the workspace root except the root `target` and `.git`: a member
     glob such as `crates/*/pkg` can match a package added at any depth, so an
-    added member changes a recorded directory. A directory symlink or more
-    than 4096 directories records nothing;
+    added member changes a recorded directory. A root manifest containing a
+    backslash (an escaped key or pattern), or whose text could let a pattern
+    reach the skipped `target` or `.git` (`target`, `.git`, or a wildcard at
+    the root level: leading, after `./` or `../`, or a dot-wildcard), a
+    directory symlink or
+    more than 4096 directories records nothing;
   - `Cargo.lock`;
   - `.cargo/config`, `.cargo/config.toml`, `Cargo.toml`, `rust-toolchain`
     and `rust-toolchain.toml` in the working directory and every ancestor,
@@ -352,7 +355,8 @@ immutability ([vision](../vision.md#product-workflow-direction)).
   resolution it drops the key's record and stats `Cargo.lock`; that instant
   is the build start. Every leased command holds
   `<workspace>/target/oxide-run-skip/active.lock` shared until its lease is
-  released. A successful `run` converts it to exclusive without waiting
+  released; Cargo's process group inherits the descriptor, so the hold
+  survives a killed Oxide while any group member runs. A successful `run` converts it to exclusive without waiting
   (another active Oxide command records nothing), then, still under its
   lease, re-checks every pre-build tuple and the environment, reads the
   dep-info and manifests and publishes atomically. Every input's mtime and
