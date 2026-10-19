@@ -431,7 +431,7 @@ def host_free_bytes(path: str) -> int:
     return int(line.split()[3]) * 1024
 
 
-def build_binaries() -> dict:
+def build_binaries(extra: tuple = (), env: dict | None = None) -> dict:
     build = subprocess.run(
         [
             "cargo",
@@ -441,10 +441,12 @@ def build_binaries() -> dict:
             "oxide",
             "--bin",
             "oxide-storage-lease",
+            *extra,
             "--message-format=json-render-diagnostics",
         ],
         stdout=subprocess.PIPE,
         text=True,
+        env=env,
         timeout=remaining(),
     )
     if build.returncode:
@@ -2244,8 +2246,212 @@ def keep_standalone_lease(runner: Runner, app: str, grant: dict) -> None:
     expect(code, 0, "standalone release", stderr)
 
 
+# Cargo version matrix (oxide#091): exact stable pins from the official
+# channel manifests, `cargo -V` and `rustc -V` first lines. Oxide itself is
+# staged with its own 1.97.1; only fixture Cargo runs the tested release.
+BUILDER = "1.97.1"
+MATRIX = {
+    "1.95.0": ("cargo 1.95.0 (f2d3ce0bd 2026-03-21)", "rustc 1.95.0 (59807616e 2026-04-14)"),
+    "1.96.1": ("cargo 1.96.1 (356927216 2026-06-26)", "rustc 1.96.1 (31fca3adb 2026-06-26)"),
+    "1.97.1": ("cargo 1.97.1 (c980f4866 2026-06-30)", "rustc 1.97.1 (8bab26f4f 2026-07-14)"),
+    "1.98.1": ("cargo 1.98.1 (797e8a9bc 2026-08-05)", "rustc 1.98.1 (48a229cea 2026-09-01)"),
+    "1.99.1": ("cargo 1.99.1 (5f94df478 2026-08-27)", "rustc 1.99.1 (58cf8f9c3 2026-10-13)"),
+}
+# Installed below-threshold release for the fallback phase; never installed
+# by this proof.
+FALLBACK = ("1.94.1", "cargo 1.94.1 (29ea6fb6a 2026-03-24)")
+
+
+def reserve(parent: str, phase: str) -> None:
+    free = host_free_bytes(parent)
+    print(f"matrix reserve {phase}: host free {free // (1024 * 1024)} MiB")
+    if free < HOST_RESERVE_BYTES:
+        fail(f"host free {free} is below the 20 GiB reserve at {phase}")
+
+
+def toolchain_identity(env: dict, cwd: str) -> tuple:
+    lines = []
+    for tool in ("cargo", "rustc"):
+        result = subprocess.run(
+            [tool, "-V"], cwd=cwd, env=env, capture_output=True, text=True, timeout=min(30, remaining())
+        )
+        expect(result.returncode, 0, f"{tool} -V", result.stderr)
+        lines.append(result.stdout.strip())
+    return tuple(lines)
+
+
+def walk_dirs(root: str, names: set) -> list:
+    found = []
+    for path, dirs, _ in os.walk(root):
+        found.extend(os.path.join(path, name) for name in dirs if name in names)
+    return found
+
+
+def decode_dep_info(runner: Runner, decoder: str, root: str, label: str) -> dict:
+    code, stdout, stderr = runner.run(runner.parent, [root], program=decoder)
+    print(f"matrix dep-info {label}: {stdout.strip()}")
+    expect(code, 0, f"dep-info decode {label}", stderr)
+    decoded = json.loads(stdout)
+    if decoded["files"] < 1 or decoded["decoded"] != decoded["files"]:
+        fail(f"dep-info {label} did not decode every file: {decoded}")
+    return decoded
+
+
+def stray_line(runner: Runner, cwd: str, label: str) -> str:
+    code, stdout, stderr = runner.run(cwd, ["status"])
+    expect(code, 0, f"status {label}", stderr)
+    line = next((line for line in stdout.splitlines() if line.startswith("stray Cargo output:")), "")
+    print(f"matrix stray {label}: {line}")
+    return line
+
+
+def prove_layout(runner: Runner, decoder: str) -> None:
+    """Effective build.build-dir, stray detection and dep-info decoding
+    under the tested Cargo, after the freshness scenarios."""
+    root = os.path.join(runner.parent, "gated")
+    a, c = os.path.join(root, "a"), os.path.join(root, "c")
+    # Oxide's commands left only final outputs in the checkout target.
+    leaked = [
+        path
+        for path in walk_dirs(os.path.join(a, "target"), {"deps", "incremental", ".fingerprint"})
+        if any(files for _, _, files in os.walk(path))
+    ]
+    if leaked:
+        fail(f"build.build-dir was not effective; intermediates in target: {leaked}")
+    slots = os.path.join(runner.pool, "payload", "slots")
+    units = walk_dirs(slots, {".fingerprint", "deps"})
+    if not any(path.endswith(".fingerprint") for path in units) or not any(path.endswith("deps") for path in units):
+        fail(f"slot build directories lack deps/ or .fingerprint/: {units}")
+    print(f"matrix build-dir: {len(units)} deps/.fingerprint directories in slots, none in {a}/target")
+    if not stray_line(runner, a, "after oxide only").startswith("stray Cargo output: none "):
+        fail("verified Cargo with only Oxide output did not report no stray output")
+    decode_dep_info(runner, decoder, slots, "slots")
+    # Plain Cargo of the tested release in the clone leaves its own layout.
+    plain = subprocess.run(
+        ["cargo", "check", "--offline"],
+        cwd=c,
+        env=runner.environment(None),
+        capture_output=True,
+        text=True,
+        timeout=min(120, remaining()),
+    )
+    expect(plain.returncode, 0, "plain cargo check", plain.stderr)
+    line = stray_line(runner, c, "after plain cargo")
+    if "holds plain-Cargo deps/ or incremental/" not in line:
+        fail(f"plain Cargo output was not reported as stray: {line}")
+    decode_dep_info(runner, decoder, os.path.join(c, "target"), "plain target")
+
+
+def prove_fallback(runner: Runner) -> None:
+    """An unverified Cargo keeps its slot with one checkout and reports
+    stray output as unknown."""
+    old = Runner(runner.oxide, runner.lease, runner.parent, extra={"RUSTUP_TOOLCHAIN": FALLBACK[0]})
+    cargo, _ = toolchain_identity(old.env, runner.parent)
+    print(f"matrix fallback toolchain: {cargo}")
+    if cargo != FALLBACK[1]:
+        fail(f"fallback Cargo is not {FALLBACK[1]}: {cargo}")
+    root = os.path.join(runner.parent, "gated")
+    a, b = os.path.join(root, "a"), os.path.join(root, "b")
+    note = f"freshness gate off: {FALLBACK[1]} is not a Cargo release Oxide verified; the slot stays with this checkout"
+    code, _, stderr = old.run(a, ["test"])
+    expect(code, 0, "fallback A", stderr)
+    first = summary(stderr, "fallback A")
+    print(f"matrix fallback A: {first}")
+    if first["warmth"] != "cold" or note not in stderr:
+        fail(f"unverified Cargo did not keep A's new slot affine: {stderr[-800:]}")
+    code, _, stderr = old.run(b, ["test"])
+    expect(code, 0, "fallback B", stderr)
+    second = summary(stderr, "fallback B")
+    print(f"matrix fallback B: {second}")
+    refused = "freshness gate refused another checkout's slot (the slot holds another checkout's unshared build)"
+    if refused not in stderr or second["warmth"] != "cold" or second["slot"] == first["slot"]:
+        fail(f"B reused A's unverified slot: {stderr[-800:]}")
+    # An existing target with no plain-Cargo intermediates in it.
+    os.makedirs(os.path.join(a, "target"), exist_ok=True)
+    line = stray_line(old, a, "unverified Cargo")
+    if not line.startswith(f"stray Cargo output: unknown in {a}/target ({FALLBACK[1]} is not a Cargo release Oxide verified"):
+        fail(f"unverified Cargo did not report stray output as unknown: {line}")
+
+
+def matrix_main(tested: str) -> int:
+    """One logical proof: the shipped freshness gate, stray detection and
+    dep-info decoder under one exact Cargo release."""
+    global STARTED
+    if tested not in MATRIX:
+        fail(f"{tested} is not a matrix release: {sorted(MATRIX)}")
+    if sys.platform != "darwin":
+        fail("the bounded APFS matrix proof requires macOS")
+    parent = os.path.join(scratch_root(), "cargo-matrix")
+    os.makedirs(parent, mode=0o700, exist_ok=False)
+    STARTED = time.monotonic()
+    reserve(parent, "admission")
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    stage = dict(os.environ)
+    for name in ("CARGO", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "RUSTC", "RUSTC_WRAPPER"):
+        stage.pop(name, None)
+    # Offline staging with the builder release into this proof's scratch.
+    stage.update(
+        {
+            "RUSTUP_TOOLCHAIN": BUILDER,
+            "CARGO_TARGET_DIR": os.path.join(parent, "stage-target"),
+            "CARGO_PROFILE_DEV_DEBUG": "0",
+        }
+    )
+    builder = toolchain_identity(stage, repo)
+    print(f"matrix builder: {builder[0]} | {builder[1]}")
+    if builder != MATRIX[BUILDER]:
+        fail(f"builder is not {BUILDER}: {builder}")
+    executables = build_binaries(("--offline", "--example", "dep_info_matrix"), stage)
+    if "dep_info_matrix" not in executables:
+        fail("compiled artifact dep_info_matrix was not reported")
+    print(f"matrix staging: {time.monotonic() - STARTED:.0f} s (host Cargo home, offline)")
+    reserve(parent, "after staging")
+    runner = Runner(executables["oxide"], executables["oxide-storage-lease"], parent, extra={"RUSTUP_TOOLCHAIN": tested})
+    identity = toolchain_identity(runner.env, parent)
+    print(f"matrix tested: {identity[0]} | {identity[1]}")
+    if identity != MATRIX[tested]:
+        fail(f"tested toolchain is not {tested}: {identity}")
+    code, _, stderr = runner.run(
+        parent,
+        ["--pool", runner.pool, "init", "--cap-bytes", str(IMAGE_BYTES), "--image-bytes", str(IMAGE_BYTES)],
+        program=runner.lease,
+    )
+    expect(code, 0, "pool init", stderr)
+    inputs = sum(len(text.encode()) for fixture in (GATED, OUTSIDE) for text in fixture.values())
+    print(f"matrix fixture inputs: {inputs} bytes")
+    if inputs > SOURCE_LIMIT_BYTES:
+        fail("fixture inputs exceed 8 MiB")
+    owned = 0
+    try:
+        prove_freshness(runner)
+        print(f"matrix freshness gate held under {identity[0]}")
+        reserve(parent, "after freshness")
+        prove_layout(runner, executables["dep_info_matrix"])
+        prove_fallback(runner)
+        owned = tree_bytes(parent, True)
+        print(f"matrix owned scratch {owned // (1024 * 1024)} MiB")
+        if owned > SCRATCH_LIMIT_BYTES:
+            fail(f"owned scratch {owned} exceeds 512 MiB")
+    except Exception:
+        print(f"matrix proof retained its owned scratch at {parent}", file=sys.stderr)
+        raise
+    payload = os.path.join(runner.pool, "payload")
+    detach = subprocess.run(["/usr/bin/hdiutil", "detach", payload], capture_output=True, text=True, timeout=60)
+    if detach.returncode:
+        fail(f"detach failed after positive completion: {detach.stderr}")
+    reserve(parent, "after detach")
+    elapsed = time.monotonic() - STARTED
+    shutil.rmtree(parent)
+    print(f"matrix proof held for {tested}: {elapsed:.0f} s, owned scratch {owned // (1024 * 1024)} MiB")
+    return 0
+
+
 def main() -> int:
     global STARTED
+    if "--cargo-matrix" in sys.argv:
+        if len(sys.argv) != 3 or sys.argv[1] != "--cargo-matrix":
+            fail("usage: test-oxide-cli.py --cargo-matrix <exact version>")
+        return matrix_main(sys.argv[2])
     parent = os.path.join(scratch_root(), "oxide-cli")
     os.makedirs(parent, mode=0o700, exist_ok=False)
     prove_wait_lines()

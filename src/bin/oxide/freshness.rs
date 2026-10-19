@@ -11,7 +11,8 @@
 //! effect-free metadata names them under the guarded command's own lock,
 //! network and config arguments. File contents, Cargo fingerprints
 //! and the slot are never touched. Inputs outside Git or ignored by it are
-//! not covered.
+//! not covered. Only a [verified Cargo release](VERIFIED_CARGO) shares a
+//! slot; any other keeps it with one checkout.
 
 use crate::cli::Resolution;
 use crate::MIB;
@@ -40,6 +41,19 @@ pub const LIMIT_NOTE: &str = "inputs outside Git or ignored by it are not checke
 /// Cargo's wording when `--locked` or `--frozen` stops it creating or
 /// updating the lock file.
 const LOCK_REFUSAL: &str = "was passed to prevent this";
+/// Exact Cargo releases (`cargo -V` prefixes) whose rules the gate relies
+/// on were checked against pinned Cargo source and fixture runs (oxide#091):
+/// the `path_mtime <= reference_mtime` freshness rule, workspace-relative
+/// unit paths, `cargo metadata` format 1, the lock and unknown `-Z` refusal
+/// wording, stable `build.build-dir` and the legacy `deps/` / `incremental/`
+/// layout. Any other release, older, newer or unknown, never shares a slot.
+pub(crate) const VERIFIED_CARGO: [&str; 5] = [
+    "cargo 1.95.0 (f2d3ce0bd ",
+    "cargo 1.96.1 (356927216 ",
+    "cargo 1.97.1 (c980f4866 ",
+    "cargo 1.98.1 (797e8a9bc ",
+    "cargo 1.99.1 (5f94df478 ",
+];
 
 /// Why the gate did not vouch for a slot.
 #[derive(Debug)]
@@ -141,7 +155,8 @@ impl Prior {
 
 /// The gate's work before Cargo, kept to record the new origin afterwards.
 pub struct Gate {
-    /// `None`: a checkout without Git content; the slot stays affine.
+    /// `None`: a checkout without Git content or verified Cargo; the slot
+    /// stays affine.
     before: Option<(PathBuf, Content)>,
     /// Paths that differed from the prior origin.
     changed: BTreeSet<String>,
@@ -150,6 +165,8 @@ pub struct Gate {
     pub cross: bool,
     pub refreshed: usize,
     pub packages: usize,
+    /// Why a new slot stays with this checkout, when Cargo is unverified.
+    note: Option<String>,
 }
 
 impl Gate {
@@ -161,12 +178,17 @@ impl Gate {
             cross: false,
             refreshed: 0,
             packages: 0,
+            note: None,
         }
     }
 
     /// Text for the summary line when the gate did visible work.
     pub fn describe(&self) -> Option<String> {
-        if self.cross {
+        if let Some(note) = &self.note {
+            Some(format!(
+                "freshness gate off: {note}; the slot stays with this checkout"
+            ))
+        } else if self.cross {
             Some(format!(
                 "freshness gate refreshed {} file(s) from another checkout's build ({} package(s) for the path change); {LIMIT_NOTE}",
                 self.refreshed, self.packages
@@ -214,20 +236,31 @@ pub fn prepare(checkout: &Path, prior: &Prior, request: &Resolution) -> Result<G
         )),
         Prior::Known(Built::Affine(owner)) if owner == checkout => Ok(Gate::affine()),
         Prior::Known(Built::Affine(_)) => Err(Refusal::Unvouched(
-            "the slot holds another checkout's build without Git content".to_owned(),
+            "the slot holds another checkout's unshared build".to_owned(),
         )),
-        // Nothing compiled yet: a checkout without Git content stays affine.
-        Prior::Fresh => Ok(match snapshot(checkout) {
-            Ok(before) => Gate {
-                before: Some(before),
+        // Nothing compiled yet: a checkout without Git content, or whose
+        // Cargo is unverified, stays affine.
+        Prior::Fresh => Ok(match verified_cargo(checkout) {
+            Err(reason) => Gate {
+                note: Some(reason),
                 ..Gate::affine()
             },
-            Err(_) => Gate::affine(),
+            Ok(_) => match snapshot(checkout) {
+                Ok(before) => Gate {
+                    before: Some(before),
+                    ..Gate::affine()
+                },
+                Err(_) => Gate::affine(),
+            },
         }),
         Prior::Known(Built::Content(origin)) => {
             let (top, content) = snapshot(checkout)?;
             let changed = differing(&top, &origin.content, &content)?;
             let cross = origin.checkout != checkout;
+            // Refreshing relies on Cargo's rules; an unchanged repeat does not.
+            if cross || !changed.is_empty() {
+                verified_cargo(checkout)?;
+            }
             let mut stale: BTreeSet<&String> = changed.iter().collect();
             if cross {
                 stale.extend(&origin.uncertain);
@@ -247,9 +280,42 @@ pub fn prepare(checkout: &Path, prior: &Prior, request: &Resolution) -> Result<G
                 cross,
                 refreshed,
                 packages,
+                note: None,
             })
         }
     }
+}
+
+/// The first `cargo -V` line Cargo reports in `dir` when it is a
+/// [verified release](VERIFIED_CARGO); otherwise why not.
+pub(crate) fn verified_cargo(dir: &Path) -> Result<String, String> {
+    let output = Command::new(crate::CARGO)
+        .arg("-V")
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|error| format!("could not start Cargo: {error}"))?;
+    let version = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    if !output.status.success() || version.is_empty() {
+        return Err("Cargo did not report its version".to_owned());
+    }
+    if is_verified(&version) {
+        Ok(version)
+    } else {
+        Err(format!("{version} is not a Cargo release Oxide verified"))
+    }
+}
+
+fn is_verified(version: &str) -> bool {
+    VERIFIED_CARGO
+        .iter()
+        .any(|prefix| version.starts_with(prefix))
 }
 
 fn now_ns() -> u64 {
@@ -1240,6 +1306,43 @@ mod tests {
             matches!(own.finish(Path::new("/a")), Some(Built::Affine(path)) if path == Path::new("/a"))
         );
         assert!(Prior::Unknown.unchanged().is_none() && Prior::Fresh.unchanged().is_none());
+    }
+
+    #[test]
+    fn only_exact_verified_cargo_releases_share() {
+        for version in [
+            "cargo 1.95.0 (f2d3ce0bd 2026-03-21)",
+            "cargo 1.96.1 (356927216 2026-06-26)",
+            "cargo 1.97.1 (c980f4866 2026-06-30)",
+            "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+            "cargo 1.99.1 (5f94df478 2026-08-27)",
+        ] {
+            assert!(is_verified(version), "{version}");
+        }
+        for version in [
+            "cargo 1.94.1 (29ea6fb6a 2026-03-24)",
+            "cargo 1.96.0 (356927216 2026-06-26)",
+            "cargo 1.97.0 (c980f4866 2026-06-30)",
+            "cargo 1.99.1 (0123456789 2026-08-27)",
+            "cargo 1.100.0 (5f94df478 2026-08-27)",
+            "cargo 1.97.1",
+            "",
+        ] {
+            assert!(!is_verified(version), "{version}");
+        }
+        let fresh = Gate {
+            note: Some(
+                "cargo 1.94.1 (29ea6fb6a 2026-03-24) is not a Cargo release Oxide verified"
+                    .to_owned(),
+            ),
+            ..Gate::affine()
+        };
+        assert!(fresh
+            .describe()
+            .is_some_and(|line| line.starts_with("freshness gate off: cargo 1.94.1")));
+        assert!(fresh
+            .finish(Path::new("/checkout"))
+            .is_some_and(|built| matches!(built, Built::Affine(_))));
     }
 
     #[test]
