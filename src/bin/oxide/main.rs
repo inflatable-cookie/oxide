@@ -12,6 +12,7 @@ mod cli;
 mod freshness;
 mod identity;
 mod process;
+mod skip;
 mod store;
 mod watchdog;
 
@@ -122,6 +123,16 @@ fn apply_storage(command: &mut Command, build_dir: &Path, checkout: &Path) {
 }
 
 fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
+    // `run` with an unchanged key executes the recorded binary before any
+    // Cargo, lease or pool access; otherwise it builds and records again.
+    let skip_request = if command == "run" {
+        skip::Request::parse(args)
+    } else {
+        None
+    };
+    if let Some(request) = &skip_request {
+        skip::try_skip(request)?;
+    }
     let mut invocation = cli::parse_leased(command, args)?;
     if command == "run" && cli::run_selection(&invocation.cargo_args).is_none() {
         // Build only what `cargo run` would run: `default-run`, else the
@@ -152,6 +163,14 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
         invocation.profile.label(),
         invocation.target.as_deref(),
     )?;
+    // Held until the lease is released: a skip never sweeps while an Oxide
+    // command is active on this checkout.
+    let activity = skip::Activity::hold(&key.checkout)?;
+    let pending = skip_request.as_ref().and_then(|request| {
+        skip::Pending::capture(request, &key.checkout)
+            .map_err(|reason| eprintln!("oxide: run skip not recorded ({reason})"))
+            .ok()
+    });
     process::install_signal_handlers()?;
     let store = Store::open_or_create()?;
     let started = Instant::now();
@@ -227,8 +246,25 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     let slot = held.slot_id.clone();
     let warm = held.reused;
     let note = gate.describe();
+    if let (Some(pending), Ok((Some(status), Some(Ok((program, manifest_dir, build)))))) =
+        (pending, &outcome)
+    {
+        // Published under the lease, only when no other Oxide command is
+        // active here. A record that cannot be published only costs the next
+        // command its skip; the reason is printed.
+        if status.success()
+            && stopped.is_none()
+            && process::received_signal().is_none()
+            && activity.exclusive()
+        {
+            if let Err(reason) = pending.publish(program, manifest_dir, build) {
+                eprintln!("oxide: run skip not recorded ({reason})");
+            }
+        }
+    }
     let origin = gate.finish(&key.checkout);
     store.release(held, origin)?;
+    drop(activity);
     let (status, executable) = outcome?;
     let status = status.ok_or("Cargo ended without a status")?;
     print_summary(&store, &invocation, &slot, warm, started, note.as_deref());
@@ -240,7 +276,7 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
         return Ok(process::exit_code(status));
     }
     match executable.unwrap_or_else(|| Err("no run target was recorded".to_owned())) {
-        Ok((program, manifest_dir)) => {
+        Ok((program, manifest_dir, _)) => {
             // Lease released: the program runs from the private target dir.
             let error = Command::new(&program)
                 .args(&invocation.program_args)
@@ -327,7 +363,11 @@ fn lease_with_gate(
     Err("the freshness gate kept refusing slots".to_owned())
 }
 
-type RunTarget = Result<(PathBuf, PathBuf), String>;
+/// The executable, its manifest directory and what the build reported for
+/// the skip key.
+type RunTarget = Result<(PathBuf, PathBuf, skip::Build), String>;
+/// Package and build-script entries kept from one build's messages.
+const MAX_REPORTED: usize = 32_768;
 
 /// `run`: wait for the build while reading Cargo's JSON for the executable.
 fn collect_run(
@@ -351,6 +391,7 @@ fn collect_run(
     });
     let selection = cli::run_selection(&invocation.cargo_args);
     let mut found: Vec<(String, PathBuf, PathBuf)> = Vec::new();
+    let mut build = Some(skip::Build::default());
     let mut status = None;
     let mut closed = false;
     while status.is_none() || !closed {
@@ -366,6 +407,7 @@ fn collect_run(
                 if invocation.json_messages {
                     println!("{line}");
                 }
+                record_build(&mut build, &line);
                 if let Some(artifact) = run_artifact(&line, selection.as_deref()) {
                     if !found.iter().any(|known| known.1 == artifact.1) {
                         found.push(artifact);
@@ -387,7 +429,7 @@ fn collect_run(
     let target = match found.len() {
         1 => {
             let (_, program, manifest_dir) = found.remove(0);
-            Ok((program, manifest_dir))
+            Ok((program, manifest_dir, build.unwrap_or_default()))
         }
         0 => Err("the build produced no binary to run; pass --bin or --example".to_owned()),
         _ => {
@@ -399,6 +441,51 @@ fn collect_run(
         }
     };
     Ok((status, Some(target)))
+}
+
+/// Add a `compiler-artifact` package or a `build-script-executed` output
+/// directory to `build`. A message without the expected fields, or too many
+/// entries, drops the whole report, which then publishes no skip key.
+fn record_build(build: &mut Option<skip::Build>, line: &str) {
+    let Some(report) = build.as_mut() else {
+        return;
+    };
+    let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+    let kept = report.packages.len() + report.scripts.len() < MAX_REPORTED;
+    let complete = match message["reason"].as_str() {
+        Some("compiler-artifact") => match (
+            message["package_id"].as_str(),
+            message["manifest_path"].as_str(),
+            message["target"]["kind"].as_array(),
+        ) {
+            (Some(id), Some(manifest), Some(kinds)) if kept => {
+                report.packages.insert(skip::Package {
+                    id: id.to_owned(),
+                    manifest: PathBuf::from(manifest),
+                    build_script: kinds.iter().any(|kind| kind == "custom-build"),
+                });
+                true
+            }
+            _ => false,
+        },
+        Some("build-script-executed") => {
+            match (message["package_id"].as_str(), message["out_dir"].as_str()) {
+                (Some(id), Some(out_dir)) if kept => {
+                    report
+                        .scripts
+                        .insert(id.to_owned(), PathBuf::from(out_dir));
+                    true
+                }
+                _ => false,
+            }
+        }
+        _ => true,
+    };
+    if !complete {
+        *build = None;
+    }
 }
 
 /// A bin or example artifact with an executable, matching any selection.

@@ -70,3 +70,11 @@ run = "python3 scripts/test-storage-lease-cli.py"
 [tasks."rust:oxide-cli"]
 admission = "heavy"
 run = "python3 scripts/test-oxide-cli.py"
+
+# The focused `oxide run` no-op fast-path proof (oxide#089): one fresh 128 MiB
+# APFS pool, 300 s from admission including product staging, the fixed #079
+# two-part timing gate with raw samples, zero-child skips under RLIMIT_NPROC 0
+# and every key class falling through. Not a benchmark and not full QA.
+[tasks."rust:oxide-run-skip"]
+admission = "heavy"
+run = "python3 scripts/test-oxide-cli.py --run-skip"

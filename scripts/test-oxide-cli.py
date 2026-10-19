@@ -45,6 +45,7 @@ full QA.
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import re
@@ -465,7 +466,7 @@ def build_binaries() -> dict:
 
 
 class Runner:
-    def __init__(self, oxide: str, lease: str, parent: str, pool: str = "pool", extra: dict | None = None):
+    def __init__(self, oxide: str, lease: str, parent: str, pool: str = "pool", extra: dict | None = None, skip: bool = False):
         self.oxide = oxide
         self.lease = lease
         self.parent = parent
@@ -502,6 +503,11 @@ class Runner:
             }
         )
         env.pop("OXIDE_POOL_BACKEND", None)
+        env.pop("OXIDE_NO_SKIP", None)
+        # The leased-path cases keep every `run` on Cargo; only the run-skip
+        # proof exercises the fast path.
+        if not skip:
+            env["OXIDE_NO_SKIP"] = "1"
         env.update(extra or {})
         self.env = env
 
@@ -2244,6 +2250,474 @@ def keep_standalone_lease(runner: Runner, app: str, grant: dict) -> None:
     expect(code, 0, "standalone release", stderr)
 
 
+# `oxide run` no-op fast path (oxide#089): `--run-skip` mode.
+
+SKIP_FIXTURE = {
+    "repo/Cargo.toml": """[package]
+name = "skipapp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+helper = { path = "helper" }
+outside = { path = "../outside" }
+
+[workspace]
+members = ["tool"]
+""",
+    "repo/rust-toolchain.toml": '[toolchain]\nchannel = "1.97.1"\n',
+    "repo/.gitignore": "/target\n/helper/Cargo.toml\n",
+    "repo/build.rs": 'fn main() {\n    println!("cargo:rerun-if-changed=build.rs");\n}\n',
+    "repo/src/msg.rs": 'pub const VERSION: &str = "v1";\n',
+    "repo/src/main.rs": """mod msg;
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let note = option_env!("SKIP_NOTE").unwrap_or("-");
+    println!("skip {} {} {} {note} {}", msg::VERSION, helper::flavor(), outside::value(), args.join(" "));
+}
+""",
+    # An in-checkout dependency whose `[lib] path` leaves its directory and
+    # whose manifest Git ignores: neither source ancestry nor Git covers it.
+    "repo/helper/Cargo.toml": """[package]
+name = "helper"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["old"]
+old = []
+new = []
+
+[lib]
+path = "../shared/lib.rs"
+""",
+    "repo/shared/lib.rs": """pub fn flavor() -> &'static str {
+    if cfg!(feature = "new") {
+        "new"
+    } else {
+        "old"
+    }
+}
+""",
+    "repo/tool/Cargo.toml": '[package]\nname = "tool"\nversion = "0.1.0"\nedition = "2021"\n',
+    "repo/tool/src/main.rs": 'fn main() {\n    println!("tool {}", std::env::args().skip(1).collect::<Vec<_>>().join(" "));\n}\n',
+    # A path dependency outside the checkout: stat-recorded, not refused.
+    "outside/Cargo.toml": '[package]\nname = "outside"\nversion = "0.1.0"\nedition = "2021"\n',
+    "outside/src/lib.rs": "pub fn value() -> u32 {\n    5\n}\n",
+}
+SKIP_REGISTRY = {
+    "Cargo.toml": '[package]\nname = "regapp"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\ncfg-if = "=1.0.0"\n\n[workspace]\n',
+    "rust-toolchain.toml": '[toolchain]\nchannel = "1.97.1"\n',
+    "src/main.rs": """cfg_if::cfg_if! {
+    if #[cfg(unix)] {
+        const OS: &str = "unix";
+    } else {
+        const OS: &str = "other";
+    }
+}
+
+fn main() {
+    println!("registry {OS} {}", std::env::args().nth(1).unwrap_or_default());
+}
+""",
+}
+SKIP_SCRIPTED = {
+    "Cargo.toml": '[package]\nname = "scriptedapp"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nlibc = "=0.2.190"\n\n[workspace]\n',
+    "rust-toolchain.toml": '[toolchain]\nchannel = "1.97.1"\n',
+    "src/main.rs": 'fn main() {\n    println!("scripted {}", unsafe { libc::getpid() } > 0);\n}\n',
+}
+SKIP_INDEX = "index.crates.io-1949cf8c6b5b557f"
+# Exactly these existing cached inputs seed the private CARGO_HOME.
+SKIP_REGISTRY_INPUTS = (
+    f"registry/index/{SKIP_INDEX}/config.json",
+    f"registry/index/{SKIP_INDEX}/.cache/cf/g-/cfg-if",
+    f"registry/cache/{SKIP_INDEX}/cfg-if-1.0.0.crate",
+    f"registry/index/{SKIP_INDEX}/.cache/li/bc/libc",
+    f"registry/cache/{SKIP_INDEX}/libc-0.2.190.crate",
+)
+SKIP_LINE = "unchanged — skipped Cargo"
+# Oxide's quick profile, so the bare Cargo baseline builds what `oxide run` builds.
+QUICK_PROFILE_ENVIRONMENT = {
+    "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
+    "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only",
+}
+
+
+def no_children() -> None:
+    """preexec: no process this user owns may fork. A skip that succeeds
+    under it started zero children; exec is unaffected."""
+    import resource
+
+    resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
+
+
+def same_spawn() -> None:
+    """preexec with the same spawn path as `no_children`, limiting nothing."""
+    import resource
+
+    resource.getrlimit(resource.RLIMIT_NPROC)
+
+
+def timed(cmd: list, cwd: str, env: dict, preexec) -> tuple:
+    started = time.perf_counter_ns()
+    result = subprocess.run(
+        cmd, cwd=cwd, env=env, capture_output=True, text=True,
+        timeout=min(120, remaining()), preexec_fn=preexec,
+    )
+    return time.perf_counter_ns() - started, result.returncode, result.stdout, result.stderr
+
+
+class SkipCase:
+    def __init__(self, runner: Runner, repo: str):
+        self.runner = runner
+        self.repo = repo
+
+    def run(self, label: str, args: list, cwd: str | None, extra: dict | None, preexec):
+        ns, code, stdout, stderr = timed(
+            [self.runner.oxide, "run", *args], cwd or self.repo, self.runner.environment(extra), preexec
+        )
+        return ns, code, stdout.strip(), stderr
+
+    def skips(self, label: str, args: list, wanted: str, cwd: str | None = None, extra: dict | None = None) -> int:
+        """Zero children: the run happens under RLIMIT_NPROC 0."""
+        ns, code, stdout, stderr = self.run(label, args, cwd, extra, no_children)
+        expect(code, 0, f"{label} (zero-child skip)", stderr)
+        if SKIP_LINE not in stderr or stdout != wanted or " slot " in stderr:
+            fail(f"{label}: expected a skip printing {wanted!r}, got {stdout!r} {stderr[-800:]!r}")
+        return ns
+
+    def builds(self, label: str, args: list, wanted, cwd: str | None = None, extra: dict | None = None) -> str:
+        """Falls through: the leased summary names a slot. `wanted` is the
+        output, or a tuple of acceptable outputs."""
+        _, code, stdout, stderr = self.run(label, args, cwd, extra, same_spawn)
+        expect(code, 0, label, stderr)
+        if SKIP_LINE in stderr or stdout not in (wanted if isinstance(wanted, tuple) else (wanted,)):
+            fail(f"{label}: expected Cargo printing {wanted!r}, got {stdout!r} {stderr[-800:]!r}")
+        summary(stderr, label)
+        return stderr
+
+
+def skip_records(repo: str) -> list:
+    directory = os.path.join(repo, "target", "oxide-run-skip")
+    if not os.path.isdir(directory):
+        return []
+    return sorted(name for name in os.listdir(directory) if name.endswith(".json"))
+
+
+def skip_record(cwd: str, args: list) -> str:
+    digest = hashlib.sha256(os.path.realpath(cwd).encode())
+    for argument in args:
+        digest.update(b"\0" + argument.encode())
+    return digest.hexdigest() + ".json"
+
+
+def write_in_place(path: str, text: str) -> None:
+    with open(path, "r+", encoding="utf-8") as handle:
+        handle.seek(0)
+        handle.write(text)
+        handle.truncate()
+
+
+def seed_registry(runner: Runner) -> None:
+    host_home = os.environ.get("CARGO_HOME") or os.path.join(os.path.expanduser("~"), ".cargo")
+    for relative in SKIP_REGISTRY_INPUTS:
+        source = os.path.join(host_home, relative)
+        if not os.path.isfile(source):
+            fail(f"named cache input missing, no substitute: {relative}")
+        target = os.path.join(runner.cargo_home, relative)
+        os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+        shutil.copyfile(source, target)
+
+
+def prove_skip_cases(runner: Runner) -> dict:
+    nest = os.path.join(runner.parent, "checkouts", "skip")
+    repo = os.path.join(nest, "repo")
+    write_fixture(nest, SKIP_FIXTURE)
+    commit_lock(runner, repo)
+    git(repo, "init", "--quiet")
+    git(repo, "add", "-A")
+    git(repo, "commit", "--quiet", "-m", "skip fixture")
+    case = SkipCase(runner, repo)
+    msg = os.path.join(repo, "src", "msg.rs")
+    evidence = {}
+
+    case.builds("first run", ["--", "a"], "skip v1 old 5 - a")
+    if skip_records(repo) != [skip_record(repo, [])]:
+        fail(f"a successful run published {skip_records(repo)}")
+    with open(os.path.join(repo, "target", "oxide-run-skip", skip_record(repo, [])), encoding="utf-8") as handle:
+        record = json.load(handle)
+    paths = {os.path.realpath(entry["path"]) for entry in record["inputs"]}
+    wanted_paths = {
+        os.path.realpath(os.path.join(nest, "outside", "src", "lib.rs")),
+        os.path.realpath(os.path.join(nest, "outside", "Cargo.toml")),
+        os.path.realpath(os.path.join(repo, "helper", "Cargo.toml")),
+        os.path.realpath(os.path.join(repo, "shared", "lib.rs")),
+        os.path.realpath(os.path.join(repo, "Cargo.lock")),
+        os.path.realpath(os.path.join(nest, ".cargo", "config.toml")),
+        os.path.realpath(os.path.join(repo, "rust-toolchain.toml")),
+    }
+    missing = sorted(path for path in wanted_paths if path not in paths)
+    if missing:
+        fail(f"skip record lacks inputs {missing}")
+    absent = [os.path.realpath(entry["path"]) for entry in record["inputs"] if entry["stat"] is None]
+    if os.path.realpath(os.path.join(nest, ".cargo", "config.toml")) not in absent:
+        fail("the absent ancestor config was not recorded as absent")
+    evidence["record_inputs"] = len(record["inputs"])
+    evidence["record_absent"] = len(absent)
+
+    case.skips("repeat skip", ["--", "b"], "skip v1 old 5 - b")
+    case.skips("repeat skip, program args after --", ["--", "--rebuild", "-p", "x"], "skip v1 old 5 - --rebuild -p x")
+    # Control: the same limit refuses the leased path's Cargo spawn.
+    _, code, _, stderr = case.run("control", [], None, {"OXIDE_NO_SKIP": "1"}, no_children)
+    if code == 0:
+        fail(f"the zero-child limit did not refuse a leased build: {stderr[-400:]!r}")
+    case.builds("--rebuild", ["--rebuild"], "skip v1 old 5 -")
+    case.builds("OXIDE_NO_SKIP", [], "skip v1 old 5 -", extra={"OXIDE_NO_SKIP": "1"})
+    case.skips("skip after forced builds", [], "skip v1 old 5 -")
+
+    # Source edit.
+    write_in_place(msg, 'pub const VERSION: &str = "v2";\n')
+    case.builds("source edit", [], "skip v2 old 5 -")
+    case.skips("source edit repeat", [], "skip v2 old 5 -")
+    # Same size, same inode, mtime restored: only ctime moves.
+    before = os.stat(msg)
+    time.sleep(0.05)
+    write_in_place(msg, 'pub const VERSION: &str = "v3";\n')
+    os.utime(msg, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = os.stat(msg)
+    if (after.st_mtime_ns, after.st_size, after.st_ino) != (before.st_mtime_ns, before.st_size, before.st_ino):
+        fail("the restored-mtime edit changed more than ctime")
+    # The skip falls through; Cargo's own mtime comparison may still call
+    # the unit fresh, so either output is Cargo's answer.
+    case.builds("restored-old-mtime edit (ctime)", [], ("skip v2 old 5 -", "skip v3 old 5 -"))
+    os.utime(msg)
+    case.builds("source touched", [], "skip v3 old 5 -")
+    case.skips("ctime repeat", [], "skip v3 old 5 -")
+
+    # Manifests: the custom-lib-path, Git-ignored helper manifest.
+    helper = os.path.join(repo, "helper", "Cargo.toml")
+    write_in_place(helper, SKIP_FIXTURE["repo/helper/Cargo.toml"].replace('default = ["old"]', 'default = ["new"]'))
+    case.builds("ignored custom-lib manifest", [], "skip v3 new 5 -")
+    case.skips("manifest repeat", [], "skip v3 new 5 -")
+    with open(os.path.join(repo, "Cargo.toml"), "a", encoding="utf-8") as handle:
+        handle.write("\n[profile.dev]\n")
+    case.builds("root manifest", [], "skip v3 new 5 -")
+    case.skips("root manifest repeat", [], "skip v3 new 5 -")
+
+    # Lock file.
+    lock = os.path.join(repo, "Cargo.lock")
+    with open(lock, encoding="utf-8") as handle:
+        lock_text = handle.read()
+    with open(lock, "a", encoding="utf-8") as handle:
+        handle.write("\n")
+    case.builds("lock change", [], "skip v3 new 5 -")
+    with open(lock, "w", encoding="utf-8") as handle:
+        handle.write(lock_text)
+    case.builds("lock restored", [], "skip v3 new 5 -")
+    case.skips("lock repeat", [], "skip v3 new 5 -")
+
+    # Config added above the checkout, where Cargo reads it.
+    os.makedirs(os.path.join(nest, ".cargo"))
+    with open(os.path.join(nest, ".cargo", "config.toml"), "w", encoding="utf-8") as handle:
+        handle.write('[env]\nSKIP_NOTE = "cfg"\n')
+    case.builds("config added", [], "skip v3 new 5 cfg")
+    case.skips("config repeat", [], "skip v3 new 5 cfg")
+
+    # Toolchain file: same installed toolchain, new file identity.
+    with open(os.path.join(repo, "rust-toolchain.toml"), "a", encoding="utf-8") as handle:
+        handle.write("# touched\n")
+    case.builds("toolchain file", [], "skip v3 new 5 cfg")
+    case.skips("toolchain repeat", [], "skip v3 new 5 cfg")
+
+    # Environment: the value is hashed, never stored.
+    secret = {"SKIP_FIXTURE_VAR": "secret-skip-value"}
+    case.builds("environment variable", [], "skip v3 new 5 cfg", extra=secret)
+    case.skips("environment repeat", [], "skip v3 new 5 cfg", extra=secret)
+    for name in skip_records(repo):
+        if "secret-skip-value" in read_text(os.path.join(repo, "target", "oxide-run-skip", name)):
+            fail("a raw environment value reached a skip record")
+    case.builds("environment variable removed", [], "skip v3 new 5 cfg")
+
+    # Deleted binary.
+    os.remove(os.path.join(repo, "target", "oxide-quick", "skipapp"))
+    case.builds("deleted binary", [], "skip v3 new 5 cfg")
+    case.skips("deleted binary repeat", [], "skip v3 new 5 cfg")
+
+    # A path dependency outside the checkout is recorded and caught.
+    write_in_place(os.path.join(nest, "outside", "src", "lib.rs"), "pub fn value() -> u32 {\n    6\n}\n")
+    case.builds("outside path dependency", [], "skip v3 new 6 cfg")
+    case.skips("outside repeat", [], "skip v3 new 6 cfg")
+
+    # A member working directory never runs another member's binary.
+    case.builds("member", [], "tool", cwd=os.path.join(repo, "tool"))
+    case.skips("member repeat", ["--", "x"], "tool x", cwd=os.path.join(repo, "tool"))
+    case.skips("root after member", [], "skip v3 new 6 cfg")
+
+    # A failed build leaves no record.
+    write_in_place(msg, "pub const VERSION: &str = ;\n")
+    _, code, _, stderr = case.run("failed build", [], None, None, same_spawn)
+    expect(code, 101, "failed build", stderr)
+    if skip_record(repo, []) in skip_records(repo):
+        fail("a failed build left a skip record")
+    write_in_place(msg, 'pub const VERSION: &str = "v4";\n')
+    case.builds("after failure", [], "skip v4 new 6 cfg")
+    case.skips("after failure repeat", [], "skip v4 new 6 cfg")
+
+    # Registry packages: eligible without a build script, refused with one.
+    seed_registry(runner)
+    registry = os.path.join(runner.parent, "checkouts", "registry")
+    write_fixture(registry, SKIP_REGISTRY)
+    commit_lock(runner, registry)
+    case.builds("registry dependency", ["--", "x"], "registry unix x", cwd=registry)
+    if not skip_records(registry):
+        fail("a registry dependency without a build script published no record")
+    case.skips("registry repeat", ["--", "y"], "registry unix y", cwd=registry)
+    scripted = os.path.join(runner.parent, "checkouts", "scripted")
+    write_fixture(scripted, SKIP_SCRIPTED)
+    commit_lock(runner, scripted)
+    stderr = case.builds("registry build script", [], "scripted true", cwd=scripted)
+    if skip_records(scripted) or "oxide: run skip not recorded" not in stderr or "build script" not in stderr:
+        fail(f"a registry build-script dependency was not refused explicitly: {stderr[-600:]!r}")
+    case.builds("registry build script repeat", [], "scripted true", cwd=scripted)
+
+    if any(slot["state"] != "idle" for slot in runner.lease_status()["slots"]):
+        fail("the skip cases left a slot held")
+    return evidence
+
+
+def timing_verdict(skip: list, leased: list, plain: list) -> dict:
+    """#079's fixed two-part gate. Skip and leased samples are `oxide run`
+    wall times that both execute the program; plain samples are warmed bare
+    `cargo build` no-ops (build only). Part 1: the slowest skip is at most
+    half the fastest leased run. Part 2: the fastest skip is at most the
+    fastest plain no-op plus the larger observed spread (max - min) of the
+    skip and plain samples. Fewer than three samples is insufficient."""
+    if min(len(skip), len(leased), len(plain)) < 3:
+        return {"failures": ["insufficient timing samples"], "part1": False, "part2": False}
+    noise = max(max(skip) - min(skip), max(plain) - min(plain))
+    part1 = max(skip) <= min(leased) / 2
+    part2 = min(skip) <= min(plain) + noise
+    failures = []
+    if not part1:
+        failures.append(f"part 1: slowest skip {max(skip)} ns > half of fastest leased {min(leased)} ns")
+    if not part2:
+        failures.append(f"part 2: fastest skip {min(skip)} ns > fastest plain {min(plain)} ns + noise {noise} ns")
+    return {"failures": failures, "part1": part1, "part2": part2, "noise_ns": noise}
+
+
+def prove_timing_verdict() -> None:
+    """Pure checks of the gate on synthetic samples, before any native work."""
+    ms = lambda *values: [value * 10**6 for value in values]
+    if timing_verdict(ms(16, 17, 18), ms(430, 440, 450), ms(16, 16.5, 17))["failures"]:
+        fail("timing gate refused a tie within noise")
+    if len(timing_verdict(ms(16, 17, 18), ms(30, 31, 32), ms(16, 16.5, 17))["failures"]) != 1:
+        fail("timing gate accepted a skip not materially faster than leased")
+    if len(timing_verdict(ms(30, 30.5, 31), ms(430, 440, 450), ms(16, 16.5, 17))["failures"]) != 1:
+        fail("timing gate accepted a skip slower than plain beyond noise")
+    if timing_verdict(ms(16, 17), ms(430, 440, 450), ms(16, 16.5, 17))["failures"] != ["insufficient timing samples"]:
+        fail("timing gate accepted too few samples")
+
+
+def measure_skip_timing(runner: Runner) -> dict:
+    """Three skips (`oxide run -- b`, zero children), three leased no-op runs
+    (`oxide run --rebuild -- b`) and, after one warm-up, three bare
+    `cargo build --profile oxide-quick` no-ops on the same fixture, profile,
+    compiler and config, in a private target directory. Every sample uses the
+    same preexec spawn path; wall times are `perf_counter_ns` around the
+    request. Raw samples and exits are kept."""
+    nest = os.path.join(runner.parent, "checkouts", "timing")
+    repo = os.path.join(nest, "repo")
+    write_fixture(nest, SKIP_FIXTURE)
+    commit_lock(runner, repo)
+    case = SkipCase(runner, repo)
+    samples = []
+    case.builds("timing setup", ["--", "a"], "skip v1 old 5 - a")
+    skip = []
+    for _ in range(3):
+        ns = case.skips("timing skip", ["--", "b"], "skip v1 old 5 - b")
+        skip.append(ns)
+        samples.append({"kind": "skip", "ns": ns, "exit": 0, "children": 0})
+    leased = []
+    for _ in range(3):
+        ns, code, stdout, stderr = case.run("timing leased", ["--rebuild", "--", "b"], None, None, same_spawn)
+        expect(code, 0, "timing leased", stderr)
+        if SKIP_LINE in stderr or stdout != "skip v1 old 5 - b":
+            fail(f"timing leased sample did not build and run: {stdout!r} {stderr[-400:]!r}")
+        leased.append(ns)
+        samples.append({"kind": "leased", "ns": ns, "exit": code})
+    plain_target = os.path.join(runner.parent, "timing-plain")
+    plain_env = runner.environment({**QUICK_PROFILE_ENVIRONMENT, "CARGO_TARGET_DIR": plain_target})
+    plain = []
+    for n in range(4):
+        ns, code, _, stderr = timed(
+            ["cargo", "build", "--offline", "-q", "--profile", "oxide-quick"], repo, plain_env, same_spawn
+        )
+        expect(code, 0, f"bare cargo build {n}", stderr)
+        if n:
+            plain.append(ns)
+            samples.append({"kind": "plain", "ns": ns, "exit": code})
+    shutil.rmtree(plain_target)
+    return {"skip_ns": skip, "leased_ns": leased, "plain_ns": plain, "samples": samples}
+
+
+def run_skip_main() -> int:
+    """The focused `oxide run` fast-path proof: one fresh 128 MiB APFS pool,
+    300 s from admission including product staging, 512 MiB scratch."""
+    global STARTED
+    STARTED = time.monotonic()
+    prove_timing_verdict()
+    if sys.platform != "darwin":
+        fail("the bounded APFS run-skip proof requires macOS")
+    root = scratch_root()
+    free = host_free_bytes(root)
+    if free < HOST_RESERVE_BYTES:
+        fail(f"host free {free} is below the 20 GiB reserve")
+    parent = os.path.join(root, "oxide-run-skip")
+    os.makedirs(parent, mode=0o700, exist_ok=False)
+    executables = build_binaries()
+    print(f"oxide product staging: {time.monotonic() - STARTED:.1f} s (host Cargo home)")
+    runner = Runner(executables["oxide"], executables["oxide-storage-lease"], parent, skip=True)
+    code, _, stderr = runner.run(
+        runner.parent,
+        ["--pool", runner.pool, "init", "--cap-bytes", str(IMAGE_BYTES), "--image-bytes", str(IMAGE_BYTES)],
+        program=runner.lease,
+    )
+    expect(code, 0, "pool init", stderr)
+    try:
+        measured = measure_skip_timing(runner)
+        verdict = timing_verdict(measured["skip_ns"], measured["leased_ns"], measured["plain_ns"])
+        print("oxide-run-skip-timing-json: " + json.dumps({"verdict": verdict, **measured}, sort_keys=True))
+        if verdict["failures"]:
+            fail(f"no-go: fixed timing gate failed: {'; '.join(verdict['failures'])}; scratch retained at {parent}")
+        free = host_free_bytes(parent)
+        if free < HOST_RESERVE_BYTES:
+            fail(f"host free {free} fell below the 20 GiB reserve")
+        evidence = prove_skip_cases(runner)
+    except Exception:
+        print(f"oxide run-skip proof retained its owned scratch at {parent}", file=sys.stderr)
+        raise
+    owned = tree_bytes(parent, True)
+    if owned > SCRATCH_LIMIT_BYTES:
+        fail(f"owned fixture scratch {owned} exceeds 512 MiB")
+    payload = os.path.join(runner.pool, "payload")
+    detach = subprocess.run(["/usr/bin/hdiutil", "detach", payload], capture_output=True, text=True, timeout=60)
+    if detach.returncode:
+        fail(f"detach failed after positive completion: {detach.stderr}")
+    elapsed = time.monotonic() - STARTED
+    shutil.rmtree(parent)
+    ms = lambda values: ", ".join(f"{value / 1e6:.3f}" for value in values)
+    print(
+        f"oxide run-skip proof held: {elapsed:.0f} s, owned scratch {owned // (1024 * 1024)} MiB; "
+        f"record {evidence['record_inputs']} inputs ({evidence['record_absent']} absent); "
+        f"skip [{ms(measured['skip_ns'])}] ms, leased [{ms(measured['leased_ns'])}] ms, "
+        f"bare cargo build [{ms(measured['plain_ns'])}] ms, noise {verdict['noise_ns'] / 1e6:.3f} ms: "
+        "part 1 pass, part 2 pass (fixture only, no real-world claim)"
+    )
+    return 0
+
+
+
 def main() -> int:
     global STARTED
     parent = os.path.join(scratch_root(), "oxide-cli")
@@ -2318,6 +2792,10 @@ def main() -> int:
 
 if __name__ == "__main__":
     try:
+        if sys.argv[1:] == ["--run-skip"]:
+            sys.exit(run_skip_main())
+        if sys.argv[1:]:
+            fail(f"unknown arguments {sys.argv[1:]}")
         sys.exit(main())
     except Exception:
         traceback.print_exc()

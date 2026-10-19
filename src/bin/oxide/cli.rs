@@ -164,6 +164,10 @@ pub fn parse_leased(command: &str, args: &[OsString]) -> Result<Invocation, Stri
             release = true;
             continue;
         }
+        // `run --rebuild` only bypasses the no-op fast path.
+        if run && text == "--rebuild" {
+            continue;
+        }
         if run {
             let format = if text == "--message-format" {
                 Some(
