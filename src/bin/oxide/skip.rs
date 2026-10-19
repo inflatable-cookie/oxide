@@ -834,20 +834,14 @@ fn workspace_dirs(checkout: &Path) -> Result<Vec<PathBuf>, String> {
     if text.len() as u64 > MAX_CONFIG_BYTES {
         return Err(format!("{} exceeds 1 MiB", manifest.display()));
     }
-    // A quoted TOML key or pattern can only be spelled differently through
-    // an escape: a backslash refuses rather than being decoded.
-    if text.contains('\\') {
-        return Err(format!("{} contains an escape", manifest.display()));
-    }
-    if !text.contains("members") {
+    let patterns =
+        member_patterns(&text).map_err(|reason| format!("{}: {reason}", manifest.display()))?;
+    let Some(patterns) = patterns else {
         return Ok(Vec::new());
-    }
-    // The walk skips the root `target` (rewritten by every build) and
-    // `.git`, so a pattern whose first path component could match them
-    // refuses: `target`, `.git`, any glob metacharacter there, or a climb.
-    if let Some(found) = reaching_pattern(&text) {
+    };
+    if let Some(pattern) = patterns.iter().find(|pattern| reaches_skipped(pattern)) {
         return Err(format!(
-            "{} may match members under target or .git (`{found}`)",
+            "{} has a member pattern `{pattern}` that may match under target or .git",
             manifest.display()
         ));
     }
@@ -883,48 +877,53 @@ fn workspace_dirs(checkout: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(dirs)
 }
 
-/// The first quoted string whose first path component (after any `./`)
-/// could match the root `target` or `.git`: either name, a glob
-/// metacharacter (`*`, `?`, `[`), a `/../` climb, or a leading `..` followed
-/// by a metacharacter or either name. Any absolute or `~`-prefixed string
-/// refuses, so an absolute path dependency in a root manifest declaring
-/// `members` records nothing either. Multi-line strings refuse whole.
-fn reaching_pattern(text: &str) -> Option<String> {
-    if text.contains("\"\"\"") || text.contains("'''") {
-        return Some("multi-line string".to_owned());
+/// `workspace.members` and `workspace.exclude` of a root manifest, parsed as
+/// TOML at record time only. `None`: no `members`, so membership comes from
+/// the manifests already recorded. A parse error or a non-string entry
+/// refuses.
+fn member_patterns(text: &str) -> Result<Option<Vec<String>>, String> {
+    #[derive(Deserialize)]
+    struct Root {
+        workspace: Option<Workspace>,
     }
-    let mut chars = text.chars();
-    while let Some(quote) = chars.find(|character| *character == '"' || *character == '\'') {
-        let value: String = chars
-            .by_ref()
-            .take_while(|character| *character != quote)
-            .collect();
-        let mut rest = value.as_str();
-        while let Some(stripped) = rest.strip_prefix("./") {
-            rest = stripped;
-        }
-        // Cargo joins each member pattern to the workspace root, so an
-        // absolute one can name any subtree, `target` and `.git` included;
-        // the first-component screen cannot see where it lands. A tilde is
-        // refused alike rather than interpreted.
-        if rest.starts_with(['/', '~']) {
-            return Some(value);
-        }
-        let first = rest.split('/').next().unwrap_or_default();
-        // A climb out of the workspace (a path dependency) only matters
-        // when the rest could wander back into a `target` or `.git`.
-        let climbing = first == ".."
-            && (rest.contains(['*', '?', '[']) || rest.contains("target") || rest.contains(".git"));
-        if first == "target"
-            || first == ".git"
-            || first.contains(['*', '?', '['])
-            || climbing
-            || value.contains("/../")
-        {
-            return Some(value);
-        }
+    #[derive(Deserialize)]
+    struct Workspace {
+        members: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
     }
-    None
+    let root: Root =
+        basic_toml::from_str(text).map_err(|error| format!("cannot parse: {error}"))?;
+    let Some(workspace) = root.workspace else {
+        return Ok(None);
+    };
+    let Some(mut patterns) = workspace.members else {
+        return Ok(None);
+    };
+    patterns.extend(workspace.exclude.unwrap_or_default());
+    Ok(Some(patterns))
+}
+
+/// A decoded member or exclude pattern the walk cannot cover: absolute or
+/// `~` (Cargo joins it to the root as-is; Oxide never normalizes), a
+/// backslash (a glob escape), a first component after any `./` that is
+/// `target` or `.git` or contains `*`, `?` or `[`, a `/../` climb, or a
+/// leading `..` followed by a metacharacter or either name.
+fn reaches_skipped(pattern: &str) -> bool {
+    let mut rest = pattern;
+    while let Some(stripped) = rest.strip_prefix("./") {
+        rest = stripped;
+    }
+    if rest.starts_with(['/', '~']) || pattern.contains('\\') {
+        return true;
+    }
+    let first = rest.split('/').next().unwrap_or_default();
+    let climbing = first == ".."
+        && (rest.contains(['*', '?', '[']) || rest.contains("target") || rest.contains(".git"));
+    first == "target"
+        || first == ".git"
+        || first.contains(['*', '?', '['])
+        || climbing
+        || pattern.contains("/../")
 }
 
 /// Each member manifest's tuple: a regular file strictly older than
@@ -1433,10 +1432,9 @@ mod tests {
         let recorded = tuples(&dirs);
         fs::create_dir_all(root.join("crates/b/pkg/src")).expect("member b");
         assert_ne!(tuples(&dirs), recorded, "a member added under crates/b");
-        // Escapes, and patterns that could reach the skipped target or .git,
-        // refuse.
+        // Patterns the walk cannot cover, as decoded by the TOML parse, and
+        // manifests that do not parse or hold non-strings, refuse.
         for refused in [
-            "[workspace]\n\"m\\u0065mbers\" = [\"crates/*/pkg\"]\n",
             "[workspace]\nmembers = [\"target/crates/*/pkg\"]\n",
             "[workspace]\nmembers = [\"*/pkg\"]\n",
             "[workspace]\nmembers = ['.*/pkg']\n",
@@ -1445,27 +1443,39 @@ mod tests {
             "[workspace]\nmembers = [\"targ[e]t/crates/*/pkg\"]\n",
             "[workspace]\nmembers = ['t?rget/x']\n",
             "[workspace]\nmembers = [\"../ws/targ*/pkg\"]\n",
-            // Absolute and tilde forms: Cargo joins them to the root as-is.
             "[workspace]\nmembers = [\"/private/tmp/ws/target/crates/*/pkg\"]\n",
             "[workspace]\nmembers = [\"/private/tmp/ws/.git/crates/*/pkg\"]\n",
             "[workspace]\nmembers = [\"//private/tmp/ws/target/crates/*/pkg\"]\n",
             "[workspace]\nmembers = ['.//private/tmp/ws/target/crates/*/pkg']\n",
-            "[workspace]\nmembers = [\"././/ws/.git/x\"]\n",
             "[workspace]\nmembers = [\"~/ws/target/crates/*/pkg\"]\n",
-            // An absolute path dependency beside `members`: the documented
-            // conservative limit.
-            "[dependencies]\ndep = { path = \"/opt/dep\" }\n\n[workspace]\nmembers = [\"tool\"]\n",
+            "[workspace]\nmembers = [\"crates/a\"]\nexclude = [\"/abs/x\"]\n",
+            // The review counterexample: an apostrophe in a comment.
+            "[workspace]\nmembers = [ # don't\n  \"/private/tmp/ws/target/crates/*/pkg\",\n]\n",
+            "[workspace]\nmembers = [ # \"quoted\" and 'single'\n  \"~/x\",\n]\n",
+            // Escaped key decoded to `members`, escaped absolute value.
+            "[workspace]\n\"m\\u0065mbers\" = [\"\\u002Fabs/target/*\"]\n",
+            "[workspace]\nmembers = [\"crates\\\\x\"]\n",
+            // Malformed and non-string.
+            "[workspace]\nmembers = [\"crates/*\"\n",
+            "[workspace]\nmembers = [1]\n",
+            "[workspace]\nmembers = \"crates/*\"\n",
         ] {
             fs::write(root.join("Cargo.toml"), refused).expect("root manifest");
             assert!(workspace_dirs(&root).is_err(), "{refused}");
         }
-        // The proof fixture's root: a member and an outside path dependency.
-        fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname = \"app\"\n\n[dependencies]\noutside = { path = \"../outside\" }\n\n[workspace]\nmembers = [\"tool\"]\n",
-        )
-        .expect("fixture root");
-        assert!(workspace_dirs(&root).is_ok());
+        // Parsed comments, quoted keys and multiline arrays stay eligible
+        // when the decoded patterns are safe.
+        for eligible in [
+            "[workspace]\n\"m\\u0065mbers\" = [\"crates/*/pkg\"]\n",
+            "[workspace]\nmembers = [ # don't \"stop\"\n  'crates/*/pkg', # it's fine\n]\nexclude = [\"crates/b\"]\n",
+            "[package]\nname = \"app\"\n\n[dependencies]\noutside = { path = \"../outside\" }\ndep = { path = \"/opt/dep\" }\n\n[workspace]\nmembers = [\"tool\"]\n",
+        ] {
+            fs::write(root.join("Cargo.toml"), eligible).expect("root manifest");
+            assert!(
+                workspace_dirs(&root).is_ok_and(|dirs| dirs.contains(&root.join("crates/b/pkg"))),
+                "{eligible}"
+            );
+        }
         // Without `members`, membership is manifest-driven: nothing to walk.
         fs::write(root.join("Cargo.toml"), "[workspace]\n").expect("plain root");
         assert_eq!(workspace_dirs(&root), Ok(Vec::new()));

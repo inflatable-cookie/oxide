@@ -18,7 +18,11 @@ The unpublished root package uses Rust edition 2021 and declares
 names remain subject to [Q-005](questions.md#q-005--what-names-are-safe-to-publish).
 It contains a Unix-only local storage prototype, the unpublished
 `oxide-storage-lease` and `oxide` binaries, and pins `sha2` 0.10.9 for
-persisted lease-token hashes. This does not establish production host support.
+persisted lease-token hashes. It pins `basic-toml` 0.1.10 (serde-only, no
+other transitive crate) so the `run` fast path can parse the workspace root
+manifest's `members` and `exclude` as real TOML when it records a key; a
+lexical screen proved unsound against comments and quoted keys. The skip
+itself never parses. This does not establish production host support.
 
 The reviewed design selects Cargo build-dir redirection as the smallest
 mechanism to qualify later. That setting is stable from Cargo 1.91; the pinned

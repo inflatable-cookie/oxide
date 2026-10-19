@@ -36,7 +36,7 @@ pool; also reported on the APFS pool). Last, one fresh private CARGO_HOME
 proves the status Cargo home line and `clean --cargo-cache`: refusals, a
 cleanup that ran through the closed proxy with no connection, Cargo's lock
 skip and a closed-proxy denial an owned control listener never sees. Setup
-downloads exactly one tiny archive (cfg-if 1.0.0); nothing else may use the
+copies one named cached archive (cfg-if 1.0.0) offline; nothing may use the
 network. The scratch is removed only after positive completion. Before any pool
 exists, `init` / `new` adoption runs on tiny scratch directories (90 s,
 64 MiB scratch) and must leave the pool uncreated. These cases run with
@@ -2033,6 +2033,12 @@ def prove_pool_cap(runner: Runner, app: str) -> None:
     print("oxide pool cap: 64 MiB applied on creation; 128 MiB reported and not applied to the existing pool")
 
 
+# The named cached inputs the Cargo-home case copies; nothing is downloaded.
+CFG_IF_INPUTS = (
+    "registry/index/index.crates.io-1949cf8c6b5b557f/config.json",
+    "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/cf/g-/cfg-if",
+    "registry/cache/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.0.crate",
+)
 CFG_IF_CHECKSUM = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
 
@@ -2090,7 +2096,7 @@ class Listener:
 
 def prove_cargo_cache(runner: Runner) -> None:
     """Cargo home reporting and `clean --cargo-cache` on one fresh private
-    CARGO_HOME. Setup downloads exactly one tiny archive (cfg-if 1.0.0);
+    CARGO_HOME. Setup copies one named cached archive (cfg-if 1.0.0) offline;
     every later Cargo HTTP request goes through Oxide's closed proxy."""
     root = os.path.join(runner.parent, "cache")
     home = os.path.join(root, "cargo-home")
@@ -2159,12 +2165,22 @@ def prove_cargo_cache(runner: Runner) -> None:
     refused(quoted, "Cargo.lock source git+ssh://", "single-quoted SSH git source")
     refused(custom, f"Cargo config file {custom}/.cargo/config.toml exists", "custom source")
 
-    # Setup: the one allowed download into the private home.
+    # Setup, offline: copy exactly the named cached cfg-if 1.0.0 archive and
+    # index inputs into the private home, then let Cargo register them
+    # offline. Nothing is downloaded; itoa stays absent for the denial case.
     write_fixture(good, {"Cargo.lock": "version = 4\n\n" + cfg_if + lock_package("cache-good", "0.1.0", deps=["cfg-if"])})
+    host_home = os.environ.get("CARGO_HOME") or os.path.join(os.path.expanduser("~"), ".cargo")
+    for relative in CFG_IF_INPUTS:
+        source = os.path.join(host_home, relative)
+        if not os.path.isfile(source):
+            fail(f"named cache input missing, no download: {relative}")
+        target = os.path.join(home, relative)
+        os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+        shutil.copyfile(source, target)
     fetched = subprocess.run(
-        ["cargo", "fetch", "--locked"], cwd=good, env=env, capture_output=True, text=True, timeout=min(90, remaining())
+        ["cargo", "fetch", "--locked", "--offline"], cwd=good, env=env, capture_output=True, text=True, timeout=min(90, remaining())
     )
-    expect(fetched.returncode, 0, "setup fetch (cfg-if 1.0.0)", fetched.stderr)
+    expect(fetched.returncode, 0, "offline setup fetch (cfg-if 1.0.0)", fetched.stderr)
     archives = []
     for current, _, files in os.walk(os.path.join(home, "registry", "cache")):
         archives += [os.path.join(current, name) for name in files if name.endswith(".crate")]
@@ -2175,7 +2191,7 @@ def prove_cargo_cache(runner: Runner) -> None:
         digest = hashlib.sha256(handle.read()).hexdigest()
     if digest != CFG_IF_CHECKSUM:
         fail(f"cfg-if archive sha256 {digest}")
-    print(f"oxide cargo-cache setup: 1 archive, cfg-if 1.0.0 from crates.io, {os.path.getsize(archives[0])} bytes, sha256 {digest}")
+    print(f"oxide cargo-cache setup: 1 archive, cfg-if 1.0.0 copied from the host cache offline, {os.path.getsize(archives[0])} bytes, sha256 {digest}")
 
     refused(good, "CARGO_NET_GIT_FETCH_WITH_CLI is set: net.git-fetch-with-cli", "git-fetch-with-cli", {"CARGO_NET_GIT_FETCH_WITH_CLI": "true"})
     write_fixture(ssh, {"Cargo.lock": "version = 4\n\n" + cfg_if + lock_package("cache-ssh", "0.1.0", deps=["cfg-if"])
@@ -2799,14 +2815,34 @@ def run_skip_main() -> int:
 
 def main() -> int:
     global STARTED
-    parent = os.path.join(scratch_root(), "oxide-cli")
-    os.makedirs(parent, mode=0o700, exist_ok=False)
-    prove_wait_lines()
-    # The proof phase includes staging the product binaries, which uses the
-    # host Cargo home and this repository's cached dependencies.
+    # The clock starts at admission, before any provisioning or staging; the
+    # host reserve is observed before effects.
     STARTED = time.monotonic()
-    executables = build_binaries()
-    print(f"oxide product staging: {time.monotonic() - STARTED:.0f} s (host Cargo home)")
+    root = scratch_root()
+    if sys.platform != "darwin":
+        fail("the bounded APFS oxide proof requires macOS")
+    free = host_free_bytes(root)
+    if free < HOST_RESERVE_BYTES:
+        fail(f"host free {free} is below the 20 GiB reserve")
+    parent = os.path.join(root, "oxide-cli")
+    os.makedirs(parent, mode=0o700, exist_ok=False)
+    peak = {"bytes": 0, "phase": ""}
+
+    def bounded(phase: str) -> None:
+        owned = tree_bytes(parent, True)
+        if owned > peak["bytes"]:
+            peak.update({"bytes": owned, "phase": phase})
+        if owned > SCRATCH_LIMIT_BYTES:
+            fail(f"owned scratch {owned} exceeds 512 MiB after {phase}")
+        free = host_free_bytes(parent)
+        if free < HOST_RESERVE_BYTES:
+            fail(f"host free {free} fell below the 20 GiB reserve after {phase}")
+
+    prove_wait_lines()
+    # Offline product staging under the owned, accounted parent.
+    executables = build_binaries(os.path.join(parent, "staging"))
+    print(f"oxide product staging: {time.monotonic() - STARTED:.0f} s (offline, host Cargo home, owned target)")
+    bounded("staging")
     runner = Runner(executables["oxide"], executables["oxide-storage-lease"], parent)
     app = os.path.join(parent, "checkouts", "app")
     write_fixture(app)
@@ -2814,11 +2850,7 @@ def main() -> int:
         fail("fixture source exceeds 8 MiB")
     prove_usage(runner, app)
     prove_adoption(runner, os.path.join(parent, "adoption"))
-    if sys.platform != "darwin":
-        fail("the bounded APFS oxide proof requires macOS")
-    free = host_free_bytes(parent)
-    if free < HOST_RESERVE_BYTES:
-        fail(f"host free {free} is below the 20 GiB reserve")
+    bounded("adoption")
     commit_lock(runner, app)
     git(app, "init", "--quiet")
     git(app, "add", "-A")
@@ -2830,9 +2862,7 @@ def main() -> int:
         raise
     payload = os.path.join(runner.pool, "payload")
     mounted = tree_bytes(payload, False)
-    owned = tree_bytes(parent, True)
-    if owned > SCRATCH_LIMIT_BYTES:
-        fail(f"owned fixture scratch {owned} exceeds 512 MiB")
+    bounded("native cases")
     detach = subprocess.run(
         ["/usr/bin/hdiutil", "detach", payload], capture_output=True, text=True, timeout=60
     )
@@ -2857,14 +2887,15 @@ def main() -> int:
     except Exception:
         print(f"oxide budget proof retained its owned scratch at {parent}", file=sys.stderr)
         raise
-    owned = max(owned, tree_bytes(parent, True))
-    if owned > SCRATCH_LIMIT_BYTES:
-        fail(f"owned fixture scratch {owned} exceeds 512 MiB")
+    bounded("budget, pool-cap and Cargo-home cases")
     elapsed = time.monotonic() - STARTED
     shutil.rmtree(parent)
+    free = host_free_bytes(root)
+    if free < HOST_RESERVE_BYTES:
+        fail(f"host free {free} fell below the 20 GiB reserve after cleanup")
     print(
-        f"oxide CLI proof held: {elapsed:.0f} s, owned scratch {owned // (1024 * 1024)} MiB "
-        f"(backing allocation included), mounted payload {mounted // (1024 * 1024)} MiB"
+        f"oxide CLI proof held: {elapsed:.0f} s from admission, peak owned scratch {peak['bytes'] // (1024 * 1024)} MiB "
+        f"after {peak['phase']} (staging, temp, copies and backing included), mounted payload {mounted // (1024 * 1024)} MiB"
     )
     return 0
 

@@ -317,22 +317,24 @@ immutability ([vision](../vision.md#product-workflow-direction)).
   - every workspace member's manifest that metadata read for selection, built
     or not (an unbuilt sibling's `default-run` changes `run`'s pick); each
     must be strictly older than a time taken before that query;
-  - when the workspace root manifest mentions `members`, every directory
-    under the workspace root except the root `target` and `.git`: a member
-    glob such as `crates/*/pkg` can match a package added at any depth, so an
-    added member changes a recorded directory. A root manifest containing a
-    backslash (an escaped key or pattern), or whose text could let a pattern
-    reach the skipped `target` or `.git` (a quoted string whose first path
-    component, after any `./`, is `target` or `.git` or contains `*`, `?` or
-    `[`; a leading `..` followed by either name or a metacharacter; a `/../`
-    climb; any absolute or `~`-prefixed quoted string, covering absolute
-    `workspace.members` and `workspace.exclude` entries, which Cargo joins to
-    the root as-is and Oxide never normalizes; or any multi-line string), a
-    directory
-    symlink or more than 4096 directories records nothing. The screen is
-    lexical and conservative, not full Cargo or TOML syntax: an absolute
-    path dependency in a root manifest declaring `members` also records
-    nothing, while a relative one such as `../outside` still records;
+  - when the workspace root manifest declares `workspace.members`, every
+    directory under the workspace root except the root `target` and `.git`:
+    a member glob such as `crates/*/pkg` can match a package added at any
+    depth, including `crates/x/sub` under an existing `crates/x`, so an added
+    member changes a recorded directory. At record time only, the root
+    manifest is parsed as TOML (`basic-toml`); comments, quoted or escaped
+    keys and multi-line arrays are decoded, never scanned as text. A parse
+    error, a non-string or non-array `members`/`exclude`, or a decoded
+    `members` or `exclude` pattern the walk cannot cover records nothing:
+    absolute or `~`-prefixed (Cargo joins it to the root as-is; Oxide never
+    normalizes), a backslash (a glob escape), a first component after any
+    `./` that is `target` or `.git` or contains `*`, `?` or `[`, a `/../`
+    climb, or a leading `..` followed by a metacharacter or either name. A
+    directory symlink or more than 4096 directories also records nothing.
+    Without `members`, membership comes from the manifests already
+    recorded, so nothing is walked. Path dependencies, absolute or relative
+    such as `../outside`, keep their stat-recorded inputs. The skip compares
+    stats only and never parses;
   - `Cargo.lock`;
   - `.cargo/config`, `.cargo/config.toml`, `Cargo.toml`, `rust-toolchain`
     and `rust-toolchain.toml` in the working directory and every ancestor,
