@@ -101,7 +101,11 @@ fn an_ordinary_check_completes_and_cleans_up() {
         "took {:?}",
         run.wall
     );
-    assert!(run.stdout.contains("  medians: same file "), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("  medians: same file "),
+        "{}",
+        run.stdout
+    );
     assert_clean(&run, "ordinary");
 }
 
@@ -135,7 +139,11 @@ fn a_blocked_copy_start_or_removal_cannot_outlive_the_cli() {
     for delay in ["copy:2000", "start:2000", "remove:2000"] {
         // The start delay holds a running slow probe; the others hold a
         // created copy.
-        let script = if delay.starts_with("start") { SLOW } else { QUICK };
+        let script = if delay.starts_with("start") {
+            SLOW
+        } else {
+            QUICK
+        };
         let run = check(
             delay.split(':').next().unwrap_or("delay"),
             script,
@@ -150,7 +158,8 @@ fn a_blocked_copy_start_or_removal_cannot_outlive_the_cli() {
             run.wall
         );
         assert!(
-            run.stdout.contains("result: inconclusive (the 600 ms limit was reached)"),
+            run.stdout
+                .contains("result: inconclusive (the 600 ms limit was reached)"),
             "{delay}: {}",
             run.stdout
         );
