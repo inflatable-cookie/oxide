@@ -1,0 +1,6 @@
+1.98 cargo 8898152 de51d4fade4f31ad8ec405261cc96bedc000d905f98980027610d6e288dbe21b https://static.rust-lang.org/dist/2026-09-03/cargo-1.98.1-aarch64-apple-darwin.tar.xz
+1.98 rustc 48951152 738e3f60114b20550fcf4f8a57c9cea0544239f214709f45594ff3fde327f577 https://static.rust-lang.org/dist/2026-09-03/rustc-1.98.1-aarch64-apple-darwin.tar.xz
+1.98 rust-std 29763340 2de831ef563ce772519a4d18ba2659f0f7428d497ef66dad24b5a35e8f8cd177 https://static.rust-lang.org/dist/2026-09-03/rust-std-1.98.1-aarch64-apple-darwin.tar.xz
+1.99 cargo 8950664 685e563d94db1f003ffa5f5831439eec02569b9950b69867953c8213269c1eaf https://static.rust-lang.org/dist/2026-10-15/cargo-1.99.1-aarch64-apple-darwin.tar.xz
+1.99 rustc 50728492 23948a0a9c162fd2952defb3fb0462c44e8fcfd1a4ab8a274a1e1bdb2cf810a3 https://static.rust-lang.org/dist/2026-10-15/rustc-1.99.1-aarch64-apple-darwin.tar.xz
+1.99 rust-std 30709240 fe79d6ab5a0321de26463999d8c112b8ad3eafbcbcf822d66a2300b45dde1031 https://static.rust-lang.org/dist/2026-10-15/rust-std-1.99.1-aarch64-apple-darwin.tar.xz

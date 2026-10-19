@@ -1,0 +1,83 @@
+
+╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ EFFIGY  /Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-8e12277b-c587-4b0a-b75c-cd365114c2a8 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── v0.14.1+local.3113774 ╯
+
+waiting for QA capacity, position 1
+
+╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ EFFIGY  /Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-8e12277b-c587-4b0a-b75c-cd365114c2a8 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── v0.14.1+local.3113774 ╯
+
+   Compiling version_check v0.9.5
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling typenum v1.20.1
+   Compiling unicode-ident v1.0.26
+   Compiling serde_core v1.0.229
+   Compiling libc v0.2.190
+   Compiling zmij v1.0.23
+   Compiling serde_json v1.0.151
+   Compiling serde v1.0.229
+   Compiling generic-array v0.14.7
+   Compiling itoa v1.0.18
+   Compiling cfg-if v1.0.5
+   Compiling memchr v2.8.3
+   Compiling syn v3.0.7
+   Compiling serdematrix reserve admission: host free 779713 MiB
+matrix builder: cargo 1.97.1 (c980f4866 2026-06-30) | rustc 1.97.1 (8bab26f4f 2026-07-14)
+matrix staging: 5 s (host Cargo home, offline)
+matrix reserve after staging: host free 779637 MiB
+matrix tested: cargo 1.95.0 (f2d3ce0bd 2026-03-21) | rustc 1.95.0 (59807616e 2026-04-14)
+matrix fixture inputs: 2607 bytes
+freshness worktree A cold: {'profile': 'quick', 'strategy': 'build+execute', 'slot': '1', 'warmth': 'cold'} units {'outside:build': False, 'embed:build': False, 'build-script-build:build': False, 'build-script-gen:build': False, 'embed:test': False, 'pathmac:build': False, 'codegen:build': False, 'codegen:test': False, 'buildrs:build': False, 'marker:build': False, 'marker:test': False, 'content:test': False}
+freshness worktree B path change: {'profile': 'quick', 'strategy': 'build+execute', 'slot': '1', 'warmth': 'warm'} units {'outside:build': True, 'embed:build': False, 'build-script-gen:build': False, 'embed:test': False, 'build-script-build:build': False, 'pathmac:build': False, 'codegen:build': False, 'codegen:test': False, 'buildrs:build': False, 'marker:build': False, 'marker:test': False, 'content:test': False}
+freshness worktree A edit: {'profile': 'quick', 'strategy': 'build+execute', 'slot': '1', 'warmth': 'warm'} units {'outside:build': True, 'embed:build': False, 'build-script-gen:build': False, 'build-script-build:build': False, 'embed:test': False, 'pathmac:build': False, 'codegen:build': False, 'codegen:test': False, 'buildrs:build': False, 'marker:build': False, 'marker:test': False, 'content:test': False}
+freshness stale scenario B: {'profile': 'quick', 'strategy': 'build+execute', 'slot': '1', 'warmth': 'warm'} units {'outside:build': True, 'embed:build': False, 'build-script-build:build': False, 'build-script-gen:build': False, 'embed:test': False, 'pathmac:build': False, 'buildrs:build': False, 'codegen:build': False, 'codegen:test': False, 'marker:build': False, 'marker:test': False, 'content:test': False}
+freshness unchanged repeat: {'profile': 'quick', 'strategy': 'build+execute', 'slot': '1', 'warmth': 'warm'} units {'build-script-build:build': True, 'pathmac:build': True, 'outside:build': True, 'build-script-gen:build': True, 'embed:build': True, 'embed:test': True, 'buildrs:build': True, 'marker:build': True, 'codegen:build': True, 'marker:test': True, 'codegen:test': True, 'content:test': True}
+freshness worktree A after commit: {'profile': 'quick', 'strategy': 'build+execute', 'slot': '1', 'warmth': 'warm'} units {'outside:build': True, 'embed:build': False, 'build-script-build:build': False, 'build-script-gen:build': False, 'embed:test': False, 'pathmac:build': False, 'buildrs:build': False, 'codegen:build': False, 'codegen:test': False, 'marker:build': False, 'marker:test': False, 'content:test': False}
+freshness refused gate: {'profile': 'quick', 'strategy': 'build+execute', 'slot': '2', 'warmth': 'cold'} units {'embed:test': False, 'outside:build': False, 'embed:build': False, 'build-script-gen:build': False, 'build-script-build:build': False, 'pathmac:build': False, 'buildrs:build': False, 'codegen:build': False, 'codegen:test': False, 'marker:build': False, 'marker:test': False, 'content:test': False}
+freshness worktree A keeps its slot: {'profile': 'quick', 'strategy': 'build+execute', 'slot': '1', 'warmth': 'warm'} units {'build-script-build:build': True, 'pathmac:build': True, 'build-script-gen:build': True, 'outside:build': True, 'embed:build': True, 'embed:test': True, 'buildrs:build': True, 'marker:build': True, 'codegen:build': True, 'marker:test': True, 'codegen:test': True, 'content:test': True}
+freshness retry after a crash in the gate: {'profile': 'quick', 'strategy': 'build+execute', 'slot': '1', 'warmth': 'warm'} units {'outside:build': True, 'embed:build': False, 'build-script-gen:build': False, 'build-script-build:build': False, 'embed:test': False, 'pathmac:build': False, 'codegen:build': False, 'codegen:test': False, 'buildrs:build': False, 'marker:build': False, 'marker:test': False, 'content:test': False}
+matrix freshness gate held under cargo 1.95.0 (f2d3ce0bd 2026-03-21)
+matrix reserve after freshness: host free 778911 MiB
+matrix build-dir: 4 deps/.fingerprint directories in slots, none in /private/tmp/oxide-cli.ToRB9R/cargo-matrix/gated/a/target
+matrix stray after oxide only: stray Cargo output: none in /private/tmp/oxide-cli.ToRB9R/cargo-matrix/gated/a/target
+matrix dep-info slots: {"build_root_paths":0,"checksums":0,"decoded":24,"environment_entries":0,"files":24,"package_root_paths":28,"refused":[]}
+matrix stray after plain cargo: stray Cargo output: /private/tmp/oxide-cli.ToRB9R/cargo-matrix/gated/c/target holds plain-Cargo deps/ or incremental/ (12 files, 0 MiB); `oxide clean` remov_derive v1.0.229
+   Compiling cpufeatures v0.2.17
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling sha2 v0.10.9
+   Compiling oxide-storage v0.1.0 (/Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-8e12277b-c587-4b0a-b75c-cd365114c2a8)
+    Finished `dev` profile [unoptimized] target(s) in 4.62s
+matrix proof retained its owned scratch at /private/tmp/oxide-cli.ToRB9R/cargo-matrix
+Traceback (most recent call last):
+  File "/Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-8e12277b-c587-4b0a-b75c-cd365114c2a8/scripts/test-oxide-cli.py", line 2527, in <module>
+    sys.exit(main())
+  File "/Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-8e12277b-c587-4b0a-b75c-cd365114c2a8/scripts/test-oxide-cli.py", line 2454, in main
+    return matrix_main(sys.argv[2])
+  File "/Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-8e12277b-c587-4b0a-b75c-cd365114c2a8/scripts/test-oxide-cli.py", line 2430, in matrix_main
+    prove_fallback(runner)
+  File "/Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-8e12277b-c587-4b0a-b75c-cd365114c2a8/scripts/test-oxide-cli.py", line 2368, in prove_fallback
+    fail(f"B reused A's unverified slot: {stderr[-800:]}")
+  File "/Users/tom/.paseo/northstar-queue/workspaces/16c152a62ccb87c9377238d7fe90d68a0a143604f0caaf9577efd2bdb18d5e9a/ns-8e12277b-c587-4b0a-b75c-cd365114c2a8/scripts/test-oxide-cli.py", line 394, in fail
+    raise RuntimeError(message)
+RuntimeError: B reused A's unverified slot: oad/slots/4/build/oxide-quick/deps/codegen-066435c1cc3653af)
+     Running unittests src/lib.rs (/private/tmp/oxide-cli.ToRB9R/cargo-matrix/pool/payload/slots/4/build/oxide-quick/deps/embed-0734bfd16387d8bb)
+     Running unittests src/lib.rs (/private/tmp/oxide-cli.ToRB9R/cargo-matrix/pool/payload/slots/4/build/oxide-quick/deps/marker-39d9f0c8b8c37b26)
+     Running tests/content.rs (/private/tmp/oxide-cli.ToRB9R/cargo-matrix/pool/payload/slots/4/build/oxide-quick/deps/content-8ee7afd7baa5718e)
+es it
+matrix dep-info plain target: {"build_root_paths":0,"checksums":0,"decoded":8,"environment_entries":0,"files":8,"package_root_paths":9,"refused":[]}
+matrix fallback toolchain: cargo 1.94.1 (29ea6fb6a 2026-03-24)
+matrix fallback A: {'profile': 'quick', 'strategy': 'build+execute', 'slot': '3', 'warmth': 'cold'}
+matrix fallback B: {'profile': 'quick', 'strategy': 'build+execute', 'slot': '4', 'warmth': 'cold'}
+   Doc-tests codegen
+   Doc-tests embed
+   Doc-tests marker
+oxide: quick profile, build+execute strategy, slot 4 cold, 1.7s, pool 12 of 127 MiB used (apfs-sparse-image-v1), freshness gate off: cargo 1.94.1 (29ea6fb6a 2026-03-24) is not a Cargo release Oxide verified; the slot stays with this checkout
+
+[error] Task failed
+  task command failed `python3 scripts/test-oxide-cli.py --cargo-matrix 1.95.0` (code=Some(1))
+exit=1

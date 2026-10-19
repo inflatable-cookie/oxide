@@ -255,6 +255,61 @@ compiling checkout's absolute paths in debug info. That is tolerable for
 Stable path remapping needs identical flags across checkouts to avoid
 fingerprint churn. The retired source-map work found no cheap general fix.
 
+## Cargo version matrix
+
+The freshness gate, stray detection and dep-info decoder depend on Cargo
+behaviour, so each is supported only on exact Cargo releases checked against
+pinned source and a fixture proof
+([evidence](../evidence/cargo-version-matrix-091/README.md), oxide#091).
+Oxide itself still builds with 1.97.1. Each pin is the latest stable patch of
+its minor in the official channel manifests on 2026-10-19.
+
+| Release | `cargo -V` prefix | Cargo source pin | Gate | Stray | Dep-info v1 | Proof |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1.95.0 | `cargo 1.95.0 (f2d3ce0bd ` | `f2d3ce0bd7f24a49f8f72d9000448f8838c4e850` | ✓ | ✓ | ✓ | run failed in the shared fallback phase (wrong expectation); every 1.95.0 phase passed first |
+| 1.96.1 | `cargo 1.96.1 (356927216 ` | `356927216a2d746168cf76e5e88cc3f4b58e029d` | ✓ | ✓ | ✓ | pass |
+| 1.97.1 | `cargo 1.97.1 (c980f4866 ` | `c980f4866141969fab6254a680546a277789d6f0` | ✓ | ✓ | ✓ | pass |
+| 1.98.1 | `cargo 1.98.1 (797e8a9bc ` | `797e8a9bca276c1c9f9f738d2a20f484fa4eea9d` | ✓ | ✓ | ✓ | pass |
+| 1.99.1 | `cargo 1.99.1 (5f94df478 ` | `5f94df4789f005f9a352888e8355ffc645b7ed0e` | ✓ | ✓ | ✓ | pass |
+
+Source facts are the same in all five pins:
+
+- `find_stale_file` treats `path_mtime <= reference_mtime` as fresh;
+- local units hash workspace-relative paths;
+- `cargo metadata` uses format 1;
+- the lock refusal and the unknown `-Z` refusal keep their wording;
+- `build.build-dir` is stable;
+- the default layout keeps `<profile>/deps`, `incremental` and
+  `.fingerprint`, and the unit-grouped layout still needs
+  `-Zbuild-dir-new-layout`;
+- encoded dep-info keeps marker `01 00 00 00 ff`, version 1.
+
+Each `effigy rust:cargo-matrix:<release>` proof ran these phases under the
+tested Cargo:
+
+- the two-worktree gate scenario;
+- effective build-dir: no intermediates in the checkout `target/`;
+- `none` from `oxide status` after Oxide alone, and stray output reported
+  after a plain `cargo check`;
+- the shipped decoder over every slot and plain-target `dep-*` file, with
+  none refused;
+- a fallback phase on installed 1.94.1.
+
+Fallback for any other Cargo, older, newer, another patch (1.96.0, 1.97.0)
+or a rebuilt one. The table is `VERIFIED_CARGO` in `freshness.rs`.
+
+- **Freshness gate.** A new slot records an affine build: only that checkout
+  reuses it, under Cargo's own checks, and the summary says `freshness gate
+  off`. A content slot that needs refreshing is refused, and the command
+  builds cold. An unchanged repeat in the same checkout runs no
+  version-sensitive step, so it skips the `cargo -V` check.
+- **Stray detection.** Intermediates it finds are reported. Finding none
+  reads `unknown`, because another layout may keep them elsewhere.
+- **Dep-info decoder.** Any other marker or version is refused, as before.
+
+Slot compatibility already includes `rustc -vV`, so releases never share a
+slot. A new Cargo release needs this check before it joins the table.
+
 ## What one command does (local executor)
 
 1. Resolve the workspace (`cargo locate-project --workspace`), identity,
@@ -348,7 +403,9 @@ explicit `recover` unless they adopt it.
   It reports pool and slot use (each slot's file names, distinct inodes and
   allocation counted once per inode), the Cargo home's allocation, and stray
   output: a checkout `target/` holding `deps/` or `incremental/` was built by
-  plain Cargo. Reclaiming that space is an explicit command; live cleanup
+  plain Cargo. Finding none reads `none` only under a
+  [verified Cargo release](#cargo-version-matrix); otherwise it reads
+  `unknown`. Reclaiming that space is an explicit command; live cleanup
   still needs scoped approval. Nothing inside a slot is ever deleted.
 - `OXIDE_POOL_CAP` sets a new pool's cap; `oxide clean --cargo-cache` asks
   Cargo for its own home cleanup ([Cargo home hygiene](#cargo-home-hygiene)).
@@ -543,7 +600,8 @@ hand-annotated upstream-bytes and refusal tests, unchanged limits (16 MiB
 input, 32768 references, 2048-byte strings) and its own two-variant refusal.
 The conversion was retired. No command calls it: the W-8 gate works from Git
 content alone. Its per-unit file and environment lists could later name the
-inputs outside Git that the gate does not cover.
+inputs outside Git that the gate does not cover. Its format is
+[verified](#cargo-version-matrix) unchanged for Cargo 1.95.0 to 1.99.1.
 
 ## Foundation slice
 
