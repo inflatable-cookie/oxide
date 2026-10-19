@@ -64,6 +64,10 @@ Oxide says the gate refused a slot, it builds cold instead; that is safe.
 - `oxide status`: pool use, slots (size and file counts), waiting commands,
   plain-Cargo output in this checkout's `target/`, and the Cargo home's size.
   It never creates the pool.
+- `oxide status --launch-check` (macOS) times a new executable's first launch
+  against a re-run, in about a second. Above 30 ms it names the app to add
+  under Privacy & Security → Developer Tools. It changes no setting; leave
+  that change to the user, and never disable Gatekeeper.
 - `oxide clean --cargo-cache` asks Cargo to clean its own download cache once,
   with network refused. Use it when the Cargo home is large and builds always
   run offline. It refuses (and says why) for config files, git or custom

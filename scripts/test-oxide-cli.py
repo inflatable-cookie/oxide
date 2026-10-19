@@ -39,8 +39,11 @@ skip and a closed-proxy denial an owned control listener never sees. Setup
 downloads exactly one tiny archive (cfg-if 1.0.0); nothing else may use the
 network. The scratch is removed only after positive completion. Before any pool
 exists, `init` / `new` adoption runs on tiny scratch directories (90 s,
-64 MiB scratch) and must leave the pool uncreated. Not a benchmark and not
-full QA.
+64 MiB scratch) and must leave the pool uncreated. Also before the pool, one
+macOS `status --launch-check` run under a Cargo that refuses and records any
+call: bounded time, its temporary copies removed, well-formed output and no
+Cargo; the hidden probe mode alone gets the same refused-Cargo control. No
+penalty threshold is asserted. Not a benchmark and not full QA.
 """
 from __future__ import annotations
 
@@ -739,6 +742,119 @@ def prove_usage(runner: Runner, cwd: str) -> None:
     expect(code, 1, "unknown backend tag", stderr)
     if os.path.lexists(runner.pool):
         fail("usage, refusals or status created the pool")
+
+
+# Records any call and refuses: the launch check must never start Cargo.
+REFUSED_CARGO = """#!/bin/sh
+echo "$*" >> "$OXIDE_FIXTURE_CARGO_CALLED"
+exit 97
+"""
+LAUNCH_LIMIT_MS = 3000
+
+
+def launch_samples(line: str, label: str) -> list:
+    match = re.fullmatch(r"(?:none|(\d+\.\d ms(?:, \d+\.\d ms)*))", line)
+    if not match:
+        fail(f"launch check {label} runs are malformed: {line!r}")
+    return [round(float(value[:-3]) * 10) for value in line.split(", ")] if match.group(1) else []
+
+
+def prove_launch_check(runner: Runner, cwd: str) -> None:
+    refused = os.path.join(runner.parent, "refused-cargo")
+    os.makedirs(refused, mode=0o700)
+    shim = os.path.join(refused, "cargo")
+    with open(shim, "w", encoding="utf-8") as handle:
+        handle.write(REFUSED_CARGO)
+    os.chmod(shim, 0o700)
+    called = os.path.join(runner.parent, "refused-cargo.log")
+    extra = {"PATH": refused + os.pathsep + runner.env["PATH"], "OXIDE_FIXTURE_CARGO_CALLED": called}
+    # Positive control: the shim sees a Cargo call.
+    code, _, _ = runner.run(cwd, ["version"], extra)
+    expect(code, 97, "refused-Cargo control")
+    if not os.path.exists(called):
+        fail("the refused Cargo recorded nothing")
+    os.unlink(called)
+    # The hidden probe mode exits before any other work.
+    code, stdout, stderr = runner.run(cwd, ["__oxide-launch-probe"], extra)
+    expect(code, 0, "hidden launch probe", stderr)
+    if stdout or stderr or os.path.exists(called):
+        fail(f"the hidden probe printed or started Cargo: {stdout!r} {stderr!r}")
+    before = set(os.listdir(runner.tmp))
+    started = time.monotonic()
+    code, stdout, stderr = runner.run(cwd, ["status", "--launch-check"], extra)
+    wall_ms = (time.monotonic() - started) * 1000
+    expect(code, 0, "status --launch-check", stderr)
+    if os.path.exists(called):
+        fail(f"status --launch-check started Cargo: {read_text(called)!r}")
+    left = set(os.listdir(runner.tmp)) - before
+    if left:
+        fail(f"status --launch-check left temporary files: {sorted(left)}")
+    if stderr:
+        fail(f"status --launch-check wrote to stderr: {stderr!r}")
+    if sys.platform != "darwin":
+        if stdout.strip() != "launch check: not applicable (it measures a macOS first-launch cost)":
+            fail(f"launch check off macOS: {stdout!r}")
+        return
+    lines = stdout.splitlines()
+    if len(lines) < 5 or not lines[0].startswith("launch check: "):
+        fail(f"launch check output is malformed: {stdout!r}")
+    same = re.fullmatch(r"  same file: warm-up (none|\d+\.\d ms); runs (.*)", lines[1])
+    fresh = re.fullmatch(r"  fresh copies: runs (.*)", lines[2])
+    took = re.fullmatch(r"  took (\d+) ms of a 3000 ms limit; temporary copies removed", lines[3])
+    if not (same and fresh and took):
+        fail(f"launch check output is malformed: {stdout!r}")
+    elapsed_ms = int(took.group(1))
+    # The reported span is the probe's own; the wall time adds one process
+    # start of an already-assessed oxide.
+    if elapsed_ms > LAUNCH_LIMIT_MS or wall_ms > LAUNCH_LIMIT_MS + 1000:
+        fail(f"launch check exceeded its bound: reported {elapsed_ms} ms, wall {wall_ms:.0f} ms")
+    same_runs = launch_samples(same.group(2), "same-file")
+    fresh_runs = launch_samples(fresh.group(1), "fresh-copy")
+    if lines[4].startswith("  result: inconclusive"):
+        if len(lines) != 5:
+            fail(f"an inconclusive launch check printed more: {stdout!r}")
+        outcome = "inconclusive"
+    else:
+        medians = re.fullmatch(
+            r"  medians: same file (\d+\.\d) ms, fresh copy (\d+\.\d) ms, difference (-?\d+\.\d) ms",
+            lines[4],
+        )
+        if not medians or same.group(1) == "none" or len(same_runs) != 5 or len(fresh_runs) != 5:
+            fail(f"launch check medians without complete samples: {stdout!r}")
+        # Medians come from the raw samples (tenths of a millisecond here).
+        for printed, runs in ((medians.group(1), same_runs), (medians.group(2), fresh_runs)):
+            if round(float(printed) * 10) != sorted(runs)[2]:
+                fail(f"launch check median {printed} is not the median of {runs}")
+        difference = float(medians.group(3))
+        result = lines[5] if len(lines) > 5 else ""
+        if result.startswith("  result: no material penalty"):
+            outcome = "no material penalty"
+            if difference > 30 or len(lines) != 6:
+                fail(f"launch check below threshold is malformed: {stdout!r}")
+        elif result.startswith("  result: penalty "):
+            outcome = "penalty"
+            advice = "\n".join(lines[6:])
+            for needed in (
+                "cause: inferred, not measured",
+                "launching app",
+                "Privacy & Security → Developer Tools",
+                "may need a restart",
+                "has not checked or changed any setting",
+                "never disable Gatekeeper globally",
+            ):
+                if needed not in advice:
+                    fail(f"launch check advice lacks {needed!r}: {stdout!r}")
+            if difference <= 30:
+                fail(f"launch check advised below the threshold: {stdout!r}")
+        else:
+            fail(f"launch check result is malformed: {stdout!r}")
+    if os.path.lexists(runner.pool):
+        fail("status --launch-check created the pool")
+    print(
+        f"oxide launch check: {outcome}, reported {elapsed_ms} ms, wall {wall_ms:.0f} ms, "
+        f"same-file runs {same.group(2)}, fresh-copy runs {fresh.group(1)}; no Cargo started, "
+        "temporary copies removed"
+    )
 
 
 def snapshot(root: str) -> dict:
@@ -2467,6 +2583,7 @@ def main() -> int:
     if tree_bytes(app, False) > SOURCE_LIMIT_BYTES:
         fail("fixture source exceeds 8 MiB")
     prove_usage(runner, app)
+    prove_launch_check(runner, app)
     prove_adoption(runner, os.path.join(parent, "adoption"))
     if sys.platform != "darwin":
         fail("the bounded APFS oxide proof requires macOS")
