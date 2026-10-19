@@ -362,6 +362,28 @@ Tom's ruling, 2026-10-19 ("Yes - if it works then we should verify coverage for 
 - Once it works, Oxide's version-sensitive behaviour must be qualified for every stable Rust from 1.95 onward, with side-by-side toolchain installs for that matrix. Versions outside the qualified range disable version-sensitive features rather than guessing.
 - Tom approved the normal-path overhead round (like-for-like gate) and dogfooding on current main on 2026-10-19 with "Approve". Dogfooding no longer waits for the overhead work; later improvements reach the installed binary through its reinstall selector.
 
+The appointed product architect clarified the boundary on 2026-10-19 after
+the overhead round's independent fixed-gate no-go. Preserve its profiles,
+author and reviewer samples, cache-order finding, crash-fixture race and
+measurement-accounting limits as negative knowledge only. Do not merge or
+install that candidate, retry or rescore its failed gate, or import its
+toolchain cache. A docs-only correction and one evidence-only Sol review
+authenticate the negative record; they supply no product acceptance. Further
+normal-path overhead work waits for ordinary dogfood evidence, with no new
+attempt authorized by this disposition.
+
+The already-approved metadata skip scope instead owns its stat capture on
+current shipped main. Its only implementation donors are the earlier skip
+code and regressions at `0f46b87` and `b313e9b`; nothing from the rejected
+overhead candidate is an input. During a normal leased build, capture the
+toolchain-resolution files, rustup settings, relevant environment and
+resolved Cargo/compiler binaries. Observe the compiler's identity before
+its query/use and verify the same generation afterwards; any change means
+no skip record. A successful skip still starts zero child processes. The
+existing 60/20 limits, two proofs per side and fixed two-part skip gate stay
+unchanged; reader and version qualification follow this implementation.
+
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
