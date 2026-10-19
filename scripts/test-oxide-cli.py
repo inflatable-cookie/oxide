@@ -2363,9 +2363,10 @@ def prove_fallback(runner: Runner) -> None:
     expect(code, 0, "fallback B", stderr)
     second = summary(stderr, "fallback B")
     print(f"matrix fallback B: {second}")
-    refused = "freshness gate refused another checkout's slot (the slot holds another checkout's unshared build)"
-    if refused not in stderr or second["warmth"] != "cold" or second["slot"] == first["slot"]:
-        fail(f"B reused A's unverified slot: {stderr[-800:]}")
+    # Affine slots are never offered to another checkout: B builds cold on
+    # its own slot, which also stays affine.
+    if note not in stderr or second["warmth"] != "cold" or second["slot"] == first["slot"]:
+        fail(f"B reused A's unverified slot or shared its own: {stderr[-800:]}")
     # An existing target with no plain-Cargo intermediates in it.
     os.makedirs(os.path.join(a, "target"), exist_ok=True)
     line = stray_line(old, a, "unverified Cargo")
