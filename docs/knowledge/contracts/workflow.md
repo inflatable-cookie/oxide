@@ -3,8 +3,9 @@
 Status: product design under Tom's
 [2026-10-18 workflow direction and bounded implementation authority](../vision.md#product-workflow-direction).
 The foundation core and `init` / `new` adoption are implemented as the
-unpublished, uninstalled `oxide` binary; the agent skill exists as repository
-source only. [Implemented foundation core](#implemented-foundation-core)
+unpublished `oxide` binary, installed for Tom only to
+[dogfood](#dogfooding-in-oxides-repository) in this repository; the agent
+skill exists as repository source only. [Implemented foundation core](#implemented-foundation-core)
 states exactly what ships, including the cross-checkout freshness gate, the
 budget-only directory backend and [Cargo home hygiene](#cargo-home-hygiene). Non-build run strategies and the
 privileged `linux-image-v1` backend are not implemented, and nothing has run
@@ -429,6 +430,83 @@ Block rules, as implemented:
   line, and names lines that run `cargo` as a command word; comments,
   `cargo-*` binaries and `$CARGO` do not count.
 
+## Dogfooding in Oxide's repository
+
+Approved by Tom on 2026-10-19 ([vision](../vision.md#product-workflow-direction)).
+Oxide's own repository is the only adopter. No skill, other project, consumer
+or global Cargo configuration is involved.
+
+- **Installed binary.** `~/.local/bin/oxide` is a regular file built with
+  `cargo build --release --locked --offline --bin oxide` from a commit on
+  pushed `origin/main`, never from a branch. `effigy oxide:install`
+  authenticates the pin with `git ls-remote`, builds it from `git archive` in
+  a private `/private/tmp/oxide-install.*` staging directory, installs through
+  a sibling temporary file and `link` (no clobber), and writes a JSON receipt
+  under `~/.local/state/oxide/install/`. The receipt records pin, tree,
+  toolchain, build command, path, owner, mode, size, time and SHA-256. It
+  refuses when any `oxide` is on `PATH` or the destination exists, and when
+  any directory from `HOME` to `~/.local/bin` is a link, is owned by another
+  user or (below `HOME`) is group or world writable. It writes only through
+  the opened directory, with no-follow opens.
+- **Updating.** After a reviewed merge, the planner runs
+  `effigy oxide:reinstall`. It replaces only a regular, user-owned binary
+  whose hash matches the newest receipt. Directly before the rename it
+  rechecks that the destination is still that file (type, owner, inode and
+  hash) and refuses otherwise. Earlier receipts are kept. `OXIDE_INSTALL_PIN=<commit>` selects an older commit on main, for
+  example to roll back. Effigy does not forward selector arguments, so the
+  pin travels in the environment.
+- **Default pool.** The first leased command created
+  `~/Library/Caches/oxide/pool` under the shipped rules: a 24 GiB
+  `apfs-sparse-image-v1` image, refused below the 20 GiB host reserve.
+- **Selectors.** `rust:compile`, `rust:compile-linux`, `rust:format` and
+  `test rust` call `oxide`. With the default `quick` profile, check and test
+  use line tables rather than `dev`'s full debug info. Focused proof, profile
+  and install selectors call Cargo, because they test or build Oxide itself.
+- **Escapes.** `rust:compile:cargo`, `rust:compile-linux:cargo`,
+  `rust:format:cargo` and `test rust-cargo` keep the plain-Cargo commands.
+  Use them when `oxide` itself is broken. They build into the checkout's
+  `target/` unless `CARGO_TARGET_DIR` points elsewhere, and `oxide init`
+  readiness lists them as plain-Cargo lines by design.
+- **Test supervisor.** `oxide` runs Cargo in its own process group and
+  forwards TERM to it, so killing the supervisor's group alone would miss
+  Cargo. `bounded-test.py` starts the command in a new session; `oxide`'s
+  `setpgid` keeps Cargo, its tests and any child orphaned by Cargo's exit in
+  that session. At the 300-second limit, before reaping its child, it
+  records every process group in the session, TERMs its own group, and
+  after ten seconds KILLs the recorded groups and then its own. It reports
+  any session or group member still alive five seconds later. A process
+  that called `setsid` is outside the session and is not seen.
+- **Fixtures.** `effigy dogfood:scripts:test` proves that escalation,
+  including the orphan whose group leader exited, and
+  the installer's refusals (linked or foreign directories, an existing
+  destination, a destination swapped during the build) on synthetic
+  fixtures. It never builds or installs.
+
+### Rollback
+
+Do not rehearse these steps; they remove the dogfood artifacts.
+
+1. Stop starting Oxide work: switch selectors to the `:cargo` escapes or
+   revert the adoption commit, which restores the plain-Cargo selectors and
+   removes the marked `AGENTS.md` block.
+2. Unlink the binary only if it still matches the newest receipt:
+   `shasum -a 256 ~/.local/bin/oxide` equals its `installed.sha256`. Keep the
+   receipts. A mismatch means an unknown file: leave it and report.
+3. To retire the pool as well, run `oxide status` with Oxide still installed,
+   or `oxide-storage-lease status` on the pool. Every slot must be idle, no
+   command waiting and no recovery pending. A held or unknown holder, group
+   or waiter means stop: preserve and report. Never reset a lease by hand.
+   That CLI has `init`, `lease`, `release`, `recover` and `status`; it has no
+   detach verb.
+4. In `hdiutil info`, find the entry whose `image-path` is
+   `~/Library/Caches/oxide/pool/image.sparseimage` and whose payload mounts
+   at `~/Library/Caches/oxide/pool/payload`. Run an ordinary
+   `hdiutil detach <its /dev/diskN>` without `-force`. If it reports busy,
+   stop and report.
+5. Once detached, the owner may remove `~/Library/Caches/oxide/pool` after
+   checking that its `receipt.json` names that same image and mount point.
+   Removal is explicit owner action, never automatic.
+
 ## Relationship to existing work
 
 Tom approved retiring the earlier machinery on 2026-10-18, on the condition
@@ -597,8 +675,9 @@ Limits:
 
 The unpublished `oxide` binary (`src/bin/oxide/`, `publish = false`) runs the
 local executor on macOS. Its covering proof is `effigy rust:oxide-cli`: tiny
-offline fixture crates on one fresh 128 MiB APFS pool. It is not installed. Its
-one real-project run is the [foundation qualification](#qualification-result)
+offline fixture crates on one fresh 128 MiB APFS pool. Its only installation
+is the [dogfood binary](#dogfooding-in-oxides-repository). Its first
+real-project run is the [foundation qualification](#qualification-result)
 on Oxide's own repository. Its result is partial, not a bounded pass.
 
 - **Classes.** As in [Shape](#shape). Plain passthrough replaces Oxide with

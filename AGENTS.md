@@ -18,11 +18,13 @@ Tom's 2026-10-10 blanket approval in [vision](docs/knowledge/vision.md#authority
 
 ## Effigy command map
 
-- `effigy rust:compile` checks the workspace and all targets with the committed lockfile.
-- `effigy rust:format` checks Rust formatting.
-- `effigy rust:compile-linux` runs `cargo check --locked --offline --target x86_64-unknown-linux-gnu` against the already-installed target. It checks compilation only: no target installation, linking or Linux runtime validation.
+- The ordinary Rust selectors run through the installed `oxide` ([dogfooding](docs/knowledge/contracts/workflow.md#dogfooding-in-oxides-repository)). If `oxide` itself is broken, use the plain-Cargo escapes `rust:compile:cargo`, `rust:compile-linux:cargo`, `rust:format:cargo` and `test rust-cargo`, and report the failure as a dogfood finding.
+- `effigy rust:compile` runs `oxide check --workspace --all-targets --locked`.
+- `effigy rust:format` runs `oxide fmt --all -- --check`, a Cargo passthrough.
+- `effigy rust:compile-linux` runs `oxide check --locked --offline --target x86_64-unknown-linux-gnu` against the already-installed target. It checks compilation only: no target installation, linking or Linux runtime validation.
+- `effigy oxide:install` builds `oxide` from a commit on pushed main and installs it at `~/.local/bin/oxide` with a hash receipt; it refuses any existing `oxide`. `effigy oxide:reinstall` replaces only the receipt-matching binary. Only the planner runs them, after a reviewed merge. `effigy dogfood:scripts:test` proves the installer's refusals and the test supervisor's timeout escalation on synthetic fixtures; it never builds or installs.
 - `effigy rust:profile-light` and `effigy rust:profile-full-debug` are opt-in profile proofs: each verifies the resolved rustc debug settings Cargo passed for workspace, dependency and build-time units and runs the focused backtrace/unwind probe under that profile. They are focused proofs, not benchmarks or an alias for full QA.
-- `effigy test rust` is the named Rust test suite. Do not add a `tasks.test` alias.
+- `effigy test rust` is the named Rust test suite, run as `oxide test`; `effigy test rust-cargo` is its plain-Cargo escape. Do not add a `tasks.test` alias.
 - `effigy docs:check` runs the Northstar link and retired-concept checks plus `git diff --check HEAD`. The link check excludes `docs/knowledge/architecture.md`, whose references to optional sibling repositories are unavailable in a standalone checkout.
 - `effigy build-context:comparison:test` runs synthetic fixtures for the incremental comparison launcher. It never enters the live image or Cargo path.
 - `effigy rust:storage-inventory-cli` builds the unpublished `oxide-storage-inventory` binary and proves the rendered output-byte ceiling on tiny synthetic fixtures. It does not inventory a real project target and is not an alias for full QA.
@@ -56,3 +58,14 @@ Re-enter at task start and coherent batch closeout.
 Preserve unrelated work. A quality audit, no-slop pass, or audit-and-fix request
 is explicit audit intent; never route it through everyday authoring.
 <!-- northstar:rust-quality:end -->
+
+<!-- oxide:begin -->
+## Rust commands: use `oxide`
+
+- Write `oxide` wherever you would write `cargo`: `oxide check`, `oxide test`, `oxide run -- <args>`, `oxide add <crate>`.
+- Profiles: `quick` (default), `--profile debug` for a debugger, `--release`. Oxide places build output, so it refuses `--target-dir`.
+- A `waiting for …` line means another build holds a slot; let it wait. `oxide status` shows the pool, slots and waits.
+- Use `oxide clean`, not `cargo clean`.
+
+Managed by `oxide init`; edits between these markers are replaced.
+<!-- oxide:end -->
