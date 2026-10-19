@@ -384,6 +384,14 @@ existing 60/20 limits, two proofs per side and fixed two-part skip gate stay
 unchanged; reader and version qualification follow this implementation.
 
 
+Supervisor architecture ruling, 2026-10-19, on the #089 skip path after two lexical false negatives in workspace-pattern scanning. This is a design ruling, not implemented behaviour:
+- The skip path does not scan manifest text. At record time only (after a successful normal leased build), it parses the root manifest with a real TOML parser and reads `workspace.members` and `workspace.exclude`.
+- Absolute or `~` patterns make the build ineligible.
+- Every directory a pattern can reach is stat-recorded through bounded recursive discovery with nearest-existing-parent guards.
+- Any parse failure records nothing.
+- At skip time Oxide only compares the recorded stats: an unchanged root manifest implies unchanged patterns.
+- One exact-pinned, dependency-light parser is allowed as a strict-profile exception: `basic-toml` `=0.1.10`, available offline. It must be justified in the implementing PR. Manifests using syntax the parser rejects simply never skip.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
