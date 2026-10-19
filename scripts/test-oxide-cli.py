@@ -2099,7 +2099,18 @@ def prove_cargo_cache(runner: Runner) -> None:
         cfg_if + lock_package("cache-custom", "0.1.0", deps=["cfg-if"]),
         {".cargo/config.toml": '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "sparse+https://mirror.invalid/index/"\n'},
     )
-    for path in (good, deny, ssh, custom):
+    # A stale lock: only crates.io in the lock, an SSH git dependency in the
+    # manifest. A single-quoted lock source is the same route.
+    stale = cache_fixture(
+        root, "cache-stale", 'cfg-if = "=1.0.0"\nremote = { git = "ssh://git@127.0.0.1:9/remote.git" }\n',
+        cfg_if + lock_package("cache-stale", "0.1.0", deps=["cfg-if"]),
+    )
+    quoted = cache_fixture(
+        root, "cache-quoted", 'remote = { git = "ssh://git@127.0.0.1:9/remote.git" }\n',
+        lock_package("cache-quoted", "0.1.0", deps=["remote"])
+        + "[[package]]\nname = \"remote\"\nversion = \"0.1.0\"\nsource = 'git+ssh://git@127.0.0.1:9/remote.git#" + "1" * 40 + "'\n",
+    )
+    for path in (good, deny, ssh, custom, stale, quoted):
         code, _, stderr = call(path, ["init"], offline)
         expect(code, 0, f"adopt {os.path.basename(path)}", stderr)
 
@@ -2111,6 +2122,7 @@ def prove_cargo_cache(runner: Runner) -> None:
 
     refused(good, "Cargo.lock is missing", "missing lockfile")
     refused(ssh, "SSH and other non-HTTP git transports cannot be contained", "SSH git source")
+    refused(quoted, "Cargo.lock source git+ssh://", "single-quoted SSH git source")
     refused(custom, f"Cargo config file {custom}/.cargo/config.toml exists", "custom source")
 
     # Setup: the one allowed download into the private home.
@@ -2135,6 +2147,7 @@ def prove_cargo_cache(runner: Runner) -> None:
     write_fixture(ssh, {"Cargo.lock": "version = 4\n\n" + cfg_if + lock_package("cache-ssh", "0.1.0", deps=["cfg-if"])
                         + lock_package("mine", "0.1.0", "sparse+https://registry.invalid/index/")})
     refused(ssh, "a custom registry the closed proxy is not proven to cover", "custom registry")
+    refused(stale, "Cargo cannot resolve this workspace offline from Cargo.lock", "stale lock with an SSH dependency")
 
     code, stdout, stderr = call(good, ["status"])
     expect(code, 0, "cargo home status", stderr)
@@ -2178,6 +2191,9 @@ def prove_cargo_cache(runner: Runner) -> None:
         code, _, stderr = call(deny, ["clean", "--cargo-cache"], {
             "CARGO_HTTP_PROXY": control, "http_proxy": control, "HTTPS_PROXY": control,
             "https_proxy": control, "ALL_PROXY": control, "CARGO_NET_RETRY": "0",
+            # Debug-only hook: the offline-resolution gate would refuse this
+            # uncached crate first; skipping it lets the fetch meet the proxy.
+            "OXIDE_TEST_SKIP_OFFLINE_RESOLUTION": "1",
         })
     finally:
         listener.close()

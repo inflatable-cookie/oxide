@@ -7,7 +7,7 @@
 //! port, and reports the outcome Cargo's `gc` trace shows. Routes the proxy
 //! cannot contain refuse before Cargo runs.
 
-use crate::{adopt, identity, process, CARGO, MIB};
+use crate::{adopt, freshness, identity, process, CARGO, MIB};
 use oxide_storage::inventory::{inventory_directory, InventoryLimits};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
@@ -175,31 +175,125 @@ fn refuse_environment<'a>(
     None
 }
 
-/// Every source in Cargo.lock must be crates.io or a path (no source line).
+/// Why one Cargo source cannot be contained, or `None` for crates.io.
+fn refuse_source(source: &str) -> Option<&'static str> {
+    if CRATES_IO.contains(&source) {
+        return None;
+    }
+    Some(if let Some(url) = source.strip_prefix("git+") {
+        if url.starts_with("https://") {
+            "git sources are not qualified for the closed proxy"
+        } else {
+            "SSH and other non-HTTP git transports cannot be contained by the closed HTTP proxy"
+        }
+    } else if source.starts_with("registry+") || source.starts_with("sparse+") {
+        "a custom registry the closed proxy is not proven to cover"
+    } else {
+        "an unsupported source kind"
+    })
+}
+
+/// A `source` key's value on one Cargo.lock line: `Some(Ok)` for a plain
+/// basic or literal string, `Some(Err)` for any other spelling, which is
+/// refused rather than guessed.
+fn lock_source(line: &str) -> Option<Result<&str, ()>> {
+    let (key, value) = line.split_once('=')?;
+    let key = key.trim();
+    if !matches!(key, "source" | "\"source\"" | "'source'") {
+        return None;
+    }
+    let value = value.trim();
+    let plain = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .filter(|inner| !inner.contains(['"', '\\']))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|rest| rest.strip_suffix('\''))
+                .filter(|inner| !inner.contains('\''))
+        });
+    Some(plain.ok_or(()))
+}
+
+/// Every source line in Cargo.lock must be crates.io. A screen only: the
+/// authority is Cargo's own offline resolution, [`offline_resolution`].
 fn refuse_lock(text: &str) -> Option<String> {
     for line in text.lines() {
-        let Some(source) = line
-            .trim()
-            .strip_prefix("source = \"")
-            .and_then(|rest| rest.strip_suffix('"'))
-        else {
-            continue;
-        };
-        if CRATES_IO.contains(&source) {
-            continue;
-        }
-        let reason = if let Some(url) = source.strip_prefix("git+") {
-            if url.starts_with("https://") {
-                "git sources are not qualified for the closed proxy"
-            } else {
-                "SSH and other non-HTTP git transports cannot be contained by the closed HTTP proxy"
+        match lock_source(line) {
+            None => {}
+            Some(Err(())) => {
+                return Some(format!(
+                    "Cargo.lock line {:?} spells a source Oxide does not read",
+                    line.trim()
+                ))
             }
-        } else if source.starts_with("registry+") || source.starts_with("sparse+") {
-            "a custom registry the closed proxy is not proven to cover"
-        } else {
-            "an unsupported source kind"
-        };
-        return Some(format!("Cargo.lock source {source}: {reason}"));
+            Some(Ok(source)) => {
+                if let Some(reason) = refuse_source(source) {
+                    return Some(format!("Cargo.lock source {source}: {reason}"));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Cargo's own parse, offline and locked, in the fetch's directory and
+/// environment. It fails when Cargo.lock is stale, when a manifest names a
+/// dependency the lock lacks, or when any source, index entry or package is
+/// not already local, so the online fetch has nothing to resolve or
+/// download that this resolve did not name. Every resolved package must
+/// then come from crates.io or a path.
+fn offline_resolution(cwd: &Path, cargo_home: Option<&Path>) -> Result<(), String> {
+    let mut command = Command::new(CARGO);
+    command
+        .args(["metadata", "--format-version", "1", "--offline", "--locked"])
+        .current_dir(cwd)
+        .env_remove("CARGO_LOG");
+    for name in PROXY_ENVIRONMENT {
+        command.env_remove(name);
+    }
+    if let Some(home) = cargo_home {
+        command.env("CARGO_HOME", home);
+    }
+    let output = freshness::run_cargo(command, freshness::MAX_METADATA_BYTES)?;
+    if !output.status.success() {
+        let error = output
+            .stderr
+            .lines()
+            .find(|line| line.starts_with("error"))
+            .unwrap_or("no error line")
+            .to_owned();
+        return Err(format!(
+            "Cargo cannot resolve this workspace offline from Cargo.lock ({error}); the lock is stale or needs a source, index entry or package that is not already local, and resolving it online could take a route the closed proxy cannot contain"
+        ));
+    }
+    if output.overflow {
+        return Err("cargo metadata output exceeds 64 MiB".to_owned());
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("Cargo metadata is not JSON: {error}"))?;
+    match refuse_resolved(&metadata) {
+        Some(reason) => Err(reason),
+        None => Ok(()),
+    }
+}
+
+/// The first resolved package whose source cannot be contained.
+fn refuse_resolved(metadata: &serde_json::Value) -> Option<String> {
+    let Some(packages) = metadata.get("packages").and_then(|value| value.as_array()) else {
+        return Some("Cargo metadata has no package list".to_owned());
+    };
+    for package in packages {
+        match package.get("source") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(source)) => {
+                if let Some(reason) = refuse_source(source) {
+                    return Some(format!("resolved package source {source}: {reason}"));
+                }
+            }
+            Some(_) => return Some("Cargo metadata has an unreadable package source".to_owned()),
+        }
     }
     None
 }
@@ -412,6 +506,13 @@ pub fn run_cache_clean(args: &[OsString]) -> Result<u8, String> {
     if let Some(reason) = refuse_lock(&text) {
         return Err(refuse(reason));
     }
+    // Debug builds only: the fixture proof skips this gate once, so the
+    // fetch itself meets the closed proxy. Release builds always run it.
+    let skip_gate =
+        cfg!(debug_assertions) && std::env::var_os("OXIDE_TEST_SKIP_OFFLINE_RESOLUTION").is_some();
+    if !skip_gate {
+        offline_resolution(&cwd, None).map_err(refuse)?;
+    }
 
     let before = measure(&home).ok().flatten();
     let proxy = closed_proxy()?;
@@ -569,6 +670,95 @@ mod tests {
         assert!(refuse_lock(&lock("registry+https://example.invalid/index"))
             .unwrap()
             .contains("custom registry"));
+    }
+
+    #[test]
+    fn lock_sources_in_either_quote_style_are_read_and_others_refuse() {
+        assert_eq!(
+            lock_source("source = 'git+ssh://h/r.git#1'"),
+            Some(Ok("git+ssh://h/r.git#1"))
+        );
+        assert_eq!(lock_source("  source=\"x\"  "), Some(Ok("x")));
+        assert_eq!(lock_source("\"source\" = 'x'"), Some(Ok("x")));
+        assert_eq!(lock_source("name = \"source\""), None);
+        assert_eq!(lock_source("source = \"git+\\u0073sh://h\""), Some(Err(())));
+        assert_eq!(lock_source("source = \"\"\"x\"\"\""), Some(Err(())));
+        assert!(
+            refuse_lock("[[package]]\nsource = 'git+ssh://git@example.invalid/a.git#1'\n")
+                .unwrap()
+                .contains("SSH")
+        );
+        assert!(refuse_lock("source = \"git+\\u0073sh://h\"\n")
+            .unwrap()
+            .contains("does not read"));
+    }
+
+    #[test]
+    fn resolved_sources_come_from_cargo_metadata() {
+        let metadata = |source: serde_json::Value| serde_json::json!({"packages": [{"name": "a", "source": null}, {"name": "b", "source": source}]});
+        assert_eq!(
+            refuse_resolved(&metadata(serde_json::json!(CRATES_IO[1]))),
+            None
+        );
+        assert!(
+            refuse_resolved(&metadata(serde_json::json!("git+ssh://h/r.git?rev=1#1")))
+                .unwrap()
+                .contains("SSH")
+        );
+        assert!(refuse_resolved(&metadata(serde_json::json!(7))).is_some());
+        assert!(refuse_resolved(&serde_json::json!({})).is_some());
+    }
+
+    /// A tiny offline fixture under the scratch temp directory, with an
+    /// empty private Cargo home; nothing here may use the network.
+    fn offline_fixture(label: &str, manifest_deps: &str, lock: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("oxide-offline-{label}-{}", std::process::id()));
+        let package = root.join("app");
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        std::fs::write(
+            package.join("Cargo.toml"),
+            format!("[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{manifest_deps}"),
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"1.97.1\"\n",
+        )
+        .unwrap();
+        std::fs::write(package.join("src/lib.rs"), "").unwrap();
+        std::fs::write(package.join("Cargo.lock"), format!("version = 4\n\n{lock}")).unwrap();
+        (root.clone(), package)
+    }
+
+    #[test]
+    fn a_stale_lock_with_an_ssh_dependency_refuses_offline() {
+        // The lock names only crates.io; the manifest adds an SSH git
+        // dependency the online resolve would fetch.
+        let (root, package) = offline_fixture(
+            "stale",
+            "remote = { git = \"ssh://git@127.0.0.1:9/remote.git\" }\n",
+            "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        );
+        let refused = offline_resolution(&package, Some(&root.join("home"))).unwrap_err();
+        assert!(
+            refused.contains("cannot resolve this workspace offline"),
+            "{refused}"
+        );
+        let (clean, local) = offline_fixture(
+            "local",
+            "",
+            "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        );
+        assert_eq!(
+            offline_resolution(&local, Some(&clean.join("home"))),
+            Ok(())
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&clean).unwrap();
     }
 
     #[test]

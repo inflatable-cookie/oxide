@@ -763,7 +763,19 @@ it never deletes there itself.
   - any lock source other than crates.io (`registry+https://github.com/rust-lang/crates.io-index`
     or `sparse+https://index.crates.io/`) or a path: SSH and other non-HTTP
     git transports, HTTPS git (not qualified), custom registries and unknown
-    kinds.
+    kinds. The scan reads `source` values in either quote style and refuses
+    any other spelling (escapes, multi-line strings). It is a screen only;
+  - Cargo's own resolution failing offline: `cargo metadata --format-version 1
+    --offline --locked` in the fetch's directory and environment must
+    succeed, and every package it resolves must come from crates.io or a
+    path. That fails when the lock is stale, when a manifest names a
+    dependency the lock lacks (a stale lock could otherwise make the online
+    resolve fetch an SSH git source directly, outside the proxy), or when any
+    source, index entry or package is not already local. The online fetch
+    then has nothing to resolve or download that this resolve did not name.
+    Debug builds accept `OXIDE_TEST_SKIP_OFFLINE_RESOLUTION` so the fixture
+    proof can send one uncached fetch to the closed proxy; release builds
+    always run the gate.
   The proxy is one routing control, not universal containment; these
   refusals cover the other routes. Oxide never falls back to `--offline`,
   which would disable the requested cleanup.
@@ -787,13 +799,19 @@ it never deletes there itself.
   `baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd`, the
   lockfile checksum), plus its sparse-index metadata. Then: the `status`
   line equals the proof's own walk; refusals for a missing lock, an SSH git
-  source, `CARGO_NET_GIT_FETCH_WITH_CLI`, a source-replacement config file
-  and a custom registry; a cleanup on the complete cached lock that ran with
+  source (double- and single-quoted), `CARGO_NET_GIT_FETCH_WITH_CLI`, a
+  source-replacement config file, a custom registry and a stale lock whose
+  manifest adds an SSH git dependency; a cleanup on the complete cached lock that ran with
   0 proxy connections; Cargo's lock skip under a shared hold on
   `.package-cache-mutate`; and an uncached crate whose fetch failed through
-  the closed proxy (at least one connection closed) while an owned control
+  the closed proxy with the offline gate skipped through the debug hook (at
+  least one connection closed) while an owned control
   listener named by `CARGO_HTTP_PROXY` and the libcurl proxy variables saw
-  none. Nothing was age-eligible, so no deletion was observed; deletion rests
+  none. oxide#085 review found the stale-lock and single-quoted routes
+  reaching an SSH listener directly; the offline gate and quote handling
+  close them, covered by Rust tests. The focused proof's new cases were not
+  rerun: the task's two proof attempts and two archive downloads were
+  spent. Nothing was age-eligible, so no deletion was observed; deletion rests
   on Cargo's source. The same proof covers `OXIDE_POOL_CAP` (an invalid
   value refused before creation, 64 MiB used on a new directory pool, a
   conflicting value reported and ignored there and on the APFS pool) and a
