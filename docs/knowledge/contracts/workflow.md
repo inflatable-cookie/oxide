@@ -978,33 +978,41 @@ advisory, exits 0 whenever it prints a result (an oversized binary refuses
 with exit 1), and reads or changes no setting.
 
 - **Off macOS.** One line: not applicable.
-- **Probe.** `oxide __oxide-launch-probe`, exactly that one argument, exits 0
-  as the first thing `main` does: before argument parsing, toolchain,
-  pool or lease work. It prints nothing and starts nothing. It is hidden
-  from usage.
-- **Measurement.** The running `oxide` (refused over 64 MiB) is copied in
-  1 MiB chunks into new owner-only files (`create_new`) in a fresh
-  owner-only directory under the temporary directory. One copy is run once
-  as warm-up and five more times; then five distinct fresh copies are each
-  written, run once and unlinked. At most one copy exists at a time. Each
-  timing spans spawn to reap of a probe with an empty environment and null
-  standard streams, polled every 250 µs. Copy time is not timed.
+- **Probe and helper.** Two hidden modes run as the first thing `main`
+  does, before argument parsing, toolchain, pool or lease work, and are
+  absent from usage. `oxide __oxide-launch-probe`, exactly that one
+  argument, exits 0 and prints and starts nothing.
+  `oxide __oxide-launch-measure` is the measuring helper the check starts;
+  it takes its directory, deadlines, delays and source as arguments.
+- **Measurement.** The check refuses a binary over 64 MiB, creates a fresh
+  owner-only directory under the temporary directory, and starts the helper
+  (the running `oxide`, with an empty environment) as the leader of a new
+  process group. The helper copies `oxide` in 1 MiB chunks into new
+  owner-only files (`create_new`). It runs one copy once as warm-up and five
+  more times; then five distinct fresh copies are each written, run once and
+  unlinked. At most one copy exists at a time. Each timing spans spawn to
+  reap of a probe with an empty environment and null standard streams,
+  polled every 250 µs; copy time is not timed. The helper reports samples
+  on a pipe, removes its own copies and directory, and stops at its
+  deadline.
 - **Bounds.** One 3 s monotonic limit covers copies, starts, waits and
-  cleanup. A measuring thread does every file and process step; the main
-  thread only collects samples, so a blocked copy, start, wait or removal
-  cannot hold it:
+  cleanup:
   - A sample counts only if its probe exited successfully by 2.75 s. At
-    2.75 s collection stops and the result is `inconclusive`.
-  - Cleanup then runs on its own thread. Under the same lock as every
-    creation, it stops new work, kills and reaps an unreaped probe (only
-    this check's own child), and removes every created file and the
-    directory. A copy in progress stops at its next chunk.
-  - The check returns by 3 s regardless. Cleanup still blocked then is
-    reported as unfinished, naming the directory that may remain; the
-    abandoned threads end with the process. A start blocked in the kernel
-    has no PID to kill yet.
-  - Elapsed time over 3 s makes the result inconclusive. A removal failure
-    is named. A signal during the check can leave the directory behind.
+    2.75 s the check stops collecting.
+  - The check then kills the whole helper group with `SIGKILL`: the helper
+    and any probe, including one still starting. The group ID is signalled
+    only before the helper is reaped, so it names only this check's
+    processes. The check reaps the helper and waits until the group is
+    empty.
+  - With every writer gone, the check removes the helper's known copy names
+    and the directory itself.
+  - Nothing it started outlives it. The one exception is the kernel holding
+    a killed process past 3 s; the report then names the process group as
+    not confirmed closed. A removal failure is named too.
+  - Elapsed time over 3 s, or an unconfirmed group, makes the result
+    inconclusive.
+  - If the check itself is killed, the helper still stops at its own
+    deadline and removes its copies; only the empty directory can remain.
 - **Result.** Raw samples always print (warm-up, five same-file runs, five
   fresh-copy runs), then the elapsed time and cleanup. With every sample, it
   prints both medians and their signed difference (negative and small
@@ -1041,12 +1049,17 @@ with exit 1), and reads or changes no setting.
   creates no pool and prints well-formed output: medians recomputed from the
   raw samples, the advice lines when advised. No penalty size is asserted.
   Unit tests cover the medians, the strict threshold, the bundle choice and
-  the report and advice text. Timing tests run shell-script probes under a
-  600 ms limit: a probe that never exits is killed and is never a sample;
-  a copy paused 2 s still returns in time with everything removed and
-  nothing recreated; a start paused inside the lock and a slow removal
-  return in time, reporting unfinished cleanup that completes afterwards.
-  An ordinary run completes under the standard limit.
+  the report and advice text.
+- **Lifecycle tests.** `tests/launch_check.rs` runs the built `oxide` to
+  exit. Its probes are shell scripts named by `OXIDE_TEST_LAUNCH_SOURCE`
+  (test-only, like `OXIDE_TEST_LAUNCH_LIMIT_MS` and
+  `OXIDE_TEST_LAUNCH_DELAY=copy|start|remove:<ms>`, which pauses inside the
+  helper). With the CLI gone, each case checks at once that the temporary
+  directory is empty and no logged probe is alive:
+  - an ordinary run completes under 3 s with medians;
+  - under a 600 ms limit, a probe that never exits is killed;
+  - a copy, a probe start and a removal each paused 2 s return within the
+    limit, inconclusive.
 
 ## Platform backends
 

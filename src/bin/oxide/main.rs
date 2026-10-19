@@ -61,9 +61,10 @@ Linux default; macOS defaults to a hard-capped APFS image).
 ";
 
 fn main() -> ExitCode {
-    // A launch-check probe exits before any other work.
-    if launch::is_probe() {
-        return ExitCode::SUCCESS;
+    // The launch-check probe exits, and its measuring helper runs, before
+    // any other work.
+    if let Some(code) = launch::hidden() {
+        return ExitCode::from(code);
     }
     process::started_ms();
     match run(std::env::args_os().skip(1).collect()) {
