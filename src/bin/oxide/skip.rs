@@ -71,8 +71,9 @@ const UNFOLLOWED_ENVIRONMENT: [&str; 6] = [
     "CARGO_BUILD_RUSTC_WRAPPER",
     "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
 ];
-/// Toolchain files under the resolved sysroot. `bin/rustc` and `bin/cargo`
-/// must exist; the rest are recorded present or absent.
+/// Toolchain files under the resolved sysroot, recorded present or absent;
+/// `bin/rustc` and `bin/cargo` must also be the actual binaries `PATH`
+/// reaches.
 const TOOLCHAIN_FILES: [&str; 5] = [
     "bin/rustc",
     "bin/cargo",
@@ -191,6 +192,10 @@ impl Stat {
             ctime_ns: i128::from(metadata.ctime()) * NANOS + i128::from(metadata.ctime_nsec()),
             regular: metadata.is_file(),
         }
+    }
+
+    fn same_file(&self, other: &Self) -> bool {
+        (self.device, self.inode) == (other.device, other.inode)
     }
 
     /// Both times strictly before `started_ns`. A whole-second time may come
@@ -374,6 +379,92 @@ pub struct Package {
     pub build_script: bool,
 }
 
+/// The actual toolchain, bound before any Cargo or rustc query or use of
+/// this command. A first sysroot query only locates it. The `PATH` `cargo`
+/// and `rustc` must be either the sysroot's own binaries or rustup proxies
+/// selecting a rustup toolchain. Their tuples are observed, then a second
+/// query must name the same sysroot with every tuple unchanged, so the
+/// actual binaries are observed before a query that uses them. The tuples
+/// are verified unchanged again at publish, after Cargo's own queries and
+/// build.
+pub struct Toolchain {
+    observed: BTreeMap<PathBuf, Option<Stat>>,
+}
+
+impl Toolchain {
+    pub fn bind() -> Result<Self, String> {
+        let cwd = std::env::current_dir()
+            .and_then(fs::canonicalize)
+            .map_err(|error| format!("cannot resolve the working directory: {error}"))?;
+        let sysroot = sysroot(&cwd).ok_or("the toolchain sysroot did not resolve")?;
+        let observed = toolchain_tuples(&cwd, &sysroot)?;
+        if self::sysroot(&cwd).as_ref() != Some(&sysroot)
+            || toolchain_tuples(&cwd, &sysroot)? != observed
+        {
+            return Err("the toolchain changed during its query".to_owned());
+        }
+        Ok(Self { observed })
+    }
+}
+
+/// Resolution inputs, the sysroot's files and the binding of `PATH`'s
+/// `cargo` and `rustc` to it.
+fn toolchain_tuples(cwd: &Path, sysroot: &Path) -> Result<BTreeMap<PathBuf, Option<Stat>>, String> {
+    let (mut observed, resolved) = resolution_inputs(cwd)?;
+    for name in TOOLCHAIN_FILES {
+        let file = sysroot.join(name);
+        observed.insert(file.clone(), stat(&file)?);
+    }
+    let toolchains = rustup_home()?.join("toolchains");
+    for (program, path) in ["cargo", "rustc"].into_iter().zip(&resolved) {
+        if let Some(rustup) = actual_binary(program, path, sysroot, &toolchains)? {
+            observed.insert(rustup.clone(), stat(&rustup)?);
+        }
+    }
+    Ok(observed)
+}
+
+/// Bind `path`, the `PATH` lookup of `program`, to the sysroot's own
+/// `bin/<program>`: the same file, or a rustup proxy (the same file as the
+/// `rustup` beside it) when the sysroot is one of rustup's toolchains.
+/// Returns the proxy's `rustup`. Anything else is an unresolved wrapper.
+fn actual_binary(
+    program: &str,
+    path: &Path,
+    sysroot: &Path,
+    toolchains: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let found = stat(path)?.ok_or_else(|| format!("{} vanished", path.display()))?;
+    let own = sysroot.join("bin").join(program);
+    let actual = stat(&own)?.ok_or_else(|| format!("{} is missing", own.display()))?;
+    if !actual.regular {
+        return Err(format!("{} is not a regular file", own.display()));
+    }
+    if found.same_file(&actual) {
+        return Ok(None);
+    }
+    let rustup = path.with_file_name("rustup");
+    let toolchains = fs::canonicalize(toolchains)
+        .map_err(|error| format!("cannot resolve {}: {error}", toolchains.display()))?;
+    match stat(&rustup)? {
+        Some(proxy) if proxy.same_file(&found) && sysroot.starts_with(&toolchains) => {
+            Ok(Some(rustup))
+        }
+        _ => Err(format!(
+            "{} is neither {} nor a rustup proxy for it",
+            path.display(),
+            own.display()
+        )),
+    }
+}
+
+fn rustup_home() -> Result<PathBuf, String> {
+    std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")))
+        .ok_or_else(|| "neither RUSTUP_HOME nor HOME is set".to_owned())
+}
+
 /// Key inputs observed before Cargo runs, published only after it succeeds.
 pub struct Pending {
     cwd: PathBuf,
@@ -381,16 +472,23 @@ pub struct Pending {
     path: PathBuf,
     args: Vec<String>,
     environment: String,
-    /// Toolchain resolution, the resolved toolchain, config and lock: bound
-    /// before Cargo and verified unchanged after it.
+    /// Toolchain, config and lock: bound before Cargo and verified unchanged
+    /// after it.
     observed: BTreeMap<PathBuf, Option<Stat>>,
+    /// Every workspace member's manifest, for target discovery.
+    members: Vec<PathBuf>,
     started_ns: i128,
 }
 
 impl Pending {
-    /// Drop this key's record, then observe the pre-build inputs. An error:
-    /// no record will be published for this command.
-    pub fn capture(request: &Request, checkout: &Path) -> Result<Self, String> {
+    /// Drop this key's record, then observe the remaining pre-build inputs.
+    /// An error: no record will be published for this command.
+    pub fn capture(
+        request: &Request,
+        checkout: &Path,
+        toolchain: Toolchain,
+        members: Vec<PathBuf>,
+    ) -> Result<Self, String> {
         let cwd = std::env::current_dir()
             .and_then(fs::canonicalize)
             .map_err(|error| format!("cannot resolve the working directory: {error}"))?;
@@ -405,22 +503,7 @@ impl Pending {
             return Err("the working directory is outside the workspace".to_owned());
         }
         let environment = environment()?;
-        // Resolution inputs bracket the toolchain query: any change between
-        // the two observations leaves the resolved toolchain ambiguous.
-        let resolution = resolution_inputs(&cwd)?;
-        let sysroot = sysroot(&cwd).ok_or("the toolchain sysroot did not resolve")?;
-        if resolution_inputs(&cwd)? != resolution {
-            return Err("toolchain resolution changed during its query".to_owned());
-        }
-        let mut observed = resolution;
-        for name in TOOLCHAIN_FILES {
-            let file = sysroot.join(name);
-            let found = stat(&file)?;
-            if name.starts_with("bin/") && !found.is_some_and(|stat| stat.regular) {
-                return Err(format!("{} is not a regular file", file.display()));
-            }
-            observed.insert(file, found);
-        }
+        let mut observed = toolchain.observed;
         let lock = checkout.join("Cargo.lock");
         observed.insert(lock.clone(), stat(&lock)?);
         Ok(Self {
@@ -430,6 +513,7 @@ impl Pending {
             args: request.args.clone(),
             environment,
             observed,
+            members,
             started_ns: now_ns().ok_or("the clock is before 1970")?,
         })
     }
@@ -468,6 +552,17 @@ impl Pending {
             }
         }
         let mut inputs = self.observed.clone();
+        // Cargo discovers build scripts and targets from directory contents:
+        // an added `build.rs` or `src/bin/*.rs` changes no recorded file, so
+        // the directories Cargo lists are recorded too, present or absent.
+        let mut packages: BTreeSet<PathBuf> = self.members.iter().cloned().collect();
+        packages.extend(participating_manifests(build)?);
+        for manifest in &packages {
+            for dir in discovery_dirs(manifest, &self.checkout)? {
+                let found = stat(&dir)?;
+                inputs.entry(dir).or_insert(found);
+            }
+        }
         for path in built {
             if inputs.contains_key(&path) {
                 continue;
@@ -598,7 +693,10 @@ fn environment() -> Result<String, String> {
 /// each ancestor's config, manifest and toolchain files, Cargo home config,
 /// rustup settings, and every `PATH` candidate for `cargo` and `rustc` up to
 /// the one that resolves. Config text naming an unfollowed input refuses.
-fn resolution_inputs(cwd: &Path) -> Result<BTreeMap<PathBuf, Option<Stat>>, String> {
+/// Also returns the resolved `cargo` and `rustc` paths.
+type Resolution = (BTreeMap<PathBuf, Option<Stat>>, Vec<PathBuf>);
+
+fn resolution_inputs(cwd: &Path) -> Result<Resolution, String> {
     let mut inputs = BTreeMap::new();
     let mut configs = Vec::new();
     let ancestors: Vec<&Path> = cwd.ancestors().collect();
@@ -624,21 +722,18 @@ fn resolution_inputs(cwd: &Path) -> Result<BTreeMap<PathBuf, Option<Stat>>, Stri
         configs.push(path.clone());
         inputs.insert(path.clone(), stat(&path)?);
     }
-    let rustup_home = std::env::var_os("RUSTUP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home.map(|home| home.join(".rustup")))
-        .ok_or("neither RUSTUP_HOME nor HOME is set")?;
-    let settings = rustup_home.join("settings.toml");
+    let settings = rustup_home()?.join("settings.toml");
     inputs.insert(settings.clone(), stat(&settings)?);
+    let mut resolved = Vec::new();
     for program in ["cargo", "rustc"] {
-        path_candidates(cwd, program, &mut inputs)?;
+        resolved.push(path_candidates(cwd, program, &mut inputs)?);
     }
     for config in configs {
         if inputs.get(&config).copied().flatten().is_some() {
             check_config(&config)?;
         }
     }
-    Ok(inputs)
+    Ok((inputs, resolved))
 }
 
 /// Record `PATH` lookups for `program` until one resolves to a regular
@@ -648,7 +743,7 @@ fn path_candidates(
     cwd: &Path,
     program: &str,
     inputs: &mut BTreeMap<PathBuf, Option<Stat>>,
-) -> Result<(), String> {
+) -> Result<PathBuf, String> {
     let path = std::env::var_os("PATH").ok_or("PATH is not set")?;
     for dir in std::env::split_paths(&path).take(MAX_PATH_ENTRIES) {
         let candidate = cwd.join(dir).join(program);
@@ -659,7 +754,7 @@ fn path_candidates(
                 .map_err(|error| error.to_string())?
                 .mode();
             if mode & 0o111 != 0 {
-                return Ok(());
+                return Ok(candidate);
             }
         }
     }
@@ -732,6 +827,45 @@ fn participating_manifests(build: &Build) -> Result<Vec<PathBuf>, String> {
         }
     }
     Ok(manifests)
+}
+
+/// Directories whose listing decides a package's automatic targets and build
+/// script: the package directory, `src`, `src/bin`, `examples` and each
+/// subdirectory of the last two, and the package's parent when it is inside
+/// the workspace (glob members). Absent ones count.
+fn discovery_dirs(manifest: &Path, checkout: &Path) -> Result<Vec<PathBuf>, String> {
+    let package = manifest
+        .parent()
+        .ok_or_else(|| format!("{} has no directory", manifest.display()))?;
+    let mut dirs = vec![
+        package.to_path_buf(),
+        package.join("src"),
+        package.join("src/bin"),
+        package.join("examples"),
+    ];
+    if let Some(parent) = package
+        .parent()
+        .filter(|parent| parent.starts_with(checkout))
+    {
+        dirs.push(parent.to_path_buf());
+    }
+    for listed in [package.join("src/bin"), package.join("examples")] {
+        let entries = match fs::read_dir(&listed) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("cannot list {}: {error}", listed.display())),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| error.to_string())?.path();
+            if entry.is_dir() {
+                dirs.push(entry);
+            }
+            if dirs.len() > MAX_INPUTS {
+                return Err(format!("{} lists too many entries", listed.display()));
+            }
+        }
+    }
+    Ok(dirs)
 }
 
 /// A build script's saved output (`output`, beside its `out_dir`) declares
@@ -955,6 +1089,84 @@ mod tests {
         // A whole-second time may be truncated: it must precede the second.
         assert!(!at(10 * NANOS, 1).before(start));
         assert!(at(9 * NANOS, 1).before(start));
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("oxide-skip-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch");
+        fs::canonicalize(dir).expect("canonical scratch")
+    }
+
+    fn tuples(dirs: &[PathBuf]) -> Vec<Option<Stat>> {
+        dirs.iter().map(|dir| stat(dir).expect("stat")).collect()
+    }
+
+    #[test]
+    fn added_build_script_or_binary_changes_the_discovery_tuples() {
+        let root = scratch("discovery");
+        let package = root.join("pkg");
+        fs::create_dir_all(package.join("src")).expect("src");
+        fs::write(package.join("Cargo.toml"), "[package]\n").expect("manifest");
+        fs::write(package.join("src/main.rs"), "fn main() {}\n").expect("main");
+        let manifest = package.join("Cargo.toml");
+        let before = discovery_dirs(&manifest, &root).expect("dirs");
+        assert!(
+            before.contains(&root),
+            "a member's parent inside the workspace"
+        );
+        let recorded = tuples(&before);
+        fs::write(package.join("build.rs"), "fn main() {}\n").expect("build script");
+        assert_ne!(tuples(&before), recorded, "an added build.rs");
+        let recorded = tuples(&before);
+        fs::create_dir_all(package.join("src/bin")).expect("bin dir");
+        fs::write(package.join("src/bin/other.rs"), "fn main() {}\n").expect("bin");
+        assert_ne!(tuples(&before), recorded, "an added src/bin target");
+        fs::create_dir_all(package.join("src/bin/tool")).expect("bin subdir");
+        let after = discovery_dirs(&manifest, &root).expect("dirs");
+        assert!(after.contains(&package.join("src/bin/tool")));
+        let recorded = tuples(&after);
+        fs::write(package.join("src/bin/tool/main.rs"), "fn main() {}\n").expect("bin main");
+        assert_ne!(
+            tuples(&after),
+            recorded,
+            "a main.rs added to a bin directory"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn only_the_sysroot_binary_or_a_rustup_proxy_binds() {
+        let root = scratch("proxy");
+        let toolchains = root.join("rustup/toolchains");
+        let sysroot = toolchains.join("1.97.1-test");
+        fs::create_dir_all(sysroot.join("bin")).expect("sysroot");
+        fs::write(sysroot.join("bin/rustc"), "rustc").expect("rustc");
+        let direct = sysroot.join("bin/rustc");
+        assert_eq!(
+            actual_binary("rustc", &direct, &sysroot, &toolchains),
+            Ok(None)
+        );
+        let proxies = root.join("proxies");
+        fs::create_dir_all(&proxies).expect("proxies");
+        fs::write(proxies.join("rustup"), "rustup").expect("rustup");
+        std::os::unix::fs::symlink("rustup", proxies.join("rustc")).expect("proxy");
+        assert_eq!(
+            actual_binary("rustc", &proxies.join("rustc"), &sysroot, &toolchains),
+            Ok(Some(proxies.join("rustup")))
+        );
+        // A rustup proxy whose sysroot is not one of rustup's toolchains.
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir_all(elsewhere.join("bin")).expect("elsewhere");
+        fs::write(elsewhere.join("bin/rustc"), "rustc").expect("rustc");
+        assert!(actual_binary("rustc", &proxies.join("rustc"), &elsewhere, &toolchains).is_err());
+        // A wrapper that is neither.
+        let wrappers = root.join("wrappers");
+        fs::create_dir_all(&wrappers).expect("wrappers");
+        fs::write(wrappers.join("rustc"), "#!/bin/sh").expect("wrapper");
+        fs::write(wrappers.join("rustup"), "rustup").expect("other rustup");
+        assert!(actual_binary("rustc", &wrappers.join("rustc"), &sysroot, &toolchains).is_err());
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

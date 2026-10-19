@@ -308,25 +308,38 @@ immutability ([vision](../vision.md#product-workflow-direction)).
     cross-checked with every `Cargo.toml` between a listed source and the
     workspace root, so a `[lib] path` outside its package or a Git-ignored
     manifest is still covered;
+  - Cargo's automatic discovery, present or absent, for every workspace
+    member (from the `cargo metadata --no-deps` the normal `run` path reads)
+    and every participating path package: the package directory (an added
+    `build.rs`), `src`, `src/bin`, `examples` and each subdirectory of the
+    last two (added targets that change `run`'s selection), and the
+    package's parent inside the workspace (glob members);
   - `Cargo.lock`;
   - `.cargo/config`, `.cargo/config.toml`, `Cargo.toml`, `rust-toolchain`
     and `rust-toolchain.toml` in the working directory and every ancestor,
     and `$CARGO_HOME/config(.toml)`, absent ones included;
   - toolchain resolution: rustup's `settings.toml`, every `PATH` candidate
-    for `cargo` and `rustc` up to the one that resolves, and the resolved
-    sysroot's `bin/rustc`, `bin/cargo`, `lib`, channel manifest and
-    component list;
+    for `cargo` and `rustc` up to the one that resolves, the `rustup` a proxy
+    is, and the resolved sysroot's `bin/rustc`, `bin/cargo`, `lib`, channel
+    manifest and component list;
   - the built binary's post-build tuple, recorded separately.
   It also holds the arguments, working directory, workspace root and a
   SHA-256 over every environment variable's name and its value's SHA-256
   (raw values are never stored), plus Oxide's profile definitions.
   `OXIDE_NO_SKIP` is an ordinary variable there, so a forced build records
   a key the next plain run does not match.
-- **Capture.** The normal path drops the key's record, then observes the
-  environment and toolchain-resolution inputs, runs `rustc --print sysroot`,
-  observes the resolution inputs again (any difference records nothing) and
-  stats the resolved toolchain binaries, config and `Cargo.lock`. That
-  instant is the build start. Every leased command holds
+- **Capture.** Before any Cargo or rustc query or use by the command
+  (metadata, `locate-project`, `rustc -vV`, the build), the normal path binds
+  the actual toolchain. A first `rustc --print sysroot` only locates it.
+  The `PATH` `cargo` and `rustc` must each be the sysroot's own binary, or a
+  rustup proxy (the same file as the `rustup` beside it) whose sysroot lies
+  under rustup's `toolchains`; any other wrapper records nothing. Oxide
+  stats the resolution inputs, the proxies and the sysroot's binaries, then a
+  second query must name the same sysroot with every tuple unchanged, so the
+  actual binaries are observed before a query that uses them. Every tuple is
+  verified unchanged again at publish, after Cargo's queries and build. After workspace
+  resolution it drops the key's record and stats `Cargo.lock`; that instant
+  is the build start. Every leased command holds
   `<workspace>/target/oxide-run-skip/active.lock` shared until its lease is
   released. A successful `run` converts it to exclusive without waiting
   (another active Oxide command records nothing), then, still under its
@@ -385,13 +398,18 @@ Generated sources a dep-info lists in a slot are stat-recorded like any
 other input. Qualification beyond the pinned toolchain is separate work.
 
 **Proof and gate.** `effigy rust:oxide-run-skip` runs one fresh 128 MiB APFS
-pool within 300 s from admission, including product staging. Skips run under
+pool within 300 s from admission, including offline product staging. Staging
+output and temporary files, fixtures, copied inputs, the pool backing and
+fixture temporary directories share one owned parent, whose allocation is
+sampled after every phase against 512 MiB together with the 20 GiB host
+reserve; fixture inputs are held under 8 MiB. Skips run under
 `RLIMIT_NPROC` 0, so a successful skip started no child; a control shows the
 same limit refuses the leased path. It covers repeat skips, each key class
 falling through (source edit, restored-old-mtime edit caught by ctime, the
 ignored custom-lib-path manifest, root manifest, lock, config added above the
 workspace, toolchain file, environment variable, deleted binary, outside path
-dependency), member selection, a failed build leaving no record, a
+dependency, an added `build.rs`, an added binary reaching Cargo's ambiguity
+refusal), member selection, a failed build leaving no record, a
 `cfg-if` registry dependency eligible and a `libc` build-script dependency
 refused, from named cached inputs in a private `CARGO_HOME`. The fixed #079
 two-part gate (architect ruling, 2026-10-19) takes three samples of each
@@ -399,9 +417,11 @@ side and prints them raw in nanoseconds: the slowest skip at most half the
 fastest leased `oxide run --rebuild` (both execute the program), and the
 fastest skip at most the fastest bare `cargo build --profile oxide-quick`
 no-op (build only) plus noise, the larger max-minus-min spread of the skip
-and bare samples. A failure ends the proof as a no-go. The accepted run held
-in 22 s: skip 10.277–12.861 ms, leased 444.143–712.410 ms, bare 28.463–30.556
-ms, noise 2.583 ms; both parts passed. Fixture timings are not a real-world
+and bare samples. A failure ends the proof as a no-go. The author's run before
+the discovery, toolchain-binding and accounting revision held in 22 s: skip
+10.277–12.861 ms, leased 444.143–712.410 ms, bare 28.463–30.556 ms, noise
+2.583 ms; both parts passed. The independent review's run of that head also
+passed both parts. Fixture timings are not a real-world
 speed claim, and the skip is not claimed to beat bare Cargo on larger
 repositories.
 

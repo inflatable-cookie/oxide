@@ -439,20 +439,41 @@ def host_free_bytes(path: str) -> int:
     return int(line.split()[3]) * 1024
 
 
-def build_binaries() -> dict:
+def build_binaries(staging: str | None = None) -> dict:
+    """Stage the product binaries. With `staging`, the build is offline and
+    its target directory and temporary files live under that owned path."""
+    command = [
+        "cargo",
+        "build",
+        "--locked",
+        "--bin",
+        "oxide",
+        "--bin",
+        "oxide-storage-lease",
+        "--message-format=json-render-diagnostics",
+    ]
+    env = None
+    if staging:
+        command.append("--offline")
+        tmp = os.path.join(staging, "tmp")
+        os.makedirs(tmp, mode=0o700)
+        env = dict(os.environ)
+        env.pop("CARGO_BUILD_TARGET_DIR", None)
+        env.pop("CARGO_BUILD_BUILD_DIR", None)
+        env.update(
+            {
+                "CARGO_TARGET_DIR": os.path.join(staging, "target"),
+                "CARGO_INCREMENTAL": "0",
+                "TMPDIR": tmp,
+                "TMP": tmp,
+                "TEMP": tmp,
+            }
+        )
     build = subprocess.run(
-        [
-            "cargo",
-            "build",
-            "--locked",
-            "--bin",
-            "oxide",
-            "--bin",
-            "oxide-storage-lease",
-            "--message-format=json-render-diagnostics",
-        ],
+        command,
         stdout=subprocess.PIPE,
         text=True,
+        env=env,
         timeout=remaining(),
     )
     if build.returncode:
@@ -2334,6 +2355,13 @@ SKIP_SCRIPTED = {
     "rust-toolchain.toml": '[toolchain]\nchannel = "1.97.1"\n',
     "src/main.rs": 'fn main() {\n    println!("scripted {}", unsafe { libc::getpid() } > 0);\n}\n',
 }
+# Automatic discovery: no build script and one binary at first.
+SKIP_DISCOVERY = {
+    "Cargo.toml": '[package]\nname = "discoverapp"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n',
+    "rust-toolchain.toml": '[toolchain]\nchannel = "1.97.1"\n',
+    "src/main.rs": 'fn main() {\n    println!("discover {}", option_env!("DISCOVERY_MARKER").unwrap_or("old"));\n}\n',
+}
+SKIP_DISCOVERY_SCRIPT = 'fn main() {\n    println!("cargo:rerun-if-changed=build.rs");\n    println!("cargo:rustc-env=DISCOVERY_MARKER=new");\n}\n'
 SKIP_INDEX = "index.crates.io-1949cf8c6b5b557f"
 # Exactly these existing cached inputs seed the private CARGO_HOME.
 SKIP_REGISTRY_INPUTS = (
@@ -2574,6 +2602,24 @@ def prove_skip_cases(runner: Runner) -> dict:
     case.builds("after failure", [], "skip v4 new 6 cfg")
     case.skips("after failure repeat", [], "skip v4 new 6 cfg")
 
+    # Cargo's automatic discovery: an added build.rs, then an added binary,
+    # change no existing file but must still fall through.
+    discovery = os.path.join(runner.parent, "checkouts", "discovery")
+    write_fixture(discovery, SKIP_DISCOVERY)
+    commit_lock(runner, discovery)
+    case.builds("discovery first", [], "discover old", cwd=discovery)
+    case.skips("discovery repeat", [], "discover old", cwd=discovery)
+    with open(os.path.join(discovery, "build.rs"), "w", encoding="utf-8") as handle:
+        handle.write(SKIP_DISCOVERY_SCRIPT)
+    case.builds("discovered build script", [], "discover new", cwd=discovery)
+    case.skips("discovered build script repeat", [], "discover new", cwd=discovery)
+    os.makedirs(os.path.join(discovery, "src", "bin"))
+    with open(os.path.join(discovery, "src", "bin", "other.rs"), "w", encoding="utf-8") as handle:
+        handle.write("fn main() {}\n")
+    _, code, _, stderr = case.run("discovered binary", [], discovery, None, same_spawn)
+    if code != 101 or SKIP_LINE in stderr or "could not determine which binary to run" not in stderr:
+        fail(f"an added binary did not reach Cargo's ambiguity refusal: exit {code} {stderr[-600:]!r}")
+
     # Registry packages: eligible without a build script, refused with one.
     seed_registry(runner)
     registry = os.path.join(runner.parent, "checkouts", "registry")
@@ -2629,7 +2675,7 @@ def prove_timing_verdict() -> None:
         fail("timing gate accepted too few samples")
 
 
-def measure_skip_timing(runner: Runner) -> dict:
+def measure_skip_timing(runner: Runner, bounded) -> dict:
     """Three skips (`oxide run -- b`, zero children), three leased no-op runs
     (`oxide run --rebuild -- b`) and, after one warm-up, three bare
     `cargo build --profile oxide-quick` no-ops on the same fixture, profile,
@@ -2667,13 +2713,18 @@ def measure_skip_timing(runner: Runner) -> dict:
         if n:
             plain.append(ns)
             samples.append({"kind": "plain", "ns": ns, "exit": code})
+    bounded("timing samples")
     shutil.rmtree(plain_target)
     return {"skip_ns": skip, "leased_ns": leased, "plain_ns": plain, "samples": samples}
 
 
 def run_skip_main() -> int:
     """The focused `oxide run` fast-path proof: one fresh 128 MiB APFS pool,
-    300 s from admission including product staging, 512 MiB scratch."""
+    300 s from admission including product staging. Staging (offline, its
+    target and temporary directories), fixtures, copies, the pool backing and
+    every fixture temporary directory live under one owned parent, whose
+    allocation is sampled after every phase against 512 MiB; the host
+    reserve is sampled with it."""
     global STARTED
     STARTED = time.monotonic()
     prove_timing_verdict()
@@ -2685,8 +2736,21 @@ def run_skip_main() -> int:
         fail(f"host free {free} is below the 20 GiB reserve")
     parent = os.path.join(root, "oxide-run-skip")
     os.makedirs(parent, mode=0o700, exist_ok=False)
-    executables = build_binaries()
-    print(f"oxide product staging: {time.monotonic() - STARTED:.1f} s (host Cargo home)")
+    peak = {"bytes": 0, "phase": ""}
+
+    def bounded(phase: str) -> None:
+        owned = tree_bytes(parent, True)
+        if owned > peak["bytes"]:
+            peak.update({"bytes": owned, "phase": phase})
+        if owned > SCRATCH_LIMIT_BYTES:
+            fail(f"owned scratch {owned} exceeds 512 MiB after {phase}")
+        free = host_free_bytes(parent)
+        if free < HOST_RESERVE_BYTES:
+            fail(f"host free {free} fell below the 20 GiB reserve after {phase}")
+
+    executables = build_binaries(os.path.join(parent, "staging"))
+    print(f"oxide product staging: {time.monotonic() - STARTED:.1f} s (offline, host Cargo home, owned target)")
+    bounded("staging")
     runner = Runner(executables["oxide"], executables["oxide-storage-lease"], parent, skip=True)
     code, _, stderr = runner.run(
         runner.parent,
@@ -2694,38 +2758,43 @@ def run_skip_main() -> int:
         program=runner.lease,
     )
     expect(code, 0, "pool init", stderr)
+    bounded("pool init")
     try:
-        measured = measure_skip_timing(runner)
+        measured = measure_skip_timing(runner, bounded)
         verdict = timing_verdict(measured["skip_ns"], measured["leased_ns"], measured["plain_ns"])
         print("oxide-run-skip-timing-json: " + json.dumps({"verdict": verdict, **measured}, sort_keys=True))
         if verdict["failures"]:
             fail(f"no-go: fixed timing gate failed: {'; '.join(verdict['failures'])}; scratch retained at {parent}")
-        free = host_free_bytes(parent)
-        if free < HOST_RESERVE_BYTES:
-            fail(f"host free {free} fell below the 20 GiB reserve")
         evidence = prove_skip_cases(runner)
+        bounded("correctness cases")
+        inputs = sum(len(text.encode()) for fixture in (SKIP_FIXTURE, SKIP_FIXTURE, SKIP_REGISTRY, SKIP_SCRIPTED, SKIP_DISCOVERY) for text in fixture.values())
+        inputs += len(SKIP_DISCOVERY_SCRIPT.encode())
+        inputs += sum(os.path.getsize(os.path.join(runner.cargo_home, relative)) for relative in SKIP_REGISTRY_INPUTS)
+        if inputs > SOURCE_LIMIT_BYTES:
+            fail(f"fixture inputs {inputs} exceed 8 MiB")
     except Exception:
         print(f"oxide run-skip proof retained its owned scratch at {parent}", file=sys.stderr)
         raise
-    owned = tree_bytes(parent, True)
-    if owned > SCRATCH_LIMIT_BYTES:
-        fail(f"owned fixture scratch {owned} exceeds 512 MiB")
     payload = os.path.join(runner.pool, "payload")
     detach = subprocess.run(["/usr/bin/hdiutil", "detach", payload], capture_output=True, text=True, timeout=60)
     if detach.returncode:
         fail(f"detach failed after positive completion: {detach.stderr}")
+    bounded("detach")
     elapsed = time.monotonic() - STARTED
     shutil.rmtree(parent)
+    free = host_free_bytes(root)
+    if free < HOST_RESERVE_BYTES:
+        fail(f"host free {free} fell below the 20 GiB reserve after cleanup")
     ms = lambda values: ", ".join(f"{value / 1e6:.3f}" for value in values)
     print(
-        f"oxide run-skip proof held: {elapsed:.0f} s, owned scratch {owned // (1024 * 1024)} MiB; "
+        f"oxide run-skip proof held: {elapsed:.0f} s, peak owned scratch {peak['bytes'] // (1024 * 1024)} MiB "
+        f"(after {peak['phase']}; staging, temp, copies and pool backing included), fixture inputs {inputs} bytes; "
         f"record {evidence['record_inputs']} inputs ({evidence['record_absent']} absent); "
         f"skip [{ms(measured['skip_ns'])}] ms, leased [{ms(measured['leased_ns'])}] ms, "
         f"bare cargo build [{ms(measured['plain_ns'])}] ms, noise {verdict['noise_ns'] / 1e6:.3f} ms: "
         "part 1 pass, part 2 pass (fixture only, no real-world claim)"
     )
     return 0
-
 
 
 def main() -> int:

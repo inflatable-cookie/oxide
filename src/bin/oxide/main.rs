@@ -135,15 +135,29 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     if let Some(request) = &skip_request {
         skip::try_skip(request)?;
     }
+    // The actual toolchain is bound before any Cargo or rustc query or use
+    // and verified unchanged when the key is published.
+    let toolchain = skip_request.as_ref().map(|_| skip::Toolchain::bind());
     let mut invocation = cli::parse_leased(command, args)?;
-    if command == "run" && cli::run_selection(&invocation.cargo_args).is_none() {
-        // Build only what `cargo run` would run: `default-run`, else the
-        // package's only binary.
-        match identity::run_pick(
+    let explicit = cli::run_selection(&invocation.cargo_args).is_some();
+    let mut members = None;
+    if command == "run" && !(explicit && skip_request.is_none()) {
+        let metadata = identity::run_pick(
             CARGO,
             invocation.manifest_path.as_deref(),
             cli::package_selection(args).as_deref(),
-        )? {
+        );
+        // An explicit selection needs the metadata only for the skip key.
+        let (pick, manifests) = match metadata {
+            Ok(metadata) => metadata,
+            Err(_) if explicit => (RunPick::Unresolved, Vec::new()),
+            Err(error) => return Err(error),
+        };
+        members = Some(manifests).filter(|manifests| !manifests.is_empty());
+        // Build only what `cargo run` would run: `default-run`, else the
+        // package's only binary.
+        match pick {
+            _ if explicit => {}
             RunPick::Bin(name) => {
                 invocation
                     .cargo_args
@@ -169,7 +183,12 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     // command is active on this checkout.
     let activity = skip::Activity::hold(&key.checkout)?;
     let pending = skip_request.as_ref().and_then(|request| {
-        skip::Pending::capture(request, &key.checkout)
+        let toolchain = toolchain?;
+        toolchain
+            .and_then(|toolchain| {
+                let members = members.ok_or("the workspace members are unknown")?;
+                skip::Pending::capture(request, &key.checkout, toolchain, members)
+            })
             .map_err(|reason| eprintln!("oxide: run skip not recorded ({reason})"))
             .ok()
     });

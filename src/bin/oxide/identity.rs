@@ -96,12 +96,13 @@ pub enum RunPick {
 /// `-p` package, else the workspace default members for the current
 /// directory (the current package, a virtual root's `default-members`, or
 /// every member). One `default-run` among them wins; otherwise exactly one
-/// binary must exist.
+/// binary must exist. The same metadata names every workspace member's
+/// manifest, which the `run` fast path watches for target discovery.
 pub fn run_pick(
     cargo: &str,
     manifest_path: Option<&Path>,
     package: Option<&str>,
-) -> Result<RunPick, String> {
+) -> Result<(RunPick, Vec<PathBuf>), String> {
     let mut command = Command::new(cargo);
     command.args(["metadata", "--no-deps", "--format-version", "1"]);
     if let Some(manifest) = manifest_path {
@@ -118,7 +119,14 @@ pub fn run_pick(
     }
     let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("Cargo metadata is not JSON: {error}"))?;
-    Ok(select_run(&metadata, package))
+    let members = metadata["packages"]
+        .as_array()
+        .ok_or("Cargo metadata lists no packages")?
+        .iter()
+        .map(|package| package["manifest_path"].as_str().map(PathBuf::from))
+        .collect::<Option<Vec<_>>>()
+        .ok_or("a workspace member has no manifest path")?;
+    Ok((select_run(&metadata, package), members))
 }
 
 fn select_run(metadata: &serde_json::Value, package: Option<&str>) -> RunPick {
