@@ -655,6 +655,63 @@ unresolved. This is source-analysis and design material, not a universal
 Cargo-equivalent skip qualification. The fixed no-go and preserved correctness
 repairs do not authorize another run, product merge or dogfooding sequence change.
 
+## Oxide normal-command overhead, round 2 (2026-10-19)
+
+oxide#088 measured Oxide's added time on a normal no-op like for like against
+plain Cargo, on one std-only fixture over a fresh 128 MiB APFS pool, on one
+macOS host. Raw records: [evidence](evidence/overhead-088/README.md). The
+gate was fixed before any result: fastest of three `oxide check` minus
+fastest `cargo check` at most 100 ms, and fastest `oxide run -- x` minus
+fastest `cargo run -- x` at most 100 ms. Main has no skip path, so every
+`oxide run` is the normal leased path. Plain Cargo used a private target
+directory, the same private `CARGO_HOME`, offline environment and toolchain.
+
+| Fastest sample, ms | Baseline (2 rounds) | Candidate (3 rounds) |
+| --- | --- | --- |
+| `oxide check` | 342.830 | 115.162 |
+| `cargo check` | 23.135 | 17.255 |
+| Gate 1 difference | 319.694 | 97.908 (pass) |
+| `oxide run -- x` | 414.255 | 243.982 |
+| `cargo run -- x` | 161.344 | 150.008 |
+| Gate 2 difference | 252.911 | 93.974 (pass) |
+| `cargo build` | 52.415 | 19.765 |
+| `cargo run` minus `cargo build` (information only) | 108.929 | 130.243 |
+
+Both gates passed by the fixed arithmetic. The #079 noise statistic (larger
+max-minus-min spread of the two compared kinds) was 25.995 ms for gate 1 and
+31.965 ms for gate 2. The margins under the ceiling (2.1 ms and 6.0 ms) are
+smaller than that noise, so another session on this host could fall either
+side of 100 ms. The baseline has two samples per kind and observes only.
+There is no claim about larger projects, other hosts, SSD writes or CPU cost.
+
+What the phase traces show (fastest samples; spans overlap):
+
+- Baseline `oxide check` reached its end marker at 338.6 ms: workspace
+  20.7 ms, three identity Git calls 28.2 ms, `rustc -vV` 27.0 ms, the
+  pre-Cargo snapshot's three Git calls 74.9 ms, seven state saves of 7.5–13.5 ms
+  each plus two origin writes, Cargo 58.7 ms against a plain 23.1 ms (the
+  wait loop polled every 20 ms), and the post-Cargo snapshot 43.9 ms. Git
+  calls took 9–28 ms each under the harness.
+- Candidate `oxide check` reached it at 112.2 ms: workspace 14.8 ms; identity
+  (two Git calls), the snapshot (two) and the cached toolchain read (0.5 ms)
+  together in 29.3 ms; the lease 29.3 ms (two saves, one origin write, the
+  lease library 8.0 ms); spawning save 8.0 ms; Cargo 18.4 ms with the running
+  save overlapped; release 26.3 ms, its post-Cargo snapshot overlapping the
+  lease library release.
+- Per uncontended no-op: Git calls 9 to 6, `rustc` spawns 1 to 0 once
+  cached, Cargo drivers for `run` 3 to 2, state saves 7 to 5. Every
+  remaining save keeps its file and directory sync. What remains is mostly
+  serial durable saves and the lease library (about 60 ms) and serial
+  process spawns.
+- `run`: the candidate's fastest sample ended 134 ms after the pre-exec
+  marker; plain `cargo run` took 130 ms longer than `cargo build`. That
+  comparison is information only; the residual's cause is not isolated.
+
+The cuts are listed in the
+[workflow](contracts/workflow.md#implemented-foundation-core) under
+per-command overhead. The stat-keyed toolchain identity is the shared
+identity the approved skip path consumes.
+
 ## Product assessment
 
 Planner recommendation: a small coherent entry point over evidence-backed mechanisms, with three capabilities: see and explain costs, bound and reuse owned storage, and apply qualified improvements with clear trade-offs. The reusable storage core must work for ordinary developers as well as orchestrators. A daemon, editor surface or UI is still an open choice; Tom's [workflow direction](vision.md#product-workflow-direction) sets an `oxide build` / `oxide run` front door as the design target.

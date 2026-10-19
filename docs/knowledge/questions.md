@@ -166,3 +166,5 @@ The #086 no-go and its incomplete correctness proof remain unchanged
 ([profile](rust-dx-landscape.md#oxide-run-overhead-profile-2026-10-19)).
 Its pre-exec/total residual has unisolated causes; it does not prove a
 binary-rewrite execution cost. The new scopes transfer no prior acceptance.
+The normal-path round's like-for-like gate passed narrowly
+([round 2](rust-dx-landscape.md#oxide-normal-command-overhead-round-2-2026-10-19)).

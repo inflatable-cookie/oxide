@@ -256,8 +256,9 @@ fingerprint churn. The retired source-map work found no cheap general fix.
 
 ## What one command does (local executor)
 
-1. Resolve the workspace (`cargo locate-project --workspace`), identity,
-   profile, strategy and toolchain.
+1. Resolve the workspace (`cargo locate-project --workspace`, or for `run`
+   the root from its target-selection `cargo metadata`), identity, profile,
+   strategy and toolchain.
 2. Lease a slot from the host pool. Prefer this checkout's last slot, then any
    idle compatible slot, then a new slot if the per-project cap and budget
    allow. Otherwise wait in order, with a visible "waiting for …" line.
@@ -690,6 +691,38 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
   and logged; clean exit and Ctrl-C release without recovery; a standalone
   CLI lease stays held through every sweep; a `setsid` escapee does not keep
   the slot held.
+- **Per-command overhead.** Measured like for like against plain Cargo in
+  [overhead round 2](../rust-dx-landscape.md#oxide-normal-command-overhead-round-2-2026-10-19).
+  A no-op spends its time in process spawns and durable saves, so:
+  - `run` takes the workspace root from the `cargo metadata` call it makes
+    for target selection; other commands call `cargo locate-project`.
+  - `rustc -vV` is cached in `<workspace>/target/oxide-toolchain.json`,
+    keyed on a stat-only observation: the toolchain environment (`RUSTUP_*`,
+    `RUSTC`, `PATH`, `HOME`, `CARGO_HOME`), every `rust-toolchain` and
+    `rust-toolchain.toml` from the workspace up to `/` (absence included),
+    rustup's `settings.toml`, the `rustc` that `RUSTC` or `PATH` names, and
+    the resolved toolchain's `bin/rustc` and `lib` (from
+    `rustc --print sysroot` on a miss). Any difference spawns `rustc` again.
+    Only a rustup proxy or the toolchain's own binary is cached; a wrapper,
+    a relative path or an unreadable input spawns every time. The entry is
+    never trusted on age and is written only where `target/` already exists.
+    The full observation digest is the shared toolchain identity for later
+    keys; it does not change the slot key.
+  - Identity reads shallow state and prefix in one Git call, then root
+    commits. A snapshot reads top level and HEAD tree in one call, then
+    status, plus `hash-object` for dirty files. Identity and toolchain run
+    together. The gate's pre-Cargo snapshot runs alongside them and the
+    lease; it serves only a lease granted without waiting, otherwise (and
+    after a refusal) the gate reads again. The build anchor is taken once the
+    group is empty; the post-Cargo snapshot then overlaps the lease release.
+  - A command granted at once takes no wait ticket; a waiting command's
+    ticket leaves in the save that records its grant. An uncontended no-op
+    makes five state saves (before the lease, its grant, spawning, running,
+    release), each with file and directory sync, plus two origin writes.
+  - Waits poll from 1 ms, doubling to 20 ms.
+  - `OXIDE_TRACE_TIMING=1` prints fixed-name phase timings on stderr. It is
+    off by default, prints no arguments, paths or environment values, and
+    stops after 1024 lines.
 - **`init` / `new`.** As in [Adoption](#adoption-oxide-init). Cargo runs as
   an ordinary child with inherited output; a Cargo failure returns Cargo's
   exit and adopts nothing. A refusal exits 1. The covering proof runs before
@@ -708,7 +741,7 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
 
 Control state lives in `<pool>/oxide-managed/` (owner-only): records mapping
 each checkout and key to a private lease project directory, FIFO wait
-tickets, an admission lock, one lock per record, each record's holder and
+tickets for commands that had to wait, an admission lock, one lock per record, each record's holder and
 lease ID, the recovery log, and `origins/<record>.json` with each slot's
 compile origin (at most 8 MiB, stamped with the record's use counter).
 `state.json` gains no field for the gate. New fields default when absent, so control

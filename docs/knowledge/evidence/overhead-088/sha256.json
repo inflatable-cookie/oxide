@@ -1,0 +1,8 @@
+{
+  "files": {
+    "baseline.json": "661aee59308b78b9f3ad8c3aa11c0a3f2deda9621eeb8442ffacd2abcd24e205",
+    "baseline.log": "6b4e38144a382242d16409c152c4b1609b877a16cc1aad683c8674bc6bead009",
+    "candidate-1.json": "1690282731d6e44b288229797395fb7cb92f5657aeb5a439a45c190d6e4bcbc6",
+    "candidate-1.log": "11c4230b0f56def953b811bcbe630ced2948307964bdf4dcf85e45887d71c7ba"
+  }
+}
