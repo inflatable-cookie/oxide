@@ -999,7 +999,11 @@ with exit 1), and reads or changes no setting.
   fresh-copy runs), then the elapsed time and cleanup. With every sample, it
   prints both medians and their signed difference (negative and small
   differences as measured). A timeout, failed probe, copy failure or
-  incomplete set is `inconclusive` with the reason and no median.
+  incomplete set is `inconclusive` with the reason and no median; at the
+  limit it also says to run it again, since a newly built `oxide`'s first
+  launches can take longer. Copies share content and code signature, so the
+  result is likely a lower bound for a freshly linked binary
+  ([finding](../rust-dx-landscape.md#oxide-launch-check-runs-2026-10-19)).
 - **Advice.** Only when the difference exceeds 30 ms. It states the cause is
   inferred, not measured, and names a best-effort launching app: the
   outermost `.app` bundle on the executable paths of this process's

@@ -166,9 +166,16 @@ pub fn report(
         (None, Some(measured)) => measured,
         (failure, _) => {
             let reason = failure.unwrap_or("incomplete samples");
+            // The first launches of a newly built oxide can themselves take
+            // longer than the limit; later copies of the same file are faster.
+            let hint = if reason == limit_reached() {
+                "; run it again, since a newly built oxide's first launches can take longer"
+            } else {
+                ""
+            };
             let _ = writeln!(
                 text,
-                "  result: inconclusive ({reason}); no median reported"
+                "  result: inconclusive ({reason}); no median reported{hint}"
             );
             return text;
         }
@@ -339,7 +346,7 @@ fn time_launch(program: &Path, deadline: Instant) -> Result<u64, String> {
                 // Not yet reaped, so the PID is still this child's.
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("the {} ms limit was reached", DEADLINE.as_millis()));
+                return Err(limit_reached());
             }
             Ok(None) => std::thread::sleep(POLL),
             Err(error) => {
@@ -351,9 +358,13 @@ fn time_launch(program: &Path, deadline: Instant) -> Result<u64, String> {
     }
 }
 
+fn limit_reached() -> String {
+    format!("the {} ms limit was reached", DEADLINE.as_millis())
+}
+
 fn check_deadline(deadline: Instant) -> Result<(), String> {
     if Instant::now() >= deadline {
-        return Err(format!("the {} ms limit was reached", DEADLINE.as_millis()));
+        return Err(limit_reached());
     }
     Ok(())
 }
@@ -592,7 +603,13 @@ mod tests {
             "x",
         );
         assert!(partial.contains("fresh copies: runs 100.0 ms, 100.0 ms\n"));
-        assert!(partial.contains("inconclusive (the 3000 ms limit was reached)"));
+        assert!(partial.contains(
+            "inconclusive (the 3000 ms limit was reached); no median reported; run it again"
+        ));
+        assert!(
+            !failed.contains("run it again"),
+            "the hint is for the limit only"
+        );
         let penalty = report(
             &full([2_300; 5], [101_600; 5]),
             None,
