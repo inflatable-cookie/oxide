@@ -750,7 +750,7 @@ Do not disable Gatekeeper globally. No host setting was changed by this probe.
 oxide#093 ships this measurement as [`oxide status --launch-check`](contracts/workflow.md#launch-check). Author runs on this host, under the running Paseo, with a 4.6 MB quick-profile `oxide`:
 
 - Completed checks took 1.2–1.8 s. Same-file medians were 1.7–3.5 ms; fresh-copy medians 193–298 ms; differences 191–295 ms. The ancestry named `Paseo.app`, which Tom says is already listed in Developer Tools. The penalty persists with it listed and Paseo not restarted, consistent with the earlier re-probe.
-- Some checks hit the 3 s limit before five fresh copies ran and reported `inconclusive`: two of three right after one build, and the focused proof's single run on its freshly built binary. One such warm-up measured 1,834 ms. Other fresh builds measured normally. The cause was not traced; host load average was about 11.
+- Some checks hit the 3 s limit before five fresh copies ran and reported `inconclusive`: two of three right after one build, and the first of the two focused proof runs (`effigy rust:oxide-cli`, 2,750 ms reported) on its freshly built binary. One such warm-up measured 1,834 ms. Other fresh builds measured normally, including the second proof run: 1,201 ms, same-file median 1.6 ms, fresh-copy median 198.0 ms. The cause was not traced; host load average was about 11.
 - Two freshly linked tiny `rustc -O` binaries first launched in 258–270 ms; a copy of each in 150–164 ms. A rebuilt binary has new code-signature content and a copy does not, so the check is likely a lower bound for a rebuild's cost. That is inferred from two samples.
 
 No setting was read or changed.
