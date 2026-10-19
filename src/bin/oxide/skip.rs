@@ -886,7 +886,9 @@ fn workspace_dirs(checkout: &Path) -> Result<Vec<PathBuf>, String> {
 /// The first quoted string whose first path component (after any `./`)
 /// could match the root `target` or `.git`: either name, a glob
 /// metacharacter (`*`, `?`, `[`), a `/../` climb, or a leading `..` followed
-/// by a metacharacter or either name. Multi-line strings refuse whole.
+/// by a metacharacter or either name. Any absolute or `~`-prefixed string
+/// refuses, so an absolute path dependency in a root manifest declaring
+/// `members` records nothing either. Multi-line strings refuse whole.
 fn reaching_pattern(text: &str) -> Option<String> {
     if text.contains("\"\"\"") || text.contains("'''") {
         return Some("multi-line string".to_owned());
@@ -900,6 +902,13 @@ fn reaching_pattern(text: &str) -> Option<String> {
         let mut rest = value.as_str();
         while let Some(stripped) = rest.strip_prefix("./") {
             rest = stripped;
+        }
+        // Cargo joins each member pattern to the workspace root, so an
+        // absolute one can name any subtree, `target` and `.git` included;
+        // the first-component screen cannot see where it lands. A tilde is
+        // refused alike rather than interpreted.
+        if rest.starts_with(['/', '~']) {
+            return Some(value);
         }
         let first = rest.split('/').next().unwrap_or_default();
         // A climb out of the workspace (a path dependency) only matters
@@ -1436,6 +1445,16 @@ mod tests {
             "[workspace]\nmembers = [\"targ[e]t/crates/*/pkg\"]\n",
             "[workspace]\nmembers = ['t?rget/x']\n",
             "[workspace]\nmembers = [\"../ws/targ*/pkg\"]\n",
+            // Absolute and tilde forms: Cargo joins them to the root as-is.
+            "[workspace]\nmembers = [\"/private/tmp/ws/target/crates/*/pkg\"]\n",
+            "[workspace]\nmembers = [\"/private/tmp/ws/.git/crates/*/pkg\"]\n",
+            "[workspace]\nmembers = [\"//private/tmp/ws/target/crates/*/pkg\"]\n",
+            "[workspace]\nmembers = ['.//private/tmp/ws/target/crates/*/pkg']\n",
+            "[workspace]\nmembers = [\"././/ws/.git/x\"]\n",
+            "[workspace]\nmembers = [\"~/ws/target/crates/*/pkg\"]\n",
+            // An absolute path dependency beside `members`: the documented
+            // conservative limit.
+            "[dependencies]\ndep = { path = \"/opt/dep\" }\n\n[workspace]\nmembers = [\"tool\"]\n",
         ] {
             fs::write(root.join("Cargo.toml"), refused).expect("root manifest");
             assert!(workspace_dirs(&root).is_err(), "{refused}");

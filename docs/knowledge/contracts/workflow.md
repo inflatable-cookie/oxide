@@ -325,9 +325,14 @@ immutability ([vision](../vision.md#product-workflow-direction)).
     reach the skipped `target` or `.git` (a quoted string whose first path
     component, after any `./`, is `target` or `.git` or contains `*`, `?` or
     `[`; a leading `..` followed by either name or a metacharacter; a `/../`
-    climb; or any multi-line string), a directory
-    symlink or
-    more than 4096 directories records nothing;
+    climb; any absolute or `~`-prefixed quoted string, covering absolute
+    `workspace.members` and `workspace.exclude` entries, which Cargo joins to
+    the root as-is and Oxide never normalizes; or any multi-line string), a
+    directory
+    symlink or more than 4096 directories records nothing. The screen is
+    lexical and conservative, not full Cargo or TOML syntax: an absolute
+    path dependency in a root manifest declaring `members` also records
+    nothing, while a relative one such as `../outside` still records;
   - `Cargo.lock`;
   - `.cargo/config`, `.cargo/config.toml`, `Cargo.toml`, `rust-toolchain`
     and `rust-toolchain.toml` in the working directory and every ancestor,
