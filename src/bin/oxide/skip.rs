@@ -417,7 +417,7 @@ fn toolchain_tuples(cwd: &Path, sysroot: &Path) -> Result<BTreeMap<PathBuf, Opti
         let file = sysroot.join(name);
         observed.insert(file.clone(), stat(&file)?);
     }
-    let toolchains = rustup_home()?.join("toolchains");
+    let toolchains = rustup_home(cwd)?.join("toolchains");
     for (program, path) in ["cargo", "rustc"].into_iter().zip(&resolved) {
         if let Some(rustup) = actual_binary(program, path, sysroot, &toolchains)? {
             observed.insert(rustup.clone(), stat(&rustup)?);
@@ -460,11 +460,39 @@ fn actual_binary(
     }
 }
 
-fn rustup_home() -> Result<PathBuf, String> {
-    std::env::var_os("RUSTUP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")))
-        .ok_or_else(|| "neither RUSTUP_HOME nor HOME is set".to_owned())
+fn rustup_home(cwd: &Path) -> Result<PathBuf, String> {
+    tool_home(
+        std::env::var_os("RUSTUP_HOME"),
+        ".rustup",
+        cwd,
+        std::env::home_dir(),
+    )
+    .ok_or_else(|| "neither RUSTUP_HOME nor a home directory resolves".to_owned())
+}
+
+fn cargo_home(cwd: &Path) -> Result<PathBuf, String> {
+    tool_home(
+        std::env::var_os("CARGO_HOME"),
+        ".cargo",
+        cwd,
+        std::env::home_dir(),
+    )
+    .ok_or_else(|| "neither CARGO_HOME nor a home directory resolves".to_owned())
+}
+
+/// `CARGO_HOME` / `RUSTUP_HOME` as Cargo and rustup resolve them (the `home`
+/// crate): an empty value is unset, a relative one joins the working
+/// directory, and unset falls back to `<home>/<dot>`.
+fn tool_home(
+    value: Option<OsString>,
+    dot: &str,
+    cwd: &Path,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    match value.filter(|value| !value.is_empty()) {
+        Some(value) => Some(cwd.join(value)),
+        None => home.map(|home| home.join(dot)),
+    }
 }
 
 /// Key inputs observed before Cargo runs, published only after it succeeds.
@@ -728,17 +756,13 @@ fn resolution_inputs(cwd: &Path) -> Result<Resolution, String> {
             inputs.insert(path.clone(), stat(&path)?);
         }
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let cargo_home = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|home| home.join(".cargo")))
-        .ok_or("neither CARGO_HOME nor HOME is set")?;
+    let cargo_home = cargo_home(cwd)?;
     for name in ["config", "config.toml"] {
         let path = cargo_home.join(name);
         configs.push(path.clone());
         inputs.insert(path.clone(), stat(&path)?);
     }
-    let settings = rustup_home()?.join("settings.toml");
+    let settings = rustup_home(cwd)?.join("settings.toml");
     inputs.insert(settings.clone(), stat(&settings)?);
     let mut resolved = Vec::new();
     for program in ["cargo", "rustc"] {
@@ -777,7 +801,8 @@ fn path_candidates(
     Err(format!("{program} does not resolve on PATH"))
 }
 
-/// When the workspace root manifest declares `members`, a glob there can
+/// When the workspace root manifest may declare `members` (the name, or any
+/// backslash that could escape it in a quoted key), a glob there can
 /// match a package added anywhere below the root, at any depth: every
 /// directory under the root is recorded (except the root `target` and
 /// `.git`), so an added member changes a recorded directory. A directory
@@ -793,7 +818,9 @@ fn workspace_dirs(checkout: &Path) -> Result<Vec<PathBuf>, String> {
     if text.len() as u64 > MAX_CONFIG_BYTES {
         return Err(format!("{} exceeds 1 MiB", manifest.display()));
     }
-    if !text.contains("members") {
+    // A quoted TOML key can only spell `members` differently through an
+    // escape, so any backslash walks too.
+    if !text.contains("members") && !text.contains('\\') {
         return Ok(Vec::new());
     }
     let mut dirs = Vec::new();
@@ -1334,10 +1361,36 @@ mod tests {
         let recorded = tuples(&dirs);
         fs::create_dir_all(root.join("crates/b/pkg/src")).expect("member b");
         assert_ne!(tuples(&dirs), recorded, "a member added under crates/b");
+        // An escaped quoted key still walks.
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\n\"m\\u0065mbers\" = [\"crates/*/pkg\"]\n",
+        )
+        .expect("escaped root manifest");
+        assert!(workspace_dirs(&root)
+            .expect("dirs")
+            .contains(&root.join("crates/b/pkg")));
         // Without `members`, membership is manifest-driven: nothing to walk.
         fs::write(root.join("Cargo.toml"), "[workspace]\n").expect("plain root");
         assert_eq!(workspace_dirs(&root), Ok(Vec::new()));
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn tool_homes_resolve_as_cargo_does() {
+        let cwd = Path::new("/w");
+        let home = Some(PathBuf::from("/h"));
+        let resolve =
+            |value: Option<&str>| tool_home(value.map(OsString::from), ".cargo", cwd, home.clone());
+        assert_eq!(resolve(None), Some(PathBuf::from("/h/.cargo")));
+        assert_eq!(
+            resolve(Some("")),
+            Some(PathBuf::from("/h/.cargo")),
+            "empty is unset"
+        );
+        assert_eq!(resolve(Some("rel")), Some(PathBuf::from("/w/rel")));
+        assert_eq!(resolve(Some("/abs")), Some(PathBuf::from("/abs")));
+        assert_eq!(tool_home(None, ".cargo", cwd, None), None);
     }
 
     #[test]

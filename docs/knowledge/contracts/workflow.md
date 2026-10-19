@@ -317,7 +317,8 @@ immutability ([vision](../vision.md#product-workflow-direction)).
   - every workspace member's manifest that metadata read for selection, built
     or not (an unbuilt sibling's `default-run` changes `run`'s pick); each
     must be strictly older than a time taken before that query;
-  - when the workspace root manifest mentions `members`, every directory
+  - when the workspace root manifest mentions `members` or contains any
+    backslash (a quoted key could escape the name), every directory
     under the workspace root except the root `target` and `.git`: a member
     glob such as `crates/*/pkg` can match a package added at any depth, so an
     added member changes a recorded directory. A directory symlink or more
@@ -325,7 +326,9 @@ immutability ([vision](../vision.md#product-workflow-direction)).
   - `Cargo.lock`;
   - `.cargo/config`, `.cargo/config.toml`, `Cargo.toml`, `rust-toolchain`
     and `rust-toolchain.toml` in the working directory and every ancestor,
-    and `$CARGO_HOME/config(.toml)`, absent ones included;
+    and `$CARGO_HOME/config(.toml)`, absent ones included. `CARGO_HOME` and
+    `RUSTUP_HOME` resolve as Cargo and rustup do: empty means unset, relative
+    joins the working directory, unset falls back to the home directory;
   - toolchain resolution: rustup's `settings.toml`, every `PATH` candidate
     for `cargo` and `rustc` up to the one that resolves, the `rustup` a proxy
     is, and the resolved sysroot's `bin/rustc`, `bin/cargo`, `lib`, channel
