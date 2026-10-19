@@ -181,16 +181,26 @@ impl Gate {
         }
     }
 
+    /// The repository top the post-Cargo snapshot must read, when the gate
+    /// took a pre-Cargo one.
+    pub fn top(&self) -> Option<&Path> {
+        self.before.as_ref().map(|(top, _)| top.as_path())
+    }
+
     /// What to record once Cargo's group is empty, or `None` when nothing
-    /// can be trusted (the next command then evicts the slot).
-    pub fn finish(self, checkout: &Path) -> Option<Built> {
-        let anchor_ns = now_ns();
+    /// can be trusted (the next command then evicts the slot). `anchor_ns`
+    /// is taken once the group is empty and before `after`, the snapshot of
+    /// [`Gate::top`].
+    pub fn finish(
+        self,
+        checkout: &Path,
+        anchor_ns: u64,
+        after: Option<Result<(PathBuf, Content), String>>,
+    ) -> Option<Built> {
         let Some((top, before)) = self.before else {
             return Some(Built::Affine(checkout.to_path_buf()));
         };
-        let span = crate::trace::span("git.snapshot-after");
-        let (_, after) = snapshot(&top).ok()?;
-        drop(span);
+        let (_, after) = after?.ok()?;
         let mut uncertain = self.carried;
         uncertain.extend(self.changed);
         uncertain.extend(differing(&top, &before, &after).ok()?);
@@ -207,9 +217,15 @@ impl Gate {
 }
 
 /// Run the gate for `checkout` before Cargo. `request` is the guarded
-/// command's resolution request (`cli::resolution`). An error means the
+/// command's resolution request (`cli::resolution`); `before` is a snapshot
+/// of `checkout` taken before Cargo for this lease. An error means the
 /// caller must not run Cargo on the slot.
-pub fn prepare(checkout: &Path, prior: &Prior, request: &Resolution) -> Result<Gate, Refusal> {
+pub fn prepare(
+    checkout: &Path,
+    prior: &Prior,
+    request: &Resolution,
+    before: Result<(PathBuf, Content), String>,
+) -> Result<Gate, Refusal> {
     match prior {
         Prior::Unknown => Err(Refusal::Unvouched(
             "the slot has no trusted build record".to_owned(),
@@ -219,7 +235,7 @@ pub fn prepare(checkout: &Path, prior: &Prior, request: &Resolution) -> Result<G
             "the slot holds another checkout's build without Git content".to_owned(),
         )),
         // Nothing compiled yet: a checkout without Git content stays affine.
-        Prior::Fresh => Ok(match before_snapshot(checkout) {
+        Prior::Fresh => Ok(match before {
             Ok(before) => Gate {
                 before: Some(before),
                 ..Gate::affine()
@@ -227,7 +243,7 @@ pub fn prepare(checkout: &Path, prior: &Prior, request: &Resolution) -> Result<G
             Err(_) => Gate::affine(),
         }),
         Prior::Known(Built::Content(origin)) => {
-            let (top, content) = before_snapshot(checkout)?;
+            let (top, content) = before?;
             let changed = differing(&top, &origin.content, &content)?;
             let cross = origin.checkout != checkout;
             let mut stale: BTreeSet<&String> = changed.iter().collect();
@@ -254,12 +270,7 @@ pub fn prepare(checkout: &Path, prior: &Prior, request: &Resolution) -> Result<G
     }
 }
 
-fn before_snapshot(checkout: &Path) -> Result<(PathBuf, Content), String> {
-    let _span = crate::trace::span("git.snapshot-before");
-    snapshot(checkout)
-}
-
-fn now_ns() -> u64 {
+pub fn now_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| {
@@ -302,13 +313,21 @@ fn nul_separated(bytes: Vec<u8>) -> Result<Vec<String>, String> {
 }
 
 /// Repository top level and content for the checkout containing `path`.
-fn snapshot(path: &Path) -> Result<(PathBuf, Content), String> {
-    let top = utf8(git(path, &["rev-parse", "--show-toplevel"])?)?;
-    let top = fs::canonicalize(top.trim())
-        .map_err(|error| format!("cannot resolve the repository: {error}"))?;
-    let tree = utf8(git(&top, &["rev-parse", "--verify", "HEAD^{tree}"])?)?
-        .trim()
-        .to_owned();
+pub fn snapshot(path: &Path) -> Result<(PathBuf, Content), String> {
+    // One call for both: the top level, then HEAD's tree (refused when HEAD
+    // has no commit).
+    let head = utf8(git(
+        path,
+        &["rev-parse", "--show-toplevel", "--verify", "HEAD^{tree}"],
+    )?)?;
+    let (top, tree) = match head.lines().collect::<Vec<_>>()[..] {
+        [top, tree] if !tree.is_empty() && tree.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
+            (top, tree.to_owned())
+        }
+        _ => return Err("git rev-parse printed an unexpected top level or tree".to_owned()),
+    };
+    let top =
+        fs::canonicalize(top).map_err(|error| format!("cannot resolve the repository: {error}"))?;
     let status = git(
         &top,
         &[
@@ -1239,16 +1258,32 @@ mod tests {
 
     #[test]
     fn untrusted_or_foreign_affine_slots_refuse_the_gate() {
-        assert!(prepare(Path::new("/b"), &Prior::Unknown, &Resolution::default()).is_err());
+        let unread = || Err("no checkout".to_owned());
+        assert!(prepare(
+            Path::new("/b"),
+            &Prior::Unknown,
+            &Resolution::default(),
+            unread()
+        )
+        .is_err());
         let affine = Prior::Known(Built::Affine(PathBuf::from("/a")));
-        assert!(prepare(Path::new("/b"), &affine, &Resolution::default()).is_err());
+        assert!(prepare(Path::new("/b"), &affine, &Resolution::default(), unread()).is_err());
         assert_eq!(affine.foreign(Path::new("/b")), Some(PathBuf::from("/a")));
-        let own =
-            prepare(Path::new("/a"), &affine, &Resolution::default()).expect("own affine slot");
-        assert!(!own.cross && own.describe().is_none());
+        let own = prepare(Path::new("/a"), &affine, &Resolution::default(), unread())
+            .expect("own affine slot");
+        assert!(!own.cross && own.describe().is_none() && own.top().is_none());
         assert!(
-            matches!(own.finish(Path::new("/a")), Some(Built::Affine(path)) if path == Path::new("/a"))
+            matches!(own.finish(Path::new("/a"), 0, None), Some(Built::Affine(path)) if path == Path::new("/a"))
         );
+        // A fresh slot whose checkout has no Git content stays affine.
+        let fresh = prepare(
+            Path::new("/a"),
+            &Prior::Fresh,
+            &Resolution::default(),
+            unread(),
+        )
+        .expect("fresh slot");
+        assert!(fresh.top().is_none());
         assert!(Prior::Unknown.unchanged().is_none() && Prior::Fresh.unchanged().is_none());
     }
 

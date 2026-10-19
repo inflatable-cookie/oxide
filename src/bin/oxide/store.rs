@@ -320,6 +320,8 @@ pub struct Lease {
     /// Checkout whose idle slot this command took; restored if the gate
     /// refuses.
     pub shared_from: Option<PathBuf>,
+    /// The command waited before this lease was granted.
+    pub waited: bool,
     lease_id: String,
     record: u64,
     _lock: File,
@@ -644,16 +646,30 @@ impl Store {
         share: bool,
     ) -> Result<Acquired, String> {
         let max_active = max_active()?;
-        let ticket = self.register_ticket()?;
+        // A command that must wait joins the FIFO queue in the save that
+        // records its wait; one granted at once never needs a ticket.
+        let mut ticket: Option<(u64, File)> = None;
         let mut announced = false;
         loop {
             if let Some(signal) = process::received_signal() {
-                self.remove_ticket(ticket.0)?;
+                if let Some((id, _)) = &ticket {
+                    self.remove_ticket(*id)?;
+                }
                 return Ok(Acquired::Interrupted(signal));
             }
-            match self.attempt(ticket.0, key, profile, max_active, share)? {
-                Ok(lease) => {
-                    self.remove_ticket(ticket.0)?;
+            match self.attempt(&mut ticket, key, profile, max_active, share)? {
+                Ok(mut lease) => {
+                    lease.waited = announced;
+                    // The granting save already dropped the ticket entry.
+                    if let Some((id, file)) = ticket.take() {
+                        drop(file);
+                        match fs::remove_file(self.ticket_path(id)) {
+                            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                                return Err(error.to_string())
+                            }
+                            _ => {}
+                        }
+                    }
                     return Ok(Acquired::Lease(lease));
                 }
                 Err(wait) => {
@@ -700,11 +716,22 @@ impl Store {
     /// Release after every writer in the group has exited, recording the
     /// slot's compile origin (`None`: untrusted from now on).
     pub fn release(&self, held: Lease, origin: Option<Built>) -> Result<(), String> {
+        self.release_after(held, || origin)
+    }
+
+    /// [`Store::release`] with the origin computed while the slot's lease is
+    /// released, so a post-Cargo read overlaps that release.
+    pub fn release_after(
+        &self,
+        held: Lease,
+        origin: impl FnOnce() -> Option<Built>,
+    ) -> Result<(), String> {
         let _admission = self.admission()?;
         let span = crate::trace::span("lease.lib-release");
         release(&self.pool, &held.lease_id)
             .map_err(|error| lease_error("could not release the slot", &error))?;
         drop(span);
+        let origin = origin();
         let mut state = self.load()?;
         if let Some(index) = state
             .records
@@ -890,9 +917,11 @@ impl Store {
         Some((total.saturating_sub(free), total))
     }
 
+    /// One admission-locked try. `ticket` is this command's place in the
+    /// FIFO queue once it has had to wait; every path that waits saves it.
     fn attempt(
         &self,
-        ticket: u64,
+        ticket: &mut Option<(u64, File)>,
         key: &SlotKey,
         profile: Profile,
         max_active: usize,
@@ -901,13 +930,17 @@ impl Store {
         let _admission = self.admission()?;
         let mut state = self.load()?;
         self.drop_dead_tickets(&mut state)?;
-        let position = state
-            .tickets
-            .iter()
-            .position(|entry| entry.id == ticket)
-            .ok_or("Oxide wait ticket was lost")?;
+        // Without a ticket, this command's place would be the queue's end.
+        let position = match ticket {
+            Some((id, _)) => state
+                .tickets
+                .iter()
+                .position(|entry| entry.id == *id)
+                .ok_or("Oxide wait ticket was lost")?,
+            None => state.tickets.len(),
+        };
         if position != 0 {
-            self.save(&state)?;
+            self.wait_in_queue(&mut state, ticket)?;
             return Ok(Err(Wait::Queue(position + 1)));
         }
         if state
@@ -915,7 +948,7 @@ impl Store {
             .iter()
             .any(|clean| clean.checkout == key.checkout)
         {
-            self.save(&state)?;
+            self.wait_in_queue(&mut state, ticket)?;
             return Ok(Err(Wait::Clean));
         }
         self.recover_settled(&mut state)?;
@@ -925,7 +958,7 @@ impl Store {
             .filter(|record| record.phase != Phase::Idle)
             .count();
         if active >= max_active {
-            self.save(&state)?;
+            self.wait_in_queue(&mut state, ticket)?;
             return Ok(Err(Wait::HostLimit(active)));
         }
 
@@ -952,13 +985,13 @@ impl Store {
         let mut lock = None;
         if let Some(index) = existing {
             if state.records[index].phase != Phase::Idle {
-                self.save(&state)?;
+                self.wait_in_queue(&mut state, ticket)?;
                 return Ok(Err(Wait::Checkout));
             }
             match probe_lock(&self.lock_path(state.records[index].id), true)? {
                 Probe::Free(file) => lock = Some(file),
                 Probe::Held | Probe::Missing => {
-                    self.save(&state)?;
+                    self.wait_in_queue(&mut state, ticket)?;
                     return Ok(Err(Wait::Checkout));
                 }
             }
@@ -1023,7 +1056,7 @@ impl Store {
                     break;
                 }
                 if !evicted {
-                    self.save(&state)?;
+                    self.wait_in_queue(&mut state, ticket)?;
                     return Ok(Err(Wait::ProjectCap));
                 }
                 existing = state.records.iter().position(|record| matches(record));
@@ -1065,7 +1098,12 @@ impl Store {
             Some(origin) => Some(origin),
             None => self.trusted_origin(&state.records[index]),
         };
-        let lease_holder = format!("oxide-{}-{ticket}", std::process::id());
+        // Unique per command: its ticket's ID, else a fresh one.
+        let holder_id = match ticket {
+            Some((id, _)) => *id,
+            None => state.take_id()?,
+        };
+        let lease_holder = format!("oxide-{}-{holder_id}", std::process::id());
         state.records[index].phase = Phase::Acquiring;
         state.records[index].process_group = None;
         state.records[index].lease_id = None;
@@ -1104,7 +1142,13 @@ impl Store {
                 if shared_from.is_some() {
                     state.records[index].checkout = shared_from;
                 }
-                self.save(&state)?;
+                if matches!(error, LeaseError::Busy)
+                    || matches!(error, LeaseError::Full if active > 0)
+                {
+                    self.wait_in_queue(&mut state, ticket)?;
+                } else {
+                    self.save(&state)?;
+                }
                 return match error {
                     LeaseError::Busy => Ok(Err(Wait::Uncertain)),
                     LeaseError::Full if active > 0 => Ok(Err(Wait::Capacity)),
@@ -1113,6 +1157,10 @@ impl Store {
             }
         };
         state.records[index].lease_id = Some(grant.lease_id.clone());
+        // The wait ticket leaves in the same save that records the grant.
+        if let Some((id, _)) = ticket {
+            state.tickets.retain(|entry| entry.id != *id);
+        }
         self.save(&state)?;
         let prior = match (grant.reused_slot, recorded) {
             (false, _) => Prior::Fresh,
@@ -1125,6 +1173,7 @@ impl Store {
             build_dir: grant.env.cargo_build_build_dir,
             prior,
             shared_from,
+            waited: false,
             lease_id: grant.lease_id,
             record,
             _lock: lock,
@@ -1319,25 +1368,31 @@ impl Store {
         self.save(&state)
     }
 
-    fn register_ticket(&self) -> Result<(u64, File), String> {
-        let _admission = self.admission()?;
-        let mut state = self.load()?;
-        self.drop_dead_tickets(&mut state)?;
-        if state.tickets.len() >= MAX_TICKETS {
-            return Err(format!(
-                "the Oxide wait queue is full ({MAX_TICKETS} commands)"
-            ));
+    /// Save `state` for a command that must wait, first giving it a ticket
+    /// at the end of the FIFO queue if it has none. Called under the
+    /// admission lock, after dead tickets were dropped.
+    fn wait_in_queue(
+        &self,
+        state: &mut State,
+        ticket: &mut Option<(u64, File)>,
+    ) -> Result<(), String> {
+        if ticket.is_none() {
+            if state.tickets.len() >= MAX_TICKETS {
+                return Err(format!(
+                    "the Oxide wait queue is full ({MAX_TICKETS} commands)"
+                ));
+            }
+            let id = state.take_id()?;
+            let Probe::Free(file) = probe_lock(&self.ticket_path(id), true)? else {
+                return Err("a new Oxide wait ticket is unexpectedly held".to_owned());
+            };
+            state.tickets.push(Ticket {
+                id,
+                pid: std::process::id(),
+            });
+            *ticket = Some((id, file));
         }
-        let id = state.take_id()?;
-        let Probe::Free(file) = probe_lock(&self.ticket_path(id), true)? else {
-            return Err("a new Oxide wait ticket is unexpectedly held".to_owned());
-        };
-        state.tickets.push(Ticket {
-            id,
-            pid: std::process::id(),
-        });
-        self.save(&state)?;
-        Ok((id, file))
+        self.save(state)
     }
 
     fn remove_ticket(&self, id: u64) -> Result<(), String> {

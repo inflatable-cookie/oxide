@@ -12,6 +12,22 @@ const FORWARDED: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 const POLL: Duration = Duration::from_millis(20);
 const LINGER_NOTICE: Duration = Duration::from_secs(2);
 
+/// Wait-poll delays: 1 ms doubling up to [`POLL`], so a short Cargo is
+/// noticed promptly; signal forwarding and watchdog sampling never wait
+/// longer than before.
+struct Backoff(Duration);
+
+impl Backoff {
+    fn new() -> Self {
+        Self(Duration::from_millis(1))
+    }
+
+    fn sleep(&mut self) {
+        std::thread::sleep(self.0);
+        self.0 = (self.0 * 2).min(POLL);
+    }
+}
+
 /// Signal received but not yet forwarded.
 static PENDING: AtomicI32 = AtomicI32::new(0);
 /// Last signal received, kept for the exit status.
@@ -98,6 +114,7 @@ pub fn forward_pending(group: i32) {
 
 /// Wait for the leader, forwarding signals.
 pub fn wait_leader(group: &mut Group) -> Result<ExitStatus, String> {
+    let mut backoff = Backoff::new();
     loop {
         forward_pending(group.id);
         if let Some(status) = group
@@ -107,7 +124,7 @@ pub fn wait_leader(group: &mut Group) -> Result<ExitStatus, String> {
         {
             return Ok(status);
         }
-        std::thread::sleep(POLL);
+        backoff.sleep();
     }
 }
 
@@ -117,6 +134,7 @@ pub fn wait_leader_watched(
     group: &mut Group,
     watchdog: &mut Watchdog,
 ) -> Result<Option<ExitStatus>, String> {
+    let mut backoff = Backoff::new();
     loop {
         forward_pending(group.id);
         if let Some(status) = group
@@ -130,7 +148,7 @@ pub fn wait_leader_watched(
         if watchdog.gave_up() {
             return Ok(None);
         }
-        std::thread::sleep(POLL);
+        backoff.sleep();
     }
 }
 
@@ -138,6 +156,7 @@ pub fn wait_leader_watched(
 /// it is observed empty, or `None` once a stopped group outlives the
 /// watchdog's bound after KILL.
 pub fn wait_group_empty_watched(group: i32, watchdog: &mut Watchdog) -> Option<Instant> {
+    let mut backoff = Backoff::new();
     let started = Instant::now();
     let mut noticed = false;
     loop {
@@ -153,13 +172,14 @@ pub fn wait_group_empty_watched(group: i32, watchdog: &mut Watchdog) -> Option<I
             eprintln!("oxide: waiting for processes left in Cargo's process group {group} to exit");
             noticed = true;
         }
-        std::thread::sleep(POLL);
+        backoff.sleep();
     }
 }
 
 /// Wait until no process remains in the group, forwarding signals. A
 /// descendant that escaped with `setsid` is not observed.
 pub fn wait_group_empty(group: i32) {
+    let mut backoff = Backoff::new();
     let started = Instant::now();
     let mut noticed = false;
     while !group_empty(group) {
@@ -168,7 +188,7 @@ pub fn wait_group_empty(group: i32) {
             eprintln!("oxide: waiting for processes left in Cargo's process group {group} to exit");
             noticed = true;
         }
-        std::thread::sleep(POLL);
+        backoff.sleep();
     }
 }
 

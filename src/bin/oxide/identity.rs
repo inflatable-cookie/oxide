@@ -21,21 +21,22 @@ pub struct SlotKey {
 }
 
 impl SlotKey {
-    pub fn resolve(
-        cargo: &str,
-        manifest_path: Option<&Path>,
-        profile: &str,
-        target: Option<&str>,
-    ) -> Result<Self, String> {
-        let span = crate::trace::span("cargo.locate-project");
-        let checkout = locate_workspace(cargo, manifest_path)?;
-        drop(span);
-        let span = crate::trace::span("identity.git");
-        let identity = digest(&Identity::infer(&checkout).key());
-        drop(span);
-        let span = crate::trace::span("rustc.version");
-        let rustc = rustc_version(&checkout)?;
-        drop(span);
+    /// The key for the workspace rooted at `checkout`. Repository identity
+    /// and the toolchain are independent reads, so they run together.
+    pub fn resolve(checkout: PathBuf, profile: &str, target: Option<&str>) -> Result<Self, String> {
+        let (identity, toolchain) = std::thread::scope(|scope| {
+            let toolchain = scope.spawn(|| {
+                let _span = crate::trace::span("rustc.version");
+                crate::toolchain::identify(&checkout)
+            });
+            let span = crate::trace::span("identity.git");
+            let identity = digest(&Identity::infer(&checkout).key());
+            drop(span);
+            (identity, toolchain.join())
+        });
+        let rustc = toolchain
+            .map_err(|_| "the toolchain read panicked")??
+            .version;
         let target = match target {
             Some(target) => target.to_owned(),
             None => std::env::var("CARGO_BUILD_TARGET")
@@ -84,6 +85,15 @@ pub fn locate_workspace(cargo: &str, manifest_path: Option<&Path>) -> Result<Pat
     fs::canonicalize(root).map_err(|error| format!("cannot resolve the workspace root: {error}"))
 }
 
+/// `cargo run`'s pick and the canonical workspace root, both from one
+/// `cargo metadata --no-deps` call.
+pub struct RunMetadata {
+    pub pick: RunPick,
+    /// `workspace_root`: the directory `cargo locate-project --workspace`
+    /// reports for the same working directory and manifest path.
+    pub workspace: PathBuf,
+}
+
 /// Which binary `cargo run` would pick without `--bin` or `--example`.
 #[derive(Debug, Eq, PartialEq)]
 pub enum RunPick {
@@ -107,7 +117,7 @@ pub fn run_pick(
     cargo: &str,
     manifest_path: Option<&Path>,
     package: Option<&str>,
-) -> Result<RunPick, String> {
+) -> Result<RunMetadata, String> {
     let mut command = Command::new(cargo);
     command.args(["metadata", "--no-deps", "--format-version", "1"]);
     if let Some(manifest) = manifest_path {
@@ -124,7 +134,14 @@ pub fn run_pick(
     }
     let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("Cargo metadata is not JSON: {error}"))?;
-    Ok(select_run(&metadata, package))
+    let root = metadata["workspace_root"]
+        .as_str()
+        .ok_or("Cargo metadata has no workspace root")?;
+    Ok(RunMetadata {
+        pick: select_run(&metadata, package),
+        workspace: fs::canonicalize(root)
+            .map_err(|error| format!("cannot resolve the workspace root: {error}"))?,
+    })
 }
 
 fn select_run(metadata: &serde_json::Value, package: Option<&str>) -> RunPick {
@@ -196,8 +213,17 @@ pub enum Identity {
 impl Identity {
     pub fn infer(workspace: &Path) -> Self {
         let path_identity = || Self::Path(workspace.to_path_buf());
-        let shallow = git(workspace, &["rev-parse", "--is-shallow-repository"])
-            .is_some_and(|value| value == "true");
+        // One call for both; `--show-prefix` prints nothing at the top.
+        let (shallow, prefix) = git(
+            workspace,
+            &["rev-parse", "--is-shallow-repository", "--show-prefix"],
+        )
+        .map(|text| {
+            let mut lines = text.lines();
+            let shallow = lines.next() == Some("true");
+            (shallow, lines.next().unwrap_or_default().trim().to_owned())
+        })
+        .unwrap_or_default();
         if shallow {
             return git(workspace, &["config", "--get", "remote.origin.url"])
                 .map(|origin| Self::Origin(normalize_origin(&origin)))
@@ -208,7 +234,6 @@ impl Identity {
         else {
             return path_identity();
         };
-        let prefix = git(workspace, &["rev-parse", "--show-prefix"]).unwrap_or_default();
         let mut roots: Vec<String> = roots.lines().map(|root| root.trim().to_owned()).collect();
         roots.sort_unstable();
         Self::Git { roots, prefix }

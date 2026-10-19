@@ -13,6 +13,7 @@ mod freshness;
 mod identity;
 mod process;
 mod store;
+mod toolchain;
 mod trace;
 mod watchdog;
 
@@ -28,6 +29,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use store::{Acquired, Backend, Cleaning, Store};
 use watchdog::Watchdog;
@@ -125,17 +127,19 @@ fn apply_storage(command: &mut Command, build_dir: &Path, checkout: &Path) {
 
 fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     let mut invocation = cli::parse_leased(command, args)?;
+    let mut workspace = None;
     if command == "run" && cli::run_selection(&invocation.cargo_args).is_none() {
         // Build only what `cargo run` would run: `default-run`, else the
-        // package's only binary.
+        // package's only binary. The same metadata names the workspace root.
         let span = trace::span("cargo.metadata-run-pick");
-        let pick = identity::run_pick(
+        let metadata = identity::run_pick(
             CARGO,
             invocation.manifest_path.as_deref(),
             cli::package_selection(args).as_deref(),
         )?;
         drop(span);
-        match pick {
+        workspace = Some(metadata.workspace);
+        match metadata.pick {
             RunPick::Bin(name) => {
                 invocation
                     .cargo_args
@@ -152,9 +156,18 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
         }
     }
     let span = trace::span("resolve.slot-key");
+    let checkout = match workspace {
+        Some(root) => root,
+        None => {
+            let _span = trace::span("cargo.locate-project");
+            identity::locate_workspace(CARGO, invocation.manifest_path.as_deref())?
+        }
+    };
+    // The gate's pre-Cargo snapshot is read while the key resolves and the
+    // slot is leased; it serves a lease granted without waiting.
+    let mut before = Background::read(checkout.clone());
     let key = SlotKey::resolve(
-        CARGO,
-        invocation.manifest_path.as_deref(),
+        checkout,
         invocation.profile.label(),
         invocation.target.as_deref(),
     )?;
@@ -166,7 +179,7 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     let started = Instant::now();
     let resolution = cli::resolution(&invocation.cargo_args);
     let span = trace::span("lease.acquire-and-gate");
-    let leased = lease_with_gate(&store, &key, invocation.profile, &resolution)?;
+    let leased = lease_with_gate(&store, &key, invocation.profile, &resolution, &mut before)?;
     drop(span);
     let (held, gate) = match leased {
         Ok(leased) => leased,
@@ -247,8 +260,13 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     let warm = held.reused;
     let note = gate.describe();
     let span = trace::span("lease.release");
-    let origin = gate.finish(&key.checkout);
-    store.release(held, origin)?;
+    // The post-Cargo snapshot runs while the lease is released.
+    let anchor_ns = freshness::now_ns();
+    let after = gate.top().map(|top| Background::read(top.to_path_buf()));
+    store.release_after(held, || {
+        let after = after.map(|mut after| after.take());
+        gate.finish(&key.checkout, anchor_ns, after)
+    })?;
     drop(span);
     let (status, executable) = outcome?;
     let status = status.ok_or("Cargo ended without a status")?;
@@ -280,6 +298,36 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     }
 }
 
+/// A checkout snapshot read on another thread; joined before Oxide returns.
+struct Background(Option<JoinHandle<Result<(PathBuf, freshness::Content), String>>>);
+
+impl Background {
+    fn read(checkout: PathBuf) -> Self {
+        Self(Some(std::thread::spawn(move || {
+            let _span = trace::span("git.snapshot");
+            freshness::snapshot(&checkout)
+        })))
+    }
+
+    /// The snapshot; an error once it was taken.
+    fn take(&mut self) -> Result<(PathBuf, freshness::Content), String> {
+        match self.0.take() {
+            Some(read) => read
+                .join()
+                .unwrap_or_else(|_| Err("the checkout read panicked".to_owned())),
+            None => Err("the checkout snapshot was already used".to_owned()),
+        }
+    }
+}
+
+impl Drop for Background {
+    fn drop(&mut self) {
+        if let Some(read) = self.0.take() {
+            let _ = read.join();
+        }
+    }
+}
+
 /// Why a leased command ends before its Cargo runs.
 enum Stop {
     /// A signal received while waiting.
@@ -301,8 +349,10 @@ fn lease_with_gate(
     key: &SlotKey,
     profile: cli::Profile,
     resolution: &cli::Resolution,
+    before: &mut Background,
 ) -> Result<Result<(store::Lease, Gate), Stop>, String> {
     let mut share = true;
+    let mut first = true;
     // A refusal leaves this checkout without a record, so the next lease is
     // a new or evicted slot; the bound only guards against a defect.
     for _ in 0..4 {
@@ -310,8 +360,19 @@ fn lease_with_gate(
             Acquired::Lease(held) => held,
             Acquired::Interrupted(signal) => return Ok(Err(Stop::Signal(signal))),
         };
+        // The snapshot read alongside the slot key serves the first lease
+        // granted without waiting; after a wait or a refusal the gate reads
+        // the checkout again.
+        let early = std::mem::take(&mut first).then(|| before.take());
+        let snapshot = match early {
+            Some(snapshot) if !held.waited => snapshot,
+            _ => {
+                let _span = trace::span("git.snapshot");
+                freshness::snapshot(&key.checkout)
+            }
+        };
         let span = trace::span("gate.prepare");
-        let refusal = freshness::prepare(&key.checkout, &held.prior, resolution);
+        let refusal = freshness::prepare(&key.checkout, &held.prior, resolution, snapshot);
         drop(span);
         // Taken just now, or left on this checkout's record by a command
         // that died before Cargo.
