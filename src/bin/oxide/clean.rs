@@ -38,7 +38,7 @@ const OWNED_FILES: [&str; 4] = [
 /// (`ops/cargo_package/mod.rs` L166, L220) and `.metabuild`
 /// (`core/manifest.rs` L740).
 const OWNED_DIRS: [&str; 5] = ["doc", "cargo-timings", "tmp", "package", ".metabuild"];
-/// Entries of a target-triple directory (`layout.rs` L243-L244 push the
+/// Entries of a target-triple directory (`layout.rs` L243-L246 push the
 /// triple onto both roots): its profile directories plus these.
 const TRIPLE_FILES: [&str; 2] = ["CACHEDIR.TAG", ".rustdoc_fingerprint.json"];
 const TRIPLE_DIRS: [&str; 3] = ["doc", "cargo-timings", "tmp"];
