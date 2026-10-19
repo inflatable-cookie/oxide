@@ -1,0 +1,1101 @@
+{
+ "gate1": {
+  "failures": [
+   "skip is slower than plain cargo build no-op beyond noise: 23.902 ms > 16.239 + 4.462 ms"
+  ],
+  "report": "skip [28.364, 25.679, 23.902] ms; leased oxide run --rebuild [342.482, 283.113, 288.609] ms; plain cargo build no-op [17.299, 16.415, 16.239] ms; noise 4.462 ms; part 1 pass, part 2 fail"
+ },
+ "gate2": {
+  "failures": [
+   "overhead not cut by half: 266.873 ms > 205.696 ms"
+  ],
+  "report": "overhead baseline 411.392 ms, candidate 266.873 ms, gate 2 fail"
+ },
+ "log_note": "stdout was interleaved with effigy's banner and a traceback in the captured log; this JSON is the oxide-candidate-json line rejoined at the interleave, with no value changed",
+ "phase": "candidate",
+ "proof_outcome": "no-go: gate 1 part 2 and gate 2 failed; the proof then stopped at prove_routing ('project slot cap of 2 was not kept'): the pool-wide slot count check saw the timing fixture's extra project slot, a harness ordering defect; later cases did not run",
+ "source": {
+  "commit": "33497f83229045dca82c17c70d225e9375745a3b",
+  "note": "candidate proof 1 of 2: effigy rust:oxide-cli; the timing case ran first on the fresh pool",
+  "tree": "3785d54f76113cef776754a0dc912784f2336e2e"
+ },
+ "timing": {
+  "counts": {
+   "measured_cargo": 9,
+   "measured_requests": 9,
+   "rustc": 8,
+   "setup_cargo": 4
+  },
+  "fixture": "05e98d39aef9418c17eb1efb85204d42b9de311fdd542c4e565e0f995430dfb0",
+  "leased_ns": [
+   342482208,
+   283112666,
+   288608667
+  ],
+  "plain_ns": [
+   17298958,
+   16415083,
+   16239334
+  ],
+  "samples": [
+   {
+    "cargo_calls": 2,
+    "exit": 0,
+    "kind": "setup",
+    "ns": 866923958,
+    "phases": [
+     {
+      "at_us": 136,
+      "name": "skip.record-read",
+      "took_us": 8
+     },
+     {
+      "at_us": 151,
+      "name": "skip.record-read",
+      "took_us": 3
+     },
+     {
+      "at_us": 156,
+      "name": "skip.record-read",
+      "took_us": 3
+     },
+     {
+      "at_us": 162,
+      "name": "skip.record-read",
+      "took_us": 3
+     },
+     {
+      "at_us": 167,
+      "name": "skip.record-read",
+      "took_us": 3
+     },
+     {
+      "at_us": 172,
+      "name": "skip.record-read",
+      "took_us": 7
+     },
+     {
+      "at_us": 182,
+      "name": "skip.record-read",
+      "took_us": 3
+     },
+     {
+      "at_us": 188,
+      "name": "skip.record-read",
+      "took_us": 3
+     },
+     {
+      "at_us": 57,
+      "name": "skip.check",
+      "took_us": 136
+     },
+     {
+      "at_us": 213,
+      "name": "cargo.metadata-run-pick",
+      "took_us": 15179
+     },
+     {
+      "at_us": 15458,
+      "name": "git.read",
+      "took_us": 7927
+     },
+     {
+      "at_us": 15452,
+      "name": "identity.git",
+      "took_us": 15188
+     },
+     {
+      "at_us": 23415,
+      "name": "git.read",
+      "took_us": 7499
+     },
+     {
+      "at_us": 15462,
+      "name": "rustc.version",
+      "took_us": 16206
+     },
+     {
+      "at_us": 15506,
+      "name": "rustc.sysroot",
+      "took_us": 17418
+     },
+     {
+      "at_us": 32929,
+      "name": "record.inputs",
+      "took_us": 458
+     },
+     {
+      "at_us": 15449,
+      "name": "record.capture",
+      "took_us": 17942
+     },
+     {
+      "at_us": 30926,
+      "name": "git.read",
+      "took_us": 6846
+     },
+     {
+      "at_us": 15444,
+      "name": "git.snapshot-before",
+      "took_us": 22340
+     },
+     {
+      "at_us": 15417,
+      "name": "resolve.slot-key",
+      "took_us": 22385
+     },
+     {
+      "at_us": 37832,
+      "name": "lease.pool-status",
+      "took_us": 293
+     },
+     {
+      "at_us": 37808,
+      "name": "store.open",
+      "took_us": 483
+     },
+     {
+      "at_us": 38398,
+      "name": "ledger.save",
+      "took_us": 13869
+     },
+     {
+      "at_us": 52368,
+      "name": "lease.pool-status",
+      "took_us": 209
+     },
+     {
+      "at_us": 52693,
+      "name": "ledger.save",
+      "took_us": 9486
+     },
+     {
+      "at_us": 62190,
+      "name": "lease.lib-lease",
+      "took_us": 28984
+     },
+     {
+      "at_us": 91181,
+      "name": "ledger.save",
+      "took_us": 8957
+     },
+     {
+      "at_us": 100214,
+      "name": "gate.prepare",
+      "took_us": 0
+     },
+     {
+      "at_us": 38300,
+      "name": "lease.acquire-and-gate",
+      "took_us": 61919
+     },
+     {
+      "at_us": 100295,
+      "name": "ledger.save",
+      "took_us": 9030
+     },
+     {
+      "at_us": 100228,
+      "name": "ledger.mark-spawning",
+      "took_us": 9107
+     },
+     {
+      "at_us": 110457,
+      "name": "ledger.save",
+      "took_us": 7646
+     },
+     {
+      "at_us": 110390,
+      "name": "ledger.mark-running",
+      "took_us": 7724
+     },
+     {
+      "at_us": 109339,
+      "name": "cargo.build",
+      "took_us": 424946
+     },
+     {
+      "at_us": 534290,
+      "name": "wait.group-close",
+      "took_us": 1
+     },
+     {
+      "at_us": 534296,
+      "name": "git.read",
+      "took_us": 7673
+     },
+     {
+      "at_us": 541998,
+      "name": "git.read",
+      "took_us": 7490
+     },
+     {
+      "at_us": 549500,
+      "name": "git.read",
+      "took_us": 6737
+     },
+     {
+      "at_us": 534296,
+      "name": "git.snapshot-after",
+      "took_us": 21957
+     },
+     {
+      "at_us": 556294,
+      "name": "lease.lib-release",
+      "took_us": 30804
+     },
+     {
+      "at_us": 587172,
+      "name": "ledger.origin",
+      "took_us": 10778
+     },
+     {
+      "at_us": 597958,
+      "name": "ledger.save",
+      "took_us": 15327
+     },
+     {
+      "at_us": 534294,
+      "name": "lease.release",
+      "took_us": 79002
+     },
+     {
+      "at_us": 613301,
+      "name": "statfs",
+      "took_us": 6
+     },
+     {
+      "at_us": 613299,
+      "name": "summary.statfs",
+      "took_us": 32
+     },
+     {
+      "at_us": 613334,
+      "name": "record.inputs",
+      "took_us": 415
+     },
+     {
+      "at_us": 613878,
+      "name": "git.check-ignore",
+      "took_us": 7133
+     },
+     {
+      "at_us": 613334,
+      "name": "record.publish",
+      "took_us": 11733
+     },
+     {
+      "at_us": 625071,
+      "name": "exec.program",
+      "took_us": 0
+     }
+    ],
+    "skipped": false,
+    "stdout": "skip v1 - a\n"
+   },
+   {
+    "cargo_calls": 0,
+    "exit": 0,
+    "kind": "skip",
+    "ns": 28363958,
+    "phases": [
+     {
+      "at_us": 101,
+      "name": "skip.record-read",
+      "took_us": 64
+     },
+     {
+      "at_us": 174,
+      "name": "skip.inputs",
+      "took_us": 414
+     },
+     {
+      "at_us": 594,
+      "name": "git.read",
+      "took_us": 8786
+     },
+     {
+      "at_us": 9414,
+      "name": "git.read",
+      "took_us": 7708
+     },
+     {
+      "at_us": 17136,
+      "name": "git.read",
+      "took_us": 6574
+     },
+     {
+      "at_us": 23779,
+      "name": "exec.program",
+      "took_us": 0
+     }
+    ],
+    "skipped": true,
+    "stdout": "skip v1 - b\n"
+   },
+   {
+    "cargo_calls": 0,
+    "exit": 0,
+    "kind": "skip",
+    "ns": 25679000,
+    "phases": [
+     {
+      "at_us": 86,
+      "name": "skip.record-read",
+      "took_us": 61
+     },
+     {
+      "at_us": 157,
+      "name": "skip.inputs",
+      "took_us": 370
+     },
+     {
+      "at_us": 533,
+      "name": "git.read",
+      "took_us": 6886
+     },
+     {
+      "at_us": 7447,
+      "name": "git.read",
+      "took_us": 7508
+     },
+     {
+      "at_us": 14969,
+      "name": "git.read",
+      "took_us": 6506
+     },
+     {
+      "at_us": 21499,
+      "name": "exec.program",
+      "took_us": 0
+     }
+    ],
+    "skipped": true,
+    "stdout": "skip v1 - b\n"
+   },
+   {
+    "cargo_calls": 0,
+    "exit": 0,
+    "kind": "skip",
+    "ns": 23901709,
+    "phases": [
+     {
+      "at_us": 74,
+      "name": "skip.record-read",
+      "took_us": 53
+     },
+     {
+      "at_us": 137,
+      "name": "skip.inputs",
+      "took_us": 352
+     },
+     {
+      "at_us": 494,
+      "name": "git.read",
+      "took_us": 6050
+     },
+     {
+      "at_us": 6573,
+      "name": "git.read",
+      "took_us": 7079
+     },
+     {
+      "at_us": 13664,
+      "name": "git.read",
+      "took_us": 6186
+     },
+     {
+      "at_us": 19872,
+      "name": "exec.program",
+      "took_us": 0
+     }
+    ],
+    "skipped": true,
+    "stdout": "skip v1 - b\n"
+   },
+   {
+    "cargo_calls": 2,
+    "exit": 0,
+    "kind": "leased",
+    "ns": 342482208,
+    "phases": [
+     {
+      "at_us": 25,
+      "name": "skip.check",
+      "took_us": 1
+     },
+     {
+      "at_us": 45,
+      "name": "cargo.metadata-run-pick",
+      "took_us": 15157
+     },
+     {
+      "at_us": 15243,
+      "name": "git.read",
+      "took_us": 8129
+     },
+     {
+      "at_us": 23421,
+      "name": "git.read",
+      "took_us": 9967
+     },
+     {
+      "at_us": 15238,
+      "name": "identity.git",
+      "took_us": 18521
+     },
+     {
+      "at_us": 15246,
+      "name": "rustc.version",
+      "took_us": 19217
+     },
+     {
+      "at_us": 15388,
+      "name": "rustc.sysroot",
+      "took_us": 19916
+     },
+     {
+      "at_us": 35312,
+      "name": "record.inputs",
+      "took_us": 695
+     },
+     {
+      "at_us": 15243,
+      "name": "record.capture",
+      "took_us": 20767
+     },
+     {
+      "at_us": 33408,
+      "name": "git.read",
+      "took_us": 7473
+     },
+     {
+      "at_us": 15240,
+      "name": "git.snapshot-before",
+      "took_us": 25657
+     },
+     {
+      "at_us": 15214,
+      "name": "resolve.slot-key",
+      "took_us": 25709
+     },
+     {
+      "at_us": 40947,
+      "name": "lease.pool-status",
+      "took_us": 1037
+     },
+     {
+      "at_us": 40929,
+      "name": "store.open",
+      "took_us": 1071
+     },
+     {
+      "at_us": 42157,
+      "name": "ledger.save",
+      "took_us": 11021
+     },
+     {
+      "at_us": 53283,
+      "name": "lease.pool-status",
+      "took_us": 697
+     },
+     {
+      "at_us": 54051,
+      "name": "ledger.origin",
+      "took_us": 4511
+     },
+     {
+      "at_us": 58568,
+      "name": "ledger.save",
+      "took_us": 9903
+     },
+     {
+      "at_us": 68482,
+      "name": "lease.lib-lease",
+      "took_us": 8763
+     },
+     {
+      "at_us": 77251,
+      "name": "ledger.save",
+      "took_us": 8205
+     },
+     {
+      "at_us": 85532,
+      "name": "gate.prepare",
+      "took_us": 8
+     },
+     {
+      "at_us": 42011,
+      "name": "lease.acquire-and-gate",
+      "took_us": 43537
+     },
+     {
+      "at_us": 85633,
+      "name": "ledger.save",
+      "took_us": 8630
+     },
+     {
+      "at_us": 85557,
+      "name": "ledger.mark-spawning",
+      "took_us": 8715
+     },
+     {
+      "at_us": 95234,
+      "name": "ledger.save",
+      "took_us": 8180
+     },
+     {
+      "at_us": 95161,
+      "name": "ledger.mark-running",
+      "took_us": 8266
+     },
+     {
+      "at_us": 94274,
+      "name": "cargo.build",
+      "took_us": 59859
+     },
+     {
+      "at_us": 154138,
+      "name": "wait.group-close",
+      "took_us": 1
+     },
+     {
+      "at_us": 154144,
+      "name": "git.read",
+      "took_us": 7791
+     },
+     {
+      "at_us": 161970,
+      "name": "git.read",
+      "took_us": 8533
+     },
+     {
+      "at_us": 170518,
+      "name": "git.read",
+      "took_us": 7936
+     },
+     {
+      "at_us": 154144,
+      "name": "git.snapshot-after",
+      "took_us": 24327
+     },
+     {
+      "at_us": 178509,
+      "name": "lease.lib-release",
+      "took_us": 7718
+     },
+     {
+      "at_us": 186301,
+      "name": "ledger.origin",
+      "took_us": 4669
+     },
+     {
+      "at_us": 190978,
+      "name": "ledger.save",
+      "took_us": 7175
+     },
+     {
+      "at_us": 154142,
+      "name": "lease.release",
+      "took_us": 44021
+     },
+     {
+      "at_us": 198168,
+      "name": "statfs",
+      "took_us": 5
+     },
+     {
+      "at_us": 198166,
+      "name": "summary.statfs",
+      "took_us": 23
+     },
+     {
+      "at_us": 198193,
+      "name": "record.inputs",
+      "took_us": 419
+     },
+     {
+      "at_us": 198730,
+      "name": "git.check-ignore",
+      "took_us": 7870
+     },
+     {
+      "at_us": 198192,
+      "name": "record.publish",
+      "took_us": 12153
+     },
+     {
+      "at_us": 210351,
+      "name": "exec.program",
+      "took_us": 0
+     }
+    ],
+    "skipped": false,
+    "stdout": "skip v1 - b\n"
+   },
+   {
+    "cargo_calls": 2,
+    "exit": 0,
+    "kind": "leased",
+    "ns": 283112666,
+    "phases": [
+     {
+      "at_us": 28,
+      "name": "skip.check",
+      "took_us": 1
+     },
+     {
+      "at_us": 51,
+      "name": "cargo.metadata-run-pick",
+      "took_us": 14761
+     },
+     {
+      "at_us": 14849,
+      "name": "git.read",
+      "took_us": 7922
+     },
+     {
+      "at_us": 14847,
+      "name": "identity.git",
+      "took_us": 15164
+     },
+     {
+      "at_us": 14856,
+      "name": "rustc.version",
+      "took_us": 15506
+     },
+     {
+      "at_us": 22801,
+      "name": "git.read",
+      "took_us": 7671
+     },
+     {
+      "at_us": 14988,
+      "name": "rustc.sysroot",
+      "took_us": 16282
+     },
+     {
+      "at_us": 31275,
+      "name": "record.inputs",
+      "took_us": 384
+     },
+     {
+      "at_us": 14850,
+      "name": "record.capture",
+      "took_us": 16813
+     },
+     {
+      "at_us": 30485,
+      "name": "git.read",
+      "took_us": 6943
+     },
+     {
+      "at_us": 14846,
+      "name": "git.snapshot-before",
+      "took_us": 22596
+     },
+     {
+      "at_us": 14822,
+      "name": "resolve.slot-key",
+      "took_us": 22660
+     },
+     {
+      "at_us": 37504,
+      "name": "lease.pool-status",
+      "took_us": 758
+     },
+     {
+      "at_us": 37487,
+      "name": "store.open",
+      "took_us": 791
+     },
+     {
+      "at_us": 38403,
+      "name": "ledger.save",
+      "took_us": 7876
+     },
+     {
+      "at_us": 46356,
+      "name": "lease.pool-status",
+      "took_us": 610
+     },
+     {
+      "at_us": 47020,
+      "name": "ledger.origin",
+      "took_us": 3135
+     },
+     {
+      "at_us": 50158,
+      "name": "ledger.save",
+      "took_us": 8150
+     },
+     {
+      "at_us": 58314,
+      "name": "lease.lib-lease",
+      "took_us": 6762
+     },
+     {
+      "at_us": 65081,
+      "name": "ledger.save",
+      "took_us": 6098
+     },
+     {
+      "at_us": 71213,
+      "name": "gate.prepare",
+      "took_us": 6
+     },
+     {
+      "at_us": 38287,
+      "name": "lease.acquire-and-gate",
+      "took_us": 32937
+     },
+     {
+      "at_us": 71279,
+      "name": "ledger.save",
+      "took_us": 7678
+     },
+     {
+      "at_us": 71230,
+      "name": "ledger.mark-spawning",
+      "took_us": 7730
+     },
+     {
+      "at_us": 79785,
+      "name": "ledger.save",
+      "took_us": 6450
+     },
+     {
+      "at_us": 79729,
+      "name": "ledger.mark-running",
+      "took_us": 6513
+     },
+     {
+      "at_us": 78962,
+      "name": "cargo.build",
+      "took_us": 17298
+     },
+     {
+      "at_us": 96265,
+      "name": "wait.group-close",
+      "took_us": 1
+     },
+     {
+      "at_us": 96270,
+      "name": "git.read",
+      "took_us": 6993
+     },
+     {
+      "at_us": 103289,
+      "name": "git.read",
+      "took_us": 7255
+     },
+     {
+      "at_us": 110556,
+      "name": "git.read",
+      "took_us": 6603
+     },
+     {
+      "at_us": 96270,
+      "name": "git.snapshot-after",
+      "took_us": 20904
+     },
+     {
+      "at_us": 117206,
+      "name": "lease.lib-release",
+      "took_us": 7800
+     },
+     {
+      "at_us": 125063,
+      "name": "ledger.origin",
+      "took_us": 3258
+     },
+     {
+      "at_us": 128326,
+      "name": "ledger.save",
+      "took_us": 7921
+     },
+     {
+      "at_us": 96269,
+      "name": "lease.release",
+      "took_us": 39987
+     },
+     {
+      "at_us": 136260,
+      "name": "statfs",
+      "took_us": 4
+     },
+     {
+      "at_us": 136259,
+      "name": "summary.statfs",
+      "took_us": 20
+     },
+     {
+      "at_us": 136282,
+      "name": "record.inputs",
+      "took_us": 372
+     },
+     {
+      "at_us": 136761,
+      "name": "git.check-ignore",
+      "took_us": 6060
+     },
+     {
+      "at_us": 136282,
+      "name": "record.publish",
+      "took_us": 9811
+     },
+     {
+      "at_us": 146100,
+      "name": "exec.program",
+      "took_us": 0
+     }
+    ],
+    "skipped": false,
+    "stdout": "skip v1 - b\n"
+   },
+   {
+    "cargo_calls": 2,
+    "exit": 0,
+    "kind": "leased",
+    "ns": 288608667,
+    "phases": [
+     {
+      "at_us": 28,
+      "name": "skip.check",
+      "took_us": 1
+     },
+     {
+      "at_us": 50,
+      "name": "cargo.metadata-run-pick",
+      "took_us": 15173
+     },
+     {
+      "at_us": 15257,
+      "name": "git.read",
+      "took_us": 8315
+     },
+     {
+      "at_us": 15259,
+      "name": "identity.git",
+      "took_us": 15230
+     },
+     {
+      "at_us": 23601,
+      "name": "git.read",
+      "took_us": 7750
+     },
+     {
+      "at_us": 15269,
+      "name": "rustc.version",
+      "took_us": 16198
+     },
+     {
+      "at_us": 15410,
+      "name": "rustc.sysroot",
+      "took_us": 16976
+     },
+     {
+      "at_us": 32390,
+      "name": "record.inputs",
+      "took_us": 405
+     },
+     {
+      "at_us": 15261,
+      "name": "record.capture",
+      "took_us": 17537
+     },
+     {
+      "at_us": 31366,
+      "name": "git.read",
+      "took_us": 7100
+     },
+     {
+      "at_us": 15256,
+      "name": "git.snapshot-before",
+      "took_us": 23224
+     },
+     {
+      "at_us": 15234,
+      "name": "resolve.slot-key",
+      "took_us": 23275
+     },
+     {
+      "at_us": 38531,
+      "name": "lease.pool-status",
+      "took_us": 974
+     },
+     {
+      "at_us": 38515,
+      "name": "store.open",
+      "took_us": 1008
+     },
+     {
+      "at_us": 39672,
+      "name": "ledger.save",
+      "took_us": 9727
+     },
+     {
+      "at_us": 49486,
+      "name": "lease.pool-status",
+      "took_us": 664
+     },
+     {
+      "at_us": 50227,
+      "name": "ledger.origin",
+      "took_us": 4276
+     },
+     {
+      "at_us": 54509,
+      "name": "ledger.save",
+      "took_us": 11804
+     },
+     {
+      "at_us": 66320,
+      "name": "lease.lib-lease",
+      "took_us": 7793
+     },
+     {
+      "at_us": 74119,
+      "name": "ledger.save",
+      "took_us": 8255
+     },
+     {
+      "at_us": 82421,
+      "name": "gate.prepare",
+      "took_us": 6
+     },
+     {
+      "at_us": 39531,
+      "name": "lease.acquire-and-gate",
+      "took_us": 42901
+     },
+     {
+      "at_us": 82500,
+      "name": "ledger.save",
+      "took_us": 7609
+     },
+     {
+      "at_us": 82441,
+      "name": "ledger.mark-spawning",
+      "took_us": 7675
+     },
+     {
+      "at_us": 91037,
+      "name": "ledger.save",
+      "took_us": 7276
+     },
+     {
+      "at_us": 90955,
+      "name": "ledger.mark-running",
+      "took_us": 7367
+     },
+     {
+      "at_us": 90119,
+      "name": "cargo.build",
+      "took_us": 17276
+     },
+     {
+      "at_us": 107399,
+      "name": "wait.group-close",
+      "took_us": 0
+     },
+     {
+      "at_us": 107405,
+      "name": "git.read",
+      "took_us": 6885
+     },
+     {
+      "at_us": 114317,
+      "name": "git.read",
+      "took_us": 6775
+     },
+     {
+      "at_us": 121104,
+      "name": "git.read",
+      "took_us": 6145
+     },
+     {
+      "at_us": 107404,
+      "name": "git.snapshot-after",
+      "took_us": 19857
+     },
+     {
+      "at_us": 127289,
+      "name": "lease.lib-release",
+      "took_us": 7901
+     },
+     {
+      "at_us": 135254,
+      "name": "ledger.origin",
+      "took_us": 6154
+     },
+     {
+      "at_us": 141412,
+      "name": "ledger.save",
+      "took_us": 8016
+     },
+     {
+      "at_us": 107403,
+      "name": "lease.release",
+      "took_us": 42035
+     },
+     {
+      "at_us": 149442,
+      "name": "statfs",
+      "took_us": 4
+     },
+     {
+      "at_us": 149441,
+      "name": "summary.statfs",
+      "took_us": 18
+     },
+     {
+      "at_us": 149462,
+      "name": "record.inputs",
+      "took_us": 368
+     },
+     {
+      "at_us": 149930,
+      "name": "git.check-ignore",
+      "took_us": 6342
+     },
+     {
+      "at_us": 149461,
+      "name": "record.publish",
+      "took_us": 10781
+     },
+     {
+      "at_us": 160270,
+      "name": "exec.program",
+      "took_us": 0
+     }
+    ],
+    "skipped": false,
+    "stdout": "skip v1 - b\n"
+   },
+   {
+    "cargo_calls": 1,
+    "exit": 0,
+    "kind": "plain",
+    "ns": 17298958
+   },
+   {
+    "cargo_calls": 1,
+    "exit": 0,
+    "kind": "plain",
+    "ns": 16415083
+   },
+   {
+    "cargo_calls": 1,
+    "exit": 0,
+    "kind": "plain",
+    "ns": 16239334
+   }
+  ],
+  "skip_ns": [
+   28363958,
+   25679000,
+   23901709
+  ]
+ }
+}

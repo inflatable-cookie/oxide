@@ -1,0 +1,7 @@
+{
+  "source_commit": "b313e9bd3bd2f941c7d04a795bb2fe5233840471",
+  "files": {
+    "baseline.json": "dfcad129976517eb34557857580731db1af907a8e33645a8a8cff0d4390525b4",
+    "candidate-1.json": "27d27743f4da1c6bafefbd449b81b20f634f1679300b74b3a610b534bf11fb7f"
+  }
+}

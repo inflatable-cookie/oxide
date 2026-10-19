@@ -347,6 +347,15 @@ decision `d59ada84-94b9-423c-8c07-54a09504e064` v2 records the relayed answer):
 
 No other project, consumer, skill installation or Nucleus change is granted.
 
+The subsequent overhead attempt did not meet its fixed skip or ordinary-path
+speed gates. Its profile and eligibility trace are retained as
+[negative knowledge](rust-dx-landscape.md#oxide-run-overhead-profile-2026-10-19),
+without adopting its product code. The architect selected evidence-only review
+and preservation, with no rerun, rescoring or changed threshold. The approved
+dogfooding sequence still requires a reviewed successor merge; changing it to
+current main, shelving the skip, or opening a normal-overhead round awaits Tom
+([Q-016](questions.md#q-016--how-should-oxide-proceed-after-the-086-no-go)).
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus

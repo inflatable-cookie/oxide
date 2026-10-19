@@ -245,7 +245,7 @@ time separately before any backend is credited.
 
 | Lever | Finding | Fit |
 | --- | --- | --- |
-| No-op fast path | Oxide can record the last successful build's content identity per checkout and binary (the freshness gate records it). If unchanged, it executes without invoking Cargo, skipping Cargo's fingerprint walk. | In Oxide's control; small, safe; after the gate. |
+| No-op fast path | Oxide can record the last successful build's content identity per checkout and binary (the freshness gate records it). If unchanged, it executes without invoking Cargo, skipping Cargo's fingerprint walk. | Not adopted: the attempted fast path did not pass its fixed timing gates ([profile](#oxide-run-overhead-profile-2026-10-19)). |
 | Optimized dependencies in `quick` | `package."*".opt-level` can make heavy dependencies run faster. Shared slots would pay that compile cost once across worktrees. It needs `--config`, because the environment cannot express `package."*"`. Measured 2026-10-18 on Oxide's workspace: about 3.3 s extra cold build and no test-runtime gain ([measurement](#optimized-dependency-measurement-2026-10-18)). | Not for the default recipe. A dependency-compute-bound project needs its own reading. Every modelled command must use the same recipe, or the slot holds two dependency sets. |
 | Workspace feature unification | Selecting different packages builds dependency variants with different features: churn and extra storage. A 2026-10-18 probe on 1.97.1 showed `resolver.feature-unification` is ignored without `-Zfeature-unification` ([RFC 3692](https://rust-lang.github.io/rfcs/3692-feature-unification.html)). The stable route is a workspace-hack crate, which is a project change. | `oxide status` could report duplicate dependency variants; the fix stays per project. |
 | Faster linkers | macOS uses Apple's linker. [Wild](https://github.com/davidlattimore/wild) is Linux-only, has no incremental linking yet, and its Mach-O port is not ready. | Linux: LLD default already; wild later. macOS: nothing to add. |
@@ -570,6 +570,90 @@ Per-worktree saving for this subject: 15,568,896 bytes (about 14.8 MiB), or 6.7%
 `cargo test --no-run` re-uplifted the three fresh bins (new inodes) because integration tests need them. In X that means a fresh full copy on the host volume. In S it means a new clone. No write volume was measured.
 
 Limits: one subject on one host, one cold build plus one `test --no-run` per layout, APFS only. No repeat, edit or branch-switch builds; no test execution; no Linux run. Clones share blocks only until either side is rewritten. Placement, lease and default behavior are unchanged. A same-volume target directory would also move final outputs off the checkout and into the pool, which affects the privacy and lifetime rules in [workflow](contracts/workflow.md#what-one-command-does-local-executor). Evidence: [final-output-links-082](evidence/final-output-links-082/summary.json).
+
+## `oxide run` overhead profile (2026-10-19)
+
+A prototype profiled the skip path and normal leased no-op on one std-only
+fixture over a fresh 128 MiB APFS pool. It used opt-in phase tracing on one
+macOS host. This is retained negative fixture knowledge; the implementation
+is not merged. Preserved records: [baseline](evidence/run-overhead-086/baseline.json),
+[candidate](evidence/run-overhead-086/candidate-1.json) and
+[preservation notes](evidence/run-overhead-086/README.md).
+
+| Fastest of three | Instrumentation-only baseline | Candidate |
+| --- | --- | --- |
+| Skip, including program execution | 24.621 ms | 23.902 ms |
+| Leased no-op, including program execution | 434.051 ms | 283.113 ms |
+| Plain `cargo build` no-op, without program execution | 22.659 ms | 16.239 ms |
+| Difference: leased minus plain build | 411.392 ms | 266.873 ms |
+
+Both fixed candidate gates failed. Skip gate part 1 passed, but part 2
+failed: 23.902 ms exceeds 16.239 ms plus the fixed 4.462 ms noise allowance.
+The ordinary-path gate required a difference at most 205.696 ms (half the
+baseline); the observed reduction was about 35%. There is no rescoring,
+criterion relaxation or claim about a larger project, SSD writes or CPU cost.
+
+The baseline phase recorded 9.061 seconds, nine measured requests and 18
+actual Cargo invocations including setup/staging. Both records retain the same
+fixture digest. Candidate timing ran before the remaining correctness cases;
+the focused proof then stopped at `prove_routing`'s project-slot-count
+assertion because its timing fixture had added another project. Registry and
+outside-path correctness cases did not execute. Existing passing selectors and
+partial observations do not supply missing end-to-end acceptance.
+
+What the phase trace shows:
+
+- The command-start to pre-exec marker interval was about 291–294 ms for the
+  two shorter baseline leased samples (361 ms for the outlier), and 146–210 ms
+  in the candidate. This includes child Cargo/rustc work, waits and syncs;
+  it is not exclusively Oxide CPU time. Phase spans are nested/overlapping and
+  must not be summed as disjoint costs.
+- Individual Git commands commonly took about 6–10 ms. The prototype's baseline
+  repeated Git reads across identity, snapshots and record publication.
+  Ledger saves commonly took several milliseconds; rustup-proxied `rustc`
+  identity/sysroot commands and Cargo workspace-resolution commands also had
+  visible process costs. These are measured categories, not a claim that
+  removing any call would preserve semantics.
+- Subtracting the pre-exec marker from total leased duration leaves roughly
+  132–147 ms in the shorter samples and about 1.025 s in the baseline outlier.
+  The marker is emitted before the `exec` call; this residual does not isolate
+  successful exec, loader/security checks, program execution or scheduling.
+  Skip samples leave about 4–5 ms. No plain `cargo run` sample was collected.
+- Pinned Cargo has a fresh-unit artifact-uplift path and a platform-dependent
+  [link/copy implementation](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/crates/cargo-util/src/paths.rs).
+  Output replacement and first-execution checks are hypotheses for part of the
+  residual, not measured causes. No per-invocation output-identity or syscall
+  proof establishes that every no-op replaced a binary. The build-only baseline
+  does not execute the program; that comparison was fixed before the run and
+  remains the failed gate's definition.
+
+Candidate changes attempted workspace-root reuse from existing metadata,
+parallel identity/toolchain/input reads, sharing the pre/post-Cargo snapshot
+between the gate and skip record, and removing the wait ticket in its granting
+save. The author reports no fsync removal. These changes are preserved source,
+not independently accepted semantic equivalence or adopted improvements.
+
+Cargo-relative source findings at pinned `c980f4866`:
+
+- The [compiler call site](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/compiler/mod.rs)
+  passes the unit's local-source classification to dep-info translation.
+  [Translation](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/compiler/fingerprint/dep_info.rs)
+  skips package-relative files when `allow_package` is false. Thus merely seeing
+  `CheckDepInfo` does not prove that all registry/git package files are followed.
+- [Final-artifact dep-info generation](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/compiler/output_depinfo.rs)
+  treats non-local package changes as lockfile-identity changes and omits their
+  ordinary package inputs. This does not expose every input Cargo can follow.
+- [Build-script fingerprints](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/compiler/fingerprint/mod.rs)
+  can follow `rerun-if-changed` paths. Non-local dep-info may also retain paths
+  outside its package/build roots. Those inputs were not covered by this
+  prototype's selected public-output strategy.
+
+The prototype allowed registry/git packages without build scripts through the
+lock/source identity and refused those with build scripts. Its new eligibility
+cases were not reached, and the outside-package input limitation remained
+unresolved. This is source-analysis and design material, not a universal
+Cargo-equivalent skip qualification. The fixed no-go and preserved correctness
+repairs do not authorize another run, product merge or dogfooding sequence change.
 
 ## Product assessment
 

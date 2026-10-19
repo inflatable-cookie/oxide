@@ -148,3 +148,16 @@ Settled by Tom on 2026-10-09: use 20 GiB as a monitored start/abort threshold, n
 Pointer, 2026-10-18: W-5 retirement execution is done ([retirements](retired.toml)).
 
 The proposed [workflow](contracts/workflow.md#open-decisions) lists W-1 to W-8: default pool, waiting and concurrency, project file, crash-recovery qualification, retirement execution, Linux backend, command naming and the cross-checkout freshness gate. Crash-recovery and retirement direction are ruled; the rest have recommendations. Owner: [workflow](contracts/workflow.md).
+
+
+## Q-016 — How should Oxide proceed after the #086 no-go?
+
+Tom approved Oxide-only dogfooding after the successor's reviewed merge
+([vision](vision.md#product-workflow-direction)). The attempted successor did
+not meet either fixed timing gate; its correctness proof also stopped before
+its new eligibility cases ([profile](rust-dx-landscape.md#oxide-run-overhead-profile-2026-10-19)).
+Open: whether dogfooding should instead use the currently shipped main, and
+whether to shelve the skip path and scope a normal-path overhead round.
+Those are with Tom in the architect's thread; no parallel operator question or
+sequence change is created here. The profile's pre-exec/total residual is an
+observation with unisolated causes, not proof of a binary-rewrite execution cost.
