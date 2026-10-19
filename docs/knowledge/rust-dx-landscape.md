@@ -719,6 +719,24 @@ None of this is merged or installed. The branch is kept only as a knowledge
 donor: do not import its runtime, its toolchain cache or its eligibility
 reasoning. Later work starts from current main.
 
+## macOS new-executable launch cost (2026-10-19)
+
+A Supervisor probe on this host (macOS, Apple Silicon; tiny `rustc -O` binary; 10 runs each) measured process launch time:
+
+| Launch | Median | Range |
+| --- | --- | --- |
+| The same file again | 2.3 ms | 1.9–295.8 ms (the 295.8 ms outlier was the first run) |
+| A fresh `copyfile` of identical content | 101.6 ms | 98.6–124.5 ms |
+| An APFS clone (`cp -c`) | 117.1 ms | 113.2–122.2 ms |
+
+Every newly written executable pays about 100 ms on its first launch, even with identical content and even as a copy-on-write clone. This is consistent with macOS XProtect/Gatekeeper first-execution assessment ([nextest: antivirus and Gatekeeper](https://nexte.st/book/antivirus-gatekeeper); [Rust forum report](https://users.rust-lang.org/t/cargo-run-slow-on-macos-when-binary-already-built/117450)). The probe did not trace the system daemon itself.
+
+It accounts for the 128–147 ms after-exec residual in the [#086 profile](#oxide-run-overhead-profile-2026-10-19), because pinned Cargo rewrites the uplifted binary on every build. It also hits every test binary after a rebuild.
+
+The documented mitigation is a host setting: add the app responsible for launching builds to Privacy & Security → Developer Tools (for example `sudo spctl developer-mode enable-terminal` for Terminal). Some reports say it is incomplete. Here the agent process chain is `Paseo.app` → Paseo Supervisor → Paseo Daemon → agent → shell. Confirming the responsible app needs root.
+
+Do not disable Gatekeeper globally. No host setting was changed by this probe.
+
 ## Product assessment
 
 Planner recommendation: a small coherent entry point over evidence-backed mechanisms, with three capabilities: see and explain costs, bound and reuse owned storage, and apply qualified improvements with clear trade-offs. The reusable storage core must work for ordinary developers as well as orchestrators. A daemon, editor surface or UI is still an open choice; Tom's [workflow direction](vision.md#product-workflow-direction) sets an `oxide build` / `oxide run` front door as the design target.
