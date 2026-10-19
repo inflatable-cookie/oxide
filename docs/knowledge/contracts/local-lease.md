@@ -275,10 +275,26 @@ A packaging-only rebuild from merged reviewed source
 `f75cbb4d0efd11034adb3d1dd826df9bb993ecf0`, PR #67) is available at:
 
 ```text
-/Users/tom/Dev/projects/oxide/target/oxide-handover/f75cbb4d0efd11034adb3d1dd826df9bb993ecf0/oxide-storage-lease
+/Users/tom/.local/share/northstar/release-audits/oxide/2026-10-19/lease-handover/f75cbb4d0efd11034adb3d1dd826df9bb993ecf0/oxide-storage-lease
 ```
 
 SHA-256: `ddceaf502589ea760a86edec8f47e3563675727f754c00888127eb4074535045`.
+
+On 2026-10-19, the four handover binaries were copied, without rebuilding or
+moving their originals, out of disposable `target/` into that durable audit
+root. `manifest.json` beside the source-ref directories records source and
+copy paths, sizes, modes and matching SHA-256 hashes. The historical copies are:
+
+| Source ref directory | Binary SHA-256 |
+| --- | --- |
+| `376844daedd363ff5c2441e3ba12d1dfbe4e54b0` | `637a68b740b0ad424a085bd42b5b30feee129962334831c3cb4ee8f60e087785` |
+| `8941ae075356b456957d5678b77dd919f34eb65f` | `9b0b0fc853c8607a94ccec765b84323d25ab42e0dcb95a40e1446b5a6cf12fbd` |
+| `ecc185bc77ce382d5a832656166a144822a1bc6a` | `9d468378af13b1438227d93c5b166ab638ce5a19adfe2ead3857ee4f6085d1a8` |
+| `f75cbb4d0efd11034adb3d1dd826df9bb993ecf0` | `ddceaf502589ea760a86edec8f47e3563675727f754c00888127eb4074535045` |
+
+This preserves existing artifacts; it grants no new validation or installation
+credit. Nucleus's installed copy and live use were not read or changed.
+
 This canonical-checkout rebuild has its own hash; the experimental binary
 hash remains unchanged in the evidence. No native fixture, consumer Cargo
 experiment, pool initialization or installation was performed by packaging.
