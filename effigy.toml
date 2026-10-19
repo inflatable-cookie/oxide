@@ -49,3 +49,11 @@ run = "python3 scripts/test-storage-lease-cli.py"
 [tasks."rust:oxide-cli"]
 admission = "heavy"
 run = "python3 scripts/test-oxide-cli.py"
+
+# The separate before-profile phase for oxide#088: stages the product and runs
+# only the overhead timing sample set (two rounds, ten measured requests) on
+# one fresh 128 MiB APFS pool inside a 120 s clock, printing every raw sample.
+# Not a gate and not full QA; `rust:oxide-cli` runs the fixed gate.
+[tasks."rust:oxide-overhead-baseline"]
+admission = "heavy"
+run = "python3 scripts/test-oxide-cli.py --baseline"

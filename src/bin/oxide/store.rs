@@ -584,8 +584,10 @@ impl Store {
     fn open_at(path: &Path) -> Result<Self, String> {
         let pool =
             fs::canonicalize(path).map_err(|error| format!("cannot open the pool: {error}"))?;
+        let span = crate::trace::span("lease.pool-status");
         let status =
             pool_status(&pool).map_err(|error| lease_error("cannot open the pool", &error))?;
+        drop(span);
         let backend = Backend::recorded(&status.backend)?;
         if let Some(requested) = requested_backend()? {
             if requested != backend {
@@ -628,6 +630,7 @@ impl Store {
     }
 
     pub fn status(&self) -> Result<PoolStatus, String> {
+        let _span = crate::trace::span("lease.pool-status");
         pool_status(&self.pool).map_err(|error| lease_error("cannot read the pool", &error))
     }
 
@@ -698,8 +701,10 @@ impl Store {
     /// slot's compile origin (`None`: untrusted from now on).
     pub fn release(&self, held: Lease, origin: Option<Built>) -> Result<(), String> {
         let _admission = self.admission()?;
+        let span = crate::trace::span("lease.lib-release");
         release(&self.pool, &held.lease_id)
             .map_err(|error| lease_error("could not release the slot", &error))?;
+        drop(span);
         let mut state = self.load()?;
         if let Some(index) = state
             .records
@@ -1089,7 +1094,9 @@ impl Store {
             },
             holder: lease_holder,
         };
+        let span = crate::trace::span("lease.lib-lease");
         let outcome = lease(request);
+        drop(span);
         let grant = match outcome {
             Ok(grant) => grant,
             Err(error) => {
@@ -1267,6 +1274,7 @@ impl Store {
     }
 
     fn write_origin(&self, id: u64, mark: u64, origin: Option<Built>) -> Result<(), String> {
+        let _span = crate::trace::span("ledger.origin");
         ensure_private_dir(&self.control.join("origins"))?;
         let bytes = serde_json::to_vec(&OriginFile {
             version: ORIGIN_VERSION,
@@ -1434,6 +1442,7 @@ impl Store {
     }
 
     fn save(&self, state: &State) -> Result<(), String> {
+        let _span = crate::trace::span("ledger.save");
         let bytes = serde_json::to_vec(state).map_err(|error| error.to_string())?;
         if bytes.len() as u64 > MAX_STATE_BYTES {
             return Err("Oxide state reached its byte limit".to_owned());
@@ -1620,6 +1629,7 @@ fn flock(file: &File, operation: libc::c_int) -> Result<(), String> {
 }
 
 pub(crate) fn statfs(path: &Path) -> Option<libc::statfs> {
+    let _span = crate::trace::span("statfs");
     let mut bytes = path.as_os_str().as_bytes().to_vec();
     bytes.push(0);
     let mut sample = std::mem::MaybeUninit::<libc::statfs>::uninit();

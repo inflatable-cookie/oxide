@@ -45,6 +45,7 @@ full QA.
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import os
 import re
@@ -73,6 +74,19 @@ END = "<!-- oxide:end -->"
 # Set after the oxide binaries compile; ordinary compiler artifacts are
 # outside the proof-phase bound.
 STARTED = 0.0
+# Fixed timing-gate failures, reported after every other case has run.
+NO_GO: list = []
+
+# The std-only overhead fixture (oxide#088), identical for the baseline phase
+# and the candidate gate.
+TIMING_FIXTURE = {
+    "Cargo.toml": '[package]\nname = "timing"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n',
+    "rust-toolchain.toml": '[toolchain]\nchannel = "1.97.1"\n',
+    ".gitignore": "/target\n",
+    "src/main.rs": 'fn main() {\n    let args: Vec<String> = std::env::args().skip(1).collect();\n    println!("timing {}", args.join(" "));\n}\n',
+}
+TRACE = re.compile(r"^oxide-trace: (?P<name>[a-z.-]+) at=(?P<at>\d+)us took=(?P<took>\d+)us$", re.M)
+GATE_CEILING_NS = 100_000_000
 
 FIXTURE = {
     "Cargo.toml": """[package]
@@ -931,6 +945,8 @@ def prove_native(runner: Runner, app: str) -> None:
         program=runner.lease,
     )
     expect(code, 0, "pool init", stderr)
+    prove_timing(runner)
+    timing_slots = len(runner.lease_status()["slots"])
     slots_root = os.path.join(runner.pool, "payload", "slots")
     # OXIDE_POOL_CAP never resizes an existing pool; a conflict is reported.
     code, stdout, stderr = runner.run(app, ["status"], {"OXIDE_POOL_CAP": "256MiB"})
@@ -970,10 +986,10 @@ def prove_native(runner: Runner, app: str) -> None:
         if units.get(crate) != "2":
             fail(f"debug {crate} debuginfo {units.get(crate)!r}; units {units}")
 
-    prove_routing(runner, app, quick_slot, debug["slot"])
+    prove_routing(runner, app, quick_slot, debug["slot"], timing_slots)
 
 
-def prove_routing(runner: Runner, app: str, quick_slot: str, debug_slot: str) -> None:
+def prove_routing(runner: Runner, app: str, quick_slot: str, debug_slot: str, timing_slots: int) -> None:
     slots_root = os.path.join(runner.pool, "payload", "slots")
     # Building passthrough: an external subcommand's $CARGO sees the
     # environment-only profile definitions and the injected build dir.
@@ -1106,7 +1122,7 @@ def prove_routing(runner: Runner, app: str, quick_slot: str, debug_slot: str) ->
             fail(f"{label}: {again} vs {rebuilt}")
         if ("freshness gate refreshed" in stderr) != gated:
             fail(f"{label}: gate note {'missing' if gated else 'unexpected'}: {stderr[-800:]}")
-    if len(runner.lease_status()["slots"]) != 2:
+    if len(runner.lease_status()["slots"]) != 2 + timing_slots:
         fail("project slot cap of 2 was not kept")
 
     prove_waiting(runner, app, app2)
@@ -2244,6 +2260,216 @@ def keep_standalone_lease(runner: Runner, app: str, grant: dict) -> None:
     expect(code, 0, "standalone release", stderr)
 
 
+def trace_phases(stderr: str) -> list:
+    """Every `OXIDE_TRACE_TIMING=1` line, in order: name, start and duration (µs)."""
+    return [
+        {"name": m["name"], "at_us": int(m["at"]), "took_us": int(m["took"])}
+        for m in TRACE.finditer(stderr)
+    ]
+
+
+def fixture_digest() -> str:
+    """Identity of the timing fixture, the sampling function and the gate
+    arithmetic, so the baseline and the candidate are known to share them."""
+    import inspect
+
+    digest = hashlib.sha256()
+    for name in sorted(TIMING_FIXTURE):
+        digest.update(name.encode() + b"\0" + TIMING_FIXTURE[name].encode() + b"\0")
+    digest.update(inspect.getsource(measure_timing).encode())
+    digest.update(inspect.getsource(overhead_gate).encode())
+    return digest.hexdigest()
+
+
+def measure_timing(runner: Runner, parent: str, rounds: int) -> dict:
+    """The timing sample set, identical for the baseline phase and the
+    candidate gate except for the number of rounds.
+
+    A fresh TIMING_FIXTURE Git checkout under `<parent>/checkouts/timing`.
+    Setup, unmeasured: `oxide check`, `oxide run -- a`, then plain `cargo
+    check` and `cargo run -- a` in a private target directory. Each round then
+    measures, in this order: `oxide check`, `cargo check`, `oxide run -- x`,
+    `cargo run -- x`, `cargo build`. On current main every `oxide run` is the
+    normal leased path (there is no skip path). Every request runs with
+    `OXIDE_TRACE_TIMING=1` and the same private, offline environment; Oxide's
+    Cargo driver calls are counted from its own `cargo.*` spans, a plain
+    request is one. Wall time is `time.perf_counter_ns()` around the whole
+    request, program execution included."""
+    repo = os.path.join(parent, "checkouts", "timing")
+    write_fixture(repo, TIMING_FIXTURE)
+    counts = {"setup_requests": 0, "setup_cargo": 0, "measured_requests": 0, "measured_cargo": 0}
+    commit_lock(runner, repo)
+    counts["setup_cargo"] += 1
+    git(repo, "init", "--quiet")
+    git(repo, "add", "-A")
+    git(repo, "commit", "--quiet", "-m", "timing fixture")
+    traced = {"OXIDE_TRACE_TIMING": "1"}
+    oxide_env = runner.environment(traced)
+    plain_env = runner.environment({**traced, "CARGO_TARGET_DIR": os.path.join(parent, "timing-plain")})
+    samples = []
+
+    def sample(kind: str, argv: list, wanted: str | None, setup: bool = False) -> None:
+        oxide = argv[0] == "oxide"
+        started = time.perf_counter_ns()
+        result = subprocess.run(
+            [runner.oxide if oxide else "cargo", *argv[1:]],
+            cwd=repo,
+            env=oxide_env if oxide else plain_env,
+            capture_output=True,
+            text=True,
+            timeout=min(120, remaining()),
+        )
+        elapsed = time.perf_counter_ns() - started
+        phases = trace_phases(result.stderr) if oxide else []
+        cargo = sum(1 for phase in phases if phase["name"].startswith("cargo.")) if oxide else 1
+        counts["setup_cargo" if setup else "measured_cargo"] += cargo
+        counts["setup_requests" if setup else "measured_requests"] += 1
+        samples.append(
+            {
+                "kind": kind,
+                "argv": argv,
+                "setup": setup,
+                "ns": elapsed,
+                "exit": result.returncode,
+                "stdout": result.stdout,
+                "stderr": TRACE.sub("", result.stderr).strip()[-2000:],
+                "cargo_calls": cargo,
+                "phases": phases,
+            }
+        )
+        expect(result.returncode, 0, f"timing {kind}", result.stderr)
+        if wanted is not None and result.stdout.strip() != wanted:
+            fail(f"timing {kind}: stdout {result.stdout!r}, expected {wanted!r}")
+
+    sample("oxide-check", ["oxide", "check"], None, setup=True)
+    sample("oxide-run", ["oxide", "run", "--", "a"], "timing a", setup=True)
+    sample("cargo-check", ["cargo", "check"], None, setup=True)
+    sample("cargo-run", ["cargo", "run", "--", "a"], "timing a", setup=True)
+    for _ in range(rounds):
+        sample("oxide-check", ["oxide", "check"], None)
+        sample("cargo-check", ["cargo", "check"], None)
+        sample("oxide-run", ["oxide", "run", "--", "x"], "timing x")
+        sample("cargo-run", ["cargo", "run", "--", "x"], "timing x")
+        sample("cargo-build", ["cargo", "build"], None)
+    shutil.rmtree(os.path.join(parent, "timing-plain"))
+    return {"fixture": fixture_digest(), "rounds": rounds, "counts": counts, "samples": samples}
+
+
+def overhead_gate(measured: dict) -> dict:
+    """The fixed oxide#088 gate, frozen before any result. Fastest of three
+    measured samples per kind (whole-request wall time):
+      gate 1: fastest `oxide check` minus fastest `cargo check` <= 100 ms;
+      gate 2: fastest `oxide run -- x` minus fastest `cargo run -- x` <= 100 ms.
+    Fewer than three samples of a gate kind is insufficient, never a pass.
+    Reported separately, never added to the ceiling: the #079 noise statistic
+    (the larger max-minus-min spread of the two compared kinds) and, for
+    information only, fastest `cargo run` minus fastest `cargo build`."""
+    by_kind: dict = {}
+    for entry in measured["samples"]:
+        if not entry["setup"]:
+            by_kind.setdefault(entry["kind"], []).append(entry["ns"])
+    fastest = {kind: min(values) for kind, values in by_kind.items()}
+    spread = {kind: max(values) - min(values) for kind, values in by_kind.items()}
+    report = {"fastest_ns": fastest, "spread_ns": spread, "failures": []}
+    for name, oxide, plain in (("gate1", "oxide-check", "cargo-check"), ("gate2", "oxide-run", "cargo-run")):
+        difference = fastest[oxide] - fastest[plain]
+        sufficient = len(by_kind[oxide]) >= 3 and len(by_kind[plain]) >= 3
+        verdict = "insufficient" if not sufficient else ("pass" if difference <= GATE_CEILING_NS else "fail")
+        report[name] = {
+            "difference_ns": difference,
+            "ceiling_ns": GATE_CEILING_NS,
+            "noise_079_ns": max(spread[oxide], spread[plain]),
+            "verdict": verdict,
+        }
+        if verdict != "pass":
+            report["failures"].append(f"{name} {verdict}: {oxide} minus {plain} = {difference / 1e6:.3f} ms (ceiling 100 ms)")
+    report["info_cargo_run_minus_build_ns"] = fastest["cargo-run"] - fastest["cargo-build"]
+    report["text"] = (
+        f"gate 1 oxide check - cargo check {report['gate1']['difference_ns'] / 1e6:.3f} ms ({report['gate1']['verdict']}); "
+        f"gate 2 oxide run - cargo run {report['gate2']['difference_ns'] / 1e6:.3f} ms ({report['gate2']['verdict']}); "
+        f"info cargo run - cargo build {report['info_cargo_run_minus_build_ns'] / 1e6:.3f} ms"
+    )
+    return report
+
+
+def prove_timing(runner: Runner) -> None:
+    """The candidate gate on the fresh pool, before any other native case, as
+    in the baseline phase. A failure is a no-go, reported after every other
+    case has run."""
+    free = host_free_bytes(runner.parent)
+    if free < HOST_RESERVE_BYTES:
+        fail(f"host free {free} is below the 20 GiB reserve")
+    measured = measure_timing(runner, runner.parent, 3)
+    verdict = overhead_gate(measured)
+    print("oxide-candidate-json: " + json.dumps({"phase": "candidate", "verdict": verdict, "timing": measured}, sort_keys=True))
+    print(f"oxide overhead timings (fixture only, no real-world claim): {verdict['text']}")
+    NO_GO.extend(verdict["failures"])
+
+
+def baseline_main() -> int:
+    """The separate oxide#088 baseline phase on current main: one fresh
+    128 MiB pool, product staging inside its 120 s clock, the timing sample
+    set (two rounds: ten measured requests) and nothing else. Prints one
+    `oxide-baseline-json:` line holding every raw sample."""
+    global STARTED, PROOF_SECONDS
+    PROOF_SECONDS = 120
+    STARTED = time.monotonic()
+    if sys.platform != "darwin":
+        fail("the baseline requires macOS")
+    parent = os.path.join(scratch_root(), "oxide-baseline")
+    os.makedirs(parent, mode=0o700, exist_ok=False)
+    free = host_free_bytes(parent)
+    if free < HOST_RESERVE_BYTES:
+        fail(f"host free {free} is below the 20 GiB reserve")
+    staged = time.monotonic()
+    executables = build_binaries()
+    staging_s = time.monotonic() - staged
+    runner = Runner(executables["oxide"], executables["oxide-storage-lease"], parent)
+    code, _, stderr = runner.run(
+        runner.parent,
+        ["--pool", runner.pool, "init", "--cap-bytes", str(IMAGE_BYTES), "--image-bytes", str(IMAGE_BYTES)],
+        program=runner.lease,
+    )
+    expect(code, 0, "pool init", stderr)
+    try:
+        measured = measure_timing(runner, parent, 2)
+    except Exception:
+        print(f"oxide baseline retained its owned scratch at {parent}", file=sys.stderr)
+        raise
+    measured["counts"]["staging_cargo"] = 1
+    counts = measured["counts"]
+    total_cargo = counts["setup_cargo"] + counts["measured_cargo"] + counts["staging_cargo"]
+    if counts["measured_requests"] > 10 or total_cargo > 32:
+        fail(f"baseline allowance exceeded: {counts}")
+    if any(slot["state"] != "idle" for slot in runner.lease_status()["slots"]):
+        fail("the baseline left a slot held")
+    owned = tree_bytes(parent, True)
+    if owned > SCRATCH_LIMIT_BYTES:
+        fail(f"owned baseline scratch {owned} exceeds 512 MiB")
+    free_after = host_free_bytes(parent)
+    payload = os.path.join(runner.pool, "payload")
+    detach = subprocess.run(["/usr/bin/hdiutil", "detach", payload], capture_output=True, text=True, timeout=60)
+    if detach.returncode:
+        fail(f"detach failed after positive completion: {detach.stderr}")
+    elapsed = time.monotonic() - STARTED
+    with open(executables["oxide"], "rb") as handle:
+        binary = hashlib.sha256(handle.read()).hexdigest()
+    shutil.rmtree(parent)
+    record = {
+        "phase": "baseline",
+        "elapsed_s": round(elapsed, 3),
+        "staging_s": round(staging_s, 3),
+        "owned_scratch_bytes": owned,
+        "host_free_bytes": [free, free_after],
+        "oxide_binary_sha256": binary,
+        "observed": overhead_gate(measured),
+        "timing": measured,
+    }
+    print("oxide-baseline-json: " + json.dumps(record, sort_keys=True))
+    print(f"oxide baseline held: {elapsed:.0f} s; observed (two rounds, not a gate): {record['observed']['text']}")
+    return 0
+
+
 def main() -> int:
     global STARTED
     parent = os.path.join(scratch_root(), "oxide-cli")
@@ -2309,6 +2535,8 @@ def main() -> int:
         fail(f"owned fixture scratch {owned} exceeds 512 MiB")
     elapsed = time.monotonic() - STARTED
     shutil.rmtree(parent)
+    if NO_GO:
+        fail("fixed overhead gate failed (no-go): " + "; ".join(NO_GO))
     print(
         f"oxide CLI proof held: {elapsed:.0f} s, owned scratch {owned // (1024 * 1024)} MiB "
         f"(backing allocation included), mounted payload {mounted // (1024 * 1024)} MiB"
@@ -2318,7 +2546,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        sys.exit(baseline_main() if sys.argv[1:] == ["--baseline"] else main())
     except Exception:
         traceback.print_exc()
         sys.exit(1)

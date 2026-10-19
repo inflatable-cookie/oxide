@@ -188,7 +188,9 @@ impl Gate {
         let Some((top, before)) = self.before else {
             return Some(Built::Affine(checkout.to_path_buf()));
         };
+        let span = crate::trace::span("git.snapshot-after");
         let (_, after) = snapshot(&top).ok()?;
+        drop(span);
         let mut uncertain = self.carried;
         uncertain.extend(self.changed);
         uncertain.extend(differing(&top, &before, &after).ok()?);
@@ -217,7 +219,7 @@ pub fn prepare(checkout: &Path, prior: &Prior, request: &Resolution) -> Result<G
             "the slot holds another checkout's build without Git content".to_owned(),
         )),
         // Nothing compiled yet: a checkout without Git content stays affine.
-        Prior::Fresh => Ok(match snapshot(checkout) {
+        Prior::Fresh => Ok(match before_snapshot(checkout) {
             Ok(before) => Gate {
                 before: Some(before),
                 ..Gate::affine()
@@ -225,7 +227,7 @@ pub fn prepare(checkout: &Path, prior: &Prior, request: &Resolution) -> Result<G
             Err(_) => Gate::affine(),
         }),
         Prior::Known(Built::Content(origin)) => {
-            let (top, content) = snapshot(checkout)?;
+            let (top, content) = before_snapshot(checkout)?;
             let changed = differing(&top, &origin.content, &content)?;
             let cross = origin.checkout != checkout;
             let mut stale: BTreeSet<&String> = changed.iter().collect();
@@ -252,6 +254,11 @@ pub fn prepare(checkout: &Path, prior: &Prior, request: &Resolution) -> Result<G
     }
 }
 
+fn before_snapshot(checkout: &Path) -> Result<(PathBuf, Content), String> {
+    let _span = crate::trace::span("git.snapshot-before");
+    snapshot(checkout)
+}
+
 fn now_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -261,6 +268,7 @@ fn now_ns() -> u64 {
 }
 
 fn git(top: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let _span = crate::trace::span("git.read");
     let output = Command::new("git")
         .args(args)
         .current_dir(top)
@@ -360,6 +368,7 @@ fn hash_objects(top: &Path, paths: &[String]) -> Result<Vec<String>, String> {
     if paths.iter().any(|path| path.contains('\n')) {
         return Err("a changed path contains a newline".to_owned());
     }
+    let _span = crate::trace::span("git.hash-object");
     let mut child = Command::new("git")
         .args(["hash-object", "--no-filters", "--stdin-paths"])
         .current_dir(top)
@@ -727,6 +736,7 @@ pub(crate) struct CargoOutput {
 
 /// Run one Cargo call, bounded in output and lifetime.
 pub(crate) fn run_cargo(mut command: Command, stdout_cap: u64) -> Result<CargoOutput, String> {
+    let _span = crate::trace::span("cargo.gate-call");
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

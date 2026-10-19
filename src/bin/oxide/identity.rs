@@ -27,9 +27,15 @@ impl SlotKey {
         profile: &str,
         target: Option<&str>,
     ) -> Result<Self, String> {
+        let span = crate::trace::span("cargo.locate-project");
         let checkout = locate_workspace(cargo, manifest_path)?;
+        drop(span);
+        let span = crate::trace::span("identity.git");
         let identity = digest(&Identity::infer(&checkout).key());
+        drop(span);
+        let span = crate::trace::span("rustc.version");
         let rustc = rustc_version(&checkout)?;
+        drop(span);
         let target = match target {
             Some(target) => target.to_owned(),
             None => std::env::var("CARGO_BUILD_TARGET")
@@ -246,6 +252,7 @@ impl Identity {
 }
 
 fn git(workspace: &Path, args: &[&str]) -> Option<String> {
+    let _span = crate::trace::span("git.identity");
     let output = Command::new("git")
         .args(args)
         .current_dir(workspace)

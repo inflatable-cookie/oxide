@@ -13,6 +13,7 @@ mod freshness;
 mod identity;
 mod process;
 mod store;
+mod trace;
 mod watchdog;
 
 use cli::{Class, Invocation, PROFILE_ENVIRONMENT};
@@ -60,6 +61,7 @@ Linux default; macOS defaults to a hard-capped APFS image).
 
 fn main() -> ExitCode {
     process::started_ms();
+    trace::init();
     match run(std::env::args_os().skip(1).collect()) {
         Ok(code) => ExitCode::from(code),
         Err(message) => {
@@ -126,11 +128,14 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     if command == "run" && cli::run_selection(&invocation.cargo_args).is_none() {
         // Build only what `cargo run` would run: `default-run`, else the
         // package's only binary.
-        match identity::run_pick(
+        let span = trace::span("cargo.metadata-run-pick");
+        let pick = identity::run_pick(
             CARGO,
             invocation.manifest_path.as_deref(),
             cli::package_selection(args).as_deref(),
-        )? {
+        )?;
+        drop(span);
+        match pick {
             RunPick::Bin(name) => {
                 invocation
                     .cargo_args
@@ -146,17 +151,24 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
             RunPick::Unresolved => {}
         }
     }
+    let span = trace::span("resolve.slot-key");
     let key = SlotKey::resolve(
         CARGO,
         invocation.manifest_path.as_deref(),
         invocation.profile.label(),
         invocation.target.as_deref(),
     )?;
+    drop(span);
     process::install_signal_handlers()?;
+    let span = trace::span("store.open");
     let store = Store::open_or_create()?;
+    drop(span);
     let started = Instant::now();
     let resolution = cli::resolution(&invocation.cargo_args);
-    let (held, gate) = match lease_with_gate(&store, &key, invocation.profile, &resolution)? {
+    let span = trace::span("lease.acquire-and-gate");
+    let leased = lease_with_gate(&store, &key, invocation.profile, &resolution)?;
+    drop(span);
+    let (held, gate) = match leased {
         Ok(leased) => leased,
         Err(Stop::Signal(signal)) => return Ok(process::signal_exit_code(signal)),
         Err(Stop::Cargo(code)) => return Ok(code),
@@ -173,10 +185,11 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     if run {
         cargo.stdout(Stdio::piped());
     }
-    let mut group = match store
-        .mark_spawning(&held)
-        .and_then(|()| process::spawn_group(&mut cargo))
-    {
+    let span = trace::span("ledger.mark-spawning");
+    let spawning = store.mark_spawning(&held);
+    drop(span);
+    let cargo_span = trace::span("cargo.build");
+    let mut group = match spawning.and_then(|()| process::spawn_group(&mut cargo)) {
         Ok(group) => group,
         Err(error) => {
             let origin = held.prior.unchanged();
@@ -185,7 +198,10 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
         }
     };
     let mut watchdog = store.watchdog();
-    let outcome = match store.mark_running(&held, group.id) {
+    let span = trace::span("ledger.mark-running");
+    let running = store.mark_running(&held, group.id);
+    drop(span);
+    let outcome = match running {
         Ok(()) if run => collect_run(&mut group, &invocation, watchdog.as_mut()),
         Ok(()) => match watchdog.as_mut() {
             Some(watchdog) => {
@@ -205,6 +221,8 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     // Release only after positive closure. A watchdog that cannot confirm
     // the stopped group closed leaves the lease held and the record naming
     // the group, so a later command recovers it once the group is empty.
+    drop(cargo_span);
+    let span = trace::span("wait.group-close");
     let closed = match (watchdog.as_mut(), &outcome) {
         (Some(_), Ok((None, _))) => None,
         (Some(watchdog), _) => process::wait_group_empty_watched(group.id, watchdog),
@@ -213,6 +231,7 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
             Some(Instant::now())
         }
     };
+    drop(span);
     let stopped = watchdog.as_ref().filter(|watchdog| watchdog.stopped());
     if let Some(watchdog) = stopped {
         eprintln!("{}", watchdog.report(group.id, closed));
@@ -227,11 +246,16 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     let slot = held.slot_id.clone();
     let warm = held.reused;
     let note = gate.describe();
+    let span = trace::span("lease.release");
     let origin = gate.finish(&key.checkout);
     store.release(held, origin)?;
+    drop(span);
     let (status, executable) = outcome?;
     let status = status.ok_or("Cargo ended without a status")?;
+    let span = trace::span("summary.statfs");
     print_summary(&store, &invocation, &slot, warm, started, note.as_deref());
+    drop(span);
+    trace::mark("leased.end");
     if stopped.is_some() {
         // A reserve stop is an ordinary failed command, never a success.
         return Ok(process::exit_code(status).max(1));
@@ -242,6 +266,7 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     match executable.unwrap_or_else(|| Err("no run target was recorded".to_owned())) {
         Ok((program, manifest_dir)) => {
             // Lease released: the program runs from the private target dir.
+            trace::mark("exec.program");
             let error = Command::new(&program)
                 .args(&invocation.program_args)
                 .env("CARGO_MANIFEST_DIR", manifest_dir)
@@ -285,7 +310,9 @@ fn lease_with_gate(
             Acquired::Lease(held) => held,
             Acquired::Interrupted(signal) => return Ok(Err(Stop::Signal(signal))),
         };
+        let span = trace::span("gate.prepare");
         let refusal = freshness::prepare(&key.checkout, &held.prior, resolution);
+        drop(span);
         // Taken just now, or left on this checkout's record by a command
         // that died before Cargo.
         let foreign = held.prior.foreign(&key.checkout);
