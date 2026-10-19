@@ -317,6 +317,11 @@ immutability ([vision](../vision.md#product-workflow-direction)).
   - every workspace member's manifest that metadata read for selection, built
     or not (an unbuilt sibling's `default-run` changes `run`'s pick); each
     must be strictly older than a time taken before that query;
+  - when the workspace root manifest mentions `members`, every directory
+    under the workspace root except the root `target` and `.git`: a member
+    glob such as `crates/*/pkg` can match a package added at any depth, so an
+    added member changes a recorded directory. A directory symlink or more
+    than 4096 directories records nothing;
   - `Cargo.lock`;
   - `.cargo/config`, `.cargo/config.toml`, `Cargo.toml`, `rust-toolchain`
     and `rust-toolchain.toml` in the working directory and every ancestor,

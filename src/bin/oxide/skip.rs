@@ -47,6 +47,8 @@ const MAX_SCRIPT_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_INPUTS: usize = 32_768;
 const MAX_ANCESTORS: usize = 64;
 const MAX_PATH_ENTRIES: usize = 256;
+/// Directories recorded for workspace member globs; past this, no record.
+const MAX_WORKSPACE_DIRS: usize = 4096;
 const STRATEGY: &str = "build+execute";
 const NANOS: i128 = 1_000_000_000;
 /// Files Cargo or rustup read from each directory between the working
@@ -572,6 +574,10 @@ impl Pending {
         // Every member manifest the selection read, built or not: an
         // unbuilt sibling's `default-run` changes which binary `run` picks.
         inputs.extend(selection_manifests(&self.members, self.selection_ns)?);
+        for dir in workspace_dirs(&self.checkout)? {
+            let found = stat(&dir)?;
+            inputs.entry(dir).or_insert(found);
+        }
         for path in built {
             if inputs.contains_key(&path) {
                 continue;
@@ -769,6 +775,57 @@ fn path_candidates(
         }
     }
     Err(format!("{program} does not resolve on PATH"))
+}
+
+/// When the workspace root manifest declares `members`, a glob there can
+/// match a package added anywhere below the root, at any depth: every
+/// directory under the root is recorded (except the root `target` and
+/// `.git`), so an added member changes a recorded directory. A directory
+/// symlink or more than [`MAX_WORKSPACE_DIRS`] directories refuses.
+fn workspace_dirs(checkout: &Path) -> Result<Vec<PathBuf>, String> {
+    let manifest = checkout.join("Cargo.toml");
+    let file = File::open(&manifest)
+        .map_err(|error| format!("cannot read {}: {error}", manifest.display()))?;
+    let mut text = String::new();
+    file.take(MAX_CONFIG_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|error| format!("cannot read {}: {error}", manifest.display()))?;
+    if text.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(format!("{} exceeds 1 MiB", manifest.display()));
+    }
+    if !text.contains("members") {
+        return Ok(Vec::new());
+    }
+    let mut dirs = Vec::new();
+    let mut pending = vec![checkout.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries = fs::read_dir(&dir)
+            .map_err(|error| format!("cannot list {}: {error}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let kind = entry.file_type().map_err(|error| error.to_string())?;
+            let path = entry.path();
+            if dir == checkout && (entry.file_name() == "target" || entry.file_name() == ".git") {
+                continue;
+            }
+            if kind.is_symlink() && path.is_dir() {
+                return Err(format!(
+                    "{} is a directory symlink under the workspace",
+                    path.display()
+                ));
+            }
+            if kind.is_dir() {
+                dirs.push(path.clone());
+                pending.push(path);
+                if dirs.len() > MAX_WORKSPACE_DIRS {
+                    return Err(format!(
+                        "the workspace has more than {MAX_WORKSPACE_DIRS} directories for member globs"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(dirs)
 }
 
 /// Each member manifest's tuple: a regular file strictly older than
@@ -1257,6 +1314,29 @@ mod tests {
         );
         // A manifest edited after the selection time is refused.
         assert!(selection_manifests(&members, selection).is_err());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_member_added_under_a_nested_glob_changes_a_recorded_directory() {
+        let root = scratch("nested-glob");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*/pkg\"]\n",
+        )
+        .expect("root manifest");
+        fs::create_dir_all(root.join("crates/a/pkg/src")).expect("member a");
+        fs::create_dir_all(root.join("crates/b")).expect("unmatched b");
+        fs::create_dir_all(root.join("target/debug")).expect("target");
+        let dirs = workspace_dirs(&root).expect("dirs");
+        assert!(dirs.contains(&root.join("crates/b")));
+        assert!(!dirs.iter().any(|dir| dir.starts_with(root.join("target"))));
+        let recorded = tuples(&dirs);
+        fs::create_dir_all(root.join("crates/b/pkg/src")).expect("member b");
+        assert_ne!(tuples(&dirs), recorded, "a member added under crates/b");
+        // Without `members`, membership is manifest-driven: nothing to walk.
+        fs::write(root.join("Cargo.toml"), "[workspace]\n").expect("plain root");
+        assert_eq!(workspace_dirs(&root), Ok(Vec::new()));
         fs::remove_dir_all(root).expect("cleanup");
     }
 
