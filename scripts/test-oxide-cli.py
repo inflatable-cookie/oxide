@@ -2473,7 +2473,10 @@ def prove_skip_cases(runner: Runner) -> dict:
     if code == 0:
         fail(f"the zero-child limit did not refuse a leased build: {stderr[-400:]!r}")
     case.builds("--rebuild", ["--rebuild"], "skip v1 old 5 -")
+    case.skips("skip after --rebuild", [], "skip v1 old 5 -")
+    # OXIDE_NO_SKIP is part of the full environment it records under.
     case.builds("OXIDE_NO_SKIP", [], "skip v1 old 5 -", extra={"OXIDE_NO_SKIP": "1"})
+    case.builds("environment without OXIDE_NO_SKIP", [], "skip v1 old 5 -")
     case.skips("skip after forced builds", [], "skip v1 old 5 -")
 
     # Source edit.
