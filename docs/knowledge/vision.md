@@ -402,6 +402,11 @@ Supervisor architecture ruling, 2026-10-19, on #089 workspace discovery (design 
 - Discovery rejects every symlink by `lstat` before following or classifying it, and refuses on metadata uncertainty. The skip then falls through to Cargo.
 - **Stop rule:** if an independent review finds another workspace-discovery false negative, there is no further narrow discovery patch. The skip path becomes eligible only when every `workspace.members` and `workspace.exclude` entry is a literal relative path, with no glob metacharacters (`*`, `?`, `[`, `{`) and no symlink. Each such path and its parent are stat-recorded directly, and glob patterns fall through to Cargo.
 - This trades skip coverage on glob-using workspaces for a rule small enough to verify. Membership matters only for Cargo's binary selection and default members, and literal paths cover that fully.
+- **Applied 2026-10-19** after the stop rule triggered (a review found a root regular-file member omitted). The discovery-free fallback is #089's active design, still unimplemented:
+  - literal relative members, excludes and `default-members` only, with direct path, parent and absence tuples and intermediate-component symlink/unknown refusal;
+  - for a root manifest without `[workspace]`, the ancestor `Cargo.toml` presence/absence along Cargo's own search, citing the pinned-source stopping rule and `package.workspace` semantics, or no record;
+  - no recursive walk.
+  A further finding against the fallback stops the task for an owner decision; there is no automatic revision.
 
 ## Authority boundaries
 
