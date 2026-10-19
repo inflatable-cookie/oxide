@@ -1096,7 +1096,11 @@ it never deletes there itself.
   754,000 MiB at every sample) passed; Cargo skipped that pass on its
   frequency gate (exit 75) because the fresh home's database was created the
   same second, so no deletion was observed. The wrapper saw 24 Cargo calls:
-  17 `locate-project`, 4 `-V`, 2 `metadata`, 1 `fetch`, no `clean`.
+  17 `locate-project`, 4 `-V`, 2 `metadata`, 1 `fetch`, no `clean`. The
+  second and last run, after the pool fix and with the aliased-pool case
+  added, passed the same way (20 s, 73 MiB owned, host free above
+  752,000 MiB, the same frequency-gate skip; 27 calls: 20 `locate-project`,
+  4 `-V`, 2 `metadata`, 1 `fetch`, no `clean`).
 
 ## Launch check
 
