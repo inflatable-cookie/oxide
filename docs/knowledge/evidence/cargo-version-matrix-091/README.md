@@ -37,8 +37,40 @@ store never offers an affine slot to another checkout (`store.rs`, shareable
 origins are `Built::Content` only), so B built cold on its own affine slot.
 The behaviour was right and the expectation was wrong. The script was fixed
 and runs 2–5 passed that phase. Run 1 remains a failed run; its 1.95.0
-feature phases are in `raw/proof-1.95.0.log`. One shared native invocation is
-left (5 of 6 used).
+feature phases are in `raw/proof-1.95.0.log`. This is the author-time ledger
+(5 of 6 submissions); the independent review consumed the sixth below. The
+`remaining_shared_extra` field in `summary.json` is preserved as an author-time
+observation, not a current allowance.
+
+## Independent review and final coverage boundary
+
+The independent reviewer used the sixth and final shared submission for
+1.95.0 at `936dee41f206202c930253723a3014efb0d6fa49`: request
+`dfbf16ed-77bc-480e-a75f-5c187682f6ac`, native exit 0, 24,599 ms. It passed
+the version-specific phases and the corrected 1.94.1 fallback control.
+All six original submissions were authenticated from their original
+scheduler settlements under caller `interactive:501`, epoch 1. The earlier
+wrong-caller `unknown_run` observations are not missing native outcomes.
+**Six of six submissions are spent.** The original failed run stays failed.
+
+Review [6270571882](https://github.com/inflatable-cookie/oxide/pull/88#issuecomment-6270571882)
+then found that the version query ran in the workspace directory while the
+guarded command inherited its caller's directory. The final repair makes the
+query inherit the same directory and adds a focused regression.
+
+Independent Sol review
+[6270741311](https://github.com/inflatable-cookie/oxide/pull/88#issuecomment-6270741311)
+accepted all four subjects at exact final head
+`a16dd7c807e0769e16f931d8a051fdd00f11b2c9`. Compile, format, Rust tests and
+docs checks passed there. It authenticated the complete retained matrix and
+fresh official source/checksum pins without launching a seventh proof.
+
+The final directory-context repair has source and unit coverage, not a new
+native member-toolchain experiment. Every retained matrix phase explicitly
+selected `RUSTUP_TOOLCHAIN`, so its Cargo selection is unchanged by that
+repair. Earlier native runs are historical evidence; they are not described
+as executions of the final head. The exact-pair support boundary and the
+absence of skip-path, reader, consumer or Linux-runtime qualification remain.
 
 ## Source boundary
 
