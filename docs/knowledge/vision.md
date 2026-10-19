@@ -340,6 +340,12 @@ Tom approved the storage-hygiene bundle on 2026-10-18 with "Approve": one Oxide-
 
 It is bounded to tiny fixtures and a private Cargo home. It grants no recipe change, no deletion inside slots, no live Cargo home cleanup and no consumer change.
 
+Tom approved two sequential scopes on 2026-10-19 with "Approve":
+- A #079 successor: the skip-unchanged path with Cargo-relative registry/git eligibility and the preserved correctness fixes, plus profiling-led reduction of both skip-path cost and normal per-command overhead.
+- Then dogfooding in Oxide's own repository only. This installs the `oxide` binary for Tom's user in `~/.local/bin`, lets the default pool be created on first use, runs `oxide init`, and routes the repository's ordinary Rust Effigy selectors through `oxide`. Plain-Cargo escape selectors and a documented rollback are kept.
+
+No other project, consumer, skill installation or Nucleus change is granted.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
