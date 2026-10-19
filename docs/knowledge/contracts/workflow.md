@@ -3,8 +3,9 @@
 Status: product design under Tom's
 [2026-10-18 workflow direction and bounded implementation authority](../vision.md#product-workflow-direction).
 The foundation core and `init` / `new` adoption are implemented as the
-unpublished, uninstalled `oxide` binary; the agent skill exists as repository
-source only. [Implemented foundation core](#implemented-foundation-core)
+unpublished `oxide` binary, installed for Tom only to
+[dogfood](#dogfooding-in-oxides-repository) in this repository; the agent
+skill exists as repository source only. [Implemented foundation core](#implemented-foundation-core)
 states exactly what ships, including the cross-checkout freshness gate, the
 budget-only directory backend and [Cargo home hygiene](#cargo-home-hygiene). Non-build run strategies and the
 privileged `linux-image-v1` backend are not implemented, and nothing has run
@@ -443,11 +444,15 @@ or global Cargo configuration is involved.
   a sibling temporary file and `link` (no clobber), and writes a JSON receipt
   under `~/.local/state/oxide/install/`. The receipt records pin, tree,
   toolchain, build command, path, owner, mode, size, time and SHA-256. It
-  refuses when any `oxide` is on `PATH` or the destination exists.
+  refuses when any `oxide` is on `PATH` or the destination exists, and when
+  any directory from `HOME` to `~/.local/bin` is a link, is owned by another
+  user or (below `HOME`) is group or world writable. It writes only through
+  the opened directory, with no-follow opens.
 - **Updating.** After a reviewed merge, the planner runs
   `effigy oxide:reinstall`. It replaces only a regular, user-owned binary
-  whose hash matches the newest receipt, by rename, and keeps earlier
-  receipts. `OXIDE_INSTALL_PIN=<commit>` selects an older commit on main, for
+  whose hash matches the newest receipt. Directly before the rename it
+  rechecks that the destination is still that file (type, owner, inode and
+  hash) and refuses otherwise. Earlier receipts are kept. `OXIDE_INSTALL_PIN=<commit>` selects an older commit on main, for
   example to roll back. Effigy does not forward selector arguments, so the
   pin travels in the environment.
 - **Default pool.** The first leased command created
@@ -462,9 +467,17 @@ or global Cargo configuration is involved.
   Use them when `oxide` itself is broken. They build into the checkout's
   `target/` unless `CARGO_TARGET_DIR` points elsewhere, and `oxide init`
   readiness lists them as plain-Cargo lines by design.
-- **Test supervisor.** `bounded-test.py` sends TERM to its group at the
-  300-second limit and KILL ten seconds later. `oxide` forwards TERM to
-  Cargo's own group, which a group KILL would not reach.
+- **Test supervisor.** `oxide` runs Cargo in its own process group and
+  forwards TERM to it, so killing the supervisor's group alone would miss
+  Cargo. At the 300-second limit `bounded-test.py` records every group led
+  by a descendant of its child, TERMs its own group, and after ten seconds
+  KILLs those groups and then its own. It reports any member of those
+  groups still alive five seconds later. A process that left with `setsid`
+  before the limit and whose group leader is not a descendant is not seen.
+- **Fixtures.** `effigy dogfood:scripts:test` proves that escalation and
+  the installer's refusals (linked or foreign directories, an existing
+  destination, a destination swapped during the build) on synthetic
+  fixtures. It never builds or installs.
 
 ### Rollback
 
@@ -659,8 +672,9 @@ Limits:
 
 The unpublished `oxide` binary (`src/bin/oxide/`, `publish = false`) runs the
 local executor on macOS. Its covering proof is `effigy rust:oxide-cli`: tiny
-offline fixture crates on one fresh 128 MiB APFS pool. It is not installed. Its
-one real-project run is the [foundation qualification](#qualification-result)
+offline fixture crates on one fresh 128 MiB APFS pool. Its only installation
+is the [dogfood binary](#dogfooding-in-oxides-repository). Its first
+real-project run is the [foundation qualification](#qualification-result)
 on Oxide's own repository. Its result is partial, not a bounded pass.
 
 - **Classes.** As in [Shape](#shape). Plain passthrough replaces Oxide with

@@ -21,6 +21,9 @@ minimum_effigy_version = "0.14.0"
 # matching the newest receipt.
 "oxide:install" = "python3 scripts/oxide-install.py"
 "oxide:reinstall" = "python3 scripts/oxide-install.py --replace"
+# Synthetic fixtures for the test supervisor's timeout escalation and the
+# installer's link, clobber and identity refusals. Never builds or installs.
+"dogfood:scripts:test" = "python3 scripts/test_dogfood_scripts.py"
 # Opt-in stable-Cargo profile proofs (oxide#068). Each verifies the resolved
 # rustc debug settings Cargo actually passed for workspace, dependency and
 # build-time units, then runs the focused native backtrace/unwind probe under

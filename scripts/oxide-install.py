@@ -12,6 +12,7 @@ import datetime
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import stat
 import subprocess
@@ -66,7 +67,7 @@ def path_entries():
     """Every `oxide` entry in a PATH directory, links included."""
     found = []
     for directory in os.environ.get("PATH", "").split(os.pathsep):
-        candidate = Path(directory or ".") / "oxide"
+        candidate = Path(os.path.abspath(Path(directory or ".") / "oxide"))
         if os.path.lexists(candidate) and candidate not in found:
             found.append(candidate)
     return found
@@ -79,39 +80,73 @@ def newest_receipt():
     return (receipts[-1], json.loads(receipts[-1].read_text())) if receipts else None
 
 
-def describe(path):
-    info = os.lstat(path)
-    return {
-        "path": str(path),
-        "owner_uid": info.st_uid,
-        "mode": oct(stat.S_IMODE(info.st_mode)),
-        "size": info.st_size,
-        "mtime": datetime.datetime.fromtimestamp(info.st_mtime, datetime.timezone.utc).isoformat(),
-        "sha256": sha256(path),
-    }
+def open_destination_directory():
+    """Open the destination's parent after refusing any link or foreign directory.
+
+    Every component from HOME down must be a real directory owned by this
+    user, and none below HOME may be group or world writable.
+    """
+    parts = DESTINATION.parent.relative_to(HOME).parts
+    for count in range(len(parts) + 1):
+        directory = HOME.joinpath(*parts[:count])
+        info = os.lstat(directory)
+        writable = count > 0 and info.st_mode & 0o022
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or writable:
+            raise Refusal(f"{directory} is not a real directory owned only by this user")
+    descriptor = os.open(DESTINATION.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    opened, checked = os.fstat(descriptor), os.lstat(DESTINATION.parent)
+    if (opened.st_dev, opened.st_ino) != (checked.st_dev, checked.st_ino):
+        os.close(descriptor)
+        raise Refusal(f"{DESTINATION.parent} changed while it was checked")
+    return descriptor
+
+
+def identity(directory, name):
+    """(device, inode, SHA-256) of a regular user-owned entry, or None if absent.
+
+    Links, other file types and foreign owners refuse.
+    """
+    try:
+        info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        raise Refusal(f"{DESTINATION.parent / name} is not a regular file owned by this user")
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+    with os.fdopen(descriptor, "rb") as file:
+        opened = os.fstat(file.fileno())
+        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            raise Refusal(f"{DESTINATION.parent / name} changed while it was read")
+        digest = hashlib.sha256()
+        for block in iter(lambda: file.read(1 << 20), b""):
+            digest.update(block)
+    return info.st_dev, info.st_ino, digest.hexdigest()
 
 
 def preflight(replace):
-    """Return the receipt being replaced, or None in initial mode."""
+    """Return (replaced receipt, expected destination identity), or Nones in initial mode."""
     entries = path_entries()
     if not replace:
         if entries:
             raise Refusal("oxide already on PATH: " + ", ".join(map(str, entries)))
         if os.path.lexists(DESTINATION):
             raise Refusal(f"{DESTINATION} already exists")
-        return None
-    others = [entry for entry in entries if entry.resolve() != DESTINATION.resolve()]
+        os.close(open_destination_directory())
+        return None, None
+    others = [entry for entry in entries if entry != DESTINATION]
     if others:
         raise Refusal("another oxide on PATH: " + ", ".join(map(str, others)))
     previous = newest_receipt()
     if previous is None:
         raise Refusal(f"no install receipt under {RECEIPTS}; use initial mode")
-    info = os.lstat(DESTINATION)
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
-        raise Refusal(f"{DESTINATION} is not a regular file owned by this user")
-    if sha256(DESTINATION) != previous[1]["installed"]["sha256"]:
+    directory = open_destination_directory()
+    try:
+        expected = identity(directory, DESTINATION.name)
+    finally:
+        os.close(directory)
+    if expected is None or expected[2] != previous[1]["installed"]["sha256"]:
         raise Refusal(f"{DESTINATION} does not match receipt {previous[0].name}")
-    return previous
+    return previous, expected
 
 
 def build(pin, staging):
@@ -136,31 +171,50 @@ def build(pin, staging):
     return staging / "target/release/oxide", versions
 
 
-def install(built, previous):
-    """Copy through a private sibling, then link (initial) or rename (replace)."""
+def install(built, expected):
+    """Copy through a private sibling, then link (initial) or rename (replace).
+
+    The destination is rechecked through the opened parent directly before the
+    link or rename: absent for link, the preflight's exact identity for rename.
+    """
     built_hash = sha256(built)
-    descriptor, temporary = tempfile.mkstemp(prefix=".oxide.install.", dir=DESTINATION.parent)
+    directory = open_destination_directory()
+    temporary = f".oxide.install.{os.getpid()}.{secrets.token_hex(8)}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     try:
-        with os.fdopen(descriptor, "wb") as output, open(built, "rb") as source:
-            shutil.copyfileobj(source, output)
+        with os.fdopen(os.open(temporary, flags, 0o700, dir_fd=directory), "wb") as output:
+            with open(built, "rb") as source:
+                shutil.copyfileobj(source, output)
             output.flush()
+            os.fchmod(output.fileno(), 0o755)
             os.fsync(output.fileno())
-        os.chmod(temporary, 0o755)
-        if sha256(temporary) != built_hash:
+        staged = identity(directory, temporary)
+        if staged[2] != built_hash:
             raise Refusal("staged copy hash differs from the build output")
-        if previous is None:
+        if identity(directory, DESTINATION.name) != expected:
+            raise Refusal(f"{DESTINATION} changed during the build")
+        if expected is None:
             # link() refuses an existing destination: no-clobber.
-            os.link(temporary, DESTINATION)
+            os.link(temporary, DESTINATION.name, src_dir_fd=directory, dst_dir_fd=directory)
         else:
-            if sha256(DESTINATION) != previous[1]["installed"]["sha256"]:
-                raise Refusal(f"{DESTINATION} changed during the build")
-            os.rename(temporary, DESTINATION)
+            os.rename(temporary, DESTINATION.name, src_dir_fd=directory, dst_dir_fd=directory)
+        if identity(directory, DESTINATION.name) != staged:
+            raise Refusal(f"{DESTINATION} is not the staged file after installation")
+        info = os.stat(DESTINATION.name, dir_fd=directory, follow_symlinks=False)
     finally:
-        if os.path.lexists(temporary):
-            os.unlink(temporary)
-    installed = describe(DESTINATION)
-    if installed["sha256"] != built_hash:
-        raise Refusal("installed hash differs from the build output")
+        try:
+            os.unlink(temporary, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        os.close(directory)
+    installed = {
+        "path": str(DESTINATION),
+        "owner_uid": info.st_uid,
+        "mode": oct(stat.S_IMODE(info.st_mode)),
+        "size": info.st_size,
+        "mtime": datetime.datetime.fromtimestamp(info.st_mtime, datetime.timezone.utc).isoformat(),
+        "sha256": staged[2],
+    }
     return built_hash, installed
 
 
@@ -177,7 +231,7 @@ def main():
     started = datetime.datetime.now(datetime.timezone.utc)
     try:
         pin, tree, tip = authenticate_pin(arguments.pin)
-        previous = preflight(arguments.replace)
+        previous, expected = preflight(arguments.replace)
         print(f"pin {pin} tree {tree} (origin main {tip})")
         print(f"destination {DESTINATION}: " + ("absent" if previous is None else f"matches {previous[0].name}"))
         if arguments.check:
@@ -186,7 +240,7 @@ def main():
         staging = Path(tempfile.mkdtemp(prefix="oxide-install.", dir="/private/tmp"))
         print(f"staging {staging}")
         built, versions = build(pin, staging)
-        built_hash, installed = install(built, previous)
+        built_hash, installed = install(built, expected)
     except (Refusal, subprocess.CalledProcessError, OSError) as error:
         print(f"oxide:install refused: {error}", file=sys.stderr)
         return 1
@@ -206,6 +260,11 @@ def main():
         },
     }
     RECEIPTS.mkdir(parents=True, exist_ok=True)
+    info = os.lstat(RECEIPTS)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        print(f"oxide:install installed but cannot write a receipt: {RECEIPTS} is not a real owned directory", file=sys.stderr)
+        print(json.dumps(receipt, indent=2))
+        return 1
     name = f"{started.strftime('%Y%m%dT%H%M%SZ')}-{pin[:12]}.json"
     with open(RECEIPTS / name, "x") as file:
         json.dump(receipt, file, indent=2)
