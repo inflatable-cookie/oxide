@@ -148,11 +148,11 @@ pub fn report_status() {
     );
 }
 
-/// Why the closed proxy cannot contain this run, or `None`.
-fn refuse_environment<'a>(
-    variables: impl IntoIterator<Item = (&'a str, &'a str)>,
-) -> Option<String> {
-    for (name, value) in variables {
+/// Why the closed proxy cannot contain this run, or `None`. Takes names
+/// only: a refused variable can hold a registry token, so no value is ever
+/// read into a message.
+fn refuse_environment<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    for name in names {
         let reason = match name {
             "CARGO_NET_RETRY" | "CARGO_REGISTRY_TOKEN" => continue,
             "CARGO_NET_OFFLINE" => "offline mode disables Cargo's cleanup",
@@ -170,7 +170,7 @@ fn refuse_environment<'a>(
             _ if name.starts_with("CARGO_UNSTABLE_") => "an unstable Cargo feature",
             _ => continue,
         };
-        return Some(format!("{name}={value} is set: {reason}"));
+        return Some(format!("{name} is set: {reason}"));
     }
     None
 }
@@ -447,17 +447,10 @@ pub fn run_cache_clean(args: &[OsString]) -> Result<u8, String> {
     let home = resolve()?;
     let cwd = std::env::current_dir()
         .map_err(|error| format!("cannot read the current directory: {error}"))?;
-    let variables: Vec<(String, String)> = std::env::vars_os()
-        .filter_map(|(name, value)| {
-            Some((
-                name.into_string().ok()?,
-                value.to_string_lossy().into_owned(),
-            ))
-        })
+    let names: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
         .collect();
-    if let Some(reason) =
-        refuse_environment(variables.iter().map(|(n, v)| (n.as_str(), v.as_str())))
-    {
+    if let Some(reason) = refuse_environment(names.iter().map(String::as_str)) {
         return Err(refuse(reason));
     }
     if let Some(file) = config_files(&cwd, &home).first() {
@@ -624,7 +617,11 @@ mod tests {
 
     #[test]
     fn uncontained_environment_refuses_with_its_reason() {
-        let refuse = |name: &str| refuse_environment([(name, "x")]);
+        let refuse = |name: &str| refuse_environment([name]);
+        assert_eq!(
+            refuse("CARGO_REGISTRIES_MINE_TOKEN").as_deref(),
+            Some("CARGO_REGISTRIES_MINE_TOKEN is set: a custom registry setting the closed proxy is not proven to cover")
+        );
         assert!(refuse("CARGO_NET_GIT_FETCH_WITH_CLI")
             .unwrap()
             .contains("git-fetch-with-cli"));

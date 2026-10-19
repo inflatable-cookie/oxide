@@ -751,7 +751,9 @@ it never deletes there itself.
   - environment: `CARGO_NET_OFFLINE` (disables cleanup),
     `CARGO_NET_GIT_FETCH_WITH_CLI`, any other `CARGO_NET_*` but
     `CARGO_NET_RETRY`, `CARGO_REGISTRIES_*`, `CARGO_REGISTRY_*` but
-    `CARGO_REGISTRY_TOKEN`, `CARGO_SOURCE_*`, `CARGO_UNSTABLE_*`;
+    `CARGO_REGISTRY_TOKEN`, `CARGO_SOURCE_*`, `CARGO_UNSTABLE_*`. The
+    refusal names the variable, never its value, since a refused variable
+    can hold a registry token;
   - any Cargo config file Cargo would read (`.cargo/config.toml` or
     `.cargo/config` in the current directory or an ancestor, or in the Cargo
     home). Oxide does not parse them: a file can set source replacement,

@@ -2143,7 +2143,7 @@ def prove_cargo_cache(runner: Runner) -> None:
         fail(f"cfg-if archive sha256 {digest}")
     print(f"oxide cargo-cache setup: 1 archive, cfg-if 1.0.0 from crates.io, {os.path.getsize(archives[0])} bytes, sha256 {digest}")
 
-    refused(good, "CARGO_NET_GIT_FETCH_WITH_CLI=true is set: net.git-fetch-with-cli", "git-fetch-with-cli", {"CARGO_NET_GIT_FETCH_WITH_CLI": "true"})
+    refused(good, "CARGO_NET_GIT_FETCH_WITH_CLI is set: net.git-fetch-with-cli", "git-fetch-with-cli", {"CARGO_NET_GIT_FETCH_WITH_CLI": "true"})
     write_fixture(ssh, {"Cargo.lock": "version = 4\n\n" + cfg_if + lock_package("cache-ssh", "0.1.0", deps=["cfg-if"])
                         + lock_package("mine", "0.1.0", "sparse+https://registry.invalid/index/")})
     refused(ssh, "a custom registry the closed proxy is not proven to cover", "custom registry")
