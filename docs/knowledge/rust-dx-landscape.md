@@ -603,7 +603,7 @@ partial observations do not supply missing end-to-end acceptance.
 
 What the phase trace shows:
 
-- The command-start to pre-exec marker interval was about 291–294 ms for the
+- The trace-initialization to pre-exec marker interval was about 291–294 ms for the
   two shorter baseline leased samples (361 ms for the outlier), and 146–210 ms
   in the candidate. This includes child Cargo/rustc work, waits and syncs;
   it is not exclusively Oxide CPU time. Phase spans are nested/overlapping and
@@ -615,7 +615,7 @@ What the phase trace shows:
   visible process costs. These are measured categories, not a claim that
   removing any call would preserve semantics.
 - Subtracting the pre-exec marker from total leased duration leaves roughly
-  132–147 ms in the shorter samples and about 1.025 s in the baseline outlier.
+  128–147 ms in the shorter samples and about 1.025 s in the baseline outlier.
   The marker is emitted before the `exec` call; this residual does not isolate
   successful exec, loader/security checks, program execution or scheduling.
   Skip samples leave about 4–5 ms. No plain `cargo run` sample was collected.
