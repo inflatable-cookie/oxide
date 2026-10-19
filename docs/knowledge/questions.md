@@ -152,19 +152,21 @@ The proposed [workflow](contracts/workflow.md#open-decisions) lists W-1 to W-8: 
 
 ## Q-016 — How should Oxide proceed after the #086 no-go?
 
-Tom approved a new metadata-based skip path, a bounded version-pinned
-internal-reader exception for build-script and dep-info coverage, and
-qualification from Rust 1.95 onward. He separately approved a normal-path
-overhead round and Oxide-only dogfooding on current main
-([vision](vision.md#product-workflow-direction)). The approved skip path is
-conditional on its fixed performance and correctness gates; unknown formats
-and unqualified versions fall through rather than guessing. Queue decisions
-`306dc549-5db6-403b-b443-1e5b85e2c8b1` and
-`62b39943-9cff-4665-9528-849ddc3a5568` retain the exact relayed replies.
-C1 (oxide#091) qualified only the shipped gate, stray detection and
-decoder on exact Cargo 1.95.0–1.99.1 pins
-([matrix](contracts/workflow.md#cargo-version-matrix)). Skip-path and
-internal-reader coverage (C2) waits for A/B.
+Tom has paused the skip path and withdrawn its planned build-script readers
+([vision](vision.md#product-workflow-direction), 2026-10-19 ruling).
+The unmerged branch and the read-only committee contract are retained for a
+possible revisit; the contract still has unresolved platform and resolution
+questions and grants no implementation or proof credit. Skip/readers version
+coverage (C2) is not admitted. C1 qualified only the shipped freshness gate,
+stray detection and decoder on exact Cargo 1.95.0–1.99.1 pins
+([matrix](contracts/workflow.md#cargo-version-matrix)). Future Rust 1.100
+qualification will cover those shipped features, with no skip or reader scope.
+
+Tom instead approved a third normal-path overhead round and an opt-in
+`oxide status --launch-check` diagnostic. Queue owns their bounded briefs and
+fixed acceptance criteria. Paseo is already listed under Developer Tools;
+whether restarting it changes the measured launch penalty remains untested.
+No restart or host-setting change follows from this ruling.
 
 The #086 no-go and its incomplete correctness proof remain unchanged
 ([profile](rust-dx-landscape.md#oxide-run-overhead-profile-2026-10-19)).

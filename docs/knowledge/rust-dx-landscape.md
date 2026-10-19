@@ -719,6 +719,14 @@ None of this is merged or installed. The branch is kept only as a knowledge
 donor: do not import its runtime, its toolchain cache or its eligibility
 reasoning. Later work starts from current main.
 
+Tom's later 2026-10-19 [ruling](vision.md#product-workflow-direction)
+pauses the unmerged skip path. Its branch and committee capture contract are
+preserved; the design has unresolved filesystem-timestamp and toolchain-resolution
+questions and is not implementation-ready. The planned build-script readers are
+withdrawn, and skip/readers version qualification is not admitted. The next
+approved work is normal-path overhead reduction and an opt-in launch diagnostic;
+no candidate optimization or skip code is adopted by that decision.
+
 ## macOS new-executable launch cost (2026-10-19)
 
 A Supervisor probe on this host (macOS, Apple Silicon; tiny `rustc -O` binary; 10 runs each) measured process launch time:
@@ -731,7 +739,7 @@ A Supervisor probe on this host (macOS, Apple Silicon; tiny `rustc -O` binary; 1
 
 Every newly written executable pays about 100 ms on its first launch, even with identical content and even as a copy-on-write clone. This is consistent with macOS XProtect/Gatekeeper first-execution assessment ([nextest: antivirus and Gatekeeper](https://nexte.st/book/antivirus-gatekeeper); [Rust forum report](https://users.rust-lang.org/t/cargo-run-slow-on-macos-when-binary-already-built/117450)). The probe did not trace the system daemon itself.
 
-It accounts for the 128–147 ms after-exec residual in the [#086 profile](#oxide-run-overhead-profile-2026-10-19), because pinned Cargo rewrites the uplifted binary on every build. It also hits every test binary after a rebuild.
+The gap is consistent with the 128–147 ms after-exec residual in the [#086 profile](#oxide-run-overhead-profile-2026-10-19). Pinned Cargo rewrites uplifted binaries, but the probe did not isolate the cause of that residual or measure rebuilt test binaries.
 
 The documented mitigation is a host setting: add the app responsible for launching builds to Privacy & Security → Developer Tools (for example `sudo spctl developer-mode enable-terminal` for Terminal). Some reports say it is incomplete. Here the agent process chain is `Paseo.app` → Paseo Supervisor → Paseo Daemon → agent → shell. Confirming the responsible app needs root.
 
