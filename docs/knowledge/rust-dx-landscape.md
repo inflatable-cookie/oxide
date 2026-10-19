@@ -655,6 +655,70 @@ unresolved. This is source-analysis and design material, not a universal
 Cargo-equivalent skip qualification. The fixed no-go and preserved correctness
 repairs do not authorize another run, product merge or dogfooding sequence change.
 
+## Oxide normal-command overhead, round 2 (2026-10-19)
+
+oxide#088 measured Oxide's added time on a normal no-op like for like against
+plain Cargo, on one std-only fixture over a fresh 128 MiB APFS pool, on one
+macOS host. **Final result: no-go.** Raw records:
+[evidence](evidence/overhead-088/README.md). The gate was fixed before any
+result: fastest of three `oxide check` minus fastest `cargo check` at most
+100 ms, and fastest `oxide run -- x` minus fastest `cargo run -- x` at most
+100 ms. The branch had no skip path, so every `oxide run` was the normal
+leased path. Plain Cargo used a private target directory, the same private
+`CARGO_HOME`, offline environment and toolchain.
+
+| Fastest sample, ms | Baseline (2 rounds, observes only) | Author candidate | Independent review |
+| --- | --- | --- | --- |
+| `oxide check` | 342.830 | 115.162 | 157.890 |
+| `cargo check` | 23.135 | 17.255 | 21.819 |
+| Gate 1 difference | 319.694 | 97.908 (pass) | 136.071 (fail) |
+| `oxide run -- x` | 414.255 | 243.982 | 273.297 |
+| `cargo run -- x` | 161.344 | 150.008 | 165.852 |
+| Gate 2 difference | 252.911 | 93.974 (pass) | 107.444 (fail) |
+| `cargo run` minus `cargo build` (information only) | 108.929 | 130.243 | 141.213 |
+
+The baseline ran on instrumentation-only `4a11f9d`. Both candidate sets ran
+the product source of `d217b37` (the reviewed head `259088e` adds docs and
+evidence only) with the same fixture digest. The independent exact-head set
+failed both gates, and that required failure decides the no-go; the sets are
+not averaged or substituted, and no noise waiver applies. The #079 noise
+statistic was 25.995 / 31.965 ms in the author's set and 11.398 / 30.399 ms
+in the review's. The difference between sets is not attributed to host load:
+none was measured.
+
+The review also found:
+
+1. The toolchain cache statted the resolved compiler only after its `-vV`
+   and sysroot spawns, so a compiler replaced in between could pair old
+   version output with the new binary. Unfixed.
+2. The background pre-Cargo snapshot ran its first Git call before the lease,
+   so the crash-in-gate fixture's hold could fire before the record reached
+   `acquiring`. The review's proof exited 1 there; later controls did not run.
+   The author's passing run does not establish that case.
+3. Aggregate bounds evidence was insufficient: off-fixture staging was not
+   counted toward 512 MiB, the reserve was checked only at boundaries, and the
+   clock started after provisioning and admission. No cap overrun is shown.
+
+What the phase traces show (author's fastest samples; spans overlap):
+
+- Baseline `oxide check` reached its end marker at 338.6 ms: workspace
+  20.7 ms, three identity Git calls 28.2 ms, `rustc -vV` 27.0 ms, the
+  pre-Cargo snapshot's three Git calls 74.9 ms, seven state saves of
+  7.5–13.5 ms each plus two origin writes, Cargo 58.7 ms against a plain
+  23.1 ms (the wait loop polled every 20 ms), and the post-Cargo snapshot
+  43.9 ms.
+- The candidate reached it at 112.2 ms with Git calls 9 to 6, a cached
+  toolchain read, five state saves and overlapped snapshots. What remained
+  was mostly serial durable saves, the lease library and process spawns.
+- These are profile observations of one host, not evidence that the cuts
+  reliably meet the gate. No cause is claimed for the time after the
+  pre-exec marker. The #086 build-only baseline is not comparable with these
+  like-for-like figures.
+
+None of this is merged or installed. The branch is kept only as a knowledge
+donor: do not import its runtime, its toolchain cache or its eligibility
+reasoning. Later work starts from current main.
+
 ## Product assessment
 
 Planner recommendation: a small coherent entry point over evidence-backed mechanisms, with three capabilities: see and explain costs, bound and reuse owned storage, and apply qualified improvements with clear trade-offs. The reusable storage core must work for ordinary developers as well as orchestrators. A daemon, editor surface or UI is still an open choice; Tom's [workflow direction](vision.md#product-workflow-direction) sets an `oxide build` / `oxide run` front door as the design target.
