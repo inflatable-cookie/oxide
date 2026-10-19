@@ -5,8 +5,8 @@ Status: product design under Tom's
 The foundation core and `init` / `new` adoption are implemented as the
 unpublished, uninstalled `oxide` binary; the agent skill exists as repository
 source only. [Implemented foundation core](#implemented-foundation-core)
-states exactly what ships, including the cross-checkout freshness gate and
-the budget-only directory backend. Non-build run strategies and the
+states exactly what ships, including the cross-checkout freshness gate, the
+budget-only directory backend and [Cargo home hygiene](#cargo-home-hygiene). Non-build run strategies and the
 privileged `linux-image-v1` backend are not implemented, and nothing has run
 on a real Linux host. Fixture proofs are not real-project
 qualification, default-pool creation outside tests, installation (binary or
@@ -25,7 +25,8 @@ until this foundation works consistently.
 ```text
 oxide <check|test|clippy|build|run> [--profile <name>] [cargo args] [-- program args]
 oxide <any other cargo command> [args]   # passed to Cargo, with storage where it builds
-oxide status                             # pool, slots, waits, stray Cargo output
+oxide status                             # pool, slots, waits, stray Cargo output, Cargo home
+oxide clean --cargo-cache                # one pass of Cargo's own home cleanup, network refused
 oxide init [cargo init args]             # make this a Cargo project if needed, then adopt Oxide
 oxide new <path> [cargo new args]        # cargo new, then adopt Oxide
 ```
@@ -343,9 +344,13 @@ explicit `recover` unless they adopt it.
   concurrent Cargo invocations ([W-2](#open-decisions)). Queue/Nucleus still
   decide which tasks run. Oxide only orders the Rust work they launch.
 - `oxide status` reuses the read-only [storage inventory](storage-inventory.md).
-  It reports pool and slot use plus stray output: a checkout `target/` holding
-  `deps/` or `incremental/` was built by plain Cargo. Reclaiming that space is
-  an explicit command; live cleanup still needs scoped approval.
+  It reports pool and slot use (each slot's file names, distinct inodes and
+  allocation counted once per inode), the Cargo home's allocation, and stray
+  output: a checkout `target/` holding `deps/` or `incremental/` was built by
+  plain Cargo. Reclaiming that space is an explicit command; live cleanup
+  still needs scoped approval. Nothing inside a slot is ever deleted.
+- `OXIDE_POOL_CAP` sets a new pool's cap; `oxide clean --cargo-cache` asks
+  Cargo for its own home cleanup ([Cargo home hygiene](#cargo-home-hygiene)).
 
 ## Execution location
 
@@ -584,8 +589,9 @@ Limits:
   change is covered only by the fixture proof.
 - The subject has a small graph, so the run says nothing about benefit on a
   heavy project.
-- The front door can only create 24 GiB pools, so a small pool still needs
-  `oxide-storage-lease init`.
+- The front door could then only create 24 GiB pools, so the small pool
+  needed `oxide-storage-lease init`. `OXIDE_POOL_CAP` (oxide#085) now sets a
+  new pool's cap.
 
 ## Implemented foundation core
 
@@ -630,7 +636,14 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
   value refuses. The variable applies only at creation: naming a backend
   other than an existing pool's refuses, so an existing pool from
   `oxide-storage-lease init` opens unchanged. See
-  [Platform backends](#platform-backends).
+  [Platform backends](#platform-backends). `OXIDE_POOL_CAP` sets the cap
+  (or budget) a new pool records: a byte count or a whole number of `KiB`,
+  `MiB`, `GiB` or `TiB`, a whole MiB, from 128 MiB (APFS) or 1 MiB
+  (directory) to 16 TiB. Any other value refuses before any effect. An
+  existing pool keeps its recorded cap: a different value prints
+  `OXIDE_POOL_CAP … not applied` and is ignored; nothing is resized or
+  migrated. Creation still refuses below the 20 GiB host reserve, and an
+  image cap bounds only the pool, not other host writes.
 - **Slots and waiting.** Per-project cap 2: a new checkout or key at the cap
   evicts the project's least recently used idle slot whole and builds cold.
   Host-wide limit 2 commands holding slots (`OXIDE_MAX_ACTIVE`, 1–32). Excess
@@ -681,15 +694,17 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
   an ordinary child with inherited output; a Cargo failure returns Cargo's
   exit and adopts nothing. A refusal exits 1. The covering proof runs before
   any pool exists and checks that adoption never creates one.
-- **`status`.** Pool path or "not created" with the backend a building
-  command would create; the backend and what bounds it; for APFS the cap and
-  payload use, for a directory pool the budget, slot allocation and the
-  watchdog trigger with the sampled pool-filesystem available bytes; slot accounting
-  coverage, each slot's state, profile and checkout (an interrupted slot
-  names the dead holder's PID and Cargo group), waiting commands, checkouts
-  being cleaned, the newest automatic recoveries, and
-  whether the current workspace's `target/` holds plain-Cargo `deps/` or
-  `incremental/`. It never creates the pool.
+- **`status`.** Pool path or "not created" with the backend and cap a
+  building command would create; the backend and what bounds it; for APFS
+  the cap and payload use, for a directory pool the budget, slot allocation
+  and the watchdog trigger with the sampled pool-filesystem available bytes;
+  slot accounting coverage, each slot's state, profile, checkout (an
+  interrupted slot names the dead holder's PID and Cargo group) and size:
+  allocation counted once per inode, file names and distinct inodes, or
+  `partial` past a walk limit; waiting commands, checkouts being cleaned, the
+  newest automatic recoveries, whether the current workspace's `target/`
+  holds plain-Cargo `deps/` or `incremental/`, and the Cargo home (see
+  [Cargo home hygiene](#cargo-home-hygiene)). It never creates the pool.
 
 Control state lives in `<pool>/oxide-managed/` (owner-only): records mapping
 each checkout and key to a private lease project directory, FIFO wait
@@ -701,6 +716,89 @@ state from the previous build opens without migration; an older build
 refuses state that has them. The lease ledger, receipt and standalone CLI
 contract are unchanged; see
 [local lease](local-lease.md#oxide-front-door-control-directory).
+
+## Cargo home hygiene
+
+Implemented in oxide#085 under Tom's
+[2026-10-18 approval](../vision.md#product-workflow-direction), from the
+[cleanup-trigger findings](../rust-dx-landscape.md#cargo-home-cleanup-triggers-2026-10-18-probe).
+Agents and proofs that always run `--offline` or `--frozen` keep Cargo from
+cleaning its home. Oxide reports the home and offers one explicit request;
+it never deletes there itself.
+
+- **Resolution.** As Cargo: `CARGO_HOME` when set and non-empty (relative
+  to the current directory), else `$HOME/.cargo`. Both unset refuses.
+- **`status`.** One `cargo home:` line: allocation counted once per inode,
+  file names and distinct inodes, from one bounded walk (200,000 entries,
+  depth 64, 10 s; `partial` past a limit). The root must be a real directory;
+  symlinks are not followed and mounts are not crossed. A second line states
+  Cargo's skip conditions as facts. No last-cleanup time is shown: Cargo's
+  only record is also set when its database is created, and reading it
+  means opening Cargo's internal database. No usage history is inferred.
+- **`oxide clean --cargo-cache`.** Takes no other arguments. Runs
+  `cargo fetch --locked --config 'cache.auto-clean-frequency="always"'
+  --config 'http.proxy="http://127.0.0.1:<port>"'` from the current
+  directory, with `CARGO_LOG=gc=trace,cargo::core::gc=trace` and the libcurl
+  proxy variables (`http_proxy`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and
+  their other spellings) removed, since `no_proxy` would bypass a forced
+  proxy. `--config` is Cargo's highest-precedence form. The port is Oxide's
+  own loopback listener: it accepts and closes every connection and
+  forwards nothing. A merely bound port is not enough: on macOS a connection
+  to it hangs until timeout. Oxide prints how many connections it closed.
+  Cargo's log lines are read as evidence and not echoed; other output passes
+  through.
+- **Refusals before Cargo runs**, each naming its reason:
+  - environment: `CARGO_NET_OFFLINE` (disables cleanup),
+    `CARGO_NET_GIT_FETCH_WITH_CLI`, any other `CARGO_NET_*` but
+    `CARGO_NET_RETRY`, `CARGO_REGISTRIES_*`, `CARGO_REGISTRY_*` but
+    `CARGO_REGISTRY_TOKEN`, `CARGO_SOURCE_*`, `CARGO_UNSTABLE_*`;
+  - any Cargo config file Cargo would read (`.cargo/config.toml` or
+    `.cargo/config` in the current directory or an ancestor, or in the Cargo
+    home). Oxide does not parse them: a file can set source replacement,
+    registries, `git-fetch-with-cli`, credential providers or includes;
+  - a Cargo other than 1.97.1 (`cargo -V`), whose trigger and trace text
+    were qualified;
+  - a workspace without the Oxide `AGENTS.md` block;
+  - a missing `Cargo.lock`, or one over 16 MiB;
+  - any lock source other than crates.io (`registry+https://github.com/rust-lang/crates.io-index`
+    or `sparse+https://index.crates.io/`) or a path: SSH and other non-HTTP
+    git transports, HTTPS git (not qualified), custom registries and unknown
+    kinds.
+  The proxy is one routing control, not universal containment; these
+  refusals cover the other routes. Oxide never falls back to `--offline`,
+  which would disable the requested cleanup.
+- **One outcome**, from Cargo's own evidence:
+  - *ran* (exit 0): the trace shows `last auto gc was …, running`, with no
+    `failed to auto-clean cache data` and fetch exit 0;
+  - *skipped by Cargo* (exit 75): exactly one skip decision, naming it: the
+    cache lock held by another Cargo (`unable to acquire mutate lock`), the
+    frequency gate (with `always`, the last pass or database creation was
+    this same second), offline, or cleanup disabled;
+  - *failed* (Cargo's code, else 1): Cargo's cleanup error, a non-zero fetch
+    (for example an uncached crate the closed proxy denied), or exit 0 with
+    zero or several decisions in the trace, which is unknown, not success.
+  Before and after, it prints the home's allocation from the same bounded
+  walk. A difference is not proof of what the cleanup deleted: a completed
+  pass can delete nothing, and other writers may change the home. No freed
+  space or SSD claim is made.
+- **Proof.** `effigy rust:oxide-cli` runs these on one fresh private
+  `CARGO_HOME` (0700, under the proof scratch), never the live home. Setup
+  downloads one archive, `cfg-if` 1.0.0 (7,934 bytes, sha256
+  `baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd`, the
+  lockfile checksum), plus its sparse-index metadata. Then: the `status`
+  line equals the proof's own walk; refusals for a missing lock, an SSH git
+  source, `CARGO_NET_GIT_FETCH_WITH_CLI`, a source-replacement config file
+  and a custom registry; a cleanup on the complete cached lock that ran with
+  0 proxy connections; Cargo's lock skip under a shared hold on
+  `.package-cache-mutate`; and an uncached crate whose fetch failed through
+  the closed proxy (at least one connection closed) while an owned control
+  listener named by `CARGO_HTTP_PROXY` and the libcurl proxy variables saw
+  none. Nothing was age-eligible, so no deletion was observed; deletion rests
+  on Cargo's source. The same proof covers `OXIDE_POOL_CAP` (an invalid
+  value refused before creation, 64 MiB used on a new directory pool, a
+  conflicting value reported and ignored there and on the APFS pool) and a
+  slot whose build script hard-links a 64 KiB file: `status` matched the
+  proof's walk, with the pair counted once.
 
 ## Platform backends
 

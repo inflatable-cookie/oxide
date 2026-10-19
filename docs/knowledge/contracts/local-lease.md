@@ -98,6 +98,9 @@ The CLI and the plain library functions keep refusing a directory pool as
 `backing_mismatch` (exit 4), so Nucleus and other CLI consumers see no
 change. A directory pool's config records `backend: directory-budget-v1`,
 the budget as `cap_bytes` and `image_bytes: 0`; an older build refuses it.
+`OXIDE_POOL_CAP` chooses the cap of a pool the front door creates
+([workflow](workflow.md#implemented-foundation-core)); this CLI's
+`init --cap-bytes` and every existing pool's recorded cap are unchanged.
 
 The library also exports `evict_idle_slot` for Oxide's per-project slot cap.
 It retires one recorded idle slot whole through the same durable eviction path

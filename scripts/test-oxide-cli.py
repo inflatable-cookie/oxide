@@ -29,8 +29,15 @@ the standalone CLI's refusal, a reserve stop on injected watchdog readings
 (a bounded writer that ignores TERM is killed, the group closes and the slot
 is released; an unreaped group member keeps closure unconfirmed and the slot
 held until the next command recovers it) and admission that evicts a whole
-idle slot on a 1 MiB budget. The scratch is removed only after positive
-completion. Before any pool
+idle slot on a 1 MiB budget. Further scratch directory pools prove slot file
+counts (a build-script hard-linked pair counted once) and OXIDE_POOL_CAP
+(refused when invalid, used on create, reported and ignored on an existing
+pool; also reported on the APFS pool). Last, one fresh private CARGO_HOME
+proves the status Cargo home line and `clean --cargo-cache`: refusals, a
+cleanup that ran through the closed proxy with no connection, Cargo's lock
+skip and a closed-proxy denial an owned control listener never sees. Setup
+downloads exactly one tiny archive (cfg-if 1.0.0); nothing else may use the
+network. The scratch is removed only after positive completion. Before any pool
 exists, `init` / `new` adoption runs on tiny scratch directories (90 s,
 64 MiB scratch) and must leave the pool uncreated. Not a benchmark and not
 full QA.
