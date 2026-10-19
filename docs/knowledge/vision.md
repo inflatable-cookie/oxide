@@ -415,6 +415,11 @@ Tom's ruling, 2026-10-19 ("Paseo is already added to the Developer Tools list, b
   - an opt-in `oxide status` check that measures the macOS new-executable launch penalty and names the app to exempt.
 - **Developer Tools:** Paseo is already listed. A re-probe at 2026-10-19 ~15:30 under the running Paseo (started 12:05) still measured a fresh-copy launch median of 147.4 ms against 3.4 ms for the same file. Either Paseo needs a restart or the responsible process is not Paseo. That is to be re-measured after a restart, which is Tom's call.
 
+Tom's rulings, 2026-10-19 ("I can't restart right now, there's a lot of in-progress work. Approve the clean/TOML fix. Use Nucleus as the second project, Effigy is in heavy development and on the critical path"):
+- **Paseo restart deferred.** The Developer Tools re-measurement waits for a restart at Tom's convenience.
+- **The `oxide clean` / `--cargo-cache` safety fix is approved,** including one exact-pinned `basic-toml` `=0.1.10` parser dependency as a strict-profile exception for reading Cargo config.
+- **Nucleus is the second adopting project; Effigy is excluded for now** (critical path). The Nucleus adoption proposal follows the dogfood report and needs the Nucleus owner's agreement before any change.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
