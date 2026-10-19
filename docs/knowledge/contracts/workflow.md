@@ -1070,10 +1070,10 @@ with exit 1), and reads or changes no setting.
   `OXIDE_TEST_LAUNCH_DELAY=copy|start|remove:<ms>`, which pauses inside the
   helper). With the CLI gone, each case checks at once that the temporary
   directory is empty and no logged probe is alive:
-  - an ordinary run completes under 3 s with medians;
-  - under a 600 ms limit, a probe that never exits is killed;
-  - a copy, a probe start and a removal each paused 2 s return within the
-    limit, inconclusive.
+  - an ordinary run completes with medians (20 s limit, for loaded hosts);
+  - under a 5 s limit, a probe that never exits is killed;
+  - under a 600 ms limit, a copy, a probe start and a removal each paused
+    2 s return within 1.6 s, inconclusive.
 
 ## Platform backends
 

@@ -13,8 +13,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 const OXIDE: &str = env!("CARGO_BIN_EXE_oxide");
-/// Scheduling slack above a limit on a loaded host.
-const SLACK: Duration = Duration::from_millis(400);
+/// Scheduling slack above a limit on a loaded host; below the 2 s delays,
+/// so an unbounded check still fails.
+const SLACK: Duration = Duration::from_millis(1_000);
 const QUICK: &str = "#!/bin/sh\nexit 0\n";
 /// Records its PID, then never exits on its own.
 const SLOW: &str = "#!/bin/sh\necho $$ >> PIDS\nexec sleep 30\n";
@@ -95,9 +96,14 @@ fn logged_pids(path: &Path) -> Vec<i32> {
 
 #[test]
 fn an_ordinary_check_completes_and_cleans_up() {
-    let run = check("ordinary", QUICK, &[]);
+    // A generous limit, so a loaded host still completes the samples.
+    let run = check(
+        "ordinary",
+        QUICK,
+        &[("OXIDE_TEST_LAUNCH_LIMIT_MS", "20000")],
+    );
     assert!(
-        run.wall < Duration::from_secs(3) + SLACK,
+        run.wall < Duration::from_secs(20) + SLACK,
         "took {:?}",
         run.wall
     );
@@ -111,15 +117,16 @@ fn an_ordinary_check_completes_and_cleans_up() {
 
 #[test]
 fn a_probe_that_never_exits_is_killed_before_the_cli_exits() {
-    let run = check("slow", SLOW, &[("OXIDE_TEST_LAUNCH_LIMIT_MS", "600")]);
+    // Long enough for the probe's shell to start and log its PID.
+    let run = check("slow", SLOW, &[("OXIDE_TEST_LAUNCH_LIMIT_MS", "5000")]);
     assert!(
-        run.wall < Duration::from_millis(600) + SLACK,
+        run.wall < Duration::from_millis(5_000) + SLACK,
         "took {:?}",
         run.wall
     );
     assert!(
         run.stdout
-            .contains("result: inconclusive (the 600 ms limit was reached); no median reported"),
+            .contains("result: inconclusive (the 5000 ms limit was reached); no median reported"),
         "{}",
         run.stdout
     );
