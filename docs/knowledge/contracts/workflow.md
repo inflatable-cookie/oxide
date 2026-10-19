@@ -469,12 +469,17 @@ or global Cargo configuration is involved.
   readiness lists them as plain-Cargo lines by design.
 - **Test supervisor.** `oxide` runs Cargo in its own process group and
   forwards TERM to it, so killing the supervisor's group alone would miss
-  Cargo. At the 300-second limit `bounded-test.py` records every group led
-  by a descendant of its child, TERMs its own group, and after ten seconds
-  KILLs those groups and then its own. It reports any member of those
-  groups still alive five seconds later. A process that left with `setsid`
-  before the limit and whose group leader is not a descendant is not seen.
-- **Fixtures.** `effigy dogfood:scripts:test` proves that escalation and
+  Cargo. Every half second `bounded-test.py` records each group led by a
+  descendant of its child, with the PID and start time of each member. A
+  recorded group stays owned after its leader exits while a recorded member
+  lives in it, so a test child orphaned by Cargo's exit is still covered.
+  At the 300-second limit it TERMs its own group, and after ten seconds
+  KILLs the owned groups and then its own. It reports any member of those
+  groups still alive five seconds later. A group whose leader and every
+  member came and went between two samples, or a process that left with
+  `setsid` into a group no descendant leads, is not seen.
+- **Fixtures.** `effigy dogfood:scripts:test` proves that escalation,
+  including the orphan whose group leader exited, and
   the installer's refusals (linked or foreign directories, an existing
   destination, a destination swapped during the build) on synthetic
   fixtures. It never builds or installs.

@@ -46,6 +46,27 @@ signal.signal(signal.SIGTERM, lambda *_: os.killpg(child.pid, signal.SIGTERM))
 child.wait()
 """
 
+# The same parent after Cargo itself exits: the group leader spawns a
+# TERM-ignoring child in its group, then exits and is reaped; the parent
+# waits for the group to empty, as `oxide` does.
+ORPHAN = """
+import os, signal, subprocess, sys, time
+leader = subprocess.Popen([sys.executable, "-c",
+    "import subprocess, sys, time; child = subprocess.Popen([sys.executable, '-c', "
+    "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)']); "
+    "open(sys.argv[1], 'w').write(str(child.pid)); time.sleep(0.6)", sys.argv[1]],
+    start_new_session=True)
+group = leader.pid
+signal.signal(signal.SIGTERM, lambda *_: os.killpg(group, signal.SIGTERM))
+leader.wait()
+while True:
+    try:
+        os.killpg(group, 0)
+    except ProcessLookupError:
+        break
+    time.sleep(0.1)
+"""
+
 
 def alive(pid):
     try:
@@ -70,6 +91,18 @@ class SupervisorTests(unittest.TestCase):
         while alive(child) and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertFalse(alive(child), "TERM-ignoring child in Cargo's group survived")
+
+    def test_timeout_reaches_the_group_after_its_leader_exits(self):
+        pid_file = SCRATCH / "orphan.pid"
+        code = bounded.supervise(
+            [sys.executable, "-c", ORPHAN, str(pid_file)], limit=2, grace=1, closure=3, sample=0.1
+        )
+        self.assertEqual(code, 124)
+        orphan = int(pid_file.read_text())
+        deadline = time.monotonic() + 3
+        while alive(orphan) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(alive(orphan), "orphan in Cargo's group survived its leader's exit")
 
 
 def sha256(data):
