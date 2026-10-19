@@ -296,7 +296,10 @@ tested Cargo:
 - a fallback phase on installed 1.94.1.
 
 Fallback for any other Cargo, older, newer, another patch (1.96.0, 1.97.0)
-or a rebuilt one. The table is `VERIFIED_CARGO` in `freshness.rs`.
+or a rebuilt one. The table is `VERIFIED_CARGO` in `freshness.rs`. Oxide
+runs `cargo -V` in the command's own working directory, not the workspace
+root, because that is where the guarded Cargo and the gate's metadata call
+resolve the toolchain. A member's `rust-toolchain.toml` therefore counts.
 
 - **Freshness gate.** A new slot records an affine build: only that checkout
   reuses it, under Cargo's own checks, and the summary says `freshness gate

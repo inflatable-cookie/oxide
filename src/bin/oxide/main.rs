@@ -724,7 +724,7 @@ fn report_stray(workspace: &Path) {
                     target.display(),
                     bytes / MIB
                 );
-            } else if let Err(reason) = freshness::verified_cargo(workspace) {
+            } else if let Err(reason) = freshness::verified_cargo() {
                 // Another layout may keep intermediates elsewhere.
                 println!(
                     "stray Cargo output: unknown in {} ({reason}; its layout is unchecked)",

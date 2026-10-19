@@ -240,7 +240,7 @@ pub fn prepare(checkout: &Path, prior: &Prior, request: &Resolution) -> Result<G
         )),
         // Nothing compiled yet: a checkout without Git content, or whose
         // Cargo is unverified, stays affine.
-        Prior::Fresh => Ok(match verified_cargo(checkout) {
+        Prior::Fresh => Ok(match verified_cargo() {
             Err(reason) => Gate {
                 note: Some(reason),
                 ..Gate::affine()
@@ -259,7 +259,7 @@ pub fn prepare(checkout: &Path, prior: &Prior, request: &Resolution) -> Result<G
             let cross = origin.checkout != checkout;
             // Refreshing relies on Cargo's rules; an unchanged repeat does not.
             if cross || !changed.is_empty() {
-                verified_cargo(checkout)?;
+                verified_cargo()?;
             }
             let mut stale: BTreeSet<&String> = changed.iter().collect();
             if cross {
@@ -286,12 +286,19 @@ pub fn prepare(checkout: &Path, prior: &Prior, request: &Resolution) -> Result<G
     }
 }
 
-/// The first `cargo -V` line Cargo reports in `dir` when it is a
+/// `cargo -V` in the inherited working directory, where the guarded Cargo
+/// and the gate's metadata call resolve their toolchain (a member's
+/// `rust-toolchain.toml` included), never the workspace root.
+fn version_command() -> Command {
+    let mut command = Command::new(crate::CARGO);
+    command.arg("-V");
+    command
+}
+
+/// The first `cargo -V` line of the command's own Cargo when it is a
 /// [verified release](VERIFIED_CARGO); otherwise why not.
-pub(crate) fn verified_cargo(dir: &Path) -> Result<String, String> {
-    let output = Command::new(crate::CARGO)
-        .arg("-V")
-        .current_dir(dir)
+pub(crate) fn verified_cargo() -> Result<String, String> {
+    let output = version_command()
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -1306,6 +1313,14 @@ mod tests {
             matches!(own.finish(Path::new("/a")), Some(Built::Affine(path)) if path == Path::new("/a"))
         );
         assert!(Prior::Unknown.unchanged().is_none() && Prior::Fresh.unchanged().is_none());
+    }
+
+    #[test]
+    fn version_check_runs_where_the_command_runs() {
+        let command = version_command();
+        assert_eq!(command.get_current_dir(), None);
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["-V"]);
     }
 
     #[test]
