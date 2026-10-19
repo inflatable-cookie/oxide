@@ -2981,6 +2981,21 @@ def prove_whole_clean(call, parent: str, triple: str, real_env: dict) -> None:
             fail("the symlink referent changed")
     print("clean --include-foreign: target removed, foreign entries named, symlink referent intact")
 
+    # A pool inside the target, named by an outside symlink: refused by its
+    # real path before any listing, wait or deletion, even with
+    # --include-foreign and for a selected clean.
+    shutil.copytree(pristine, target, symlinks=True)
+    write_fixture(target, {"shared-pool/slots/1/sentinel": "slot"})
+    alias = os.path.join(parent, "pool-alias")
+    os.symlink(os.path.join(target, "shared-pool"), alias)
+    for args in (["--include-foreign"], ["--dry-run", "--include-foreign"], ["--release"]):
+        before = tree_state(target)
+        code, stdout, stderr = call(app, ["clean", *args], {"OXIDE_POOL": alias})
+        expect(code, 1, f"clean {args} with the pool inside the target", stderr)
+        if "is inside" not in stderr or "shared slots are never cleaned" not in stderr or stdout or tree_state(target) != before:
+            fail(f"clean {args} did not refuse the aliased pool before any effect: {stderr!r}")
+    print("pool inside the target through an outside symlink: whole, dry-run and selected cleans refused, slot sentinel intact")
+
     for args, needle in ((["-p", "clean-app", "--dry-run"], "lists paths only for a whole-target clean"),
                          (["--doc", "--include-foreign"], "--include-foreign applies only to a whole-target clean"),
                          (["--target", triple], "not supported for a whole-target clean")):

@@ -210,10 +210,25 @@ fn cargo_owned(path: &Path, name: &OsStr, metadata: &Metadata) -> bool {
     OWNED_DIRS.contains(&name) || profile_dir(path) || triple_dir(path)
 }
 
+/// The pool directory's device and inode, resolved through symlinks, or
+/// `None` when no pool exists yet.
+type Protected = Option<(u64, u64)>;
+
 /// Enumerate `target` without following symlinks or crossing a mount. An
 /// unreadable directory or a bound reached refuses: the plan is complete or
-/// there is none.
-fn plan(target: &Path) -> Result<Option<Plan>, String> {
+/// there is none. A directory with the pool's identity refuses, whatever
+/// path names the pool.
+fn plan(target: &Path, pool: Protected) -> Result<Option<Plan>, String> {
+    let refuse_pool = |path: &Path, metadata: &Metadata| {
+        if pool == Some((metadata.dev(), metadata.ino())) {
+            Err(format!(
+                "{} is the Oxide pool; shared slots are never cleaned",
+                path.display()
+            ))
+        } else {
+            Ok(())
+        }
+    };
     let root = match std::fs::symlink_metadata(target) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("cannot read {}: {error}", target.display())),
@@ -228,6 +243,7 @@ fn plan(target: &Path) -> Result<Option<Plan>, String> {
         }
         Ok(metadata) => metadata,
     };
+    refuse_pool(target, &root)?;
     let mut plan = Plan {
         entries: vec![Planned {
             path: target.to_path_buf(),
@@ -269,6 +285,7 @@ fn plan(target: &Path) -> Result<Option<Plan>, String> {
                 ));
             }
             if is_dir(&metadata) {
+                refuse_pool(&path, &metadata)?;
                 if depth + 1 >= MAX_DEPTH {
                     return Err(format!(
                         "{} is nested deeper than {MAX_DEPTH} levels; Oxide refuses rather than remove an incomplete list",
@@ -326,21 +343,50 @@ fn summary(plan: &Plan) -> String {
     )
 }
 
-/// Refuse a pool that lives inside the target: its slots are shared.
-fn refuse_pool_inside(target: &Path) -> Result<(), String> {
+/// Refuse a pool that lives inside the target, by path text and by real
+/// path (an outside symlink can name a pool inside), and return the pool's
+/// identity for the enumeration's own check.
+fn protect_pool(target: &Path) -> Result<Protected, String> {
     let pool = store::pool_path()?;
-    if pool.starts_with(target) {
-        return Err(format!(
+    let inside = |pool: &Path| {
+        Err(format!(
             "clean refused: the Oxide pool {} is inside {}; shared slots are never cleaned",
             pool.display(),
             target.display()
-        ));
+        ))
+    };
+    if pool.starts_with(target) {
+        return inside(&pool);
     }
-    Ok(())
+    match std::fs::metadata(&pool) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "clean refused: cannot resolve the Oxide pool {}: {error}",
+            pool.display()
+        )),
+        Ok(metadata) => {
+            let real = std::fs::canonicalize(&pool).map_err(|error| {
+                format!(
+                    "clean refused: cannot resolve the Oxide pool {}: {error}",
+                    pool.display()
+                )
+            })?;
+            let real_target =
+                std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+            if real.starts_with(&real_target) {
+                return inside(&pool);
+            }
+            Ok(Some((metadata.dev(), metadata.ino())))
+        }
+    }
 }
 
-fn checked_plan(target: &Path, include_foreign: bool) -> Result<Option<Plan>, String> {
-    let plan = plan(target).map_err(|reason| format!("clean refused: {reason}"))?;
+fn checked_plan(
+    target: &Path,
+    pool: Protected,
+    include_foreign: bool,
+) -> Result<Option<Plan>, String> {
+    let plan = plan(target, pool).map_err(|reason| format!("clean refused: {reason}"))?;
     match plan {
         Some(plan) if !plan.foreign.is_empty() && !include_foreign => {
             Err(refuse_foreign(target, &plan))
@@ -381,9 +427,9 @@ fn remove(plan: &Plan) -> Result<(), String> {
 
 fn run_whole(workspace: &Path, dry_run: bool, include_foreign: bool) -> Result<u8, String> {
     let target = workspace.join("target");
-    refuse_pool_inside(&target)?;
+    let pool = protect_pool(&target)?;
     // Refusal precedes waiting, deletion and any affinity change.
-    let first = checked_plan(&target, include_foreign)?;
+    let first = checked_plan(&target, pool, include_foreign)?;
     if dry_run {
         let Some(plan) = first else {
             eprintln!(
@@ -421,7 +467,7 @@ fn run_whole(workspace: &Path, dry_run: bool, include_foreign: bool) -> Result<u
     };
     // Plan again under the clean barrier: what is removed is what this plan
     // lists.
-    let outcome = checked_plan(&target, include_foreign).and_then(|plan| match plan {
+    let outcome = checked_plan(&target, pool, include_foreign).and_then(|plan| match plan {
         None => Ok(None),
         Some(plan) => remove(&plan).map(|()| Some(plan)),
     });
@@ -472,6 +518,7 @@ fn run_whole(workspace: &Path, dry_run: bool, include_foreign: bool) -> Result<u
 /// injected slot build directory. It waits for active commands in the
 /// checkout and blocks new ones until it finishes.
 fn run_selected(args: &[OsString], workspace: &Path) -> Result<u8, String> {
+    protect_pool(&workspace.join("target"))?;
     process::install_signal_handlers()?;
     let store = Store::open_existing()?;
     let guard = match &store {
@@ -602,7 +649,7 @@ mod tests {
         let root = scratch("classify");
         let target = root.join("target");
         cargo_target(&target);
-        let clean = plan(&target).unwrap().unwrap();
+        let clean = plan(&target, None).unwrap().unwrap();
         assert!(clean.foreign.is_empty(), "{:?}", clean.foreign);
         assert_eq!(clean.entries[0].path, target);
         // A plausible name without Cargo's lock is not a profile directory;
@@ -615,7 +662,7 @@ mod tests {
         std::fs::create_dir_all(target.join("aarch64-apple-darwin/release")).unwrap();
         std::fs::write(target.join("aarch64-apple-darwin/release/.cargo-lock"), "").unwrap();
         std::fs::write(target.join("aarch64-apple-darwin/extra"), "").unwrap();
-        let mixed = plan(&target).unwrap().unwrap();
+        let mixed = plan(&target, None).unwrap().unwrap();
         assert_eq!(
             mixed.foreign,
             os(&[
@@ -644,10 +691,10 @@ mod tests {
         std::fs::write(outside.join("sentinel"), "keep").unwrap();
         std::fs::create_dir_all(target.join("handover/nested")).unwrap();
         symlink(&outside, target.join("handover/nested/escape")).unwrap();
-        assert!(checked_plan(&target, false)
+        assert!(checked_plan(&target, None, false)
             .unwrap_err()
             .contains("handover"));
-        let plan = checked_plan(&target, true).unwrap().unwrap();
+        let plan = checked_plan(&target, None, true).unwrap().unwrap();
         assert!(plan
             .entries
             .iter()
@@ -663,7 +710,7 @@ mod tests {
         let root = scratch("late");
         let target = root.join("target");
         cargo_target(&target);
-        let plan = checked_plan(&target, false).unwrap().unwrap();
+        let plan = checked_plan(&target, None, false).unwrap().unwrap();
         std::fs::write(target.join("doc/late"), "new").unwrap();
         let left = remove(&plan).unwrap_err();
         assert!(left.contains("not in the plan"), "{left}");
@@ -672,12 +719,37 @@ mod tests {
     }
 
     #[test]
+    fn the_pool_is_refused_by_identity_through_an_outside_symlink() {
+        let root = scratch("pool");
+        let target = root.join("target");
+        cargo_target(&target);
+        let pool = target.join("shared-pool/slots");
+        std::fs::create_dir_all(&pool).unwrap();
+        std::fs::write(pool.join("sentinel"), "slot").unwrap();
+        symlink(target.join("shared-pool"), root.join("pool-alias")).unwrap();
+        let alias = std::fs::metadata(root.join("pool-alias")).unwrap();
+        let identity = Some((alias.dev(), alias.ino()));
+        for include_foreign in [false, true] {
+            let refused = checked_plan(&target, identity, include_foreign).unwrap_err();
+            assert!(refused.contains("is the Oxide pool"), "{refused}");
+        }
+        let whole = std::fs::metadata(&target).unwrap();
+        assert!(plan(&target, Some((whole.dev(), whole.ino())))
+            .unwrap_err()
+            .contains("is the Oxide pool"));
+        assert_eq!(std::fs::read(pool.join("sentinel")).unwrap(), b"slot");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn a_symlinked_or_missing_target_is_not_cleaned_through() {
         let root = scratch("link");
         std::fs::create_dir(root.join("real")).unwrap();
         symlink(root.join("real"), root.join("target")).unwrap();
-        assert!(plan(&root.join("target")).unwrap_err().contains("symlink"));
-        assert!(plan(&root.join("absent")).unwrap().is_none());
+        assert!(plan(&root.join("target"), None)
+            .unwrap_err()
+            .contains("symlink"));
+        assert!(plan(&root.join("absent"), None).unwrap().is_none());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

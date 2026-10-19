@@ -895,8 +895,12 @@ only under `--verbose`, and a whole-target clean removes every entry.
 - **Plan.** One enumeration of the target and everything under it, parents
   first. Symlinks are listed as entries and never followed; another
   filesystem under the target, an unreadable directory, more than 1,000,000
-  entries or depth 256 refuse rather than truncate. A symlinked target and a
-  pool inside the target refuse.
+  entries or depth 256 refuse rather than truncate. A symlinked target
+  refuses. So does the Oxide pool inside the target, checked by path, by
+  real path (an outside `OXIDE_POOL` symlink can name a pool inside) and by
+  the pool directory's device and inode during enumeration; selected cleans
+  get the same path checks. oxide#095 review found an outside symlink
+  passing the path-only check, so `--include-foreign` deleted the pool.
 - **Ownership.** Each top-level entry is classified against Cargo's target
   layout at the pinned commit `c980f4866141969fab6254a680546a277789d6f0`:
   - files [`CACHEDIR.TAG`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/crates/cargo-util/src/paths.rs#L799-L802),
@@ -1074,7 +1078,10 @@ it never deletes there itself.
   outside sentinel added, the dry run and the clean both refuse naming them
   with nothing changed; the `--include-foreign` dry run lists exactly the
   tree and the clean removes it, sentinel intact; selected-clean
-  `--dry-run`/`--include-foreign` and `--target` refuse. A fresh private
+  `--dry-run`/`--include-foreign` and `--target` refuse; with `OXIDE_POOL`
+  an outside symlink to a pool directory inside the target, the
+  `--include-foreign` clean, its dry run and a `--release` clean all refuse
+  with the slot sentinel and tree unchanged. A fresh private
   `CARGO_HOME` is seeded by copying `cfg-if` 1.0.0 and its sparse-index
   entry from the host cache (checksum checked, nothing fetched); there each
   risky key refuses by name (`source`, `registries`, both credential-provider
