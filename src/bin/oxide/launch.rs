@@ -7,9 +7,12 @@
 
 use std::ffi::OsStr;
 use std::fmt::Write as _;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 /// The hidden probe argument. `main` checks it before anything else.
@@ -22,6 +25,7 @@ const WORK_DEADLINE: Duration = Duration::from_millis(2_750);
 pub const THRESHOLD_MS: u64 = 30;
 /// One copy exists at a time; a larger binary is refused.
 const MAX_COPY_BYTES: u64 = 64 * 1024 * 1024;
+const COPY_CHUNK: usize = 1024 * 1024;
 const RUNS: usize = 5;
 const POLL: Duration = Duration::from_micros(250);
 const MAX_ANCESTORS: usize = 64;
@@ -139,13 +143,8 @@ fn runs(values: &[u64]) -> String {
 }
 
 /// The full report: raw samples, then either the result or why there is none.
-pub fn report(
-    samples: &Samples,
-    failure: Option<&str>,
-    app: &App,
-    elapsed: Duration,
-    cleanup: &str,
-) -> String {
+pub fn report(outcome: &Outcome, limit: Duration, app: &App) -> String {
+    let samples = &outcome.samples;
     let mut text = String::from(
         "launch check: a new executable's first launch against a re-run of the same file\n",
     );
@@ -156,19 +155,27 @@ pub fn report(
         runs(&samples.same)
     );
     let _ = writeln!(text, "  fresh copies: runs {}", runs(&samples.fresh));
+    let cleanup = match &outcome.cleanup {
+        Cleanup::Removed => "temporary copies removed".to_owned(),
+        Cleanup::Left(left) => format!("could not remove {}", left.join(", ")),
+        Cleanup::Unfinished => format!(
+            "cleanup did not finish within the limit; {} may remain",
+            outcome.dir.display()
+        ),
+    };
     let _ = writeln!(
         text,
         "  took {} ms of a {} ms limit; {cleanup}",
-        elapsed.as_millis(),
-        DEADLINE.as_millis()
+        outcome.elapsed.as_millis(),
+        limit.as_millis()
     );
-    let measured = match (failure, samples.measured()) {
+    let measured = match (outcome.failure.as_deref(), samples.measured()) {
         (None, Some(measured)) => measured,
         (failure, _) => {
             let reason = failure.unwrap_or("incomplete samples");
             // The first launches of a newly built oxide can themselves take
             // longer than the limit; later copies of the same file are faster.
-            let hint = if reason == limit_reached() {
+            let hint = if reason == limit_reached(limit) {
                 "; run it again, since a newly built oxide's first launches can take longer"
             } else {
                 ""
@@ -247,150 +254,338 @@ pub fn advice(app: &App) -> String {
     text
 }
 
-/// Private scratch: every created file and the directory are removed on drop.
-struct Scratch {
-    dir: PathBuf,
-    files: Vec<PathBuf>,
+/// Deadlines for one check, plus delays the tests inject.
+#[derive(Clone, Copy, Debug)]
+pub struct Plan {
+    /// The check returns by then, whatever is still blocked.
+    pub limit: Duration,
+    /// Samples must complete by then; no new work starts after it.
+    pub work: Duration,
+    pub delays: Delays,
 }
 
-impl Scratch {
-    fn create() -> Result<Self, String> {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.subsec_nanos());
-        let dir =
-            std::env::temp_dir().join(format!("oxide-launch-check-{}-{nanos}", std::process::id()));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .map_err(|error| format!("could not create {}: {error}", dir.display()))?;
-        Ok(Self {
-            dir,
-            files: Vec::new(),
-        })
+/// Pauses before a copy's data, inside a start and inside each removal.
+/// Zero outside tests.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Delays {
+    pub copy: Duration,
+    pub start: Duration,
+    pub remove: Duration,
+}
+
+impl Plan {
+    pub const STANDARD: Self = Self {
+        limit: DEADLINE,
+        work: WORK_DEADLINE,
+        delays: Delays {
+            copy: Duration::ZERO,
+            start: Duration::ZERO,
+            remove: Duration::ZERO,
+        },
+    };
+}
+
+fn pause(delay: Duration) {
+    if !delay.is_zero() {
+        std::thread::sleep(delay);
+    }
+}
+
+fn limit_reached(limit: Duration) -> String {
+    format!("the {} ms limit was reached", limit.as_millis())
+}
+
+const STOPPED: &str = "stopped at the limit";
+
+/// What the measuring thread owns and cleanup must undo. Every change is
+/// made under the lock, so cleanup sees each created file and an unreaped
+/// child, and nothing new is created once it has started.
+#[derive(Default)]
+struct Owned {
+    stopped: bool,
+    dir: Option<PathBuf>,
+    files: Vec<PathBuf>,
+    child: Option<Child>,
+}
+
+#[derive(Default)]
+struct Check {
+    owned: Mutex<Owned>,
+    /// Mirrors `Owned::stopped` for the unlocked copy loop.
+    stopped: AtomicBool,
+}
+
+impl Check {
+    fn lock(&self) -> MutexGuard<'_, Owned> {
+        self.owned.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A new copy of `source`, owner-only and executable.
-    fn copy(&mut self, source: &Path, name: &str) -> Result<PathBuf, String> {
-        let path = self.dir.join(name);
-        self.files.push(path.clone());
-        std::fs::copy(source, &path)
-            .and_then(|_| std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)))
-            .map_err(|error| format!("could not copy oxide: {error}"))?;
-        Ok(path)
+    /// One step under the lock, refused once cleanup has started.
+    fn step<T>(&self, action: impl FnOnce(&mut Owned) -> Result<T, String>) -> Result<T, String> {
+        let mut owned = self.lock();
+        if owned.stopped {
+            return Err(STOPPED.to_owned());
+        }
+        action(&mut owned)
     }
 
-    fn remove(&mut self, path: &Path) -> Result<(), String> {
-        std::fs::remove_file(path)
-            .map_err(|error| format!("could not remove {}: {error}", path.display()))?;
-        self.files.retain(|file| file != path);
-        Ok(())
-    }
-
-    /// Remove everything; the description names anything left behind.
-    fn cleanup(mut self) -> String {
-        let left = self.remove_all();
-        if left.is_empty() {
-            "temporary copies removed".to_owned()
-        } else {
-            format!("could not remove {}", left.join(", "))
+    /// A new owner-only executable copy of `source`, written in chunks.
+    fn copy(&self, source: &Path, path: &Path, plan: &Plan) -> Result<(), String> {
+        let failed = |error: std::io::Error| format!("could not copy oxide: {error}");
+        let mut output = self.step(|owned| {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o700)
+                .open(path)
+                .map_err(failed)?;
+            owned.files.push(path.to_owned());
+            Ok(file)
+        })?;
+        pause(plan.delays.copy);
+        let mut input = std::fs::File::open(source).map_err(failed)?;
+        let mut buffer = vec![0_u8; COPY_CHUNK];
+        let mut written = 0_u64;
+        loop {
+            if self.stopped.load(Ordering::SeqCst) {
+                return Err(STOPPED.to_owned());
+            }
+            let read = input.read(&mut buffer).map_err(failed)?;
+            if read == 0 {
+                return Ok(());
+            }
+            written += read as u64;
+            if written > MAX_COPY_BYTES {
+                return Err(format!(
+                    "oxide grew past the {} MiB copy limit",
+                    MAX_COPY_BYTES / crate::MIB
+                ));
+            }
+            output.write_all(&buffer[..read]).map_err(failed)?;
         }
     }
 
-    fn remove_all(&mut self) -> Vec<String> {
+    /// Time one probe launch. A sample counts only if the probe exited
+    /// successfully by `deadline`; otherwise the unreaped child is left
+    /// for cleanup to kill and reap.
+    fn launch(&self, program: &Path, plan: &Plan, deadline: Instant) -> Result<u64, String> {
+        let started = self.step(|owned| {
+            pause(plan.delays.start);
+            let started = Instant::now();
+            let child = Command::new(program)
+                .arg(PROBE)
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|error| format!("could not start a probe: {error}"))?;
+            owned.child = Some(child);
+            Ok(started)
+        })?;
+        loop {
+            let exited = self.step(|owned| {
+                let child = owned.child.as_mut().ok_or("the probe was not recorded")?;
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        owned.child = None;
+                        Ok(Some((status, Instant::now())))
+                    }
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(format!("could not wait for a probe: {error}")),
+                }
+            })?;
+            if let Some((status, ended)) = exited {
+                if ended > deadline {
+                    return Err(limit_reached(plan.limit));
+                }
+                if !status.success() {
+                    return Err(format!("a probe exited with {status}"));
+                }
+                let elapsed = ended.duration_since(started);
+                return Ok(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX));
+            }
+            if Instant::now() >= deadline {
+                return Err(limit_reached(plan.limit));
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
+    fn remove(&self, path: &Path, plan: &Plan) -> Result<(), String> {
+        self.step(|owned| {
+            pause(plan.delays.remove);
+            std::fs::remove_file(path)
+                .map_err(|error| format!("could not remove {}: {error}", path.display()))?;
+            owned.files.retain(|file| file != path);
+            Ok(())
+        })
+    }
+
+    /// Stop new work, kill and reap an unreaped probe (only this check's
+    /// own child), then remove every created file and the directory.
+    /// Returns what is left behind.
+    fn clean(&self, plan: &Plan) -> Vec<String> {
+        let mut owned = self.lock();
+        owned.stopped = true;
+        self.stopped.store(true, Ordering::SeqCst);
+        if let Some(mut child) = owned.child.take() {
+            // Not yet reaped, so the PID is still this child's.
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         let mut left = Vec::new();
-        for file in std::mem::take(&mut self.files) {
+        for file in std::mem::take(&mut owned.files) {
+            pause(plan.delays.remove);
             match std::fs::remove_file(&file) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => left.push(file.display().to_string()),
             }
         }
-        if std::fs::remove_dir(&self.dir).is_err() && self.dir.exists() {
-            left.push(self.dir.display().to_string());
+        if let Some(dir) = owned.dir.take() {
+            if std::fs::remove_dir(&dir).is_err() && dir.exists() {
+                left.push(dir.display().to_string());
+            }
         }
         left
     }
 }
 
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        if !self.files.is_empty() || self.dir.exists() {
-            let _ = self.remove_all();
-        }
-    }
-}
-
-/// Time one probe launch. Past the deadline the child is killed and reaped.
-fn time_launch(program: &Path, deadline: Instant) -> Result<u64, String> {
-    let started = Instant::now();
-    let mut child = Command::new(program)
-        .arg(PROBE)
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("could not start a probe: {error}"))?;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-                return if status.success() {
-                    Ok(elapsed)
-                } else {
-                    Err(format!("a probe exited with {status}"))
-                };
-            }
-            Ok(None) if Instant::now() >= deadline => {
-                // Not yet reaped, so the PID is still this child's.
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(limit_reached());
-            }
-            Ok(None) => std::thread::sleep(POLL),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("could not wait for a probe: {error}"));
-            }
-        }
-    }
-}
-
-fn limit_reached() -> String {
-    format!("the {} ms limit was reached", DEADLINE.as_millis())
-}
-
-fn check_deadline(deadline: Instant) -> Result<(), String> {
-    if Instant::now() >= deadline {
-        return Err(limit_reached());
-    }
-    Ok(())
+/// A sample or the end of the measuring thread.
+enum Event {
+    Warmup(u64),
+    Same(u64),
+    Fresh(u64),
+    Done(Result<(), String>),
 }
 
 /// Warm-up and same-file runs on one copy, then one fresh copy per run.
 /// At most one copy exists at a time.
 fn measure(
-    scratch: &mut Scratch,
+    check: &Check,
     source: &Path,
-    samples: &mut Samples,
+    dir: &Path,
+    plan: &Plan,
     deadline: Instant,
+    events: &mpsc::Sender<Event>,
 ) -> Result<(), String> {
-    let same = scratch.copy(source, "same")?;
-    samples.warmup = Some(time_launch(&same, deadline)?);
+    check.step(|owned| {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dir)
+            .map_err(|error| format!("could not create {}: {error}", dir.display()))?;
+        owned.dir = Some(dir.to_owned());
+        Ok(())
+    })?;
+    let same = dir.join("same");
+    check.copy(source, &same, plan)?;
+    let _ = events.send(Event::Warmup(check.launch(&same, plan, deadline)?));
     for _ in 0..RUNS {
-        check_deadline(deadline)?;
-        samples.same.push(time_launch(&same, deadline)?);
+        let _ = events.send(Event::Same(check.launch(&same, plan, deadline)?));
     }
-    scratch.remove(&same)?;
+    check.remove(&same, plan)?;
     for run in 0..RUNS {
-        check_deadline(deadline)?;
-        let fresh = scratch.copy(source, &format!("fresh-{run}"))?;
-        samples.fresh.push(time_launch(&fresh, deadline)?);
-        scratch.remove(&fresh)?;
+        let fresh = dir.join(format!("fresh-{run}"));
+        check.copy(source, &fresh, plan)?;
+        let _ = events.send(Event::Fresh(check.launch(&fresh, plan, deadline)?));
+        check.remove(&fresh, plan)?;
     }
     Ok(())
+}
+
+/// How cleanup ended.
+#[derive(Debug, Eq, PartialEq)]
+pub enum Cleanup {
+    Removed,
+    Left(Vec<String>),
+    /// Still blocked at the limit; the directory may remain.
+    Unfinished,
+}
+
+/// What one check observed.
+pub struct Outcome {
+    pub samples: Samples,
+    pub failure: Option<String>,
+    pub cleanup: Cleanup,
+    pub elapsed: Duration,
+    /// The private directory the check used.
+    pub dir: PathBuf,
+}
+
+/// A fresh private directory name under the temporary directory.
+fn scratch_dir() -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    std::env::temp_dir().join(format!(
+        "oxide-launch-check-{}-{nanos}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ))
+}
+
+/// Measure on a separate thread and clean up on another, so a blocked copy,
+/// start, wait or removal cannot hold the check past `plan.limit`. A thread
+/// still blocked then is abandoned and ends with the process; the report
+/// names what may remain.
+pub fn run_measure(source: &Path, plan: Plan) -> Outcome {
+    let started = Instant::now();
+    let limit = started + plan.limit;
+    let deadline = started + plan.work;
+    let dir = scratch_dir();
+    let check = Arc::new(Check::default());
+    let (events, received) = mpsc::channel();
+    {
+        let check = Arc::clone(&check);
+        let source = source.to_owned();
+        let dir = dir.clone();
+        std::thread::spawn(move || {
+            let result = measure(&check, &source, &dir, &plan, deadline, &events);
+            let _ = events.send(Event::Done(result));
+        });
+    }
+    let mut samples = Samples::default();
+    let mut failure = loop {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match received.recv_timeout(wait) {
+            Ok(Event::Warmup(micros)) => samples.warmup = Some(micros),
+            Ok(Event::Same(micros)) => samples.same.push(micros),
+            Ok(Event::Fresh(micros)) => samples.fresh.push(micros),
+            Ok(Event::Done(result)) => break result.err(),
+            Err(mpsc::RecvTimeoutError::Timeout) => break Some(limit_reached(plan.limit)),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break Some("the measurement stopped unexpectedly".to_owned())
+            }
+        }
+    };
+    let (cleaned, outcome) = mpsc::channel();
+    {
+        let check = Arc::clone(&check);
+        std::thread::spawn(move || {
+            let _ = cleaned.send(check.clean(&plan));
+        });
+    }
+    let cleanup = match outcome.recv_timeout(limit.saturating_duration_since(Instant::now())) {
+        Ok(left) if left.is_empty() => Cleanup::Removed,
+        Ok(left) => Cleanup::Left(left),
+        Err(_) => {
+            failure.get_or_insert_with(|| limit_reached(plan.limit));
+            Cleanup::Unfinished
+        }
+    };
+    let elapsed = started.elapsed();
+    if elapsed > plan.limit {
+        failure.get_or_insert_with(|| limit_reached(plan.limit));
+    }
+    Outcome {
+        samples,
+        failure,
+        cleanup,
+        elapsed,
+        dir,
+    }
 }
 
 /// `oxide status --launch-check`.
@@ -399,7 +594,6 @@ pub fn run_check() -> Result<u8, String> {
         println!("launch check: not applicable (it measures a macOS first-launch cost)");
         return Ok(0);
     }
-    let started = Instant::now();
     let source =
         std::env::current_exe().map_err(|error| format!("could not locate oxide: {error}"))?;
     let size = std::fs::metadata(&source)
@@ -412,16 +606,9 @@ pub fn run_check() -> Result<u8, String> {
             MAX_COPY_BYTES / crate::MIB
         ));
     }
-    let mut samples = Samples::default();
-    let mut scratch = Scratch::create()?;
-    let failure = measure(&mut scratch, &source, &mut samples, started + WORK_DEADLINE).err();
-    let cleanup = scratch.cleanup();
-    let elapsed = started.elapsed();
+    let outcome = run_measure(&source, Plan::STANDARD);
     let app = launching_app(&ancestry());
-    print!(
-        "{}",
-        report(&samples, failure.as_deref(), &app, elapsed, &cleanup)
-    );
+    print!("{}", report(&outcome, DEADLINE, &app));
     Ok(0)
 }
 
@@ -553,16 +740,20 @@ mod tests {
         );
     }
 
+    fn render(samples: Samples, failure: Option<&str>, cleanup: Cleanup) -> String {
+        let outcome = Outcome {
+            samples,
+            failure: failure.map(str::to_owned),
+            cleanup,
+            elapsed: Duration::from_millis(900),
+            dir: PathBuf::from("/t/oxide-launch-check-1"),
+        };
+        report(&outcome, DEADLINE, &App::None)
+    }
+
     #[test]
     fn report_keeps_raw_samples_and_states_the_result() {
-        let elapsed = Duration::from_millis(900);
-        let small = report(
-            &full([2_300; 5], [2_500; 5]),
-            None,
-            &App::None,
-            elapsed,
-            "temporary copies removed",
-        );
+        let small = render(full([2_300; 5], [2_500; 5]), None, Cleanup::Removed);
         assert!(small.contains("same file: warm-up 120.0 ms; runs 2.3 ms, 2.3 ms"));
         assert!(small.contains("medians: same file 2.3 ms, fresh copy 2.5 ms, difference 0.2 ms"));
         assert!(small.contains("result: no material penalty"));
@@ -570,21 +761,12 @@ mod tests {
             !small.contains("Developer Tools"),
             "no advice below the threshold"
         );
-        let negative = report(
-            &full([3_000; 5], [2_000; 5]),
-            None,
-            &App::None,
-            elapsed,
-            "x",
-        );
+        let negative = render(full([3_000; 5], [2_000; 5]), None, Cleanup::Removed);
         assert!(negative.contains("difference -1.0 ms"));
-        let failed = full([2_000; 5], [100_000; 5]);
-        let failed = report(
-            &failed,
+        let failed = render(
+            full([2_000; 5], [100_000; 5]),
             Some("a probe exited with exit status: 1"),
-            &App::None,
-            elapsed,
-            "x",
+            Cleanup::Left(vec!["/t/x".to_owned()]),
         );
         assert!(failed.contains(
             "result: inconclusive (a probe exited with exit status: 1); no median reported"
@@ -595,12 +777,10 @@ mod tests {
             same: vec![1; 5],
             fresh: vec![100_000; 2],
         };
-        let partial = report(
-            &partial,
+        let partial = render(
+            partial,
             Some("the 3000 ms limit was reached"),
-            &App::None,
-            elapsed,
-            "x",
+            Cleanup::Unfinished,
         );
         assert!(partial.contains("fresh copies: runs 100.0 ms, 100.0 ms\n"));
         assert!(partial.contains(
@@ -610,17 +790,164 @@ mod tests {
             !failed.contains("run it again"),
             "the hint is for the limit only"
         );
-        let penalty = report(
-            &full([2_300; 5], [101_600; 5]),
-            None,
-            &App::None,
-            elapsed,
-            "x",
-        );
+        let penalty = render(full([2_300; 5], [101_600; 5]), None, Cleanup::Removed);
         assert!(penalty.contains(
             "result: penalty 99.3 ms per newly written executable, above the 30 ms threshold"
         ));
-        assert!(penalty.contains("took 900 ms of a 3000 ms limit; x"));
+        assert!(penalty.contains("took 900 ms of a 3000 ms limit; temporary copies removed"));
+        assert!(failed.contains("; could not remove /t/x\n"));
+        assert!(partial.contains(
+            "; cleanup did not finish within the limit; /t/oxide-launch-check-1 may remain\n"
+        ));
+    }
+
+    /// A private directory for test sources, and a short plan.
+    fn source(label: &str, script: &str) -> PathBuf {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("launch-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("launch scratch");
+        let path = dir.join("probe");
+        std::fs::write(&path, script).expect("probe script");
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("probe mode");
+        path
+    }
+
+    const LIMIT: Duration = Duration::from_millis(600);
+    /// Scheduling slack above the limit on a loaded host.
+    const SLACK: Duration = Duration::from_millis(400);
+
+    fn plan(delays: Delays) -> Plan {
+        Plan {
+            limit: LIMIT,
+            work: Duration::from_millis(500),
+            delays,
+        }
+    }
+
+    /// Run a check and assert its bound.
+    fn bounded(label: &str, script: &str, plan: Plan) -> Outcome {
+        let probe = source(label, script);
+        let started = Instant::now();
+        let outcome = run_measure(&probe, plan);
+        let wall = started.elapsed();
+        assert!(
+            wall < plan.limit + SLACK,
+            "{label}: returned after {wall:?}"
+        );
+        assert!(outcome.elapsed <= wall);
+        outcome
+    }
+
+    fn eventually_gone(dir: &Path) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while dir.exists() {
+            assert!(Instant::now() < until, "left behind: {}", dir.display());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A new script file pays the same first-launch cost as a binary, so
+    /// a complete check needs the standard limit.
+    const QUICK: &str = "#!/bin/sh\nexit 0\n";
+
+    #[test]
+    fn an_ordinary_check_completes_and_cleans_up() {
+        let outcome = bounded("ordinary", QUICK, Plan::STANDARD);
+        assert_eq!(outcome.failure, None);
+        assert!(
+            outcome.samples.measured().is_some(),
+            "{:?}",
+            outcome.samples
+        );
+        assert_eq!(outcome.cleanup, Cleanup::Removed);
+        assert!(
+            !outcome.dir.exists(),
+            "left behind: {}",
+            outcome.dir.display()
+        );
+    }
+
+    #[test]
+    fn a_probe_past_the_deadline_is_killed_and_never_a_sample() {
+        let outcome = bounded(
+            "slow",
+            "#!/bin/sh\nexec sleep 30\n",
+            plan(Delays::default()),
+        );
+        assert_eq!(
+            outcome.failure.as_deref(),
+            Some("the 600 ms limit was reached")
+        );
+        assert_eq!(outcome.samples.warmup, None);
+        assert_eq!(outcome.cleanup, Cleanup::Removed);
+        assert!(
+            !outcome.dir.exists(),
+            "left behind: {}",
+            outcome.dir.display()
+        );
+    }
+
+    #[test]
+    fn a_slow_copy_cannot_hold_the_check() {
+        let delays = Delays {
+            copy: Duration::from_secs(2),
+            ..Delays::default()
+        };
+        let outcome = bounded("copy", QUICK, plan(delays));
+        assert_eq!(
+            outcome.failure.as_deref(),
+            Some("the 600 ms limit was reached")
+        );
+        assert_eq!(outcome.samples.measured(), None);
+        // The copy pauses outside the lock, so cleanup ran in time.
+        assert_eq!(outcome.cleanup, Cleanup::Removed);
+        assert!(
+            !outcome.dir.exists(),
+            "left behind: {}",
+            outcome.dir.display()
+        );
+        // The resumed copy stops without creating anything.
+        std::thread::sleep(Duration::from_millis(2_100));
+        assert!(
+            !outcome.dir.exists(),
+            "recreated: {}",
+            outcome.dir.display()
+        );
+    }
+
+    #[test]
+    fn a_slow_start_or_removal_reports_what_may_remain() {
+        for (label, delays) in [
+            (
+                "start",
+                Delays {
+                    start: Duration::from_secs(1),
+                    ..Delays::default()
+                },
+            ),
+            (
+                "remove",
+                Delays {
+                    remove: Duration::from_millis(700),
+                    ..Delays::default()
+                },
+            ),
+        ] {
+            let outcome = bounded(label, QUICK, plan(delays));
+            assert_eq!(
+                outcome.failure.as_deref(),
+                Some("the 600 ms limit was reached"),
+                "{label}"
+            );
+            assert_eq!(outcome.samples.measured(), None, "{label}");
+            assert_eq!(outcome.cleanup, Cleanup::Unfinished, "{label}");
+            // In this test process the abandoned threads finish; cleanup
+            // then kills any started probe and removes everything.
+            eventually_gone(&outcome.dir);
+        }
     }
 
     #[test]

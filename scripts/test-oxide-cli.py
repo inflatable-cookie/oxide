@@ -43,7 +43,10 @@ exists, `init` / `new` adoption runs on tiny scratch directories (90 s,
 macOS `status --launch-check` run under a Cargo that refuses and records any
 call: bounded time, its temporary copies removed, well-formed output and no
 Cargo; the hidden probe mode alone gets the same refused-Cargo control. No
-penalty threshold is asserted. Not a benchmark and not full QA.
+penalty threshold is asserted. `--launch-check` runs only that case: offline
+staging into its own scratch (counted), the 20 GiB reserve sampled at
+admission and after each phase, no pool, image or download, 300 s including
+cleanup. Not a benchmark and not full QA.
 """
 from __future__ import annotations
 
@@ -2378,9 +2381,9 @@ MATRIX = {
 FALLBACK = ("1.94.1", "cargo 1.94.1 (29ea6fb6a 2026-03-24)")
 
 
-def reserve(parent: str, phase: str) -> None:
+def reserve(parent: str, phase: str, proof: str = "matrix") -> None:
     free = host_free_bytes(parent)
-    print(f"matrix reserve {phase}: host free {free // (1024 * 1024)} MiB")
+    print(f"{proof} reserve {phase}: host free {free // (1024 * 1024)} MiB")
     if free < HOST_RESERVE_BYTES:
         fail(f"host free {free} is below the 20 GiB reserve at {phase}")
 
@@ -2563,8 +2566,72 @@ def matrix_main(tested: str) -> int:
     return 0
 
 
+def launch_main() -> int:
+    """The launch check alone, offline: no pool, image, download or Cargo
+    home other than the host's cached registry for staging."""
+    global STARTED
+    if sys.platform != "darwin":
+        fail("the launch-check proof requires macOS")
+    STARTED = time.monotonic()
+    # Sampled before this proof writes anything, on the scratch filesystem.
+    reserve(os.environ.get("OXIDE_TASK_SCRATCH_ROOT") or "/private/tmp", "admission", "launch")
+    root = scratch_root()
+    parent = os.path.join(root, "oxide-launch")
+    os.makedirs(parent, mode=0o700, exist_ok=False)
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    stage = dict(os.environ)
+    for name in ("CARGO", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "RUSTC", "RUSTC_WRAPPER"):
+        stage.pop(name, None)
+    # Offline staging with the builder release into this proof's scratch,
+    # so its footprint is counted.
+    stage.update(
+        {
+            "RUSTUP_TOOLCHAIN": BUILDER,
+            "CARGO_TARGET_DIR": os.path.join(parent, "stage-target"),
+            "CARGO_PROFILE_DEV_DEBUG": "0",
+            "CARGO_NET_OFFLINE": "true",
+        }
+    )
+    setup = time.monotonic()
+    builder = toolchain_identity(stage, repo)
+    setup_seconds = time.monotonic() - setup
+    print(f"launch setup: 2 version calls, {setup_seconds:.1f} s, 0 MiB written")
+    if builder != MATRIX[BUILDER] or setup_seconds > 30:
+        fail(f"setup is not {BUILDER} within 30 s: {builder}, {setup_seconds:.1f} s")
+    executables = build_binaries(("--offline",), stage)
+    staged = tree_bytes(parent, False)
+    print(f"launch staging: {time.monotonic() - STARTED:.0f} s, {staged // (1024 * 1024)} MiB (host Cargo home, offline)")
+    if staged > SCRATCH_LIMIT_BYTES:
+        fail(f"staging {staged} exceeds 512 MiB")
+    reserve(parent, "after staging", "launch")
+    runner = Runner(executables["oxide"], executables["oxide-storage-lease"], parent)
+    app = os.path.join(parent, "app")
+    os.makedirs(app, mode=0o700)
+    try:
+        prove_launch_check(runner, app)
+        reserve(parent, "after launch check", "launch")
+        owned = tree_bytes(parent, False)
+        if owned > SCRATCH_LIMIT_BYTES:
+            fail(f"owned scratch {owned} exceeds 512 MiB")
+    except Exception:
+        print(f"launch proof retained its owned scratch at {parent}", file=sys.stderr)
+        raise
+    shutil.rmtree(parent)
+    if not os.environ.get("OXIDE_TASK_SCRATCH_ROOT"):
+        os.rmdir(root)
+    elapsed = time.monotonic() - STARTED
+    if elapsed > PROOF_SECONDS:
+        fail(f"launch proof took {elapsed:.0f} s, over {PROOF_SECONDS} s")
+    print(f"oxide launch-check proof held: {elapsed:.0f} s including cleanup, owned scratch {owned // (1024 * 1024)} MiB")
+    return 0
+
+
 def main() -> int:
     global STARTED
+    if "--launch-check" in sys.argv:
+        if len(sys.argv) != 2:
+            fail("usage: test-oxide-cli.py --launch-check")
+        return launch_main()
     if "--cargo-matrix" in sys.argv:
         if len(sys.argv) != 3 or sys.argv[1] != "--cargo-matrix":
             fail("usage: test-oxide-cli.py --cargo-matrix <exact version>")

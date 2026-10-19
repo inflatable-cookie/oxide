@@ -71,6 +71,12 @@ run = "python3 scripts/test-storage-lease-cli.py"
 admission = "heavy"
 run = "python3 scripts/test-oxide-cli.py"
 
+# The launch check alone (oxide#093): offline staging into owned scratch,
+# no pool, image or download. Not a benchmark and not full QA.
+[tasks."rust:oxide-cli:launch-check"]
+admission = "heavy"
+run = "python3 scripts/test-oxide-cli.py --launch-check"
+
 # Cargo version matrix (oxide#091): one logical proof per exact stable
 # release. Each stages `oxide` offline with the builder 1.97.1, then runs the
 # shipped freshness gate, stray detection and dep-info decoder under the

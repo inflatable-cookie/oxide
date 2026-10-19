@@ -982,19 +982,29 @@ with exit 1), and reads or changes no setting.
   as the first thing `main` does: before argument parsing, toolchain,
   pool or lease work. It prints nothing and starts nothing. It is hidden
   from usage.
-- **Measurement.** The running `oxide` (refused over 64 MiB) is copied into
-  a fresh owner-only directory under the temporary directory. One copy is
-  run once as warm-up and five more times; then five distinct fresh copies
-  are each written, run once and unlinked. At most one copy exists at a
-  time. Each timing spans spawn to reap of a probe with an empty
-  environment and null standard streams, polled every 250 µs. Copy time is
-  not timed.
-- **Bounds.** One 3 s monotonic deadline covers copies, starts, waits and
-  cleanup: new work stops at 2.75 s and a probe still running then is killed
-  and reaped (only Oxide's own child). Every copy and the directory are
-  removed on every ordinary path, including errors and timeouts; a removal
-  failure is named in the output. A signal during the check can leave the
-  directory behind.
+- **Measurement.** The running `oxide` (refused over 64 MiB) is copied in
+  1 MiB chunks into new owner-only files (`create_new`) in a fresh
+  owner-only directory under the temporary directory. One copy is run once
+  as warm-up and five more times; then five distinct fresh copies are each
+  written, run once and unlinked. At most one copy exists at a time. Each
+  timing spans spawn to reap of a probe with an empty environment and null
+  standard streams, polled every 250 µs. Copy time is not timed.
+- **Bounds.** One 3 s monotonic limit covers copies, starts, waits and
+  cleanup. A measuring thread does every file and process step; the main
+  thread only collects samples, so a blocked copy, start, wait or removal
+  cannot hold it:
+  - A sample counts only if its probe exited successfully by 2.75 s. At
+    2.75 s collection stops and the result is `inconclusive`.
+  - Cleanup then runs on its own thread. Under the same lock as every
+    creation, it stops new work, kills and reaps an unreaped probe (only
+    this check's own child), and removes every created file and the
+    directory. A copy in progress stops at its next chunk.
+  - The check returns by 3 s regardless. Cleanup still blocked then is
+    reported as unfinished, naming the directory that may remain; the
+    abandoned threads end with the process. A start blocked in the kernel
+    has no PID to kill yet.
+  - Elapsed time over 3 s makes the result inconclusive. A removal failure
+    is named. A signal during the check can leave the directory behind.
 - **Result.** Raw samples always print (warm-up, five same-file runs, five
   fresh-copy runs), then the elapsed time and cleanup. With every sample, it
   prints both medians and their signed difference (negative and small
@@ -1016,8 +1026,14 @@ with exit 1), and reads or changes no setting.
   holds responsible.
 - **Never.** No Cargo, pool, network, `spctl`, privileged call, TCC read,
   settings change or restart.
-- **Proof.** `effigy rust:oxide-cli` runs it once before any pool exists,
-  with `PATH` led by a `cargo` that records any call and exits 97. A
+- **Proof.** `effigy rust:oxide-cli:launch-check` is the focused route. It
+  stages `oxide` offline with 1.97.1 into its own scratch (counted in the
+  512 MiB), from the host's cached registry, with no pool, image, Cargo home
+  setup or download. It logs its setup (two version calls, at most 30 s),
+  samples the 20 GiB reserve before writing anything and after staging and
+  the check, and stays within 300 s including cleanup. `effigy
+  rust:oxide-cli` runs the same case before any pool exists. The case puts
+  a `cargo` that records any call and exits 97 first on `PATH`. A
   positive control shows that shim records `oxide version`. The hidden
   probe exits 0 with no output and no Cargo call. `status --launch-check`
   exits 0 within its bound (reported at most 3,000 ms, wall at most
@@ -1025,7 +1041,12 @@ with exit 1), and reads or changes no setting.
   creates no pool and prints well-formed output: medians recomputed from the
   raw samples, the advice lines when advised. No penalty size is asserted.
   Unit tests cover the medians, the strict threshold, the bundle choice and
-  the report and advice text.
+  the report and advice text. Timing tests run shell-script probes under a
+  600 ms limit: a probe that never exits is killed and is never a sample;
+  a copy paused 2 s still returns in time with everything removed and
+  nothing recreated; a start paused inside the lock and a slow removal
+  return in time, reporting unfinished cleanup that completes afterwards.
+  An ordinary run completes under the standard limit.
 
 ## Platform backends
 
