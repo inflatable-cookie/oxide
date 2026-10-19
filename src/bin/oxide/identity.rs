@@ -17,6 +17,7 @@ pub struct SlotKey {
     /// Digest of the inferred repository identity.
     pub identity: String,
     /// Digest of identity + Cargo profile + `rustc -vV` + target + backend.
+    /// The compiler comes from the caller's context, never the checkout.
     pub compatibility: String,
 }
 
@@ -29,7 +30,10 @@ impl SlotKey {
     ) -> Result<Self, String> {
         let checkout = locate_workspace(cargo, manifest_path)?;
         let identity = digest(&Identity::infer(&checkout).key());
-        let rustc = rustc_version(&checkout)?;
+        // The guarded Cargo inherits this process's working directory and
+        // environment, so rustup selects its toolchain there, not at the
+        // workspace root. `--manifest-path` moves neither.
+        let rustc = rustc_version(None)?;
         let target = match target {
             Some(target) => target.to_owned(),
             None => std::env::var("CARGO_BUILD_TARGET")
@@ -158,15 +162,16 @@ fn select_run(metadata: &serde_json::Value, package: Option<&str>) -> RunPick {
     }
 }
 
-/// `rustc -vV` as rustup resolves it for the workspace. Oxide never selects
-/// or pins the toolchain.
-pub fn rustc_version(workspace: &Path) -> Result<String, String> {
+/// `rustc -vV` of `RUSTC`, else of `rustc` as rustup resolves it. `None`
+/// runs it in the inherited working directory and environment, where the
+/// guarded Cargo resolves its compiler (a member's `rust-toolchain.toml`
+/// included); readiness names a directory instead. Oxide never selects or
+/// pins the toolchain.
+pub fn rustc_version(directory: Option<&Path>) -> Result<String, String> {
     let rustc = std::env::var_os("RUSTC")
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| OsString::from("rustc"));
-    let output = Command::new(rustc)
-        .arg("-vV")
-        .current_dir(workspace)
+    let output = rustc_command(rustc, directory)
         .output()
         .map_err(|error| format!("could not start rustc: {error}"))?;
     if !output.status.success() {
@@ -176,6 +181,15 @@ pub fn rustc_version(workspace: &Path) -> Result<String, String> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn rustc_command(rustc: OsString, directory: Option<&Path>) -> Command {
+    let mut command = Command::new(rustc);
+    command.arg("-vV");
+    if let Some(directory) = directory {
+        command.current_dir(directory);
+    }
+    command
 }
 
 /// Inferred repository identity: Git root commits plus the workspace path
@@ -287,6 +301,80 @@ pub fn digest(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn scratch(label: &str) -> PathBuf {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("identity-{label}-{:x}", std::process::id()));
+        fs::create_dir(&dir).expect("scratch dir");
+        fs::canonicalize(dir).expect("canonical scratch")
+    }
+
+    /// A stand-in `rustc` that prints where it ran. The slot key's query runs
+    /// in the inherited directory and environment, as the guarded Cargo
+    /// does; readiness runs where it was asked.
+    #[test]
+    fn rustc_query_runs_in_the_callers_context() {
+        let dir = scratch("rustc-context");
+        let fake = dir.join("rustc");
+        fs::write(&fake, "#!/bin/sh\npwd -P\n").expect("stand-in rustc");
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("executable");
+        let member = dir.join("member");
+        fs::create_dir(&member).expect("member dir");
+        let query =
+            |directory: Option<&Path>| rustc_command(fake.clone().into_os_string(), directory);
+        let ran = |directory: Option<&Path>| {
+            let output = query(directory).output().expect("stand-in rustc ran");
+            assert!(output.status.success());
+            PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+        };
+        let caller =
+            fs::canonicalize(std::env::current_dir().expect("cwd")).expect("canonical cwd");
+        assert_eq!(ran(None), caller);
+        assert_eq!(ran(Some(&member)), member);
+        let inherited = query(None);
+        assert_eq!(inherited.get_current_dir(), None);
+        assert_eq!(inherited.get_envs().count(), 0);
+        assert_eq!(inherited.get_args().collect::<Vec<_>>(), ["-vV"]);
+        fs::remove_dir_all(&dir).expect("remove scratch");
+    }
+
+    /// `--manifest-path` names the workspace that owns the slot; the
+    /// compiler in the key stays the caller's.
+    #[test]
+    fn manifest_path_moves_ownership_not_the_compiler() {
+        let dir = scratch("manifest-path");
+        let workspace = dir.join("other");
+        fs::create_dir_all(workspace.join("src")).expect("package dir");
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"other\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        fs::write(workspace.join("src/lib.rs"), "").expect("lib");
+        let key = SlotKey::resolve(
+            crate::CARGO,
+            Some(&workspace.join("Cargo.toml")),
+            "quick",
+            Some("x-target"),
+        )
+        .expect("slot key");
+        assert_eq!(key.checkout, workspace);
+        assert!(matches!(Identity::infer(&workspace), Identity::Path(path) if path == workspace));
+        let identity = digest(&format!("path:{}", workspace.display()));
+        assert_eq!(key.identity, identity);
+        let rustc = rustc_version(None).expect("caller rustc");
+        assert_eq!(
+            key.compatibility,
+            digest(&format!(
+                "{identity}\nquick\n{}\nx-target\ndefault",
+                digest(&rustc)
+            ))
+        );
+        fs::remove_dir_all(&dir).expect("remove scratch");
+    }
 
     #[test]
     fn origin_forms_normalise_to_one_identity() {

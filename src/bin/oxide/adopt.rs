@@ -304,7 +304,7 @@ fn replace_file(path: &Path, contents: &[u8]) -> Result<(), String> {
 /// creates the pool or edits a file.
 fn print_readiness(workspace: &Path) {
     println!("readiness:");
-    match identity::rustc_version(workspace) {
+    match identity::rustc_version(Some(workspace)) {
         Ok(version) => {
             let release = version.lines().next().unwrap_or("rustc").trim();
             let host = version
