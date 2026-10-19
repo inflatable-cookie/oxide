@@ -408,6 +408,13 @@ Supervisor architecture ruling, 2026-10-19, on #089 workspace discovery (design 
   - no recursive walk.
   A further finding against the fallback stops the task for an owner decision; there is no automatic revision.
 
+Tom's ruling, 2026-10-19 ("Paseo is already added to the Developer Tools list, but Paseo might need restarting to take effect. Otherwise yes, go for it"):
+- **Pause the skip path.** #089 closes unmerged with its branch and the committee contract (`~/.local/share/northstar/release-audits/oxide/2026-10-19/089-capture-committee/reconciled-contract.md`, SHA-256 `46d785bf…`) preserved as the plan if it is revisited. B (#090) is withdrawn and C2 is not admitted.
+- **Lower-risk work instead:**
+  - a third overhead round on the normal path, from #088's donor with its defects fixed;
+  - an opt-in `oxide status` check that measures the macOS new-executable launch penalty and names the app to exempt.
+- **Developer Tools:** Paseo is already listed. A re-probe at 2026-10-19 ~15:30 under the running Paseo (started 12:05) still measured a fresh-copy launch median of 147.4 ms against 3.4 ms for the same file. Either Paseo needs a restart or the responsible process is not Paseo. That is to be re-measured after a restart, which is Tom's call.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
