@@ -398,6 +398,11 @@ Tom approved two live cleanups on 2026-10-19 with "Do the cleanups":
 
 The approval covers a later retry of that cache pass when the host is quiet.
 
+Supervisor architecture ruling, 2026-10-19, on #089 workspace discovery (design only, not implemented):
+- Discovery rejects every symlink by `lstat` before following or classifying it, and refuses on metadata uncertainty. The skip then falls through to Cargo.
+- **Stop rule:** if an independent review finds another workspace-discovery false negative, there is no further narrow discovery patch. The skip path becomes eligible only when every `workspace.members` and `workspace.exclude` entry is a literal relative path, with no glob metacharacters (`*`, `?`, `[`, `{`) and no symlink. Each such path and its parent are stat-recorded directly, and glob patterns fall through to Cargo.
+- This trades skip coverage on glob-using workspaces for a rule small enough to verify. Membership matters only for Cargo's binary selection and default members, and literal paths cover that fully.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
