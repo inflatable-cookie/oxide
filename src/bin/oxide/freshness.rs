@@ -32,7 +32,7 @@ pub const MAX_PATHS: usize = 4096;
 /// Files listed for the path-change step.
 const MAX_LISTED: usize = 200_000;
 /// `cargo metadata` output and lifetime for the path-change step.
-const MAX_METADATA_BYTES: u64 = 64 * MIB;
+pub(crate) const MAX_METADATA_BYTES: u64 = 64 * MIB;
 const MAX_METADATA_ERROR_BYTES: u64 = 64 * 1024;
 const METADATA_TIME: Duration = Duration::from_secs(60);
 const DELETED: &str = "deleted";
@@ -718,15 +718,15 @@ fn probe(
         .map_err(|error| format!("Cargo metadata is not JSON: {error}"))
 }
 
-struct CargoOutput {
-    status: std::process::ExitStatus,
-    stdout: Vec<u8>,
-    overflow: bool,
-    stderr: String,
+pub(crate) struct CargoOutput {
+    pub(crate) status: std::process::ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) overflow: bool,
+    pub(crate) stderr: String,
 }
 
 /// Run one Cargo call, bounded in output and lifetime.
-fn run_cargo(mut command: Command, stdout_cap: u64) -> Result<CargoOutput, String> {
+pub(crate) fn run_cargo(mut command: Command, stdout_cap: u64) -> Result<CargoOutput, String> {
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -39,6 +39,12 @@ cargo run --bin oxide-storage-inventory -- --root /path/to/target \
     --max-entries 50000 --max-depth 24 --max-output-bytes 32768 --max-elapsed-ms 10000
 ```
 
+The `oxide` front door calls the library read-only for `status`: stray
+`target/` output, each slot's size and file counts, and the Cargo home
+([workflow](workflow.md#cargo-home-hygiene)). It reports `total.files`,
+`total.distinct_files` and `total.allocated_bytes`, and `partial` when
+coverage is incomplete.
+
 The inventory stays a runnable product command. It is not a language-neutral
 QA alias and does not scan a real project target. Covering exact-head CLI
 proof of the unpublished binary is `effigy rust:storage-inventory-cli`: it

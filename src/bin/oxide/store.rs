@@ -378,7 +378,6 @@ pub struct SlotView {
     /// Cargo's group is empty; if the group was never recorded,
     /// `oxide-storage-lease recover` is explicit.
     pub interrupted: Option<Interrupted>,
-    pub bytes: Option<u64>,
 }
 
 pub struct Interrupted {
@@ -440,6 +439,66 @@ fn requested_backend() -> Result<Option<Backend>, String> {
         Some("apfs-sparse-image") => Ok(Some(Backend::ApfsImage)),
         _ => Err("OXIDE_POOL_BACKEND must be directory-budget or apfs-sparse-image".to_owned()),
     }
+}
+
+/// Smallest cap each backend accepts: the APFS proofs use 128 MiB images;
+/// a budget-only pool's budget is only an admission figure.
+const MIN_APFS_CAP_BYTES: u64 = 128 * 1024 * 1024;
+const MIN_BUDGET_CAP_BYTES: u64 = 1024 * 1024;
+const MAX_CAP_BYTES: u64 = 16 * 1024 * GIB;
+
+/// `OXIDE_POOL_CAP`: a whole number of bytes or of `KiB`, `MiB`, `GiB` or
+/// `TiB`, a whole MiB, within the backend's range. It applies only when a
+/// pool is created; unset means the 24 GiB default.
+pub fn requested_cap(backend: Backend) -> Result<Option<u64>, String> {
+    let Some(value) = std::env::var_os("OXIDE_POOL_CAP") else {
+        return Ok(None);
+    };
+    let value = value.to_str().ok_or("OXIDE_POOL_CAP must be valid UTF-8")?;
+    parse_cap(value, backend).map(Some)
+}
+
+fn parse_cap(value: &str, backend: Backend) -> Result<u64, String> {
+    let digits = value.bytes().take_while(u8::is_ascii_digit).count();
+    let (number, unit) = value.split_at(digits);
+    let scale: u64 = match unit {
+        "" => 1,
+        "KiB" => 1024,
+        "MiB" => 1024 * 1024,
+        "GiB" => GIB,
+        "TiB" => 1024 * GIB,
+        _ => 0,
+    };
+    let bytes = number
+        .parse::<u64>()
+        .ok()
+        .filter(|_| scale > 0)
+        .and_then(|number| number.checked_mul(scale))
+        .ok_or_else(|| {
+            format!("OXIDE_POOL_CAP={value} is not a byte count or a whole number of KiB, MiB, GiB or TiB")
+        })?;
+    let minimum = match backend {
+        Backend::ApfsImage => MIN_APFS_CAP_BYTES,
+        Backend::DirectoryBudget => MIN_BUDGET_CAP_BYTES,
+    };
+    if bytes % (1024 * 1024) != 0 || !(minimum..=MAX_CAP_BYTES).contains(&bytes) {
+        return Err(format!(
+            "OXIDE_POOL_CAP={value} must be a whole MiB from {} MiB to {} TiB for {}",
+            minimum / (1024 * 1024),
+            MAX_CAP_BYTES / (1024 * GIB),
+            backend.tag()
+        ));
+    }
+    Ok(bytes)
+}
+
+/// The cap a new pool would record.
+pub fn creation_cap(backend: Backend) -> Result<u64, String> {
+    Ok(match (requested_cap(backend)?, backend) {
+        (Some(cap), _) => cap,
+        (None, Backend::DirectoryBudget) => budget_bytes(),
+        (None, Backend::ApfsImage) => DEFAULT_CAP_BYTES,
+    })
 }
 
 /// The backend a new pool gets: the APFS image on macOS unless the caller
@@ -505,7 +564,8 @@ impl Store {
     pub fn open_or_create() -> Result<Self, String> {
         let path = pool_path()?;
         if fs::symlink_metadata(&path).is_err() {
-            create_pool(&path, creation_backend()?)?;
+            let backend = creation_backend()?;
+            create_pool(&path, backend, creation_cap(backend)?)?;
         }
         let store = Self::open_at(&path)?;
         store.ensure_control()?;
@@ -534,6 +594,20 @@ impl Store {
                     pool.display(),
                     backend.tag()
                 ));
+            }
+        }
+        if let Some(requested) = requested_cap(backend)? {
+            if requested != status.cap_bytes {
+                eprintln!(
+                    "oxide: OXIDE_POOL_CAP {} MiB not applied: the pool at {} keeps its recorded {} MiB {}; the cap applies only when a pool is created",
+                    requested / (1024 * 1024),
+                    pool.display(),
+                    status.cap_bytes / (1024 * 1024),
+                    match backend {
+                        Backend::ApfsImage => "cap",
+                        Backend::DirectoryBudget => "budget",
+                    }
+                );
             }
         }
         let control = pool.join(MANAGED_NAME);
@@ -781,7 +855,6 @@ impl Store {
                             holder_pid: record.holder.as_ref().map(|holder| holder.pid),
                             path: return_path(record, slot),
                         }),
-                    bytes: slot.unique_allocated_bytes,
                 }
             })
             .collect();
@@ -1384,7 +1457,7 @@ impl Store {
     }
 }
 
-fn create_pool(path: &Path, backend: Backend) -> Result<(), String> {
+fn create_pool(path: &Path, backend: Backend, cap: u64) -> Result<(), String> {
     let parent = path.parent().ok_or("the pool path has no parent")?;
     let name = path
         .file_name()
@@ -1407,24 +1480,23 @@ fn create_pool(path: &Path, backend: Backend) -> Result<(), String> {
     let created = match backend {
         Backend::ApfsImage => {
             eprintln!(
-                "oxide: creating the build pool at {} ({} GiB cap, {}, {})",
+                "oxide: creating the build pool at {} ({} MiB cap, {}, {})",
                 pool.display(),
-                DEFAULT_CAP_BYTES / GIB,
+                cap / (1024 * 1024),
                 backend.tag(),
                 backend.bound()
             );
-            init_pool(&pool, DEFAULT_CAP_BYTES, DEFAULT_CAP_BYTES)
+            init_pool(&pool, cap, cap)
         }
         Backend::DirectoryBudget => {
-            let budget = budget_bytes();
             eprintln!(
                 "oxide: creating the build pool at {} ({} MiB budget, {}, {})",
                 pool.display(),
-                budget / (1024 * 1024),
+                cap / (1024 * 1024),
                 backend.tag(),
                 backend.bound()
             );
-            init_budget_pool(&pool, budget)
+            init_budget_pool(&pool, cap)
         }
     };
     match created {
@@ -1693,6 +1765,33 @@ mod tests {
         state.settle_idle(0);
         assert_eq!(state.recoveries.len(), 1);
         assert!(state.records[0].pending_recovery.is_none());
+    }
+
+    #[test]
+    fn pool_cap_parses_units_and_backend_ranges() {
+        let apfs = Backend::ApfsImage;
+        let budget = Backend::DirectoryBudget;
+        assert_eq!(parse_cap("128MiB", apfs), Ok(128 * 1024 * 1024));
+        assert_eq!(parse_cap("134217728", apfs), Ok(128 * 1024 * 1024));
+        assert_eq!(parse_cap("2GiB", apfs), Ok(2 * GIB));
+        assert_eq!(parse_cap("1TiB", budget), Ok(1024 * GIB));
+        assert_eq!(parse_cap("1024KiB", budget), Ok(1024 * 1024));
+        assert_eq!(parse_cap("1MiB", budget), Ok(1024 * 1024));
+        for invalid in [
+            "",
+            "MiB",
+            "12MB",
+            "1.5GiB",
+            "-1",
+            "64 MiB",
+            "99999999999999999999",
+        ] {
+            assert!(parse_cap(invalid, budget).is_err(), "{invalid}");
+        }
+        assert!(parse_cap("64MiB", apfs).is_err());
+        assert!(parse_cap("1048577", budget).is_err());
+        assert!(parse_cap("17TiB", budget).is_err());
+        assert!(parse_cap("0", budget).is_err());
     }
 
     #[test]

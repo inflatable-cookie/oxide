@@ -61,8 +61,16 @@ Oxide says the gate refused a slot, it builds cold instead; that is safe.
 
 ## Status and cleaning
 
-- `oxide status`: pool use, slots, waiting commands, and plain-Cargo output in
-  this checkout's `target/`. It never creates the pool.
+- `oxide status`: pool use, slots (size and file counts), waiting commands,
+  plain-Cargo output in this checkout's `target/`, and the Cargo home's size.
+  It never creates the pool.
+- `oxide clean --cargo-cache` asks Cargo to clean its own download cache once,
+  with network refused. Use it when the Cargo home is large and builds always
+  run offline. It refuses (and says why) for config files, git or custom
+  sources, a missing `Cargo.lock` and similar routes; it reports `ran`,
+  `skipped` or `failed`. Do not delete files in the Cargo home or a slot by
+  hand.
+- `OXIDE_POOL_CAP` sets the cap only when a pool is first created.
 - Use `oxide clean`, never plain `cargo clean`. `oxide clean` waits for active
   commands in this checkout, removes its private output and slot affinity, and
   leaves shared slots intact. Plain `cargo clean` does not know the slot; with

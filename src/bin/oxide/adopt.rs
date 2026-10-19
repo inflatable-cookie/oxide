@@ -159,6 +159,17 @@ fn adopt(manifest: &Path) -> Result<u8, String> {
     Ok(0)
 }
 
+/// The workspace root's `AGENTS.md` holds one ordered Oxide marker pair.
+/// A link or unreadable file is not adoption.
+pub fn is_adopted(workspace: &Path) -> bool {
+    let agents = workspace.join(AGENTS);
+    std::fs::symlink_metadata(&agents).is_ok_and(|metadata| metadata.is_file())
+        && std::fs::read(&agents)
+            .ok()
+            .and_then(|text| find_block(&text).ok().flatten())
+            .is_some()
+}
+
 /// What [`write_block`] did.
 #[derive(Debug, Eq, PartialEq)]
 enum Written {
