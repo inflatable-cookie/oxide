@@ -821,6 +821,16 @@ impl Store {
         Ok(detached)
     }
 
+    /// End a refused or failed clean without touching affinity.
+    pub fn abandon_clean(&self, guard: CleanGuard) -> Result<(), String> {
+        let _admission = self.admission()?;
+        let mut state = self.load()?;
+        state.cleans.retain(|clean| clean.id != guard.id);
+        self.save(&state)?;
+        let _ = fs::remove_file(self.ticket_path(guard.id));
+        Ok(())
+    }
+
     pub fn report(&self) -> Result<Report, String> {
         let pool = self.status()?;
         let state = if self.control.exists() {

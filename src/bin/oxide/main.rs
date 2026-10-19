@@ -8,6 +8,7 @@
 
 mod adopt;
 mod cargo_home;
+mod clean;
 mod cli;
 mod freshness;
 mod identity;
@@ -23,13 +24,12 @@ use oxide_storage::inventory::{inventory_directory, Category, InventoryLimits};
 use oxide_storage::lease::SlotOccupancy;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use store::{Acquired, Backend, Cleaning, Store};
+use store::{Acquired, Backend, Store};
 use watchdog::Watchdog;
 
 /// The `cargo` rustup resolves for the current directory. Oxide never selects
@@ -42,7 +42,9 @@ oxide: Cargo with managed build storage and profiles
 USAGE:
     oxide <check|test|clippy|build|run> [--profile quick|debug|release] [cargo args] [-- args]
     oxide <other cargo command> [args]   passed to Cargo; leased when it can build
-    oxide clean [cargo clean args]       private outputs and slot affinity; slots stay
+    oxide clean [--dry-run] [--include-foreign]
+                                         remove <workspace>/target and slot affinity; slots stay
+    oxide clean <-p|--doc|--profile ...> Cargo's selected clean, same storage rules
     oxide clean --cargo-cache            one pass of Cargo's own home cleanup, no network
     oxide status                         pool, slots, waits, stray output and Cargo home
     oxide status --launch-check          macOS: time a new executable's first launch
@@ -53,6 +55,8 @@ Profiles: quick (default, line tables), debug (full debug info), release (the
 project's own). Oxide places build output, so --target-dir and --config
 build.build-dir/target-dir are refused. Adoption writes one marked block in the
 workspace-root AGENTS.md and prints readiness; there is no Oxide config file.
+A whole-target clean refuses entries Cargo does not create in target/ unless
+--include-foreign is given; --dry-run prints every path it would remove.
 OXIDE_POOL selects the pool; OXIDE_MAX_ACTIVE the host-wide build limit (2).
 OXIDE_POOL_CAP sets a new pool's cap (bytes, KiB, MiB, GiB or TiB; default
 24 GiB); an existing pool keeps its recorded cap.
@@ -105,7 +109,7 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
     match cli::classify(command) {
         Class::Plain => Err(exec_cargo(&args)),
         Class::Status => run_status(rest),
-        Class::Clean => run_clean(rest),
+        Class::Clean => clean::run(rest),
         Class::Init => adopt::run_init(rest),
         Class::New => adopt::run_new(rest),
         Class::Modelled | Class::Building => run_leased(command, rest),
@@ -118,7 +122,7 @@ fn exec_cargo(args: &[OsString]) -> String {
     format!("could not start Cargo: {error}")
 }
 
-fn apply_storage(command: &mut Command, build_dir: &Path, checkout: &Path) {
+pub(crate) fn apply_storage(command: &mut Command, build_dir: &Path, checkout: &Path) {
     command
         .env("CARGO_BUILD_BUILD_DIR", build_dir)
         .env("CARGO_TARGET_DIR", checkout.join("target"))
@@ -466,78 +470,6 @@ fn print_summary(
         if warm { "warm" } else { "cold" },
         started.elapsed().as_secs_f64()
     );
-}
-
-/// `cargo clean` against the private target directory and an empty private
-/// build directory, then drop this checkout's slot affinity. Plain
-/// `cargo clean` would delete an injected slot build directory. It waits for
-/// active commands in the checkout and blocks new ones until it finishes.
-fn run_clean(args: &[OsString]) -> Result<u8, String> {
-    if args.first().is_some_and(|first| first == "--cargo-cache") {
-        return cargo_home::run_cache_clean(&args[1..]);
-    }
-    if args.iter().any(|argument| argument == "--cargo-cache") {
-        return Err(
-            "--cargo-cache must come first and alone: `oxide clean --cargo-cache`".to_owned(),
-        );
-    }
-    cli::refuse_storage_overrides(args)?;
-    let manifest = cli::manifest_path(args);
-    let workspace = identity::locate_workspace(CARGO, manifest.as_deref())?;
-    process::install_signal_handlers()?;
-    let store = Store::open_existing()?;
-    let guard = match &store {
-        Some(store) => match store.begin_clean(&workspace)? {
-            Cleaning::Guard(guard) => Some(guard),
-            Cleaning::Interrupted(signal) => return Ok(process::signal_exit_code(signal)),
-        },
-        None => None,
-    };
-    let scratch = private_scratch()?;
-    let mut cargo = Command::new(CARGO);
-    cargo.arg("clean").args(args);
-    apply_storage(&mut cargo, &scratch.join("build"), &workspace);
-    // The clean barrier must outlive this process if Cargo does: the child
-    // inherits the clean lock and runs as a recorded group whose end is
-    // awaited before the barrier lifts.
-    if let Some(guard) = &guard {
-        guard.share_with_children()?;
-    }
-    let status = process::spawn_group(&mut cargo).and_then(|mut group| {
-        let recorded = match (&store, &guard) {
-            (Some(store), Some(guard)) => store.clean_running(guard, group.id),
-            _ => Ok(()),
-        };
-        let status = process::wait_leader(&mut group);
-        process::wait_group_empty(group.id);
-        recorded.and(status)
-    });
-    let _ = std::fs::remove_dir(scratch.join("build"));
-    let _ = std::fs::remove_dir(&scratch);
-    let detached = match (&store, guard) {
-        (Some(store), Some(guard)) => store.finish_clean(guard, &workspace)?,
-        _ => 0,
-    };
-    let status = status?;
-    if detached > 0 {
-        eprintln!(
-            "oxide: dropped this checkout's slot affinity; {detached} slot(s) kept until evicted"
-        );
-    }
-    Ok(process::exit_code(status))
-}
-
-fn private_scratch() -> Result<PathBuf, String> {
-    let root = std::env::temp_dir();
-    for attempt in 0..16_u32 {
-        let path = root.join(format!("oxide-clean-{}-{attempt}", std::process::id()));
-        match std::fs::DirBuilder::new().mode(0o700).create(&path) {
-            Ok(()) => return Ok(path),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("cannot create a private clean directory: {error}")),
-        }
-    }
-    Err("cannot allocate a private clean directory".to_owned())
 }
 
 fn run_status(args: &[OsString]) -> Result<u8, String> {

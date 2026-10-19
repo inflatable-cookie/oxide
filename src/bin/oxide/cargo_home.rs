@@ -41,6 +41,7 @@ const PROXY_ENVIRONMENT: [&str; 8] = [
     "NO_PROXY",
 ];
 const MAX_LOCK_BYTES: u64 = 16 * MIB;
+const MAX_CONFIG_BYTES: u64 = MIB;
 const LIMITS: InventoryLimits = InventoryLimits {
     max_entries: 200_000,
     max_depth: 64,
@@ -300,7 +301,7 @@ fn refuse_resolved(metadata: &serde_json::Value) -> Option<String> {
 
 /// Cargo config files Cargo would read: `.cargo/config.toml` and
 /// `.cargo/config` in the current directory and every ancestor, then in the
-/// Cargo home. Oxide does not parse them; any one refuses.
+/// Cargo home. Each is parsed; see [`refuse_config`].
 fn config_files(cwd: &Path, home: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut candidates: Vec<PathBuf> = cwd
@@ -315,6 +316,155 @@ fn config_files(cwd: &Path, home: &Path) -> Vec<PathBuf> {
         }
     }
     found
+}
+
+/// Read one config file as Cargo would (following a symlink) and parse it
+/// as TOML 1.0. Unreadable, oversized, non-UTF-8 or unparseable files
+/// refuse; parser text is never shown, since it can quote a value.
+fn read_config(path: &Path) -> Result<serde_json::Value, String> {
+    let unreadable = |reason: String| format!("Cargo config file {} {reason}", path.display());
+    let metadata =
+        std::fs::metadata(path).map_err(|error| unreadable(format!("cannot be read ({error})")))?;
+    if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
+        return Err(unreadable(
+            "is not a regular file of at most 1 MiB".to_owned(),
+        ));
+    }
+    let bytes =
+        std::fs::read(path).map_err(|error| unreadable(format!("cannot be read ({error})")))?;
+    let text = String::from_utf8(bytes).map_err(|_| unreadable("is not UTF-8".to_owned()))?;
+    basic_toml::from_str(&text).map_err(|error| {
+        let line = error
+            .line_col()
+            .map(|(line, _)| format!(" (line {})", line + 1))
+            .unwrap_or_default();
+        unreadable(format!(
+            "cannot be parsed as TOML 1.0{line}; Oxide refuses a config it cannot read"
+        ))
+    })
+}
+
+/// A key name for a message: bounded, never a value.
+fn key_name(name: &str) -> String {
+    let shown: String = name.chars().take(64).collect();
+    format!("{shown:?}")
+}
+
+/// Settings `cargo fetch` and `cargo metadata` ignore or Oxide overrides;
+/// every other key refuses. Whole tables: aliases cannot shadow built-in
+/// commands; `term`, `cargo-new`, `doc`, `install`, `future-incompat-report`
+/// and `profile` affect other commands or output; `target` and `env` apply
+/// when Cargo compiles or runs; `resolver` only selects among versions the
+/// lock already fixes.
+const CONTAINED_TABLES: [&str; 10] = [
+    "alias",
+    "term",
+    "cargo-new",
+    "doc",
+    "install",
+    "future-incompat-report",
+    "profile",
+    "target",
+    "env",
+    "resolver",
+];
+/// Single keys inside otherwise refused tables. `http.proxy` and
+/// `cache.auto-clean-frequency` are overridden by Oxide's own `--config`.
+const CONTAINED_KEYS: [(&str, &[&str]); 5] = [
+    ("net", &["retry"]),
+    (
+        "http",
+        &[
+            "proxy",
+            "timeout",
+            "low-speed-limit",
+            "multiplexing",
+            "debug",
+            "user-agent",
+            "check-revoke",
+            "ssl-version",
+            "cainfo",
+            "proxy-cainfo",
+        ],
+    ),
+    (
+        "build",
+        &[
+            "jobs",
+            "target",
+            "target-dir",
+            "build-dir",
+            "rustflags",
+            "rustdocflags",
+            "incremental",
+            "dep-info-basedir",
+            "pipelining",
+            "warnings",
+        ],
+    ),
+    ("cache", &["auto-clean-frequency"]),
+    ("registry", &["token"]),
+];
+
+/// The reason a named key cannot be contained.
+fn config_reason(table: &str, key: Option<&str>) -> &'static str {
+    match (table, key) {
+        ("source", _) => {
+            "source replacement can route downloads the closed proxy is not proven to cover"
+        }
+        ("registries", _) => "a custom registry the closed proxy is not proven to cover",
+        ("registry", Some("credential-provider" | "global-credential-providers"))
+        | ("credential-alias", _) => {
+            "credential providers run programs the closed proxy cannot contain"
+        }
+        ("registry", Some("default")) => "it changes the default registry",
+        ("net", Some("git-fetch-with-cli")) => {
+            "net.git-fetch-with-cli runs the git CLI, which the closed HTTP proxy cannot contain"
+        }
+        ("net", Some("offline")) => "offline mode disables Cargo's cleanup",
+        ("net", Some("ssh")) => "SSH transports cannot be contained by the closed HTTP proxy",
+        ("include", _) => "it includes another config file",
+        ("patch", _) => "[patch] can name git or registry sources outside crates.io",
+        ("paths", _) => "path overrides change what Cargo resolves",
+        ("unstable", _) => "an unstable Cargo feature",
+        ("build", Some("rustc" | "rustc-wrapper" | "rustc-workspace-wrapper" | "rustdoc")) => {
+            "it names a program Cargo runs, which the closed proxy cannot contain"
+        }
+        _ => "a setting Oxide has not shown the closed proxy contains",
+    }
+}
+
+/// The first key in one parsed config that the closed proxy cannot contain.
+/// TOML has already joined quoted, dotted and nested spellings into one
+/// table tree.
+fn refuse_config(config: &serde_json::Value) -> Option<String> {
+    let Some(tables) = config.as_object() else {
+        return Some("the document is not a table".to_owned());
+    };
+    for (table, value) in tables {
+        if CONTAINED_TABLES.contains(&table.as_str()) {
+            continue;
+        }
+        let refuse = |key: Option<&str>| {
+            let name = match key {
+                Some(key) => format!("{}.{}", key_name(table), key_name(key)),
+                None => key_name(table),
+            };
+            Some(format!("key {name}: {}", config_reason(table, key)))
+        };
+        let Some((_, allowed)) = CONTAINED_KEYS.iter().find(|(name, _)| name == table) else {
+            return refuse(None);
+        };
+        let Some(keys) = value.as_object() else {
+            return refuse(None);
+        };
+        for key in keys.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return refuse(Some(key));
+            }
+        }
+    }
+    None
 }
 
 /// Oxide's own proxy on 127.0.0.1: it accepts and closes every
@@ -453,11 +603,14 @@ pub fn run_cache_clean(args: &[OsString]) -> Result<u8, String> {
     if let Some(reason) = refuse_environment(names.iter().map(String::as_str)) {
         return Err(refuse(reason));
     }
-    if let Some(file) = config_files(&cwd, &home).first() {
-        return Err(refuse(format!(
-            "Cargo config file {} exists; it could set source replacement, registries, git-fetch-with-cli, credential providers or includes, and Oxide does not parse it",
-            file.display()
-        )));
+    for file in config_files(&cwd, &home) {
+        let config = read_config(&file).map_err(refuse)?;
+        if let Some(reason) = refuse_config(&config) {
+            return Err(refuse(format!(
+                "Cargo config file {} sets {reason}",
+                file.display()
+            )));
+        }
     }
     let version = Command::new(CARGO)
         .arg("-V")
@@ -770,6 +923,112 @@ mod tests {
         assert_eq!(config_files(&deep, &home), vec![root.join(".cargo/config")]);
         std::fs::write(home.join("config.toml"), "").unwrap();
         assert_eq!(config_files(&deep, &home).len(), 2);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn parsed(text: &str) -> Result<serde_json::Value, ()> {
+        basic_toml::from_str(text).map_err(|_| ())
+    }
+
+    #[test]
+    fn contained_configs_proceed() {
+        for text in [
+            "",
+            "# [build]\n#jobs = 8\n",
+            "[build]\njobs = 4\nrustflags = [\"-Cdebuginfo=1\"]\n[alias]\nb = \"build\"\n[term]\ncolor = \"never\"\n",
+            "[target.x86_64-unknown-linux-gnu]\nlinker = \"clang\"\n[net]\nretry = 3\n[http]\ntimeout = 30\n[registry]\ntoken = \"t\"\n",
+            "[env]\nRUST_TEST_THREADS = \"1\"\n[profile.dev]\ndebug = 1\n[cache]\nauto-clean-frequency = \"never\"\n",
+        ] {
+            assert_eq!(refuse_config(&parsed(text).unwrap()), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn risky_config_keys_refuse_in_every_spelling() {
+        for (text, needle) in [
+            (
+                "[source.crates-io]\nreplace-with = \"m\"\n",
+                "source replacement",
+            ),
+            (
+                "source.crates-io.replace-with = \"m\"\n",
+                "source replacement",
+            ),
+            (
+                "[registries.mine]\nindex = \"sparse+https://r.invalid/\"\n",
+                "custom registry",
+            ),
+            (
+                "[registry]\ncredential-provider = \"cargo:token\"\n",
+                "credential providers",
+            ),
+            (
+                "registry.global-credential-providers = [\"x\"]\n",
+                "credential providers",
+            ),
+            ("[credential-alias]\nx = \"y\"\n", "credential providers"),
+            ("[net]\ngit-fetch-with-cli = true\n", "git CLI"),
+            ("net.\"git-fetch-with-cli\" = true\n", "git CLI"),
+            ("\"net\".'git-fetch-with-cli' = true\n", "git CLI"),
+            ("net = { git-fetch-with-cli = true }\n", "git CLI"),
+            ("[net]\noffline = true\n", "offline"),
+            ("[net.ssh]\nknown-hosts = []\n", "SSH"),
+            ("include = \"other.toml\"\n", "includes another config file"),
+            (
+                "[patch.crates-io]\nx = { git = \"ssh://h/x\" }\n",
+                "[patch]",
+            ),
+            ("paths = [\"/x\"]\n", "path overrides"),
+            ("[unstable]\ngc = true\n", "unstable"),
+            ("[build]\nrustc-wrapper = \"w\"\n", "names a program"),
+            ("[registry]\ndefault = \"mine\"\n", "default registry"),
+            ("[http]\nunknown = 1\n", "not shown"),
+            ("[made-up]\nx = 1\n", "not shown"),
+            ("net = 3\n", "not shown"),
+        ] {
+            let reason = refuse_config(&parsed(text).unwrap()).unwrap_or_default();
+            assert!(reason.contains(needle), "{text}: {reason}");
+        }
+    }
+
+    #[test]
+    fn unreadable_configs_refuse_without_values() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("oxide-config-read-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("config.toml");
+        // Malformed, and TOML 1.1-only syntax (a newline in an inline table).
+        for text in [
+            "[net\ngit-fetch-with-cli = true\n",
+            "token = \"secret-value\n",
+            "net = {\n  retry = 2\n}\n",
+        ] {
+            std::fs::write(&file, text).unwrap();
+            let refused = read_config(&file).unwrap_err();
+            assert!(
+                refused.contains("cannot be parsed as TOML 1.0"),
+                "{refused}"
+            );
+            assert!(!refused.contains("secret"), "{refused}");
+        }
+        std::fs::write(
+            &file,
+            "[registry]\ntoken = \"secret-value\"\n[registries.x]\ntoken = \"secret-value\"\n",
+        )
+        .unwrap();
+        let reason = refuse_config(&read_config(&file).unwrap()).unwrap();
+        assert!(
+            reason.contains("\"registries\"") && !reason.contains("secret"),
+            "{reason}"
+        );
+        std::fs::write(
+            &file,
+            vec![b'#'; usize::try_from(MAX_CONFIG_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        assert!(read_config(&file).unwrap_err().contains("at most 1 MiB"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
