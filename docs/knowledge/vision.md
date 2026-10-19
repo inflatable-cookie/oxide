@@ -392,6 +392,12 @@ Supervisor architecture ruling, 2026-10-19, on the #089 skip path after two lexi
 - At skip time Oxide only compares the recorded stats: an unchanged root manifest implies unchanged patterns.
 - One exact-pinned, dependency-light parser is allowed as a strict-profile exception: `basic-toml` `=0.1.10`, available offline. It must be justified in the implementing PR. Manifests using syntax the parser rejects simply never skip.
 
+Tom approved two live cleanups on 2026-10-19 with "Do the cleanups":
+- `oxide clean` in the root checkout. It ran and removed 2,148 files; the reviewed lease handover binaries under `target/oxide-handover/` were restored with matching hashes.
+- One `oxide clean --cargo-cache` pass. It was refused while the comments-only `~/.cargo/config.toml` existed. With that file moved aside for the single command and restored byte-identical, Cargo skipped the cleanup because another Cargo process held the package cache lock (exit 75); nothing was deleted.
+
+The approval covers a later retry of that cache pass when the host is quiet.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
