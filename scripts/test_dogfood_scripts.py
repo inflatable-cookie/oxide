@@ -34,28 +34,29 @@ def load(name):
 bounded = load("bounded-test")
 installer = load("oxide-install")
 
-# An `oxide`-shaped parent: Cargo-like child in its own group that ignores
-# TERM, a parent that forwards TERM to that group and waits for it.
+# An `oxide`-shaped parent: Cargo-like child in its own group (`setpgid`, as
+# `oxide` does) that ignores TERM, a parent that forwards TERM to that group
+# and waits for it.
 FORWARDER = """
 import os, signal, subprocess, sys
 child = subprocess.Popen([sys.executable, "-c",
     "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"],
-    start_new_session=True)
+    preexec_fn=lambda: os.setpgid(0, 0))
 open(sys.argv[1], "w").write(str(child.pid))
 signal.signal(signal.SIGTERM, lambda *_: os.killpg(child.pid, signal.SIGTERM))
 child.wait()
 """
 
 # The same parent after Cargo itself exits: the group leader spawns a
-# TERM-ignoring child in its group, then exits and is reaped; the parent
-# waits for the group to empty, as `oxide` does.
+# TERM-ignoring child in its group, then exits at once and is reaped; the
+# parent waits for the group to empty, as `oxide` does.
 ORPHAN = """
 import os, signal, subprocess, sys, time
 leader = subprocess.Popen([sys.executable, "-c",
     "import subprocess, sys, time; child = subprocess.Popen([sys.executable, '-c', "
     "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)']); "
-    "open(sys.argv[1], 'w').write(str(child.pid)); time.sleep(0.6)", sys.argv[1]],
-    start_new_session=True)
+    "open(sys.argv[1], 'w').write(str(child.pid))", sys.argv[1]],
+    preexec_fn=lambda: os.setpgid(0, 0))
 group = leader.pid
 signal.signal(signal.SIGTERM, lambda *_: os.killpg(group, signal.SIGTERM))
 leader.wait()
@@ -95,7 +96,7 @@ class SupervisorTests(unittest.TestCase):
     def test_timeout_reaches_the_group_after_its_leader_exits(self):
         pid_file = SCRATCH / "orphan.pid"
         code = bounded.supervise(
-            [sys.executable, "-c", ORPHAN, str(pid_file)], limit=2, grace=1, closure=3, sample=0.1
+            [sys.executable, "-c", ORPHAN, str(pid_file)], limit=2, grace=1, closure=3
         )
         self.assertEqual(code, 124)
         orphan = int(pid_file.read_text())
