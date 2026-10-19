@@ -11,7 +11,9 @@ RustQuality policy remains in force with no unresolved-MSRV exception. The
 prototype's recorded checks exercised this compiler. Supporting an older
 compiler requires deliberate compatibility validation and a revised policy.
 This minimum governs building Oxide itself; consumer project compilers remain
-independently resolved inputs to their build-storage identity.
+independently resolved inputs to their build-storage identity. The Cargo
+releases the freshness gate, stray detection and dep-info decoder support are
+listed in the [Cargo version matrix](contracts/workflow.md#cargo-version-matrix).
 
 The unpublished root package uses Rust edition 2021 and declares
 `rust-version = "1.97.1"`. Its internal name is `oxide-storage`; publication

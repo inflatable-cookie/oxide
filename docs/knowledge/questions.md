@@ -161,6 +161,10 @@ conditional on its fixed performance and correctness gates; unknown formats
 and unqualified versions fall through rather than guessing. Queue decisions
 `306dc549-5db6-403b-b443-1e5b85e2c8b1` and
 `62b39943-9cff-4665-9528-849ddc3a5568` retain the exact relayed replies.
+C1 (oxide#091) qualified only the shipped gate, stray detection and
+decoder on exact Cargo 1.95.0–1.99.1 pins
+([matrix](contracts/workflow.md#cargo-version-matrix)). Skip-path and
+internal-reader coverage (C2) waits for A/B.
 
 The #086 no-go and its incomplete correctness proof remain unchanged
 ([profile](rust-dx-landscape.md#oxide-run-overhead-profile-2026-10-19)).

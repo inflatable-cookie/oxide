@@ -1,0 +1,114 @@
+{
+  "task": "oxide#091 (C1)",
+  "scope": "Shipped freshness gate, stray ordinary-Cargo output detection and dep-info decoder only; no skip path, build-script reader or donor code.",
+  "builder": {
+    "toolchain": "1.97.1",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+    "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "note": "Oxide and the decoder driver were staged offline with the builder in every proof; only fixture Cargo ran the tested release."
+  },
+  "channel_manifests": {
+    "source": "https://static.rust-lang.org/dist/channel-rust-<minor>.toml, sha256 matched the published .sha256 for every file",
+    "fetched": "2026-10-19T14:40Z",
+    "stable": "1.99.1 (channel-rust-stable.toml identical to channel-rust-1.99.toml)",
+    "1.100": "not published (HTTP 404); not installed",
+    "raw": "raw/channel-manifests.txt"
+  },
+  "matrix": [
+    {
+      "minor": "1.95", "release": "1.95.0", "manifest_date": "2026-04-16",
+      "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)", "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+      "cargo_commit": "f2d3ce0bd7f24a49f8f72d9000448f8838c4e850",
+      "toolchain": "already installed; observed and reused",
+      "proof": "failed (exit 1) in the shared 1.94.1 fallback phase on a wrong script expectation; every 1.95.0 phase before it passed",
+      "freshness_gate": "pass", "build_dir_effective": "pass", "stray_none_after_oxide": "pass", "stray_reported_after_plain_cargo": "pass",
+      "dep_info": "24/24 slot files and 8/8 plain-target files decoded, 0 refused",
+      "fallback_phase": "failed: expected a gate refusal for B; the store never offers an affine slot, so B built cold on its own affine slot (behaviour correct, expectation wrong)"
+    },
+    {
+      "minor": "1.96", "release": "1.96.1", "manifest_date": "2026-06-30",
+      "cargo": "cargo 1.96.1 (356927216 2026-06-26)", "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)",
+      "cargo_commit": "356927216a2d746168cf76e5e88cc3f4b58e029d",
+      "toolchain": "already installed; observed and reused",
+      "proof": "pass (exit 0, 46 s)",
+      "freshness_gate": "pass", "build_dir_effective": "pass", "stray_none_after_oxide": "pass", "stray_reported_after_plain_cargo": "pass",
+      "dep_info": "24/24 slot files and 8/8 plain-target files decoded, 0 refused",
+      "fallback_phase": "pass"
+    },
+    {
+      "minor": "1.97", "release": "1.97.1", "manifest_date": "2026-07-16",
+      "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)", "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+      "cargo_commit": "c980f4866141969fab6254a680546a277789d6f0",
+      "toolchain": "installed control (builder); not upgraded",
+      "proof": "pass (exit 0, 67 s)",
+      "freshness_gate": "pass", "build_dir_effective": "pass", "stray_none_after_oxide": "pass", "stray_reported_after_plain_cargo": "pass",
+      "dep_info": "24/24 slot files and 8/8 plain-target files decoded, 0 refused",
+      "fallback_phase": "pass"
+    },
+    {
+      "minor": "1.98", "release": "1.98.1", "manifest_date": "2026-09-03",
+      "cargo": "cargo 1.98.1 (797e8a9bc 2026-08-05)", "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+      "cargo_commit": "797e8a9bca276c1c9f9f738d2a20f484fa4eea9d",
+      "toolchain": "installed by this task (minimal profile)",
+      "proof": "pass (exit 0, 35 s)",
+      "freshness_gate": "pass", "build_dir_effective": "pass", "stray_none_after_oxide": "pass", "stray_reported_after_plain_cargo": "pass",
+      "dep_info": "24/24 slot files and 8/8 plain-target files decoded, 0 refused",
+      "fallback_phase": "pass"
+    },
+    {
+      "minor": "1.99", "release": "1.99.1", "manifest_date": "2026-10-15",
+      "cargo": "cargo 1.99.1 (5f94df478 2026-08-27)", "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+      "cargo_commit": "5f94df4789f005f9a352888e8355ffc645b7ed0e",
+      "toolchain": "installed by this task (minimal profile)",
+      "proof": "pass (exit 0, 33 s)",
+      "freshness_gate": "pass", "build_dir_effective": "pass", "stray_none_after_oxide": "pass", "stray_reported_after_plain_cargo": "pass",
+      "dep_info": "24/24 slot files and 8/8 plain-target files decoded, 0 refused",
+      "fallback_phase": "pass"
+    }
+  ],
+  "source_checks": {
+    "files": "raw/cargo-source-files.sha256 (fetched read-only from raw.githubusercontent.com/rust-lang/cargo/<full commit>/...; 1.99.1 moved src/cargo/core/* to src/*)",
+    "encoded_dep_info": "fingerprint/dep_info.rs byte-identical 1.95.0-1.98.1; 1.99.1 differs only in import paths. CURRENT_ENCODED_DEP_INFO_VERSION = 1, marker 01 00 00 00 ff, in all five.",
+    "mtime_rule": "`if path_mtime <= reference_mtime` (fresh) in find_stale_file in all five",
+    "relative_unit_paths": "local fingerprint `path: util::hash_u64(path_args(ws, unit).0)` in all five",
+    "metadata": "cargo metadata `const VERSION: u32 = 1` in all five; fields read: packages, manifest_path, source, targets, src_path (runtime-checked by the gate scenario)",
+    "lock_refusal": "`... because {locked_flag} was passed to prevent this` in all five",
+    "unknown_z_refusal": "`unknown `-Z` flag specified: {k}` in all five",
+    "build_dir": "GlobalContext::build_dir has no unstable gate in all five (stable since 1.91)",
+    "layout": "stable layout keeps <profile>/deps, incremental, .fingerprint in all five; the unit-grouped layout stays behind -Zbuild-dir-new-layout in all five. 1.95.0 differs only in lock file naming (.cargo-lock vs .cargo-build-lock/.cargo-artifact-lock from 1.96.1), which none of the three features reads."
+  },
+  "fallback": {
+    "release_table": "src/bin/oxide/freshness.rs VERIFIED_CARGO: exact `cargo -V` prefix incl. commit; any other release (older, newer, 1.96.0, 1.97.0, 1.100+, rebuilt Cargo) is unverified",
+    "freshness": "unverified Cargo: a new slot records an affine build (never shared, summary says `freshness gate off`); a content slot that needs refreshing is refused and the command builds cold; an unchanged same-checkout repeat runs no version-sensitive step",
+    "stray": "unverified Cargo with no deps/ or incremental/ found reports `unknown`, not `none`; found intermediates are still reported",
+    "dep_info": "unchanged: any marker other than 01 00 00 00 ff or version other than 1 refuses (Unsupported); no command calls the decoder",
+    "runtime": "installed 1.94.1 (below threshold) in each proof: A cold on an affine slot with the note, B cold on its own slot, status `unknown`"
+  },
+  "proof_ledger": {
+    "cap": "6 native invocations task-wide (5 versions + 1 shared extra, both roles)",
+    "used_by_author": 5,
+    "remaining_shared_extra": 1,
+    "runs": [
+      {"n": 1, "selector": "rust:cargo-matrix:1.95.0", "request_id": "d1f5f370-42a9-47be-97ad-27a7da2f6950", "start": "2026-10-19T14:49:28Z", "end": "2026-10-19T14:55:01Z", "exit": 1, "head": "588e934058545d20ebf714150ded6cd85cd12e9c"},
+      {"n": 2, "selector": "rust:cargo-matrix:1.96.1", "request_id": "29a9140b-8ee2-4c00-8eb2-5090ac9fbcfb", "start": "2026-10-19T14:55:51Z", "end": "2026-10-19T14:56:39Z", "exit": 0},
+      {"n": 3, "selector": "rust:cargo-matrix:1.97.1", "request_id": "1df68e6f-b009-4eed-b7d6-dc1e0cbabb6f", "start": "2026-10-19T14:56:45Z", "end": "2026-10-19T14:57:53Z", "exit": 0},
+      {"n": 4, "selector": "rust:cargo-matrix:1.98.1", "request_id": "c0a2ee2a-3414-4d2a-80b8-1a5154908a6b", "start": "2026-10-19T14:57:53Z", "end": "2026-10-19T14:58:30Z", "exit": 0},
+      {"n": 5, "selector": "rust:cargo-matrix:1.99.1", "request_id": "0e48a785-7692-47c1-8a44-f5fcd153928f", "start": "2026-10-19T14:58:30Z", "end": "2026-10-19T14:59:04Z", "exit": 0}
+    ],
+    "runs_2_to_5_head": "e3d06be189cf859d6de240d3d26f86366b45bf8b (fallback-expectation fix; Rust source identical to run 1)",
+    "settlement": "Caller exit codes and Effigy's terminal output are the settlement record. `effigy tasks request status --caller northstar-worker` returned authenticated unknown_run for all five ids: the submitting caller identity was not that name, so no scheduler epoch was retrieved.",
+    "closure": "Runs 2-5 detached their image and removed scratch after positive completion. Run 1 retained its scratch; with zero open files under the payload (lsof) the image was detached normally and the 96 MiB scratch removed before run 2. At most one owned image was attached at any time.",
+    "bounds": "each passing run <= 67 s from staging start, owned scratch <= 97 MiB, fixture inputs 2607 bytes, host free >= 777 GiB at every phase"
+  },
+  "host_effects": {
+    "installed": [
+      {"toolchain": "1.98.1-aarch64-apple-darwin", "profile": "minimal", "downloaded_bytes": 87612644, "installed_kib": 446500},
+      {"toolchain": "1.99.1-aarch64-apple-darwin", "profile": "minimal", "downloaded_bytes": 90388396, "installed_kib_after_install": 462532, "installed_kib_final": 455320}
+    ],
+    "reused": ["1.95.0-aarch64-apple-darwin (557632 KiB)", "1.96.1-aarch64-apple-darwin (561108 KiB)", "1.97.1-aarch64-apple-darwin (control)"],
+    "default_before_after": "stable-aarch64-apple-darwin (default), unchanged; `stable` still resolves to cargo 1.97.1",
+    "overrides_before_after": "no overrides",
+    "oxide_rust_version": "1.97.1, unchanged",
+    "retained": "Matrix toolchains stay installed as the architect requested; removal is Tom's later choice (`rustup toolchain uninstall 1.98.1 1.99.1`)."
+  }
+}

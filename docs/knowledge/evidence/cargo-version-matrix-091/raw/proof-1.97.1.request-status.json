@@ -1,0 +1,28 @@
+{
+  "binary": {
+    "active_version": "v0.14.1+local.3113774",
+    "display_version": "v0.14.1+local.3113774",
+    "name": "effigy",
+    "version": "0.14.1"
+  },
+  "command": {
+    "kind": "tasks",
+    "name": "tasks"
+  },
+  "error": {
+    "details": {
+      "caller": "northstar-worker",
+      "reason": "unknown_run",
+      "request_id": "1df68e6f-b009-4eed-b7d6-dc1e0cbabb6f",
+      "schema": "effigy.host_run.request-status.v1",
+      "schema_version": 1,
+      "state": "authenticated_absence"
+    },
+    "kind": "RunnerError",
+    "message": "authenticated unknown_run for host-run request northstar-worker/1df68e6f-b009-4eed-b7d6-dc1e0cbabb6f; only this result permits a same-key submission"
+  },
+  "ok": false,
+  "result": null,
+  "schema": "effigy.command.v1",
+  "schema_version": 1
+}

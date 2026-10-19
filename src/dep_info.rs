@@ -1,5 +1,10 @@
 //! Bounded reader for Cargo c980f4866 `EncodedDepInfo` version 1.
 //!
+//! The format (marker `01 00 00 00 ff`, version 1) is identical in the
+//! pinned source of Cargo 1.95.0 (f2d3ce0bd), 1.96.1 (356927216), 1.97.1
+//! (c980f4866), 1.98.1 (797e8a9bc) and 1.99.1 (5f94df478), and decoded every
+//! fixture unit each wrote (oxide#091). Any other marker or version refuses.
+//!
 //! Decoding retains Cargo's package/build-root path tag, optional checksum and
 //! environment presence. It does not resolve paths, consult the filesystem or
 //! infer a unit graph. Kept from the retired registered route as input for the

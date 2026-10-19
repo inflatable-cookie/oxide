@@ -1,0 +1,27 @@
+2026-10-19T15:00:28Z
+stable-aarch64-apple-darwin (default)
+nightly-2026-08-05-aarch64-apple-darwin
+1.80-aarch64-apple-darwin
+1.85-aarch64-apple-darwin
+1.85.0-aarch64-apple-darwin
+1.90.0-aarch64-apple-darwin
+1.93.0-aarch64-apple-darwin
+1.94.1-aarch64-apple-darwin
+1.95-aarch64-apple-darwin
+1.95.0-aarch64-apple-darwin
+1.96-aarch64-apple-darwin
+1.96.0-aarch64-apple-darwin
+1.96.1-aarch64-apple-darwin
+1.97-aarch64-apple-darwin
+1.97.0-aarch64-apple-darwin
+1.97.1-aarch64-apple-darwin (active)
+1.98.1-aarch64-apple-darwin
+1.99.1-aarch64-apple-darwin
+default: stable-aarch64-apple-darwin (default)
+overrides: no overrides
+/dev/disk3s1s1  3902614160   12342244 793526124     2%  458732 4293282291    0%   /
+557632	/Users/tom/.rustup/toolchains/1.95.0-aarch64-apple-darwin
+561108	/Users/tom/.rustup/toolchains/1.96.1-aarch64-apple-darwin
+446500	/Users/tom/.rustup/toolchains/1.98.1-aarch64-apple-darwin
+455320	/Users/tom/.rustup/toolchains/1.99.1-aarch64-apple-darwin
+0

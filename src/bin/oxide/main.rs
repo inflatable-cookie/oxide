@@ -686,7 +686,8 @@ fn slot_size(pool: &Path, slot_id: &str) -> String {
 }
 
 /// Plain Cargo leaves `deps/` or `incremental/` in the checkout's `target/`;
-/// Oxide keeps intermediates in its slot.
+/// Oxide keeps intermediates in its slot. Finding none means none only for a
+/// verified Cargo release, whose layout was checked.
 fn report_stray(workspace: &Path) {
     let target = workspace.join("target");
     if !target.is_dir() {
@@ -717,14 +718,20 @@ fn report_stray(workspace: &Path) {
             } else {
                 " (partial scan)"
             };
-            if files == 0 {
-                println!("stray Cargo output: none in {}{coverage}", target.display());
-            } else {
+            if files > 0 {
                 println!(
                     "stray Cargo output: {} holds plain-Cargo deps/ or incremental/ ({files} files, {} MiB){coverage}; `oxide clean` removes it",
                     target.display(),
                     bytes / MIB
                 );
+            } else if let Err(reason) = freshness::verified_cargo() {
+                // Another layout may keep intermediates elsewhere.
+                println!(
+                    "stray Cargo output: unknown in {} ({reason}; its layout is unchecked)",
+                    target.display()
+                );
+            } else {
+                println!("stray Cargo output: none in {}{coverage}", target.display());
             }
         }
         Err(error) => println!("stray Cargo output: scan unavailable ({error})"),

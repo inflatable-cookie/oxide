@@ -70,3 +70,28 @@ run = "python3 scripts/test-storage-lease-cli.py"
 [tasks."rust:oxide-cli"]
 admission = "heavy"
 run = "python3 scripts/test-oxide-cli.py"
+
+# Cargo version matrix (oxide#091): one logical proof per exact stable
+# release. Each stages `oxide` offline with the builder 1.97.1, then runs the
+# shipped freshness gate, stray detection and dep-info decoder under the
+# tested Cargo over one fresh 128 MiB APFS pool, plus the installed 1.94.1
+# fallback. Never installs a toolchain. Not a benchmark and not full QA.
+[tasks."rust:cargo-matrix:1.95.0"]
+admission = "heavy"
+run = "python3 scripts/test-oxide-cli.py --cargo-matrix 1.95.0"
+
+[tasks."rust:cargo-matrix:1.96.1"]
+admission = "heavy"
+run = "python3 scripts/test-oxide-cli.py --cargo-matrix 1.96.1"
+
+[tasks."rust:cargo-matrix:1.97.1"]
+admission = "heavy"
+run = "python3 scripts/test-oxide-cli.py --cargo-matrix 1.97.1"
+
+[tasks."rust:cargo-matrix:1.98.1"]
+admission = "heavy"
+run = "python3 scripts/test-oxide-cli.py --cargo-matrix 1.98.1"
+
+[tasks."rust:cargo-matrix:1.99.1"]
+admission = "heavy"
+run = "python3 scripts/test-oxide-cli.py --cargo-matrix 1.99.1"
