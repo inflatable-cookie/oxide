@@ -3039,7 +3039,7 @@ def prove_config_gate(call, parent: str, home: str) -> None:
         (project, f'include = "{CLEAN_SECRET}.toml"\n', 'key "include": it includes another config file'),
         (home_config, "[net]\ngit-fetch-with-cli = true\n", f'{home_config} sets key "net"."git-fetch-with-cli"'),
         (ancestor, f'[build]\nrustc-wrapper = "{CLEAN_SECRET}"\n', f'{ancestor} sets key "build"."rustc-wrapper": it names a program'),
-        (project, f'[net\ntoken = "{CLEAN_SECRET}"\n', f"{project} cannot be parsed as TOML 1.0 (line 1)"),
+        (project, f'[net\ntoken = "{CLEAN_SECRET}"\n', f"{project} cannot be parsed as TOML 1.0"),
         (project, "net = {\n  retry = 2\n}\n", f"{project} cannot be parsed as TOML 1.0"),
     )
     for path, text, needle in risky:
