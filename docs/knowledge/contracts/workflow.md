@@ -127,8 +127,8 @@ Identity chooses which warm slot to try:
 
 The slot compatibility key is repository identity + Cargo profile + resolved
 toolchain (`rustc -vV`) + target triple + codegen backend. The toolchain is
-whatever rustup resolves for the project directory; Oxide does not select or
-pin it.
+whatever rustup resolves where the command runs (see
+[caller context](#cargo-version-matrix)); Oxide does not select or pin it.
 
 ## Cross-checkout freshness
 
@@ -311,12 +311,26 @@ resolve the toolchain. A member's `rust-toolchain.toml` therefore counts.
   reads `unknown`, because another layout may keep them elsewhere.
 - **Dep-info decoder.** Any other marker or version is refused, as before.
 
-Slot compatibility includes `rustc -vV`. That query currently resolves from
-the canonical workspace root, while guarded Cargo inherits the invocation
-directory. Compiler separation therefore assumes both directories resolve the
-same toolchain; a member-local toolchain file can violate that assumption.
-The matrix fixtures explicitly set `RUSTUP_TOOLCHAIN` and do not qualify that
-case. A new Cargo release needs this check before it joins the table.
+Slot compatibility includes `rustc -vV` of `RUSTC`, else of `rustc`, run
+like `cargo -V` in the command's own working directory and environment, not
+the workspace root (oxide#094). The guarded Cargo inherits both, and
+`--manifest-path` moves neither: rustup selects the toolchain from the working
+directory, so `--manifest-path` names only the package and the workspace that
+owns the slot. Repository identity and the slot's checkout still come from
+the canonical workspace root. `effigy rust:oxide-toolchain-context`
+([evidence](../evidence/toolchain-context-094/README.md)) proves on
+installed 1.97.1 (root) and 1.96.1 (member `rust-toolchain.toml`) that each
+key digests the `rustc -vV` the build script saw Cargo use: root and member
+contexts get separate slots of one owner, same-context repeats reuse warm,
+`--manifest-path` either way follows the working directory, and `RUSTC` or
+`RUSTUP_TOOLCHAIN` from the root select the member compiler's slot.
+
+Not represented in the key, and so unsupported for compiler separation:
+`build.rustc` or `build.rustc-wrapper` from Cargo config files or `--config`,
+`CARGO_BUILD_RUSTC`, `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, and a `PATH`
+whose `rustc` belongs to a different installation than its `cargo`. `oxide
+init` readiness still reports the toolchain rustup resolves at the workspace
+root. A new Cargo release needs this check before it joins the table.
 
 ## What one command does (local executor)
 

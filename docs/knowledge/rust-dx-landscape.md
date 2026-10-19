@@ -727,6 +727,65 @@ withdrawn, and skip/readers version qualification is not admitted. The next
 approved work is normal-path overhead reduction and an opt-in launch diagnostic;
 no candidate optimization or skip code is adopted by that decision.
 
+## Oxide normal-command overhead, round 3 (2026-10-19)
+
+oxide#092 retried the like-for-like gate with #088's reductions imported and
+changes intended to address its defects, using a paired method fixed before any result: on one
+std-only fixture over a fresh 128 MiB APFS pool, one warm-up of each, then
+nine interleaved pairs (order alternating), statistic the median paired
+difference, ceiling 100 ms per gate. Plain Cargo used Oxide's quick profile,
+a private target directory, the same private `CARGO_HOME`, offline
+environment, lock file and toolchain. **Result: no-go on the author's own
+proof.** Raw records: [evidence](evidence/overhead-092/README.md).
+
+| Paired no-op, ms | Baseline (1 pair, observes only) | Candidate (9 pairs) |
+| --- | --- | --- |
+| Gate 1: `oxide check` minus `cargo check` | 355.949 | median 142.656 (fail) |
+| Gate 2: `oxide run -- x` minus `cargo run -- x` | 272.397 | median 81.556 (pass) |
+
+Gate 1's nine differences were 132.5–211.9 ms. Gate 2's ranged from
+−224.545 to +338.156 ms. Plain run ranged 223.415–623.755 ms and Oxide
+run 321.175–561.571 ms. The fixed statistic passes this captured set; the
+variation establishes neither a stable overhead bound nor its cause. The brief stops on any measured
+candidate failure, so there was no second proof, tuning, replay or reviewer
+measurement. Nothing from the branch is merged or installed.
+
+Candidate changes, unaccepted: #088's combined Git reads, run metadata
+naming the workspace, overlapped snapshots, ticket only when waiting and
+wait-poll backoff; Git reads in parallel; a toolchain cache resolved in the
+caller's directory and environment, recording only when the resolved
+compiler and every input observe the same before and after `rustc -vV`; and
+a debug-only gate hold replacing the racy Git-wrapper hold. Unit regressions
+were added for the bracket and caller context. The author's log and pinned
+harness indicate that its correctness cases completed once before the overall
+timing failure; no independent product/runtime review was performed. Ordinary
+compile, format, full Rust tests and lease proof were not run after the stop.
+The evidence-only review ran no validation and grants no semantic-equivalence
+or product acceptance. Remaining native proof allowance stayed unused.
+
+What the candidate traces show (fastest check sample, 163.6 ms, end marker
+at 158.6 ms; spans overlap):
+
+- Captured plain-check and Git-operation times were higher than the reported
+  #088 samples: 30.3–37.9 ms versus 17–23 ms for plain check, and 14–16 ms
+  versus about 7 ms for Git operations. Host load was not measured; no cause
+  for the difference is established.
+- Before Cargo: `cargo locate-project` 25.6 ms, then identity and snapshot
+  Git reads in parallel 16.5 ms, a cached toolchain read 0.8 ms.
+- Two origin operations, five state saves (7.487–12.520 ms each), and lease
+  library lease/release spans sum to 70.972 ms. These enclosing operation
+  durations overlap Cargo and the post-Cargo Git snapshot; they do not isolate
+  sync latency or additive critical-path cost. State saves sync the file then
+  the control directory; origin writes sync their temporary file before rename.
+  The installed Rust 1.97.1 macOS implementation routes `sync_all` through
+  `F_FULLFSYNC`; no syscall trace was taken. Durability changes need separate
+  design authority; these observations do not prove a redesign necessary for
+  every possible reduction.
+- Oxide's own Cargo call took 44.3 ms against the 30–38 ms plain request.
+- The first measured check's version span was about 65 ms. Source requires an
+  existing `target/` for its best-effort cache write; this is consistent with
+  a cold warm-up not populating the cache, not an independently observed miss.
+
 ## macOS new-executable launch cost (2026-10-19)
 
 A Supervisor probe on this host (macOS, Apple Silicon; tiny `rustc -O` binary; 10 runs each) measured process launch time:
