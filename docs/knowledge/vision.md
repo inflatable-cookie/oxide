@@ -54,8 +54,8 @@ strict requirement to beat bare Cargo. A reported fixture tie does not establish
 a bare-Cargo speedup or a result on larger repositories. All correctness,
 conservative-eligibility and independent exact-head review requirements remain.
 This is the architect's disposition within the approved feature scope, not a
-new answer attributed to Tom. Profiling ordinary command overhead is a separate,
-unapproved proposal.
+new answer attributed to Tom. Profiling ordinary command overhead is separately scoped; Tom subsequently
+approved the combined successor below.
 
 The architect clarified the same fast-path boundary on 2026-10-19: Cargo's
 ordinary freshness semantics are the reference, rather than absolute input
@@ -77,9 +77,9 @@ skips package-relative files when `allow_package` is false, and the
 passes the unit's local-source classification. Merely observing `CheckDepInfo`
 is insufficient to conclude that all downloaded source files are followed.
 Retained correctness fixes are research material, not an accepted fast path.
-A successor combining supported source eligibility and profiling of skip and
-ordinary command costs is a separate proposal requiring Tom's approval; the
-failed performance threshold is not relaxed again.
+The separately approved successor below combines supported source eligibility
+and profiling of skip and ordinary command costs. The failed performance
+threshold is not relaxed again.
 
 Tom's ruling, 2026-10-18: draw a line under the mechanism experiments and design a proper user workflow. Oxide should provide a replacement build service: instead of `cargo build` / `cargo run`, the user requests `oxide build …` / `oxide run …` against a named profile (quickest dev loop, light debug, full debug, release and similar). Oxide then handles storage/space management, worktree reuse, building and running where needed. The build location and system are abstracted from the user, so the same request could execute locally, on CI, in the cloud or on another machine on the local network. Tom asked whether `cargo build` and `cargo run` can be redirected to these commands.
 
@@ -340,7 +340,8 @@ Tom approved the storage-hygiene bundle on 2026-10-18 with "Approve": one Oxide-
 
 It is bounded to tiny fixtures and a private Cargo home. It grants no recipe change, no deletion inside slots, no live Cargo home cleanup and no consumer change.
 
-Tom approved two sequential scopes on 2026-10-19 with "Approve":
+Tom approved two sequential scopes on 2026-10-19 with "Approve" (Queue
+decision `d59ada84-94b9-423c-8c07-54a09504e064` v2 records the relayed answer):
 - A #079 successor: the skip-unchanged path with Cargo-relative registry/git eligibility and the preserved correctness fixes, plus profiling-led reduction of both skip-path cost and normal per-command overhead.
 - Then dogfooding in Oxide's own repository only. This installs the `oxide` binary for Tom's user in `~/.local/bin`, lets the default pool be created on first use, runs `oxide init`, and routes the repository's ordinary Rust Effigy selectors through `oxide`. Plain-Cargo escape selectors and a documented rollback are kept.
 
