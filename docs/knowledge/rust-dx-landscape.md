@@ -659,58 +659,65 @@ repairs do not authorize another run, product merge or dogfooding sequence chang
 
 oxide#088 measured Oxide's added time on a normal no-op like for like against
 plain Cargo, on one std-only fixture over a fresh 128 MiB APFS pool, on one
-macOS host. Raw records: [evidence](evidence/overhead-088/README.md). The
-gate was fixed before any result: fastest of three `oxide check` minus
-fastest `cargo check` at most 100 ms, and fastest `oxide run -- x` minus
-fastest `cargo run -- x` at most 100 ms. Main has no skip path, so every
-`oxide run` is the normal leased path. Plain Cargo used a private target
-directory, the same private `CARGO_HOME`, offline environment and toolchain.
+macOS host. **Final result: no-go.** Raw records:
+[evidence](evidence/overhead-088/README.md). The gate was fixed before any
+result: fastest of three `oxide check` minus fastest `cargo check` at most
+100 ms, and fastest `oxide run -- x` minus fastest `cargo run -- x` at most
+100 ms. The branch had no skip path, so every `oxide run` was the normal
+leased path. Plain Cargo used a private target directory, the same private
+`CARGO_HOME`, offline environment and toolchain.
 
-| Fastest sample, ms | Baseline (2 rounds) | Candidate (3 rounds) |
-| --- | --- | --- |
-| `oxide check` | 342.830 | 115.162 |
-| `cargo check` | 23.135 | 17.255 |
-| Gate 1 difference | 319.694 | 97.908 (pass) |
-| `oxide run -- x` | 414.255 | 243.982 |
-| `cargo run -- x` | 161.344 | 150.008 |
-| Gate 2 difference | 252.911 | 93.974 (pass) |
-| `cargo build` | 52.415 | 19.765 |
-| `cargo run` minus `cargo build` (information only) | 108.929 | 130.243 |
+| Fastest sample, ms | Baseline (2 rounds, observes only) | Author candidate | Independent review |
+| --- | --- | --- | --- |
+| `oxide check` | 342.830 | 115.162 | 157.890 |
+| `cargo check` | 23.135 | 17.255 | 21.819 |
+| Gate 1 difference | 319.694 | 97.908 (pass) | 136.071 (fail) |
+| `oxide run -- x` | 414.255 | 243.982 | 273.297 |
+| `cargo run -- x` | 161.344 | 150.008 | 165.852 |
+| Gate 2 difference | 252.911 | 93.974 (pass) | 107.444 (fail) |
+| `cargo run` minus `cargo build` (information only) | 108.929 | 130.243 | 141.213 |
 
-Both gates passed by the fixed arithmetic. The #079 noise statistic (larger
-max-minus-min spread of the two compared kinds) was 25.995 ms for gate 1 and
-31.965 ms for gate 2. The margins under the ceiling (2.1 ms and 6.0 ms) are
-smaller than that noise, so another session on this host could fall either
-side of 100 ms. The baseline has two samples per kind and observes only.
-There is no claim about larger projects, other hosts, SSD writes or CPU cost.
+The baseline ran on instrumentation-only `4a11f9d`. Both candidate sets ran
+the product source of `d217b37` (the reviewed head `259088e` adds docs and
+evidence only) with the same fixture digest. The independent exact-head set
+failed both gates, and that required failure decides the no-go; the sets are
+not averaged or substituted, and no noise waiver applies. The #079 noise
+statistic was 25.995 / 31.965 ms in the author's set and 11.398 / 30.399 ms
+in the review's. The difference between sets is not attributed to host load:
+none was measured.
 
-What the phase traces show (fastest samples; spans overlap):
+The review also found:
+
+1. The toolchain cache statted the resolved compiler only after its `-vV`
+   and sysroot spawns, so a compiler replaced in between could pair old
+   version output with the new binary. Unfixed.
+2. The background pre-Cargo snapshot ran its first Git call before the lease,
+   so the crash-in-gate fixture's hold could fire before the record reached
+   `acquiring`. The review's proof exited 1 there; later controls did not run.
+   The author's passing run does not establish that case.
+3. Aggregate bounds evidence was insufficient: off-fixture staging was not
+   counted toward 512 MiB, the reserve was checked only at boundaries, and the
+   clock started after provisioning and admission. No cap overrun is shown.
+
+What the phase traces show (author's fastest samples; spans overlap):
 
 - Baseline `oxide check` reached its end marker at 338.6 ms: workspace
   20.7 ms, three identity Git calls 28.2 ms, `rustc -vV` 27.0 ms, the
-  pre-Cargo snapshot's three Git calls 74.9 ms, seven state saves of 7.5–13.5 ms
-  each plus two origin writes, Cargo 58.7 ms against a plain 23.1 ms (the
-  wait loop polled every 20 ms), and the post-Cargo snapshot 43.9 ms. Git
-  calls took 9–28 ms each under the harness.
-- Candidate `oxide check` reached it at 112.2 ms: workspace 14.8 ms; identity
-  (two Git calls), the snapshot (two) and the cached toolchain read (0.5 ms)
-  together in 29.3 ms; the lease 29.3 ms (two saves, one origin write, the
-  lease library 8.0 ms); spawning save 8.0 ms; Cargo 18.4 ms with the running
-  save overlapped; release 26.3 ms, its post-Cargo snapshot overlapping the
-  lease library release.
-- Per uncontended no-op: Git calls 9 to 6, `rustc` spawns 1 to 0 once
-  cached, Cargo drivers for `run` 3 to 2, state saves 7 to 5. Every
-  remaining save keeps its file and directory sync. What remains is mostly
-  serial durable saves and the lease library (about 60 ms) and serial
-  process spawns.
-- `run`: the candidate's fastest sample ended 134 ms after the pre-exec
-  marker; plain `cargo run` took 130 ms longer than `cargo build`. That
-  comparison is information only; the residual's cause is not isolated.
+  pre-Cargo snapshot's three Git calls 74.9 ms, seven state saves of
+  7.5–13.5 ms each plus two origin writes, Cargo 58.7 ms against a plain
+  23.1 ms (the wait loop polled every 20 ms), and the post-Cargo snapshot
+  43.9 ms.
+- The candidate reached it at 112.2 ms with Git calls 9 to 6, a cached
+  toolchain read, five state saves and overlapped snapshots. What remained
+  was mostly serial durable saves, the lease library and process spawns.
+- These are profile observations of one host, not evidence that the cuts
+  reliably meet the gate. No cause is claimed for the time after the
+  pre-exec marker. The #086 build-only baseline is not comparable with these
+  like-for-like figures.
 
-The cuts are listed in the
-[workflow](contracts/workflow.md#implemented-foundation-core) under
-per-command overhead. The stat-keyed toolchain identity is the shared
-identity the approved skip path consumes.
+None of this is merged or installed. The branch is kept only as a knowledge
+donor: do not import its runtime, its toolchain cache or its eligibility
+reasoning. Later work starts from current main.
 
 ## Product assessment
 
