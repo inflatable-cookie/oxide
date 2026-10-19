@@ -44,6 +44,10 @@ The strategy is how Oxide met the profile (`build`, or `build+execute` for
 another checkout's idle slot: the line then adds what the freshness gate
 refreshed and that inputs outside Git or ignored by it are not checked. If
 Oxide says the gate refused a slot, it builds cold instead; that is safe.
+A repeat `oxide run` with nothing changed prints `unchanged — skipped Cargo`
+and runs the last binary directly. `oxide run skip not recorded (…)` says why
+the next run will build again; that is safe. If a build script reads
+something it does not declare, use `oxide run --rebuild` (or `OXIDE_NO_SKIP=1`).
 
 ## Waits and refusals
 

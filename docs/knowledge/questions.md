@@ -162,6 +162,10 @@ and unqualified versions fall through rather than guessing. Queue decisions
 `306dc549-5db6-403b-b443-1e5b85e2c8b1` and
 `62b39943-9cff-4665-9528-849ddc3a5568` retain the exact relayed replies.
 
+Pointer, 2026-10-19: the metadata skip path shipped as the
+[`run` no-op fast path](contracts/workflow.md#run-no-op-fast-path); registry
+and Git build scripts stay refused and other Rust versions stay unqualified.
+
 The #086 no-go and its incomplete correctness proof remain unchanged
 ([profile](rust-dx-landscape.md#oxide-run-overhead-profile-2026-10-19)).
 Its pre-exec/total residual has unisolated causes; it does not prove a

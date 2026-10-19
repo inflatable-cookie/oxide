@@ -528,7 +528,10 @@ fn write_record(path: &Path, record: &Record) -> Result<(), String> {
     if count >= MAX_RECORDS {
         for entry in fs::read_dir(dir).map_err(|error| error.to_string())? {
             let entry = entry.map_err(|error| error.to_string())?.path();
-            if entry.extension().is_some_and(|extension| extension == "json") {
+            if entry
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
                 let _ = fs::remove_file(entry);
             }
         }

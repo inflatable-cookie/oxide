@@ -39,8 +39,15 @@ skip and a closed-proxy denial an owned control listener never sees. Setup
 downloads exactly one tiny archive (cfg-if 1.0.0); nothing else may use the
 network. The scratch is removed only after positive completion. Before any pool
 exists, `init` / `new` adoption runs on tiny scratch directories (90 s,
-64 MiB scratch) and must leave the pool uncreated. Not a benchmark and not
+64 MiB scratch) and must leave the pool uncreated. These cases run with
+OXIDE_NO_SKIP=1, so every `run` takes the leased path. Not a benchmark and not
 full QA.
+
+`--run-skip` is the separate focused proof of the `oxide run` no-op fast path
+(effigy rust:oxide-run-skip): its own fresh 128 MiB APFS pool and 300 s clock
+from admission, zero-child skips under RLIMIT_NPROC 0, every key class
+falling through, registry eligibility and refusal from named cached inputs in
+a private CARGO_HOME, and #079's fixed two-part timing gate with raw samples.
 """
 from __future__ import annotations
 

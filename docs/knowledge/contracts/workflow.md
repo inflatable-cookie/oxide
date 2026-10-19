@@ -7,7 +7,8 @@ unpublished `oxide` binary, installed for Tom only to
 [dogfood](#dogfooding-in-oxides-repository) in this repository; the agent
 skill exists as repository source only. [Implemented foundation core](#implemented-foundation-core)
 states exactly what ships, including the cross-checkout freshness gate, the
-budget-only directory backend and [Cargo home hygiene](#cargo-home-hygiene). Non-build run strategies and the
+[`run` no-op fast path](#run-no-op-fast-path), the budget-only directory
+backend and [Cargo home hygiene](#cargo-home-hygiene). Non-build run strategies and the
 privileged `linux-image-v1` backend are not implemented, and nothing has run
 on a real Linux host. Fixture proofs are not real-project
 qualification, default-pool creation outside tests, installation (binary or
@@ -257,6 +258,9 @@ fingerprint churn. The retired source-map work found no cheap general fix.
 
 ## What one command does (local executor)
 
+0. `run` only: if the [no-op fast path](#run-no-op-fast-path) key matches,
+   execute the recorded binary and stop: no child process, lease, slot or
+   pool access.
 1. Resolve the workspace (`cargo locate-project --workspace`), identity,
    profile, strategy and toolchain.
 2. Lease a slot from the host pool. Prefer this checkout's last slot, then any
@@ -279,6 +283,127 @@ The [qualified cross-worktree result](project-adoption.md#focused-cross-worktree
 supports this shape for one workflow: a different-path checkout on a shared
 slot rebuilt only its changed unit, and tests ran every time. It did not isolate
 the mtime hazard above.
+
+## `run` no-op fast path
+
+Implemented and fixture-proven, not real-project qualified. `oxide run`
+executes the binary from its last successful build directly when an
+in-process file-metadata check shows nothing the key observes has changed.
+Any doubt takes the normal leased path, which records again on success.
+Cargo's ordinary freshness semantics are the reference, not absolute input
+immutability ([vision](../vision.md#product-workflow-direction)).
+
+- **Key.** One record per canonical working directory and modelled build
+  arguments (`--bin`, `--example`, `-p` / `--package`, `--features` / `-F`,
+  `--all-features`, `--no-default-features`, `--profile`, `--release` / `-r`,
+  `--target`, in the given order). The working directory is part of the key,
+  so a member directory never runs another member's binary. Program arguments
+  after `--` are not part of the key and pass unchanged. Each input is a
+  stat tuple following symbolic links: device, inode, size, mtime and ctime
+  in nanoseconds, regular-file flag, or explicit absence. The record holds
+  tuples for:
+  - every path in the final binary's documented dep-info (`<binary>.d`);
+  - every participating manifest: each path package's `manifest_path` from
+    the build's `compiler-artifact` messages (fresh units included),
+    cross-checked with every `Cargo.toml` between a listed source and the
+    workspace root, so a `[lib] path` outside its package or a Git-ignored
+    manifest is still covered;
+  - `Cargo.lock`;
+  - `.cargo/config`, `.cargo/config.toml`, `Cargo.toml`, `rust-toolchain`
+    and `rust-toolchain.toml` in the working directory and every ancestor,
+    and `$CARGO_HOME/config(.toml)`, absent ones included;
+  - toolchain resolution: rustup's `settings.toml`, every `PATH` candidate
+    for `cargo` and `rustc` up to the one that resolves, and the resolved
+    sysroot's `bin/rustc`, `bin/cargo`, `lib`, channel manifest and
+    component list;
+  - the built binary's post-build tuple, recorded separately.
+  It also holds the arguments, working directory, workspace root and a
+  SHA-256 over every environment variable's name and its value's SHA-256
+  (raw values are never stored), plus Oxide's profile definitions.
+  `OXIDE_NO_SKIP` is an ordinary variable there, so a forced build records
+  a key the next plain run does not match.
+- **Capture.** The normal path drops the key's record, then observes the
+  environment and toolchain-resolution inputs, runs `rustc --print sysroot`,
+  observes the resolution inputs again (any difference records nothing) and
+  stats the resolved toolchain binaries, config and `Cargo.lock`. That
+  instant is the build start. Every leased command holds
+  `<workspace>/target/oxide-run-skip/active.lock` shared until its lease is
+  released. A successful `run` converts it to exclusive without waiting
+  (another active Oxide command records nothing), then, still under its
+  lease, re-checks every pre-build tuple and the environment, reads the
+  dep-info and manifests and publishes atomically. Every input's mtime and
+  ctime must be strictly older than the build start (a whole-second time
+  older than its whole second, for truncating filesystems); the binary is
+  exempt. A failed or interrupted build, a reserve stop, a missing or
+  partial build report, or any read error publishes nothing.
+- **Skip.** Only on an exact match of version, working directory,
+  arguments, workspace root, environment digest and every tuple, with the
+  activity lock free and the binary a regular file of the recorded tuple. The
+  check is in-process: no Cargo, metadata, rustc, rustup, Git or shell child.
+  It prints `oxide: <profile> profile, build+execute strategy, unchanged —
+  skipped Cargo`, then replaces Oxide with the program, as the normal path
+  does. A program failure is the program's exit code, never a rebuild.
+- **Concurrency.** As Cargo's: the skip sweeps the tuples, then executes. A
+  write landing after the sweep is caught by the next `oxide run`.
+- **Eligibility.** Pinned Cargo 1.97.1 follows registry and Git package
+  sources through their source identity, not file metadata: the
+  [compiler call site](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/compiler/mod.rs#L454-L465)
+  passes the unit's local-source classification, and
+  [dep-info translation](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/compiler/fingerprint/dep_info.rs#L262-L267)
+  skips package-relative files for non-local units. `Cargo.lock` in the key
+  covers them as Cargo does. A registry or Git package with a build script
+  is refused: Cargo follows its `rerun-if-changed` paths wherever they point
+  and no documented output reports them. A path package's build script must
+  declare `rerun-if-changed` or `rerun-if-env-changed` in its saved output;
+  otherwise Cargo fingerprints the whole package listing, which the key does
+  not observe. Path inputs outside the checkout are stat-recorded, not
+  refused. Every dep-info path must be absolute and a regular file (a
+  directory input refuses). Any other source kind refuses. A refusal prints
+  `oxide: run skip not recorded (<reason>)` on the normal path; it is
+  explicit, not an implied all-project speedup.
+- **Ineligible arguments and settings.** Any other argument before `--`
+  (including `-v`, `--manifest-path`, `--message-format`, `--config`,
+  `--locked`); a working directory outside the workspace; `RUSTC`,
+  `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER` or their `CARGO_BUILD_*` forms
+  set; a Cargo config containing `include`, `replace-with`, `paths` or
+  `rustc`; a config over 1 MiB.
+- **Record.** Versioned JSON (version 4) in
+  `<workspace>/target/oxide-run-skip/`, at most 4 MiB each and 64 per
+  checkout (cleared past that), so `oxide clean` drops records with the
+  binaries. A missing, other-version, partial or corrupt record never skips.
+- **Overrides.** `oxide run --rebuild` (before `--`) or `OXIDE_NO_SKIP=1`
+  (any non-empty value) runs Cargo and records again. `--rebuild` after `--`
+  is a program argument. `test`, `check`, `build` and `clippy` always run
+  Cargo; they only hold the activity lock.
+
+**Limits.** A build script's undeclared reads (an outside file without a
+`rerun-if-changed` line, a tool on the system) are not observed; nor is a
+linker or system library changing in place. Stat tuples are cooperative
+same-user evidence, not content attestation. Exact source and lock coverage
+is relative to pinned Cargo, not downloaded-source immutability.
+Generated sources a dep-info lists in a slot are stat-recorded like any
+other input. Qualification beyond the pinned toolchain is separate work.
+
+**Proof and gate.** `effigy rust:oxide-run-skip` runs one fresh 128 MiB APFS
+pool within 300 s from admission, including product staging. Skips run under
+`RLIMIT_NPROC` 0, so a successful skip started no child; a control shows the
+same limit refuses the leased path. It covers repeat skips, each key class
+falling through (source edit, restored-old-mtime edit caught by ctime, the
+ignored custom-lib-path manifest, root manifest, lock, config added above the
+workspace, toolchain file, environment variable, deleted binary, outside path
+dependency), member selection, a failed build leaving no record, a
+`cfg-if` registry dependency eligible and a `libc` build-script dependency
+refused, from named cached inputs in a private `CARGO_HOME`. The fixed #079
+two-part gate (architect ruling, 2026-10-19) takes three samples of each
+side and prints them raw in nanoseconds: the slowest skip at most half the
+fastest leased `oxide run --rebuild` (both execute the program), and the
+fastest skip at most the fastest bare `cargo build --profile oxide-quick`
+no-op (build only) plus noise, the larger max-minus-min spread of the skip
+and bare samples. A failure ends the proof as a no-go. The accepted run held
+in 22 s: skip 10.277–12.861 ms, leased 444.143–712.410 ms, bare 28.463–30.556
+ms, noise 2.583 ms; both parts passed. Fixture timings are not a real-world
+speed claim, and the skip is not claimed to beat bare Cargo on larger
+repositories.
 
 ## Crash recovery
 
@@ -739,7 +864,8 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
   root's `default-members`, or every member), the single `default-run`, else
   the only binary. Several binaries refuse with Cargo's error and exit 101
   before any lease. `run` builds only that target, releases, then replaces
-  Oxide with the program. It sets `CARGO_MANIFEST_DIR` only; other `cargo run`
+  Oxide with the program; an unchanged key skips straight to the program
+  ([fast path](#run-no-op-fast-path)). It sets `CARGO_MANIFEST_DIR` only; other `cargo run`
   environment (`CARGO_PKG_*`, dylib paths) is not set. Exit codes are Cargo's,
   or the program's for `run`.
 - **Summary.** One stderr line per leased command: profile, strategy (`build`

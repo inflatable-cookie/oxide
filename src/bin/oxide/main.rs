@@ -49,7 +49,9 @@ USAGE:
     oxide new <path> [cargo new args]    cargo new, then adopt Oxide
 
 Profiles: quick (default, line tables), debug (full debug info), release (the
-project's own). Oxide places build output, so --target-dir and --config
+project's own). `run` skips Cargo when nothing it records has changed since its
+last successful build; `oxide run --rebuild` or OXIDE_NO_SKIP=1 forces Cargo.
+Oxide places build output, so --target-dir and --config
 build.build-dir/target-dir are refused. Adoption writes one marked block in the
 workspace-root AGENTS.md and prints readiness; there is no Oxide config file.
 OXIDE_POOL selects the pool; OXIDE_MAX_ACTIVE the host-wide build limit (2).
@@ -473,9 +475,7 @@ fn record_build(build: &mut Option<skip::Build>, line: &str) {
         Some("build-script-executed") => {
             match (message["package_id"].as_str(), message["out_dir"].as_str()) {
                 (Some(id), Some(out_dir)) if kept => {
-                    report
-                        .scripts
-                        .insert(id.to_owned(), PathBuf::from(out_dir));
+                    report.scripts.insert(id.to_owned(), PathBuf::from(out_dir));
                     true
                 }
                 _ => false,
