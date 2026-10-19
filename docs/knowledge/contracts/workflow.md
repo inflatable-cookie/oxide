@@ -322,9 +322,11 @@ immutability ([vision](../vision.md#product-workflow-direction)).
     glob such as `crates/*/pkg` can match a package added at any depth, so an
     added member changes a recorded directory. A root manifest containing a
     backslash (an escaped key or pattern), or whose text could let a pattern
-    reach the skipped `target` or `.git` (`target`, `.git`, or a wildcard at
-    the root level: leading, after `./` or `../`, or a dot-wildcard), a
-    directory symlink or
+    reach the skipped `target` or `.git` (a quoted string whose first path
+    component, after any `./`, is `target` or `.git` or contains `*`, `?` or
+    `[`; a leading `..` followed by either name or a metacharacter; a `/../`
+    climb; or any multi-line string), a directory
+    symlink or
     more than 4096 directories records nothing;
   - `Cargo.lock`;
   - `.cargo/config`, `.cargo/config.toml`, `Cargo.toml`, `rust-toolchain`

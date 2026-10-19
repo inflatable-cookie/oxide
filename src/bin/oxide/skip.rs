@@ -843,14 +843,9 @@ fn workspace_dirs(checkout: &Path) -> Result<Vec<PathBuf>, String> {
         return Ok(Vec::new());
     }
     // The walk skips the root `target` (rewritten by every build) and
-    // `.git`, so a pattern that could reach them refuses: one naming them,
-    // or a wildcard at the root level (leading, after `./` or after `../`),
-    // including a dot-wildcard.
-    let reaching = [
-        "target", ".git", "\"*", "'*", "\"?", "'?", "\"[", "'[", "./*", "./?", "./[", "\".*",
-        "'.*", "\".?", "'.?", "\".[", "'.[",
-    ];
-    if let Some(found) = reaching.iter().find(|pattern| text.contains(*pattern)) {
+    // `.git`, so a pattern whose first path component could match them
+    // refuses: `target`, `.git`, any glob metacharacter there, or a climb.
+    if let Some(found) = reaching_pattern(&text) {
         return Err(format!(
             "{} may match members under target or .git (`{found}`)",
             manifest.display()
@@ -886,6 +881,41 @@ fn workspace_dirs(checkout: &Path) -> Result<Vec<PathBuf>, String> {
         }
     }
     Ok(dirs)
+}
+
+/// The first quoted string whose first path component (after any `./`)
+/// could match the root `target` or `.git`: either name, a glob
+/// metacharacter (`*`, `?`, `[`), a `/../` climb, or a leading `..` followed
+/// by a metacharacter or either name. Multi-line strings refuse whole.
+fn reaching_pattern(text: &str) -> Option<String> {
+    if text.contains("\"\"\"") || text.contains("'''") {
+        return Some("multi-line string".to_owned());
+    }
+    let mut chars = text.chars();
+    while let Some(quote) = chars.find(|character| *character == '"' || *character == '\'') {
+        let value: String = chars
+            .by_ref()
+            .take_while(|character| *character != quote)
+            .collect();
+        let mut rest = value.as_str();
+        while let Some(stripped) = rest.strip_prefix("./") {
+            rest = stripped;
+        }
+        let first = rest.split('/').next().unwrap_or_default();
+        // A climb out of the workspace (a path dependency) only matters
+        // when the rest could wander back into a `target` or `.git`.
+        let climbing = first == ".."
+            && (rest.contains(['*', '?', '[']) || rest.contains("target") || rest.contains(".git"));
+        if first == "target"
+            || first == ".git"
+            || first.contains(['*', '?', '['])
+            || climbing
+            || value.contains("/../")
+        {
+            return Some(value);
+        }
+    }
+    None
 }
 
 /// Each member manifest's tuple: a regular file strictly older than
@@ -1403,6 +1433,9 @@ mod tests {
             "[workspace]\nmembers = ['.*/pkg']\n",
             "[workspace]\nmembers = [\"crates/../*\"]\n",
             "[workspace]\nmembers = [\"./*/pkg\"]\n",
+            "[workspace]\nmembers = [\"targ[e]t/crates/*/pkg\"]\n",
+            "[workspace]\nmembers = ['t?rget/x']\n",
+            "[workspace]\nmembers = [\"../ws/targ*/pkg\"]\n",
         ] {
             fs::write(root.join("Cargo.toml"), refused).expect("root manifest");
             assert!(workspace_dirs(&root).is_err(), "{refused}");
@@ -1447,8 +1480,9 @@ mod tests {
         // A second open description cannot take it exclusively meanwhile.
         let other = File::open(root.join(RECORD_DIR).join(ACTIVITY_LOCK)).expect("open");
         assert!(!try_exclusive(&other));
+        // Not re-taken after the drop: a concurrently spawned test child may
+        // have inherited the descriptor, which is exactly the point.
         drop(activity);
-        assert!(try_exclusive(&other));
         fs::remove_dir_all(root).expect("cleanup");
     }
 
