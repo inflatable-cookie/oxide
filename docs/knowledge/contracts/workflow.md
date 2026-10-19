@@ -329,8 +329,11 @@ immutability ([vision](../vision.md#product-workflow-direction)).
     absolute or `~`-prefixed (Cargo joins it to the root as-is; Oxide never
     normalizes), a backslash (a glob escape), a first component after any
     `./` that is `target` or `.git` or contains `*`, `?` or `[`, a `/../`
-    climb, or a leading `..` followed by a metacharacter or either name. A
-    directory symlink or more than 4096 directories also records nothing.
+    climb, or a leading `..` followed by a metacharacter or either name. Any
+    symlink the walk meets, judged by its own type and never its referent
+    (dangling, file or directory: a dangling link can later resolve to a new
+    member), or more than 4096 directories also records nothing. Outside
+    path-dependency inputs are unaffected and stay stat-recorded.
     Without `members`, membership comes from the manifests already
     recorded, so nothing is walked. Path dependencies, absolute or relative
     such as `../outside`, keep their stat-recorded inputs. The skip compares

@@ -820,7 +820,9 @@ fn path_candidates(
 /// When the workspace root manifest declares `members`, a glob there can
 /// match a package added anywhere below the root, at any depth: every
 /// directory under the root is recorded (except the root `target` and
-/// `.git`), so an added member changes a recorded directory. A manifest whose
+/// `.git`), so an added member changes a recorded directory. Any symlink the
+/// walk meets refuses, judged by its own type: dangling, file or directory.
+/// A manifest whose
 /// patterns could reach those two, an escape, a directory symlink or more
 /// than [`MAX_WORKSPACE_DIRS`] directories refuses.
 fn workspace_dirs(checkout: &Path) -> Result<Vec<PathBuf>, String> {
@@ -857,9 +859,12 @@ fn workspace_dirs(checkout: &Path) -> Result<Vec<PathBuf>, String> {
             if dir == checkout && (entry.file_name() == "target" || entry.file_name() == ".git") {
                 continue;
             }
-            if kind.is_symlink() && path.is_dir() {
+            // Classified by the entry's own type, never its referent: a link
+            // that dangles now can resolve to a new member later, so any
+            // link refuses.
+            if kind.is_symlink() {
                 return Err(format!(
-                    "{} is a directory symlink under the workspace",
+                    "{} is a symlink under the workspace",
                     path.display()
                 ));
             }
@@ -1512,6 +1517,47 @@ mod tests {
         // Not re-taken after the drop: a concurrently spawned test child may
         // have inherited the descriptor, which is exactly the point.
         drop(activity);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn any_symlink_in_the_member_walk_refuses() {
+        let root = scratch("member-links");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*/pkg\"]\n",
+        )
+        .expect("root manifest");
+        fs::create_dir_all(root.join("crates/a/pkg")).expect("member a");
+        assert!(workspace_dirs(&root).is_ok(), "a real-directory workspace");
+        // A dangling link into the skipped target: refused before and after
+        // its referent appears.
+        let link = root.join("crates/b");
+        std::os::unix::fs::symlink("../target/new", &link).expect("dangling link");
+        assert!(workspace_dirs(&root).is_err(), "dangling link");
+        fs::create_dir_all(root.join("target/new/pkg")).expect("referent member");
+        assert!(
+            workspace_dirs(&root).is_err(),
+            "link now resolving to a member"
+        );
+        fs::remove_file(&link).expect("unlink");
+        // A link to an existing directory, and to a regular file that is
+        // later replaced by a directory.
+        fs::create_dir_all(root.join("elsewhere/pkg")).expect("directory referent");
+        std::os::unix::fs::symlink("../elsewhere", &link).expect("directory link");
+        assert!(workspace_dirs(&root).is_err(), "directory link");
+        fs::remove_file(&link).expect("unlink");
+        fs::write(root.join("file"), "x").expect("file referent");
+        std::os::unix::fs::symlink("../file", &link).expect("file link");
+        assert!(workspace_dirs(&root).is_err(), "file link");
+        fs::remove_file(root.join("file")).expect("drop file");
+        fs::create_dir_all(root.join("file/pkg")).expect("file replaced by directory");
+        assert!(workspace_dirs(&root).is_err(), "file link now a directory");
+        fs::remove_file(&link).expect("unlink");
+        // Back to real directories, including a nested new member.
+        fs::create_dir_all(root.join("crates/b/pkg")).expect("real member b");
+        let dirs = workspace_dirs(&root).expect("real directories");
+        assert!(dirs.contains(&root.join("crates/b/pkg")));
         fs::remove_dir_all(root).expect("cleanup");
     }
 
