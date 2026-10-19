@@ -70,14 +70,18 @@ Oxide says the gate refused a slot, it builds cold instead; that is safe.
   that change to the user, and never disable Gatekeeper.
 - `oxide clean --cargo-cache` asks Cargo to clean its own download cache once,
   with network refused. Use it when the Cargo home is large and builds always
-  run offline. It refuses (and says why) for config files, git or custom
-  sources, a missing `Cargo.lock` and similar routes; it reports `ran`,
+  run offline. It reads Cargo config and refuses (naming the key or file) for
+  source replacement, registries, credential providers, `git-fetch-with-cli`,
+  includes, unknown keys or unparseable files, and for git or custom sources,
+  a missing `Cargo.lock` and similar routes; it reports `ran`,
   `skipped` or `failed`. Do not delete files in the Cargo home or a slot by
   hand.
 - `OXIDE_POOL_CAP` sets the cap only when a pool is first created.
 - Use `oxide clean`, never plain `cargo clean`. `oxide clean` waits for active
   commands in this checkout, removes its private output and slot affinity, and
-  leaves shared slots intact. Plain `cargo clean` does not know the slot; with
+  leaves shared slots intact. If `target/` holds anything Cargo did not
+  create, it refuses and names it: move it out, or pass `--include-foreign`.
+  `oxide clean --dry-run` prints every path a clean would remove. Plain `cargo clean` does not know the slot; with
   Oxide's storage environment it would delete the shared build directory.
 
 ## Adoption

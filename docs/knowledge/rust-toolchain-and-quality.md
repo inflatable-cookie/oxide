@@ -20,7 +20,13 @@ The unpublished root package uses Rust edition 2021 and declares
 names remain subject to [Q-005](questions.md#q-005--what-names-are-safe-to-publish).
 It contains a Unix-only local storage prototype, the unpublished
 `oxide-storage-lease` and `oxide` binaries, and pins `sha2` 0.10.9 for
-persisted lease-token hashes. This does not establish production host support.
+persisted lease-token hashes. It pins `basic-toml` `=0.1.10` (oxide#095), the
+strict-profile exception in Tom's
+[2026-10-19 ruling](vision.md#product-workflow-direction), only to parse Cargo
+config for [`clean --cargo-cache`](contracts/workflow.md#cargo-home-hygiene):
+a TOML 1.0 parser whose only dependency is the already-pinned `serde`, so
+`Cargo.lock` gains this one package; it was resolved offline from the local
+cache (checksum `ba62675e8242a4c4e806d12f11d136e626e6c8361d6b829310732241652a178a`, matching the cached archive). This does not establish production host support.
 
 The reviewed design selects Cargo build-dir redirection as the smallest
 mechanism to qualify later. That setting is stable from Cargo 1.91; the pinned

@@ -77,6 +77,15 @@ run = "python3 scripts/test-oxide-cli.py"
 admission = "heavy"
 run = "python3 scripts/test-oxide-cli.py --launch-check"
 
+# Clean safety (oxide#095): stages `oxide` offline with 1.97.1, then proves
+# whole-target `clean` ownership (real Cargo target, foreign entries, dry
+# run, --include-foreign, symlink referent) and `clean --cargo-cache` config
+# parsing on a private CARGO_HOME seeded by copying cfg-if 1.0.0 from the host
+# cache. No pool, image or download. Not a benchmark and not full QA.
+[tasks."rust:oxide-cli:clean-safety"]
+admission = "heavy"
+run = "python3 scripts/test-oxide-cli.py --clean-safety"
+
 # Toolchain context (oxide#094): stages `oxide` offline with 1.97.1, then on
 # one fresh 128 MiB APFS pool checks that each caller context of a scratch
 # workspace (root 1.97.1, member 1.96.1, `--manifest-path`, RUSTC,

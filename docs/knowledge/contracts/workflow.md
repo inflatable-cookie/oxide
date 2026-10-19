@@ -28,6 +28,7 @@ oxide <check|test|clippy|build|run> [--profile <name>] [cargo args] [-- program 
 oxide <any other cargo command> [args]   # passed to Cargo, with storage where it builds
 oxide status                             # pool, slots, waits, stray Cargo output, Cargo home
 oxide status --launch-check              # macOS: a new executable's first-launch penalty, advisory
+oxide clean [--dry-run] [--include-foreign]  # remove <workspace>/target and slot affinity
 oxide clean --cargo-cache                # one pass of Cargo's own home cleanup, network refused
 oxide init [cargo init args]             # make this a Cargo project if needed, then adopt Oxide
 oxide new <path> [cargo new args]        # cargo new, then adopt Oxide
@@ -40,7 +41,7 @@ Commands fall into four classes:
 | Modelled | `check`, `test`, `clippy`, `build`, `run` | Profile-aware, leased, strategy-selected (see [profiles](#profiles-and-strategies)). |
 | Building passthrough | Other built-ins that compile (`doc`, `bench`, `rustc`, `rustdoc`, `fix`) and every unknown or external subcommand (`nextest`, `llvm-cov`, `miri`) | Passed to Cargo unchanged, under a lease with storage and profile definitions injected. Unknown commands are treated as building, which is the conservative choice. |
 | Plain passthrough | Non-building built-ins (`fmt`, `tree`, `metadata`, `add`, `remove`, `update`, `info`, `search`, `install`, `publish`, `login`, `vendor`, `fetch`, `generate-lockfile`, `locate-project`, `pkgid`, `version`, `help`) | Run as plain Cargo; no lease. |
-| Extended built-ins | `init`, `new`, `clean` | Cargo's command plus Oxide's step (see [adoption](#adoption-oxide-init)). `clean` removes the checkout's private outputs and slot affinity and never deletes a shared slot: a 2026-10-18 probe showed plain `cargo clean` also deletes the injected build directory. |
+| Extended built-ins | `init`, `new`, `clean` | Cargo's command plus Oxide's step (see [adoption](#adoption-oxide-init)). `clean` removes the checkout's private outputs and slot affinity and never deletes a shared slot: a 2026-10-18 probe showed plain `cargo clean` also deletes the injected build directory. A whole-target clean is Oxide's own plan ([clean](#clean)). |
 | Oxide-owned | `status` | Oxide semantics. |
 
 - A built-in Oxide extends keeps Cargo's meaning and adds to it. Purely
@@ -878,6 +879,70 @@ refuses state that has them. The lease ledger, receipt and standalone CLI
 contract are unchanged; see
 [local lease](local-lease.md#oxide-front-door-control-directory).
 
+## Clean
+
+Implemented in oxide#095 under Tom's
+[2026-10-19 ruling](../vision.md#product-workflow-direction), after a live
+`oxide clean` removed reviewed binaries under `target/oxide-handover/` that
+its dry run had not listed: Cargo 1.97.1's `clean --dry-run` prints paths
+only under `--verbose`, and a whole-target clean removes every entry.
+
+- **Whole-target clean** (no `-p`, `--workspace`, `--doc`, `--profile` or
+  `--release`). Oxide plans and removes `<workspace>/target` itself; Cargo's
+  `clean` is not run. It accepts `--dry-run`, `--include-foreign`,
+  `--manifest-path`, `-q`, `-v`, `--color`, `--locked`, `--frozen` and
+  `--offline`; any other argument refuses.
+- **Plan.** One enumeration of the target and everything under it, parents
+  first. Symlinks are listed as entries and never followed; another
+  filesystem under the target, an unreadable directory, more than 1,000,000
+  entries or depth 256 refuse rather than truncate. A symlinked target
+  refuses. So does the Oxide pool inside the target, checked by path, by
+  real path (an outside `OXIDE_POOL` symlink can name a pool inside) and by
+  the pool directory's device and inode during enumeration; selected cleans
+  get the same path checks. oxide#095 review found an outside symlink
+  passing the path-only check, so `--include-foreign` deleted the pool.
+- **Ownership.** Each top-level entry is classified against Cargo's target
+  layout at the pinned commit `c980f4866141969fab6254a680546a277789d6f0`:
+  - files [`CACHEDIR.TAG`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/crates/cargo-util/src/paths.rs#L799-L802),
+    [`.rustc_info.json`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/util/context/mod.rs#L511),
+    [`.future-incompat-report.json`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/compiler/future_incompat.rs#L98)
+    and [`.rustdoc_fingerprint.json`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/compiler/fingerprint/rustdoc.rs#L192-L199);
+  - directories [`doc`, `cargo-timings`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/compiler/layout.rs#L312-L313),
+    [`tmp`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/compiler/layout.rs#L329),
+    [`package`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/ops/cargo_package/mod.rs#L220)
+    and [`.metabuild`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/manifest.rs#L740);
+  - a profile directory, whatever its name, only when it holds a regular-file
+    [`.cargo-lock` or `.cargo-build-lock`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/compiler/layout.rs#L262-L291),
+    which Cargo creates in every profile directory it uses (not on NFS,
+    where Oxide therefore refuses);
+  - a target-triple directory ([pushed onto both roots](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/core/compiler/layout.rs#L243-L246))
+    only when it holds at least one such profile directory and otherwise
+    only `CACHEDIR.TAG`, `.rustdoc_fingerprint.json`, `doc`,
+    `cargo-timings` or `tmp`.
+  Anything else, including a symlink or a plausible name without Cargo's
+  lock, is foreign. Contents below the top level are not classified.
+- **Foreign entries refuse** by default, naming them (first 20), in the dry
+  run and the real clean alike, before any wait, deletion or affinity change.
+  `--include-foreign` adds them to the plan; it authorizes only the
+  enumerated tree, never a symlink's referent.
+- **`--dry-run`** prints every planned path on stdout, the target included,
+  and a summary on stderr. It changes nothing, takes no clean barrier and
+  leaves affinity alone.
+- **Real clean.** Waits for active commands in the checkout as before, plans
+  again under the clean barrier (a refusal there ends the clean without
+  touching affinity), then removes exactly the planned paths, children
+  first: files and symlinks are unlinked, directories removed only when
+  empty. A path that changed type or gained unplanned content is left,
+  listed, and the command fails with affinity kept. On success it drops
+  this checkout's slot affinity and prints the counts and any included
+  foreign entries.
+- **Selected clean** (`-p`, `--workspace`, `--doc`, `--profile`,
+  `--release`) is Cargo's, as before: private target, empty private build
+  directory, affinity dropped. Cargo removes only its own named artifacts
+  there. `--dry-run` with a selection refuses, since Cargo's selected dry run
+  does not print every path; so does `--include-foreign`.
+- **Proof.** `effigy rust:oxide-cli:clean-safety` (below).
+
 ## Cargo home hygiene
 
 Implemented in oxide#085 under Tom's
@@ -915,10 +980,32 @@ it never deletes there itself.
     `CARGO_REGISTRY_TOKEN`, `CARGO_SOURCE_*`, `CARGO_UNSTABLE_*`. The
     refusal names the variable, never its value, since a refused variable
     can hold a registry token;
-  - any Cargo config file Cargo would read (`.cargo/config.toml` or
-    `.cargo/config` in the current directory or an ancestor, or in the Cargo
-    home). Oxide does not parse them: a file can set source replacement,
-    registries, `git-fetch-with-cli`, credential providers or includes;
+  - a Cargo config file Cargo would read (`.cargo/config.toml` or
+    `.cargo/config` in the current directory or an ancestor, or
+    `config.toml` or `config` in the Cargo home) that is unreadable, larger
+    than 1 MiB, not UTF-8, or not parseable as TOML 1.0 by the exact-pinned
+    `basic-toml` 0.1.10 (oxide#095), which also refuses TOML 1.1-only syntax
+    and datetimes. Each file is parsed, so quoted, dotted and nested
+    spellings of a key are one key. The refusal names the file and, for a
+    parse failure, the line; parser text, which can quote a value, is never
+    shown;
+  - any parsed key outside a fixed contained set, named by key, never by
+    value: `source`, `registries`, `registry.credential-provider`,
+    `registry.global-credential-providers`, `credential-alias`,
+    `registry.default`, `net.git-fetch-with-cli`, `net.offline`, `net.ssh`,
+    `include`, `patch`, `paths`, `unstable`, the program settings
+    `build.rustc`, `build.rustc-wrapper`, `build.rustc-workspace-wrapper`
+    and `build.rustdoc`, and every unknown key. Contained, so a config of
+    only these (or comments) proceeds: the tables `alias`, `term`,
+    `cargo-new`, `doc`, `install`, `future-incompat-report`, `profile`,
+    `target`, `env` and `resolver`; `net.retry`; `registry.token`;
+    `cache.auto-clean-frequency` and `http.proxy`, which Oxide's own
+    `--config` overrides; the `http` keys `timeout`, `low-speed-limit`,
+    `multiplexing`, `debug`, `user-agent`, `check-revoke`, `ssl-version`,
+    `cainfo` and `proxy-cainfo`; and the `build` keys `jobs`, `target`,
+    `target-dir`, `build-dir`, `rustflags`, `rustdocflags`, `incremental`,
+    `dep-info-basedir`, `pipelining` and `warnings`. The environment screen
+    above does not cover `RUSTC_WRAPPER` or `RUSTC`;
   - a Cargo other than 1.97.1 (`cargo -V`), whose trigger and trace text
     were qualified;
   - a workspace without the Oxide `AGENTS.md` block;
@@ -963,7 +1050,7 @@ it never deletes there itself.
   lockfile checksum), plus its sparse-index metadata. Then: the `status`
   line equals the proof's own walk; refusals for a missing lock, an SSH git
   source (double- and single-quoted), `CARGO_NET_GIT_FETCH_WITH_CLI`, a
-  source-replacement config file, a custom registry and a stale lock whose
+  config file setting source replacement, a custom registry and a stale lock whose
   manifest adds an SSH git dependency; a cleanup on the complete cached lock that ran with
   0 proxy connections; Cargo's lock skip under a shared hold on
   `.package-cache-mutate`; and an uncached crate whose fetch failed through
@@ -980,6 +1067,40 @@ it never deletes there itself.
   conflicting value reported and ignored there and on the APFS pool) and a
   slot whose build script hard-links a 64 KiB file: `status` matched the
   proof's walk, with the pair counted once.
+
+- **Clean-safety proof.** `effigy rust:oxide-cli:clean-safety` (oxide#095)
+  stages `oxide` offline with 1.97.1 and needs no pool, image or download.
+  `cargo` on its `PATH` is a recording wrapper that refuses `cargo clean`.
+  A tiny std-only crate gets a real Cargo target (`cargo build --offline
+  --target <host>`, private empty `CARGO_HOME`). On it: the Cargo-only dry
+  run lists exactly the tree and changes nothing, and the clean removes it;
+  then, with a nested foreign directory, a foreign file and a symlink to an
+  outside sentinel added, the dry run and the clean both refuse naming them
+  with nothing changed; the `--include-foreign` dry run lists exactly the
+  tree and the clean removes it, sentinel intact; selected-clean
+  `--dry-run`/`--include-foreign` and `--target` refuse; with `OXIDE_POOL`
+  an outside symlink to a pool directory inside the target, the
+  `--include-foreign` clean, its dry run and a `--release` clean all refuse
+  with the slot sentinel and tree unchanged. A fresh private
+  `CARGO_HOME` is seeded by copying `cfg-if` 1.0.0 and its sparse-index
+  entry from the host cache (checksum checked, nothing fetched); there each
+  risky key refuses by name (`source`, `registries`, both credential-provider
+  keys, quoted-dotted `net.git-fetch-with-cli`, `include`; one in the Cargo
+  home, a `build.rustc-wrapper` in an ancestor's `.cargo/config`), with no
+  config value in any diagnostic; a malformed file and a TOML 1.1 inline
+  table refuse as unparseable; missing lock, SSH lock source, stale lock and
+  `CARGO_NET_GIT_FETCH_WITH_CLI` still refuse; and a comments-only project
+  config with a `[build]`/`[term]` home config proceeds to Cargo with zero
+  proxy connections and a labelled outcome. Its first run (2026-10-19, 25 s
+  after admission including cleanup, 72 MiB owned, host free above
+  754,000 MiB at every sample) passed; Cargo skipped that pass on its
+  frequency gate (exit 75) because the fresh home's database was created the
+  same second, so no deletion was observed. The wrapper saw 24 Cargo calls:
+  17 `locate-project`, 4 `-V`, 2 `metadata`, 1 `fetch`, no `clean`. The
+  second and last run, after the pool fix and with the aliased-pool case
+  added, passed the same way (20 s, 73 MiB owned, host free above
+  752,000 MiB, the same frequency-gate skip; 27 calls: 20 `locate-project`,
+  4 `-V`, 2 `metadata`, 1 `fetch`, no `clean`).
 
 ## Launch check
 
