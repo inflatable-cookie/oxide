@@ -356,6 +356,12 @@ dogfooding sequence still requires a reviewed successor merge; changing it to
 current main, shelving the skip, or opening a normal-overhead round awaits Tom
 ([Q-016](questions.md#q-016--how-should-oxide-proceed-after-the-086-no-go)).
 
+Tom's ruling, 2026-10-19 ("Yes - if it works then we should verify coverage for all rust versions from a certain threshold.. maybe 1.95?"), answering the Supervisor's proposal to replace shelving the skip path:
+- The skip path continues with a file-metadata input identity (no Git spawns): stat records for the final binary's dep-info inputs, manifests, `Cargo.lock`, Cargo config and toolchain-resolution files, plus an environment digest.
+- A deliberate, bounded exception lets version-pinned, fail-closed readers of Cargo's internal build-script output and encoded dep-info supply non-local build-script and absolute inputs. An unknown Cargo version or format falls back to Cargo.
+- Once it works, Oxide's version-sensitive behaviour must be qualified for every stable Rust from 1.95 onward, with side-by-side toolchain installs for that matrix. Versions outside the qualified range disable version-sensitive features rather than guessing.
+- The normal-path overhead round proceeds first, because the skip path consumes its toolchain-identity work.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
