@@ -152,12 +152,17 @@ The proposed [workflow](contracts/workflow.md#open-decisions) lists W-1 to W-8: 
 
 ## Q-016 — How should Oxide proceed after the #086 no-go?
 
-Tom approved Oxide-only dogfooding after the successor's reviewed merge
-([vision](vision.md#product-workflow-direction)). The attempted successor did
-not meet either fixed timing gate; its correctness proof also stopped before
-its new eligibility cases ([profile](rust-dx-landscape.md#oxide-run-overhead-profile-2026-10-19)).
-Open: whether dogfooding should instead use the currently shipped main, and
-whether to shelve the skip path and scope a normal-path overhead round.
-Those are with Tom in the architect's thread; no parallel operator question or
-sequence change is created here. The profile's pre-exec/total residual is an
-observation with unisolated causes, not proof of a binary-rewrite execution cost.
+Tom approved a new metadata-based skip path, a bounded version-pinned
+internal-reader exception for build-script and dep-info coverage, and
+qualification from Rust 1.95 onward. He separately approved a normal-path
+overhead round and Oxide-only dogfooding on current main
+([vision](vision.md#product-workflow-direction)). The approved skip path is
+conditional on its fixed performance and correctness gates; unknown formats
+and unqualified versions fall through rather than guessing. Queue decisions
+`306dc549-5db6-403b-b443-1e5b85e2c8b1` and
+`62b39943-9cff-4665-9528-849ddc3a5568` retain the exact relayed replies.
+
+The #086 no-go and its incomplete correctness proof remain unchanged
+([profile](rust-dx-landscape.md#oxide-run-overhead-profile-2026-10-19)).
+Its pre-exec/total residual has unisolated causes; it does not prove a
+binary-rewrite execution cost. The new scopes transfer no prior acceptance.
