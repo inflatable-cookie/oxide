@@ -2248,7 +2248,7 @@ def prove_cargo_cache(runner: Runner) -> None:
     refused(good, "Cargo.lock is missing", "missing lockfile")
     refused(ssh, "SSH and other non-HTTP git transports cannot be contained", "SSH git source")
     refused(quoted, "Cargo.lock source git+ssh://", "single-quoted SSH git source")
-    refused(custom, f"Cargo config file {custom}/.cargo/config.toml exists", "custom source")
+    refused(custom, f'Cargo config file {custom}/.cargo/config.toml sets key "source"', "custom source")
 
     # Setup: the one allowed download into the private home.
     write_fixture(good, {"Cargo.lock": "version = 4\n\n" + cfg_if + lock_package("cache-good", "0.1.0", deps=["cfg-if"])})
@@ -2868,6 +2868,304 @@ def context_main() -> int:
     return 0
 
 
+CLEAN_SECRET = "oxide-secret-value"
+WRAPPER = """#!/bin/sh
+printf '%s\\n' "$*" >> "$OXIDE_PROOF_CARGO_LOG"
+if [ "$1" = clean ]; then
+    echo "proof cargo: clean refused" >&2
+    exit 97
+fi
+exec "$OXIDE_PROOF_REAL_CARGO" "$@"
+"""
+
+
+def tree_state(root: str) -> dict:
+    """Every path under root, root included, to (kind, size, mtime_ns);
+    symlinks are recorded and never followed."""
+    state = {}
+    for current, dirs, files in os.walk(root, followlinks=False):
+        for name in [current, *(os.path.join(current, entry) for entry in dirs + files)]:
+            metadata = os.lstat(name)
+            kind = "link" if os.path.islink(name) else "dir" if os.path.isdir(name) else "file"
+            state[name] = (kind, metadata.st_size, metadata.st_mtime_ns)
+    return state
+
+
+def seed_cargo_home(home: str) -> None:
+    """Copy cfg-if 1.0.0 and its sparse-index entry from the host Cargo
+    home into the private one; nothing is fetched."""
+    host = os.environ.get("CARGO_HOME") or os.path.join(os.path.expanduser("~"), ".cargo")
+    copied = 0
+    for index in sorted(os.listdir(os.path.join(host, "registry", "index"))):
+        crate = os.path.join(host, "registry", "cache", index, "cfg-if-1.0.0.crate")
+        entry = os.path.join(host, "registry", "index", index, ".cache", "cf", "g-", "cfg-if")
+        config = os.path.join(host, "registry", "index", index, "config.json")
+        if not (os.path.isfile(crate) and os.path.isfile(entry)):
+            continue
+        with open(crate, "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
+        if digest != CFG_IF_CHECKSUM:
+            fail(f"host cfg-if 1.0.0 archive sha256 {digest}")
+        for source in (crate, entry, config):
+            if not os.path.isfile(source):
+                continue
+            target = os.path.join(home, os.path.relpath(source, host))
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copyfile(source, target)
+            copied += os.path.getsize(source)
+        print(f"clean-safety seed: cfg-if 1.0.0 (sha256 {digest}) and its index entry copied from {index}, {copied} bytes, no download")
+        return
+    fail("the host Cargo home has no cached cfg-if 1.0.0 with its index entry; the proof does not fetch")
+
+
+def prove_whole_clean(call, parent: str, triple: str, real_env: dict) -> None:
+    """Whole-target clean on a real Cargo target, then with foreign
+    entries: dry run equals the plan, refusal changes nothing,
+    --include-foreign removes only the enumerated tree."""
+    app = os.path.join(parent, "clean-app")
+    write_fixture(app, {
+        "Cargo.toml": '[package]\nname = "clean-app"\nversion = "0.1.0"\nedition = "2021"\n',
+        "rust-toolchain.toml": '[toolchain]\nchannel = "1.97.1"\n',
+        "src/main.rs": "fn main() {}\n",
+    })
+    built = subprocess.run(
+        ["cargo", "build", "--offline", "--target", triple], cwd=app, env=real_env,
+        capture_output=True, text=True, timeout=min(120, remaining()),
+    )
+    expect(built.returncode, 0, "fixture cargo build", built.stderr)
+    target = os.path.join(app, "target")
+    pristine = os.path.join(parent, "clean-pristine")
+    shutil.copytree(target, pristine, symlinks=True)
+    print(f"clean-safety Cargo target: {sorted(os.listdir(target))}")
+
+    def dry(label: str, args: list) -> None:
+        before = tree_state(target)
+        code, stdout, stderr = call(app, ["clean", "--dry-run", *args])
+        expect(code, 0, label, stderr)
+        listed = set(stdout.splitlines())
+        if listed != set(before):
+            fail(f"{label}: listed {len(listed)} paths, the tree holds {len(before)}: {sorted(listed ^ set(before))[:10]}")
+        if tree_state(target) != before or "nothing was removed" not in stderr:
+            fail(f"{label}: the dry run changed the tree or did not say so: {stderr!r}")
+        print(f"{label}: {len(listed)} paths listed, equal to the tree, nothing changed")
+
+    dry("Cargo-only dry run", [])
+    code, _, stderr = call(app, ["clean"])
+    expect(code, 0, "Cargo-only clean", stderr)
+    if os.path.lexists(target) or "oxide: removed " not in stderr or "foreign" in stderr:
+        fail(f"Cargo-only clean did not remove the target cleanly: {stderr!r}")
+
+    shutil.copytree(pristine, target, symlinks=True)
+    outside = os.path.join(parent, "clean-outside")
+    os.makedirs(outside)
+    with open(os.path.join(outside, "sentinel"), "w") as handle:
+        handle.write("keep")
+    write_fixture(target, {"oxide-handover/bin/tool": "reviewed binary", "oxide-handover/bin/deep/receipt.json": "{}", "notes.txt": "mine"})
+    os.symlink(outside, os.path.join(target, "oxide-handover", "escape"))
+    for label, args in (("foreign dry run", ["--dry-run"]), ("foreign clean", [])):
+        before = tree_state(target)
+        code, stdout, stderr = call(app, ["clean", *args])
+        expect(code, 1, label, stderr)
+        if "clean refused" not in stderr or "oxide-handover" not in stderr or "notes.txt" not in stderr or "--include-foreign" not in stderr:
+            fail(f"{label}: refusal did not name the foreign entries: {stderr!r}")
+        if stdout or tree_state(target) != before:
+            fail(f"{label}: refusal listed or changed something")
+        print(f"{label}: refused, naming oxide-handover and notes.txt, nothing changed")
+    dry("foreign dry run --include-foreign", ["--include-foreign"])
+    code, _, stderr = call(app, ["clean", "--include-foreign"])
+    expect(code, 0, "clean --include-foreign", stderr)
+    if os.path.lexists(target) or "including foreign entries (--include-foreign): notes.txt, oxide-handover" not in stderr:
+        fail(f"clean --include-foreign did not remove and name the foreign entries: {stderr!r}")
+    with open(os.path.join(outside, "sentinel")) as handle:
+        if handle.read() != "keep":
+            fail("the symlink referent changed")
+    print("clean --include-foreign: target removed, foreign entries named, symlink referent intact")
+
+    for args, needle in ((["-p", "clean-app", "--dry-run"], "lists paths only for a whole-target clean"),
+                         (["--doc", "--include-foreign"], "--include-foreign applies only to a whole-target clean"),
+                         (["--target", triple], "not supported for a whole-target clean")):
+        code, _, stderr = call(app, ["clean", *args])
+        expect(code, 1, f"clean {args}", stderr)
+        if needle not in stderr:
+            fail(f"clean {args} refusal did not say {needle!r}: {stderr!r}")
+
+
+def prove_config_gate(call, parent: str, home: str) -> None:
+    """`clean --cargo-cache` reads Cargo config: risky keys in each config
+    location refuse by name, unparseable files refuse, a comments-only
+    project config with an unrelated home config proceeds."""
+    offline = {"CARGO_NET_OFFLINE": "true"}
+    cfg_if = lock_package("cfg-if", "1.0.0", CRATES_IO_SOURCE, CFG_IF_CHECKSUM)
+    root = os.path.join(parent, "config")
+    good = cache_fixture(root, "config-good", 'cfg-if = "=1.0.0"\n', cfg_if + lock_package("config-good", "0.1.0", deps=["cfg-if"]))
+    missing = cache_fixture(root, "config-missing", 'cfg-if = "=1.0.0"\n', None)
+    ssh = cache_fixture(
+        root, "config-ssh", 'remote = { git = "ssh://git@127.0.0.1:9/remote.git" }\n',
+        lock_package("config-ssh", "0.1.0", deps=["remote"])
+        + lock_package("remote", "0.1.0", "git+ssh://git@127.0.0.1:9/remote.git#" + "1" * 40),
+    )
+    stale = cache_fixture(
+        root, "config-stale", 'cfg-if = "=1.0.0"\nremote = { git = "ssh://git@127.0.0.1:9/remote.git" }\n',
+        cfg_if + lock_package("config-stale", "0.1.0", deps=["cfg-if"]),
+    )
+    for path in (good, missing, ssh, stale):
+        code, _, stderr = call(path, ["init"], offline)
+        expect(code, 0, f"adopt {os.path.basename(path)}", stderr)
+    project = os.path.join(good, ".cargo", "config.toml")
+    os.makedirs(os.path.dirname(project))
+    home_config = os.path.join(home, "config.toml")
+    ancestor = os.path.join(root, ".cargo", "config")
+
+    def refused(cwd: str, needle: str, label: str, extra: dict | None = None) -> None:
+        code, _, stderr = call(cwd, ["clean", "--cargo-cache"], extra)
+        expect(code, 1, label, stderr)
+        if "oxide: clean --cargo-cache refused: " not in stderr or needle not in stderr or "asking Cargo to clean" in stderr:
+            fail(f"{label}: refusal did not name {needle!r}: {stderr!r}")
+        if CLEAN_SECRET in stderr:
+            fail(f"{label}: a config value reached the diagnostic")
+        print(f"{label}: refused ({needle})")
+
+    def written(path: str, text: str) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write(text)
+
+    risky = (
+        (project, f'[source.crates-io]\nreplace-with = "{CLEAN_SECRET}"\n', f'{project} sets key "source": source replacement'),
+        (project, f'[registries.mine]\nindex = "sparse+https://{CLEAN_SECRET}.invalid/"\n', 'key "registries": a custom registry'),
+        (project, f'[registry]\ncredential-provider = "{CLEAN_SECRET}"\n', 'key "registry"."credential-provider": credential providers'),
+        (project, f'registry.global-credential-providers = ["{CLEAN_SECRET}"]\n', 'key "registry"."global-credential-providers": credential providers'),
+        (project, "\"net\".'git-fetch-with-cli' = true\n", 'key "net"."git-fetch-with-cli": net.git-fetch-with-cli'),
+        (project, f'include = "{CLEAN_SECRET}.toml"\n', 'key "include": it includes another config file'),
+        (home_config, "[net]\ngit-fetch-with-cli = true\n", f'{home_config} sets key "net"."git-fetch-with-cli"'),
+        (ancestor, f'[build]\nrustc-wrapper = "{CLEAN_SECRET}"\n', f'{ancestor} sets key "build"."rustc-wrapper": it names a program'),
+        (project, f'[net\ntoken = "{CLEAN_SECRET}"\n', f"{project} cannot be parsed as TOML 1.0 (line 1)"),
+        (project, "net = {\n  retry = 2\n}\n", f"{project} cannot be parsed as TOML 1.0"),
+    )
+    for path, text, needle in risky:
+        written(path, text)
+        refused(good, needle, f"config {os.path.basename(os.path.dirname(path))}/{os.path.basename(path)} {text.splitlines()[0][:40]!r}")
+        os.remove(path)
+
+    # Existing refusals, with no config present.
+    refused(missing, "Cargo.lock is missing", "missing lockfile")
+    refused(ssh, "SSH and other non-HTTP git transports cannot be contained", "SSH git source")
+    refused(stale, "Cargo cannot resolve this workspace offline from Cargo.lock", "stale lock with an SSH dependency")
+    refused(good, "CARGO_NET_GIT_FETCH_WITH_CLI is set: net.git-fetch-with-cli", "git-fetch-with-cli", {"CARGO_NET_GIT_FETCH_WITH_CLI": "true"})
+
+    written(project, '# [source.crates-io]\n# replace-with = "mirror"\n')
+    written(home_config, '[build]\njobs = 2\n\n[term]\ncolor = "never"\n')
+    code, _, stderr = call(good, ["clean", "--cargo-cache"])
+    if code not in (0, 75) or "asking Cargo to clean" not in stderr:
+        fail(f"comments-only config did not proceed to Cargo: exit {code} {stderr!r}")
+    if not re.search(r"oxide: closed proxy 127\.0\.0\.1:\d+ closed 0 connection\(s\)", stderr):
+        fail(f"the proceeding cleanup reached for the network: {stderr!r}")
+    outcome = next((line for line in stderr.splitlines() if line.startswith(("oxide: Cargo cleanup ran", "oxide: Cargo skipped cleanup"))), None)
+    if outcome is None:
+        fail(f"no labelled outcome: {stderr!r}")
+    print(f"comments-only project config with an unrelated home config: proceeded, exit {code}, 0 proxy connections, {outcome}")
+
+
+def clean_safety_main() -> int:
+    """`oxide clean` target ownership and `clean --cargo-cache` config
+    parsing on scratch fixtures: no pool, image or download."""
+    global STARTED
+    if sys.platform != "darwin":
+        fail("the clean-safety proof requires macOS")
+    STARTED = time.monotonic()
+    reserve(os.environ.get("OXIDE_TASK_SCRATCH_ROOT") or "/private/tmp", "admission", "clean-safety")
+    root = scratch_root()
+    parent = os.path.join(root, "oxide-clean-safety")
+    os.makedirs(parent, mode=0o700, exist_ok=False)
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    stage = dict(os.environ)
+    for name in ("CARGO", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "RUSTC", "RUSTC_WRAPPER"):
+        stage.pop(name, None)
+    stage.update({
+        "RUSTUP_TOOLCHAIN": BUILDER,
+        "CARGO_TARGET_DIR": os.path.join(parent, "stage-target"),
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_NET_OFFLINE": "true",
+    })
+    setup = time.monotonic()
+    builder = toolchain_identity(stage, repo)
+    setup_seconds = time.monotonic() - setup
+    print(f"clean-safety setup: 2 version calls, {setup_seconds:.1f} s, 0 MiB written")
+    if builder != MATRIX[BUILDER] or setup_seconds > 30:
+        fail(f"setup is not {BUILDER} within 30 s: {builder}, {setup_seconds:.1f} s")
+    executables = build_binaries(("--offline",), stage)
+    staged = tree_bytes(parent, False)
+    print(f"clean-safety staging: {time.monotonic() - STARTED:.0f} s, {staged // (1024 * 1024)} MiB (host Cargo home, offline)")
+    if staged > SCRATCH_LIMIT_BYTES:
+        fail(f"staging {staged} exceeds 512 MiB")
+    reserve(parent, "after staging", "clean-safety")
+
+    real_cargo = shutil.which("cargo")
+    if not real_cargo:
+        fail("no cargo on PATH")
+    bindir = os.path.join(parent, "bin")
+    os.makedirs(bindir)
+    write_fixture(bindir, {"cargo": WRAPPER})
+    os.chmod(os.path.join(bindir, "cargo"), 0o755)
+    cargo_log = os.path.join(parent, "cargo-calls.log")
+    no_pool = os.path.join(parent, "never-created-pool")
+    home = os.path.join(parent, "cargo-home")
+    os.makedirs(home, mode=0o700)
+    base = {name: value for name, value in os.environ.items()
+            if not (name.startswith(("CARGO_NET_", "CARGO_REGISTR", "CARGO_SOURCE_", "CARGO_UNSTABLE_", "CARGO_HTTP_", "CARGO_TARGET_DIR", "CARGO_BUILD_"))
+                    or name.lower().endswith("_proxy") or name in ("CARGO", "RUSTC", "RUSTC_WRAPPER", "CARGO_HOME"))}
+    # An empty private home for the fixture build and locate calls; the
+    # host Cargo home serves only offline staging.
+    build_home = os.path.join(parent, "build-home")
+    os.makedirs(build_home, mode=0o700)
+    base["CARGO_HOME"] = os.path.realpath(build_home)
+    real_env = {**base, "CARGO_NET_OFFLINE": "true"}
+    env = {**base, "PATH": bindir + os.pathsep + base.get("PATH", ""), "OXIDE_POOL": no_pool,
+           "OXIDE_PROOF_CARGO_LOG": cargo_log, "OXIDE_PROOF_REAL_CARGO": real_cargo}
+
+    def call(cwd: str, args: list, extra: dict | None = None, cargo_home: str | None = None):
+        result = subprocess.run(
+            [executables["oxide"], *args], cwd=cwd,
+            env={**env, **({"CARGO_HOME": cargo_home} if cargo_home else {}), **(extra or {})},
+            capture_output=True, text=True, timeout=min(60, remaining()),
+        )
+        return result.returncode, result.stdout, result.stderr
+
+    triple = {"arm64": "aarch64-apple-darwin", "x86_64": "x86_64-apple-darwin"}[os.uname().machine]
+    try:
+        prove_whole_clean(call, parent, triple, real_env)
+        reserve(parent, "after whole-target clean", "clean-safety")
+        seed_cargo_home(home)
+        prove_config_gate(lambda cwd, args, extra=None: call(cwd, args, extra, os.path.realpath(home)), parent, os.path.realpath(home))
+        reserve(parent, "after config gate", "clean-safety")
+        with open(cargo_log) as handle:
+            calls = handle.read().splitlines()
+        commands = {}
+        for line in calls:
+            word = line.split(" ")[0] if line else ""
+            commands[word] = commands.get(word, 0) + 1
+        print(f"clean-safety Cargo calls through the recording wrapper: {len(calls)} {dict(sorted(commands.items()))}")
+        if commands.get("clean") or commands.get("fetch") != 1:
+            fail("Oxide called cargo clean, or cargo fetch other than once for the proceeding cleanup")
+        if os.path.lexists(no_pool):
+            fail("the clean-safety proof created a pool")
+        owned = tree_bytes(parent, False)
+        print(f"clean-safety owned scratch: {owned // (1024 * 1024)} MiB")
+        if owned > SCRATCH_LIMIT_BYTES:
+            fail(f"owned scratch {owned} exceeds 512 MiB")
+    except Exception:
+        print(f"clean-safety proof retained its owned scratch at {parent}", file=sys.stderr)
+        raise
+    shutil.rmtree(parent)
+    if not os.environ.get("OXIDE_TASK_SCRATCH_ROOT"):
+        os.rmdir(root)
+    elapsed = time.monotonic() - STARTED
+    if elapsed > PROOF_SECONDS:
+        fail(f"clean-safety proof took {elapsed:.0f} s, over {PROOF_SECONDS} s")
+    print(f"oxide clean-safety proof held: {elapsed:.0f} s including cleanup, owned scratch {owned // (1024 * 1024)} MiB, scratch removed")
+    return 0
+
+
 def launch_main() -> int:
     """The launch check alone, offline: no pool, image, download or Cargo
     home other than the host's cached registry for staging."""
@@ -2930,6 +3228,10 @@ def launch_main() -> int:
 
 def main() -> int:
     global STARTED
+    if "--clean-safety" in sys.argv:
+        if sys.argv[1:] != ["--clean-safety"]:
+            fail("usage: test-oxide-cli.py --clean-safety")
+        return clean_safety_main()
     if "--launch-check" in sys.argv:
         if len(sys.argv) != 2:
             fail("usage: test-oxide-cli.py --launch-check")
