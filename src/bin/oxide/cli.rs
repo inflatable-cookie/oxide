@@ -20,6 +20,8 @@ pub enum Class {
     New,
     /// `status`: Oxide-owned.
     Status,
+    /// `pool`: Oxide-owned pool registration; not a Cargo built-in.
+    Pool,
 }
 
 pub fn classify(command: &str) -> Class {
@@ -27,6 +29,7 @@ pub fn classify(command: &str) -> Class {
         "check" | "test" | "clippy" | "build" | "run" => Class::Modelled,
         "clean" => Class::Clean,
         "status" => Class::Status,
+        "pool" => Class::Pool,
         "init" => Class::Init,
         "new" => Class::New,
         "fmt" | "tree" | "metadata" | "add" | "remove" | "update" | "info" | "search"
@@ -434,6 +437,7 @@ mod tests {
         }
         assert_eq!(classify("clean"), Class::Clean);
         assert_eq!(classify("status"), Class::Status);
+        assert_eq!(classify("pool"), Class::Pool);
         assert_eq!(classify("init"), Class::Init);
         assert_eq!(classify("new"), Class::New);
     }

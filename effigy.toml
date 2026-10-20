@@ -95,6 +95,17 @@ run = "python3 scripts/test-oxide-cli.py --clean-safety"
 admission = "heavy"
 run = "python3 scripts/test-oxide-cli.py --toolchain-context"
 
+# Removable build volume, part 1 (oxide#097): stages `oxide` offline with
+# 1.97.1, then models the removable drive as one separately attached 128 MiB
+# APFS sparse image in owned scratch, mounted by hdiutil at a unique
+# /Volumes/<name>, over a budget-only internal directory pool: registration
+# and refusals, selection present / below reserve / absent, flush cost,
+# injected flush-failure retirement, status. Ordinary detach only. Not a
+# benchmark and not full QA.
+[tasks."rust:oxide-removable-pool"]
+admission = "heavy"
+run = "python3 scripts/test-oxide-removable-pool.py"
+
 # Cargo version matrix (oxide#091): one logical proof per exact stable
 # release. Each stages `oxide` offline with the builder 1.97.1, then runs the
 # shipped freshness gate, stray detection and dep-info decoder under the

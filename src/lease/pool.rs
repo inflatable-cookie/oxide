@@ -1,7 +1,6 @@
 //! Exclusive pool: short-lived flock, durable JSON ledger, idle-only eviction.
 
 use super::backing::{self, BackingPaths, CapacitySample};
-use super::BUDGET_BACKEND_DIRECTORY_V1;
 use super::{
     canonical_existing_dir, current_uid, ensure_private_dir, io_error, persist_private_file,
     random_hex, read_private_file, remove_tree_owned, AccountingCoverage, CapacityObservations,
@@ -13,10 +12,13 @@ use super::{
 };
 #[cfg(test)]
 use super::{ByteObservation, ObservationUnknownReason};
+use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
 use crate::inventory::{inventory_directory, InventoryLimits};
+use crate::volume::Binding;
 use crate::{BoundedBacking, BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
@@ -45,6 +47,21 @@ struct PoolConfig {
     store_id: String,
     cap_bytes: u64,
     image_bytes: u64,
+    /// The removable volume of an `apfs-volume-v1` pool. Absent for every
+    /// other backend, so their config bytes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    volume: Option<VolumeConfig>,
+}
+
+/// Where an `apfs-volume-v1` pool keeps its payload: `payload_dir` directly
+/// under the mount root of the volume with this UUID. Config, ledger and
+/// lock stay in the internal pool directory.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct VolumeConfig {
+    mount_point: PathBuf,
+    volume_uuid: String,
+    payload_dir: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -85,20 +102,38 @@ enum SlotPersistState {
 enum Payload {
     Bounded(BoundedBacking),
     Budget(PathBuf),
+    /// A directory on a verified removable volume, held open. Slot
+    /// directories are created through `fd`, never by path.
+    Volume {
+        binding: Binding,
+        root: PathBuf,
+        fd: OwnedFd,
+    },
 }
 
 impl Payload {
     fn payload_root(&self) -> &Path {
         match self {
             Self::Bounded(backing) => backing.payload_root(),
-            Self::Budget(root) => root,
+            Self::Budget(root) | Self::Volume { root, .. } => root,
         }
     }
 
     fn verified_capacity_bytes(&self) -> Result<u64, LeaseError> {
         match self {
             Self::Bounded(backing) => Ok(backing.descriptor().verified_capacity_bytes),
-            Self::Budget(_) => Err(LeaseError::BackingMismatch),
+            Self::Budget(_) | Self::Volume { .. } => Err(LeaseError::BackingMismatch),
+        }
+    }
+
+    /// Recheck a removable volume before Oxide changes anything on it.
+    fn verify_volume(&self) -> Result<(), LeaseError> {
+        match self {
+            Self::Volume { binding, .. } => binding
+                .verify()
+                .map(|_| ())
+                .map_err(|_| LeaseError::BackingMismatch),
+            Self::Bounded(_) | Self::Budget(_) => Ok(()),
         }
     }
 }
@@ -149,6 +184,7 @@ pub fn init(request: InitRequest) -> Result<PoolInfo, LeaseError> {
         store_id: store_id.clone(),
         cap_bytes: request.cap_bytes,
         image_bytes: request.image_bytes,
+        volume: None,
     };
     let ledger = Ledger {
         version: LEASE_VERSION,
@@ -180,13 +216,95 @@ pub mod managed {
     use super::super::{
         ensure_private_dir, LeaseError, LeaseGrant, PoolInfo, PoolStatus, ReleaseReceipt,
         BUDGET_BACKEND_DIRECTORY_V1, CONFIG_NAME, LEASE_VERSION, PAYLOAD_NAME, SLOTS_NAME,
+        VOLUME_BACKEND_APFS_V1,
     };
     use super::LeaseRequest;
     use super::{
         lock_pool, prepare_new_pool, random_hex, write_config, write_ledger, Backends, Ledger,
-        Pool, PoolConfig,
+        Payload, Pool, PoolConfig, VolumeConfig,
     };
+    use crate::volume::Binding;
+    use std::os::fd::AsFd;
     use std::path::Path;
+    use std::time::Duration;
+
+    /// Create an `apfs-volume-v1` pool: config, ledger and lock in `pool`
+    /// (internal), payload in a new empty owner-only `payload_dir` on the
+    /// verified volume, created through the volume's descriptor. The budget
+    /// is an admission figure only.
+    pub fn init_volume_pool(
+        pool: &Path,
+        binding: &Binding,
+        payload_dir: &str,
+        budget_bytes: u64,
+    ) -> Result<PoolInfo, LeaseError> {
+        if budget_bytes == 0 {
+            return Err(LeaseError::InvalidInput("budget must be positive"));
+        }
+        let pool = prepare_new_pool(pool)?;
+        let _lock = lock_pool(&pool)?;
+        if pool.join(CONFIG_NAME).symlink_metadata().is_ok() {
+            return Err(LeaseError::InvalidInput("pool already initialized"));
+        }
+        let payload = binding
+            .dir_at(binding.fd(), payload_dir, true)
+            .map_err(LeaseError::Io)?;
+        let root = binding.mount_point().join(payload_dir);
+        let entries = std::fs::read_dir(&root)
+            .map_err(|error| LeaseError::Io(error.to_string()))?
+            .count();
+        if entries != 0 {
+            return Err(LeaseError::InvalidInput(
+                "the volume's payload directory is not empty",
+            ));
+        }
+        binding
+            .dir_at(payload.as_fd(), SLOTS_NAME, true)
+            .map_err(LeaseError::Io)?;
+        let store_id = random_hex(16)?;
+        let config = PoolConfig {
+            version: LEASE_VERSION,
+            backend: VOLUME_BACKEND_APFS_V1.to_owned(),
+            store_id: store_id.clone(),
+            cap_bytes: budget_bytes,
+            image_bytes: 0,
+            volume: Some(VolumeConfig {
+                mount_point: binding.mount_point().to_path_buf(),
+                volume_uuid: binding.uuid().to_owned(),
+                payload_dir: payload_dir.to_owned(),
+            }),
+        };
+        let ledger = Ledger {
+            version: LEASE_VERSION,
+            store_id: store_id.clone(),
+            cap_bytes: budget_bytes,
+            next_slot: 1,
+            next_lease: 1,
+            slots: Vec::new(),
+        };
+        write_config(&pool, &config)?;
+        write_ledger(&pool, &ledger)?;
+        Ok(PoolInfo {
+            version: LEASE_VERSION,
+            store_id,
+            backend: config.backend,
+            cap_bytes: budget_bytes,
+            verified_capacity_bytes: 0,
+        })
+    }
+
+    /// Flush an `apfs-volume-v1` pool's volume with the pool lock held and
+    /// return the time the flush took. Any doubt about the volume is an
+    /// error.
+    pub fn flush_volume(pool: &Path) -> Result<Duration, LeaseError> {
+        let opened = Pool::open_inner(pool, false, Backends::WithBudget)?;
+        match &opened.backing {
+            Payload::Volume { binding, .. } => binding.flush().map_err(LeaseError::Io),
+            Payload::Bounded(_) | Payload::Budget(_) => Err(LeaseError::Unsupported(
+                "the pool is not on a removable volume",
+            )),
+        }
+    }
 
     /// Create a budget-only directory pool. The budget is recorded once and
     /// drives admission and whole-idle-slot eviction; nothing enforces it
@@ -210,6 +328,7 @@ pub mod managed {
             store_id: store_id.clone(),
             cap_bytes: budget_bytes,
             image_bytes: 0,
+            volume: None,
         };
         let ledger = Ledger {
             version: LEASE_VERSION,
@@ -292,6 +411,7 @@ pub(super) fn create_injected(pool: &Path, cap_bytes: u64) -> Result<PoolInfo, L
         store_id: store_id.clone(),
         cap_bytes,
         image_bytes: cap_bytes,
+        volume: None,
     };
     let ledger = Ledger {
         version: LEASE_VERSION,
@@ -454,6 +574,8 @@ impl Pool {
         let backing =
             if config.backend == BUDGET_BACKEND_DIRECTORY_V1 && backends == Backends::WithBudget {
                 open_budget_payload(&root, &paths, &config)?
+            } else if config.backend == VOLUME_BACKEND_APFS_V1 && backends == Backends::WithBudget {
+                open_volume_payload(&paths, &config)?
             } else {
                 if config.version != LEASE_VERSION
                     || config.backend != BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1
@@ -642,8 +764,22 @@ impl Pool {
         let incarnation = 1_u64;
         let lease_id = self.mint_lease_id(slot_id, incarnation)?;
         let slot_path = self.slot_path(slot_id)?;
-        ensure_private_dir(&slot_path)?;
-        ensure_private_dir(&slot_path.join("build"))?;
+        match &self.backing {
+            Payload::Volume { binding, fd, .. } => {
+                let create = |dir: std::os::fd::BorrowedFd<'_>, name: &str, new: bool| {
+                    binding
+                        .dir_at(dir, name, new)
+                        .map_err(|_| LeaseError::BackingMismatch)
+                };
+                let slots = create(fd.as_fd(), SLOTS_NAME, false)?;
+                let slot = create(slots.as_fd(), &slot_id.to_string(), true)?;
+                create(slot.as_fd(), "build", true)?;
+            }
+            Payload::Bounded(_) | Payload::Budget(_) => {
+                ensure_private_dir(&slot_path)?;
+                ensure_private_dir(&slot_path.join("build"))?;
+            }
+        }
         self.ledger.slots.push(SlotRecord {
             id: slot_id,
             incarnation,
@@ -961,6 +1097,9 @@ impl Pool {
     }
 
     fn remove_owned_slot(&self, path: &Path) -> Result<(), LeaseError> {
+        // A volume that is not this pool's verified root has no slots to
+        // remove: the path would resolve elsewhere.
+        self.backing.verify_volume()?;
         let slots_root = self.backing.payload_root().join(SLOTS_NAME);
         let slots_root = canonical_existing_dir(&slots_root, true)?;
         if path.parent() != Some(slots_root.as_path()) {
@@ -1045,6 +1184,44 @@ fn open_budget_payload(
     }
     validate_lease_payload_entries(&payload, &[])?;
     Ok(Payload::Budget(payload))
+}
+
+/// The removable payload: the recorded directory on the mount root of the
+/// recorded volume, opened through the verified root's descriptor and
+/// matching its path. Image, receipt or an internal `payload` refuse.
+fn open_volume_payload(paths: &BackingPaths, config: &PoolConfig) -> Result<Payload, LeaseError> {
+    let Some(volume) = config.volume.as_ref() else {
+        return Err(LeaseError::BackingMismatch);
+    };
+    if config.version != LEASE_VERSION || config.cap_bytes == 0 || config.image_bytes != 0 {
+        return Err(LeaseError::BackingMismatch);
+    }
+    if paths.image.symlink_metadata().is_ok()
+        || paths.receipt.symlink_metadata().is_ok()
+        || paths.mount.symlink_metadata().is_ok()
+    {
+        return Err(LeaseError::BackingMismatch);
+    }
+    let binding = Binding::open(&volume.mount_point, Some(&volume.volume_uuid))
+        .map_err(|_| LeaseError::BackingMismatch)?;
+    let fd = binding
+        .dir_at(binding.fd(), &volume.payload_dir, false)
+        .map_err(|_| LeaseError::BackingMismatch)?;
+    let root = volume.mount_point.join(&volume.payload_dir);
+    let payload = canonical_existing_dir(&root, true).map_err(|_| LeaseError::BackingMismatch)?;
+    let by_path = fs::symlink_metadata(&payload).map_err(io_error)?;
+    let by_fd = fs::File::from(fd.try_clone().map_err(io_error)?)
+        .metadata()
+        .map_err(io_error)?;
+    if payload != root || by_path.dev() != by_fd.dev() || by_path.ino() != by_fd.ino() {
+        return Err(LeaseError::BackingMismatch);
+    }
+    validate_lease_payload_entries(&payload, &[])?;
+    Ok(Payload::Volume {
+        binding,
+        root: payload,
+        fd,
+    })
 }
 
 fn validate_lease_payload_entries(
