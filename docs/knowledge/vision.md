@@ -596,6 +596,7 @@ Tom, 2026-10-20, approved three changes ("1. Approve 2. Approve 3. Approve!") af
    - The cache is 52 GB at `~/Library/Caches/acowtancy-farmyard-managed-target` and is not Oxide-managed.
    - Condition: the setup refuses when `/Volumes/Builds` is not the mounted registered volume, so an undocked start never creates a `/Volumes/Builds/...` path on the internal disk.
    - Acowtancy owns the change.
+   - **Superseded the same day.** Tom approved Acowtancy's T-5 retirement of the container Rust ladder ("Approve both"). Normal Farmyard QA already builds on the host, so #671 closes unfinished and the 52 GB cache is deleted after T-5 merges. Farmyard's host QA reaches the Builds drive through Oxide once #670 merges.
 
 Tom, 2026-10-20, "Approve": the post-#102 Builds cutover bridge.
 - **Gap:** the #102 binary refuses a removable registration under a previous pool root, no command retires one, and registration requires an empty payload. Installing #102 as-is would send every Oxide build to the internal SSD.
@@ -606,6 +607,16 @@ Tom, 2026-10-20, "Approve": the post-#102 Builds cutover bridge.
   4. Verify that the removable pool is selected.
 - Deleting the retired copies needs a separate approval.
 - Product follow-up: a supported retire command that refuses unless the old pool is drained.
+
+Tom, 2026-10-20, "Yes": accept #099 (bypass inherited `rustc-wrapper` such as sccache) as-is at PR97 exact head `b547ba51`. This is operator acceptance, not a review pass.
+- **Evidence:** all four product subjects passed independent source review, but the overall verdict was changes_required.
+- **Disclosed gaps:**
+  - the proof's timeout closes Oxide's session while Cargo runs in a different group, so Cargo descendants may keep writing;
+  - the plain-Cargo staging has no continuous reserve watchdog;
+  - the final dual-file/cleanup native case never ran (capacity timeout);
+  - the author overran (about 72 min against 45).
+- **Accepted risks:** a faulty bypass could fail builds or misreport policy. The internal-SSD effect is a removed possible cache-write path, not a measured saving.
+- The apparatus defects are follow-up corrections; issues found in use are fixed forward.
 
 ## Authority boundaries
 
