@@ -137,7 +137,9 @@ run = "python3 scripts/test-oxide-cli.py --cargo-matrix 1.99.1"
 # `$CARGO` never run a recording fake `build.rustc-wrapper` (config, env and
 # `--config`), plain Cargo does, the workspace wrapper and clippy-driver
 # still run, and the OXIDE_ALLOW_RUSTC_WRAPPER=1 opt-in restores it with its
-# warning. No real sccache, image or download. Not a benchmark and not full QA.
+# warning. No real sccache, image or download. Plain-Cargo staging has no
+# host-reserve watchdog (reserve checked before and after). Not a benchmark
+# and not full QA.
 [tasks."rust:oxide-wrapper-bypass"]
 admission = "heavy"
 run = "python3 scripts/test-oxide-wrapper-bypass.py"

@@ -80,7 +80,7 @@ pub enum Inherited {
 /// subcommand, whose arguments Cargo does not read.
 pub fn inherited(config_args: &[OsString]) -> Inherited {
     let files = match (std::env::current_dir(), cargo_home::resolve()) {
-        (Ok(cwd), Ok(home)) => cargo_home::config_files(&cwd, &home),
+        (Ok(cwd), Ok(home)) => config_files(&cwd, &home),
         (Err(error), _) => {
             return Inherited::Unknown(format!("cannot read the current directory: {error}"))
         }
@@ -93,6 +93,41 @@ pub fn inherited(config_args: &[OsString]) -> Inherited {
         &files,
         |path| cargo_home::read_config(path),
     )
+}
+
+/// The config files Cargo 1.97.1 reads, highest precedence first
+/// (`GlobalContext::walk_tree` and `get_file_path`, `util/context/mod.rs`
+/// 1630-1706): in `.cargo/` of the current directory and each ancestor, then
+/// in the Cargo home unless an ancestor already covered it, one file per
+/// directory. `config` wins over `config.toml` when both exist, and Cargo
+/// ignores the `.toml`. The clean safety gate's own helper deliberately reads
+/// both; this one mirrors Cargo for an accurate name.
+fn config_files(cwd: &Path, home: &Path) -> Vec<PathBuf> {
+    let canonical = |dir: &Path| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut files = Vec::new();
+    let mut seen = Vec::new();
+    for dir in cwd.ancestors().map(|dir| dir.join(".cargo")) {
+        files.extend(effective_file(&dir));
+        seen.push(canonical(&dir));
+    }
+    if !seen.contains(&canonical(home)) && !seen.iter().any(|dir| dir == home) {
+        files.extend(effective_file(home));
+    }
+    files
+}
+
+/// Cargo's choice in one directory: `config` when it opens (a symlink is
+/// followed), else an existing `config.toml`.
+fn effective_file(dir: &Path) -> Option<PathBuf> {
+    let plain = dir.join("config");
+    let toml = dir.join("config.toml");
+    if std::fs::File::open(&plain).is_ok() {
+        Some(plain)
+    } else if toml.exists() {
+        Some(toml)
+    } else {
+        None
+    }
 }
 
 fn inherited_from(
@@ -405,6 +440,74 @@ mod tests {
             inherited_from(None, &[], None, &[], reader(&[])),
             Inherited::None
         );
+    }
+
+    #[test]
+    fn config_files_follow_cargos_choice_of_one_file_per_directory() {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!("oxide-wrapper-files-{}", std::process::id()));
+        let cwd = root.join("work/app");
+        let home = root.join("cargo-home");
+        let write = |path: PathBuf, text: &str| {
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, text).expect("write");
+        };
+        // Both names in the working directory and in the home: Cargo reads
+        // `config`, so an empty wrapper in the ignored `.toml` must not hide
+        // the one Cargo uses.
+        write(
+            cwd.join(".cargo/config.toml"),
+            "build.rustc-wrapper = \"\"\n",
+        );
+        write(
+            cwd.join(".cargo/config"),
+            "build.rustc-wrapper = \"near\"\n",
+        );
+        write(root.join("work/.cargo/config.toml"), "build.jobs = 1\n");
+        write(home.join("config.toml"), "build.rustc-wrapper = \"\"\n");
+        write(home.join("config"), "build.rustc-wrapper = \"far\"\n");
+        let found = |cwd: &Path| {
+            let files = config_files(cwd, &home);
+            let named = inherited_from(None, &[], None, &files, |path| {
+                cargo_home::read_config(path)
+            });
+            (files, named)
+        };
+        let (files, named) = found(&cwd);
+        assert_eq!(files.first(), Some(&cwd.join(".cargo/config")));
+        assert!(files.contains(&root.join("work/.cargo/config.toml")));
+        assert_eq!(files.last(), Some(&home.join("config")));
+        assert!(!files
+            .iter()
+            .any(|file| file == &cwd.join(".cargo/config.toml")));
+        assert!(!files.contains(&home.join("config.toml")));
+        assert_eq!(
+            named,
+            Inherited::Named {
+                program: "near".to_owned(),
+                source: cwd.join(".cargo/config").display().to_string()
+            }
+        );
+        let (_, named) = found(&root.join("work"));
+        assert_eq!(
+            named,
+            Inherited::Named {
+                program: "far".to_owned(),
+                source: home.join("config").display().to_string()
+            }
+        );
+        // The home is not read twice when an ancestor's `.cargo` is the home.
+        let files = config_files(&cwd, &cwd.join(".cargo"));
+        assert_eq!(
+            files
+                .iter()
+                .filter(|file| **file == cwd.join(".cargo/config"))
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(&root).expect("cleanup");
     }
 
     #[test]

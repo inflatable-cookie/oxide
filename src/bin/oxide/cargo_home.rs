@@ -302,7 +302,7 @@ fn refuse_resolved(metadata: &serde_json::Value) -> Option<String> {
 /// Cargo config files Cargo would read: `.cargo/config.toml` and
 /// `.cargo/config` in the current directory and every ancestor, then in the
 /// Cargo home. Each is parsed; see [`refuse_config`].
-pub(crate) fn config_files(cwd: &Path, home: &Path) -> Vec<PathBuf> {
+fn config_files(cwd: &Path, home: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut candidates: Vec<PathBuf> = cwd
         .ancestors()

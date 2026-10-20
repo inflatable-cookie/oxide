@@ -10,9 +10,17 @@ subcommand's `$CARGO build` never do, nor do environment-only,
 `RUSTC_WORKSPACE_WRAPPER` still runs, `oxide clippy` runs the installed
 clippy-driver, `OXIDE_ALLOW_RUSTC_WRAPPER=1` restores the wrapper with its
 warning, other values are ignored, and summary and `status` lines are
-checked. No real sccache, image or download. 300 s including cleanup, 512 MiB
-owned scratch, 20 GiB host reserve sampled at admission and after each
-phase. Not a benchmark and not full QA.
+checked, including a Cargo home holding both `config` and `config.toml`
+(Cargo reads only `config`). No real sccache, image or download. 300 s
+including cleanup, 512 MiB owned scratch. Every child is settled on any
+failure after its spawn.
+
+Host reserve: the 20 GiB reserve is sampled at admission and after each
+phase. The fixture builds run under Oxide's own host-reserve watchdog (scratch
+directory pool). Plain-Cargo staging has no existing host-reserve watchdog
+covering it: this script only checks the reserve before and after staging
+(observed staging write 68 MiB). That gap is reported, not filled with a
+bespoke supervisor. Not a benchmark and not full QA.
 """
 from __future__ import annotations
 
@@ -85,27 +93,55 @@ def tree_bytes(root: str) -> int:
 
 
 def run(argv: list, cwd: str, env: dict, limit: float = 90) -> tuple:
-    """One child in its own session, always settled: on timeout TERM then
-    KILL its process group (Oxide forwards TERM to its Cargo group)."""
+    """One child in its own session. Every failure after the spawn (deadline,
+    timeout, read error, interrupt) settles it before raising: TERM to its
+    process group (Oxide forwards TERM to its Cargo group), then KILL. A group
+    that still exists afterwards is reported as unclosed, never as closed."""
+    timeout = min(limit, remaining())
     child = subprocess.Popen(
         argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, start_new_session=True,
+        text=True, errors="replace", start_new_session=True,
     )
     try:
-        stdout, stderr = child.communicate(timeout=min(limit, remaining()))
-    except subprocess.TimeoutExpired:
-        for sig, wait in ((signal.SIGTERM, 10), (signal.SIGKILL, 10)):
-            try:
-                os.killpg(child.pid, sig)
-            except ProcessLookupError:
-                break
-            try:
-                child.communicate(timeout=wait)
-                break
-            except subprocess.TimeoutExpired:
-                continue
-        fail(f"{argv[:3]} timed out; its process group was signalled")
+        stdout, stderr = child.communicate(timeout=timeout)
+    except BaseException:
+        settle(child, argv)
+        raise
     return child.returncode, stdout, stderr
+
+
+def group_gone(pgid: int) -> bool | None:
+    try:
+        os.killpg(pgid, 0)
+        return False
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return None
+
+
+def settle(child: subprocess.Popen, argv: list) -> None:
+    """TERM, then KILL, the child's whole process group; each step waits up
+    to 10 s for the group to empty, reaping the leader."""
+    state = None
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(child.pid, sig)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            child.poll()
+            state = group_gone(child.pid)
+            if state is not False:
+                break
+            time.sleep(0.1)
+        if state is not False:
+            break
+    child.poll()
+    verdict = {True: "settled", False: "UNCLOSED", None: "closure UNKNOWN"}[state]
+    print(f"wrapper-bypass: process group {child.pid} of {argv[:3]} {verdict} after a failure", file=sys.stderr)
+    print("wrapper-bypass: a Cargo group Oxide started is closed only if Oxide forwarded TERM before KILL", file=sys.stderr)
 
 
 def lines(path: str) -> list:
@@ -230,6 +266,21 @@ def prove(oxide: str, parent: str) -> None:
         text = leased(args, label, {"CARGO_HOME": no_config, **extra})
         if named not in text:
             fail(f"{label}: the bypassed wrapper was not named")
+    # Both names in one Cargo home: Cargo reads `config` and ignores the
+    # `.toml`, whose empty wrapper must not hide the real one.
+    dual = os.path.join(parent, "cargo-home-dual")
+    write(os.path.join(dual, "config.toml"), '[build]\nrustc-wrapper = ""\n')
+    write(os.path.join(dual, "config"), f'[build]\nrustc-wrapper = "{outer}"\n')
+    text = leased(["check"], "dual config files, opt-in", {"CARGO_HOME": dual, "OXIDE_ALLOW_RUSTC_WRAPPER": "1"}, wanted_outer=1)
+    if f"rustc wrapper active: {outer}, unqualified" not in text:
+        fail("dual config files: the opt-in summary does not name the active wrapper")
+    text = leased(["check"], "dual config files", {"CARGO_HOME": dual})
+    if named not in text:
+        fail("dual config files: the bypassed wrapper was not named")
+    code, stdout, _ = run([oxide, "status"], app, {**base, "CARGO_HOME": dual})
+    if code or f"rustc wrapper: inherited {outer} (from {os.path.join(dual, 'config')}); bypassed" not in stdout:
+        fail(f"dual config files: status is wrong\n{stdout}")
+    print("wrapper-bypass dual config files status: names the wrapper from config, not config.toml")
     text = leased(["check"], "no inherited wrapper", {"CARGO_HOME": no_config})
     if "rustc wrapper" in text:
         fail("a summary named a wrapper where none is inherited")

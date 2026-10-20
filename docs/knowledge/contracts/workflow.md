@@ -388,10 +388,12 @@ changes Cargo config, the sccache server or its cache.
   wrapper, where it came from and its effective state. Oxide reads the name in
   Cargo's order (`RUSTC_WRAPPER`, the command's `--config`, then
   `CARGO_BUILD_RUSTC_WRAPPER`, then config files from the current directory
-  up and the Cargo home). An unreadable file or an `include` reports the name
+  up and the Cargo home, one per directory as Cargo picks it: `config` over
+  `config.toml` when both exist). An unreadable file or an `include` reports the name
   as unknown, never as none; the bypass does not depend on the name.
 - **Proof:** `effigy rust:oxide-wrapper-bypass`, on fixtures with a recording
-  fake wrapper only. Evidence is in the oxide#099 PR.
+  fake wrapper only. Evidence is in the oxide#099 PR. Its plain-Cargo staging
+  has no host-reserve watchdog; the reserve is checked before and after.
 
 The [qualified cross-worktree result](project-adoption.md#focused-cross-worktree-result)
 supports this shape for one workflow: a different-path checkout on a shared
