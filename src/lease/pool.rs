@@ -3,14 +3,14 @@
 use super::backing::BackingPaths;
 use super::{
     canonical_existing_dir, current_uid, ensure_private_dir, io_error, persist_private_file,
-    random_hex, read_private_file, remove_tree_owned, AccountingCoverage, LeaseEnvironment,
-    LeaseError, LeaseGrant, PoolStatus, Profile, ReleaseReceipt, SlotOccupancy, SlotStatus,
-    ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES, CONFIG_NAME,
-    LEASE_VERSION, LEDGER_NAME, LOCK_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_PATH_BYTES,
-    MAX_SLOTS, SLOTS_NAME,
+    random_hex, read_private_file, remove_tree_owned, AccountingCoverage, AccountingGap,
+    AccountingGapKind, AccountingScan, LeaseEnvironment, LeaseError, LeaseGrant, PoolStatus,
+    Profile, ReleaseReceipt, SlotOccupancy, SlotStatus, ACCOUNTING_MAX_DEPTH,
+    ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME,
+    LOCK_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, SLOTS_NAME,
 };
 use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
-use crate::inventory::{inventory_directory, InventoryLimits};
+use crate::inventory::{inventory_directory, GapKind, InventoryError, InventoryLimits};
 use crate::volume::Binding;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -436,11 +436,8 @@ impl Pool {
         {
             let slot_path =
                 self.validate_idle_slot_scope(idle, incarnation, &project, request.profile)?;
-            let sizes = inventory_sizes(&slot_path)?;
-            if sizes.coverage != AccountingCoverage::Complete {
-                return Err(LeaseError::UnknownAccounting);
-            }
-            let unique = sizes.unique.ok_or(LeaseError::UnknownAccounting)?;
+            // Reuse and recycling both need this slot's own walk complete.
+            let unique = inventory_sizes(&slot_path).require_complete()?;
             if should_recycle_slot(unique, self.budget) {
                 self.retire_idle_slot(idle, incarnation, &project, request.profile)?;
                 return self.allocate(project, workspace, request);
@@ -509,17 +506,11 @@ impl Pool {
                 return Err(LeaseError::LedgerExhausted);
             }
         }
-        let accounted = self.payload_accounting()?;
-        if accounted.coverage != AccountingCoverage::Complete {
-            return Err(LeaseError::UnknownAccounting);
-        }
-        if accounted.unique.is_some_and(|bytes| bytes >= self.budget) {
+        // New-slot admission needs the whole-payload walk complete, before
+        // and after any eviction.
+        if self.payload_accounting().require_complete()? >= self.budget {
             self.evict_idle_until_under_cap()?;
-            let accounted = self.payload_accounting()?;
-            if accounted.coverage != AccountingCoverage::Complete {
-                return Err(LeaseError::UnknownAccounting);
-            }
-            if accounted.unique.is_some_and(|bytes| bytes >= self.budget) {
+            if self.payload_accounting().require_complete()? >= self.budget {
                 return Err(LeaseError::Full);
             }
         }
@@ -600,17 +591,19 @@ impl Pool {
         })
     }
 
+    /// Observational: walks the payload and each slot with the same bounds
+    /// as admission, and reports each walk's coverage, causes and time.
     fn status(&self) -> Result<PoolStatus, LeaseError> {
-        let accounted = self.payload_accounting()?;
+        let accounted = self.payload_accounting();
         let mut coverage = if self.reconciliation_blocked {
             AccountingCoverage::Unknown
         } else {
-            accounted.coverage
+            accounted.scan.coverage
         };
         let mut slots = Vec::new();
         for slot in &self.ledger.slots {
             let sizes = self.slot_accounting(slot.id)?;
-            match sizes.coverage {
+            match sizes.scan.coverage {
                 AccountingCoverage::Complete => {}
                 AccountingCoverage::Partial if coverage == AccountingCoverage::Complete => {
                     coverage = AccountingCoverage::Partial;
@@ -634,6 +627,7 @@ impl Pool {
                 lease_id: slot.lease_id.clone(),
                 logical_bytes: sizes.logical,
                 unique_allocated_bytes: sizes.unique,
+                accounting: sizes.scan,
             });
         }
         let full = match coverage {
@@ -650,6 +644,7 @@ impl Pool {
             payload_logical_bytes: accounted.logical,
             payload_unique_allocated_bytes: accounted.unique,
             coverage,
+            payload_accounting: accounted.scan,
             full,
             slots,
         })
@@ -735,11 +730,7 @@ impl Pool {
 
     fn evict_idle_until_under_cap(&mut self) -> Result<(), LeaseError> {
         loop {
-            let accounted = self.payload_accounting()?;
-            if accounted.coverage != AccountingCoverage::Complete {
-                return Err(LeaseError::UnknownAccounting);
-            }
-            if accounted.unique.unwrap_or(0) < self.budget {
+            if self.payload_accounting().require_complete()? < self.budget {
                 return Ok(());
             }
             if !self.evict_one_idle()? {
@@ -871,7 +862,7 @@ impl Pool {
         remove_tree_owned(&slots_root, path)
     }
 
-    fn payload_accounting(&self) -> Result<Sizes, LeaseError> {
+    fn payload_accounting(&self) -> Sizes {
         let slots = self.backing.payload_root().join(SLOTS_NAME);
         inventory_sizes(&slots)
     }
@@ -883,7 +874,7 @@ impl Pool {
                 return Ok(Sizes {
                     logical: Some(0),
                     unique: Some(0),
-                    coverage: AccountingCoverage::Complete,
+                    scan: scan(AccountingCoverage::Complete, Vec::new(), 0, 0),
                 });
             }
             Err(error) => return Err(io_error(error)),
@@ -891,12 +882,12 @@ impl Pool {
                 return Ok(Sizes {
                     logical: None,
                     unique: None,
-                    coverage: AccountingCoverage::Unknown,
+                    scan: root_failure(AccountingGapKind::RootSymlink, 0),
                 });
             }
             Ok(_) => {}
         }
-        inventory_sizes(&path)
+        Ok(inventory_sizes(&path))
     }
 }
 
@@ -1007,7 +998,20 @@ fn validate_lease_payload_entries(
 struct Sizes {
     logical: Option<u64>,
     unique: Option<u64>,
-    coverage: AccountingCoverage,
+    scan: AccountingScan,
+}
+
+impl Sizes {
+    /// Unique allocated bytes of a complete walk. A partial, late or
+    /// unknown walk refuses with its scan; its bytes are never used.
+    fn require_complete(&self) -> Result<u64, LeaseError> {
+        match (self.scan.coverage, self.unique) {
+            (AccountingCoverage::Complete, Some(unique)) => Ok(unique),
+            _ => Err(LeaseError::AccountingIncomplete(Box::new(
+                self.scan.clone(),
+            ))),
+        }
+    }
 }
 
 fn occupancy(state: SlotPersistState) -> SlotOccupancy {
@@ -1018,29 +1022,127 @@ fn occupancy(state: SlotPersistState) -> SlotOccupancy {
     }
 }
 
-fn inventory_sizes(path: &Path) -> Result<Sizes, LeaseError> {
+#[cfg(test)]
+thread_local! {
+    static TEST_LIMITS: std::cell::Cell<Option<InventoryLimits>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `body` with these accounting bounds on this thread (tests only).
+#[cfg(test)]
+pub(super) fn with_accounting_limits<T>(
+    max_entries: u64,
+    max_depth: usize,
+    max_elapsed_ms: u64,
+    body: impl FnOnce() -> T,
+) -> T {
     let limits = InventoryLimits {
+        max_entries,
+        max_depth,
+        max_output_bytes: 64,
+        max_elapsed_ms,
+    };
+    TEST_LIMITS.with(|cell| cell.set(Some(limits)));
+    let result = body();
+    TEST_LIMITS.with(|cell| cell.set(None));
+    result
+}
+
+fn accounting_limits() -> InventoryLimits {
+    #[cfg(test)]
+    if let Some(limits) = TEST_LIMITS.with(std::cell::Cell::get) {
+        return limits;
+    }
+    InventoryLimits {
         max_entries: ACCOUNTING_MAX_ENTRIES,
         max_depth: ACCOUNTING_MAX_DEPTH,
         max_output_bytes: 64,
         max_elapsed_ms: ACCOUNTING_MAX_ELAPSED_MS,
+    }
+}
+
+fn scan(
+    coverage: AccountingCoverage,
+    gaps: Vec<AccountingGap>,
+    entries_visited: u64,
+    elapsed_ms: u64,
+) -> AccountingScan {
+    let limits = accounting_limits();
+    AccountingScan {
+        coverage,
+        gaps,
+        entries_visited,
+        elapsed_ms,
+        max_entries: limits.max_entries,
+        max_depth: limits.max_depth,
+        max_elapsed_ms: limits.max_elapsed_ms,
+    }
+}
+
+fn root_failure(kind: AccountingGapKind, elapsed_ms: u64) -> AccountingScan {
+    let gap = AccountingGap {
+        kind,
+        occurrences: 1,
     };
-    match inventory_directory(path, limits) {
-        Ok(report) if report.coverage.complete => Ok(Sizes {
-            logical: Some(report.total.logical_bytes_by_name),
-            unique: Some(report.total.allocated_bytes),
-            coverage: AccountingCoverage::Complete,
-        }),
-        Ok(report) => Ok(Sizes {
-            logical: Some(report.total.logical_bytes_by_name),
-            unique: Some(report.total.allocated_bytes),
-            coverage: AccountingCoverage::Partial,
-        }),
-        Err(_) => Ok(Sizes {
-            logical: None,
-            unique: None,
-            coverage: AccountingCoverage::Unknown,
-        }),
+    scan(AccountingCoverage::Unknown, vec![gap], 0, elapsed_ms)
+}
+
+fn gap_kind(kind: GapKind) -> AccountingGapKind {
+    match kind {
+        GapKind::EntryLimit => AccountingGapKind::EntryLimit,
+        GapKind::DepthLimit => AccountingGapKind::DepthLimit,
+        GapKind::ElapsedDeadline => AccountingGapKind::ElapsedDeadline,
+        GapKind::MountBoundary => AccountingGapKind::MountBoundary,
+        GapKind::UnreadableEntry => AccountingGapKind::UnreadableEntry,
+        GapKind::MissingMetadata => AccountingGapKind::MissingMetadata,
+        // Accounting renders nothing, so an output gap means unusable metadata.
+        GapKind::UnsupportedMetadata | GapKind::OutputLimit => {
+            AccountingGapKind::UnsupportedMetadata
+        }
+    }
+}
+
+/// One bounded walk with the pool accounting bounds. Bytes of an incomplete
+/// walk are a lower bound for status only.
+fn inventory_sizes(path: &Path) -> Sizes {
+    let started = std::time::Instant::now();
+    match inventory_directory(path, accounting_limits()) {
+        Ok(report) => {
+            let coverage = if report.coverage.complete {
+                AccountingCoverage::Complete
+            } else {
+                AccountingCoverage::Partial
+            };
+            let gaps = report
+                .coverage
+                .gaps
+                .iter()
+                .map(|gap| AccountingGap {
+                    kind: gap_kind(gap.kind),
+                    occurrences: gap.occurrences,
+                })
+                .collect();
+            Sizes {
+                logical: Some(report.total.logical_bytes_by_name),
+                unique: Some(report.total.allocated_bytes),
+                scan: scan(coverage, gaps, report.entries_visited, report.elapsed_ms),
+            }
+        }
+        Err(error) => {
+            let kind = match error {
+                InventoryError::RootMissing(_) => AccountingGapKind::RootMissing,
+                InventoryError::RootNotDirectory(_) => AccountingGapKind::RootNotDirectory,
+                InventoryError::RootUnreadable { .. } | InventoryError::InvalidLimits(_) => {
+                    AccountingGapKind::RootUnreadable
+                }
+            };
+            let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            Sizes {
+                logical: None,
+                unique: None,
+                scan: root_failure(kind, elapsed),
+            }
+        }
     }
 }
 

@@ -176,7 +176,10 @@ A lease taken through this CLI is never recovered that way.
 
 **status** lists finite slots with holder, observed workspace, occupancy,
 logical and unique allocated bytes, pool cap, and full/unknown. Coverage is
-`complete`, `partial` or `unknown`. Unknown accounting is honest. No payload
+`complete`, `partial` or `unknown`. Unknown accounting is honest. Each walk
+also reports its gap kinds, entries visited, elapsed time and bounds
+(`payload_accounting`, and `accounting` per slot; see
+[accounting walks](#capacity-and-eviction)). No payload
 or secret content is printed. The legacy `full` field compares owned-slot
 unique allocated bytes with the declared cap. It retains that documented
 meaning and does not establish physical filesystem headroom.
@@ -219,60 +222,88 @@ or unknown, and any output truncation, returns exit 2.
 
 ## Capacity and eviction
 
-The verified APFS volume is the hard aggregate bound, and the declared cap
-must equal the image size so that volume size is the enforced ceiling. A
-smaller declared cap on a larger volume is refused at init and at open:
-admission accounting alone is not a quota. Admission uses the
-pinned cap and the [storage inventory](storage-inventory.md) unique-allocated
-figure for owned slots; filesystem metadata directories remain outside that
-slot accounting. The measured `verified_capacity_bytes` (APFS metadata
-overhead below the declared size) is the effective OS bound, and writers
-cannot exceed the declared ceiling through it. Control/ledger headroom stays outside the payload and
-is bounded (`MAX_LEDGER_BYTES` 256 KiB, `MAX_SLOTS` 32). Eviction happens only
-at lease time and only for known owned idle whole slots. Held occupancy,
-foreign entries, symlinked pool/payload/slots/slot roots, unknown accounting
-and mismatched backing refuse. During a durably recorded whole-slot deletion,
-an owned nested symlink entry may be unlinked as a leaf after its parent and
+Current pools are budget-only (`directory-budget-v1`, `apfs-volume-v1`):
+the budget is a soft admission figure with no OS ceiling, and current
+budget, watchdog and removable behaviour is owned by
+[workflow](workflow.md#budget-only-default-pool-and-user-configuration).
+Admission uses this admission's budget (`LeaseRequest.budget_bytes`, else
+the recorded one) and the [storage inventory](storage-inventory.md)
+unique-allocated figure for owned slots, a `(device, inode)` union so a hard
+link counts once; filesystem metadata directories remain outside that slot
+accounting. Control/ledger headroom stays outside the payload and is bounded
+(`MAX_LEDGER_BYTES` 256 KiB, `MAX_SLOTS` 32). Eviction happens only at lease
+time and only for known owned idle whole slots. Held occupancy, foreign
+entries, symlinked pool/payload/slots/slot roots, unknown accounting and
+mismatched backing refuse. During a durably recorded whole-slot deletion, an
+owned nested symlink entry may be unlinked as a leaf after its parent and
 entry ownership are verified. The target is never followed or removed.
 Deletion never touches project or workspace paths. A lost delete is
 reconciled only for the recorded evicting slot path.
 
-Before leasing a compatible idle slot, the CLI inventories that exact slot's
-complete unique allocated bytes. At `ceil(cap_bytes / 2)` or above, it durably
-retires that idle generation and allocates a fresh monotonic slot and lease;
-the grant reports `reused_slot: false`. Below the threshold, it keeps the warm
-slot. Incomplete or unknown accounting refuses the lease. A held same-holder
-replay keeps its exact lease and path, and another holder remains busy without
-recycling the held slot. This policy can make an acquisition pay a cold-build
-cost to discard a large idle cache. The threshold supplies headroom at
-acquisition; it does not guarantee that a particular build fits, reserve half
-the volume, constrain writes during a lease, or prevent `ENOSPC`. Other slots
-and OS metadata still consume the aggregate cap, so ordinary admission and
-refusal rules apply after the selected generation is removed.
+**Accounting walks (oxide#108).** Every pool accounting walk uses the same
+pool-specific bounds: 2,000,000 entries, depth 64 below the walked root and a
+60 s cooperative deadline. They are separate from the inventory tool's
+defaults, which are unchanged. The callers:
 
-Writes that fill the volume return ENOSPC from the OS and remain leased; this
-CLI does not repeat the filesystem-full proof (see bounded storage).
+| Walk | Gate |
+| --- | --- |
+| The matching idle slot's own walk before reuse or recycling | Must be complete, or the lease refuses |
+| The whole-payload walk before a new slot, and again after eviction | Must be complete, or the lease refuses |
+| The whole-payload walk before each idle eviction in the loop | Must be complete, or the lease refuses |
+| `status`: the whole payload and each slot | Observational; reports coverage, causes and time |
 
-Host reserve, APFS metadata and private workspace `target`/temp bytes are
-distinct from managed payload bytes. Status does not add them together.
+A walk that reaches a bound, meets an unreadable entry, missing or unusable
+metadata or a mount boundary, or cannot open its root is incomplete. It
+refuses with reason `unknown_accounting` (exit 3, unchanged), and the error
+names the gap kinds (`entry_limit`, `depth_limit`, `elapsed_deadline`,
+`mount_boundary`, `unreadable_entry`, `missing_metadata`,
+`unsupported_metadata`, `root_missing`, `root_not_directory`,
+`root_unreadable`, `root_symlink`) with counts, entries visited, elapsed
+milliseconds and the bounds used. No path or name is printed. An incomplete
+walk's bytes are never used for admission and never make a slot an eviction
+candidate; `status` shows them as a lower bound. A measured zero stays
+distinct from unknown. Only a slot whose own walk completes can be reused;
+other `unknown_accounting` refusals (invalid identities, ledger, ownership or
+backing failures, foreign entries) are unchanged.
 
-Deletion of an idle slot frees space inside the payload filesystem for later
-builds. Returning host-allocated sparse-image space is a different operation:
-this CLI does not compact its backing image. A retained host allocation does
-not itself mean the deleted slot still consumes live payload space. Apple's
-installed `hdiutil(1)` manual documents conditional APFS sparse-image compaction;
-that is not a shipped Oxide operation or authority to compact a mounted or
-uncertain pool. The payload ceiling also does not claim an exact ceiling on
-all host-side image/control metadata, snapshots or private target/temp output.
+The bounds are finite, not an arbitrary-size guarantee. The entry bound
+covers 32 slots of 60,657 entries, the largest single-project slot reported
+(Farmyard, 2026-10-20); a pool beyond it refuses until idle slots are
+evicted or cleaned. A walk over a slow or cold volume can reach the deadline;
+`status` reports each walk's elapsed time. One admission may walk the payload
+more than once (the front door's `status`, then the library's admission
+walk), so its cost grows with pool size. The 50,000-entry, depth-24, 5 s
+bounds before oxide#108 refused real build caches (Praxis's 76,669-entry and
+Farmyard's 60,657-entry trees, Supervisor report), including reuse of an
+existing slot above 50,000 entries.
 
-A new empty slot still cannot hold a build larger than the remaining payload
-capacity. Increasing the pool changes that finite limit; it does not remove
-it. No build-size distribution or failure percentage is established. Selective
-`cargo clean -p` before release is not part of this interface and has not been
-qualified as removing all historical path-specific workspace artifacts while
-preserving the desired shared intermediates. Any such cleanup would remain
-inside exclusive ownership with admitted execution and positive completion;
-it cannot be added after an assertion that all writers have ended.
+Before leasing a compatible idle slot, the library inventories that exact
+slot's complete unique allocated bytes. At `ceil(budget / 2)` or above, it
+durably retires that idle generation and allocates a fresh monotonic slot and
+lease; the grant reports `reused_slot: false`. Below the threshold, it keeps
+the warm slot. Incomplete or unknown accounting refuses the lease. A held
+same-holder replay keeps its exact lease and path, and another holder remains
+busy without recycling the held slot. This policy can make an acquisition pay
+a cold-build cost to discard a large idle cache. The threshold supplies
+headroom at acquisition; it does not guarantee that a particular build fits,
+reserve space, constrain writes during a lease, or prevent `ENOSPC`. Other
+slots still count against the budget, so ordinary admission and refusal rules
+apply after the selected generation is removed.
+
+History, retired with the image backend (oxide#102): the verified APFS
+sparse-image volume was the hard aggregate bound, the declared cap had to
+equal the image size, and `verified_capacity_bytes` was the effective OS
+bound. Current pools have no such ceiling.
+
+Nothing in the library stops a leased build from filling its filesystem:
+writes then fail with the OS's own error and the lease stays held. The front
+door's best-effort host-reserve watchdog is owned by
+[workflow](workflow.md#directory-budget-v1-as-shipped). Host reserve, OS
+metadata and private workspace `target`/temp bytes are distinct from managed
+payload bytes; status does not add them together. Deleting an idle slot frees
+its space on the payload filesystem. No build-size distribution or failure
+percentage is established. Selective `cargo clean -p` is not part of this
+interface.
 
 ## Exit codes
 

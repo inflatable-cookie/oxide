@@ -1288,6 +1288,23 @@ oxide#102.
   `status` shows the effective one. Builds can still run out of real space:
   the 20 GiB host-reserve watchdog stops the owned group below its 22 GiB
   trigger, and ordinary filesystem errors still fail a build.
+- **Accounting walks (oxide#108).** Admission, reuse, eviction and `status`
+  walk the slots with one set of pool bounds: 2,000,000 entries, depth 64,
+  60 s (previously 50,000, 24 and 5 s, which refused Praxis's 76,669-entry
+  and Farmyard's 60,657-entry pools). Reusing an idle slot needs that slot's
+  own walk complete; a new slot needs the whole-payload walk complete before
+  and after eviction. An incomplete walk refuses with `unknown_accounting`
+  and names its cause (`entry_limit`, `depth_limit`, `elapsed_deadline`,
+  `unreadable_entry`, `missing_metadata`, a mount boundary or a root
+  failure), entries visited, elapsed time and bounds; its bytes are never
+  used and never make a slot evictable. The bounds are finite: a larger pool
+  refuses until idle slots are evicted or cleaned. Owning detail:
+  [local lease](local-lease.md#capacity-and-eviction). Rust tests cover
+  each old bound, an unreadable entry, a symlinked slot root and hard links
+  with injected bounds. The native selector `effigy rust:pool-scale` has no
+  passing run: its first session staged the reference binary twice and is
+  apparatus evidence only, and the corrected selector is held because no
+  existing guard samples the host reserve during plain-Cargo staging.
 - **Precedence.** Environment, then the user config file, then defaults.
   `OXIDE_POOL` sets the path (relative resolves against the current
   directory); `OXIDE_POOL_CAP` sets the budget. Sizes are whole bytes or a
@@ -1370,7 +1387,10 @@ oxide#102.
   `OXIDE_CONFIG`, the pool path and budget with their sources, then per
   pool: backend, soft budget, slot allocation, the pool filesystem's
   available and total space (shared, no Oxide quota or ceiling), Time Machine
-  and Spotlight state, legacy and orphaned pools.
+  and Spotlight state, legacy and orphaned pools. `slot accounting walk:`
+  reports the payload walk's coverage, causes, entries and milliseconds; a
+  slot whose own walk is incomplete gets its own line saying it is not
+  reused. An incomplete payload walk shows allocation as `at least`.
 - **Explicit slot release.** `oxide pool recover-interrupted <slot>`
   replaces the retired CLI's `recover` for an interrupted slot automatic
   [crash recovery](#crash-recovery) keeps held. Source- and unit-reviewed;
