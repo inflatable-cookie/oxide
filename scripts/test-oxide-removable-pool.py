@@ -211,7 +211,7 @@ def main() -> int:
     if raw:
         root = os.path.realpath(raw)
     else:
-        made = subprocess.run(["mktemp", "-d", "/private/tmp/oxide-removable.XXXXXX"], capture_output=True, text=True, timeout=30)
+        made = subprocess.run(["mktemp", "-d", "/private/tmp/oxide-rmpool.XXXXXX"], capture_output=True, text=True, timeout=30)
         if made.returncode:
             fail("mktemp failed")
         root = os.path.realpath(made.stdout.strip())
@@ -339,7 +339,11 @@ def run(proof: Proof, parent: str) -> None:
     code, _, stderr = oxide_run(["check"], "internal, nothing registered")
     expect(code == 0, "internal check failed")
     line = summary(stderr)
-    expect("directory-budget-v1" in line and "removable" not in stderr, f"unregistered build changed: {line}")
+    # The scratch path itself contains "removable"; look for Oxide's words.
+    expect(
+        "directory-budget-v1" in line and "removable volume" not in stderr and "apfs-volume-v1" not in stderr,
+        f"unregistered build changed: {line}",
+    )
     code, stdout, _ = oxide_run(["status"], "status, nothing registered")
     expect(code == 0 and "removable pool: none registered" in stdout, "status did not report no registration")
 
