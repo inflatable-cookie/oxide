@@ -5,8 +5,8 @@ use super::{
     canonical_existing_dir, current_uid, ensure_private_dir, io_error, is_finder_metadata,
     is_tolerated_metadata_file, persist_private_file, random_hex, read_private_file,
     remove_tree_owned, unexpected_entry, AccountingCoverage, AccountingGap, AccountingGapKind,
-    AccountingScan, LeaseEnvironment, LeaseError, LeaseGrant, PoolStatus, Profile,
-    ReleaseReceipt, SlotOccupancy, SlotStatus, ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS,
+    AccountingScan, LeaseEnvironment, LeaseError, LeaseGrant, PoolStatus, Profile, ReleaseReceipt,
+    SlotOccupancy, SlotStatus, ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS,
     ACCOUNTING_MAX_ENTRIES, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME, LOCK_NAME, MAX_HOLDER_BYTES,
     MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, SLOTS_NAME,
 };
@@ -1083,7 +1083,13 @@ fn scan(
     entries_visited: u64,
     elapsed_ms: u64,
 ) -> AccountingScan {
-    scan_with(accounting_limits(), coverage, gaps, entries_visited, elapsed_ms)
+    scan_with(
+        accounting_limits(),
+        coverage,
+        gaps,
+        entries_visited,
+        elapsed_ms,
+    )
 }
 
 fn scan_with(
@@ -1117,7 +1123,13 @@ fn root_failure_with(
         kind,
         occurrences: 1,
     };
-    scan_with(limits, AccountingCoverage::Unknown, vec![gap], 0, elapsed_ms)
+    scan_with(
+        limits,
+        AccountingCoverage::Unknown,
+        vec![gap],
+        0,
+        elapsed_ms,
+    )
 }
 
 fn gap_kind(kind: GapKind) -> AccountingGapKind {

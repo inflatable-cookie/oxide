@@ -154,8 +154,9 @@ impl LeaseError {
             Self::InvalidInput(_) => "invalid_input",
             Self::Busy => "busy",
             Self::Full => "full",
-            Self::UnknownAccounting | Self::UnexpectedEntry { .. } => "unknown_accounting",
-            Self::UnknownAccounting | Self::AccountingIncomplete(_) => "unknown_accounting",
+            Self::UnknownAccounting
+            | Self::UnexpectedEntry { .. }
+            | Self::AccountingIncomplete(_) => "unknown_accounting",
             Self::UnsafePath(_) => "unsafe_path",
             Self::HolderConflict => "holder_conflict",
             Self::NotFound => "not_found",
