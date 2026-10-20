@@ -521,7 +521,11 @@ Supervisor architecture decision, 2026-10-20: **Oxide follows Longhorn's storage
 - Tom raised path fragmentation across his tools: "I would like to avoid fragmentation".
 - Config: `~/Library/Application Support/oxide/config/config.toml` on macOS, `$XDG_CONFIG_HOME/oxide/config.toml` on Linux, with an explicit `OXIDE_CONFIG` override. An explicit override may name any file, including a legacy one. Oxide never implicitly adopts `~/.config/oxide`; on macOS, `status` warns it is ignored.
 - Default unconfigured pool: under `~/Library/Caches/oxide`. Other Oxide state, logs and receipts follow the same table when they are next touched.
-- Tom asked whether Oxide could use Longhorn's config system directly instead of mirroring the policy. On 2026-10-20 he chose a lighter Longhorn crate for CLI apps ("Yeah - let's make it lighter to adopt for CLI apps"). The Supervisor requested a small storage-layout crate from the Longhorn Supervisor. Oxide switches to it once it is tagged. Mirrored paths are identical, so the switch moves no files.
+- Tom asked whether Oxide could use Longhorn's config system directly instead of mirroring the policy. On 2026-10-20 he chose a lighter Longhorn crate for CLI apps ("Yeah - let's make it lighter to adopt for CLI apps"). The Supervisor requested a small storage-layout crate from the Longhorn Supervisor. Oxide switches to it once it is tagged. Mirrored paths are identical, so the switch moves no files. Tom's follow-up, 2026-10-20:
+- Longhorn's crate arrives as a breaking change in Longhorn 0.4.0.
+- Oxide mirrors the policy until then ("There's a sequence to getting the layout stuff done so we should mirror it for now until it's ready").
+- On adoption, Oxide's `sha2` pin moves to match Longhorn's (0.11 line), so one `sha2` version is built.
+- Tom also asked Longhorn for TOML support in its config system, which Oxide may or may not use later.
 
 ## Authority boundaries
 
