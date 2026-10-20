@@ -19,6 +19,11 @@ benchmark and not full QA.
 
 from __future__ import annotations
 
+import sys
+
+# No bytecode files in the counted tree or the repository.
+sys.dont_write_bytecode = True
+
 import json
 import os
 import plistlib
@@ -26,9 +31,10 @@ import secrets
 import shutil
 import signal
 import subprocess
-import sys
-import threading
 import time
+
+import bounded_runner as br
+import bounded_runner_cases
 
 BUILDER = "1.97.1"
 IMAGE_MIB = 128
@@ -52,10 +58,18 @@ exec "REAL_CARGO" "$@"
 
 STARTED = time.monotonic()
 OUTPUT = 0
-# Sessions of owned children not yet positively closed. Teardown never
-# detaches while one remains.
-UNCLOSED: set = set()
 SCRATCH_VARIABLES = ("OXIDE_TASK_SCRATCH_ROOT", "TMPDIR", "TMP", "TEMP")
+# The session guardian (scripts/bounded_runner.py), created at admission.
+GUARDIAN = None
+
+
+_print = print
+
+
+def print(*args, **kwargs):  # runner diagnostics count toward the output allowance
+    if GUARDIAN is not None:
+        GUARDIAN.count_output(sum(len(str(arg)) + 1 for arg in args))
+    _print(*args, **kwargs)
 
 
 def fail(message: str) -> None:
@@ -72,149 +86,52 @@ def remaining() -> float:
 def emit(label: str, text: str) -> None:
     global OUTPUT
     OUTPUT += len(text.encode())
+    if GUARDIAN is not None:
+        GUARDIAN.count_output(len(text.encode()) + len(label) + 40)
+        GUARDIAN.check(experimental=False)
     if OUTPUT > LOG_LIMIT_BYTES:
         fail("proof output exceeds 32 MiB")
     print(f"----- {label} ({len(text.encode())} bytes) -----")
     print(text, end="" if text.endswith("\n") or not text else "\n")
 
 
-def processes() -> list:
-    """[(pid, process group, session or None)] for every visible process."""
-    listing = subprocess.run(["ps", "-A", "-o", "pid=,pgid="], check=True, capture_output=True, text=True, timeout=30)
-    table = []
-    for line in listing.stdout.splitlines():
-        pid, group = map(int, line.split())
-        try:
-            session = os.getsid(pid)
-        except (ProcessLookupError, PermissionError):
-            session = None
-        table.append((pid, group, session))
-    return table
-
-
-def close_session(session: int, groups: set, child: subprocess.Popen) -> list:
-    """TERM then KILL every group seen in `session`, reaping the leader;
-    return survivors."""
-    for number in (signal.SIGTERM, signal.SIGKILL):
-        groups |= {group for _, group, member in processes() if member == session}
-        for group in groups:
-            try:
-                os.killpg(group, number)
-            except (ProcessLookupError, PermissionError):
-                pass
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            child.poll()
-            alive = [pid for pid, group, member in processes() if member == session or group in groups]
-            if not alive:
-                return []
-            time.sleep(0.1)
-    child.poll()
-    return [pid for pid, group, member in processes() if member == session or group in groups]
-
-
-def run_owned(command: list, *, env: dict, cwd: str | None = None, text: bool = True, timeout: float = 120) -> subprocess.CompletedProcess:
-    """Run in a new session (its ID is the child's PID; `oxide` keeps Cargo's
-    groups in it). After exit or timeout, every process of the session must
-    be positively gone before the proof continues or tears down."""
-    limit = min(timeout, remaining())
-    child = subprocess.Popen(
-        command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text, start_new_session=True
-    )
-    session = child.pid
-    UNCLOSED.add(session)
-    groups = {session}
-    timed_out = False
-    try:
-        stdout, stderr = child.communicate(timeout=limit)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        survivors = close_session(session, groups, child)
-        stdout, stderr = child.communicate()
-        if survivors:
-            fail(f"{command[0]} timed out and session {session} kept {survivors}; evidence kept, no detach")
-    survivors = [pid for pid, group, member in processes() if member == session and pid != session]
-    if survivors:
-        survivors = close_session(session, groups, child)
-        if survivors:
-            fail(f"{command[0]} left session {session} members {survivors}; evidence kept, no detach")
-    UNCLOSED.discard(session)
-    if timed_out:
-        fail(f"{command[0]} exceeded its time limit; its session closed")
-    return subprocess.CompletedProcess(command, child.returncode, stdout, stderr)
-
-
-class Reserve:
-    """Samples host free space every 250 ms from admission to teardown."""
-
-    def __init__(self, path: str):
-        self.path = path
-        self.minimum = None
-        self.breach = None
-        self.stop = threading.Event()
-        self.thread = threading.Thread(target=self.loop, daemon=True)
-
-    def free(self) -> int:
-        stat = os.statvfs(self.path)
-        return stat.f_bavail * stat.f_frsize
-
-    def loop(self) -> None:
-        while not self.stop.is_set():
-            free = self.free()
-            self.minimum = free if self.minimum is None else min(self.minimum, free)
-            if free < HOST_RESERVE_BYTES and self.breach is None:
-                self.breach = free
-            self.stop.wait(0.25)
-
-    def check(self, phase: str) -> None:
-        if self.breach is not None:
-            fail(f"host free {self.breach} fell below the 20 GiB reserve (at or before {phase})")
-
-
-def tree_bytes(root: str) -> int:
-    total = 0
-    if not os.path.exists(root):
-        return 0
-    for current, dirs, files in os.walk(root, followlinks=False):
-        dirs[:] = [name for name in dirs if not os.path.ismount(os.path.join(current, name))]
-        for name in files:
-            path = os.path.join(current, name)
-            if os.path.islink(path):
-                continue
-            metadata = os.lstat(path)
-            allocated = metadata.st_blocks * 512
-            total += allocated if name.endswith(".sparseimage") else max(metadata.st_size, allocated)
-    return total
+def run_owned(command: list, *, env: dict, cwd: str | None = None, text: bool = True, timeout: float = 120, cleanup: bool = False):
+    """Every child goes through the guardian's single supervised spawn path."""
+    result = GUARDIAN.run(command, env=env, cwd=cwd, timeout=timeout, cleanup=cleanup)
+    if text:
+        result.stdout = result.stdout.decode(errors="replace")
+        result.stderr = result.stderr.decode(errors="replace")
+    return result
 
 
 class Proof:
-    def __init__(self, parent: str, reserve: Reserve):
+    def __init__(self, parent: str):
         self.parent = parent
-        self.reserve = reserve
-        self.owned_peak = 0
         self.mount = None
         self.image = os.path.join(parent, "volume.sparseimage")
         self.env = dict(os.environ)
         self.name = "OxRm" + secrets.token_hex(4)
 
     def account(self, phase: str) -> None:
-        self.reserve.check(phase)
-        owned = tree_bytes(self.parent) + (tree_bytes(self.mount) if self.mount and os.path.ismount(self.mount) else 0)
-        self.owned_peak = max(self.owned_peak, owned)
-        print(f"sample {phase}: {time.monotonic() - STARTED:.1f} s, owned {owned // 1024} KiB, host free {self.reserve.free() // MIB} MiB")
-        if owned > SCRATCH_LIMIT_BYTES:
-            fail(f"owned bytes {owned} exceed 512 MiB at {phase}")
+        GUARDIAN.check()
+        print(
+            f"sample {phase}: {time.monotonic() - STARTED:.1f} s, max sampled owned {GUARDIAN.walk_max // 1024} KiB "
+            f"over {GUARDIAN.walk_count} complete walks, host free minimum {GUARDIAN.reserve_min // MIB} MiB"
+        )
 
-    def hdiutil(self, *args: str) -> subprocess.CompletedProcess:
-        result = run_owned(["/usr/bin/hdiutil", *args], env=self.env, text=False, timeout=60)
+    def hdiutil(self, *args: str, cleanup: bool = False) -> subprocess.CompletedProcess:
+        result = run_owned(["/usr/bin/hdiutil", *args], env=self.env, text=False, timeout=60, cleanup=cleanup)
         emit(f"hdiutil {args[0]} exit {result.returncode}", result.stderr.decode(errors="replace"))
         return result
 
     def attach(self, read_only: bool = False) -> str:
         args = ["attach", "-nobrowse", "-plist", *(["-readonly"] if read_only else []), self.image]
+        # Attach intent before mutation: until resolved, owned bytes are
+        # unknown and the walk faults rather than counting zero.
+        GUARDIAN.walker.unresolved_attach = (self.image, IMAGE_MIB * MIB)
         result = self.hdiutil(*args)
         if result.returncode:
-            fail("attach failed")
+            fail("attach failed; attachment unresolved, image preserved")
         entities = plistlib.loads(result.stdout)["system-entities"]
         mounts = [entity for entity in entities if entity.get("mount-point")]
         if len(mounts) != 1:
@@ -225,20 +142,25 @@ class Proof:
             self.mount = mount
             fail(f"the scratch volume mounted at {mount}, not /Volumes/{self.name}")
         self.mount = mount
+        GUARDIAN.walker.mounts[mount] = os.stat(mount).st_dev
+        GUARDIAN.walker.unresolved_attach = None
         print(f"attached {self.image} at {mount} ({mounts[0].get('dev-entry')}, read-only {read_only})")
         return mount
 
-    def detach(self) -> None:
+    def detach(self, cleanup: bool = False) -> None:
+        if GUARDIAN.walker.unresolved_attach is not None:
+            fail(f"attachment of {self.image} is unresolved; image and scratch preserved")
         if not self.mount or not os.path.ismount(self.mount):
             return
-        if UNCLOSED:
-            fail(f"owned sessions {sorted(UNCLOSED)} are not positively closed; no detach, evidence kept")
-        # Ordinary detach only; a busy volume stops the proof.
-        result = self.hdiutil("detach", self.mount)
+        if GUARDIAN.unclosed:
+            fail(f"owned sessions {sorted(GUARDIAN.unclosed)} are not positively closed; no detach, evidence kept")
+        # Ordinary detach only; a busy volume stops the proof. The payload
+        # stays counted until the mount is confirmed gone.
+        GUARDIAN.walker.hold(self.mount)
+        result = self.hdiutil("detach", self.mount, cleanup=cleanup)
         if result.returncode:
             fail(f"ordinary detach of {self.mount} failed; evidence kept")
-        if os.path.exists(self.mount):
-            fail(f"{self.mount} still exists after detach")
+        GUARDIAN.walker.release(self.mount)
 
 
 def build(parent: str, repo: str) -> str:
@@ -256,6 +178,9 @@ def build(parent: str, repo: str) -> str:
             "CARGO_BUILD_RUSTC_WRAPPER": "",
             "CARGO_TARGET_DIR": os.path.join(parent, "stage-target"),
             "CARGO_PROFILE_DEV_DEBUG": "0",
+            # Fewer transient files under the walked staging target.
+            "CARGO_INCREMENTAL": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
         }
     )
     result = run_owned(
@@ -304,30 +229,54 @@ def main() -> int:
     for name in SCRATCH_VARIABLES:
         os.environ[name] = scratch
     print(f"scratch variables {', '.join(SCRATCH_VARIABLES)} = {scratch}")
-    reserve = Reserve(parent)
-    if reserve.free() < HOST_RESERVE_BYTES:
+    global GUARDIAN
+    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+    br.install_cancellation()
+    if br.host_free(parent) < HOST_RESERVE_BYTES:
         fail("host free space is below the 20 GiB reserve before any effect")
-    reserve.thread.start()
-    proof = Proof(parent, reserve)
+    GUARDIAN = br.Guardian(STARTED, parent, br.Walker([parent]), work_seconds=240, total_seconds=PROOF_SECONDS)
+    proof = Proof(parent)
+    first = None
     try:
+        GUARDIAN.wait_healthy()
+        # Synthetic fault cases first, under this real guardian.
+        cases_root = os.path.join(parent, "synthetic")
+        os.makedirs(cases_root, mode=0o700)
+        count = bounded_runner_cases.run_cases(GUARDIAN, cases_root, dict(os.environ), print)
+        shutil.rmtree(cases_root)
+        print(f"synthetic preflight held: {count} cases, {time.monotonic() - STARTED:.1f} s")
+        GUARDIAN.check()
         run(proof, parent)
-    except BaseException:
-        # Detach only after every owned session closed positively.
+    except BaseException as error:
+        first = error
+    if first is not None:
+        # Cleanup-only: ordinary detach after positive closure, never
+        # clearing the fault or starting experimental work.
         try:
-            proof.detach()
+            GUARDIAN.settle()
+            proof.detach(cleanup=True)
         except BaseException as error:  # keep the first failure
-            print(f"teardown after failure: {error}", file=sys.stderr)
-        print(f"removable-pool proof failed after {time.monotonic() - STARTED:.0f} s; evidence kept at {parent}", file=sys.stderr)
-        raise
-    finally:
-        reserve.stop.set()
+            print(f"cleanup after failure: {error!r}", file=sys.stderr)
+        for failure in GUARDIAN.cleanup_failures:
+            print(f"cleanup failure: {failure}", file=sys.stderr)
+        print(
+            f"removable-pool proof failed after {time.monotonic() - STARTED:.0f} s (guardian first fault: {GUARDIAN.first}); "
+            f"evidence kept at {parent}",
+            file=sys.stderr,
+        )
+        GUARDIAN.shutdown()
+        raise first
+    GUARDIAN.check(experimental=False)
+    walks, peak, low = GUARDIAN.walk_count, GUARDIAN.walk_max, GUARDIAN.reserve_min
+    GUARDIAN.shutdown()
     shutil.rmtree(parent)
     if raw is None:
         os.rmdir(root)
     elapsed = time.monotonic() - STARTED
     print(
-        f"removable-pool proof held: {elapsed:.0f} s, owned peak {proof.owned_peak // MIB} MiB, "
-        f"host free minimum {reserve.minimum // MIB} MiB, output {OUTPUT} bytes, scratch removed"
+        f"removable-pool proof held: {elapsed:.0f} s, max sampled owned {peak // MIB} MiB over {walks} complete walks "
+        f"(at most every 2 s, each within 1 s; 512 MiB monitored cap, not an instantaneous ceiling), "
+        f"host free minimum {low // MIB} MiB, output {OUTPUT} bytes, scratch removed"
     )
     if elapsed > PROOF_SECONDS:
         fail(f"proof exceeded {PROOF_SECONDS} s including cleanup")
@@ -339,7 +288,7 @@ def run(proof: Proof, parent: str) -> None:
     real_cargo = shutil.which("cargo")
     if not real_cargo:
         fail("no cargo on PATH")
-    source = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, timeout=30)
+    source = run_owned(["git", "rev-parse", "HEAD"], cwd=repo, env=dict(os.environ), timeout=30)
     print(f"removable-pool proof {os.getpid()} source {source.stdout.strip()} volume name {proof.name}")
     if os.path.lexists(f"/Volumes/{proof.name}"):
         fail(f"/Volumes/{proof.name} already exists; never touched")
