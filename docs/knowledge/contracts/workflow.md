@@ -529,6 +529,7 @@ The standard pattern for consumer projects (Tom, 2026-10-20, [vision](../vision.
   - Queue warm-merge hooks;
   - container builds;
   - selectors whose scripts run a binary from `target/debug/` after a quick build. Under the current `oxide-quick` output directory they would miss the fresh binary or run a stale one. #106 moves `quick` and `debug` output to `target/debug/`.
+  - tests that find a sibling binary by going from `current_exe()` in `deps/` to its profile directory. With Cargo's build-dir, test executables run from the slot (`<slot>/build/<profile>/deps`) while final binaries are uplifted to `<workspace>/target/<profile>/`. This holds for any build-dir user, and #106 does not change it. Repair: integration tests use `env!("CARGO_BIN_EXE_<name>")`; other code also tries `$CARGO_TARGET_DIR/<profile dir name>/`, which Oxide exports. Found by Figmatic's post-merge QA on 2026-10-20: 7 studio tests failed with "no capture renderer beside …/slots/4/build/oxide-quick".
 - **nextest.** Until #106, pass `--cargo-profile oxide-quick` so nextest shares the quick slot.
 - **Worktree seeding.** Selectors that move to `oxide` drop any copy of a primary checkout's `target/` into worktrees. The shared slot is the warm state.
 - **Proof per project:**
