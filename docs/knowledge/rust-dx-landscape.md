@@ -846,6 +846,25 @@ Compatibility is UNKNOWN and benefit INSUFFICIENT. The three cost pairs did
 not run; the S1–S3 times (1.73, 1.06, 0.83 s) are single observations, not
 cost samples.
 
+## sccache with Oxide: modes and path sensitivity (2026-10-20)
+
+Supervisor probes on sccache 0.18.0. Each used an isolated private `SCCACHE_DIR` and `SCCACHE_SERVER_UDS`, a tiny crate with the `cfg-if` and `itoa` registry dependencies, `--offline`, and `CARGO_INCREMENTAL=0`. The live machine server was never touched.
+
+- **Client-side mode exists** (`SCCACHE_CLIENT_SIDE`, since 0.17.0). Per the [0.18.0 architecture doc](https://docs.rs/crate/sccache/0.18.0/source/docs/Architecture.md), the CLI process runs the compile pipeline and the compiler; the daemon only holds the storage backend and stats, and each cache operation is forwarded over IPC. Under Oxide this puts every slot writer inside the build's process group, which is the closure #096 could not get from server-side mode. That is source-unverified for 0.18.0.
+  - Known issues: [#2796](https://github.com/mozilla/sccache/issues/2796) ("local cache is not populated", open) and [#2804](https://github.com/mozilla/sccache/issues/2804) (stats, closed 2026-10-19).
+  - In the probe, client-side mode stored cache entries but reported no hit or miss counts.
+- **Rust cache hits are target-path sensitive.** Server-side stats:
+  - first build at target path A: 0 hits, 2 misses;
+  - the same path again after removal: +2 hits;
+  - a different target path B: +2 misses, no hits.
+  - Setting `SCCACHE_BASEDIRS` to the parent of both target directories gave the same result. 0.18.0 contains basedir code, but it did not normalize this Rust case. Upstream Rust basedir stripping ([#2678](https://codspeed.io/mozilla/sccache/branches/vercel%3Aupstream-pr%2Frust-basedirs)) was not observed in this build. A related correctness bug exists for C/C++ ([#2863](https://github.com/mozilla/sccache/issues/2863)).
+- **Consequence:** every Oxide slot has its own path and recycled slots get new IDs, so sccache gives cross-slot or cold-slot hits only if the paths Cargo passes to rustc are identical. As shipped, it adds little to Oxide-managed builds.
+- **Live machine server reading (2026-10-20 ~13:00):** Rust hit rate 70.7% (16,525 hits). Average compile 1.957 s, average hit read 0.001 s. Non-cacheable reasons: crate-type 9,826, incremental 1,014. Under the path finding, these hits come from repeated builds at unchanged target paths. That is an inference, not attributed.
+
+Paths to complementarity, unqualified:
+1. Upstream Rust basedir normalization.
+2. An Oxide stable build-path alias: each concurrently active lease builds through a fixed per-index alias path to its slot, so sccache keys match across slots and projects. Combined with client-side mode for writer closure. Needs proof that Cargo does not canonicalize the alias, and an account of debug-info path effects.
+
 ## Product assessment
 
 Planner recommendation: a small coherent entry point over evidence-backed mechanisms, with three capabilities: see and explain costs, bound and reuse owned storage, and apply qualified improvements with clear trade-offs. The reusable storage core must work for ordinary developers as well as orchestrators. A daemon, editor surface or UI is still an open choice; Tom's [workflow direction](vision.md#product-workflow-direction) sets an `oxide build` / `oxide run` front door as the design target.
