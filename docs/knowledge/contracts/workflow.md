@@ -1341,6 +1341,25 @@ A lease records which pool it uses. Each pool stays warm on its own.
 
 **Drive:** the dedicated spare 1 TB SSD (Tom, 2026-10-20), formatted by Tom in Disk Utility as plain APFS volume `Builds` (UUID `A6AC3ED7-33EA-46B4-8082-7254CF291ED2`). Vault and its Time Machine backups stay untouched. **Decided (Tom, 2026-10-20):** a 750 GB Oxide admission cap and a 100 GB free-space reserve, both set at registration. **Not yet decided:** the exact flush primitive and its cost.
 
+## Adaptive sccache location (proposed)
+
+Approved design direction (Tom, 2026-10-20). Not implemented. It applies to builds that do **not** go through Oxide; Oxide-managed builds bypass inherited wrappers.
+
+- **Constraint from sccache:** the cache location (`SCCACHE_DIR`) is read when its server starts, and "the local storage only supports a single sccache server at a time" ([Local.md](https://github.com/mozilla/sccache/blob/main/docs/Local.md)). Multi-level caches write to every level, so they don't keep writes off the internal SSD.
+- **Design: one server and cache per location, chosen per compile.** A small Oxide-shipped wrapper binary becomes the machine `rustc-wrapper`. On each compile it runs the removable-volume identity check from #097, with no child process.
+  - **Volume present:** `SCCACHE_DIR` on the volume, plus a dedicated `SCCACHE_SERVER_UDS` socket in a private internal runtime directory.
+  - **Volume absent:** a separate internal cache directory and socket.
+  - Then it execs sccache with the original arguments.
+  - Each location keeps its own server and cache, so two servers never share one. Nothing restarts on a switch; an idle server exits on sccache's own timeout.
+- **No spill:** the `/Volumes` permission rule from the removable design applies. A vanished volume cannot be recreated on the internal disk.
+- **Known costs, to be measured:**
+  - a compile in flight at the moment of undocking may fail;
+  - each cache warms independently;
+  - undocked compiles still write the internal cache, so its cap should be small.
+- **Rollout:** after review, a staged host step switches `build.rustc-wrapper` in `~/.cargo/config.toml` to the wrapper. It is reversible by restoring the line, and the Effigy owner is informed first. The previous default server and cache are retired by stopping that server before the switch; they are never shared.
+
+**Not yet decided:** cache caps (proposed 100 GB on `Builds` and 15 GB internal, within the drive's space beside the 750 GB pool cap and 100 GB reserve).
+
 ## Open decisions
 
 - **W-1 Default pool.** Foundation choice above: per-user cache directory,

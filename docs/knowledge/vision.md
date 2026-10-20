@@ -474,6 +474,8 @@ Tom's rulings, 2026-10-20 ("Let's start with sccache bypassed in oxide, see how 
 - **Oxide-managed builds bypass any inherited rustc wrapper (today the machine-wide sccache).** Other tools keep using the wrapper. This ends the interim interrupted-build risk once shipped, and sccache integration can be revisited later from the #096 evidence.
 - **On the `Builds` drive, Oxide's admission cap is 750 GB and it keeps at least 100 GB free** (the registration reserve).
 
+Tom approved, 2026-10-20 ("Yes please"), a design and task for an adaptive sccache location wrapper, sequenced after #097. While docked it uses one sccache server and cache on the registered `Builds` volume, and a separate internal server and small cache when undocked. Oxide's volume-identity check selects between them per compile. Switching the machine-wide `rustc-wrapper` to it is a separate, staged host step after independent review, with the Effigy owner informed first.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
