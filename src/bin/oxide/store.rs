@@ -1914,6 +1914,67 @@ fn lease_error(context: &str, error: &LeaseError) -> String {
 mod tests {
     use super::*;
 
+    fn paired_controls() -> (PathBuf, Store, Store) {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!(
+            "oxide-barrier-{}-{}",
+            std::process::id(),
+            process::now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let store = |name: &str| Store {
+            pool: root.join(name),
+            backend: Backend::DirectoryBudget,
+            payload: root.join(name).join("payload"),
+            control: root.join(name).join(MANAGED_NAME),
+            sibling: None,
+        };
+        let (internal, removable) = (store("internal"), store("removable"));
+        for side in [&internal, &removable] {
+            fs::create_dir_all(&side.pool).unwrap();
+            side.ensure_control().unwrap();
+        }
+        let internal_control = internal.control.clone();
+        let removable_control = removable.control.clone();
+        (
+            root,
+            internal.with_sibling(&removable_control, false),
+            removable.with_sibling(&internal_control, true),
+        )
+    }
+
+    /// The checkout clean barrier spans both pools: an internal clean waits
+    /// for the checkout's active removable command, and a removable slot
+    /// attempt sees a live internal clean under the internal admission lock.
+    #[test]
+    fn clean_barrier_spans_both_pools() {
+        let (root, internal, removable) = paired_controls();
+        let checkout = Path::new("/checkout");
+        let other = Path::new("/other");
+        let mut state = State::default();
+        state
+            .records
+            .push(record(Phase::Running, Some(i32::MAX), Some("v1.a.1.1.1")));
+        removable.save(&state).unwrap();
+        assert!(internal.sibling_busy(checkout));
+        assert!(!internal.sibling_busy(other));
+        let Cleaning::Guard(guard) = internal.begin_clean(other).unwrap() else {
+            panic!("clean of an idle checkout was interrupted");
+        };
+        let (lock, cleaning) = removable.sibling_barrier(other).unwrap();
+        assert!(lock.is_some() && cleaning);
+        drop(lock);
+        assert!(!removable.sibling_barrier(checkout).unwrap().1);
+        internal.abandon_clean(guard).unwrap();
+        assert!(!removable.sibling_barrier(other).unwrap().1);
+        // The internal store itself never takes the other pool's lock.
+        assert!(internal.sibling_barrier(other).unwrap().0.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn record(phase: Phase, group: Option<i32>, lease_id: Option<&str>) -> Record {
         Record {
             id: 1,
