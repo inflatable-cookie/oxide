@@ -17,10 +17,6 @@ name = "oxide-storage-inventory"
 path = "src/bin/storage_inventory.rs"
 
 [[bin]]
-name = "oxide-storage-lease"
-path = "src/bin/storage_lease.rs"
-
-[[bin]]
 name = "oxide"
 path = "src/bin/oxide/main.rs"
 

@@ -10,6 +10,7 @@ mod adopt;
 mod cargo_home;
 mod clean;
 mod cli;
+mod config;
 mod freshness;
 mod identity;
 mod launch;
@@ -468,19 +469,15 @@ fn print_summary(
         "run" | "test" => "build+execute",
         _ => "build",
     };
-    let pool = match (store.backend, store.payload_use()) {
-        (Backend::ApfsImage, Some((used, total))) => {
-            format!("pool {} of {} MiB used", used / MIB, total / MIB)
-        }
-        (Backend::DirectoryBudget | Backend::ApfsVolume, Some((used, budget))) => format!(
+    let pool = match store.payload_use() {
+        Some((used, budget)) => format!(
             "pool {} MiB allocated of {} MiB budget",
             used / MIB,
             budget / MIB
         ),
-        (_, None) => "pool use unknown".to_owned(),
+        None => "pool use unknown".to_owned(),
     };
     let backend = match store.backend {
-        Backend::ApfsImage => format!(" ({})", store.backend.tag()),
         Backend::DirectoryBudget => format!(" ({}, budget-only)", store.backend.tag()),
         Backend::ApfsVolume => format!(
             " ({}, budget-only, removable {})",
@@ -503,24 +500,25 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
         [flag] if flag == "--launch-check" => return launch::run_check(),
         _ => return Err("status takes no arguments except --launch-check".to_owned()),
     }
-    println!("pool: {}", store::pool_path()?.display());
-    match Store::open_existing()? {
-        None => {
-            let backend = store::creation_backend()?;
+    let settings = store::settings()?;
+    print_settings(&settings);
+    match Store::open_existing() {
+        Ok(None) => {
             println!(
-                "  not created; the first building oxide command creates it ({}: {}), cap {} MiB",
-                backend.tag(),
-                backend.bound(),
-                store::creation_cap(backend)? / MIB
+                "  not created; the first building oxide command creates it ({}: {})",
+                Backend::DirectoryBudget.tag(),
+                Backend::DirectoryBudget.bound()
             );
         }
-        Some(store) => {
+        Ok(Some(store)) => {
             print_pool(&store)?;
             if let Some(removable) = removable::status(&store)? {
                 print_pool(&removable)?;
             }
         }
+        Err(error) => println!("  cannot open: {error}"),
     }
+    print_other_pools(&settings);
     match identity::locate_workspace(CARGO, None) {
         Ok(workspace) => report_stray(&workspace),
         Err(_) => println!("stray Cargo output: no Cargo workspace here"),
@@ -538,17 +536,6 @@ fn print_pool(store: &Store) -> Result<(), String> {
         store.backend.bound()
     );
     match store.backend {
-        Backend::ApfsImage => {
-            let used = store
-                .payload_use()
-                .map(|(used, total)| format!("{} of {} MiB used", used / MIB, total / MIB))
-                .unwrap_or_else(|| "use unknown".to_owned());
-            println!(
-                "  cap {} MiB, {used}, slot accounting {:?}",
-                report.pool.cap_bytes / MIB,
-                report.pool.coverage
-            );
-        }
         Backend::DirectoryBudget => {
             let used = report.pool.payload_unique_allocated_bytes.map_or_else(
                 || "slot allocation unknown".to_owned(),
@@ -559,10 +546,24 @@ fn print_pool(store: &Store) -> Result<(), String> {
                 |bytes| format!("{} MiB", bytes / MIB),
             );
             println!(
-                "  budget {} MiB, {used}, slot accounting {:?}",
-                report.pool.cap_bytes / MIB,
+                "  soft budget {} MB (checked at admission; a running build may grow past it), {used}, slot accounting {:?}",
+                store.budget(report.pool.cap_bytes) / 1_000_000,
                 report.pool.coverage
             );
+            let physical = store::statfs(&store.payload).and_then(|sample| {
+                let block = u64::try_from(sample.f_bsize).ok()?;
+                Some((sample.f_blocks.checked_mul(block)?, sample.f_bavail.checked_mul(block)?))
+            });
+            match physical {
+                Some((capacity, available)) => println!(
+                    "  filesystem: {} MiB available of {} MiB capacity (shared; no Oxide quota or hard ceiling)",
+                    available / MIB,
+                    capacity / MIB
+                ),
+                None => println!("  filesystem: capacity unknown (no Oxide quota or hard ceiling)"),
+            }
+            println!("  Time Machine: {}", backup_line(&store.pool));
+            println!("  Spotlight: {}", config::spotlight_advice(&store.pool));
             println!(
                 "  reserve watchdog: stops a build below {} GiB available ({} GiB reserve + {} GiB margin), best effort; pool filesystem available {available}",
                 (store::HOST_RESERVE_BYTES + watchdog::MARGIN_BYTES) / store::GIB,
@@ -737,5 +738,86 @@ fn report_stray(workspace: &Path) {
             }
         }
         Err(error) => println!("stray Cargo output: scan unavailable ({error})"),
+    }
+}
+
+/// Config file, path and budget with where each came from. Never prints
+/// file contents or unrelated environment values.
+fn print_settings(settings: &config::Settings) {
+    let file = &settings.file;
+    println!(
+        "config: {} ({}{})",
+        file.path.display(),
+        if file.explicit {
+            "selected by OXIDE_CONFIG"
+        } else {
+            "platform location"
+        },
+        if file.present { "" } else { ", absent" }
+    );
+    if let Some(ignored) = config::ignored_legacy_config(&config::Facts::from_env()) {
+        println!(
+            "  ignored: {} exists but is never read on macOS; move its settings to the file above",
+            ignored.display()
+        );
+    }
+    println!(
+        "pool: {} (from {})",
+        settings.pool.display(),
+        settings.pool_source.describe()
+    );
+    println!(
+        "  soft budget {} MB (from {})",
+        settings.budget / 1_000_000,
+        settings.budget_source.describe()
+    );
+}
+
+fn backup_line(pool: &Path) -> String {
+    match config::backup_state(pool) {
+        config::Backup::Excluded => "excluded (tmutil isexcluded)".to_owned(),
+        config::Backup::NotExcluded(reason) => format!("NOT excluded ({reason})"),
+        config::Backup::NotApplicable => "not applicable on this platform".to_owned(),
+    }
+}
+
+/// Pools Oxide knows of at other paths: the retired image pool's default
+/// and pools it created before a path change. Read-only and informational;
+/// Oxide never moves or deletes them.
+fn print_other_pools(settings: &config::Settings) {
+    let facts = config::Facts::from_env();
+    let current = std::fs::canonicalize(&settings.pool).unwrap_or_else(|_| settings.pool.clone());
+    let mut seen = Vec::new();
+    let candidates = config::legacy_default_pool(&facts)
+        .into_iter()
+        .chain(config::default_pool(&facts))
+        .chain(config::known_pools(&facts));
+    for path in candidates {
+        let resolved = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if resolved == current || seen.contains(&resolved) {
+            continue;
+        }
+        seen.push(resolved);
+        let registered = path.join(oxide_storage::lease::MANAGED_NAME).join("removable.json");
+        let removable = if std::fs::symlink_metadata(&registered).is_ok() {
+            "; holds a removable registration Oxide does not use from here"
+        } else {
+            ""
+        };
+        match config::inspect(&path) {
+            config::Found::Absent => {}
+            config::Found::LegacyImage => println!(
+                "legacy pool: {} (retired apfs-sparse-image-v1; not used, attached or written; pending planner retirement{removable})",
+                path.display()
+            ),
+            config::Found::Directory => println!(
+                "orphaned pool: {} (not the current pool; Oxide never moves or deletes it{removable})",
+                path.display()
+            ),
+            config::Found::Unknown => println!(
+                "other pool path: {} (unrecognised; left alone)",
+                path.display()
+            ),
+        }
     }
 }

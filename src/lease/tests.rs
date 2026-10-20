@@ -1,13 +1,11 @@
-use super::backing::CapacitySample;
 use super::managed;
 use super::pool::{
-    capacity_status_injected, create_injected, evict_idle_slot_injected, lease_injected,
-    mark_evicting_for_test, recover_injected, release_injected, status_injected,
+    create_injected, evict_idle_slot_injected, lease_injected, mark_evicting_for_test,
+    recover_injected, release_injected, status_injected,
 };
 use super::{
-    init_pool, render_capacity_status_human, render_capacity_status_json, render_status_json,
-    AccountingCoverage, ByteObservation, LeaseError, LeaseRequest, ObservationUnknownReason,
-    Profile, SlotOccupancy, BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME,
+    AccountingCoverage, LeaseError, LeaseRequest, Profile, SlotOccupancy,
+    BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME,
 };
 use std::fs::{self, File};
 use std::io::Write;
@@ -79,6 +77,7 @@ fn request_with_profile(
         workspace: workspace.to_path_buf(),
         profile,
         holder: holder.to_owned(),
+        budget_bytes: None,
     }
 }
 
@@ -89,16 +88,6 @@ fn lease_sequence(lease_id: &str) -> u64 {
         .expect("lease sequence")
         .parse()
         .expect("numeric lease sequence")
-}
-
-fn injected_capacity_sample() -> CapacitySample {
-    CapacitySample {
-        payload_free_bytes: ByteObservation::observed(0),
-        payload_available_bytes: ByteObservation::observed(0),
-        image_logical_bytes: ByteObservation::observed(0),
-        image_allocated_bytes: ByteObservation::observed(0),
-        host_available_bytes: ByteObservation::observed(0),
-    }
 }
 
 fn snapshot_tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
@@ -759,37 +748,6 @@ fn unsafe_evicting_slot_root_stays_unavailable_without_blocking_status_or_releas
 }
 
 #[test]
-fn known_macos_metadata_added_after_init_is_outside_slot_accounting() {
-    let fx = Fixture::new("metadata-after-init");
-    let pool = fx.dir("pool");
-    create_injected(&pool, 1024 * 1024).expect("init before OS metadata appears");
-    let payload = pool.join("payload");
-    for name in [
-        ".fseventsd",
-        ".Spotlight-V100",
-        ".Trashes",
-        ".TemporaryItems",
-    ] {
-        let metadata_dir = payload.join(name);
-        fs::create_dir(&metadata_dir).expect("post-init metadata directory");
-        if name == ".fseventsd" {
-            fs::write(metadata_dir.join("fseventsd-uuid"), b"metadata").expect("FSEvents UUID");
-        }
-    }
-
-    let status = status_injected(&pool).expect("known metadata directories are accepted");
-    assert_eq!(status.coverage, AccountingCoverage::Complete);
-    assert_eq!(status.payload_logical_bytes, Some(0));
-    assert_eq!(status.payload_unique_allocated_bytes, Some(0));
-    assert!(status.slots.is_empty());
-    let project = fx.dir("project");
-    let workspace = fx.dir("workspace");
-    let grant = lease_injected(request(&pool, &project, &workspace, "holder-a"))
-        .expect("lease after delayed metadata arrival");
-    assert_eq!(grant.slot_id, "1");
-}
-
-#[test]
 fn unknown_or_non_directory_macos_metadata_entries_refuse() {
     for case in ["unknown-name", "known-file", "known-symlink"] {
         let fx = Fixture::new(case);
@@ -817,203 +775,14 @@ fn unknown_or_non_directory_macos_metadata_entries_refuse() {
 }
 
 #[test]
-fn injected_capacity_samples_keep_zero_unknown_and_partial_distinct() {
-    let fx = Fixture::new("capacity-samples-injected");
-    let pool = fx.dir("pool");
-    create_injected(&pool, 4 * 1024 * 1024).expect("init synthetic pool");
-
-    let partial = capacity_status_injected(
-        &pool,
-        CapacitySample {
-            payload_free_bytes: ByteObservation::observed(0),
-            payload_available_bytes: ByteObservation::unknown(
-                ObservationUnknownReason::Unsupported,
-            ),
-            image_logical_bytes: ByteObservation::observed(0),
-            image_allocated_bytes: ByteObservation::unknown(ObservationUnknownReason::Overflow),
-            host_available_bytes: ByteObservation::unknown(ObservationUnknownReason::SampleFailed),
-        },
-    )
-    .expect("injected partial capacity report");
-    assert_eq!(partial.capacity.coverage, AccountingCoverage::Partial);
-    assert_eq!(partial.capacity.payload_free_bytes.value_bytes, Some(0));
-    assert_eq!(partial.capacity.payload_available_bytes.value_bytes, None);
-    assert_eq!(
-        partial.capacity.payload_available_bytes.unknown_reason,
-        Some(ObservationUnknownReason::Unsupported)
-    );
-    let json = serde_json::to_value(&partial).expect("serialize injected report");
-    assert_eq!(json["capacity"]["payload_free_bytes"]["value_bytes"], 0);
-    assert!(json["capacity"]["payload_available_bytes"]["value_bytes"].is_null());
-
-    let unknown = ByteObservation::unknown(ObservationUnknownReason::Unsupported);
-    let report = capacity_status_injected(
-        &pool,
-        CapacitySample {
-            payload_free_bytes: unknown,
-            payload_available_bytes: unknown,
-            image_logical_bytes: unknown,
-            image_allocated_bytes: unknown,
-            host_available_bytes: unknown,
-        },
-    )
-    .expect("injected unknown capacity report");
-    assert_eq!(report.capacity.coverage, AccountingCoverage::Unknown);
-}
-
-#[test]
-fn injected_capacity_keeps_hardlink_and_metadata_accounting_separate() {
-    let fx = Fixture::new("capacity-hardlinks-injected");
-    let pool = fx.dir("pool");
-    create_injected(&pool, 4 * 1024 * 1024).expect("init synthetic pool");
-    let payload = pool.join("payload");
-    fs::create_dir(payload.join(".fseventsd")).expect("synthetic APFS metadata directory");
-    fs::write(
-        payload.join(".fseventsd").join("fseventsd-uuid"),
-        vec![b'm'; 16 * 1024],
-    )
-    .expect("synthetic APFS metadata file");
-
-    let project = fx.dir("project");
-    let workspace = fx.dir("workspace");
-    let grant = lease_injected(request(&pool, &project, &workspace, "capacity-holder"))
-        .expect("held synthetic lease");
-    let original = grant.env.cargo_build_build_dir.join("payload.bin");
-    let hardlink = grant.env.cargo_build_build_dir.join("payload-hardlink.bin");
-    fs::write(&original, vec![b'x'; 4096]).expect("synthetic payload");
-    fs::hard_link(&original, &hardlink).expect("synthetic hardlink");
-
-    let report = capacity_status_injected(&pool, injected_capacity_sample())
-        .expect("injected capacity status");
-    assert_eq!(report.capacity.coverage, AccountingCoverage::Complete);
-    assert_eq!(report.capacity.payload_available_bytes.value_bytes, Some(0));
-    assert_eq!(report.status.full, Some(false));
-    assert!(report.notes[0].contains("not filesystem headroom"));
-    assert!(
-        !render_capacity_status_json(&report, 65_536)
-            .expect("complete zero-sample render")
-            .partial
-    );
-    assert_eq!(report.status.payload_logical_bytes, Some(8192));
-    let unique = report
-        .status
-        .payload_unique_allocated_bytes
-        .expect("complete synthetic slot allocation");
-    assert!(unique > 0 && unique < 8192);
-    assert_eq!(report.status.slots.len(), 1);
-    assert_eq!(report.capacity.payload_free_bytes.value_bytes, Some(0));
-}
-
-#[test]
-fn injected_capacity_status_preserves_held_and_evicting_bytes() {
-    let fx = Fixture::new("capacity-observational-injected");
-    let pool = fx.dir("pool");
-    create_injected(&pool, 4 * 1024 * 1024).expect("init synthetic pool");
-    let project_held = fx.dir("project-held");
-    let project_evicting = fx.dir("project-evicting");
-    let workspace = fx.dir("workspace");
-    let held = lease_injected(request(
-        &pool,
-        &project_held,
-        &workspace,
-        "held-capacity-holder",
-    ))
-    .expect("held lease");
-    let held_bytes = held.env.cargo_build_build_dir.join("held.bin");
-    fs::write(&held_bytes, b"held bytes remain byte-for-byte").expect("held payload");
-
-    let evicting = lease_injected(request(
-        &pool,
-        &project_evicting,
-        &workspace,
-        "evicting-capacity-holder",
-    ))
-    .expect("second lease");
-    let evicting_bytes = evicting.env.cargo_build_build_dir.join("evicting.bin");
-    fs::write(&evicting_bytes, b"evicting bytes remain byte-for-byte").expect("evicting payload");
-    release_injected(&pool, &evicting.lease_id).expect("release second lease");
-    mark_evicting_for_test(&pool, evicting.slot_id.parse().expect("numeric slot id"))
-        .expect("record Evicting state");
-
-    let before = snapshot_tree(&pool);
-    let report = capacity_status_injected(&pool, injected_capacity_sample())
-        .expect("injected observational capacity status");
-    let after = snapshot_tree(&pool);
-    assert_eq!(before, after);
-    assert_eq!(report.status.coverage, AccountingCoverage::Unknown);
-    assert_eq!(report.status.full, None);
-    assert!(report
-        .status
-        .slots
-        .iter()
-        .any(|slot| { slot.slot_id == held.slot_id && slot.state == SlotOccupancy::Held }));
-    assert!(report.status.slots.iter().any(|slot| {
-        slot.slot_id == evicting.slot_id && slot.state == SlotOccupancy::Abandoned
-    }));
-    assert!(evicting_bytes.exists());
-}
-
-#[test]
-fn capacity_rendering_is_utf8_valid_and_obeys_64_byte_and_normal_caps() {
-    let fx = Fixture::new("capacity-rendering");
-    let pool = fx.dir("pool");
-    create_injected(&pool, 4 * 1024 * 1024).expect("init synthetic pool");
-    let mut report = capacity_status_injected(&pool, injected_capacity_sample())
-        .expect("injected complete capacity report");
-    report.status.store_id = "🦀".repeat(48);
-
-    let tiny_json = render_capacity_status_json(&report, 64).expect("64-byte JSON cap");
-    assert!(tiny_json.truncated);
-    assert!(tiny_json.bytes.len() <= 64);
-    let tiny_json_value: serde_json::Value =
-        serde_json::from_slice(&tiny_json.bytes).expect("valid truncated JSON");
-    assert_eq!(tiny_json_value["truncated"], true);
-
-    let tiny_human = render_capacity_status_human(&report, 64).expect("64-byte human cap");
-    assert!(tiny_human.truncated);
-    assert!(tiny_human.bytes.len() <= 64);
-    std::str::from_utf8(&tiny_human.bytes).expect("truncated human UTF-8");
-
-    let normal_json = render_capacity_status_json(&report, 65_536).expect("normal JSON cap");
-    assert!(!normal_json.truncated);
-    serde_json::from_slice::<serde_json::Value>(&normal_json.bytes).expect("normal JSON");
-    let normal_human = render_capacity_status_human(&report, 65_536).expect("normal human cap");
-    assert!(!normal_human.truncated);
-    let human = std::str::from_utf8(&normal_human.bytes).expect("normal human UTF-8");
-    assert!(human.contains("payload filesystem available (statfs f_bavail)"));
-    assert!(human.contains("not APFS unique extents"));
-    assert!(matches!(
-        render_capacity_status_json(&report, 63),
-        Err(LeaseError::InvalidInput(_))
-    ));
-}
-
-#[test]
-fn status_json_stays_bounded() {
-    let fx = Fixture::new("status");
-    let pool = fx.dir("pool");
-    create_injected(&pool, 1024 * 1024).expect("init");
-    let project = fx.dir("project");
-    let workspace = fx.dir("workspace");
-    lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
-    let status = status_injected(&pool).expect("status");
-    let rendered = render_status_json(&status, 64).expect("render");
-    assert!(rendered.bytes.len() <= 64);
-    assert!(rendered.truncated);
-}
-
-#[test]
 fn failed_init_lock_only_retry_succeeds() {
     let fx = Fixture::new("init-retry");
     let pool = fx.dir("pool");
-    let undersized = init_pool(&pool, 1024, 512);
-    assert!(
-        matches!(undersized, Err(LeaseError::InvalidInput(_))),
-        "{undersized:?}"
-    );
+    let zero = create_injected(&pool, 0);
+    assert!(matches!(zero, Err(LeaseError::InvalidInput(_))), "{zero:?}");
     assert!(
         !pool.join("lock").exists(),
-        "cap check must run before creating lock"
+        "budget check must run before creating lock"
     );
 
     File::create(pool.join("lock")).unwrap();
@@ -1027,20 +796,6 @@ fn failed_init_lock_only_retry_succeeds() {
     assert!(
         matches!(refused, Err(LeaseError::InvalidInput(_))),
         "{refused:?}"
-    );
-}
-
-#[test]
-fn product_open_refuses_directory_injection() {
-    let fx = Fixture::new("product");
-    let pool = fx.dir("pool");
-    create_injected(&pool, 1024 * 1024).expect("init");
-    let project = fx.dir("project");
-    let workspace = fx.dir("workspace");
-    let result = super::lease(request(&pool, &project, &workspace, "holder-a"));
-    assert!(
-        matches!(result, Err(LeaseError::BackingMismatch)),
-        "CLI path must not treat a directory as the APFS product: {result:?}"
     );
 }
 
@@ -1136,31 +891,6 @@ fn budget_pool_admits_against_the_budget_and_evicts_whole_idle_slots() {
 }
 
 #[test]
-fn hard_bound_entry_points_refuse_a_budget_pool() {
-    let fx = Fixture::new("budget-cli");
-    let pool = fx.dir("pool");
-    managed::init_budget_pool(&pool, 1024 * 1024).expect("init budget pool");
-    let project = fx.dir("project");
-    let workspace = fx.dir("workspace");
-    assert!(matches!(
-        super::lease(request(&pool, &project, &workspace, "holder-a")),
-        Err(LeaseError::BackingMismatch)
-    ));
-    assert!(matches!(
-        super::status(&pool),
-        Err(LeaseError::BackingMismatch)
-    ));
-    assert!(matches!(
-        super::capacity_status(&pool),
-        Err(LeaseError::BackingMismatch)
-    ));
-    assert!(matches!(
-        super::release(&pool, "v1.x.1.1.1"),
-        Err(LeaseError::BackingMismatch)
-    ));
-}
-
-#[test]
 fn budget_pool_refuses_image_files_foreign_payload_entries_and_a_zero_budget() {
     let fx = Fixture::new("budget-shape");
     assert!(matches!(
@@ -1191,11 +921,84 @@ fn budget_pool_refuses_image_files_foreign_payload_entries_and_a_zero_budget() {
 }
 
 #[test]
-fn managed_entry_points_still_open_the_injected_apfs_shape_only_through_the_hard_bound_path() {
-    // The injected directory poses as the APFS backend for ledger tests; the
-    // managed path opens real backings only, so it refuses the injection.
-    let fx = Fixture::new("managed-injected");
+fn a_pool_recording_the_retired_image_backend_refuses_untouched() {
+    // A legacy `apfs-sparse-image-v1` pool: config, ledger, receipt and an
+    // image file, as the retired backend left them. Every entry point
+    // refuses before writing; nothing is attached, created or removed.
+    let fx = Fixture::new("legacy-image");
     let pool = fx.dir("pool");
-    create_injected(&pool, 1024 * 1024).expect("init");
-    assert!(managed::status(&pool).is_err());
+    fs::set_permissions(&pool, fs::Permissions::from_mode(0o700)).expect("private pool");
+    let write = |name: &str, bytes: &[u8]| {
+        let path = pool.join(name);
+        fs::write(&path, bytes).expect("legacy file");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private file");
+    };
+    write(
+        "config.json",
+        br#"{"version":1,"backend":"apfs-sparse-image-v1","store_id":"00","cap_bytes":134217728,"image_bytes":134217728}"#,
+    );
+    write(
+        "ledger.json",
+        br#"{"version":1,"store_id":"00","cap_bytes":134217728,"next_slot":1,"next_lease":1,"slots":[]}"#,
+    );
+    write("receipt.json", b"{}");
+    write("image.sparseimage", b"");
+    let before = snapshot_tree(&pool);
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    assert!(matches!(
+        managed::status(&pool),
+        Err(LeaseError::BackingMismatch)
+    ));
+    assert!(matches!(
+        managed::lease(request(&pool, &project, &workspace, "holder-a")),
+        Err(LeaseError::BackingMismatch)
+    ));
+    assert!(matches!(
+        managed::release(&pool, "v1.00.1.1.1"),
+        Err(LeaseError::BackingMismatch)
+    ));
+    // The pool lock may be created; every recorded byte is unchanged.
+    let after: Vec<_> = snapshot_tree(&pool)
+        .into_iter()
+        .filter(|(path, _)| path != Path::new("lock"))
+        .collect();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn a_changed_soft_budget_applies_at_the_next_admission() {
+    let fx = Fixture::new("soft-budget");
+    let pool = fx.dir("pool");
+    managed::init_budget_pool(&pool, 64 * 1024 * 1024).expect("init budget pool");
+    let workspace = fx.dir("workspace");
+    let project_a = fx.dir("project-a");
+    let first = managed::lease(request(&pool, &project_a, &workspace, "holder-a")).expect("a");
+    // The build grows past any later budget; nothing stops it while held.
+    let mut file = File::create(first.env.cargo_build_build_dir.join("payload.bin"))
+        .expect("payload file");
+    file.write_all(&vec![7_u8; 256 * 1024]).expect("grow past budget");
+    managed::release(&pool, &first.lease_id).expect("release a");
+    // The recorded 64 MiB budget admits a second project beside it.
+    let project_b = fx.dir("project-b");
+    let second = managed::lease(request(&pool, &project_b, &workspace, "holder-b")).expect("b");
+    managed::release(&pool, &second.lease_id).expect("release b");
+    assert_eq!(managed::status(&pool).expect("status").slots.len(), 2);
+    // A smaller budget applies at the next admission: whole idle slots go.
+    let project_c = fx.dir("project-c");
+    let mut smaller = request(&pool, &project_c, &workspace, "holder-c");
+    smaller.budget_bytes = Some(64 * 1024);
+    let third = managed::lease(smaller).expect("admitted after idle eviction");
+    let status = managed::status(&pool).expect("status after eviction");
+    assert!(status.slots.iter().all(|slot| slot.slot_id == third.slot_id
+        || slot.state == SlotOccupancy::Idle));
+    assert!(!status.slots.iter().any(|slot| slot.slot_id == first.slot_id));
+    // The recorded budget is unchanged.
+    assert_eq!(status.cap_bytes, 64 * 1024 * 1024);
+    let mut zero = request(&pool, &project_a, &workspace, "holder-z");
+    zero.budget_bytes = Some(0);
+    assert!(matches!(
+        managed::lease(zero),
+        Err(LeaseError::InvalidInput(_))
+    ));
 }

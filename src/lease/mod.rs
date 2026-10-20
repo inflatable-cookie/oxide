@@ -1,12 +1,14 @@
-//! Same-user local lease CLI over durable exclusive slots and bounded payload
-//! storage.
+//! Same-user leases over durable exclusive slots in a budget-only pool, used
+//! by the `oxide` front door.
 //!
-//! This is the unpublished lean product surface: a short-lived OS lock plus an
-//! atomic local ledger, no resident daemon, HMAC, issuer, callback service or
-//! Cargo invocation. Same-UID callers are trusted cooperators; private paths
-//! and safety checks still refuse foreign paths and symlinked roots. A
-//! durably recorded idle deletion unlinks an owned nested symlink entry without
-//! following its target. Owning contract: `docs/knowledge/contracts/local-lease.md`.
+//! A short-lived OS lock plus an atomic local ledger, no resident daemon,
+//! HMAC, issuer, callback service or Cargo invocation. Same-UID callers are
+//! trusted cooperators; private paths and safety checks still refuse foreign
+//! paths and symlinked roots. A durably recorded idle deletion unlinks an
+//! owned nested symlink entry without following its target. The standalone
+//! lease CLI and the APFS sparse-image backend are retired (oxide#102); a
+//! pool recording that backend refuses to open. Owning contract:
+//! `docs/knowledge/contracts/workflow.md`.
 
 mod backing;
 mod pool;
@@ -18,36 +20,19 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-pub use pool::{
-    capacity_status, evict_idle_slot, lease, managed, recover, release, status, LeaseRequest,
-};
+pub use pool::{managed, LeaseRequest};
 
 #[cfg(test)]
 mod tests;
 
 /// Version of the lease JSON, receipts, pool config and ledger.
 pub const LEASE_VERSION: u32 = 1;
-/// Unpublished binary name. Publication naming remains Q-005.
-pub const BINARY_NAME: &str = "oxide-storage-lease";
-/// Default rendered status cap in bytes.
-pub const DEFAULT_STATUS_OUTPUT_BYTES: usize = 64 * 1024;
-/// Minimum rendered status cap.
-pub const MIN_STATUS_OUTPUT_BYTES: usize = 64;
-/// Version of the separate status capacity envelope.
-pub const CAPACITY_STATUS_VERSION: u32 = 1;
-pub const CAPACITY_STATUS_NOTES: [&str; 4] = [
-    "status.full compares owned slot allocation with declared cap; it is not filesystem headroom",
-    "payload free and available bytes are samples, not reservations, build-fit predictions, attributable writes, or guaranteed reclaimable space",
-    "image st_blocks is host file allocation, not APFS unique extents or snapshot accounting",
-    "private target/temp, control, OS and snapshot overhead are excluded; whole-host cost and Finder purgeable are unknown",
-];
 /// Budget-only directory backend for the `oxide` front door: admission and
-/// whole-idle-slot eviction against a recorded budget, with no OS ceiling.
-/// Only [`managed`] opens it; the standalone CLI refuses it.
+/// whole-idle-slot eviction against a soft budget, with no OS ceiling.
 pub const BUDGET_BACKEND_DIRECTORY_V1: &str = "directory-budget-v1";
 /// Removable-volume backend for the `oxide` front door: config, ledger and
 /// lock internal, payload in a directory on a registered external APFS
-/// volume. Budget-only like the directory backend; only [`managed`] opens it.
+/// volume. Budget-only like the directory backend.
 pub const VOLUME_BACKEND_APFS_V1: &str = "apfs-volume-v1";
 /// Finite slot count. Exhaustion refuses a new slot.
 pub const MAX_SLOTS: usize = 32;
@@ -273,311 +258,12 @@ pub struct PoolStatus {
     pub slots: Vec<SlotStatus>,
 }
 
-/// A byte sample is either an exact value or an explicit bounded unknown.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ByteObservation {
-    pub value_bytes: Option<u64>,
-    pub unknown_reason: Option<ObservationUnknownReason>,
-}
-
-impl ByteObservation {
-    pub const fn observed(value_bytes: u64) -> Self {
-        Self {
-            value_bytes: Some(value_bytes),
-            unknown_reason: None,
-        }
-    }
-
-    pub const fn unknown(reason: ObservationUnknownReason) -> Self {
-        Self {
-            value_bytes: None,
-            unknown_reason: Some(reason),
-        }
-    }
-}
-
-/// Finite reasons for a capacity sample that could not be reported.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ObservationUnknownReason {
-    Unsupported,
-    SampleFailed,
-    Overflow,
-}
-
-/// Measurements from the explicitly verified pool payload and pinned image.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CapacityObservations {
-    pub declared_cap_bytes: u64,
-    pub verified_capacity_bytes: u64,
-    pub payload_free_bytes: ByteObservation,
-    pub payload_available_bytes: ByteObservation,
-    pub image_logical_bytes: ByteObservation,
-    pub image_allocated_bytes: ByteObservation,
-    pub host_available_bytes: ByteObservation,
-    pub coverage: AccountingCoverage,
-}
-
-impl CapacityObservations {
-    fn new(
-        declared_cap_bytes: u64,
-        verified_capacity_bytes: u64,
-        payload_free_bytes: ByteObservation,
-        payload_available_bytes: ByteObservation,
-        image_logical_bytes: ByteObservation,
-        image_allocated_bytes: ByteObservation,
-        host_available_bytes: ByteObservation,
-    ) -> Self {
-        let known = [
-            payload_free_bytes,
-            payload_available_bytes,
-            image_logical_bytes,
-            image_allocated_bytes,
-            host_available_bytes,
-        ]
-        .into_iter()
-        .filter(|sample| sample.value_bytes.is_some())
-        .count();
-        let coverage = if known == 5 {
-            AccountingCoverage::Complete
-        } else if known == 0 {
-            AccountingCoverage::Unknown
-        } else {
-            AccountingCoverage::Partial
-        };
-        Self {
-            declared_cap_bytes,
-            verified_capacity_bytes,
-            payload_free_bytes,
-            payload_available_bytes,
-            image_logical_bytes,
-            image_allocated_bytes,
-            host_available_bytes,
-            coverage,
-        }
-    }
-}
-
-/// Versioned capacity output. The nested status retains its strict legacy shape.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct CapacityStatus {
-    pub version: u32,
-    pub status: PoolStatus,
-    pub capacity: CapacityObservations,
-    pub notes: [&'static str; 4],
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountingCoverage {
     Complete,
     Partial,
     Unknown,
-}
-
-/// Rendered status bytes plus whether the finite output cap cut the report.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RenderedStatus {
-    pub bytes: Vec<u8>,
-    pub truncated: bool,
-    pub partial: bool,
-}
-
-pub fn init_pool(pool: &Path, cap_bytes: u64, image_bytes: u64) -> Result<PoolInfo, LeaseError> {
-    pool::init(pool::InitRequest {
-        pool: pool.to_path_buf(),
-        cap_bytes,
-        image_bytes,
-    })
-}
-
-pub fn render_status_json(
-    status: &PoolStatus,
-    max_output_bytes: usize,
-) -> Result<RenderedStatus, LeaseError> {
-    render_bounded(
-        serde_json::to_vec(status).map_err(|error| LeaseError::Io(error.to_string()))?,
-        max_output_bytes,
-        true,
-        status.coverage != AccountingCoverage::Complete,
-    )
-}
-
-pub fn render_status_human(
-    status: &PoolStatus,
-    max_output_bytes: usize,
-) -> Result<RenderedStatus, LeaseError> {
-    let mut text = format!(
-        "oxide-storage-lease status\nstore {} backend {} cap {}\ncoverage {:?} full {:?}\npayload logical {:?} unique {:?}\nslots {}\n",
-        status.store_id,
-        status.backend,
-        status.cap_bytes,
-        status.coverage,
-        status.full,
-        status.payload_logical_bytes,
-        status.payload_unique_allocated_bytes,
-        status.slots.len()
-    );
-    for slot in &status.slots {
-        text.push_str(&format!(
-            "  slot {} inc {} {:?} project {} workspace {} profile {} holder {} lease {} logical {:?} unique {:?}\n",
-            slot.slot_id,
-            slot.incarnation,
-            slot.state,
-            slot.project.display(),
-            slot.workspace.display(),
-            slot.profile.as_str(),
-            slot.holder.as_deref().unwrap_or("-"),
-            slot.lease_id.as_deref().unwrap_or("-"),
-            slot.logical_bytes,
-            slot.unique_allocated_bytes
-        ));
-    }
-    render_bounded(
-        text.into_bytes(),
-        max_output_bytes,
-        false,
-        status.coverage != AccountingCoverage::Complete,
-    )
-}
-
-pub fn render_capacity_status_json(
-    report: &CapacityStatus,
-    max_output_bytes: usize,
-) -> Result<RenderedStatus, LeaseError> {
-    render_bounded(
-        serde_json::to_vec(report).map_err(|error| LeaseError::Io(error.to_string()))?,
-        max_output_bytes,
-        true,
-        report.status.coverage != AccountingCoverage::Complete
-            || report.capacity.coverage != AccountingCoverage::Complete,
-    )
-}
-
-pub fn render_capacity_status_human(
-    report: &CapacityStatus,
-    max_output_bytes: usize,
-) -> Result<RenderedStatus, LeaseError> {
-    let status = &report.status;
-    let capacity = &report.capacity;
-    let mut text = format!(
-        "oxide-storage-lease status --capacity\nstore {} backend {}\nlegacy cap {} bytes; full {:?} (slot allocation vs declared cap, not filesystem headroom)\nslot accounting {:?}: logical {:?} bytes, unique allocated {:?} bytes\ncapacity observation coverage {:?}\n",
-        status.store_id,
-        status.backend,
-        status.cap_bytes,
-        status.full,
-        status.coverage,
-        status.payload_logical_bytes,
-        status.payload_unique_allocated_bytes,
-        capacity.coverage,
-    );
-    for slot in &status.slots {
-        text.push_str(&format!(
-            "  slot {} {:?} logical {:?} bytes, unique allocated {:?} bytes\n",
-            slot.slot_id, slot.state, slot.logical_bytes, slot.unique_allocated_bytes
-        ));
-    }
-    text.push_str(&format!(
-        "declared payload cap {} bytes; verified payload ceiling {} bytes\n",
-        capacity.declared_cap_bytes, capacity.verified_capacity_bytes
-    ));
-    append_observation(
-        &mut text,
-        "payload filesystem free (statfs f_bfree)",
-        capacity.payload_free_bytes,
-    );
-    append_observation(
-        &mut text,
-        "payload filesystem available (statfs f_bavail)",
-        capacity.payload_available_bytes,
-    );
-    append_observation(
-        &mut text,
-        "image file logical (st_size)",
-        capacity.image_logical_bytes,
-    );
-    append_observation(
-        &mut text,
-        "image file allocated (st_blocks x 512; not APFS unique extents)",
-        capacity.image_allocated_bytes,
-    );
-    append_observation(
-        &mut text,
-        "host filesystem available at pool (statfs f_bavail)",
-        capacity.host_available_bytes,
-    );
-    text.push_str(
-        "observations are not reservations, fit predictions or attributable writes\nnot whole-host cost: control, private target/temp, OS and snapshot overhead excluded; Finder purgeable unknown\n",
-    );
-    render_bounded(
-        text.into_bytes(),
-        max_output_bytes,
-        false,
-        status.coverage != AccountingCoverage::Complete
-            || capacity.coverage != AccountingCoverage::Complete,
-    )
-}
-
-fn append_observation(text: &mut String, label: &str, observation: ByteObservation) {
-    match (observation.value_bytes, observation.unknown_reason) {
-        (Some(bytes), None) => text.push_str(&format!("{label}: {bytes} bytes\n")),
-        (None, Some(reason)) => text.push_str(&format!("{label}: unknown ({reason:?})\n")),
-        _ => text.push_str(&format!("{label}: unknown (sample_failed)\n")),
-    }
-}
-
-fn render_bounded(
-    mut bytes: Vec<u8>,
-    max_output_bytes: usize,
-    json: bool,
-    partial: bool,
-) -> Result<RenderedStatus, LeaseError> {
-    if max_output_bytes < MIN_STATUS_OUTPUT_BYTES {
-        return Err(LeaseError::InvalidInput(
-            "max-output-bytes must be at least 64",
-        ));
-    }
-    if bytes.len() <= max_output_bytes {
-        if json && !bytes.ends_with(&[b'\n']) {
-            bytes.push(b'\n');
-            if bytes.len() > max_output_bytes {
-                bytes.pop();
-            }
-        }
-        return Ok(RenderedStatus {
-            truncated: false,
-            partial,
-            bytes,
-        });
-    }
-    if json {
-        return Ok(RenderedStatus {
-            bytes: b"{\"truncated\":true,\"partial\":true}\n".to_vec(),
-            truncated: true,
-            partial: true,
-        });
-    }
-    let marker = b"\n[output truncated at max_output_bytes]\n";
-    if max_output_bytes <= marker.len() {
-        return Ok(RenderedStatus {
-            bytes: marker[..max_output_bytes].to_vec(),
-            truncated: true,
-            partial: true,
-        });
-    }
-    let keep = max_output_bytes - marker.len();
-    let mut cut = bytes[..keep].to_vec();
-    while !cut.is_empty() && std::str::from_utf8(&cut).is_err() {
-        cut.pop();
-    }
-    cut.extend_from_slice(marker);
-    Ok(RenderedStatus {
-        bytes: cut,
-        truncated: true,
-        partial: true,
-    })
 }
 
 fn current_uid() -> u32 {

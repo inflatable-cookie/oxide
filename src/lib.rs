@@ -1,17 +1,11 @@
-//! Bounded storage primitives, a local lease CLI, read-only target inventory
-//! and a bounded Cargo dep-info decoder.
-
-#[cfg(unix)]
-mod storage;
-
-#[cfg(unix)]
-pub use storage::*;
+//! Budget-only build-slot leases, read-only target inventory and a bounded
+//! Cargo dep-info decoder for the `oxide` front door.
 
 /// Bounded read-only inventory of one explicitly selected target directory.
 #[cfg(unix)]
 pub mod inventory;
 
-/// Unpublished same-user local lease CLI over bounded exclusive slots.
+/// Same-user leases over exclusive slots in a budget-only pool.
 #[cfg(unix)]
 pub mod lease;
 

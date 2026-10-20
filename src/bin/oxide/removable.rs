@@ -9,6 +9,7 @@
 //! (`diskutil info -plist`, `diskutil apfs list -plist <container>`) for the
 //! container UUID, APFS roles and quota.
 
+use crate::config::{self, Facts};
 use crate::process;
 use crate::store::{self, Backend, Store};
 use crate::MIB;
@@ -136,6 +137,9 @@ fn register(mount: &Path, reserve: u64, cap: u64) -> Result<u8, String> {
     let identity = disk_identity(binding.mount_point(), binding.uuid())?;
     check_identity(&identity, None)?;
     let internal = Store::open_or_create()?;
+    if let Some(previous) = previous_registration(&internal) {
+        return Err(previous_registration_refusal(&previous));
+    }
     let control = internal.control().to_path_buf();
     if fs::symlink_metadata(control.join(REGISTRATION)).is_ok()
         || fs::symlink_metadata(control.join(POOL_DIR)).is_ok()
@@ -351,6 +355,34 @@ pub fn registration(internal: &Store) -> Result<Option<Registration>, String> {
     Ok(Some(registration))
 }
 
+/// A removable registration (or its pool state) under another pool Oxide
+/// knows of: the retired image pool's default path, the built-in default or
+/// a pool created before a path change. Read-only: names only.
+pub fn previous_registration(internal: &Store) -> Option<PathBuf> {
+    let facts = Facts::from_env();
+    let current = fs::canonicalize(&internal.pool).unwrap_or_else(|_| internal.pool.clone());
+    config::legacy_default_pool(&facts)
+        .into_iter()
+        .chain(config::default_pool(&facts))
+        .chain(config::known_pools(&facts))
+        .find(|path| {
+            let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            let control = path.join(oxide_storage::lease::MANAGED_NAME);
+            resolved != current
+                && (fs::symlink_metadata(control.join(REGISTRATION)).is_ok()
+                    || fs::symlink_metadata(control.join(POOL_DIR)).is_ok())
+        })
+}
+
+/// Oxide never moves a registration or its ledger, and never creates a
+/// second one that could claim the same volume.
+pub fn previous_registration_refusal(previous: &Path) -> String {
+    format!(
+        "a removable volume is registered under the previous pool {}; Oxide does not move that registration or its ledger and will not create a second one. Before registering here: with the oxide build that used that pool, confirm `oxide status` shows no held slots or waiting commands for its removable pool, then retire the old registration as a separate step; its files stay until then",
+        previous.display()
+    )
+}
+
 /// Decide, when a build starts, whether it uses the removable pool: the
 /// registered volume is the mounted root at its mount point (rechecked on an
 /// open descriptor), `/Volumes` stays non-writable, the volume is writable
@@ -359,9 +391,15 @@ pub fn registration(internal: &Store) -> Result<Option<Registration>, String> {
 /// registration and the library rebinds the volume on every open.
 pub fn select(internal: Store) -> Result<Selected, String> {
     let Some(registration) = registration(&internal)? else {
+        let note = previous_registration(&internal).map(|previous| {
+            format!(
+                "internal pool: the removable registration under the previous pool {} is not used; see `oxide status`",
+                previous.display()
+            )
+        });
         return Ok(Selected {
             store: internal,
-            note: None,
+            note,
             removable: false,
         });
     };
@@ -537,14 +575,16 @@ mod tests {
     }
 
     #[test]
-    fn sizes_are_explicit_whole_mib() {
+    fn sizes_are_explicit_units() {
         assert_eq!(size("--reserve", "1GiB"), Ok(1024 * MIB));
+        assert_eq!(size("--reserve", "100GB"), Ok(100_000_000_000));
+        assert_eq!(size("--cap", "750000000000"), Ok(750_000_000_000));
         for invalid in [
             "",
             "0",
             "1.5GiB",
             "-1",
-            "1GB",
+            "1gb",
             "18446744073709551616",
             "99999999999TiB",
         ] {

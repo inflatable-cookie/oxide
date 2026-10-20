@@ -1,21 +1,17 @@
 //! Exclusive pool: short-lived flock, durable JSON ledger, idle-only eviction.
 
-use super::backing::{self, BackingPaths, CapacitySample};
+use super::backing::BackingPaths;
 use super::{
     canonical_existing_dir, current_uid, ensure_private_dir, io_error, persist_private_file,
-    random_hex, read_private_file, remove_tree_owned, AccountingCoverage, CapacityObservations,
-    CapacityStatus, LeaseEnvironment, LeaseError, LeaseGrant, PoolInfo, PoolStatus, Profile,
-    ReleaseReceipt, SlotOccupancy, SlotStatus, ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS,
-    ACCOUNTING_MAX_ENTRIES, CAPACITY_STATUS_NOTES, CAPACITY_STATUS_VERSION, CONFIG_NAME,
-    LEASE_VERSION, LEDGER_NAME, LOCK_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_PATH_BYTES,
-    MAX_SLOTS, SLOTS_NAME,
+    random_hex, read_private_file, remove_tree_owned, AccountingCoverage, LeaseEnvironment,
+    LeaseError, LeaseGrant, PoolStatus, Profile, ReleaseReceipt, SlotOccupancy,
+    SlotStatus, ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES,
+    CONFIG_NAME, LEASE_VERSION, LEDGER_NAME, LOCK_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES,
+    MAX_PATH_BYTES, MAX_SLOTS, SLOTS_NAME,
 };
-#[cfg(test)]
-use super::{ByteObservation, ObservationUnknownReason};
 use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
 use crate::inventory::{inventory_directory, InventoryLimits};
 use crate::volume::Binding;
-use crate::{BoundedBacking, BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::{AsFd, OwnedFd};
@@ -24,12 +20,6 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
-pub(super) struct InitRequest {
-    pub pool: PathBuf,
-    pub cap_bytes: u64,
-    pub image_bytes: u64,
-}
-
 #[derive(Clone, Debug)]
 pub struct LeaseRequest {
     pub pool: PathBuf,
@@ -37,6 +27,10 @@ pub struct LeaseRequest {
     pub workspace: PathBuf,
     pub profile: Profile,
     pub holder: String,
+    /// The soft budget for this admission. `None` uses the budget recorded
+    /// at creation. It drives admission and whole-idle-slot eviction only;
+    /// nothing enforces it while a build writes.
+    pub budget_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -97,10 +91,8 @@ enum SlotPersistState {
     Evicting,
 }
 
-/// Where slots live. Only the APFS image is a verified hard bound; the
-/// budget-only directory never mints a [`BoundedBacking`].
+/// Where slots live. Neither payload is an OS-enforced bound.
 enum Payload {
-    Bounded(BoundedBacking),
     Budget(PathBuf),
     /// A directory on a verified removable volume, held open. Slot
     /// directories are created through `fd`, never by path.
@@ -114,15 +106,7 @@ enum Payload {
 impl Payload {
     fn payload_root(&self) -> &Path {
         match self {
-            Self::Bounded(backing) => backing.payload_root(),
             Self::Budget(root) | Self::Volume { root, .. } => root,
-        }
-    }
-
-    fn verified_capacity_bytes(&self) -> Result<u64, LeaseError> {
-        match self {
-            Self::Bounded(backing) => Ok(backing.descriptor().verified_capacity_bytes),
-            Self::Budget(_) | Self::Volume { .. } => Err(LeaseError::BackingMismatch),
         }
     }
 
@@ -133,17 +117,9 @@ impl Payload {
                 .verify()
                 .map(|_| ())
                 .map_err(|_| LeaseError::BackingMismatch),
-            Self::Bounded(_) | Self::Budget(_) => Ok(()),
+            Self::Budget(_) => Ok(()),
         }
     }
-}
-
-/// Which recorded backends an open accepts. The standalone CLI and its
-/// library entry points stay hard-bound only.
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Backends {
-    HardBoundOnly,
-    WithBudget,
 }
 
 pub(super) struct Pool {
@@ -152,66 +128,14 @@ pub(super) struct Pool {
     config: PoolConfig,
     backing: Payload,
     ledger: Ledger,
+    /// Admission budget: the recorded one unless the request overrides it.
+    budget: u64,
     reconciliation_blocked: bool,
 }
 
-pub fn init(request: InitRequest) -> Result<PoolInfo, LeaseError> {
-    if request.cap_bytes == 0 {
-        return Err(LeaseError::InvalidInput("cap-bytes must be positive"));
-    }
-    // Checked before any host effect: the declared cap must equal the image
-    // size so the volume size is the enforced ceiling. A smaller cap on a
-    // larger volume is not OS-enforced and is refused.
-    if request.image_bytes != request.cap_bytes {
-        return Err(LeaseError::InvalidInput(
-            "cap-bytes must equal image-bytes so the volume size is the enforced ceiling",
-        ));
-    }
-    refuse_unsupported_init_platform()?;
-    let pool = prepare_new_pool(&request.pool)?;
-    let _lock = lock_pool(&pool)?;
-    if pool.join(CONFIG_NAME).symlink_metadata().is_ok() {
-        return Err(LeaseError::InvalidInput("pool already initialized"));
-    }
-    let paths = BackingPaths::under(&pool);
-    let backing = backing::provision(&paths, request.cap_bytes, request.image_bytes)?;
-    ensure_private_dir(&backing.payload_root().join(SLOTS_NAME))?;
-    validate_lease_payload_entries(backing.payload_root(), &LEASE_METADATA_DIRS)?;
-    let store_id = random_hex(16)?;
-    let config = PoolConfig {
-        version: LEASE_VERSION,
-        backend: BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1.to_owned(),
-        store_id: store_id.clone(),
-        cap_bytes: request.cap_bytes,
-        image_bytes: request.image_bytes,
-        volume: None,
-    };
-    let ledger = Ledger {
-        version: LEASE_VERSION,
-        store_id: store_id.clone(),
-        cap_bytes: request.cap_bytes,
-        next_slot: 1,
-        next_lease: 1,
-        slots: Vec::new(),
-    };
-    write_config(&pool, &config)?;
-    write_ledger(&pool, &ledger)?;
-    Ok(PoolInfo {
-        version: LEASE_VERSION,
-        store_id,
-        backend: config.backend,
-        cap_bytes: request.cap_bytes,
-        verified_capacity_bytes: backing.descriptor().verified_capacity_bytes,
-    })
-}
-
-pub fn lease(request: LeaseRequest) -> Result<LeaseGrant, LeaseError> {
-    let mut pool = Pool::open(&request.pool)?;
-    pool.lease(&request)
-}
-
-/// Entry points for the `oxide` front door. They open either recorded
-/// backend; the standalone CLI uses the hard-bound-only functions above.
+/// Entry points for the `oxide` front door. They open a budget-only
+/// directory or removable-volume pool; a pool recording the retired APFS
+/// sparse-image backend refuses with [`LeaseError::BackingMismatch`].
 pub mod managed {
     use super::super::{
         ensure_private_dir, LeaseError, LeaseGrant, PoolInfo, PoolStatus, ReleaseReceipt,
@@ -220,7 +144,7 @@ pub mod managed {
     };
     use super::LeaseRequest;
     use super::{
-        lock_pool, prepare_new_pool, random_hex, write_config, write_ledger, Backends, Ledger,
+        lock_pool, prepare_new_pool, random_hex, write_config, write_ledger, Ledger,
         Payload, Pool, PoolConfig, VolumeConfig,
     };
     use crate::volume::Binding;
@@ -297,10 +221,10 @@ pub mod managed {
     /// return the time the flush took. Any doubt about the volume is an
     /// error.
     pub fn flush_volume(pool: &Path) -> Result<Duration, LeaseError> {
-        let opened = Pool::open_inner(pool, false, Backends::WithBudget)?;
+        let opened = Pool::open(pool)?;
         match &opened.backing {
             Payload::Volume { binding, .. } => binding.flush().map_err(LeaseError::Io),
-            Payload::Bounded(_) | Payload::Budget(_) => Err(LeaseError::Unsupported(
+            Payload::Budget(_) => Err(LeaseError::Unsupported(
                 "the pool is not on a removable volume",
             )),
         }
@@ -350,128 +274,65 @@ pub mod managed {
     }
 
     pub fn lease(request: LeaseRequest) -> Result<LeaseGrant, LeaseError> {
-        Pool::open_inner(&request.pool, false, Backends::WithBudget)?.lease(&request)
+        Pool::open(&request.pool)?.lease(&request)
     }
 
     pub fn release(pool: &Path, lease_id: &str) -> Result<ReleaseReceipt, LeaseError> {
-        Pool::open_inner(pool, false, Backends::WithBudget)?.release_or_recover(lease_id, false)
+        Pool::open(pool)?.release_or_recover(lease_id, false)
     }
 
     pub fn recover(pool: &Path, lease_id: &str) -> Result<ReleaseReceipt, LeaseError> {
-        Pool::open_inner(pool, false, Backends::WithBudget)?.release_or_recover(lease_id, true)
+        Pool::open(pool)?.release_or_recover(lease_id, true)
     }
 
     pub fn status(pool: &Path) -> Result<PoolStatus, LeaseError> {
-        Pool::open_inner(pool, false, Backends::WithBudget)?.status()
+        Pool::open(pool)?.status()
     }
 
+    /// Retire one recorded idle slot by ID after rechecking its durable
+    /// scope, for the per-project slot-cap eviction.
     pub fn evict_idle_slot(pool: &Path, slot_id: &str) -> Result<(), LeaseError> {
-        Pool::open_inner(pool, false, Backends::WithBudget)?.evict_idle(slot_id)
+        Pool::open(pool)?.evict_idle(slot_id)
     }
 }
 
-pub fn release(pool: &Path, lease_id: &str) -> Result<ReleaseReceipt, LeaseError> {
-    let mut opened = Pool::open(pool)?;
-    opened.release_or_recover(lease_id, false)
-}
-
-pub fn recover(pool: &Path, lease_id: &str) -> Result<ReleaseReceipt, LeaseError> {
-    let mut opened = Pool::open(pool)?;
-    opened.release_or_recover(lease_id, true)
-}
-
-pub fn status(pool: &Path) -> Result<PoolStatus, LeaseError> {
-    let opened = Pool::open(pool)?;
-    opened.status()
-}
-
-pub fn capacity_status(pool: &Path) -> Result<CapacityStatus, LeaseError> {
-    let (opened, sample) = Pool::open_observational(pool, false)?;
-    opened.capacity_status(sample)
-}
-
-/// Retire one recorded idle slot by ID after rechecking its durable scope.
-/// The `oxide` front door uses this for its per-project slot-cap eviction;
-/// the standalone lease CLI does not expose it.
-pub fn evict_idle_slot(pool: &Path, slot_id: &str) -> Result<(), LeaseError> {
-    Pool::open(pool)?.evict_idle(slot_id)
-}
-
+// Test entry points: the library tests drive a budget-only directory pool.
 #[cfg(test)]
-pub(super) fn create_injected(pool: &Path, cap_bytes: u64) -> Result<PoolInfo, LeaseError> {
-    let pool = prepare_new_pool(pool)?;
-    let _lock = lock_pool(&pool)?;
-    let mount = pool.join(super::PAYLOAD_NAME);
-    let backing = backing::inject_directory(&mount, cap_bytes)?;
-    ensure_private_dir(&backing.payload_root().join(SLOTS_NAME))?;
-    let store_id = random_hex(16)?;
-    let config = PoolConfig {
-        version: LEASE_VERSION,
-        backend: BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1.to_owned(),
-        store_id: store_id.clone(),
-        cap_bytes,
-        image_bytes: cap_bytes,
-        volume: None,
-    };
-    let ledger = Ledger {
-        version: LEASE_VERSION,
-        store_id: store_id.clone(),
-        cap_bytes,
-        next_slot: 1,
-        next_lease: 1,
-        slots: Vec::new(),
-    };
-    write_config(&pool, &config)?;
-    write_ledger(&pool, &ledger)?;
-    Ok(PoolInfo {
-        version: LEASE_VERSION,
-        store_id,
-        backend: config.backend,
-        cap_bytes,
-        verified_capacity_bytes: backing.descriptor().verified_capacity_bytes,
-    })
+pub(super) fn create_injected(
+    pool: &Path,
+    cap_bytes: u64,
+) -> Result<super::PoolInfo, LeaseError> {
+    managed::init_budget_pool(pool, cap_bytes)
 }
 
 #[cfg(test)]
 pub(super) fn lease_injected(request: LeaseRequest) -> Result<LeaseGrant, LeaseError> {
-    let mut opened = Pool::open_with(&request.pool, true)?;
-    opened.lease(&request)
+    managed::lease(request)
 }
 
 #[cfg(test)]
 pub(super) fn release_injected(pool: &Path, lease_id: &str) -> Result<ReleaseReceipt, LeaseError> {
-    let mut opened = Pool::open_with(pool, true)?;
-    opened.release_or_recover(lease_id, false)
+    managed::release(pool, lease_id)
 }
 
 #[cfg(test)]
 pub(super) fn recover_injected(pool: &Path, lease_id: &str) -> Result<ReleaseReceipt, LeaseError> {
-    let mut opened = Pool::open_with(pool, true)?;
-    opened.release_or_recover(lease_id, true)
+    managed::recover(pool, lease_id)
 }
 
 #[cfg(test)]
 pub(super) fn evict_idle_slot_injected(pool: &Path, slot_id: &str) -> Result<(), LeaseError> {
-    Pool::open_with(pool, true)?.evict_idle(slot_id)
+    managed::evict_idle_slot(pool, slot_id)
 }
 
 #[cfg(test)]
 pub(super) fn status_injected(pool: &Path) -> Result<PoolStatus, LeaseError> {
-    Pool::open_with(pool, true)?.status()
-}
-
-#[cfg(test)]
-pub(super) fn capacity_status_injected(
-    pool: &Path,
-    sample: CapacitySample,
-) -> Result<CapacityStatus, LeaseError> {
-    let (opened, _) = Pool::open_observational(pool, true)?;
-    opened.capacity_status(sample)
+    managed::status(pool)
 }
 
 #[cfg(test)]
 pub(super) fn mark_evicting_for_test(pool: &Path, slot_id: u64) -> Result<(), LeaseError> {
-    let mut opened = Pool::open_with(pool, true)?;
+    let mut opened = Pool::open(pool)?;
     let slot = opened
         .slot_mut(slot_id)
         .ok_or(LeaseError::UnknownAccounting)?;
@@ -483,114 +344,20 @@ pub(super) fn mark_evicting_for_test(pool: &Path, slot_id: u64) -> Result<(), Le
 }
 
 impl Pool {
+    /// Open a budget-only directory or removable-volume pool. Any other
+    /// recorded backend, including the retired `apfs-sparse-image-v1`,
+    /// refuses before anything under the pool is touched.
     fn open(root: &Path) -> Result<Self, LeaseError> {
-        Self::open_inner(root, false, Backends::HardBoundOnly)
-    }
-
-    #[cfg(test)]
-    fn open_with(root: &Path, injected: bool) -> Result<Self, LeaseError> {
-        Self::open_inner(root, injected, Backends::HardBoundOnly)
-    }
-
-    fn open_observational(
-        root: &Path,
-        injected: bool,
-    ) -> Result<(Self, CapacitySample), LeaseError> {
-        // Capacity status preserves Evicting records; only ordinary opens reconcile them.
-        let root = canonical_existing_dir(root, true)?;
-        refuse_foreign_pool_entries(&root)?;
-        let lock = lock_pool_existing(&root)?;
-        let config = read_config(&root)?;
-        if config.version != LEASE_VERSION
-            || config.backend != BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1
-            || config.cap_bytes == 0
-            || config.cap_bytes != config.image_bytes
-        {
-            return Err(LeaseError::BackingMismatch);
-        }
-        let paths = BackingPaths::under(&root);
-        let (backing, sample) = if injected {
-            #[cfg(test)]
-            {
-                let backing = backing::inject_directory(&paths.mount, config.cap_bytes)?;
-                let unknown = ByteObservation::unknown(ObservationUnknownReason::Unsupported);
-                (
-                    backing,
-                    CapacitySample {
-                        payload_free_bytes: unknown,
-                        payload_available_bytes: unknown,
-                        image_logical_bytes: unknown,
-                        image_allocated_bytes: unknown,
-                        host_available_bytes: unknown,
-                    },
-                )
-            }
-            #[cfg(not(test))]
-            {
-                let _ = (&paths, &config);
-                return Err(LeaseError::BackingMismatch);
-            }
-        } else {
-            backing::open_observational(&paths, config.cap_bytes, config.image_bytes)?
-        };
-        if backing.descriptor().payload_root != paths.mount {
-            return Err(LeaseError::BackingMismatch);
-        }
-        validate_lease_payload_entries(backing.payload_root(), &LEASE_METADATA_DIRS)?;
-        let backing = Payload::Bounded(backing);
-        let ledger = read_ledger(&root)?;
-        if ledger.version != LEASE_VERSION
-            || ledger.store_id != config.store_id
-            || ledger.cap_bytes != config.cap_bytes
-        {
-            return Err(LeaseError::BackingMismatch);
-        }
-        if ledger.slots.len() > MAX_SLOTS {
-            return Err(LeaseError::LedgerExhausted);
-        }
-        let reconciliation_blocked = ledger
-            .slots
-            .iter()
-            .any(|slot| slot.state == SlotPersistState::Evicting);
-        Ok((
-            Self {
-                _lock: lock,
-                root,
-                config,
-                backing,
-                ledger,
-                reconciliation_blocked,
-            },
-            sample,
-        ))
-    }
-
-    fn open_inner(root: &Path, injected: bool, backends: Backends) -> Result<Self, LeaseError> {
         let root = canonical_existing_dir(root, true)?;
         refuse_foreign_pool_entries(&root)?;
         let lock = lock_pool(&root)?;
         let config = read_config(&root)?;
         let paths = BackingPaths::under(&root);
-        let backing =
-            if config.backend == BUDGET_BACKEND_DIRECTORY_V1 && backends == Backends::WithBudget {
-                open_budget_payload(&root, &paths, &config)?
-            } else if config.backend == VOLUME_BACKEND_APFS_V1 && backends == Backends::WithBudget {
-                open_volume_payload(&paths, &config)?
-            } else {
-                if config.version != LEASE_VERSION
-                    || config.backend != BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1
-                    || config.cap_bytes == 0
-                    || config.cap_bytes != config.image_bytes
-                {
-                    return Err(LeaseError::BackingMismatch);
-                }
-                let backing = open_backing(&paths, &config, injected)?;
-                if backing.descriptor().payload_root != paths.mount {
-                    return Err(LeaseError::BackingMismatch);
-                }
-                validate_lease_payload_entries(backing.payload_root(), &LEASE_METADATA_DIRS)?;
-                Payload::Bounded(backing)
-            };
+        let backing = match config.backend.as_str() {
+            BUDGET_BACKEND_DIRECTORY_V1 => open_budget_payload(&root, &paths, &config)?,
+            VOLUME_BACKEND_APFS_V1 => open_volume_payload(&paths, &config)?,
+            _ => return Err(LeaseError::BackingMismatch),
+        };
         let ledger = read_ledger(&root)?;
         if ledger.version != LEASE_VERSION
             || ledger.store_id != config.store_id
@@ -606,6 +373,7 @@ impl Pool {
             root,
             config,
             backing,
+            budget: ledger.cap_bytes,
             ledger,
             reconciliation_blocked: false,
         };
@@ -620,6 +388,12 @@ impl Pool {
     fn lease(&mut self, request: &LeaseRequest) -> Result<LeaseGrant, LeaseError> {
         if self.reconciliation_blocked {
             return Err(LeaseError::UnknownAccounting);
+        }
+        if let Some(budget) = request.budget_bytes {
+            if budget == 0 {
+                return Err(LeaseError::InvalidInput("budget must be positive"));
+            }
+            self.budget = budget;
         }
         let project = canonical_existing_dir(&request.project, false)?;
         let workspace = canonical_existing_dir(&request.workspace, false)?;
@@ -669,7 +443,7 @@ impl Pool {
                 return Err(LeaseError::UnknownAccounting);
             }
             let unique = sizes.unique.ok_or(LeaseError::UnknownAccounting)?;
-            if should_recycle_slot(unique, self.config.cap_bytes) {
+            if should_recycle_slot(unique, self.budget) {
                 self.retire_idle_slot(idle, incarnation, &project, request.profile)?;
                 return self.allocate(project, workspace, request);
             }
@@ -743,7 +517,7 @@ impl Pool {
         }
         if accounted
             .unique
-            .is_some_and(|bytes| bytes >= self.config.cap_bytes)
+            .is_some_and(|bytes| bytes >= self.budget)
         {
             self.evict_idle_until_under_cap()?;
             let accounted = self.payload_accounting()?;
@@ -752,7 +526,7 @@ impl Pool {
             }
             if accounted
                 .unique
-                .is_some_and(|bytes| bytes >= self.config.cap_bytes)
+                .is_some_and(|bytes| bytes >= self.budget)
             {
                 return Err(LeaseError::Full);
             }
@@ -775,7 +549,7 @@ impl Pool {
                 let slot = create(slots.as_fd(), &slot_id.to_string(), true)?;
                 create(slot.as_fd(), "build", true)?;
             }
-            Payload::Bounded(_) | Payload::Budget(_) => {
+            Payload::Budget(_) => {
                 ensure_private_dir(&slot_path)?;
                 ensure_private_dir(&slot_path.join("build"))?;
             }
@@ -889,25 +663,6 @@ impl Pool {
         })
     }
 
-    fn capacity_status(&self, sample: CapacitySample) -> Result<CapacityStatus, LeaseError> {
-        let status = self.status()?;
-        let capacity = CapacityObservations::new(
-            self.config.cap_bytes,
-            self.backing.verified_capacity_bytes()?,
-            sample.payload_free_bytes,
-            sample.payload_available_bytes,
-            sample.image_logical_bytes,
-            sample.image_allocated_bytes,
-            sample.host_available_bytes,
-        );
-        Ok(CapacityStatus {
-            version: CAPACITY_STATUS_VERSION,
-            status,
-            capacity,
-            notes: CAPACITY_STATUS_NOTES,
-        })
-    }
-
     fn grant_from(&self, slot: &SlotRecord, reused_slot: bool) -> Result<LeaseGrant, LeaseError> {
         let lease_id = slot.lease_id.clone().ok_or(LeaseError::UnknownAccounting)?;
         let build = self.slot_path(slot.id)?.join("build");
@@ -992,7 +747,7 @@ impl Pool {
             if accounted.coverage != AccountingCoverage::Complete {
                 return Err(LeaseError::UnknownAccounting);
             }
-            if accounted.unique.unwrap_or(0) < self.config.cap_bytes {
+            if accounted.unique.unwrap_or(0) < self.budget {
                 return Ok(());
             }
             if !self.evict_one_idle()? {
@@ -1153,17 +908,9 @@ impl Pool {
     }
 }
 
-const LEASE_METADATA_DIRS: [&str; 4] = [
-    ".fseventsd",
-    ".Spotlight-V100",
-    ".Trashes",
-    ".TemporaryItems",
-];
-
 /// The budget-only payload is a plain owner-only directory holding `slots`.
-/// It is never minted as a [`BoundedBacking`]: the recorded budget is not
-/// OS-enforced. Image and receipt files refuse, so an APFS pool
-/// is never reinterpreted as a directory.
+/// The budget is not OS-enforced. Image and receipt files refuse, so a legacy
+/// APFS image pool is never reinterpreted as a directory.
 fn open_budget_payload(
     root: &Path,
     paths: &BackingPaths,
@@ -1365,17 +1112,6 @@ fn prepare_new_pool(pool: &Path) -> Result<PathBuf, LeaseError> {
     canonical_existing_dir(pool, true)
 }
 
-fn refuse_unsupported_init_platform() -> Result<(), LeaseError> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        return Err(LeaseError::Unsupported(
-            "bounded APFS payload backing is macOS-only",
-        ));
-    }
-    #[cfg(target_os = "macos")]
-    Ok(())
-}
-
 /// Empty, or only the CLI's leftover `lock` from a failed init.
 fn refuse_occupied_init_directory(pool: &Path) -> Result<(), LeaseError> {
     let mut leftover_lock = false;
@@ -1403,10 +1139,6 @@ fn refuse_occupied_init_directory(pool: &Path) -> Result<(), LeaseError> {
 
 fn lock_pool(pool: &Path) -> Result<File, LeaseError> {
     lock_pool_inner(pool, true)
-}
-
-fn lock_pool_existing(pool: &Path) -> Result<File, LeaseError> {
-    lock_pool_inner(pool, false)
 }
 
 fn lock_pool_inner(pool: &Path, create: bool) -> Result<File, LeaseError> {
@@ -1466,19 +1198,6 @@ fn read_config(pool: &Path) -> Result<PoolConfig, LeaseError> {
 fn read_ledger(pool: &Path) -> Result<Ledger, LeaseError> {
     let bytes = read_private_file(&pool.join(LEDGER_NAME))?;
     serde_json::from_slice(&bytes).map_err(|_| LeaseError::UnknownAccounting)
-}
-
-fn open_backing(
-    paths: &BackingPaths,
-    config: &PoolConfig,
-    injected: bool,
-) -> Result<BoundedBacking, LeaseError> {
-    #[cfg(test)]
-    if injected {
-        return backing::inject_directory(&paths.mount, config.cap_bytes);
-    }
-    let _ = injected;
-    backing::open(paths, config.cap_bytes, config.image_bytes)
 }
 
 fn refuse_foreign_pool_entries(pool: &Path) -> Result<(), LeaseError> {
