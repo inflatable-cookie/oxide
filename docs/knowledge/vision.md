@@ -527,6 +527,18 @@ Supervisor architecture decision, 2026-10-20: **Oxide follows Longhorn's storage
 - On adoption, Oxide's `sha2` pin moves to match Longhorn's (0.11 line), so one `sha2` version is built.
 - Tom also asked Longhorn for TOML support in its config system, which Oxide may or may not use later.
 
+Tom's ruling, 2026-10-20, on #097. He asked "Does it work? Can we just merge it? This is a lot of effort for test harnesses", then "Yeah" to the Supervisor's proposal:
+- Let the current independent review of the three-fault runner correction finish.
+- If it passes, merge normally.
+- If it finds any further runner/apparatus defect, apply **option A immediately**: merge #097's product code and docs on the existing evidence, with the runner/apparatus changes excluded from the delivered diff or explicitly marked as unqualified tooling, and no further runner rounds. The existing evidence is:
+  - unchanged Rust at `4c6f49b`;
+  - the reviewer-authenticated compile, format, 136 Rust tests, Linux compile and docs;
+  - the author's native removable-pool proofs;
+  - earlier real product defects fixed;
+  - no product defects found in the latest source reviews.
+  Tom's operator acceptance replaces the missing independent native proof, recorded as such and not as a review pass.
+- Real-world use (Builds registration after #102, then the Nucleus trial) is the practical qualification.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
