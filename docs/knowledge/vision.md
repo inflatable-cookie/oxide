@@ -572,6 +572,14 @@ Tom, 2026-10-20: "It would be pretty handy to group them by project name so it's
 - **Dogfood finding the same day:** Finder `.DS_Store` files written into `/Volumes/Builds/oxide-pool` and `slots/` at 18:15 made the removable pool fail closed (`unknown_accounting`), so builds silently selected the internal pool. The Supervisor removed the two `.DS_Store` files at 18:22 and selection returned to the removable pool.
 - Routine correction: ignore well-known macOS metadata entries in pool accounting instead of treating them as foreign writers.
 
+Tom, 2026-10-20, approved option A on Longhorn's Queue decision `4dd34aa0`. It becomes the standard pattern for consumer projects adopting Oxide.
+- **CI-aware selectors.** When CI or release workflows call the same Effigy selectors and the runners lack `oxide`, the selectors run `cargo` under `GITHUB_ACTIONS` and `oxide` everywhere else. Locally they fail loudly when `oxide` is missing and never fall back to Cargo silently. No workflow file changes.
+- **Escapes.** Each moved selector gets a `:cargo` sibling with the plain-Cargo command, for use when `oxide` is broken.
+- **Stays on Cargo:** scripts that set `CARGO_TARGET_DIR` (Oxide refuses it), wrapping tools such as the Tauri CLI, Queue hooks and CI.
+- Installing `oxide` on CI runners waits on publication (Q-005).
+- Adopters so far: Praxis (no GitHub workflows), Underlay (CI calls Cargo directly) and Longhorn (option A).
+- This folds into the workflow contract's adoption section and the Oxide skill once #102 stops editing them.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
