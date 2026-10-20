@@ -562,6 +562,11 @@ Tom's rulings, 2026-10-20 16:55Z. The Supervisor measured about 579 GB written t
 
 Until #098, Tom avoids undocking during builds. Until #099, inherited sccache still applies to Oxide builds.
 
+Tom, 2026-10-20: "Doesn't the built binary need to go back on the internal SSD, that's kinda the point, right?"
+- Product default changed: final outputs (the checkout `target/`) stay checkout-local on the internal SSD, so they remain available undocked and at expected paths. Only slot intermediates use the removable pool.
+- "Outputs follow the pool" becomes an explicit per-invocation or per-config opt-in for projects whose final-artifact rewrite churn proves material.
+- #098's brief is amended before dispatch. The Praxis trial measures final-output write volume.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
