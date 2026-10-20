@@ -644,6 +644,17 @@ Tom, 2026-10-21, "105 fast path approved, continue clean up". Background: Finder
   Earlier verdicts and gaps are kept.
 - **Cleanup continues** on the retired Builds tree only after a fresh positive idle and no-ongoing-writes check. No force or recovery.
 
+Tom, 2026-10-21, "Yeah perfect, approve": an Oxide CI shim replaces per-project CI switching. Longhorn's `GITHUB_ACTIONS` helper "will do for now, but need something more elegant".
+1. **One crate, two builds.** The shim is a feature-gated build of the same `oxide` crate.
+   - It shares the command-line parser and argument refusals, but has no pool, slot, lease, removable or freshness machinery.
+   - Built-in commands become their `cargo` equivalent unchanged, and `quick`/`debug` apply the same profile recipe environment.
+   - `exec` runs the command and `clean` runs `cargo clean`. `status` reports passthrough and exits 0. Exit codes are Cargo's.
+2. **Never environment-triggered.** The full binary never switches to passthrough because of `CI`, `GITHUB_ACTIONS` or similar. The installed artifact decides the behaviour.
+3. **Distribution.** Release builds of the shim plus a `setup-oxide` GitHub Action, on the `setup-effigy` pattern. The release, tags and workflow for this are approved. The crates.io name stays open under Q-005.
+4. **Order.** The shim follows #106, so its profile mapping matches. Then the release and action, then Longhorn as first adopter. Each consumer's CI workflow edit is approved project by project.
+
+Once a project adopts it, its selectors call `oxide` unconditionally. Local `:cargo` escapes stay for a broken `oxide`.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
