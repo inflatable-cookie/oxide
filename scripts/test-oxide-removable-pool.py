@@ -234,7 +234,9 @@ def main() -> int:
     br.install_cancellation()
     if br.host_free(parent) < HOST_RESERVE_BYTES:
         fail("host free space is below the 20 GiB reserve before any effect")
-    GUARDIAN = br.Guardian(STARTED, parent, br.Walker([parent]), work_seconds=240, total_seconds=PROOF_SECONDS)
+    # The reserve is sampled on /private/tmp, which outlives the guarded
+    # removal of the owned scratch.
+    GUARDIAN = br.Guardian(STARTED, "/private/tmp", br.Walker([parent]), work_seconds=240, total_seconds=PROOF_SECONDS)
     proof = Proof(parent)
     first = None
     try:
@@ -267,9 +269,18 @@ def main() -> int:
         GUARDIAN.shutdown()
         raise first
     GUARDIAN.check(experimental=False)
+    # Guarded removal: the owned-byte record switches explicitly to the last
+    # complete total (removal only shrinks it), the reserve and deadline
+    # monitors stay live, and removal is a bounded cleanup step.
+    GUARDIAN.sample_storage()
+    GUARDIAN.check(experimental=False)
+    GUARDIAN.walker.frozen = GUARDIAN.walk_max
+    removal = run_owned(["/bin/rm", "-rf", parent], env=dict(os.environ), cwd="/", timeout=60, cleanup=True)
+    if removal.returncode != 0 or os.path.lexists(parent):
+        fail(f"guarded removal of {parent} failed (exit {removal.returncode})")
+    GUARDIAN.check(experimental=False)
     walks, peak, low = GUARDIAN.walk_count, GUARDIAN.walk_max, GUARDIAN.reserve_min
     GUARDIAN.shutdown()
-    shutil.rmtree(parent)
     if raw is None:
         os.rmdir(root)
     elapsed = time.monotonic() - STARTED

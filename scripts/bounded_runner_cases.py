@@ -246,7 +246,7 @@ def run_cases(outer: br.Guardian, scratch: str, env: dict, log) -> int:
         raise AssertionError("TERM-ignoring group was not escalated to KILL and closed")
 
     case("failed process observation keeps the session unclosed for the outer guardian")
-    def blind():
+    def blind(_timeout=None):
         raise OSError("ps failed")
     guardian = real_inner(outer, scratch, table=blind)
     threading.Timer(0.3, lambda: guardian.fault("reserve", "injected")).start()
@@ -278,6 +278,136 @@ def run_cases(outer: br.Guardian, scratch: str, env: dict, log) -> int:
     clock.now += 301
     if guardian.cleanup("detach stand-in", lambda: True):
         raise AssertionError("cleanup ran after the total deadline")
+
+    # Review 6295233361 regressions ----------------------------------------
+    case("late final lstat is not published")
+    single = os.path.join(scratch, "single")
+    os.makedirs(single)
+    clock = FakeClock()
+    def late_final(path):
+        result = os.lstat(path)
+        clock.now += 1.5
+        return result
+    guardian = inner(outer, scratch, clock=clock, walker=br.Walker([single], clock=clock, lstat=late_final))
+    before = guardian.walk_at
+    guardian.sample_storage()
+    if guardian.walk_at != before:
+        raise AssertionError("a late walk refreshed the sample time")
+    expect_fault(guardian, "storage")
+
+    case("late scandir is not published")
+    clock = FakeClock()
+    def late_listing(path):
+        clock.now += 1.5
+        return os.scandir(path)
+    guardian = inner(outer, scratch, clock=clock, walker=br.Walker([single], clock=clock, scandir=late_listing))
+    guardian.sample_storage()
+    expect_fault(guardian, "storage")
+
+    for label, slow in (("stat", "stat"), ("ismount", "ismount"), ("statvfs", "statvfs")):
+        case(f"late mount {label} is not published")
+        clock = FakeClock()
+        def advance(function):
+            def wrapped(path):
+                result = function(path)
+                clock.now += 1.5
+                return result
+            return wrapped
+        observers = {"stat": os.stat, "ismount": lambda _p: True, "statvfs": os.statvfs}
+        observers[slow] = advance(observers[slow])
+        walker = br.Walker([], clock=clock, **observers)
+        walker.mounts[scratch] = os.stat(scratch).st_dev
+        guardian = inner(outer, scratch, clock=clock, walker=walker)
+        guardian.sample_storage()
+        expect_fault(guardian, "storage")
+
+    case("second ENOENT attempt that runs past the original deadline")
+    clock = FakeClock()
+    calls = {"n": 0}
+    def first_vanishes(path):
+        calls["n"] += 1
+        clock.now += 0.6
+        if calls["n"] == 1:
+            raise FileNotFoundError(path)
+        return os.lstat(path)
+    guardian = inner(outer, scratch, clock=clock, walker=br.Walker([single], clock=clock, lstat=first_vanishes))
+    guardian.sample_storage()
+    expect_fault(guardian, "storage")
+
+    case("cleanup leader that closes its streams but stays alive fails and is closed")
+    guardian = real_inner(outer, scratch)
+    removed = {"done": False}
+    try:
+        guardian.run(["/bin/sh", "-c", "exec >&- 2>&-; sleep 30"], env=env, timeout=0.5, cleanup=True)
+        removed["done"] = True  # a false success would authorize removal
+    except br.Fault:
+        pass
+    guardian.stop.set()
+    if removed["done"] or not guardian.cleanup_failures:
+        raise AssertionError("a live cleanup leader was reported as a successful step")
+    if outer.unclosed:
+        raise AssertionError("the timed-out cleanup leader was not positively closed")
+
+    case("deadline expiry during close does not mint grace time")
+    guardian = real_inner(outer, scratch, total_seconds=1.5)
+    started = time.monotonic()
+    try:
+        guardian.run(["/bin/sh", "-c", "trap '' TERM; sleep 30"], env=env, timeout=0.3)
+        raise AssertionError("time limit did not fault")
+    except br.Fault:
+        pass
+    guardian.stop.set()
+    # Closing within what is left is fine; minting new grace windows is not.
+    if time.monotonic() - started > 3.0:
+        raise AssertionError("closure ran past the original total deadline")
+    no_members(outer, 0)
+
+    case("deadline expiry during drain")
+    guardian = real_inner(outer, scratch, total_seconds=1.0)
+    started = time.monotonic()
+    try:
+        guardian.run(["/bin/sh", "-c", "sleep 30 &"], env=env, timeout=30)
+        raise AssertionError("an open pipe near the deadline did not fault")
+    except br.Fault:
+        pass
+    guardian.stop.set()
+    if time.monotonic() - started > 2.5:
+        raise AssertionError("drain ran past the original total deadline")
+    no_members(outer, 0)
+
+    case("settle after the deadline leaves sessions unclosed")
+    guardian = real_inner(outer, scratch, table=blind)
+    threading.Timer(0.3, lambda: guardian.fault("reserve", "injected")).start()
+    try:
+        guardian.run(["/bin/sleep", "30"], env=env, timeout=30)
+    except br.Fault:
+        pass
+    guardian.stop.set()
+    guardian.total_deadline = time.monotonic() - 1
+    started = time.monotonic()
+    if not guardian.settle() or time.monotonic() - started > 0.5:
+        raise AssertionError("settle after the deadline claimed closure or took time")
+    no_members(outer, 0)
+
+    case("deadline expiry during a cleanup step")
+    guardian = real_inner(outer, scratch, total_seconds=1.0)
+    try:
+        guardian.run(["/bin/sleep", "30"], env=env, timeout=30, cleanup=True)
+        raise AssertionError("a cleanup step past the deadline succeeded")
+    except br.Fault:
+        pass
+    guardian.stop.set()
+    if not guardian.cleanup_failures:
+        raise AssertionError("cleanup expiry was not recorded")
+    no_members(outer, 0)
+
+    case("frozen accounting during guarded removal")
+    walker = br.Walker([single])
+    last = walker.sample()
+    walker.frozen = last
+    os.rmdir(single)
+    if walker.sample() != last:
+        raise AssertionError("removal accounting was not the last complete total")
 
     if outer.unclosed:
         raise AssertionError(f"outer guardian still holds {sorted(outer.unclosed)}")

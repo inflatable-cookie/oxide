@@ -86,11 +86,27 @@ def host_free(path: str) -> int:
 class Walker:
     """Whole-walk owned-byte total over `roots` plus counted mounts."""
 
-    def __init__(self, roots: list, clock=time.monotonic, lstat=os.lstat, scandir=os.scandir):
+    def __init__(
+        self,
+        roots: list,
+        clock=time.monotonic,
+        lstat=os.lstat,
+        scandir=os.scandir,
+        stat=os.stat,
+        statvfs=os.statvfs,
+        ismount=os.path.ismount,
+    ):
         self.roots = roots
         self.clock = clock
         self.lstat = lstat
         self.scandir = scandir
+        self.stat = stat
+        self.statvfs = statvfs
+        self.ismount = ismount
+        # Set before guarded removal of the owned roots: the last complete
+        # total, reported as a conservative upper bound while removal only
+        # shrinks it.
+        self.frozen = None
         # Mounts: path -> st_dev of the positively identified mount root.
         self.mounts = {}
         # Attach intent recorded before mutation and not yet resolved:
@@ -100,33 +116,43 @@ class Walker:
         # detach is confirmed.
         self.held = {}
 
+    def _late(self, deadline: float) -> None:
+        if self.clock() > deadline:
+            raise TimeoutError("owned-byte observation finished after its 1 s deadline")
+
     def _walk_once(self, deadline: float) -> int:
         total = 0
         stack = [root for root in self.roots if os.path.lexists(root)]
+        self._late(deadline)
         mounts = dict(self.mounts)
         held = dict(self.held)
         pending = self.unresolved_attach
         while stack:
-            if self.clock() > deadline:
-                raise TimeoutError("owned-byte walk exceeded its 1 s deadline")
+            self._late(deadline)
             current = stack.pop()
             if current in mounts:
                 continue
             metadata = self.lstat(current)
+            self._late(deadline)
             total += max(metadata.st_size, metadata.st_blocks * 512)
             if stat_mode.S_ISDIR(metadata.st_mode):
                 with self.scandir(current) as entries:
                     for entry in entries:
                         stack.append(entry.path)
+                self._late(deadline)
         total += sum(held.values())
         if pending is not None:
             total += pending[1]
         for mount, device in mounts.items():
-            metadata = os.stat(mount)
-            if metadata.st_dev != device or not os.path.ismount(mount):
+            metadata = self.stat(mount)
+            self._late(deadline)
+            if metadata.st_dev != device or not self.ismount(mount):
                 raise OSError(errno.ENODEV, f"{mount} is no longer the identified mount")
-            stat = os.statvfs(mount)
-            total += (stat.f_blocks - stat.f_bfree) * stat.f_frsize
+            self._late(deadline)
+            sample = self.statvfs(mount)
+            self._late(deadline)
+            total += (sample.f_blocks - sample.f_bfree) * sample.f_frsize
+        self._late(deadline)
         return total
 
     def mount_used(self, mount: str) -> int:
@@ -146,10 +172,15 @@ class Walker:
 
     def sample(self) -> int:
         """At most two complete attempts within one 1 s deadline."""
+        if self.frozen is not None:
+            return self.frozen
         deadline = self.clock() + WALK_DEADLINE
         for attempt in (1, 2):
             try:
-                return self._walk_once(deadline)
+                total = self._walk_once(deadline)
+                # One deadline across both attempts, checked before publishing.
+                self._late(deadline)
+                return total
             except FileNotFoundError:
                 if attempt == 2:
                     raise
@@ -280,29 +311,41 @@ class Guardian:
             return self.outer.count_output(size) and not over
         return not over
 
+    def remaining(self) -> float:
+        """What is left of the ORIGINAL total budget; never extended."""
+        return self.total_deadline - self.clock()
+
     # Processes ------------------------------------------------------------
     def _members(self, session: int, groups: set) -> list:
-        return [pid for pid, group, member in self.table() if member == session or group in groups]
+        left = self.remaining()
+        if left <= 0:
+            raise TimeoutError("no total budget left to observe processes")
+        table = self.table(min(PS_TIMEOUT, left))
+        return [pid for pid, group, member in table if member == session or group in groups]
 
     def close(self, session: int, groups: set, child: subprocess.Popen) -> bool:
         """TERM then KILL every group of the session, reaping the leader,
         then a fresh observation. False when closure is not positive."""
         try:
             for number, grace in ((signal.SIGTERM, TERM_GRACE), (signal.SIGKILL, KILL_GRACE)):
-                groups |= {group for _, group, member in self.table() if member == session}
+                if self.remaining() <= 0:
+                    self.fault("deadline", f"no total budget left to close session {session}")
+                    return False
+                groups |= {group for _, group, member in self.table(min(PS_TIMEOUT, self.remaining())) if member == session}
                 for group in groups:
                     try:
                         os.killpg(group, number)
                     except (ProcessLookupError, PermissionError):
                         pass
-                end = time.monotonic() + grace
+                # Grace windows never extend the original total deadline.
+                end = time.monotonic() + min(grace, max(0.0, self.remaining()))
                 while time.monotonic() < end:
                     child.poll()
-                    if not self._members(session, groups):
+                    if child.returncode is not None and not self._members(session, groups):
                         return True
                     time.sleep(0.1)
             child.poll()
-            return not self._members(session, groups)
+            return child.returncode is not None and not self._members(session, groups)
         except Exception as error:
             self.fault("observation", f"process observation failed: {error!r}")
             return False
@@ -331,6 +374,7 @@ class Guardian:
         chunks = {"stdout": [], "stderr": []}
         readers = []
         closed = False
+        timed_out = False
         try:
             for owner in (self, self.outer):
                 if owner is not None:
@@ -355,6 +399,7 @@ class Guardian:
             while child.poll() is None:
                 if self.clock() > limit:
                     if cleanup:
+                        timed_out = True
                         self.cleanup_failures.append(f"{command[0]} exceeded its cleanup time limit")
                         break
                     self.fault("deadline", f"{command[0]} exceeded its time limit")
@@ -363,21 +408,24 @@ class Guardian:
                 if self.outer is not None:
                     self.outer.check(experimental=False)
                 time.sleep(POLL)
-            end = time.monotonic() + DRAIN_GRACE
-            for reader in readers:
-                reader.join(max(0.0, end - time.monotonic()))
-            if child.poll() is not None and any(reader.is_alive() for reader in readers):
-                self.fault("output", f"{command[0]} left a pipe open after exit")
-            try:
-                closed = not [pid for pid in self._members(session, groups) if pid != session]
-            except Exception as error:
-                self.fault("observation", f"process observation failed: {error!r}")
+            if child.poll() is not None:
+                end = time.monotonic() + min(DRAIN_GRACE, max(0.0, self.remaining()))
+                for reader in readers:
+                    reader.join(max(0.0, end - time.monotonic()))
+                if any(reader.is_alive() for reader in readers):
+                    self.fault("output", f"{command[0]} left a pipe open after exit")
+                # Closure needs the reaped leader AND a fresh empty observation
+                # of the whole session and its groups, leader included.
+                try:
+                    closed = child.returncode is not None and not self._members(session, groups)
+                except Exception as error:
+                    self.fault("observation", f"process observation failed: {error!r}")
             if not closed:
                 closed = self.close(session, groups, child)
         finally:
             if not closed:
                 closed = self.close(session, groups, child)
-            end = time.monotonic() + DRAIN_GRACE
+            end = time.monotonic() + min(DRAIN_GRACE, max(0.0, self.remaining()))
             for reader in readers:
                 reader.join(max(0.0, end - time.monotonic()))
             pipes_open = any(reader.is_alive() for reader in readers)
@@ -393,6 +441,10 @@ class Guardian:
             self.check(experimental=False)
         elif self.unclosed:
             raise Fault(f"cleanup step left sessions {sorted(self.unclosed)} unclosed")
+        if timed_out:
+            raise Fault(f"cleanup step {command[0]} timed out; its session was closed, the step failed")
+        if child.returncode is None:
+            raise Fault(f"{command[0]} has no exit status; treated as failure")
         return subprocess.CompletedProcess(
             command, child.returncode, b"".join(chunks["stdout"]), b"".join(chunks["stderr"])
         )
@@ -408,6 +460,9 @@ class Guardian:
         sessions that remain unclosed."""
         for session in sorted(self.unclosed):
             child = self.children.get(session)
+            if self.remaining() <= 0:
+                # Settlement never mints time: what is left stays unclosed.
+                break
             if child is not None and self.close(session, {session}, child):
                 self.unclosed.discard(session)
                 for stream in (child.stdout, child.stderr):
