@@ -1304,7 +1304,9 @@ Rules:
 
 Approved design direction (Tom, 2026-10-20). The goal: while the laptop is docked, Oxide's build-data writes go to a dedicated external SSD, and undocking at any moment is safe, with work falling back to the internal SSD. Measured motivation: [internal SSD write baseline](../storage-efficiency.md#internal-ssd-write-baseline-2026-10-20).
 
-Part 1 (registration, selection and flush on release) is implemented and fixture-proven; part 2 (surprise removal, lost-volume leases, discard after unclean disappearance and final outputs on the volume) is not. No real drive is registered: real registration waits for part 2's reviewed merge and Tom formatting `OxideBuild`.
+Part 1 (registration, selection and flush on release) is implemented, with author fixture evidence and Tom's operator acceptance; the final independent native proof remains missing. Part 2 (surprise removal, lost-volume leases, discard after unclean disappearance and final outputs on the volume) is not implemented.
+
+Tom approved an early host trial on 2026-10-20. His `Builds` volume (`A6AC3ED7-33EA-46B4-8082-7254CF291ED2`, `/Volumes/Builds`) is registered and selected for the next build when present. The whole-MiB parser records an admission cap of 715255 MiB (749999226880 bytes, rounded down from 750 GB) and a reserve of 95368 MiB (100000595968 bytes, rounded up to retain at least 100 GB free). These are a budget and start threshold, not an APFS quota. **Do not undock during builds until surprise-removal handling is implemented.** The current registration and control state live under the existing internal pool; a later internal-pool move must preserve them safely or require explicit re-registration. Installation identity and before/after observations are retained in the user's install receipts and release audit.
 
 ### Implemented: part 1
 
