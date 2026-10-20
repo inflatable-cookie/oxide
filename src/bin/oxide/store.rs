@@ -414,7 +414,7 @@ pub struct SlotView {
     pub managed: bool,
     /// Held with no live Oxide owner. The next command recovers it once
     /// Cargo's group is empty; if the group was never recorded,
-    /// `oxide-storage-lease recover` is explicit.
+    /// `oxide pool recover-interrupted <slot>` is explicit.
     pub interrupted: Option<Interrupted>,
     /// Why a removable-volume slot was retired and stays held.
     pub retired: Option<String>,
@@ -1415,6 +1415,71 @@ impl Store {
             state.settle_idle(index);
         }
         Ok(())
+    }
+
+    /// Explicit release of an interrupted slot that automatic recovery keeps
+    /// held: Cargo's group was never recorded, or the lease is not provably
+    /// the record's. It replaces the retired standalone CLI's `recover`.
+    /// The caller asserts nothing still writes in the slot; Oxide still
+    /// refuses while any live command holds the record or the slot is
+    /// retired, and logs the release like an automatic recovery.
+    pub fn recover_interrupted(&self, slot_id: &str) -> Result<(), String> {
+        let _admission = self.admission()?;
+        let mut state = self.load()?;
+        let status = self.status()?;
+        let slot = status
+            .slots
+            .iter()
+            .find(|slot| slot.slot_id == slot_id && slot.state == SlotOccupancy::Held)
+            .ok_or_else(|| format!("slot {slot_id} is not held in {}", self.pool.display()))?;
+        let lease_id = slot.lease_id.clone().ok_or("the held slot has no lease ID")?;
+        let index = state
+            .records
+            .iter()
+            .position(|record| record.active() && self.affinity_dir(record.id) == slot.project)
+            .ok_or_else(|| format!("slot {slot_id} has no interrupted oxide command record"))?;
+        let record = &state.records[index];
+        if record.retired.is_some() {
+            return Err(format!(
+                "slot {slot_id} is retired after a failed flush and stays held"
+            ));
+        }
+        let Probe::Free(_owner) = probe_lock(&self.lock_path(record.id), true)? else {
+            return Err(format!("a live oxide command holds slot {slot_id}"));
+        };
+        if matches!(
+            return_path(record, slot),
+            Return::NeverStarted | Return::GroupEmpty(_)
+        ) {
+            return Err(format!(
+                "slot {slot_id} is recovered automatically by the next command once its Cargo group is empty"
+            ));
+        }
+        let recovery = Recovery {
+            slot_id: slot.slot_id.clone(),
+            lease_id,
+            checkout: record.checkout.clone(),
+            holder_pid: record.holder.as_ref().map_or(0, |holder| holder.pid),
+            holder_started_ms: record.holder.as_ref().map_or(0, |holder| holder.started_ms),
+            process_group: record.process_group,
+            recovered_ms: process::now_ms(),
+            recovered_by: std::process::id(),
+        };
+        state.records[index].pending_recovery = Some(recovery.clone());
+        self.save(&state)?;
+        let record_id = state.records[index].id;
+        if !self.flush_before_idle(&recovery.slot_id, record_id)? {
+            return Err(format!(
+                "slot {slot_id} stays held: the removable volume flush failed"
+            ));
+        }
+        let mut state = self.load()?;
+        recover(&self.pool, &recovery.lease_id)
+            .map_err(|error| lease_error("cannot recover the slot", &error))?;
+        state.records[index].pending_recovery = None;
+        state.log_recovery(recovery);
+        state.settle_idle(index);
+        self.save(&state)
     }
 
     fn forget_record(&self, state: &mut State, id: u64) {

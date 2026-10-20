@@ -63,11 +63,17 @@ pub struct Selected {
 
 const USAGE: &str = "\
 usage: oxide pool register-removable <mount-point> --reserve <size> --cap <size>
+       oxide pool recover-interrupted <slot>
 
-Registers a dedicated APFS volume mounted directly under /Volumes as the
-preferred build pool. <size> is bytes or a whole number of KiB, MiB, GiB or
-TiB. --reserve is the free space a build start must find above it; --cap is
-Oxide's admission budget on the volume. Both are required.";
+register-removable registers a dedicated APFS volume mounted directly under
+/Volumes as the preferred build pool. <size> is bytes or a whole number of
+KB, MB, GB, TB, KiB, MiB, GiB or TiB. --reserve is the free space a build
+start must find above it; --cap is Oxide's admission budget on the volume.
+Both are required.
+
+recover-interrupted releases a slot `oxide status` shows held by an
+interrupted command whose Cargo group was not recorded or whose lease is not
+provably its own. Run it only when nothing still writes in that slot.";
 
 /// `oxide pool ...`
 pub fn run(args: &[OsString]) -> Result<u8, String> {
@@ -98,6 +104,23 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
             let reserve = size("--reserve", reserve)?;
             let cap = size("--cap", cap)?;
             register(Path::new(mount), reserve, cap)
+        }
+        ["recover-interrupted", slot] => {
+            let Some(internal) = Store::open_existing()? else {
+                return Err("no pool exists".to_owned());
+            };
+            let target = match registration(&internal)? {
+                Some(_) if !internal_holds(&internal, slot)? => Store::open_removable(
+                    &internal.control().join(POOL_DIR),
+                    registration(&internal)?
+                        .map(|registration| registration.mount_point.join(PAYLOAD_DIR))
+                        .ok_or("the registration disappeared")?,
+                )?,
+                _ => internal,
+            };
+            target.recover_interrupted(slot)?;
+            println!("released slot {slot} in {}", target.pool.display());
+            Ok(0)
         }
         // Debug builds only: the focused proof applies the real mount-parent
         // rule to an owned scratch directory.
@@ -372,6 +395,13 @@ pub fn previous_registration(internal: &Store) -> Option<PathBuf> {
                 && (fs::symlink_metadata(control.join(REGISTRATION)).is_ok()
                     || fs::symlink_metadata(control.join(POOL_DIR)).is_ok())
         })
+}
+
+/// Whether the internal pool holds `slot`; otherwise a removable one may.
+fn internal_holds(internal: &Store, slot: &str) -> Result<bool, String> {
+    Ok(internal.status()?.slots.iter().any(|held| {
+        held.slot_id == slot && held.state == oxide_storage::lease::SlotOccupancy::Held
+    }))
 }
 
 /// Oxide never moves a registration or its ledger, and never creates a

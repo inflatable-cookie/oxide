@@ -45,6 +45,12 @@ call: bounded time, its temporary copies removed, well-formed output and no
 Cargo; the hidden probe mode alone gets the same refused-Cargo control. No
 penalty threshold is asserted. Not a benchmark and not full QA.
 
+Suspended by oxide#102: the default proof, `--cargo-matrix` and
+`--toolchain-context` provision their pool with the retired
+`oxide-storage-lease` CLI and APFS sparse-image backend; they refuse before
+any effect until migrated to a directory pool. `--launch-check` and
+`--clean-safety` use no pool and still run.
+
 `--cargo-matrix <release>`, `--toolchain-context` and `--launch-check` are
 separate focused proofs that run none of the above; see their functions.
 `--launch-check` runs only the launch-check case: offline staging into its
@@ -449,8 +455,6 @@ def build_binaries(extra: tuple = (), env: dict | None = None) -> dict:
             "--locked",
             "--bin",
             "oxide",
-            "--bin",
-            "oxide-storage-lease",
             *extra,
             "--message-format=json-render-diagnostics",
         ],
@@ -470,9 +474,8 @@ def build_binaries(extra: tuple = (), env: dict | None = None) -> dict:
         name = message.get("target", {}).get("name")
         if message.get("reason") == "compiler-artifact" and message.get("executable"):
             executables[name] = message["executable"]
-    for name in ("oxide", "oxide-storage-lease"):
-        if name not in executables:
-            fail(f"compiled artifact {name} was not reported")
+    if "oxide" not in executables:
+        fail("compiled artifact oxide was not reported")
     return executables
 
 
@@ -3219,7 +3222,7 @@ def launch_main() -> int:
     if staged > SCRATCH_LIMIT_BYTES:
         fail(f"staging {staged} exceeds 512 MiB")
     reserve(parent, "after staging", "launch")
-    runner = Runner(executables["oxide"], executables["oxide-storage-lease"], parent)
+    runner = Runner(executables["oxide"], None, parent)
     app = os.path.join(parent, "app")
     os.makedirs(app, mode=0o700)
     try:
@@ -3241,6 +3244,16 @@ def launch_main() -> int:
     return 0
 
 
+# oxide#102 retired the APFS sparse-image backend and the standalone
+# `oxide-storage-lease` CLI these proofs provision their pool with. They stay
+# suspended, refusing before any effect, until migrated to a directory pool;
+# their code is kept for that migration.
+RETIRED_POOL_PROOF = (
+    "suspended: this proof provisions its pool with the retired oxide-storage-lease CLI "
+    "and apfs-sparse-image-v1 backend (oxide#102); it refuses until migrated to a directory pool"
+)
+
+
 def main() -> int:
     global STARTED
     if "--clean-safety" in sys.argv:
@@ -3254,11 +3267,14 @@ def main() -> int:
     if "--cargo-matrix" in sys.argv:
         if len(sys.argv) != 3 or sys.argv[1] != "--cargo-matrix":
             fail("usage: test-oxide-cli.py --cargo-matrix <exact version>")
+        fail(RETIRED_POOL_PROOF)
         return matrix_main(sys.argv[2])
     if "--toolchain-context" in sys.argv:
         if sys.argv[1:] != ["--toolchain-context"]:
             fail("usage: test-oxide-cli.py --toolchain-context")
+        fail(RETIRED_POOL_PROOF)
         return context_main()
+    fail(RETIRED_POOL_PROOF)
     parent = os.path.join(scratch_root(), "oxide-cli")
     os.makedirs(parent, mode=0o700, exist_ok=False)
     prove_wait_lines()

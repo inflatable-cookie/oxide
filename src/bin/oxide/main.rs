@@ -622,11 +622,11 @@ fn print_pool(store: &Store) -> Result<(), String> {
                         "Cargo group {group}; recovered once the group is empty"
                     ),
                     store::Return::GroupUnrecorded => {
-                        "Cargo group not recorded; `oxide-storage-lease recover` releases it"
+                        "Cargo group not recorded; `oxide pool recover-interrupted <slot>` releases it"
                             .to_owned()
                     }
                     store::Return::NotOwn => {
-                        "lease not provably this command's; `oxide-storage-lease recover` releases it"
+                        "lease not provably this command's; `oxide pool recover-interrupted <slot>` releases it"
                             .to_owned()
                     }
                 };

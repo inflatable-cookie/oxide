@@ -15,6 +15,19 @@ Bounds: 300 s from admission through teardown, 512 MiB owned bytes
 processes, 20 GiB host reserve sampled every 250 ms. No forced detach: an
 ordinary detach that fails stops the proof and keeps the evidence. Not a
 benchmark and not full QA.
+
+`--budget-default` (oxide#102, selector `rust:oxide-budget-default`) first
+runs the budget-only default-pool cases in the same guarded session, over a
+scratch HOME (Rust toolchains still from the real RUSTUP_HOME): legacy image
+pool detection without touching it, default creation at the new path as a
+directory pool with a verified Time Machine exclusion, honest Spotlight
+status, the ignored macOS `~/.config` file, config-file and environment
+precedence, refusals (Git work tree, symlink alias, /Volumes, unknown key,
+malformed file) creating nothing, the orphan report after a path change, a
+build growing past a tiny soft budget completing, whole-idle-slot eviction
+at the next admission and an injected low-reserve watchdog stop. The
+removable phase then also proves the previous-registration refusal (idle and
+held legacy fixtures) before its ordinary registration.
 """
 
 from __future__ import annotations
@@ -45,6 +58,21 @@ LOG_LIMIT_BYTES = 32 * 1024 * 1024
 HOST_RESERVE_BYTES = 20 * 1024 * 1024 * 1024
 CARGO_LIMIT = 96
 MIB = 1024 * 1024
+
+BUDGET_DEFAULT = "--budget-default" in sys.argv[1:]
+# A build script that writes 4 MiB into the slot, past a 2 MB soft budget.
+GROWER = {
+    "Cargo.toml": '[package]\nname = "grower"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n',
+    "build.rs": 'fn main() {\n    let out = std::env::var("OUT_DIR").unwrap();\n    std::fs::write(format!("{out}/grown.bin"), vec![7_u8; 4 * 1024 * 1024]).unwrap();\n}\n',
+    "src/lib.rs": "pub fn value() -> u32 {\n    3\n}\n",
+}
+# A build script that runs long enough for the watchdog to stop it.
+SLEEPER = {
+    "Cargo.toml": '[package]\nname = "sleeper"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n',
+    "build.rs": "fn main() {\n    std::thread::sleep(std::time::Duration::from_secs(30));\n}\n",
+    "src/lib.rs": "pub fn value() -> u32 {\n    5\n}\n",
+}
+LEGACY_CONFIG = '{"version":1,"backend":"apfs-sparse-image-v1","store_id":"00","cap_bytes":134217728,"image_bytes":134217728}'
 
 FIXTURE = {
     "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
@@ -204,6 +232,8 @@ def build(parent: str, repo: str) -> str:
 
 
 def main() -> int:
+    if sys.argv[1:] not in ([], ["--budget-default"]):
+        fail("usage: test-oxide-removable-pool.py [--budget-default]")
     if sys.platform != "darwin":
         fail("the removable-pool proof requires macOS")
     raw = os.environ.get("OXIDE_TASK_SCRATCH_ROOT")
@@ -294,6 +324,217 @@ def main() -> int:
     return 0
 
 
+def write_tree(root: str, files: dict) -> str:
+    for relative, text in files.items():
+        path = os.path.join(root, relative)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+    return os.path.realpath(root)
+
+
+def snapshot(root: str) -> dict:
+    found = {}
+    for directory, _, files in os.walk(root):
+        for name in files:
+            path = os.path.join(directory, name)
+            with open(path, "rb") as handle:
+                found[os.path.relpath(path, root)] = handle.read()
+    return found
+
+
+def legacy_image_pool(home: str) -> str:
+    """The retired image pool's shape at its default path, in scratch."""
+    legacy = os.path.join(home, "Library/Caches/oxide/pool")
+    os.makedirs(os.path.join(legacy, "payload"), mode=0o700)
+    for name, text in (("config.json", LEGACY_CONFIG), ("receipt.json", "{}"), ("image.sparseimage", "")):
+        with open(os.path.join(legacy, name), "w", encoding="utf-8") as handle:
+            handle.write(text)
+    return legacy
+
+
+def budget_default(proof, parent: str, home: str, base: dict, oxide_run, expect, summary) -> None:
+    """oxide#102: the budget-only default pool, config, refusals, soft
+    budget growth and eviction, watchdog, legacy detection."""
+    env = {name: value for name, value in base.items() if not name.startswith("OXIDE_POOL")}
+    env["OXIDE_TASK_SCRATCH_ROOT"] = base["OXIDE_TASK_SCRATCH_ROOT"]
+
+    def call(args: list, label: str, extra: dict | None = None, cwd: str | None = None, drop: tuple = ()) -> tuple:
+        call_env = {name: value for name, value in env.items() if name not in drop}
+        call_env.update(extra or {})
+        result = run_owned([proof.oxide, *args], cwd=cwd or app, env=call_env, timeout=120)
+        emit(f"budget: {label}: exit {result.returncode} stdout", result.stdout)
+        emit(f"budget: {label}: stderr", result.stderr)
+        return result.returncode, result.stdout, result.stderr
+
+    caches = os.path.join(home, "Library/Caches/oxide")
+    default = os.path.join(caches, "build-pool")
+    support = os.path.join(home, "Library/Application Support/oxide")
+    config_file = os.path.join(support, "config/config.toml")
+    legacy = legacy_image_pool(home)
+    before = snapshot(legacy)
+    app = write_tree(os.path.join(parent, "budget-app"), FIXTURE)
+
+    # Nothing created: status names the platform config, default path and
+    # budget, and reports the legacy image pool without touching it.
+    code, stdout, _ = call(["status"], "status before any pool")
+    for needle in (
+        f"config: {config_file} (platform location, absent)",
+        f"pool: {default} (from built-in default)",
+        "soft budget 100000 MB (from built-in default)",
+        "not created; the first building oxide command creates it (directory-budget-v1",
+        f"legacy pool: {legacy} (retired apfs-sparse-image-v1; not used, attached or written",
+    ):
+        expect(code == 0 and needle in stdout, f"status lacks {needle!r}")
+    expect(not os.path.exists(default), "status created the default pool")
+
+    # A pool path at the legacy image pool refuses without touching it.
+    code, _, stderr = call(["check"], "legacy image pool selected", {"OXIDE_POOL": legacy})
+    expect(code != 0 and "retired apfs-sparse-image-v1" in stderr, "the legacy image pool was not refused")
+    code, _, stderr = call(["check"], "retired backend request", {"OXIDE_POOL_BACKEND": "apfs-sparse-image"})
+    expect(code != 0 and "OXIDE_POOL_BACKEND is retired" in stderr, "the retired backend request was not refused")
+
+    # First build: the default pool is a budget-only directory at the new path.
+    code, _, stderr = call(["check"], "first build creates the default pool")
+    line = summary(stderr)
+    expect(
+        code == 0 and "directory-budget-v1" in line and f"creating the build pool at {os.path.realpath(caches)}/build-pool (100000 MB soft budget, directory-budget-v1" in stderr,
+        f"default creation: {stderr}",
+    )
+    expect(os.path.isfile(os.path.join(default, "config.json")) and not os.path.exists(os.path.join(default, "image.sparseimage")), "default pool is not a directory pool")
+    with open(os.path.join(default, "config.json"), encoding="utf-8") as handle:
+        recorded = json.load(handle)
+    expect(recorded["backend"] == "directory-budget-v1" and recorded["cap_bytes"] == 100_000_000_000, f"recorded {recorded}")
+    excluded = run_owned(["/usr/bin/tmutil", "isexcluded", default], env=env, timeout=30)
+    emit(f"tmutil isexcluded exit {excluded.returncode}", excluded.stdout + excluded.stderr)
+    expect(excluded.stdout.startswith("[Excluded]"), "the new pool is not excluded from Time Machine")
+    expect(snapshot(legacy) == before, "the legacy image pool changed")
+
+    # Ignored ~/.config, Time Machine and Spotlight lines, no file contents.
+    dot_config = os.path.join(home, ".config/oxide")
+    os.makedirs(dot_config, mode=0o700)
+    with open(os.path.join(dot_config, "config.toml"), "w", encoding="utf-8") as handle:
+        handle.write('[pool]\npath = "/never-read-secret"\n')
+    code, stdout, _ = call(["status"], "status with the default pool")
+    for needle in (
+        f"ignored: {dot_config}/config.toml exists but is never read on macOS",
+        "backend directory-budget-v1: budget-only",
+        "soft budget 100000 MB (checked at admission",
+        "(shared; no Oxide quota or hard ceiling)",
+        "Time Machine: excluded (tmutil isexcluded)",
+        f"Spotlight: not excluded by Oxide; to stop indexing, add {os.path.realpath(default)} in System Settings",
+        f"legacy pool: {legacy}",
+    ):
+        expect(code == 0 and needle in stdout, f"status lacks {needle!r}")
+    expect("never-read-secret" not in stdout, "status printed ignored file contents")
+
+    # Config file: path and budget, then environment precedence.
+    dev = os.path.join(parent, "dev")
+    os.makedirs(dev, mode=0o700)
+    configured = os.path.join(dev, "oxide")
+    os.makedirs(os.path.dirname(config_file), mode=0o700)
+
+    def write_config(text: str) -> None:
+        with open(config_file, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    write_config(f'[pool]\npath = "{configured}"\nbudget = "2MB"\n')
+    code, stdout, _ = call(["status"], "status from the config file")
+    for needle in (
+        f"config: {config_file} (platform location)",
+        f"pool: {configured} (from config file)",
+        "soft budget 2 MB (from config file)",
+        f"orphaned pool: {default} (not the current pool; Oxide never moves or deletes it",
+    ):
+        expect(code == 0 and needle in stdout, f"status lacks {needle!r}")
+    code, stdout, _ = call(["status"], "environment over the file", {"OXIDE_POOL_CAP": "3MB"})
+    expect(code == 0 and "soft budget 3 MB (from OXIDE_POOL_CAP)" in stdout, "OXIDE_POOL_CAP did not win")
+    explicit = os.path.join(parent, "explicit.toml")
+    with open(explicit, "w", encoding="utf-8") as handle:
+        handle.write('[pool]\nbudget = "5MB"\n')
+    code, stdout, _ = call(["status"], "OXIDE_CONFIG", {"OXIDE_CONFIG": explicit})
+    expect(code == 0 and f"config: {explicit} (selected by OXIDE_CONFIG)" in stdout and "soft budget 5 MB (from config file)" in stdout, "OXIDE_CONFIG was not used")
+
+    # Refusals create nothing.
+    repo = os.path.join(parent, "repo")
+    os.makedirs(os.path.join(repo, ".git"), mode=0o700)
+    alias = os.path.join(parent, "alias")
+    os.symlink(repo, alias)
+    for text, needle, label in (
+        (f'[pool]\npath = "{repo}/pool"\n', "inside the Git work tree", "git work tree"),
+        (f'[pool]\npath = "{alias}/pool"\n', "inside the Git work tree", "symlink alias into a work tree"),
+        ('[pool]\npath = "/Volumes/OxNone/pool"\n', "external volume", "/Volumes"),
+        ('[pool]\nbudgte = "2MB"\n', config_file, "unknown key"),
+        ("[pool\n", config_file, "malformed file"),
+        ('[pool]\npath = "relative/pool"\n', "must be absolute", "relative path"),
+    ):
+        write_config(text)
+        code, _, stderr = call(["check"], f"refusal: {label}")
+        expect(code != 0 and needle in stderr, f"{label} was not refused with {needle!r}")
+    expect(not os.path.exists(os.path.join(repo, "pool")), "a refusal created a pool")
+
+    # Soft budget: a build grows past 2 MB and completes; the next
+    # admission evicts the whole idle slot.
+    write_config(f'[pool]\npath = "{configured}"\nbudget = "2MB"\n')
+    grower = write_tree(os.path.join(parent, "grower"), GROWER)
+    code, _, stderr = call(["check"], "build grows past the soft budget", cwd=grower)
+    line = summary(stderr)
+    expect(code == 0 and "of 1 MiB budget" in line, f"growth build: {line}")
+    with open(os.path.join(configured, "ledger.json"), encoding="utf-8") as handle:
+        slots = json.load(handle)["slots"]
+    expect(len(slots) == 1 and slots[0]["state"] == "idle", f"ledger after growth {slots}")
+    grown = slots[0]["id"]
+    excluded = run_owned(["/usr/bin/tmutil", "isexcluded", configured], env=env, timeout=30)
+    expect(excluded.stdout.startswith("[Excluded]"), "the configured pool is not excluded from Time Machine")
+    code, stdout, _ = call(["status"], "status after growth")
+    allocated = [l for l in stdout.splitlines() if "MiB allocated by slots" in l]
+    expect(code == 0 and allocated and int(allocated[0].split("MiB allocated by slots")[0].split()[-1]) >= 4, f"growth not reported: {allocated}")
+    code, _, stderr = call(["check"], "next admission evicts the idle slot")
+    expect(code == 0, "admission after growth failed")
+    with open(os.path.join(configured, "ledger.json"), encoding="utf-8") as handle:
+        slots = json.load(handle)["slots"]
+    expect(all(slot["id"] != grown for slot in slots), f"the grown idle slot was not evicted: {slots}")
+    expect(not os.path.exists(os.path.join(configured, "payload/slots", str(grown))), "evicted slot bytes remain")
+
+    # Watchdog: an injected low reading stops a running build.
+    sleeper = write_tree(os.path.join(parent, "sleeper"), SLEEPER)
+    readings = os.path.join(parent, "watchdog.readings")
+    with open(readings, "w", encoding="utf-8") as handle:
+        handle.write(str(1024 * MIB))
+    started = time.monotonic()
+    code, _, stderr = call(["check"], "injected low reserve", {"OXIDE_TEST_WATCHDOG_READINGS": readings}, cwd=sleeper)
+    expect(code != 0 and "oxide: reserve stop (injected test readings)" in stderr, "the watchdog did not stop the build")
+    expect(time.monotonic() - started < 25, "the watchdog stop took the whole sleep")
+    expect(snapshot(legacy) == before, "the legacy image pool changed")
+    proof.account("after budget-default cases")
+
+
+def previous_registration_refused(home: str, mount: str, control: str, oxide_run, expect) -> None:
+    """A registration under the previous (legacy) pool refuses a new one and
+    is never moved, forked or removed: idle and held fixtures."""
+    legacy = os.path.join(home, "Library/Caches/oxide/pool")
+    managed = os.path.join(legacy, "oxide-managed")
+    os.makedirs(managed, mode=0o700)
+    with open(os.path.join(managed, "removable.json"), "w", encoding="utf-8") as handle:
+        handle.write('{"version":1}')
+    for case in ("idle", "held"):
+        if case == "held":
+            held = os.path.join(managed, "removable")
+            os.makedirs(held, mode=0o700)
+            with open(os.path.join(held, "ledger.json"), "w", encoding="utf-8") as handle:
+                handle.write('{"slots":[{"id":1,"state":"held"}]}')
+        before = snapshot(legacy)
+        code, _, stderr = oxide_run(["pool", "register-removable", mount, "--reserve", "16MiB", "--cap", "64MiB"], f"refusal: previous registration ({case})")
+        expect(code != 0 and "registered under the previous pool" in stderr and "no held slots or waiting commands" in stderr, f"{case} previous registration was not refused")
+        expect(snapshot(legacy) == before, f"the {case} previous registration changed")
+        expect(not os.path.exists(os.path.join(control, "removable.json")) and not os.path.exists(os.path.join(control, "removable")), "a refusal forked a removable ledger")
+        expect(not os.path.exists(os.path.join(mount, "oxide-pool")), "a refusal wrote to the volume")
+    code, _, stderr = oxide_run(["check"], "build note: previous registration")
+    expect(code == 0 and "the removable registration under the previous pool" in stderr, "the previous registration was silently dropped")
+    # The fixture is this proof's own scratch; remove it for the no-registration path.
+    shutil.rmtree(legacy)
+
+
 def run(proof: Proof, parent: str) -> None:
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     real_cargo = shutil.which("cargo")
@@ -304,6 +545,7 @@ def run(proof: Proof, parent: str) -> None:
     if os.path.lexists(f"/Volumes/{proof.name}"):
         fail(f"/Volumes/{proof.name} already exists; never touched")
     oxide = build(parent, repo)
+    proof.oxide = oxide
     print(f"staging: {time.monotonic() - STARTED:.0f} s (1 Cargo process)")
     proof.account("after staging")
 
@@ -319,8 +561,11 @@ def run(proof: Proof, parent: str) -> None:
     os.chmod(wrapper, 0o755)
     pool = os.path.join(parent, "pool")
     env = dict(os.environ)
+    real_rustup = env.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")
+    home = os.path.join(parent, "home")
+    os.makedirs(home, mode=0o700)
     for name in list(env):
-        if name.startswith("SCCACHE_") or name.startswith("OXIDE_") or name in (
+        if name.startswith("SCCACHE_") or name.startswith("OXIDE_") or name.startswith("XDG_") or name in (
             "CARGO", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "RUSTC", "RUSTUP_TOOLCHAIN"
         ):
             env.pop(name)
@@ -330,6 +575,9 @@ def run(proof: Proof, parent: str) -> None:
             "OXIDE_POOL_BACKEND": "directory-budget",
             "OXIDE_POOL_CAP": "64MiB",
             "CARGO_HOME": cargo_home,
+            # Oxide's config, state and legacy lookups stay in scratch.
+            "HOME": home,
+            "RUSTUP_HOME": real_rustup,
             "PATH": bin_dir + os.pathsep + env.get("PATH", ""),
             "CARGO_NET_OFFLINE": "true",
             "CARGO_TERM_COLOR": "never",
@@ -371,6 +619,9 @@ def run(proof: Proof, parent: str) -> None:
         lines = [line for line in stderr.splitlines() if " profile, " in line and " strategy, slot " in line]
         expect(len(lines) == 1, f"expected one summary line: {stderr}")
         return lines[0]
+
+    if BUDGET_DEFAULT:
+        budget_default(proof, parent, home, env, oxide_run, expect, summary)
 
     control = os.path.join(pool, "oxide-managed")
     removable_root = os.path.join(control, "removable")
@@ -455,6 +706,8 @@ def run(proof: Proof, parent: str) -> None:
     proof.account("after attach")
     code, stdout, stderr = oxide_run(["pool", "register-removable", mount + "x", "--reserve", "16MiB", "--cap", "64MiB"], "refusal: prefix look-alike")
     expect(code != 0, "prefix look-alike registered")
+    if BUDGET_DEFAULT:
+        previous_registration_refused(home, mount, control, oxide_run, expect)
     code, stdout, stderr = oxide_run(["pool", "register-removable", mount, "--reserve", "16MiB", "--cap", "64MiB"], "register")
     expect(code == 0 and "registered removable pool" in stdout, "registration failed")
     with open(os.path.join(control, "removable.json"), encoding="utf-8") as handle:
