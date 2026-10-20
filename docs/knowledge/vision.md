@@ -476,6 +476,13 @@ Tom's rulings, 2026-10-20 ("Let's start with sccache bypassed in oxide, see how 
 
 Tom approved, 2026-10-20 ("Yes please"), a design and task for an adaptive sccache location wrapper, sequenced after #097. While docked it uses one sccache server and cache on the registered `Builds` volume, and a separate internal server and small cache when undocked. Oxide's volume-identity check selects between them per compile. Switching the machine-wide `rustc-wrapper` to it is a separate, staged host step after independent review, with the Effigy owner informed first.
 
+Tom, 2026-10-20 ("Can you have another look into sccache working with oxide? It feels like we gave up too easily and they should compliment each other", then "Yeah do it"): approved one bounded qualification of making sccache complement Oxide. It covers:
+- sccache client-side mode for writer closure;
+- an Oxide stable build-path alias to remove the target-path sensitivity found on 2026-10-20 ([landscape](rust-dx-landscape.md#sccache-with-oxide-modes-and-path-sensitivity-2026-10-20));
+- the release status of upstream Rust basedir normalization.
+
+It is evidence and knowledge only. No runtime change, install or live server operation. A positive result needs a separate integration brief. The #099 bypass stays until then.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
