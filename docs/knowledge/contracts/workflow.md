@@ -1336,7 +1336,7 @@ A lease records which pool it uses. Each pool stays warm on its own.
 - **Queue worktrees and Colima's VM disk stay internal:** they hold live state that an unplug would break.
 - Spotlight indexing of build locations is a host setting, recommended separately.
 
-**Not yet decided:** the drive (a builds volume beside Time Machine on Vault, or the dedicated spare 1 TB SSD), the volume size and quota, encryption with keychain auto-unlock, and the exact flush primitive and its cost.
+**Drive:** the dedicated spare 1 TB SSD (Tom, 2026-10-20), erased as APFS volume `OxideBuild`. Vault and its Time Machine backups stay untouched. **Not yet decided:** the reserve/quota policy, encryption with keychain auto-unlock (plain APFS recommended for seamless remounting), and the exact flush primitive and its cost.
 
 ## Open decisions
 
