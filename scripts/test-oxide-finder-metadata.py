@@ -2,10 +2,12 @@
 """Focused proof for Finder metadata in pool accounting (oxide#105).
 
 A short fixed script, not a supervision framework: Effigy heavy admission
-gates the start; the 20 GiB host reserve on /private/tmp and the owned
-scratch bytes (`du`, the sparse image's allocation included) are checked
-before every phase; every child runs in its own session with a timeout cut
-from one 300 s budget, and a timed-out session is killed whole. Cleanup is
+gates the start; owned scratch bytes (`du`, the sparse image's allocation
+included) are checked before every phase; every child, staging included,
+starts only after its deadline (cut from one 300 s budget) and the 20 GiB
+host reserve on /private/tmp are checked, runs in its own session, and has
+host free space sampled every 250 ms while it runs; a breach, a failed
+sample or the deadline kills that session whole. Cleanup is
 ordinary `hdiutil detach` and removal of the scratch; anything uncertain
 keeps its evidence.
 
@@ -39,6 +41,7 @@ BUILDER = "1.97.1"
 PROOF_SECONDS = 300
 SCRATCH_LIMIT_BYTES = 512 * 1024 * 1024
 HOST_RESERVE_BYTES = 20 * 1024 * 1024 * 1024
+RESERVE_POLL_SECONDS = 0.25
 MIB = 1024 * 1024
 STARTED = time.monotonic()
 FIXTURE = {
@@ -88,6 +91,11 @@ class Proof:
         print(f"phase {label}: {time.monotonic() - STARTED:.1f} s, owned {used // 1024} KiB, host free {free // MIB} MiB", flush=True)
 
     def run(self, command: list, *, cwd: str | None = None, env: dict | None = None, timeout: float = 120) -> subprocess.CompletedProcess:
+        # The deadline is fixed before the child exists, so a refused
+        # deadline never leaves an untracked writer behind.
+        deadline = time.monotonic() + min(timeout, remaining())
+        if shutil.disk_usage("/private/tmp").free < HOST_RESERVE_BYTES:
+            fail(f"host free space is below the 20 GiB reserve before {command[0]}")
         child = subprocess.Popen(
             command,
             cwd=cwd,
@@ -96,12 +104,27 @@ class Proof:
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        try:
-            out, err = child.communicate(timeout=min(timeout, remaining()))
-        except subprocess.TimeoutExpired:
-            os.killpg(child.pid, signal.SIGKILL)
-            child.communicate()
-            fail(f"{command[0]} timed out; its session was killed")
+        # While the child runs, host free space is sampled every 250 ms; a
+        # breach, a failed sample or the deadline kills its whole session.
+        # communicate() keeps partial output across timeouts.
+        while True:
+            try:
+                out, err = child.communicate(timeout=RESERVE_POLL_SECONDS)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                free = shutil.disk_usage("/private/tmp").free
+                problem = None if free >= HOST_RESERVE_BYTES else f"host free {free // MIB} MiB is below the 20 GiB reserve"
+            except OSError as error:
+                problem = f"host free space sample failed ({error})"
+            if problem is None and time.monotonic() >= deadline:
+                problem = "deadline reached"
+            if problem is not None:
+                os.killpg(child.pid, signal.SIGKILL)
+                child.communicate()
+                fail(f"{command[0]}: {problem}; its session was killed")
+            self.low = free if self.low is None else min(self.low, free)
         return subprocess.CompletedProcess(command, child.returncode, out, err)
 
     def oxide(self, args: list, label: str, cwd: str) -> tuple:
@@ -185,7 +208,7 @@ def stage(proof: Proof, repo: str) -> str:
 
 
 def run(proof: Proof, repo: str) -> None:
-    source = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, timeout=30).stdout.strip()
+    source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
     name = "OxFm" + secrets.token_hex(4)
     mount = f"/Volumes/{name}"
     print(f"finder-metadata proof {os.getpid()} source {source} volume {name}")

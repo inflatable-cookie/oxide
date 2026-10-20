@@ -106,8 +106,9 @@ admission = "heavy"
 run = "python3 scripts/test-oxide-removable-pool.py --budget-default"
 
 # Finder metadata (oxide#105): a short fixed script under heavy admission
-# (reserve and owned bytes checked between phases, one 300 s budget, child
-# sessions killed on timeout, ordinary detach). Stages `oxide` offline with
+# (deadline checked before each child, 20 GiB reserve sampled every 250 ms
+# while it runs, owned bytes between phases, one 300 s budget, child
+# sessions killed on breach or deadline, ordinary detach). Stages `oxide` offline with
 # 1.97.1; .DS_Store and ._* files at every pool level keep a budget-only
 # internal pool and one 128 MiB scratch-image removable pool complete and
 # warm, bytes counted; an unknown payload entry refuses by name and nothing
