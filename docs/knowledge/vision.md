@@ -454,6 +454,8 @@ finite clocks, process/storage limits and proof allowances. The
 [open compatibility question](questions.md#q-017--can-sccache-sharing-preserve-oxides-slot-writer-closure)
 owns the remaining evidence boundary.
 
+Tom's ruling, 2026-10-20 ("Yeah, the risk is acceptable for now"): until #096 qualifies sccache, and any approved follow-up builds an interrupted-lease mitigation, Oxide's dogfood builds keep inheriting the machine-wide `rustc-wrapper = sccache`. Tom accepts the interim exposure: after an interrupted, killed or recovered Oxide build, a server-side compile outside the Cargo process group may still write into a slot that has been released. Oxide does not disable the inherited wrapper in the meantime.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
