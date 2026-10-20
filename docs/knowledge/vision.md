@@ -503,6 +503,13 @@ Supervisor interpretation, sequenced after #097's reviewed merge:
 
 Until #098 merges, Tom avoids undocking during active builds. Until #099 merges, Nucleus builds through `oxide` inherit sccache under the accepted interim risk.
 
+Tom's ruling, 2026-10-20: "I think we can remove the legacy lease tool and probably the volume based pools - having a hard cap on drive space doesn't help very much, it would just break large builds and cause MORE churn."
+- This supersedes the earlier direction that pools carry an OS-enforced hard ceiling (see [bounded storage](contracts/bounded-storage.md)). Pools become budget-only: admission against a soft budget with whole-idle-slot eviction, plus the host-reserve watchdog from #077. A removable volume's own capacity is its only hard limit.
+- Supervisor sequencing, pending Tom's answers on the internal budget value and deletion of the existing image pool:
+  1. after #098, the internal default pool becomes `directory-budget-v1`, and the existing sparse-image pool is migrated and retired once idle;
+  2. after the Nucleus trial confirms Nucleus runs on `oxide`, the standalone `oxide-storage-lease` CLI and the `apfs-sparse-image-v1` backend are retired, with evidence preserved.
+- Nucleus's own 8 GiB pool remains its owner's to remove.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
