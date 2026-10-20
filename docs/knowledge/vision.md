@@ -607,6 +607,16 @@ Tom, 2026-10-20, "Approve": the post-#102 Builds cutover bridge.
 - Deleting the retired copies needs a separate approval.
 - Product follow-up: a supported retire command that refuses unless the old pool is drained.
 
+Tom, 2026-10-20, "Yes": accept #099 (bypass inherited `rustc-wrapper` such as sccache) as-is at PR97 exact head `b547ba51`. This is operator acceptance, not a review pass.
+- **Evidence:** all four product subjects passed independent source review, but the overall verdict was changes_required.
+- **Disclosed gaps:**
+  - the proof's timeout closes Oxide's session while Cargo runs in a different group, so Cargo descendants may keep writing;
+  - the plain-Cargo staging has no continuous reserve watchdog;
+  - the final dual-file/cleanup native case never ran (capacity timeout);
+  - the author overran (about 72 min against 45).
+- **Accepted risks:** a faulty bypass could fail builds or misreport policy. The internal-SSD effect is a removed possible cache-write path, not a measured saving.
+- The apparatus defects are follow-up corrections; issues found in use are fixed forward.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
