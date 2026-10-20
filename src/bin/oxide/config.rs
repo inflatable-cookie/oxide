@@ -343,6 +343,17 @@ fn check_size(bytes: u64) -> Result<u64, String> {
 /// volume (`/Volumes/...`, where a removable volume is registered), after
 /// resolving symlinks in its nearest existing ancestor. Unknown refuses.
 pub fn refuse_unsafe_pool_path(path: &Path) -> Result<(), String> {
+    // `..` after a missing component would resolve only once the missing
+    // parents exist, past this check: refuse it outright.
+    if path
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(format!(
+            "the pool path {} must not contain . or .. components",
+            path.display()
+        ));
+    }
     let mut existing = path;
     while fs::symlink_metadata(existing).is_err() {
         existing = existing
@@ -436,9 +447,16 @@ pub fn inspect(path: &Path) -> Found {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Found::Absent,
         Err(_) => return Found::Unknown,
-        Ok(metadata) if !metadata.is_dir() => return Found::Unknown,
         Ok(_) => {}
     }
+    // Judge what an alias names, so a symlink to a legacy pool is legacy.
+    let Ok(resolved) = fs::canonicalize(path) else {
+        return Found::Unknown;
+    };
+    if !fs::metadata(&resolved).is_ok_and(|metadata| metadata.is_dir()) {
+        return Found::Unknown;
+    }
+    let path = resolved.as_path();
     if fs::symlink_metadata(path.join("image.sparseimage")).is_ok()
         || fs::symlink_metadata(path.join("receipt.json")).is_ok()
     {
@@ -793,6 +811,13 @@ mod tests {
         fs::create_dir_all(&plain).expect("plain");
         assert_eq!(refuse_unsafe_pool_path(&plain.join("pool")), Ok(()));
         assert!(refuse_unsafe_pool_path(Path::new("/Volumes/Builds/pool")).is_err());
+        // A missing component followed by .. would only resolve into the
+        // work tree after creation: refused before any lookup.
+        let traversal = plain.join("missing/../../repo/pool");
+        let refused = refuse_unsafe_pool_path(&traversal).expect_err("traversal");
+        assert!(refused.contains(".."), "{refused}");
+        assert!(refuse_unsafe_pool_path(&plain.join("missing/../pool")).is_err());
+        assert!(!plain.join("missing").exists());
     }
 
     #[test]
@@ -803,6 +828,9 @@ mod tests {
         fs::create_dir_all(&image).expect("image pool");
         fs::write(image.join("image.sparseimage"), b"").expect("image");
         assert_eq!(inspect(&image), Found::LegacyImage);
+        let alias = scratch.0.join("alias");
+        std::os::unix::fs::symlink(&image, &alias).expect("alias");
+        assert_eq!(inspect(&alias), Found::LegacyImage);
         let recorded = scratch.0.join("recorded");
         fs::create_dir_all(&recorded).expect("recorded");
         fs::write(

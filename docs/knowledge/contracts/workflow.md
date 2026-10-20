@@ -1246,14 +1246,19 @@ oxide#102.
   pool is retired separately. The control root (ledger, leases, Oxide state,
   removable registration) lives inside the pool, so a configured pool keeps
   its control root with it.
-- **Path refusals.** After resolving the nearest existing ancestor's
-  symlinks: a path inside a Git work tree (any ancestor holding `.git`), or
+- **Path refusals.** A pool path (from the environment or the file) with a
+  `.` or `..` component refuses outright, so a missing component followed
+  by `..` cannot reach a work tree once its parents exist. Then, after
+  resolving the nearest existing ancestor's symlinks: a path inside a Git
+  work tree (any ancestor holding `.git`), or
   under `/Volumes` or on a volume mounted there (where a removable volume is
   registered, aliases included), refuses. Unknown identity refuses.
 - **Legacy image pool.** A pool path holding `image.sparseimage` or
   `receipt.json`, or whose config records `apfs-sparse-image-v1`, refuses
   with a retirement message and is never locked, attached, mounted,
-  recovered, cleaned or written. `status` reads only file names and the
+  recovered, cleaned or written. A symlink alias is judged by the directory
+  it names, and the library repeats the check read-only before it creates
+  or takes the pool lock. `status` reads only file names and the
   config's backend at the legacy default path and reports `legacy pool: …
   pending planner retirement`. No conversion, copying or deletion.
 - **Path changes.** Nothing moves or deletes an old pool. `status` lists
@@ -1273,12 +1278,11 @@ oxide#102.
   registration is not used and continues on the internal pool.
   `register-removable` also refuses while the volume's `oxide-pool`
   directory is not empty, so an old registration's slots are never adopted.
-  Observed 2026-10-20 during this task: the installed pre-#102 `oxide`
-  builds on `/Volumes/Builds/oxide-pool`, so a real `Builds` registration
-  exists under the legacy default pool's control root (inferred from that
-  build's pool). After the #102 reinstall it is not used until the planner
-  retires it and that payload directory after fresh positive idleness, then
-  registers again.
+  The real `Builds` registration ([above](#removable-build-volume)) lives
+  under the legacy default pool's control root, so after this change it is
+  not used, and re-registering refuses until the planner retires it and its
+  `oxide-pool` payload directory after fresh positive idleness, then
+  registers again through the shipped command.
 - **Time Machine.** On macOS a pool Oxide creates is excluded with the
   sticky, unprivileged `tmutil addexclusion <pool>` and verified with
   `tmutil isexcluded` before any build writes; failure or an unknown result

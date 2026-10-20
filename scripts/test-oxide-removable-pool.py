@@ -22,8 +22,9 @@ scratch HOME (Rust toolchains still from the real RUSTUP_HOME): legacy image
 pool detection without touching it, default creation at the new path as a
 directory pool with a verified Time Machine exclusion, honest Spotlight
 status, the ignored macOS `~/.config` file, config-file and environment
-precedence, refusals (Git work tree, symlink alias, /Volumes, unknown key,
-malformed file) creating nothing, the orphan report after a path change, a
+precedence, refusals (Git work tree, symlink alias, `..` traversal in
+OXIDE_POOL, /Volumes, unknown key, malformed file) creating nothing, a
+symlink alias to the legacy pool refused before any lock, the orphan report after a path change, a
 build growing past a tiny soft budget completing, whole-idle-slot eviction
 at the next admission and an injected low-reserve watchdog stop. The
 removable phase then also proves the previous-registration refusal (idle and
@@ -391,6 +392,12 @@ def budget_default(proof, parent: str, home: str, base: dict, oxide_run, expect,
     # A pool path at the legacy image pool refuses without touching it.
     code, _, stderr = call(["check"], "legacy image pool selected", {"OXIDE_POOL": legacy})
     expect(code != 0 and "retired apfs-sparse-image-v1" in stderr, "the legacy image pool was not refused")
+    # A symlink alias to it refuses before any lock is created or taken.
+    alias = os.path.join(parent, "legacy-alias")
+    os.symlink(legacy, alias)
+    code, _, stderr = call(["check"], "legacy image pool alias", {"OXIDE_POOL": alias})
+    expect(code != 0 and "retired apfs-sparse-image-v1" in stderr, "the legacy alias was not refused")
+    expect(snapshot(legacy) == before and not os.path.exists(os.path.join(legacy, "lock")), "the legacy alias touched the pool")
     code, _, stderr = call(["check"], "retired backend request", {"OXIDE_POOL_BACKEND": "apfs-sparse-image"})
     expect(code != 0 and "OXIDE_POOL_BACKEND is retired" in stderr, "the retired backend request was not refused")
 
@@ -471,6 +478,10 @@ def budget_default(proof, parent: str, home: str, base: dict, oxide_run, expect,
         write_config(text)
         code, _, stderr = call(["check"], f"refusal: {label}")
         expect(code != 0 and needle in stderr, f"{label} was not refused with {needle!r}")
+    traversal = os.path.join(parent, "missing", "..", "repo", "pool")
+    code, _, stderr = call(["check"], "refusal: OXIDE_POOL traversal into a work tree", {"OXIDE_POOL": traversal})
+    expect(code != 0 and ".. components" in stderr, "OXIDE_POOL traversal was not refused")
+    expect(not os.path.exists(os.path.join(parent, "missing")), "the traversal refusal created parents")
     expect(not os.path.exists(os.path.join(repo, "pool")), "a refusal created a pool")
 
     # Soft budget: a build grows past 2 MB and completes; the next

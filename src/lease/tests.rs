@@ -958,12 +958,32 @@ fn a_pool_recording_the_retired_image_backend_refuses_untouched() {
         managed::release(&pool, "v1.00.1.1.1"),
         Err(LeaseError::BackingMismatch)
     ));
-    // The pool lock may be created; every recorded byte is unchanged.
-    let after: Vec<_> = snapshot_tree(&pool)
-        .into_iter()
-        .filter(|(path, _)| path != Path::new("lock"))
-        .collect();
-    assert_eq!(before, after);
+    // Refused before the lock: no lock file is created and every recorded
+    // byte is unchanged, through the pool path or a symlink alias.
+    assert_eq!(snapshot_tree(&pool), before);
+    let alias = fx.path().join("alias");
+    symlink(&pool, &alias).expect("alias");
+    assert!(managed::status(&alias).is_err());
+    assert!(!pool.join("lock").exists());
+    assert_eq!(snapshot_tree(&pool), before);
+    // A config recording the image backend refuses alone, before the lock.
+    let recorded = fx.dir("recorded");
+    fs::set_permissions(&recorded, fs::Permissions::from_mode(0o700)).expect("private pool");
+    fs::write(
+        recorded.join("config.json"),
+        br#"{"version":1,"backend":"apfs-sparse-image-v1","store_id":"00","cap_bytes":134217728,"image_bytes":134217728}"#,
+    )
+    .expect("config");
+    fs::set_permissions(
+        recorded.join("config.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("private config");
+    assert!(matches!(
+        managed::status(&recorded),
+        Err(LeaseError::BackingMismatch)
+    ));
+    assert!(!recorded.join("lock").exists());
 }
 
 #[test]

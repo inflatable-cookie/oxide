@@ -347,6 +347,7 @@ impl Pool {
     fn open(root: &Path) -> Result<Self, LeaseError> {
         let root = canonical_existing_dir(root, true)?;
         refuse_foreign_pool_entries(&root)?;
+        refuse_retired_image_pool(&root)?;
         let lock = lock_pool(&root)?;
         let config = read_config(&root)?;
         let paths = BackingPaths::under(&root);
@@ -1189,6 +1190,26 @@ fn read_config(pool: &Path) -> Result<PoolConfig, LeaseError> {
 fn read_ledger(pool: &Path) -> Result<Ledger, LeaseError> {
     let bytes = read_private_file(&pool.join(LEDGER_NAME))?;
     serde_json::from_slice(&bytes).map_err(|_| LeaseError::UnknownAccounting)
+}
+
+/// Read-only, before the pool lock is created or taken: a pool holding the
+/// retired image or receipt, or whose config records any backend but the
+/// two current ones, refuses untouched. A missing config is left to the
+/// locked read, which waits for a concurrent creation.
+fn refuse_retired_image_pool(pool: &Path) -> Result<(), LeaseError> {
+    let paths = BackingPaths::under(pool);
+    if paths.image.symlink_metadata().is_ok() || paths.receipt.symlink_metadata().is_ok() {
+        return Err(LeaseError::BackingMismatch);
+    }
+    if pool.join(CONFIG_NAME).symlink_metadata().is_err() {
+        return Ok(());
+    }
+    let config = read_config(pool)?;
+    if config.backend == BUDGET_BACKEND_DIRECTORY_V1 || config.backend == VOLUME_BACKEND_APFS_V1 {
+        Ok(())
+    } else {
+        Err(LeaseError::BackingMismatch)
+    }
 }
 
 fn refuse_foreign_pool_entries(pool: &Path) -> Result<(), LeaseError> {
