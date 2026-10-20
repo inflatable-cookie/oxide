@@ -521,7 +521,7 @@ Supervisor architecture decision, 2026-10-20: **Oxide follows Longhorn's storage
 - Tom raised path fragmentation across his tools: "I would like to avoid fragmentation".
 - Config: `~/Library/Application Support/oxide/config/config.toml` on macOS, `$XDG_CONFIG_HOME/oxide/config.toml` on Linux, with an explicit `OXIDE_CONFIG` override. An explicit override may name any file, including a legacy one. Oxide never implicitly adopts `~/.config/oxide`; on macOS, `status` warns it is ignored.
 - Default unconfigured pool: under `~/Library/Caches/oxide`. Other Oxide state, logs and receipts follow the same table when they are next touched.
-- Tom asked whether Oxide could use Longhorn's config system directly instead of mirroring the policy. That is pending his choice. Mirrored paths are identical, so a later switch to a Longhorn crate moves no files.
+- Tom asked whether Oxide could use Longhorn's config system directly instead of mirroring the policy. On 2026-10-20 he chose a lighter Longhorn crate for CLI apps ("Yeah - let's make it lighter to adopt for CLI apps"). The Supervisor requested a small storage-layout crate from the Longhorn Supervisor. Oxide switches to it once it is tagged. Mirrored paths are identical, so the switch moves no files.
 
 ## Authority boundaries
 
