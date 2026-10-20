@@ -392,8 +392,12 @@ changes Cargo config, the sccache server or its cache.
   `config.toml` when both exist). An unreadable file or an `include` reports the name
   as unknown, never as none; the bypass does not depend on the name.
 - **Proof:** `effigy rust:oxide-wrapper-bypass`, on fixtures with a recording
-  fake wrapper only. Evidence is in the oxide#099 PR. Its plain-Cargo staging
-  has no host-reserve watchdog; the reserve is checked before and after.
+  fake wrapper only. Evidence is in the oxide#099 PR. The selector is unqualified
+  test tooling: timeout cleanup can leave Cargo's separate process group running.
+  Its plain-Cargo staging has no host-reserve watchdog; the reserve is checked
+  before and after. The final dual-config and corrected-cleanup cases have no
+  native run. Tom's acceptance of the product source with these disclosed gaps
+  does not qualify the apparatus or supply that missing evidence.
 
 The [qualified cross-worktree result](project-adoption.md#focused-cross-worktree-result)
 supports this shape for one workflow: a different-path checkout on a shared
