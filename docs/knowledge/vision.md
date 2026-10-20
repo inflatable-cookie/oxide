@@ -597,6 +597,16 @@ Tom, 2026-10-20, approved three changes ("1. Approve 2. Approve 3. Approve!") af
    - Condition: the setup refuses when `/Volumes/Builds` is not the mounted registered volume, so an undocked start never creates a `/Volumes/Builds/...` path on the internal disk.
    - Acowtancy owns the change.
 
+Tom, 2026-10-20, "Approve": the post-#102 Builds cutover bridge.
+- **Gap:** the #102 binary refuses a removable registration under a previous pool root, no command retires one, and registration requires an empty payload. Installing #102 as-is would send every Oxide build to the internal SSD.
+- **Bridge:**
+  1. Owner-coordinated quiescence of Oxide-using work, then a status check showing no held slots or waiting commands on either old pool.
+  2. Rename the old registration and removable pool state aside, and rename `/Volumes/Builds/oxide-pool` to `oxide-pool.retired-20261020`. Renames only: no deletion, no data copy, though they still write filesystem metadata.
+  3. Pinned reinstall, the `~/Dev/oxide` 100 GB pool, and a fresh `register-removable` with the same reserve and cap.
+  4. Verify that the removable pool is selected.
+- Deleting the retired copies needs a separate approval.
+- Product follow-up: a supported retire command that refuses unless the old pool is drained.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
