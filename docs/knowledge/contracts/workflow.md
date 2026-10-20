@@ -7,7 +7,8 @@ unpublished `oxide` binary, installed for Tom only to
 [dogfood](#dogfooding-in-oxides-repository) in this repository; the agent
 skill exists as repository source only. [Implemented foundation core](#implemented-foundation-core)
 states exactly what ships, including the cross-checkout freshness gate, the
-budget-only directory backend and [Cargo home hygiene](#cargo-home-hygiene). Non-build run strategies and the
+budget-only directory backend, [Cargo home hygiene](#cargo-home-hygiene) and
+part 1 of the [removable build volume](#removable-build-volume). Non-build run strategies and the
 privileged `linux-image-v1` backend are not implemented, and nothing has run
 on a real Linux host. Fixture proofs are not real-project
 qualification, default-pool creation outside tests, installation (binary or
@@ -1299,9 +1300,34 @@ Rules:
   compiles for the installed `x86_64-unknown-linux-gnu` target; no Linux
   runtime behaviour is validated.
 
-## Removable build volume (proposed)
+## Removable build volume
 
-Approved design direction (Tom, 2026-10-20). Not implemented. The goal: while the laptop is docked, Oxide's build-data writes go to a dedicated external SSD, and undocking at any moment is safe, with work falling back to the internal SSD. Measured motivation: [internal SSD write baseline](../storage-efficiency.md#internal-ssd-write-baseline-2026-10-20).
+Approved design direction (Tom, 2026-10-20). The goal: while the laptop is docked, Oxide's build-data writes go to a dedicated external SSD, and undocking at any moment is safe, with work falling back to the internal SSD. Measured motivation: [internal SSD write baseline](../storage-efficiency.md#internal-ssd-write-baseline-2026-10-20).
+
+Part 1 (registration, selection and flush on release) is implemented and fixture-proven; part 2 (surprise removal, lost-volume leases, discard after unclean disappearance and final outputs on the volume) is not. No real drive is registered: real registration waits for part 2's reviewed merge and Tom formatting `OxideBuild`.
+
+### Implemented: part 1
+
+- **Backend `apfs-volume-v1`.** Config, ledger, lock and Oxide's own state live in `<internal pool>/oxide-managed/removable/`; the registration in `<internal pool>/oxide-managed/removable.json`. Only slot payload is on the volume, in `<mount>/oxide-pool/slots/`. No disk image on the volume. Budget-only: Oxide's admission cap is an estimate, not an APFS quota, and the volume's capacity is shared with every other directory on it. Only the front door's `managed` library entry points open it; the standalone lease CLI refuses it like a directory pool. No reserve watchdog runs on the volume: its reserve is checked when a build starts.
+- **Registration.** `oxide pool register-removable <mount-point> --reserve <size> --cap <size>` (macOS). `pool` is not a Cargo built-in. Both sizes are required, whole MiB from 1 MiB to 16 TiB; zero, overflow and malformed values refuse. Oxide never picks a reserve, cap or quota, and changes no APFS setting. Before any write it requires:
+  - a path of exactly `/Volumes/<name>`: nested paths, `..`, hidden names, prefix look-alikes and custom mount parents refuse;
+  - `/Volumes` a root-owned real directory that `faccessat(W_OK, AT_EACCESS)` (ACLs included) refuses to the user;
+  - the name opened with `O_NOFOLLOW | O_DIRECTORY` (a symlink alias refuses), whose descriptor's `fstatfs` `f_mntonname` names exactly that path, whose `st_dev` differs from `/Volumes`'s, `f_fstypename` `apfs`, not `MNT_RDONLY`, not `MNT_ROOTFS`, and writable by the user;
+  - `diskutil info -plist` agreeing on the volume UUID (the kernel's `ATTR_VOL_UUID`), mount point and APFS, with a container other than the one holding `/System/Volumes/Data`;
+  - `diskutil apfs list -plist <container>` listing the volume with no APFS role: a Backup (Time Machine) role, and every other role, refuses.
+  It records mount point, volume UUID, container UUID, reserve, cap, the volume's capacity and APFS quota (`CapacityQuota`, none when 0) at registration. A second registration refuses. The payload directory is created empty through the volume's descriptor.
+- **Selection, when a leased command starts.** With nothing registered, the internal pool is used exactly as before. Otherwise the removable pool is used only if, at that moment, the mount point opens as above with the registered UUID, `/Volumes` stays non-writable, the volume is writable and its available space is above the reserve; the library then re-verifies the volume and the payload directory (same device and inode by path and by descriptor) on every open. Anything else falls back to the internal pool with one `oxide: internal pool: removable volume not used (<reason>)` line. Selection creates nothing, so a stale `/Volumes/<name>` is never written to.
+- **No stale-mount-point writes by Oxide.** Oxide creates slot directories with `mkdirat` relative to descriptors opened from the verified mount root, rechecking the binding (descriptor still the registered root, path still that root's device) before each creation and before removing a slot. Cargo itself writes through the slot path; while the volume is mounted that path is the volume. A mid-build removal is part 2.
+- **Flush on release.** Before a removable slot becomes idle (normal release, a refused shared slot handed back, and crash recovery), Oxide calls `fsync_volume_np(fd, SYNC_VOLUME_FULLSYNC | SYNC_VOLUME_WAIT)` on the verified mount-root descriptor, verifying the binding before and after. The summary line prints its cost; `status` lists recent flushes. The flush runs after positive writer closure and is a durability step, not a closure proof. A failed or unknown flush retires the slot: the record becomes `retired`, the lease stays held, the slot is never reused, recovered or deleted, and the build's own exit code is unchanged.
+- **Pools and limits.** Each pool keeps its own slots, records, origins and warmth; a lease belongs to the pool whose ledger granted it. The host-wide build limit counts active commands in both pools, reading the other pool's atomically replaced state without its lock, so two commands starting in different pools at the same instant may briefly exceed it by one. `oxide clean` drops affinity in the internal pool only.
+- **Status.** `status` prints the internal pool, the registration (volume and container UUIDs, reserve, admission cap, capacity and quota at registration), the volume's current available/total space, which pool the next build would use and why, and the removable pool's slots, flushes and retired slots.
+- **Platforms.** Off macOS, registration refuses and selection always falls back.
+
+Sources: `fstatfs(2)` / `sys/mount.h`; `getattrlist(2)` / `sys/attr.h` (`ATTR_VOL_UUID`); `faccessat(2)` with `AT_EACCESS`; `fsync_volume_np(3)` / `unistd.h` (macOS 10.8+: `SYNC_VOLUME_FULLSYNC` writes data and metadata to the disk hardware, `SYNC_VOLUME_WAIT` waits; returns a non-zero error code on failure); `diskutil(8)`. Observed on macOS 26.6: `fgetattrlist(ATTR_VOL_UUID)` on a non-root directory's descriptor answers the containing volume's UUID despite the man page's `EINVAL` rule, so the UUID is never treated as proof of a mount root.
+
+**Proof.** `effigy rust:oxide-removable-pool` stages `oxide` offline with 1.97.1 and models the drive as one separately attached 128 MiB APFS sparse image in owned scratch, mounted by `hdiutil` at a unique `/Volumes/<name>`, over a budget-only internal directory pool: unregistered behaviour unchanged; refusals (missing, zero and overflowing reserve, custom parent, nested path, absent volume, the `Macintosh HD` symlink alias, read-only attach, prefix look-alike, second registration); registration matching `diskutil`'s UUID with only `slots` on the volume; selection present (cold then warm, flush cost recorded), below its reserve and absent after an ordinary detach (no mount point recreated); an injected flush failure (debug builds only) retiring a held slot that the next build does not reuse; warmth kept across detach and re-attach; status. Unit tests cover the stale-directory and descriptor-swap cases with real kernel metadata, injected device change, Backup and other roles, and size parsing. A Backup-role volume, a mismatched device under the registered name and a stale `/Volumes/<name>` cannot be created unprivileged, so they are unit-tested only. 300 s, 512 MiB owned bytes including the mounted payload, ordinary detach only. Not a benchmark or real-drive qualification.
+
+### Design
 
 **Volume and backend.**
 - A dedicated APFS volume (for example `OxideBuild`) on the external drive.
@@ -1322,14 +1348,14 @@ Approved design direction (Tom, 2026-10-20). Not implemented. The goal: while th
 
 A lease records which pool it uses. Each pool stays warm on its own.
 
-**Surprise removal.**
+**Surprise removal (part 2, not implemented).**
 - A build whose volume vanishes fails like any I/O error, and its lease is marked lost-volume.
 - **On releasing an external slot, Oxide flushes the volume** (`sync_volume_np` with full-sync-and-wait, or an equivalent the implementation cites). So a released slot's writes are on the device before it can be reused.
 - A flush failure makes the slot held and non-reusable. It does not authorize deletion while writers are unknown.
 - After an unclean disappearance, slots held at that moment are non-reusable. Discard them only after positive writer closure; otherwise quarantine and retain accounting. A vanished device, or Oxide's Cargo group ending while an inherited sccache server may still write, is not sufficient closure. Idle, flushed slots are kept.
 - The ledger never lives on the removable volume.
 
-**Final outputs follow the pool when docked.** The target directory moves to a per-checkout directory on the external volume, cutting the per-build copies of final binaries on the internal SSD. When undocked, builds write the checkout-local target again.
+**Final outputs follow the pool when docked (part 2, not implemented).** The target directory moves to a per-checkout directory on the external volume, cutting the per-build copies of final binaries on the internal SSD. When undocked, builds write the checkout-local target again.
 - Binaries built while docked are not available undocked; `oxide run` and `oxide test` rebuild them.
 - An opt-out keeps outputs in the checkout.
 
@@ -1339,7 +1365,7 @@ A lease records which pool it uses. Each pool stays warm on its own.
 - **Queue worktrees and Colima's VM disk stay internal:** they hold live state that an unplug would break.
 - Spotlight indexing of build locations is a host setting, recommended separately.
 
-**Drive:** the dedicated spare 1 TB SSD (Tom, 2026-10-20), erased as APFS volume `OxideBuild`. Vault and its Time Machine backups stay untouched. **Not yet decided:** the real drive's explicit reserve and quota values, and the exact flush primitive and its cost. Tom will format it as plain APFS in Disk Utility; no agent retries or bypasses the denied erase operation.
+**Drive:** the dedicated spare 1 TB SSD (Tom, 2026-10-20), erased as APFS volume `OxideBuild`. Vault and its Time Machine backups stay untouched. **Not yet decided:** the real drive's explicit reserve and cap values (registration requires both), and the flush's cost on the real drive. Tom will format it as plain APFS in Disk Utility; no agent retries or bypasses the denied erase operation.
 
 ## Open decisions
 

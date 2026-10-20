@@ -91,10 +91,14 @@ automatic crash recovery touches only leases whose ID or holder string its
 own control record names.
 
 Oxide calls the library's `managed` entry points (`lease`, `release`,
-`recover`, `status`, `evict_idle_slot`, `init_budget_pool`). They behave as
+`recover`, `status`, `evict_idle_slot`, `init_budget_pool`,
+`init_volume_pool`, `flush_volume`). They behave as
 the functions below on an APFS pool and also open the budget-only
-`directory-budget-v1` pool ([workflow](workflow.md#directory-budget-v1-as-shipped)).
-The CLI and the plain library functions keep refusing a directory pool as
+`directory-budget-v1` pool ([workflow](workflow.md#directory-budget-v1-as-shipped))
+and the removable `apfs-volume-v1` pool ([workflow](workflow.md#removable-build-volume)),
+whose config adds a `volume` object (mount point, volume UUID, payload
+directory); other configs serialize unchanged.
+The CLI and the plain library functions keep refusing both as
 `backing_mismatch` (exit 4), so Nucleus and other CLI consumers see no
 change. A directory pool's config records `backend: directory-budget-v1`,
 the budget as `cap_bytes` and `image_bytes: 0`; an older build refuses it.

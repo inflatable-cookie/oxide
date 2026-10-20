@@ -465,7 +465,7 @@ Tom's rulings, 2026-10-20, on moving build writes off the non-replaceable intern
   - The dedicated build drive is that spare SSD (USB "500SSD1", `disk10`). It replaces the Vault builds-volume option, so Vault and its Time Machine backups stay untouched.
   - The Supervisor's `diskutil eraseDisk` was refused by macOS privacy controls (-69464). Tom erases it in Disk Utility as plain APFS volume `OxideBuild`.
 
-Requirement: anything placed on the removable drive must tolerate surprise removal at any moment and fall back to the internal SSD without operator action. Live-state systems that cannot (Queue worktrees, VM disks) stay internal. The design lives in [workflow](contracts/workflow.md#removable-build-volume-proposed).
+Requirement: anything placed on the removable drive must tolerate surprise removal at any moment and fall back to the internal SSD without operator action. Live-state systems that cannot (Queue worktrees, VM disks) stay internal. The design lives in [workflow](contracts/workflow.md#removable-build-volume).
 
 ## Authority boundaries
 
