@@ -456,3 +456,23 @@ Limits:
 - Oxide's and Nucleus's pool images live on the internal SSD, so their writes are included.
 
 The SSD's own wear indicator was not read (no SMART tool is installed).
+
+## External build drive probe (2026-10-20)
+
+A Supervisor read-only probe, plus one throwaway build, on the dedicated build drive Tom formatted as APFS volume `Builds` (Crucial MX500 1 TB SATA SSD in a USB enclosure, `disk10`, unencrypted, ownership disabled, UUID `A6AC3ED7-33EA-46B4-8082-7254CF291ED2`). macOS reported neither TRIM status nor link speed. The comparison ran at load averages of about 28–36, against the FileVault-encrypted internal SSD:
+
+| Measurement | Internal SSD | `Builds` (USB) |
+| --- | --- | --- |
+| 1 GiB sequential write plus `F_FULLFSYNC` | 961 MB/s | 469 MB/s |
+| 4,000 × 16 KiB file creates plus directory fsync | 2,263 files/s | 12,412 files/s |
+| Cold `cargo build` of Oxide, sccache disabled | 18.3 s | 13.9 s |
+| Incremental rebuild after one edit | 2.4 s | 1.6 s |
+| Build output size | 207 MB | 206 MB |
+
+Limits:
+- One run each, always internal first. The first run warmed the page cache for shared registry sources, so the order confounds the build times.
+- The host was heavily loaded by other agents' I/O.
+- Small-file results reflect contention and encryption on the internal SSD, not intrinsic device speed.
+
+It indicates that the USB drive is not a bottleneck for this workload under current conditions. It is not a benchmark.
+
