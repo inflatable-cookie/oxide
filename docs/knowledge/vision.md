@@ -627,6 +627,14 @@ Tom, 2026-10-20, "Yes" to two items.
    - Before consumer holds are released, a fresh worktree must lease a new slot on the Builds drive and a large existing slot must be reusable.
 2. **A separately scoped task qualifies one shared test supervisor.** It samples the host reserve continuously across every writer in a proof session, and observes and settles every Cargo process group on early exit and on timeout. Elevated tasks then stop building per-task apparatus.
 
+Tom, 2026-10-21, "Cleanup approved", covering the post-cutover leftovers listed to him:
+- the two legacy disk-image pools, Oxide's under `~/Library/Caches/oxide/pool` and Nucleus's. Nucleus's needs a note to its owner first.
+- the retired Builds payload `/Volumes/Builds/oxide-pool.retired-20261020`, and the retired registration entries;
+- the interim internal pool `~/Dev/oxide-interim`;
+- Longhorn #061's plain-Cargo `target/` (about 5.1 GiB) left by the `:cargo` escapes.
+
+Each removal still needs a fresh positive idle/closure check at the time. Held or unknown state stops that item. Ordinary detach only. The planner runs Oxide-owned host items; consumer owners run their own checkouts.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
