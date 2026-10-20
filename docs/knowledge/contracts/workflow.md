@@ -624,20 +624,112 @@ or global Cargo configuration is involved.
   Use them when `oxide` itself is broken. They build into the checkout's
   `target/` unless `CARGO_TARGET_DIR` points elsewhere, and `oxide init`
   readiness lists them as plain-Cargo lines by design.
-- **Test supervisor.** `oxide` runs Cargo in its own process group and
-  forwards TERM to it, so killing the supervisor's group alone would miss
-  Cargo. `bounded-test.py` starts the command in a new session; `oxide`'s
-  `setpgid` keeps Cargo, its tests and any child orphaned by Cargo's exit in
-  that session. At the 300-second limit, before reaping its child, it
-  records every process group in the session, TERMs its own group, and
-  after ten seconds KILLs the recorded groups and then its own. It reports
-  any session or group member still alive five seconds later. A process
-  that called `setsid` is outside the session and is not seen.
-- **Fixtures.** `effigy dogfood:scripts:test` proves that escalation,
-  including the orphan whose group leader exited, and
-  the installer's refusals (linked or foreign directories, an existing
-  destination, a destination swapped during the build) on synthetic
-  fixtures. It never builds or installs.
+- **Test supervisor.** `test rust`, `test rust-cargo` and `rust:pool-scale`
+  run under the [shared proof supervisor](#shared-proof-supervisor).
+- **Fixtures.** `effigy dogfood:scripts:test` proves the installer's refusals
+  (linked or foreign directories, an existing destination, a destination
+  swapped during the build) on synthetic fixtures. It never builds or
+  installs.
+
+### Shared proof supervisor
+
+`scripts/bounded-test.py` is the one shared session supervisor for
+repository tests and native proofs, qualified by oxide#109 on macOS at the
+source its receipt names. It owns the whole proof command, not just Cargo:
+
+```sh
+python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--receipt PATH] [--] command ...
+```
+
+- **Lifecycle.** It starts before the command's first writer and stays
+  active through child closure and owned scratch cleanup. A future short
+  fixed proof script runs entirely as its command (an Effigy `heavy` task
+  whose `run` is `python3 scripts/bounded-test.py python3 scripts/<proof>.py`)
+  and writes only inside `OXIDE_TASK_SCRATCH_ROOT`. Staging, fixtures and
+  Cargo then share one guard; the script adds no supervision or accounting
+  of its own.
+- **Deadline.** One absolute limit (default 300 s) covers the command,
+  closure and cleanup. Work stops 30 s before it; every closure step uses
+  only what remains. `ps` is called with the remaining time as its timeout;
+  drains, reaping and scratch removal are joined with bounded waits. Nothing
+  starts a fresh timeout window past the limit.
+- **Host reserve.** Raw `statvfs` `f_bavail` of the scratch's file system is
+  sampled every 0.25 s on a thread. The abort threshold is 22 GiB: the
+  20 GiB reserve plus the 2 GiB margin. A low or missing first reading
+  refuses before spawn. Any sample below it, a failed sample or a gap over
+  1 s latches a fault and cancels the command; the check uses each
+  sampler's whole history, so a dip between checks is not lost. This is a
+  sampled abort threshold: unrelated writers can overshoot between samples.
+  The receipt reports the sample count, largest gap and observed minimum.
+- **Scratch.** Without a caller's `OXIDE_TASK_SCRATCH_ROOT` it creates and
+  owns `/private/tmp/oxide-proof.*` and passes it as
+  `OXIDE_TASK_SCRATCH_ROOT`, `TMPDIR`, `TMP` and `TEMP`. A caller's root is
+  adopted, monitored and never removed. It is walked every 2 s, hard links
+  once. A complete sample over the budget (default 512 MiB), a failed walk or
+  none for 10 s faults. The budget is monitored, not a hard ceiling. Owned
+  scratch is removed only after positive closure.
+- **Closure.** The command leads a new session. Its exit is seen through
+  kqueue `NOTE_EXIT` without reaping, so the session ID stays reserved
+  while closure observes it. Every path (exit at any status, deadline,
+  monitor fault, SIGINT or SIGTERM to the supervisor, exception after spawn)
+  runs one closure: a fresh `ps` observation of the session, TERM to every
+  group with a member positively in it (Cargo's separate `setpgid` groups
+  before the leader's), a bounded wait, KILL to the survivors' groups, a
+  bounded wait, then a fresh observation. A group other than the leader's is
+  re-verified through a live member just before each signal; a member whose
+  session cannot be read is never signalled. Closure is positive only when
+  no member remains, the leader is reaped and both output pipes reached EOF.
+  An observation, signalling or reaping error, a survivor, an exhausted
+  budget or a pipe still held open is `UNCLOSED`: the exit is nonzero and
+  owned scratch is kept. If observation fails, the leader's own group (still
+  positively owned) is KILLed, and closure stays `UNCLOSED`.
+- **Exit and output.** The command's status when healthy and closed; 124
+  deadline; 125 refusal, guard fault, exception, or `UNCLOSED` with an
+  otherwise zero status; 128+N on signal N. The primary cause and any
+  cleanup errors are reported separately. Leftover groups settled after a
+  healthy exit are reported, and the status is kept. Output is forwarded by
+  threads; past 32 MiB per stream it is drained and discarded.
+- **Scope.** The cooperative session only. A process that calls `setsid`
+  leaves it and is seen only while it still holds an output pipe;
+  arbitrary same-user writers are outside the promise. Neither is proven
+  contained. A PID recycled between a group's re-verification and `killpg`
+  is a residual race. macOS only.
+
+**Qualification.** `effigy proof:supervisor:qualify` (heavy) is a short
+bootstrap around the candidate, not a qualified guard itself: a healthy
+reserve reading before and after, its own fixed 300 s wall limit, and tiny
+fixtures. It runs `bounded-test.py --limit 280 --scratch-budget-mib 512`
+around `scripts/test_supervisor.py`, which runs, in order:
+
+- pure cases with a fake clock, process table, signals and readings: low
+  initial reserve, the exact 22 GiB threshold, measurement errors, stale
+  sampler, a latched dip, scratch over budget, failed process listing,
+  expired deadline, budget exhausted mid-escalation, an unreadable-session
+  member and a recycled group (never signalled), a pipe held outside the
+  session, exception after spawn, spawn failure, cancellation, status
+  mapping;
+- writers before and after a simulated staging step in the candidate's
+  scratch;
+- real tiny Python children: normal and nonzero exit with a live
+  TERM-ignoring child in its own group, timeouts against an `oxide`-shaped
+  forwarder and a group whose leader already exited, pipe pressure, an
+  endless writer, an injected low reserve, an exception after spawn, and
+  SIGTERM and SIGINT to the supervisor process.
+
+Each real case requires positive closure and every fixture PID gone when the
+supervisor returns, well before the fixtures' 90 s self-exit fallback. The
+bootstrap prints a receipt binding the commit, the SHA-256 of supervisor,
+suite and bootstrap, the platform, every case and the limitations. Effigy
+admission waits are outside its 300 s. `effigy proof:supervisor:test` runs
+the pure cases alone. Qualification receipts are recorded on the
+oxide#109 PR.
+
+Earlier evidence stays historical. `test rust` and `rust:pool-scale` keep
+their invocation. Their runs from oxide#109 on get continuous reserve
+sampling and the 270 s work window. Pool-scale's own `mktemp` scratch lies
+outside the supervisor's monitored scratch, so its 512 MiB figure remains
+its own phase measurement. `scripts/bounded_runner.py` (oxide#097) is
+separate and stays unqualified.
 
 ### Rollback
 

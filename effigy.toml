@@ -21,9 +21,12 @@ minimum_effigy_version = "0.14.0"
 # matching the newest receipt.
 "oxide:install" = "python3 scripts/oxide-install.py"
 "oxide:reinstall" = "python3 scripts/oxide-install.py --replace"
-# Synthetic fixtures for the test supervisor's timeout escalation and the
-# installer's link, clobber and identity refusals. Never builds or installs.
+# Synthetic fixtures for the installer's link, clobber and identity
+# refusals. Never builds or installs.
 "dogfood:scripts:test" = "python3 scripts/test_dogfood_scripts.py"
+# The shared session supervisor's pure cases (oxide#109): fake clock, process
+# table, signals and readings; spawns nothing. Not the qualification.
+"proof:supervisor:test" = "python3 scripts/test_supervisor.py --pure"
 # Opt-in stable-Cargo profile proofs (oxide#068). Each verifies the resolved
 # rustc debug settings Cargo actually passed for workspace, dependency and
 # build-time units, then runs the focused native backtrace/unwind probe under
@@ -50,6 +53,16 @@ default = false
 [test.suites.rust-cargo]
 run = "python3 scripts/bounded-test.py cargo test --workspace --all-targets --locked"
 default = false
+
+# Shared session supervisor qualification (oxide#109): a short bootstrap
+# (healthy reserve readings, fixed 300 s wall limit) runs the candidate
+# `bounded-test.py` around its synthetic suite: pure fault injection first,
+# then tiny real Python children and fixture writers in owned scratch. Prints
+# a receipt binding sources, platform, cases and limitations. 512 MiB
+# monitored scratch. Not a benchmark and not full QA.
+[tasks."proof:supervisor:qualify"]
+admission = "heavy"
+run = "python3 scripts/qualify-supervisor.py"
 
 # SUSPENDED by oxide#102: provisions its pool with the retired standalone
 # lease CLI and APFS image backend, so it refuses before any effect until
@@ -111,7 +124,7 @@ run = "python3 scripts/test-oxide-removable-pool.py --budget-default"
 # bound's refusal, same-generation warm reuse of a 60,000-entry idle slot, a
 # new slot beside a 60,000-entry payload, and idle-only eviction with
 # hard links counted once beside a held slot. 300 s and 512 MiB owned
-# scratch including cleanup, under the session supervisor of `test rust`.
+# scratch including cleanup, under the shared session supervisor.
 # Not a benchmark and not full QA.
 [tasks."rust:pool-scale"]
 admission = "heavy"
