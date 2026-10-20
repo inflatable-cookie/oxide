@@ -618,6 +618,15 @@ Tom, 2026-10-20, "Yes": accept #099 (bypass inherited `rustc-wrapper` such as sc
 - **Accepted risks:** a faulty bypass could fail builds or misreport policy. The internal-SSD effect is a removed possible cache-write path, not a measured saving.
 - The apparatus defects are follow-up corrections; issues found in use are fixed forward.
 
+Tom, 2026-10-20, "Yes" to two items.
+1. **#108 (pool accounting limits) takes the fast path.**
+   - Publish the exact source PR, then an independent source-only review.
+   - If that review finds no product defect, operator acceptance explicitly replaces both missing native proofs.
+   - Recorded with the acceptance: the inconclusive first native run (the old binary exercised twice), the unrun separated-root native, and two apparatus gaps. The gaps are (a) no continuous host-reserve guard for plain-Cargo staging and fixture writes, only phase samples; (b) `bounded-test.py` does not settle the remaining Cargo groups on an early script exit.
+   - It is a task-specific exception, not elevated-tier qualification.
+   - Before consumer holds are released, a fresh worktree must lease a new slot on the Builds drive and a large existing slot must be reusable.
+2. **A separately scoped task qualifies one shared test supervisor.** It samples the host reserve continuously across every writer in a proof session, and observes and settles every Cargo process group on early exit and on timeout. Elevated tasks then stop building per-task apparatus.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
