@@ -567,6 +567,11 @@ Tom, 2026-10-20: "Doesn't the built binary need to go back on the internal SSD, 
 - "Outputs follow the pool" becomes an explicit per-invocation or per-config opt-in for projects whose final-artifact rewrite churn proves material.
 - #098's brief is amended before dispatch. The Praxis trial measures final-output write volume.
 
+Tom, 2026-10-20: "It would be pretty handy to group them by project name so it's obvious what's what" (pool slots).
+- Approved a human-readable slot layout for newly created slots, for example `slots/<project-label>-<short-identity>/<profile>-<n>`. Existing slots keep their paths, because renaming would break absolute paths Cargo recorded inside them.
+- **Dogfood finding the same day:** Finder `.DS_Store` files written into `/Volumes/Builds/oxide-pool` and `slots/` at 18:15 made the removable pool fail closed (`unknown_accounting`), so builds silently selected the internal pool. The Supervisor removed the two `.DS_Store` files at 18:22 and selection returned to the removable pool.
+- Routine correction: ignore well-known macOS metadata entries in pool accounting instead of treating them as foreign writers.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
