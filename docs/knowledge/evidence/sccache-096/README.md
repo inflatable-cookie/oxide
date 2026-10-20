@@ -217,3 +217,34 @@ attributable write counter.
 - `effigy docs:check`: exit 0.
 - Source reads: pinned files and the tag tarball in a private
   `/private/tmp` scratch, outside the repository.
+
+## Revision after exact-head review 6289051691
+
+Review verdicts: closure_evidence_truthful fail, identity_and_isolation fail,
+cost_evidence_truthful pass, bounded_delivery fail. Harness corrections, made
+inside the original author clock with no native proof and no further
+submission (the second proof slot stays unused; about 12 minutes of the
+clock remained, less than the previous admission wait):
+
+1. Launcher substitution used the bare word `SCCACHE`, rewriting every
+   `SCCACHE_*` name and the wrapped/unwrapped guard. Placeholders are now
+   `@SCCACHE@`, `@REAL_CARGO@` and `@LOG@`; the harness refuses a rendered
+   launcher that keeps a placeholder, contains `/sccache_`, or lacks
+   `SCCACHE_NO_DAEMON=1` or the guard. A synthetic render keeps all nine
+   private `SCCACHE_*` names, and `sh -n` accepts it. Neither Cargo nor
+   sccache ran.
+2. Failure teardown relied on the server PID registry. It now detaches only
+   after positive closure: every owned group (the staging build, every Cargo
+   group leader in the launcher log, every Oxide record's process group) and
+   every registered server must report ESRCH within 10 s. Anything else,
+   including an unreadable state, keeps the image and scratch held, and their
+   IDs are printed.
+3. A reserve breach only set a flag, and aggregate size was checked at
+   checkpoints only, after the staging Cargo home was removed. The monitor
+   now samples the reserve every 250 ms and owned bytes every fourth sample
+   (about 1 s), staging included. On either breach it SIGKILLs every owned
+   group and registered server. Staging runs as its own process group, and
+   owned bytes are checked before the staging Cargo home is removed.
+
+The harness still has never run natively. Compatibility stays UNKNOWN,
+benefit INSUFFICIENT and write volume UNKNOWN.

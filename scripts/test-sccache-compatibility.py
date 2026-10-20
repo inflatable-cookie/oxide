@@ -53,27 +53,27 @@ PAIRS = 3
 # (Oxide's metadata gate) is plain Cargo. The server's stdio goes to files,
 # not to Oxide's pipes.
 LAUNCHER = """#!/bin/sh
-printf '%s|%s|%s\\n' "$$" "$(pwd -P)" "$*" >> "LOG"
+printf '%s|%s|%s\\n' "$$" "$(pwd -P)" "$*" >> "@LOG@"
 case " $* " in
   *" check "*|*" build "*) ;;
-  *) exec "REAL_CARGO" "$@" ;;
+  *) exec "@REAL_CARGO@" "$@" ;;
 esac
-[ -n "$FIXTURE_SCCACHE" ] || exec "REAL_CARGO" "$@"
+[ -n "$FIXTURE_SCCACHE" ] || exec "@REAL_CARGO@" "$@"
 s="$FIXTURE_SCCACHE"
 export SCCACHE_NO_DAEMON=1 SCCACHE_SERVER_UDS="$s/r/$$.sock" SCCACHE_DIR="$s/cache" \\
   SCCACHE_CACHE_SIZE=64M SCCACHE_CONF="$s/config.toml" SCCACHE_CACHED_CONF="$s/cached-config.toml" \\
   SCCACHE_IDLE_TIMEOUT="${FIXTURE_IDLE:-600}"
-SCCACHE_LOG=debug SCCACHE_ERROR_LOG="$s/l/$$.server" "SCCACHE" --start-server </dev/null >"$s/l/$$.start" 2>&1 || exit 97
+SCCACHE_LOG=debug SCCACHE_ERROR_LOG="$s/l/$$.server" "@SCCACHE@" --start-server </dev/null >"$s/l/$$.start" 2>&1 || exit 97
 g=$(ps -o pgid= -p $$ | tr -d ' ')
 ps -A -o pid=,pgid=,ppid=,lstart=,command= | awk -v g="$g" '$2==g' > "$s/l/$$.group"
 if [ -n "$FIXTURE_HOLD" ]; then
   : > "$FIXTURE_HOLD.ready"
   while [ ! -e "$FIXTURE_HOLD.go" ]; do sleep 0.1; done
 fi
-RUSTC_WRAPPER="SCCACHE" "REAL_CARGO" "$@"
+RUSTC_WRAPPER="@SCCACHE@" "@REAL_CARGO@" "$@"
 rc=$?
-"SCCACHE" --show-stats --stats-format=json </dev/null >"$s/l/$$.stats" 2>&1
-"SCCACHE" --stop-server </dev/null >"$s/l/$$.stop" 2>&1
+"@SCCACHE@" --show-stats --stats-format=json </dev/null >"$s/l/$$.stats" 2>&1
+"@SCCACHE@" --stop-server </dev/null >"$s/l/$$.stop" 2>&1
 exit $rc
 """
 
@@ -98,6 +98,10 @@ class Monitor:
         self.owned_peak = 0
         self.log_bytes = 0
         self.servers = {}
+        # Owned writers: Popen children leading their own groups, and every
+        # Cargo group leader the launcher log names.
+        self.children = []
+        self.cargo_log = None
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self.loop, daemon=True)
 
@@ -112,8 +116,55 @@ class Monitor:
             self.free_min = free if self.free_min is None else min(self.free_min, free)
             if free < cli.HOST_RESERVE_BYTES:
                 self.breach = f"host free {free} below the 20 GiB reserve"
+            elif self.samples % 4 == 0:
+                owned = cli.tree_bytes(self.parent, True)
+                self.owned_peak = max(self.owned_peak, owned)
+                if owned > cli.SCRATCH_LIMIT_BYTES:
+                    self.breach = f"owned {owned} exceeds 512 MiB"
+            if self.breach:
+                self.stop_writers()
                 return
             self.stop.wait(0.25)
+
+    def groups(self) -> set:
+        found = {child.pid for child in self.children}
+        if self.cargo_log and os.path.exists(self.cargo_log):
+            with open(self.cargo_log, encoding="utf-8") as handle:
+                found.update(int(line.split("|", 1)[0]) for line in handle if line.split("|", 1)[0].isdigit())
+        try:
+            with open(os.path.join(self.parent, "pool", "oxide-managed", "state.json"), encoding="utf-8") as handle:
+                found.update(r["process_group"] for r in json.load(handle)["records"] if r.get("process_group"))
+        except FileNotFoundError:
+            pass
+        return found
+
+    def stop_writers(self) -> None:
+        """KILL every owned group (each launcher and staging build leads one)
+        and every registered server."""
+        for group in self.groups():
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except OSError:
+                pass
+        for pid in self.servers:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    def closed(self, seconds: float = 10) -> list:
+        """Positive closure: every owned group and server ESRCH. Returns what
+        is still not ESRCH (or unreadable) after a finite wait."""
+        deadline = time.monotonic() + seconds
+        while True:
+            try:
+                open_groups = [g for g in self.groups() if cli.probe(os.killpg, g) != "ESRCH"]
+            except Exception as error:
+                return [f"unknown: {error}"]
+            pending = open_groups + [f"server {pid}" for pid in self.live_servers()]
+            if not pending or time.monotonic() > deadline:
+                return pending
+            time.sleep(0.1)
 
     def check(self, phase: str) -> None:
         if self.breach:
@@ -476,7 +527,23 @@ def main() -> int:
     builder = cli.toolchain_identity(stage, repo)
     if builder != cli.MATRIX[cli.BUILDER]:
         cli.fail(f"builder is not {cli.BUILDER}: {builder}")
-    executables = cli.build_binaries(("--offline",), stage)
+    build = subprocess.Popen(
+        ["cargo", "build", "--locked", "--offline", "--bin", "oxide", "--bin", "oxide-storage-lease", "--message-format=json-render-diagnostics"],
+        cwd=repo, env=stage, stdout=subprocess.PIPE, text=True, process_group=0,
+    )
+    monitor.children.append(build)
+    out, _ = build.communicate(timeout=cli.remaining())
+    if monitor.breach or build.returncode:
+        cli.fail(f"staging exit {build.returncode} {monitor.breach or ''}")
+    executables = {}
+    for line in out.splitlines():
+        if line.startswith("{"):
+            message = json.loads(line)
+            if message.get("reason") == "compiler-artifact" and message.get("executable"):
+                executables[message["target"]["name"]] = message["executable"]
+    if set(executables) != {"oxide", "oxide-storage-lease"}:
+        cli.fail(f"staging artifacts {sorted(executables)}")
+    monitor.check("after staging, before seed removal")
     receipt = {
         "source_commit": commit[0],
         "source_tree": commit[1],
@@ -492,6 +559,7 @@ def main() -> int:
         cli.fail(f"a compiler wrapper ran during staging: {os.listdir(stage_sc)}")
     shutil.rmtree(stage_home)
     monitor.check("after staging")
+    monitor.cargo_log = os.path.join(parent, "cargo.log")
     runner = cli.Runner(
         executables["oxide"], executables["oxide-storage-lease"], parent,
         extra={"HOME": home, "RUSTUP_HOME": rustup_home, "RUSTUP_AUTO_INSTALL": "0"},
@@ -508,7 +576,10 @@ def main() -> int:
     cargo_log = os.path.join(parent, "cargo.log")
     launcher = os.path.join(runner.bin, "cargo")
     with open(launcher, "w", encoding="utf-8") as handle:
-        handle.write(LAUNCHER.replace("REAL_CARGO", real_cargo).replace("SCCACHE", SCCACHE).replace('"LOG"', f'"{cargo_log}"'))
+        text = LAUNCHER.replace("@REAL_CARGO@", real_cargo).replace("@SCCACHE@", SCCACHE).replace("@LOG@", cargo_log)
+        if re.search(r"@[A-Z_]+@", text) or "/sccache_" in text or "SCCACHE_NO_DAEMON=1" not in text or '[ -n "$FIXTURE_SCCACHE" ]' not in text:
+            cli.fail("launcher substitution changed more than its placeholders")
+        handle.write(text)
     os.chmod(launcher, 0o755)
     inputs = sum(len(text.encode()) for text in FIXTURE.values())
     print(f"fixture inputs: {inputs} bytes per checkout")
@@ -521,9 +592,11 @@ def main() -> int:
     try:
         report = prove(proof)
     except Exception:
-        live = monitor.live_servers()
-        if live:
-            print(f"UNKNOWN closure: live owned servers {live}; image {payload} and scratch {parent} stay held", file=sys.stderr)
+        if monitor.breach:
+            monitor.stop_writers()
+        pending = monitor.closed()
+        if pending:
+            print(f"UNKNOWN closure: {pending} not ESRCH; image {payload} and scratch {parent} stay held", file=sys.stderr)
         else:
             detach = subprocess.run(["/usr/bin/hdiutil", "detach", payload], capture_output=True, text=True, timeout=60)
             print(f"no owned server alive; detach exit {detach.returncode}; retained scratch {parent}", file=sys.stderr)
@@ -535,9 +608,9 @@ def main() -> int:
     report["cargo_processes"] = {"staging": 1, "toolchain_version": 1, "fixture": len(calls), "total": total}
     if total > CARGO_LIMIT:
         cli.fail(f"{total} Cargo driver processes exceed {CARGO_LIMIT}")
-    live = monitor.live_servers()
-    if live:
-        cli.fail(f"owned servers still alive before cleanup: {live}")
+    pending = monitor.closed(0)
+    if pending:
+        cli.fail(f"owned groups or servers not closed before cleanup: {pending}")
     monitor.check("before detach")
     detach = subprocess.run(["/usr/bin/hdiutil", "detach", payload], capture_output=True, text=True, timeout=60)
     if detach.returncode:
