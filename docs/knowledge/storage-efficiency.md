@@ -441,3 +441,18 @@ synthetic targets and applies to Acowtancy's host routes only.
 Apparent target size is not allocated storage. A smaller retained target is
 not proof of fewer SSD writes, and no SSD-life estimate follows from these
 findings.
+
+## Internal SSD write baseline (2026-10-20)
+
+A read-only Supervisor observation at 2026-10-20 ~11:52, about 23 h 52 min after boot (2026-10-19 12:00:50), on Tom's laptop (128 GiB RAM, load average ~51):
+
+- **Host writes to the internal SSD (`disk0`) since boot: 6,077,384,359,936 bytes (~6.08 TB)**, plus ~6.14 TB read. Source: the IOBlockStorageDriver `Bytes (Write)` statistic, which agrees with `iostat` cumulative transfer.
+- **Not swap:** `vm_stat` swap-outs are 0 and swap usage is 0.
+- **Live processes explain only ~191 GB** of their lifetime writes (`proc_pid_rusage` byte counters, 1,003 readable processes). Largest: the Virtualization VM (Colima) 50 GB, the sccache server 39 GB, `nucleusd` 18 GB, Spotlight `corespotlightd` 11 GB, Paseo processes about 27 GB combined.
+- **The remaining ~5.9 TB came from processes that had already exited.** Short-lived build, test, linker and Git processes are the likely writers, but that is not attributed.
+
+Limits:
+- One day, under heavy multi-agent load. It is not a daily average, a wear figure or an Oxide attribution; most Rust builds on this host do not run through Oxide.
+- Oxide's and Nucleus's pool images live on the internal SSD, so their writes are included.
+
+The SSD's own wear indicator was not read (no SMART tool is installed).
