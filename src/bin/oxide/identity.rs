@@ -108,6 +108,7 @@ pub fn run_pick(
 ) -> Result<RunPick, String> {
     let mut command = Command::new(cargo);
     command.args(["metadata", "--no-deps", "--format-version", "1"]);
+    crate::wrapper::apply(&mut command);
     if let Some(manifest) = manifest_path {
         command.arg("--manifest-path").arg(manifest);
     }

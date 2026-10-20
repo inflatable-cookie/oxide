@@ -302,7 +302,7 @@ fn refuse_resolved(metadata: &serde_json::Value) -> Option<String> {
 /// Cargo config files Cargo would read: `.cargo/config.toml` and
 /// `.cargo/config` in the current directory and every ancestor, then in the
 /// Cargo home. Each is parsed; see [`refuse_config`].
-fn config_files(cwd: &Path, home: &Path) -> Vec<PathBuf> {
+pub(crate) fn config_files(cwd: &Path, home: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut candidates: Vec<PathBuf> = cwd
         .ancestors()
@@ -321,7 +321,7 @@ fn config_files(cwd: &Path, home: &Path) -> Vec<PathBuf> {
 /// Read one config file as Cargo would (following a symlink) and parse it
 /// as TOML 1.0. Unreadable, oversized, non-UTF-8 or unparseable files
 /// refuse; parser text is never shown, since it can quote a value.
-fn read_config(path: &Path) -> Result<serde_json::Value, String> {
+pub(crate) fn read_config(path: &Path) -> Result<serde_json::Value, String> {
     let unreadable = |reason: String| format!("Cargo config file {} {reason}", path.display());
     let metadata =
         std::fs::metadata(path).map_err(|error| unreadable(format!("cannot be read ({error})")))?;

@@ -328,9 +328,11 @@ contexts get separate slots of one owner, same-context repeats reuse warm,
 `RUSTUP_TOOLCHAIN` from the root select the member compiler's slot.
 
 Not represented in the key, and so unsupported for compiler separation:
-`build.rustc` or `build.rustc-wrapper` from Cargo config files or `--config`,
-`CARGO_BUILD_RUSTC`, `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, and a `PATH`
-whose `rustc` belongs to a different installation than its `cargo`. `oxide
+`build.rustc` from Cargo config files or `--config`, `CARGO_BUILD_RUSTC`,
+`RUSTC_WORKSPACE_WRAPPER`, an inherited rustc wrapper kept by the
+`OXIDE_ALLOW_RUSTC_WRAPPER=1` opt-in, and a `PATH` whose `rustc` belongs to a
+different installation than its `cargo`. By default leased builds bypass the
+inherited rustc wrapper ([below](#inherited-rustc-wrapper)). `oxide
 init` readiness still reports the toolchain rustup resolves at the workspace
 root. A new Cargo release needs this check before it joins the table.
 
@@ -346,13 +348,50 @@ root. A new Cargo release needs this check before it joins the table.
    - the build directory pointed at the slot;
    - the target directory set to `<checkout>/target`, so final outputs stay
      private, as in the [local lease](local-lease.md);
-   - the profile definitions in the environment.
+   - the profile definitions in the environment;
+   - `RUSTC_WRAPPER` set to the empty string, unless the opt-in keeps an
+     inherited wrapper ([below](#inherited-rustc-wrapper)).
 5. `run`: keep the lease for the build, release it, then execute the binary
    from the private target directory. `test`: keep the lease through test
    execution, because test binaries live in the build directory. Reuse never
    skips tests.
 6. When the process group exits, record the compile origin, release the lease
    and print one line: profile, strategy, warm/cold, elapsed time, pool use.
+
+### Inherited rustc wrapper
+
+Leased builds bypass any inherited rustc wrapper, today the machine-wide
+`build.rustc-wrapper = sccache` (Tom, 2026-10-20, oxide#099). Plain `cargo`,
+plain passthrough such as `oxide fmt`, and other tools keep it; Oxide never
+changes Cargo config, the sccache server or its cache.
+
+- **Mechanism.** Every Cargo call Oxide makes for a leased command (the
+  build itself, the freshness gate's metadata and lock calls, `run`'s target
+  pick, a selected `clean`) gets `RUSTC_WRAPPER=""`. Cargo 1.97.1 reads that
+  variable before any config layer ([`maybe_get_tool`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/util/context/mod.rs#L1805-L1825)),
+  so it beats config files, `CARGO_BUILD_RUSTC_WRAPPER` and `--config`, and an
+  empty wrapper is [skipped](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/crates/cargo-util/src/process_builder.rs#L549-L557).
+  Cargo's [environment reference](https://doc.rust-lang.org/cargo/reference/environment-variables.html)
+  documents the empty-string override. Child Cargo calls inherit it, so an
+  external subcommand's `$CARGO` is covered. A child that rewrites its own
+  environment is not contained.
+- **Untouched:** `RUSTC_WORKSPACE_WRAPPER` and Clippy's driver, so `oxide
+  clippy` runs clippy-driver with no outer wrapper; `RUSTC`,
+  `RUSTUP_TOOLCHAIN`, the slot key and profiles.
+- **Opt-in.** Only `OXIDE_ALLOW_RUSTC_WRAPPER=1` keeps the inherited wrapper.
+  It is unqualified for Oxide's interruption semantics and toolchain identity:
+  a wrapper's server can outlive the Cargo group Oxide closes. Any other value
+  is ignored and reported; the wrapper is still bypassed.
+- **Visibility.** The summary line names the bypassed wrapper once, for
+  example `rustc wrapper bypassed: /opt/homebrew/bin/sccache`, or says the
+  opt-in kept it, active and unqualified. `oxide status` prints the inherited
+  wrapper, where it came from and its effective state. Oxide reads the name in
+  Cargo's order (`RUSTC_WRAPPER`, the command's `--config`, then
+  `CARGO_BUILD_RUSTC_WRAPPER`, then config files from the current directory
+  up and the Cargo home). An unreadable file or an `include` reports the name
+  as unknown, never as none; the bypass does not depend on the name.
+- **Proof:** `effigy rust:oxide-wrapper-bypass`, on fixtures with a recording
+  fake wrapper only. Evidence is in the oxide#099 PR.
 
 The [qualified cross-worktree result](project-adoption.md#focused-cross-worktree-result)
 supports this shape for one workflow: a different-path checkout on a shared

@@ -45,6 +45,12 @@ fn is_building_builtin(command: &str) -> bool {
     matches!(command, "doc" | "bench" | "rustc" | "rustdoc" | "fix")
 }
 
+/// Whether Cargo itself reads this leased command's `--config` arguments.
+/// An external subcommand receives them as its own.
+pub fn reads_config_args(command: &str) -> bool {
+    classify(command) == Class::Modelled || is_building_builtin(command)
+}
+
 /// The user's intent. Strategies stay `build` in the foundation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Profile {

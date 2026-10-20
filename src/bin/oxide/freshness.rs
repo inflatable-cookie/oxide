@@ -636,6 +636,7 @@ fn cargo_command(checkout: &Path, leading: &[&str], args: &[OsString]) -> Comman
         .args(args)
         .arg("--manifest-path")
         .arg(checkout.join("Cargo.toml"));
+    crate::wrapper::apply(&mut command);
     command
 }
 
@@ -685,6 +686,7 @@ fn cargo_metadata(checkout: &Path, request: &Resolution) -> Result<serde_json::V
     };
     let mut parse = Command::new(crate::CARGO);
     parse.args(check);
+    crate::wrapper::apply(&mut parse);
     if !cargo_accepts(parse)? {
         return Err(Refusal::Unvouched(
             "Cargo rejects this command's arguments, so it never resolves the lock file".to_owned(),
