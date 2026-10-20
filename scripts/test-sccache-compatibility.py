@@ -106,11 +106,21 @@ class Monitor:
         self.thread = threading.Thread(target=self.loop, daemon=True)
 
     def loop(self) -> None:
+        # Any failed or racing reading is an unknown: it aborts the writers
+        # rather than silently ending the monitor.
+        try:
+            self.watch()
+        except Exception as error:
+            self.breach = self.breach or f"accounting failed: {error}"
+            self.stop_writers()
+
+    def watch(self) -> None:
         while not self.stop.is_set():
             try:
                 free = cli.host_free_bytes(self.parent)
             except Exception as error:  # unknown reading stops the proof
                 self.breach = f"reserve reading failed: {error}"
+                self.stop_writers()
                 return
             self.samples += 1
             self.free_min = free if self.free_min is None else min(self.free_min, free)
@@ -532,7 +542,20 @@ def main() -> int:
         cwd=repo, env=stage, stdout=subprocess.PIPE, text=True, process_group=0,
     )
     monitor.children.append(build)
-    out, _ = build.communicate(timeout=cli.remaining())
+    try:
+        out, _ = build.communicate(timeout=cli.remaining())
+    except subprocess.TimeoutExpired:
+        # Settle the staging group before failing: KILL, reap, then require
+        # ESRCH for the whole group.
+        os.killpg(build.pid, signal.SIGKILL)
+        build.communicate()
+        # Own bounded wait: cli.wait_gone consults the expired proof clock.
+        deadline = time.monotonic() + 10
+        while cli.probe(os.killpg, build.pid) != "ESRCH" and time.monotonic() < deadline:
+            time.sleep(0.1)
+        state = cli.probe(os.killpg, build.pid)
+        print(f"staging timed out; group {build.pid} {state}; scratch {parent} held", file=sys.stderr)
+        raise
     if monitor.breach or build.returncode:
         cli.fail(f"staging exit {build.returncode} {monitor.breach or ''}")
     executables = {}

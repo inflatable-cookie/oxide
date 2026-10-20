@@ -248,3 +248,19 @@ clock remained, less than the previous admission wait):
 
 The harness still has never run natively. Compatibility stays UNKNOWN,
 benefit INSUFFICIENT and write volume UNKNOWN.
+
+## Revision after exact-head review 6289170915
+
+Verdicts: closure_evidence_truthful fail, identity_and_isolation pass,
+cost_evidence_truthful pass, bounded_delivery fail. Two harness corrections,
+again with no native proof (the author clock ended at 10:53:36 UTC):
+
+1. The monitor thread now wraps all accounting. A failed or racing reserve or
+   tree reading records a breach and SIGKILLs every owned group and server;
+   it no longer ends the thread silently.
+2. A staging timeout SIGKILLs the staging Cargo group, reaps the leader,
+   waits up to 10 s for the group to report ESRCH, prints its state and keeps
+   the scratch held before failing.
+
+Compatibility stays UNKNOWN, benefit INSUFFICIENT and write volume UNKNOWN.
+The harness has still never run natively.
