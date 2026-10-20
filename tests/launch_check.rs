@@ -107,8 +107,13 @@ fn assert_clean(run: &Run, label: &str) {
         .map(|entry| entry.path())
         .collect();
     assert!(left.is_empty(), "{label}: left behind {left:?}");
+    // Only the settled report: "… ms limit; temporary copies removed". An
+    // Unsettled cleanup ("process group … not confirmed closed …; temporary
+    // copies removed") fails even if the group is gone by the time of the
+    // post-exit ESRCH check.
     assert!(
-        run.stdout.contains("; temporary copies removed\n"),
+        run.stdout.contains(" ms limit; temporary copies removed\n")
+            && !run.stdout.contains("not confirmed closed"),
         "{label}: {}",
         run.stdout
     );
