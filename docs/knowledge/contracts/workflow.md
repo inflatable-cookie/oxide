@@ -1478,7 +1478,7 @@ Sources: `.DS_Store` is the Finder store that Apple's `com.apple.desktopservices
 - **Internal budget pool.** Metadata at the pool root, payload root, `slots`, slot and build tree keeps status `Complete`, the payload figure rises by the payload-side bytes, and the next check is warm.
 - **Removable pool on one owned 128 MiB scratch APFS image** at a unique `/Volumes/<name>`. The same files in the control root and on the volume keep it selected and warm, with the bytes counted. Then an unknown payload-root entry makes `status` and the next build fall back, naming the entry. Every metadata file and the unknown entry are still present afterwards.
 
-Cleanup is an ordinary detach and removal of the scratch. Not a benchmark or real-drive qualification.
+Cleanup is an ordinary detach and removal of the scratch. Not a benchmark or real-drive qualification. The author's single run at `02a83a8` (2026-10-20) passed in 38 s of script time, after about 8 minutes waiting for Effigy admission. Staging took 15 s. The internal and removable payload figures each rose from 0 to 12 MiB with the metadata and stayed `Complete`, and both repeats were warm. The fallback named `"stray\x07entry"`. All 20 metadata files and the unknown entry were kept. Peak owned scratch at the phase checks was 105 MiB, and the lowest host free space was 586318 MiB.
 
 ## Removable build volume
 
