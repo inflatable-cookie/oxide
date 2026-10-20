@@ -328,9 +328,11 @@ contexts get separate slots of one owner, same-context repeats reuse warm,
 `RUSTUP_TOOLCHAIN` from the root select the member compiler's slot.
 
 Not represented in the key, and so unsupported for compiler separation:
-`build.rustc` or `build.rustc-wrapper` from Cargo config files or `--config`,
-`CARGO_BUILD_RUSTC`, `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, and a `PATH`
-whose `rustc` belongs to a different installation than its `cargo`. `oxide
+`build.rustc` from Cargo config files or `--config`, `CARGO_BUILD_RUSTC`,
+`RUSTC_WORKSPACE_WRAPPER`, an inherited rustc wrapper kept by the
+`OXIDE_ALLOW_RUSTC_WRAPPER=1` opt-in, and a `PATH` whose `rustc` belongs to a
+different installation than its `cargo`. By default leased builds bypass the
+inherited rustc wrapper ([below](#inherited-rustc-wrapper)). `oxide
 init` readiness still reports the toolchain rustup resolves at the workspace
 root. A new Cargo release needs this check before it joins the table.
 
@@ -346,13 +348,56 @@ root. A new Cargo release needs this check before it joins the table.
    - the build directory pointed at the slot;
    - the target directory set to `<checkout>/target`, so final outputs stay
      private, as in the [local lease](local-lease.md);
-   - the profile definitions in the environment.
+   - the profile definitions in the environment;
+   - `RUSTC_WRAPPER` set to the empty string, unless the opt-in keeps an
+     inherited wrapper ([below](#inherited-rustc-wrapper)).
 5. `run`: keep the lease for the build, release it, then execute the binary
    from the private target directory. `test`: keep the lease through test
    execution, because test binaries live in the build directory. Reuse never
    skips tests.
 6. When the process group exits, record the compile origin, release the lease
    and print one line: profile, strategy, warm/cold, elapsed time, pool use.
+
+### Inherited rustc wrapper
+
+Leased builds bypass any inherited rustc wrapper, today the machine-wide
+`build.rustc-wrapper = sccache` (Tom, 2026-10-20, oxide#099). Plain `cargo`,
+plain passthrough such as `oxide fmt`, and other tools keep it; Oxide never
+changes Cargo config, the sccache server or its cache.
+
+- **Mechanism.** Every Cargo call Oxide makes for a leased command (the
+  build itself, the freshness gate's metadata and lock calls, `run`'s target
+  pick, a selected `clean`) gets `RUSTC_WRAPPER=""`. Cargo 1.97.1 reads that
+  variable before any config layer ([`maybe_get_tool`](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/cargo/util/context/mod.rs#L1805-L1825)),
+  so it beats config files, `CARGO_BUILD_RUSTC_WRAPPER` and `--config`, and an
+  empty wrapper is [skipped](https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/crates/cargo-util/src/process_builder.rs#L549-L557).
+  Cargo's [environment reference](https://doc.rust-lang.org/cargo/reference/environment-variables.html)
+  documents the empty-string override. Child Cargo calls inherit it, so an
+  external subcommand's `$CARGO` is covered. A child that rewrites its own
+  environment is not contained.
+- **Untouched:** `RUSTC_WORKSPACE_WRAPPER` and Clippy's driver, so `oxide
+  clippy` runs clippy-driver with no outer wrapper; `RUSTC`,
+  `RUSTUP_TOOLCHAIN`, the slot key and profiles.
+- **Opt-in.** Only `OXIDE_ALLOW_RUSTC_WRAPPER=1` keeps the inherited wrapper.
+  It is unqualified for Oxide's interruption semantics and toolchain identity:
+  a wrapper's server can outlive the Cargo group Oxide closes. Any other value
+  is ignored and reported; the wrapper is still bypassed.
+- **Visibility.** The summary line names the bypassed wrapper once, for
+  example `rustc wrapper bypassed: /opt/homebrew/bin/sccache`, or says the
+  opt-in kept it, active and unqualified. `oxide status` prints the inherited
+  wrapper, where it came from and its effective state. Oxide reads the name in
+  Cargo's order (`RUSTC_WRAPPER`, the command's `--config`, then
+  `CARGO_BUILD_RUSTC_WRAPPER`, then config files from the current directory
+  up and the Cargo home, one per directory as Cargo picks it: `config` over
+  `config.toml` when both exist). An unreadable file or an `include` reports the name
+  as unknown, never as none; the bypass does not depend on the name.
+- **Proof:** `effigy rust:oxide-wrapper-bypass`, on fixtures with a recording
+  fake wrapper only. Evidence is in the oxide#099 PR. The selector is unqualified
+  test tooling: timeout cleanup can leave Cargo's separate process group running.
+  Its plain-Cargo staging has no host-reserve watchdog; the reserve is checked
+  before and after. The final dual-config and corrected-cleanup cases have no
+  native run. Tom's acceptance of the product source with these disclosed gaps
+  does not qualify the apparatus or supply that missing evidence.
 
 The [qualified cross-worktree result](project-adoption.md#focused-cross-worktree-result)
 supports this shape for one workflow: a different-path checkout on a shared
@@ -529,6 +574,7 @@ The standard pattern for consumer projects (Tom, 2026-10-20, [vision](../vision.
   - Queue warm-merge hooks;
   - container builds;
   - selectors whose scripts run a binary from `target/debug/` after a quick build. Under the current `oxide-quick` output directory they would miss the fresh binary or run a stale one. #106 moves `quick` and `debug` output to `target/debug/`.
+  - tests that find a sibling binary by going from `current_exe()` in `deps/` to its profile directory. With Cargo's build-dir, test executables run from the slot (`<slot>/build/<profile>/deps`) while final binaries are uplifted to `<workspace>/target/<profile>/`. This holds for any build-dir user, and #106 does not change it. Repair: integration tests use `env!("CARGO_BIN_EXE_<name>")`; other code also tries `$CARGO_TARGET_DIR/<profile dir name>/`, which Oxide exports. Found by Figmatic's post-merge QA on 2026-10-20: 7 studio tests failed with "no capture renderer beside …/slots/4/build/oxide-quick".
 - **nextest.** Until #106, pass `--cargo-profile oxide-quick` so nextest shares the quick slot.
 - **Worktree seeding.** Selectors that move to `oxide` drop any copy of a primary checkout's `target/` into worktrees. The shared slot is the warm state.
 - **Proof per project:**
@@ -1242,6 +1288,25 @@ oxide#102.
   `status` shows the effective one. Builds can still run out of real space:
   the 20 GiB host-reserve watchdog stops the owned group below its 22 GiB
   trigger, and ordinary filesystem errors still fail a build.
+- **Accounting walks (oxide#108).** Admission, reuse, eviction and `status`
+  walk the slots with one set of pool bounds: 2,000,000 entries, depth 64
+  (65 for the whole-payload walk, which starts at the payload root; see
+  [Finder metadata](#finder-metadata-in-pools)),
+  60 s (previously 50,000, 24 and 5 s, which refused Praxis's 76,669-entry
+  and Farmyard's 60,657-entry pools). Reusing an idle slot needs that slot's
+  own walk complete; a new slot needs the whole-payload walk complete before
+  and after eviction. An incomplete walk refuses with `unknown_accounting`
+  and names its cause (`entry_limit`, `depth_limit`, `elapsed_deadline`,
+  `unreadable_entry`, `missing_metadata`, a mount boundary or a root
+  failure), entries visited, elapsed time and bounds; its bytes are never
+  used and never make a slot evictable. The bounds are finite: a larger pool
+  refuses until idle slots are evicted or cleaned. Owning detail:
+  [local lease](local-lease.md#capacity-and-eviction). Rust tests cover
+  each old bound, an unreadable entry, a symlinked slot root and hard links
+  with injected bounds. The native selector `effigy rust:pool-scale` has no
+  passing run: its first session staged the reference binary twice and is
+  apparatus evidence only, and the corrected selector is held because no
+  existing guard samples the host reserve during plain-Cargo staging.
 - **Precedence.** Environment, then the user config file, then defaults.
   `OXIDE_POOL` sets the path (relative resolves against the current
   directory); `OXIDE_POOL_CAP` sets the budget. Sizes are whole bytes or a
@@ -1324,7 +1389,10 @@ oxide#102.
   `OXIDE_CONFIG`, the pool path and budget with their sources, then per
   pool: backend, soft budget, slot allocation, the pool filesystem's
   available and total space (shared, no Oxide quota or ceiling), Time Machine
-  and Spotlight state, legacy and orphaned pools.
+  and Spotlight state, legacy and orphaned pools. `slot accounting walk:`
+  reports the payload walk's coverage, causes, entries and milliseconds; a
+  slot whose own walk is incomplete gets its own line saying it is not
+  reused. An incomplete payload walk shows allocation as `at least`.
 - **Explicit slot release.** `oxide pool recover-interrupted <slot>`
   replaces the retired CLI's `recover` for an interrupted slot automatic
   [crash recovery](#crash-recovery) keeps held. Source- and unit-reviewed;
@@ -1469,7 +1537,7 @@ oxide#105. Finder writes `.DS_Store` files, and AppleDouble `._<name>` sidecars 
 
 A metadata-named symlink, directory, FIFO or other special file is still refused. So are a file owned by another user, a file on another device, and a near-miss name (`._`, `.ds_store`, `.DS_Store.bak`). Every other unknown entry also refuses wherever it did before. A name never establishes a lease, never makes a slot reusable and never permits a cleanup. Oxide never deletes, moves or rewrites these files. A whole-slot eviction still removes everything inside the slot, as before. Pool creation still requires an empty directory.
 
-**Named refusals.** A refused pool-root or payload-root entry is reported with its place and an escaped name. The category stays `unknown_accounting`, with exit 3. For example: `cannot open the removable pool: unknown_accounting (the payload directory holds an unexpected entry "stray\x07entry")`. Printable ASCII appears as is. Each other byte, including `"`, `\`, controls, non-ASCII and non-UTF-8, appears as `\xNN`. At most 64 name bytes are printed, then `...`. Accounting that is incomplete for another reason, such as a depth, entry or time bound or an unreadable entry, still reports only the category, because the walk does not record which entry caused it. Status remains read-only. Removable selection falls back with the named reason.
+**Named refusals.** A refused pool-root or payload-root entry is reported with its place and an escaped name. The category stays `unknown_accounting`, with exit 3. For example: `cannot open the removable pool: unknown_accounting (the payload directory holds an unexpected entry "stray\x07entry")`. Printable ASCII appears as is. Each other byte, including `"`, `\`, controls, non-ASCII and non-UTF-8, appears as `\xNN`. At most 64 name bytes are printed, then `...`. Accounting that is incomplete for another reason, such as a depth, entry or time bound or an unreadable entry, reports the walk's cause and counts ([accounting walks](#budget-only-default-pool-and-user-configuration), oxide#108) but no entry path, because the walk does not record which entry caused it. Status remains read-only. Removable selection falls back with the named reason.
 
 Sources: `.DS_Store` is the Finder store that Apple's `com.apple.desktopservices` `DSDontWriteNetworkStores` and `DSDontWriteUSBStores` preferences control (Apple Support, "Adjust SMB browsing behavior in macOS"). The AppleDouble `._*` form is from `dot_clean(1)`: "Merge ._* files with corresponding native files", and AppleDouble is documented in `copyfile(3)`.
 

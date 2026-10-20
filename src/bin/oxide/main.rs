@@ -18,12 +18,13 @@ mod process;
 mod removable;
 mod store;
 mod watchdog;
+mod wrapper;
 
 use cli::{Class, Invocation, PROFILE_ENVIRONMENT};
 use freshness::{Gate, Refusal};
 use identity::{RunPick, SlotKey};
 use oxide_storage::inventory::{inventory_directory, Category, InventoryLimits};
-use oxide_storage::lease::SlotOccupancy;
+use oxide_storage::lease::{AccountingCoverage, PoolStatus, SlotOccupancy};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
@@ -62,6 +63,9 @@ workspace-root AGENTS.md and prints readiness; there is no Oxide config file.
 A whole-target clean refuses entries Cargo does not create in target/ unless
 --include-foreign is given; --dry-run prints every path it would remove.
 OXIDE_POOL selects the pool; OXIDE_MAX_ACTIVE the host-wide build limit (2).
+Leased builds bypass any inherited rustc wrapper (such as sccache);
+OXIDE_ALLOW_RUSTC_WRAPPER=1 keeps it, unqualified for Oxide's interruption
+and toolchain identity.
 OXIDE_POOL_CAP sets a new pool's cap (bytes, KiB, MiB, GiB or TiB; default
 24 GiB); an existing pool keeps its recorded cap.
 OXIDE_POOL_BACKEND=directory-budget creates a budget-only directory pool (the
@@ -135,6 +139,7 @@ pub(crate) fn apply_storage(command: &mut Command, build_dir: &Path, checkout: &
     for (name, value) in PROFILE_ENVIRONMENT {
         command.env(name, value);
     }
+    wrapper::apply(command);
 }
 
 fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
@@ -187,6 +192,15 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
         return Ok(process::signal_exit_code(signal));
     }
     let run = command == "run";
+    let config_args = if cli::reads_config_args(command) {
+        &invocation.cargo_args[..]
+    } else {
+        &[]
+    };
+    let wrapper_note = wrapper::summary(
+        wrapper::Policy::from_env(),
+        &wrapper::inherited(config_args),
+    );
     let mut cargo = Command::new(CARGO);
     cargo.args(&invocation.cargo_args);
     apply_storage(&mut cargo, &held.build_dir, &key.checkout);
@@ -246,7 +260,12 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     }
     let slot = held.slot_id.clone();
     let warm = held.reused;
-    let note = gate.describe();
+    let note = [gate.describe(), wrapper_note]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let note = (!note.is_empty()).then_some(note);
     let origin = gate.finish(&key.checkout);
     store.release(held, origin)?;
     let (status, executable) = outcome?;
@@ -502,6 +521,10 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
     }
     let settings = store::settings()?;
     print_settings(&settings);
+    println!(
+        "{}",
+        wrapper::status_line(wrapper::Policy::from_env(), &wrapper::inherited(&[]))
+    );
     match Store::open_existing() {
         Ok(None) => {
             println!(
@@ -537,10 +560,7 @@ fn print_pool(store: &Store) -> Result<(), String> {
     );
     match store.backend {
         Backend::DirectoryBudget => {
-            let used = report.pool.payload_unique_allocated_bytes.map_or_else(
-                || "slot allocation unknown".to_owned(),
-                |used| format!("{} MiB allocated by slots", used / MIB),
-            );
+            let used = slot_use(&report.pool);
             let available = watchdog::available_bytes(&store.payload).map_or_else(
                 || "unknown".to_owned(),
                 |bytes| format!("{} MiB", bytes / MIB),
@@ -575,10 +595,7 @@ fn print_pool(store: &Store) -> Result<(), String> {
             );
         }
         Backend::ApfsVolume => {
-            let used = report.pool.payload_unique_allocated_bytes.map_or_else(
-                || "slot allocation unknown".to_owned(),
-                |used| format!("{} MiB allocated by slots", used / MIB),
-            );
+            let used = slot_use(&report.pool);
             println!(
                 "  payload {}, admission cap {} MiB, {used}, slot accounting {:?}",
                 store.payload.display(),
@@ -599,6 +616,7 @@ fn print_pool(store: &Store) -> Result<(), String> {
             }
         }
     }
+    println!("  slot accounting walk: {}", report.pool.payload_accounting);
     println!(
         "  slots {}, waiting commands {}",
         report.slots.len(),
@@ -649,6 +667,19 @@ fn print_pool(store: &Store) -> Result<(), String> {
             slot.slot_id,
             slot.profile.as_deref().unwrap_or("-")
         );
+        let incomplete = report
+            .pool
+            .slots
+            .iter()
+            .find(|pooled| pooled.slot_id == slot.slot_id)
+            .map(|pooled| &pooled.accounting)
+            .filter(|scan| scan.coverage != AccountingCoverage::Complete);
+        if let Some(scan) = incomplete {
+            println!(
+                "    slot {} accounting walk: {scan}; it is not reused while incomplete",
+                slot.slot_id
+            );
+        }
     }
     let now = process::now_ms();
     for recovery in &report.recoveries {
@@ -668,6 +699,21 @@ fn print_pool(store: &Store) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Slot allocation from the payload walk; an incomplete walk is a lower
+/// bound and says so.
+fn slot_use(pool: &PoolStatus) -> String {
+    match (
+        pool.payload_unique_allocated_bytes,
+        pool.payload_accounting.coverage,
+    ) {
+        (Some(used), AccountingCoverage::Complete) => {
+            format!("{} MiB allocated by slots", used / MIB)
+        }
+        (Some(used), _) => format!("at least {} MiB allocated by slots", used / MIB),
+        (None, _) => "slot allocation unknown".to_owned(),
+    }
 }
 
 /// File names, distinct inodes and allocation counted once per inode for

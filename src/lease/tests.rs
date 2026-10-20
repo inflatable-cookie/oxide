@@ -1,11 +1,11 @@
 use super::managed;
 use super::pool::{
     create_injected, evict_idle_slot_injected, lease_injected, mark_evicting_for_test,
-    recover_injected, release_injected, status_injected,
+    recover_injected, release_injected, status_injected, with_accounting_limits,
 };
 use super::{
-    AccountingCoverage, LeaseError, LeaseRequest, Profile, SlotOccupancy,
-    BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME,
+    AccountingCoverage, AccountingGapKind, AccountingScan, LeaseError, LeaseRequest, Profile,
+    SlotOccupancy, BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME,
 };
 use std::fs::{self, File};
 use std::io::Write;
@@ -85,6 +85,31 @@ fn unexpected(place: &'static str, entry: &str) -> LeaseError {
     LeaseError::UnexpectedEntry {
         place,
         entry: entry.to_owned(),
+    }
+}
+
+/// The scan of a refusal for incomplete accounting.
+fn incomplete<T: std::fmt::Debug>(result: Result<T, LeaseError>) -> AccountingScan {
+    match result {
+        Err(LeaseError::AccountingIncomplete(scan)) => {
+            assert_eq!(
+                LeaseError::AccountingIncomplete(scan.clone()).reason(),
+                "unknown_accounting"
+            );
+            *scan
+        }
+        other => panic!("expected incomplete accounting, got {other:?}"),
+    }
+}
+
+fn gap_kinds(scan: &AccountingScan) -> Vec<AccountingGapKind> {
+    scan.gaps.iter().map(|gap| gap.kind).collect()
+}
+
+/// `count` empty files directly under `dir`.
+fn fill(dir: &Path, count: usize) {
+    for index in 0..count {
+        File::create(dir.join(format!("f{index}"))).expect("fixture file");
     }
 }
 
@@ -432,20 +457,37 @@ fn partial_accounting_and_unsafe_slot_root_refuse_compatible_reuse() {
         fs::create_dir(&nested).expect("nested fixture directory");
     }
     release_injected(&pool, &partial.lease_id).expect("release partial candidate");
-    assert!(matches!(
+    // The old depth bound (24) stops this slot's walk: reuse refuses.
+    let refused = with_accounting_limits(50_000, 24, 5_000, || {
         lease_injected(request(
             &pool,
             &partial_project,
             &workspace,
-            "partial-retry"
-        )),
-        Err(LeaseError::UnknownAccounting)
-    ));
+            "partial-retry",
+        ))
+    });
+    let scan = incomplete(refused);
+    assert_eq!(scan.coverage, AccountingCoverage::Partial);
+    assert_eq!(gap_kinds(&scan), vec![AccountingGapKind::DepthLimit]);
     assert!(pool
         .join("payload")
         .join("slots")
         .join(&partial.slot_id)
         .exists());
+    // The pool bounds cover it: the same slot generation is reused.
+    let reused = lease_injected(request(
+        &pool,
+        &partial_project,
+        &workspace,
+        "partial-retry",
+    ))
+    .expect("deep slot reused under the pool bounds");
+    assert!(reused.reused_slot);
+    assert_eq!(
+        (reused.slot_id.as_str(), reused.incarnation.as_str()),
+        (partial.slot_id.as_str(), partial.incarnation.as_str())
+    );
+    release_injected(&pool, &reused.lease_id).expect("release reused");
 
     let unsafe_pool = fx.dir("unsafe-pool");
     create_injected(&unsafe_pool, 8 * 1024 * 1024).expect("init unsafe pool");
@@ -722,6 +764,10 @@ fn unsafe_evicting_slot_root_stays_unavailable_without_blocking_status_or_releas
         .expect("unsafe generation remains recorded");
     assert_eq!(abandoned.state, SlotOccupancy::Abandoned);
     assert_eq!(abandoned.unique_allocated_bytes, None);
+    assert_eq!(
+        gap_kinds(&abandoned.accounting),
+        vec![AccountingGapKind::RootSymlink]
+    );
     let held_status = status
         .slots
         .iter()
@@ -1197,4 +1243,188 @@ fn unexpected_entry_names_are_escaped_and_bounded() {
             &format!("{}...", "y".repeat(64))
         ))
     );
+}
+
+#[test]
+fn entry_bound_refuses_reuse_and_allocation_with_its_cause_then_pool_bounds_admit() {
+    let fx = Fixture::new("entry-bound");
+    let pool = fx.dir("pool");
+    managed::init_budget_pool(&pool, 64 * 1024 * 1024).expect("init budget pool");
+    let workspace = fx.dir("workspace");
+    let big = fx.dir("big");
+    let small_a = fx.dir("small-a");
+    let small_b = fx.dir("small-b");
+    let fresh = fx.dir("fresh");
+    let mut slots = Vec::new();
+    for (project, files) in [(&big, 30), (&small_a, 12), (&small_b, 12)] {
+        let grant = managed::lease(request(&pool, project, &workspace, "fill")).expect("lease");
+        fill(&grant.env.cargo_build_build_dir, files);
+        managed::release(&pool, &grant.lease_id).expect("release");
+        slots.push(grant);
+    }
+    let before = managed::status(&pool).expect("status");
+    with_accounting_limits(20, 64, 60_000, || {
+        // A single slot over the bound: its reuse walk stops at the bound.
+        let scan = incomplete(managed::lease(request(&pool, &big, &workspace, "reuse")));
+        assert_eq!(scan.coverage, AccountingCoverage::Partial);
+        assert_eq!(gap_kinds(&scan), vec![AccountingGapKind::EntryLimit]);
+        assert_eq!((scan.entries_visited, scan.max_entries), (20, 20));
+        let message = LeaseError::AccountingIncomplete(Box::new(scan)).to_string();
+        assert!(message.contains("partial, entry_limit x1, 20 entries in"));
+        assert!(message.contains("(bounds 20 entries, depth 64, 60000 ms)"));
+        // Each slot under the bound but the pool over it: a slot under the
+        // bound is still reused, and a new slot's admission walk refuses.
+        let warm = managed::lease(request(&pool, &small_a, &workspace, "warm")).expect("warm");
+        assert!(warm.reused_slot);
+        assert_eq!(warm.slot_id, slots[1].slot_id);
+        managed::release(&pool, &warm.lease_id).expect("release warm");
+        let scan = incomplete(managed::lease(request(&pool, &fresh, &workspace, "new")));
+        assert_eq!(gap_kinds(&scan), vec![AccountingGapKind::EntryLimit]);
+        // Status reports each walk's own cause; nothing changed.
+        let status = managed::status(&pool).expect("status under the bound");
+        assert_eq!(
+            status.payload_accounting.coverage,
+            AccountingCoverage::Partial
+        );
+        let own = |id: &str| {
+            status
+                .slots
+                .iter()
+                .find(|slot| slot.slot_id == id)
+                .map(|slot| slot.accounting.coverage)
+        };
+        assert_eq!(own(&slots[0].slot_id), Some(AccountingCoverage::Partial));
+        assert_eq!(own(&slots[1].slot_id), Some(AccountingCoverage::Complete));
+        assert_eq!(status.slots.len(), before.slots.len());
+    });
+    // The pool bounds cover the same tree: the big slot is reused as the
+    // same generation and a new slot is admitted.
+    let reused = managed::lease(request(&pool, &big, &workspace, "reuse")).expect("reuse");
+    assert!(reused.reused_slot);
+    assert_eq!(
+        (reused.slot_id.as_str(), reused.incarnation.as_str()),
+        (slots[0].slot_id.as_str(), slots[0].incarnation.as_str())
+    );
+    let admitted = managed::lease(request(&pool, &fresh, &workspace, "new")).expect("new slot");
+    assert!(!admitted.reused_slot);
+    let status = managed::status(&pool).expect("status");
+    assert_eq!(status.coverage, AccountingCoverage::Complete);
+    assert_eq!(status.payload_accounting.gaps, Vec::new());
+    assert_eq!(status.slots.len(), 4);
+}
+
+#[test]
+fn elapsed_deadline_refuses_with_its_cause() {
+    let fx = Fixture::new("elapsed-bound");
+    let pool = fx.dir("pool");
+    managed::init_budget_pool(&pool, 64 * 1024 * 1024).expect("init budget pool");
+    let workspace = fx.dir("workspace");
+    let project = fx.dir("project");
+    let grant = managed::lease(request(&pool, &project, &workspace, "a")).expect("lease");
+    managed::release(&pool, &grant.lease_id).expect("release");
+    with_accounting_limits(2_000_000, 64, 0, || {
+        let scan = incomplete(managed::lease(request(&pool, &project, &workspace, "b")));
+        assert_eq!(gap_kinds(&scan), vec![AccountingGapKind::ElapsedDeadline]);
+        let scan = incomplete(managed::lease(request(
+            &pool,
+            &fx.dir("other"),
+            &workspace,
+            "c",
+        )));
+        assert_eq!(gap_kinds(&scan), vec![AccountingGapKind::ElapsedDeadline]);
+    });
+    assert!(
+        managed::lease(request(&pool, &project, &workspace, "b"))
+            .expect("reuse")
+            .reused_slot
+    );
+}
+
+#[test]
+fn unreadable_slot_entry_refuses_reuse_admission_and_eviction() {
+    let fx = Fixture::new("unreadable");
+    let pool = fx.dir("pool");
+    managed::init_budget_pool(&pool, 1024).expect("init tiny budget pool");
+    let workspace = fx.dir("workspace");
+    let project = fx.dir("project");
+    let grant = managed::lease(request(&pool, &project, &workspace, "a")).expect("lease");
+    fs::write(
+        grant.env.cargo_build_build_dir.join("blob"),
+        vec![1_u8; 8192],
+    )
+    .expect("blob");
+    let locked = grant.env.cargo_build_build_dir.join("locked");
+    fs::create_dir(&locked).expect("locked dir");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    managed::release(&pool, &grant.lease_id).expect("release");
+    let reuse = managed::lease(request(&pool, &project, &workspace, "b"));
+    // Over the tiny budget with the only idle slot unmeasurable: no eviction.
+    let admit = managed::lease(request(&pool, &fx.dir("other"), &workspace, "c"));
+    let status = managed::status(&pool);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("restore");
+    for scan in [incomplete(reuse), incomplete(admit)] {
+        assert_eq!(scan.coverage, AccountingCoverage::Partial);
+        assert_eq!(gap_kinds(&scan), vec![AccountingGapKind::UnreadableEntry]);
+    }
+    let status = status.expect("status");
+    assert_eq!(status.slots.len(), 1);
+    assert_eq!(status.slots[0].state, SlotOccupancy::Idle);
+    assert_eq!(status.full, None);
+    assert_eq!(
+        gap_kinds(&status.slots[0].accounting),
+        vec![AccountingGapKind::UnreadableEntry]
+    );
+    assert!(grant.env.cargo_build_build_dir.join("blob").exists());
+    // Measurable again, the idle slot is evicted whole at admission.
+    let admitted =
+        managed::lease(request(&pool, &fx.dir("third"), &workspace, "d")).expect("admitted");
+    assert_ne!(admitted.slot_id, grant.slot_id);
+    assert!(!grant.env.cargo_build_build_dir.exists());
+}
+
+#[test]
+fn hard_links_are_counted_once_by_admission() {
+    let fx = Fixture::new("hardlinks");
+    let pool = fx.dir("pool");
+    managed::init_budget_pool(&pool, 64 * 1024 * 1024).expect("init budget pool");
+    let workspace = fx.dir("workspace");
+    let project = fx.dir("project");
+    let grant = managed::lease(request(&pool, &project, &workspace, "a")).expect("lease");
+    let original = grant.env.cargo_build_build_dir.join("original");
+    fs::write(&original, vec![3_u8; 64 * 1024]).expect("original");
+    for name in ["link-1", "link-2", "link-3"] {
+        fs::hard_link(&original, grant.env.cargo_build_build_dir.join(name)).expect("link");
+    }
+    managed::release(&pool, &grant.lease_id).expect("release");
+    let status = managed::status(&pool).expect("status");
+    let unique = status.payload_unique_allocated_bytes.expect("unique");
+    let logical = status.payload_logical_bytes.expect("logical");
+    assert_eq!(logical, 4 * 64 * 1024);
+    assert!(unique < 2 * 64 * 1024, "unique {unique}");
+    // A budget between the unique and per-name totals admits a new slot
+    // without evicting the linked one.
+    let mut between = request(&pool, &fx.dir("other"), &workspace, "b");
+    between.budget_bytes = Some(3 * 64 * 1024);
+    let admitted = managed::lease(between).expect("admitted beside the linked slot");
+    assert_ne!(admitted.slot_id, grant.slot_id);
+    assert!(original.exists());
+}
+
+#[test]
+fn pool_bounds_are_separate_from_the_inventory_defaults() {
+    assert_eq!(crate::inventory::DEFAULT_MAX_ENTRIES, 200_000);
+    assert_eq!(crate::inventory::DEFAULT_MAX_DEPTH, 64);
+    assert_eq!(crate::inventory::DEFAULT_MAX_ELAPSED_MS, 30_000);
+    let fx = Fixture::new("bounds");
+    let pool = fx.dir("pool");
+    managed::init_budget_pool(&pool, 1024 * 1024).expect("init budget pool");
+    let status = managed::status(&pool).expect("status");
+    let walk = &status.payload_accounting;
+    // The payload walk starts one level above `slots` (oxide#105), so its
+    // depth bound is one deeper: slot contents keep 64.
+    assert_eq!(
+        (walk.max_entries, walk.max_depth, walk.max_elapsed_ms),
+        (2_000_000, 65, 60_000)
+    );
+    assert_eq!(walk.coverage, AccountingCoverage::Complete);
 }

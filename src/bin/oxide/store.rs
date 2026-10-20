@@ -1891,6 +1891,7 @@ fn lease_error(context: &str, error: &LeaseError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxide_storage::lease::{AccountingCoverage, AccountingScan};
 
     fn paired_controls() -> (PathBuf, Store, Store) {
         let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
@@ -1987,6 +1988,15 @@ mod tests {
             lease_id: Some(lease_id.to_owned()),
             logical_bytes: None,
             unique_allocated_bytes: None,
+            accounting: AccountingScan {
+                coverage: AccountingCoverage::Unknown,
+                gaps: Vec::new(),
+                entries_visited: 0,
+                elapsed_ms: 0,
+                max_entries: 1,
+                max_depth: 0,
+                max_elapsed_ms: 0,
+            },
         }
     }
 

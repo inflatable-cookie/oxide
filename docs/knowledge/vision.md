@@ -596,6 +596,53 @@ Tom, 2026-10-20, approved three changes ("1. Approve 2. Approve 3. Approve!") af
    - The cache is 52 GB at `~/Library/Caches/acowtancy-farmyard-managed-target` and is not Oxide-managed.
    - Condition: the setup refuses when `/Volumes/Builds` is not the mounted registered volume, so an undocked start never creates a `/Volumes/Builds/...` path on the internal disk.
    - Acowtancy owns the change.
+   - **Superseded the same day.** Tom approved Acowtancy's T-5 retirement of the container Rust ladder ("Approve both"). Normal Farmyard QA already builds on the host, so #671 closes unfinished and the 52 GB cache is deleted after T-5 merges. Farmyard's host QA reaches the Builds drive through Oxide once #670 merges.
+
+Tom, 2026-10-20, "Approve": the post-#102 Builds cutover bridge.
+- **Gap:** the #102 binary refuses a removable registration under a previous pool root, no command retires one, and registration requires an empty payload. Installing #102 as-is would send every Oxide build to the internal SSD.
+- **Bridge:**
+  1. Owner-coordinated quiescence of Oxide-using work, then a status check showing no held slots or waiting commands on either old pool.
+  2. Rename the old registration and removable pool state aside, and rename `/Volumes/Builds/oxide-pool` to `oxide-pool.retired-20261020`. Renames only: no deletion, no data copy, though they still write filesystem metadata.
+  3. Pinned reinstall, the `~/Dev/oxide` 100 GB pool, and a fresh `register-removable` with the same reserve and cap.
+  4. Verify that the removable pool is selected.
+- Deleting the retired copies needs a separate approval.
+- Product follow-up: a supported retire command that refuses unless the old pool is drained.
+
+Tom, 2026-10-20, "Yes": accept #099 (bypass inherited `rustc-wrapper` such as sccache) as-is at PR97 exact head `b547ba51`. This is operator acceptance, not a review pass.
+- **Evidence:** all four product subjects passed independent source review, but the overall verdict was changes_required.
+- **Disclosed gaps:**
+  - the proof's timeout closes Oxide's session while Cargo runs in a different group, so Cargo descendants may keep writing;
+  - the plain-Cargo staging has no continuous reserve watchdog;
+  - the final dual-file/cleanup native case never ran (capacity timeout);
+  - the author overran (about 72 min against 45).
+- **Accepted risks:** a faulty bypass could fail builds or misreport policy. The internal-SSD effect is a removed possible cache-write path, not a measured saving.
+- The apparatus defects are follow-up corrections; issues found in use are fixed forward.
+
+Tom, 2026-10-20, "Yes" to two items.
+1. **#108 (pool accounting limits) takes the fast path.**
+   - Publish the exact source PR, then an independent source-only review.
+   - If that review finds no product defect, operator acceptance explicitly replaces both missing native proofs.
+   - Recorded with the acceptance: the inconclusive first native run (the old binary exercised twice), the unrun separated-root native, and two apparatus gaps. The gaps are (a) no continuous host-reserve guard for plain-Cargo staging and fixture writes, only phase samples; (b) `bounded-test.py` does not settle the remaining Cargo groups on an early script exit.
+   - It is a task-specific exception, not elevated-tier qualification.
+   - Before consumer holds are released, a fresh worktree must lease a new slot on the Builds drive and a large existing slot must be reusable.
+2. **A separately scoped task qualifies one shared test supervisor.** It samples the host reserve continuously across every writer in a proof session, and observes and settles every Cargo process group on early exit and on timeout. Elevated tasks then stop building per-task apparatus.
+
+Tom, 2026-10-21, "Cleanup approved", covering the post-cutover leftovers listed to him:
+- the two legacy disk-image pools, Oxide's under `~/Library/Caches/oxide/pool` and Nucleus's. Nucleus's needs a note to its owner first.
+- the retired Builds payload `/Volumes/Builds/oxide-pool.retired-20261020`, and the retired registration entries;
+- the interim internal pool `~/Dev/oxide-interim`;
+- Longhorn #061's plain-Cargo `target/` (about 5.1 GiB) left by the `:cargo` escapes.
+
+Each removal still needs a fresh positive idle/closure check at the time. Held or unknown state stops that item. Ordinary detach only. The planner runs Oxide-owned host items; consumer owners run their own checkouts.
+
+Tom, 2026-10-21, "105 fast path approved, continue clean up". Background: Finder wrote `.DS_Store` files into the live Builds pool at about 23:09Z from an open window on the drive, despite `DSDontWriteUSBStores`, and selection fell back to the internal pool.
+- **#105 (ignore macOS metadata in pool accounting):**
+  1. integrate onto accepted #108 and current main, then run the covering checks;
+  2. an independent source-only review;
+  3. if it finds no product defect, operator acceptance replaces the missing author native;
+  4. merge and install.
+  Earlier verdicts and gaps are kept.
+- **Cleanup continues** on the retired Builds tree only after a fresh positive idle and no-ongoing-writes check. No force or recovery.
 
 ## Authority boundaries
 

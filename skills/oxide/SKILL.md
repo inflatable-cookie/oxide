@@ -98,6 +98,7 @@ When switching selectors:
   - scripts that set their own `CARGO_TARGET_DIR`, because Oxide replaces it;
   - tools that run Cargo themselves, such as the Tauri CLI;
   - container builds;
-  - scripts that read a quick build's binary from `target/debug/`.
+  - scripts that read a quick build's binary from `target/debug/`;
+  - tests that find sibling binaries from `current_exe()`, unless repaired. Test executables run from the slot, not `target/`. Use `env!("CARGO_BIN_EXE_<name>")` or `$CARGO_TARGET_DIR`.
 
   Full rules: [workflow](../../docs/knowledge/contracts/workflow.md#switching-an-existing-project).
