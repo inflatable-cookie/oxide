@@ -59,9 +59,13 @@ QUICK_ENV = {
     "CARGO_PROFILE_OXIDE_QUICK_INHERITS": "dev",
     "CARGO_PROFILE_OXIDE_QUICK_DEBUG": "line-tables-only",
 }
-CLIENT_LOG = "sccache::compiler::compiler=debug,sccache::server=debug"
-HIT_RE = re.compile(rb"\[([^\]]+)\]: Cache (hit|miss) in")
-CANNOT_RE = re.compile(rb"CannotCache\(([^)]*)\)")
+# Client-side mode is disabled whenever SCCACHE_LOG is set (config.rs:1412-1419),
+# so clients never log. Hits are counted from the private server's debug log:
+# a `storage_get_path` key already present in the cache before the build is a
+# hit, otherwise a miss; `handle_client: compile` would mean server-side mode.
+GET_RE = re.compile(rb"storage_get_path key=([0-9a-f]+)")
+PUT_RE = re.compile(rb"storage_put_raw key=([0-9a-f]+)")
+COMPILE_RE = re.compile(rb"handle_client: compile")
 
 
 class Abort(Exception):
@@ -83,6 +87,8 @@ class State:
     stop_monitor = threading.Event()
     preexisting_sccache = set()
     servers = []         # (generation, pid, pgid)
+    procs = {}           # pgid -> Popen, so settle can reap
+    server_log = None
 
 
 def elapsed():
@@ -205,6 +211,9 @@ def settle(pgid, label, grace=5.0):
     """Wait for an owned group to be empty; SIGKILL after grace; record."""
     start = time.monotonic()
     while time.monotonic() - start < grace:
+        proc = State.procs.get(pgid)
+        if proc is not None:
+            proc.poll()
         if not group_alive(pgid):
             State.closed.add(pgid)
             return round((time.monotonic() - start) * 1000, 1)
@@ -217,6 +226,8 @@ def settle(pgid, label, grace=5.0):
         pass
     start2 = time.monotonic()
     while time.monotonic() - start2 < 5.0:
+        if State.procs.get(pgid) is not None:
+            State.procs[pgid].poll()
         if not group_alive(pgid):
             State.closed.add(pgid)
             return "killed-after-grace"
@@ -236,6 +247,7 @@ def spawn(label, argv, env, cwd, logname, cargo=False):
     proc = subprocess.Popen(argv, env=env, cwd=cwd, stdout=out, stderr=err,
                             stdin=subprocess.DEVNULL, start_new_session=True)
     State.groups[proc.pid] = label
+    State.procs[proc.pid] = proc
     proc._logs = (out, err, logname)
     return proc
 
@@ -269,18 +281,31 @@ def read_log(logname, which="err"):
         return f.read()
 
 
-def cache_counts(logname):
-    data = read_log(logname)
-    hits, misses = {}, {}
-    for m in HIT_RE.finditer(data):
-        name = m.group(1).decode()
-        tgt = hits if m.group(2) == b"hit" else misses
-        tgt[name] = tgt.get(name, 0) + 1
-    cannot = {}
-    for m in CANNOT_RE.finditer(data):
-        key = m.group(1).decode()[:60]
-        cannot[key] = cannot.get(key, 0) + 1
-    return {"hits": hits, "misses": misses, "cannot_cache": cannot}
+def cache_keys():
+    keys = set()
+    for _, _, files in os.walk(os.path.join(State.root, "sccache", "cache")):
+        keys.update(files)
+    return keys
+
+
+def begin_counts():
+    log = State.server_log
+    return (cache_keys(), log, os.path.getsize(log) if log and os.path.exists(log) else 0)
+
+
+def end_counts(token):
+    before, log, offset = token
+    if not log or log != State.server_log or not os.path.exists(log):
+        return {"unknown": "server generation changed or log missing"}
+    with open(log, "rb") as f:
+        f.seek(offset)
+        seg = f.read()
+    gets = [m.decode() for m in GET_RE.findall(seg)]
+    puts = [m.decode() for m in PUT_RE.findall(seg)]
+    return {"hits": sum(1 for k in gets if k in before),
+            "misses": sum(1 for k in gets if k not in before),
+            "puts": len(puts), "server_side_compiles": len(COMPILE_RE.findall(seg)),
+            "hit_keys": sorted(k[:12] for k in gets if k in before)}
 
 
 def snapshot(path):
@@ -429,7 +454,6 @@ def client_env(root, alias, target):
     env.update({
         "RUSTC_WRAPPER": SCCACHE,
         "SCCACHE_CLIENT_SIDE": "1",
-        "SCCACHE_LOG": CLIENT_LOG,
         "CARGO_BUILD_BUILD_DIR": alias,
         "CARGO_TARGET_DIR": target,
     })
@@ -468,6 +492,7 @@ def start_server(root, generation):
     else:
         raise Abort("server generation %d not ready" % generation)
     ready = round(time.monotonic() - start, 3)
+    State.server_log = os.path.join(State.root, "logs", "server-%d.err" % generation)
     State.servers.append((generation, proc.pid, proc.pid))
     emit("server-start", generation=generation, pid=proc.pid, pgid=proc.pid,
          ready_s=ready, members=ps_members({proc.pid}))
@@ -519,8 +544,9 @@ def point(root, index, slot):
 
 def cargo_build(root, label, proj, env, extra=()):
     argv = [CARGO, "build", "--profile", PROFILE, "--offline", "-v"] + list(extra)
+    token = begin_counts()
     rc, secs, closed = run(label, argv, env, proj, label, timeout=150, cargo=True)
-    counts = cache_counts(label) if "RUSTC_WRAPPER" in env else None
+    counts = end_counts(token) if "RUSTC_WRAPPER" in env else None
     return rc, secs, closed, counts
 
 
@@ -605,10 +631,13 @@ const DIR: &str = "@GATE@";
 #[proc_macro]
 pub fn hold(_input: TokenStream) -> TokenStream {
     let d = Path::new(DIR);
-    // Hold only the real compile, not sccache's `--emit dep-info` pre-pass.
+    // sccache's hashing runs `rustc --emit dep-info` first (rust.rs:241-268),
+    // which expands this macro; hold the next expansion, the real compile.
+    // The harness checks the held PID's command line independently.
     let args: Vec<String> = std::env::args().collect();
-    let real = args.iter().any(|a| a.starts_with("--emit=") && a.contains("link"));
-    if real && d.join("block").exists() {
+    if d.join("block").exists() && !d.join("prepass").exists() {
+        fs::write(d.join("prepass"), format!("{}\n{}", std::process::id(), args.join(" "))).unwrap();
+    } else if d.join("block").exists() {
         fs::write(d.join("entered"), format!("{}\n{}", std::process::id(), args.join(" "))).unwrap();
         let start = Instant::now();
         while !d.join("release").exists() {
@@ -700,7 +729,8 @@ def wait_file(path, proc, bound):
 # Safety mode
 
 def safety(root):
-    vendor(root, lock_subset(["cfg-if", "memchr"]))
+    lock = open(os.path.join(REPO, "Cargo.lock")).read()
+    vendor(root, lock_packages(lock))
     isolation_evidence(root, "before-cargo")
     slots_root = os.path.join(root, "slots")
     gate = os.path.join(root, "gate")
@@ -720,6 +750,7 @@ def safety(root):
     point(root, 0, k1)
     write(os.path.join(gate, "block"), "1")
     env = client_env(root, alias0, os.path.join(blk, "target"))
+    tok = begin_counts()
     proc = spawn("C1", [CARGO, "build", "--profile", PROFILE, "--offline", "-v"], env, blk,
                  "C1", cargo=True)
     waited = wait_file(os.path.join(gate, "entered"), proc, 60)
@@ -731,6 +762,8 @@ def safety(root):
     entered = open(os.path.join(gate, "entered")).read()
     rustc_pid = int(entered.split()[0])
     members = ps_members({proc.pid})
+    held_cmd = subprocess.run(["ps", "-o", "pid=,ppid=,pgid=,command=", "-p", str(rustc_pid)],
+                              capture_output=True, text=True, timeout=10).stdout.strip()[:2500]
     before = snapshot(k1)
     os.killpg(proc.pid, signal.SIGKILL)
     kill_at = time.monotonic()
@@ -744,21 +777,26 @@ def safety(root):
     rustc_gone = not pid_alive(rustc_pid)
     results["C1"] = {
         "handshake_s": waited, "rustc_pid": rustc_pid, "group_members_at_hold": members,
-        "held_rustc_args": entered.split("\n", 1)[-1][:1500],
+        "held_rustc_args_from_macro": entered.split("\n", 1)[-1][:1500],
+        "held_process_ps": held_cmd,
+        "held_is_real_compile": "--emit=dep-info,metadata,link" in held_cmd
+        and "deps.d" not in held_cmd,
         "group_empty_ms_after_kill": closed_ms, "rustc_pid_esrch": rustc_gone,
         "slot_diff_hold_to_closure": snap_diff(before, after),
         "slot_diff_closure_to_later": snap_diff(after, later),
         "server_open_files_under_slots": open_slot, "server_open_files_total": nopen,
-        "cache_counts": cache_counts("C1"),
+        "cache_counts": end_counts(tok),
         "kill_to_later_s": round(time.monotonic() - kill_at, 3),
     }
     emit("C1", **results["C1"])
 
     # C2: kill the private daemon while the client's rustc is held, then
     # release the hold and observe the client's result and group closure.
-    os.unlink(os.path.join(gate, "entered"))
+    for n in ("entered", "prepass"):
+        os.unlink(os.path.join(gate, n))
     k2 = make_slot(root, "k2")
     point(root, 0, k2)
+    tok = begin_counts()
     proc = spawn("C2", [CARGO, "build", "--profile", PROFILE, "--offline", "-v"], env, blk,
                  "C2", cargo=True)
     waited = wait_file(os.path.join(gate, "entered"), proc, 60)
@@ -782,11 +820,11 @@ def safety(root):
         "handshake_s": waited, "server_killed_closed_ms": server_closed, "cargo_rc": rc,
         "group_empty_ms_after_exit": closed_ms,
         "untracked_new_sccache_processes": {str(k): v for k, v in new_untracked.items()},
-        "cache_counts": cache_counts("C2"),
+        "cache_counts": end_counts(tok),
         "stderr_tail": read_log("C2")[-1500:].decode("utf-8", "replace"),
     }
     emit("C2", **results["C2"])
-    for n in ("block", "release", "entered"):
+    for n in ("block", "release", "entered", "prepass"):
         if os.path.exists(os.path.join(gate, n)):
             os.unlink(os.path.join(gate, n))
     generation = 2
@@ -820,6 +858,7 @@ def safety(root):
     os.chmod(deps2, 0o555)
     point(root, 0, h2)
     fd = os.open(os.path.join(deps2, rlib[0]), os.O_RDONLY | os.O_NONBLOCK)
+    tok = begin_counts()
     proc = spawn("C3", [CARGO, "build", "--profile", PROFILE, "--offline", "-v"], henv, hp,
                  "C3", cargo=True)
     start = time.monotonic()
@@ -868,7 +907,7 @@ def safety(root):
         c3.update({"handshake": False, "rc": rc})
     os.close(fd)
     os.chmod(deps2, 0o755)
-    c3["cache_counts"] = cache_counts("C3")
+    c3["cache_counts"] = end_counts(tok)
     results["C3"] = c3
     emit("C3", **c3)
 
@@ -969,6 +1008,29 @@ def safety(root):
          real_slot=binary.count(slots_root.encode()),
          slot_scan_sB=slot_paths(sB))
     stop_server(root, server, generation)
+
+    # Pre-declared benefit gate (PROTOCOL.md): both closure handshakes reached
+    # with empty groups, no slot change after closure, no server-held slot
+    # file, every wrapped build client-side, and both mitigations correct.
+    def quiet(case):
+        c = results.get(case, {})
+        return (c.get("slot_diff_closure_to_later", {}).get("counts") == [0, 0, 0]
+                and not c.get("server_open_files_under_slots"))
+    def marks(label, want):
+        b = results.get(label, {}).get("binary", {})
+        return (results.get(label, {}).get("rc") == 0 and b.get("compiled_marker") == want
+                and b.get("runtime_marker") == want)
+    wrapped = [r.get("cache_counts") for r in results.values() if isinstance(r, dict)]
+    server_side = sum(c.get("server_side_compiles", 0) for c in wrapped if isinstance(c, dict))
+    gate_checks = {
+        "C1": results["C1"].get("held_is_real_compile") is True and quiet("C1"),
+        "C3": results["C3"].get("mid_write") is True and quiet("C3"),
+        "client_side_everywhere": server_side == 0,
+        "B6_affinity_correct": marks("B6-affinity-p1-idx0-sB", "sB"),
+        "B7_invalidation_correct": marks("B7-invalidate-p1-idx1-sA", "sA"),
+    }
+    results["benefit_gate"] = gate_checks
+    emit("benefit-gate", checks=gate_checks, server_side_compiles=server_side)
     return results
 
 
@@ -994,8 +1056,6 @@ def pid_alive(pid):
 # Benefit mode
 
 def benefit(root):
-    lock = open(os.path.join(REPO, "Cargo.lock")).read()
-    vendor(root, lock_packages(lock))
     proj = os.path.join(root, "proj", "oxide")
     os.makedirs(proj)
     head = subprocess.run(["git", "-C", REPO, "rev-parse", "HEAD"], capture_output=True,
@@ -1023,9 +1083,11 @@ def benefit(root):
         cache_before = (owned_bytes(cache), sum(len(f) for _, _, f in os.walk(cache)))
         start = time.monotonic()
         server = start_server(root, len(State.servers) + 1) if wrapped else None
+        tok = begin_counts()
         env = client_env(root, alias0, target) if wrapped else plain_env(root, alias0, target)
         argv = [CARGO, "build", "--profile", PROFILE, "--locked", "--offline"]
         rc, secs, closed = run(label, argv, env, proj, label, timeout=200, cargo=True)
+        counts = end_counts(tok) if wrapped else None
         if server:
             stop_server(root, server, len(State.servers))
         total = round(time.monotonic() - start, 3)
@@ -1039,7 +1101,7 @@ def benefit(root):
                "children_user_sys_s": round((ru1.ru_utime - ru0.ru_utime)
                                             + (ru1.ru_stime - ru0.ru_stime), 3)}
         if wrapped:
-            rec["cache_counts"] = cache_counts(label)
+            rec["cache_counts"] = counts
         emit("sample", **rec)
         samples.append(rec)
         if rc != 0:
@@ -1047,6 +1109,7 @@ def benefit(root):
         shutil.rmtree(slot)
         return rec
 
+    State.server_log = None
     one("W0-populate", True)
     order = [("P1-U", False), ("P1-W", True), ("P2-W", True), ("P2-U", False),
              ("P3-U", False), ("P3-W", True)]
@@ -1058,7 +1121,7 @@ def benefit(root):
 # --------------------------------------------------------------------------
 
 def main():
-    mode = "benefit" if "--benefit" in sys.argv[1:] else "safety"
+    mode = "safety+conditional-benefit"
     root = make_root()
     State.preexisting_sccache = set(sccache_pids())
     tool = {"sccache": SCCACHE, "sccache_real": os.path.realpath(SCCACHE),
@@ -1073,7 +1136,11 @@ def main():
     mon.start()
     status, result = "ok", None
     try:
-        result = safety(root) if mode == "safety" else benefit(root)
+        result = safety(root)
+        if all(result["benefit_gate"].values()):
+            benefit(root)
+        else:
+            emit("benefit-skipped", reason="pre-declared gate not met")
     except Abort as exc:
         status = "aborted: %s" % exc
     except Exception as exc:  # noqa: BLE001 - always reach teardown

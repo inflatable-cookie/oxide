@@ -93,3 +93,31 @@ cache allocated bytes and file count, `ru_oublock` of reaped children
 stops at 255 s; 1 GiB owned bytes; 96 Cargo launches; 8 MiB inputs; 32 MiB
 logs; host free space >= 20 GiB sampled every 250 ms. Breach -> SIGKILL
 every owned group and report.
+
+## Amendment after native session 1 (recorded before session 2)
+
+Session 1 (Effigy start 12:50:37 UTC) aborted at 6.2 s with every owned
+group closed: C1's hold never fired. Its private server log shows
+`handle_client: compile` for every unit, so the clients ran server-side.
+Source: `src/config.rs:1412-1419` turns client-side mode off whenever
+`SCCACHE_LOG` is set (and when a dist scheduler is configured). The harness
+had set `SCCACHE_LOG` on clients to count hits. Why the argv-gated hold also
+did not fire under server-side compiles was not traced.
+
+Changes for session 2, the last author session:
+
+- Clients get no `SCCACHE_LOG`. Hits and misses are counted from the private
+  server's own debug log: each `storage_get_path` key is a hit if that key
+  was in the cache directory before the build, else a miss; `storage_put_raw`
+  keys are puts; any `handle_client: compile` line means server-side mode.
+- The proc-macro holds its second expansion (the first is sccache's
+  dep-info pre-pass). The harness records the held PID's `ps` command line
+  and requires `--emit=dep-info,metadata,link` without the pre-pass's
+  `deps.d` output.
+- One run: safety cases, then the benefit pairs only if this pre-declared
+  gate holds: C1 handshake on the real compile with no slot change after
+  closure and no server-held slot file; C3 mid-write with the same; zero
+  server-side compiles; B6 and B7 binaries report their own slot at compile
+  time and at run time. Benefit builds all use index 0 with fresh slots, a
+  layout both mitigations allow. The separate `:benefit` selector is
+  removed.

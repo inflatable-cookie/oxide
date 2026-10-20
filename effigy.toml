@@ -127,7 +127,3 @@ run = "python3 scripts/test-oxide-cli.py --cargo-matrix 1.99.1"
 [tasks."rust:sccache-client-alias"]
 admission = "heavy"
 run = "python3 scripts/probe-sccache-client-alias.py"
-
-[tasks."rust:sccache-client-alias:benefit"]
-admission = "heavy"
-run = "python3 scripts/probe-sccache-client-alias.py --benefit"
