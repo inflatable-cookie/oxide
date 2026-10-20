@@ -655,6 +655,13 @@ Tom, 2026-10-21, "Yeah perfect, approve": an Oxide CI shim replaces per-project 
 
 Once a project adopts it, its selectors call `oxide` unconditionally. Local `:cargo` escapes stay for a broken `oxide`.
 
+Tom, 2026-10-21, "Approve", answering two questions.
+1. **Direct GitHub merge of #105** (PR #96 at `ddfccfb63fcf219fcbcbe6ecab5a6d494afbb7e2`). Operator acceptance had already been applied, and Queue verification was waiting on a full board. The merge is reconciled through Queue's external-merge closeout, followed by the pinned install.
+2. **Test scratch goes on the pool.** For the processes Oxide launches (`test`, `run`, external subcommands, and `exec` once it exists), Oxide points `TMPDIR`/`TMP`/`TEMP` at a per-slot scratch directory on the selected pool, so undocked it falls back with the pool.
+   - Oxide replaces `TMPDIR` only when it is still macOS's default per-user temp directory. Any deliberate value, such as Oxide's own `/private/tmp` validation scratch, is kept.
+   - Scratch is removed at slot release and covered by crash recovery. That makes it elevated tier, sequenced after the #109 shared supervisor.
+   - Motivation: whole-device counters still showed heavy internal-SSD writes after the cutover (742 GB since a 20:43Z boot by 23:50Z, unattributed). Effigy and Queue-worktree scratch are separate decisions, pending attribution data.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
