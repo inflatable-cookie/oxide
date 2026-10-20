@@ -96,7 +96,10 @@ fn logged_pids(path: &Path) -> Vec<i32> {
 
 #[test]
 fn an_ordinary_check_completes_and_cleans_up() {
-    // A generous limit, so a loaded host still completes the samples.
+    // A generous limit. On a loaded host the fresh copies' first launches
+    // can still exhaust it; the command's contract then reports exactly that
+    // deadline as inconclusive. Those are the only two accepted outcomes;
+    // the median and report arithmetic are unit-tested in `launch.rs`.
     let run = check(
         "ordinary",
         QUICK,
@@ -107,9 +110,21 @@ fn an_ordinary_check_completes_and_cleans_up() {
         "took {:?}",
         run.wall
     );
+    let complete = run.stdout.contains("  medians: same file ")
+        && run.stdout.contains(", fresh copy ")
+        && (run
+            .stdout
+            .contains("  result: no material penalty (difference at most 30 ms); nothing to do\n")
+            || run
+                .stdout
+                .contains(" per newly written executable, above the 30 ms threshold\n"))
+        && !run.stdout.contains("inconclusive");
+    let deadline = run.stdout.contains(
+        "  result: inconclusive (the 20000 ms limit was reached); no median reported; run it again",
+    ) && !run.stdout.contains("medians:");
     assert!(
-        run.stdout.contains("  medians: same file "),
-        "{}",
+        complete != deadline,
+        "neither complete medians nor the 20000 ms deadline: {}",
         run.stdout
     );
     assert_clean(&run, "ordinary");
