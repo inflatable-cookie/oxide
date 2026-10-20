@@ -1305,16 +1305,18 @@ Approved design direction (Tom, 2026-10-20). Not implemented. The goal: while th
 
 **Volume and backend.**
 - A dedicated APFS volume (for example `OxideBuild`) on the external drive.
-- A new `apfs-volume-v1` backend uses the volume itself as the pool payload root. Its size, or an APFS quota, is the OS-enforced ceiling.
+- A new `apfs-volume-v1` backend uses a dedicated directory on the volume as the pool payload root. Report physical volume capacity and any APFS quota separately from Oxide's configured admission cap. Capacity shared by directories is not an exclusive quota for Oxide.
 - No disk image on removable media: a long-lived image attachment turns a surprise removal into stuck I/O.
 
 **Control plane internal, data plane external.**
 - Registration, ledger and leases stay in the internal pool directory. These are small writes.
 - Slots, and optionally final outputs, live on the external volume.
-- Registration records the volume and container UUIDs.
+- Registration records the volume and container UUIDs and an explicit reserve value; it does not choose the real drive's reserve or quota policy.
+- Accept only an OS-verified mount root directly under `/Volumes`, whose parent is effectively non-writable by the user (including ACL/access semantics). Refuse custom mount points under user-writable paths, the internal boot/data volume and Backup-role volumes.
 
 **Selection, only when a build starts.** The external pool is used only when all of these hold; otherwise the internal default pool is used:
-- the registered volume UUID is mounted, at a mount point whose device matches it. A stale `/Volumes/<name>` directory on the internal disk must never be mistaken for the drive. Re-check the device immediately before creating any path;
+- the registered volume UUID is mounted, at a mount point whose device matches it. A stale `/Volumes/<name>` directory on the internal disk must never be mistaken for the drive. Re-check the device before creation and bind Oxide's mutations to an opened directory descriptor for the verified device, or an equivalent that closes the check/use race;
+- the `/Volumes` parent remains effectively non-writable. This prevents an unprivileged child from recreating a removed mount point, but does not establish that the OS always removes it: stale underlying directory ownership and writability require source and fixture verification. If child writes could land on the internal parent after removal, refuse rather than claim no spill;
 - it is writable;
 - its free space is above the reserve.
 
@@ -1323,7 +1325,8 @@ A lease records which pool it uses. Each pool stays warm on its own.
 **Surprise removal.**
 - A build whose volume vanishes fails like any I/O error, and its lease is marked lost-volume.
 - **On releasing an external slot, Oxide flushes the volume** (`sync_volume_np` with full-sync-and-wait, or an equivalent the implementation cites). So a released slot's writes are on the device before it can be reused.
-- After an unclean disappearance, slots held at that moment are discarded on reattach. They are rebuildable cache, never reused. Idle, flushed slots are kept.
+- A flush failure makes the slot held and non-reusable. It does not authorize deletion while writers are unknown.
+- After an unclean disappearance, slots held at that moment are non-reusable. Discard them only after positive writer closure; otherwise quarantine and retain accounting. A vanished device, or Oxide's Cargo group ending while an inherited sccache server may still write, is not sufficient closure. Idle, flushed slots are kept.
 - The ledger never lives on the removable volume.
 
 **Final outputs follow the pool when docked.** The target directory moves to a per-checkout directory on the external volume, cutting the per-build copies of final binaries on the internal SSD. When undocked, builds write the checkout-local target again.
@@ -1336,7 +1339,7 @@ A lease records which pool it uses. Each pool stays warm on its own.
 - **Queue worktrees and Colima's VM disk stay internal:** they hold live state that an unplug would break.
 - Spotlight indexing of build locations is a host setting, recommended separately.
 
-**Drive:** the dedicated spare 1 TB SSD (Tom, 2026-10-20), erased as APFS volume `OxideBuild`. Vault and its Time Machine backups stay untouched. **Not yet decided:** the reserve/quota policy, encryption with keychain auto-unlock (plain APFS recommended for seamless remounting), and the exact flush primitive and its cost.
+**Drive:** the dedicated spare 1 TB SSD (Tom, 2026-10-20), erased as APFS volume `OxideBuild`. Vault and its Time Machine backups stay untouched. **Not yet decided:** the real drive's explicit reserve and quota values, and the exact flush primitive and its cost. Tom will format it as plain APFS in Disk Utility; no agent retries or bypasses the denied erase operation.
 
 ## Open decisions
 
