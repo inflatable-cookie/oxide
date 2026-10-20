@@ -72,9 +72,13 @@ Rust caching:
   values. Source differs: `src/compiler/rust.rs:1287` accepts `metadata`
   without `link` and `:1625-1636` handles metadata-only output, so `check`
   units are cacheable by source.
-- `src/compiler/rust.rs:1208` `-C incremental` is `CannotCache`; Cargo passes
-  it for local path units under an incremental profile, so quick-profile
-  workspace units always compile in the client. `src/commands.rs:902-912` the
+- `src/compiler/rust.rs:1208` `-C incremental` is `CannotCache`. The
+  earlier inference here, that quick-profile workspace units therefore always
+  compile in the client, is contradicted by native proof 2: under the
+  wrapper, the `app` workspace unit was hashed, compiled by the server and
+  stored. That unit evidently received no `-C incremental`; the Cargo-side
+  cause was not traced, and incremental output is therefore not shown to be
+  unchanged under the wrapper. `src/commands.rs:902-912` the
   client exits 1 if `CARGO_INCREMENTAL=1` or `CARGO_BUILD_INCREMENTAL=1` is in
   its environment; Oxide sets neither (no match in `src/`).
 - Hash key (`src/compiler/rust.rs:1503-1596`): arguments except `-L`,
@@ -125,8 +129,8 @@ any sccache-specific signal. Costs and limits, stated up front:
   one. Concurrency is therefore UNRUN and its arrangement UNKNOWN.
 - The server's lifetime extends the slot hold: a killed launcher leaves a live
   server holding the slot until its idle timeout.
-- Workspace units under the quick profile are never cached; only non-local
-  dependencies can hit.
+- (Corrected after proof 2.) Quick-profile workspace units were not refused
+  as incremental under the wrapper; see Result.
 
 ## Protocol for the native proof (recorded before effects)
 
@@ -177,7 +181,9 @@ Write volume is UNKNOWN.
 
 ## Result
 
-Compatibility: UNKNOWN. Benefit: INSUFFICIENT. Write volume: UNKNOWN.
+Compatibility: UNKNOWN. Benefit: NO-BENEFIT observed for cross-slot sharing on
+this fixture, with the cause inferred; INSUFFICIENT overall. Write volume:
+UNKNOWN. The native proof-2 record follows the proof-1 history below.
 
 - Shared daemon (a) and quarantine: NO-GO by source, above. No native effect
   was needed or taken.
@@ -309,3 +315,63 @@ environments, and the launcher render. All 7 passed. The first run errored
 before any assertion: Effigy's `python3` is 3.9.6, which has no
 `Popen(process_group=)`, so the earlier native harness would also have
 failed at staging. The child is now started with `start_new_session=True`.
+
+## Native proof 2 (author's last allowed submission)
+
+`effigy rust:sccache-compatibility` at clean head `8c62748`, submitted
+11:03:16 UTC, admitted 11:04:29 UTC, exit 1 after about 35 s. Raw output:
+[raw/proof2-effigy-output.log](raw/proof2-effigy-output.log) (ANSI codes
+stripped, nothing else). The per-launch group listings, stats, start and stop
+files are copied verbatim into [raw/proof2-launches](raw/proof2-launches).
+The `*.server-extract.log` files are grep extracts of the server debug logs
+(parse, hash, hit/miss, store lines), not full logs.
+
+Staging: 22 locked archives seeded (checksums verified), offline 1.97.1, no
+wrapper. The private stage sccache directory stayed empty. Staging receipt:
+`oxide` sha256 `9a80e67e…`, `oxide-storage-lease` `eb318eb0…`. Owned peak
+before seed removal 90 MiB; host free minimum 697,854 MiB.
+
+| Case | Result |
+| --- | --- |
+| S1 miss (`w1`, slot 1 cold, 1.73 s) | `cfg_if` and `app` both hashed, missed, compiled by the server, stored; 3 requests not cacheable (`-vV`, `--print`). |
+| S2 second checkout (`w2`, slot 2 cold, 1.06 s) | No hit: `cfg_if` key `091ac32e…` differs from S1's `ea034695…`. |
+| S3 workspace change (slot 2 warm, 0.83 s) | `app` rebuilt (1 miss, stored); `cfg_if` Cargo-fresh. |
+| S4 no wrapper (`w3`, slot 3 cold, 0.59 s) | Ran. The slot-key comparison was not reached, so it is unreported. |
+| S5 Ctrl-C | Stopped by harness assertion before the signal (see below). |
+| S6, S7, three cost pairs | Not run. |
+
+Native observation, from the raw `*.group` listings: every wrapped launch's
+foreground server (`/opt/homebrew/bin/sccache`, PPID 1 after
+`--start-server` exited) had the launcher's process group ID, i.e. it was
+inside Oxide's Cargo group (launches 86828, 87121, 87371 and 88007). Oxide
+releases a slot only after `killpg(group, 0)` reports ESRCH, so for S1–S3 the
+server's exit before release follows from that shipped check plus the
+observed membership. That is an inference: the harness's own per-server ESRCH
+assertion was vacuous.
+
+Harness defect that stopped the run: server identity matched the canonical
+Cellar path, but `ps` reports the invoked `/opt/homebrew/bin/sccache`. No
+server was registered, the S1–S3 "server gone" assertions checked nothing,
+and S5's "exactly one server" assertion failed. That is a harness failure,
+not a writer-closure observation. After it, supervision SIGKILLed the owned
+groups, found every owned target ESRCH and detached the image (exit 0). A
+later read-only check found server PIDs 86844, 87125, 87374 and 88014 ESRCH.
+Scratch `/private/tmp/oxide-cli.OdGPci/sc096` (staging target, fixtures,
+full server logs) is retained, not deleted.
+
+No-hit cause, inferred: Oxide sets `CARGO_BUILD_BUILD_DIR` (slot) and
+`CARGO_TARGET_DIR` (checkout) for Cargo (`src/bin/oxide/main.rs:127-128`).
+Cargo's environment reaches the wrapper, and sccache hashes every `CARGO_*`
+variable except four (`src/compiler/rust.rs:1580-1594`). Per-slot values
+would therefore change every key. Environments were not diffed.
+
+Workspace incremental: the `app` unit was cached rather than refused as
+incremental, so quick-profile incremental behaviour under the wrapper is not
+shown to be unchanged. Cause untraced.
+
+Proof accounting: author submissions 2 of 2 used (one capacity timeout, one
+harness failure). Under the owner phase there is no retry and no further
+repair. Cargo drivers this run: staging 1, toolchain `-V` 1, launcher log
+entries for S1–S5. Remaining question: whether a corrected identity match
+plus a cache key independent of slot and checkout paths can show both
+closure (S5–S7) and a cross-slot hit.

@@ -205,11 +205,14 @@ group ends only when the shared daemon exits. A foreground server
 (`SCCACHE_NO_DAEMON=1`) started inside Oxide's Cargo group keeps every
 server-side writer in that group; nothing in sccache changes group below
 `daemonix`. That makes Oxide's shipped `killpg` closure applicable, at the
-cost of one wrapped lease per cache at a time, a slot hold for the server's
-lifetime, and no caching of quick-profile workspace units. A crash-safe cache
+cost of one wrapped lease per cache at a time and a slot hold for the
+server's lifetime. A crash-safe cache
 lock that outlives the server, concurrency, in-flight cancellation and write
-volume remain open. The native proof of the foreground arrangement did not run: its one
-submission ended in Effigy's `capacity_timeout` after 30 minutes, never
-launched. Its
+volume remain open. Native proof 2 observed the foreground server inside Oxide's Cargo group
+for every wrapped command. It found no cross-slot cache hit, inferred to come
+from the per-slot `CARGO_BUILD_BUILD_DIR`/`CARGO_TARGET_DIR` that sccache hashes.
+It saw the workspace unit cached rather than refused as incremental. It
+stopped on a harness identity-match defect before the Ctrl-C and crash
+cases; no author proof remains. Its
 compatibility is UNKNOWN and its benefit INSUFFICIENT; no integration task
 follows from this record alone.

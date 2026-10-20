@@ -829,18 +829,20 @@ slot closure ([evidence](evidence/sccache-096/README.md), [Q-017](questions.md#q
   server-side writers in that group, so Oxide's existing closure applies. It
   serializes wrapped leases per cache and holds the slot while the server
   lives.
-- Benefit is limited by source: quick-profile workspace units pass
-  `-C incremental` and are never cached; linking crates are not cached;
-  the hash includes the working directory and `CARGO_*` variables, so only
-  dependencies whose source lives in a shared Cargo home can hit across
-  checkouts. Source caches `check` metadata-only units although the Rust notes
+- Benefit is limited: linking crates are not cached, and the hash includes
+  the working directory and `CARGO_*` variables. Natively (oxide#096 proof
+  2), a registry dependency missed in a second Oxide slot because its key
+  changed, which is consistent with Oxide's per-slot `CARGO_BUILD_BUILD_DIR`.
+  Under the wrapper the quick-profile workspace unit was cached rather than
+  refused as incremental (cause untraced). Source caches `check` metadata-only units although the Rust notes
   say `link` is required.
 - Write volume was not attributable within scope: UNKNOWN. Cache bytes are
   not writes.
 
-The native proof of the foreground arrangement ended in Effigy's
-`capacity_timeout` without launching, so compatibility is UNKNOWN and
-benefit INSUFFICIENT. No timings, hit rates or storage figures exist.
+Native proof 2 saw the in-group foreground server, then stopped on a harness
+defect before the cancellation cases, so compatibility is UNKNOWN and
+benefit INSUFFICIENT. Only the S1–S3 single-command times exist (1.73, 1.06,
+0.83 s); the fixed cost pairs and storage figures were not run.
 
 ## Product assessment
 
