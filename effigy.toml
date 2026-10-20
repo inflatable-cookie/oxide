@@ -105,6 +105,17 @@ run = "python3 scripts/test-oxide-removable-pool.py"
 admission = "heavy"
 run = "python3 scripts/test-oxide-removable-pool.py --budget-default"
 
+# Pool accounting at build-cache scale (oxide#108): stages the candidate and
+# the base commit's `oxide` offline with 1.97.1 and no rustc wrapper, then on
+# private directory pools with more than 50,000 real entries proves the old
+# bound's refusal, same-generation warm reuse of a 60,000-entry idle slot, a
+# new slot beside a 60,000-entry payload, and idle-only eviction with
+# hard links counted once beside a held slot. 300 s and 512 MiB owned
+# scratch including cleanup. Not a benchmark and not full QA.
+[tasks."rust:pool-scale"]
+admission = "heavy"
+run = "python3 scripts/test-pool-scale.py"
+
 # SUSPENDED by oxide#102 (retired image pool provisioning; refuses before
 # any effect until migrated). Cargo version matrix (oxide#091): one logical proof per exact stable
 # release. Each stages `oxide` offline with the builder 1.97.1, then runs the

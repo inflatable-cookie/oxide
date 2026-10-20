@@ -44,10 +44,15 @@ pub const MAX_HOLDER_BYTES: usize = 128;
 pub const MAX_PATH_BYTES: usize = 1024;
 /// Finite lease-id text.
 pub const MAX_LEASE_ID_BYTES: usize = 160;
-/// Cooperative inventory bound used for slot accounting.
-const ACCOUNTING_MAX_ENTRIES: u64 = 50_000;
-const ACCOUNTING_MAX_DEPTH: usize = 24;
-const ACCOUNTING_MAX_ELAPSED_MS: u64 = 5_000;
+/// Cooperative inventory bounds for pool accounting (oxide#108), separate
+/// from the inventory tool's defaults. Sized for real build caches: 32 slots
+/// of a 60k-entry Cargo build directory (Farmyard's observed 60,657) stay
+/// under the entry bound; depth covers build-script `out` trees; the
+/// deadline allows a cold walk of a USB pool. A walk that hits any bound is
+/// incomplete and refuses where complete accounting is required.
+const ACCOUNTING_MAX_ENTRIES: u64 = 2_000_000;
+const ACCOUNTING_MAX_DEPTH: usize = 64;
+const ACCOUNTING_MAX_ELAPSED_MS: u64 = 60_000;
 
 const CONFIG_NAME: &str = "config.json";
 const LEDGER_NAME: &str = "ledger.json";
@@ -107,6 +112,9 @@ pub enum LeaseError {
     Busy,
     Full,
     UnknownAccounting,
+    /// A bounded accounting walk that admission, reuse or eviction needed
+    /// did not complete. Same reason and exit code as `UnknownAccounting`.
+    AccountingIncomplete(Box<AccountingScan>),
     UnsafePath(&'static str),
     HolderConflict,
     NotFound,
@@ -124,7 +132,10 @@ impl LeaseError {
         match self {
             Self::Usage(_) | Self::InvalidInput(_) | Self::Io(_) | Self::Unsupported(_) => 1,
             Self::Busy | Self::HolderConflict => 2,
-            Self::Full | Self::UnknownAccounting | Self::LedgerExhausted => 3,
+            Self::Full
+            | Self::UnknownAccounting
+            | Self::AccountingIncomplete(_)
+            | Self::LedgerExhausted => 3,
             Self::UnsafePath(_) | Self::BackingMismatch => 4,
             Self::NotFound => 5,
         }
@@ -136,7 +147,7 @@ impl LeaseError {
             Self::InvalidInput(_) => "invalid_input",
             Self::Busy => "busy",
             Self::Full => "full",
-            Self::UnknownAccounting => "unknown_accounting",
+            Self::UnknownAccounting | Self::AccountingIncomplete(_) => "unknown_accounting",
             Self::UnsafePath(_) => "unsafe_path",
             Self::HolderConflict => "holder_conflict",
             Self::NotFound => "not_found",
@@ -158,6 +169,9 @@ impl std::fmt::Display for LeaseError {
             Self::Full => formatter.write_str("pool cap cannot admit a new slot"),
             Self::UnknownAccounting => {
                 formatter.write_str("owned accounting is unknown or a foreign entry is present")
+            }
+            Self::AccountingIncomplete(scan) => {
+                write!(formatter, "owned accounting is incomplete: {scan}")
             }
             Self::HolderConflict => {
                 formatter.write_str("holder is already bound to a different lease")
@@ -241,6 +255,8 @@ pub struct SlotStatus {
     pub lease_id: Option<String>,
     pub logical_bytes: Option<u64>,
     pub unique_allocated_bytes: Option<u64>,
+    /// This slot's own walk, the one reuse needs complete.
+    pub accounting: AccountingScan,
 }
 
 /// Finite pool status. Partial or unknown accounting is explicit.
@@ -254,6 +270,8 @@ pub struct PoolStatus {
     pub payload_logical_bytes: Option<u64>,
     pub payload_unique_allocated_bytes: Option<u64>,
     pub coverage: AccountingCoverage,
+    /// The whole-payload walk, the one new-slot admission needs complete.
+    pub payload_accounting: AccountingScan,
     pub full: Option<bool>,
     pub slots: Vec<SlotStatus>,
 }
@@ -264,6 +282,93 @@ pub enum AccountingCoverage {
     Complete,
     Partial,
     Unknown,
+}
+
+/// Why one accounting walk is not complete. Walk gaps come from the
+/// inventory; root failures mean no walk ran.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountingGapKind {
+    EntryLimit,
+    DepthLimit,
+    ElapsedDeadline,
+    MountBoundary,
+    UnreadableEntry,
+    MissingMetadata,
+    UnsupportedMetadata,
+    RootMissing,
+    RootNotDirectory,
+    RootUnreadable,
+    RootSymlink,
+}
+
+impl AccountingGapKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EntryLimit => "entry_limit",
+            Self::DepthLimit => "depth_limit",
+            Self::ElapsedDeadline => "elapsed_deadline",
+            Self::MountBoundary => "mount_boundary",
+            Self::UnreadableEntry => "unreadable_entry",
+            Self::MissingMetadata => "missing_metadata",
+            Self::UnsupportedMetadata => "unsupported_metadata",
+            Self::RootMissing => "root_missing",
+            Self::RootNotDirectory => "root_not_directory",
+            Self::RootUnreadable => "root_unreadable",
+            Self::RootSymlink => "root_symlink",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountingGap {
+    pub kind: AccountingGapKind,
+    pub occurrences: u64,
+}
+
+/// What one bounded accounting walk covered: coverage, gap causes, entries
+/// visited and elapsed time. No paths, names or contents.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountingScan {
+    pub coverage: AccountingCoverage,
+    pub gaps: Vec<AccountingGap>,
+    pub entries_visited: u64,
+    pub elapsed_ms: u64,
+    /// The bounds this walk used.
+    pub max_entries: u64,
+    pub max_depth: usize,
+    pub max_elapsed_ms: u64,
+}
+
+impl std::fmt::Display for AccountingScan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let coverage = match self.coverage {
+            AccountingCoverage::Complete => "complete",
+            AccountingCoverage::Partial => "partial",
+            AccountingCoverage::Unknown => "unknown",
+        };
+        write!(formatter, "{coverage}")?;
+        for (index, gap) in self.gaps.iter().enumerate() {
+            let separator = if index == 0 { ", " } else { " + " };
+            write!(
+                formatter,
+                "{separator}{} x{}",
+                gap.kind.as_str(),
+                gap.occurrences
+            )?;
+        }
+        write!(
+            formatter,
+            ", {} entries in {} ms (bounds {} entries, depth {}, {} ms)",
+            self.entries_visited,
+            self.elapsed_ms,
+            self.max_entries,
+            self.max_depth,
+            self.max_elapsed_ms
+        )
+    }
 }
 
 fn current_uid() -> u32 {
