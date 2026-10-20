@@ -865,6 +865,17 @@ Paths to complementarity, unqualified:
 1. Upstream Rust basedir normalization.
 2. An Oxide stable build-path alias: each concurrently active lease builds through a fixed per-index alias path to its slot, so sccache keys match across slots and projects. Combined with client-side mode for writer closure. Needs proof that Cargo does not canonicalize the alias, and an account of debug-info path effects.
 
+### Client-side mode and alias qualification (oxide#101, 2026-10-20)
+
+[Evidence](evidence/sccache-101/README.md). Knowledge only: one native session aborted and the second never launched (Effigy capacity timeout), so nearly everything below is source.
+
+- **Client-side closure: UNKNOWN.** Source (sccache `01c35e69`) supports it: the client process hashes, runs rustc and restores hits into the slot (temp file then rename); the server only answers storage requests and writes its cache directory. Not exercised natively.
+- **Silent fallback: UNSAFE.** `config.rs:1412-1419` turns client-side mode off whenever `SCCACHE_LOG` is set or a dist scheduler is configured; the server then compiles into slots from outside the Cargo group. Native session 1 hit this. Any integration must own the endpoint and scrub the client environment.
+- **Alias spelling survives.** Cargo 1.97.1 does not canonicalize `CARGO_TARGET_DIR` or `build.build-dir` (source); `--out-dir`, `-L` and `--extern` kept the alias natively. `OUT_DIR`/`CARGO_*` values not observed natively.
+- **Index change: UNSAFE by source.** Cargo drops `OUT_DIR` and build-script env from rebuild tracking (`fingerprint/dep_info.rs:308-339`, which documents the moved-target case), so a slot rebuilt under a new index keeps fresh units that embed the old alias, by then another slot's. Not demonstrated natively. Affinity and invalidation mitigations: UNKNOWN, not run.
+- **Benefit: INSUFFICIENT; writes UNKNOWN.** No hit rate or cold-slot time measured. #2796 (local level empty in client-side mode) was reported on a multi-level cache; single-level local disk is unmeasured.
+- **Upstream:** 0.18.0 is the latest release; Rust basedir normalization (#2678, #2794, #2918) is unmerged. If released it would remove the need for an alias but carry the same embedded-path hazard for restored objects (inference).
+
 ## Product assessment
 
 Planner recommendation: a small coherent entry point over evidence-backed mechanisms, with three capabilities: see and explain costs, bound and reuse owned storage, and apply qualified improvements with clear trade-offs. The reusable storage core must work for ordinary developers as well as orchestrators. A daemon, editor surface or UI is still an open choice; Tom's [workflow direction](vision.md#product-workflow-direction) sets an `oxide build` / `oxide run` front door as the design target.

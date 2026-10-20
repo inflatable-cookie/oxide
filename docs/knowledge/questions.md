@@ -222,3 +222,13 @@ Compatibility UNKNOWN, benefit INSUFFICIENT, writes UNKNOWN. No integration
 follows from this record. A future attempt would need a cancellation and
 crash closure proof, a crash-safe cache lock, concurrency handling and a
 cache key independent of slot and checkout paths.
+
+oxide#101 outcome, knowledge only ([evidence](evidence/sccache-101/README.md)):
+client-side mode (0.17+) moves every slot writer into the client by source,
+so closure is source-supported but natively UNKNOWN; it silently reverts to
+server-side when `SCCACHE_LOG` is set or a dist scheduler is configured
+(UNSAFE). A stable per-index build-dir alias keeps its spelling through
+Cargo, but rebuilding a slot under a different index is UNSAFE by Cargo
+source; the affinity and invalidation mitigations were not run. Benefit
+INSUFFICIENT, writes UNKNOWN. Upstream Rust basedir normalization is
+unreleased.
