@@ -14,6 +14,7 @@ mod freshness;
 mod identity;
 mod launch;
 mod process;
+mod removable;
 mod store;
 mod watchdog;
 
@@ -48,6 +49,8 @@ USAGE:
     oxide clean --cargo-cache            one pass of Cargo's own home cleanup, no network
     oxide status                         pool, slots, waits, stray output and Cargo home
     oxide status --launch-check          macOS: time a new executable's first launch
+    oxide pool register-removable <mount-point> --reserve <size> --cap <size>
+                                         macOS: prefer a dedicated APFS volume under /Volumes
     oxide init [cargo init args] [path]  cargo init if no Cargo.toml, then adopt Oxide
     oxide new <path> [cargo new args]    cargo new, then adopt Oxide
 
@@ -109,6 +112,7 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
     match cli::classify(command) {
         Class::Plain => Err(exec_cargo(&args)),
         Class::Status => run_status(rest),
+        Class::Pool => removable::run(rest),
         Class::Clean => clean::run(rest),
         Class::Init => adopt::run_init(rest),
         Class::New => adopt::run_new(rest),
@@ -164,7 +168,11 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
         invocation.target.as_deref(),
     )?;
     process::install_signal_handlers()?;
-    let store = Store::open_or_create()?;
+    let selected = removable::select(Store::open_or_create()?)?;
+    let store = selected.store;
+    if let (false, Some(note)) = (selected.removable, &selected.note) {
+        eprintln!("oxide: {note}");
+    }
     let started = Instant::now();
     let resolution = cli::resolution(&invocation.cargo_args);
     let (held, gate) = match lease_with_gate(&store, &key, invocation.profile, &resolution)? {
@@ -243,6 +251,18 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     let (status, executable) = outcome?;
     let status = status.ok_or("Cargo ended without a status")?;
     print_summary(&store, &invocation, &slot, warm, started, note.as_deref());
+    if store.backend == Backend::ApfsVolume {
+        match store.last_flush() {
+            Some(flush) if flush.slot_id == slot => match flush.micros {
+                Some(micros) => eprintln!(
+                    "oxide: flushed the removable volume before releasing slot {slot} in {:.1} ms",
+                    micros as f64 / 1000.0
+                ),
+                None => eprintln!("oxide: slot {slot} is retired: its flush failed"),
+            },
+            _ => {}
+        }
+    }
     if stopped.is_some() {
         // A reserve stop is an ordinary failed command, never a success.
         return Ok(process::exit_code(status).max(1));
@@ -452,7 +472,7 @@ fn print_summary(
         (Backend::ApfsImage, Some((used, total))) => {
             format!("pool {} of {} MiB used", used / MIB, total / MIB)
         }
-        (Backend::DirectoryBudget, Some((used, budget))) => format!(
+        (Backend::DirectoryBudget | Backend::ApfsVolume, Some((used, budget))) => format!(
             "pool {} MiB allocated of {} MiB budget",
             used / MIB,
             budget / MIB
@@ -462,6 +482,11 @@ fn print_summary(
     let backend = match store.backend {
         Backend::ApfsImage => format!(" ({})", store.backend.tag()),
         Backend::DirectoryBudget => format!(" ({}, budget-only)", store.backend.tag()),
+        Backend::ApfsVolume => format!(
+            " ({}, budget-only, removable {})",
+            store.backend.tag(),
+            store.payload.display()
+        ),
     };
     let note = note.map(|note| format!(", {note}")).unwrap_or_default();
     eprintln!(
@@ -490,110 +515,9 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
             );
         }
         Some(store) => {
-            let report = store.report()?;
-            println!(
-                "  backend {}: {}",
-                store.backend.tag(),
-                store.backend.bound()
-            );
-            match store.backend {
-                Backend::ApfsImage => {
-                    let used = store
-                        .payload_use()
-                        .map(|(used, total)| format!("{} of {} MiB used", used / MIB, total / MIB))
-                        .unwrap_or_else(|| "use unknown".to_owned());
-                    println!(
-                        "  cap {} MiB, {used}, slot accounting {:?}",
-                        report.pool.cap_bytes / MIB,
-                        report.pool.coverage
-                    );
-                }
-                Backend::DirectoryBudget => {
-                    let used = report.pool.payload_unique_allocated_bytes.map_or_else(
-                        || "slot allocation unknown".to_owned(),
-                        |used| format!("{} MiB allocated by slots", used / MIB),
-                    );
-                    let available = watchdog::available_bytes(&store.pool.join("payload"))
-                        .map_or_else(
-                            || "unknown".to_owned(),
-                            |bytes| format!("{} MiB", bytes / MIB),
-                        );
-                    println!(
-                        "  budget {} MiB, {used}, slot accounting {:?}",
-                        report.pool.cap_bytes / MIB,
-                        report.pool.coverage
-                    );
-                    println!(
-                        "  reserve watchdog: stops a build below {} GiB available ({} GiB reserve + {} GiB margin), best effort; pool filesystem available {available}",
-                        (store::HOST_RESERVE_BYTES + watchdog::MARGIN_BYTES) / store::GIB,
-                        store::HOST_RESERVE_BYTES / store::GIB,
-                        watchdog::MARGIN_BYTES / store::GIB
-                    );
-                }
-            }
-            println!(
-                "  slots {}, waiting commands {}",
-                report.slots.len(),
-                report.waiting
-            );
-            for checkout in &report.cleaning {
-                println!("  cleaning {}", checkout.display());
-            }
-            for slot in &report.slots {
-                let state = match (slot.state, &slot.interrupted) {
-                    (SlotOccupancy::Held, Some(interrupted)) => {
-                        let holder = interrupted
-                            .holder_pid
-                            .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string());
-                        let path = match interrupted.path {
-                            store::Return::NeverStarted => {
-                                "Cargo never started; the next command recovers it".to_owned()
-                            }
-                            store::Return::GroupEmpty(group) => format!(
-                                "Cargo group {group}; recovered once the group is empty"
-                            ),
-                            store::Return::GroupUnrecorded => {
-                                "Cargo group not recorded; `oxide-storage-lease recover` releases it"
-                                    .to_owned()
-                            }
-                            store::Return::NotOwn => {
-                                "lease not provably this command's; `oxide-storage-lease recover` releases it"
-                                    .to_owned()
-                            }
-                        };
-                        format!("held by an interrupted command (oxide pid {holder}, {path})")
-                    }
-                    (SlotOccupancy::Held, None) => "held".to_owned(),
-                    _ => "idle".to_owned(),
-                };
-                let owner = match (&slot.checkout, slot.managed) {
-                    (Some(checkout), _) => checkout.display().to_string(),
-                    (None, true) => "no checkout affinity".to_owned(),
-                    (None, false) => "not managed by oxide".to_owned(),
-                };
-                let bytes = slot_size(&store.pool, &slot.slot_id);
-                println!(
-                    "  slot {} {state} {} {owner} {bytes}",
-                    slot.slot_id,
-                    slot.profile.as_deref().unwrap_or("-")
-                );
-            }
-            let now = process::now_ms();
-            for recovery in &report.recoveries {
-                let group = recovery.process_group.map_or_else(
-                    || "Cargo never started".to_owned(),
-                    |group| format!("Cargo group {group} empty"),
-                );
-                let checkout = recovery.checkout.as_deref().map_or_else(
-                    || "no checkout affinity".to_owned(),
-                    |checkout| checkout.display().to_string(),
-                );
-                println!(
-                    "  recovered slot {} {}s ago: oxide pid {} died ({group}), {checkout}",
-                    recovery.slot_id,
-                    now.saturating_sub(recovery.recovered_ms) / 1000,
-                    recovery.holder_pid
-                );
+            print_pool(&store)?;
+            if let Some(removable) = removable::status(&store)? {
+                print_pool(&removable)?;
             }
         }
     }
@@ -605,15 +529,152 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
     Ok(0)
 }
 
+/// Backend, use, slots and recoveries of one opened pool.
+fn print_pool(store: &Store) -> Result<(), String> {
+    let report = store.report()?;
+    println!(
+        "  backend {}: {}",
+        store.backend.tag(),
+        store.backend.bound()
+    );
+    match store.backend {
+        Backend::ApfsImage => {
+            let used = store
+                .payload_use()
+                .map(|(used, total)| format!("{} of {} MiB used", used / MIB, total / MIB))
+                .unwrap_or_else(|| "use unknown".to_owned());
+            println!(
+                "  cap {} MiB, {used}, slot accounting {:?}",
+                report.pool.cap_bytes / MIB,
+                report.pool.coverage
+            );
+        }
+        Backend::DirectoryBudget => {
+            let used = report.pool.payload_unique_allocated_bytes.map_or_else(
+                || "slot allocation unknown".to_owned(),
+                |used| format!("{} MiB allocated by slots", used / MIB),
+            );
+            let available = watchdog::available_bytes(&store.payload).map_or_else(
+                || "unknown".to_owned(),
+                |bytes| format!("{} MiB", bytes / MIB),
+            );
+            println!(
+                "  budget {} MiB, {used}, slot accounting {:?}",
+                report.pool.cap_bytes / MIB,
+                report.pool.coverage
+            );
+            println!(
+                "  reserve watchdog: stops a build below {} GiB available ({} GiB reserve + {} GiB margin), best effort; pool filesystem available {available}",
+                (store::HOST_RESERVE_BYTES + watchdog::MARGIN_BYTES) / store::GIB,
+                store::HOST_RESERVE_BYTES / store::GIB,
+                watchdog::MARGIN_BYTES / store::GIB
+            );
+        }
+        Backend::ApfsVolume => {
+            let used = report.pool.payload_unique_allocated_bytes.map_or_else(
+                || "slot allocation unknown".to_owned(),
+                |used| format!("{} MiB allocated by slots", used / MIB),
+            );
+            println!(
+                "  payload {}, admission cap {} MiB, {used}, slot accounting {:?}",
+                store.payload.display(),
+                report.pool.cap_bytes / MIB,
+                report.pool.coverage
+            );
+            for flush in &report.flushes {
+                let outcome = match (flush.micros, &flush.error) {
+                    (Some(micros), _) => format!("{:.1} ms", micros as f64 / 1000.0),
+                    (None, Some(error)) => format!("failed ({error}); slot retired"),
+                    (None, None) => "failed; slot retired".to_owned(),
+                };
+                println!(
+                    "  flush before releasing slot {}: {outcome}, {}s ago",
+                    flush.slot_id,
+                    process::now_ms().saturating_sub(flush.at_ms) / 1000
+                );
+            }
+        }
+    }
+    println!(
+        "  slots {}, waiting commands {}",
+        report.slots.len(),
+        report.waiting
+    );
+    for checkout in &report.cleaning {
+        println!("  cleaning {}", checkout.display());
+    }
+    for slot in &report.slots {
+        let state = match (slot.state, &slot.interrupted) {
+            (SlotOccupancy::Held, _) if slot.retired.is_some() => format!(
+                "retired and held, never reused ({})",
+                slot.retired.as_deref().unwrap_or_default()
+            ),
+            (SlotOccupancy::Held, Some(interrupted)) => {
+                let holder = interrupted
+                    .holder_pid
+                    .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string());
+                let path = match interrupted.path {
+                    store::Return::NeverStarted => {
+                        "Cargo never started; the next command recovers it".to_owned()
+                    }
+                    store::Return::GroupEmpty(group) => format!(
+                        "Cargo group {group}; recovered once the group is empty"
+                    ),
+                    store::Return::GroupUnrecorded => {
+                        "Cargo group not recorded; `oxide-storage-lease recover` releases it"
+                            .to_owned()
+                    }
+                    store::Return::NotOwn => {
+                        "lease not provably this command's; `oxide-storage-lease recover` releases it"
+                            .to_owned()
+                    }
+                };
+                format!("held by an interrupted command (oxide pid {holder}, {path})")
+            }
+            (SlotOccupancy::Held, None) => "held".to_owned(),
+            _ => "idle".to_owned(),
+        };
+        let owner = match (&slot.checkout, slot.managed) {
+            (Some(checkout), _) => checkout.display().to_string(),
+            (None, true) => "no checkout affinity".to_owned(),
+            (None, false) => "not managed by oxide".to_owned(),
+        };
+        let bytes = slot_size(&store.payload, &slot.slot_id);
+        println!(
+            "  slot {} {state} {} {owner} {bytes}",
+            slot.slot_id,
+            slot.profile.as_deref().unwrap_or("-")
+        );
+    }
+    let now = process::now_ms();
+    for recovery in &report.recoveries {
+        let group = recovery.process_group.map_or_else(
+            || "Cargo never started".to_owned(),
+            |group| format!("Cargo group {group} empty"),
+        );
+        let checkout = recovery.checkout.as_deref().map_or_else(
+            || "no checkout affinity".to_owned(),
+            |checkout| checkout.display().to_string(),
+        );
+        println!(
+            "  recovered slot {} {}s ago: oxide pid {} died ({group}), {checkout}",
+            recovery.slot_id,
+            now.saturating_sub(recovery.recovered_ms) / 1000,
+            recovery.holder_pid
+        );
+    }
+    Ok(())
+}
+
 /// File names, distinct inodes and allocation counted once per inode for
 /// one slot. Reporting only: nothing inside a slot is ever deleted. The
 /// slot must resolve to itself under the canonical pool, so a link never
 /// leads the walk elsewhere.
-fn slot_size(pool: &Path, slot_id: &str) -> String {
+fn slot_size(payload: &Path, slot_id: &str) -> String {
     if slot_id.is_empty() || !slot_id.bytes().all(|byte| byte.is_ascii_digit()) {
         return "size unknown".to_owned();
     }
-    let slot = pool.join("payload").join("slots").join(slot_id);
+    let slot = payload.join("slots").join(slot_id);
     match std::fs::canonicalize(&slot) {
         Ok(resolved) if resolved == slot => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return "empty".to_owned(),

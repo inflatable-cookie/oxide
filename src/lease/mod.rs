@@ -45,6 +45,10 @@ pub const CAPACITY_STATUS_NOTES: [&str; 4] = [
 /// whole-idle-slot eviction against a recorded budget, with no OS ceiling.
 /// Only [`managed`] opens it; the standalone CLI refuses it.
 pub const BUDGET_BACKEND_DIRECTORY_V1: &str = "directory-budget-v1";
+/// Removable-volume backend for the `oxide` front door: config, ledger and
+/// lock internal, payload in a directory on a registered external APFS
+/// volume. Budget-only like the directory backend; only [`managed`] opens it.
+pub const VOLUME_BACKEND_APFS_V1: &str = "apfs-volume-v1";
 /// Finite slot count. Exhaustion refuses a new slot.
 pub const MAX_SLOTS: usize = 32;
 /// Finite ledger file size including the atomic temp.

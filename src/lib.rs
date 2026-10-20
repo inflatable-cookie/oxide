@@ -18,3 +18,8 @@ pub mod lease;
 /// Bounded decoder for Cargo's encoded dep-info, kept as input for the
 /// cross-checkout freshness gate.
 pub mod dep_info;
+
+/// Identity, descriptor binding and flush of a removable APFS volume for the
+/// `apfs-volume-v1` pool backend.
+#[cfg(unix)]
+pub mod volume;

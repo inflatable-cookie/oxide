@@ -26,11 +26,11 @@ use crate::identity::SlotKey;
 use crate::process;
 use crate::watchdog::Watchdog;
 use oxide_storage::lease::managed::{
-    evict_idle_slot, init_budget_pool, lease, recover, release, status as pool_status,
+    evict_idle_slot, flush_volume, init_budget_pool, lease, recover, release, status as pool_status,
 };
 use oxide_storage::lease::{
     init_pool, LeaseError, LeaseRequest, PoolStatus, Profile as LeaseProfile, SlotOccupancy,
-    SlotStatus, BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME,
+    SlotStatus, BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME, VOLUME_BACKEND_APFS_V1,
 };
 use oxide_storage::BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1;
 use serde::{Deserialize, Serialize};
@@ -62,6 +62,8 @@ const STATE_VERSION: u32 = 1;
 const MAX_ORIGIN_BYTES: u64 = 8 * 1024 * 1024;
 const ORIGIN_VERSION: u32 = 1;
 const WAIT_POLL: Duration = Duration::from_millis(200);
+/// Removable-volume flushes kept for `oxide status`, newest last.
+const MAX_FLUSHES: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +75,10 @@ enum Phase {
     Spawning,
     /// Cargo runs as leader of `process_group`.
     Running,
+    /// A removable-volume slot whose flush before release failed or is
+    /// unknown. Its lease stays held: never reused, recovered or deleted
+    /// here.
+    Retired,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -97,6 +103,16 @@ struct Record {
     /// between that recovery and moving it into the log.
     #[serde(default)]
     pending_recovery: Option<Recovery>,
+    /// Why a [`Phase::Retired`] slot was retired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retired: Option<String>,
+}
+
+impl Record {
+    /// Holds a command now: neither idle nor retired.
+    fn active(&self) -> bool {
+        !matches!(self.phase, Phase::Idle | Phase::Retired)
+    }
 }
 
 /// The `oxide` process holding a record, and the lease holder string it
@@ -138,6 +154,18 @@ pub struct Recovery {
     pub recovered_by: u32,
 }
 
+/// One flush of a removable-volume pool before a slot went idle.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Flush {
+    pub slot_id: String,
+    pub at_ms: u64,
+    /// `None` when the flush failed and the slot was retired.
+    pub micros: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Ticket {
@@ -170,6 +198,8 @@ struct State {
     records: Vec<Record>,
     #[serde(default)]
     recoveries: Vec<Recovery>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    flushes: Vec<Flush>,
 }
 
 impl Default for State {
@@ -182,6 +212,7 @@ impl Default for State {
             cleans: Vec::new(),
             records: Vec::new(),
             recoveries: Vec::new(),
+            flushes: Vec::new(),
         }
     }
 }
@@ -209,6 +240,13 @@ impl State {
         record.holder = None;
         record.lease_id = None;
         record.pending_recovery = None;
+    }
+
+    fn log_flush(&mut self, flush: Flush) {
+        if self.flushes.len() >= MAX_FLUSHES {
+            self.flushes.remove(0);
+        }
+        self.flushes.push(flush);
     }
 
     fn log_recovery(&mut self, recovery: Recovery) {
@@ -260,7 +298,9 @@ fn return_path(record: &Record, slot: &SlotStatus) -> Return {
         (false, _, _) => Return::NotOwn,
         (true, Phase::Acquiring, _) => Return::NeverStarted,
         (true, Phase::Running, Some(group)) => Return::GroupEmpty(group),
-        (true, Phase::Running | Phase::Spawning | Phase::Idle, _) => Return::GroupUnrecorded,
+        (true, Phase::Running | Phase::Spawning | Phase::Idle | Phase::Retired, _) => {
+            Return::GroupUnrecorded
+        }
     }
 }
 
@@ -362,6 +402,7 @@ pub enum Cleaning {
 /// Pool and slot view for `oxide status`.
 pub struct Report {
     pub pool: PoolStatus,
+    pub flushes: Vec<Flush>,
     pub waiting: usize,
     pub cleaning: Vec<PathBuf>,
     pub slots: Vec<SlotView>,
@@ -378,6 +419,8 @@ pub struct SlotView {
     /// Cargo's group is empty; if the group was never recorded,
     /// `oxide-storage-lease recover` is explicit.
     pub interrupted: Option<Interrupted>,
+    /// Why a removable-volume slot was retired and stays held.
+    pub retired: Option<String>,
 }
 
 pub struct Interrupted {
@@ -388,7 +431,13 @@ pub struct Interrupted {
 pub struct Store {
     pub pool: PathBuf,
     pub backend: Backend,
+    /// The slot payload root: `<pool>/payload`, or the directory on the
+    /// removable volume.
+    pub payload: PathBuf,
     control: PathBuf,
+    /// The other pool's `state.json` when a removable pool is registered, so
+    /// the host-wide build limit counts both pools.
+    sibling: Option<PathBuf>,
 }
 
 /// The pool's recorded backend.
@@ -399,6 +448,10 @@ pub enum Backend {
     /// Plain directory: admission and idle eviction against a recorded
     /// budget, plus the best-effort host-reserve watchdog. No ceiling.
     DirectoryBudget,
+    /// A directory on a registered removable APFS volume: admission against
+    /// a recorded budget, volume reserve checked when a build starts, flush
+    /// before a slot goes idle. No ceiling of its own.
+    ApfsVolume,
 }
 
 impl Backend {
@@ -406,6 +459,7 @@ impl Backend {
         match self {
             Self::ApfsImage => BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1,
             Self::DirectoryBudget => BUDGET_BACKEND_DIRECTORY_V1,
+            Self::ApfsVolume => VOLUME_BACKEND_APFS_V1,
         }
     }
 
@@ -416,6 +470,9 @@ impl Backend {
             Self::DirectoryBudget => {
                 "budget-only: admission estimate plus best-effort reserve watchdog, no hard ceiling"
             }
+            Self::ApfsVolume => {
+                "budget-only on a removable volume: admission estimate, volume reserve checked when a build starts, no hard ceiling"
+            }
         }
     }
 
@@ -423,6 +480,7 @@ impl Backend {
         match tag {
             BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1 => Ok(Self::ApfsImage),
             BUDGET_BACKEND_DIRECTORY_V1 => Ok(Self::DirectoryBudget),
+            VOLUME_BACKEND_APFS_V1 => Ok(Self::ApfsVolume),
             other => Err(format!("the pool records an unknown backend {other:?}")),
         }
     }
@@ -458,7 +516,7 @@ pub fn requested_cap(backend: Backend) -> Result<Option<u64>, String> {
     parse_cap(value, backend).map(Some)
 }
 
-fn parse_cap(value: &str, backend: Backend) -> Result<u64, String> {
+pub fn parse_cap(value: &str, backend: Backend) -> Result<u64, String> {
     let digits = value.bytes().take_while(u8::is_ascii_digit).count();
     let (number, unit) = value.split_at(digits);
     let scale: u64 = match unit {
@@ -479,7 +537,7 @@ fn parse_cap(value: &str, backend: Backend) -> Result<u64, String> {
         })?;
     let minimum = match backend {
         Backend::ApfsImage => MIN_APFS_CAP_BYTES,
-        Backend::DirectoryBudget => MIN_BUDGET_CAP_BYTES,
+        Backend::DirectoryBudget | Backend::ApfsVolume => MIN_BUDGET_CAP_BYTES,
     };
     if bytes % (1024 * 1024) != 0 || !(minimum..=MAX_CAP_BYTES).contains(&bytes) {
         return Err(format!(
@@ -497,7 +555,7 @@ pub fn creation_cap(backend: Backend) -> Result<u64, String> {
     Ok(match (requested_cap(backend)?, backend) {
         (Some(cap), _) => cap,
         (None, Backend::DirectoryBudget) => budget_bytes(),
-        (None, Backend::ApfsImage) => DEFAULT_CAP_BYTES,
+        (None, Backend::ApfsImage | Backend::ApfsVolume) => DEFAULT_CAP_BYTES,
     })
 }
 
@@ -572,6 +630,35 @@ impl Store {
         Ok(store)
     }
 
+    /// Open the registered removable pool whose config and ledger live in
+    /// `root` (internal) and whose payload is `payload` on the volume. The
+    /// library verifies the volume on every open. The pool-creation
+    /// environment does not apply to it.
+    pub fn open_removable(root: &Path, payload: PathBuf) -> Result<Self, String> {
+        let pool = fs::canonicalize(root)
+            .map_err(|error| format!("cannot open the removable pool: {error}"))?;
+        let status = pool_status(&pool)
+            .map_err(|error| lease_error("cannot open the removable pool", &error))?;
+        if Backend::recorded(&status.backend)? != Backend::ApfsVolume {
+            return Err("the removable pool records another backend".to_owned());
+        }
+        let store = Self {
+            control: pool.join(MANAGED_NAME),
+            pool,
+            backend: Backend::ApfsVolume,
+            payload,
+            sibling: None,
+        };
+        store.ensure_control()?;
+        Ok(store)
+    }
+
+    /// The private control directory, which holds the removable
+    /// registration and pool of an internal pool.
+    pub fn control(&self) -> &Path {
+        &self.control
+    }
+
     /// Open an existing pool. Never creates one.
     pub fn open_existing() -> Result<Option<Self>, String> {
         let path = pool_path()?;
@@ -605,16 +692,18 @@ impl Store {
                     status.cap_bytes / (1024 * 1024),
                     match backend {
                         Backend::ApfsImage => "cap",
-                        Backend::DirectoryBudget => "budget",
+                        Backend::DirectoryBudget | Backend::ApfsVolume => "budget",
                     }
                 );
             }
         }
         let control = pool.join(MANAGED_NAME);
         Ok(Self {
+            payload: pool.join("payload"),
             pool,
             backend,
             control,
+            sibling: None,
         })
     }
 
@@ -622,8 +711,8 @@ impl Store {
     /// budget-only pool has one; the APFS image's ceiling is the OS's.
     pub fn watchdog(&self) -> Option<Watchdog> {
         match self.backend {
-            Backend::ApfsImage => None,
-            Backend::DirectoryBudget => Some(Watchdog::for_pool(&self.pool.join("payload"))),
+            Backend::ApfsImage | Backend::ApfsVolume => None,
+            Backend::DirectoryBudget => Some(Watchdog::for_pool(&self.payload)),
         }
     }
 
@@ -698,6 +787,9 @@ impl Store {
     /// slot's compile origin (`None`: untrusted from now on).
     pub fn release(&self, held: Lease, origin: Option<Built>) -> Result<(), String> {
         let _admission = self.admission()?;
+        if !self.flush_before_idle(&held.slot_id, held.record)? {
+            return Ok(());
+        }
         release(&self.pool, &held.lease_id)
             .map_err(|error| lease_error("could not release the slot", &error))?;
         let mut state = self.load()?;
@@ -717,6 +809,9 @@ impl Store {
     /// release it and give it back, origin unchanged.
     pub fn unshare(&self, held: Lease) -> Result<(), String> {
         let _admission = self.admission()?;
+        if !self.flush_before_idle(&held.slot_id, held.record)? {
+            return Ok(());
+        }
         release(&self.pool, &held.lease_id)
             .map_err(|error| lease_error("could not release the slot", &error))?;
         let mut state = self.load()?;
@@ -731,6 +826,89 @@ impl Store {
             self.write_origin(held.record, state.records[index].last_used, origin)?;
         }
         self.save(&state)
+    }
+
+    /// A removable-volume slot is flushed to the device before it can go
+    /// idle; any other backend returns `true` at once. A failed or unknown
+    /// flush retires the slot: the record becomes [`Phase::Retired`], the
+    /// lease stays held, and `false` tells the caller not to release. This is
+    /// a durability step after writer closure, not a closure proof. The
+    /// caller holds the admission lock.
+    fn flush_before_idle(&self, slot_id: &str, record: u64) -> Result<bool, String> {
+        if self.backend != Backend::ApfsVolume {
+            return Ok(true);
+        }
+        let outcome = flush_volume(&self.pool);
+        let mut state = self.load()?;
+        let flushed = match &outcome {
+            Ok(elapsed) => {
+                state.log_flush(Flush {
+                    slot_id: slot_id.to_owned(),
+                    at_ms: process::now_ms(),
+                    micros: Some(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)),
+                    error: None,
+                });
+                true
+            }
+            Err(error) => {
+                let reason = format!("flush before release failed: {error}");
+                eprintln!(
+                    "oxide: removable volume flush failed for slot {slot_id} ({error}); the slot is retired and stays held, never reused"
+                );
+                state.log_flush(Flush {
+                    slot_id: slot_id.to_owned(),
+                    at_ms: process::now_ms(),
+                    micros: None,
+                    error: Some(error.to_string()),
+                });
+                if let Some(entry) = state.records.iter_mut().find(|entry| entry.id == record) {
+                    entry.phase = Phase::Retired;
+                    entry.process_group = None;
+                    entry.retired = Some(reason);
+                }
+                false
+            }
+        };
+        self.save(&state)?;
+        Ok(flushed)
+    }
+
+    /// The last flush of this pool, for the summary line.
+    pub fn last_flush(&self) -> Option<Flush> {
+        self.load().ok()?.flushes.pop()
+    }
+
+    /// Count the other pool's active records for the host-wide limit. Its
+    /// state is replaced atomically, so it is read without its lock; a
+    /// command starting in the other pool at the same moment may briefly
+    /// exceed the limit by one.
+    pub fn with_sibling(mut self, control: &Path) -> Self {
+        self.sibling = Some(control.join("state.json"));
+        self
+    }
+
+    fn sibling_active(&self) -> usize {
+        let Some(path) = &self.sibling else {
+            return 0;
+        };
+        let Ok(Some(file)) = private_file(path, false) else {
+            return 0;
+        };
+        let mut bytes = Vec::new();
+        if file
+            .take(MAX_STATE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            return 0;
+        }
+        serde_json::from_slice::<State>(&bytes).map_or(0, |state| {
+            state
+                .records
+                .iter()
+                .filter(|record| record.active())
+                .count()
+        })
     }
 
     /// The gate cannot vouch for this checkout's own slot (no trusted record,
@@ -764,7 +942,7 @@ impl Store {
                 self.recover_settled(&mut state)?;
                 let busy = state.cleans.iter().any(|clean| clean.checkout == checkout)
                     || state.records.iter().any(|record| {
-                        record.checkout.as_deref() == Some(checkout) && record.phase != Phase::Idle
+                        record.checkout.as_deref() == Some(checkout) && record.active()
                     });
                 if !busy {
                     if state.cleans.len() >= MAX_TICKETS {
@@ -810,7 +988,9 @@ impl Store {
         let mut state = self.load()?;
         let mut detached = 0;
         for record in &mut state.records {
-            if record.checkout.as_deref() == Some(checkout) && record.phase == Phase::Idle {
+            if record.checkout.as_deref() == Some(checkout)
+                && matches!(record.phase, Phase::Idle | Phase::Retired)
+            {
                 record.checkout = None;
                 detached += 1;
             }
@@ -854,7 +1034,7 @@ impl Store {
                     managed: record.is_some(),
                     interrupted: record
                         .filter(|record| {
-                            record.phase != Phase::Idle
+                            record.active()
                                 && slot.state == SlotOccupancy::Held
                                 && !matches!(
                                     probe_lock(&self.lock_path(record.id), false),
@@ -865,11 +1045,13 @@ impl Store {
                             holder_pid: record.holder.as_ref().map(|holder| holder.pid),
                             path: return_path(record, slot),
                         }),
+                    retired: record.and_then(|record| record.retired.clone()),
                 }
             })
             .collect();
         Ok(Report {
             pool,
+            flushes: state.flushes,
             waiting: state.tickets.len(),
             cleaning: state
                 .cleans
@@ -884,11 +1066,11 @@ impl Store {
     /// Used and total bytes of the mounted payload volume; for a budget-only
     /// pool, slot allocation and the recorded budget.
     pub fn payload_use(&self) -> Option<(u64, u64)> {
-        if self.backend == Backend::DirectoryBudget {
+        if self.backend != Backend::ApfsImage {
             let status = self.status().ok()?;
             return Some((status.payload_unique_allocated_bytes?, status.cap_bytes));
         }
-        let sample = statfs(&self.pool.join("payload"))?;
+        let sample = statfs(&self.payload)?;
         let block = u64::try_from(sample.f_bsize).ok()?;
         let total = sample.f_blocks.checked_mul(block)?;
         let free = sample.f_bfree.checked_mul(block)?;
@@ -927,8 +1109,9 @@ impl Store {
         let active = state
             .records
             .iter()
-            .filter(|record| record.phase != Phase::Idle)
-            .count();
+            .filter(|record| record.active())
+            .count()
+            + self.sibling_active();
         if active >= max_active {
             self.save(&state)?;
             return Ok(Err(Wait::HostLimit(active)));
@@ -940,7 +1123,8 @@ impl Store {
             status.slots.iter().any(|slot| slot.project == project)
         };
         let matches = |record: &Record| {
-            record.checkout.as_deref() == Some(key.checkout.as_path())
+            record.phase != Phase::Retired
+                && record.checkout.as_deref() == Some(key.checkout.as_path())
                 && record.compatibility == key.compatibility
         };
         let stale: Vec<u64> = state
@@ -1006,6 +1190,7 @@ impl Store {
             let project_slots = state
                 .records
                 .iter()
+                .filter(|record| record.phase != Phase::Retired)
                 .filter(|record| record.identity == key.identity && has_slot(record))
                 .count();
             if project_slots >= PROJECT_SLOT_CAP {
@@ -1059,6 +1244,7 @@ impl Store {
                     holder: None,
                     lease_id: None,
                     pending_recovery: None,
+                    retired: None,
                 });
                 state.records.len() - 1
             }
@@ -1141,7 +1327,7 @@ impl Store {
         let mut status: Option<PoolStatus> = None;
         for index in 0..state.records.len() {
             let record = &state.records[index];
-            if record.phase == Phase::Idle {
+            if !record.active() {
                 continue;
             }
             let Probe::Free(_owner) = probe_lock(&self.lock_path(record.id), true)? else {
@@ -1188,6 +1374,12 @@ impl Store {
                     // event is durable before the ledger changes.
                     state.records[index].pending_recovery = Some(recovery.clone());
                     self.save(state)?;
+                    let record_id = state.records[index].id;
+                    if !self.flush_before_idle(&recovery.slot_id, record_id)? {
+                        // Retired on disk; keep this copy in step.
+                        *state = self.load()?;
+                        continue;
+                    }
                     recover(&self.pool, &recovery.lease_id)
                         .map_err(|error| lease_error("cannot recover a settled slot", &error))?;
                     eprintln!(
@@ -1508,6 +1700,11 @@ fn create_pool(path: &Path, backend: Backend, cap: u64) -> Result<(), String> {
             );
             init_budget_pool(&pool, cap)
         }
+        Backend::ApfsVolume => {
+            return Err(
+                "a removable pool is created only by `oxide pool register-removable`".to_owned(),
+            )
+        }
     };
     match created {
         Ok(_) => Ok(()),
@@ -1664,6 +1861,7 @@ mod tests {
             }),
             lease_id: lease_id.map(str::to_owned),
             pending_recovery: None,
+            retired: None,
         }
     }
 
