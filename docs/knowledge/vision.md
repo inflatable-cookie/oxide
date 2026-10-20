@@ -514,6 +514,9 @@ Tom's ruling, 2026-10-20: "I think we can remove the legacy lease tool and proba
   - Tom approved deleting both existing disk-image pools once idle: Oxide's default pool (`~/Library/Caches/oxide/pool`) and Nucleus's build-cache pool (`~/.config/nucleus/prod/build-cache`).
   - Retirement no longer waits for the Nucleus trial. Nucleus's lease-CLI integration may break temporarily; its designed refusal path is a cold private build.
 
+Tom's ruling, 2026-10-20: the internal pool lives at `~/Dev/oxide` ("~/Dev/oxide is fine"), with a 100 GB budget, set through the user config file the retirement task (#102) adds.
+- Observed when the choice was made: `~/Dev/oxide` did not exist, `~/Dev` is not a Git work tree, and `tmutil isexcluded ~/Dev` reports `[Excluded]`. All of `~/Dev` is already outside Time Machine.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
