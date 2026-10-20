@@ -106,6 +106,14 @@ run = "python3 scripts/test-oxide-cli.py --toolchain-context"
 admission = "heavy"
 run = "python3 scripts/test-sccache-compatibility.py"
 
+# Synthetic regressions for that harness's supervision (post-launch clock
+# expiry, parse failure and interrupt during staging, unreadable writer
+# sources, monitor failure, private temp binding, launcher render). Only
+# `sh`/`sleep` children in one fresh /private/tmp directory; no Cargo,
+# sccache, pool or image.
+[tasks."rust:sccache-compatibility:synthetic"]
+run = "python3 scripts/test_sccache_harness.py"
+
 # Cargo version matrix (oxide#091): one logical proof per exact stable
 # release. Each stages `oxide` offline with the builder 1.97.1, then runs the
 # shipped freshness gate, stray detection and dep-info decoder under the

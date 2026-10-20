@@ -264,3 +264,48 @@ again with no native proof (the author clock ended at 10:53:36 UTC):
 
 Compatibility stays UNKNOWN, benefit INSUFFICIENT and write volume UNKNOWN.
 The harness has still never run natively.
+
+## Owner correction phase (2026-10-20, review 6289278937)
+
+Owner ruling at 10:57:58 UTC under Tom's standing routine-correction
+authority: one separate phase, author until 11:42:58 UTC, three named
+harness repairs, no proof replenishment. The original clock, the spent
+10:05 UTC submission and reviews 6289051691, 6289170915 and 6289278937 stay
+as recorded. Phase start 10:58:32 UTC; no owned resources were live (the
+only `/private/tmp/oxide-validation.*` directory from this task, created at
+10:05 UTC, was empty; no `sc096` process or image).
+
+1. Clock and supervision. Effects stop at 255 s; 45 s inside the 300 s
+   proof are reserved for teardown. `stage_build` checks the clock before
+   creating the child; from then on any exception (clock, breach, artifact
+   parse, interrupt) settles the staging group with a bounded SIGKILL, reap
+   and ESRCH wait before propagating. Success also requires the whole group
+   to be gone. `main` runs every effect under one `try` that settles all
+   owned writers by the reserved deadline, detaches the image only after
+   positive closure and otherwise prints the held identities.
+2. Writer discovery. Registered children, the launcher log, Oxide's state
+   records and registered servers are read independently. A malformed,
+   unreadable or racing source becomes an UNKNOWN entry that keeps the
+   resources held; it does not stop signals to the other known targets, and
+   one failed signal does not stop the rest. A target seen ESRCH is marked
+   settled and never signalled again, so a PID reused after an owned writer
+   exited is not hit (the monitor scans every 250 ms; reuse within that
+   window is the remaining limit). A monitor-thread failure kills the
+   writers and interrupts the main thread. Owned-byte walks count a file
+   deleted between listing and `lstat` as zero; any other error is a breach.
+3. Temp containment. `TMPDIR`, `TMP`, `TEMP` and `OXIDE_TASK_SCRATCH_ROOT`
+   are bound to `<parent>/tmp` before staging or any helper, and every child
+   environment inherits them.
+
+Regressions: `effigy rust:sccache-compatibility:synthetic`
+([script](../../../../scripts/test_sccache_harness.py)), 7 cases with real
+`sh`/`sleep` children in a fresh `/private/tmp` directory: clock expiry
+after the staging child exists, parse failure with a live group member, an
+interrupt during staging, malformed state plus an unreadable log plus an
+injected signal failure (the other child and the server are still killed;
+three UNKNOWN entries are reported), monitor failure (main interrupted,
+writer killed), sentinel temp paths absent from staging, base and fixture
+environments, and the launcher render. All 7 passed. The first run errored
+before any assertion: Effigy's `python3` is 3.9.6, which has no
+`Popen(process_group=)`, so the earlier native harness would also have
+failed at staging. The child is now started with `start_new_session=True`.

@@ -20,6 +20,7 @@ not product compatibility and not full QA.
 """
 from __future__ import annotations
 
+import _thread
 import hashlib
 import importlib.util
 import json
@@ -46,6 +47,10 @@ CACHE_LIMIT_BYTES = 64 * 1024 * 1024
 LOG_LIMIT_BYTES = 32 * 1024 * 1024
 CARGO_LIMIT = 96
 IDLE_SECONDS = 12
+# Reserved inside the 300 s proof for settling, closure checks and detach;
+# effects stop at 300 - TEARDOWN_SECONDS.
+TEARDOWN_SECONDS = 45
+DEADLINE = [float("inf")]
 PAIRS = 3
 
 # Run by `oxide` as `cargo`, so it leads Oxide's Cargo process group. Only
@@ -88,7 +93,16 @@ FIXTURE = {
 
 
 class Monitor:
-    """Host reserve every 250 ms; owned bytes, logs and server PIDs."""
+    """Host reserve every 250 ms; owned bytes, logs, writers and closure.
+
+    Writers are discovered from independent sources, each read on its own:
+    registered Popen children, the launcher log (every line's PID leads a
+    Cargo group), Oxide's state records and registered servers. A target
+    seen ESRCH is marked settled and never signalled again, so a PID reused
+    by another process after this proof's writer exited is never hit. A
+    discovery or signal failure is kept as UNKNOWN; it never suppresses
+    attempts on the other targets.
+    """
 
     def __init__(self, parent: str):
         self.parent = parent
@@ -98,88 +112,133 @@ class Monitor:
         self.owned_peak = 0
         self.log_bytes = 0
         self.servers = {}
-        # Owned writers: Popen children leading their own groups, and every
-        # Cargo group leader the launcher log names.
         self.children = []
         self.cargo_log = None
+        self.settled = set()
+        self.unknown = []
+        self.kill = os.kill
+        self.killpg = os.killpg
         self.stop = threading.Event()
         self.thread = threading.Thread(target=self.loop, daemon=True)
 
     def loop(self) -> None:
-        # Any failed or racing reading is an unknown: it aborts the writers
-        # rather than silently ending the monitor.
+        # Any failure here aborts the writers and interrupts the main thread,
+        # whose supervision then settles and reports; the monitor never dies
+        # silently while children run.
         try:
             self.watch()
-        except Exception as error:
-            self.breach = self.breach or f"accounting failed: {error}"
+        except BaseException as error:
+            self.breach = self.breach or f"monitor failed: {error!r}"
+        if self.breach and not self.stop.is_set():
             self.stop_writers()
+            _thread.interrupt_main()
 
     def watch(self) -> None:
         while not self.stop.is_set():
-            try:
-                free = cli.host_free_bytes(self.parent)
-            except Exception as error:  # unknown reading stops the proof
-                self.breach = f"reserve reading failed: {error}"
-                self.stop_writers()
-                return
+            free = cli.host_free_bytes(self.parent)
             self.samples += 1
             self.free_min = free if self.free_min is None else min(self.free_min, free)
             if free < cli.HOST_RESERVE_BYTES:
                 self.breach = f"host free {free} below the 20 GiB reserve"
-            elif self.samples % 4 == 0:
-                owned = cli.tree_bytes(self.parent, True)
+                return
+            if self.samples % 4 == 0:
+                owned = owned_bytes(self.parent)
                 self.owned_peak = max(self.owned_peak, owned)
                 if owned > cli.SCRATCH_LIMIT_BYTES:
                     self.breach = f"owned {owned} exceeds 512 MiB"
-            if self.breach:
-                self.stop_writers()
-                return
+                    return
+            self.targets()
             self.stop.wait(0.25)
 
-    def groups(self) -> set:
-        found = {child.pid for child in self.children}
-        if self.cargo_log and os.path.exists(self.cargo_log):
-            with open(self.cargo_log, encoding="utf-8") as handle:
-                found.update(int(line.split("|", 1)[0]) for line in handle if line.split("|", 1)[0].isdigit())
+    def note(self, message: str) -> None:
+        if message not in self.unknown:
+            self.unknown.append(message)
+
+    def targets(self) -> tuple:
+        """Unsettled (groups, single PIDs). Settles anything already ESRCH."""
+        groups, pids = set(), set()
+        for child, leader in list(self.children):
+            (groups if leader else pids).add(child.pid)
+        if self.cargo_log:
+            try:
+                with open(self.cargo_log, encoding="utf-8") as handle:
+                    for line in handle:
+                        head = line.split("|", 1)[0]
+                        if head.isdigit():
+                            groups.add(int(head))
+            except FileNotFoundError:
+                pass
+            except Exception as error:
+                self.note(f"launcher log unreadable: {error!r}")
+        state = os.path.join(self.parent, "pool", "oxide-managed", "state.json")
         try:
-            with open(os.path.join(self.parent, "pool", "oxide-managed", "state.json"), encoding="utf-8") as handle:
-                found.update(r["process_group"] for r in json.load(handle)["records"] if r.get("process_group"))
+            with open(state, encoding="utf-8") as handle:
+                for record in json.load(handle)["records"]:
+                    if record.get("process_group"):
+                        groups.add(int(record["process_group"]))
         except FileNotFoundError:
             pass
-        return found
+        except Exception as error:
+            self.note(f"Oxide state unreadable: {error!r}")
+        pids.update(self.servers)
+        for kind, found, call in (("group", groups, self.killpg), ("pid", pids, self.kill)):
+            for target in list(found):
+                if (kind, target) in self.settled:
+                    found.discard(target)
+                elif cli.probe(call, target) == "ESRCH":
+                    self.settled.add((kind, target))
+                    found.discard(target)
+        return groups, pids
 
     def stop_writers(self) -> None:
-        """KILL every owned group (each launcher and staging build leads one)
-        and every registered server."""
-        for group in self.groups():
+        """SIGKILL every unsettled owned group and PID, each independently."""
+        try:
+            groups, pids = self.targets()
+        except Exception as error:
+            self.note(f"writer discovery failed: {error!r}")
+            groups = {child.pid for child, leader in self.children if leader}
+            pids = {child.pid for child, leader in self.children if not leader} | set(self.servers)
+        for kind, found, call in (("group", groups, self.killpg), ("pid", pids, self.kill)):
+            for target in found:
+                try:
+                    call(target, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except Exception as error:
+                    self.note(f"SIGKILL {kind} {target} failed: {error!r}")
+        for child, _ in list(self.children):
             try:
-                os.killpg(group, signal.SIGKILL)
-            except OSError:
-                pass
-        for pid in self.servers:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
-
-    def closed(self, seconds: float = 10) -> list:
-        """Positive closure: every owned group and server ESRCH. Returns what
-        is still not ESRCH (or unreadable) after a finite wait."""
-        deadline = time.monotonic() + seconds
-        while True:
-            try:
-                open_groups = [g for g in self.groups() if cli.probe(os.killpg, g) != "ESRCH"]
+                child.poll()
             except Exception as error:
-                return [f"unknown: {error}"]
-            pending = open_groups + [f"server {pid}" for pid in self.live_servers()]
-            if not pending or time.monotonic() > deadline:
-                return pending
+                self.note(f"reap {child.pid} failed: {error!r}")
+
+    def closed(self, until: float) -> list:
+        """Positive closure by `until` (monotonic): every owned group and PID
+        ESRCH and no UNKNOWN. Returns what is still open or unknown."""
+        while True:
+            for child, _ in list(self.children):
+                try:
+                    child.poll()
+                except Exception as error:
+                    self.note(f"reap {child.pid} failed: {error!r}")
+            try:
+                groups, pids = self.targets()
+            except Exception as error:
+                self.note(f"writer discovery failed: {error!r}")
+                groups, pids = set(), set()
+            pending = [f"group {g}" for g in sorted(groups)] + [f"pid {p}" for p in sorted(pids)]
+            if not pending or time.monotonic() >= until:
+                return pending + [f"UNKNOWN {message}" for message in self.unknown]
             time.sleep(0.1)
+
+    def settle(self, until: float) -> list:
+        self.stop_writers()
+        return self.closed(until)
 
     def check(self, phase: str) -> None:
         if self.breach:
             cli.fail(f"{phase}: {self.breach}")
-        owned = cli.tree_bytes(self.parent, True)
+        owned = owned_bytes(self.parent)
         self.owned_peak = max(self.owned_peak, owned)
         print(f"sample {phase}: {cli.remaining():.0f} s left, owned {owned // 1024} KiB, reserve samples {self.samples}, host free min {(self.free_min or 0) // (1024 * 1024)} MiB")
         if owned > cli.SCRATCH_LIMIT_BYTES:
@@ -194,6 +253,77 @@ class Monitor:
 
     def live_servers(self) -> list:
         return [pid for pid in self.servers if cli.probe(os.kill, pid) != "ESRCH"]
+
+
+def owned_bytes(root: str) -> int:
+    """`cli.tree_bytes` accounting, except that a file removed between
+    listing and lstat occupies nothing and counts zero. Any other error
+    propagates as an unknown reading."""
+    total = 0
+
+    def raise_error(error: OSError) -> None:
+        if not isinstance(error, FileNotFoundError):
+            raise error
+
+    for current, dirs, files in os.walk(root, followlinks=False, onerror=raise_error):
+        dirs[:] = [name for name in dirs if not os.path.ismount(os.path.join(current, name))]
+        for name in files:
+            try:
+                metadata = os.lstat(os.path.join(current, name))
+            except FileNotFoundError:
+                continue
+            if (metadata.st_mode & 0o170000) == 0o120000:
+                continue
+            allocated = metadata.st_blocks * 512
+            total += allocated if name == "image.sparseimage" else max(metadata.st_size, allocated)
+    return total
+
+
+def bind_temp(parent: str) -> str:
+    """One fresh private temp directory under the owned parent, bound for this
+    process and every child before staging or any helper runs."""
+    tmp = os.path.join(parent, "tmp")
+    os.makedirs(tmp, mode=0o700, exist_ok=True)
+    tmp = os.path.realpath(tmp)
+    for name in ("TMPDIR", "TMP", "TEMP", "OXIDE_TASK_SCRATCH_ROOT"):
+        os.environ[name] = tmp
+    return tmp
+
+
+def stage_build(monitor: Monitor, argv: list, cwd: str, env: dict) -> dict:
+    """Run the staging build as its own process group under unconditional
+    supervision: any failure after the child exists (clock, breach, parse,
+    interrupt) settles the group within the reserved teardown time before
+    propagating. Success also requires the whole group to be gone."""
+    cli.remaining()
+    build = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, text=True, start_new_session=True)
+    monitor.children.append((build, True))
+    try:
+        out, _ = build.communicate(timeout=cli.remaining())
+        if monitor.breach:
+            cli.fail(f"staging stopped: {monitor.breach}")
+        if build.returncode:
+            cli.fail(f"staging exit {build.returncode}")
+        executables = {}
+        for line in out.splitlines():
+            if line.startswith("{"):
+                message = json.loads(line)
+                if message.get("reason") == "compiler-artifact" and message.get("executable"):
+                    executables[message["target"]["name"]] = message["executable"]
+        pending = monitor.closed(min(DEADLINE[0], time.monotonic() + 5))
+        if pending:
+            cli.fail(f"staging group not closed: {pending}")
+        return executables
+    except BaseException:
+        pending = monitor.settle(min(DEADLINE[0], time.monotonic() + TEARDOWN_SECONDS))
+        try:
+            build.wait(timeout=max(0.1, DEADLINE[0] - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            pending.append(f"staging leader {build.pid} unreaped")
+        if build.stdout:
+            build.stdout.close()
+        print(f"staging failed; closure pending {pending or 'none'}", file=sys.stderr)
+        raise
 
 
 def sha256_file(path: str) -> str:
@@ -351,6 +481,7 @@ class Proof:
     def held(self, cwd: str, label: str, idle: int):
         hold = os.path.join(self.parent, f"hold-{label}")
         child, log = self.runner.start(cwd, ["check"], label, self.wrapped({"FIXTURE_HOLD": hold, "FIXTURE_IDLE": str(idle)}))
+        self.monitor.children.append((child, False))
         cli.wait_for(lambda: os.path.exists(hold + ".ready"), f"{label} server start", 60)
         found = self.collect(label)
         if len(found["servers"]) != 1:
@@ -480,14 +611,40 @@ def main() -> int:
     if sys.platform != "darwin":
         cli.fail("the sccache compatibility proof requires macOS")
     cli.STARTED = time.monotonic()
+    DEADLINE[0] = cli.STARTED + 300
+    # Every cli helper's clock now ends where teardown's reserve begins.
+    cli.PROOF_SECONDS = 300 - TEARDOWN_SECONDS
     admitted = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    cli.reserve(os.environ.get("OXIDE_TASK_SCRATCH_ROOT") or "/private/tmp", "admission", "sccache")
+    provided = os.environ.get("OXIDE_TASK_SCRATCH_ROOT")
+    cli.reserve(provided or "/private/tmp", "admission", "sccache")
     root = cli.scratch_root()
     parent = os.path.join(root, "sc096")
     os.makedirs(parent, mode=0o700, exist_ok=False)
+    tmp = bind_temp(parent)
     monitor = Monitor(parent)
     monitor.thread.start()
-    print(f"sccache proof admitted {admitted}, scratch {parent}")
+    payload = [None]
+    try:
+        return run(monitor, parent, root, provided, tmp, admitted, payload)
+    except BaseException:
+        monitor.stop.set()
+        until = max(time.monotonic() + 1, DEADLINE[0] - 5)
+        pending = monitor.settle(until)
+        if pending:
+            print(f"UNKNOWN closure: {pending}; image {payload[0]} and scratch {parent} stay held", file=sys.stderr)
+        elif payload[0] and os.path.ismount(payload[0]):
+            detach = subprocess.run(
+                ["/usr/bin/hdiutil", "detach", payload[0]], capture_output=True, text=True,
+                timeout=max(1, DEADLINE[0] - time.monotonic()),
+            )
+            print(f"owned writers closed; detach exit {detach.returncode}; retained scratch {parent}", file=sys.stderr)
+        else:
+            print(f"owned writers closed; no mounted image; retained scratch {parent}", file=sys.stderr)
+        raise
+
+
+def run(monitor: Monitor, parent: str, root: str, provided, tmp: str, admitted: str, payload: list) -> int:
+    print(f"sccache proof admitted {admitted}, scratch {parent}, private temp {tmp}")
     repo = os.path.dirname(HERE)
     host_home = os.environ.get("CARGO_HOME") or os.path.join(os.path.expanduser("~"), ".cargo")
     rustup_home = os.environ.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")
@@ -537,33 +694,12 @@ def main() -> int:
     builder = cli.toolchain_identity(stage, repo)
     if builder != cli.MATRIX[cli.BUILDER]:
         cli.fail(f"builder is not {cli.BUILDER}: {builder}")
-    build = subprocess.Popen(
+    executables = stage_build(
+        monitor,
         ["cargo", "build", "--locked", "--offline", "--bin", "oxide", "--bin", "oxide-storage-lease", "--message-format=json-render-diagnostics"],
-        cwd=repo, env=stage, stdout=subprocess.PIPE, text=True, process_group=0,
+        repo,
+        stage,
     )
-    monitor.children.append(build)
-    try:
-        out, _ = build.communicate(timeout=cli.remaining())
-    except subprocess.TimeoutExpired:
-        # Settle the staging group before failing: KILL, reap, then require
-        # ESRCH for the whole group.
-        os.killpg(build.pid, signal.SIGKILL)
-        build.communicate()
-        # Own bounded wait: cli.wait_gone consults the expired proof clock.
-        deadline = time.monotonic() + 10
-        while cli.probe(os.killpg, build.pid) != "ESRCH" and time.monotonic() < deadline:
-            time.sleep(0.1)
-        state = cli.probe(os.killpg, build.pid)
-        print(f"staging timed out; group {build.pid} {state}; scratch {parent} held", file=sys.stderr)
-        raise
-    if monitor.breach or build.returncode:
-        cli.fail(f"staging exit {build.returncode} {monitor.breach or ''}")
-    executables = {}
-    for line in out.splitlines():
-        if line.startswith("{"):
-            message = json.loads(line)
-            if message.get("reason") == "compiler-artifact" and message.get("executable"):
-                executables[message["target"]["name"]] = message["executable"]
     if set(executables) != {"oxide", "oxide-storage-lease"}:
         cli.fail(f"staging artifacts {sorted(executables)}")
     monitor.check("after staging, before seed removal")
@@ -606,24 +742,14 @@ def main() -> int:
     os.chmod(launcher, 0o755)
     inputs = sum(len(text.encode()) for text in FIXTURE.values())
     print(f"fixture inputs: {inputs} bytes per checkout")
+    payload[0] = os.path.join(runner.pool, "payload")
     code, _, stderr = runner.run(
         parent, ["--pool", runner.pool, "init", "--cap-bytes", str(cli.IMAGE_BYTES), "--image-bytes", str(cli.IMAGE_BYTES)], program=runner.lease
     )
     cli.expect(code, 0, "pool init", stderr)
     proof = Proof(parent, monitor, runner, sc, real_cargo)
-    payload = os.path.join(runner.pool, "payload")
-    try:
-        report = prove(proof)
-    except Exception:
-        if monitor.breach:
-            monitor.stop_writers()
-        pending = monitor.closed()
-        if pending:
-            print(f"UNKNOWN closure: {pending} not ESRCH; image {payload} and scratch {parent} stay held", file=sys.stderr)
-        else:
-            detach = subprocess.run(["/usr/bin/hdiutil", "detach", payload], capture_output=True, text=True, timeout=60)
-            print(f"no owned server alive; detach exit {detach.returncode}; retained scratch {parent}", file=sys.stderr)
-        raise
+    payload[0] = os.path.join(runner.pool, "payload")
+    report = prove(proof)
     with open(cargo_log, encoding="utf-8") as handle:
         calls = handle.read().splitlines()
     monitor.emit("launcher Cargo calls", "\n".join(calls) + "\n")
@@ -631,11 +757,11 @@ def main() -> int:
     report["cargo_processes"] = {"staging": 1, "toolchain_version": 1, "fixture": len(calls), "total": total}
     if total > CARGO_LIMIT:
         cli.fail(f"{total} Cargo driver processes exceed {CARGO_LIMIT}")
-    pending = monitor.closed(0)
+    pending = monitor.closed(time.monotonic())
     if pending:
         cli.fail(f"owned groups or servers not closed before cleanup: {pending}")
     monitor.check("before detach")
-    detach = subprocess.run(["/usr/bin/hdiutil", "detach", payload], capture_output=True, text=True, timeout=60)
+    detach = subprocess.run(["/usr/bin/hdiutil", "detach", payload[0]], capture_output=True, text=True, timeout=60)
     if detach.returncode:
         cli.fail(f"detach failed after positive closure: {detach.stderr}")
     monitor.stop.set()
@@ -645,13 +771,13 @@ def main() -> int:
     report["servers"] = monitor.servers
     report["resources"] = {"owned_peak_bytes": monitor.owned_peak, "host_free_min_bytes": monitor.free_min, "reserve_samples": monitor.samples, "output_bytes": monitor.log_bytes}
     shutil.rmtree(parent)
-    if not os.environ.get("OXIDE_TASK_SCRATCH_ROOT"):
+    if not provided:
         os.rmdir(root)
     elapsed = time.monotonic() - cli.STARTED
     report["elapsed_s"] = round(elapsed, 1)
     print("report " + json.dumps(report, sort_keys=True))
-    if elapsed > cli.PROOF_SECONDS:
-        cli.fail(f"proof took {elapsed:.0f} s, over {cli.PROOF_SECONDS} s including cleanup")
+    if elapsed > 300:
+        cli.fail(f"proof took {elapsed:.0f} s, over 300 s including cleanup")
     print(f"sccache proof completed: {elapsed:.0f} s including cleanup, scratch removed")
     return 0
 
