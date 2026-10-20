@@ -489,6 +489,8 @@ Tom's ruling, 2026-10-20, on remote builds: deferred. "Let's focus on the extern
 - Oracle Always Free was considered and not pursued: reports say the free Arm allowance is now 2 OCPU / 12 GB, with idle reclamation.
 - The executor seam in [workflow — Execution location](contracts/workflow.md#execution-location) stays as designed, with only the local executor.
 
+Tom, 2026-10-20 ("Yeah that works"), after #101: keep the #099 bypass. Measure cold-slot frequency and cost from dogfood use, and reconsider sccache (the unqualified candidate: no-build-script units only, client-side mode, an Oxide-owned endpoint and a scrubbed environment) only if cold builds show a real cost. Cargo's own cross-workspace cache is the preferred long-term complement.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
