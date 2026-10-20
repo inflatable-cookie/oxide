@@ -596,6 +596,7 @@ Tom, 2026-10-20, approved three changes ("1. Approve 2. Approve 3. Approve!") af
    - The cache is 52 GB at `~/Library/Caches/acowtancy-farmyard-managed-target` and is not Oxide-managed.
    - Condition: the setup refuses when `/Volumes/Builds` is not the mounted registered volume, so an undocked start never creates a `/Volumes/Builds/...` path on the internal disk.
    - Acowtancy owns the change.
+   - **Superseded the same day.** Tom approved Acowtancy's T-5 retirement of the container Rust ladder ("Approve both"). Normal Farmyard QA already builds on the host, so #671 closes unfinished and the 52 GB cache is deleted after T-5 merges. Farmyard's host QA reaches the Builds drive through Oxide once #670 merges.
 
 Tom, 2026-10-20, "Approve": the post-#102 Builds cutover bridge.
 - **Gap:** the #102 binary refuses a removable registration under a previous pool root, no command retires one, and registration requires an empty payload. Installing #102 as-is would send every Oxide build to the internal SSD.
