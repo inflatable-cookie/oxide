@@ -4,7 +4,16 @@ Scope: whether a cache shared across builds can keep Oxide's exclusive-slot
 release and recovery semantics, and what it costs on a tiny fixture. Evidence
 only: no production Rust change, no auto-detection or enabling, no wrapper
 chaining, no installation. The user's and Effigy's machine-wide sccache
-server, cache and config were never started, stopped, queried or read.
+server and cache were never started, stopped or queried. The machine-wide
+Cargo config was not fully isolated. Cargo reads the config of every
+ancestor directory, and the checkout lies under `/Users/tom`, so product
+staging's Cargo read `~/.cargo/config.toml`. A private `CARGO_HOME`/`HOME`
+does not stop that lookup. Staging overrode only its `rustc-wrapper` with
+`RUSTC_WRAPPER=""`; any other keys in that file would have applied to
+staging. Its contents were not inspected, and an empty private sccache
+directory was the only check that no wrapper ran. Fixture checkouts under
+`/private/tmp` have no such ancestor config. That follows from Cargo's
+documented lookup and was not observed.
 
 Final delivery is documentation and evidence only. The executable proof
 harness, its synthetic regressions, their Effigy selectors and the `AGENTS.md`
@@ -153,9 +162,11 @@ output, one 128 MiB APFS pool, 64 MiB cache, 96 Cargo driver processes.
 1. Staging: clean checkout required; Cargo.lock's 22 cached archives (checksums
    verified) and index entries copied into a private `CARGO_HOME`; offline
    `cargo build --locked` with 1.97.1. The checkout's ancestors include the
-   machine-wide `~/.cargo/config.toml`, so staging sets `RUSTC_WRAPPER=""`
-   and points every sccache variable at an empty private directory, which must
-   still be empty afterwards. Receipt: commit, tree, toolchain, binary hashes.
+   machine-wide `~/.cargo/config.toml`, which Cargo therefore reads despite
+   the private Cargo home. Staging sets `RUSTC_WRAPPER=""` to override that
+   file's wrapper; it does not neutralise the file's other keys. Every
+   sccache variable points at an empty private directory, which must still be
+   empty afterwards. Receipt: commit, tree, toolchain, binary hashes.
 2. Fixture: `app` depending on `cfg-if =1.0.0` (seeded by copy), private HOME
    and Cargo home, all `SCCACHE_*` and wrapper variables removed (names
    logged, never values), private empty `SCCACHE_CONF`, private
@@ -209,8 +220,13 @@ Compatibility: UNKNOWN. Benefit: INSUFFICIENT. Write volume: UNKNOWN.
   (`src/bin/oxide/main.rs:127-128`), and sccache hashes every `CARGO_*`
   variable except four (`src/compiler/rust.rs:1580-1594`). The two
   environments were not diffed.
-- **Storage and writes:** no cache-size figure was recorded, and cache
-  occupancy or allocated bytes would not be write volume. No attributable
+- **Storage and writes:** after S1, S2 and S3, sccache's own `--show-stats`
+  reported `cache_size` 5,963, 11,923 and 14,135 bytes against a 64 MiB
+  maximum ([raw stats](raw/proof2-launches); `*.stop` prints 6, 12 and 14
+  KiB). These are sccache's occupancy accounting for the shared scratch
+  cache: not allocated bytes, and not write volume. The roughly doubled size
+  after S2 is consistent with S2 storing new entries rather than reusing
+  S1's. No allocated-byte or file count was recorded. No attributable
   write counter was available. Writes are UNKNOWN.
 
 ## Native proof 2
