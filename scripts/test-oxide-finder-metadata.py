@@ -78,6 +78,9 @@ class Proof:
         self.peak = 0
         self.low = None
         self.env = dict(os.environ)
+        # Child sessions not yet positively closed; while any remains,
+        # nothing is detached and the scratch is kept.
+        self.unclosed = set()
 
     def phase(self, label: str) -> None:
         free = shutil.disk_usage("/private/tmp").free
@@ -104,6 +107,33 @@ class Proof:
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
+        self.unclosed.add(child.pid)
+        try:
+            out, err = self.watch(child, command[0], deadline)
+        except BaseException:
+            # Any exception after spawn (KeyboardInterrupt, SIGTERM, a
+            # failed sample) closes the child's session before it unwinds.
+            self.close(child)
+            raise
+        self.unclosed.discard(child.pid)
+        return subprocess.CompletedProcess(command, child.returncode, out, err)
+
+    def close(self, child: subprocess.Popen) -> None:
+        """KILL the child's whole session, then reap its leader within
+        10 s. Only a reaped leader counts as closed; otherwise the pid stays
+        in `unclosed`. Members that left the session are not covered."""
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            child.communicate(timeout=10)
+        except BaseException as error:
+            print(f"session {child.pid} not positively closed: {error!r}", file=sys.stderr)
+            return
+        self.unclosed.discard(child.pid)
+
+    def watch(self, child: subprocess.Popen, name: str, deadline: float) -> tuple:
         # While the child runs, host free space is sampled every 250 ms; a
         # breach, a failed sample or the deadline kills its whole session.
         # communicate() keeps partial output across timeouts.
@@ -121,11 +151,9 @@ class Proof:
             if problem is None and time.monotonic() >= deadline:
                 problem = "deadline reached"
             if problem is not None:
-                os.killpg(child.pid, signal.SIGKILL)
-                child.communicate()
-                fail(f"{command[0]}: {problem}; its session was killed")
+                fail(f"{name}: {problem}; its session is killed")
             self.low = free if self.low is None else min(self.low, free)
-        return subprocess.CompletedProcess(command, child.returncode, out, err)
+        return out, err
 
     def oxide(self, args: list, label: str, cwd: str) -> tuple:
         result = self.run([self.binary, *args], cwd=cwd)
@@ -134,6 +162,8 @@ class Proof:
         return result.returncode, stdout, stderr
 
     def detach(self) -> None:
+        if self.unclosed:
+            fail(f"sessions {sorted(self.unclosed)} are not positively closed; no detach, evidence kept")
         if self.mount and os.path.ismount(self.mount):
             result = self.run(["/usr/bin/hdiutil", "detach", self.mount], timeout=60)
             if result.returncode:
@@ -326,6 +356,11 @@ def run(proof: Proof, repo: str) -> None:
     proof.detach()
 
 
+def terminated(signum, frame) -> None:
+    # SIGTERM unwinds like Ctrl-C, so Proof.run closes its child first.
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
 def main() -> int:
     if sys.platform != "darwin":
         fail("the Finder metadata proof requires macOS")
@@ -338,6 +373,7 @@ def main() -> int:
     for name in ("OXIDE_TASK_SCRATCH_ROOT", "TMPDIR", "TMP", "TEMP"):
         os.environ[name] = tmp
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    signal.signal(signal.SIGTERM, terminated)
     proof = Proof(root)
     try:
         run(proof, repo)
