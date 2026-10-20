@@ -14,7 +14,18 @@ Tom authorized planning and queueing the next bounded tranche on 2026-10-09. App
 
 When a change alters current truth, update its owning knowledge file in the same PR. Record operator rulings before yielding.
 
-Tom's 2026-10-10 blanket approval in [vision](docs/knowledge/vision.md#authority-boundaries) gives standing authority for routine Oxide-only corrections and equivalent bounded retries toward the agreed Rust reuse proof. Use scoped Queue briefs and independent review; do not re-request permission solely for a correction or fresh equivalent session. Each session retains its recorded time/storage/invocation caps and conservative uncertainty rules. Material scope changes still need an operator ruling.
+Tom's 2026-10-10 blanket approval in [vision](docs/knowledge/vision.md#authority-boundaries) gives standing authority for routine Oxide-only corrections and equivalent bounded retries toward the agreed Rust reuse proof. Use scoped Queue briefs and independent review; do not re-request permission solely for a correction or fresh equivalent session. Preserve historical session limits and evidence; new validation follows the policy below. Material scope changes still need an operator ruling.
+
+## Validate
+
+Tom approved risk-proportionate verification on 2026-10-20 ([vision](docs/knowledge/vision.md#product-workflow-direction)). Every product brief names its tier, covering Effigy selectors, wall-clock limit and scratch-disk budget.
+
+- **Standard, the default:** the author runs covering compile, format when applicable, unit/regression tests, docs checks when docs change, and the focused native proof. An independent reviewer reviews the exact published source, regressions and the author's evidence. The reviewer does not repeat the native proof or covering selectors; missing or inadequate evidence is reported honestly.
+- **Elevated:** add an independent reviewer native session for changes that delete or recycle storage, decide crash recovery or writer closure, or write to removable media. The brief states the trigger and focused selector. Fixture isolation does not by itself remove a product's elevated trigger.
+- Native proofs use a separately qualified shared runner or a short fixed script under existing host safeguards: Effigy heavy admission, the host-reserve watchdog, a wall-clock limit and scratch cleanup. Do not build a bespoke in-process supervision or accounting harness for each task. The removable-pool runner and selector are unqualified tooling; their existence does not qualify a shared runner.
+- Gate experiments on wall-clock time and a scratch-disk budget. Measure and report resource figures; Cargo-call, version-probe and monitor-timing counters are observations, not acceptance gates. Preserve product correctness, isolation, ownership and conservative handling of unknown writers. Do not reset active clocks or erase earlier failures. Explicit historical limits stay historical; a scoped amendment names any in-flight change.
+- Run targeted checks through Effigy, not raw tools. Do not run full `effigy qa` or repeat completed validation without a changed input or unresolved finding that warrants it. Milestone QA remains separate.
+- Tom may accept a task as-is. Record this as operator acceptance, preserve independent findings and missing evidence, and merge/close out without another publication-only review loop. If Queue cannot represent that disposition, raise the capability gap with its owner; do not fabricate a verdict or silently bypass a gate. A direct GitHub merge requires explicit scoped authorization and is reconciled through Queue's external-merge closeout.
 
 ## Effigy command map
 

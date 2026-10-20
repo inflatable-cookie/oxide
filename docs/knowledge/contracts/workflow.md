@@ -1432,7 +1432,9 @@ Rules:
 
 Approved design direction (Tom, 2026-10-20). The goal: while the laptop is docked, Oxide's build-data writes go to a dedicated external SSD, and undocking at any moment is safe, with work falling back to the internal SSD. Measured motivation: [internal SSD write baseline](../storage-efficiency.md#internal-ssd-write-baseline-2026-10-20).
 
-Part 1 (registration, selection and flush on release) is implemented and fixture-proven; part 2 (surprise removal, lost-volume leases, discard after unclean disappearance and final outputs on the volume) is not. No real drive is registered: real registration waits for part 2's reviewed merge and Tom formatting `OxideBuild`.
+Part 1 (registration, selection and flush on release) is implemented, with author fixture evidence and Tom's operator acceptance; the final independent native proof remains missing. Part 2 (surprise removal, lost-volume leases, discard after unclean disappearance and opt-in final outputs on the volume) is not implemented.
+
+Tom approved an early host trial on 2026-10-20. His `Builds` volume (`A6AC3ED7-33EA-46B4-8082-7254CF291ED2`, `/Volumes/Builds`) is registered and selected for the next build when present. The whole-MiB parser records an admission cap of 715255 MiB (749999226880 bytes, rounded down from 750 GB) and a reserve of 95368 MiB (100000595968 bytes, rounded up to retain at least 100 GB free). These are a budget and start threshold, not an APFS quota. **Do not undock during builds until surprise-removal handling is implemented.** The current registration and control state live under the existing internal pool; a later internal-pool move must preserve them safely or require explicit re-registration. Installation identity and before/after observations are retained in the user's install receipts and release audit.
 
 ### Implemented: part 1
 
@@ -1484,12 +1486,13 @@ A lease records which pool it uses. Each pool stays warm on its own.
 - After an unclean disappearance, slots held at that moment are non-reusable. Discard them only after positive writer closure; otherwise quarantine and retain accounting. A vanished device, or Oxide's Cargo group ending while an inherited sccache server may still write, is not sufficient closure. Idle, flushed slots are kept.
 - The ledger never lives on the removable volume.
 
-**Final outputs follow the pool when docked (part 2, not implemented).** The target directory moves to a per-checkout directory on the external volume, cutting the per-build copies of final binaries on the internal SSD. When undocked, builds write the checkout-local target again.
-- Binaries built while docked are not available undocked; `oxide run` and `oxide test` rebuild them.
-- An opt-out keeps outputs in the checkout.
+**Final outputs stay checkout-local by default.** `CARGO_TARGET_DIR` remains `<checkout>/target` regardless of where slot intermediates live, keeping built binaries at the expected checkout path when undocked (Tom, 2026-10-20).
+- **Following the pool is an explicit opt-in (part 2, not implemented):** a documented per-invocation flag and/or user config key enables a per-checkout output directory on the selected removable pool. Without the opt-in, docking alone never moves final outputs.
+- With the opt-in, an unavailable removable pool falls back to checkout-local outputs. `oxide run` and `oxide test` use the effective output location; opting in or changing pool selection does not itself move or delete existing artifacts.
+- External outputs are unavailable undocked. A later command may rebuild into the checkout; an interrupted command is never automatically replayed.
 
 **What moves and what doesn't:**
-- **Moves now:** Oxide pools and outputs.
+- **Moves by default:** slot intermediates. Final outputs stay checkout-local; following the pool is the proposed opt-in above.
 - **The sccache cache follows the pool only if #096's serialized per-build server model is adopted** (cache inside the pool). The current machine-wide server fixes its cache path at start-up. If that path is on a removable drive, a disappearance can silently recreate it on the internal disk, so it is not moved.
 - **Queue worktrees and Colima's VM disk stay internal:** they hold live state that an unplug would break.
 - Spotlight indexing of build locations is a host setting, recommended separately.

@@ -543,6 +543,30 @@ Tom's superseding ruling, 2026-10-20: "You know what, actually, let's just merge
 - #097 merges now, on operator acceptance, without waiting for the in-flight review. The review gate is overridden by Tom, recorded as operator acceptance and not as a review pass.
 - The runner/apparatus is unqualified tooling. Issues found in use are fixed as they arise.
 
+Tom approved, 2026-10-20 ("Yes"), a lighter, risk-proportionate verification policy for Oxide product tasks, after #097's harness-dominated review cycle:
+1. **Standard tier, the default:** unit and regression tests, the author's native proof, and an independent reviewer source review. No independent reviewer native session.
+   - **Elevated tier**, for tasks that delete or recycle storage, perform crash recovery or writer-closure decisions, or write to removable media: an independent reviewer native session as well.
+2. **Native proofs** use one shared runner, or a short fixed script relying on host safeguards (Effigy heavy admission, the host-reserve watchdog, a wall-clock limit and scratch cleanup). Tasks do not author bespoke in-process supervision or accounting harnesses.
+3. **Bounds:** wall-clock time and a scratch-disk budget only. Resource figures are measured and reported, not used as per-task accounting gates (no Cargo-call or version-probe counters).
+4. **A documented operator-acceptance fast path:** when Tom accepts a task as-is, it merges and closes without a further publication-only review loop.
+
+The planner implements this in AGENTS.md "Validate", the Queue validation policy and brief templates. It applies to briefs from now on, with in-flight tasks at the planner's discretion.
+
+Tom's rulings, 2026-10-20 16:55Z. The Supervisor measured about 579 GB written to the internal SSD in 2 h 37 min (whole-device, not attributed).
+1. "Yes" to the fast path:
+   - reinstall `oxide` from current `main` (which includes #097) now;
+   - register `Builds` now, with a 750 GB decimal cap and 100 GB reserve, expressed in whole MiB as the CLI requires;
+   - re-register after #102 if its legacy-root handling requires it.
+   This supersedes the earlier "register after #102" ordering.
+2. "We need to prove with something not on the critical path but still with active work now.. praxis is probably the best dogfood case." Praxis becomes the first external adopter, coordinated through its own Supervisor. Effigy and Nucleus are not switched now.
+
+Until #098, Tom avoids undocking during builds. Until #099, inherited sccache still applies to Oxide builds.
+
+Tom, 2026-10-20: "Doesn't the built binary need to go back on the internal SSD, that's kinda the point, right?"
+- Product default changed: final outputs (the checkout `target/`) stay checkout-local on the internal SSD, so they remain available undocked and at expected paths. Only slot intermediates use the removable pool.
+- "Outputs follow the pool" becomes an explicit per-invocation or per-config opt-in for projects whose final-artifact rewrite churn proves material.
+- #098's brief is amended before dispatch. The Praxis trial measures final-output write volume.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
