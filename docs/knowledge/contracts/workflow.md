@@ -1299,6 +1299,45 @@ Rules:
   compiles for the installed `x86_64-unknown-linux-gnu` target; no Linux
   runtime behaviour is validated.
 
+## Removable build volume (proposed)
+
+Approved design direction (Tom, 2026-10-20). Not implemented. The goal: while the laptop is docked, Oxide's build-data writes go to a dedicated external SSD, and undocking at any moment is safe, with work falling back to the internal SSD. Measured motivation: [internal SSD write baseline](../storage-efficiency.md#internal-ssd-write-baseline-2026-10-20).
+
+**Volume and backend.**
+- A dedicated APFS volume (for example `OxideBuild`) on the external drive.
+- A new `apfs-volume-v1` backend uses the volume itself as the pool payload root. Its size, or an APFS quota, is the OS-enforced ceiling.
+- No disk image on removable media: a long-lived image attachment turns a surprise removal into stuck I/O.
+
+**Control plane internal, data plane external.**
+- Registration, ledger and leases stay in the internal pool directory. These are small writes.
+- Slots, and optionally final outputs, live on the external volume.
+- Registration records the volume and container UUIDs.
+
+**Selection, only when a build starts.** The external pool is used only when all of these hold; otherwise the internal default pool is used:
+- the registered volume UUID is mounted, at a mount point whose device matches it. A stale `/Volumes/<name>` directory on the internal disk must never be mistaken for the drive. Re-check the device immediately before creating any path;
+- it is writable;
+- its free space is above the reserve.
+
+A lease records which pool it uses. Each pool stays warm on its own.
+
+**Surprise removal.**
+- A build whose volume vanishes fails like any I/O error, and its lease is marked lost-volume.
+- **On releasing an external slot, Oxide flushes the volume** (`sync_volume_np` with full-sync-and-wait, or an equivalent the implementation cites). So a released slot's writes are on the device before it can be reused.
+- After an unclean disappearance, slots held at that moment are discarded on reattach. They are rebuildable cache, never reused. Idle, flushed slots are kept.
+- The ledger never lives on the removable volume.
+
+**Final outputs follow the pool when docked.** The target directory moves to a per-checkout directory on the external volume, cutting the per-build copies of final binaries on the internal SSD. When undocked, builds write the checkout-local target again.
+- Binaries built while docked are not available undocked; `oxide run` and `oxide test` rebuild them.
+- An opt-out keeps outputs in the checkout.
+
+**What moves and what doesn't:**
+- **Moves now:** Oxide pools and outputs.
+- **The sccache cache follows the pool only if #096's serialized per-build server model is adopted** (cache inside the pool). The current machine-wide server fixes its cache path at start-up. If that path is on a removable drive, a disappearance can silently recreate it on the internal disk, so it is not moved.
+- **Queue worktrees and Colima's VM disk stay internal:** they hold live state that an unplug would break.
+- Spotlight indexing of build locations is a host setting, recommended separately.
+
+**Not yet decided:** the drive (a builds volume beside Time Machine on Vault, or the dedicated spare 1 TB SSD), the volume size and quota, encryption with keychain auto-unlock, and the exact flush primitive and its cost.
+
 ## Open decisions
 
 - **W-1 Default pool.** Foundation choice above: per-user cache directory,

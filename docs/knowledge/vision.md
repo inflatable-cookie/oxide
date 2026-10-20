@@ -456,6 +456,14 @@ owns the remaining evidence boundary.
 
 Tom's ruling, 2026-10-20 ("Yeah, the risk is acceptable for now"): until #096 qualifies sccache, and any approved follow-up builds an interrupted-lease mitigation, Oxide's dogfood builds keep inheriting the machine-wide `rustc-wrapper = sccache`. Tom accepts the interim exposure: after an interrupted, killed or recovered Oxide build, a server-side compile outside the Cargo process group may still write into a slot that has been released. Oxide does not disable the inherited wrapper in the meantime.
 
+Tom's rulings, 2026-10-20, on moving build writes off the non-replaceable internal SSD:
+- "Yes, add a builds volume with a reserve" (on the external drive).
+- "Approve the design" (Oxide's removable-volume pool with internal fallback).
+- "Yes - it needs to be seamless, I need to be able to disconnect my machine from the dock at a moment's notice so all systems that move to that drive need to be adaptive. The dock is a CalDigit TS5 Plus."
+- Tom then connected a spare 1 TB SSD as a possible dedicated build drive.
+
+Requirement: anything placed on the removable drive must tolerate surprise removal at any moment and fall back to the internal SSD without operator action. Live-state systems that cannot (Queue worktrees, VM disks) stay internal. The design lives in [workflow](contracts/workflow.md#removable-build-volume-proposed).
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
