@@ -1271,6 +1271,14 @@ oxide#102.
   its removable pool has no held slot or waiting command, then retire the
   old registration as a separate step. A build prints that the previous
   registration is not used and continues on the internal pool.
+  `register-removable` also refuses while the volume's `oxide-pool`
+  directory is not empty, so an old registration's slots are never adopted.
+  Observed 2026-10-20 during this task: the installed pre-#102 `oxide`
+  builds on `/Volumes/Builds/oxide-pool`, so a real `Builds` registration
+  exists under the legacy default pool's control root (inferred from that
+  build's pool). After the #102 reinstall it is not used until the planner
+  retires it and that payload directory after fresh positive idleness, then
+  registers again.
 - **Time Machine.** On macOS a pool Oxide creates is excluded with the
   sticky, unprivileged `tmutil addexclusion <pool>` and verified with
   `tmutil isexcluded` before any build writes; failure or an unknown result
