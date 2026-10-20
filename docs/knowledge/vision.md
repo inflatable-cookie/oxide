@@ -470,6 +470,10 @@ Tom's rulings, 2026-10-20, on moving build writes off the non-replaceable intern
 
 Requirement: anything placed on the removable drive must tolerate surprise removal at any moment and fall back to the internal SSD without operator action. Live-state systems that cannot (Queue worktrees, VM disks) stay internal. The design lives in [workflow](contracts/workflow.md#removable-build-volume-proposed).
 
+Tom's rulings, 2026-10-20 ("Let's start with sccache bypassed in oxide, see how we get on, we can return to it later. I'm happy with your drive usage proposal"):
+- **Oxide-managed builds bypass any inherited rustc wrapper (today the machine-wide sccache).** Other tools keep using the wrapper. This ends the interim interrupted-build risk once shipped, and sccache integration can be revisited later from the #096 evidence.
+- **On the `Builds` drive, Oxide's admission cap is 750 GB and it keeps at least 100 GB free** (the registration reserve).
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
