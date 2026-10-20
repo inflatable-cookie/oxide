@@ -1278,7 +1278,7 @@ oxide#102.
   registration is not used and continues on the internal pool.
   `register-removable` also refuses while the volume's `oxide-pool`
   directory is not empty, so an old registration's slots are never adopted.
-  The real `Builds` registration ([above](#removable-build-volume)) lives
+  The real `Builds` registration ([below](#removable-build-volume)) lives
   under the legacy default pool's control root, so after this change it is
   not used, and re-registering refuses until the planner retires it and its
   `oxide-pool` payload directory after fresh positive idleness, then
