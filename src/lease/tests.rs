@@ -81,6 +81,13 @@ fn request_with_profile(
     }
 }
 
+fn unexpected(place: &'static str, entry: &str) -> LeaseError {
+    LeaseError::UnexpectedEntry {
+        place,
+        entry: entry.to_owned(),
+    }
+}
+
 fn lease_sequence(lease_id: &str) -> u64 {
     lease_id
         .rsplit('.')
@@ -515,7 +522,8 @@ fn symlink_pool_and_foreign_entry_refuse() {
     assert!(matches!(result, Err(LeaseError::UnsafePath(_))));
     File::create(pool.join("foreign")).unwrap();
     let result = lease_injected(request(&pool, &project, &workspace, "holder-a"));
-    assert!(matches!(result, Err(LeaseError::UnknownAccounting)));
+    assert_eq!(result, Err(unexpected("pool directory", "foreign")));
+    assert_eq!(result.unwrap_err().reason(), "unknown_accounting");
 }
 
 #[test]
@@ -767,10 +775,15 @@ fn unknown_or_non_directory_macos_metadata_entries_refuse() {
             }
             _ => unreachable!(),
         };
-        assert!(matches!(
+        let name = if case == "unknown-name" {
+            ".unrecognized"
+        } else {
+            ".fseventsd"
+        };
+        assert_eq!(
             status_injected(&pool),
-            Err(LeaseError::UnknownAccounting)
-        ));
+            Err(unexpected("payload directory", name))
+        );
     }
 }
 
@@ -909,10 +922,10 @@ fn budget_pool_refuses_image_files_foreign_payload_entries_and_a_zero_budget() {
     fs::remove_file(&image).expect("remove image");
     let foreign = pool.join("payload/foreign");
     fs::create_dir(&foreign).expect("foreign entry");
-    assert!(matches!(
+    assert_eq!(
         managed::status(&pool),
-        Err(LeaseError::UnknownAccounting)
-    ));
+        Err(unexpected("payload directory", "foreign"))
+    );
     fs::remove_dir(&foreign).expect("remove foreign");
     assert!(matches!(
         managed::init_budget_pool(&pool, 1024 * 1024),
@@ -1027,4 +1040,161 @@ fn a_changed_soft_budget_applies_at_the_next_admission() {
         managed::lease(zero),
         Err(LeaseError::InvalidInput(_))
     ));
+}
+
+/// Finder's `.DS_Store` and AppleDouble `._*` regular files at the pool
+/// root, payload root, `slots`, a slot and its build tree: every open
+/// succeeds, payload bytes count, a hard link counts once, and an idle slot
+/// is reused. Nothing is deleted.
+#[test]
+fn finder_metadata_is_counted_and_tolerated_at_every_level() {
+    let fx = Fixture::new("finder");
+    let pool = fx.dir("pool");
+    managed::init_budget_pool(&pool, 64 * 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let first = lease_injected(request(&pool, &project, &workspace, "holder-a")).expect("lease");
+    let build = first.env.cargo_build_build_dir.clone();
+    let object = build.join("object");
+    fs::write(&object, vec![7_u8; 64 * 1024]).expect("build output");
+    release_injected(&pool, &first.lease_id).expect("release");
+    let before = status_injected(&pool).expect("status before");
+    assert_eq!(before.coverage, AccountingCoverage::Complete);
+
+    let payload = pool.join("payload");
+    let slots = payload.join("slots");
+    let slot = slots.join(&first.slot_id);
+    let mut added = 0_u64;
+    let mut metadata = Vec::new();
+    for (dir, counted) in [
+        (pool.clone(), false),
+        (payload.clone(), true),
+        (slots.clone(), true),
+        (slot.clone(), true),
+        (build.clone(), true),
+    ] {
+        for (name, len) in [(".DS_Store", 6148_usize), ("._object", 4096)] {
+            let path = dir.join(name);
+            fs::write(&path, vec![0_u8; len]).expect("finder metadata");
+            if counted {
+                added += len as u64;
+            }
+            metadata.push(path);
+        }
+    }
+    let after = status_injected(&pool).expect("metadata tolerated");
+    assert_eq!(after.coverage, AccountingCoverage::Complete);
+    assert_eq!(
+        after.payload_logical_bytes,
+        before.payload_logical_bytes.map(|bytes| bytes + added)
+    );
+    assert!(after.payload_unique_allocated_bytes > before.payload_unique_allocated_bytes);
+
+    let unique = after.payload_unique_allocated_bytes;
+    fs::hard_link(&object, payload.join("._linked")).expect("hard-linked sidecar");
+    let linked = status_injected(&pool).expect("hard link tolerated");
+    assert_eq!(
+        linked.payload_logical_bytes,
+        after.payload_logical_bytes.map(|bytes| bytes + 64 * 1024)
+    );
+    assert_eq!(linked.payload_unique_allocated_bytes, unique);
+
+    let again = lease_injected(request(&pool, &project, &workspace, "holder-b")).expect("reuse");
+    assert!(again.reused_slot);
+    assert_eq!(again.slot_id, first.slot_id);
+    release_injected(&pool, &again.lease_id).expect("release reuse");
+    for path in &metadata {
+        assert!(path.is_file(), "{} kept", path.display());
+    }
+}
+
+/// A Finder-looking name is no exemption: a symlink, directory or special
+/// file under it refuses, named, at the pool and payload roots, and nothing
+/// is removed. Near-miss names refuse the same way.
+#[test]
+fn finder_looking_non_files_and_near_miss_names_refuse_by_name() {
+    let cases: [(&str, &str, &str); 9] = [
+        ("pool", ".DS_Store", "symlink"),
+        ("pool", "._x", "dir"),
+        ("pool", "._", "file"),
+        ("payload", ".DS_Store", "dir"),
+        ("payload", "._x", "symlink"),
+        ("payload", "._x", "fifo"),
+        ("payload", "._", "file"),
+        ("payload", ".ds_store", "file"),
+        ("payload", ".DS_Store.bak", "file"),
+    ];
+    for (place, name, kind) in cases {
+        let fx = Fixture::new("finder-refuse");
+        let pool = fx.dir("pool");
+        managed::init_budget_pool(&pool, 1024 * 1024).expect("init");
+        let dir = if place == "pool" {
+            pool.clone()
+        } else {
+            pool.join("payload")
+        };
+        let path = dir.join(name);
+        let target = fx.dir("target");
+        match kind {
+            "file" => fs::write(&path, b"x").expect("file"),
+            "dir" => fs::create_dir(&path).expect("dir"),
+            "symlink" => symlink(&target, &path).expect("symlink"),
+            "fifo" => {
+                let text =
+                    std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("path");
+                // SAFETY: a valid NUL-terminated path; mkfifo has no other
+                // precondition.
+                assert_eq!(unsafe { libc::mkfifo(text.as_ptr(), 0o600) }, 0);
+            }
+            _ => unreachable!(),
+        }
+        let place = if place == "pool" {
+            "pool directory"
+        } else {
+            "payload directory"
+        };
+        assert_eq!(
+            status_injected(&pool),
+            Err(unexpected(place, name)),
+            "{place} {name} {kind}"
+        );
+        assert!(fs::symlink_metadata(&path).is_ok(), "nothing removed");
+    }
+}
+
+/// The refusal names the entry with control, quote, backslash and
+/// non-ASCII bytes escaped, and elides a long name. APFS refuses a
+/// non-UTF-8 name, so that byte form is checked on the label directly.
+#[test]
+fn unexpected_entry_names_are_escaped_and_bounded() {
+    use std::os::unix::ffi::OsStrExt;
+    let fx = Fixture::new("finder-escape");
+    let pool = fx.dir("pool");
+    managed::init_budget_pool(&pool, 1024 * 1024).expect("init");
+    assert_eq!(
+        super::entry_label(std::ffi::OsStr::from_bytes(b"\xff\x80ok")),
+        r"\xff\x80ok"
+    );
+    let raw = std::ffi::OsStr::from_bytes("a\n\x1b\"\\\u{e9} b".as_bytes());
+    let path = pool.join("payload").join(raw);
+    fs::write(&path, b"x").expect("odd name");
+    let refused = status_injected(&pool).unwrap_err();
+    assert_eq!(
+        refused,
+        unexpected("payload directory", r#"a\x0a\x1b\x22\x5c\xc3\xa9 b"#)
+    );
+    assert_eq!(
+        refused.to_string(),
+        r#"the payload directory holds an unexpected entry "a\x0a\x1b\x22\x5c\xc3\xa9 b""#
+    );
+    fs::remove_file(&path).expect("remove odd name");
+    let long = "y".repeat(100);
+    fs::write(pool.join("payload").join(&long), b"x").expect("long name");
+    assert_eq!(
+        status_injected(&pool),
+        Err(unexpected(
+            "payload directory",
+            &format!("{}...", "y".repeat(64))
+        ))
+    );
 }

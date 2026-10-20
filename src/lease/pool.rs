@@ -2,9 +2,10 @@
 
 use super::backing::BackingPaths;
 use super::{
-    canonical_existing_dir, current_uid, ensure_private_dir, io_error, persist_private_file,
-    random_hex, read_private_file, remove_tree_owned, AccountingCoverage, LeaseEnvironment,
-    LeaseError, LeaseGrant, PoolStatus, Profile, ReleaseReceipt, SlotOccupancy, SlotStatus,
+    canonical_existing_dir, current_uid, ensure_private_dir, io_error, is_finder_metadata,
+    is_tolerated_metadata_file, persist_private_file, random_hex, read_private_file,
+    remove_tree_owned, unexpected_entry, AccountingCoverage, LeaseEnvironment, LeaseError,
+    LeaseGrant, PoolStatus, Profile, ReleaseReceipt, SlotOccupancy, SlotStatus,
     ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES, CONFIG_NAME,
     LEASE_VERSION, LEDGER_NAME, LOCK_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_PATH_BYTES,
     MAX_SLOTS, SLOTS_NAME,
@@ -19,6 +20,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+
+/// Where a refused entry sits, for [`LeaseError::UnexpectedEntry`].
+const POOL_PLACE: &str = "pool directory";
+const PAYLOAD_PLACE: &str = "payload directory";
 
 #[derive(Clone, Debug)]
 pub struct LeaseRequest {
@@ -871,9 +876,11 @@ impl Pool {
         remove_tree_owned(&slots_root, path)
     }
 
+    /// The payload root's whole tree: `slots` and any tolerated Finder
+    /// metadata beside it, one `(device, inode)` union. One extra level
+    /// keeps slot contents at the depth bound they had under `slots`.
     fn payload_accounting(&self) -> Result<Sizes, LeaseError> {
-        let slots = self.backing.payload_root().join(SLOTS_NAME);
-        inventory_sizes(&slots)
+        inventory_sizes_to_depth(self.backing.payload_root(), ACCOUNTING_MAX_DEPTH + 1)
     }
 
     fn slot_accounting(&self, id: u64) -> Result<Sizes, LeaseError> {
@@ -976,17 +983,26 @@ fn validate_lease_payload_entries(
     for entry in fs::read_dir(payload_root).map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
         let name = entry.file_name();
-        let name = name.to_str().ok_or(LeaseError::UnknownAccounting)?;
-        let is_slots = name == SLOTS_NAME;
-        if !is_slots && !metadata_dirs.contains(&name) {
-            return Err(LeaseError::UnknownAccounting);
+        let refuse = || unexpected_entry(PAYLOAD_PLACE, &name);
+        if is_finder_metadata(&name) {
+            // Counted by payload accounting, which walks the payload root.
+            let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
+            if !is_tolerated_metadata_file(&metadata, root_device) {
+                return Err(refuse());
+            }
+            continue;
+        }
+        let text = name.to_str().ok_or_else(refuse)?;
+        let is_slots = text == SLOTS_NAME;
+        if !is_slots && !metadata_dirs.contains(&text) {
+            return Err(refuse());
         }
         let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
         if metadata.file_type().is_symlink()
             || !metadata.file_type().is_dir()
             || metadata.dev() != root_device
         {
-            return Err(LeaseError::UnknownAccounting);
+            return Err(refuse());
         }
         if is_slots {
             if metadata.uid() != current_uid() || metadata.permissions().mode() & 0o077 != 0 {
@@ -1019,9 +1035,13 @@ fn occupancy(state: SlotPersistState) -> SlotOccupancy {
 }
 
 fn inventory_sizes(path: &Path) -> Result<Sizes, LeaseError> {
+    inventory_sizes_to_depth(path, ACCOUNTING_MAX_DEPTH)
+}
+
+fn inventory_sizes_to_depth(path: &Path, max_depth: usize) -> Result<Sizes, LeaseError> {
     let limits = InventoryLimits {
         max_entries: ACCOUNTING_MAX_ENTRIES,
-        max_depth: ACCOUNTING_MAX_DEPTH,
+        max_depth,
         max_output_bytes: 64,
         max_elapsed_ms: ACCOUNTING_MAX_ELAPSED_MS,
     };
@@ -1213,12 +1233,21 @@ fn refuse_retired_image_pool(pool: &Path) -> Result<(), LeaseError> {
 }
 
 fn refuse_foreign_pool_entries(pool: &Path) -> Result<(), LeaseError> {
+    let device = fs::symlink_metadata(pool).map_err(io_error)?.dev();
     for entry in fs::read_dir(pool).map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
         let name = entry.file_name();
-        let name = name.to_string_lossy();
+        if is_finder_metadata(&name) {
+            // Control-directory bytes, like config and ledger: not payload.
+            let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
+            if !is_tolerated_metadata_file(&metadata, device) {
+                return Err(unexpected_entry(POOL_PLACE, &name));
+            }
+            continue;
+        }
+        let text = name.to_string_lossy();
         let allowed = matches!(
-            name.as_ref(),
+            text.as_ref(),
             super::CONFIG_NAME
                 | super::LEDGER_NAME
                 | super::LOCK_NAME
@@ -1226,9 +1255,9 @@ fn refuse_foreign_pool_entries(pool: &Path) -> Result<(), LeaseError> {
                 | super::RECEIPT_NAME
                 | super::PAYLOAD_NAME
                 | super::MANAGED_NAME
-        ) || name.starts_with("ledger.tmp-");
+        ) || text.starts_with("ledger.tmp-");
         if !allowed {
-            return Err(LeaseError::UnknownAccounting);
+            return Err(unexpected_entry(POOL_PLACE, &name));
         }
         let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
         if metadata.file_type().is_symlink() {
