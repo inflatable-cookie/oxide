@@ -119,15 +119,17 @@ class Proof:
         return subprocess.CompletedProcess(command, child.returncode, out, err)
 
     def close(self, child: subprocess.Popen) -> None:
-        """KILL the child's whole session, then reap its leader within
-        10 s. Only a reaped leader counts as closed; otherwise the pid stays
-        in `unclosed`. Members that left the session are not covered."""
+        """KILL the child's whole session, then reap its leader within what
+        is left of the original 300 s (at most 10 s; no wait once it is
+        spent). Only a reaped leader counts as closed; otherwise the pid
+        stays in `unclosed`. Members that left the session are not covered."""
         try:
             os.killpg(child.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        left = PROOF_SECONDS - (time.monotonic() - STARTED)
         try:
-            child.communicate(timeout=10)
+            child.communicate(timeout=max(0.0, min(10.0, left)))
         except BaseException as error:
             print(f"session {child.pid} not positively closed: {error!r}", file=sys.stderr)
             return
@@ -385,7 +387,9 @@ def main() -> int:
         print(f"finder-metadata proof failed after {time.monotonic() - STARTED:.0f} s; evidence kept at {root}", file=sys.stderr)
         raise
     proof.phase("before removal")
-    shutil.rmtree(root)
+    # Removal is a child like any other: inside the deadline and watched.
+    removal = proof.run(["/bin/rm", "-rf", root], timeout=60)
+    expect(removal.returncode == 0 and not os.path.lexists(root), f"removal of {root} failed (exit {removal.returncode})")
     elapsed = time.monotonic() - STARTED
     print(
         f"finder-metadata proof held: {elapsed:.0f} s, peak owned {proof.peak // MIB} MiB at phase checks "
