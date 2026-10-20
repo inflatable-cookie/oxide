@@ -539,6 +539,10 @@ Tom's ruling, 2026-10-20, on #097. He asked "Does it work? Can we just merge it?
   Tom's operator acceptance replaces the missing independent native proof, recorded as such and not as a review pass.
 - Real-world use (Builds registration after #102, then the Nucleus trial) is the practical qualification.
 
+Tom's superseding ruling, 2026-10-20: "You know what, actually, let's just merge it. If issues arise, we can fix them. This has taken too long already."
+- #097 merges now, on operator acceptance, without waiting for the in-flight review. The review gate is overridden by Tom, recorded as operator acceptance and not as a review pass.
+- The runner/apparatus is unqualified tooling. Issues found in use are fixed as they arise.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
