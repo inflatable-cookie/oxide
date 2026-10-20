@@ -816,6 +816,36 @@ oxide#093 ships this measurement as [`oxide status --launch-check`](contracts/wo
 
 No setting was read or changed.
 
+## sccache 0.18.0 sharing and slot closure (2026-10-20)
+
+oxide#096 traced pinned sccache 0.18.0 (commit `01c35e69`) against Oxide's
+slot closure ([evidence](evidence/sccache-096/README.md), [Q-017](questions.md#q-017--can-sccache-sharing-preserve-oxides-slot-writer-closure)).
+
+- The default shared detached daemon is outside every Cargo group and gives
+  no per-request closure after cancellation. It SIGKILLs only the direct
+  compiler, and a running cache-hit restoration continues. That makes it a
+  source no-go for release or recovery under current Oxide semantics, and
+  quarantine behind it is unbounded. Other future sharing designs are not
+  ruled out.
+- Serial foreground servers over one persistent cache can share by source.
+  Natively, each wrapped command's server sat inside Oxide's Cargo process
+  group. Closure after cancellation or a crash, and concurrency, are
+  unproven.
+- Benefit is limited by source: linking crates are not cached, and the hash
+  includes the working directory and `CARGO_*` variables. On the oxide#096
+  fixture a registry dependency had no hit in a second Oxide slot, and its
+  key differed. Per-slot `CARGO_BUILD_BUILD_DIR` is the source-based
+  hypothesis; environments were not diffed. The workspace unit was hashed
+  and stored although sccache refuses incremental units, cause untraced.
+  Source caches `check` metadata-only units although the Rust notes say
+  `link` is required.
+- Write volume was not attributable within scope: UNKNOWN. Cache bytes are
+  not writes.
+
+Compatibility is UNKNOWN and benefit INSUFFICIENT. The three cost pairs did
+not run; the S1–S3 times (1.73, 1.06, 0.83 s) are single observations, not
+cost samples.
+
 ## Product assessment
 
 Planner recommendation: a small coherent entry point over evidence-backed mechanisms, with three capabilities: see and explain costs, bound and reuse owned storage, and apply qualified improvements with clear trade-offs. The reusable storage core must work for ordinary developers as well as orchestrators. A daemon, editor surface or UI is still an open choice; Tom's [workflow direction](vision.md#product-workflow-direction) sets an `oxide build` / `oxide run` front door as the design target.
