@@ -1289,7 +1289,9 @@ oxide#102.
   the 20 GiB host-reserve watchdog stops the owned group below its 22 GiB
   trigger, and ordinary filesystem errors still fail a build.
 - **Accounting walks (oxide#108).** Admission, reuse, eviction and `status`
-  walk the slots with one set of pool bounds: 2,000,000 entries, depth 64,
+  walk the slots with one set of pool bounds: 2,000,000 entries, depth 64
+  (65 for the whole-payload walk, which starts at the payload root; see
+  [Finder metadata](#finder-metadata-in-pools)),
   60 s (previously 50,000, 24 and 5 s, which refused Praxis's 76,669-entry
   and Farmyard's 60,657-entry pools). Reusing an idle slot needs that slot's
   own walk complete; a new slot needs the whole-payload walk complete before
@@ -1468,8 +1470,9 @@ Rules:
   pool's own device; config, ledger and lock sit beside it as for APFS, with
   no image or receipt. The config records the backend, store ID and budget
   recorded at creation (`cap_bytes`, default 100 GB; `image_bytes` 0). An
-  image or receipt file, any payload entry but `slots`, or a payload on
-  another device refuses.
+  image or receipt file, any payload entry but `slots` and
+  [Finder metadata](#finder-metadata-in-pools), or a payload on another
+  device refuses.
 - **Admission.** The ledger's existing rules with this command's soft budget
   (`LeaseRequest.budget_bytes`, else the recorded one) as the cap:
   owned slots' unique allocated bytes at lease time, whole-idle-slot
@@ -1523,6 +1526,27 @@ Rules:
   refusals in the library. `effigy rust:compile-linux` checks that the crate
   compiles for the installed `x86_64-unknown-linux-gnu` target; no Linux
   runtime behaviour is validated.
+
+### Finder metadata in pools
+
+oxide#105. Finder writes `.DS_Store` files, and AppleDouble `._<name>` sidecars where a filesystem lacks native extended attributes. Both can appear in a pool directory someone has browsed. Both backends tolerate exactly these two forms and nothing broader. The name is `.DS_Store`, or `._` followed by a nonempty name; the entry is a regular file (no-follow), owned by the caller and on the directory's device. The tolerated places are:
+
+- **Pool root and the removable control root.** Allowed beside config, ledger, lock and `oxide-managed`. These bytes are control-directory bytes, like the ledger, and are not payload.
+- **Payload root** (`<pool>/payload`, or `<mount>/oxide-pool`). Allowed beside `slots`. Payload accounting now walks the payload root, not `slots` alone. The bytes therefore count in the payload figure and the soft-budget admission check, and the `(device, inode)` union counts a hard link once. The depth bound is one level deeper, so slot contents keep their previous allowance.
+- **`slots`, a slot and its build tree.** This is unchanged: these were never name-checked. Every regular file there, metadata included, counts in the slot's own figure.
+
+A metadata-named symlink, directory, FIFO or other special file is still refused. So are a file owned by another user, a file on another device, and a near-miss name (`._`, `.ds_store`, `.DS_Store.bak`). Every other unknown entry also refuses wherever it did before. A name never establishes a lease, never makes a slot reusable and never permits a cleanup. Oxide never deletes, moves or rewrites these files. A whole-slot eviction still removes everything inside the slot, as before. Pool creation still requires an empty directory.
+
+**Named refusals.** A refused pool-root or payload-root entry is reported with its place and an escaped name. The category stays `unknown_accounting`, with exit 3. For example: `cannot open the removable pool: unknown_accounting (the payload directory holds an unexpected entry "stray\x07entry")`. Printable ASCII appears as is. Each other byte, including `"`, `\`, controls, non-ASCII and non-UTF-8, appears as `\xNN`. At most 64 name bytes are printed, then `...`. Accounting that is incomplete for another reason, such as a depth, entry or time bound or an unreadable entry, reports the walk's cause and counts ([accounting walks](#budget-only-default-pool-and-user-configuration), oxide#108) but no entry path, because the walk does not record which entry caused it. Status remains read-only. Removable selection falls back with the named reason.
+
+Sources: `.DS_Store` is the Finder store that Apple's `com.apple.desktopservices` `DSDontWriteNetworkStores` and `DSDontWriteUSBStores` preferences control (Apple Support, "Adjust SMB browsing behavior in macOS"). The AppleDouble `._*` form is from `dot_clean(1)`: "Merge ._* files with corresponding native files", and AppleDouble is documented in `copyfile(3)`.
+
+**Proof.** `effigy rust:oxide-finder-metadata` (`scripts/test-oxide-finder-metadata.py`) is a short fixed script under Effigy heavy admission. It does not use the unqualified #097 runner. Before every phase it checks owned scratch bytes from `du`, which include the sparse image's allocation. The 512 MiB figure is a budget checked between phases, not a ceiling. Every child, staging included, starts only after its deadline (cut from one 300 s budget) and the 20 GiB reserve on `/private/tmp` have been checked. Each child runs in its own session. While it runs, host free space is sampled every 250 ms, and a breach, a failed sample or the deadline kills the whole session. Any exception after a child starts, including Ctrl-C and SIGTERM (which unwinds the same way), kills that child's session and reaps its leader before unwinding. It waits at most 10 s for this, and never past the original 300 s. A session not positively closed blocks detach and keeps the scratch. The reserve watchdog during children and the deadline-before-spawn order were added after independent review 6301259831 at `1f02fdf` found them missing. The exception-path closure was added after review 6301598979 at `fd1ad57`. The deadline bound on that wait, and the scratch removal running as a deadline-checked child, were added after review 6301733025 at `7114bb7`. The single author submission at `02a83a8` ran the earlier script, which checked the reserve only between phases; the corrected script has not run natively. It stages `oxide` offline with 1.97.1 and runs with wrappers disabled under a private `HOME`, `CARGO_HOME` and `OXIDE_POOL`. It never touches the installed binary, the default pool or a real drive. It checks two pools:
+
+- **Internal budget pool.** Metadata at the pool root, payload root, `slots`, slot and build tree keeps status `Complete`, the payload figure rises by the payload-side bytes, and the next check is warm.
+- **Removable pool on one owned 128 MiB scratch APFS image** at a unique `/Volumes/<name>`. The same files in the control root and on the volume keep it selected and warm, with the bytes counted. Then an unknown payload-root entry makes `status` and the next build fall back, naming the entry. Every metadata file and the unknown entry are still present afterwards.
+
+Cleanup is an ordinary detach and removal of the scratch. Not a benchmark or real-drive qualification. The author's single run at `02a83a8` (2026-10-20) passed in 38 s of script time, after about 8 minutes waiting for Effigy admission. Staging took 15 s. The internal and removable payload figures each rose from 0 to 12 MiB with the metadata and stayed `Complete`, and both repeats were warm. The fallback named `"stray\x07entry"`. All 20 metadata files and the unknown entry were kept. Peak owned scratch at the phase checks was 105 MiB, and the lowest host free space was 586318 MiB.
 
 ## Removable build volume
 

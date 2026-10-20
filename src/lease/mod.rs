@@ -112,6 +112,12 @@ pub enum LeaseError {
     Busy,
     Full,
     UnknownAccounting,
+    /// An entry the pool's shape does not allow, named by its place and an
+    /// escaped name. Same `unknown_accounting` category and exit code.
+    UnexpectedEntry {
+        place: &'static str,
+        entry: String,
+    },
     /// A bounded accounting walk that admission, reuse or eviction needed
     /// did not complete. Same reason and exit code as `UnknownAccounting`.
     AccountingIncomplete(Box<AccountingScan>),
@@ -134,6 +140,7 @@ impl LeaseError {
             Self::Busy | Self::HolderConflict => 2,
             Self::Full
             | Self::UnknownAccounting
+            | Self::UnexpectedEntry { .. }
             | Self::AccountingIncomplete(_)
             | Self::LedgerExhausted => 3,
             Self::UnsafePath(_) | Self::BackingMismatch => 4,
@@ -147,7 +154,9 @@ impl LeaseError {
             Self::InvalidInput(_) => "invalid_input",
             Self::Busy => "busy",
             Self::Full => "full",
-            Self::UnknownAccounting | Self::AccountingIncomplete(_) => "unknown_accounting",
+            Self::UnknownAccounting
+            | Self::UnexpectedEntry { .. }
+            | Self::AccountingIncomplete(_) => "unknown_accounting",
             Self::UnsafePath(_) => "unsafe_path",
             Self::HolderConflict => "holder_conflict",
             Self::NotFound => "not_found",
@@ -169,6 +178,12 @@ impl std::fmt::Display for LeaseError {
             Self::Full => formatter.write_str("pool cap cannot admit a new slot"),
             Self::UnknownAccounting => {
                 formatter.write_str("owned accounting is unknown or a foreign entry is present")
+            }
+            Self::UnexpectedEntry { place, entry } => {
+                write!(
+                    formatter,
+                    "the {place} holds an unexpected entry \"{entry}\""
+                )
             }
             Self::AccountingIncomplete(scan) => {
                 write!(formatter, "owned accounting is incomplete: {scan}")
@@ -282,6 +297,55 @@ pub enum AccountingCoverage {
     Complete,
     Partial,
     Unknown,
+}
+
+/// Finder metadata a pool tolerates beside its own entries: exactly
+/// `.DS_Store` (Finder's Desktop Services store; Apple's
+/// `com.apple.desktopservices` `DSDontWriteNetworkStores` /
+/// `DSDontWriteUSBStores` preferences govern where Finder writes it) and
+/// AppleDouble sidecars `._<name>` with a nonempty `<name>` (dot_clean(1):
+/// "Merge ._* files with corresponding native files"). The name alone
+/// grants nothing: callers still require an owned regular file on the
+/// pool's device, and its bytes stay in accounting.
+fn is_finder_metadata(name: &std::ffi::OsStr) -> bool {
+    let name = name.as_bytes();
+    name == b".DS_Store" || (name.len() > 2 && name.starts_with(b"._"))
+}
+
+/// Whether a no-follow `metadata` is a Finder metadata file the pool may
+/// hold: a regular caller-owned file on `device`.
+fn is_tolerated_metadata_file(metadata: &fs::Metadata, device: u64) -> bool {
+    metadata.file_type().is_file() && metadata.dev() == device && metadata.uid() == current_uid()
+}
+
+/// Longest entry name, in bytes, a diagnostic prints before eliding.
+const MAX_ENTRY_LABEL_BYTES: usize = 64;
+
+/// An entry name safe to print: printable ASCII except `"` and `\` as is,
+/// every other byte (control, non-ASCII, non-UTF-8) as `\xNN`, at most
+/// [`MAX_ENTRY_LABEL_BYTES`] input bytes followed by `...` when longer.
+fn entry_label(name: &std::ffi::OsStr) -> String {
+    use std::fmt::Write as _;
+    let bytes = name.as_bytes();
+    let mut label = String::new();
+    for &byte in bytes.iter().take(MAX_ENTRY_LABEL_BYTES) {
+        if byte == b' ' || (byte.is_ascii_graphic() && byte != b'"' && byte != b'\\') {
+            label.push(char::from(byte));
+        } else {
+            let _ = write!(label, "\\x{byte:02x}");
+        }
+    }
+    if bytes.len() > MAX_ENTRY_LABEL_BYTES {
+        label.push_str("...");
+    }
+    label
+}
+
+fn unexpected_entry(place: &'static str, name: &std::ffi::OsStr) -> LeaseError {
+    LeaseError::UnexpectedEntry {
+        place,
+        entry: entry_label(name),
+    }
 }
 
 /// Why one accounting walk is not complete. Walk gaps come from the

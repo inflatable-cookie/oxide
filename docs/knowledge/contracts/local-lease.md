@@ -242,7 +242,9 @@ reconciled only for the recorded evicting slot path.
 
 **Accounting walks (oxide#108).** Every pool accounting walk uses the same
 pool-specific bounds: 2,000,000 entries, depth 64 below the walked root and a
-60 s cooperative deadline. They are separate from the inventory tool's
+60 s cooperative deadline. The whole-payload walk starts at the payload root,
+one level above `slots`, so it uses depth 65 and slot contents keep 64
+([Finder metadata](workflow.md#finder-metadata-in-pools), oxide#105). They are separate from the inventory tool's
 defaults, which are unchanged. The callers:
 
 | Walk | Gate |
