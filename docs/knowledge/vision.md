@@ -552,6 +552,16 @@ Tom approved, 2026-10-20 ("Yes"), a lighter, risk-proportionate verification pol
 
 The planner implements this in AGENTS.md "Validate", the Queue validation policy and brief templates. It applies to briefs from now on, with in-flight tasks at the planner's discretion.
 
+Tom's rulings, 2026-10-20 16:55Z. The Supervisor measured about 579 GB written to the internal SSD in 2 h 37 min (whole-device, not attributed).
+1. "Yes" to the fast path:
+   - reinstall `oxide` from current `main` (which includes #097) now;
+   - register `Builds` now, with a 750 GB decimal cap and 100 GB reserve, expressed in whole MiB as the CLI requires;
+   - re-register after #102 if its legacy-root handling requires it.
+   This supersedes the earlier "register after #102" ordering.
+2. "We need to prove with something not on the critical path but still with active work now.. praxis is probably the best dogfood case." Praxis becomes the first external adopter, coordinated through its own Supervisor. Effigy and Nucleus are not switched now.
+
+Until #098, Tom avoids undocking during builds. Until #099, inherited sccache still applies to Oxide builds.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
