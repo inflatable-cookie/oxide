@@ -635,6 +635,15 @@ Tom, 2026-10-21, "Cleanup approved", covering the post-cutover leftovers listed 
 
 Each removal still needs a fresh positive idle/closure check at the time. Held or unknown state stops that item. Ordinary detach only. The planner runs Oxide-owned host items; consumer owners run their own checkouts.
 
+Tom, 2026-10-21, "105 fast path approved, continue clean up". Background: Finder wrote `.DS_Store` files into the live Builds pool at about 23:09Z from an open window on the drive, despite `DSDontWriteUSBStores`, and selection fell back to the internal pool.
+- **#105 (ignore macOS metadata in pool accounting):**
+  1. integrate onto accepted #108 and current main, then run the covering checks;
+  2. an independent source-only review;
+  3. if it finds no product defect, operator acceptance replaces the missing author native;
+  4. merge and install.
+  Earlier verdicts and gaps are kept.
+- **Cleanup continues** on the retired Builds tree only after a fresh positive idle and no-ongoing-writes check. No force or recovery.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
