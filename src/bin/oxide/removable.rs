@@ -98,6 +98,19 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
             let cap = size("--cap", cap)?;
             register(Path::new(mount), reserve, cap)
         }
+        // Debug builds only: the focused proof applies the real mount-parent
+        // rule to an owned scratch directory.
+        #[cfg(debug_assertions)]
+        ["debug-check-parent", parent] => match volume::refuse_writable_parent(Path::new(parent)) {
+            Ok(()) => {
+                println!("parent accepted: {parent}");
+                Ok(0)
+            }
+            Err(reason) => {
+                println!("parent refused: {reason}");
+                Ok(1)
+            }
+        },
         ["-h" | "--help"] | [] => {
             println!("{USAGE}");
             Ok(0)

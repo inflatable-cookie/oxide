@@ -16,9 +16,17 @@
 //!   volume's UUID, so the UUID is never taken as proof of a mount root.
 //!   Root-ness comes from `f_mntonname` equality and from the mount root's
 //!   `st_dev` differing from its parent directory's.
-//! - `faccessat(2)` with `AT_EACCESS`: an access check with the effective
-//!   IDs; on macOS it is decided by the kernel's authorization, ACLs
-//!   included.
+//! - `faccessat(2)` with `AT_EACCESS`: used only for the mounted volume's
+//!   own writability. A denied combined `W_OK` does not prove a specific
+//!   right such as `add_subdirectory` is denied, so the mount-parent rule
+//!   never relies on it ([`judge_parent`]).
+//! - `acl_get_fd_np(3)` with `ACL_TYPE_EXTENDED` and `acl_get_entry(3)`
+//!   (`sys/acl.h`): the parent's extended ACL is read through its
+//!   descriptor; `NULL` with `ENOENT` means none, a returned ACL is freed
+//!   with `acl_free(3)`, any other result is unknown and refuses.
+//! - `sys/stat.h` `UF_HIDDEN` (`0x8000`, a GUI display hint): the only
+//!   file flag allowed on the mount parent; the standard `/Volumes` carries
+//!   it.
 //! - `fsync_volume_np(3)` (`unistd.h`, macOS 10.8+): flush the volume the
 //!   descriptor is on; `SYNC_VOLUME_FULLSYNC` flushes data and metadata to
 //!   the device, not just its cache, and `SYNC_VOLUME_WAIT` waits for the
@@ -249,24 +257,170 @@ impl Binding {
     }
 }
 
-/// `faccessat(AT_EACCESS)` must refuse writing to `parent`, and `parent`
-/// must be a root-owned real directory.
-pub fn refuse_writable_parent(parent: &Path) -> Result<(), String> {
-    let metadata = std::fs::symlink_metadata(parent)
-        .map_err(|error| format!("cannot inspect {}: {error}", parent.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(format!("{} is not a real directory", parent.display()));
+/// `sys/stat.h`: `UF_HIDDEN`, a hint not to display the item in a GUI.
+pub const UF_HIDDEN: u32 = 0x0000_8000;
+
+/// The extended ACL of the mount parent as read through its descriptor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Acl {
+    /// `acl_get_fd_np` returned `NULL` with `ENOENT`, or an ACL with no entry.
+    None,
+    Entries(usize),
+    Unknown(String),
+}
+
+/// Structural facts about a mount parent, observed once through an opened
+/// descriptor, or injected by tests.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParentFacts {
+    /// `lstat` says a real directory, not a symlink.
+    pub real_directory: bool,
+    /// The opened descriptor is the same device and inode as the `lstat`.
+    pub coherent: bool,
+    pub uid: u32,
+    pub mode: u32,
+    pub flags: u32,
+    pub acl: Acl,
+    /// The caller's effective UID.
+    pub euid: u32,
+}
+
+/// The deny-by-default mount-parent rule, at registration and at every
+/// selection: an unprivileged caller, a real root-owned directory with no
+/// group or other write and no special mode bits, positively no extended
+/// ACL entries, and no file flag except `UF_HIDDEN`. Every violation is
+/// reported, so one check cannot hide another. It never relies on a
+/// combined `W_OK` access check.
+pub fn judge_parent(parent: &Path, facts: &ParentFacts) -> Result<(), String> {
+    let mut reasons = Vec::new();
+    if facts.euid == 0 {
+        reasons.push("the caller runs as root, which can write any parent".to_owned());
     }
-    if std::os::unix::fs::MetadataExt::uid(&metadata) != 0 {
-        return Err(format!("{} is not owned by root", parent.display()));
+    if !facts.real_directory {
+        reasons.push("it is not a real directory".to_owned());
     }
-    if writable(parent)? {
-        return Err(format!(
-            "{} is writable by this user, so a removed mount point could be recreated on the internal disk",
-            parent.display()
+    if !facts.coherent {
+        reasons.push("its path and descriptor disagree".to_owned());
+    }
+    if facts.uid != 0 {
+        reasons.push(format!("it is owned by UID {}, not root", facts.uid));
+    }
+    if facts.mode & 0o022 != 0 {
+        reasons.push(format!(
+            "mode {:o} allows group or other write",
+            facts.mode & 0o7777
         ));
     }
-    Ok(())
+    if facts.mode & 0o7000 != 0 {
+        reasons.push(format!(
+            "mode {:o} has setuid, setgid or sticky bits",
+            facts.mode & 0o7777
+        ));
+    }
+    match &facts.acl {
+        Acl::None => {}
+        Acl::Entries(count) => reasons.push(format!("it has {count} extended ACL entries")),
+        Acl::Unknown(error) => reasons.push(format!("its extended ACL is unknown ({error})")),
+    }
+    if facts.flags & !UF_HIDDEN != 0 {
+        reasons.push(format!(
+            "it has file flags {:#x} beyond UF_HIDDEN",
+            facts.flags
+        ));
+    }
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "mount parent {} is not provably closed to this user: {}",
+            parent.display(),
+            reasons.join("; ")
+        ))
+    }
+}
+
+/// Observe `parent` through a descriptor and apply [`judge_parent`].
+pub fn refuse_writable_parent(parent: &Path) -> Result<(), String> {
+    let facts = observe_parent(parent)?;
+    judge_parent(parent, &facts)
+}
+
+pub fn observe_parent(parent: &Path) -> Result<ParentFacts, String> {
+    let by_path = std::fs::symlink_metadata(parent)
+        .map_err(|error| format!("cannot inspect {}: {error}", parent.display()))?;
+    let fd = open_dir(None, parent)?;
+    let stat = fstat(fd.as_fd_ref())?;
+    use std::os::unix::fs::MetadataExt;
+    Ok(ParentFacts {
+        real_directory: by_path.is_dir() && !by_path.file_type().is_symlink(),
+        coherent: u64::try_from(stat.st_dev).ok() == Some(by_path.dev())
+            && u64::try_from(stat.st_ino).ok() == Some(by_path.ino()),
+        uid: stat.st_uid,
+        mode: u32::from(stat.st_mode),
+        flags: file_flags(&stat),
+        acl: extended_acl(&fd),
+        // SAFETY: geteuid has no preconditions.
+        euid: unsafe { libc::geteuid() },
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn file_flags(stat: &libc::stat) -> u32 {
+    stat.st_flags
+}
+
+#[cfg(not(target_os = "macos"))]
+fn file_flags(_stat: &libc::stat) -> u32 {
+    u32::MAX
+}
+
+#[cfg(target_os = "macos")]
+fn extended_acl(fd: &OwnedFd) -> Acl {
+    // sys/acl.h
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+    const ACL_NEXT_ENTRY: libc::c_int = -1;
+    extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> *mut libc::c_void;
+        fn acl_get_entry(
+            acl: *mut libc::c_void,
+            id: libc::c_int,
+            entry: *mut *mut libc::c_void,
+        ) -> libc::c_int;
+        fn acl_free(object: *mut libc::c_void) -> libc::c_int;
+    }
+    // SAFETY: valid descriptor; the returned ACL is freed below.
+    let acl = unsafe { acl_get_fd_np(fd.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENOENT) => Acl::None,
+            _ => Acl::Unknown(error.to_string()),
+        };
+    }
+    let mut count = 0_usize;
+    let mut entry = std::ptr::null_mut();
+    let mut id = ACL_FIRST_ENTRY;
+    // SAFETY: `acl` is a live ACL; entries borrow it until it is freed.
+    while unsafe { acl_get_entry(acl, id, &mut entry) } == 0 {
+        count += 1;
+        id = ACL_NEXT_ENTRY;
+        if count > 1024 {
+            break;
+        }
+    }
+    // SAFETY: `acl` came from acl_get_fd_np and is freed once.
+    unsafe { acl_free(acl) };
+    if count == 0 {
+        Acl::None
+    } else {
+        Acl::Entries(count)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn extended_acl(_fd: &OwnedFd) -> Acl {
+    Acl::Unknown("extended ACLs are read on macOS only".to_owned())
 }
 
 /// Whether the effective user may write `path`, ACLs included.
@@ -637,15 +791,87 @@ mod tests {
         std::fs::remove_dir_all(parent).unwrap();
     }
 
+    fn standard() -> ParentFacts {
+        ParentFacts {
+            real_directory: true,
+            coherent: true,
+            uid: 0,
+            mode: 0o40755,
+            flags: UF_HIDDEN,
+            acl: Acl::None,
+            euid: 501,
+        }
+    }
+
+    #[test]
+    fn parent_rule_is_structural_and_reports_every_violation() {
+        let parent = Path::new("/Volumes");
+        assert!(judge_parent(parent, &standard()).is_ok());
+        let mut stricter = standard();
+        stricter.mode = 0o40700;
+        stricter.flags = 0;
+        assert!(judge_parent(parent, &stricter).is_ok());
+        let cases: Vec<(fn(&mut ParentFacts), &str)> = vec![
+            (|facts| facts.euid = 0, "root"),
+            (|facts| facts.real_directory = false, "not a real directory"),
+            (|facts| facts.coherent = false, "disagree"),
+            (|facts| facts.uid = 501, "not root"),
+            (|facts| facts.mode = 0o40775, "group or other write"),
+            (|facts| facts.mode = 0o40757, "group or other write"),
+            (|facts| facts.mode = 0o41755, "sticky"),
+            (|facts| facts.mode = 0o42755, "sticky"),
+            (|facts| facts.acl = Acl::Entries(1), "extended ACL entries"),
+            (
+                |facts| facts.acl = Acl::Unknown("EINVAL".to_owned()),
+                "extended ACL is unknown",
+            ),
+            (
+                |facts| facts.flags = UF_HIDDEN | 0x0002_0000,
+                "beyond UF_HIDDEN",
+            ),
+            (|facts| facts.flags = 0x0000_0002, "beyond UF_HIDDEN"),
+        ];
+        for (change, reason) in cases {
+            let mut facts = standard();
+            change(&mut facts);
+            let error = judge_parent(parent, &facts).unwrap_err();
+            assert!(error.contains(reason), "{reason}: {error}");
+        }
+        // The combined-W_OK concern: a root-owned 0755 parent that denies
+        // W_OK may still grant add_subdirectory through an ACL entry. The
+        // rule refuses on the ACL alone, without any access check.
+        let mut granted = standard();
+        granted.acl = Acl::Entries(1);
+        assert!(judge_parent(parent, &granted)
+            .unwrap_err()
+            .contains("extended ACL entries"));
+        // A non-root owner does not hide the ACL reason.
+        granted.uid = 501;
+        let both = judge_parent(parent, &granted).unwrap_err();
+        assert!(
+            both.contains("not root") && both.contains("extended ACL entries"),
+            "{both}"
+        );
+    }
+
+    /// Read-only positive control on the real standard parent.
     #[cfg(target_os = "macos")]
     #[test]
-    fn volumes_is_not_writable_here() {
-        // The host's /Volumes is root-owned 0755; a user-writable directory
-        // stands in for a custom mount parent.
-        assert!(refuse_writable_parent(Path::new(VOLUMES)).is_ok());
+    fn the_standard_volumes_parent_is_accepted() {
+        let facts = observe_parent(Path::new(VOLUMES)).unwrap();
+        assert_eq!(facts.acl, Acl::None);
+        if facts.euid != 0 {
+            assert!(
+                refuse_writable_parent(Path::new(VOLUMES)).is_ok(),
+                "{facts:?}"
+            );
+        }
         let parent = scratch("parent");
-        assert!(writable(&parent).unwrap());
-        assert!(refuse_writable_parent(&parent).is_err());
+        let error = refuse_writable_parent(&parent).unwrap_err();
+        assert!(
+            error.contains("not root") && !error.contains("ACL"),
+            "{error}"
+        );
         std::fs::remove_dir_all(parent).unwrap();
     }
 }

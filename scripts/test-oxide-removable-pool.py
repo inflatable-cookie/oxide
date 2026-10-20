@@ -435,6 +435,31 @@ def run(proof: Proof, parent: str) -> None:
     code, stdout, _ = oxide_run(["status"], "status, nothing registered")
     expect(code == 0 and "removable pool: none registered" in stdout, "status did not report no registration")
 
+    # Mount-parent rule: the real standard /Volumes (read only), then an
+    # owned scratch directory before and after an account-name ACL. The
+    # ACL refusal must be reported by name, not hidden behind the owner.
+    import pwd
+
+    shape = run_owned(["/usr/bin/stat", "-f", "%Su %Sp %Sf flags=%f", "/Volumes"], env=env, timeout=30)
+    emit(f"/Volumes shape exit {shape.returncode}", shape.stdout + shape.stderr)
+    code, stdout, _ = oxide_run(["pool", "debug-check-parent", "/Volumes"], "parent rule: /Volumes")
+    expect(code == 0 and "parent accepted: /Volumes" in stdout, "the standard /Volumes parent was refused")
+    acl_dir = os.path.join(parent, "acl-parent")
+    os.makedirs(acl_dir, mode=0o755)
+    os.chmod(acl_dir, 0o755)
+    code, stdout, _ = oxide_run(["pool", "debug-check-parent", acl_dir], "parent rule: owned, no ACL")
+    expect(code == 1 and "not root" in stdout and "ACL" not in stdout, "owned directory control did not refuse on owner alone")
+    account = pwd.getpwuid(os.geteuid()).pw_name
+    expect(account and not account.isdigit() and pwd.getpwnam(account).pw_uid == os.geteuid(), f"account name {account!r} does not round-trip")
+    grant = run_owned(["/bin/chmod", "+a", f"{account} allow add_subdirectory", acl_dir], env=env, timeout=30)
+    emit(f"chmod +a '{account} allow add_subdirectory' exit {grant.returncode}", grant.stdout + grant.stderr)
+    expect(grant.returncode == 0, "the owned ACL could not be set")
+    listing = run_owned(["/bin/ls", "-led", acl_dir], env=env, timeout=30)
+    emit(f"ls -led exit {listing.returncode}", listing.stdout + listing.stderr)
+    expect(f"user:{account} allow add_subdirectory" in listing.stdout, "the owned ACL is not visible")
+    code, stdout, _ = oxide_run(["pool", "debug-check-parent", acl_dir], "parent rule: owned, with ACL")
+    expect(code == 1 and "1 extended ACL entries" in stdout and "not root" in stdout, "the ACL was not refused by name")
+
     # Refusals before any image exists.
     image_size = f"{IMAGE_MIB}m"
     for args, needle, label in (
