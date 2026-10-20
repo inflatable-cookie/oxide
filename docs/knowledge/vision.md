@@ -491,6 +491,18 @@ Tom's ruling, 2026-10-20, on remote builds: deferred. "Let's focus on the extern
 
 Tom, 2026-10-20 ("Yeah that works"), after #101: keep the #099 bypass. Measure cold-slot frequency and cost from dogfood use, and reconsider sccache (the unqualified candidate: no-build-script units only, client-side mode, an Oxide-owned endpoint and a scrubbed environment) only if cold builds show a real cost. Cargo's own cross-workspace cache is the preferred long-term complement.
 
+Tom's ruling, 2026-10-20: "Once 097 is merged, let's switch nucleus over to use oxide - update the agent documentation to swap `oxide` for `cargo` for everything, hook up the external drive as the target cache space, do some work on nucleus, see how we go, both in the paseo worktrees on the host machine and in the oxide slots."
+
+Supervisor interpretation, sequenced after #097's reviewed merge:
+1. **Planner steps.** Reinstall `oxide` from the merged commit. Register the `Builds` volume (750 GB cap, 100 GB reserve). This supersedes the earlier hold that waited for #098 as well.
+2. **Nucleus changes go through the Nucleus Supervisor**, carrying Tom's ruling:
+   - write the `oxide init` block;
+   - change agent-facing docs and Effigy Rust selectors from `cargo` to `oxide`, keeping plain-Cargo escape selectors;
+   - turn off the existing lease-CLI build-cache integration for the trial, so there is one storage path.
+3. **Observation:** internal SSD and `Builds` device write counters, `oxide status`, slot reuse, waits, recoveries, stray plain-Cargo output in Nucleus worktrees, and task failures.
+
+Until #098 merges, Tom avoids undocking during active builds. Until #099 merges, Nucleus builds through `oxide` inherit sccache under the accepted interim risk.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
