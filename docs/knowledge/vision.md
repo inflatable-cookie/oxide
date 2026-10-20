@@ -424,7 +424,13 @@ Tom's sccache ruling, 2026-10-20: after asking how to integrate Effigy's
 independently installed sccache with Oxide and whether they interfere, Tom
 answered "OK, let's do it". This authorizes bounded Oxide-only qualification
 first, with an Opus High author and independent Sol High review; it does not
-make sccache an enabled or qualified production wrapper.
+make sccache a qualified production wrapper. The Effigy owner separately
+reported a machine-wide `[build] rustc-wrapper` setting in
+`~/.cargo/config.toml` on 2026-10-20 (setup record
+`reference-sccache-machine-setup.md`, owning Supervisor `a683cd79`). Oxide
+inherits Cargo configuration, so ordinary runs may already use that wrapper.
+This attributed setup record is not a live server observation or lifecycle
+qualification, and this ruling does not alter it.
 
 The deciding question is whether a cache shared across builds can establish
 closure of every server-side compiler and output-copy writer before Oxide
