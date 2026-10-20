@@ -457,7 +457,7 @@ fn run_whole(workspace: &Path, dry_run: bool, include_foreign: bool) -> Result<u
         return Ok(0);
     }
     process::install_signal_handlers()?;
-    let store = Store::open_existing()?;
+    let store = crate::removable::coordinate(Store::open_existing()?)?;
     let guard = match &store {
         Some(store) => match store.begin_clean(workspace)? {
             Cleaning::Guard(guard) => Some(guard),
@@ -520,7 +520,7 @@ fn run_whole(workspace: &Path, dry_run: bool, include_foreign: bool) -> Result<u
 fn run_selected(args: &[OsString], workspace: &Path) -> Result<u8, String> {
     protect_pool(&workspace.join("target"))?;
     process::install_signal_handlers()?;
-    let store = Store::open_existing()?;
+    let store = crate::removable::coordinate(Store::open_existing()?)?;
     let guard = match &store {
         Some(store) => match store.begin_clean(workspace)? {
             Cleaning::Guard(guard) => Some(guard),

@@ -435,9 +435,20 @@ pub struct Store {
     /// removable volume.
     pub payload: PathBuf,
     control: PathBuf,
-    /// The other pool's `state.json` when a removable pool is registered, so
-    /// the host-wide build limit counts both pools.
-    sibling: Option<PathBuf>,
+    /// The other pool's control directory when a removable pool is
+    /// registered: the host-wide limit counts both pools and a checkout's
+    /// clean barrier spans both.
+    sibling: Option<Sibling>,
+}
+
+/// The other pool of a registered pair.
+struct Sibling {
+    control: PathBuf,
+    /// Set on the removable store: its slot attempts also hold the internal
+    /// pool's admission lock (always internal first), which internal
+    /// `oxide clean` holds while it checks and marks. That makes a clean in
+    /// either pool and a removable build for the same checkout exclusive.
+    barrier: bool,
 }
 
 /// The pool's recorded backend.
@@ -878,31 +889,31 @@ impl Store {
         self.load().ok()?.flushes.pop()
     }
 
-    /// Count the other pool's active records for the host-wide limit. Its
-    /// state is replaced atomically, so it is read without its lock; a
-    /// command starting in the other pool at the same moment may briefly
-    /// exceed the limit by one.
-    pub fn with_sibling(mut self, control: &Path) -> Self {
-        self.sibling = Some(control.join("state.json"));
+    /// Pair this store with the other pool's control directory. `barrier`
+    /// is set for the removable store (see [`Sibling`]). The other pool's
+    /// state is replaced atomically and read without its own lock; for the
+    /// host-wide limit, a command starting in the other pool at the same
+    /// moment may briefly exceed it by one.
+    pub fn with_sibling(mut self, control: &Path, barrier: bool) -> Self {
+        self.sibling = Some(Sibling {
+            control: control.to_path_buf(),
+            barrier,
+        });
         self
     }
 
-    fn sibling_active(&self) -> usize {
-        let Some(path) = &self.sibling else {
-            return 0;
-        };
-        let Ok(Some(file)) = private_file(path, false) else {
-            return 0;
-        };
+    fn sibling_state(&self) -> Option<State> {
+        let sibling = self.sibling.as_ref()?;
+        let file = private_file(&sibling.control.join("state.json"), false).ok()??;
         let mut bytes = Vec::new();
-        if file
-            .take(MAX_STATE_BYTES + 1)
+        file.take(MAX_STATE_BYTES + 1)
             .read_to_end(&mut bytes)
-            .is_err()
-        {
-            return 0;
-        }
-        serde_json::from_slice::<State>(&bytes).map_or(0, |state| {
+            .ok()?;
+        serde_json::from_slice::<State>(&bytes).ok()
+    }
+
+    fn sibling_active(&self) -> usize {
+        self.sibling_state().map_or(0, |state| {
             state
                 .records
                 .iter()
@@ -911,11 +922,64 @@ impl Store {
         })
     }
 
+    /// Whether the other pool holds an active command for `checkout`
+    /// (internal clean checks the removable pool's commands).
+    fn sibling_busy(&self, checkout: &Path) -> bool {
+        self.sibling_state().is_some_and(|state| {
+            state
+                .records
+                .iter()
+                .any(|record| record.checkout.as_deref() == Some(checkout) && record.active())
+        })
+    }
+
+    /// The internal pool's admission lock, for the removable store's slot
+    /// attempts, plus whether a live internal clean covers `checkout`. A
+    /// clean mark counts while its lock is held or its Cargo group lives.
+    fn sibling_barrier(&self, checkout: &Path) -> Result<(Option<File>, bool), String> {
+        let Some(sibling) = self.sibling.as_ref().filter(|sibling| sibling.barrier) else {
+            return Ok((None, false));
+        };
+        let file = private_file(&sibling.control.join("admission.lock"), true)?
+            .ok_or("the internal admission lock is missing")?;
+        flock(&file, libc::LOCK_EX)?;
+        let cleaning = match self.sibling_state() {
+            None => false,
+            Some(state) => {
+                let mut live = false;
+                for clean in state
+                    .cleans
+                    .iter()
+                    .filter(|clean| clean.checkout == checkout)
+                {
+                    let path = sibling
+                        .control
+                        .join("waiters")
+                        .join(format!("{}.lock", clean.id));
+                    live |= match probe_lock(&path, false)? {
+                        Probe::Held => true,
+                        Probe::Free(_) => clean
+                            .process_group
+                            .is_some_and(|group| !process::group_empty(group)),
+                        Probe::Missing => false,
+                    };
+                }
+                live
+            }
+        };
+        Ok((Some(file), cleaning))
+    }
+
     /// The gate cannot vouch for this checkout's own slot (no trusted record,
     /// or its history cannot be read): release it before Cargo and evict it
     /// whole, so the command builds cold instead of reusing it unchecked.
     pub fn discard(&self, held: Lease) -> Result<(), String> {
         let _admission = self.admission()?;
+        // Even an evicted removable slot is flushed first: a failed flush
+        // retires it held instead of releasing and deleting it.
+        if !self.flush_before_idle(&held.slot_id, held.record)? {
+            return Ok(());
+        }
         release(&self.pool, &held.lease_id)
             .map_err(|error| lease_error("could not release the slot", &error))?;
         evict_idle_slot(&self.pool, &held.slot_id)
@@ -943,7 +1007,8 @@ impl Store {
                 let busy = state.cleans.iter().any(|clean| clean.checkout == checkout)
                     || state.records.iter().any(|record| {
                         record.checkout.as_deref() == Some(checkout) && record.active()
-                    });
+                    })
+                    || self.sibling_busy(checkout);
                 if !busy {
                     if state.cleans.len() >= MAX_TICKETS {
                         return Err(format!("too many concurrent oxide cleans ({MAX_TICKETS})"));
@@ -1085,6 +1150,8 @@ impl Store {
         max_active: usize,
         share: bool,
     ) -> Result<Result<Lease, Wait>, String> {
+        // Internal admission first (removable store only), then this pool's.
+        let (_barrier, cleaning) = self.sibling_barrier(&key.checkout)?;
         let _admission = self.admission()?;
         let mut state = self.load()?;
         self.drop_dead_tickets(&mut state)?;
@@ -1097,10 +1164,11 @@ impl Store {
             self.save(&state)?;
             return Ok(Err(Wait::Queue(position + 1)));
         }
-        if state
-            .cleans
-            .iter()
-            .any(|clean| clean.checkout == key.checkout)
+        if cleaning
+            || state
+                .cleans
+                .iter()
+                .any(|clean| clean.checkout == key.checkout)
         {
             self.save(&state)?;
             return Ok(Err(Wait::Clean));
@@ -1375,9 +1443,11 @@ impl Store {
                     state.records[index].pending_recovery = Some(recovery.clone());
                     self.save(state)?;
                     let record_id = state.records[index].id;
-                    if !self.flush_before_idle(&recovery.slot_id, record_id)? {
-                        // Retired on disk; keep this copy in step.
-                        *state = self.load()?;
+                    let flushed = self.flush_before_idle(&recovery.slot_id, record_id)?;
+                    // The flush saved its receipt (and any retirement);
+                    // continue from that state so it is not overwritten.
+                    *state = self.load()?;
+                    if !flushed {
                         continue;
                     }
                     recover(&self.pool, &recovery.lease_id)

@@ -121,6 +121,7 @@ fn register(mount: &Path, reserve: u64, cap: u64) -> Result<u8, String> {
         return Err(format!("{} is not writable", mount.display()));
     }
     let identity = disk_identity(binding.mount_point(), binding.uuid())?;
+    check_identity(&identity, None)?;
     let internal = Store::open_or_create()?;
     let control = internal.control().to_path_buf();
     if fs::symlink_metadata(control.join(REGISTRATION)).is_ok()
@@ -158,8 +159,14 @@ fn register(mount: &Path, reserve: u64, cap: u64) -> Result<u8, String> {
     Ok(0)
 }
 
+/// What `diskutil` reports about a mounted volume, as checked at
+/// registration and again whenever selection considers it.
 struct DiskIdentity {
     container_uuid: String,
+    container_ref: String,
+    /// The container holding `/System/Volumes/Data`.
+    data_container_ref: String,
+    roles: Vec<String>,
     quota_bytes: Option<u64>,
 }
 
@@ -179,22 +186,16 @@ fn disk_identity(mount: &Path, uuid: &str) -> Result<DiskIdentity, String> {
             mount.display()
         ));
     }
-    let container = field("APFSContainerReference")
+    let container_ref = field("APFSContainerReference")
         .ok_or_else(|| format!("diskutil reports no APFS container for {}", mount.display()))?
         .to_owned();
-    // The boot/data container is never accepted, whatever the volume.
     let data = plist(&["info", "-plist", "/System/Volumes/Data"])?;
-    if data
+    let data_container_ref = data
         .get("APFSContainerReference")
         .and_then(serde_json::Value::as_str)
-        == Some(container.as_str())
-    {
-        return Err(format!(
-            "{} is in the internal boot/data container",
-            mount.display()
-        ));
-    }
-    let list = plist(&["apfs", "list", "-plist", &container])?;
+        .ok_or("diskutil reports no container for /System/Volumes/Data")?
+        .to_owned();
+    let list = plist(&["apfs", "list", "-plist", &container_ref])?;
     let entry = list["Containers"]
         .as_array()
         .and_then(|containers| containers.first())
@@ -211,16 +212,38 @@ fn disk_identity(mount: &Path, uuid: &str) -> Result<DiskIdentity, String> {
                 .find(|volume| volume["APFSVolumeUUID"] == uuid)
         })
         .ok_or("diskutil does not list the volume in its container")?;
-    let roles: Vec<&str> = volume["Roles"]
+    let roles = volume["Roles"]
         .as_array()
-        .map(|roles| roles.iter().filter_map(serde_json::Value::as_str).collect())
-        .unwrap_or_default();
-    refuse_roles(&roles)?;
-    let quota_bytes = volume["CapacityQuota"].as_u64().filter(|quota| *quota > 0);
+        .ok_or("diskutil reports no role list for the volume")?
+        .iter()
+        .map(|role| role.as_str().map(str::to_owned).ok_or("a role is not text"))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(DiskIdentity {
         container_uuid,
-        quota_bytes,
+        container_ref,
+        data_container_ref,
+        roles,
+        quota_bytes: volume["CapacityQuota"].as_u64().filter(|quota| *quota > 0),
     })
+}
+
+/// The boot/data container and every APFS role refuse; at selection the
+/// container must also be the registered one.
+fn check_identity(identity: &DiskIdentity, registered: Option<&str>) -> Result<(), String> {
+    if identity.container_ref == identity.data_container_ref {
+        return Err("the volume is in the internal boot/data container".to_owned());
+    }
+    let roles: Vec<&str> = identity.roles.iter().map(String::as_str).collect();
+    refuse_roles(&roles)?;
+    if let Some(registered) = registered {
+        if identity.container_uuid != registered {
+            return Err(format!(
+                "the volume is in container {}, not the registered {registered}",
+                identity.container_uuid
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Only a plain data volume with no APFS role is accepted: a Time Machine
@@ -340,13 +363,13 @@ pub fn select(internal: Store) -> Result<Selected, String> {
                 registration.mount_point.display()
             );
             Ok(Selected {
-                store: store.with_sibling(internal.control()),
+                store: store.with_sibling(internal.control(), true),
                 note: Some(note),
                 removable: true,
             })
         }
         Err(reason) => Ok(Selected {
-            store: internal.with_sibling(&control),
+            store: internal.with_sibling(&control, false),
             note: Some(format!(
                 "internal pool: removable volume not used ({reason})"
             )),
@@ -364,6 +387,10 @@ fn usable(internal: &Store, registration: &Registration) -> Result<Store, String
     if !volume::writable(binding.mount_point())? {
         return Err("the volume is not writable".to_owned());
     }
+    // Container, boot/data and role exclusions again: a registered volume
+    // may since have gained a role or moved. Unknown metadata refuses.
+    let identity = disk_identity(binding.mount_point(), binding.uuid())?;
+    check_identity(&identity, Some(&registration.container_uuid))?;
     let available = binding
         .verify()?
         .available_bytes
@@ -379,6 +406,23 @@ fn usable(internal: &Store, registration: &Registration) -> Result<Store, String
         &internal.control().join(POOL_DIR),
         registration.mount_point.join(PAYLOAD_DIR),
     )
+}
+
+/// Pair the internal store with a registered removable pool's state, so
+/// `oxide clean` waits for the checkout's removable builds too. Without a
+/// registration the store is returned unchanged.
+pub fn coordinate(internal: Option<Store>) -> Result<Option<Store>, String> {
+    let Some(internal) = internal else {
+        return Ok(None);
+    };
+    if registration(&internal)?.is_none() {
+        return Ok(Some(internal));
+    }
+    let control = internal
+        .control()
+        .join(POOL_DIR)
+        .join(oxide_storage::lease::MANAGED_NAME);
+    Ok(Some(internal.with_sibling(&control, false)))
 }
 
 /// `status` lines for the registration and the removable pool. Returns the
@@ -449,6 +493,34 @@ mod tests {
         for role in ["Data", "System", "Preboot", "Recovery", "VM", "Update"] {
             assert!(refuse_roles(&[role]).is_err(), "{role}");
         }
+    }
+
+    fn identity(container: &str, roles: &[&str]) -> DiskIdentity {
+        DiskIdentity {
+            container_uuid: container.to_owned(),
+            container_ref: "disk13".to_owned(),
+            data_container_ref: "disk3".to_owned(),
+            roles: roles.iter().map(|role| (*role).to_owned()).collect(),
+            quota_bytes: None,
+        }
+    }
+
+    /// Injected metadata: selection refuses a registered volume that later
+    /// gained the Backup role, moved to another container or sits in the
+    /// boot/data container.
+    #[test]
+    fn selection_rechecks_container_and_roles() {
+        let registered = "7CADDF63-E2EA-4EF5-8D0B-889B7E829171";
+        assert!(check_identity(&identity(registered, &[]), Some(registered)).is_ok());
+        let backup =
+            check_identity(&identity(registered, &["Backup"]), Some(registered)).unwrap_err();
+        assert!(backup.contains("Backup"), "{backup}");
+        let moved = check_identity(&identity("OTHER", &[]), Some(registered)).unwrap_err();
+        assert!(moved.contains("not the registered"), "{moved}");
+        let mut internal = identity(registered, &[]);
+        internal.container_ref = "disk3".to_owned();
+        assert!(check_identity(&internal, Some(registered)).is_err());
+        assert!(check_identity(&internal, None).is_err());
     }
 
     #[test]

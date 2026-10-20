@@ -24,6 +24,7 @@ import os
 import plistlib
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -51,6 +52,10 @@ exec "REAL_CARGO" "$@"
 
 STARTED = time.monotonic()
 OUTPUT = 0
+# Sessions of owned children not yet positively closed. Teardown never
+# detaches while one remains.
+UNCLOSED: set = set()
+SCRATCH_VARIABLES = ("OXIDE_TASK_SCRATCH_ROOT", "TMPDIR", "TMP", "TEMP")
 
 
 def fail(message: str) -> None:
@@ -71,6 +76,72 @@ def emit(label: str, text: str) -> None:
         fail("proof output exceeds 32 MiB")
     print(f"----- {label} ({len(text.encode())} bytes) -----")
     print(text, end="" if text.endswith("\n") or not text else "\n")
+
+
+def processes() -> list:
+    """[(pid, process group, session or None)] for every visible process."""
+    listing = subprocess.run(["ps", "-A", "-o", "pid=,pgid="], check=True, capture_output=True, text=True, timeout=30)
+    table = []
+    for line in listing.stdout.splitlines():
+        pid, group = map(int, line.split())
+        try:
+            session = os.getsid(pid)
+        except (ProcessLookupError, PermissionError):
+            session = None
+        table.append((pid, group, session))
+    return table
+
+
+def close_session(session: int, groups: set, child: subprocess.Popen) -> list:
+    """TERM then KILL every group seen in `session`, reaping the leader;
+    return survivors."""
+    for number in (signal.SIGTERM, signal.SIGKILL):
+        groups |= {group for _, group, member in processes() if member == session}
+        for group in groups:
+            try:
+                os.killpg(group, number)
+            except (ProcessLookupError, PermissionError):
+                pass
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            child.poll()
+            alive = [pid for pid, group, member in processes() if member == session or group in groups]
+            if not alive:
+                return []
+            time.sleep(0.1)
+    child.poll()
+    return [pid for pid, group, member in processes() if member == session or group in groups]
+
+
+def run_owned(command: list, *, env: dict, cwd: str | None = None, text: bool = True, timeout: float = 120) -> subprocess.CompletedProcess:
+    """Run in a new session (its ID is the child's PID; `oxide` keeps Cargo's
+    groups in it). After exit or timeout, every process of the session must
+    be positively gone before the proof continues or tears down."""
+    limit = min(timeout, remaining())
+    child = subprocess.Popen(
+        command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text, start_new_session=True
+    )
+    session = child.pid
+    UNCLOSED.add(session)
+    groups = {session}
+    timed_out = False
+    try:
+        stdout, stderr = child.communicate(timeout=limit)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        survivors = close_session(session, groups, child)
+        stdout, stderr = child.communicate()
+        if survivors:
+            fail(f"{command[0]} timed out and session {session} kept {survivors}; evidence kept, no detach")
+    survivors = [pid for pid, group, member in processes() if member == session and pid != session]
+    if survivors:
+        survivors = close_session(session, groups, child)
+        if survivors:
+            fail(f"{command[0]} left session {session} members {survivors}; evidence kept, no detach")
+    UNCLOSED.discard(session)
+    if timed_out:
+        fail(f"{command[0]} exceeded its time limit; its session closed")
+    return subprocess.CompletedProcess(command, child.returncode, stdout, stderr)
 
 
 class Reserve:
@@ -123,6 +194,7 @@ class Proof:
         self.owned_peak = 0
         self.mount = None
         self.image = os.path.join(parent, "volume.sparseimage")
+        self.env = dict(os.environ)
         self.name = "OxRm" + secrets.token_hex(4)
 
     def account(self, phase: str) -> None:
@@ -134,7 +206,7 @@ class Proof:
             fail(f"owned bytes {owned} exceed 512 MiB at {phase}")
 
     def hdiutil(self, *args: str) -> subprocess.CompletedProcess:
-        result = subprocess.run(["/usr/bin/hdiutil", *args], capture_output=True, timeout=min(60, remaining()))
+        result = run_owned(["/usr/bin/hdiutil", *args], env=self.env, text=False, timeout=60)
         emit(f"hdiutil {args[0]} exit {result.returncode}", result.stderr.decode(errors="replace"))
         return result
 
@@ -159,6 +231,8 @@ class Proof:
     def detach(self) -> None:
         if not self.mount or not os.path.ismount(self.mount):
             return
+        if UNCLOSED:
+            fail(f"owned sessions {sorted(UNCLOSED)} are not positively closed; no detach, evidence kept")
         # Ordinary detach only; a busy volume stops the proof.
         result = self.hdiutil("detach", self.mount)
         if result.returncode:
@@ -168,6 +242,7 @@ class Proof:
 
 
 def build(parent: str, repo: str) -> str:
+    # os.environ already carries the four scratch variables.
     stage = dict(os.environ)
     for name in list(stage):
         if name.startswith("SCCACHE_") or name in ("CARGO", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "RUSTC"):
@@ -183,14 +258,13 @@ def build(parent: str, repo: str) -> str:
             "CARGO_PROFILE_DEV_DEBUG": "0",
         }
     )
-    result = subprocess.run(
+    result = run_owned(
         ["cargo", "build", "--locked", "--offline", "--bin", "oxide", "--message-format=json-render-diagnostics"],
         cwd=repo,
-        stdout=subprocess.PIPE,
-        text=True,
         env=stage,
-        timeout=remaining(),
+        timeout=240,
     )
+    emit(f"staging exit {result.returncode} stderr", result.stderr)
     if result.returncode:
         fail(f"staging exit {result.returncode}")
     for line in result.stdout.splitlines():
@@ -219,6 +293,17 @@ def main() -> int:
         fail(f"scratch {root} is not under /private/tmp")
     parent = os.path.join(root, "removable-pool")
     os.makedirs(parent, mode=0o700, exist_ok=False)
+    # One fresh canonical temp directory, inside the counted tree, for this
+    # process and every child (staging, oxide, Cargo, hdiutil) before any of
+    # them writes.
+    scratch = os.path.join(parent, "tmp")
+    os.makedirs(scratch, mode=0o700)
+    scratch = os.path.realpath(scratch)
+    if not scratch.startswith("/private/tmp/"):
+        fail(f"scratch {scratch} is not canonical under /private/tmp")
+    for name in SCRATCH_VARIABLES:
+        os.environ[name] = scratch
+    print(f"scratch variables {', '.join(SCRATCH_VARIABLES)} = {scratch}")
     reserve = Reserve(parent)
     if reserve.free() < HOST_RESERVE_BYTES:
         fail("host free space is below the 20 GiB reserve before any effect")
@@ -227,6 +312,7 @@ def main() -> int:
     try:
         run(proof, parent)
     except BaseException:
+        # Detach only after every owned session closed positively.
         try:
             proof.detach()
         except BaseException as error:  # keep the first failure
@@ -263,8 +349,8 @@ def run(proof: Proof, parent: str) -> None:
 
     bin_dir = os.path.join(parent, "bin")
     cargo_home = os.path.join(parent, "cargo-home")
-    tmp = os.path.join(parent, "tmp")
-    for path in (bin_dir, cargo_home, tmp):
+    tmp = os.environ["TMPDIR"]
+    for path in (bin_dir, cargo_home):
         os.makedirs(path, mode=0o700)
     cargo_log = os.path.join(parent, "cargo.log")
     wrapper = os.path.join(bin_dir, "cargo")
@@ -291,11 +377,13 @@ def run(proof: Proof, parent: str) -> None:
             "RUSTC_WORKSPACE_WRAPPER": "",
             "CARGO_BUILD_RUSTC_WRAPPER": "",
             "RUSTUP_AUTO_INSTALL": "0",
+            "OXIDE_TASK_SCRATCH_ROOT": tmp,
             "TMPDIR": tmp,
             "TMP": tmp,
             "TEMP": tmp,
         }
     )
+    proof.env = env
     app = os.path.join(parent, "app")
     for relative, text in FIXTURE.items():
         path = os.path.join(app, relative)
@@ -310,7 +398,7 @@ def run(proof: Proof, parent: str) -> None:
     def oxide_run(args: list, label: str, extra: dict | None = None, cwd: str = app) -> tuple:
         call_env = dict(env)
         call_env.update(extra or {})
-        result = subprocess.run([oxide, *args], cwd=cwd, env=call_env, capture_output=True, text=True, timeout=min(120, remaining()))
+        result = run_owned([oxide, *args], cwd=cwd, env=call_env, timeout=120)
         emit(f"{label}: exit {result.returncode} stdout", result.stdout)
         emit(f"{label}: stderr", result.stderr)
         return result.returncode, result.stdout, result.stderr
@@ -363,11 +451,10 @@ def run(proof: Proof, parent: str) -> None:
     expect(not os.path.exists(os.path.join(control, "removable.json")), "a refusal wrote a registration")
     expect(not os.path.lexists(f"/Volumes/{proof.name}"), "a refusal created a mount point")
 
-    create = subprocess.run(
+    create = run_owned(
         ["/usr/bin/hdiutil", "create", "-size", image_size, "-fs", "APFS", "-volname", proof.name, "-type", "SPARSE", proof.image],
-        capture_output=True,
-        text=True,
-        timeout=min(60, remaining()),
+        env=env,
+        timeout=60,
     )
     emit(f"hdiutil create exit {create.returncode}", create.stdout + create.stderr)
     expect(create.returncode == 0, "image creation failed")
@@ -387,7 +474,7 @@ def run(proof: Proof, parent: str) -> None:
     expect(code == 0 and "registered removable pool" in stdout, "registration failed")
     with open(os.path.join(control, "removable.json"), encoding="utf-8") as handle:
         registration = json.load(handle)
-    info = plistlib.loads(subprocess.run(["/usr/sbin/diskutil", "info", "-plist", mount], capture_output=True, timeout=30).stdout)
+    info = plistlib.loads(run_owned(["/usr/sbin/diskutil", "info", "-plist", mount], env=env, text=False, timeout=30).stdout)
     expect(registration["volume_uuid"] == info["VolumeUUID"], "registered UUID is not diskutil's")
     expect(registration["mount_point"] == mount and registration["reserve_bytes"] == 16 * MIB and registration["cap_bytes"] == 64 * MIB, f"registration {registration}")
     # Control plane internal, data plane external.
