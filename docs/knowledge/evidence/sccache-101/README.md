@@ -159,11 +159,25 @@ start 12:50:37 UTC; the harness aborted at 6.17 s and exited 1
   under `/private/tmp/oxide-sc101.b1mlro12/alias/0/oxide-quick/deps`: no
   canonicalization to the slot path.
 - Teardown: 2 of 2 owned groups closed, no unknown state, no sccache
-  process left that was not present at start, 1 Cargo launch, owned peak
-  2,523,136 bytes, minimum host free space 717,813,780,480 bytes over 24
-  samples. The private server took the lingering path in teardown (members
-  empty, group still answering signal 0) and closed after SIGKILL; a likely
-  unreaped zombie, since the harness had not waited on it. Scratch retained.
+  process left that was not present at start, 1 Cargo launch. The private
+  server took the lingering path in teardown (members empty, group still
+  answering signal 0) and closed after SIGKILL; a likely unreaped zombie,
+  since the harness had not waited on it. Scratch retained.
+- Resource readings, as recorded in the ledger: `owned_peak` 2,523,136
+  bytes, `reserve_min` 717,813,780,480 bytes over 24 samples,
+  `logs_bytes` 20,480. These are weaker than the bounds in
+  [PROTOCOL.md](PROTOCOL.md#bounds), which state what was intended, not what
+  this session established:
+  - The storage value is the maximum of successful samples, not a measured
+    peak. The session-1 recipe (`6322f0f`) sampled owned bytes about every
+    2 s (every eighth 250 ms monitor tick), skipped entries whose `lstat`
+    failed, and did not surface directory traversal errors.
+  - There is no pre-effect reserve receipt. `make_root()` created the root,
+    its directories, the ledger and the private config before the reserve
+    monitor started; the 24 samples cover the run after that.
+  - The 32 MiB log bound was not monitored or enforced during execution;
+    `logs_bytes` is one end-of-run observation.
+  - None of this shows a cap or reserve breach or a remaining writer.
 
 ## Amendment and native session 2 (never launched, consumed)
 
