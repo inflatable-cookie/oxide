@@ -175,3 +175,22 @@ binary-rewrite execution cost. The new scopes transfer no prior acceptance.
 The normal-path round is a final no-go: independent review measured both
 like-for-like gates above 100 ms, and nothing from it is merged
 ([round 2](rust-dx-landscape.md#oxide-normal-command-overhead-round-2-2026-10-19)).
+
+
+## Q-017 — Can sccache sharing preserve Oxide's slot writer closure?
+
+Tom approved qualification first ([vision](vision.md#product-workflow-direction)).
+Cargo compiler-wrapper compatibility alone does not prove that Oxide can
+release or recover a slot safely: sccache's server runs compiler/cache-output
+tasks, whereas Oxide's current closure proof follows the Cargo process group.
+Wrapper/toolchain identity is also unqualified beyond the delivered
+[caller-context cases](contracts/workflow.md#cargo-version-matrix).
+
+The pinned sccache 0.18.0 [local-cache contract](https://github.com/mozilla/sccache/blob/v0.18.0/docs/Local.md)
+allows only one server per local cache. Qualification must find a source-grounded,
+attributable closure arrangement that also reuses cache entries between builds,
+or retain a precise no-go. A private cache per build alone establishes no
+cross-build sharing benefit. Cold-slot timings, incremental/non-incremental
+unit behavior, extra storage and actual attributable write counters are separate
+observations; missing counters remain unknown. No production wrapper is enabled
+by this question or by an evidence-only outcome.

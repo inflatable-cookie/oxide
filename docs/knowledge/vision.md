@@ -420,6 +420,34 @@ Tom's rulings, 2026-10-19 ("I can't restart right now, there's a lot of in-progr
 - **The `oxide clean` / `--cargo-cache` safety fix is approved,** including one exact-pinned `basic-toml` `=0.1.10` parser dependency as a strict-profile exception for reading Cargo config.
 - **Nucleus is the second adopting project; Effigy is excluded for now** (critical path). The Nucleus adoption proposal follows the dogfood report and needs the Nucleus owner's agreement before any change.
 
+Tom's sccache ruling, 2026-10-20: after asking how to integrate Effigy's
+independently installed sccache with Oxide and whether they interfere, Tom
+answered "OK, let's do it". This authorizes bounded Oxide-only qualification
+first, with an Opus High author and independent Sol High review; it does not
+make sccache an enabled or qualified production wrapper.
+
+The deciding question is whether a cache shared across builds can establish
+closure of every server-side compiler and output-copy writer before Oxide
+releases or recovers a slot. A private server inside the Cargo process group,
+serialized server lifetimes over one cache, and attributable shared-server
+completion are candidates to verify against pinned sccache 0.18.0 source, not
+accepted mechanisms. Multiple concurrent servers must not share one local
+cache. The proof must distinguish incremental workspace units from cacheable
+dependency units and measure cold-slot benefit, server overhead, additional
+storage and attributable writes. Cache size is not bytes written or SSD wear;
+unavailable write attribution remains unknown.
+
+Qualification uses isolated owned servers, endpoints, caches and fixtures. It
+must not operate on Effigy's or the user's existing server, cache or config,
+override an existing compiler wrapper, change quick-profile incremental
+settings, install tools or enable remote caching. Unproven writer closure is a
+no-go. An honest negative or insufficient result is retained as evidence only;
+a positive result permits a separately scoped integration brief under this
+approval, with independent review before product enablement. Queue owns the
+finite clocks, process/storage limits and proof allowances. The
+[open compatibility question](questions.md#q-017--can-sccache-sharing-preserve-oxides-slot-writer-closure)
+owns the remaining evidence boundary.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
