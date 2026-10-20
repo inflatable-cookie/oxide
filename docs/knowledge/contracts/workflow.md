@@ -1339,7 +1339,7 @@ A lease records which pool it uses. Each pool stays warm on its own.
 - **Queue worktrees and Colima's VM disk stay internal:** they hold live state that an unplug would break.
 - Spotlight indexing of build locations is a host setting, recommended separately.
 
-**Drive:** the dedicated spare 1 TB SSD (Tom, 2026-10-20), erased as APFS volume `OxideBuild`. Vault and its Time Machine backups stay untouched. **Not yet decided:** the real drive's explicit reserve and quota values, and the exact flush primitive and its cost. Tom will format it as plain APFS in Disk Utility; no agent retries or bypasses the denied erase operation.
+**Drive:** the dedicated spare 1 TB SSD (Tom, 2026-10-20), formatted by Tom in Disk Utility as plain APFS volume `Builds` (UUID `A6AC3ED7-33EA-46B4-8082-7254CF291ED2`). Vault and its Time Machine backups stay untouched. **Decided (Tom, 2026-10-20):** a 750 GB Oxide admission cap and a 100 GB free-space reserve, both set at registration. **Not yet decided:** the exact flush primitive and its cost.
 
 ## Open decisions
 
