@@ -1,8 +1,12 @@
 """Pool accounting at build-cache scale (oxide#108), on private directory pools.
 
-Stages the candidate `oxide` and the base commit's `oxide` (old 50,000-entry
-pool bound) offline with plain Cargo and 1.97.1, no rustc wrapper, into owned
-scratch. Fixture builds use a private HOME, CARGO_HOME and OXIDE_POOL, never
+Stages the candidate `oxide` (this clean HEAD) and the reference `oxide` (the
+merge-base with origin/main, old 50,000-entry pool bound) offline with plain
+Cargo and 1.97.1, no rustc wrapper, into owned scratch: each from its own
+source tree into its own fresh target and build directory. Before any fixture
+it records each source commit, tree, manifest and lock hash, the staged binary
+SHA-256 and Cargo's compiled/fresh lines, and requires the two binaries to
+differ and only the candidate to carry its new accounting diagnostic. Fixture builds use a private HOME, CARGO_HOME and OXIDE_POOL, never
 the installed binary or a live pool. Cases, each with more than 50,000 real
 entries:
 
@@ -21,6 +25,7 @@ benchmark and not full QA. Scratch is removed only after positive completion.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -36,6 +41,7 @@ PROOF_SECONDS = 300
 OLD_BOUND = 50_000
 MIB = 1024 * 1024
 STARTED = time.monotonic()
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 FIXTURE = {
     "Cargo.toml": '[package]\nname = "scale"\nversion = "0.1.0"\nedition = "2021"\n',
@@ -102,13 +108,27 @@ def owned(parent: str, phase: str) -> int:
     return used
 
 
+DIAGNOSTIC = b"owned accounting is incomplete"
+
+
+def sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def stage(source: str, target: str, out: str, log: str, env: dict) -> str:
+    """Build `oxide` from `source` into its own fresh target and build dir."""
+    if os.path.lexists(target):
+        fail(f"staging target {target} already exists")
     with open(log, "w") as handle:
         build = subprocess.run(
             ["cargo", "build", "--locked", "--offline", "-v", "--bin", "oxide",
              "--manifest-path", os.path.join(source, "Cargo.toml")],
-            cwd=source, env={**env, "CARGO_TARGET_DIR": target}, stdout=handle,
-            stderr=subprocess.STDOUT, timeout=remaining(),
+            cwd=source, env={**env, "CARGO_TARGET_DIR": target, "CARGO_BUILD_BUILD_DIR": target},
+            stdout=handle, stderr=subprocess.STDOUT, timeout=remaining(),
         )
     with open(log) as handle:
         text = handle.read()
@@ -118,7 +138,20 @@ def stage(source: str, target: str, out: str, log: str, env: dict) -> str:
         fail(f"staging {source} ran a rustc wrapper")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     shutil.copy2(os.path.join(target, "debug", "oxide"), out)
+    units = [line.strip() for line in text.splitlines()
+             if re.match(r"\s*(Compiling|Fresh) oxide-storage ", line)]
+    print(f"pool-scale staged {out}: sha256 {sha256(out)}; {units}")
+    if not any(unit.startswith("Compiling oxide-storage ") for unit in units):
+        fail(f"staging {source} did not compile oxide-storage: {units}")
     return out
+
+
+def identity(source: str, commit: str) -> dict:
+    tree = subprocess.run(["git", "rev-parse", f"{commit}^{{tree}}"], cwd=REPO,
+                          capture_output=True, text=True, timeout=30).stdout.strip()
+    return {"commit": commit, "tree": tree,
+            "Cargo.toml": sha256(os.path.join(source, "Cargo.toml")),
+            "Cargo.lock": sha256(os.path.join(source, "Cargo.lock"))}
 
 
 def write_fixture(root: str) -> None:
@@ -333,7 +366,10 @@ def prove_eviction(parent: str, env: dict, new: str) -> None:
 def main() -> int:
     if sys.platform != "darwin":
         fail("the pool-scale proof requires macOS")
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    repo = REPO
+    if subprocess.run(["git", "status", "--porcelain"], cwd=repo, capture_output=True,
+                      text=True, timeout=30).stdout.strip():
+        fail("the candidate checkout is not clean, so HEAD does not name its source")
     reserve("/private/tmp", "admission")
     made = subprocess.run(["mktemp", "-d", "/private/tmp/oxide-pool-scale.XXXXXX"],
                           capture_output=True, text=True, timeout=30)
@@ -357,11 +393,21 @@ def main() -> int:
                      and name not in ("CARGO", "CARGO_INCREMENTAL", "RUSTUP_TOOLCHAIN")}
         stage_env.update({"RUSTUP_TOOLCHAIN": BUILDER, "RUSTC_WRAPPER": "", "CARGO_PROFILE_DEV_DEBUG": "0",
                           "CARGO_NET_OFFLINE": "true"})
-        target = os.path.join(parent, "stage-target")
-        old = stage(old_src, target, os.path.join(parent, "bin-old", "oxide"), os.path.join(parent, "stage-old.log"), stage_env)
-        new = stage(repo, target, os.path.join(parent, "bin-new", "oxide"), os.path.join(parent, "stage-new.log"), stage_env)
+        identities = {"reference": identity(old_src, base), "candidate": identity(repo, head)}
+        print(f"pool-scale sources: {json.dumps(identities, sort_keys=True)}")
+        old = stage(old_src, os.path.join(parent, "stage-reference"), os.path.join(parent, "bin-old", "oxide"),
+                    os.path.join(parent, "stage-reference.log"), stage_env)
+        new = stage(repo, os.path.join(parent, "stage-candidate"), os.path.join(parent, "bin-new", "oxide"),
+                    os.path.join(parent, "stage-candidate.log"), stage_env)
         shutil.rmtree(old_src)
-        print(f"pool-scale staging: base {base}, candidate {head}, {time.monotonic() - STARTED:.0f} s")
+        with open(old, "rb") as handle:
+            old_bytes = handle.read()
+        with open(new, "rb") as handle:
+            new_bytes = handle.read()
+        if old_bytes == new_bytes or DIAGNOSTIC in old_bytes or DIAGNOSTIC not in new_bytes:
+            fail("staged binaries are not a distinct reference and candidate carrying the new diagnostic")
+        print(f"pool-scale staging: reference {base}, candidate {head}, binaries differ, "
+              f"candidate diagnostic present, {time.monotonic() - STARTED:.0f} s")
         owned(parent, "after staging")
         reserve(parent, "after staging")
 
