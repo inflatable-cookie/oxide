@@ -483,6 +483,12 @@ Tom, 2026-10-20 ("Can you have another look into sccache working with oxide? It 
 
 It is evidence and knowledge only. No runtime change, install or live server operation. A positive result needs a separate integration brief. The #099 bypass stays until then.
 
+Tom's ruling, 2026-10-20, on remote builds: deferred. "Let's focus on the external volume support for now and come back to remote builds later."
+- The gaming PC (Bazzite) is not a useful day-to-day remote. Underlay web apps (future deploy target: Render) must integrate with the local dev environment through Effigy's gateway, and running their Rust APIs on a separate Linux host would need complex, frequently changing networking.
+- A Mac mini is the intended future server ("when I can afford to buy a Mac Mini I will, but that won't be immediate").
+- Oracle Always Free was considered and not pursued: reports say the free Arm allowance is now 2 OCPU / 12 GB, with idle reclamation.
+- The executor seam in [workflow — Execution location](contracts/workflow.md#execution-location) stays as designed, with only the local executor.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
