@@ -464,6 +464,9 @@ Tom's rulings, 2026-10-20, on moving build writes off the non-replaceable intern
 - Tom, 2026-10-20: "The 1TB drive can be wiped, that's the Time Machine from my old machine, don't need it any more".
   - The dedicated build drive is that spare SSD (USB "500SSD1", `disk10`). It replaces the Vault builds-volume option, so Vault and its Time Machine backups stay untouched.
   - The Supervisor's `diskutil eraseDisk` was refused by macOS privacy controls (-69464). Tom erases it in Disk Utility as plain APFS volume `OxideBuild`.
+- Tom, 2026-10-20: "The 1TB is old and ultimately fairly disposable.. let's see how it fairs, if it's slow we can switch to Vault as per your original suggestion with a 500GB volume.. if this approach is effective, I'll look at picking up a 1TB nvme."
+  - Tom formatted the drive as APFS volume `Builds`.
+  - It is treated as consumable. Its rated endurance is about 360 TB written, so Oxide should report its writes.
 
 Requirement: anything placed on the removable drive must tolerate surprise removal at any moment and fall back to the internal SSD without operator action. Live-state systems that cannot (Queue worktrees, VM disks) stay internal. The design lives in [workflow](contracts/workflow.md#removable-build-volume-proposed).
 
