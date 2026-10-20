@@ -181,8 +181,8 @@ consumer leases.
   snapshots make any walk approximate. Unknown size is unknown, not zero.
   Occupied-space deltas are not write volume.
 - **Hard bound.** A sampled walk is accounting plus abort. The kernel bound
-  Oxide uses is one fixed-size APFS volume in a sparse image
-  ([bounded storage](contracts/bounded-storage.md)); its oxide#055 proof
+  Oxide used until oxide#102 retired it was one fixed-size APFS volume in a
+  sparse image; its oxide#055 proof
   observed genuine ENOSPC under an open lease with the control ledger outside
   the payload staying durable. Sparse image logical size is not host
   allocation; do not add image and slot figures.
@@ -191,9 +191,10 @@ consumer leases.
   not measured. The #064 run's union footprint was about 3.46 GB. Neither is a
   representative workload or a production budget.
 
-The 128 MiB lease selector proves the current lease lifecycle on a fresh owned
-payload. It does not fill the filesystem or qualify a real Cargo footprint.
-[Local lease](contracts/local-lease.md) owns current capacity semantics.
+The retired 128 MiB lease selector proved the lease lifecycle on a fresh owned
+payload. It did not fill the filesystem or qualify a real Cargo footprint.
+[Workflow](contracts/workflow.md#budget-only-default-pool-and-user-configuration)
+owns current capacity semantics.
 
 ## Preserved receipts
 

@@ -92,7 +92,11 @@ impl Facts {
             Ok(self.home()?.join("Library/Application Support/oxide/state"))
         } else {
             Ok(self
-                .xdg(self.xdg_state_home.as_ref(), "XDG_STATE_HOME", ".local/state")?
+                .xdg(
+                    self.xdg_state_home.as_ref(),
+                    "XDG_STATE_HOME",
+                    ".local/state",
+                )?
                 .join("oxide"))
         }
     }
@@ -285,7 +289,9 @@ fn expand_path(text: &str, facts: &Facts) -> Result<PathBuf, String> {
         PathBuf::from(text)
     };
     if !path.is_absolute() {
-        return Err(format!("[pool] path {text:?} must be absolute after ~ expansion"));
+        return Err(format!(
+            "[pool] path {text:?} must be absolute after ~ expansion"
+        ));
     }
     if path
         .components()
@@ -463,7 +469,10 @@ pub fn legacy_default_pool(facts: &Facts) -> Option<PathBuf> {
 
 /// The built-in default pool path, whatever the current settings say.
 pub fn default_pool(facts: &Facts) -> Option<PathBuf> {
-    facts.cache_dir().ok().map(|dir| dir.join(DEFAULT_POOL_LEAF))
+    facts
+        .cache_dir()
+        .ok()
+        .map(|dir| dir.join(DEFAULT_POOL_LEAF))
 }
 
 fn known_pools_file(facts: &Facts) -> Result<PathBuf, String> {
@@ -671,8 +680,8 @@ mod tests {
 
     #[test]
     fn config_keys_types_and_units() {
-        let parsed = parse_config("[pool]\npath = \"~/Dev/oxide\"\nbudget = \"100GB\"\n")
-            .expect("valid");
+        let parsed =
+            parse_config("[pool]\npath = \"~/Dev/oxide\"\nbudget = \"100GB\"\n").expect("valid");
         let section = parsed.pool.expect("pool");
         assert_eq!(section.budget, Some(Budget::Text("100GB".to_owned())));
         assert_eq!(
@@ -804,8 +813,11 @@ mod tests {
         assert_eq!(inspect(&recorded), Found::LegacyImage);
         let budget = scratch.0.join("budget");
         fs::create_dir_all(&budget).expect("budget");
-        fs::write(budget.join("config.json"), br#"{"backend":"directory-budget-v1"}"#)
-            .expect("config");
+        fs::write(
+            budget.join("config.json"),
+            br#"{"backend":"directory-budget-v1"}"#,
+        )
+        .expect("config");
         assert_eq!(inspect(&budget), Found::Directory);
         assert_eq!(inspect(&scratch.0), Found::Unknown);
     }
@@ -821,7 +833,10 @@ mod tests {
         remember_pool(&linux, Path::new("/pools/5")).expect("again");
         let known = known_pools(&linux);
         assert_eq!(known.len(), MAX_KNOWN_POOLS);
-        assert_eq!(known.last().map(PathBuf::as_path), Some(Path::new("/pools/5")));
+        assert_eq!(
+            known.last().map(PathBuf::as_path),
+            Some(Path::new("/pools/5"))
+        );
         assert_eq!(known.iter().filter(|path| path.ends_with("5")).count(), 1);
     }
 }

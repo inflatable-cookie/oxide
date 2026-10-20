@@ -6,8 +6,12 @@ requires no shared slot or consumer lifecycle integration.
 
 This contract records the boundary between Oxide's storage facility and
 consumer-owned integration. The proposed explicit command surface lives in
-[workflow](workflow.md); the unpublished callable interface is the
-[local lease CLI](local-lease.md). No production Queue/Nucleus binding,
+[workflow](workflow.md). The standalone [local lease CLI](local-lease.md)
+described below as Nucleus's interface was retired from this repository in
+oxide#102 (Tom, 2026-10-20: Nucleus may break temporarily; its designed
+refusal path is a cold private build). Nucleus's installed copy and the
+reviewed handover copies are retained; the Nucleus trial moves it to `oxide`.
+The sections below are the historical boundary. No production Queue/Nucleus binding,
 consumer configuration key, service deployment or installation follows from
 this document. Q-010/Q-011 hold the integration answers; Q-012 holds the
 consumer-owned source-path and task-attempt gates.

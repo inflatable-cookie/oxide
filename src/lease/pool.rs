@@ -4,10 +4,10 @@ use super::backing::BackingPaths;
 use super::{
     canonical_existing_dir, current_uid, ensure_private_dir, io_error, persist_private_file,
     random_hex, read_private_file, remove_tree_owned, AccountingCoverage, LeaseEnvironment,
-    LeaseError, LeaseGrant, PoolStatus, Profile, ReleaseReceipt, SlotOccupancy,
-    SlotStatus, ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES,
-    CONFIG_NAME, LEASE_VERSION, LEDGER_NAME, LOCK_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES,
-    MAX_PATH_BYTES, MAX_SLOTS, SLOTS_NAME,
+    LeaseError, LeaseGrant, PoolStatus, Profile, ReleaseReceipt, SlotOccupancy, SlotStatus,
+    ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES, CONFIG_NAME,
+    LEASE_VERSION, LEDGER_NAME, LOCK_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_PATH_BYTES,
+    MAX_SLOTS, SLOTS_NAME,
 };
 use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
 use crate::inventory::{inventory_directory, InventoryLimits};
@@ -144,8 +144,8 @@ pub mod managed {
     };
     use super::LeaseRequest;
     use super::{
-        lock_pool, prepare_new_pool, random_hex, write_config, write_ledger, Ledger,
-        Payload, Pool, PoolConfig, VolumeConfig,
+        lock_pool, prepare_new_pool, random_hex, write_config, write_ledger, Ledger, Payload, Pool,
+        PoolConfig, VolumeConfig,
     };
     use crate::volume::Binding;
     use std::os::fd::AsFd;
@@ -298,10 +298,7 @@ pub mod managed {
 
 // Test entry points: the library tests drive a budget-only directory pool.
 #[cfg(test)]
-pub(super) fn create_injected(
-    pool: &Path,
-    cap_bytes: u64,
-) -> Result<super::PoolInfo, LeaseError> {
+pub(super) fn create_injected(pool: &Path, cap_bytes: u64) -> Result<super::PoolInfo, LeaseError> {
     managed::init_budget_pool(pool, cap_bytes)
 }
 
@@ -515,19 +512,13 @@ impl Pool {
         if accounted.coverage != AccountingCoverage::Complete {
             return Err(LeaseError::UnknownAccounting);
         }
-        if accounted
-            .unique
-            .is_some_and(|bytes| bytes >= self.budget)
-        {
+        if accounted.unique.is_some_and(|bytes| bytes >= self.budget) {
             self.evict_idle_until_under_cap()?;
             let accounted = self.payload_accounting()?;
             if accounted.coverage != AccountingCoverage::Complete {
                 return Err(LeaseError::UnknownAccounting);
             }
-            if accounted
-                .unique
-                .is_some_and(|bytes| bytes >= self.budget)
-            {
+            if accounted.unique.is_some_and(|bytes| bytes >= self.budget) {
                 return Err(LeaseError::Full);
             }
         }

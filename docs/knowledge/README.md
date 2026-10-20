@@ -12,7 +12,7 @@
 
 [Storage inventory](contracts/storage-inventory.md) owns the shipped bounded read-only inventory of one explicitly selected target directory: categories, logical-versus-allocated and hardlink-union accounting, coverage gaps, exit semantics, explicit unknowns and its fixture limits. It is a diagnostic, not storage ownership or cleanup authority.
 
-[Local lease](contracts/local-lease.md) owns the unpublished same-user local lease CLI: init/lease/release/recover/status, JSON and exits, finite pool/ledger limits, idle-only eviction, the `oxide` control-directory tolerance, the CLI's refusal of directory pools and the explicit not-Nucleus-ready / cross-worktree-unqualified boundary.
+[Local lease](contracts/local-lease.md) owns the retained library lease semantics `oxide` uses (pool, ledger, finite limits, idle-only eviction, the control directory) and the history of the retired standalone CLI and its Nucleus handover. [Workflow](contracts/workflow.md#budget-only-default-pool-and-user-configuration) owns the budget-only default pool, soft budget and user configuration.
 
 [Project adoption](contracts/project-adoption.md) owns the consumer integration boundary, the reviewed cross-worktree result and the owner-reported Nucleus lease use. [Rust toolchain and quality](rust-toolchain-and-quality.md) owns the development compiler, initial minimum Rust version and quality-policy routing. [Opt-in stable Cargo profiles](contracts/stable-cargo-profiles.md) owns Oxide's own `oxide-light`/`oxide-full-debug` recipes, their debugging tradeoff, the focused profile-proof selectors and the no-go disposition of the comparison observations.
 

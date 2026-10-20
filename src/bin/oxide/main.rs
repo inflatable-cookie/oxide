@@ -552,7 +552,10 @@ fn print_pool(store: &Store) -> Result<(), String> {
             );
             let physical = store::statfs(&store.payload).and_then(|sample| {
                 let block = u64::try_from(sample.f_bsize).ok()?;
-                Some((sample.f_blocks.checked_mul(block)?, sample.f_bavail.checked_mul(block)?))
+                Some((
+                    sample.f_blocks.checked_mul(block)?,
+                    sample.f_bavail.checked_mul(block)?,
+                ))
             });
             match physical {
                 Some((capacity, available)) => println!(
@@ -798,7 +801,9 @@ fn print_other_pools(settings: &config::Settings) {
             continue;
         }
         seen.push(resolved);
-        let registered = path.join(oxide_storage::lease::MANAGED_NAME).join("removable.json");
+        let registered = path
+            .join(oxide_storage::lease::MANAGED_NAME)
+            .join("removable.json");
         let removable = if std::fs::symlink_metadata(&registered).is_ok() {
             "; holds a removable registration Oxide does not use from here"
         } else {

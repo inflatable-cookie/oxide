@@ -4,7 +4,7 @@ frozen = ["docs/knowledge/evidence/**"]
 [[retired]]
 id = "protected-storage-daemon-and-routes"
 retired = "2026-10-18"
-replacement = "The local lease CLI and verified bounded backing remain; future product commands are designed in docs/knowledge/contracts/workflow.md."
+replacement = "Product commands are the `oxide` front door in docs/knowledge/contracts/workflow.md. (The local lease CLI and bounded backing kept at that time were themselves retired by oxide#102; see apfs-image-pool-and-standalone-lease-cli.)"
 owner = "docs/knowledge/contracts/workflow.md"
 terms = [
   "private-qualification",
@@ -55,3 +55,32 @@ paths = [
   "docs/knowledge/contracts/ordinary-cargo-reuse-identity.md",
 ]
 config_keys = ["private-qualification", "private-qualification-fixture"]
+
+[[retired]]
+id = "apfs-image-pool-and-standalone-lease-cli"
+retired = "2026-10-20"
+replacement = "Budget-only directory-budget-v1 internal pool with a 100 GB soft budget, configurable path and budget, the host-reserve watchdog and `oxide pool recover-interrupted`; the lease library stays for `oxide`. Evidence is preserved. Removable apfs-volume-v1 and test-only APFS scratch images remain."
+owner = "docs/knowledge/contracts/workflow.md"
+terms = [
+  "oxide-storage-lease",
+  "rust:storage-lease-cli",
+  "test-storage-lease-cli",
+  "BoundedBacking",
+  "BoundedBackendDescriptor",
+  "BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1",
+]
+paths = [
+  "src/bin/storage_lease.rs",
+  "src/storage/",
+  "scripts/test-storage-lease-cli.py",
+  "docs/knowledge/contracts/bounded-storage.md",
+]
+# History of the retired CLI and image backend; suspended proofs keep their
+# code for migration.
+allow = [
+  "AGENTS.md",
+  "docs/knowledge/contracts/local-lease.md",
+  "docs/knowledge/contracts/project-adoption.md",
+  "docs/knowledge/vision.md",
+  "scripts/test-oxide-cli.py",
+]

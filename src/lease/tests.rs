@@ -975,9 +975,10 @@ fn a_changed_soft_budget_applies_at_the_next_admission() {
     let project_a = fx.dir("project-a");
     let first = managed::lease(request(&pool, &project_a, &workspace, "holder-a")).expect("a");
     // The build grows past any later budget; nothing stops it while held.
-    let mut file = File::create(first.env.cargo_build_build_dir.join("payload.bin"))
-        .expect("payload file");
-    file.write_all(&vec![7_u8; 256 * 1024]).expect("grow past budget");
+    let mut file =
+        File::create(first.env.cargo_build_build_dir.join("payload.bin")).expect("payload file");
+    file.write_all(&vec![7_u8; 256 * 1024])
+        .expect("grow past budget");
     managed::release(&pool, &first.lease_id).expect("release a");
     // The recorded 64 MiB budget admits a second project beside it.
     let project_b = fx.dir("project-b");
@@ -990,9 +991,14 @@ fn a_changed_soft_budget_applies_at_the_next_admission() {
     smaller.budget_bytes = Some(64 * 1024);
     let third = managed::lease(smaller).expect("admitted after idle eviction");
     let status = managed::status(&pool).expect("status after eviction");
-    assert!(status.slots.iter().all(|slot| slot.slot_id == third.slot_id
-        || slot.state == SlotOccupancy::Idle));
-    assert!(!status.slots.iter().any(|slot| slot.slot_id == first.slot_id));
+    assert!(status
+        .slots
+        .iter()
+        .all(|slot| slot.slot_id == third.slot_id || slot.state == SlotOccupancy::Idle));
+    assert!(!status
+        .slots
+        .iter()
+        .any(|slot| slot.slot_id == first.slot_id));
     // The recorded budget is unchanged.
     assert_eq!(status.cap_bytes, 64 * 1024 * 1024);
     let mut zero = request(&pool, &project_a, &workspace, "holder-z");

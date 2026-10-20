@@ -1432,7 +1432,10 @@ impl Store {
             .iter()
             .find(|slot| slot.slot_id == slot_id && slot.state == SlotOccupancy::Held)
             .ok_or_else(|| format!("slot {slot_id} is not held in {}", self.pool.display()))?;
-        let lease_id = slot.lease_id.clone().ok_or("the held slot has no lease ID")?;
+        let lease_id = slot
+            .lease_id
+            .clone()
+            .ok_or("the held slot has no lease ID")?;
         let index = state
             .records
             .iter()

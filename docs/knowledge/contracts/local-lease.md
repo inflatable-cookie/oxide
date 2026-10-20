@@ -1,6 +1,22 @@
-# Same-user local lease CLI
+# Local lease library (standalone CLI retired)
 
-Status: unpublished Oxide-only product command. Same-UID callers take exclusive
+**Retired, oxide#102 (Tom, 2026-10-20).** The standalone
+`oxide-storage-lease` binary, its `rust:storage-lease-cli` selector and the
+`apfs-sparse-image-v1` backend are gone from this repository. The library
+(`oxide_storage::lease::managed`) keeps the pool, ledger, leases, release,
+recover, status, idle eviction and the `oxide` control directory below, and
+opens only `directory-budget-v1` and `apfs-volume-v1` pools; a pool recording
+`apfs-sparse-image-v1`, or holding an image or receipt file, refuses with
+`backing_mismatch` before anything is written. `LeaseRequest.budget_bytes`
+carries the caller's soft budget for one admission. Current pool, budget and
+recovery behaviour is owned by
+[workflow](workflow.md#budget-only-default-pool-and-user-configuration);
+`oxide pool recover-interrupted <slot>` replaced the CLI's explicit `recover`.
+The sections on the CLI, image backing, capacity status, exit codes and the
+reviewed handover below are history: Nucleus's installed binary and the
+reviewed handover copies outside this repository are retained, untouched.
+
+Former status: unpublished Oxide-only product command. Same-UID callers take exclusive
 owned slots on a verified APFS payload volume through a short-lived OS lock and
 a durable JSON ledger. There is no resident daemon, HMAC credential, issuer,
 callback service, Cargo runner, scheduler or Git manager. A focused pinned
@@ -12,8 +28,8 @@ this is not an installed service or a general source-invalidation guarantee.
 
 Publication naming remains [Q-005](../questions.md#q-005--what-names-are-safe-to-publish).
 The package stays `publish = false`. The binary name `oxide-storage-lease` is
-internal. Capacity semantics are owned by
-[bounded storage](bounded-storage.md). Consumer adoption remains
+internal. Capacity semantics were owned by the bounded-storage contract,
+retired with the image backend. Consumer adoption remains
 [project adoption](project-adoption.md).
 
 ## Callable
