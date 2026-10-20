@@ -475,4 +475,3 @@ Limits:
 - Small-file results reflect contention and encryption on the internal SSD, not intrinsic device speed.
 
 It indicates that the USB drive is not a bottleneck for this workload under current conditions. It is not a benchmark.
-
