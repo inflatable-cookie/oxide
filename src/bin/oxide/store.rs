@@ -21,6 +21,7 @@
 //! and are never recovered here.
 
 use crate::cli::Profile;
+use crate::config::{self, Backup, Facts, Found, Settings};
 use crate::freshness::{Built, Prior};
 use crate::identity::SlotKey;
 use crate::process;
@@ -29,10 +30,9 @@ use oxide_storage::lease::managed::{
     evict_idle_slot, flush_volume, init_budget_pool, lease, recover, release, status as pool_status,
 };
 use oxide_storage::lease::{
-    init_pool, LeaseError, LeaseRequest, PoolStatus, Profile as LeaseProfile, SlotOccupancy,
-    SlotStatus, BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME, VOLUME_BACKEND_APFS_V1,
+    LeaseError, LeaseRequest, PoolStatus, Profile as LeaseProfile, SlotOccupancy, SlotStatus,
+    BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME, VOLUME_BACKEND_APFS_V1,
 };
-use oxide_storage::BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -43,9 +43,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const GIB: u64 = 1024 * 1024 * 1024;
-/// Cap of an automatically created pool; the sparse image is the same size.
-/// A directory pool records the same value as its budget.
-const DEFAULT_CAP_BYTES: u64 = 24 * GIB;
 /// Automatic creation refuses below this host free space.
 pub const HOST_RESERVE_BYTES: u64 = 20 * GIB;
 const DEFAULT_MAX_ACTIVE: usize = 2;
@@ -417,7 +414,7 @@ pub struct SlotView {
     pub managed: bool,
     /// Held with no live Oxide owner. The next command recovers it once
     /// Cargo's group is empty; if the group was never recorded,
-    /// `oxide-storage-lease recover` is explicit.
+    /// `oxide pool recover-interrupted <slot>` is explicit.
     pub interrupted: Option<Interrupted>,
     /// Why a removable-volume slot was retired and stays held.
     pub retired: Option<String>,
@@ -435,6 +432,10 @@ pub struct Store {
     /// removable volume.
     pub payload: PathBuf,
     control: PathBuf,
+    /// The soft budget for this command's admissions: the effective setting
+    /// for the internal pool, `None` (the recorded budget) for a removable
+    /// pool.
+    budget: Option<u64>,
     /// The other pool's control directory when a removable pool is
     /// registered: the host-wide limit counts both pools and a checkout's
     /// clean barrier spans both.
@@ -451,13 +452,12 @@ struct Sibling {
     barrier: bool,
 }
 
-/// The pool's recorded backend.
+/// The pool's recorded backend. Neither has a ceiling of its own; the
+/// retired `apfs-sparse-image-v1` backend refuses to open.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Backend {
-    /// macOS sparse image: the volume size is an OS-enforced ceiling.
-    ApfsImage,
-    /// Plain directory: admission and idle eviction against a recorded
-    /// budget, plus the best-effort host-reserve watchdog. No ceiling.
+    /// Plain directory: admission and idle eviction against a soft budget,
+    /// plus the best-effort host-reserve watchdog. No ceiling.
     DirectoryBudget,
     /// A directory on a registered removable APFS volume: admission against
     /// a recorded budget, volume reserve checked when a build starts, flush
@@ -465,10 +465,12 @@ pub enum Backend {
     ApfsVolume,
 }
 
+/// The retired image backend's recorded tag (oxide#102).
+const LEGACY_IMAGE_BACKEND: &str = "apfs-sparse-image-v1";
+
 impl Backend {
     pub fn tag(self) -> &'static str {
         match self {
-            Self::ApfsImage => BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1,
             Self::DirectoryBudget => BUDGET_BACKEND_DIRECTORY_V1,
             Self::ApfsVolume => VOLUME_BACKEND_APFS_V1,
         }
@@ -477,9 +479,8 @@ impl Backend {
     /// What bounds the pool, as `status` and every summary line say it.
     pub fn bound(self) -> &'static str {
         match self {
-            Self::ApfsImage => "OS-enforced ceiling",
             Self::DirectoryBudget => {
-                "budget-only: admission estimate plus best-effort reserve watchdog, no hard ceiling"
+                "budget-only: soft budget checked at admission plus best-effort reserve watchdog, no hard ceiling"
             }
             Self::ApfsVolume => {
                 "budget-only on a removable volume: admission estimate, volume reserve checked when a build starts, no hard ceiling"
@@ -489,131 +490,60 @@ impl Backend {
 
     fn recorded(tag: &str) -> Result<Self, String> {
         match tag {
-            BOUNDED_BACKEND_APFS_SPARSE_IMAGE_V1 => Ok(Self::ApfsImage),
             BUDGET_BACKEND_DIRECTORY_V1 => Ok(Self::DirectoryBudget),
             VOLUME_BACKEND_APFS_V1 => Ok(Self::ApfsVolume),
+            LEGACY_IMAGE_BACKEND => Err(legacy_refusal()),
             other => Err(format!("the pool records an unknown backend {other:?}")),
         }
     }
 }
 
-/// `OXIDE_POOL_BACKEND`: `directory-budget` or `apfs-sparse-image`. Unset
-/// means the platform default; any other value refuses.
-fn requested_backend() -> Result<Option<Backend>, String> {
-    let Some(value) = std::env::var_os("OXIDE_POOL_BACKEND") else {
-        return Ok(None);
-    };
-    match value.to_str() {
-        Some("directory-budget") => Ok(Some(Backend::DirectoryBudget)),
-        Some("apfs-sparse-image") => Ok(Some(Backend::ApfsImage)),
-        _ => Err("OXIDE_POOL_BACKEND must be directory-budget or apfs-sparse-image".to_owned()),
+fn legacy_refusal() -> String {
+    "the pool is a retired apfs-sparse-image-v1 image pool; Oxide no longer attaches, writes or removes it. Choose another pool path (unset OXIDE_POOL or change [pool] path); the old pool is retired separately".to_owned()
+}
+
+/// `OXIDE_POOL_BACKEND` is retired with the image backend: unset or
+/// `directory-budget` only.
+fn refuse_retired_backend_request() -> Result<(), String> {
+    match std::env::var_os("OXIDE_POOL_BACKEND") {
+        None => Ok(()),
+        Some(value) if value == "directory-budget" => Ok(()),
+        Some(_) => Err(
+            "OXIDE_POOL_BACKEND is retired: the apfs-sparse-image backend is gone and every internal pool is directory-budget".to_owned(),
+        ),
     }
 }
 
-/// Smallest cap each backend accepts: the APFS proofs use 128 MiB images;
-/// a budget-only pool's budget is only an admission figure.
-const MIN_APFS_CAP_BYTES: u64 = 128 * 1024 * 1024;
-const MIN_BUDGET_CAP_BYTES: u64 = 1024 * 1024;
-const MAX_CAP_BYTES: u64 = 16 * 1024 * GIB;
-
-/// `OXIDE_POOL_CAP`: a whole number of bytes or of `KiB`, `MiB`, `GiB` or
-/// `TiB`, a whole MiB, within the backend's range. It applies only when a
-/// pool is created; unset means the 24 GiB default.
-pub fn requested_cap(backend: Backend) -> Result<Option<u64>, String> {
-    let Some(value) = std::env::var_os("OXIDE_POOL_CAP") else {
-        return Ok(None);
-    };
-    let value = value.to_str().ok_or("OXIDE_POOL_CAP must be valid UTF-8")?;
-    parse_cap(value, backend).map(Some)
+/// A size flag of `oxide pool register-removable`, with `OXIDE_POOL_CAP`'s
+/// units. The removable backend keeps its own range check.
+pub fn parse_cap(value: &str, _backend: Backend) -> Result<u64, String> {
+    config::parse_size(value).map_err(|error| format!("OXIDE_POOL_CAP={value} {error}"))
 }
 
-pub fn parse_cap(value: &str, backend: Backend) -> Result<u64, String> {
-    let digits = value.bytes().take_while(u8::is_ascii_digit).count();
-    let (number, unit) = value.split_at(digits);
-    let scale: u64 = match unit {
-        "" => 1,
-        "KiB" => 1024,
-        "MiB" => 1024 * 1024,
-        "GiB" => GIB,
-        "TiB" => 1024 * GIB,
-        _ => 0,
-    };
-    let bytes = number
-        .parse::<u64>()
-        .ok()
-        .filter(|_| scale > 0)
-        .and_then(|number| number.checked_mul(scale))
-        .ok_or_else(|| {
-            format!("OXIDE_POOL_CAP={value} is not a byte count or a whole number of KiB, MiB, GiB or TiB")
-        })?;
-    let minimum = match backend {
-        Backend::ApfsImage => MIN_APFS_CAP_BYTES,
-        Backend::DirectoryBudget | Backend::ApfsVolume => MIN_BUDGET_CAP_BYTES,
-    };
-    if bytes % (1024 * 1024) != 0 || !(minimum..=MAX_CAP_BYTES).contains(&bytes) {
-        return Err(format!(
-            "OXIDE_POOL_CAP={value} must be a whole MiB from {} MiB to {} TiB for {}",
-            minimum / (1024 * 1024),
-            MAX_CAP_BYTES / (1024 * GIB),
-            backend.tag()
-        ));
-    }
-    Ok(bytes)
+/// The effective settings: environment, then config file, then defaults.
+pub fn settings() -> Result<Settings, String> {
+    refuse_retired_backend_request()?;
+    config::settings(&Facts::from_env())
 }
 
-/// The cap a new pool would record.
-pub fn creation_cap(backend: Backend) -> Result<u64, String> {
-    Ok(match (requested_cap(backend)?, backend) {
-        (Some(cap), _) => cap,
-        (None, Backend::DirectoryBudget) => budget_bytes(),
-        (None, Backend::ApfsImage | Backend::ApfsVolume) => DEFAULT_CAP_BYTES,
-    })
-}
-
-/// The backend a new pool gets: the APFS image on macOS unless the caller
-/// asks for a directory, and the directory everywhere else.
-pub fn creation_backend() -> Result<Backend, String> {
-    match requested_backend()? {
-        Some(Backend::ApfsImage) if !cfg!(target_os = "macos") => {
-            Err("the apfs-sparse-image backend is macOS-only".to_owned())
-        }
-        Some(backend) => Ok(backend),
-        None if cfg!(target_os = "macos") => Ok(Backend::ApfsImage),
-        None => Ok(Backend::DirectoryBudget),
-    }
-}
-
-/// `OXIDE_POOL`, else the per-user cache: `~/Library/Caches/oxide/pool` on
-/// macOS, `$XDG_CACHE_HOME/oxide/pool` or `~/.cache/oxide/pool` elsewhere.
+/// The internal pool path from the effective settings.
 pub fn pool_path() -> Result<PathBuf, String> {
-    let configured = match std::env::var_os("OXIDE_POOL").filter(|value| !value.is_empty()) {
-        Some(path) => PathBuf::from(path),
-        None => {
-            let xdg = std::env::var_os("XDG_CACHE_HOME")
-                .filter(|value| !cfg!(target_os = "macos") && Path::new(value).is_absolute());
-            match xdg {
-                Some(cache) => Path::new(&cache).join("oxide/pool"),
-                None => {
-                    let home = std::env::var_os("HOME")
-                        .filter(|value| !value.is_empty())
-                        .ok_or("HOME is unset; set OXIDE_POOL to choose the pool")?;
-                    let cache = if cfg!(target_os = "macos") {
-                        "Library/Caches"
-                    } else {
-                        ".cache"
-                    };
-                    Path::new(&home).join(cache).join("oxide/pool")
-                }
-            }
-        }
-    };
-    if configured.is_absolute() {
-        Ok(configured)
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(configured))
-            .map_err(|error| format!("cannot resolve OXIDE_POOL: {error}"))
+    settings().map(|settings| settings.pool)
+}
+
+/// The soft budget for the next admission. Debug builds accept
+/// `OXIDE_TEST_BUDGET_BYTES` above everything else, so fixture proofs can
+/// exercise admission on a tiny budget.
+pub fn admission_budget(settings: &Settings) -> u64 {
+    #[cfg(debug_assertions)]
+    if let Some(bytes) = std::env::var("OXIDE_TEST_BUDGET_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+    {
+        return bytes;
     }
+    settings.budget
 }
 
 /// `OXIDE_MAX_ACTIVE`, else 2.
@@ -629,14 +559,35 @@ pub fn max_active() -> Result<usize, String> {
 }
 
 impl Store {
-    /// Open the pool, creating it on first use above the host reserve.
+    /// Open the pool, creating it on first use above the host reserve. A
+    /// macOS pool is excluded from Time Machine before any build writes into
+    /// it; an unverified exclusion refuses before Cargo starts.
     pub fn open_or_create() -> Result<Self, String> {
-        let path = pool_path()?;
-        if fs::symlink_metadata(&path).is_err() {
-            let backend = creation_backend()?;
-            create_pool(&path, backend, creation_cap(backend)?)?;
+        let settings = settings()?;
+        let path = settings.pool.clone();
+        config::refuse_unsafe_pool_path(&path)?;
+        match config::inspect(&path) {
+            Found::Absent => create_pool(&path, admission_budget(&settings))?,
+            Found::LegacyImage => return Err(legacy_refusal()),
+            Found::Directory | Found::Unknown => {}
         }
-        let store = Self::open_at(&path)?;
+        let store = Self::open_at(&path, &settings)?;
+        if !config::has_sticky_exclusion(&store.pool) {
+            match config::exclude_from_backup(&store.pool) {
+                Backup::Excluded | Backup::NotApplicable => {}
+                Backup::NotExcluded(reason) => {
+                    return Err(format!(
+                        "refusing to build: the pool {} is not excluded from Time Machine ({reason}); Oxide excludes its own pool with `tmutil addexclusion` and builds only once `tmutil isexcluded` confirms it",
+                        store.pool.display()
+                    ))
+                }
+            }
+        }
+        if !matches!(settings.pool_source, config::Source::Environment(_)) {
+            if let Err(error) = config::remember_pool(&Facts::from_env(), &store.pool) {
+                eprintln!("oxide: could not record the pool path for status: {error}");
+            }
+        }
         store.ensure_control()?;
         Ok(store)
     }
@@ -658,6 +609,7 @@ impl Store {
             pool,
             backend: Backend::ApfsVolume,
             payload,
+            budget: None,
             sibling: None,
         };
         store.ensure_control()?;
@@ -670,43 +622,32 @@ impl Store {
         &self.control
     }
 
-    /// Open an existing pool. Never creates one.
+    /// Open an existing pool. Never creates one; a retired image pool
+    /// refuses without being touched.
     pub fn open_existing() -> Result<Option<Self>, String> {
-        let path = pool_path()?;
-        if fs::symlink_metadata(&path).is_err() {
-            return Ok(None);
+        let settings = settings()?;
+        match config::inspect(&settings.pool) {
+            Found::Absent => Ok(None),
+            Found::LegacyImage => Err(legacy_refusal()),
+            Found::Directory | Found::Unknown => {
+                config::refuse_unsafe_pool_path(&settings.pool)?;
+                Self::open_at(&settings.pool, &settings).map(Some)
+            }
         }
-        Self::open_at(&path).map(Some)
     }
 
-    fn open_at(path: &Path) -> Result<Self, String> {
+    fn open_at(path: &Path, settings: &Settings) -> Result<Self, String> {
         let pool =
             fs::canonicalize(path).map_err(|error| format!("cannot open the pool: {error}"))?;
         let status =
             pool_status(&pool).map_err(|error| lease_error("cannot open the pool", &error))?;
         let backend = Backend::recorded(&status.backend)?;
-        if let Some(requested) = requested_backend()? {
-            if requested != backend {
-                return Err(format!(
-                    "the pool at {} uses {}; OXIDE_POOL_BACKEND applies only when a pool is created (unset it or choose another OXIDE_POOL)",
-                    pool.display(),
-                    backend.tag()
-                ));
-            }
-        }
-        if let Some(requested) = requested_cap(backend)? {
-            if requested != status.cap_bytes {
-                eprintln!(
-                    "oxide: OXIDE_POOL_CAP {} MiB not applied: the pool at {} keeps its recorded {} MiB {}; the cap applies only when a pool is created",
-                    requested / (1024 * 1024),
-                    pool.display(),
-                    status.cap_bytes / (1024 * 1024),
-                    match backend {
-                        Backend::ApfsImage => "cap",
-                        Backend::DirectoryBudget | Backend::ApfsVolume => "budget",
-                    }
-                );
-            }
+        if backend != Backend::DirectoryBudget {
+            return Err(format!(
+                "the pool at {} records {}, not an internal pool",
+                pool.display(),
+                backend.tag()
+            ));
         }
         let control = pool.join(MANAGED_NAME);
         Ok(Self {
@@ -714,15 +655,22 @@ impl Store {
             pool,
             backend,
             control,
+            budget: Some(admission_budget(settings)),
             sibling: None,
         })
     }
 
-    /// The best-effort host-reserve watchdog for a supervised build. Only a
-    /// budget-only pool has one; the APFS image's ceiling is the OS's.
+    /// This command's soft admission budget, or the recorded one.
+    pub fn budget(&self, recorded: u64) -> u64 {
+        self.budget.unwrap_or(recorded)
+    }
+
+    /// The best-effort host-reserve watchdog for a supervised build. The
+    /// internal pool has one; a removable pool checks its volume reserve
+    /// when a build starts.
     pub fn watchdog(&self) -> Option<Watchdog> {
         match self.backend {
-            Backend::ApfsImage | Backend::ApfsVolume => None,
+            Backend::ApfsVolume => None,
             Backend::DirectoryBudget => Some(Watchdog::for_pool(&self.payload)),
         }
     }
@@ -1128,18 +1076,13 @@ impl Store {
         })
     }
 
-    /// Used and total bytes of the mounted payload volume; for a budget-only
-    /// pool, slot allocation and the recorded budget.
+    /// Slot allocation and this command's soft budget.
     pub fn payload_use(&self) -> Option<(u64, u64)> {
-        if self.backend != Backend::ApfsImage {
-            let status = self.status().ok()?;
-            return Some((status.payload_unique_allocated_bytes?, status.cap_bytes));
-        }
-        let sample = statfs(&self.payload)?;
-        let block = u64::try_from(sample.f_bsize).ok()?;
-        let total = sample.f_blocks.checked_mul(block)?;
-        let free = sample.f_bfree.checked_mul(block)?;
-        Some((total.saturating_sub(free), total))
+        let status = self.status().ok()?;
+        Some((
+            status.payload_unique_allocated_bytes?,
+            self.budget(status.cap_bytes),
+        ))
     }
 
     fn attempt(
@@ -1352,6 +1295,7 @@ impl Store {
                 Profile::Quick | Profile::Release => LeaseProfile::Dev,
             },
             holder: lease_holder,
+            budget_bytes: self.budget,
         };
         let outcome = lease(request);
         let grant = match outcome {
@@ -1471,6 +1415,74 @@ impl Store {
             state.settle_idle(index);
         }
         Ok(())
+    }
+
+    /// Explicit release of an interrupted slot that automatic recovery keeps
+    /// held: Cargo's group was never recorded, or the lease is not provably
+    /// the record's. It replaces the retired standalone CLI's `recover`.
+    /// The caller asserts nothing still writes in the slot; Oxide still
+    /// refuses while any live command holds the record or the slot is
+    /// retired, and logs the release like an automatic recovery.
+    pub fn recover_interrupted(&self, slot_id: &str) -> Result<(), String> {
+        let _admission = self.admission()?;
+        let mut state = self.load()?;
+        let status = self.status()?;
+        let slot = status
+            .slots
+            .iter()
+            .find(|slot| slot.slot_id == slot_id && slot.state == SlotOccupancy::Held)
+            .ok_or_else(|| format!("slot {slot_id} is not held in {}", self.pool.display()))?;
+        let lease_id = slot
+            .lease_id
+            .clone()
+            .ok_or("the held slot has no lease ID")?;
+        let index = state
+            .records
+            .iter()
+            .position(|record| record.active() && self.affinity_dir(record.id) == slot.project)
+            .ok_or_else(|| format!("slot {slot_id} has no interrupted oxide command record"))?;
+        let record = &state.records[index];
+        if record.retired.is_some() {
+            return Err(format!(
+                "slot {slot_id} is retired after a failed flush and stays held"
+            ));
+        }
+        let Probe::Free(_owner) = probe_lock(&self.lock_path(record.id), true)? else {
+            return Err(format!("a live oxide command holds slot {slot_id}"));
+        };
+        if matches!(
+            return_path(record, slot),
+            Return::NeverStarted | Return::GroupEmpty(_)
+        ) {
+            return Err(format!(
+                "slot {slot_id} is recovered automatically by the next command once its Cargo group is empty"
+            ));
+        }
+        let recovery = Recovery {
+            slot_id: slot.slot_id.clone(),
+            lease_id,
+            checkout: record.checkout.clone(),
+            holder_pid: record.holder.as_ref().map_or(0, |holder| holder.pid),
+            holder_started_ms: record.holder.as_ref().map_or(0, |holder| holder.started_ms),
+            process_group: record.process_group,
+            recovered_ms: process::now_ms(),
+            recovered_by: std::process::id(),
+        };
+        state.records[index].pending_recovery = Some(recovery.clone());
+        self.save(&state)?;
+        let record_id = state.records[index].id;
+        if !self.flush_before_idle(&recovery.slot_id, record_id)? {
+            return Err(format!(
+                "slot {slot_id} stays held: the removable volume flush failed"
+            ));
+        }
+        let mut state = self.load()?;
+        recover(&self.pool, &recovery.lease_id)
+            .map_err(|error| lease_error("cannot recover the slot", &error))?;
+        state.records[index].pending_recovery = None;
+        state.log_recovery(recovery);
+        state.settle_idle(index);
+        self.save(&state)
     }
 
     fn forget_record(&self, state: &mut State, id: u64) {
@@ -1729,7 +1741,7 @@ impl Store {
     }
 }
 
-fn create_pool(path: &Path, backend: Backend, cap: u64) -> Result<(), String> {
+fn create_pool(path: &Path, budget: u64) -> Result<(), String> {
     let parent = path.parent().ok_or("the pool path has no parent")?;
     let name = path
         .file_name()
@@ -1749,54 +1761,20 @@ fn create_pool(path: &Path, backend: Backend, cap: u64) -> Result<(), String> {
         ));
     }
     let pool = parent.join(name);
-    let created = match backend {
-        Backend::ApfsImage => {
-            eprintln!(
-                "oxide: creating the build pool at {} ({} MiB cap, {}, {})",
-                pool.display(),
-                cap / (1024 * 1024),
-                backend.tag(),
-                backend.bound()
-            );
-            init_pool(&pool, cap, cap)
-        }
-        Backend::DirectoryBudget => {
-            eprintln!(
-                "oxide: creating the build pool at {} ({} MiB budget, {}, {})",
-                pool.display(),
-                cap / (1024 * 1024),
-                backend.tag(),
-                backend.bound()
-            );
-            init_budget_pool(&pool, cap)
-        }
-        Backend::ApfsVolume => {
-            return Err(
-                "a removable pool is created only by `oxide pool register-removable`".to_owned(),
-            )
-        }
-    };
-    match created {
+    let backend = Backend::DirectoryBudget;
+    eprintln!(
+        "oxide: creating the build pool at {} ({} MB soft budget, {}, {})",
+        pool.display(),
+        budget / 1_000_000,
+        backend.tag(),
+        backend.bound()
+    );
+    match init_budget_pool(&pool, budget) {
         Ok(_) => Ok(()),
         // Another command created it first.
         Err(_) if pool.join("config.json").is_file() => Ok(()),
         Err(error) => Err(lease_error("could not create the pool", &error)),
     }
-}
-
-/// The recorded budget of a new directory pool. Debug builds accept
-/// `OXIDE_TEST_BUDGET_BYTES` so the fixture proof can exercise admission on
-/// a tiny budget; release builds always record the default.
-fn budget_bytes() -> u64 {
-    #[cfg(debug_assertions)]
-    if let Some(bytes) = std::env::var("OXIDE_TEST_BUDGET_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|bytes| *bytes > 0)
-    {
-        return bytes;
-    }
-    DEFAULT_CAP_BYTES
 }
 
 /// Create missing ancestors owner-only; existing ones are left as they are.
@@ -1930,6 +1908,7 @@ mod tests {
             backend: Backend::DirectoryBudget,
             payload: root.join(name).join("payload"),
             control: root.join(name).join(MANAGED_NAME),
+            budget: None,
             sibling: None,
         };
         let (internal, removable) = (store("internal"), store("removable"));
@@ -2107,30 +2086,36 @@ mod tests {
     }
 
     #[test]
-    fn pool_cap_parses_units_and_backend_ranges() {
-        let apfs = Backend::ApfsImage;
+    fn pool_cap_parses_decimal_and_binary_units() {
         let budget = Backend::DirectoryBudget;
-        assert_eq!(parse_cap("128MiB", apfs), Ok(128 * 1024 * 1024));
-        assert_eq!(parse_cap("134217728", apfs), Ok(128 * 1024 * 1024));
-        assert_eq!(parse_cap("2GiB", apfs), Ok(2 * GIB));
+        assert_eq!(parse_cap("100GB", budget), Ok(100_000_000_000));
         assert_eq!(parse_cap("1TiB", budget), Ok(1024 * GIB));
         assert_eq!(parse_cap("1024KiB", budget), Ok(1024 * 1024));
-        assert_eq!(parse_cap("1MiB", budget), Ok(1024 * 1024));
+        assert_eq!(parse_cap("12MB", budget), Ok(12_000_000));
+        assert_eq!(parse_cap("1048577", budget), Ok(1_048_577));
         for invalid in [
             "",
             "MiB",
-            "12MB",
             "1.5GiB",
             "-1",
             "64 MiB",
             "99999999999999999999",
+            "17TiB",
+            "0",
         ] {
-            assert!(parse_cap(invalid, budget).is_err(), "{invalid}");
+            let error = parse_cap(invalid, budget).unwrap_err();
+            assert!(error.contains("OXIDE_POOL_CAP"), "{error}");
         }
-        assert!(parse_cap("64MiB", apfs).is_err());
-        assert!(parse_cap("1048577", budget).is_err());
-        assert!(parse_cap("17TiB", budget).is_err());
-        assert!(parse_cap("0", budget).is_err());
+    }
+
+    #[test]
+    fn the_retired_image_backend_refuses_by_name() {
+        let error = Backend::recorded("apfs-sparse-image-v1").unwrap_err();
+        assert!(error.contains("retired"), "{error}");
+        assert_eq!(
+            Backend::recorded("directory-budget-v1"),
+            Ok(Backend::DirectoryBudget)
+        );
     }
 
     #[test]

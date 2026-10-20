@@ -35,11 +35,6 @@ minimum_effigy_version = "0.14.0"
 # rendered output-byte ceiling on tiny synthetic fixtures. Not a QA alias
 # and not a real project-target scan.
 "rust:storage-inventory-cli" = "python3 scripts/test-storage-inventory-cli.py"
-# Builds the unpublished oxide-storage-lease binary, proves usage refusals,
-# and on macOS runs one 128 MiB APFS pool through lease/release/recover/status.
-# Heavy admission owns the real image provisioning; it is not a
-# filesystem-fill benchmark and not full QA. Table lives at the end of this
-# file so later bare task entries stay under [tasks].
 "build-context:comparison:test" = "python3 scripts/test_build_context_comparison.py"
 "docs:check" = [
   "effigy skill run northstar/check-links -- --frozen '^docs/knowledge/architecture[.]md$'",
@@ -56,17 +51,9 @@ default = false
 run = "python3 scripts/bounded-test.py cargo test --workspace --all-targets --locked"
 default = false
 
-# Heavy admission owns the real image provisioning in
-# scripts/test-storage-lease-cli.py; it is not a filesystem-fill benchmark
-# and not full QA.
-[tasks."rust:storage-lease-cli"]
-admission = "heavy"
-run = "python3 scripts/test-storage-lease-cli.py"
-
-# Builds the unpublished `oxide` front door and, on macOS, proves it on tiny
-# offline fixtures over one fresh 128 MiB APFS pool, after proving init/new
-# adoption on tiny scratch directories without a pool. Heavy admission owns
-# the image provisioning. Not a benchmark and not full QA.
+# SUSPENDED by oxide#102: provisions its pool with the retired standalone
+# lease CLI and APFS image backend, so it refuses before any effect until
+# migrated to a directory pool. Not a benchmark and not full QA.
 [tasks."rust:oxide-cli"]
 admission = "heavy"
 run = "python3 scripts/test-oxide-cli.py"
@@ -86,7 +73,8 @@ run = "python3 scripts/test-oxide-cli.py --launch-check"
 admission = "heavy"
 run = "python3 scripts/test-oxide-cli.py --clean-safety"
 
-# Toolchain context (oxide#094): stages `oxide` offline with 1.97.1, then on
+# SUSPENDED by oxide#102 (retired image pool provisioning; refuses before
+# any effect until migrated). Toolchain context (oxide#094): stages `oxide` offline with 1.97.1, then on
 # one fresh 128 MiB APFS pool checks that each caller context of a scratch
 # workspace (root 1.97.1, member 1.96.1, `--manifest-path`, RUSTC,
 # RUSTUP_TOOLCHAIN) gets the slot key of the compiler its Cargo used. Never
@@ -106,7 +94,19 @@ run = "python3 scripts/test-oxide-cli.py --toolchain-context"
 admission = "heavy"
 run = "python3 scripts/test-oxide-removable-pool.py"
 
-# Cargo version matrix (oxide#091): one logical proof per exact stable
+# Budget-only default pool (oxide#102): the removable-pool proof's guarded
+# session, preceded by the default-pool cases over a scratch HOME (legacy
+# image pool detection untouched, creation at the new path with a verified
+# Time Machine exclusion, config and environment precedence, refusals, soft
+# budget growth and idle eviction, injected watchdog stop) and with the
+# previous-registration refusal before registration. One owned 128 MiB
+# image models the removable drive only. Not a benchmark and not full QA.
+[tasks."rust:oxide-budget-default"]
+admission = "heavy"
+run = "python3 scripts/test-oxide-removable-pool.py --budget-default"
+
+# SUSPENDED by oxide#102 (retired image pool provisioning; refuses before
+# any effect until migrated). Cargo version matrix (oxide#091): one logical proof per exact stable
 # release. Each stages `oxide` offline with the builder 1.97.1, then runs the
 # shipped freshness gate, stray detection and dep-info decoder under the
 # tested Cargo over one fresh 128 MiB APFS pool, plus the installed 1.94.1

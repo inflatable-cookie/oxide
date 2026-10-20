@@ -391,7 +391,10 @@ leases taken by `oxide` commands only:
 - A command that dies after recording "Cargo starting" but before recording
   its group cannot prove the group empty. That slot stays held, `oxide
   status` marks it interrupted with no recorded group, and
-  `oxide-storage-lease recover` is the explicit release. A record written by
+  `oxide pool recover-interrupted <slot>` is the explicit release (it
+  replaced the retired standalone CLI's `recover`, oxide#102). It still
+  refuses while a live command holds the record, for a retired slot, or when
+  the next command would recover the slot automatically. A record written by
   an earlier front-door build has no holder, so it is kept the same way.
   `oxide status` names which of these applies to each interrupted slot and
   promises automatic recovery only where the rule allows it.
@@ -400,8 +403,9 @@ leases taken by `oxide` commands only:
   event is written to the record before the ledger recovery and moved into
   the log after it, so a crash between the two still logs it on the next
   sweep. `oxide status` shows the newest 16.
-- Leases taken through the standalone `oxide-storage-lease` CLI have no
-  control record and no lock holder, so they are never auto-recovered.
+- A held lease with no Oxide control record (for example one an older
+  standalone-CLI build took) has no lock holder, so it is never
+  auto-recovered.
 
 **Residual risk.** A descendant that leaves the group with `setsid` or a new
 spawn group is invisible to `killpg`. If it still writes in the slot when the
@@ -415,10 +419,11 @@ explicit `recover` unless they adopt it.
 
 ## Storage and space management
 
-- One per-user host pool: the existing [bounded APFS backend](bounded-storage.md)
-  on macOS, where the volume size is the hard aggregate ceiling; the
-  budget-only [directory backend](#platform-backends) elsewhere or by explicit
-  setting. Only whole idle slots are evicted.
+- One per-user host pool: the budget-only
+  [directory backend](#budget-only-default-pool-and-user-configuration) on
+  every platform. Its soft budget is checked at admission; a running build
+  may grow past it while real free space holds. Only whole idle slots are
+  evicted. The APFS sparse-image backend is retired (oxide#102).
 - The first command creates the pool automatically ([W-1](#open-decisions)).
 - Per-project slot cap, recommended 2 to start, plus a host-wide limit on
   concurrent Cargo invocations ([W-2](#open-decisions)). Queue/Nucleus still
@@ -431,7 +436,8 @@ explicit `recover` unless they adopt it.
   [verified Cargo release](#cargo-version-matrix); otherwise it reads
   `unknown`. Reclaiming that space is an explicit command; live cleanup
   still needs scoped approval. Nothing inside a slot is ever deleted.
-- `OXIDE_POOL_CAP` sets a new pool's cap; `oxide clean --cargo-cache` asks
+- `OXIDE_POOL_CAP` or the config file sets the soft budget for the next
+  admission; `oxide clean --cargo-cache` asks
   Cargo for its own home cleanup ([Cargo home hygiene](#cargo-home-hygiene)).
 
 ## Execution location
@@ -537,8 +543,12 @@ or global Cargo configuration is involved.
   example to roll back. Effigy does not forward selector arguments, so the
   pin travels in the environment.
 - **Default pool.** The first leased command created
-  `~/Library/Caches/oxide/pool` under the shipped rules: a 24 GiB
-  `apfs-sparse-image-v1` image, refused below the 20 GiB host reserve.
+  `~/Library/Caches/oxide/pool` under the then-shipped rules: a 24 GiB
+  `apfs-sparse-image-v1` image, refused below the 20 GiB host reserve. That
+  backend is retired (oxide#102): current `oxide` never attaches, writes or
+  removes that pool and `status` lists it as `legacy pool`. Its ordinary
+  detach and deletion are a separate Tom-approved planner step after fresh
+  positive idleness.
 - **Selectors.** `rust:compile`, `rust:compile-linux`, `rust:format` and
   `test rust` call `oxide`. With the default `quick` profile, check and test
   use line tables rather than `dev`'s full debug info. Focused proof, profile
@@ -573,12 +583,11 @@ Do not rehearse these steps; they remove the dogfood artifacts.
 2. Unlink the binary only if it still matches the newest receipt:
    `shasum -a 256 ~/.local/bin/oxide` equals its `installed.sha256`. Keep the
    receipts. A mismatch means an unknown file: leave it and report.
-3. To retire the pool as well, run `oxide status` with Oxide still installed,
-   or `oxide-storage-lease status` on the pool. Every slot must be idle, no
-   command waiting and no recovery pending. A held or unknown holder, group
-   or waiter means stop: preserve and report. Never reset a lease by hand.
-   That CLI has `init`, `lease`, `release`, `recover` and `status`; it has no
-   detach verb.
+3. To retire a legacy image pool: current `oxide` never opens it, so prove
+   idleness from fresh evidence (no process holds its lock, image or payload;
+   every ledger slot idle, no waiter and no pending recovery in its
+   `oxide-managed/state.json`). A held or unknown holder, group or waiter
+   means stop: preserve and report. Never reset a lease by hand.
 4. In `hdiutil info`, find the entry whose `image-path` is
    `~/Library/Caches/oxide/pool/image.sparseimage` and whose payload mounts
    at `~/Library/Caches/oxide/pool/payload`. Run an ordinary
@@ -597,7 +606,7 @@ Assessment:
 
 | Keep | Why |
 | --- | --- |
-| [Local lease](local-lease.md), pool, APFS backing and [bounded storage](bounded-storage.md) | The storage layer of every `oxide` command; live with Nucleus. |
+| [Local lease](local-lease.md) library: pool, ledger, leases, recovery, eviction | The storage layer of every `oxide` command. Its standalone CLI and the APFS image backing are retired (oxide#102); Nucleus keeps its installed copy until its owner switches. |
 | [Storage inventory](storage-inventory.md) | Backs `oxide status` and stray detection. |
 | [Stable profiles](stable-cargo-profiles.md) knowledge | Source of the `quick` / `debug` recipes. |
 | Cargo freshness, path-embedding, containment and capacity findings in [qualification readiness](../qualification-readiness.md) | Ground the freshness gate, debug-path limit and crash-recovery design. Kept as evidence; the narrative is condensed. |
@@ -787,24 +796,10 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
   runs before Cargo. A slot detached by `oxide clean` is never shared. If the
   gate refuses, the slot goes back unchanged and the command takes a new or
   evicted slot cold.
-- **Pool.** `OXIDE_POOL`, else `~/Library/Caches/oxide/pool` on macOS and
-  `$XDG_CACHE_HOME/oxide/pool` or `~/.cache/oxide/pool` elsewhere, created on
-  first building command. Creation refuses below 20 GiB host free space. On
-  macOS the default is `apfs-sparse-image-v1` with a 24 GiB cap equal to its
-  sparse image. `OXIDE_POOL_BACKEND=directory-budget` selects
-  `directory-budget-v1` instead, with a recorded 24 GiB budget; it is the
-  default on other platforms, where `apfs-sparse-image` refuses. Any other
-  value refuses. The variable applies only at creation: naming a backend
-  other than an existing pool's refuses, so an existing pool from
-  `oxide-storage-lease init` opens unchanged. See
-  [Platform backends](#platform-backends). `OXIDE_POOL_CAP` sets the cap
-  (or budget) a new pool records: a byte count or a whole number of `KiB`,
-  `MiB`, `GiB` or `TiB`, a whole MiB, from 128 MiB (APFS) or 1 MiB
-  (directory) to 16 TiB. Any other value refuses before any effect. An
-  existing pool keeps its recorded cap: a different value prints
-  `OXIDE_POOL_CAP … not applied` and is ignored; nothing is resized or
-  migrated. Creation still refuses below the 20 GiB host reserve, and an
-  image cap bounds only the pool, not other host writes.
+- **Pool.** A budget-only `directory-budget-v1` pool at the path and soft
+  budget of [user configuration](#budget-only-default-pool-and-user-configuration),
+  created on the first building command. Creation refuses below 20 GiB host
+  free space.
 - **Slots and waiting.** Per-project cap 2: a new checkout or key at the cap
   evicts the project's least recently used idle slot whole and builds cold.
   Host-wide limit 2 commands holding slots (`OXIDE_MAX_ACTIVE`, 1–32). Excess
@@ -826,9 +821,8 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
   or the program's for `run`.
 - **Summary.** One stderr line per leased command: profile, strategy (`build`
   or `build+execute`), slot, warm/cold, elapsed time, pool use and backend:
-  `pool 3 of 128 MiB used (apfs-sparse-image-v1)` (payload volume use), or
-  `pool 12 MiB allocated of 24576 MiB budget (directory-budget-v1, budget-only)`
-  (slot allocation against the budget).
+  `pool 12 MiB allocated of 95367 MiB budget (directory-budget-v1, budget-only)`
+  (slot allocation against this command's soft budget).
   When the gate refreshed files, or reconciled another checkout's build, it
   appends the count and the outside-Git limit. A refused gate prints its
   reason on its own line before the cold build.
@@ -1190,19 +1184,162 @@ with exit 1), and reads or changes no setting.
   exit. Its probes are shell scripts named by `OXIDE_TEST_LAUNCH_SOURCE`
   (test-only, like `OXIDE_TEST_LAUNCH_LIMIT_MS` and
   `OXIDE_TEST_LAUNCH_DELAY=copy|start|remove:<ms>`, which pauses inside the
-  helper). With the CLI gone, each case checks at once that the temporary
-  directory is empty and no logged probe is alive:
-  - an ordinary run completes with medians (20 s limit, for loaded hosts);
-  - under a 5 s limit, a probe that never exits is killed;
+  helper). In debug builds `OXIDE_TEST_LAUNCH_GROUP_LOG` names a fresh file
+  that receives the measuring helper's process-group ID once it is spawned;
+  it changes nothing else. With the CLI gone, each case checks at once that
+  the temporary directory is empty, that recorded group is gone
+  (`kill(-group, 0)` fails with exactly `ESRCH`; a missing record fails) and
+  no logged probe is alive:
+  - an ordinary run (20 s limit) reports either complete medians with a result, or exactly that deadline as inconclusive with no median, within the limit and cleaned up; any other outcome fails;
+  - under a 5 s limit, a slow probe's group is closed by the deadline
+    (whether the script reached its PID marker under host load is separate;
+    every PID it logged must be dead);
   - under a 600 ms limit, a copy, a probe start and a removal each paused
     2 s return within 1.6 s, inconclusive.
 
+## Budget-only default pool and user configuration
+
+Tom's 2026-10-20 rulings ([vision](../vision.md#product-workflow-direction)):
+a hard cap on drive space "would just break large builds and cause MORE
+churn"; retire the disk image and the standalone lease tool; a 100 GB
+internal budget; make the pool's location and size configurable. Shipped in
+oxide#102.
+
+- **Backend.** Every internal pool is `directory-budget-v1`
+  ([as shipped](#directory-budget-v1-as-shipped)). Oxide no longer creates,
+  attaches, verifies or detaches APFS sparse images, and the standalone
+  `oxide-storage-lease` binary and its selector are gone. The library's
+  ledger, leases, crash recovery, eviction and inventory remain; `oxide`
+  is their only caller.
+- **Soft budget.** Default 100 GB, decimal (100000000000 bytes). It is
+  checked at admission: owned slots' unique allocation against the budget,
+  whole-idle-slot eviction until under it, `Full` when only held slots
+  remain. It is not a quota, a sparse-file size, a mid-build threshold or a
+  promise to reserve that much disk. A running build may grow past it; the
+  next admission evicts whole idle slots. Oxide never deletes active or
+  uncertain slots or files to meet it. A changed budget takes effect at the
+  next admission; the pool's recorded creation budget is unchanged and
+  `status` shows the effective one. Builds can still run out of real space:
+  the 20 GiB host-reserve watchdog stops the owned group below its 22 GiB
+  trigger, and ordinary filesystem errors still fail a build.
+- **Precedence.** Environment, then the user config file, then defaults.
+  `OXIDE_POOL` sets the path (relative resolves against the current
+  directory); `OXIDE_POOL_CAP` sets the budget. Sizes are whole bytes or a
+  whole number of `KB`, `MB`, `GB`, `TB` (decimal) or `KiB`, `MiB`, `GiB`,
+  `TiB`, from 1 MiB to 16 TiB; anything else refuses before any effect.
+  `OXIDE_POOL_BACKEND` is retired: unset or `directory-budget` only.
+- **Config file.** Machine configuration, never a project file. Platform
+  location (Longhorn platform-native-v1 policy, mirrored, no dependency):
+  macOS `~/Library/Application Support/oxide/config/config.toml`; elsewhere
+  `$XDG_CONFIG_HOME/oxide/config.toml`, with XDG's `~/.config` when the
+  variable is unset; a relative `XDG_CONFIG_HOME` or a missing `HOME`
+  refuses. `OXIDE_CONFIG` (absolute) selects another file; only the selected
+  file is parsed. On macOS `~/.config/oxide/config.toml` is never read;
+  `status` says it is ignored, without printing its contents. Parsed with
+  `basic-toml` 0.1.10; at most 64 KiB:
+
+  ```toml
+  [pool]
+  path = "~/Dev/oxide"   # ~ or ~/ expands to HOME; absolute, no . or ..
+  budget = "100GB"       # or a byte count
+  ```
+
+  An unknown key, a wrong type or a parse failure refuses with the file
+  named.
+- **Default path.** `~/Library/Caches/oxide/build-pool` on macOS,
+  `$XDG_CACHE_HOME/oxide/build-pool` or `~/.cache/oxide/build-pool`
+  elsewhere: distinct from the retired image pool's `…/oxide/pool`, so that
+  pool is retired separately. The control root (ledger, leases, Oxide state,
+  removable registration) lives inside the pool, so a configured pool keeps
+  its control root with it.
+- **Path refusals.** A pool path (from the environment or the file) with a
+  `.` or `..` component refuses outright, so a missing component followed
+  by `..` cannot reach a work tree once its parents exist. Then, after
+  resolving the nearest existing ancestor's symlinks: a path inside a Git
+  work tree (any ancestor holding `.git`), or
+  under `/Volumes` or on a volume mounted there (where a removable volume is
+  registered, aliases included), refuses. Unknown identity refuses.
+- **Legacy image pool.** A pool path holding `image.sparseimage` or
+  `receipt.json`, or whose config records `apfs-sparse-image-v1`, refuses
+  with a retirement message and is never locked, attached, mounted,
+  recovered, cleaned or written. A symlink alias is judged by the directory
+  it names, and the library repeats the check read-only before it creates
+  or takes the pool lock. `status` reads only file names and the
+  config's backend at the legacy default path and reports `legacy pool: …
+  pending planner retirement`. No conversion, copying or deletion.
+- **Path changes.** Nothing moves or deletes an old pool. `status` lists
+  pools at other known paths as `orphaned pool`: the built-in default and
+  pools Oxide created from the config file or default, recorded (newest 16)
+  in the platform state directory (`~/Library/Application Support/oxide/state/pools.json`
+  on macOS, `$XDG_STATE_HOME/oxide/pools.json` elsewhere). Pools named by
+  `OXIDE_POOL` are not recorded. The record is informational, never
+  ownership or reclaim proof; there is no home or drive scan.
+- **Previous removable registration.** A registration or removable pool
+  state under another known pool's control root (the legacy default, the
+  built-in default or a recorded pool) is never moved, adopted, forked or
+  removed. `oxide pool register-removable` refuses while it exists, naming
+  the safe prerequisites: confirm with the build that used that pool that
+  its removable pool has no held slot or waiting command, then retire the
+  old registration as a separate step. A build prints that the previous
+  registration is not used and continues on the internal pool.
+  `register-removable` also refuses while the volume's `oxide-pool`
+  directory is not empty, so an old registration's slots are never adopted.
+  The real `Builds` registration ([below](#removable-build-volume)) lives
+  under the legacy default pool's control root, so after this change it is
+  not used, and re-registering refuses until the planner retires it and its
+  `oxide-pool` payload directory after fresh positive idleness, then
+  registers again through the shipped command.
+- **Time Machine.** On macOS a pool Oxide creates is excluded with the
+  sticky, unprivileged `tmutil addexclusion <pool>` and verified with
+  `tmutil isexcluded` before any build writes; failure or an unknown result
+  refuses before Cargo. Each later command checks the exclusion attribute
+  (`com.apple.metadata:com_apple_backup_excludeItem`) on the pool root and
+  re-runs that pair when it is missing. Only the owned pool root is
+  excluded, never a parent such as `~/Dev`. `status` reports
+  `tmutil isexcluded`. Other platforms: not applicable.
+- **Spotlight.** Apple documents only the Spotlight Privacy list, which needs
+  the user, so Oxide applies no exclusion. `status` says `not excluded by
+  Oxide` with that advice. Other platforms: not applicable.
+- **`status`.** The config file and whether it exists or was selected by
+  `OXIDE_CONFIG`, the pool path and budget with their sources, then per
+  pool: backend, soft budget, slot allocation, the pool filesystem's
+  available and total space (shared, no Oxide quota or ceiling), Time Machine
+  and Spotlight state, legacy and orphaned pools.
+- **Explicit slot release.** `oxide pool recover-interrupted <slot>`
+  replaces the retired CLI's `recover` for an interrupted slot automatic
+  [crash recovery](#crash-recovery) keeps held. Source- and unit-reviewed;
+  no native proof drives it.
+- **Proof.** `effigy rust:oxide-budget-default` runs the
+  [removable proof](#removable-build-volume)'s guarded session with these
+  cases first, over a scratch `HOME` (toolchains from the real
+  `RUSTUP_HOME`): status before any pool; the legacy image pool shape
+  detected, refused by path and byte-identical; `OXIDE_POOL_BACKEND`
+  refusal; default creation at the new path as a 100 GB directory pool with
+  `tmutil isexcluded` confirmed; the ignored `~/.config` file, Time Machine,
+  Spotlight and filesystem lines; config-file, `OXIDE_POOL_CAP` and
+  `OXIDE_CONFIG` precedence; the orphan report; Git work tree, symlink
+  alias, `/Volumes`, unknown key, malformed and relative-path refusals that
+  create nothing; a build script writing 4 MiB past a 2 MB budget
+  completing, then the next admission evicting that whole idle slot; an
+  injected low reading stopping a sleeping build. Before registering, the
+  removable phase proves the previous-registration refusal with idle and
+  held fixtures (bytes unchanged, no forked ledger, nothing on the volume)
+  and the build note. The selector shares `rust:oxide-removable-pool`'s
+  unqualified runner.
+- **Suspended proofs.** `rust:oxide-cli`, `rust:cargo-matrix:<release>` and
+  `rust:oxide-toolchain-context` provisioned their pool with the retired CLI
+  and image backend. They refuse before any effect until migrated to a
+  directory pool; their earlier results remain historical evidence.
+  `rust:oxide-cli:launch-check` and `rust:oxide-cli:clean-safety` use no
+  pool and still run.
+
 ## Platform backends
 
-`directory-budget-v1` is implemented (see [below](#directory-budget-v1-as-shipped));
-`linux-image-v1`, CI cache save/restore and container execution are proposed
-only. The pool needs a backend on every host where builds run. On macOS, the APFS
-sparse image gives an unprivileged hard ceiling. Linux has no unprivileged
+`directory-budget-v1` is implemented (see [below](#directory-budget-v1-as-shipped))
+and is the only internal backend; `linux-image-v1`, CI cache save/restore and
+container execution are proposed only. The APFS sparse image that gave macOS
+an unprivileged hard ceiling is retired (oxide#102): a hard cap broke large
+builds. Linux has no unprivileged
 equivalent: loop mounts, XFS/ext4 project quotas and btrfs qgroup limits all
 need root, and the filesystems an unprivileged user namespace may mount
 (`tmpfs`, overlay, FUSE) are RAM-backed or slow. The default must still need
@@ -1210,8 +1347,8 @@ no setup, per Tom's ease-of-use ruling.
 
 | Backend | Where | Bound | Setup |
 | --- | --- | --- | --- |
-| `apfs-sparse-image-v1` (shipped) | macOS | OS-enforced aggregate ceiling | None; created automatically |
-| `directory-budget-v1` | Any host, the Linux default | Budget only: admission plus whole-idle-slot eviction against a recorded budget, with no OS ceiling. A supervised build samples caller-available space through `statfs` and attempts to stop its own process group below the 22 GiB trigger (20 GiB protected reserve plus 2 GiB margin). Best effort, with no guarantee against faster writers or other processes; no directory walk during the build. | None |
+| `apfs-sparse-image-v1` (retired, oxide#102) | macOS | Was an OS-enforced aggregate ceiling | Never created or opened now |
+| `directory-budget-v1` | Every host, the default | Budget only: admission plus whole-idle-slot eviction against a soft budget, with no OS ceiling. A supervised build samples caller-available space through `statfs` and attempts to stop its own process group below the 22 GiB trigger (20 GiB protected reserve plus 2 GiB margin). Best effort, with no guarantee against faster writers or other processes; no directory walk during the build. | None |
 | `linux-image-v1` | Long-lived Linux hosts (LAN build box) | OS-enforced ceiling on an ext4/XFS image or project-quota directory | One optional privileged provisioning step, then unprivileged use |
 
 Rules:
@@ -1244,10 +1381,11 @@ Rules:
 - **Shape.** `<pool>/payload/slots/` is a plain owner-only directory on the
   pool's own device; config, ledger and lock sit beside it as for APFS, with
   no image or receipt. The config records the backend, store ID and budget
-  (`cap_bytes`, default 24 GiB; `image_bytes` 0). An image or receipt file,
-  any payload entry but `slots`, or a payload on another device refuses.
-  The library never mints a `BoundedBacking` for it.
-- **Admission.** The ledger's existing rules with the budget as the cap:
+  recorded at creation (`cap_bytes`, default 100 GB; `image_bytes` 0). An
+  image or receipt file, any payload entry but `slots`, or a payload on
+  another device refuses.
+- **Admission.** The ledger's existing rules with this command's soft budget
+  (`LeaseRequest.budget_bytes`, else the recorded one) as the cap:
   owned slots' unique allocated bytes at lease time, whole-idle-slot
   eviction until under budget, `Full` when only held slots remain, and
   half-budget idle recycling. Nothing enforces the budget while a build
@@ -1272,12 +1410,12 @@ Rules:
   group is empty.
 - **Test hooks.** Debug builds only: `OXIDE_TEST_WATCHDOG_READINGS` names a
   file holding the available-bytes reading, and `OXIDE_TEST_BUDGET_BYTES`
-  sets a new pool's budget. Release builds ignore both. The reserve and
+  overrides the soft budget above every other source. Release builds ignore
+  both. The reserve and
   margin have no override.
-- **Standalone CLI.** `oxide-storage-lease` refuses a directory pool
-  (`backing_mismatch`, exit 4); see
-  [local lease](local-lease.md#oxide-front-door-control-directory).
-- **Proof.** `effigy rust:oxide-cli` adds a macOS case on two scratch
+- **Proof.** Current: `effigy rust:oxide-budget-default`
+  ([above](#budget-only-default-pool-and-user-configuration)). Historical,
+  before the CLI's retirement: `effigy rust:oxide-cli` added a macOS case on two scratch
   directory pools after the APFS image is detached: creation, summary and
   `status` labelling; standalone refusal; a reserve stop on injected
   readings where a bounded writer that ignores TERM lowers the reading by
@@ -1311,13 +1449,13 @@ Tom approved an early host trial on 2026-10-20. His `Builds` volume (`A6AC3ED7-3
 ### Implemented: part 1
 
 - **Backend `apfs-volume-v1`.** Config, ledger, lock and Oxide's own state live in `<internal pool>/oxide-managed/removable/`; the registration in `<internal pool>/oxide-managed/removable.json`. Only slot payload is on the volume, in `<mount>/oxide-pool/slots/`. No disk image on the volume. Budget-only: Oxide's admission cap is an estimate, not an APFS quota, and the volume's capacity is shared with every other directory on it. Only the front door's `managed` library entry points open it; the standalone lease CLI refuses it like a directory pool. No reserve watchdog runs on the volume: its reserve is checked when a build starts.
-- **Registration.** `oxide pool register-removable <mount-point> --reserve <size> --cap <size>` (macOS). `pool` is not a Cargo built-in. Both sizes are required, whole MiB from 1 MiB to 16 TiB; zero, overflow and malformed values refuse. Oxide never picks a reserve, cap or quota, and changes no APFS setting. Before any write it requires:
+- **Registration.** `oxide pool register-removable <mount-point> --reserve <size> --cap <size>` (macOS). `pool` is not a Cargo built-in. Both sizes are required, from 1 MiB to 16 TiB in the [size units](#budget-only-default-pool-and-user-configuration) (oxide#102 dropped the whole-MiB rule and added decimal units, so `750000000000` is accepted); zero, overflow and malformed values refuse. Oxide never picks a reserve, cap or quota, and changes no APFS setting. Before any write it requires:
   - a path of exactly `/Volumes/<name>`: nested paths, `..`, hidden names, prefix look-alikes and custom mount parents refuse;
   - `/Volumes` passing the structural mount-parent rule, at registration and at every selection: the caller is not root; `/Volumes` is a real directory (not a symlink) whose path and opened descriptor agree; it is owned by root with no group or other write and no setuid, setgid or sticky bit; `acl_get_fd_np(ACL_TYPE_EXTENDED)` positively reports no extended ACL entry (`ENOENT`, or an ACL with no entry), any other result refuses; and it has no file flag except `UF_HIDDEN` (`sys/stat.h`, a GUI display hint the standard `/Volumes` carries). Every violation is reported. A denied combined `faccessat(W_OK)` is not used, since it does not prove that a specific right such as `add_subdirectory` is denied;
   - the name opened with `O_NOFOLLOW | O_DIRECTORY` (a symlink alias refuses), whose descriptor's `fstatfs` `f_mntonname` names exactly that path, whose `st_dev` differs from `/Volumes`'s, `f_fstypename` `apfs`, not `MNT_RDONLY`, not `MNT_ROOTFS`, and writable by the user;
   - `diskutil info -plist` agreeing on the volume UUID (the kernel's `ATTR_VOL_UUID`), mount point and APFS, with a container other than the one holding `/System/Volumes/Data`;
   - `diskutil apfs list -plist <container>` listing the volume with no APFS role: a Backup (Time Machine) role, and every other role, refuses.
-  It records mount point, volume UUID, container UUID, reserve, cap, the volume's capacity and APFS quota (`CapacityQuota`, none when 0) at registration. A second registration refuses. The payload directory is created empty through the volume's descriptor.
+  It records mount point, volume UUID, container UUID, reserve, cap, the volume's capacity and APFS quota (`CapacityQuota`, none when 0) at registration. A second registration refuses, and so does a registration left under a previous pool's control root ([oxide#102](#budget-only-default-pool-and-user-configuration)). The payload directory is created empty through the volume's descriptor.
 - **Selection, when a leased command starts.** With nothing registered, the internal pool is used exactly as before. Otherwise the removable pool is used only if, at that moment, the mount point opens as above with the registered UUID, `/Volumes` still passes the mount-parent rule, the volume is writable, `diskutil` again reports it in the registered container, outside the boot/data container and with no APFS role (unknown metadata refuses), and its available space is above the reserve; the library then re-verifies the volume and the payload directory (same device and inode by path and by descriptor) on every open. Anything else falls back to the internal pool with one `oxide: internal pool: removable volume not used (<reason>)` line. Selection creates nothing, so a stale `/Volumes/<name>` is never written to.
 - **No stale-mount-point writes by Oxide.** Oxide creates slot directories with `mkdirat` relative to descriptors opened from the verified mount root, rechecking the binding (descriptor still the registered root, path still that root's device) before each creation and before removing a slot. Cargo itself writes through the slot path; while the volume is mounted that path is the volume. A mid-build removal is part 2.
 - **Flush on release.** Before a removable slot becomes idle (normal release, a refused shared slot handed back, an untrusted slot released for eviction, and crash recovery), Oxide calls `fsync_volume_np(fd, SYNC_VOLUME_FULLSYNC | SYNC_VOLUME_WAIT)` on the verified mount-root descriptor, verifying the binding before and after. The summary line prints its cost; `status` lists recent flushes, including those made during crash recovery. The flush runs after positive writer closure and is a durability step, not a closure proof. A failed or unknown flush retires the slot: the record becomes `retired`, the lease stays held, the slot is never reused, recovered or deleted, and the build's own exit code is unchanged.
@@ -1392,9 +1530,10 @@ Approved design direction (Tom, 2026-10-20). Not implemented. It applies to buil
 
 ## Open decisions
 
-- **W-1 Default pool.** Foundation choice above: per-user cache directory,
-  24 GiB sparse image, refuse below the 20 GiB host reserve. Revisit with real
-  use.
+- **W-1 Default pool.** Ruled 2026-10-20 and shipped in oxide#102: a
+  budget-only directory pool, 100 GB soft budget, configurable path and
+  budget, refuse below the 20 GiB host reserve
+  ([above](#budget-only-default-pool-and-user-configuration)).
 - **W-2 Waiting and concurrency.** Foundation choice above: per-project cap
   2, host-wide limit 2, strict FIFO waiting, idle-slot eviction before
   waiting. Coordinates with

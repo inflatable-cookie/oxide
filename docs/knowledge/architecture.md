@@ -3,8 +3,8 @@
 These are the production ownership constraints agreed by Tom on 2026-10-09,
 applied to the facilities that remain after the 2026-10-18 retirement
 ([retirements](retired.toml)). The proposed user workflow lives in
-[workflow](contracts/workflow.md); the unpublished CLI semantics live in
-[local lease](contracts/local-lease.md) and
+[workflow](contracts/workflow.md); the retained lease library semantics live in
+[local lease](contracts/local-lease.md) and the inventory CLI in
 [storage inventory](contracts/storage-inventory.md).
 
 ## Storage and ownership
@@ -18,7 +18,8 @@ settlement before reuse or eviction. The one exception is Tom's 2026-10-18
 ruling that lets Oxide's own commands recover a lease whose holder lock is
 free and whose Cargo process group is empty
 ([vision](vision.md#product-workflow-direction),
-[workflow](contracts/workflow.md#crash-recovery)); standalone leases never are.
+[workflow](contracts/workflow.md#crash-recovery)); leases without an Oxide
+control record never are.
 
 Exact-run final binaries, logs, QA receipts and evidence remain independently
 owned and preserved. Cargo intermediates are internal and may contain test
@@ -39,14 +40,13 @@ ownership or eviction authority and never recommends deletion.
 
 ## Current facilities
 
-- The root library keeps the verified bounded APFS backing capability
-  ([bounded storage](contracts/bounded-storage.md)) used by the local lease
-  CLI. There is no background storage service or project adapter.
-- The local lease CLI provides explicit same-user pool, lease, release,
-  recovery and status operations. Tom's 2026-10-16 Nucleus ruling selected it
-  in place of the protected callback integration. UID trust permits a
-  cooperative caller's explicit writer-closed release; TTL or holder loss alone
-  does not establish closure.
+- The root library keeps the same-user pool, ledger, lease, recovery and
+  eviction code `oxide` uses, over budget-only directory and removable-volume
+  pools. There is no background storage service or project adapter. The
+  standalone lease CLI and the APFS sparse-image backing are retired
+  (oxide#102); Nucleus keeps its installed copy until its owner switches.
+  UID trust permits a cooperative caller's explicit writer-closed release;
+  TTL or holder loss alone does not establish closure.
 - The inventory CLI reads one explicitly selected target directory.
 - A bounded decoder for Cargo's encoded dep-info (`oxide_storage::dep_info`)
   is kept. The cross-checkout freshness gate works from Git content and does
@@ -56,16 +56,21 @@ ownership or eviction authority and never recommends deletion.
 
 ## Storage invariants
 
-1. **Bound ownership.** A hard capacity claim requires a verified backing
-   descriptor for the canonical APFS payload. A directory-only root is a
-   budgeted directory, not a hard filesystem bound.
+1. **Soft budgets, no artificial ceiling.** Tom's 2026-10-20 ruling replaced
+   the earlier hard-ceiling invariant: a hard cap broke large builds and
+   caused churn ([vision](vision.md#product-workflow-direction)). A pool's
+   budget is a soft admission figure with whole-idle-slot eviction; nothing
+   stops a running build for passing it. Real free-space safety comes from
+   the host-reserve watchdog and the filesystem itself; a registered
+   removable volume's own capacity is its only hard limit. No pool claims a
+   hard bound.
 2. **Exclusive use.** A lease names one owned slot generation. A second claim
    cannot use it while ownership is active or uncertain.
 3. **Conservative recovery.** Unknown or uncertain writer state preserves bytes
    and accounting. Age, a missing reply, or a PID observation is not release
    evidence. Reclaim requires the proof defined by the lease contract.
-4. **Finite capacity.** Admission respects the configured payload ceiling and
-   refuses when capacity or ownership cannot be established. Capacity pressure
+4. **Finite capacity.** Admission respects the soft budget and refuses when
+   only held slots remain or capacity or ownership cannot be established. Capacity pressure
    produces an actionable refusal and inventory; never delete active or
    uncertain storage or consumer-retained evidence to make room.
 5. **Private final outputs.** Reusing Cargo intermediates must not share

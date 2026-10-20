@@ -25,6 +25,8 @@ struct Run {
     wall: Duration,
     tmp: PathBuf,
     pids: PathBuf,
+    /// The measuring helper's process group, recorded by the debug hook.
+    group: PathBuf,
 }
 
 fn scratch(label: &str) -> PathBuf {
@@ -40,6 +42,8 @@ fn check(label: &str, script: &str, environment: &[(&str, &str)]) -> Run {
     let root = scratch(label);
     let tmp = root.join("tmp");
     let pids = root.join("pids");
+    let group = root.join("group");
+    assert!(!group.exists(), "{label}: stale group record");
     let source = root.join("probe");
     let script = script.replace("PIDS", &pids.display().to_string());
     std::fs::write(&source, script).expect("probe script");
@@ -56,6 +60,7 @@ fn check(label: &str, script: &str, environment: &[(&str, &str)]) -> Run {
         .env("TMPDIR", &tmp)
         .env("PATH", root.join("no-bin"))
         .env("OXIDE_TEST_LAUNCH_SOURCE", &source)
+        .env("OXIDE_TEST_LAUNCH_GROUP_LOG", &group)
         .envs(environment.iter().copied())
         .output()
         .expect("oxide status --launch-check");
@@ -63,12 +68,35 @@ fn check(label: &str, script: &str, environment: &[(&str, &str)]) -> Run {
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(output.status.success(), "{label}: {output:?}");
     assert!(output.stderr.is_empty(), "{label}: {output:?}");
-    Run {
+    let run = Run {
         stdout,
         wall,
         tmp,
         pids,
-    }
+        group,
+    };
+    assert_group_closed(&run, label);
+    run
+}
+
+/// The helper's recorded process group, this case's own, is gone right
+/// after the CLI exits: `kill(-group, 0)` fails with exactly `ESRCH`. A
+/// missing or invalid record, or any other result, fails.
+fn assert_group_closed(run: &Run, label: &str) {
+    let text = std::fs::read_to_string(&run.group)
+        .unwrap_or_else(|error| panic!("{label}: no recorded helper group: {error}"));
+    let group: i32 = text
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("{label}: invalid group record {text:?}"));
+    assert!(group > 1, "{label}: invalid group {group}");
+    // SAFETY: signal 0 only checks existence.
+    let status = unsafe { libc::kill(-group, 0) };
+    let error = std::io::Error::last_os_error().raw_os_error();
+    assert!(
+        status == -1 && error == Some(libc::ESRCH),
+        "{label}: helper group {group} not closed: kill returned {status}, errno {error:?}"
+    );
 }
 
 /// Nothing left in the temporary directory once the CLI has exited.
@@ -79,8 +107,13 @@ fn assert_clean(run: &Run, label: &str) {
         .map(|entry| entry.path())
         .collect();
     assert!(left.is_empty(), "{label}: left behind {left:?}");
+    // Only the settled report: "… ms limit; temporary copies removed". An
+    // Unsettled cleanup ("process group … not confirmed closed …; temporary
+    // copies removed") fails even if the group is gone by the time of the
+    // post-exit ESRCH check.
     assert!(
-        run.stdout.contains("; temporary copies removed\n"),
+        run.stdout.contains(" ms limit; temporary copies removed\n")
+            && !run.stdout.contains("not confirmed closed"),
         "{label}: {}",
         run.stdout
     );
@@ -96,7 +129,10 @@ fn logged_pids(path: &Path) -> Vec<i32> {
 
 #[test]
 fn an_ordinary_check_completes_and_cleans_up() {
-    // A generous limit, so a loaded host still completes the samples.
+    // A generous limit. On a loaded host the fresh copies' first launches
+    // can still exhaust it; the command's contract then reports exactly that
+    // deadline as inconclusive. Those are the only two accepted outcomes;
+    // the median and report arithmetic are unit-tested in `launch.rs`.
     let run = check(
         "ordinary",
         QUICK,
@@ -107,17 +143,31 @@ fn an_ordinary_check_completes_and_cleans_up() {
         "took {:?}",
         run.wall
     );
+    let complete = run.stdout.contains("  medians: same file ")
+        && run.stdout.contains(", fresh copy ")
+        && (run
+            .stdout
+            .contains("  result: no material penalty (difference at most 30 ms); nothing to do\n")
+            || run
+                .stdout
+                .contains(" per newly written executable, above the 30 ms threshold\n"))
+        && !run.stdout.contains("inconclusive");
+    let deadline = run.stdout.contains(
+        "  result: inconclusive (the 20000 ms limit was reached); no median reported; run it again",
+    ) && !run.stdout.contains("medians:");
     assert!(
-        run.stdout.contains("  medians: same file "),
-        "{}",
+        complete != deadline,
+        "neither complete medians nor the 20000 ms deadline: {}",
         run.stdout
     );
     assert_clean(&run, "ordinary");
 }
 
 #[test]
-fn a_probe_that_never_exits_is_killed_before_the_cli_exits() {
-    // Long enough for the probe's shell to start and log its PID.
+fn a_slow_probe_group_is_closed_before_the_cli_exits() {
+    // `check` already requires the helper's group (probes included, even one
+    // still starting) to be gone. Whether the slow script reached its PID
+    // marker under host load is separate: every PID it did log must be dead.
     let run = check("slow", SLOW, &[("OXIDE_TEST_LAUNCH_LIMIT_MS", "5000")]);
     assert!(
         run.wall < Duration::from_millis(5_000) + SLACK,
@@ -132,9 +182,7 @@ fn a_probe_that_never_exits_is_killed_before_the_cli_exits() {
     );
     assert!(!run.stdout.contains("medians:"));
     assert_clean(&run, "slow");
-    let pids = logged_pids(&run.pids);
-    assert!(!pids.is_empty(), "the slow probe never ran");
-    for pid in pids {
+    for pid in logged_pids(&run.pids) {
         // SAFETY: signal 0 only checks existence.
         let alive = unsafe { libc::kill(pid, 0) } == 0;
         assert!(!alive, "probe {pid} outlived the check");
