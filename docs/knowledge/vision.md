@@ -517,6 +517,12 @@ Tom's ruling, 2026-10-20: "I think we can remove the legacy lease tool and proba
 Tom's ruling, 2026-10-20: the internal pool lives at `~/Dev/oxide` ("~/Dev/oxide is fine"), with a 100 GB budget, set through the user config file the retirement task (#102) adds.
 - Observed when the choice was made: `~/Dev/oxide` did not exist, `~/Dev` is not a Git work tree, and `tmutil isexcluded ~/Dev` reports `[Excluded]`. All of `~/Dev` is already outside Time Machine.
 
+Supervisor architecture decision, 2026-10-20: **Oxide follows Longhorn's storage-location policy** (`longhorn/docs/guides/storage-configuration-backup.md`, location table).
+- Tom raised path fragmentation across his tools: "I would like to avoid fragmentation".
+- Config: `~/Library/Application Support/oxide/config/config.toml` on macOS, `$XDG_CONFIG_HOME/oxide/config.toml` on Linux, with an explicit `OXIDE_CONFIG` override. An explicit override may name any file, including a legacy one. Oxide never implicitly adopts `~/.config/oxide`; on macOS, `status` warns it is ignored.
+- Default unconfigured pool: under `~/Library/Caches/oxide`. Other Oxide state, logs and receipts follow the same table when they are next touched.
+- Tom asked whether Oxide could use Longhorn's config system directly instead of mirroring the policy. That is pending his choice. Mirrored paths are identical, so a later switch to a Longhorn crate moves no files.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
