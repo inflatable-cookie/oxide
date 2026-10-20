@@ -6,6 +6,12 @@ only: no production Rust change, no auto-detection or enabling, no wrapper
 chaining, no installation. The user's and Effigy's machine-wide sccache
 server, cache and config were never started, stopped, queried or read.
 
+Final delivery is documentation and evidence only. The executable proof
+harness, its synthetic regressions, their Effigy selectors and the `AGENTS.md`
+command-map entry are not delivered. They remain inspectable on the retained
+task branch `ns-c5d17ad7-a25f-4aa2-9c09-a757ca73b846` at the failed-experiment
+head `c487775` (see [harness provenance](#harness-provenance)).
+
 ## Pinned inputs
 
 - sccache tag `v0.18.0`, annotated tag object `e969b1c00e64`, commit
@@ -72,13 +78,12 @@ Rust caching:
   values. Source differs: `src/compiler/rust.rs:1287` accepts `metadata`
   without `link` and `:1625-1636` handles metadata-only output, so `check`
   units are cacheable by source.
-- `src/compiler/rust.rs:1208` `-C incremental` is `CannotCache`. The
-  earlier inference here, that quick-profile workspace units therefore always
-  compile in the client, is contradicted by native proof 2: under the
-  wrapper, the `app` workspace unit was hashed, compiled by the server and
-  stored. That unit evidently received no `-C incremental`; the Cargo-side
-  cause was not traced, and incremental output is therefore not shown to be
-  unchanged under the wrapper. `src/commands.rs:902-912` the
+- `src/compiler/rust.rs:1208` `-C incremental` is `CannotCache`: sccache
+  does not cache incremental units. In native proof 2 the `app` workspace
+  unit was nevertheless hashed and stored, so that compile carried no
+  `-C incremental`. The cause and configuration were not traced. This record
+  makes no claim that quick-profile workspace units are always uncached, and
+  none that quick incremental behaviour was preserved or changed. `src/commands.rs:902-912` the
   client exits 1 if `CARGO_INCREMENTAL=1` or `CARGO_BUILD_INCREMENTAL=1` is in
   its environment; Oxide sets neither (no match in `src/`).
 - Hash key (`src/compiler/rust.rs:1503-1596`): arguments except `-L`,
@@ -94,7 +99,10 @@ Rust caching:
 
 ## Candidate assessment (before native effects)
 
-(a) Shared daemon, per-request completion. NO-GO by source. The daemon is in
+(a) Shared daemon, per-request completion. NO-GO by source under current
+Oxide semantics: the normal detached-daemon interruption and closure protocol
+gives Oxide no attributable closure. This does not show that every future
+cache-sharing design is impossible. The daemon is in
 its own session, outside every Oxide Cargo group. Normal completion is
 ordered (cache write, then response), but a cancelled or crashed command
 only aborts the request future: the direct compiler gets SIGKILL with no
@@ -109,7 +117,8 @@ source-supported descendant model is the server's own process group
 group). For a shared daemon that group ends only when the daemon exits, at
 600 s idle by default or on an explicit stop, and any other build keeps it
 alive. Closure of the server generation that wrote into a quarantined slot is
-therefore unbounded while builds continue: unbounded quarantine is no-go.
+therefore unbounded while builds continue: unbounded quarantine is no-go
+(source-based, under current Oxide semantics).
 The exact generation is identifiable (PID plus start time), but its exit is
 not the closure of its orphaned compiler children unless its group is empty.
 
@@ -129,13 +138,14 @@ any sccache-specific signal. Costs and limits, stated up front:
   one. Concurrency is therefore UNRUN and its arrangement UNKNOWN.
 - The server's lifetime extends the slot hold: a killed launcher leaves a live
   server holding the slot until its idle timeout.
-- (Corrected after proof 2.) Quick-profile workspace units were not refused
-  as incremental under the wrapper; see Result.
+- An earlier version of this list said quick-profile workspace units are
+  never cached. That was an unsupported inference and is withdrawn; see the
+  incremental bullet in the source trace.
 
 ## Protocol for the native proof (recorded before effects)
 
 Selector `effigy rust:sccache-compatibility`
-([script](../../../../scripts/test-sccache-compatibility.py)). Admission clock
+([script at `c487775`, not delivered](https://github.com/inflatable-cookie/oxide/blob/c487775be5260079c43cfc5fdd36e02c4e5a3bdb/scripts/test-sccache-compatibility.py)). Admission clock
 starts before staging; the 20 GiB host reserve is sampled at admission and
 every 250 ms; 300 s, 512 MiB owned, 8 MiB fixture source, 32 MiB retained
 output, one 128 MiB APFS pool, 64 MiB cache, 96 Cargo driver processes.
@@ -179,199 +189,155 @@ process set; the server is reparented away from the launcher, so
 `rusage`-style child totals miss it, and no privileged tracing is allowed.
 Write volume is UNKNOWN.
 
-## Result
+## Final record
 
-Compatibility: UNKNOWN. Benefit: NO-BENEFIT observed for cross-slot sharing on
-this fixture, with the cause inferred; INSUFFICIENT overall. Write volume:
-UNKNOWN. The native proof-2 record follows the proof-1 history below.
+Compatibility: UNKNOWN. Benefit: INSUFFICIENT. Write volume: UNKNOWN.
 
-- Shared daemon (a) and quarantine: NO-GO by source, above. No native effect
-  was needed or taken.
-- Foreground server per lease (b): source-supported only. Native proof 1 was
-  submitted at 10:05 UTC through `effigy rust:sccache-compatibility`, waited
-  at "waiting for QA capacity, position 1" and ended at 10:35 UTC with exit 1:
-  `capacity_timeout: heavy run 826638d6… was never launched because capacity
-  did not free in time; this is a capacity timeout, not a validation failure`
-  ([raw/proof1-admission.log](raw/proof1-admission.log); the repeated wait
-  line is kept once and colour codes are stripped, nothing else changed). The
-  harness never started: no staging, pool, server or Cargo process, and no
-  owned resources exist. The submission counts as one of the two author
-  proofs. No second submission: 18 minutes of the author clock remained, the
-  brief allows a second attempt only for a harness or setup correction, and
-  another admission wait of that length would overrun the clock.
-- Unrun, so not claimed: every native scenario S1–S7, the three cost pairs,
-  cache bytes, per-unit hit/miss classes and the slot-key comparison.
+- **Shared detached daemon (a) and quarantine:** NO-GO by source under
+  current Oxide semantics, as above. No native effect was taken.
+- **Serial foreground servers over one persistent cache (b):** sharing is
+  possible by source. Native proof 2's raw process listings show each wrapped
+  command's server inside Oxide's Cargo process group. Closure after
+  cancellation or a crash, and concurrency, remain UNPROVEN. The group
+  listings and the ordinary teardown are not a cancellation proof.
+- **Cross-slot reuse:** on this fixture a registry dependency had no cache
+  hit in a second checkout and cold slot, and its key differed. That is an
+  observation, not a timed no-benefit conclusion: the three cost pairs did
+  not run.
+- **Cause of the different key (hypothesis, source-based):** Oxide sets
+  `CARGO_BUILD_BUILD_DIR` (slot) and `CARGO_TARGET_DIR` (checkout) for Cargo
+  (`src/bin/oxide/main.rs:127-128`), and sccache hashes every `CARGO_*`
+  variable except four (`src/compiler/rust.rs:1580-1594`). The two
+  environments were not diffed.
+- **Storage and writes:** no cache-size figure was recorded, and cache
+  occupancy or allocated bytes would not be write volume. No attributable
+  write counter was available. Writes are UNKNOWN.
 
-Open question for the reviewer or a later bounded run: do S1–S7 hold on
-real hardware (every recorded server PID ESRCH before release; the slot held
-while a killed launcher's server lives; recovery only after the group
-empties), and does the cross-checkout dependency hit appear? Separately, an
-integration would still need a crash-safe cache lock that outlives the
-server, a decision for concurrent leases, wrapper preservation and an
-attributable write counter.
+## Native proof 2
+
+`effigy rust:sccache-compatibility` at clean head
+`8c62748f6987a00b550988c62cf32d42c4503d65`. Submitted at 11:03:16 UTC. The
+Effigy receipt records start 11:04:29 UTC, finish 11:04:54 UTC, 25,009 ms,
+state `failed`; the harness exited 1. That submission was the author's last
+allowed native proof.
+
+Evidence files:
+
+- [raw/proof2-effigy-output.log](raw/proof2-effigy-output.log): the full
+  Effigy output with only ANSI colour codes stripped.
+- [raw/proof2-launches](raw/proof2-launches): `*.group`, `*.stats`, `*.start`
+  and `*.stop` are verbatim copies of the per-launch files.
+- `*.server-extract.log`: grep extracts (parse, hash, hit/miss and store
+  lines) of the server debug logs, not the full logs. The full logs remain in
+  the retained scratch.
+
+Staging: 22 locked archives seeded with verified checksums, offline 1.97.1,
+no wrapper; the private stage sccache directory stayed empty. Staging receipt
+(no embedded source attribution): `oxide` sha256
+`9a80e67e553ef20ae150a393e986f63ef8f231fb1e51c3d819f3ed0388bf897e`,
+`oxide-storage-lease`
+`eb318eb01842fa1cbf97d6fb7794ffef4d054cfb1f069406e5fcc7c31a067c30`.
+
+| Case | Observation |
+| --- | --- |
+| S1 (`w1`, slot 1 cold, 1.73 s) | `cfg_if` and `app` hashed, missed, compiled by the server and stored; 3 requests not cacheable (`-vV`, `--print`). |
+| S2 (`w2`, slot 2 cold, 1.06 s) | No hit: `cfg_if` key `091ac32e…` differs from S1's `ea034695…`. |
+| S3 (`w2` edited, slot 2 warm, 0.83 s) | `app` rebuilt (1 miss, stored); `cfg_if` was Cargo-fresh. |
+| S4 (`w3`, no wrapper, slot 3 cold, 0.59 s) | Execution occurred. The slot-key comparison was not reached. |
+| S5 Ctrl-C | Failed the harness's "exactly one server" assertion before any signal. |
+| S6, S7, active compiler or cache-hit interruption, concurrency, three cost pairs | UNRUN. |
+
+The timings are single observations, not cost samples.
+
+Group membership: in the raw `*.group` listings, each wrapped launch's
+`/opt/homebrew/bin/sccache` server (PPID 1 once `--start-server` exited)
+carries the launcher's process group ID. Launches: 86828, 87121, 87371,
+88007. Oxide releases a slot only when `killpg(group, 0)` reports ESRCH, so
+the server leaving before release in S1–S3 is inferred, not asserted.
+
+The harness's per-server registration and ESRCH assertions were vacuous. It
+matched the canonical Cellar path, while `ps` shows the invoked
+`/opt/homebrew/bin/sccache`. No server was registered, and S5's
+"exactly one server" assertion failed. That is a harness defect, not a
+writer-closure observation.
+
+Teardown, as printed by the harness: "owned writers closed; detach exit 0;
+retained scratch /private/tmp/oxide-cli.OdGPci/sc096". Owned-group discovery
+covered the launcher-log groups and registered children; servers were never
+registered. A read-only `kill(pid, 0)` afterwards reported ESRCH for server
+PIDs 86844, 87125, 87374 and 88014. That check is not in a retained receipt;
+it is recorded here only as an author observation. The scratch is retained
+and was not deleted or re-measured.
+
+## History (immutable)
+
+- Author clock 09:53:36–10:53:36 UTC: source trace, setup (3 commands, 1 s,
+  zero Cargo; [raw/setup.log](raw/setup.log)), protocol committed before
+  effects (`07fffdc`).
+- Native proof 1 was submitted at 10:05 UTC and ended at 10:35 UTC in
+  Effigy `capacity_timeout` (launched=false, exit 1;
+  [raw/proof1-admission.log](raw/proof1-admission.log): the repeated wait
+  line kept once, colour stripped). No staging, pool or server ran. No
+  Effigy history receipt for it survives in the workspace report store.
+- Review 6289051691 at `709c189`: closure_evidence_truthful fail,
+  identity_and_isolation fail, cost_evidence_truthful pass, bounded_delivery
+  fail. Findings: launcher substitution corrupted `SCCACHE_*` names, failure
+  detach without owned-group closure, reserve breach not stopping writers.
+  Fixed in `5f29444`.
+- Review 6289170915 at `5f29444`: closure fail, identity pass, cost pass,
+  delivery fail. Findings: monitor failure did not abort writers, staging
+  timeout did not settle its group. Fixed in `752d33c`.
+- Review 6289278937 at `752d33c`: closure fail, identity fail, cost pass,
+  delivery fail. Findings: staging supervision covered only a timeout,
+  unreadable state could stop signalling, temp paths escaped the scratch.
+  The original author clock was exhausted; that run stopped without edits.
+- Owner correction phase from 10:57:58 UTC (author phase started 10:58:32,
+  hard cutoff 11:42:58): the three repairs in `8c62748`, with 7 synthetic
+  regressions passing through their selector. The first synthetic run errored
+  because Effigy's `python3` is 3.9.6, which has no `Popen(process_group=)`;
+  the earlier native harness would also have failed at staging.
+- Native proof 2 at `8c62748`, above. Author native submissions: 2 of 2
+  spent. The binding stop then fired; the owner chose this knowledge-only
+  closeout. No further repair, native or synthetic run.
+
+## Harness provenance
+
+Not delivered; retained on the pushed task branch.
+
+- Failed-experiment head `c487775be5260079c43cfc5fdd36e02c4e5a3bdb`, tree
+  `6eb1d03750199dda208262c603cca3f445b290ce`.
+- `scripts/test-sccache-compatibility.py` blob
+  `9bbadc9ebeaabc0c0f366bd7b845e30e9ed54a14` ([view](https://github.com/inflatable-cookie/oxide/blob/c487775be5260079c43cfc5fdd36e02c4e5a3bdb/scripts/test-sccache-compatibility.py)).
+- `scripts/test_sccache_harness.py` blob
+  `c912d8a10a86d98df92486740b2d2b0ff408e033` ([view](https://github.com/inflatable-cookie/oxide/blob/c487775be5260079c43cfc5fdd36e02c4e5a3bdb/scripts/test_sccache_harness.py)).
+- `effigy.toml` blob `b54ba55d380a9b6d43e28efa79a58dcb385b6aa8` (selectors
+  `rust:sccache-compatibility` and `:synthetic`).
+- `AGENTS.md` blob `ef5d44b96dfadb67f2a15724f9dd4ef971fa8d0c`.
+
+## Retained artifacts and receipts
+
+- In-repo raw evidence: hashes in [raw/MANIFEST.sha256](raw/MANIFEST.sha256).
+- Owned Effigy receipts from the ignored `.effigy/reports` store, copied
+  before workspace retirement to
+  `release-audits/oxide/2026-10-20/096-sccache-author/` (17 files; its
+  `MANIFEST.sha256` has sha256
+  `4d141fa8d8bd57cc883a7de39146c311b56ffb56800af503b2d5fdf46eac6404`). This
+  covers the proof-2 receipt, the synthetic receipts (failed 11:02:20,
+  succeeded 11:02:31) and the docs-check receipts. Reviewer-owned receipts
+  were not copied.
+- Retained scratch `/private/tmp/oxide-cli.OdGPci/sc096`: not deleted. The
+  image was detached per the harness output.
 
 ## Bounded delivery
 
-- Author clock: first run start 09:53:36 UTC; work stopped near 10:40 UTC,
-  inside 60 minutes including the 30-minute admission wait.
-- Setup allowance: 3 commands, 1 s, zero Cargo. Proofs: 1 submitted,
-  0 launched, 0 Cargo driver processes, no pool, image, server or scratch
-  beyond the empty validation directory Effigy never used.
-- Harness checks: `python3 -m py_compile` and an import of the module
-  (which loads `test-oxide-cli.py`) passed. The harness has never run
-  natively; its scenarios, assertions and cleanup are unexercised.
-- `effigy docs:check`: exit 0.
-- Source reads: pinned files and the tag tarball in a private
-  `/private/tmp` scratch, outside the repository.
-
-## Revision after exact-head review 6289051691
-
-Review verdicts: closure_evidence_truthful fail, identity_and_isolation fail,
-cost_evidence_truthful pass, bounded_delivery fail. Harness corrections, made
-inside the original author clock with no native proof and no further
-submission (the second proof slot stays unused; about 12 minutes of the
-clock remained, less than the previous admission wait):
-
-1. Launcher substitution used the bare word `SCCACHE`, rewriting every
-   `SCCACHE_*` name and the wrapped/unwrapped guard. Placeholders are now
-   `@SCCACHE@`, `@REAL_CARGO@` and `@LOG@`; the harness refuses a rendered
-   launcher that keeps a placeholder, contains `/sccache_`, or lacks
-   `SCCACHE_NO_DAEMON=1` or the guard. A synthetic render keeps all nine
-   private `SCCACHE_*` names, and `sh -n` accepts it. Neither Cargo nor
-   sccache ran.
-2. Failure teardown relied on the server PID registry. It now detaches only
-   after positive closure: every owned group (the staging build, every Cargo
-   group leader in the launcher log, every Oxide record's process group) and
-   every registered server must report ESRCH within 10 s. Anything else,
-   including an unreadable state, keeps the image and scratch held, and their
-   IDs are printed.
-3. A reserve breach only set a flag, and aggregate size was checked at
-   checkpoints only, after the staging Cargo home was removed. The monitor
-   now samples the reserve every 250 ms and owned bytes every fourth sample
-   (about 1 s), staging included. On either breach it SIGKILLs every owned
-   group and registered server. Staging runs as its own process group, and
-   owned bytes are checked before the staging Cargo home is removed.
-
-The harness still has never run natively. Compatibility stays UNKNOWN,
-benefit INSUFFICIENT and write volume UNKNOWN.
-
-## Revision after exact-head review 6289170915
-
-Verdicts: closure_evidence_truthful fail, identity_and_isolation pass,
-cost_evidence_truthful pass, bounded_delivery fail. Two harness corrections,
-again with no native proof (the author clock ended at 10:53:36 UTC):
-
-1. The monitor thread now wraps all accounting. A failed or racing reserve or
-   tree reading records a breach and SIGKILLs every owned group and server;
-   it no longer ends the thread silently.
-2. A staging timeout SIGKILLs the staging Cargo group, reaps the leader,
-   waits up to 10 s for the group to report ESRCH, prints its state and keeps
-   the scratch held before failing.
-
-Compatibility stays UNKNOWN, benefit INSUFFICIENT and write volume UNKNOWN.
-The harness has still never run natively.
-
-## Owner correction phase (2026-10-20, review 6289278937)
-
-Owner ruling at 10:57:58 UTC under Tom's standing routine-correction
-authority: one separate phase, author until 11:42:58 UTC, three named
-harness repairs, no proof replenishment. The original clock, the spent
-10:05 UTC submission and reviews 6289051691, 6289170915 and 6289278937 stay
-as recorded. Phase start 10:58:32 UTC; no owned resources were live (the
-only `/private/tmp/oxide-validation.*` directory from this task, created at
-10:05 UTC, was empty; no `sc096` process or image).
-
-1. Clock and supervision. Effects stop at 255 s; 45 s inside the 300 s
-   proof are reserved for teardown. `stage_build` checks the clock before
-   creating the child; from then on any exception (clock, breach, artifact
-   parse, interrupt) settles the staging group with a bounded SIGKILL, reap
-   and ESRCH wait before propagating. Success also requires the whole group
-   to be gone. `main` runs every effect under one `try` that settles all
-   owned writers by the reserved deadline, detaches the image only after
-   positive closure and otherwise prints the held identities.
-2. Writer discovery. Registered children, the launcher log, Oxide's state
-   records and registered servers are read independently. A malformed,
-   unreadable or racing source becomes an UNKNOWN entry that keeps the
-   resources held; it does not stop signals to the other known targets, and
-   one failed signal does not stop the rest. A target seen ESRCH is marked
-   settled and never signalled again, so a PID reused after an owned writer
-   exited is not hit (the monitor scans every 250 ms; reuse within that
-   window is the remaining limit). A monitor-thread failure kills the
-   writers and interrupts the main thread. Owned-byte walks count a file
-   deleted between listing and `lstat` as zero; any other error is a breach.
-3. Temp containment. `TMPDIR`, `TMP`, `TEMP` and `OXIDE_TASK_SCRATCH_ROOT`
-   are bound to `<parent>/tmp` before staging or any helper, and every child
-   environment inherits them.
-
-Regressions: `effigy rust:sccache-compatibility:synthetic`
-([script](../../../../scripts/test_sccache_harness.py)), 7 cases with real
-`sh`/`sleep` children in a fresh `/private/tmp` directory: clock expiry
-after the staging child exists, parse failure with a live group member, an
-interrupt during staging, malformed state plus an unreadable log plus an
-injected signal failure (the other child and the server are still killed;
-three UNKNOWN entries are reported), monitor failure (main interrupted,
-writer killed), sentinel temp paths absent from staging, base and fixture
-environments, and the launcher render. All 7 passed. The first run errored
-before any assertion: Effigy's `python3` is 3.9.6, which has no
-`Popen(process_group=)`, so the earlier native harness would also have
-failed at staging. The child is now started with `start_new_session=True`.
-
-## Native proof 2 (author's last allowed submission)
-
-`effigy rust:sccache-compatibility` at clean head `8c62748`, submitted
-11:03:16 UTC, admitted 11:04:29 UTC, exit 1 after about 35 s. Raw output:
-[raw/proof2-effigy-output.log](raw/proof2-effigy-output.log) (ANSI codes
-stripped, nothing else). The per-launch group listings, stats, start and stop
-files are copied verbatim into [raw/proof2-launches](raw/proof2-launches).
-The `*.server-extract.log` files are grep extracts of the server debug logs
-(parse, hash, hit/miss, store lines), not full logs.
-
-Staging: 22 locked archives seeded (checksums verified), offline 1.97.1, no
-wrapper. The private stage sccache directory stayed empty. Staging receipt:
-`oxide` sha256 `9a80e67e…`, `oxide-storage-lease` `eb318eb0…`. Owned peak
-before seed removal 90 MiB; host free minimum 697,854 MiB.
-
-| Case | Result |
-| --- | --- |
-| S1 miss (`w1`, slot 1 cold, 1.73 s) | `cfg_if` and `app` both hashed, missed, compiled by the server, stored; 3 requests not cacheable (`-vV`, `--print`). |
-| S2 second checkout (`w2`, slot 2 cold, 1.06 s) | No hit: `cfg_if` key `091ac32e…` differs from S1's `ea034695…`. |
-| S3 workspace change (slot 2 warm, 0.83 s) | `app` rebuilt (1 miss, stored); `cfg_if` Cargo-fresh. |
-| S4 no wrapper (`w3`, slot 3 cold, 0.59 s) | Ran. The slot-key comparison was not reached, so it is unreported. |
-| S5 Ctrl-C | Stopped by harness assertion before the signal (see below). |
-| S6, S7, three cost pairs | Not run. |
-
-Native observation, from the raw `*.group` listings: every wrapped launch's
-foreground server (`/opt/homebrew/bin/sccache`, PPID 1 after
-`--start-server` exited) had the launcher's process group ID, i.e. it was
-inside Oxide's Cargo group (launches 86828, 87121, 87371 and 88007). Oxide
-releases a slot only after `killpg(group, 0)` reports ESRCH, so for S1–S3 the
-server's exit before release follows from that shipped check plus the
-observed membership. That is an inference: the harness's own per-server ESRCH
-assertion was vacuous.
-
-Harness defect that stopped the run: server identity matched the canonical
-Cellar path, but `ps` reports the invoked `/opt/homebrew/bin/sccache`. No
-server was registered, the S1–S3 "server gone" assertions checked nothing,
-and S5's "exactly one server" assertion failed. That is a harness failure,
-not a writer-closure observation. After it, supervision SIGKILLed the owned
-groups, found every owned target ESRCH and detached the image (exit 0). A
-later read-only check found server PIDs 86844, 87125, 87374 and 88014 ESRCH.
-Scratch `/private/tmp/oxide-cli.OdGPci/sc096` (staging target, fixtures,
-full server logs) is retained, not deleted.
-
-No-hit cause, inferred: Oxide sets `CARGO_BUILD_BUILD_DIR` (slot) and
-`CARGO_TARGET_DIR` (checkout) for Cargo (`src/bin/oxide/main.rs:127-128`).
-Cargo's environment reaches the wrapper, and sccache hashes every `CARGO_*`
-variable except four (`src/compiler/rust.rs:1580-1594`). Per-slot values
-would therefore change every key. Environments were not diffed.
-
-Workspace incremental: the `app` unit was cached rather than refused as
-incremental, so quick-profile incremental behaviour under the wrapper is not
-shown to be unchanged. Cause untraced.
-
-Proof accounting: author submissions 2 of 2 used (one capacity timeout, one
-harness failure). Under the owner phase there is no retry and no further
-repair. Cargo drivers this run: staging 1, toolchain `-V` 1, launcher log
-entries for S1–S5. Remaining question: whether a corrected identity match
-plus a cache key independent of slot and checkout paths can show both
-closure (S5–S7) and a cross-slot hit.
+- Original author clock: 60 minutes, exhausted at 10:53:36 UTC.
+- Correction phase: within the 11:42:58 UTC cutoff, including this
+  documentation extraction.
+- Setup allowance: 3 commands, 1 s, zero Cargo.
+- Native submissions: 2 of 2 (one capacity timeout, one harness failure).
+- Proof-2 Cargo driver processes: staging 1 and toolchain `cargo -V` 1. The
+  launcher-log calls for S1–S5 were not totalled because the run stopped
+  before its count step.
+- This closeout ran no compiler, Cargo, sccache, synthetic or native proof,
+  and no server, process or volume probe. Its only check is `effigy
+  docs:check`.

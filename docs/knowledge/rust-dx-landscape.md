@@ -821,28 +821,30 @@ No setting was read or changed.
 oxide#096 traced pinned sccache 0.18.0 (commit `01c35e69`) against Oxide's
 slot closure ([evidence](evidence/sccache-096/README.md), [Q-017](questions.md#q-017--can-sccache-sharing-preserve-oxides-slot-writer-closure)).
 
-- The default shared daemon is outside every Cargo group and offers no
-  per-request closure after cancellation: it SIGKILLs only the direct
-  compiler, and a running cache-hit restoration continues. No-go for
-  release or recovery; quarantine behind it is unbounded.
-- A foreground server per lease, started inside the Cargo group, keeps all
-  server-side writers in that group, so Oxide's existing closure applies. It
-  serializes wrapped leases per cache and holds the slot while the server
-  lives.
-- Benefit is limited: linking crates are not cached, and the hash includes
-  the working directory and `CARGO_*` variables. Natively (oxide#096 proof
-  2), a registry dependency missed in a second Oxide slot because its key
-  changed, which is consistent with Oxide's per-slot `CARGO_BUILD_BUILD_DIR`.
-  Under the wrapper the quick-profile workspace unit was cached rather than
-  refused as incremental (cause untraced). Source caches `check` metadata-only units although the Rust notes
-  say `link` is required.
+- The default shared detached daemon is outside every Cargo group and gives
+  no per-request closure after cancellation. It SIGKILLs only the direct
+  compiler, and a running cache-hit restoration continues. That makes it a
+  source no-go for release or recovery under current Oxide semantics, and
+  quarantine behind it is unbounded. Other future sharing designs are not
+  ruled out.
+- Serial foreground servers over one persistent cache can share by source.
+  Natively, each wrapped command's server sat inside Oxide's Cargo process
+  group. Closure after cancellation or a crash, and concurrency, are
+  unproven.
+- Benefit is limited by source: linking crates are not cached, and the hash
+  includes the working directory and `CARGO_*` variables. On the oxide#096
+  fixture a registry dependency had no hit in a second Oxide slot, and its
+  key differed. Per-slot `CARGO_BUILD_BUILD_DIR` is the source-based
+  hypothesis; environments were not diffed. The workspace unit was hashed
+  and stored although sccache refuses incremental units, cause untraced.
+  Source caches `check` metadata-only units although the Rust notes say
+  `link` is required.
 - Write volume was not attributable within scope: UNKNOWN. Cache bytes are
   not writes.
 
-Native proof 2 saw the in-group foreground server, then stopped on a harness
-defect before the cancellation cases, so compatibility is UNKNOWN and
-benefit INSUFFICIENT. Only the S1–S3 single-command times exist (1.73, 1.06,
-0.83 s); the fixed cost pairs and storage figures were not run.
+Compatibility is UNKNOWN and benefit INSUFFICIENT. The three cost pairs did
+not run; the S1–S3 times (1.73, 1.06, 0.83 s) are single observations, not
+cost samples.
 
 ## Product assessment
 

@@ -195,24 +195,30 @@ unit behavior, extra storage and actual attributable write counters are separate
 observations; missing counters remain unknown. No production wrapper is enabled
 by this question or by an evidence-only outcome.
 
-oxide#096 source findings ([evidence](evidence/sccache-096/README.md), pinned
-commit `01c35e69`): a shared daemon is a no-go for slot closure. It runs in
-its own session; a cancelled request only aborts the server future, SIGKILLs
-the direct compiler without reaping or signalling descendants, and leaves a
-running cache-hit restoration to finish, with no completion signal to Oxide.
-Quarantine behind a shared daemon is unbounded, because the server generation's
-group ends only when the shared daemon exits. A foreground server
-(`SCCACHE_NO_DAEMON=1`) started inside Oxide's Cargo group keeps every
-server-side writer in that group; nothing in sccache changes group below
-`daemonix`. That makes Oxide's shipped `killpg` closure applicable, at the
-cost of one wrapped lease per cache at a time and a slot hold for the
-server's lifetime. A crash-safe cache
-lock that outlives the server, concurrency, in-flight cancellation and write
-volume remain open. Native proof 2 observed the foreground server inside Oxide's Cargo group
-for every wrapped command. It found no cross-slot cache hit, inferred to come
-from the per-slot `CARGO_BUILD_BUILD_DIR`/`CARGO_TARGET_DIR` that sccache hashes.
-It saw the workspace unit cached rather than refused as incremental. It
-stopped on a harness identity-match defect before the Ctrl-C and crash
-cases; no author proof remains. Its
-compatibility is UNKNOWN and its benefit INSUFFICIENT; no integration task
-follows from this record alone.
+oxide#096 outcome, knowledge only ([evidence](evidence/sccache-096/README.md),
+pinned sccache commit `01c35e69`). Under current Oxide semantics the normal
+shared detached-daemon protocol is a source no-go for slot closure. The daemon
+runs in its own session. A cancelled request only aborts the server future;
+the server SIGKILLs the direct compiler without reaping it or signalling
+descendants. A running cache-hit restoration keeps writing, and nothing
+signals completion to Oxide. Quarantine behind a shared daemon is unbounded.
+This does not rule out every future cache-sharing design.
+
+Serial foreground servers (`SCCACHE_NO_DAEMON=1`) over one persistent cache
+can share by source. Native proof 2's raw listings show each wrapped
+command's server inside Oxide's Cargo process group. Closure after
+cancellation or a crash, and concurrency, are UNPROVEN: the harness's
+per-server assertion was vacuous, and its Ctrl-C case failed before
+signalling.
+
+On that fixture, a registry dependency had no hit in a second checkout's
+cold slot, and its key differed. The cause is a source-based hypothesis, not
+a diffed fact: Oxide's per-slot `CARGO_BUILD_BUILD_DIR`/`CARGO_TARGET_DIR`,
+which sccache hashes. The workspace unit was hashed and stored although
+sccache refuses incremental units; that cause is untraced. Cost pairs did
+not run.
+
+Compatibility UNKNOWN, benefit INSUFFICIENT, writes UNKNOWN. No integration
+follows from this record. A future attempt would need a cancellation and
+crash closure proof, a crash-safe cache lock, concurrency handling and a
+cache key independent of slot and checkout paths.
