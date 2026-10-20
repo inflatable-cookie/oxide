@@ -1,0 +1,4 @@
+87371 87371 87294 Tue Oct 20 12:04:52 2026     /bin/sh /private/tmp/oxide-cli.OdGPci/sc096/bin/cargo check --profile oxide-quick
+87374 87371     1 Tue Oct 20 12:04:52 2026     /opt/homebrew/bin/sccache
+87378 87371 87371 Tue Oct 20 12:04:52 2026     ps -A -o pid=,pgid=,ppid=,lstart=,command=
+87379 87371 87371 Tue Oct 20 12:04:52 2026     awk -v g 87371

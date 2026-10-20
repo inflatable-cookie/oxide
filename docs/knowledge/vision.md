@@ -464,8 +464,84 @@ Tom's rulings, 2026-10-20, on moving build writes off the non-replaceable intern
 - Tom, 2026-10-20: "The 1TB drive can be wiped, that's the Time Machine from my old machine, don't need it any more".
   - The dedicated build drive is that spare SSD (USB "500SSD1", `disk10`). It replaces the Vault builds-volume option, so Vault and its Time Machine backups stay untouched.
   - The Supervisor's `diskutil eraseDisk` was refused by macOS privacy controls (-69464). Tom erases it in Disk Utility as plain APFS volume `OxideBuild`.
+- Tom, 2026-10-20: "The 1TB is old and ultimately fairly disposable.. let's see how it fairs, if it's slow we can switch to Vault as per your original suggestion with a 500GB volume.. if this approach is effective, I'll look at picking up a 1TB nvme."
+  - Tom formatted the drive as APFS volume `Builds`.
+  - It is treated as consumable. Its rated endurance is about 360 TB written, so Oxide should report its writes.
 
 Requirement: anything placed on the removable drive must tolerate surprise removal at any moment and fall back to the internal SSD without operator action. Live-state systems that cannot (Queue worktrees, VM disks) stay internal. The design lives in [workflow](contracts/workflow.md#removable-build-volume).
+
+Tom's rulings, 2026-10-20 ("Let's start with sccache bypassed in oxide, see how we get on, we can return to it later. I'm happy with your drive usage proposal"):
+- **Oxide-managed builds bypass any inherited rustc wrapper (today the machine-wide sccache).** Other tools keep using the wrapper. This ends the interim interrupted-build risk once shipped, and sccache integration can be revisited later from the #096 evidence.
+- **On the `Builds` drive, Oxide's admission cap is 750 GB and it keeps at least 100 GB free** (the registration reserve).
+
+Tom approved, 2026-10-20 ("Yes please"), a design and task for an adaptive sccache location wrapper, sequenced after #097. While docked it uses one sccache server and cache on the registered `Builds` volume, and a separate internal server and small cache when undocked. Oxide's volume-identity check selects between them per compile. Switching the machine-wide `rustc-wrapper` to it is a separate, staged host step after independent review, with the Effigy owner informed first.
+
+Tom, 2026-10-20 ("Can you have another look into sccache working with oxide? It feels like we gave up too easily and they should compliment each other", then "Yeah do it"): approved one bounded qualification of making sccache complement Oxide. It covers:
+- sccache client-side mode for writer closure;
+- an Oxide stable build-path alias to remove the target-path sensitivity found on 2026-10-20 ([landscape](rust-dx-landscape.md#sccache-with-oxide-modes-and-path-sensitivity-2026-10-20));
+- the release status of upstream Rust basedir normalization.
+
+It is evidence and knowledge only. No runtime change, install or live server operation. A positive result needs a separate integration brief. The #099 bypass stays until then.
+
+Tom's ruling, 2026-10-20, on remote builds: deferred. "Let's focus on the external volume support for now and come back to remote builds later."
+- The gaming PC (Bazzite) is not a useful day-to-day remote. Underlay web apps (future deploy target: Render) must integrate with the local dev environment through Effigy's gateway, and running their Rust APIs on a separate Linux host would need complex, frequently changing networking.
+- A Mac mini is the intended future server ("when I can afford to buy a Mac Mini I will, but that won't be immediate").
+- Oracle Always Free was considered and not pursued: reports say the free Arm allowance is now 2 OCPU / 12 GB, with idle reclamation.
+- The executor seam in [workflow — Execution location](contracts/workflow.md#execution-location) stays as designed, with only the local executor.
+
+Tom, 2026-10-20 ("Yeah that works"), after #101: keep the #099 bypass. Measure cold-slot frequency and cost from dogfood use, and reconsider sccache (the unqualified candidate: no-build-script units only, client-side mode, an Oxide-owned endpoint and a scrubbed environment) only if cold builds show a real cost. Cargo's own cross-workspace cache is the preferred long-term complement.
+
+Tom's ruling, 2026-10-20: "Once 097 is merged, let's switch nucleus over to use oxide - update the agent documentation to swap `oxide` for `cargo` for everything, hook up the external drive as the target cache space, do some work on nucleus, see how we go, both in the paseo worktrees on the host machine and in the oxide slots."
+
+Supervisor interpretation, sequenced after #097's reviewed merge:
+1. **Planner steps.** Reinstall `oxide` from the merged commit. Register the `Builds` volume (750 GB cap, 100 GB reserve). This supersedes the earlier hold that waited for #098 as well.
+2. **Nucleus changes go through the Nucleus Supervisor**, carrying Tom's ruling:
+   - write the `oxide init` block;
+   - change agent-facing docs and Effigy Rust selectors from `cargo` to `oxide`, keeping plain-Cargo escape selectors;
+   - turn off the existing lease-CLI build-cache integration for the trial, so there is one storage path.
+3. **Observation:** internal SSD and `Builds` device write counters, `oxide status`, slot reuse, waits, recoveries, stray plain-Cargo output in Nucleus worktrees, and task failures.
+
+Until #098 merges, Tom avoids undocking during active builds. Until #099 merges, Nucleus builds through `oxide` inherit sccache under the accepted interim risk.
+
+Tom's ruling, 2026-10-20: "I think we can remove the legacy lease tool and probably the volume based pools - having a hard cap on drive space doesn't help very much, it would just break large builds and cause MORE churn."
+- This supersedes the earlier direction that pools carry an OS-enforced hard ceiling (see [bounded storage](contracts/bounded-storage.md)). Pools become budget-only: admission against a soft budget with whole-idle-slot eviction, plus the host-reserve watchdog from #077. A removable volume's own capacity is its only hard limit.
+- Supervisor sequencing, pending Tom's answers on the internal budget value and deletion of the existing image pool:
+  1. after #098, the internal default pool becomes `directory-budget-v1`, and the existing sparse-image pool is migrated and retired once idle;
+  2. after the Nucleus trial confirms Nucleus runs on `oxide`, the standalone `oxide-storage-lease` CLI and the `apfs-sparse-image-v1` backend are retired, with evidence preserved.
+- Nucleus's own 8 GiB pool remains its owner's to remove.
+- Tom, 2026-10-20 follow-up: "I'm not doing anything with nucleus right now so we don't need to wait on the oxide side to do any of this.. nucleus can break temporarily and it wouldn't be a problem. I'm happy to get rid of the disk image and leases now."
+  - The internal default pool budget is 100 GB (decimal), after Tom asked whether 40 GB was a choke point for large projects undocked. The internal SSD is 4 TB with 669 GiB free; a larger budget means fewer eviction-driven rebuilds.
+  - Tom approved deleting both existing disk-image pools once idle: Oxide's default pool (`~/Library/Caches/oxide/pool`) and Nucleus's build-cache pool (`~/.config/nucleus/prod/build-cache`).
+  - Retirement no longer waits for the Nucleus trial. Nucleus's lease-CLI integration may break temporarily; its designed refusal path is a cold private build.
+
+Tom's ruling, 2026-10-20: the internal pool lives at `~/Dev/oxide` ("~/Dev/oxide is fine"), with a 100 GB budget, set through the user config file the retirement task (#102) adds.
+- Observed when the choice was made: `~/Dev/oxide` did not exist, `~/Dev` is not a Git work tree, and `tmutil isexcluded ~/Dev` reports `[Excluded]`. All of `~/Dev` is already outside Time Machine.
+
+Supervisor architecture decision, 2026-10-20: **Oxide follows Longhorn's storage-location policy** (`longhorn/docs/guides/storage-configuration-backup.md`, location table).
+- Tom raised path fragmentation across his tools: "I would like to avoid fragmentation".
+- Config: `~/Library/Application Support/oxide/config/config.toml` on macOS, `$XDG_CONFIG_HOME/oxide/config.toml` on Linux, with an explicit `OXIDE_CONFIG` override. An explicit override may name any file, including a legacy one. Oxide never implicitly adopts `~/.config/oxide`; on macOS, `status` warns it is ignored.
+- Default unconfigured pool: under `~/Library/Caches/oxide`. Other Oxide state, logs and receipts follow the same table when they are next touched.
+- Tom asked whether Oxide could use Longhorn's config system directly instead of mirroring the policy. On 2026-10-20 he chose a lighter Longhorn crate for CLI apps ("Yeah - let's make it lighter to adopt for CLI apps"). The Supervisor requested a small storage-layout crate from the Longhorn Supervisor. Oxide switches to it once it is tagged. Mirrored paths are identical, so the switch moves no files. Tom's follow-up, 2026-10-20:
+- Longhorn's crate arrives as a breaking change in Longhorn 0.4.0.
+- Oxide mirrors the policy until then ("There's a sequence to getting the layout stuff done so we should mirror it for now until it's ready").
+- On adoption, Oxide's `sha2` pin moves to match Longhorn's (0.11 line), so one `sha2` version is built.
+- Tom also asked Longhorn for TOML support in its config system, which Oxide may or may not use later.
+
+Tom's ruling, 2026-10-20, on #097. He asked "Does it work? Can we just merge it? This is a lot of effort for test harnesses", then "Yeah" to the Supervisor's proposal:
+- Let the current independent review of the three-fault runner correction finish.
+- If it passes, merge normally.
+- If it finds any further runner/apparatus defect, apply **option A immediately**: merge #097's product code and docs on the existing evidence, with the runner/apparatus changes excluded from the delivered diff or explicitly marked as unqualified tooling, and no further runner rounds. The existing evidence is:
+  - unchanged Rust at `4c6f49b`;
+  - the reviewer-authenticated compile, format, 136 Rust tests, Linux compile and docs;
+  - the author's native removable-pool proofs;
+  - earlier real product defects fixed;
+  - no product defects found in the latest source reviews.
+  Tom's operator acceptance replaces the missing independent native proof, recorded as such and not as a review pass.
+- Real-world use (Builds registration after #102, then the Nucleus trial) is the practical qualification.
+
+Tom's superseding ruling, 2026-10-20: "You know what, actually, let's just merge it. If issues arise, we can fix them. This has taken too long already."
+- #097 merges now, on operator acceptance, without waiting for the in-flight review. The review gate is overridden by Tom, recorded as operator acceptance and not as a review pass.
+- The runner/apparatus is unqualified tooling. Issues found in use are fixed as they arise.
 
 ## Authority boundaries
 

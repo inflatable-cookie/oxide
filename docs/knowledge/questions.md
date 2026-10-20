@@ -194,3 +194,41 @@ cross-build sharing benefit. Cold-slot timings, incremental/non-incremental
 unit behavior, extra storage and actual attributable write counters are separate
 observations; missing counters remain unknown. No production wrapper is enabled
 by this question or by an evidence-only outcome.
+
+oxide#096 outcome, knowledge only ([evidence](evidence/sccache-096/README.md),
+pinned sccache commit `01c35e69`). Under current Oxide semantics the normal
+shared detached-daemon protocol is a source no-go for slot closure. The daemon
+runs in its own session. A cancelled request only aborts the server future;
+the server SIGKILLs the direct compiler without reaping it or signalling
+descendants. A running cache-hit restoration keeps writing, and nothing
+signals completion to Oxide. Quarantine behind a shared daemon is unbounded.
+This does not rule out every future cache-sharing design.
+
+Serial foreground servers (`SCCACHE_NO_DAEMON=1`) over one persistent cache
+can share by source. Native proof 2's raw listings show each wrapped
+command's server inside Oxide's Cargo process group. Closure after
+cancellation or a crash, and concurrency, are UNPROVEN: the harness's
+per-server assertion was vacuous, and its Ctrl-C case failed before
+signalling.
+
+On that fixture, a registry dependency had no hit in a second checkout's
+cold slot, and its key differed. The cause is a source-based hypothesis, not
+a diffed fact: Oxide's per-slot `CARGO_BUILD_BUILD_DIR`/`CARGO_TARGET_DIR`,
+which sccache hashes. The workspace unit was hashed and stored although
+sccache refuses incremental units; that cause is untraced. Cost pairs did
+not run.
+
+Compatibility UNKNOWN, benefit INSUFFICIENT, writes UNKNOWN. No integration
+follows from this record. A future attempt would need a cancellation and
+crash closure proof, a crash-safe cache lock, concurrency handling and a
+cache key independent of slot and checkout paths.
+
+oxide#101 outcome, knowledge only ([evidence](evidence/sccache-101/README.md)):
+client-side mode (0.17+) moves every slot writer into the client by source,
+so closure is source-supported but natively UNKNOWN; it silently reverts to
+server-side when `SCCACHE_LOG` is set or a dist scheduler is configured
+(UNSAFE). A stable per-index build-dir alias keeps its spelling through
+Cargo, but rebuilding a slot under a different index is UNSAFE by Cargo
+source; the affinity and invalidation mitigations were not run. Benefit
+INSUFFICIENT, writes UNKNOWN. Upstream Rust basedir normalization is
+unreleased.
