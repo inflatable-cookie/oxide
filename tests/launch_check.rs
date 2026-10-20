@@ -25,6 +25,8 @@ struct Run {
     wall: Duration,
     tmp: PathBuf,
     pids: PathBuf,
+    /// The measuring helper's process group, recorded by the debug hook.
+    group: PathBuf,
 }
 
 fn scratch(label: &str) -> PathBuf {
@@ -40,6 +42,8 @@ fn check(label: &str, script: &str, environment: &[(&str, &str)]) -> Run {
     let root = scratch(label);
     let tmp = root.join("tmp");
     let pids = root.join("pids");
+    let group = root.join("group");
+    assert!(!group.exists(), "{label}: stale group record");
     let source = root.join("probe");
     let script = script.replace("PIDS", &pids.display().to_string());
     std::fs::write(&source, script).expect("probe script");
@@ -56,6 +60,7 @@ fn check(label: &str, script: &str, environment: &[(&str, &str)]) -> Run {
         .env("TMPDIR", &tmp)
         .env("PATH", root.join("no-bin"))
         .env("OXIDE_TEST_LAUNCH_SOURCE", &source)
+        .env("OXIDE_TEST_LAUNCH_GROUP_LOG", &group)
         .envs(environment.iter().copied())
         .output()
         .expect("oxide status --launch-check");
@@ -63,12 +68,35 @@ fn check(label: &str, script: &str, environment: &[(&str, &str)]) -> Run {
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(output.status.success(), "{label}: {output:?}");
     assert!(output.stderr.is_empty(), "{label}: {output:?}");
-    Run {
+    let run = Run {
         stdout,
         wall,
         tmp,
         pids,
-    }
+        group,
+    };
+    assert_group_closed(&run, label);
+    run
+}
+
+/// The helper's recorded process group, this case's own, is gone right
+/// after the CLI exits: `kill(-group, 0)` fails with exactly `ESRCH`. A
+/// missing or invalid record, or any other result, fails.
+fn assert_group_closed(run: &Run, label: &str) {
+    let text = std::fs::read_to_string(&run.group)
+        .unwrap_or_else(|error| panic!("{label}: no recorded helper group: {error}"));
+    let group: i32 = text
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("{label}: invalid group record {text:?}"));
+    assert!(group > 1, "{label}: invalid group {group}");
+    // SAFETY: signal 0 only checks existence.
+    let status = unsafe { libc::kill(-group, 0) };
+    let error = std::io::Error::last_os_error().raw_os_error();
+    assert!(
+        status == -1 && error == Some(libc::ESRCH),
+        "{label}: helper group {group} not closed: kill returned {status}, errno {error:?}"
+    );
 }
 
 /// Nothing left in the temporary directory once the CLI has exited.
@@ -131,8 +159,10 @@ fn an_ordinary_check_completes_and_cleans_up() {
 }
 
 #[test]
-fn a_probe_that_never_exits_is_killed_before_the_cli_exits() {
-    // Long enough for the probe's shell to start and log its PID.
+fn a_slow_probe_group_is_closed_before_the_cli_exits() {
+    // `check` already requires the helper's group (probes included, even one
+    // still starting) to be gone. Whether the slow script reached its PID
+    // marker under host load is separate: every PID it did log must be dead.
     let run = check("slow", SLOW, &[("OXIDE_TEST_LAUNCH_LIMIT_MS", "5000")]);
     assert!(
         run.wall < Duration::from_millis(5_000) + SLACK,
@@ -147,9 +177,7 @@ fn a_probe_that_never_exits_is_killed_before_the_cli_exits() {
     );
     assert!(!run.stdout.contains("medians:"));
     assert_clean(&run, "slow");
-    let pids = logged_pids(&run.pids);
-    assert!(!pids.is_empty(), "the slow probe never ran");
-    for pid in pids {
+    for pid in logged_pids(&run.pids) {
         // SAFETY: signal 0 only checks existence.
         let alive = unsafe { libc::kill(pid, 0) } == 0;
         assert!(!alive, "probe {pid} outlived the check");

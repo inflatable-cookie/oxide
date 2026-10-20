@@ -1184,10 +1184,16 @@ with exit 1), and reads or changes no setting.
   exit. Its probes are shell scripts named by `OXIDE_TEST_LAUNCH_SOURCE`
   (test-only, like `OXIDE_TEST_LAUNCH_LIMIT_MS` and
   `OXIDE_TEST_LAUNCH_DELAY=copy|start|remove:<ms>`, which pauses inside the
-  helper). With the CLI gone, each case checks at once that the temporary
-  directory is empty and no logged probe is alive:
+  helper). In debug builds `OXIDE_TEST_LAUNCH_GROUP_LOG` names a fresh file
+  that receives the measuring helper's process-group ID once it is spawned;
+  it changes nothing else. With the CLI gone, each case checks at once that
+  the temporary directory is empty, that recorded group is gone
+  (`kill(-group, 0)` fails with exactly `ESRCH`; a missing record fails) and
+  no logged probe is alive:
   - an ordinary run (20 s limit) reports either complete medians with a result, or exactly that deadline as inconclusive with no median, within the limit and cleaned up; any other outcome fails;
-  - under a 5 s limit, a probe that never exits is killed;
+  - under a 5 s limit, a slow probe's group is closed by the deadline
+    (whether the script reached its PID marker under host load is separate;
+    every PID it logged must be dead);
   - under a 600 ms limit, a copy, a probe start and a removal each paused
     2 s return within 1.6 s, inconclusive.
 

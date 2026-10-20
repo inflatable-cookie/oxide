@@ -595,6 +595,7 @@ pub fn run_measure(plan: &Plan, oxide: &Path) -> Outcome {
         }
     };
     let group = i32::try_from(child.id()).unwrap_or(0);
+    record_group_for_tests(group);
     let (lines, received) = mpsc::channel();
     if let Some(stdout) = child.stdout.take() {
         // Probes have null streams, so the pipe closes with the helper.
@@ -658,6 +659,24 @@ pub fn run_measure(plan: &Plan, oxide: &Path) -> Outcome {
     };
     let failure = failure.or_else(|| (!closed).then(|| limit_reached(plan.limit)));
     finish(samples, failure, cleanup)
+}
+
+/// Debug builds only: `OXIDE_TEST_LAUNCH_GROUP_LOG` names a file, absent
+/// beforehand, that receives the measuring helper's process-group ID once it
+/// is spawned, so the integration tests can check that group is gone after
+/// the CLI exits. Observation only: a write failure is ignored here (the
+/// test fails on the missing record) and nothing else changes.
+fn record_group_for_tests(group: i32) {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("OXIDE_TEST_LAUNCH_GROUP_LOG") {
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .and_then(|mut file| writeln!(file, "{group}"));
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = group;
 }
 
 /// `oxide status --launch-check`.
