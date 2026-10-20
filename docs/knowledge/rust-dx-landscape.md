@@ -876,6 +876,22 @@ Paths to complementarity, unqualified:
 - **Benefit: INSUFFICIENT; writes UNKNOWN.** No hit rate or cold-slot time measured. #2796 (local level empty in client-side mode) was reported on a multi-level cache; single-level local disk is unmeasured.
 - **Upstream:** 0.18.0 is the latest release; Rust basedir normalization (#2678, #2794, #2918) is unmerged. If released it would remove the need for an alias but carry the same embedded-path hazard for restored objects (inference).
 
+## Rust 1.98–1.100 relevance (2026-10-20)
+
+Host state: rustup `stable` is 1.97.1; 1.98.1 and 1.99.1 are installed for Oxide's [Cargo version matrix](contracts/workflow.md#cargo-version-matrix) but are no project's default. Figmatic and Acowtancy's Farmyard pin 1.96; Effigy, Longhorn, Oxide, loophole and signal pin 1.97.1.
+
+From the [1.98.0](https://blog.rust-lang.org/2026/08/20/Rust-1.98.0/), [1.99.0](https://blog.rust-lang.org/2026/10/01/Rust-1.99.0/) and [1.99.1](https://blog.rust-lang.org/2026/10/15/Rust-1.99.1/) announcements and the [Cargo changelog](https://doc.rust-lang.org/nightly/cargo/CHANGELOG.html):
+- **Cargo 1.98:** nothing stabilized. New Clippy lints, for example `chunks_exact_to_as_chunks`, which failed Longhorn's `-D warnings` runner.
+- **Cargo 1.99:**
+  - a built-in `debug` profile, identical to `dev` for now, as preparation for moving `dev` away from full debugging. A 2026-10-20 probe found `--profile debug` builds into `target/debug/` on 1.99.1 and is refused on 1.97.1. This matches the quick/debug split recorded in [vision](vision.md#product-workflow-direction) (#106);
+  - incremental compilation off by default when `CI` is set;
+  - internal hashing performance work.
+  - No build-dir, GC, linking or debug-info default changes.
+- **Rust 1.99.1:** fixes `rust-lld` failing on macOS outside the rustup proxy, plus two non-macOS regressions.
+- **Cargo 1.100 (2026-11-12):** the new build-dir layout becomes the default, which unblocks artifact GC and cross-workspace caching. Tools are told to use JSON messages rather than layout paths. Oxide's stray detection and #083 depend on it.
+
+Implication: moving from 1.97 to 1.99 brings no measured speed or disk benefit. Each rustc change also gives every Oxide slot a new compatibility key, so the next builds are cold. One bump straight to 1.100 costs one cold cycle instead of two.
+
 ## Product assessment
 
 Planner recommendation: a small coherent entry point over evidence-backed mechanisms, with three capabilities: see and explain costs, bound and reuse owned storage, and apply qualified improvements with clear trade-offs. The reusable storage core must work for ordinary developers as well as orchestrators. A daemon, editor surface or UI is still an open choice; Tom's [workflow direction](vision.md#product-workflow-direction) sets an `oxide build` / `oxide run` front door as the design target.
