@@ -509,6 +509,10 @@ Tom's ruling, 2026-10-20: "I think we can remove the legacy lease tool and proba
   1. after #098, the internal default pool becomes `directory-budget-v1`, and the existing sparse-image pool is migrated and retired once idle;
   2. after the Nucleus trial confirms Nucleus runs on `oxide`, the standalone `oxide-storage-lease` CLI and the `apfs-sparse-image-v1` backend are retired, with evidence preserved.
 - Nucleus's own 8 GiB pool remains its owner's to remove.
+- Tom, 2026-10-20 follow-up: "I'm not doing anything with nucleus right now so we don't need to wait on the oxide side to do any of this.. nucleus can break temporarily and it wouldn't be a problem. I'm happy to get rid of the disk image and leases now."
+  - The internal default pool budget is 100 GB (decimal), after Tom asked whether 40 GB was a choke point for large projects undocked. The internal SSD is 4 TB with 669 GiB free; a larger budget means fewer eviction-driven rebuilds.
+  - Tom approved deleting both existing disk-image pools once idle: Oxide's default pool (`~/Library/Caches/oxide/pool`) and Nucleus's build-cache pool (`~/.config/nucleus/prod/build-cache`).
+  - Retirement no longer waits for the Nucleus trial. Nucleus's lease-CLI integration may break temporarily; its designed refusal path is a cold private build.
 
 ## Authority boundaries
 
