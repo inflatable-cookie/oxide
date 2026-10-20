@@ -1299,8 +1299,12 @@ oxide#102.
   failure), entries visited, elapsed time and bounds; its bytes are never
   used and never make a slot evictable. The bounds are finite: a larger pool
   refuses until idle slots are evicted or cleaned. Owning detail:
-  [local lease](local-lease.md#capacity-and-eviction). Proof:
-  `effigy rust:pool-scale` (below).
+  [local lease](local-lease.md#capacity-and-eviction). Rust tests cover
+  each old bound, an unreadable entry, a symlinked slot root and hard links
+  with injected bounds. The native selector `effigy rust:pool-scale` has no
+  passing run: its first session staged the reference binary twice and is
+  apparatus evidence only, and the corrected selector is held because no
+  existing guard samples the host reserve during plain-Cargo staging.
 - **Precedence.** Environment, then the user config file, then defaults.
   `OXIDE_POOL` sets the path (relative resolves against the current
   directory); `OXIDE_POOL_CAP` sets the budget. Sizes are whole bytes or a
