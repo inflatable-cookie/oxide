@@ -580,6 +580,23 @@ Tom, 2026-10-20, approved option A on Longhorn's Queue decision `4dd34aa0`. It b
 - Adopters so far: Praxis (no GitHub workflows), Underlay (CI calls Cargo directly) and Longhorn (option A).
 - This folds into the workflow contract's adoption section and the Oxide skill once #102 stops editing them.
 
+Tom, 2026-10-20, approved three changes ("1. Approve 2. Approve 3. Approve!") after the adoption audit (Queue tracker lead `f4813b68`).
+1. **`oxide exec [--manifest-path <Cargo.toml>] [--profile …] -- <command…>`** runs a tool that calls Cargo itself (Tauri CLI, bun or npm scripts) with Oxide's storage for one workspace.
+   - Before launching, it does what a leased build does: resolve the workspace, run the freshness gate, lease a slot and apply the storage and profile environment.
+   - It then runs the command in its own process group, forwards signals and holds the lease until the command exits. Crash recovery is the same as for other leased commands.
+   - Final outputs stay in `<workspace>/target`. Limit: one workspace per invocation.
+   - **Second-slot rule:** when a checkout's slot is held, for example by a long-running `tauri dev`, a further command in that checkout takes another compatible slot instead of waiting.
+   - Motivating case: Acowtancy's Tauri app (`apps/bovine-desktop/src-tauri/target`, 94 GB on 2026-10-20).
+2. **Final outputs land in `target/debug/`.**
+   - `quick` and `debug` tune Cargo's built-in `dev` profile through `CARGO_PROFILE_DEV_*` environment instead of the custom `oxide-quick` and `oxide-debug` profiles.
+   - Outputs land where plain Cargo puts them, and external subcommands such as nextest get the recipe without `--cargo-profile`.
+   - The slot compatibility key must still separate the two recipes. Both share the `target/debug/` binary, and the latest build wins.
+   - Motivation: Figmatic's harness, Acowtancy's OpenAPI check and courier tests, Cream's widget validator and Farmyard's scoring-parity script all read `target/debug/`. Under `target/oxide-quick/` they break or silently run a stale binary.
+3. **Acowtancy's container-managed Farmyard cache moves to the Builds drive.**
+   - The cache is 52 GB at `~/Library/Caches/acowtancy-farmyard-managed-target` and is not Oxide-managed.
+   - Condition: the setup refuses when `/Volumes/Builds` is not the mounted registered volume, so an undocked start never creates a `/Volumes/Builds/...` path on the internal disk.
+   - Acowtancy owns the change.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
