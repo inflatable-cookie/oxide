@@ -517,6 +517,26 @@ Block rules, as implemented:
   line, and names lines that run `cargo` as a command word; comments,
   `cargo-*` binaries and `$CARGO` do not count.
 
+### Switching an existing project
+
+The standard pattern for consumer projects (Tom, 2026-10-20, [vision](../vision.md#product-workflow-direction)). It was first applied to Underlay, Praxis, Longhorn, Figmatic and Acowtancy; Queue lead `f4813b68` tracks the rollout.
+
+- **Selectors.** Ordinary build, check, clippy, test and nextest selectors call `oxide`. Each main selector keeps a `:cargo` sibling with the plain-Cargo command, for when `oxide` is broken.
+- **CI-aware rule.** When CI or release workflows call the same Effigy selectors and the runners lack `oxide`, the selector runs `cargo` under `GITHUB_ACTIONS=true` and `oxide` otherwise. Locally, a missing `oxide` fails loudly and names the `:cargo` escape; it never falls back silently. Workflow files do not change. Installing `oxide` on runners waits on publication (Q-005).
+- **Stays on Cargo:**
+  - scripts that choose their own `CARGO_TARGET_DIR`, because Oxide replaces an inherited value with `<workspace>/target`;
+  - tools that run Cargo themselves (the Tauri CLI, packaging scripts), until `oxide exec` lands;
+  - Queue warm-merge hooks;
+  - container builds;
+  - selectors whose scripts run a binary from `target/debug/` after a quick build. Under the current `oxide-quick` output directory they would miss the fresh binary or run a stale one. #106 moves `quick` and `debug` output to `target/debug/`.
+- **nextest.** Until #106, pass `--cargo-profile oxide-quick` so nextest shares the quick slot.
+- **Worktree seeding.** Selectors that move to `oxide` drop any copy of a primary checkout's `target/` into worktrees. The shared slot is the warm state.
+- **Proof per project:**
+  - the moved selectors pass under `oxide` and, where the CI-aware rule applies, under `cargo` with `GITHUB_ACTIONS=true`;
+  - `oxide status` shows the project's slot and which pool served it;
+  - one cold run and one warm repeat are timed, as observations.
+  - Anything that changes a test result stays on `cargo` and is reported as a dogfood finding.
+
 ## Dogfooding in Oxide's repository
 
 Approved by Tom on 2026-10-19 ([vision](../vision.md#product-workflow-direction)).

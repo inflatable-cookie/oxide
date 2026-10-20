@@ -578,7 +578,7 @@ Tom, 2026-10-20, approved option A on Longhorn's Queue decision `4dd34aa0`. It b
 - **Stays on Cargo:** scripts that set `CARGO_TARGET_DIR` (Oxide refuses it), wrapping tools such as the Tauri CLI, Queue hooks and CI.
 - Installing `oxide` on CI runners waits on publication (Q-005).
 - Adopters so far: Praxis (no GitHub workflows), Underlay (CI calls Cargo directly) and Longhorn (option A).
-- This folds into the workflow contract's adoption section and the Oxide skill once #102 stops editing them.
+- Folded into the [workflow contract](contracts/workflow.md#switching-an-existing-project) and the Oxide skill after #102 merged.
 
 Tom, 2026-10-20, approved three changes ("1. Approve 2. Approve 3. Approve!") after the adoption audit (Queue tracker lead `f4813b68`).
 1. **`oxide exec [--manifest-path <Cargo.toml>] [--profile …] -- <command…>`** runs a tool that calls Cargo itself (Tauri CLI, bun or npm scripts) with Oxide's storage for one workspace.

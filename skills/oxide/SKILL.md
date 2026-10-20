@@ -90,3 +90,14 @@ writes a short guidance block into the workspace-root `AGENTS.md`. Re-running is
 safe. It prints readiness, including Effigy selectors that still call plain
 `cargo`. It never edits Effigy files; switching a selector to `oxide` is the
 project's choice.
+
+When switching selectors:
+- **Escapes:** keep a `:cargo` escape beside each main one.
+- **CI:** if CI calls the same selectors, run `cargo` when `GITHUB_ACTIONS=true` and `oxide` otherwise, failing loudly when `oxide` is missing.
+- **Stay on `cargo`:**
+  - scripts that set their own `CARGO_TARGET_DIR`, because Oxide replaces it;
+  - tools that run Cargo themselves, such as the Tauri CLI;
+  - container builds;
+  - scripts that read a quick build's binary from `target/debug/`.
+
+  Full rules: [workflow](../../docs/knowledge/contracts/workflow.md#switching-an-existing-project).
