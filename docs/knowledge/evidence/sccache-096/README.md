@@ -177,4 +177,43 @@ Write volume is UNKNOWN.
 
 ## Result
 
-Pending the native proof.
+Compatibility: UNKNOWN. Benefit: INSUFFICIENT. Write volume: UNKNOWN.
+
+- Shared daemon (a) and quarantine: NO-GO by source, above. No native effect
+  was needed or taken.
+- Foreground server per lease (b): source-supported only. Native proof 1 was
+  submitted at 10:05 UTC through `effigy rust:sccache-compatibility`, waited
+  at "waiting for QA capacity, position 1" and ended at 10:35 UTC with exit 1:
+  `capacity_timeout: heavy run 826638d6… was never launched because capacity
+  did not free in time; this is a capacity timeout, not a validation failure`
+  ([raw/proof1-admission.log](raw/proof1-admission.log); the repeated wait
+  line is kept once and colour codes are stripped, nothing else changed). The
+  harness never started: no staging, pool, server or Cargo process, and no
+  owned resources exist. The submission counts as one of the two author
+  proofs. No second submission: 18 minutes of the author clock remained, the
+  brief allows a second attempt only for a harness or setup correction, and
+  another admission wait of that length would overrun the clock.
+- Unrun, so not claimed: every native scenario S1–S7, the three cost pairs,
+  cache bytes, per-unit hit/miss classes and the slot-key comparison.
+
+Open question for the reviewer or a later bounded run: do S1–S7 hold on
+real hardware (every recorded server PID ESRCH before release; the slot held
+while a killed launcher's server lives; recovery only after the group
+empties), and does the cross-checkout dependency hit appear? Separately, an
+integration would still need a crash-safe cache lock that outlives the
+server, a decision for concurrent leases, wrapper preservation and an
+attributable write counter.
+
+## Bounded delivery
+
+- Author clock: first run start 09:53:36 UTC; work stopped near 10:40 UTC,
+  inside 60 minutes including the 30-minute admission wait.
+- Setup allowance: 3 commands, 1 s, zero Cargo. Proofs: 1 submitted,
+  0 launched, 0 Cargo driver processes, no pool, image, server or scratch
+  beyond the empty validation directory Effigy never used.
+- Harness checks: `python3 -m py_compile` and an import of the module
+  (which loads `test-oxide-cli.py`) passed. The harness has never run
+  natively; its scenarios, assertions and cleanup are unexercised.
+- `effigy docs:check`: exit 0.
+- Source reads: pinned files and the tag tarball in a private
+  `/private/tmp` scratch, outside the repository.
