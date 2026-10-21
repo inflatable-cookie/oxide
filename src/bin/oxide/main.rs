@@ -45,6 +45,8 @@ oxide: Cargo with managed build storage and profiles
 USAGE:
     oxide <check|test|clippy|build|run> [--profile quick|debug|release] [cargo args] [-- args]
     oxide <other cargo command> [args]   passed to Cargo; leased when it can build
+    oxide exec [--manifest-path <Cargo.toml>] [--profile quick|debug|release] -- <command> [args]
+                                         run a tool that calls Cargo itself, leased
     oxide clean [--dry-run] [--include-foreign]
                                          remove <workspace>/target and slot affinity; slots stay
     oxide clean <-p|--doc|--profile ...> Cargo's selected clean, same storage rules
@@ -123,6 +125,13 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
         Class::Clean => clean::run(rest),
         Class::Init => adopt::run_init(rest),
         Class::New => adopt::run_new(rest),
+        Class::Exec => match cli::parse_exec(rest)? {
+            Some(invocation) => run_invocation(invocation),
+            None => {
+                print!("{}", cli::EXEC_USAGE);
+                Ok(0)
+            }
+        },
         Class::Modelled | Class::Building => run_leased(command, rest),
     }
 }
@@ -180,6 +189,33 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
             RunPick::Unresolved => {}
         }
     }
+    run_invocation(invocation)
+}
+
+/// What `oxide status` shows as an exec holder: `exec <program>`, escaped
+/// and bounded to one line.
+fn exec_label(tool: &[OsString]) -> Option<String> {
+    let program = tool.first()?;
+    Some(format!(
+        "exec {}",
+        wrapper::shown(&program.to_string_lossy())
+    ))
+}
+
+/// The tool's standard input: a terminal stays with Oxide, because the
+/// tool's own process group is in the background and a terminal read would
+/// stop it. Anything else (a pipe, a file, nothing) passes through.
+fn exec_stdin() -> Stdio {
+    // SAFETY: isatty only inspects descriptor 0.
+    if unsafe { libc::isatty(0) } == 1 {
+        Stdio::null()
+    } else {
+        Stdio::inherit()
+    }
+}
+
+fn run_invocation(invocation: Invocation) -> Result<u8, String> {
+    let exec = invocation.command == "exec";
     let key = SlotKey::resolve(
         CARGO,
         invocation.manifest_path.as_deref(),
@@ -194,7 +230,14 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     }
     let started = Instant::now();
     let resolution = cli::resolution(&invocation.cargo_args);
-    let (held, gate) = match lease_with_gate(&store, &key, invocation.profile, &resolution)? {
+    let label = exec_label(&invocation.tool);
+    let (held, gate) = match lease_with_gate(
+        &store,
+        &key,
+        invocation.profile,
+        &resolution,
+        label.as_deref(),
+    )? {
         Ok(leased) => leased,
         Err(Stop::Signal(signal)) => return Ok(process::signal_exit_code(signal)),
         Err(Stop::Cargo(code)) => return Ok(code),
@@ -204,8 +247,8 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
         store.release(held, origin)?;
         return Ok(process::signal_exit_code(signal));
     }
-    let run = command == "run";
-    let config_args = if cli::reads_config_args(command) {
+    let run = invocation.command == "run";
+    let config_args = if cli::reads_config_args(&invocation.command) {
         &invocation.cargo_args[..]
     } else {
         &[]
@@ -214,8 +257,18 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
         wrapper::Policy::from_env(),
         &wrapper::inherited(config_args),
     );
-    let mut cargo = Command::new(CARGO);
-    cargo.args(&invocation.cargo_args);
+    let mut cargo = match invocation.tool.split_first() {
+        Some((program, args)) => {
+            let mut tool = Command::new(program);
+            tool.args(args).stdin(exec_stdin());
+            tool
+        }
+        None => {
+            let mut cargo = Command::new(CARGO);
+            cargo.args(&invocation.cargo_args);
+            cargo
+        }
+    };
     apply_storage(
         &mut cargo,
         &held.build_dir,
@@ -225,15 +278,31 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     if run {
         cargo.stdout(Stdio::piped());
     }
-    let mut group = match store
+    let started_group = store
         .mark_spawning(&held)
-        .and_then(|()| process::spawn_group(&mut cargo))
-    {
+        .map_err(Unstarted::Record)
+        .and_then(|()| process::start_group(&mut cargo).map_err(Unstarted::Spawn));
+    let mut group = match started_group {
         Ok(group) => group,
         Err(error) => {
             let origin = held.prior.unchanged();
             store.release(held, origin)?;
-            return Err(error);
+            return match error {
+                Unstarted::Record(error) => Err(error),
+                Unstarted::Spawn(error) if exec => {
+                    eprintln!(
+                        "oxide: could not start {}: {error}",
+                        wrapper::shown(&invocation.tool[0].to_string_lossy())
+                    );
+                    // A shell's convention: 127 not found, 126 not runnable.
+                    Ok(if error.kind() == std::io::ErrorKind::NotFound {
+                        127
+                    } else {
+                        126
+                    })
+                }
+                Unstarted::Spawn(error) => Err(format!("could not start Cargo: {error}")),
+            };
         }
     };
     let mut watchdog = store.watchdog();
@@ -333,6 +402,14 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     }
 }
 
+/// Why the leased child did not start.
+enum Unstarted {
+    /// Recording the spawn failed; nothing was started.
+    Record(String),
+    /// The program could not be started.
+    Spawn(std::io::Error),
+}
+
 /// Why a leased command ends before its Cargo runs.
 enum Stop {
     /// A signal received while waiting.
@@ -354,12 +431,13 @@ fn lease_with_gate(
     key: &SlotKey,
     profile: cli::Profile,
     resolution: &cli::Resolution,
+    label: Option<&str>,
 ) -> Result<Result<(store::Lease, Gate), Stop>, String> {
     let mut share = true;
     // A refusal leaves this checkout without a record, so the next lease is
     // a new or evicted slot; the bound only guards against a defect.
     for _ in 0..4 {
-        let mut held = match store.acquire(key, profile, share)? {
+        let mut held = match store.acquire(key, profile, share, label)? {
             Acquired::Lease(held) => held,
             Acquired::Interrupted(signal) => return Ok(Err(Stop::Signal(signal))),
         };
@@ -516,7 +594,7 @@ fn print_summary(
     note: Option<&str>,
 ) {
     let strategy = match invocation.command.as_str() {
-        "run" | "test" => "build+execute",
+        "run" | "test" | "exec" => "build+execute",
         _ => "build",
     };
     let size = match measured {
@@ -687,9 +765,13 @@ fn print_pool(store: &Store) -> Result<(), String> {
                             .to_owned()
                     }
                 };
-                format!("held by an interrupted command (oxide pid {holder}, {path})")
+                let command = slot.holder.as_deref().unwrap_or("command");
+                format!("held by an interrupted {command} (oxide pid {holder}, {path})")
             }
-            (SlotOccupancy::Held, None) => "held".to_owned(),
+            (SlotOccupancy::Held, None) => match &slot.holder {
+                Some(command) => format!("held by {command}"),
+                None => "held".to_owned(),
+            },
             _ => "idle".to_owned(),
         };
         let owner = match (&slot.checkout, slot.managed) {
