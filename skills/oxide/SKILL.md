@@ -80,6 +80,11 @@ Oxide says the gate refused a slot, it builds cold instead; that is safe.
 - `oxide status`: pool use, slots (size and file counts), waiting commands,
   plain-Cargo output in this checkout's `target/`, and the Cargo home's size.
   It never creates the pool.
+- `oxide pool describe --json` (macOS): the registered drive as stable JSON
+  (schema `oxide.pool.describe/1`). Branch on `available`, not on reason
+  strings. It changes nothing. The answer is a snapshot: before writing into
+  `suggested_scratch_root`, recheck the volume UUID and mount root. The
+  suggestion is not write permission, and nothing writes under `payload`.
 - `oxide status --launch-check` (macOS) times a new executable's first launch
   against a re-run, in about a second. Above 30 ms it names the app to add
   under Privacy & Security → Developer Tools. It changes no setting; leave

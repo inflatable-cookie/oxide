@@ -143,15 +143,18 @@ pub(super) struct Pool {
 /// directory or removable-volume pool; a pool recording the retired APFS
 /// sparse-image backend refuses with [`LeaseError::BackingMismatch`].
 pub mod managed {
+    use super::super::backing::BackingPaths;
     use super::super::{
-        ensure_private_dir, LeaseError, LeaseGrant, Leased, LedgerView, PoolInfo, PoolStatus,
-        ReleaseReceipt, BUDGET_BACKEND_DIRECTORY_V1, CONFIG_NAME, LEASE_VERSION, PAYLOAD_NAME,
-        SLOTS_NAME, VOLUME_BACKEND_APFS_V1,
+        canonical_existing_dir, ensure_private_dir, LeaseError, LeaseGrant, Leased, LedgerView,
+        PoolInfo, PoolStatus, ReleaseReceipt, VolumeDescription, BUDGET_BACKEND_DIRECTORY_V1,
+        CONFIG_NAME, LEASE_VERSION, LEDGER_NAME, MAX_SLOTS, PAYLOAD_NAME, SLOTS_NAME,
+        VOLUME_BACKEND_APFS_V1,
     };
     use super::LeaseRequest;
     use super::{
-        lock_pool, prepare_new_pool, random_hex, write_config, write_ledger, Ledger, Payload, Pool,
-        PoolConfig, VolumeConfig,
+        lock_pool, prepare_new_pool, random_hex, read_config, read_ledger,
+        refuse_foreign_pool_entries, write_config, write_ledger, Ledger, Payload, Pool, PoolConfig,
+        SlotPersistState, VolumeConfig,
     };
     use crate::volume::Binding;
     use std::os::fd::AsFd;
@@ -304,6 +307,59 @@ pub mod managed {
     /// where [`status`] does.
     pub fn ledger_view(pool: &Path) -> Result<LedgerView, LeaseError> {
         Pool::open(pool)?.ledger_view()
+    }
+
+    /// Read-only description of an `apfs-volume-v1` pool from its config and
+    /// ledger. It takes no lock, creates nothing, writes nothing and runs no
+    /// reconciliation, so a recorded deletion is reported as it stands. Every
+    /// write is an atomic rename, so a read sees the files before or after a
+    /// write. A missing config or ledger is [`LeaseError::NotFound`]; any
+    /// other refusal is the same shape check [`Pool::open`] makes.
+    pub fn describe_volume(pool: &Path) -> Result<VolumeDescription, LeaseError> {
+        let root = canonical_existing_dir(pool, true)?;
+        for name in [CONFIG_NAME, LEDGER_NAME] {
+            if root.join(name).symlink_metadata().is_err() {
+                return Err(LeaseError::NotFound);
+            }
+        }
+        refuse_foreign_pool_entries(&root)?;
+        let paths = BackingPaths::under(&root);
+        if paths.image.symlink_metadata().is_ok()
+            || paths.receipt.symlink_metadata().is_ok()
+            || paths.mount.symlink_metadata().is_ok()
+        {
+            return Err(LeaseError::BackingMismatch);
+        }
+        let config = read_config(&root)?;
+        if config.version != LEASE_VERSION
+            || config.backend != VOLUME_BACKEND_APFS_V1
+            || config.cap_bytes == 0
+            || config.image_bytes != 0
+        {
+            return Err(LeaseError::BackingMismatch);
+        }
+        let volume = config.volume.ok_or(LeaseError::BackingMismatch)?;
+        let ledger = read_ledger(&root)?;
+        if ledger.version != LEASE_VERSION
+            || ledger.store_id != config.store_id
+            || ledger.cap_bytes != config.cap_bytes
+            || ledger.slots.len() > MAX_SLOTS
+        {
+            return Err(LeaseError::BackingMismatch);
+        }
+        let evicting_slots = ledger
+            .slots
+            .iter()
+            .filter(|slot| slot.state == SlotPersistState::Evicting)
+            .count();
+        Ok(VolumeDescription {
+            store_id: config.store_id,
+            cap_bytes: config.cap_bytes,
+            mount_point: volume.mount_point,
+            volume_uuid: volume.volume_uuid,
+            payload_dir: volume.payload_dir,
+            evicting_slots,
+        })
     }
 
     /// Retire one recorded idle slot by ID after rechecking its durable

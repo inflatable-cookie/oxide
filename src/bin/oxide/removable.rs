@@ -26,12 +26,12 @@ use std::process::Command;
 /// Registration file in the internal control directory.
 const REGISTRATION: &str = "removable.json";
 /// The removable pool's internal root (config, ledger, lock, Oxide state).
-const POOL_DIR: &str = "removable";
+pub const POOL_DIR: &str = "removable";
 /// The payload directory directly under the volume's mount root.
 pub const PAYLOAD_DIR: &str = "oxide-pool";
 const REGISTRATION_VERSION: u32 = 1;
 const MAX_REGISTRATION_BYTES: u64 = 16 * 1024;
-const MAX_PLIST_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_PLIST_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -64,6 +64,7 @@ pub struct Selected {
 const USAGE: &str = "\
 usage: oxide pool register-removable <mount-point> --reserve <size> --cap <size>
        oxide pool recover-interrupted <slot>
+       oxide pool describe --json
 
 register-removable registers a dedicated APFS volume mounted directly under
 /Volumes as the preferred build pool. <size> is bytes or a whole number of
@@ -73,7 +74,10 @@ Both are required.
 
 recover-interrupted releases a slot `oxide status` shows held by an
 interrupted command whose Cargo group was not recorded or whose lease is not
-provably its own. Run it only when nothing still writes in that slot.";
+provably its own. Run it only when nothing still writes in that slot.
+
+describe --json prints the registered drive as stable, read-only JSON on
+stdout (schema oxide.pool.describe/1). It changes nothing.";
 
 /// `oxide pool ...`
 pub fn run(args: &[OsString]) -> Result<u8, String> {
@@ -82,6 +86,8 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
         .map(|arg| arg.to_str().ok_or("arguments must be valid UTF-8"))
         .collect::<Result<_, _>>()?;
     match args.as_slice() {
+        ["describe", "--json"] => crate::describe::print_json(),
+        ["describe", ..] => Err(USAGE.to_owned()),
         ["register-removable", rest @ ..] => {
             let mut mount = None;
             let mut reserve = None;
@@ -157,7 +163,7 @@ fn register(mount: &Path, reserve: u64, cap: u64) -> Result<u8, String> {
     if !volume::writable(binding.mount_point())? {
         return Err(format!("{} is not writable", mount.display()));
     }
-    let identity = disk_identity(binding.mount_point(), binding.uuid())?;
+    let identity = disk_identity(binding.mount_point(), binding.uuid(), &plist)?;
     check_identity(&identity, None)?;
     let internal = Store::open_or_create()?;
     if let Some(previous) = previous_registration(&internal) {
@@ -201,8 +207,8 @@ fn register(mount: &Path, reserve: u64, cap: u64) -> Result<u8, String> {
 
 /// What `diskutil` reports about a mounted volume, as checked at
 /// registration and again whenever selection considers it.
-struct DiskIdentity {
-    container_uuid: String,
+pub struct DiskIdentity {
+    pub container_uuid: String,
     container_ref: String,
     /// The container holding `/System/Volumes/Data`.
     data_container_ref: String,
@@ -210,8 +216,14 @@ struct DiskIdentity {
     quota_bytes: Option<u64>,
 }
 
-fn disk_identity(mount: &Path, uuid: &str) -> Result<DiskIdentity, String> {
-    let info = plist(&["info", "-plist", path_str(mount)?])?;
+/// `read` runs one `diskutil` query as JSON: the build path's [`plist`], or
+/// `oxide pool describe`'s bounded reader.
+pub fn disk_identity(
+    mount: &Path,
+    uuid: &str,
+    read: &dyn Fn(&[&str]) -> Result<serde_json::Value, String>,
+) -> Result<DiskIdentity, String> {
+    let info = read(&["info", "-plist", path_str(mount)?])?;
     let field = |key: &str| info.get(key).and_then(serde_json::Value::as_str);
     if field("VolumeUUID") != Some(uuid) {
         return Err(format!(
@@ -229,13 +241,13 @@ fn disk_identity(mount: &Path, uuid: &str) -> Result<DiskIdentity, String> {
     let container_ref = field("APFSContainerReference")
         .ok_or_else(|| format!("diskutil reports no APFS container for {}", mount.display()))?
         .to_owned();
-    let data = plist(&["info", "-plist", "/System/Volumes/Data"])?;
+    let data = read(&["info", "-plist", "/System/Volumes/Data"])?;
     let data_container_ref = data
         .get("APFSContainerReference")
         .and_then(serde_json::Value::as_str)
         .ok_or("diskutil reports no container for /System/Volumes/Data")?
         .to_owned();
-    let list = plist(&["apfs", "list", "-plist", &container_ref])?;
+    let list = read(&["apfs", "list", "-plist", &container_ref])?;
     let entry = list["Containers"]
         .as_array()
         .and_then(|containers| containers.first())
@@ -269,7 +281,7 @@ fn disk_identity(mount: &Path, uuid: &str) -> Result<DiskIdentity, String> {
 
 /// The boot/data container and every APFS role refuse; at selection the
 /// container must also be the registered one.
-fn check_identity(identity: &DiskIdentity, registered: Option<&str>) -> Result<(), String> {
+pub fn check_identity(identity: &DiskIdentity, registered: Option<&str>) -> Result<(), String> {
     if identity.container_ref == identity.data_container_ref {
         return Err("the volume is in the internal boot/data container".to_owned());
     }
@@ -359,7 +371,13 @@ fn write_registration(control: &Path, registration: &Registration) -> Result<(),
 }
 
 pub fn registration(internal: &Store) -> Result<Option<Registration>, String> {
-    let path = internal.control().join(REGISTRATION);
+    read_registration(internal.control())
+}
+
+/// The registration in an internal pool's control directory, read only.
+/// `None` when nothing is registered; an unreadable one is an error.
+pub fn read_registration(control: &Path) -> Result<Option<Registration>, String> {
+    let path = control.join(REGISTRATION);
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -470,7 +488,7 @@ fn usable(internal: &Store, registration: &Registration) -> Result<Store, String
     }
     // Container, boot/data and role exclusions again: a registered volume
     // may since have gained a role or moved. Unknown metadata refuses.
-    let identity = disk_identity(binding.mount_point(), binding.uuid())?;
+    let identity = disk_identity(binding.mount_point(), binding.uuid(), &plist)?;
     check_identity(&identity, Some(&registration.container_uuid))?;
     let available = binding
         .verify()?

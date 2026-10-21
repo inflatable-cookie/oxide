@@ -1741,9 +1741,9 @@ A lease records which pool it uses. Each pool stays warm on its own.
 
 **Drive:** the dedicated spare 1 TB SSD (Tom, 2026-10-20), formatted by Tom in Disk Utility as plain APFS volume `Builds` (UUID `A6AC3ED7-33EA-46B4-8082-7254CF291ED2`). Vault and its Time Machine backups stay untouched. **Decided (Tom, 2026-10-20):** a 750 GB Oxide admission cap and a 100 GB free-space reserve, both set at registration. The flush primitive is implemented (`fsync_volume_np` with full sync and wait; see part 1 above); **not yet measured:** its cost on the real drive.
 
-### Proposed: `oxide pool describe --json` (lead `beec4971`)
+### `oxide pool describe --json`
 
-Proposed, not implemented. This is the stable, read-only interface other tools use to find the Builds drive. Its first consumer is Effigy's opt-in `[scratch] source = "oxide"` (Effigy lead `1a007b5d`). Output on stdout, schema version 1:
+The stable, read-only interface other tools use to find the registered Builds drive. Oxide#112 implements it in source. It is not yet natively proven: the native proof waits for #109 qualification or Tom's task-specific exception. Output on stdout, schema version 1:
 
 ```json
 {
@@ -1763,19 +1763,26 @@ Proposed, not implemented. This is the stable, read-only interface other tools u
 }
 ```
 
-- **`removable`** is `null` when no drive is registered, and `selected` is then `"internal"`.
-- **`mode`** is `"permanent"` or `"ephemeral"`. Until the drive-mode lead ships, it is always `"ephemeral"`.
-- **`available`** is **passive eligibility**, not a prediction that the next build will open or be admitted to the pool. It is `true` only when every check below passes, using only read-only observations:
-  - the registered drive passes selection's checks: the `/Volumes` mount-parent rule, the opened mount root with the registered volume UUID, the registered container outside the boot and data container, no APFS role, writability, and available space above the reserve;
-  - the removable pool's existing config and ledger read cleanly with matching identities.
+- **`removable`** is `null` when no drive is registered, and `selected` is then `"internal"`. When the registration file exists but cannot be read, `removable` is an object whose `mount_point`, `volume_uuid`, `payload` and `suggested_scratch_root` are `null`, with `available: false` and reason `"metadata_unknown"`. Nothing identifies the drive then, so no identity is invented.
+- **`mode`** is `"permanent"` or `"ephemeral"`. Until the drive-mode feature ships, it is always `"ephemeral"`.
+- **`available`** is **passive eligibility**, not a prediction that the next build will open or be admitted to the pool. It is `true` only when every check passes, using read-only observations:
+  - the mount point holds the registered volume's root: `facts.mounted_on` is the path and the UUID matches, so a stale directory on the internal disk never qualifies;
+  - the `Binding` opens with the registered UUID, which applies the `/Volumes` mount-parent rule, and the volume is writable;
+  - `diskutil` reports the registered container, outside the boot/data container, with no APFS role;
+  - available space is above the registered reserve;
+  - the payload directory exists;
+  - the removable pool's config and ledger read cleanly, and the config matches the registration (volume, UUID, payload directory and budget).
 
-  Every `diskutil` or `plutil` read is bounded by a timeout and an output-size cap, and a timeout, oversize output or parse failure counts as unknown. Anything pending, indeterminate or unknown makes it `false`, with a reason: an `Evicting` record awaiting reconciliation (`"pending_reconciliation"`), missing control directories, unreadable or mismatched metadata (`"metadata_unknown"`, `"identity_mismatch"`), `"absent"` or `"below_reserve"`. `unavailable_reason` is otherwise `null`. Consumers branch on `available`, not on reason strings.
+  Every `diskutil` or `plutil` call is bounded: 5 s each and a 4 MiB output cap. A timeout, oversize output or parse failure counts as unknown. An `Evicting` record in the ledger makes the drive unavailable, because a build's open would reconcile it; `describe` reconciles nothing and reports it.
+- **`unavailable_reason`** is `null` when available. Otherwise one of: `absent` (nothing mounted at the registered path), `identity_mismatch` (a different volume, container or budget than registered), `volume_unusable` (refused by a selection rule such as the mount parent, read-only, a role or the boot container), `below_reserve`, `metadata_unknown` (a probe failed, timed out, was over cap or could not be parsed), `control_missing` (no internal control directory, config or ledger), `payload_missing`, or `pending_reconciliation`. Consumers branch on `available`, not on reason strings.
+- **`unavailable_detail`** is a human-readable explanation, added in schema 1. Its text is not stable.
 - **`selected`** is the passive preference: `"removable"` when `available` is true, otherwise `"internal"`. It is not a promise of the next build's selection, which stays authoritative inside the build and may differ, for example after its own reconciliation.
-- **`suggested_scratch_root`** is always outside `payload`. It is a suggestion, not a promise that the directory exists or a grant of write authority. Consumers create their own subdirectory, for example `<root>/effigy/<run-id>`, and never write under `payload`.
-- **Read-only.** Running `describe` mutates nothing. It never uses the build path's pool-opening helpers. It creates no control directories, reconciles no recorded deletion, writes no ledger and walks no accounting. Held records are reported as they are, with no claim about closure or accounting.
+- **`suggested_scratch_root`** is always outside `payload`. It is a suggestion, not a promise that the directory exists or a grant of write authority. Consumers create their own subdirectory, for example `<root>/<tool>/<run-id>`, and never write under `payload`.
+- **Read-only.** Running `describe` mutates nothing. It never uses the build path's pool openers (`Store::open_removable`, `Pool::open`), because those reconcile recorded deletions and create control directories. It reads the removable pool's config and ledger directly (`managed::describe_volume`): no lock, no control directory, no ledger write, no accounting walk. Held records are reported as they are, with no claim about closure or accounting.
 - **A snapshot.** The data is a point-in-time observation. Before writing, consumers still apply their own gate: the volume UUID, the mount root, and a device different from both `/` and `/System/Volumes/Data`.
-- **Exit codes:** 0 whenever the description was produced, whether or not a drive is registered or available. Non-zero only when Oxide itself fails, with the reason on stderr.
+- **Exit codes:** 0 whenever the description was produced, whether or not a drive is registered or available. Non-zero only when Oxide itself fails (for example, settings cannot be read), with the reason on stderr.
 - **Compatibility:** fields may be added in schema 1. Removing or renaming a field needs `oxide.pool.describe/2`.
+- **Proof.** Library tests read a private config and ledger fixture, including a pending record, and check the directory tree is unchanged afterwards. Refusals (other backends, mismatched store IDs, missing files) leave the tree unchanged. CLI unit tests cover the RFC 3339 timestamp, null and unknown-registration JSON with escaping, reason tags, bounded reads and their output cap. Not yet proven: a real or tiny APFS volume (the native `rust:pool-describe` proof is not added and runs only under #109 or an explicit exception).
 
 ## Adaptive sccache location (proposed)
 

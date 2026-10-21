@@ -11,6 +11,7 @@ mod cargo_home;
 mod clean;
 mod cli;
 mod config;
+mod describe;
 mod freshness;
 mod identity;
 mod launch;
@@ -55,6 +56,7 @@ USAGE:
     oxide status --launch-check          macOS: time a new executable's first launch
     oxide pool register-removable <mount-point> --reserve <size> --cap <size>
                                          macOS: prefer a dedicated APFS volume under /Volumes
+    oxide pool describe --json           the registered drive as read-only JSON
     oxide init [cargo init args] [path]  cargo init if no Cargo.toml, then adopt Oxide
     oxide new <path> [cargo new args]    cargo new, then adopt Oxide
 
