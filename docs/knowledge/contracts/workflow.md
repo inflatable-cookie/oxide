@@ -760,6 +760,9 @@ a regression, and routes nothing else. At `52e4a89` the author native passed
 50/50, the reviewer native timed out in admission without launching, and
 review `6318598212` found one more P1: a post-gate custodian exception
 escaped shutdown. Tom's post-gate exception repair phase fixes only that.
+Its second author native at `2abe9c6` passed 56/56. Review `6319610400`
+then found the exception handler calling `traceback.extract_tb` (source
+file lookup) before latching; the diagnostic repair below fixes only that.
 
 ```sh
 python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence DIR] [--root-parent DIR] [--] command ...
@@ -846,6 +849,13 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   - Process: signal or reap errors; SIGINT or SIGTERM to the custodian.
   - Exception: any exception in the custodian after setup, and a monitor
     message with a missing or ill-typed field (`protocol: malformed`).
+    The fault is latched first, as `custodian exception: <class name>`,
+    with the name read from the C-level type slot. The custodian never
+    converts an exception to text (no `str`, `repr` or format) and never
+    uses `traceback` or `linecache`. Only then is the innermost function
+    and line recorded, read from the traceback object's own fields; a
+    failing record never undoes the latch. OS errors are reported by
+    `errno` name.
     Each phase after setup (launch, watch, stop, reap, census, finish) runs
     under its own guard, so the bounded pinned stop (TERM, grace, KILL; the
     KILL is sent even if the stop itself raises), WNOHANG reap, census and
@@ -856,6 +866,9 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
     writable at once, with no traceback, and exits 125.
   - Closure: an uncertain census after `stopped`; no certain empty census
     or a missing EOF witness within the census window.
+  - Clock: a reading stamped later than the custodian's own clock reading
+    when it arrives. Both sides use the same system-wide clock, so such a
+    reading is never fresh.
 - **Clock and deadlines.** One clock everywhere: `CLOCK_UPTIME_RAW` integer
   nanoseconds. The supervisor refuses before any proof work if that clock,
   kqueue, macOS or the self-checked `kinfo_proc` layout is missing.
@@ -911,7 +924,8 @@ path is printed for the owner.
 
 It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
 `scripts/test_supervisor.py`. The suite runs in order:
-- 26 pure cases: guard thresholds, staleness and errors; exit precedence;
+- 30 pure cases: guard thresholds, staleness and errors, a future-stamped
+  reading; exit precedence;
   census member, foreign, identity change, first-seen unreadable, zombie,
   gone, `ESRCH` with a failing re-read (uncertain), a zombie confirmed gone
   within the round, escaped and reparented member, backwards start time,
@@ -919,7 +933,11 @@ It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
   faults; ready before readings; census before reap; an uncertain census
   latched over a later empty one; malformed and ill-typed monitor
   messages latched without raising; the top-level report not blocking on a
-  full pipe; refusal to signal an unpinned target;
+  full pipe; the exception handler latching with `linecache`, `traceback`,
+  `open` and `stat` all forbidden, latching when its record raises, and
+  never converting hostile exception text (hostile `__str__`, `__repr__`,
+  `__format__`, metaclass `__name__` and `str`-subclass name); refusal to
+  signal an unpinned target;
 - writers before and after a simulated staging step;
 - 30 real cases with tiny Python fixtures and injected faults:
   - exit 0, owned cleanup, nonzero, exec 127, output saturation;
@@ -940,8 +958,9 @@ It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
   - post-gate exceptions: an event-loop exception, a failing kqueue, a
     malformed monitor message, and an exception during the stop. Each has a
     TERM-ignoring leader and group child: pinned TERM then KILL, the child
-    dead, the leader reaped, the last reserve sample within 1 s of the
-    monitor's final publication, owned scratch kept, exit 125. The author
+    dead, the leader reaped, the last reserve sample no later than and
+    within 1 s of the monitor's final publication, owned scratch kept,
+    exit 125. The author
     native at `74f1b65` failed only the earlier, stricter form of that
     sampling assertion (a sample after the reap) in two cases;
   - a fixture deadline holding across `exec` and for a late grandchild, with
@@ -956,7 +975,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 56 cases;
+- all 60 cases;
 - every real case directory and receipt still present after the
   candidate's cleanup.
 

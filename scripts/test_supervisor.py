@@ -118,6 +118,14 @@ class PureGuard(unittest.TestCase):
         guard.reading({"kind": "reserve", "value": 500 * GIB, "at": 1010 * NS})
         self.assertIn("scratch readings stale", guard.check(1010 * NS + 1))
 
+    def test_future_stamped_reading_latches(self):
+        # A reading stamped after the custodian's own clock reading is never
+        # fresh, so it cannot keep a stopped sampler looking alive.
+        guard = self.guard()
+        guard.reading({"kind": "reserve", "value": 500 * GIB, "at": 2000 * NS}, now=1000 * NS)
+        self.assertIn("future", guard.fault)
+        self.assertIsNone(guard.reserve_at)
+
     def test_over_budget(self):
         guard = self.guard()
         guard.reading({"kind": "scratch", "value": 513 * 1024 * 1024, "complete": True, "at": 1000 * NS})
@@ -343,6 +351,103 @@ class PureProtocol(unittest.TestCase):
         start = now_ns()
         bounded.report("x" * 10000, fd=write_end)
         self.assertLess(now_ns() - start, NS)
+
+    # Review 6319610400: the exception path latches first and is filesystem-free.
+
+    def raised(self, error):
+        def innermost():
+            raise error
+        try:
+            innermost()
+        except BaseException as caught:
+            return caught
+
+    def test_exception_latches_without_source_lookup(self):
+        import builtins, linecache, traceback
+        calls = []
+
+        def forbidden(name):
+            def call(*_args, **_kwargs):
+                calls.append(name)
+                raise AssertionError(f"{name} called")
+            return call
+
+        targets = [(linecache, n) for n in ("getline", "getlines", "checkcache", "lazycache", "updatecache")]
+        targets += [(traceback, n) for n in ("extract_tb", "format_exception", "format_tb", "print_exc")]
+        targets += [(traceback.StackSummary, "extract"), (builtins, "open"), (os, "stat"), (os, "lstat")]
+        error = self.raised(ValueError("boom"))
+        custodian = self.custodian()
+        records = []
+        custodian.record = lambda kind, **fields: records.append((kind, fields))
+        saved = [(owner, name, getattr(owner, name)) for owner, name in targets]
+        try:
+            for owner, name in targets:
+                setattr(owner, name, forbidden(name))
+            custodian.exception(error)
+        finally:
+            for owner, name, value in saved:
+                setattr(owner, name, value)
+        self.assertEqual(calls, [])
+        self.assertEqual(custodian.guard.fault, "custodian exception: ValueError")
+        self.assertEqual(records[0][1]["type"], "ValueError")
+        self.assertTrue(records[0][1]["where"].startswith("innermost:"), records)
+
+    def test_exception_latches_when_diagnostics_raise(self):
+        custodian = self.custodian()
+
+        def broken(*_args, **_kwargs):
+            raise RuntimeError("diagnostics failed")
+
+        custodian.record = broken
+        custodian.exception(self.raised(OSError(9, "bad")))  # must not raise
+        self.assertEqual(custodian.guard.fault, "custodian exception: OSError")
+        custodian.exception(self.raised(KeyError("second")))
+        self.assertEqual(custodian.guard.fault, "custodian exception: OSError")  # first fault kept
+
+    def test_hostile_exception_text_is_never_converted(self):
+        touched = []
+
+        class HostileName(str):
+            def __str__(self):
+                touched.append("name str")
+                raise AssertionError
+
+            def __format__(self, spec):
+                touched.append("name format")
+                raise AssertionError
+
+            def __radd__(self, other):
+                touched.append("name radd")
+                raise AssertionError
+
+        class Meta(type):
+            @property
+            def __name__(cls):
+                touched.append("metaclass name")
+                raise AssertionError
+
+        class Hostile(Exception, metaclass=Meta):
+            def __str__(self):
+                touched.append("str")
+                raise AssertionError
+
+            def __repr__(self):
+                touched.append("repr")
+                raise AssertionError
+
+            def __format__(self, spec):
+                touched.append("format")
+                raise AssertionError
+
+        type.__dict__["__name__"].__set__(Hostile, HostileName("Hostile"))
+        custodian = self.custodian()
+        records = []
+        custodian.record = lambda kind, **fields: records.append(fields)
+        custodian.exception(self.raised(Hostile()))
+        self.assertEqual(touched, [])
+        self.assertEqual(custodian.guard.fault, "custodian exception: Hostile")
+        self.assertIs(type(custodian.guard.fault), str)
+        self.assertEqual(json.loads(json.dumps(records))[0]["type"], "Hostile")
 
     def test_unpinned_target_is_never_signalled(self):
         custodian = self.custodian()
@@ -601,8 +706,9 @@ class Real(unittest.TestCase):
         # within the guard's 1 s staleness window of the monitor's final
         # publication. (Shutdown can finish inside one 0.25 s interval, so a
         # sample after the reap itself is not required; native 74f1b65.)
-        self.assertLess(self.receipt["published_ns"] - self.receipt["reserve"]["last_ns"],
-                        bounded.RESERVE_STALE_NS, "reserve sampling went stale before the shutdown ended")
+        age = self.receipt["published_ns"] - self.receipt["reserve"]["last_ns"]
+        self.assertGreaterEqual(age, 0, "reserve sample stamped after the final publication")
+        self.assertLess(age, bounded.RESERVE_STALE_NS, "reserve sampling went stale before the shutdown ended")
         [root] = list(self.dir.glob("oxide-proof.*"))
         self.assertTrue((root / "scratch").is_dir(), "scratch removed after an exception")
 

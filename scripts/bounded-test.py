@@ -61,7 +61,6 @@ import sys
 import tempfile
 import threading
 import time
-import traceback
 
 NS = 1_000_000_000
 GIB = 1024 ** 3
@@ -109,6 +108,43 @@ def report(text, fd=2):
             os.write(fd, text.encode()[: select.PIPE_BUF])
     except (OSError, ValueError):
         pass
+
+
+_TYPE_NAME = type.__dict__["__name__"]
+_TRACEBACK = BaseException.__dict__["__traceback__"]
+_ERRNO = OSError.__dict__["errno"]
+
+
+def type_name(error):
+    """The exception's class name from the C-level type slot, as an exact
+    str: no str/repr/format of the exception, no metaclass or subclass hook,
+    no traceback or linecache, no I/O."""
+    try:
+        return str.__str__(_TYPE_NAME.__get__(type(error)))[:64]
+    except BaseException:
+        return "?"
+
+
+def where_of(error):
+    """Innermost frame's function and line from the traceback object's own
+    fields: bounded walk, no source lookup or I/O."""
+    try:
+        tb = _TRACEBACK.__get__(error)
+        for _ in range(64):
+            if tb.tb_next is None:
+                break
+            tb = tb.tb_next
+        return str.__str__(tb.tb_frame.f_code.co_name)[:64] + ":" + str(int(tb.tb_lineno))
+    except BaseException:
+        return "?"
+
+
+def errno_name(error):
+    try:
+        value = _ERRNO.__get__(error)
+        return errno.errorcode.get(value, "?") if type(value) is int else "?"
+    except BaseException:
+        return "?"
 
 
 def typed(value, kind):
@@ -311,9 +347,13 @@ class Guard:
         if self.fault is None:
             self.fault = fault
 
-    def reading(self, message):
+    def reading(self, message, now=None):
         kind = message["kind"]
-        if message.get("error"):
+        if now is not None and message["at"] > now:
+            # Same system-wide clock on both sides: a future stamp is never a
+            # fresh reading, so it cannot keep a stopped sampler looking alive.
+            self.latch(f"{kind} reading stamped in the future")
+        elif message.get("error"):
             self.latch(f"{kind} measurement failed: {message['error']}")
         elif kind == "reserve":
             self.reserve_at = max(self.reserve_at or 0, message["at"])
@@ -620,7 +660,7 @@ class Custodian:
         try:
             os.write(self.cmd_w, data)
         except OSError as error:
-            self.guard.latch(f"protocol: command pipe write failed: {error}")
+            self.guard.latch("protocol: command pipe write failed: " + errno_name(error))
 
     def signal_pinned(self, pid, number, group):
         """Signal a child this process holds unreaped, so neither its PID nor
@@ -638,9 +678,9 @@ class Custodian:
                 (os.killpg if group else os.kill)(pid, number)
                 entry["result"] = "sent"
             except OSError as error:
-                entry["result"] = errno.errorcode.get(error.errno, str(error.errno))
-                if error.errno not in (errno.ESRCH, errno.EPERM):  # EPERM: zombie-only group
-                    self.guard.latch(f"signal {entry['signal']} to {pid}: {error}")
+                entry["result"] = errno_name(error)
+                if entry["result"] not in ("ESRCH", "EPERM"):  # EPERM: zombie-only group
+                    self.guard.latch(f"signal {entry['signal']} to {pid}: {entry['result']}")
         self.record("signal", **entry)
 
     def reap(self, pid):
@@ -652,15 +692,14 @@ class Custodian:
         return status if done == pid else None
 
     def exception(self, error):
-        """Latch an exception as a fault (the first fault is kept) and record
-        the first few. Never raises."""
+        """Latch first, from the class name alone; then, best effort, record
+        the innermost function and line (first few only). Never converts the
+        exception to text, never looks up source, never raises."""
+        self.guard.latch("custodian exception: " + type_name(error))
         try:
-            frames = traceback.extract_tb(error.__traceback__)
-            where = f"{frames[-1].name}:{frames[-1].lineno}" if frames else "?"
-            self.guard.latch(f"custodian exception: {type(error).__name__}: {error} at {where}")
             self.exceptions += 1
             if self.exceptions <= EXCEPTION_RECORDS:
-                self.record("exception", error=repr(error)[:500], where=where)
+                self.record("exception", type=type_name(error), where=where_of(error))
         except BaseException:
             pass
 
@@ -751,7 +790,7 @@ class Custodian:
             return
         kind = message["type"]
         if kind == "reading":
-            self.guard.reading(message)
+            self.guard.reading(message, now_ns())
         elif kind == "ready":
             # Ready counts only with completed readings already received.
             if self.guard.reserve_at is None or self.guard.scratch_at is None:
@@ -1138,6 +1177,6 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except BaseException as error:  # no traceback: bounded, non-blocking report only
-        report(f"bounded-test.py: internal error, exit 125: {error!r}\n")
+        report("bounded-test.py: internal error, exit 125: " + type_name(error) + "\n")
         code = 125
     sys.exit(code)
