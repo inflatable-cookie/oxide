@@ -325,9 +325,13 @@ fn print_readiness(workspace: &Path) {
             ),
             Ok(Some(store)) => match store.status() {
                 Ok(status) => {
-                    let used = store
-                        .payload_use()
-                        .map(|(used, total)| format!("{} of {} MiB used", used / MIB, total / MIB))
+                    // This full status's own whole-payload walk.
+                    let used = status
+                        .payload_unique_allocated_bytes
+                        .map(|used| {
+                            let total = store.budget(status.cap_bytes);
+                            format!("{} of {} MiB used", used / MIB, total / MIB)
+                        })
                         .unwrap_or_else(|| "use unknown".to_owned());
                     println!(
                         "  pool: {}, cap {} MiB, {used}",

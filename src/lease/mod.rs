@@ -291,6 +291,65 @@ pub struct PoolStatus {
     pub slots: Vec<SlotStatus>,
 }
 
+/// Ledger membership of an opened pool, for callers that need no sizes.
+/// It has no byte or coverage fields, so a walk it skipped cannot read as
+/// zero or complete. Opening it is [`managed::status`]'s opening, including
+/// recorded-deletion reconciliation, so it is not side-effect-free.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LedgerView {
+    pub store_id: String,
+    pub backend: String,
+    pub cap_bytes: u64,
+    /// A recorded deletion could not complete at this open.
+    pub reconciliation_blocked: bool,
+    pub slots: Vec<LedgerSlot>,
+}
+
+/// One ledger record: [`SlotStatus`] without its accounting.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LedgerSlot {
+    pub slot_id: String,
+    pub incarnation: String,
+    pub state: SlotOccupancy,
+    pub project: PathBuf,
+    pub workspace: PathBuf,
+    pub profile: Profile,
+    pub holder: Option<String>,
+    pub lease_id: Option<String>,
+}
+
+impl From<&SlotStatus> for LedgerSlot {
+    fn from(slot: &SlotStatus) -> Self {
+        Self {
+            slot_id: slot.slot_id.clone(),
+            incarnation: slot.incarnation.clone(),
+            state: slot.state,
+            project: slot.project.clone(),
+            workspace: slot.workspace.clone(),
+            profile: slot.profile,
+            holder: slot.holder.clone(),
+            lease_id: slot.lease_id.clone(),
+        }
+    }
+}
+
+/// The complete walk reuse made of exactly this slot generation, under the
+/// pool lock, before this lease took it. Nothing measures a new slot or a
+/// held same-holder replay, and nothing remeasures after release.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReuseMeasurement {
+    pub slot_id: String,
+    pub incarnation: String,
+    pub unique_allocated_bytes: u64,
+}
+
+/// A grant and, when reuse walked the slot, that measurement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Leased {
+    pub grant: LeaseGrant,
+    pub measured: Option<ReuseMeasurement>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountingCoverage {

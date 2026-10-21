@@ -24,7 +24,7 @@ use cli::{Class, Invocation, PROFILE_ENVIRONMENT};
 use freshness::{Gate, Refusal};
 use identity::{RunPick, SlotKey};
 use oxide_storage::inventory::{inventory_directory, Category, InventoryLimits};
-use oxide_storage::lease::{AccountingCoverage, PoolStatus, SlotOccupancy};
+use oxide_storage::lease::{AccountingCoverage, PoolStatus, ReuseMeasurement, SlotOccupancy};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
@@ -260,6 +260,7 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     }
     let slot = held.slot_id.clone();
     let warm = held.reused;
+    let measured = held.measured.clone();
     let note = [gate.describe(), wrapper_note]
         .into_iter()
         .flatten()
@@ -270,7 +271,15 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     store.release(held, origin)?;
     let (status, executable) = outcome?;
     let status = status.ok_or("Cargo ended without a status")?;
-    print_summary(&store, &invocation, &slot, warm, started, note.as_deref());
+    print_summary(
+        &store,
+        &invocation,
+        &slot,
+        warm,
+        measured.as_ref(),
+        started,
+        note.as_deref(),
+    );
     if store.backend == Backend::ApfsVolume {
         match store.last_flush() {
             Some(flush) if flush.slot_id == slot => match flush.micros {
@@ -475,12 +484,16 @@ fn run_artifact(line: &str, selection: Option<&str>) -> Option<(String, PathBuf,
     ))
 }
 
-/// One line: profile, strategy, slot warmth, elapsed time and pool use.
+/// One line: profile, strategy, slot warmth, elapsed time, the slot's size
+/// when leased and this command's budget. It walks nothing: the size is the
+/// library's reuse walk of that exact slot generation, never a walk after
+/// release, when another command may hold the slot.
 fn print_summary(
     store: &Store,
     invocation: &Invocation,
     slot: &str,
     warm: bool,
+    measured: Option<&ReuseMeasurement>,
     started: Instant,
     note: Option<&str>,
 ) {
@@ -488,14 +501,19 @@ fn print_summary(
         "run" | "test" => "build+execute",
         _ => "build",
     };
-    let pool = match store.payload_use() {
-        Some((used, budget)) => format!(
-            "pool {} MiB allocated of {} MiB budget",
-            used / MIB,
-            budget / MIB
+    let size = match measured {
+        Some(measured) => format!(
+            "slot {} was {} MiB when leased",
+            measured.slot_id,
+            measured.unique_allocated_bytes / MIB
         ),
-        None => "pool use unknown".to_owned(),
+        None if !warm => "new slot".to_owned(),
+        None => "slot size unknown".to_owned(),
     };
+    let pool = format!(
+        "{size}, {} MiB budget, pool total: see oxide status",
+        store.command_budget() / MIB
+    );
     let backend = match store.backend {
         Backend::DirectoryBudget => format!(" ({}, budget-only)", store.backend.tag()),
         Backend::ApfsVolume => format!(
