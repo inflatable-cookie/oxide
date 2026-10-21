@@ -292,9 +292,9 @@ reserve space, constrain writes during a lease, or prevent `ENOSPC`. Other
 slots still count against the budget, so ordinary admission and refusal rules
 apply after the selected generation is removed.
 
-### Proposed: cached closed-slot accounting (lead `cbb2824d`)
+### Parked: cached closed-slot accounting (lead `cbb2824d`)
 
-Proposed, not implemented. Revision 2 answers Sol's prospective review of `5852670` (changes required: shared-inode mutation, metadata outside slots, transition rules). Revision 2 drops revision 1's held baselines and overcounting sums.
+Parked on 2026-10-21, not implemented. Sol's re-review of revision 2 (`d578447`) was again changes required. Transient hard-link mutation means an idle slot's contents and link topology cannot be shown to be unchanged cheaply, and out-of-lock walks need snapshot and conditional-commit rules. An exact cache therefore needs an immutability mechanism or an explicit policy relaxation. The per-command cost is addressed first by removing the front door's non-authoritative whole-payload walks, a separate correction. Both review verdicts are kept on the lead. Revision 2 text follows for reference. Revision 2 answers Sol's prospective review of `5852670` (changes required: shared-inode mutation, metadata outside slots, transition rules). Revision 2 drops revision 1's held baselines and overcounting sums.
 
 **Goal.** Stop walking every idle slot on every command, while keeping today's admission figures. Today each command walks the whole payload at least twice: once in the front door's selection status and once at library admission. Measured on the Builds pool: 95,020 entries in 1.2 s, then 201,948 entries in 3.4 s an hour later.
 
