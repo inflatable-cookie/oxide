@@ -461,7 +461,19 @@ impl<'a> Walker<'a> {
             }
             let read_dir = self
                 .test_hook_error(&directory, WalkPoint::BeforeReadDir)
-                .map_or_else(|| fs::read_dir(&directory), Err);
+                .map_or_else(
+                    || {
+                        #[cfg(test)]
+                        {
+                            crate::test_fs::read_dir(&directory)
+                        }
+                        #[cfg(not(test))]
+                        {
+                            fs::read_dir(&directory)
+                        }
+                    },
+                    Err,
+                );
             let entries = match read_dir {
                 Ok(entries) => entries,
                 Err(error)
@@ -1351,7 +1363,7 @@ pub mod walk_observer {
 mod tests {
     use super::*;
     use std::io::Write as _;
-    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{symlink, MetadataExt};
     use std::path::Path as StdPath;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1658,17 +1670,13 @@ mod tests {
         fixture.file("debug/deps/ok.rlib", 10);
         let locked = fixture.path().join("debug/incremental");
         fixture.file("debug/incremental/hidden.o", 10);
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-        let still_readable = fs::read_dir(&locked).is_ok();
+        let denied = crate::test_fs::PermissionDeniedGuard::read_dir(&locked);
         let report = inventory_directory(fixture.path(), InventoryLimits::default()).unwrap();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
-
-        if still_readable {
-            // Privileged environments can read a 0o000 directory.
-            return;
-        }
+        assert_eq!(denied.hits(), 1);
         assert!(!report.coverage.complete);
-        assert!(gap(&report, GapKind::UnreadableEntry) >= 1);
+        assert_eq!(gap(&report, GapKind::UnreadableEntry), 1);
+        assert_eq!(report.total.files, 1);
+        assert_eq!(report.total.logical_bytes_by_name, 10);
     }
 
     #[test]

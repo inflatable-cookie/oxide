@@ -1050,7 +1050,11 @@ impl Pool {
     /// share these checks.
     fn slot_root(&self, id: u64) -> Result<(PathBuf, Option<fs::Metadata>), LeaseError> {
         let path = self.slot_path(id)?;
-        match fs::symlink_metadata(&path) {
+        #[cfg(test)]
+        let metadata = crate::test_fs::symlink_metadata(&path);
+        #[cfg(not(test))]
+        let metadata = fs::symlink_metadata(&path);
+        match metadata {
             Ok(metadata) => Ok((path, Some(metadata))),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((path, None)),
             Err(error) => Err(io_error(error)),

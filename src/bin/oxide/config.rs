@@ -1,8 +1,8 @@
-//! Machine configuration: where the internal pool lives and its soft budget.
+//! Machine configuration: pool location and budget, plus the host build limit.
 //!
 //! Owning contract: `docs/knowledge/contracts/workflow.md` (User
-//! configuration). Precedence is environment (`OXIDE_POOL`,
-//! `OXIDE_POOL_CAP`), then the user config file, then built-in defaults.
+//! configuration). Precedence is environment, then the user config file,
+//! then built-in defaults.
 //! The file sits at the platform-native location: on macOS
 //! `~/Library/Application Support/oxide/config/config.toml`, elsewhere
 //! `$XDG_CONFIG_HOME/oxide/config.toml` (XDG's `~/.config` when unset).
@@ -18,6 +18,11 @@ use std::path::{Component, Path, PathBuf};
 /// 100 GB, decimal: the built-in soft budget of the internal pool.
 pub const DEFAULT_BUDGET_BYTES: u64 = 100_000_000_000;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+const MAX_ACTIVE_LIMIT: usize = 32;
+const FALLBACK_MAX_ACTIVE: usize = 2;
+/// A larger result is not credible for a local macOS host and is not used
+/// for automatic admission policy.
+const MAX_PHYSICAL_CORES: usize = 1024;
 /// Leaf of the built-in pool under the platform cache. Distinct from the
 /// retired image pool's `pool` leaf, so that one is retired separately.
 const DEFAULT_POOL_LEAF: &str = "build-pool";
@@ -37,6 +42,39 @@ pub struct Facts {
     pub xdg_state_home: Option<OsString>,
     pub oxide_pool: Option<OsString>,
     pub oxide_pool_cap: Option<OsString>,
+    pub oxide_max_active: Option<OsString>,
+    pub physical_cores: PhysicalCoreCount,
+}
+
+/// The physical-core fact used by the automatic active-build default.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum PhysicalCoreCount {
+    #[default]
+    NotQueried,
+    Available(usize),
+    Unavailable(String),
+}
+
+/// The resolved host-wide command limit and the basis status reports.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveBuildLimit {
+    pub value: usize,
+    pub source: Source,
+    detail: Option<String>,
+}
+
+impl ActiveBuildLimit {
+    pub fn provenance(&self, config_path: &Path) -> String {
+        let source = match self.source {
+            Source::Environment(name) => name.to_owned(),
+            Source::File => format!("config file {} [pool].max_active", config_path.display()),
+            Source::Default => "built-in default".to_owned(),
+        };
+        match &self.detail {
+            Some(detail) => format!("{source}; {detail}"),
+            None => source,
+        }
+    }
 }
 
 impl Facts {
@@ -51,6 +89,8 @@ impl Facts {
             xdg_state_home: var("XDG_STATE_HOME"),
             oxide_pool: var("OXIDE_POOL"),
             oxide_pool_cap: std::env::var_os("OXIDE_POOL_CAP"),
+            oxide_max_active: std::env::var_os("OXIDE_MAX_ACTIVE"),
+            physical_cores: PhysicalCoreCount::NotQueried,
         }
     }
 
@@ -140,6 +180,7 @@ struct FileConfig {
 struct PoolSection {
     path: Option<String>,
     budget: Option<Budget>,
+    max_active: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq)]
@@ -156,6 +197,8 @@ pub struct Settings {
     pub pool_source: Source,
     pub budget: u64,
     pub budget_source: Source,
+    pub active_build_limit: ActiveBuildLimit,
+    pub ignored_legacy_config: Option<PathBuf>,
     pub file: ConfigFile,
 }
 
@@ -250,13 +293,137 @@ pub fn settings(facts: &Facts) -> Result<Settings, String> {
             None => (DEFAULT_BUDGET_BYTES, Source::Default),
         },
     };
+    let active_build_limit = resolve_active_build_limit(facts, section.max_active, &file.path)?;
+    let ignored_legacy_config = ignored_legacy_config(facts);
     Ok(Settings {
         pool,
         pool_source,
         budget,
         budget_source,
+        active_build_limit,
+        ignored_legacy_config,
         file,
     })
+}
+
+fn resolve_active_build_limit(
+    facts: &Facts,
+    config_value: Option<i64>,
+    config_path: &Path,
+) -> Result<ActiveBuildLimit, String> {
+    if let Some(value) = &facts.oxide_max_active {
+        let value = value
+            .to_str()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| (1..=MAX_ACTIVE_LIMIT).contains(value))
+            .ok_or_else(|| {
+                format!("OXIDE_MAX_ACTIVE must be an integer from 1 to {MAX_ACTIVE_LIMIT}")
+            })?;
+        return Ok(ActiveBuildLimit {
+            value,
+            source: Source::Environment("OXIDE_MAX_ACTIVE"),
+            detail: None,
+        });
+    }
+    if let Some(value) = config_value {
+        let value = usize::try_from(value)
+            .ok()
+            .filter(|value| (1..=MAX_ACTIVE_LIMIT).contains(value))
+            .ok_or_else(|| {
+                format!(
+                    "{}: [pool] max_active must be an integer from 1 to {MAX_ACTIVE_LIMIT}",
+                    config_path.display()
+                )
+            })?;
+        return Ok(ActiveBuildLimit {
+            value,
+            source: Source::File,
+            detail: None,
+        });
+    }
+
+    let fallback = |reason: String| ActiveBuildLimit {
+        value: FALLBACK_MAX_ACTIVE,
+        source: Source::Default,
+        detail: Some(format!(
+            "physical-core fallback: {reason}; using {FALLBACK_MAX_ACTIVE}"
+        )),
+    };
+    if !facts.macos {
+        return Ok(fallback(
+            "physical-core query unsupported on this platform".to_owned(),
+        ));
+    }
+    let queried;
+    let physical_cores = match &facts.physical_cores {
+        PhysicalCoreCount::NotQueried => {
+            queried = physical_core_count();
+            &queried
+        }
+        fact => fact,
+    };
+    match physical_cores {
+        PhysicalCoreCount::Available(cores) if (1..=MAX_PHYSICAL_CORES).contains(cores) => {
+            let value = (*cores / 4).clamp(FALLBACK_MAX_ACTIVE, 4);
+            Ok(ActiveBuildLimit {
+                value,
+                source: Source::Default,
+                detail: Some(format!(
+                    "physical cores from hw.physicalcpu={cores}; formula min(4, max(2, floor({cores}/4)))"
+                )),
+            })
+        }
+        PhysicalCoreCount::Available(cores) => Ok(fallback(format!(
+            "hw.physicalcpu returned invalid count {cores} (expected 1..={MAX_PHYSICAL_CORES})"
+        ))),
+        PhysicalCoreCount::Unavailable(reason) => {
+            Ok(fallback(format!("hw.physicalcpu unavailable ({reason})")))
+        }
+        PhysicalCoreCount::NotQueried => unreachable!("physical-core query was attempted"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn physical_core_count() -> PhysicalCoreCount {
+    let name = b"hw.physicalcpu\0";
+    let mut count: libc::c_int = 0;
+    let mut length = std::mem::size_of_val(&count);
+    // SAFETY: `name` is NUL-terminated, `count` and `length` are writable,
+    // and no new value is supplied to sysctl.
+    let result = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr().cast(),
+            (&mut count as *mut libc::c_int).cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result != 0 {
+        return PhysicalCoreCount::Unavailable(std::io::Error::last_os_error().to_string());
+    }
+    if length != std::mem::size_of_val(&count) {
+        return PhysicalCoreCount::Unavailable(format!(
+            "hw.physicalcpu returned {length} bytes, expected {}",
+            std::mem::size_of_val(&count)
+        ));
+    }
+    if count <= 0 {
+        return PhysicalCoreCount::Unavailable(format!(
+            "hw.physicalcpu returned nonpositive count {count}"
+        ));
+    }
+    match usize::try_from(count) {
+        Ok(count) => PhysicalCoreCount::Available(count),
+        Err(_) => PhysicalCoreCount::Unavailable(format!(
+            "hw.physicalcpu count {count} does not fit usize"
+        )),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn physical_core_count() -> PhysicalCoreCount {
+    PhysicalCoreCount::Unavailable("unsupported platform".to_owned())
 }
 
 fn read_config(path: &Path) -> Result<FileConfig, String> {
@@ -641,6 +808,7 @@ mod tests {
         Facts {
             macos,
             home: Some("/home/user".into()),
+            physical_cores: PhysicalCoreCount::Unavailable("injected unsupported query".to_owned()),
             ..Facts::default()
         }
     }
@@ -694,14 +862,21 @@ mod tests {
         assert_eq!(settings.pool_source, Source::Default);
         assert_eq!(settings.budget, 100_000_000_000);
         assert_eq!(settings.budget_source, Source::Default);
+        assert_eq!(settings.active_build_limit.value, 2);
+        assert!(settings
+            .active_build_limit
+            .provenance(&settings.file.path)
+            .contains("physical-core fallback"));
     }
 
     #[test]
     fn config_keys_types_and_units() {
         let parsed =
-            parse_config("[pool]\npath = \"~/Dev/oxide\"\nbudget = \"100GB\"\n").expect("valid");
+            parse_config("[pool]\npath = \"~/Dev/oxide\"\nbudget = \"100GB\"\nmax_active = 3\n")
+                .expect("valid");
         let section = parsed.pool.expect("pool");
         assert_eq!(section.budget, Some(Budget::Text("100GB".to_owned())));
+        assert_eq!(section.max_active, Some(3));
         assert_eq!(
             expand_path(section.path.as_deref().expect("path"), &facts(true)),
             Ok(PathBuf::from("/home/user/Dev/oxide"))
@@ -711,6 +886,7 @@ mod tests {
         assert!(parse_config("[other]\n").is_err());
         assert!(parse_config("[pool\n").is_err());
         assert!(parse_config("[pool]\npath = 3\n").is_err());
+        assert!(parse_config("[pool]\nmax_active = \"3\"\n").is_err());
         assert!(expand_path("~other/x", &facts(true)).is_err());
         assert!(expand_path("relative/x", &facts(true)).is_err());
         assert!(expand_path("/a/../b", &facts(true)).is_err());
@@ -747,7 +923,11 @@ mod tests {
     fn precedence_is_environment_then_file_then_default() {
         let scratch = Scratch::new("precedence");
         let file = scratch.0.join("config.toml");
-        fs::write(&file, "[pool]\npath = \"/from/file\"\nbudget = \"2GB\"\n").expect("config");
+        fs::write(
+            &file,
+            "[pool]\npath = \"/from/file\"\nbudget = \"2GB\"\nmax_active = 3\n",
+        )
+        .expect("config");
         let mut chosen = facts(true);
         chosen.oxide_config = Some(file.clone().into());
         let from_file = settings(&chosen).expect("file");
@@ -755,14 +935,78 @@ mod tests {
         assert_eq!(from_file.pool_source, Source::File);
         assert_eq!(from_file.budget, 2_000_000_000);
         assert_eq!(from_file.budget_source, Source::File);
+        assert_eq!(from_file.active_build_limit.value, 3);
+        assert_eq!(from_file.active_build_limit.source, Source::File);
+        assert!(from_file
+            .active_build_limit
+            .provenance(&file)
+            .contains("[pool].max_active"));
         chosen.oxide_pool = Some("/from/env".into());
         chosen.oxide_pool_cap = Some("3GB".into());
+        chosen.oxide_max_active = Some("4".into());
         let from_env = settings(&chosen).expect("env");
         assert_eq!(from_env.pool, Path::new("/from/env"));
         assert_eq!(from_env.pool_source, Source::Environment("OXIDE_POOL"));
         assert_eq!(from_env.budget, 3_000_000_000);
+        assert_eq!(from_env.active_build_limit.value, 4);
+        assert_eq!(
+            from_env.active_build_limit.source,
+            Source::Environment("OXIDE_MAX_ACTIVE")
+        );
         chosen.oxide_pool_cap = Some("lots".into());
         assert!(settings(&chosen).is_err());
+        chosen.oxide_pool_cap = None;
+        fs::write(&file, "[pool]\nmax_active = 0\n").expect("invalid lower-priority value");
+        assert_eq!(
+            settings(&chosen)
+                .expect("environment wins")
+                .active_build_limit
+                .value,
+            4
+        );
+        chosen.oxide_max_active = None;
+        let refused = settings(&chosen).expect_err("invalid selected file value");
+        assert!(refused.contains(&file.display().to_string()), "{refused}");
+        assert!(refused.contains("[pool] max_active"), "{refused}");
+        for valid in [1, 32] {
+            fs::write(&file, format!("[pool]\nmax_active = {valid}\n")).expect("config bound");
+            assert_eq!(
+                settings(&chosen)
+                    .expect("config bound")
+                    .active_build_limit
+                    .value,
+                valid
+            );
+        }
+        for invalid in ["-1", "0", "33", "9223372036854775807"] {
+            fs::write(&file, format!("[pool]\nmax_active = {invalid}\n"))
+                .expect("bad config bound");
+            let refused = settings(&chosen).expect_err(invalid);
+            assert!(refused.contains(&file.display().to_string()), "{refused}");
+            assert!(refused.contains("[pool] max_active"), "{refused}");
+        }
+        fs::write(&file, "[pool]\nmax_active = 9223372036854775808\n").expect("overflow config");
+        let refused = settings(&chosen).expect_err("overflow config value");
+        assert!(refused.contains(&file.display().to_string()), "{refused}");
+        fs::write(&file, "[pool]\nmax_active = 3\n").expect("valid file before environment checks");
+        for invalid in ["0", "33", "-1", "1.5", "18446744073709551616"] {
+            chosen.oxide_max_active = Some(invalid.into());
+            let refused = settings(&chosen).expect_err(invalid);
+            assert!(refused.contains("OXIDE_MAX_ACTIVE"), "{refused}");
+        }
+        for valid in ["1", "32"] {
+            chosen.oxide_max_active = Some(valid.into());
+            assert_eq!(
+                settings(&chosen).expect(valid).active_build_limit.value,
+                valid.parse::<usize>().unwrap()
+            );
+        }
+        chosen.oxide_max_active = None;
+        fs::write(&file, "[pool]\nmax_active = \"three\"\n").expect("wrong type");
+        chosen.oxide_max_active = Some("4".into());
+        let refused = settings(&chosen).expect_err("wrong-type lower-priority value");
+        assert!(refused.contains(&file.display().to_string()), "{refused}");
+        chosen.oxide_max_active = None;
         fs::write(&file, "[pool]\nbudgte = \"2GB\"\n").expect("typo");
         chosen.oxide_pool_cap = None;
         let refused = settings(&chosen).expect_err("unknown key");
@@ -770,6 +1014,62 @@ mod tests {
         fs::write(&file, "not toml at all [").expect("malformed");
         let refused = settings(&chosen).expect_err("malformed");
         assert!(refused.contains(&file.display().to_string()), "{refused}");
+    }
+
+    #[test]
+    fn physical_core_formula_and_fallback_are_explicit() {
+        for (cores, expected) in [
+            (1, 2),
+            (7, 2),
+            (8, 2),
+            (11, 2),
+            (12, 3),
+            (15, 3),
+            (16, 4),
+            (1024, 4),
+        ] {
+            let mut input = facts(true);
+            input.physical_cores = PhysicalCoreCount::Available(cores);
+            let active = settings(&input)
+                .expect("derived setting")
+                .active_build_limit;
+            assert_eq!(active.value, expected, "{cores} cores");
+            assert_eq!(active.source, Source::Default);
+            let provenance = active.provenance(Path::new("/config"));
+            assert!(
+                provenance.contains(&format!("hw.physicalcpu={cores}")),
+                "{provenance}"
+            );
+            assert!(provenance.contains("floor("), "{provenance}");
+        }
+
+        for fact in [
+            PhysicalCoreCount::Available(0),
+            PhysicalCoreCount::Available(1025),
+            PhysicalCoreCount::Available(usize::MAX),
+            PhysicalCoreCount::Unavailable("sysctl name is missing".to_owned()),
+            PhysicalCoreCount::Unavailable("injected query failure".to_owned()),
+        ] {
+            let mut input = facts(true);
+            input.physical_cores = fact;
+            let active = settings(&input)
+                .expect("fallback setting")
+                .active_build_limit;
+            assert_eq!(active.value, FALLBACK_MAX_ACTIVE);
+            assert!(active
+                .provenance(Path::new("/config"))
+                .contains("physical-core fallback"));
+        }
+
+        let mut other_platform = facts(false);
+        other_platform.physical_cores = PhysicalCoreCount::Available(64);
+        let active = settings(&other_platform)
+            .expect("other platform fallback")
+            .active_build_limit;
+        assert_eq!(active.value, FALLBACK_MAX_ACTIVE);
+        assert!(active
+            .provenance(Path::new("/config"))
+            .contains("unsupported on this platform"));
     }
 
     #[test]

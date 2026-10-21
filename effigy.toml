@@ -205,6 +205,18 @@ run = "python3 scripts/test-oxide-finder-metadata.py"
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-oxide-pool-layout.py"
 
+# Host-wide active-build limit (oxide#111), under the qualified #109 shared
+# supervisor (SHA-256 8e379c93416c6e06b7f06bec7f86dba4fca4c8900b1cc87f1eb6303d39897a9d).
+# Stages oxide offline with 1.97.1; status reports derived/config/environment
+# provenance; tiny exec fixtures prove cap 2 waits for the third, config 3
+# admits the third and waits for the fourth, release admits waiters, and a
+# synthetic unavailable removable registration still counts both pools. No
+# real removable volume or fixture compilation. 300 s absolute, 512 MiB
+# monitored scratch; script stops work 30 s before the supervisor deadline.
+[tasks."rust:max-active"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-max-active.py"
+
 # SUSPENDED by oxide#102 (retired image pool provisioning; refuses before
 # any effect until migrated). Cargo version matrix (oxide#091): one logical proof per exact stable
 # release. Each stages `oxide` offline with the builder 1.97.1, then runs the

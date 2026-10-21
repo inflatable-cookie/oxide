@@ -63,10 +63,14 @@ dev profile, so outputs land in target/debug as with plain Cargo; release is the
 project's own. --cargo-profile oxide-quick/oxide-debug still build but are
 deprecated: external tools get the quick recipe without them. Oxide places build output, so --target-dir and --config
 build.build-dir/target-dir are refused. Adoption writes one marked block in the
-workspace-root AGENTS.md and prints readiness; there is no Oxide config file.
+workspace-root AGENTS.md and prints readiness; adoption does not create an
+Oxide config file.
 A whole-target clean refuses entries Cargo does not create in target/ unless
 --include-foreign is given; --dry-run prints every path it would remove.
-OXIDE_POOL selects the pool; OXIDE_MAX_ACTIVE the host-wide build limit (2).
+OXIDE_POOL selects the pool; OXIDE_MAX_ACTIVE sets the host-wide active-build
+limit (1–32), ahead of [pool] max_active in the user config. The automatic
+macOS default is min(4, max(2, floor(physical cores/4))); other platforms and
+unavailable core counts use 2.
 Leased builds bypass any inherited rustc wrapper (such as sccache);
 OXIDE_ALLOW_RUSTC_WRAPPER=1 keeps it, unqualified for Oxide's interruption
 and toolchain identity.
@@ -639,7 +643,7 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
         "{}",
         wrapper::status_line(wrapper::Policy::from_env(), &wrapper::inherited(&[]))
     );
-    match Store::open_existing() {
+    match Store::open_existing_with(&settings) {
         Ok(None) => {
             println!(
                 "  not created; the first building oxide command creates it ({}: {})",
@@ -1126,7 +1130,7 @@ fn print_settings(settings: &config::Settings) {
         },
         if file.present { "" } else { ", absent" }
     );
-    if let Some(ignored) = config::ignored_legacy_config(&config::Facts::from_env()) {
+    if let Some(ignored) = &settings.ignored_legacy_config {
         println!(
             "  ignored: {} exists but is never read on macOS; move its settings to the file above",
             ignored.display()
@@ -1141,6 +1145,11 @@ fn print_settings(settings: &config::Settings) {
         "  soft budget {} MB (from {})",
         settings.budget / 1_000_000,
         settings.budget_source.describe()
+    );
+    println!(
+        "host-wide active-build limit: {} (from {})",
+        settings.active_build_limit.value,
+        settings.active_build_limit.provenance(&settings.file.path)
     );
 }
 
