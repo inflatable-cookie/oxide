@@ -151,6 +151,11 @@ def source_facts(source: str) -> str:
     return ", ".join(f"{name} {sha256(os.path.join(source, name))[:16]}" for name in ("Cargo.toml", "Cargo.lock"))
 
 
+# Status's exact line for no registered removable pool: an absence, not a
+# pool section. It still ends the block before it.
+NO_REMOVABLE = "removable pool: none registered"
+
+
 def sections(stdout: str) -> list:
     """(header, slot lines) per pool block, in display order."""
     blocks = []
@@ -161,7 +166,7 @@ def sections(stdout: str) -> list:
             blocks[-1][1].append(line)
         elif not line.startswith(" ") and blocks and not line.startswith(("most recent use", "selected for")):
             blocks.append((line, []))
-    return [block for block in blocks if block[0].startswith(("internal pool:", "removable pool:"))]
+    return [block for block in blocks if block[0].startswith(("internal pool:", "removable pool:")) and block[0] != NO_REMOVABLE]
 
 
 def slot_place(lines: list, slot: str) -> str:
@@ -257,6 +262,7 @@ def run(proof: Proof, repo: str) -> None:
     expect(stdout.splitlines().count("selected for the next build: internal pool (no removable volume registered)") == 1, "selection line missing")
     blocks = sections(stdout)
     expect([block[0].split(":")[0] for block in blocks] == ["internal pool"], f"blocks {blocks}")
+    expect(stdout.splitlines().count(NO_REMOVABLE) == 1, "the no-registration line is not shown exactly once")
     line = slot_place(blocks[0][1], "1")
     expect(" project app " in line and line.endswith("slots/1 (legacy path)"), f"legacy slot line: {line}")
     code, _, stderr = proof.oxide(["check"], "candidate warm on legacy slot", apps["legacy"])
