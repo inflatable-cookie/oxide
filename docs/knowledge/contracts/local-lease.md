@@ -292,6 +292,49 @@ reserve space, constrain writes during a lease, or prevent `ENOSPC`. Other
 slots still count against the budget, so ordinary admission and refusal rules
 apply after the selected generation is removed.
 
+### Proposed: ledger-only view for front-door membership checks (lead `e4c74399`)
+
+Proposed, not implemented. This is a routine correction with no admission, closure, recovery or deletion change.
+
+**Problem.** The library's `status` runs one whole-payload walk plus one walk per slot. The front door calls it on ordinary commands where it needs only ledger membership. From source at `3842239`:
+
+| Call site | What it uses from status |
+| --- | --- |
+| `Store::open_at` (internal pool, every command) | `backend` |
+| `Store::open_removable` (selection through `usable`, every command while registered) | `backend` |
+| `Store::attempt` (acquisition affinity, ~store.rs 1131) | `slots[].project` |
+| `Store::recover_settled` (~1349) | held `slots[]` by project |
+| `Store::recover_interrupted` (~1429) | held `slots[]`: `slot_id`, `lease_id`, project |
+| `removable::internal_holds` | held `slots[]` by ID |
+| `Store::payload_use` (the per-command result line) | `payload_unique_allocated_bytes`, `cap_bytes` |
+
+On a removable pool, one ordinary command therefore pays several full walks. At 201,948 entries one walk took 3.4 s.
+
+**Change.**
+1. **Typed ledger-only view.** The library adds `ledger_view(pool) -> LedgerView`. It is opened through the unchanged `Pool::open`: canonical root, foreign-entry and retired-image refusals, pool lock, config and backing verification, ledger identity checks, the slot limit and `reconcile_evicting`. It returns:
+   - `backend` and `cap_bytes`;
+   - `reconciliation_blocked`;
+   - each slot's `id`, `incarnation`, occupancy, `project`, `workspace`, `profile`, `holder` and `lease_id`.
+
+   The type has **no byte or coverage fields**, so a missing walk cannot be read as zero or Complete.
+2. **Ledger-view callers:** the first six call sites above switch to it, with identical decisions.
+3. **Full status stays** for:
+   - explicit `oxide status`, including `Store::report`, `slot_size` and the recursive reporting;
+   - `oxide init`/`new` readiness;
+   - every library admission, eviction and reuse walk. Their behaviour and bounds are unchanged.
+4. **The result line stops walking.** It no longer calls `payload_use`. On reuse, it reports the reused slot's size from the reuse walk the library already ran, labelled with its provenance ("slot 5 was 7.9 GiB when leased"). On a new slot it says "new slot". It points to `oxide status` for the pool total. No new walk is added, and nothing walks a slot after release, when another command may hold it.
+
+**Effect.** An ordinary reuse command walks only its target slot, which is the library's existing reuse walk. New-slot allocation keeps exactly today's authoritative whole-payload walk.
+
+**Proof.** Standard tier. A test hook counts accounting walks per root. On a fixture pool of at least 200,000 entries:
+- an ordinary reuse command makes zero whole-payload walks and zero walks of unrelated slots;
+- selection, affinity, held-unknown recovery and explicit recovery decide identically to before;
+- new-slot admission performs the same walks as today;
+- explicit `oxide status` still runs the full walks;
+- the result line shows its provenance label and never shows zero or Complete for an unwalked figure.
+
+The brief stops if any recovery, closure, deletion or admission semantics would change.
+
 ### Parked: cached closed-slot accounting (lead `cbb2824d`)
 
 Parked on 2026-10-21, not implemented. Sol's re-review of revision 2 (`d578447`) was again changes required. Transient hard-link mutation means an idle slot's contents and link topology cannot be shown to be unchanged cheaply, and out-of-lock walks need snapshot and conditional-commit rules. An exact cache therefore needs an immutability mechanism or an explicit policy relaxation. The per-command cost is addressed first by removing the front door's non-authoritative whole-payload walks, a separate correction. Both review verdicts are kept on the lead. Revision 2 text follows for reference. Revision 2 answers Sol's prospective review of `5852670` (changes required: shared-inode mutation, metadata outside slots, transition rules). Revision 2 drops revision 1's held baselines and overcounting sums.
