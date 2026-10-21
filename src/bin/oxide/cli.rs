@@ -79,19 +79,44 @@ impl Profile {
         }
     }
 
-    /// Cargo profile name; `release` stays the project's own profile.
-    pub fn cargo_name(self) -> &'static str {
+    /// The recipe this profile selects, in the slot compatibility key.
+    /// `quick` and `debug` share Cargo's `dev` name, so the key names the
+    /// recipe. Version 2 tunes Cargo's own `dev` profile through
+    /// [`Profile::dev_recipe`]; version 1 keys (the bare labels) built the
+    /// custom `oxide-quick` / `oxide-debug` profiles. Release is unchanged.
+    pub fn recipe_key(self) -> &'static str {
         match self {
-            Self::Quick => "oxide-quick",
-            Self::Debug => "oxide-debug",
+            Self::Quick => "quick:dev-recipe-2",
+            Self::Debug => "debug:dev-recipe-2",
             Self::Release => "release",
+        }
+    }
+
+    /// Cargo's `dev` settings this profile sets (`Some`) or clears (`None`)
+    /// in every leased child's environment. Child Cargo calls, including an
+    /// external subcommand's `$CARGO`, inherit them; `test` inherits `dev`.
+    /// Clearing keeps an outer `debug` command's build override out of a
+    /// nested `quick` one. Release leaves `dev` as the caller has it.
+    pub fn dev_recipe(self) -> &'static [(&'static str, Option<&'static str>)] {
+        match self {
+            Self::Quick => &[
+                ("CARGO_PROFILE_DEV_DEBUG", Some("line-tables-only")),
+                ("CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG", None),
+            ],
+            Self::Debug => &[
+                ("CARGO_PROFILE_DEV_DEBUG", Some("full")),
+                ("CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG", Some("full")),
+            ],
+            Self::Release => &[],
         }
     }
 }
 
-/// Environment-only profile definitions. Child Cargo calls inherit them; a
-/// `--config` definition is invisible to an external subcommand's `$CARGO`.
-pub const PROFILE_ENVIRONMENT: [(&str, &str); 5] = [
+/// Deprecated custom profiles, still defined for every leased command so an
+/// external tool's existing `--cargo-profile oxide-quick` or `oxide-debug`
+/// keeps building. Their outputs stay in `target/oxide-quick` and
+/// `target/oxide-debug`; only Oxide's own profiles moved to `target/debug`.
+pub const LEGACY_PROFILE_ENVIRONMENT: [(&str, &str); 5] = [
     ("CARGO_PROFILE_OXIDE_QUICK_INHERITS", "dev"),
     ("CARGO_PROFILE_OXIDE_QUICK_DEBUG", "line-tables-only"),
     ("CARGO_PROFILE_OXIDE_DEBUG_INHERITS", "dev"),
@@ -193,29 +218,29 @@ pub fn parse_leased(command: &str, args: &[OsString]) -> Result<Invocation, Stri
     if release && selected.is_some_and(|profile| profile != Profile::Release) {
         return Err("--release conflicts with --profile quick or debug".to_owned());
     }
-    let explicit = release || selected.is_some();
     let profile = if release {
         Profile::Release
     } else {
         selected.unwrap_or(Profile::Quick)
     };
-    // Modelled commands always name their Cargo profile; building built-ins
-    // keep Cargo's own default unless the caller chose an Oxide profile.
-    if modelled || explicit {
-        let position = cargo_args
-            .iter()
-            .position(|argument| argument == "--")
-            .unwrap_or(cargo_args.len());
-        let flags = if profile == Profile::Release {
-            vec![OsString::from("--release")]
-        } else {
-            vec![
-                OsString::from("--profile"),
-                OsString::from(profile.cargo_name()),
-            ]
-        };
-        cargo_args.splice(position..position, flags);
-    }
+    // Oxide consumes its own `--profile` and never forwards `quick` or
+    // `debug` as a Cargo profile name, even where a newer Cargo accepts
+    // `--profile debug`. Their recipe is `dev` tuned by the environment, so
+    // commands keep Cargo's default profile (`dev`, or `test` inheriting it).
+    // `bench` defaults to a release-based profile, so an explicit quick or
+    // debug bench names `dev`.
+    let flags = match profile {
+        Profile::Release => vec![OsString::from("--release")],
+        Profile::Quick | Profile::Debug if command == "bench" && selected.is_some() => {
+            vec![OsString::from("--profile"), OsString::from("dev")]
+        }
+        _ => Vec::new(),
+    };
+    let position = cargo_args
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(cargo_args.len());
+    cargo_args.splice(position..position, flags);
     if run {
         cargo_args.push(OsString::from("--message-format=json-render-diagnostics"));
     }
@@ -449,25 +474,73 @@ mod tests {
     }
 
     #[test]
-    fn modelled_commands_default_to_quick_and_translate_profiles() {
+    fn modelled_commands_consume_oxide_profiles_and_keep_cargo_defaults() {
         let quick = parse_leased("check", &args(&["-p", "demo"])).unwrap();
         assert_eq!(quick.profile, Profile::Quick);
-        assert_eq!(
-            quick.cargo_args,
-            args(&["check", "-p", "demo", "--profile", "oxide-quick"])
-        );
-        let debug =
-            parse_leased("test", &args(&["--profile", "debug", "--", "--nocapture"])).unwrap();
-        assert_eq!(
-            debug.cargo_args,
-            args(&["test", "--profile", "oxide-debug", "--", "--nocapture"])
-        );
+        assert_eq!(quick.cargo_args, args(&["check", "-p", "demo"]));
+        // Both spellings of `--profile debug` are Oxide's own: never
+        // forwarded, even though Cargo 1.99 accepts `--profile debug`.
+        for spelling in [&["--profile", "debug"][..], &["--profile=debug"]] {
+            let mut given = spelling.to_vec();
+            given.extend(["--", "--nocapture"]);
+            let debug = parse_leased("test", &args(&given)).unwrap();
+            assert_eq!(debug.profile, Profile::Debug);
+            assert_eq!(debug.cargo_args, args(&["test", "--", "--nocapture"]));
+        }
+        let explicit = parse_leased("build", &args(&["--profile", "quick"])).unwrap();
+        assert_eq!(explicit.profile, Profile::Quick);
+        assert_eq!(explicit.cargo_args, args(&["build"]));
         let release = parse_leased("build", &args(&["--release"])).unwrap();
         assert_eq!(release.profile, Profile::Release);
         assert_eq!(release.cargo_args, args(&["build", "--release"]));
+        let named = parse_leased(
+            "clippy",
+            &args(&["--profile=release", "--", "-D", "warnings"]),
+        );
+        assert_eq!(
+            named.unwrap().cargo_args,
+            args(&["clippy", "--release", "--", "-D", "warnings"])
+        );
         assert!(parse_leased("build", &args(&["--release", "--profile=quick"])).is_err());
         assert!(parse_leased("build", &args(&["--profile", "dev"])).is_err());
+        assert!(parse_leased("build", &args(&["--profile", "oxide-quick"])).is_err());
         assert!(parse_leased("build", &args(&["--profile=quick", "--profile=debug"])).is_err());
+    }
+
+    #[test]
+    fn recipes_tune_dev_and_keys_separate_them() {
+        assert_eq!(
+            Profile::Quick.dev_recipe(),
+            &[
+                ("CARGO_PROFILE_DEV_DEBUG", Some("line-tables-only")),
+                ("CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG", None),
+            ]
+        );
+        assert_eq!(
+            Profile::Debug.dev_recipe(),
+            &[
+                ("CARGO_PROFILE_DEV_DEBUG", Some("full")),
+                ("CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG", Some("full")),
+            ]
+        );
+        assert!(Profile::Release.dev_recipe().is_empty());
+        let keys = [Profile::Quick, Profile::Debug, Profile::Release].map(Profile::recipe_key);
+        assert_eq!(
+            keys,
+            ["quick:dev-recipe-2", "debug:dev-recipe-2", "release"]
+        );
+        // Version-1 keys were the bare labels; a changed recipe never meets
+        // one. Release kept its recipe and its key.
+        assert_ne!(Profile::Quick.recipe_key(), Profile::Quick.label());
+        assert_ne!(Profile::Debug.recipe_key(), Profile::Debug.label());
+        assert_eq!(Profile::Release.recipe_key(), Profile::Release.label());
+        // The deprecated custom profiles stay defined for existing adopters.
+        let legacy: Vec<&str> = LEGACY_PROFILE_ENVIRONMENT
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(legacy.contains(&"CARGO_PROFILE_OXIDE_QUICK_INHERITS"));
+        assert!(legacy.contains(&"CARGO_PROFILE_OXIDE_DEBUG_BUILD_OVERRIDE_DEBUG"));
     }
 
     #[test]
@@ -491,8 +564,6 @@ mod tests {
                 "build",
                 "--bin",
                 "demo",
-                "--profile",
-                "oxide-quick",
                 "--message-format=json-render-diagnostics"
             ])
         );
@@ -509,13 +580,30 @@ mod tests {
             external.cargo_args,
             args(&["nextest", "run", "--cargo-profile", "oxide-quick"])
         );
+        let tool = parse_leased("nextest", &args(&["run", "--cargo-profile", "debug"])).unwrap();
+        assert_eq!(tool.profile, Profile::Quick);
+        assert_eq!(
+            tool.cargo_args,
+            args(&["nextest", "run", "--cargo-profile", "debug"])
+        );
         let doc = parse_leased("doc", &args(&["--no-deps"])).unwrap();
         assert_eq!(doc.cargo_args, args(&["doc", "--no-deps"]));
+        let doc = parse_leased("doc", &args(&["--profile", "debug", "--no-deps"])).unwrap();
+        assert_eq!(doc.profile, Profile::Debug);
+        assert_eq!(doc.cargo_args, args(&["doc", "--no-deps"]));
+        // `bench` keeps its own release-based default; an explicit quick or
+        // debug bench names `dev`, whose recipe the environment sets.
+        let bench = parse_leased("bench", &args(&[])).unwrap();
+        assert_eq!(bench.profile, Profile::Quick);
+        assert_eq!(bench.cargo_args, args(&["bench"]));
         let bench = parse_leased("bench", &args(&["--profile", "debug"])).unwrap();
         assert_eq!(bench.profile, Profile::Debug);
+        assert_eq!(bench.cargo_args, args(&["bench", "--profile", "dev"]));
+        let bench = parse_leased("bench", &args(&["--release", "--", "--exact"])).unwrap();
+        assert_eq!(bench.profile, Profile::Release);
         assert_eq!(
             bench.cargo_args,
-            args(&["bench", "--profile", "oxide-debug"])
+            args(&["bench", "--release", "--", "--exact"])
         );
     }
 
@@ -608,15 +696,7 @@ mod tests {
         assert!(plain.args.is_empty() && !plain.help);
         assert_eq!(
             plain.parse_check,
-            Some(args(&[
-                "check",
-                "-p",
-                "app",
-                "--profile",
-                "oxide-quick",
-                "-Z",
-                PARSE_CHECK
-            ]))
+            Some(args(&["check", "-p", "app", "-Z", PARSE_CHECK]))
         );
         let locked = resolution(
             &parse_leased("test", &args(&["--locked"]))
@@ -640,15 +720,7 @@ mod tests {
         // The parse check goes before `--`, so it never reaches a test binary.
         assert_eq!(
             resolution(&passed.cargo_args).parse_check,
-            Some(args(&[
-                "test",
-                "--profile",
-                "oxide-quick",
-                "-Z",
-                PARSE_CHECK,
-                "--",
-                "--help"
-            ]))
+            Some(args(&["test", "-Z", PARSE_CHECK, "--", "--help"]))
         );
         // External subcommands are scanned after their name too, and have no
         // parse check: Cargo does not parse their arguments.

@@ -28,8 +28,12 @@ Plain `cargo` still works but builds privately and wastes space;
 - `--profile debug`: full debug info, for a debugger session.
 - `--release` or `--profile release`: the project's own release profile.
 
-External tools name the Cargo profile themselves, for example
-`oxide nextest run --cargo-profile oxide-quick`.
+`quick` and `debug` tune Cargo's `dev` profile, so binaries land in
+`target/debug/` as with plain Cargo; the latest build wins.
+External tools get the quick recipe with no flag: `oxide nextest run`.
+`--cargo-profile oxide-quick` is deprecated and builds into
+`target/oxide-quick/`. A tool's `--cargo-profile debug` is Cargo's own
+profile, not Oxide's `--profile debug`.
 
 ## What Oxide prints
 
@@ -98,7 +102,6 @@ When switching selectors:
   - scripts that set their own `CARGO_TARGET_DIR`, because Oxide replaces it;
   - tools that run Cargo themselves, such as the Tauri CLI;
   - container builds;
-  - scripts that read a quick build's binary from `target/debug/`;
   - tests that find sibling binaries from `current_exe()`, unless repaired. Test executables run from the slot, not `target/`. Use `env!("CARGO_BIN_EXE_<name>")` or `$CARGO_TARGET_DIR`.
 
   Full rules: [workflow](../../docs/knowledge/contracts/workflow.md#switching-an-existing-project).
