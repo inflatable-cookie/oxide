@@ -76,11 +76,18 @@ pub struct Group {
 
 /// Start `command` as the leader of a new process group.
 pub fn spawn_group(command: &mut Command) -> Result<Group, String> {
-    let child = command
-        .process_group(0)
-        .spawn()
-        .map_err(|error| format!("could not start Cargo: {error}"))?;
-    let id = i32::try_from(child.id()).map_err(|_| "Cargo process ID is out of range")?;
+    start_group(command).map_err(|error| format!("could not start Cargo: {error}"))
+}
+
+/// [`spawn_group`] keeping the start error, for `exec`'s exit code.
+pub fn start_group(command: &mut Command) -> std::io::Result<Group> {
+    let child = command.process_group(0).spawn()?;
+    let id = i32::try_from(child.id()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "process ID is out of range",
+        )
+    })?;
     Ok(Group { child, id })
 }
 

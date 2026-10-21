@@ -5,10 +5,11 @@ use super::{
     canonical_existing_dir, current_uid, ensure_private_dir, io_error, is_finder_metadata,
     is_tolerated_metadata_file, persist_private_file, random_hex, read_private_file,
     remove_tree_owned, unexpected_entry, AccountingCoverage, AccountingGap, AccountingGapKind,
-    AccountingScan, LeaseEnvironment, LeaseError, LeaseGrant, PoolStatus, Profile, ReleaseReceipt,
-    SlotOccupancy, SlotStatus, ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS,
-    ACCOUNTING_MAX_ENTRIES, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME, LOCK_NAME, MAX_HOLDER_BYTES,
-    MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, SLOTS_NAME,
+    AccountingScan, LeaseEnvironment, LeaseError, LeaseGrant, Leased, LedgerSlot, LedgerView,
+    PoolStatus, Profile, ReleaseReceipt, ReuseMeasurement, SlotOccupancy, SlotStatus,
+    ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES, CONFIG_NAME,
+    LEASE_VERSION, LEDGER_NAME, LOCK_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_PATH_BYTES,
+    MAX_SLOTS, SLOTS_NAME,
 };
 use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
 use crate::inventory::{inventory_directory, GapKind, InventoryError, InventoryLimits};
@@ -143,9 +144,9 @@ pub(super) struct Pool {
 /// sparse-image backend refuses with [`LeaseError::BackingMismatch`].
 pub mod managed {
     use super::super::{
-        ensure_private_dir, LeaseError, LeaseGrant, PoolInfo, PoolStatus, ReleaseReceipt,
-        BUDGET_BACKEND_DIRECTORY_V1, CONFIG_NAME, LEASE_VERSION, PAYLOAD_NAME, SLOTS_NAME,
-        VOLUME_BACKEND_APFS_V1,
+        ensure_private_dir, LeaseError, LeaseGrant, Leased, LedgerView, PoolInfo, PoolStatus,
+        ReleaseReceipt, BUDGET_BACKEND_DIRECTORY_V1, CONFIG_NAME, LEASE_VERSION, PAYLOAD_NAME,
+        SLOTS_NAME, VOLUME_BACKEND_APFS_V1,
     };
     use super::LeaseRequest;
     use super::{
@@ -279,6 +280,11 @@ pub mod managed {
     }
 
     pub fn lease(request: LeaseRequest) -> Result<LeaseGrant, LeaseError> {
+        lease_measured(request).map(|leased| leased.grant)
+    }
+
+    /// [`lease`], with the reuse walk's measurement of the slot it took.
+    pub fn lease_measured(request: LeaseRequest) -> Result<Leased, LeaseError> {
         Pool::open(&request.pool)?.lease(&request)
     }
 
@@ -292,6 +298,12 @@ pub mod managed {
 
     pub fn status(pool: &Path) -> Result<PoolStatus, LeaseError> {
         Pool::open(pool)?.status()
+    }
+
+    /// Ledger membership without any accounting walk; it refuses exactly
+    /// where [`status`] does.
+    pub fn ledger_view(pool: &Path) -> Result<LedgerView, LeaseError> {
+        Pool::open(pool)?.ledger_view()
     }
 
     /// Retire one recorded idle slot by ID after rechecking its durable
@@ -388,7 +400,7 @@ impl Pool {
         write_ledger(&self.root, &self.ledger)
     }
 
-    fn lease(&mut self, request: &LeaseRequest) -> Result<LeaseGrant, LeaseError> {
+    fn lease(&mut self, request: &LeaseRequest) -> Result<Leased, LeaseError> {
         if self.reconciliation_blocked {
             return Err(LeaseError::UnknownAccounting);
         }
@@ -407,7 +419,10 @@ impl Pool {
                 && existing.profile == request.profile
                 && existing.state == SlotPersistState::Held
             {
-                return self.grant_from(existing, true);
+                return Ok(Leased {
+                    grant: self.grant_from(existing, true)?,
+                    measured: None,
+                });
             }
             if existing.state == SlotPersistState::Held {
                 return Err(LeaseError::HolderConflict);
@@ -445,11 +460,31 @@ impl Pool {
             let unique = inventory_sizes(&slot_path).require_complete()?;
             if should_recycle_slot(unique, self.budget) {
                 self.retire_idle_slot(idle, incarnation, &project, request.profile)?;
-                return self.allocate(project, workspace, request);
+                return self.allocate_unmeasured(project, workspace, request);
             }
-            return self.take_idle(idle, incarnation, project, workspace, request);
+            return Ok(Leased {
+                grant: self.take_idle(idle, incarnation, project, workspace, request)?,
+                measured: Some(ReuseMeasurement {
+                    slot_id: idle.to_string(),
+                    incarnation: incarnation.to_string(),
+                    unique_allocated_bytes: unique,
+                }),
+            });
         }
-        self.allocate(project, workspace, request)
+        self.allocate_unmeasured(project, workspace, request)
+    }
+
+    /// A new slot: nothing measured it.
+    fn allocate_unmeasured(
+        &mut self,
+        project: PathBuf,
+        workspace: PathBuf,
+        request: &LeaseRequest,
+    ) -> Result<Leased, LeaseError> {
+        Ok(Leased {
+            grant: self.allocate(project, workspace, request)?,
+            measured: None,
+        })
     }
 
     fn evict_idle(&mut self, slot_id: &str) -> Result<(), LeaseError> {
@@ -617,19 +652,16 @@ impl Pool {
                     coverage = AccountingCoverage::Unknown;
                 }
             }
+            let member = ledger_slot(slot);
             slots.push(SlotStatus {
-                slot_id: slot.id.to_string(),
-                incarnation: slot.incarnation.to_string(),
-                state: occupancy(slot.state),
-                project: slot.project.clone(),
-                workspace: slot.workspace.clone(),
-                profile: slot.profile,
-                holder: if slot.state == SlotPersistState::Held {
-                    Some(slot.holder.clone())
-                } else {
-                    None
-                },
-                lease_id: slot.lease_id.clone(),
+                slot_id: member.slot_id,
+                incarnation: member.incarnation,
+                state: member.state,
+                project: member.project,
+                workspace: member.workspace,
+                profile: member.profile,
+                holder: member.holder,
+                lease_id: member.lease_id,
                 logical_bytes: sizes.logical,
                 unique_allocated_bytes: sizes.unique,
                 accounting: sizes.scan,
@@ -651,6 +683,24 @@ impl Pool {
             coverage,
             payload_accounting: accounted.scan,
             full,
+            slots,
+        })
+    }
+
+    /// Status's opening and per-record refusals without its walks: a zero
+    /// slot ID and a slot-root lookup error other than `NotFound` refuse in
+    /// the same ledger order. A missing root, held or idle, stays a member.
+    fn ledger_view(&self) -> Result<LedgerView, LeaseError> {
+        let mut slots = Vec::new();
+        for slot in &self.ledger.slots {
+            self.slot_root(slot.id)?;
+            slots.push(ledger_slot(slot));
+        }
+        Ok(LedgerView {
+            store_id: self.config.store_id.clone(),
+            backend: self.config.backend.clone(),
+            cap_bytes: self.config.cap_bytes,
+            reconciliation_blocked: self.reconciliation_blocked,
             slots,
         })
     }
@@ -874,27 +924,32 @@ impl Pool {
         inventory_sizes_deeper(self.backing.payload_root(), 1)
     }
 
-    fn slot_accounting(&self, id: u64) -> Result<Sizes, LeaseError> {
+    /// A slot's path and no-follow root metadata, `None` when missing. A
+    /// zero ID and any other lookup error refuse; status and the ledger view
+    /// share these checks.
+    fn slot_root(&self, id: u64) -> Result<(PathBuf, Option<fs::Metadata>), LeaseError> {
         let path = self.slot_path(id)?;
         match fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Sizes {
-                    logical: Some(0),
-                    unique: Some(0),
-                    scan: scan(AccountingCoverage::Complete, Vec::new(), 0, 0),
-                });
-            }
-            Err(error) => return Err(io_error(error)),
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Ok(Sizes {
-                    logical: None,
-                    unique: None,
-                    scan: root_failure(AccountingGapKind::RootSymlink, 0),
-                });
-            }
-            Ok(_) => {}
+            Ok(metadata) => Ok((path, Some(metadata))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((path, None)),
+            Err(error) => Err(io_error(error)),
         }
-        Ok(inventory_sizes(&path))
+    }
+
+    fn slot_accounting(&self, id: u64) -> Result<Sizes, LeaseError> {
+        match self.slot_root(id)? {
+            (_, None) => Ok(Sizes {
+                logical: Some(0),
+                unique: Some(0),
+                scan: scan(AccountingCoverage::Complete, Vec::new(), 0, 0),
+            }),
+            (_, Some(metadata)) if metadata.file_type().is_symlink() => Ok(Sizes {
+                logical: None,
+                unique: None,
+                scan: root_failure(AccountingGapKind::RootSymlink, 0),
+            }),
+            (path, Some(_)) => Ok(inventory_sizes(&path)),
+        }
     }
 }
 
@@ -1027,6 +1082,20 @@ impl Sizes {
                 self.scan.clone(),
             ))),
         }
+    }
+}
+
+/// A record's membership fields, as status and the ledger view show them.
+fn ledger_slot(slot: &SlotRecord) -> LedgerSlot {
+    LedgerSlot {
+        slot_id: slot.id.to_string(),
+        incarnation: slot.incarnation.to_string(),
+        state: occupancy(slot.state),
+        project: slot.project.clone(),
+        workspace: slot.workspace.clone(),
+        profile: slot.profile,
+        holder: (slot.state == SlotPersistState::Held).then(|| slot.holder.clone()),
+        lease_id: slot.lease_id.clone(),
     }
 }
 

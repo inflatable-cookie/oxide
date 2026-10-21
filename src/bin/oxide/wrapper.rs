@@ -244,7 +244,7 @@ fn config_values(args: &[OsString]) -> Vec<String> {
 }
 
 /// One line, bounded: control characters escaped, long text cut.
-fn shown(text: &str) -> String {
+pub fn shown(text: &str) -> String {
     let escaped: String = text
         .chars()
         .map(|character| {

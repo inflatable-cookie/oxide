@@ -20,11 +20,11 @@ mod store;
 mod watchdog;
 mod wrapper;
 
-use cli::{Class, Invocation, PROFILE_ENVIRONMENT};
+use cli::{Class, Invocation, Profile, LEGACY_PROFILE_ENVIRONMENT};
 use freshness::{Gate, Refusal};
 use identity::{RunPick, SlotKey};
 use oxide_storage::inventory::{inventory_directory, Category, InventoryLimits};
-use oxide_storage::lease::{AccountingCoverage, PoolStatus, SlotOccupancy};
+use oxide_storage::lease::{AccountingCoverage, PoolStatus, ReuseMeasurement, SlotOccupancy};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
@@ -45,6 +45,8 @@ oxide: Cargo with managed build storage and profiles
 USAGE:
     oxide <check|test|clippy|build|run> [--profile quick|debug|release] [cargo args] [-- args]
     oxide <other cargo command> [args]   passed to Cargo; leased when it can build
+    oxide exec [--manifest-path <Cargo.toml>] [--profile quick|debug|release] -- <command> [args]
+                                         run a tool that calls Cargo itself, leased
     oxide clean [--dry-run] [--include-foreign]
                                          remove <workspace>/target and slot affinity; slots stay
     oxide clean <-p|--doc|--profile ...> Cargo's selected clean, same storage rules
@@ -56,8 +58,10 @@ USAGE:
     oxide init [cargo init args] [path]  cargo init if no Cargo.toml, then adopt Oxide
     oxide new <path> [cargo new args]    cargo new, then adopt Oxide
 
-Profiles: quick (default, line tables), debug (full debug info), release (the
-project's own). Oxide places build output, so --target-dir and --config
+Profiles: quick (default, line tables) and debug (full debug info) tune Cargo's
+dev profile, so outputs land in target/debug as with plain Cargo; release is the
+project's own. --cargo-profile oxide-quick/oxide-debug still build but are
+deprecated: external tools get the quick recipe without them. Oxide places build output, so --target-dir and --config
 build.build-dir/target-dir are refused. Adoption writes one marked block in the
 workspace-root AGENTS.md and prints readiness; there is no Oxide config file.
 A whole-target clean refuses entries Cargo does not create in target/ unless
@@ -121,6 +125,13 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
         Class::Clean => clean::run(rest),
         Class::Init => adopt::run_init(rest),
         Class::New => adopt::run_new(rest),
+        Class::Exec => match cli::parse_exec(rest)? {
+            Some(invocation) => run_invocation(invocation),
+            None => {
+                print!("{}", cli::EXEC_USAGE);
+                Ok(0)
+            }
+        },
         Class::Modelled | Class::Building => run_leased(command, rest),
     }
 }
@@ -131,12 +142,23 @@ fn exec_cargo(args: &[OsString]) -> String {
     format!("could not start Cargo: {error}")
 }
 
-pub(crate) fn apply_storage(command: &mut Command, build_dir: &Path, checkout: &Path) {
+pub(crate) fn apply_storage(
+    command: &mut Command,
+    build_dir: &Path,
+    checkout: &Path,
+    profile: Profile,
+) {
     command
         .env("CARGO_BUILD_BUILD_DIR", build_dir)
         .env("CARGO_TARGET_DIR", checkout.join("target"))
         .env_remove("CARGO_BUILD_TARGET_DIR");
-    for (name, value) in PROFILE_ENVIRONMENT {
+    for (name, value) in profile.dev_recipe() {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+    for (name, value) in LEGACY_PROFILE_ENVIRONMENT {
         command.env(name, value);
     }
     wrapper::apply(command);
@@ -167,10 +189,37 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
             RunPick::Unresolved => {}
         }
     }
+    run_invocation(invocation)
+}
+
+/// What `oxide status` shows as an exec holder: `exec <program>`, escaped
+/// and bounded to one line.
+fn exec_label(tool: &[OsString]) -> Option<String> {
+    let program = tool.first()?;
+    Some(format!(
+        "exec {}",
+        wrapper::shown(&program.to_string_lossy())
+    ))
+}
+
+/// The tool's standard input: a terminal stays with Oxide, because the
+/// tool's own process group is in the background and a terminal read would
+/// stop it. Anything else (a pipe, a file, nothing) passes through.
+fn exec_stdin() -> Stdio {
+    // SAFETY: isatty only inspects descriptor 0.
+    if unsafe { libc::isatty(0) } == 1 {
+        Stdio::null()
+    } else {
+        Stdio::inherit()
+    }
+}
+
+fn run_invocation(invocation: Invocation) -> Result<u8, String> {
+    let exec = invocation.command == "exec";
     let key = SlotKey::resolve(
         CARGO,
         invocation.manifest_path.as_deref(),
-        invocation.profile.label(),
+        invocation.profile.recipe_key(),
         invocation.target.as_deref(),
     )?;
     process::install_signal_handlers()?;
@@ -181,7 +230,14 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     }
     let started = Instant::now();
     let resolution = cli::resolution(&invocation.cargo_args);
-    let (held, gate) = match lease_with_gate(&store, &key, invocation.profile, &resolution)? {
+    let label = exec_label(&invocation.tool);
+    let (held, gate) = match lease_with_gate(
+        &store,
+        &key,
+        invocation.profile,
+        &resolution,
+        label.as_deref(),
+    )? {
         Ok(leased) => leased,
         Err(Stop::Signal(signal)) => return Ok(process::signal_exit_code(signal)),
         Err(Stop::Cargo(code)) => return Ok(code),
@@ -191,8 +247,8 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
         store.release(held, origin)?;
         return Ok(process::signal_exit_code(signal));
     }
-    let run = command == "run";
-    let config_args = if cli::reads_config_args(command) {
+    let run = invocation.command == "run";
+    let config_args = if cli::reads_config_args(&invocation.command) {
         &invocation.cargo_args[..]
     } else {
         &[]
@@ -201,21 +257,52 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
         wrapper::Policy::from_env(),
         &wrapper::inherited(config_args),
     );
-    let mut cargo = Command::new(CARGO);
-    cargo.args(&invocation.cargo_args);
-    apply_storage(&mut cargo, &held.build_dir, &key.checkout);
+    let mut cargo = match invocation.tool.split_first() {
+        Some((program, args)) => {
+            let mut tool = Command::new(program);
+            tool.args(args).stdin(exec_stdin());
+            tool
+        }
+        None => {
+            let mut cargo = Command::new(CARGO);
+            cargo.args(&invocation.cargo_args);
+            cargo
+        }
+    };
+    apply_storage(
+        &mut cargo,
+        &held.build_dir,
+        &key.checkout,
+        invocation.profile,
+    );
     if run {
         cargo.stdout(Stdio::piped());
     }
-    let mut group = match store
+    let started_group = store
         .mark_spawning(&held)
-        .and_then(|()| process::spawn_group(&mut cargo))
-    {
+        .map_err(Unstarted::Record)
+        .and_then(|()| process::start_group(&mut cargo).map_err(Unstarted::Spawn));
+    let mut group = match started_group {
         Ok(group) => group,
         Err(error) => {
             let origin = held.prior.unchanged();
             store.release(held, origin)?;
-            return Err(error);
+            return match error {
+                Unstarted::Record(error) => Err(error),
+                Unstarted::Spawn(error) if exec => {
+                    eprintln!(
+                        "oxide: could not start {}: {error}",
+                        wrapper::shown(&invocation.tool[0].to_string_lossy())
+                    );
+                    // A shell's convention: 127 not found, 126 not runnable.
+                    Ok(if error.kind() == std::io::ErrorKind::NotFound {
+                        127
+                    } else {
+                        126
+                    })
+                }
+                Unstarted::Spawn(error) => Err(format!("could not start Cargo: {error}")),
+            };
         }
     };
     let mut watchdog = store.watchdog();
@@ -260,6 +347,7 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     }
     let slot = held.slot_id.clone();
     let warm = held.reused;
+    let measured = held.measured.clone();
     let note = [gate.describe(), wrapper_note]
         .into_iter()
         .flatten()
@@ -270,7 +358,15 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     store.release(held, origin)?;
     let (status, executable) = outcome?;
     let status = status.ok_or("Cargo ended without a status")?;
-    print_summary(&store, &invocation, &slot, warm, started, note.as_deref());
+    print_summary(
+        &store,
+        &invocation,
+        &slot,
+        warm,
+        measured.as_ref(),
+        started,
+        note.as_deref(),
+    );
     if store.backend == Backend::ApfsVolume {
         match store.last_flush() {
             Some(flush) if flush.slot_id == slot => match flush.micros {
@@ -306,6 +402,14 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     }
 }
 
+/// Why the leased child did not start.
+enum Unstarted {
+    /// Recording the spawn failed; nothing was started.
+    Record(String),
+    /// The program could not be started.
+    Spawn(std::io::Error),
+}
+
 /// Why a leased command ends before its Cargo runs.
 enum Stop {
     /// A signal received while waiting.
@@ -327,12 +431,13 @@ fn lease_with_gate(
     key: &SlotKey,
     profile: cli::Profile,
     resolution: &cli::Resolution,
+    label: Option<&str>,
 ) -> Result<Result<(store::Lease, Gate), Stop>, String> {
     let mut share = true;
     // A refusal leaves this checkout without a record, so the next lease is
     // a new or evicted slot; the bound only guards against a defect.
     for _ in 0..4 {
-        let mut held = match store.acquire(key, profile, share)? {
+        let mut held = match store.acquire(key, profile, share, label)? {
             Acquired::Lease(held) => held,
             Acquired::Interrupted(signal) => return Ok(Err(Stop::Signal(signal))),
         };
@@ -475,27 +580,36 @@ fn run_artifact(line: &str, selection: Option<&str>) -> Option<(String, PathBuf,
     ))
 }
 
-/// One line: profile, strategy, slot warmth, elapsed time and pool use.
+/// One line: profile, strategy, slot warmth, elapsed time, the slot's size
+/// when leased and this command's budget. It walks nothing: the size is the
+/// library's reuse walk of that exact slot generation, never a walk after
+/// release, when another command may hold the slot.
 fn print_summary(
     store: &Store,
     invocation: &Invocation,
     slot: &str,
     warm: bool,
+    measured: Option<&ReuseMeasurement>,
     started: Instant,
     note: Option<&str>,
 ) {
     let strategy = match invocation.command.as_str() {
-        "run" | "test" => "build+execute",
+        "run" | "test" | "exec" => "build+execute",
         _ => "build",
     };
-    let pool = match store.payload_use() {
-        Some((used, budget)) => format!(
-            "pool {} MiB allocated of {} MiB budget",
-            used / MIB,
-            budget / MIB
+    let size = match measured {
+        Some(measured) => format!(
+            "slot {} was {} MiB when leased",
+            measured.slot_id,
+            measured.unique_allocated_bytes / MIB
         ),
-        None => "pool use unknown".to_owned(),
+        None if !warm => "new slot".to_owned(),
+        None => "slot size unknown".to_owned(),
     };
+    let pool = format!(
+        "{size}, {} MiB budget, pool total: see oxide status",
+        store.command_budget() / MIB
+    );
     let backend = match store.backend {
         Backend::DirectoryBudget => format!(" ({}, budget-only)", store.backend.tag()),
         Backend::ApfsVolume => format!(
@@ -651,9 +765,13 @@ fn print_pool(store: &Store) -> Result<(), String> {
                             .to_owned()
                     }
                 };
-                format!("held by an interrupted command (oxide pid {holder}, {path})")
+                let command = slot.holder.as_deref().unwrap_or("command");
+                format!("held by an interrupted {command} (oxide pid {holder}, {path})")
             }
-            (SlotOccupancy::Held, None) => "held".to_owned(),
+            (SlotOccupancy::Held, None) => match &slot.holder {
+                Some(command) => format!("held by {command}"),
+                None => "held".to_owned(),
+            },
             _ => "idle".to_owned(),
         };
         let owner = match (&slot.checkout, slot.managed) {
@@ -869,6 +987,62 @@ fn print_other_pools(settings: &config::Settings) {
                 "other pool path: {} (unrecognised; left alone)",
                 path.display()
             ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::ffi::OsStr;
+
+    fn environment(profile: Profile) -> HashMap<String, Option<String>> {
+        let mut command = Command::new(CARGO);
+        command.env("CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG", "full");
+        apply_storage(
+            &mut command,
+            Path::new("/pool/slot/build"),
+            Path::new("/work"),
+            profile,
+        );
+        command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(OsStr::to_string_lossy).map(Into::into),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn leased_children_get_the_dev_recipe_and_legacy_definitions() {
+        let set = |value: &str| Some(Some(value.to_owned()));
+        let quick = environment(Profile::Quick);
+        assert_eq!(quick.get("CARGO_TARGET_DIR"), set("/work/target").as_ref());
+        assert_eq!(
+            quick.get("CARGO_PROFILE_DEV_DEBUG"),
+            set("line-tables-only").as_ref()
+        );
+        // An outer debug command's build override never reaches quick.
+        assert_eq!(
+            quick.get("CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG"),
+            Some(&None)
+        );
+        let debug = environment(Profile::Debug);
+        assert_eq!(debug.get("CARGO_PROFILE_DEV_DEBUG"), set("full").as_ref());
+        assert_eq!(
+            debug.get("CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG"),
+            set("full").as_ref()
+        );
+        let release = environment(Profile::Release);
+        assert_eq!(release.get("CARGO_PROFILE_DEV_DEBUG"), None);
+        for profile in [quick, debug, release] {
+            for (name, value) in LEGACY_PROFILE_ENVIRONMENT {
+                assert_eq!(profile.get(name), set(value).as_ref(), "{name}");
+            }
         }
     }
 }

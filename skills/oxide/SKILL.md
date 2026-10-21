@@ -17,7 +17,18 @@ oxide test -p core -- --nocapture
 oxide run -- --port 8080
 oxide add serde        # non-building commands are plain Cargo
 oxide nextest run      # external subcommands work too
+oxide exec -- npm run tauri build   # a tool that runs Cargo itself
 ```
+
+`oxide exec [--manifest-path <Cargo.toml>] [--profile quick|debug|release] -- <command…>`
+runs one tool that calls Cargo for one workspace with Oxide's storage, recipe
+and wrapper policy. Oxide's options go before `--`; the command after it is
+kept exactly and keeps your working directory. `--profile` picks the recipe
+only: the tool still chooses dev or release itself. Outputs stay in
+`<workspace>/target`. The slot stays held until every process in the tool's
+group exits. A terminal stdin is not passed (the tool reads end-of-file).
+Cooperative only: a tool that sets its own `CARGO_TARGET_DIR`, switches
+workspace or toolchain, or daemonizes escapes Oxide.
 
 Plain `cargo` still works but builds privately and wastes space;
 `oxide status` reports that output.
@@ -28,8 +39,12 @@ Plain `cargo` still works but builds privately and wastes space;
 - `--profile debug`: full debug info, for a debugger session.
 - `--release` or `--profile release`: the project's own release profile.
 
-External tools name the Cargo profile themselves, for example
-`oxide nextest run --cargo-profile oxide-quick`.
+`quick` and `debug` tune Cargo's `dev` profile, so binaries land in
+`target/debug/` as with plain Cargo; the latest build wins.
+External tools get the quick recipe with no flag: `oxide nextest run`.
+`--cargo-profile oxide-quick` is deprecated and builds into
+`target/oxide-quick/`. A tool's `--cargo-profile debug` is Cargo's own
+profile, not Oxide's `--profile debug`.
 
 ## What Oxide prints
 
@@ -46,13 +61,15 @@ Oxide says the gate refused a slot, it builds cold instead; that is safe.
 
 ## Waits and refusals
 
-- `oxide: waiting for …` means another build holds the slot or the host limit.
-  Let it wait; do not kill it or fall back to `cargo`. Ctrl-C cancels a wait
+- `oxide: waiting for …` means the host limit is reached, or this checkout's
+  slots are all busy with no room for another. A second command in a busy
+  checkout normally takes another slot instead of waiting. Let it wait; do not kill it or fall back to `cargo`. Ctrl-C cancels a wait
   (exit 130).
 - Oxide places build output, so it refuses `--target-dir`, a leading
   `+toolchain`, `--config` keys for `build.build-dir` / `build.target-dir`, and
   `--config` file paths. Drop the flag; do not work around it.
-- Exit codes are Cargo's, or the program's for `oxide run`.
+- Exit codes are Cargo's, or the program's for `oxide run` and `oxide exec`
+  (127: program not found).
 - `oxide: reserve stop: …` on a directory pool means host free space fell
   below about 22 GiB, so Oxide stopped the build to protect the 20 GiB
   reserve. Free disk space before retrying; do not loop. If it says closure
@@ -96,9 +113,8 @@ When switching selectors:
 - **CI:** if CI calls the same selectors, run `cargo` when `GITHUB_ACTIONS=true` and `oxide` otherwise, failing loudly when `oxide` is missing.
 - **Stay on `cargo`:**
   - scripts that set their own `CARGO_TARGET_DIR`, because Oxide replaces it;
-  - tools that run Cargo themselves, such as the Tauri CLI;
+  - tools that run Cargo themselves, such as the Tauri CLI, unless run through `oxide exec` and checked in that project;
   - container builds;
-  - scripts that read a quick build's binary from `target/debug/`;
   - tests that find sibling binaries from `current_exe()`, unless repaired. Test executables run from the slot, not `target/`. Use `env!("CARGO_BIN_EXE_<name>")` or `$CARGO_TARGET_DIR`.
 
   Full rules: [workflow](../../docs/knowledge/contracts/workflow.md#switching-an-existing-project).

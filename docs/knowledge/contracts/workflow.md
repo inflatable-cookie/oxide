@@ -27,6 +27,7 @@ until this foundation works consistently.
 ```text
 oxide <check|test|clippy|build|run> [--profile <name>] [cargo args] [-- program args]
 oxide <any other cargo command> [args]   # passed to Cargo, with storage where it builds
+oxide exec [--manifest-path <Cargo.toml>] [--profile <name>] -- <command…>  # a tool that calls Cargo itself
 oxide status                             # pool, slots, waits, stray Cargo output, Cargo home
 oxide status --launch-check              # macOS: a new executable's first-launch penalty, advisory
 oxide clean [--dry-run] [--include-foreign]  # remove <workspace>/target and slot affinity
@@ -43,7 +44,7 @@ Commands fall into four classes:
 | Building passthrough | Other built-ins that compile (`doc`, `bench`, `rustc`, `rustdoc`, `fix`) and every unknown or external subcommand (`nextest`, `llvm-cov`, `miri`) | Passed to Cargo unchanged, under a lease with storage and profile definitions injected. Unknown commands are treated as building, which is the conservative choice. |
 | Plain passthrough | Non-building built-ins (`fmt`, `tree`, `metadata`, `add`, `remove`, `update`, `info`, `search`, `install`, `publish`, `login`, `vendor`, `fetch`, `generate-lockfile`, `locate-project`, `pkgid`, `version`, `help`) | Run as plain Cargo; no lease. |
 | Extended built-ins | `init`, `new`, `clean` | Cargo's command plus Oxide's step (see [adoption](#adoption-oxide-init)). `clean` removes the checkout's private outputs and slot affinity and never deletes a shared slot: a 2026-10-18 probe showed plain `cargo clean` also deletes the injected build directory. A whole-target clean is Oxide's own plan ([clean](#clean)). |
-| Oxide-owned | `status` | Oxide semantics. |
+| Oxide-owned | `status`, `pool`, `exec` | Oxide semantics. `exec` runs a tool that calls Cargo itself under a lease ([below](#oxide-exec-cargo-wrapping-tools)); it shadows an external `cargo-exec` subcommand, which stays reachable as plain `cargo exec`. |
 
 - A built-in Oxide extends keeps Cargo's meaning and adds to it. Purely
   Oxide verbs never reuse a Cargo built-in name.
@@ -51,14 +52,15 @@ Commands fall into four classes:
   Oxide owns storage placement, so `--target-dir`, and `--config` keys that set
   `build.build-dir` or `build.target-dir`, are refused with an explanation.
 - All injection uses environment variables (`CARGO_BUILD_BUILD_DIR`,
-  `CARGO_TARGET_DIR`, `CARGO_PROFILE_OXIDE_*`), because child Cargo calls inherit
-  them. A 2026-10-18 probe on 1.97.1 showed that a `--config` profile
-  definition is invisible to an external subcommand's `$CARGO` call, while an
+  `CARGO_TARGET_DIR`, `CARGO_PROFILE_DEV_*`, the deprecated
+  `CARGO_PROFILE_OXIDE_*`), because child Cargo calls inherit them. A
+  2026-10-18 probe on 1.97.1 showed that a `--config` profile definition is
+  invisible to an external subcommand's `$CARGO` call, while an
   environment-only definition works there.
-- Built-in commands get `--profile <oxide name>` translated to the Cargo profile
-  name. External tools receive arguments untouched. They name the Cargo profile
-  themselves (for example `oxide nextest run --cargo-profile oxide-quick`), or
-  they get Cargo's default profile in a separate unit set.
+- Built-in commands consume Oxide's `--profile quick|debug` and keep Cargo's
+  default profile; `release` becomes `--release` (see [profiles](#profiles-and-strategies)).
+  External tools receive arguments untouched and build with the quick recipe
+  through the inherited `dev` settings, with no profile flag.
 
 ## Profiles and strategies
 
@@ -71,14 +73,20 @@ intent for one command. Names stay stable while strategies improve.
 | `debug` | Full debugger experience | Full-debug recipe | Full-debug build plus execute | Full-debug build plus execute |
 | `release` | Production-shaped output | Project's own `release` profile | Release build plus execute | Release build plus execute |
 
-Cargo recipes are defined through environment variables only, so no
-`Cargo.toml` edit is needed. A 2026-10-18 probe confirmed that a custom profile
-defined that way builds, works from child Cargo calls and inherits the
-project's own `[profile.dev]` settings:
+`quick` and `debug` tune Cargo's built-in `dev` profile through
+`CARGO_PROFILE_DEV_*` environment variables on every leased Cargo process
+(Tom, 2026-10-20, [vision](../vision.md#product-workflow-direction); oxide#106).
+No `Cargo.toml` or machine configuration changes. Every other `dev` setting
+stays the project's own, `test` inherits the recipe, and child Cargo calls,
+including an external subcommand's, inherit it with no profile flag. Final
+outputs therefore land where plain Cargo puts them, `target/debug/`:
 
-- `oxide-quick`: inherits `dev`, `debug = "line-tables-only"` for every unit.
+- `quick`: `CARGO_PROFILE_DEV_DEBUG=line-tables-only` for every unit; it
+  clears `CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG`, so build-time units keep
+  Cargo's `dev` default (no debug info) and an outer `debug` command's
+  setting never reaches a nested quick one.
   Per-package overrides (`package."*"`) cannot be expressed through the
-  environment; the probe showed the dependency stayed at line tables. So this
+  environment; a 2026-10-18 probe showed the dependency stayed at line tables. So this
   recipe keeps dependency line tables, unlike the `oxide-light` recipe in
   [stable Cargo profiles](stable-cargo-profiles.md). Whether dependency debug-off
   is worth a config file is part of [W-3](#open-decisions).
@@ -87,14 +95,35 @@ project's own `[profile.dev]` settings:
   `split-debuginfo = "packed"` if a fix is adopted and rejects workspace
   debug-off for `quick` ([landscape](../rust-dx-landscape.md#stale-debug-object-measurement-2026-10-18)).
   The recipe is unchanged pending that decision.
-- `oxide-debug`: inherits `dev`, full debug for every unit, including build-time
-  units through `CARGO_PROFILE_OXIDE_DEBUG_BUILD_OVERRIDE_DEBUG`.
-- `release`: untouched.
+- `debug`: `CARGO_PROFILE_DEV_DEBUG=full` and
+  `CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG=full`: full debug for every unit,
+  including build-time units.
+- `release`: untouched; `dev` stays as the caller has it.
 
-`debug` cannot be a Cargo profile name because Cargo reserves it; the `oxide-`
-prefix also avoids clashing with project profiles. The recipes are the
-intended defaults, not measured speed or storage claims. That contract's
-comparison stands as a no-go.
+Commands keep Cargo's default profile: `dev` for `check`, `clippy`, `build`,
+`run`, `doc`, `rustc`, `rustdoc` and `fix`, `test` (inheriting `dev`) for
+`test`. `bench` keeps its release-based default; an explicit `--profile quick`
+or `debug` bench passes `--profile dev`. Both recipes share
+`target/debug/<bin>` and the latest build wins, as with plain Cargo. Their
+intermediates stay in separate slots ([key](#project-identity-without-configuration)).
+
+Oxide always consumes its own `--profile debug`. Cargo 1.99 adds a built-in
+`debug` profile, currently like `dev`; a 2026-10-20 probe built
+`--profile debug` into `target/debug/` on 1.99.1 and 1.97.1 refused it
+([landscape](../rust-dx-landscape.md#rust-1981100-relevance-2026-10-20)).
+A tool argument such as `oxide nextest run --cargo-profile debug` passes
+through unchanged and selects Cargo's own version-dependent profile, which is
+not Oxide's full-debug recipe: that profile's inheritance and build override
+are Cargo's. Use `oxide nextest run` for the quick recipe.
+
+**Deprecated custom profiles.** Before oxide#106 the recipes were the custom
+profiles `oxide-quick` and `oxide-debug`, built into `target/oxide-quick/` and
+`target/oxide-debug/`. Their `CARGO_PROFILE_OXIDE_*` definitions stay in every
+leased environment, so an existing `--cargo-profile oxide-quick` or
+`oxide-debug` still builds, into those directories, not `target/debug/`. Drop
+the flag. The recipes are the intended defaults, not measured speed or
+storage claims. The [stable profiles](stable-cargo-profiles.md) comparison
+stands as a no-go.
 
 **Run strategies.** A quick run means "execute the current source as soon as
 possible". Candidates are a Cranelift ahead-of-time backend, Cranelift JIT and
@@ -127,8 +156,15 @@ Identity chooses which warm slot to try:
    URL.
 3. Outside Git: the canonical workspace root, with no cross-checkout reuse.
 
-The slot compatibility key is repository identity + Cargo profile + resolved
-toolchain (`rustc -vV`) + target triple + codegen backend. The toolchain is
+The slot compatibility key is repository identity + Oxide recipe key +
+resolved toolchain (`rustc -vV`) + target triple + codegen backend. The
+recipe key is `quick:dev-recipe-2`, `debug:dev-recipe-2` or `release`.
+Version 1 keys were the bare `quick` and `debug` of the custom-profile
+recipes, so a slot built by them is never reused for the `dev` recipes: the
+first quick or debug command after the change takes a new slot cold. Older
+slots are not renamed, copied or deleted; they leave through normal eviction,
+which at the per-project cap of 2 evicts the least recently used idle slot.
+Status still labels them `quick` or `debug`. The toolchain is
 whatever rustup resolves where the command runs (see
 [caller context](#cargo-version-matrix)); Oxide does not select or pin it.
 
@@ -343,6 +379,19 @@ root. A new Cargo release needs this check before it joins the table.
 2. Lease a slot from the host pool. Prefer this checkout's last slot, then any
    idle compatible slot, then a new slot if the per-project cap and budget
    allow. Otherwise wait in order, with a visible "waiting for …" line.
+   **Second-slot rule** (Tom, 2026-10-20, oxide#107): when this checkout's
+   slot for the same key is busy (a live command such as a long `oxide exec
+   -- tauri dev`, or an interrupted one whose group may still run), a further
+   leased command in the checkout takes another idle compatible slot (its own
+   other slot, else another checkout's through the freshness gate) or a new
+   slot through the normal cap, budget and host admission. The busy slot is
+   never reused, released, evicted or relabelled. At the per-project cap of 2
+   an idle slot of the project may be evicted whole, as for any new slot; with
+   no idle candidate and no room the command waits ("another oxide command in
+   this checkout"). The host limit, FIFO order, clean barrier and
+   unknown-accounting refusal are unchanged. Two slots of one checkout share
+   `<workspace>/target`: Cargo serializes the brief final-output uplift on
+   `target/<profile>` and the latest final artifact wins.
 3. Run the freshness gate when the slot's last origin differs.
 4. Run the real Cargo as the leader of a new process group, with:
    - the build directory pointed at the slot;
@@ -357,6 +406,70 @@ root. A new Cargo release needs this check before it joins the table.
    skips tests.
 6. When the process group exits, record the compile origin, release the lease
    and print one line: profile, strategy, warm/cold, elapsed time, pool use.
+
+### `oxide exec`: Cargo-wrapping tools
+
+Tom approved `oxide exec` on 2026-10-20 ([vision](../vision.md#product-workflow-direction),
+oxide#107). Motivating case: Acowtancy's Tauri app.
+
+```text
+oxide exec [--manifest-path <Cargo.toml>] [--profile quick|debug|release] -- <command> [args]
+```
+
+- **Parsing.** Oxide's options come before the mandatory `--`; everything
+  after it is the command, kept exactly (non-UTF-8 included) and spawned
+  directly, never through a shell. A missing `--` or command, a duplicate or
+  unknown option, `--release` (use `--profile release`), `--target-dir` and
+  `--config` refuse before any lease. `oxide exec --help` prints usage; after
+  `--`, `--help` belongs to the tool.
+- **Workspace.** From the working directory or `--manifest-path`, through the
+  same caller-Cargo and toolchain identity rules as `build`. Neither moves the
+  tool's working directory or changes its arguments. One Cargo workspace per
+  invocation.
+- **Lease.** The same slot key (recipe, compiler, target), freshness gate,
+  admission, host limit, clean barrier and reserve watchdog as a leased Cargo
+  command. The gate runs with Cargo's defaults: the tool's own lock or network
+  flags are not known to Oxide. A tool that will compile never skips it.
+- **Environment.** The same storage, recipe and rustc-wrapper function as
+  every leased command (`apply_storage`): intermediates go to the held slot,
+  final outputs to `<workspace>/target`, and the [wrapper bypass](#inherited-rustc-wrapper)
+  reaches the tool's nested Cargo calls. `--profile` selects the recipe and
+  slot only. The tool still chooses its own dev or release build; Oxide
+  neither rewrites its flags nor inspects what it built. The release recipe
+  is the project's own.
+- **Process.** The tool is the leader of a recorded process group. Ctrl-C and
+  termination signals are forwarded to the group. The lease stays held until
+  the leader has exited **and** the group is empty, so a member that outlives
+  the leader keeps the slot held. Crash recovery is [the same](#crash-recovery):
+  a killed `oxide` whose tool group lives leaves the slot held and unused,
+  recovered by a later command only once that group is gone.
+- **Exit code.** The tool's, or 128 + signal when a signal ended it; 127 when
+  the program is not found, 126 when it cannot start. A reserve stop still
+  fails the command.
+- **Input.** The tool's group is not the terminal's foreground group, so a
+  terminal read would stop it. A terminal standard input is therefore
+  replaced by `/dev/null` (the tool reads end-of-file); a pipe or file passes
+  through. Interactive prompts are not supported.
+- **Status.** `oxide status` shows the holder as `exec <program>` (control
+  characters escaped, at most 160 characters), live or interrupted. The
+  summary line names the `build+execute` strategy.
+
+**Limits.** This is a cooperative contract, not containment. A tool escapes
+Oxide's storage if it sets `CARGO_TARGET_DIR` or a build directory itself,
+changes workspace or toolchain, or builds an unrelated project. A descendant
+that calls `setsid` or daemonizes leaves the group: it is not a qualified
+writer, and Oxide makes no crash-closure claim for it. The explicit wrapper
+opt-in stays unqualified ([#099](#inherited-rustc-wrapper)).
+
+**Evidence.** `effigy rust:oxide-exec` uses a short fixed shell tool that
+calls the inherited `cargo build` and `cargo metadata`; `cargo metadata`
+reporting `target_directory` as `<workspace>/target` is that fixture's
+observation. A real `tauri build` or `tauri dev`, including Vite's
+`beforeDevCommand`, is Acowtancy-owned dogfood after merge: expected to work,
+unverified here. No Tauri build-directory or output-discovery compatibility,
+performance or saving is claimed. The proof runs under the old
+`scripts/bounded-test.py` on route B (Tom, 2026-10-21) with its documented
+gaps, which do not qualify that script or any shared runner.
 
 ### Inherited rustc wrapper
 
@@ -431,8 +544,9 @@ leases taken by `oxide` commands only:
   it stays held until they are reaped and `ESRCH` follows. The fixture proof
   waits for that reap within its existing bound instead of reading `EPERM`
   as gone. No PID age, TTL or start-time comparison is
-  used to decide. A follower in the same checkout waits; other commands go
-  on with other slots.
+  used to decide. A follower in the same checkout takes another compatible
+  slot or a new one under the [second-slot rule](#what-one-command-does-local-executor),
+  and waits only when no safe slot exists; the held slot is never touched.
 - A command that dies after recording "Cargo starting" but before recording
   its group cannot prove the group empty. That slot stays held, `oxide
   status` marks it interrupted with no recorded group, and
@@ -570,12 +684,12 @@ The standard pattern for consumer projects (Tom, 2026-10-20, [vision](../vision.
 - **CI-aware rule.** When CI or release workflows call the same Effigy selectors and the runners lack `oxide`, the selector runs `cargo` under `GITHUB_ACTIONS=true` and `oxide` otherwise. Locally, a missing `oxide` fails loudly and names the `:cargo` escape; it never falls back silently. Workflow files do not change. Installing `oxide` on runners waits on publication (Q-005).
 - **Stays on Cargo:**
   - scripts that choose their own `CARGO_TARGET_DIR`, because Oxide replaces an inherited value with `<workspace>/target`;
-  - tools that run Cargo themselves (the Tauri CLI, packaging scripts), until `oxide exec` lands;
+  - tools that run Cargo themselves (the Tauri CLI, packaging scripts) unless moved to [`oxide exec`](#oxide-exec-cargo-wrapping-tools), and anything that sets its own target or build directory;
   - Queue warm-merge hooks;
   - container builds;
-  - selectors whose scripts run a binary from `target/debug/` after a quick build. Under the current `oxide-quick` output directory they would miss the fresh binary or run a stale one. #106 moves `quick` and `debug` output to `target/debug/`.
-  - tests that find a sibling binary by going from `current_exe()` in `deps/` to its profile directory. With Cargo's build-dir, test executables run from the slot (`<slot>/build/<profile>/deps`) while final binaries are uplifted to `<workspace>/target/<profile>/`. This holds for any build-dir user, and #106 does not change it. Repair: integration tests use `env!("CARGO_BIN_EXE_<name>")`; other code also tries `$CARGO_TARGET_DIR/<profile dir name>/`, which Oxide exports. Found by Figmatic's post-merge QA on 2026-10-20: 7 studio tests failed with "no capture renderer beside …/slots/4/build/oxide-quick".
-- **nextest.** Until #106, pass `--cargo-profile oxide-quick` so nextest shares the quick slot.
+  - tests that find a sibling binary by going from `current_exe()` in `deps/` to its profile directory. With Cargo's build-dir, test executables run from the slot (`<slot>/build/<profile>/deps`) while final binaries are uplifted to `<workspace>/target/<profile>/`. This holds for any build-dir user; #106 moved only the final outputs to `target/debug/`. Repair: integration tests use `env!("CARGO_BIN_EXE_<name>")`; other code also tries `$CARGO_TARGET_DIR/<profile dir name>/`, which Oxide exports. Found by Figmatic's post-merge QA on 2026-10-20: 7 studio tests failed with "no capture renderer beside …/slots/4/build/oxide-quick".
+- **nextest.** `oxide nextest run` with no profile flag builds with the quick recipe in the quick slot. Drop an existing `--cargo-profile oxide-quick`: it still builds, but into `target/oxide-quick/`.
+- **Final outputs.** Since #106, `quick` and `debug` binaries are in `target/debug/`, so scripts that read them there can move to `oxide`. Earlier adopters' `target/oxide-quick/` directories are left alone; `oxide clean` removes them with the rest of `target/`.
 - **Worktree seeding.** Selectors that move to `oxide` drop any copy of a primary checkout's `target/` into worktrees. The shared slot is the warm state.
 - **Proof per project:**
   - the moved selectors pass under `oxide` and, where the CI-aware rule applies, under `cargo` with `GITHUB_ACTIONS=true`;
@@ -997,17 +1111,18 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
   Cargo, so output and exit codes are Cargo's. Unknown commands are building
   passthrough. A leading `+toolchain` or Cargo flag before the command
   refuses; `--version`, `-V` and `--list` pass through.
-- **Profiles.** `quick` (default) and `debug` translate to `oxide-quick` and
-  `oxide-debug`; `release` and `--release` use the project's `release`. Both
-  recipes are always defined in the environment, so external tools can name
-  either. Building built-ins translate `--profile` only when given; external
-  subcommands receive arguments untouched.
+- **Profiles.** `quick` (default) and `debug` set their `dev` recipe in the
+  environment and remove Oxide's `--profile` from Cargo's arguments; `release`
+  and `--release` pass `--release`. An explicit quick or debug `bench` passes
+  `--profile dev`. The deprecated `oxide-quick` / `oxide-debug` definitions
+  are always in the environment too. External subcommands receive arguments
+  untouched and the quick recipe.
 - **Refusals.** `--target-dir`, `--config` keys `build.build-dir` /
   `build.target-dir` (any quoting or `build = {…}` form) and every `--config`
   file path refuse, because a file could set either key.
 - **Identity and key.** Git root commits plus the workspace prefix; shallow
   clones use the normalised `origin`; otherwise the canonical path. The slot
-  key adds the Oxide profile, the `rustc -vV` digest, the target (`--target`,
+  key adds the Oxide recipe key, the `rustc -vV` digest, the target (`--target`,
   then `CARGO_BUILD_TARGET`, then host) and the default backend. Building
   passthrough uses the quick key unless a built-in names another profile;
   Cargo's per-profile subdirectories keep profiles apart inside one slot.
@@ -1027,7 +1142,8 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
   Host-wide limit 2 commands holding slots (`OXIDE_MAX_ACTIVE`, 1–32). Excess
   commands wait in FIFO order, print one `oxide: waiting for …` line on stderr
   and cancel on Ctrl-C with exit 130. Another command in the same checkout
-  and key waits too.
+  and key takes a compatible spare slot or creates one within budget; it waits
+  when no safe slot or host capacity is available.
 - **Execution.** Cargo runs from the caller's directory as leader of a new
   process group, with `CARGO_BUILD_BUILD_DIR` on the slot and
   `CARGO_TARGET_DIR=<workspace>/target`. SIGINT, SIGTERM and SIGHUP are
@@ -1042,9 +1158,13 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
   environment (`CARGO_PKG_*`, dylib paths) is not set. Exit codes are Cargo's,
   or the program's for `run`.
 - **Summary.** One stderr line per leased command: profile, strategy (`build`
-  or `build+execute`), slot, warm/cold, elapsed time, pool use and backend:
-  `pool 12 MiB allocated of 95367 MiB budget (directory-budget-v1, budget-only)`
-  (slot allocation against this command's soft budget).
+  or `build+execute`), slot, warm/cold, elapsed time, the slot's size when
+  leased, this command's soft budget and the backend:
+  `slot 5 was 12 MiB when leased, 95367 MiB budget, pool total: see oxide status (directory-budget-v1, budget-only)`.
+  The size is the library's reuse walk of that exact slot generation; a new
+  slot says `new slot` and a held replay `slot size unknown`. The line walks
+  nothing, so the pool total is in `oxide status`
+  ([ledger-only view](local-lease.md#ledger-only-view-for-front-door-membership-oxide110-lead-e4c74399)).
   When the gate refreshed files, or reconciled another checkout's build, it
   appends the count and the outside-Git limit. A refused gate prints its
   reason on its own line before the cold build.
@@ -1058,7 +1178,9 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
   the group is empty.
 - **Crash recovery.** Per [Crash recovery](#crash-recovery), for Oxide's own
   commands only. A follower in the same checkout waits while the crashed
-  command's group survives, then recovers. If the crashed command's Cargo had
+  command's group survives, then recovers. Since oxide#107 the follower first
+  takes another compatible slot or a new one when capacity allows, and the
+  held slot is recovered by a later command once its group is empty. If the crashed command's Cargo had
   started, the recovered slot has no trusted build record, so the follower
   evicts it and builds cold; if Cargo never started, the follower reuses it
   through the freshness gate. The fixture proof

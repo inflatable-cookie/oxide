@@ -22,6 +22,7 @@ pub const BLOCK: &str = "\
 
 - Write `oxide` wherever you would write `cargo`: `oxide check`, `oxide test`, `oxide run -- <args>`, `oxide add <crate>`.
 - Profiles: `quick` (default), `--profile debug` for a debugger, `--release`. Oxide places build output, so it refuses `--target-dir`.
+- A tool that runs Cargo itself (Tauri CLI, npm or bun scripts): `oxide exec -- <command>`.
 - A `waiting for …` line means another build holds a slot; let it wait. `oxide status` shows the pool, slots and waits.
 - Use `oxide clean`, not `cargo clean`.
 
@@ -325,9 +326,13 @@ fn print_readiness(workspace: &Path) {
             ),
             Ok(Some(store)) => match store.status() {
                 Ok(status) => {
-                    let used = store
-                        .payload_use()
-                        .map(|(used, total)| format!("{} of {} MiB used", used / MIB, total / MIB))
+                    // This full status's own whole-payload walk.
+                    let used = status
+                        .payload_unique_allocated_bytes
+                        .map(|used| {
+                            let total = store.budget(status.cap_bytes);
+                            format!("{} of {} MiB used", used / MIB, total / MIB)
+                        })
                         .unwrap_or_else(|| "use unknown".to_owned());
                     println!(
                         "  pool: {}, cap {} MiB, {used}",

@@ -696,6 +696,46 @@ Tom, 2026-10-21, "Yeah do it" (Queue decision `bc874ae7`), after the #109 correc
   4. No start-time exclusion.
 - **Stop rule:** if review raises only minor points, they are fixed during implementation. A new P1 class switches elevated tasks to the documented-gap route (B), with no further design rounds.
 
+Tom, 2026-10-21, "Approved": a single drive mode. Context: Tom mounted the Builds SATA drive permanently to the laptop and wanted the features that depend on that to be configurable ("literally just one configuration option for the drive itself to say it's permanent or ephemeral").
+1. **The setting:** `oxide pool register-removable <mount> --mode permanent|ephemeral`, changeable with `oxide pool set-mode`. The default is `ephemeral`, today's behaviour.
+2. **`permanent` changes three things:**
+   - when the drive is missing, the fallback to the internal pool is **loud**: a warning on every command and in `status`;
+   - final outputs go on the drive, with the checkout's `target/` a link that Oxide maintains, folded into the planned "outputs follow the pool" work;
+   - Oxide's per-slot test scratch goes on the drive.
+
+   `ephemeral` keeps the quiet fallback and checkout-local outputs.
+3. **One source of truth:** `oxide pool describe --json` publishes the mount, volume UUID, mode and a suggested scratch root outside the pool. Other tools (Effigy run scratch #244, Queue task workspaces, the sccache directory) may read it, and each keeps its own override.
+4. **Order:**
+   1. the mode and the loud fallback, with `describe --json` alongside it, both after #110;
+   2. outputs on the drive, after #106;
+   3. consumer adoption through each tool's owner.
+
+2026-10-21, applying Tom's conditional ruling on Queue decision `bc874ae7` (no new ask). #109's implementation review (`6312725112` at `22d1280`) recorded genuine author and reviewer native passes, but failed closure and deadlines, with a **new P1 class**: nested guardian ownership. The outer qualification deletes the scratch and evidence of live, deliberately `UNCLOSED` sessions. Other faults: uncertainty not latched, a failed confirmation treated as absent, cancellation after the ack, and unbounded bootstrap finalization. Under the stop rule, elevated tasks therefore take **route B**:
+- **The route:** their native proofs use main's `scripts/bounded-test.py` at `3d947a9`, plus Effigy heavy admission, a wall-clock limit and the task's own scratch root.
+- **Disclosed per task:**
+  - no free-space monitoring of staging or fixture writes;
+  - no supervisor-enforced scratch budget or cleanup;
+  - on the timeout path, numeric TERM and KILL of recorded session groups without positive identity;
+  - the old guard's escalation can run past 300 s.
+- **#109:** stays unqualified, with PR #99 unmerged under its merge hold. No further repair or design rounds.
+- **#107:** loses only its #109 dependency. Product gates, counts and holds are unchanged, and #098 and #100 keep their original holds.
+- New standard-tier leads do not automatically inherit the #110/#106 exception.
+
+Tom, 2026-10-21, on Queue decision `b44b106a`: **"#104 only for now"**. #104 (standard tier) may use the documented-gap old guard (main's `scripts/bounded-test.py` at `3d947a9`) for one corrected author native session. That run must use separate fresh target and build directories, record source and binary hashes, and assert that the binaries differ. All gaps are disclosed. This is not a standing validation-policy change. The same day Tom approved `chmod 755 /Volumes/Builds`, which removed the volume root's group write; Effigy's trusted-binary check had refused slot-resident test executables under the group-writable root (Oxide papercut `297e082b`).
+
+Tom, 2026-10-21, "Approve", in answer to "get the proof harness sorted out properly now so we don't keep hitting this". **#109 reopens as one focused completion task** against the already-passed revision-4 design (`29f0950e`).
+- **Scope:** fix exactly the defects in implementation review `6312725112` at `22d1280`:
+  1. qualification deleting the resources of deliberately `UNCLOSED` nested sessions;
+  2. no enforced absolute bound over bootstrap finalization;
+  3. an uncertain final census not latched;
+  4. a failed confirmation read as absence;
+  5. (P2) cancellation after the ack still opening the gate.
+- **Acceptance, agreed up front:** that defect list with a regression test for each, plus the design's proof list.
+- **Elevated tier:** independent review, and one native session per side.
+- Until it qualifies, tasks use the exceptions already granted.
+
+A host check the same day found no kernel-level shortcut: on macOS 26.6.2, `launchctl remove` of a submitted job did not kill a `setsid`-escaped descendant.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
