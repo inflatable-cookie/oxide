@@ -37,13 +37,53 @@ import secrets
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _spec = importlib.util.spec_from_file_location("finder_metadata", os.path.join(HERE, "test-oxide-finder-metadata.py"))
 runner = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(runner)
-Proof, expect, fail, summary, MIB = runner.Proof, runner.expect, runner.fail, runner.summary, runner.MIB
+expect, fail, summary, MIB = runner.expect, runner.fail, runner.summary, runner.MIB
+# Work stops this long before the shared runner's absolute deadline, inside
+# its 20 s stop reserve plus margin for detach.
+SHUTDOWN_MARGIN_S = 30
+
+
+def work_left() -> float:
+    """Seconds of work left before the shared runner's exported absolute
+    CLOCK_UPTIME_RAW deadline (OXIDE_PROOF_DEADLINE_NS) less the shutdown
+    margin; never a fresh process-relative budget."""
+    deadline = int(os.environ["OXIDE_PROOF_DEADLINE_NS"])
+    left = (deadline - time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)) / 1e9 - SHUTDOWN_MARGIN_S
+    if left <= 5:
+        fail("work deadline reached before the runner's shutdown margin")
+    return left
+
+
+class Proof(runner.Proof):
+    """The #105 helper's phase checks and detach, with children kept in the
+    shared runner's cooperative session: no new session per child and no
+    session kill. On a timeout only the pinned child itself is killed and,
+    unless reaped, stays in `unclosed`, which blocks detach and keeps
+    evidence; the runner decides closure and cleanup."""
+
+    def run(self, command: list, *, cwd: str | None = None, env: dict | None = None, timeout: float = 120) -> subprocess.CompletedProcess:
+        limit = min(timeout, work_left())
+        child = subprocess.Popen(command, cwd=cwd, env=env or self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.unclosed.add(child.pid)
+        try:
+            out, err = child.communicate(timeout=limit)
+        except BaseException:
+            child.kill()
+            try:
+                child.communicate(timeout=5)
+                self.unclosed.discard(child.pid)
+            except BaseException as error:
+                print(f"child {child.pid} not reaped: {error!r}", file=sys.stderr)
+            raise
+        self.unclosed.discard(child.pid)
+        return subprocess.CompletedProcess(command, child.returncode, out, err)
 BASE = "850260c"
 FIXTURE = runner.FIXTURE
 
@@ -168,6 +208,8 @@ def run(proof: Proof, repo: str) -> None:
     env = dict(os.environ)
     real_rustup = env.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")
     for key in list(env):
+        if key in ("OXIDE_PROOF_EVIDENCE", "OXIDE_PROOF_DEADLINE_NS"):
+            continue  # owner-supplied by the qualified runner, not ambient config
         if key.startswith(("SCCACHE_", "OXIDE_", "XDG_")) or key in ("CARGO", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "RUSTC", "RUSTUP_TOOLCHAIN"):
             env.pop(key)
     tmp = os.environ["TMPDIR"]
@@ -298,38 +340,53 @@ def terminated(signum, frame) -> None:
     raise KeyboardInterrupt(f"signal {signum}")
 
 
+def overdue(signum, frame) -> None:
+    raise RuntimeError("work deadline reached (SIGALRM fallback)")
+
+
+def record(name: str, text: str) -> None:
+    """Evidence goes to the runner's OXIDE_PROOF_EVIDENCE, which it keeps."""
+    with open(os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], name), "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
 def main() -> int:
     if sys.platform != "darwin":
         fail("the pool layout proof requires macOS")
-    made = subprocess.run(["mktemp", "-d", "/private/tmp/oxide-layout.XXXXXX"], capture_output=True, text=True, timeout=30)
-    expect(made.returncode == 0, "mktemp failed")
-    root = os.path.realpath(made.stdout.strip())
-    expect(root.startswith("/private/tmp/oxide-layout."), f"scratch {root} is not under /private/tmp")
-    tmp = os.path.join(root, "tmp")
-    os.makedirs(tmp, mode=0o700)
-    for name in ("OXIDE_TASK_SCRATCH_ROOT", "TMPDIR", "TMP", "TEMP"):
-        os.environ[name] = tmp
+    # All writes go under the qualified runner's monitored scratch, which it
+    # binds to all four temp variables; it owns closure and cleanup.
+    scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
+    expect(bool(scratch) and os.path.realpath(scratch) == scratch, f"OXIDE_TASK_SCRATCH_ROOT {scratch!r} is not canonical")
+    for name in ("TMPDIR", "TMP", "TEMP"):
+        expect(os.environ.get(name) == scratch, f"{name} is not the runner's scratch")
+    expect(os.path.isdir(os.environ.get("OXIDE_PROOF_EVIDENCE", "")) and "OXIDE_PROOF_DEADLINE_NS" in os.environ, "not under the qualified runner")
+    root = tempfile.mkdtemp(prefix="pool-layout.", dir=scratch)
     repo = os.path.dirname(HERE)
     signal.signal(signal.SIGTERM, terminated)
+    signal.signal(signal.SIGALRM, overdue)
+    signal.setitimer(signal.ITIMER_REAL, work_left())
     proof = Proof(root)
     try:
         run(proof, repo)
-    except BaseException:
+        proof.detach()
+    except BaseException as failure:
         try:
             proof.detach()
         except BaseException as error:
             print(f"cleanup after failure: {error!r}", file=sys.stderr)
-        print(f"pool-layout proof failed after {time.monotonic() - runner.STARTED:.0f} s; evidence kept at {root}", file=sys.stderr)
+        record("result.txt", f"failed: {failure!r}\nunclosed children: {sorted(proof.unclosed)}\nmount: {proof.mount}\nroot: {root}\n")
+        print(f"pool-layout proof failed after {time.monotonic() - runner.STARTED:.0f} s; scratch {root} left to the runner", file=sys.stderr)
         raise
-    proof.phase("before removal")
-    removal = proof.run(["/bin/rm", "-rf", root], timeout=60)
-    expect(removal.returncode == 0 and not os.path.lexists(root), f"removal of {root} failed (exit {removal.returncode})")
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    proof.phase("end")
     elapsed = time.monotonic() - runner.STARTED
-    print(
-        f"pool-layout proof held: {elapsed:.0f} s, peak owned {proof.peak // MIB} MiB at phase checks "
-        f"(512 MiB budget, checked between phases, not a ceiling), host free minimum {proof.low // MIB} MiB, scratch removed"
+    summary_line = (
+        f"pool-layout proof held: {elapsed:.0f} s script time, peak owned {proof.peak // MIB} MiB at phase checks, "
+        f"host free minimum {proof.low // MIB} MiB; scratch closure and cleanup are the shared runner's"
     )
-    expect(elapsed <= runner.PROOF_SECONDS, f"proof exceeded {runner.PROOF_SECONDS} s")
+    record("result.txt", f"passed\n{summary_line}\n")
+    print(summary_line)
     return 0
 
 

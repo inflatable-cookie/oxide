@@ -226,45 +226,38 @@ identity, ledger semantics, admission, eviction and recovery are unchanged.
   changes no ledger.
 
 **Proof.** `effigy rust:oxide-pool-layout`
-(`scripts/test-oxide-pool-layout.py`) is a short fixed script under Effigy
-heavy admission that reuses the #105 script's child runner unchanged
-(deadline before each child from one 300 s budget, 20 GiB reserve sampled
-every 250 ms while a child runs, owned scratch checked between phases
-against 512 MiB, sessions killed on breach or deadline, ordinary detach).
+(`scripts/test-oxide-pool-layout.py`) runs under the qualified shared proof
+supervisor: `bounded-test.py --limit 300 --scratch-budget-mib 512 --`
+(oxide#109). The script writes only under the supervisor's scratch
+(`OXIDE_TASK_SCRATCH_ROOT`, equal to the other three temp variables) and
+its evidence directory (`OXIDE_PROOF_EVIDENCE`), keeps every child in the
+supervisor's session, stops work 30 s before the exported absolute
+`OXIDE_PROOF_DEADLINE_NS` (with a `SIGALRM` fallback) and leaves closure and
+scratch cleanup to the supervisor. It reuses the #105 script's phase checks
+and staging helpers; on a child timeout it kills only that child, and an
+unreaped child blocks detach and keeps evidence.
 It stages the base commit's and this HEAD's `oxide` offline with 1.97.1,
 each into its own fresh `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR`
-under the owned scratch with inherited build routing scrubbed. It logs both
-commits, trees, manifest and lock digests and binary SHA-256s, and refuses
-before any pool or image exists unless the binaries differ and only the
-candidate carries a #104 status string.
-Over a private `HOME`, `CARGO_HOME` and pool: the base binary makes a legacy
-`slots/1`, which the candidate reuses warm in place; same-named checkouts
-get separate labelled folders; a debug slot joins its project's folder;
-one 128 MiB scratch APFS image registered as the removable pool gets
-labelled slots, including a slot 1 beside the internal slot 1; status order,
-grouping and most-recent attribution are checked with the volume selected
-and after an ordinary detach. Not a benchmark or real-drive qualification.
+with inherited build routing scrubbed. It logs both commits, trees,
+manifest and lock digests and binary SHA-256s, and refuses before any pool
+or image exists unless the binaries differ and only the candidate carries a
+#104 status string. Over a private `HOME`, `CARGO_HOME` and pool: the base
+binary makes a legacy `slots/1`, which the candidate reuses warm in place;
+same-named checkouts get separate labelled folders; a debug slot joins its
+project's folder; one 128 MiB scratch APFS image registered as the
+removable pool gets labelled slots, including a slot 1 beside the internal
+slot 1; status order, grouping and most-recent attribution are checked with
+the volume selected and after an ordinary detach. Not a benchmark or
+real-drive qualification.
 
-**Native status: not passed.** The single author session at `de7bb8b`
+**Earlier submissions (history).** The first author session at `de7bb8b`
 (2026-10-21) staged both sources into one shared target directory; Cargo
 reused the base build for the candidate (both SHA-256 `46db66ce…`), so the
 first candidate `status` printed the old format and the script failed after
-16 s, before any image or product exercise. Its log and 11 MiB scratch are
-kept.
-
-**Guard (#104-only operator exception, 2026-10-21).** The selector runs the
-script under the old `scripts/bounded-test.py`, byte-identical to `3d947a9`
-(SHA-256 `9dffe4f3…c49344`). It gives no continuous reserve monitoring
-across all writes and no supervisor-enforced scratch budget or cleanup;
-phase samples and the script's own cleanup are not equivalent. At 300 s it
-signals recorded numeric process groups with unmeasured reuse risk, and the
-script starts each child in its own session, outside the session the
-supervisor records. A normal leader exit and reap does not establish that
-Cargo's separate groups closed. 300 s plus escalation and blocking calls is
-not an absolute ceiling. This grants no standing rule or shared-runner
-qualification. The child runner imported
-from the #105 script is unqualified: it kills the leader's session and reaps
-the leader, which does not prove Cargo's separate process groups closed.
+16 s, before any image or product exercise. Two later submissions under a
+#104-only exception for the old `3d947a9` supervisor never launched: run
+`a5b87b4a…` was withdrawn and settled cancelled, and run `bde2d70a…` hit
+Effigy's capacity timeout. All three are consumed.
 
 **Compatibility of the new records.** Legacy slots and a ledger without
 `dir` serialize byte-for-byte as before; a labelled slot's path is fixed at
