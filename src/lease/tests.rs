@@ -1605,8 +1605,7 @@ fn ledger_view_keeps_status_refusals_and_non_gating_gaps() {
         lease_injected(request(&denied, &denied_project, &workspace, "d")).expect("lease");
     let slots = denied.join("payload").join("slots");
     let denied_slot_root = slots.join(&denied_grant.slot_id);
-    let denied_lookup =
-        crate::test_fs::PermissionDeniedGuard::symlink_metadata(&denied_slot_root);
+    let denied_lookup = crate::test_fs::PermissionDeniedGuard::symlink_metadata(&denied_slot_root);
     let from_status = status_injected(&denied).map(|_| ());
     let from_view = ledger_injected(&denied).map(|_| ());
     assert_eq!(denied_lookup.hits(), 2);
