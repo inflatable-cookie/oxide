@@ -723,6 +723,19 @@ Tom, 2026-10-21, "Approved": a single drive mode. Context: Tom mounted the Build
 
 Tom, 2026-10-21, on Queue decision `b44b106a`: **"#104 only for now"**. #104 (standard tier) may use the documented-gap old guard (main's `scripts/bounded-test.py` at `3d947a9`) for one corrected author native session. That run must use separate fresh target and build directories, record source and binary hashes, and assert that the binaries differ. All gaps are disclosed. This is not a standing validation-policy change. The same day Tom approved `chmod 755 /Volumes/Builds`, which removed the volume root's group write; Effigy's trusted-binary check had refused slot-resident test executables under the group-writable root (Oxide papercut `297e082b`).
 
+Tom, 2026-10-21, "Approve", in answer to "get the proof harness sorted out properly now so we don't keep hitting this". **#109 reopens as one focused completion task** against the already-passed revision-4 design (`29f0950e`).
+- **Scope:** fix exactly the defects in implementation review `6312725112` at `22d1280`:
+  1. qualification deleting the resources of deliberately `UNCLOSED` nested sessions;
+  2. no enforced absolute bound over bootstrap finalization;
+  3. an uncertain final census not latched;
+  4. a failed confirmation read as absence;
+  5. (P2) cancellation after the ack still opening the gate.
+- **Acceptance, agreed up front:** that defect list with a regression test for each, plus the design's proof list.
+- **Elevated tier:** independent review, and one native session per side.
+- Until it qualifies, tasks use the exceptions already granted.
+
+A host check the same day found no kernel-level shortcut: on macOS 26.6.2, `launchctl remove` of a submitted job did not kill a `setsid`-escaped descendant.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
