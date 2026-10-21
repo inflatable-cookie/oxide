@@ -118,7 +118,6 @@ CRATES_SOURCES = ("registry+https://github.com/rust-lang/crates.io-index", "spar
 # The one supported crates.io sparse namespace: the name Cargo gives this host's
 # sparse index and cache, as build_context_comparison.CARGO_REGISTRY_NAMESPACE.
 CRATES_NAMESPACE = "index.crates.io-1949cf8c6b5b557f"
-CRATES_PREFIX = "index.crates.io-"
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 VERSION_RE = re.compile(r"^[0-9]+[.][0-9]+[.][0-9]+(?:[-+][0-9A-Za-z.+-]+)?$")
 CHECKSUM_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -346,20 +345,14 @@ def lstat_real_dir(path: Path, label: str) -> None:
 
 
 def crates_namespace(host_registry: Path) -> str:
-    """The supported crates.io namespace, matched exactly on index and cache.
+    """The supported crates.io namespace, selected by its exact name.
 
-    Each side must list exactly CRATES_NAMESPACE among its crates.io-prefixed
-    names. A prefix-only or other-hash name, an extra name, or a missing side
-    refuses. The name is never chosen independently per side.
+    CRATES_NAMESPACE is selected on both index and cache. Other entries in
+    either root are not listed, traversed or copied, and their presence is not
+    ambiguity. A missing or non-directory selected path refuses in seed_from_lock.
     """
     for kind in ("index", "cache"):
-        kind_dir = host_registry / kind
-        lstat_real_dir(kind_dir, f"host {kind} root")
-        found = sorted(name for name in os.listdir(kind_dir) if name.startswith(CRATES_PREFIX))
-        if found != [CRATES_NAMESPACE]:
-            raise SeedRefusal(
-                f"host {kind}: expected only the supported namespace {CRATES_NAMESPACE}, found {found}"
-            )
+        lstat_real_dir(host_registry / kind, f"host {kind} root")
     return CRATES_NAMESPACE
 
 
