@@ -2,12 +2,13 @@
 
 use super::backing::BackingPaths;
 use super::{
-    canonical_existing_dir, current_uid, ensure_private_dir, io_error, persist_private_file,
-    random_hex, read_private_file, remove_tree_owned, AccountingCoverage, AccountingGap,
-    AccountingGapKind, AccountingScan, LeaseEnvironment, LeaseError, LeaseGrant, PoolStatus,
-    Profile, ReleaseReceipt, SlotOccupancy, SlotStatus, ACCOUNTING_MAX_DEPTH,
-    ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME,
-    LOCK_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, SLOTS_NAME,
+    canonical_existing_dir, current_uid, ensure_private_dir, io_error, is_finder_metadata,
+    is_tolerated_metadata_file, persist_private_file, random_hex, read_private_file,
+    remove_tree_owned, unexpected_entry, AccountingCoverage, AccountingGap, AccountingGapKind,
+    AccountingScan, LeaseEnvironment, LeaseError, LeaseGrant, PoolStatus, Profile, ReleaseReceipt,
+    SlotOccupancy, SlotStatus, ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS,
+    ACCOUNTING_MAX_ENTRIES, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME, LOCK_NAME, MAX_HOLDER_BYTES,
+    MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, SLOTS_NAME,
 };
 use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
 use crate::inventory::{inventory_directory, GapKind, InventoryError, InventoryLimits};
@@ -19,6 +20,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+
+/// Where a refused entry sits, for [`LeaseError::UnexpectedEntry`].
+const POOL_PLACE: &str = "pool directory";
+const PAYLOAD_PLACE: &str = "payload directory";
 
 #[derive(Clone, Debug)]
 pub struct LeaseRequest {
@@ -862,9 +867,11 @@ impl Pool {
         remove_tree_owned(&slots_root, path)
     }
 
+    /// The payload root's whole tree: `slots` and any tolerated Finder
+    /// metadata beside it, one `(device, inode)` union. One extra level
+    /// keeps slot contents at the depth bound they had under `slots`.
     fn payload_accounting(&self) -> Sizes {
-        let slots = self.backing.payload_root().join(SLOTS_NAME);
-        inventory_sizes(&slots)
+        inventory_sizes_deeper(self.backing.payload_root(), 1)
     }
 
     fn slot_accounting(&self, id: u64) -> Result<Sizes, LeaseError> {
@@ -967,17 +974,26 @@ fn validate_lease_payload_entries(
     for entry in fs::read_dir(payload_root).map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
         let name = entry.file_name();
-        let name = name.to_str().ok_or(LeaseError::UnknownAccounting)?;
-        let is_slots = name == SLOTS_NAME;
-        if !is_slots && !metadata_dirs.contains(&name) {
-            return Err(LeaseError::UnknownAccounting);
+        let refuse = || unexpected_entry(PAYLOAD_PLACE, &name);
+        if is_finder_metadata(&name) {
+            // Counted by payload accounting, which walks the payload root.
+            let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
+            if !is_tolerated_metadata_file(&metadata, root_device) {
+                return Err(refuse());
+            }
+            continue;
+        }
+        let text = name.to_str().ok_or_else(refuse)?;
+        let is_slots = text == SLOTS_NAME;
+        if !is_slots && !metadata_dirs.contains(&text) {
+            return Err(refuse());
         }
         let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
         if metadata.file_type().is_symlink()
             || !metadata.file_type().is_dir()
             || metadata.dev() != root_device
         {
-            return Err(LeaseError::UnknownAccounting);
+            return Err(refuse());
         }
         if is_slots {
             if metadata.uid() != current_uid() || metadata.permissions().mode() & 0o077 != 0 {
@@ -1067,7 +1083,22 @@ fn scan(
     entries_visited: u64,
     elapsed_ms: u64,
 ) -> AccountingScan {
-    let limits = accounting_limits();
+    scan_with(
+        accounting_limits(),
+        coverage,
+        gaps,
+        entries_visited,
+        elapsed_ms,
+    )
+}
+
+fn scan_with(
+    limits: InventoryLimits,
+    coverage: AccountingCoverage,
+    gaps: Vec<AccountingGap>,
+    entries_visited: u64,
+    elapsed_ms: u64,
+) -> AccountingScan {
     AccountingScan {
         coverage,
         gaps,
@@ -1080,11 +1111,25 @@ fn scan(
 }
 
 fn root_failure(kind: AccountingGapKind, elapsed_ms: u64) -> AccountingScan {
+    root_failure_with(accounting_limits(), kind, elapsed_ms)
+}
+
+fn root_failure_with(
+    limits: InventoryLimits,
+    kind: AccountingGapKind,
+    elapsed_ms: u64,
+) -> AccountingScan {
     let gap = AccountingGap {
         kind,
         occurrences: 1,
     };
-    scan(AccountingCoverage::Unknown, vec![gap], 0, elapsed_ms)
+    scan_with(
+        limits,
+        AccountingCoverage::Unknown,
+        vec![gap],
+        0,
+        elapsed_ms,
+    )
 }
 
 fn gap_kind(kind: GapKind) -> AccountingGapKind {
@@ -1105,8 +1150,17 @@ fn gap_kind(kind: GapKind) -> AccountingGapKind {
 /// One bounded walk with the pool accounting bounds. Bytes of an incomplete
 /// walk are a lower bound for status only.
 fn inventory_sizes(path: &Path) -> Sizes {
+    inventory_sizes_deeper(path, 0)
+}
+
+/// [`inventory_sizes`] with the depth bound raised by `extra_depth`, for a
+/// root that sits that many levels above the slots; the scan reports the
+/// bounds actually used.
+fn inventory_sizes_deeper(path: &Path, extra_depth: usize) -> Sizes {
     let started = std::time::Instant::now();
-    match inventory_directory(path, accounting_limits()) {
+    let mut limits = accounting_limits();
+    limits.max_depth = limits.max_depth.saturating_add(extra_depth);
+    match inventory_directory(path, limits) {
         Ok(report) => {
             let coverage = if report.coverage.complete {
                 AccountingCoverage::Complete
@@ -1125,7 +1179,13 @@ fn inventory_sizes(path: &Path) -> Sizes {
             Sizes {
                 logical: Some(report.total.logical_bytes_by_name),
                 unique: Some(report.total.allocated_bytes),
-                scan: scan(coverage, gaps, report.entries_visited, report.elapsed_ms),
+                scan: scan_with(
+                    limits,
+                    coverage,
+                    gaps,
+                    report.entries_visited,
+                    report.elapsed_ms,
+                ),
             }
         }
         Err(error) => {
@@ -1140,7 +1200,7 @@ fn inventory_sizes(path: &Path) -> Sizes {
             Sizes {
                 logical: None,
                 unique: None,
-                scan: root_failure(kind, elapsed),
+                scan: root_failure_with(limits, kind, elapsed),
             }
         }
     }
@@ -1315,12 +1375,21 @@ fn refuse_retired_image_pool(pool: &Path) -> Result<(), LeaseError> {
 }
 
 fn refuse_foreign_pool_entries(pool: &Path) -> Result<(), LeaseError> {
+    let device = fs::symlink_metadata(pool).map_err(io_error)?.dev();
     for entry in fs::read_dir(pool).map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
         let name = entry.file_name();
-        let name = name.to_string_lossy();
+        if is_finder_metadata(&name) {
+            // Control-directory bytes, like config and ledger: not payload.
+            let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
+            if !is_tolerated_metadata_file(&metadata, device) {
+                return Err(unexpected_entry(POOL_PLACE, &name));
+            }
+            continue;
+        }
+        let text = name.to_string_lossy();
         let allowed = matches!(
-            name.as_ref(),
+            text.as_ref(),
             super::CONFIG_NAME
                 | super::LEDGER_NAME
                 | super::LOCK_NAME
@@ -1328,9 +1397,9 @@ fn refuse_foreign_pool_entries(pool: &Path) -> Result<(), LeaseError> {
                 | super::RECEIPT_NAME
                 | super::PAYLOAD_NAME
                 | super::MANAGED_NAME
-        ) || name.starts_with("ledger.tmp-");
+        ) || text.starts_with("ledger.tmp-");
         if !allowed {
-            return Err(LeaseError::UnknownAccounting);
+            return Err(unexpected_entry(POOL_PLACE, &name));
         }
         let metadata = fs::symlink_metadata(entry.path()).map_err(io_error)?;
         if metadata.file_type().is_symlink() {

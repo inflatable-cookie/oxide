@@ -242,7 +242,9 @@ reconciled only for the recorded evicting slot path.
 
 **Accounting walks (oxide#108).** Every pool accounting walk uses the same
 pool-specific bounds: 2,000,000 entries, depth 64 below the walked root and a
-60 s cooperative deadline. They are separate from the inventory tool's
+60 s cooperative deadline. The whole-payload walk starts at the payload root,
+one level above `slots`, so it uses depth 65 and slot contents keep 64
+([Finder metadata](workflow.md#finder-metadata-in-pools), oxide#105). They are separate from the inventory tool's
 defaults, which are unchanged. The callers:
 
 | Walk | Gate |
@@ -289,6 +291,129 @@ headroom at acquisition; it does not guarantee that a particular build fits,
 reserve space, constrain writes during a lease, or prevent `ENOSPC`. Other
 slots still count against the budget, so ordinary admission and refusal rules
 apply after the selected generation is removed.
+
+### Proposed: ledger-only view for front-door membership checks (lead `e4c74399`)
+
+Proposed, not implemented. This is a routine correction with no admission, closure, recovery or deletion change.
+
+**Problem.** The library's `status` runs one whole-payload walk plus one walk per slot. The front door calls it on ordinary commands where it needs only ledger membership. From source at `3842239`:
+
+| Call site | What it uses from status |
+| --- | --- |
+| `Store::open_at` (internal pool, every command) | `backend` |
+| `Store::open_removable` (selection through `usable`, every command while registered) | `backend` |
+| `Store::attempt` (acquisition affinity, ~store.rs 1131) | `slots[].project` |
+| `Store::recover_settled` (~1349) | held `slots[]` by project |
+| `Store::recover_interrupted` (~1429) | held `slots[]`: `slot_id`, `lease_id`, project |
+| `removable::internal_holds` | held `slots[]` by ID |
+| `Store::payload_use` (the per-command result line) | `payload_unique_allocated_bytes`, `cap_bytes` |
+
+On a removable pool, one ordinary command therefore pays several full walks. At 201,948 entries one walk took 3.4 s.
+
+**Change.**
+1. **Typed ledger-only view.** The library adds `ledger_view(pool) -> LedgerView`.
+   - **Opening:** through the unchanged `Pool::open`: canonical root, foreign-entry and retired-image refusals, pool lock, config and backing verification, ledger identity checks, the slot limit and `reconcile_evicting`. The view is therefore **not side-effect-free**: existing recorded-deletion reconciliation can run exactly as it does today.
+   - **Per-record checks:** under the same pool lock, for each ledger record it keeps full status's cheap, non-recursive checks, with the same error categories:
+     - `slot_path` rejects a zero slot ID;
+     - the slot root's `symlink_metadata` error, other than `NotFound`, propagates.
+
+     A record whose root is `NotFound`, held roots included, stays a member as today. No closure is inferred from a missing root, and no refusal is added because former coverage was only partial.
+   - **Returns:**
+     - `backend` and `cap_bytes`;
+     - `reconciliation_blocked`;
+     - each slot's `id`, `incarnation`, occupancy, `project`, `workspace`, `profile`, `holder` and `lease_id`.
+
+     The type has **no byte or coverage fields**, so a missing walk cannot be read as zero or Complete. Selection and recovery refusal boundaries are unchanged.
+2. **Ledger-view callers:** the first six call sites above switch to it, with identical decisions.
+3. **Full status stays** for:
+   - explicit `oxide status`, including `Store::report`, `slot_size` and the recursive reporting;
+   - `oxide init`/`new` readiness in `adopt.rs`, which keeps its own full status and `payload_use`, or reuses the readiness status it has already completed;
+   - every library admission, eviction and reuse walk. Their behaviour and bounds are unchanged.
+
+   Only the per-command summary stops calling `payload_use`.
+4. **The result line stops walking.** It reports a measurement only when this lease produced one: the library's reuse walk, labelled with its provenance ("slot 5 was 7.9 GiB when leased"). Otherwise it reports none. That covers a new slot ("new slot") and a held same-holder replay, where `reused_slot` does not imply a fresh measurement. It points to `oxide status` for the pool total. No new walk is added, and nothing walks a slot after release, when another command may hold it.
+
+**Effect.** An ordinary reuse command walks only its target slot, which is the library's existing reuse walk. New-slot allocation keeps exactly today's authoritative whole-payload walk.
+
+**Proof.** Standard tier. A test hook observes **every** inventory entry point and private front-door measurement, counting walks per root. On a fixture pool of at least 200,000 entries:
+- an ordinary reuse command makes zero whole-payload walks and zero walks of unrelated slots;
+- selection and its fallback, affinity, held-unknown recovery and explicit recovery decide identically to before;
+- a zero slot ID and a slot-root metadata error are refused with the same categories as today;
+- a missing held root stays a member;
+- partial accounting stays non-gating wherever it is today;
+- new-slot admission and eviction performs the same walks with the same outcomes;
+- explicit `oxide status` and `init`/`new` readiness still report full accounting;
+- the result line shows its provenance label, or no measurement on a new slot or replay, and never zero or Complete for an unwalked figure;
+- nothing walks after release.
+
+The brief stops if any recovery, closure, deletion or admission semantics would change.
+
+### Parked: cached closed-slot accounting (lead `cbb2824d`)
+
+Parked on 2026-10-21, not implemented. Sol's re-review of revision 2 (`d578447`) was again changes required. Transient hard-link mutation means an idle slot's contents and link topology cannot be shown to be unchanged cheaply, and out-of-lock walks need snapshot and conditional-commit rules. An exact cache therefore needs an immutability mechanism or an explicit policy relaxation. The per-command cost is addressed first by removing the front door's non-authoritative whole-payload walks, a separate correction. Both review verdicts are kept on the lead. Revision 2 text follows for reference. Revision 2 answers Sol's prospective review of `5852670` (changes required: shared-inode mutation, metadata outside slots, transition rules). Revision 2 drops revision 1's held baselines and overcounting sums.
+
+**Goal.** Stop walking every idle slot on every command, while keeping today's admission figures. Today each command walks the whole payload at least twice: once in the front door's selection status and once at library admission. Measured on the Builds pool: 95,020 entries in 1.2 s, then 201,948 entries in 3.4 s an hour later.
+
+**What is cached.** A closed observation per idle slot: `{incarnation, closing lease ID, unique bytes, logical bytes, entries, shared inodes, measured-at}`.
+- *Shared inodes* counts regular inodes whose `nlink` exceeds the links found inside that slot.
+- An incomplete walk stores no observation. It stores a diagnostic instead: gap causes, an observed lower bound and the time.
+- Ledger records stay within `MAX_LEDGER_BYTES`. The worst-case serialized size is proven in tests.
+
+**Admission figure.** The fast path is the sum of three parts:
+1. fresh shallow accounting of the payload root and `slots/` entries: the tolerated macOS metadata from oxide#105, never control-root bytes;
+2. a fresh walk of each **held** slot, as today, so held growth still counts;
+3. the cached observation of each **idle** slot.
+
+The fast path applies only when every idle slot has a valid observation with zero shared inodes, every held-slot walk shows zero shared inodes, and every shallow metadata entry has `nlink == 1`. Under those conditions the slots are pairwise disjoint: an inode in two slots has links outside each, so it shows as shared in both. The sum then equals today's `(device, inode)` union.
+
+Otherwise admission uses the **union fallback**: fresh bounded walks of the root entries and every slot, unioned as today. The fallback also refreshes the observations of idle slots whose walks complete. Shared-inode mutation therefore never reaches the sums or subtractions. In Sol's B/A case, B closes with shared inodes greater than zero, and every later admission and eviction takes the union path. There is no persistent inode census.
+
+**Validity.** An observation is valid only while all of these hold:
+- the slot is idle and unleased;
+- its incarnation and last lease ID equal the observation's;
+- its root `(device, inode)` and the removable volume binding are unchanged;
+- it is younger than the maximum age (proposed 24 h).
+
+Anything else invalidates it.
+
+**Transitions.** Every row is one atomic, synced ledger replacement unless stated otherwise.
+
+| Event | Ledger result | Crash before / after the write |
+| --- | --- | --- |
+| Allocate a new slot | Held; no observation | Unchanged / held new slot (recovery as today) |
+| Acquire or replay an idle slot | Held; observation **cleared in the same write that changes `last_lease_id`** | Idle with observation / held without one |
+| Close or recover (after positive writer closure and, on removable pools, a successful flush; the walk runs through the bound slot fd before the write) | Idle, plus the new observation if the walk completed, or the diagnostic if not | Still held, so closure or recovery repeats the walk / idle, settled |
+| Removable flush fails | Retired or held, as today; no observation | Unchanged |
+| Lazy refresh (idle, observation missing or expired): walk outside the pool lock, then recheck under it | Observation or diagnostic, **written before and independently of the admission decision**, so progress survives a refusal | No change / refreshed |
+| Recycle, eviction or reconciliation | Evicting, observation cleared, then the record is removed after deletion as today | As today |
+| Upgrade a v1 ledger | v2 with no observations; held slots are unaffected because they are always walked fresh | The first v2 write is the durable upgrade; before it, the ledger is still v1 |
+| `status --verify` | May publish observations for **idle** slots that still match under the lock; never for held slots | No change / refreshed |
+
+**Rules.**
+- **Refresh per admission:** each admission refreshes at most two missing or expired observations, oldest first. If any stay missing, that admission takes the union fallback, so behaviour matches today.
+- **Reuse:** reusing a compatible idle slot still walks only that slot, as today. It is never blocked by other slots' missing observations.
+- **Locking:** the internal admission barrier comes before the removable admission, and pool locking stays inside admission. Nothing blocks on a record-owner lock while holding admission, or takes admission from inside the pool lock. Walks run outside the pool lock and publish only after a recheck.
+- **Missing observations:** these are reported as "not cached". They are never a selection failure, and they never cause a new fallback to the internal pool. The existing explicit selection fallbacks are unchanged.
+- **Front-door paths:** one library accounting result serves every path, with no private walks: selection, `status`, the per-command result line, `slot_size` and the recursive reporting at `main.rs:664`, project-cap eviction, shared-slot handback, untrusted-slot discard, normal and reserve-stop release, automatic and explicit recovery, and removable flush and retirement.
+- **`status --verify`:** each walk uses the existing bounds, with an overall deadline (proposed 300 s). A partial result is reported as partial, and only completed idle walks are published.
+- **Ledger version:** the ledger version is independent of the lease and config wire identities, and existing held IDs are preserved. Old binaries refuse a v2 ledger without changing it.
+
+**Policy change for Tom.** One remains: **delayed detection inside idle slots.** Between measurements (at most the maximum age, and also at every reuse, recycle or `status --verify`), two things go unseen:
+- a newly unreadable entry or mount boundary inside an idle slot;
+- Finder metadata bytes added inside an idle slot.
+
+Today a new allocation would detect the first, and count the second, immediately. Revision 2 has no other admission change: held slots still count fresh, unions stay exact, and duplicate accounting adds no evictions.
+
+**Proof (after #109 qualification, elevated, `rust:pool-accounting-cache`).**
+- A pool of at least 200,000 entries, including a slot of at least 60,000, where fast-path admission walks only the held slots and the root.
+- Each transition row and both crash sides.
+- Lazy refresh persisting across a refusal.
+- A migrated held slot.
+- Cross-slot links, including mutation followed by eviction, taking the union path.
+- Root metadata, including a hard-linked entry.
+- `status --verify` running alongside a held build.
+- Removable flush failure and reattachment.
+- Measured close-time and acquire-time cost.
 
 History, retired with the image backend (oxide#102): the verified APFS
 sparse-image volume was the hard aggregate bound, the declared cap had to

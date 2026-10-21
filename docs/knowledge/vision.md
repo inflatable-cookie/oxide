@@ -627,6 +627,75 @@ Tom, 2026-10-20, "Yes" to two items.
    - Before consumer holds are released, a fresh worktree must lease a new slot on the Builds drive and a large existing slot must be reusable.
 2. **A separately scoped task qualifies one shared test supervisor.** It samples the host reserve continuously across every writer in a proof session, and observes and settles every Cargo process group on early exit and on timeout. Elevated tasks then stop building per-task apparatus.
 
+Tom, 2026-10-21, "Cleanup approved", covering the post-cutover leftovers listed to him:
+- the two legacy disk-image pools, Oxide's under `~/Library/Caches/oxide/pool` and Nucleus's. Nucleus's needs a note to its owner first.
+- the retired Builds payload `/Volumes/Builds/oxide-pool.retired-20261020`, and the retired registration entries;
+- the interim internal pool `~/Dev/oxide-interim`;
+- Longhorn #061's plain-Cargo `target/` (about 5.1 GiB) left by the `:cargo` escapes.
+
+Each removal still needs a fresh positive idle/closure check at the time. Held or unknown state stops that item. Ordinary detach only. The planner runs Oxide-owned host items; consumer owners run their own checkouts.
+
+Tom, 2026-10-21, "105 fast path approved, continue clean up". Background: Finder wrote `.DS_Store` files into the live Builds pool at about 23:09Z from an open window on the drive, despite `DSDontWriteUSBStores`, and selection fell back to the internal pool.
+- **#105 (ignore macOS metadata in pool accounting):**
+  1. integrate onto accepted #108 and current main, then run the covering checks;
+  2. an independent source-only review;
+  3. if it finds no product defect, operator acceptance replaces the missing author native;
+  4. merge and install.
+  Earlier verdicts and gaps are kept.
+- **Cleanup continues** on the retired Builds tree only after a fresh positive idle and no-ongoing-writes check. No force or recovery.
+
+Tom, 2026-10-21, "Yeah perfect, approve": an Oxide CI shim replaces per-project CI switching. Longhorn's `GITHUB_ACTIONS` helper "will do for now, but need something more elegant".
+1. **One crate, two builds.** The shim is a feature-gated build of the same `oxide` crate.
+   - It shares the command-line parser and argument refusals, but has no pool, slot, lease, removable or freshness machinery.
+   - Built-in commands become their `cargo` equivalent unchanged, and `quick`/`debug` apply the same profile recipe environment.
+   - `exec` runs the command and `clean` runs `cargo clean`. `status` reports passthrough and exits 0. Exit codes are Cargo's.
+2. **Never environment-triggered.** The full binary never switches to passthrough because of `CI`, `GITHUB_ACTIONS` or similar. The installed artifact decides the behaviour.
+3. **Distribution.** Release builds of the shim plus a `setup-oxide` GitHub Action, on the `setup-effigy` pattern. The release, tags and workflow for this are approved. The crates.io name stays open under Q-005.
+4. **Order.** The shim follows #106, so its profile mapping matches. Then the release and action, then Longhorn as first adopter. Each consumer's CI workflow edit is approved project by project.
+
+Once a project adopts it, its selectors call `oxide` unconditionally. Local `:cargo` escapes stay for a broken `oxide`.
+
+Tom, 2026-10-21, "Approve", answering two questions.
+1. **Direct GitHub merge of #105** (PR #96 at `ddfccfb63fcf219fcbcbe6ecab5a6d494afbb7e2`). Operator acceptance had already been applied, and Queue verification was waiting on a full board. The merge is reconciled through Queue's external-merge closeout, followed by the pinned install.
+2. **Test scratch goes on the pool.** For the processes Oxide launches (`test`, `run`, external subcommands, and `exec` once it exists), Oxide points `TMPDIR`/`TMP`/`TEMP` at a per-slot scratch directory on the selected pool, so undocked it falls back with the pool.
+   - Oxide replaces `TMPDIR` only when it is still macOS's default per-user temp directory. Any deliberate value, such as Oxide's own `/private/tmp` validation scratch, is kept.
+   - Scratch is removed at slot release and covered by crash recovery. That makes it elevated tier, sequenced after the #109 shared supervisor.
+   - Motivation: whole-device counters still showed heavy internal-SSD writes after the cutover (742 GB since a 20:43Z boot by 23:50Z, unattributed). Effigy and Queue-worktree scratch are separate decisions, pending attribution data.
+
+Tom, 2026-10-21, "Yes to all your suggestions": the Builds volume may hold non-Oxide scratch **outside** `/Volumes/Builds/oxide-pool`. The case that prompted it is test and QA temporary writes, owned by Effigy for the selectors it runs.
+- The scratch must fall back to the internal default when the registered volume is absent.
+- It must never create `/Volumes/Builds/...` on the internal disk.
+- Oxide's pool keeps refusing unknown entries inside its own payload.
+
+Queue's backup and retention changes from the same ruling are owned by Queue.
+
+Tom, 2026-10-21, "Yes, (2)" (Queue decision `99ed1d7f`): the shared native-proof supervisor (#109) takes the **pinned-leader cooperative closure** contract.
+- **Only the pinned group is signalled by number.** That is the leader's own group, pinned by the unreaped leader. TERM and KILL reach descendant groups only through their own parents' cooperative cascade (Oxide forwards to Cargo, and nextest handles its test groups).
+- **Survivors fail the run closed.** Session members that remain in other groups, or members whose membership is uncertain, are reported. The run fails UNCLOSED and its scratch is retained. No numeric signal goes to unpinned groups.
+- **Why:** macOS gives no positive-identity signal for a group the supervisor does not pin, and a recheck does not close the reuse race.
+- **What it replaces:** the earlier "settles every Cargo process group" wording, replaced prospectively. This is not a qualification; the correction still needs independent review.
+
+The same day Tom agreed Effigy's run-scratch design, which Effigy owns and which ships in v0.15.
+
+Tom, 2026-10-21, "I'll go with your recommendation C for 109", the native-proof route while #109 is unqualified.
+1. **Standard-tier exception for #110 and #106 only, until #109 qualifies.** Their native proofs run under main's `scripts/bounded-test.py` at `3d947a9`, Effigy heavy admission, a wall-clock limit and the task's own scratch root. Each task's evidence discloses the gaps:
+   - no free-space monitoring of plain-Cargo staging or fixture writes;
+   - no supervisor-enforced scratch budget or scratch cleanup;
+   - on the timeout path, numeric TERM and KILL of recorded session groups without positive identity.
+
+   No probability is assigned to either risk.
+2. **#109 gets one more prospective design revision.** It must be one complete actor, launch-gate and control protocol with a failure table that keeps the original guards and the output and receipt contract. If that revision is again changes required, Tom chooses for elevated tasks between the documented-gap route and a different mechanism, such as a disposable VM as the custody and disk bound.
+
+Elevated tasks keep waiting for a qualified supervisor.
+
+Tom, 2026-10-21, "Yeah do it" (Queue decision `bc874ae7`), after the #109 correction's revision 3 was reviewed as changes required. Tom declined a VM ("too heavy").
+- **One final, narrow design round:** revision 4 changes only the four P1s from the revision 3 review.
+  1. A session-ready ack before the gate, with cancellation before the gate using `kill` on the pinned PID.
+  2. Precedence of fault, reap and command status.
+  3. A system-wide `CLOCK_UPTIME_RAW`.
+  4. No start-time exclusion.
+- **Stop rule:** if review raises only minor points, they are fixed during implementation. A new P1 class switches elevated tasks to the documented-gap route (B), with no further design rounds.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
