@@ -509,6 +509,7 @@ def main() -> None:
     expect(not dirty, f"source checkout is dirty: {dirty}")
     make_dir(LOGS)
     make_dir(WORKSPACES)
+    make_dir(os.path.join(ROOT, "markers"))
 
     env = clear_owned_environment()
     config = os.path.join(ROOT, "config", "config.toml")
