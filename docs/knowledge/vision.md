@@ -669,6 +669,14 @@ Tom, 2026-10-21, "Yes to all your suggestions": the Builds volume may hold non-O
 
 Queue's backup and retention changes from the same ruling are owned by Queue.
 
+Tom, 2026-10-21, "Yes, (2)" (Queue decision `99ed1d7f`): the shared native-proof supervisor (#109) takes the **pinned-leader cooperative closure** contract.
+- **Only the pinned group is signalled by number.** That is the leader's own group, pinned by the unreaped leader. TERM and KILL reach descendant groups only through their own parents' cooperative cascade (Oxide forwards to Cargo, and nextest handles its test groups).
+- **Survivors fail the run closed.** Session members that remain in other groups, or members whose membership is uncertain, are reported. The run fails UNCLOSED and its scratch is retained. No numeric signal goes to unpinned groups.
+- **Why:** macOS gives no positive-identity signal for a group the supervisor does not pin, and a recheck does not close the reuse race.
+- **What it replaces:** the earlier "settles every Cargo process group" wording, replaced prospectively. This is not a qualification; the correction still needs independent review.
+
+The same day Tom agreed Effigy's run-scratch design, which Effigy owns and which ships in v0.15.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
