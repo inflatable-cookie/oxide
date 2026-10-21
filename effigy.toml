@@ -209,10 +209,13 @@ admission = "heavy"
 run = "python3 scripts/test-oxide-wrapper-bypass.py"
 
 # Proposed proof for `oxide pool describe --json` (oxide#112). HELD: the
-# script refuses before any effect until the owner binds a qualified #109
-# shared runner or Tom's task-specific exception for oxide#112. Running it
-# now only prints the refusal. Proposed bounds: 300 s, 512 MiB owned scratch.
-# Coverage gaps are listed in the script's own docstring (`--plan`).
+# script's gate RUN_BOUND is False, so this selector refuses before any effect
+# until the owner binds a qualified #109 shared runner or Tom's task-specific
+# exception for oxide#112 and sets the gate. Proposed activation, as an outer
+# old-guard wrapper (unchanged scripts/bounded-test.py, SHA-256
+# 9dffe4f3cb8cbb7de33fc50798986cd7a9860cb55b3aee66942b1a0ea9c49344):
+#   python3 scripts/bounded-test.py python3 scripts/test-pool-describe.py
+# Not run. Coverage gaps are listed in the script's docstring (--plan).
 [tasks."rust:pool-describe"]
 admission = "heavy"
 run = "python3 scripts/test-pool-describe.py"
