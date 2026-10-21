@@ -81,6 +81,12 @@ PERSIST = 8 * MIB
 FORWARD = 32 * MIB
 CENSUS_INTERVAL = 0.2
 CONFIRM_TRIES, CONFIRM_PAUSE = 20, 0.05  # gone confirmation within one round, at most 1 s
+DIAG_MAX_BYTES = 16384  # compact UTF-8 JSON ceiling for the optional receipt census diagnostics
+DIAG_MAX_ROWS = 20  # at most 20 diagnostic summary rows; the rest count as omitted
+U64MAX = 2 ** 64 - 1
+CONFIRM_VALUES = ("absent", "replaced", "matching_exhausted", "read_failed")
+FINAL_VALUES = ("not_read", "absent", "replaced", "same_identity", "read_failed")
+DIAG_ERROR_VALUES = ("none", "permission", "not_found", "io", "other")
 MAX_LINE = 64 * 1024
 INJECTIONS = {
     "setup-stall", "no-detector", "ack-eof", "ack-wrong", "cancel-before-ack", "monitor-die",
@@ -261,6 +267,129 @@ class Kinfo:
             raise ValueError("layout does not match this process")
 
 
+def _diag_u64(value):
+    """Valid unsigned 64-bit diagnostic integer, else None (omitted, never sanitized)."""
+    return value if type(value) is int and 0 <= value <= U64MAX else None
+
+
+def _diag_small(value, low, high):
+    return value if type(value) is int and low <= value <= high else None
+
+
+def _diag_classify(error):
+    """Map an exception to (enumerated category, bounded errno or None).
+
+    Reads only the C-level errno slot; never converts the exception to
+    text. Unknown or unbounded values become omitted, never widened."""
+    if error is None:
+        return ("none", None)
+    try:
+        code = _ERRNO.__get__(error)
+    except BaseException:
+        code = None
+    if type(code) is not int:
+        return ("other", None)
+    bounded = code if 0 <= code <= 4095 else None
+    try:
+        if code == errno.ESRCH:
+            return ("not_found", bounded)
+        if code == errno.EACCES or code == errno.EPERM:
+            return ("permission", bounded)
+        if code == errno.EIO:
+            return ("io", bounded)
+    except BaseException:
+        return ("other", bounded)
+    return ("other", bounded)
+
+
+def _diag_row(row, tries, confirm, final, error, err_no):
+    """One bounded diagnostic summary row with fixed enums only.
+
+    Allowed keys only: initial pid/start/ppid/pgid/uid/zombie plus
+    confirm_tries/confirm/final/error and an optional bounded errno.
+    Invalid numerics are omitted (absent), never sanitized."""
+    out = {}
+    source = row if isinstance(row, dict) else {}
+    for key in ("pid", "start", "ppid", "pgid", "uid"):
+        try:
+            valid = _diag_u64(source.get(key))
+        except BaseException:
+            valid = None
+        if valid is not None:
+            out[key] = valid
+    try:
+        zombie = source.get("zombie")
+    except BaseException:
+        zombie = None
+    if zombie is True:
+        out["zombie"] = True
+    elif zombie is False:
+        out["zombie"] = False
+    valid_tries = _diag_small(tries, 0, CONFIRM_TRIES)
+    if valid_tries is not None:
+        out["confirm_tries"] = valid_tries
+    if confirm in CONFIRM_VALUES:
+        out["confirm"] = confirm
+    if final in FINAL_VALUES:
+        out["final"] = final
+    if error in DIAG_ERROR_VALUES:
+        out["error"] = error
+    if type(err_no) is int and 0 <= err_no <= 4095:
+        out["errno"] = err_no
+    return out
+
+
+def _diag_object(attempted, rows, saturated):
+    """Build the optional diagnostics object under the byte ceiling.
+
+    Drops complete rows from the end first with an explicit omitted count;
+    if even the minimal object cannot fit, returns None (omit entirely).
+    Never raises; serialization failure also returns None."""
+    try:
+        if type(attempted) is not int or attempted < 0:
+            attempted = U64MAX
+            saturated = True
+        elif attempted > U64MAX:
+            attempted = U64MAX
+            saturated = True
+        kept = list(rows[:DIAG_MAX_ROWS])
+        omitted = len(rows) - len(kept)
+        if omitted < 0:
+            omitted = 0
+        if omitted > U64MAX:
+            omitted = U64MAX
+            saturated = True
+        retained = len(kept)
+        if retained > U64MAX:
+            retained = U64MAX
+            saturated = True
+        obj = {"attempted": attempted, "retained": retained, "omitted": omitted,
+               "saturated": bool(saturated), "rows": kept}
+        compact = json.dumps(obj, ensure_ascii=True, separators=(',', ':')).encode("utf-8")
+        if len(compact) <= DIAG_MAX_BYTES:
+            return obj
+        while kept:
+            kept = kept[:-1]
+            omitted = len(rows) - len(kept)
+            if omitted < 0:
+                omitted = 0
+            if omitted > U64MAX:
+                omitted = U64MAX
+                saturated = True
+            retained = len(kept)
+            obj = {"attempted": attempted, "retained": retained, "omitted": omitted,
+                   "saturated": bool(saturated), "rows": kept}
+            compact = json.dumps(obj, ensure_ascii=True, separators=(',', ':')).encode("utf-8")
+            if len(compact) <= DIAG_MAX_BYTES:
+                return obj
+        minimal = {"attempted": attempted, "retained": 0, "omitted": len(rows) if len(rows) <= U64MAX else U64MAX,
+                   "saturated": bool(saturated or len(rows) > U64MAX), "rows": []}
+        compact = json.dumps(minimal, ensure_ascii=True, separators=(',', ':')).encode("utf-8")
+        return minimal if len(compact) <= DIAG_MAX_BYTES else None
+    except BaseException:
+        return None
+
+
 class Census:
     """Classifies every process against session `sid` (the leader's PID).
 
@@ -270,27 +399,55 @@ class Census:
     parent. Positively foreign: a validated other session, never a member.
     Gone: getsid ESRCH and a later successful KERN_PROC_PID read lacks the
     identity; a zombie still present is re-read within the round, at most
-    CONFIRM_TRIES times. A failed read confirms nothing. Everything else
+    CONFIRM_TRIES times. When that confirmation does not establish absence,
+    the round's existing final KERN_PROC_PID read for the same PID is still
+    checked under the same rule: a successful read showing None or a
+    different start token establishes Gone and drops only the old tracked
+    (PID, start) identity. A replacement identity is never declared foreign
+    or member by inference. A failed read confirms nothing. Everything else
     (other getsid errors, identity change, failed or missing metadata,
     unconfirmed zombies, a failed snapshot) is uncertain and blocks closure,
-    first-seen rows included. Start time is never used to exclude a process."""
+    first-seen rows included. Start time is never used to exclude a process.
+
+    The round also builds an optional, monitor-receipt-only diagnostics
+    object summarizing ESRCH rows (confirm attempts/outcome and the final
+    read result with an enumerated error category). It never leaves this
+    round's return value: the census IPC message keeps only
+    after/members/uncertain/certain, and the diagnostics never change
+    classification, membership, authoritative counts, first fault, closure
+    or cleanup, nor consume extra reads, time or retry budget."""
 
     def __init__(self, sid, snapshot=Kinfo.all, getsid=os.getsid, reread=Kinfo.one, pause=time.sleep):
         self.sid, self.snapshot, self.getsid, self.reread, self.pause = sid, snapshot, getsid, reread, pause
         self.tracked = {}
 
-    def confirm_gone(self, row):
-        """True only on a successful read that lacks the identity."""
+    def confirm_gone_info(self, row):
+        """Confirm absence, reporting how. Returns (gone, tries, outcome, error).
+
+        `gone` follows the existing Gone rule (a successful read lacking the
+        identity); `tries` is the bounded 1..20 re-read count; `outcome` is
+        one of absent/replaced/matching_exhausted/read_failed; `error` is
+        the reread exception or None. Same reads, pauses and budget as
+        confirm_gone."""
+        tries = 0
         for attempt in range(CONFIRM_TRIES):
             if attempt:
                 self.pause(CONFIRM_PAUSE)
+            tries += 1
             try:
                 again = self.reread(row["pid"])
-            except Exception:
-                return False
-            if again is None or again["start"] != row["start"]:
-                return True
-        return False
+            except Exception as error:
+                return (False, tries, "read_failed", error)
+            if again is None:
+                return (True, tries, "absent", None)
+            if again["start"] != row["start"]:
+                return (True, tries, "replaced", None)
+        return (False, tries, "matching_exhausted", None)
+
+    def confirm_gone(self, row):
+        """True only on a successful read that lacks the identity."""
+        gone, _tries, _outcome, _error = self.confirm_gone_info(row)
+        return gone
 
     def round(self):
         try:
@@ -303,17 +460,71 @@ class Census:
             if identity not in present:
                 del self.tracked[identity]
         members, uncertain = [], []
+        diag_attempted, diag_saturated, diag_rows = 0, False, []
         for row in rows:
             identity = (row["pid"], row["start"])
-            failure = None
+            failure, getsid_error = None, None
             try:
                 session = self.getsid(row["pid"])
-            except ProcessLookupError:
-                session, failure = None, "gone"
+            except ProcessLookupError as error:
+                session, failure, getsid_error = None, "gone", error
             except OSError as error:
                 session, failure = None, f"getsid: {error}"
-            if failure == "gone" and self.confirm_gone(row):
-                self.tracked.pop(identity, None)
+            if failure == "gone":
+                if diag_attempted >= U64MAX:
+                    diag_saturated = True
+                else:
+                    diag_attempted += 1
+                gone, tries, confirm_outcome, _confirm_error = self.confirm_gone_info(row)
+                if gone:
+                    self.tracked.pop(identity, None)
+                    try:
+                        diag_rows.append(_diag_row(row, tries, confirm_outcome, "not_read", "none", None))
+                    except BaseException:
+                        pass
+                    continue
+                try:
+                    again = self.reread(row["pid"])
+                except Exception as error:
+                    again = None
+                    failure = f"reread: {error}" if failure in (None, "gone") else failure
+                    try:
+                        category, number = _diag_classify(error)
+                        diag_rows.append(_diag_row(row, tries, confirm_outcome, "read_failed", category, number))
+                    except BaseException:
+                        pass
+                    stable = False
+                else:
+                    if again is None:
+                        self.tracked.pop(identity, None)
+                        try:
+                            diag_rows.append(_diag_row(row, tries, confirm_outcome, "absent", "none", None))
+                        except BaseException:
+                            pass
+                        continue
+                    if again["start"] != row["start"]:
+                        self.tracked.pop(identity, None)
+                        try:
+                            diag_rows.append(_diag_row(row, tries, confirm_outcome, "replaced", "none", None))
+                        except BaseException:
+                            pass
+                        continue
+                    stable = True
+                    try:
+                        category, number = _diag_classify(getsid_error)
+                        diag_rows.append(_diag_row(row, tries, confirm_outcome, "same_identity", category, number))
+                    except BaseException:
+                        pass
+                    failure = "getsid ESRCH, absence not confirmed"
+                if failure is None and stable and session == self.sid:
+                    self.tracked[identity] = row
+                    members.append(row)
+                elif identity in self.tracked:
+                    members.append(row)
+                elif failure is None and stable:
+                    continue  # positively foreign
+                else:
+                    uncertain.append(dict(row, reason=failure or "identity changed across getsid"))
                 continue
             try:
                 again = self.reread(row["pid"])
@@ -331,8 +542,21 @@ class Census:
                 continue  # positively foreign
             else:
                 uncertain.append(dict(row, reason=failure or "identity changed across getsid"))
-        return {"certain": not uncertain, "members": len(members), "uncertain": len(uncertain),
+        result = {"certain": not uncertain, "members": len(members), "uncertain": len(uncertain),
                 "member_rows": members[:20], "uncertain_rows": uncertain[:20]}
+        if diag_attempted:
+            try:
+                diagnostics = _diag_object(diag_attempted, diag_rows, diag_saturated)
+            except BaseException:
+                diagnostics = None
+            if diagnostics is not None:
+                try:
+                    check = json.dumps(diagnostics, ensure_ascii=True, separators=(',', ':')).encode("utf-8")
+                    if len(check) <= DIAG_MAX_BYTES and len(diagnostics.get("rows", [])) <= DIAG_MAX_ROWS:
+                        result["diagnostics"] = diagnostics
+                except BaseException:
+                    pass
+        return result
 
 
 # Guard and precedence (custodian side, pure) -------------------------------------

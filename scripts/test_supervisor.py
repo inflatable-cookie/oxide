@@ -278,6 +278,221 @@ class PureCensus(unittest.TestCase):
         self.assertFalse(result["certain"])
 
 
+class PureCensusFinalAbsence(unittest.TestCase):
+    """Oxide#114: the round's existing final read applies the Gone rule."""
+
+    def test_final_none_after_matching_exhaustion_untracked(self):
+        base = row(109, start=5)
+        table = FakeTable([base], {109: ProcessLookupError(3, "gone")},
+                           reread={109: lambda reads: row(109, start=5) if reads <= 20 else None})
+        check = census(table)
+        result = check.round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
+        self.assertEqual(table.reads, 21)
+        self.assertNotIn((109, 5), check.tracked)
+        diag = result.get("diagnostics")
+        self.assertIsNotNone(diag)
+        self.assertEqual(diag["attempted"], 1)
+        self.assertEqual(diag["rows"][0]["confirm"], "matching_exhausted")
+        self.assertEqual(diag["rows"][0]["final"], "absent")
+
+    def test_final_replacement_after_matching_exhaustion_untracked(self):
+        table = FakeTable([row(110, start=5)], {110: ProcessLookupError(3, "gone")},
+                           reread={110: lambda reads: row(110, start=5) if reads <= 20 else row(110, start=9)})
+        check = census(table)
+        result = check.round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
+        self.assertEqual(table.reads, 21)
+        self.assertNotIn((110, 5), check.tracked)
+        self.assertNotIn((110, 9), check.tracked)
+        self.assertEqual(result["diagnostics"]["rows"][0]["final"], "replaced")
+
+    def test_final_none_tracked_drops_only_old(self):
+        table = FakeTable([row(111, start=5)], {111: 100})
+        check = census(table)
+        self.assertEqual(check.round()["members"], 1)
+        table.sessions = {111: ProcessLookupError(3, "gone")}
+        table.reads = 0
+        table.rereads = {111: lambda reads: row(111, start=5) if reads <= 20 else None}
+        result = check.round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
+        self.assertNotIn((111, 5), check.tracked)
+
+    def test_final_replacement_tracked_not_foreign_by_inference(self):
+        table = FakeTable([row(112, start=5)], {112: 100})
+        check = census(table)
+        check.round()
+        table.sessions = {112: ProcessLookupError(3, "gone")}
+        table.reads = 0
+        table.rereads = {112: lambda reads: row(112, start=5) if reads <= 20 else row(112, start=9)}
+        result = check.round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
+        self.assertNotIn((112, 5), check.tracked)
+        self.assertNotIn((112, 9), check.tracked)
+        # The replacement identity is a new row next round, foreign by validation, not by inference.
+        table.rows = [row(112, start=9)]
+        table.sessions = {112: 7}
+        table.rereads = {}
+        table.reads = 0
+        follow = check.round()
+        self.assertEqual((follow["certain"], follow["members"], follow["uncertain"]), (True, 0, 0))
+
+    def test_persistent_matching_untracked_still_uncertain(self):
+        table = FakeTable([row(113, start=5)], {113: ProcessLookupError(3, "gone")})
+        check = census(table)
+        result = check.round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual(table.reads, 21)
+        self.assertEqual(result["diagnostics"]["rows"][0]["final"], "same_identity")
+
+    def test_persistent_matching_tracked_stays_member(self):
+        table = FakeTable([row(114, start=5)], {114: 100})
+        check = census(table)
+        check.round()
+        table.sessions = {114: ProcessLookupError(3, "gone")}
+        table.reads = 0
+        result = check.round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 1, 0))
+
+    def test_final_read_failure_still_blocks(self):
+        def failing(_reads):
+            raise PermissionError(13, "denied")
+        table = FakeTable([row(115, start=5)], {115: ProcessLookupError(3, "gone")}, reread={115: failing})
+        result = census(table).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual(result["diagnostics"]["rows"][0]["final"], "read_failed")
+
+    def test_confirm_read_failure_then_final_absence_gone(self):
+        def flaky(reads):
+            if reads == 1:
+                raise PermissionError(13, "denied")
+            return None
+        table = FakeTable([row(116, start=5)], {116: ProcessLookupError(3, "gone")}, reread={116: flaky})
+        check = census(table)
+        result = check.round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
+        self.assertEqual(table.reads, 2)
+        self.assertEqual(result["diagnostics"]["rows"][0]["confirm"], "read_failed")
+        self.assertEqual(result["diagnostics"]["rows"][0]["final"], "absent")
+
+    def test_confirm_read_failure_then_final_failure_blocks(self):
+        def failing(_reads):
+            raise PermissionError(13, "denied")
+        table = FakeTable([row(117, start=5)], {117: ProcessLookupError(3, "gone")}, reread={117: failing})
+        result = census(table).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual(table.reads, 2)
+
+    def test_non_esrch_still_blocks(self):
+        table = FakeTable([row(118, start=5)], {118: PermissionError(1, "denied")})
+        result = census(table).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertNotIn("diagnostics", result)
+
+    def test_tracked_changes_still_member_until_positive_absence(self):
+        table = FakeTable([row(119, start=5, ppid=101)], {119: 100})
+        check = census(table)
+        self.assertEqual(check.round()["members"], 1)
+        table.rows = [row(119, start=5, ppid=1, uid=0)]
+        table.sessions = {119: 119}
+        table.reads = 0
+        self.assertEqual(check.round()["members"], 1)
+        table.sessions = {119: ProcessLookupError(3, "gone")}
+        table.reads = 0
+        table.rereads = {119: lambda reads: row(119, start=5, ppid=1, uid=0) if reads <= 20 else None}
+        result = check.round()
+        self.assertEqual((result["certain"], result["members"]), (True, 0))
+
+
+class PureDiagnostics(unittest.TestCase):
+    def test_enums_and_no_raw_text(self):
+        table = FakeTable([row(120, start=5)], {120: ProcessLookupError(3, "gone")})
+        result = census(table).round()
+        diag = result["diagnostics"]
+        self.assertEqual((diag["attempted"], diag["retained"]), (1, 1))
+        self.assertEqual(diag["omitted"], 0)
+        self.assertFalse(diag["saturated"])
+        entry = diag["rows"][0]
+        self.assertIn(entry["confirm"], bounded.CONFIRM_VALUES)
+        self.assertIn(entry["final"], bounded.FINAL_VALUES)
+        self.assertIn(entry["error"], bounded.DIAG_ERROR_VALUES)
+        self.assertEqual(entry["confirm_tries"], 20)
+        blob = json.dumps(diag, ensure_ascii=True, separators=(',', ':')).encode("utf-8")
+        self.assertLessEqual(len(blob), bounded.DIAG_MAX_BYTES)
+        text = blob.decode("utf-8")
+        self.assertNotIn("denied", text)
+        self.assertNotIn("ProcessLookup", text)
+
+    def test_max_width_rows_under_ceiling(self):
+        big = {"pid": bounded.U64MAX, "start": bounded.U64MAX, "ppid": bounded.U64MAX,
+               "pgid": bounded.U64MAX, "uid": bounded.U64MAX, "zombie": True}
+        rows = [bounded._diag_row(big, 20, "matching_exhausted", "same_identity", "other", 4095)
+                for _ in range(20)]
+        obj = bounded._diag_object(20, rows, False)
+        self.assertEqual((obj["retained"], obj["omitted"]), (20, 0))
+        blob = json.dumps(obj, ensure_ascii=True, separators=(',', ':')).encode("utf-8")
+        self.assertLessEqual(len(blob), bounded.DIAG_MAX_BYTES)
+
+    def test_overflow_omitted_count(self):
+        rows = [bounded._diag_row(row(200 + i, start=i), 20, "matching_exhausted", "same_identity",
+                                   "not_found", 3) for i in range(25)]
+        obj = bounded._diag_object(25, rows, False)
+        self.assertEqual((obj["attempted"], obj["retained"], obj["omitted"]), (25, 20, 5))
+        self.assertLessEqual(len(json.dumps(obj, ensure_ascii=True, separators=(',', ':')).encode("utf-8")),
+                             bounded.DIAG_MAX_BYTES)
+
+    def test_byte_ceiling_drops_rows_without_changing_classification(self):
+        table = FakeTable([row(121, start=5)], {121: ProcessLookupError(3, "gone")})
+        plain = census(table).round()
+        saved = bounded.DIAG_MAX_BYTES
+        bounded.DIAG_MAX_BYTES = 120
+        try:
+            table2 = FakeTable([row(121, start=5)], {121: ProcessLookupError(3, "gone")})
+            trimmed = census(table2).round()
+        finally:
+            bounded.DIAG_MAX_BYTES = saved
+        self.assertEqual((plain["certain"], plain["members"], plain["uncertain"]),
+                         (trimmed["certain"], trimmed["members"], trimmed["uncertain"]))
+        diag = trimmed.get("diagnostics")
+        if diag is not None:
+            blob = json.dumps(diag, ensure_ascii=True, separators=(',', ':')).encode("utf-8")
+            self.assertLessEqual(len(blob), 120)
+            self.assertGreaterEqual(diag["omitted"], 0)
+
+    def test_serialization_failure_omits_without_changing_result(self):
+        table = FakeTable([row(122, start=5)], {122: ProcessLookupError(3, "gone")})
+        expected = census(table).round()
+        real_dumps = json.dumps
+
+        def broken(*_args, **_kwargs):
+            raise ValueError("injected")
+        table2 = FakeTable([row(122, start=5)], {122: ProcessLookupError(3, "gone")})
+        check = census(table2)
+        saved = bounded.json.dumps
+        bounded.json.dumps = broken
+        try:
+            result = check.round()
+        finally:
+            bounded.json.dumps = saved
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]),
+                         (expected["certain"], expected["members"], expected["uncertain"]))
+        self.assertNotIn("diagnostics", result)
+        self.assertTrue(real_dumps is not None)
+
+    def test_invalid_numerics_omitted(self):
+        table = FakeTable([row(105, start=-5)], {105: ProcessLookupError(3, "gone")},
+                           reread={105: None})
+        result = census(table).round()
+        self.assertEqual((result["certain"], result["members"]), (True, 0))
+        entry = result["diagnostics"]["rows"][0]
+        self.assertNotIn("start", entry)
+        self.assertEqual(entry["confirm"], "absent")
+
+    def test_no_diagnostics_without_esrch(self):
+        table = FakeTable([row(101), row(200)], {101: 100, 200: 7})
+        self.assertNotIn("diagnostics", census(table).round())
+
+
 class PureProtocol(unittest.TestCase):
     def custodian(self):
         custodian = bounded.Custodian(["true"])
@@ -939,7 +1154,8 @@ def main():
     loader = unittest.defaultTestLoader
     runner = unittest.TextTestRunner(verbosity=2, resultclass=Results)
     pure = unittest.TestSuite(loader.loadTestsFromTestCase(case)
-                              for case in (PureGuard, PurePrecedence, PureCensus, PureProtocol))
+                              for case in (PureGuard, PurePrecedence, PureCensus, PureCensusFinalAbsence,
+                                           PureDiagnostics, PureProtocol))
     ok = runner.run(pure).wasSuccessful()
     if sys.argv[1:] != ["--pure"]:
         # Writers before and after a simulated staging step, in the outer
