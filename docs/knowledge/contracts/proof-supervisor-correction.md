@@ -1,11 +1,20 @@
 # Proposed correction: shared proof supervisor (oxide#109)
 
 Proposed, not implemented; it awaits independent design review. This is
-revision 3, and the last revision under Tom's 2026-10-21 route-C ruling
-([vision](../vision.md#authority-boundaries)): if this is again changes
-required, Tom chooses the mechanism for elevated tasks. It answers Sol's
-review of revision 2 (`ccf9d98f`), and corrects `scripts/bounded-test.py` at
-`f5a998c`, keeping that baseline's guards:
+revision 4. Under Tom's 2026-10-21 ruling on Queue decision `bc874ae7` ("Yeah
+do it"), it is a final, narrow round that changes only the four P1s from the
+review of revision 3 (`c8ab934f`):
+1. the launch gate passing before the child's `setsid`;
+2. fault, reap and command-status precedence;
+3. the per-interpreter monotonic origin;
+4. start-time exclusion.
+
+**Stop rule:** if review raises only minor points, they are fixed during
+implementation without another design round. A new P1 class switches elevated
+tasks to the documented-gap route (B), with no further design rounds.
+
+The baseline being corrected is `scripts/bounded-test.py` at `f5a998c`. This
+design keeps that baseline's guards:
 - the reserve fault on staleness after 1 s;
 - the scratch fault on staleness after 10 s, with its monitored budget;
 - bounded output draining, with discard past the forward limit;
@@ -57,32 +66,43 @@ arbitrary descendants.
    doesn't arrive by then, or arrives with low or failed readings, the
    custodian kills its pinned monitor, reaps it with `WNOHANG`, exits non-zero
    and launches nothing.
-3. The custodian forks the **leader**. The child:
-   - calls `setsid`;
-   - `dup2`s the output write ends;
-   - closes everything else;
-   - blocks reading a gate pipe.
-
-   The custodian registers kqueue `NOTE_EXIT` for it. `ESRCH` means the child
-   is already a zombie, and any other error means there is no detector. Only
-   then does it write one byte to the gate pipe, which can't block because the
-   pipe is empty. The child then `exec`s the command, or `_exit(127)`s on
-   failure. Custody, meaning the pin and the detector, therefore exists before
-   the proof can run, and any blocking exec work happens in the child.
-4. With no detector, the custodian never opens the gate. It sends SIGKILL to
-   the pinned child, and the outcome is `UNCLOSED`.
+3. The custodian forks the **leader**. The child, in order:
+   1. calls `setsid`;
+   2. `dup2`s the output write ends;
+   3. closes everything else;
+   4. writes one **session-ready** byte to an ack pipe;
+   5. blocks reading the gate pipe.
+4. The custodian waits for the session-ready byte with `select` until the
+   setup deadline. Only after it arrives (the child's PID is now its SID and
+   PGID) does the custodian register kqueue `NOTE_EXIT`. `ESRCH` means the
+   child is already a zombie, and any other error means there is no detector.
+   The custodian then writes one byte to the gate pipe, which can't block
+   because the pipe is empty. The child `exec`s the command, or `_exit(127)`s
+   on failure. Custody, meaning the pin, the session and the detector, exists
+   before the proof can run. Any blocking exec work happens in the child.
+5. **Cancellation before the gate opens** (setup deadline, a fault, a signal,
+   no ack, or no detector) uses `kill(child_pid, SIGKILL)` on the pinned,
+   unreaped child. It never uses `killpg`, because the group may not exist yet.
+   The gate is never opened afterwards. The outcome is `UNCLOSED` (or "not
+   launched", if the ack never arrived and the child was reaped as killed),
+   with scratch kept.
 
 ## Control protocol
 
 Every message carries `run_id` (128 random bits), the leader's PID, its
-kernel start time (`kinfo_proc` `p_starttime`), a sequence number and a
-monotonic stamp. `time.monotonic` is `mach_absolute_time`, which is comparable
-across processes. A message with a wrong `run_id` or leader identity is a
-fault.
+kernel start time (`kinfo_proc` `p_starttime`, used only as an identity
+token), a sequence number and a stamp. A message with a wrong `run_id` or
+leader identity is a fault.
+
+**One clock everywhere:** `time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)`.
+Python 3.9's `time.monotonic` has a per-interpreter origin, so it isn't used.
+Every stamp, deadline, freshness check and exported fixture deadline uses this
+system-wide clock. It was verified on the host on 2026-10-21: available in
+Python 3.9.6, and separate interpreters read one consistent timeline.
 
 | Message | Custodian action |
 | --- | --- |
-| `reading reserve=<bytes> at=<mono>` / `reading scratch=<bytes> complete=<bool> at=<mono>` | Track the newest **completed** reading. Latch a fault if no reserve reading is newer than 1 s, no scratch reading is newer than 10 s, reserve is below the threshold, or scratch is over budget. Freshness is enforced until the custodian exits, through closure and cleanup too. A heartbeat without a measurement doesn't count. |
+| `reading reserve=<bytes> at=<uptime_ns>` / `reading scratch=<bytes> complete=<bool> at=<uptime_ns>` | Track the newest **completed** reading. Latch a fault if no reserve reading is newer than 1 s, no scratch reading is newer than 10 s, reserve is below the threshold, or scratch is over budget. Freshness is enforced until the custodian exits, through closure and cleanup too. A heartbeat without a measurement doesn't count. |
 | `output eof stdout` / `output eof stderr` | Record the pipe-EOF witness. Both are required for `closed`. |
 | `census seq=<n> after=<stop-seq> members=<k> uncertain=<u> certain=<bool>` | Accepted as final only if it started after the custodian's `stopped` message. |
 | `cleanup_started`, `cleanup_complete`, `monitor_complete` | Ordering checks; see the receipt phases below. |
@@ -105,10 +125,22 @@ reserve and a 2 s exit margin.
 | Final census with `certain`, 0 members and 0 uncertain, plus both EOF witnesses | Closure established. Tell the monitor `cleanup`. Otherwise `UNCLOSED`: tell the monitor `keep`. |
 | `monitor_complete`, or `exit_at` | Reap the monitor with `WNOHANG`. If it's still running at `exit_at`, KILL the pinned monitor and do one `WNOHANG` reap. Exit. |
 
-**Custodian exit code:** 0 only if there are no latched faults, closure was
-established, `monitor_complete` arrived before `exit_at`, and both children
-were reaped. Otherwise it is non-zero (124 for the deadline, 125 for faults or
-`UNCLOSED`).
+**Precedence:**
+1. Any latched fault (detector, signal, reap, guard, protocol, monitor death,
+   uncertain census, missing EOF) makes closure **not established**. The
+   custodian sends `keep`, never `cleanup`, and no later message changes that.
+   Cleanup runs only after closure is established with no latched fault.
+2. The command's own status is recorded separately, from the leader's
+   `waitpid` status, and is never overwritten. An exec failure (127), a
+   non-zero exit or death by signal is never success.
+3. **Custodian exit code**, highest priority first:
+   1. 124 if `stop_at` or `exit_at` triggered;
+   2. 125 for any latched fault or `UNCLOSED`;
+   3. otherwise the command's own exit status, or 128+N for signal N.
+
+   It is 0 only when there is no fault, closure was established,
+   `monitor_complete` arrived before `exit_at`, both children were reaped,
+   and the command exited 0.
 
 ## Receipt phases (monitor)
 
@@ -147,20 +179,23 @@ across the `getsid` call. Each process is then classified:
 - **Member:** validated session equals SID. Once a member, it stays tracked
   by (PID, `p_starttime`) until a snapshot shows that identity gone, whatever
   its UID or parent.
-- **Positively foreign:** a validated session that isn't SID, with no earlier
-  membership. Also any process whose `p_starttime` precedes the leader's:
-  it can't descend from the leader.
+- **Positively foreign:** only a validated session that isn't SID, with no
+  earlier membership. **Start time is never used to exclude a process.**
+  `p_starttime` is calendar time and can move backwards.
+- **Gone:** `getsid` returned `ESRCH`, and a later snapshot confirms that the
+  (PID, `p_starttime`) identity is absent.
 - **Uncertain:**
-  - started at or after the leader and not validated (unreadable session,
-    identity changed, or missing metadata);
+  - not validated: `getsid` failed other than as gone, the identity changed
+    across `getsid`, or metadata is missing;
   - any process at all in an incomplete, failed or timed-out snapshot.
 
   Uncertain blocks `closed`. It is never treated as foreign, and that holds
   for first-seen processes too.
 
-Start-time comparisons use the kernel's `p_starttime` on both sides, never
-receipt wall time. A false `UNCLOSED` caused by an unrelated process started
-during the run with an unreadable session is accepted: the run fails closed.
+This is practical because `getsid` reaches other users' processes on macOS.
+On the host on 2026-10-21, 1,068 of 1,069 processes returned a session. The
+one failure was `ESRCH`, a process that had just exited. So uncertain cases are
+transient, and a false `UNCLOSED` from one is accepted: the run fails closed.
 
 ## Fixture fallbacks
 
@@ -169,10 +204,11 @@ does three things first:
 1. `signal.signal(SIGALRM, SIG_DFL)`;
 2. `signal.pthread_sigmask(SIG_UNBLOCK, {SIGALRM})`;
 3. `signal.setitimer(ITIMER_REAL, remaining)`, where `remaining` is
-   `FIXTURE_DEADLINE_MONO - time.monotonic()`.
+   `(FIXTURE_DEADLINE_NS - clock_gettime_ns(CLOCK_UPTIME_RAW)) / 1e9`.
 
-`FIXTURE_DEADLINE_MONO` is an absolute monotonic deadline passed in the
-environment. A late grandchild therefore can't extend it, and gets a
+`FIXTURE_DEADLINE_NS` is an absolute deadline on the system-wide
+`CLOCK_UPTIME_RAW`, passed in the environment. It stays valid across `exec`
+and in every descendant. A late grandchild therefore can't extend it, and gets a
 non-positive remaining time that exits it immediately.
 
 Required ordering: **case verdict deadline < fixture fallback deadline <
@@ -211,7 +247,11 @@ the pinned child at that moment.
 - monitor success followed by a custodian timeout;
 - an inherited SIGALRM that is ignored or blocked;
 - a group that cascades (`closed`);
-- a separate-group survivor (`UNCLOSED`, never signalled).
+- a separate-group survivor (`UNCLOSED`, never signalled);
+- cancellation before the session-ready ack, using `kill` on the pinned PID with no `killpg`;
+- an exec failure (127) and a non-zero command exit, never success;
+- a latched fault followed by a later `closed` census, with no cleanup;
+- a fixture deadline that holds across `exec` and in a late grandchild.
 
 If any of this can't be met within the approved scope, the brief stops and
 names the missing mechanism.

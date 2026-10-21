@@ -688,6 +688,14 @@ Tom, 2026-10-21, "I'll go with your recommendation C for 109", the native-proof 
 
 Elevated tasks keep waiting for a qualified supervisor.
 
+Tom, 2026-10-21, "Yeah do it" (Queue decision `bc874ae7`), after the #109 correction's revision 3 was reviewed as changes required. Tom declined a VM ("too heavy").
+- **One final, narrow design round:** revision 4 changes only the four P1s from the revision 3 review.
+  1. A session-ready ack before the gate, with cancellation before the gate using `kill` on the pinned PID.
+  2. Precedence of fault, reap and command status.
+  3. A system-wide `CLOCK_UPTIME_RAW`.
+  4. No start-time exclusion.
+- **Stop rule:** if review raises only minor points, they are fixed during implementation. A new P1 class switches elevated tasks to the documented-gap route (B), with no further design rounds.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
