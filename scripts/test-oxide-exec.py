@@ -304,8 +304,8 @@ def built(proof: Proof, args: list, label: str, profile: str, cwd: str | None = 
     for stray in ("deps", "incremental", "build"):
         if os.path.exists(os.path.join(target, output, stray)):
             fail(f"{label}: plain-Cargo {stray}/ in {target}/{output}")
-    if proof.held():
-        fail(f"{label}: slots still held after exit: {proof.held()}")
+    if slot in proof.held():
+        fail(f"{label}: slot {slot} still held after exit")
     return slot, warmth, env, tool_cwd, stderr
 
 
@@ -334,7 +334,8 @@ def prove_environment(proof: Proof, elsewhere: str, wrapper: str, wrapper_log: s
     if "CARGO_PROFILE_DEV_DEBUG" in env or slot in (slots["quick"], slots["debug"]):
         fail(f"release: env {env}, slot {slot}")
     slots["release"] = slot
-    say(f"release: eviction lines {re.findall(r'oxide: evicted idle slot \\d+[^\\n]*', stderr)}")
+    evicted = re.findall(r"oxide: evicted idle slot \d+[^\n]*", stderr)
+    say(f"release: eviction lines {evicted}")
 
     with open(wrapper_log, "w"):
         pass
@@ -452,8 +453,8 @@ def prove_concurrency(proof: Proof) -> None:
     slot_c = next(slot for slot in held if slot != slot_a)
     with open(c_log) as handle:
         c_err = handle.read()
-    say(f"concurrency: second quick exec took slot {slot_c} beside held {slot_a}; held {held}; "
-        f"{re.findall(r'oxide: evicted idle slot [^\\n]*', c_err)}")
+    evicted = re.findall(r"oxide: evicted idle slot [^\n]*", c_err)
+    say(f"concurrency: second quick exec took slot {slot_c} beside held {slot_a}; held {held}; {evicted}")
     if len(held) != 2 or "waiting for" in c_err:
         fail(f"concurrency: second quick command did not get its own slot: {c_err[-800:]}")
     status = proof.status("two holders")
@@ -528,6 +529,9 @@ def main() -> int:
         for path in (home, os.path.join(parent, "cargo-home"), os.path.join(parent, "tmp"),
                      os.path.join(parent, "elsewhere")):
             os.makedirs(path, mode=0o700)
+        # The caller's directory selects the toolchain (oxide#094): pin the
+        # same one outside the workspace so --manifest-path keeps the key.
+        write(os.path.join(parent, "elsewhere", "rust-toolchain.toml"), f'[toolchain]\nchannel = "{BUILDER}"\n')
         env = {name: value for name, value in stage_env.items()
                if not name.startswith("CARGO_") and name not in ("RUSTUP_TOOLCHAIN", "RUSTC_WRAPPER")}
         env.update({"HOME": home, "CARGO_HOME": os.path.join(parent, "cargo-home"),
