@@ -590,6 +590,7 @@ def case_unknown_registration(proof: Proof, artifact: Path) -> None:
     assert removable["mount_point"] is None and removable["volume_uuid"] is None
     assert removable["unavailable_reason"] == "metadata_unknown", removable
     assert removable["available"] is False and removable["payload"] is None
+    assert "reserve_bytes" in removable and removable["reserve_bytes"] is None, removable
     assert snapshot(case) == before, "describe changed the fixture"
 
 
@@ -615,6 +616,8 @@ def case_absent_volume(proof: Proof, artifact: Path) -> None:
     assert removable["available"] is False and text["selected"] == "internal"
     assert removable["payload"] == f"{mount}/oxide-pool"
     assert removable["suggested_scratch_root"] == f"{mount}/scratch"
+    reserve = removable["reserve_bytes"]
+    assert type(reserve) is int and reserve == 1024, removable
     assert not os.path.exists(mount), "describe created a /Volumes path"
     assert snapshot(case) == before, "describe changed the fixture"
 
