@@ -1,85 +1,273 @@
 #!/usr/bin/env python3
-"""Shared session supervisor for repository tests and native proofs (oxide#109).
+"""Shared proof supervisor: pinned-leader cooperative closure (oxide#109).
 
-    bounded-test.py [--limit S] [--scratch-budget-mib N] [--receipt PATH] [--] command ...
+    bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence DIR] [--root-parent DIR] [--] command ...
 
-One supervisor owns the whole proof command, from before its first writer
-starts through child closure and owned scratch cleanup:
+Implements docs/knowledge/contracts/proof-supervisor-correction.md (revision
+4, reviewed at 29f0950e). Three processes:
 
-- One absolute deadline (default 300 s) covers the command, closure and
-  cleanup. Work stops `CLEANUP_SECONDS` before it; every closure step uses
-  only what is left. Nothing runs after it unbounded.
-- Raw host free space (`statvfs` `f_bavail`) is sampled every 0.25 s on a
-  thread. A reading below the 22 GiB abort threshold (20 GiB reserve plus
-  2 GiB margin), a failed sample or no sample for 1 s latches a fault and
-  cancels the command; a low or missing first reading refuses before spawn.
-  This is a sampled abort threshold, not an instantaneous guarantee against
-  unrelated writers.
-- The scratch directory (owned: created here and passed as
-  `OXIDE_TASK_SCRATCH_ROOT`, `TMPDIR`, `TMP` and `TEMP`; or adopted from a
-  caller's `OXIDE_TASK_SCRATCH_ROOT`) is walked every 2 s. A complete sample
-  over the budget (default 512 MiB), a failed walk or none for 10 s faults.
-  The budget is monitored and reported, not a hard ceiling.
-- The command starts in a new session whose ID is the leader's PID. Its exit
-  is detected without reaping (kqueue `NOTE_EXIT`), so that ID cannot be
-  reused while closure runs. On every path (exit, timeout, fault, SIGINT or
-  SIGTERM to the supervisor, exception after spawn) the session is observed
-  afresh, every group in it is TERMed, then KILLed, Cargo-style separate
-  groups before the leader's, then observed again. Closure is positive only
-  when no session member remains, the leader is reaped and both output pipes
-  reached EOF. Observation, signalling or reaping errors, survivors, an
-  exhausted budget or a pipe still held elsewhere leave it UNCLOSED: the exit
-  is nonzero and owned scratch is kept.
-- Scope is the cooperative session: a process that calls `setsid` leaves it
-  and is not seen unless it still holds an output pipe. Unrelated same-user
-  writers are outside the promise.
+- The custodian (this process) is single-threaded. It owns the absolute
+  deadline, both pins (the monitor and the proof leader, held unreaped) and
+  every signal. After setup it makes only bounded calls: fork, kevent and
+  select with a zero or remaining-budget timeout, waitpid WNOHANG, kill or
+  killpg on a pinned child, and non-blocking pipe I/O. It never touches files
+  or stdio after setup and never signals a number it does not hold unreaped.
+- The monitor (first child) owns all I/O: the evidence directory and receipt
+  phases, output draining, reserve and scratch sampling, the session census
+  and cleanup. It reports to the custodian over a control pipe.
+- The leader (second child) calls setsid, acknowledges, and execs the command
+  only after the custodian holds its NOTE_EXIT detector and opens the gate.
 
-Exit: the command's own status when healthy and closed; 124 deadline; 125
-guard fault, refusal, exception or UNCLOSED with an otherwise zero status;
-128+N on signal N. Output is forwarded on threads; past 32 MiB per stream it
-is drained and discarded.
+Closure is established only with no latched fault, the leader reaped, a
+census started after the leader was reaped that is certain with no members
+and no uncertain rows, and EOF on both output pipes. Anything else is
+UNCLOSED and scratch is kept. Groups other than the pinned leader's are never
+signalled.
+
+One clock: CLOCK_UPTIME_RAW integer nanoseconds. Exit: 124 deadline; 125
+fault (including SIGINT or SIGTERM to the custodian), refusal or UNCLOSED;
+otherwise the command's status (128+N for signal N). The receipt has no success phase: success is phase `monitor_complete`
+plus custodian exit 0, recorded by the caller.
+
+Scope: the cooperative session. A process that calls setsid leaves it and is
+seen only while tracked or holding an output pipe; arbitrary same-user
+writers are outside the promise. Host free space is a sampled abort
+threshold; the owned-byte budget is monitored, not a hard ceiling. macOS
+only.
+
+OXIDE_SUPERVISOR_INJECT (comma list from INJECTIONS) is a test-only
+fault-injection hook used by scripts/test_supervisor.py.
 """
 from __future__ import annotations
 
+import ctypes
 import errno
 import json
 import os
-import platform
+import secrets
 import select
 import shutil
 import signal
 import stat
-import subprocess
+import struct
 import sys
 import tempfile
 import threading
 import time
 
+NS = 1_000_000_000
 GIB = 1024 ** 3
 MIB = 1024 ** 2
-LIMIT_SECONDS = 300
-CLEANUP_SECONDS = 30
-TERM_GRACE = 10
-KILL_GRACE = 5
-RESERVE_BYTES = 20 * GIB
-MARGIN_BYTES = 2 * GIB
-RESERVE_INTERVAL = 0.25
-RESERVE_STALE = 1.0
+LIMIT_S = 300
+STOP_RESERVE_S = 20
+EXIT_MARGIN_S = 2
+SETUP_S = 10
+TERM_GRACE_S = 5
+CENSUS_GRACE_S = 10
+THRESHOLD = 22 * GIB  # 20 GiB reserve + 2 GiB margin
+RESERVE_INTERVAL, RESERVE_STALE_NS = 0.25, 1 * NS
+SCRATCH_INTERVAL, SCRATCH_STALE_NS = 2.0, 10 * NS
 SCRATCH_BUDGET = 512 * MIB
-SCRATCH_INTERVAL = 2.0
-SCRATCH_STALE = 10.0
-OUTPUT_FORWARD = 32 * MIB
-PS_TIMEOUT = 5.0
-POLL = 0.05
+PERSIST = 8 * MIB
+FORWARD = 32 * MIB
+CENSUS_INTERVAL = 0.2
+MAX_LINE = 64 * 1024
+INJECTIONS = {
+    "setup-stall", "no-detector", "ack-eof", "ack-wrong", "cancel-before-ack", "monitor-die",
+    "monitor-stall", "cleanup-interrupt", "custodian-timeout-after-monitor", "census-uncertain",
+    "reserve-low-after",
+}
 
 
-def free_bytes(path):
-    sample = os.statvfs(path)
-    return sample.f_bavail * sample.f_frsize
+def now_ns():
+    return time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+
+
+def capability():
+    """Missing primitives; refused before any proof work, with no fallback."""
+    missing = []
+    if sys.platform != "darwin":
+        missing.append("macOS")
+    if not hasattr(time, "CLOCK_UPTIME_RAW"):
+        missing.append("CLOCK_UPTIME_RAW")
+    if not hasattr(select, "kqueue"):
+        missing.append("kqueue")
+    if not missing:
+        try:
+            Kinfo.check()
+        except Exception as error:
+            missing.append(f"kinfo_proc ({error})")
+    return missing
+
+
+# Census (monitor side) ---------------------------------------------------------
+
+
+class Kinfo:
+    """struct kinfo_proc via sysctl, at offsets checked against this process."""
+
+    SIZE, PID, STAT, UID, PPID, PGID = 648, 40, 36, 420, 560, 564
+    _libc = None
+
+    @classmethod
+    def sysctl(cls, mib):
+        if cls._libc is None:
+            cls._libc = ctypes.CDLL(None, use_errno=True)
+        array = (ctypes.c_int * len(mib))(*mib)
+        for _ in range(3):
+            size = ctypes.c_size_t(0)
+            if cls._libc.sysctl(array, len(mib), None, ctypes.byref(size), None, 0):
+                raise OSError(ctypes.get_errno(), "sysctl size")
+            buffer = ctypes.create_string_buffer(size.value + 64 * cls.SIZE)
+            size = ctypes.c_size_t(len(buffer))
+            if cls._libc.sysctl(array, len(mib), buffer, ctypes.byref(size), None, 0) == 0:
+                return buffer.raw[: size.value]
+            if ctypes.get_errno() != errno.ENOMEM:
+                raise OSError(ctypes.get_errno(), "sysctl read")
+        raise OSError(errno.ENOMEM, "process table kept growing")
+
+    @classmethod
+    def parse(cls, raw):
+        if len(raw) % cls.SIZE:
+            raise ValueError("kinfo_proc size mismatch")
+        rows = []
+        for offset in range(0, len(raw), cls.SIZE):
+            sec, usec = struct.unpack_from("<qi", raw, offset)
+            rows.append({
+                "pid": struct.unpack_from("<i", raw, offset + cls.PID)[0],
+                "start": sec * 1_000_000 + usec,  # identity token only, never ordered
+                "zombie": raw[offset + cls.STAT] == 5,
+                "uid": struct.unpack_from("<I", raw, offset + cls.UID)[0],
+                "ppid": struct.unpack_from("<i", raw, offset + cls.PPID)[0],
+                "pgid": struct.unpack_from("<i", raw, offset + cls.PGID)[0],
+            })
+        return rows
+
+    @classmethod
+    def all(cls):
+        return [row for row in cls.parse(cls.sysctl([1, 14, 0])) if row["pid"] > 0]
+
+    @classmethod
+    def one(cls, pid):
+        rows = cls.parse(cls.sysctl([1, 14, 1, pid]))
+        return rows[0] if rows and rows[0]["pid"] == pid else None
+
+    @classmethod
+    def check(cls):
+        row = cls.one(os.getpid())
+        if row is None or (row["ppid"], row["pgid"], row["uid"]) != (os.getppid(), os.getpgid(0), os.getuid()):
+            raise ValueError("layout does not match this process")
+
+
+class Census:
+    """Classifies every process against session `sid` (the leader's PID).
+
+    Member: getsid reads `sid` with the PID and start token unchanged across
+    the call (KERN_PROC_PID re-read). A member stays tracked by (PID, start)
+    until a snapshot lacks that identity, whatever its later session, UID or
+    parent. Positively foreign: a validated other session, never a member.
+    Gone: getsid ESRCH and the re-read lacks the identity. Everything else
+    (other getsid errors, identity change, missing metadata, zombies, a failed
+    snapshot) is uncertain and blocks closure, first-seen rows included.
+    Start time is never used to exclude a process."""
+
+    def __init__(self, sid, snapshot=Kinfo.all, getsid=os.getsid, reread=Kinfo.one):
+        self.sid, self.snapshot, self.getsid, self.reread = sid, snapshot, getsid, reread
+        self.tracked = {}
+
+    def round(self):
+        try:
+            rows = self.snapshot()
+        except Exception as error:
+            return {"certain": False, "members": len(self.tracked), "uncertain": 1,
+                    "error": f"snapshot: {error}", "member_rows": [], "uncertain_rows": []}
+        present = {(row["pid"], row["start"]) for row in rows}
+        for identity in list(self.tracked):
+            if identity not in present:
+                del self.tracked[identity]
+        members, uncertain = [], []
+        for row in rows:
+            identity = (row["pid"], row["start"])
+            failure = None
+            try:
+                session = self.getsid(row["pid"])
+            except ProcessLookupError:
+                session, failure = None, "gone"
+            except OSError as error:
+                session, failure = None, f"getsid: {error}"
+            try:
+                again = self.reread(row["pid"])
+            except Exception as error:
+                again, failure = None, failure or f"reread: {error}"
+            stable = again is not None and again["start"] == row["start"]
+            if failure == "gone" and not stable:
+                self.tracked.pop(identity, None)
+            elif failure is None and stable and session == self.sid:
+                self.tracked[identity] = row
+                members.append(row)
+            elif identity in self.tracked:
+                members.append(row)
+            elif failure is None and stable:
+                continue  # positively foreign
+            else:
+                uncertain.append(dict(row, reason=failure or "identity changed across getsid"))
+        return {"certain": not uncertain, "members": len(members), "uncertain": len(uncertain),
+                "member_rows": members[:20], "uncertain_rows": uncertain[:20]}
+
+
+# Guard and precedence (custodian side, pure) -------------------------------------
+
+
+class Guard:
+    """Newest completed readings and the latched first fault."""
+
+    def __init__(self, start_ns, threshold=THRESHOLD, budget=SCRATCH_BUDGET):
+        self.start_ns, self.threshold, self.budget = start_ns, threshold, budget
+        self.reserve_at = self.scratch_at = None
+        self.fault = None
+
+    def latch(self, fault):
+        if self.fault is None:
+            self.fault = fault
+
+    def reading(self, message):
+        kind = message["kind"]
+        if message.get("error"):
+            self.latch(f"{kind} measurement failed: {message['error']}")
+        elif kind == "reserve":
+            self.reserve_at = max(self.reserve_at or 0, message["at"])
+            if message["value"] < self.threshold:
+                self.latch(f"host free {message['value']} bytes below the {self.threshold} byte abort threshold")
+        elif message.get("complete"):
+            self.scratch_at = max(self.scratch_at or 0, message["at"])
+            if message["value"] > self.budget:
+                self.latch(f"owned bytes {message['value']} over the {self.budget} byte budget")
+
+    def check(self, now):
+        for kind, at, stale in (("reserve", self.reserve_at, RESERVE_STALE_NS),
+                                ("scratch", self.scratch_at, SCRATCH_STALE_NS)):
+            if now - (self.start_ns if at is None else at) > stale:
+                self.latch(f"{kind} readings stale: none in {stale / NS:g} s")
+        return self.fault
+
+
+def exit_code(deadline_hit, fault, closed, status):
+    """124 deadline; 125 fault or UNCLOSED; else the command's own status."""
+    if deadline_hit:
+        return 124
+    if fault is not None or not closed or status is None:
+        return 125
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return 125
+
+
+# Monitor -------------------------------------------------------------------------
 
 
 def tree_bytes(root):
-    """Allocated bytes under `root`, hard links once; vanished entries skipped."""
     total, seen, stack = 0, set(), [root]
     while stack:
         path = stack.pop()
@@ -100,509 +288,608 @@ def tree_bytes(root):
     return total
 
 
-def ps_table(timeout):
-    """[(pid, pgid, sid or None, state)] for every visible process. A getsid
-    failure on a live process leaves its session unknown (None)."""
-    listing = subprocess.run(
-        ["/bin/ps", "-A", "-o", "pid=,pgid=,stat="],
-        capture_output=True, text=True, timeout=timeout, check=True,
-    ).stdout
-    table = []
-    for line in listing.splitlines():
-        pid, group, state = line.split(None, 2)
-        pid, group = int(pid), int(group)
-        try:
-            session = os.getsid(pid)
-        except ProcessLookupError:
-            if not state.startswith("Z"):
-                continue  # exited between ps and getsid
-            session = None  # zombies have no readable session
-        except PermissionError:
-            session = None
-        table.append((pid, group, session, state.strip()))
-    return table
-
-
-def identity(pid):
-    return os.getpgid(pid), os.getsid(pid)
-
-
-class Sampler:
-    """Runs `measure` every `interval` on a daemon thread; the supervisor
-    reads the latest state. Stopped threads are abandoned, never joined."""
-
-    def __init__(self, measure, interval, clock):
-        self.measure, self.interval, self.clock = measure, interval, clock
+class Monitor:
+    def __init__(self, ctx, ctl_w, cmd_r, out_r, err_r):
+        self.ctx, self.ctl_w, self.cmd_r = ctx, ctl_w, cmd_r
         self.lock = threading.Lock()
+        self.seq = 0
+        self.leader = None  # [pid, start] once bound
         self.stop = threading.Event()
-        self.value = self.minimum = self.maximum = self.first = self.last = None
-        self.error = None
-        self.count = 0
-        self.max_gap = 0.0
+        self.census_stop = threading.Event()
+        self.inject = set(ctx["inject"])
+        self.pipes = [(out_r, "stdout", 1), (err_r, "stderr", 2)]
+        self.receipt = {
+            "run_id": ctx["run_id"], "command": ctx["command"], "limit_s": ctx["limit_s"],
+            "root": ctx["root"], "scratch": ctx["scratch"], "evidence": ctx["evidence"],
+            "scratch_owned": ctx["owned"], "start_ns": ctx["start_ns"], "abort_threshold": THRESHOLD,
+            "phase": None, "leader": None, "custodian": [], "outcome": None,
+            "reserve": {"samples": 0, "minimum": None, "max_gap_ns": 0, "first_ns": None, "last_ns": None},
+            "owned_bytes": {"samples": 0, "maximum": None, "budget": ctx["budget"], "last_ns": None},
+            "output": {}, "census": None, "census_rounds": 0,
+        }
 
-    def sample_once(self):
-        try:
-            value = self.measure()
-        except Exception as error:  # any failed measurement is a fault
-            with self.lock:
-                if self.error is None:
-                    self.error = f"{type(error).__name__}: {error}"
-            return
-        now = self.clock()
+    def send(self, message_type, **fields):
         with self.lock:
-            if self.last is not None:
-                self.max_gap = max(self.max_gap, now - self.last)
-            if self.first is None:
-                self.first = now
-            self.value, self.last = value, now
-            self.count += 1
-            self.minimum = value if self.minimum is None else min(self.minimum, value)
-            self.maximum = value if self.maximum is None else max(self.maximum, value)
+            self.seq += 1
+            message = {"run": self.ctx["run_id"], "leader": self.leader, "seq": self.seq,
+                       "at": now_ns(), "type": message_type, **fields}
+            os.write(self.ctl_w, (json.dumps(message) + "\n").encode())
 
-    def start(self):
-        def loop():
-            while not self.stop.is_set():
-                self.sample_once()
-                self.stop.wait(self.interval)
+    def publish(self, phase):
+        with self.lock:
+            self.receipt["phase"] = phase
+            self.receipt["published_ns"] = now_ns()
+            path = os.path.join(self.ctx["evidence"], "receipt.json")
+            with open(path + ".tmp", "w") as handle:
+                json.dump(self.receipt, handle, indent=1)
+            os.replace(path + ".tmp", path)
 
-        threading.Thread(target=loop, daemon=True).start()
+    def sample_reserve(self):
+        stats = self.receipt["reserve"]
+        while not self.stop.is_set():
+            try:
+                reading = os.statvfs(self.ctx["reserve_path"])
+                value = reading.f_bavail * reading.f_frsize
+                if "reserve-low-after" in self.inject and stats["samples"] >= 8:
+                    value = 1 * GIB  # injected reading; the disk is never filled
+                at = now_ns()
+                with self.lock:
+                    if stats["last_ns"] is not None:
+                        stats["max_gap_ns"] = max(stats["max_gap_ns"], at - stats["last_ns"])
+                    stats["first_ns"] = stats["first_ns"] or at
+                    stats["last_ns"] = at
+                    stats["samples"] += 1
+                    stats["minimum"] = value if stats["minimum"] is None else min(stats["minimum"], value)
+                self.send("reading", kind="reserve", value=value)
+            except OSError as error:
+                self.send("reading", kind="reserve", error=str(error))
+            self.stop.wait(RESERVE_INTERVAL)
 
+    def sample_owned(self):
+        stats = self.receipt["owned_bytes"]
+        while not self.stop.is_set():
+            try:
+                value = tree_bytes(self.ctx["root"])
+                with self.lock:
+                    stats["samples"] += 1
+                    stats["last_ns"] = now_ns()
+                    stats["maximum"] = value if stats["maximum"] is None else max(stats["maximum"], value)
+                self.send("reading", kind="scratch", value=value, complete=True)
+            except OSError as error:
+                self.send("reading", kind="scratch", complete=False, error=str(error))
+            self.stop.wait(SCRATCH_INTERVAL)
 
-class Drain:
-    """Reads one pipe to EOF on a daemon thread, forwarding a bounded prefix."""
-
-    def __init__(self, pipe, sink):
-        self.pipe, self.sink = pipe, sink
-        self.eof = threading.Event()
-        self.bytes = self.discarded = 0
-        threading.Thread(target=self.run, daemon=True).start()
-
-    def run(self):
-        fd = self.pipe.fileno()
-        try:
+    def drain(self, fd, name, sink):
+        counts = self.receipt["output"].setdefault(
+            name, {"bytes": 0, "persisted": 0, "forwarded": 0, "discarded": 0})
+        with open(os.path.join(self.ctx["evidence"], f"{name}.log"), "wb") as log:
             while True:
                 chunk = os.read(fd, 65536)
                 if not chunk:
                     break
-                self.bytes += len(chunk)
-                if self.sink is None or self.bytes > OUTPUT_FORWARD:
-                    self.discarded += len(chunk)
-                    continue
-                try:
-                    self.sink.write(chunk)
-                    self.sink.flush()
-                except (BrokenPipeError, ValueError, OSError):
-                    self.sink = None
-        finally:
-            self.eof.set()
+                counts["bytes"] += len(chunk)
+                used = 0
+                if counts["persisted"] < PERSIST:
+                    part = chunk[: PERSIST - counts["persisted"]]
+                    log.write(part)
+                    counts["persisted"] += len(part)
+                    used = len(part)
+                if counts["forwarded"] < FORWARD and sink is not None:
+                    part = chunk[: FORWARD - counts["forwarded"]]
+                    try:
+                        os.write(sink, part)
+                        counts["forwarded"] += len(part)
+                        used = max(used, len(part))
+                    except OSError:
+                        sink = None
+                counts["discarded"] += len(chunk) - used
+        os.close(fd)
+        self.send("output_eof", stream=name)
 
+    def census_loop(self, after):
+        census = Census(self.leader[0])
+        while not self.census_stop.is_set():
+            result = census.round()
+            if "census-uncertain" in self.inject:
+                result = dict(result, certain=False, uncertain=max(1, result["uncertain"]))
+            with self.lock:
+                self.receipt["census"] = result
+                self.receipt["census_rounds"] += 1
+            self.send("census", after=after, members=result["members"], uncertain=result["uncertain"],
+                      certain=result["certain"])
+            self.census_stop.wait(CENSUS_INTERVAL)
 
-class Leader:
-    """The supervised command: own session, piped output, exit seen without
-    reaping so its PID (the session ID) stays reserved until `reap`."""
-
-    def __init__(self, command, env, sinks):
-        self.process = subprocess.Popen(
-            command, start_new_session=True, env=env,
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        self.pid = self.process.pid
-        self.drains = [Drain(self.process.stdout, sinks[0]), Drain(self.process.stderr, sinks[1])]
-        self.done = False
-        try:
-            self.queue = select.kqueue()
-            event = select.kevent(
-                self.pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ONESHOT, select.KQ_NOTE_EXIT
-            )
-            self._take(self.queue.control([event], 1, 0))
-        except BaseException:
-            # Without exit notification the session cannot be closed safely
-            # later; stop the leader's own group now, while it is unreaped.
-            os.killpg(self.pid, signal.SIGKILL)
-            self.process.wait(KILL_GRACE)
-            raise
-
-    def _take(self, events):
-        for event in events:
-            if event.flags & select.KQ_EV_ERROR:
-                if event.data != errno.ESRCH:
-                    raise OSError(event.data, "kqueue registration failed")
-            self.done = True  # NOTE_EXIT, or ESRCH: already a zombie
-
-    def exited(self, timeout=0.0):
-        if not self.done:
-            self._take(self.queue.control(None, 1, max(timeout, 0.0)))
-        return self.done
-
-    def reap(self, timeout):
-        try:
-            status = self.process.wait(timeout=max(timeout, 0.0))
-        except subprocess.TimeoutExpired:
-            return None
-        self.queue.close()
-        return status
-
-    def output_closed(self, timeout):
-        end = time.monotonic() + max(timeout, 0.0)
-        for drain in self.drains:
-            if not drain.eof.wait(max(end - time.monotonic(), 0.0)):
-                return False
-        return True
-
-    def output(self):
-        return {"bytes": sum(d.bytes for d in self.drains), "discarded": sum(d.discarded for d in self.drains)}
-
-
-class Supervisor:
-    def __init__(
-        self, command, *, limit=LIMIT_SECONDS, cleanup=CLEANUP_SECONDS, term_grace=TERM_GRACE,
-        kill_grace=KILL_GRACE, scratch=None, owned=None, scratch_budget=SCRATCH_BUDGET,
-        threshold=RESERVE_BYTES + MARGIN_BYTES, clock=time.monotonic, sleep=time.sleep,
-        free_space=free_bytes, scratch_size=tree_bytes, observe=ps_table, identity=identity,
-        killpg=os.killpg, spawn=None, sinks=None, threaded=True,
-    ):
-        if not limit > cleanup >= term_grace + kill_grace + 3:
-            raise ValueError("need limit > cleanup >= term grace + kill grace + 3 s")
-        self.command, self.limit, self.cleanup = command, limit, cleanup
-        self.term_grace, self.kill_grace = term_grace, kill_grace
-        self.scratch, self.owned, self.scratch_budget = scratch, owned, scratch_budget
-        self.threshold, self.clock, self.sleep = threshold, clock, sleep
-        self.free_space, self.scratch_size = free_space, scratch_size
-        self.observe, self.identity, self.killpg = observe, identity, killpg
-        self.spawn = spawn or (lambda command, env: Leader(command, env, self.sinks))
-        self.sinks = sinks or (sys.stdout.buffer, sys.stderr.buffer)
-        self.threaded = threaded
-        self.cancelled = None
-        self.fault = None
-        self.receipt = {}
-
-    def cancel(self, number):
-        if self.cancelled is None:
-            self.cancelled = number
-
-    # Monitors -----------------------------------------------------------
-
-    def monitor_fault(self, scratch=True):
-        """The first monitor fault, or None. Faults latch: they are judged on
-        each sampler's whole history (first error, minimum, maximum, largest
-        gap), so a reading between checks is not lost and nothing clears."""
-        if self.fault is not None:
-            return self.fault
-        checks = [(self.reserve, "host free-space", RESERVE_STALE)]
-        if scratch:
-            checks.append((self.scratch_sampler, "scratch", SCRATCH_STALE))
-        if not self.threaded:
-            for sampler, _, _ in checks:
-                sampler.sample_once()
-        now = self.clock()
-        for sampler, name, stale in checks:
-            with sampler.lock:
-                error, last, gap = sampler.error, sampler.last, sampler.max_gap
-                minimum, maximum = sampler.minimum, sampler.maximum
-            if error is not None:
-                self.fault = f"{name} measurement failed: {error}"
-            elif max(gap, now - (self.started if last is None else last)) > stale:
-                self.fault = f"{name} sampler stale: no sample for {stale:g} s"
-            elif sampler is self.reserve and minimum is not None and minimum < self.threshold:
-                self.fault = f"host free {minimum} bytes is below the {self.threshold} byte abort threshold"
-            elif sampler is self.scratch_sampler and maximum is not None and maximum > self.scratch_budget:
-                self.fault = f"scratch {maximum} bytes is over the {self.scratch_budget} byte budget"
-            if self.fault is not None:
-                return self.fault
-        return None
-
-    # Closure ------------------------------------------------------------
-
-    def remaining(self):
-        return self.deadline - self.clock()
-
-    def members(self, session, groups, leader_done):
-        """Fresh session members, excluding the exited (unreaped) leader. A
-        member whose session is unreadable counts when its group is known."""
-        if self.remaining() <= 0:
-            raise TimeoutError("closure budget exhausted before observation")
-        found = []
-        for pid, group, sid, state in self.observe(min(PS_TIMEOUT, self.remaining())):
-            if pid == session and leader_done:
-                continue
-            if sid == session:
-                groups.add(group)
-                found.append((pid, group, sid, state))
-            elif sid is None and group in groups:
-                found.append((pid, group, sid, state))
-        return found
-
-    def signal_groups(self, session, found, number, closure):
-        """Signal each group with a member positively in this session, verified
-        again just before the signal. Separate groups go before the leader's."""
-        targets = {}
-        for pid, group, sid, _ in found:
-            if sid == session:
-                targets.setdefault(group, pid)
-        for group in sorted(targets, key=lambda g: g == session):
-            if group != session:
-                # The leader is unreaped, so its group cannot be recycled;
-                # any other group is checked again through a live member.
-                try:
-                    if self.identity(targets[group]) != (group, session):
-                        continue  # moved or gone; the next observation decides
-                except ProcessLookupError:
-                    continue
-                except OSError as error:
-                    closure["errors"].append(f"identity of group {group}: {error}")
-                    continue
-            try:
-                self.killpg(group, number)
-                closure["signals"].append([group, signal.Signals(number).name])
-            except ProcessLookupError:
-                pass
-            except OSError as error:
-                closure["errors"].append(f"signal {number} to group {group}: {error}")
-
-    def close(self, leader):
-        session = leader.pid
-        closure = {"state": "UNCLOSED", "signals": [], "errors": [], "survivors": [], "settled": 0}
-        groups = {session}
-        found = None
-        try:
-            done = leader.exited(0)
-            found = self.members(session, groups, done)
-            first = len(found)
-            for number, grace in ((signal.SIGTERM, self.term_grace), (signal.SIGKILL, self.kill_grace)):
-                if not found:
-                    break
-                self.signal_groups(session, found, number, closure)
-                end = min(self.clock() + grace, self.deadline)
-                while True:
-                    done = leader.exited(0)
-                    found = self.members(session, groups, done)
-                    if not found or self.clock() >= end:
-                        break
-                    self.sleep(0.1)
-            closure["settled"] = first - len(found)
-        except Exception as error:
-            closure["errors"].append(f"observation: {type(error).__name__}: {error}")
-            found = None
-            # The leader's own group stays positively owned while it is
-            # unreaped; stop it even though the session cannot be seen.
-            if not leader.exited(0):
-                try:
-                    self.killpg(session, signal.SIGKILL)
-                    closure["signals"].append([session, "SIGKILL"])
-                except OSError as kill_error:
-                    closure["errors"].append(f"signal 9 to group {session}: {kill_error}")
-                leader.exited(min(self.kill_grace, max(self.remaining(), 0.0)))
-        if found:
-            closure["survivors"] = [list(member) for member in found]
-        status = None
-        if leader.exited(0):
-            status = leader.reap(min(1.0, max(self.remaining(), 0.0)))
-            if status is None:
-                closure["errors"].append("leader exit status not collected")
-        else:
-            closure["errors"].append("leader still running after KILL")
-        pipes = leader.output_closed(min(2.0, max(self.remaining(), 0.0)))
-        if not pipes:
-            closure["errors"].append("an output pipe is still held open (possibly outside the session)")
-        if found == [] and status is not None and pipes and not closure["errors"]:
-            closure["state"] = "closed"
-        return status, closure
-
-    # Run ----------------------------------------------------------------
-
-    def prepare_scratch(self):
-        if self.scratch is None:
-            adopted = os.environ.get("OXIDE_TASK_SCRATCH_ROOT")
-            if adopted:
-                self.scratch, self.owned = os.path.realpath(adopted), False
-                if not os.path.isdir(self.scratch):
-                    raise FileNotFoundError(f"OXIDE_TASK_SCRATCH_ROOT {self.scratch} is not a directory")
-            else:
-                base = "/private/tmp" if sys.platform == "darwin" else tempfile.gettempdir()
-                self.scratch = os.path.realpath(tempfile.mkdtemp(prefix="oxide-proof.", dir=base))
-                self.owned = True
-        env = dict(os.environ)
-        if self.owned:
-            for name in ("OXIDE_TASK_SCRATCH_ROOT", "TMPDIR", "TMP", "TEMP"):
-                env[name] = self.scratch
-        return env
-
-    def remove_scratch(self, receipt):
-        if not self.owned:
-            return
-        thread = threading.Thread(target=shutil.rmtree, args=(self.scratch,), daemon=True)
-        thread.start()
-        thread.join(max(self.remaining(), 0.0))
-        if os.path.lexists(self.scratch):
-            receipt["cleanup_errors"].append(f"owned scratch {self.scratch} not fully removed")
-        else:
-            receipt["scratch_removed"] = True
+    def commands(self):
+        buffer = b""
+        while True:
+            chunk = os.read(self.cmd_r, 4096)
+            if not chunk:
+                return
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                yield json.loads(line)
 
     def run(self):
-        self.started = self.clock()
-        self.deadline = self.started + self.limit
-        receipt = self.receipt
-        receipt.update({
-            "command": self.command, "limit_s": self.limit, "cleanup_reserved_s": self.cleanup,
-            "primary": None, "closure": None, "cleanup_errors": [], "scratch_removed": False,
-        })
-        env = self.prepare_scratch()
-        # Sample the scratch's file system at a path that outlives its removal.
-        reserve_path = os.path.dirname(self.scratch) if self.owned else self.scratch
-        receipt.update({"scratch": self.scratch, "scratch_owned": self.owned, "reserve_path": reserve_path})
-        self.reserve = Sampler(lambda: self.free_space(reserve_path), RESERVE_INTERVAL, self.clock)
-        self.scratch_sampler = Sampler(lambda: self.scratch_size(self.scratch), SCRATCH_INTERVAL, self.clock)
-        if self.threaded:
-            self.reserve.start()
-            self.scratch_sampler.start()
-            while self.reserve.count == 0 and self.reserve.error is None:
-                if self.clock() - self.started > RESERVE_STALE:
-                    break
-                self.sleep(POLL)
-        leader = status = None
-        fault = self.monitor_fault()
-        if self.reserve.count == 0 and fault is None:
-            fault = self.fault = "no initial host free-space reading"
-        if fault is not None:
-            receipt["primary"] = {"kind": "refused", "detail": fault}
+        ctx = self.ctx
+        os.makedirs(ctx["evidence"], exist_ok=True)
+        self.publish("started: incomplete")
+        if "setup-stall" in self.inject:
+            time.sleep(SETUP_S + 5)
+        for target in (self.sample_reserve, self.sample_owned):
+            threading.Thread(target=target, daemon=True).start()
+        for fd, name, sink in self.pipes:
+            threading.Thread(target=self.drain, args=(fd, name, sink), daemon=True).start()
+        while self.receipt["reserve"]["samples"] == 0 or self.receipt["owned_bytes"]["samples"] == 0:
+            time.sleep(0.02)
+        self.send("ready")
+        if "monitor-die" in self.inject:
+            time.sleep(1.0)
+            os._exit(3)
+        decision = "keep"
+        for command in self.commands():
+            kind = command["type"]
+            if kind == "leader":
+                row = Kinfo.one(command["pid"])
+                with self.lock:
+                    self.leader = [command["pid"], None if row is None else row["start"]]
+                    self.receipt["leader"] = self.leader
+            elif kind == "record":
+                with self.lock:
+                    self.receipt["custodian"].append(command["record"])
+            elif kind == "stopped":
+                if "monitor-stall" in self.inject:
+                    with self.lock:  # every sender blocks: readings go stale
+                        time.sleep(LIMIT_S)
+                if self.leader is not None:
+                    threading.Thread(target=self.census_loop, args=(command["seq"],), daemon=True).start()
+            elif kind in ("cleanup", "keep"):
+                decision = kind
+                with self.lock:
+                    self.receipt["outcome"] = command.get("outcome")
+                break
+        self.census_stop.set()
+        if decision == "cleanup":
+            self.publish("closure_established: cleanup_pending")
+            self.publish("cleanup_partial_or_unknown")
+            if ctx["owned"]:
+                if "cleanup-interrupt" in self.inject:
+                    os._exit(4)  # the published phase stays partial
+                shutil.rmtree(ctx["scratch"], ignore_errors=True)
+                if os.path.lexists(ctx["scratch"]):
+                    self.send("cleanup_failed")
+                    return
+            self.publish("cleanup_complete")
         else:
-            try:
-                receipt["spawned_at_s"] = self.clock() - self.started
-                leader = self.spawn(self.command, env)
-            except Exception as error:
-                receipt["primary"] = {"kind": "spawn_failed", "detail": f"{type(error).__name__}: {error}"}
-        if leader is not None:
-            try:
-                receipt["primary"] = self.watch(leader)
-            except BaseException as error:  # post-spawn exception, closure still runs
-                receipt["primary"] = {"kind": "exception", "detail": f"{type(error).__name__}: {error}"}
-            status, receipt["closure"] = self.close(leader)
-            receipt["closed_at_s"] = self.clock() - self.started
-            receipt["output"] = getattr(leader, "output", lambda: None)()
-        closed = leader is None or receipt["closure"]["state"] == "closed"
-        # A fault first seen during closure fails an otherwise healthy run.
-        late = self.monitor_fault() if self.fault is None else None
-        self.scratch_sampler.stop.set()
-        if closed:
-            self.remove_scratch(receipt)
-        else:
-            receipt["cleanup_errors"].append(f"closure not positive; scratch {self.scratch} retained")
-        if late is None and self.fault is None:
-            late = self.monitor_fault(scratch=False)
-        self.reserve.stop.set()
-        if late is not None:
-            receipt["late_fault"] = late
-        receipt["status"] = status
-        receipt["exit_code"] = self.exit_code(status, closed, late)
-        receipt["wall_s"] = round(self.clock() - self.started, 3)
-        receipt["reserve"] = self.sampler_report(self.reserve, RESERVE_INTERVAL)
-        receipt["reserve"]["abort_threshold_bytes"] = self.threshold
-        receipt["scratch_usage"] = self.sampler_report(self.scratch_sampler, SCRATCH_INTERVAL)
-        receipt["scratch_usage"]["budget_bytes"] = self.scratch_budget
-        return receipt["exit_code"]
+            self.publish("unclosed: scratch_kept")
+        self.publish("monitor_complete: pending_custodian")
+        self.summary()
+        self.send("monitor_complete")
+        self.stop.set()
 
-    def watch(self, leader):
-        work_end = self.deadline - self.cleanup
+    def summary(self):
+        receipt, reserve = self.receipt, self.receipt["reserve"]
+        outcome = receipt.get("outcome") or {}
+        minimum = "none" if reserve["minimum"] is None else f"{reserve['minimum'] / GIB:.1f} GiB"
+        peak = receipt["owned_bytes"]["maximum"] or 0
+        lines = [
+            f"supervisor: {outcome.get('closure', 'UNCLOSED')}; command status {outcome.get('status')};"
+            f" fault {outcome.get('fault')}; deadline {outcome.get('deadline')}",
+            f"supervisor: host free sampled {reserve['samples']} times every {RESERVE_INTERVAL} s (largest gap"
+            f" {reserve['max_gap_ns'] / NS:.3f} s), minimum {minimum}, abort threshold 22 GiB; sampled, not an"
+            " instantaneous guarantee",
+            f"supervisor: owned bytes peak {peak / MIB:.1f} MiB of {receipt['owned_bytes']['budget'] // MIB} MiB"
+            f" monitored budget; evidence {receipt['evidence']}",
+        ]
+        try:
+            os.write(2, ("\n".join(lines) + "\n").encode())
+        except OSError:
+            pass
+
+
+def monitor_main(ctx, ctl_w, cmd_r, out_r, err_r):
+    code = 1
+    try:
+        Monitor(ctx, ctl_w, cmd_r, out_r, err_r).run()
+        code = 0
+    finally:
+        os._exit(code)
+
+
+# Custodian -----------------------------------------------------------------------
+
+
+class Custodian:
+    def __init__(self, command, limit_s=LIMIT_S, budget=SCRATCH_BUDGET, evidence=None, root_parent="/private/tmp"):
+        self.command, self.limit_s, self.budget, self.evidence_arg = command, limit_s, budget, evidence
+        self.root_parent = root_parent
+        self.inject = {item for item in os.environ.get("OXIDE_SUPERVISOR_INJECT", "").split(",") if item}
+        if self.inject - INJECTIONS:
+            raise SystemExit(f"bounded-test.py: unknown injection {sorted(self.inject - INJECTIONS)}")
+        self.cancelled = None
+        self.ctl_buffer = b""
+        self.monitor_seq = self.seq = 0
+        self.leader = self.monitor = None
+        self.leader_start = None
+        self.leader_bound = False
+        self.leader_exited = self.monitor_exited = self.monitor_reaped = False
+        self.leader_status = None
+        self.ready = False
+        self.eof = set()
+        self.census_ok = False
+        self.reaped_seq = None
+        self.monitor_complete = False
+        self.deadline_hit = False
+
+    def record(self, kind, **fields):
+        self.tell("record", record={"at": now_ns(), "event": kind, **fields})
+
+    def tell(self, kind, **fields):
+        self.seq += 1
+        data = (json.dumps({"run": self.run_id, "seq": self.seq, "type": kind, **fields}) + "\n").encode()
+        try:
+            os.write(self.cmd_w, data)
+        except OSError as error:
+            self.guard.latch(f"protocol: command pipe write failed: {error}")
+
+    def signal_pinned(self, pid, number, group):
+        """Signal a child this process holds unreaped, so neither its PID nor
+        the group it leads can have been reused. Records custody at the
+        moment of the signal."""
+        held = (pid == self.leader and self.leader_status is None) or (
+            pid == self.monitor and not self.monitor_reaped)
+        entry = {"target": pid, "killpg": group, "signal": signal.Signals(number).name,
+                 "pin": "leader" if pid == self.leader else "monitor" if pid == self.monitor else None,
+                 "held_unreaped": held}
+        if not held:
+            entry["result"] = "refused: not a pinned child"
+        else:
+            try:
+                (os.killpg if group else os.kill)(pid, number)
+                entry["result"] = "sent"
+            except OSError as error:
+                entry["result"] = errno.errorcode.get(error.errno, str(error.errno))
+                if error.errno not in (errno.ESRCH, errno.EPERM):  # EPERM: zombie-only group
+                    self.guard.latch(f"signal {entry['signal']} to {pid}: {error}")
+        self.record("signal", **entry)
+
+    def reap(self, pid):
+        try:
+            done, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            self.guard.latch(f"reap: {pid} is not our child")
+            return None
+        return status if done == pid else None
+
+    def pump(self, timeout_ns):
+        timeout = max(0, min(timeout_ns, 50_000_000)) / NS
+        for event in self.kq.control(None, 8, timeout):
+            if event.filter == select.KQ_FILTER_PROC:
+                if event.ident == self.leader:
+                    self.leader_exited = True
+                elif event.ident == self.monitor:
+                    self.monitor_exited = True
+        self.read_messages()
+        if self.cancelled:
+            self.guard.latch(f"cancelled by signal {self.cancelled}")
+        if self.monitor_exited and not self.monitor_complete:
+            self.guard.latch("monitor died")
+        self.guard.check(now_ns())
+
+    def read_messages(self):
         while True:
-            if leader.exited(POLL):
-                return {"kind": "exit"}
-            if self.cancelled is not None:
-                return {"kind": "signal", "detail": signal.Signals(self.cancelled).name, "number": self.cancelled}
-            fault = self.monitor_fault()
-            if fault is not None:
-                return {"kind": "fault", "detail": fault}
-            if self.clock() >= work_end:
-                return {"kind": "deadline", "detail": f"work exceeded {self.limit - self.cleanup:g} s"}
+            try:
+                chunk = os.read(self.ctl_r, 65536)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            self.ctl_buffer += chunk
+            if len(self.ctl_buffer) > 4 * MAX_LINE:
+                break
+        while b"\n" in self.ctl_buffer:
+            line, self.ctl_buffer = self.ctl_buffer.split(b"\n", 1)
+            try:
+                message = json.loads(line)
+            except ValueError:
+                self.guard.latch("protocol: malformed control message")
+                continue
+            self.accept(message)
+        if len(self.ctl_buffer) > MAX_LINE:
+            self.guard.latch("protocol: control line overflow")
+            self.ctl_buffer = b""
 
-    def exit_code(self, status, closed, late):
-        kind = self.receipt["primary"]["kind"]
-        if kind == "deadline":
-            code = 124
-        elif kind == "signal":
-            code = 128 + self.receipt["primary"]["number"]
-        elif kind == "exit" and status is not None and late is None:
-            code = status if status >= 0 else 128 - status
+    def accept(self, message):
+        if message.get("run") != self.run_id or message.get("seq") != self.monitor_seq + 1:
+            self.guard.latch(f"protocol: unexpected run or sequence ({message.get('type')})")
+            return
+        self.monitor_seq = message["seq"]
+        leader = message.get("leader")
+        if leader is not None:
+            if leader[0] != self.leader or self.leader is None or (
+                    self.leader_start is not None and leader[1] != self.leader_start):
+                self.guard.latch("protocol: message names a leader that is not the pinned leader")
+                return
+            self.leader_start, self.leader_bound = leader[1], True
+        elif self.leader_bound:
+            self.guard.latch("protocol: leader identity dropped after binding")
+            return
+        kind = message["type"]
+        if kind == "reading":
+            self.guard.reading(message)
+        elif kind == "ready":
+            # Ready counts only with completed readings already received.
+            if self.guard.reserve_at is None or self.guard.scratch_at is None:
+                self.guard.latch("protocol: ready before completed readings")
+            self.ready = True
+        elif kind == "output_eof":
+            self.eof.add(message["stream"])
+        elif kind == "census":
+            if self.reaped_seq is not None and message["after"] >= self.reaped_seq:
+                self.census_ok = message["certain"] and message["members"] == 0 and message["uncertain"] == 0
+        elif kind == "monitor_complete":
+            self.monitor_complete = True
+        elif kind == "cleanup_failed":
+            self.guard.latch("cleanup: owned scratch not fully removed")
+
+    def setup(self):
+        missing = capability()
+        if missing:
+            raise SystemExit(f"bounded-test.py: refused before any proof work; missing {', '.join(missing)}")
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)  # never auto-reap a pinned child
+        for number in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(number, lambda n, _f: setattr(self, "cancelled", self.cancelled or n))
+        self.start = now_ns()
+        self.absolute = self.start + int(self.limit_s * NS)
+        self.stop_at = self.absolute - STOP_RESERVE_S * NS
+        self.exit_at = self.absolute - EXIT_MARGIN_S * NS
+        self.setup_at = min(self.start + SETUP_S * NS, self.stop_at)
+        self.run_id = secrets.token_hex(16)
+        self.guard = Guard(self.start, budget=self.budget)
+        adopted = os.environ.get("OXIDE_TASK_SCRATCH_ROOT")
+        if adopted:
+            scratch = os.path.realpath(adopted)
+            if not os.path.isdir(scratch):
+                raise SystemExit(f"bounded-test.py: OXIDE_TASK_SCRATCH_ROOT {scratch} is not a directory")
+            root, owned, reserve_path = scratch, False, scratch
+            evidence = self.evidence_arg or tempfile.mkdtemp(prefix="supervisor-evidence.", dir=scratch)
         else:
-            code = 125
-        return 125 if code == 0 and not closed else code
-
-    def sampler_report(self, sampler, interval):
-        start = self.started
-        return {
-            "interval_s": interval, "samples": sampler.count, "minimum": sampler.minimum,
-            "maximum": sampler.maximum, "max_gap_s": round(sampler.max_gap, 3), "error": sampler.error,
-            "first_at_s": None if sampler.first is None else round(sampler.first - start, 3),
-            "last_at_s": None if sampler.last is None else round(sampler.last - start, 3),
+            root = os.path.realpath(tempfile.mkdtemp(prefix="oxide-proof.", dir=self.root_parent))
+            scratch, owned, reserve_path = os.path.join(root, "scratch"), True, os.path.realpath(self.root_parent)
+            os.mkdir(scratch)
+            evidence = self.evidence_arg or os.path.join(root, "evidence")
+        self.env = dict(os.environ)
+        if owned:
+            for name in ("OXIDE_TASK_SCRATCH_ROOT", "TMPDIR", "TMP", "TEMP"):
+                self.env[name] = scratch
+        self.env["OXIDE_PROOF_DEADLINE_NS"] = str(self.absolute)
+        self.ctx = {
+            "run_id": self.run_id, "command": self.command, "limit_s": self.limit_s, "root": root,
+            "scratch": scratch, "evidence": os.path.realpath(evidence), "owned": owned,
+            "budget": self.budget, "reserve_path": reserve_path, "start_ns": self.start,
+            "inject": sorted(self.inject),
         }
+        self.devnull = os.open(os.devnull, os.O_RDONLY)
 
+    def launch_monitor(self):
+        self.ctl_r, ctl_w = os.pipe()
+        cmd_r, self.cmd_w = os.pipe()
+        out_r, self.out_w = os.pipe()
+        err_r, self.err_w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            for fd in (self.ctl_r, self.cmd_w, self.out_w, self.err_w, self.devnull):
+                os.close(fd)
+            monitor_main(self.ctx, ctl_w, cmd_r, out_r, err_r)
+        self.monitor = pid
+        for fd in (ctl_w, cmd_r, out_r, err_r):
+            os.close(fd)
+        os.set_blocking(self.ctl_r, False)
+        os.set_blocking(self.cmd_w, False)
+        self.kq = select.kqueue()
+        self.kq.control([
+            select.kevent(self.ctl_r, select.KQ_FILTER_READ, select.KQ_EV_ADD),
+            select.kevent(pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ONESHOT, select.KQ_NOTE_EXIT),
+        ], 0, 0)
+        while not self.ready and self.guard.fault is None and not self.monitor_exited and not self.cancelled:
+            if now_ns() >= self.setup_at:
+                break
+            self.pump(self.setup_at - now_ns())
+        if self.ready and self.guard.fault is None and not self.cancelled:
+            return True
+        self.not_launched = self.guard.fault or ("cancelled" if self.cancelled else "monitor setup failed or slow")
+        self.guard.latch(f"not launched: {self.not_launched}")
+        return False
 
-def describe(receipt):
-    primary, closure = receipt["primary"], receipt["closure"]
-    lines = [f"supervisor: exit {receipt['exit_code']}; {primary['kind']}"
-             + (f": {primary['detail']}" if primary.get("detail") else "")
-             + (f" (command status {receipt['status']})" if receipt["status"] is not None else "")
-             + f"; wall {receipt['wall_s']} s of {receipt['limit_s']} s"]
-    if closure is not None:
-        lines.append(f"supervisor: closure {closure['state']}; settled {closure['settled']} remaining"
-                     f" process(es); signals {closure['signals']}")
-        for error in closure["errors"]:
-            lines.append(f"supervisor: closure error: {error}")
-        if closure["survivors"]:
-            lines.append(f"supervisor: survivors [pid, pgid, sid, state]: {closure['survivors']}")
-    reserve = receipt["reserve"]
-    minimum = "none" if reserve["minimum"] is None else f"{reserve['minimum'] / GIB:.1f} GiB"
-    lines.append(f"supervisor: host free sampled {reserve['samples']} times every {reserve['interval_s']} s"
-                 f" (largest gap {reserve['max_gap_s']} s), minimum {minimum}, abort threshold"
-                 f" {reserve['abort_threshold_bytes'] / GIB:g} GiB; sampled, not an instantaneous guarantee")
-    usage = receipt["scratch_usage"]
-    peak = "none" if usage["maximum"] is None else f"{usage['maximum'] / MIB:.1f} MiB"
-    lines.append(f"supervisor: scratch peak {peak} of {usage['budget_bytes'] // MIB} MiB monitored budget"
-                 f" ({usage['samples']} complete samples); {receipt['scratch']}"
-                 + (" removed" if receipt["scratch_removed"] else ""))
-    if receipt.get("late_fault"):
-        lines.append(f"supervisor: fault during closure: {receipt['late_fault']}")
-    for error in receipt["cleanup_errors"]:
-        lines.append(f"supervisor: cleanup: {error}")
-    return lines
+    def launch_leader(self):
+        ack_r, ack_w = os.pipe()
+        gate_r, gate_w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            try:
+                os.setsid()
+                os.dup2(self.devnull, 0)
+                os.dup2(self.out_w, 1)
+                os.dup2(self.err_w, 2)
+                for fd in range(3, 256):
+                    if fd not in (ack_w, gate_r):
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                for number in (signal.SIGPIPE, signal.SIGINT, signal.SIGTERM, signal.SIGCHLD, signal.SIGALRM):
+                    signal.signal(number, signal.SIG_DFL)
+                signal.pthread_sigmask(signal.SIG_SETMASK, set())
+                if "ack-eof" not in self.inject:  # session-ready: setsid and dup2 succeeded
+                    os.write(ack_w, b"X" if "ack-wrong" in self.inject else b"R")
+                os.close(ack_w)
+                if os.read(gate_r, 2) != b"G":
+                    os._exit(125)  # gate EOF, error or unexpected bytes: never exec
+                os.close(gate_r)
+                os.execvpe(self.command[0], self.command, self.env)
+            except BaseException:
+                pass
+            os._exit(127)
+        self.leader = pid
+        for fd in (ack_w, gate_r, self.out_w, self.err_w, self.devnull):
+            os.close(fd)
+        if "cancel-before-ack" in self.inject:
+            self.cancelled = signal.SIGTERM
+        ack = b""
+        while not self.cancelled and self.guard.fault is None and now_ns() < self.setup_at:
+            ready, _, _ = select.select([ack_r], [], [], max(0, min(self.setup_at - now_ns(), 50_000_000)) / NS)
+            if ready:
+                try:
+                    ack = os.read(ack_r, 2)
+                except OSError:
+                    ack = b"<error>"
+                break
+            self.pump(0)
+        os.close(ack_r)
+        detector = False
+        if ack == b"R" and not self.cancelled and self.guard.fault is None and "no-detector" not in self.inject:
+            try:
+                detector = True
+                for event in self.kq.control([select.kevent(
+                        pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                        select.KQ_NOTE_EXIT)], 1, 0):
+                    if event.flags & select.KQ_EV_ERROR:
+                        if event.data == errno.ESRCH:
+                            self.leader_exited = True  # already a zombie: still pinned
+                        else:
+                            detector = False
+            except OSError:
+                detector = False
+        if not detector:
+            reason = (f"signal {self.cancelled}" if self.cancelled else self.guard.fault) or (
+                "no exit detector" if ack == b"R" else f"session-ready ack {ack!r}")
+            self.record("cancel_before_gate", reason=reason, ack=ack.decode(errors="replace"))
+            self.signal_pinned(pid, signal.SIGKILL, group=False)  # pinned PID; never killpg before the gate
+            os.close(gate_w)
+            self.guard.latch(f"launch cancelled: {reason}")
+            return False
+        os.write(gate_w, b"G")
+        os.close(gate_w)
+        self.tell("leader", pid=pid)
+        self.record("gate_open", leader=pid)
+        return True
+
+    def stop_leader(self, trigger):
+        self.record("stop", trigger=trigger, fault=self.guard.fault)
+        end = min(now_ns() + TERM_GRACE_S * NS, self.exit_at)
+        self.signal_pinned(self.leader, signal.SIGTERM, group=True)
+        while now_ns() < end:
+            try:
+                os.killpg(self.leader, 0)  # the pinned group: unreaped leader
+            except OSError:
+                break  # no member a signal could reach
+            self.pump(end - now_ns())
+        self.signal_pinned(self.leader, signal.SIGKILL, group=True)
+
+    def run(self):
+        self.setup()
+        if not self.launch_monitor():
+            # Setup slow or failed: launch nothing, stop the pinned monitor now.
+            self.signal_pinned(self.monitor, signal.SIGKILL, group=False)
+            status, end = None, min(now_ns() + NS, self.exit_at)
+            while status is None and now_ns() < end:
+                status = self.reap(self.monitor)
+                if status is None:
+                    self.pump(min(end - now_ns(), 20_000_000))
+            self.monitor_reaped = status is not None
+            return 125
+        launched = self.launch_leader()
+        if launched:
+            while not (self.leader_exited or self.cancelled or self.guard.fault):
+                if now_ns() >= self.stop_at:
+                    self.deadline_hit = True
+                    break
+                self.pump(self.stop_at - now_ns())
+            self.stop_leader("leader exit" if self.leader_exited else "stop_at deadline" if self.deadline_hit
+                             else f"signal {self.cancelled}" if self.cancelled else "fault")
+        while self.leader_status is None and now_ns() < self.exit_at:
+            self.leader_status = self.reap(self.leader)
+            if self.leader_status is None:
+                self.pump(self.exit_at - now_ns())
+        if self.leader_status is None:
+            self.guard.latch("reap: leader not reaped by exit_at; pin kept, no further signal")
+            self.deadline_hit = True
+        self.tell("stopped")
+        self.reaped_seq = self.seq
+        self.record("leader_reaped", status=self.leader_status)
+        if launched:
+            census_end = min(now_ns() + CENSUS_GRACE_S * NS, self.exit_at)
+            while not (self.census_ok and len(self.eof) == 2) and now_ns() < census_end:
+                self.pump(census_end - now_ns())
+            if not self.census_ok:
+                self.guard.latch("closure not established: no certain empty census after the leader was reaped")
+            elif len(self.eof) != 2:
+                self.guard.latch("closure not established: output EOF witness missing")
+        return self.finish(launched)
+
+    def finish(self, launched):
+        self.closed = launched and self.guard.fault is None and self.census_ok and len(self.eof) == 2
+        status = self.leader_status
+        decoded = None if status is None else (
+            os.WEXITSTATUS(status) if os.WIFEXITED(status) else -os.WTERMSIG(status) if os.WIFSIGNALED(status) else None)
+        outcome = {"closure": "closed" if self.closed else "UNCLOSED", "status": decoded,
+                   "fault": self.guard.fault, "deadline": self.deadline_hit, "launched": launched}
+        self.tell("cleanup" if self.closed else "keep", outcome=outcome)
+        if "custodian-timeout-after-monitor" in self.inject:
+            self.exit_at = now_ns()  # injected: the custodian runs out right after deciding
+        while not self.monitor_complete and not self.monitor_exited and now_ns() < self.exit_at:
+            self.pump(self.exit_at - now_ns())
+        if not self.monitor_complete:
+            self.deadline_hit = self.deadline_hit or now_ns() >= self.exit_at
+            self.guard.latch("monitor did not complete")
+        status = None
+        end = min(now_ns() + NS // 2, self.absolute)
+        while status is None and now_ns() < end:
+            status = self.reap(self.monitor)
+            if status is None:
+                self.pump(min(end - now_ns(), 20_000_000))
+        if status is None:
+            self.signal_pinned(self.monitor, signal.SIGKILL, group=False)
+            end = min(now_ns() + NS // 2, self.absolute)
+            while status is None and now_ns() < end:
+                status = self.reap(self.monitor)
+                if status is None:
+                    self.pump(min(end - now_ns(), 20_000_000))
+        self.monitor_reaped = status is not None
+        if status is None:
+            self.guard.latch("monitor not reaped after KILL")
+        if not launched:
+            return 124 if self.deadline_hit else 125
+        return exit_code(self.deadline_hit, self.guard.fault, self.closed, self.leader_status)
 
 
 def parse(argv):
-    options = {"limit": LIMIT_SECONDS, "scratch_budget": SCRATCH_BUDGET, "receipt": None}
+    options = {"limit": LIMIT_S, "budget": SCRATCH_BUDGET, "evidence": None, "root_parent": "/private/tmp"}
     while argv and argv[0].startswith("--"):
         flag = argv.pop(0)
         if flag == "--":
             break
-        if flag not in ("--limit", "--scratch-budget-mib", "--receipt") or not argv:
+        if flag not in ("--limit", "--scratch-budget-mib", "--evidence", "--root-parent") or not argv:
             raise SystemExit(f"bounded-test.py: unknown or incomplete option {flag}")
         value = argv.pop(0)
         if flag == "--limit":
             options["limit"] = float(value)
         elif flag == "--scratch-budget-mib":
-            options["scratch_budget"] = int(value) * MIB
+            options["budget"] = int(value) * MIB
+        elif flag == "--evidence":
+            options["evidence"] = value
         else:
-            options["receipt"] = value
+            options["root_parent"] = value
     if not argv:
         raise SystemExit("bounded-test.py: no command")
+    if options["limit"] <= STOP_RESERVE_S + SETUP_S:
+        raise SystemExit(f"bounded-test.py: --limit must exceed {STOP_RESERVE_S + SETUP_S} s")
     return argv, options
 
 
 def main(argv):
     command, options = parse(list(argv))
-    if not hasattr(select, "kqueue"):
-        raise SystemExit("bounded-test.py: needs kqueue process-exit notification (macOS)")
-    if options["limit"] <= CLEANUP_SECONDS:
-        raise SystemExit(f"bounded-test.py: --limit must exceed the {CLEANUP_SECONDS} s cleanup reserve")
-    supervisor = Supervisor(command, limit=options["limit"], scratch_budget=options["scratch_budget"])
-    for number in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(number, lambda n, _frame: supervisor.cancel(n))
-    code = supervisor.run()
-    supervisor.receipt["platform"] = {"system": platform.platform(), "python": platform.python_version()}
-    for line in describe(supervisor.receipt):
-        print(line, file=sys.stderr, flush=True)
-    if options["receipt"]:
-        with open(options["receipt"], "w") as handle:
-            json.dump(supervisor.receipt, handle, indent=2)
-    return code
+    return Custodian(command, options["limit"], options["budget"], options["evidence"], options["root_parent"]).run()
 
 
 if __name__ == "__main__":

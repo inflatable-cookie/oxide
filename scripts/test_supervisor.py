@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Synthetic qualification suite for the shared session supervisor (oxide#109).
+"""Synthetic qualification suite for the shared proof supervisor (oxide#109).
 
-Runs under `proof:supervisor:qualify`, inside the candidate supervisor's own
-session and scratch. Pure cases drive `bounded-test.py` with a fake clock,
-process table, signals and readings: nothing is spawned and no survivor can
-outlive them. Real cases run tiny Python children in owned scratch and check
-that every fixture PID is gone as soon as the supervisor returns. Fixture
-sleepers carry a finite self-exit fallback (90 s) as secondary protection; a
-case passes only when the supervisor closed them well before it.
-Low-reserve cases inject readings and never fill the disk.
+Runs inside the candidate supervisor's own session under
+`proof:supervisor:qualify`. Pure cases (run first) drive the guard,
+precedence, census and control-protocol logic with fake inputs: nothing is
+spawned. Real cases run `bounded-test.py` as a separate process around tiny
+Python fixtures, with test-only injected faults (OXIDE_SUPERVISOR_INJECT) and
+injected readings; the disk is never filled.
+
+Every fixture process first resets and unblocks SIGALRM and arms an interval
+timer to FIXTURE_DEADLINE_NS, an absolute CLOCK_UPTIME_RAW deadline in the
+environment, so a late descendant exits at once. Ordering: case verdict
+(45 s) < fixture fallback (60 s) < qualification (300 s). A case asserts its
+verdict before the fallback; fallback expiry never counts as closure.
 """
 from __future__ import annotations
 
@@ -25,406 +29,251 @@ from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent
 SUPERVISOR = SCRIPTS / "bounded-test.py"
-_scratch_root = os.environ.get("OXIDE_TASK_SCRATCH_ROOT")
-SCRATCH = Path(tempfile.mkdtemp(prefix="suite.", dir=_scratch_root or None)).resolve()
+SCRATCH = Path(tempfile.mkdtemp(prefix="suite.", dir=os.environ.get("OXIDE_TASK_SCRATCH_ROOT") or None)).resolve()
+NS = 1_000_000_000
 GIB = 1024 ** 3
-FALLBACK = 90  # fixture self-exit, seconds; never reached by a passing case
+VERDICT_S, FALLBACK_S = 45, 60
+CASES = []
 
 spec = importlib.util.spec_from_file_location("bounded_test", SUPERVISOR)
 bounded = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bounded)
 
 
-# Pure fakes ---------------------------------------------------------------
+def now_ns():
+    return time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
 
 
-class Clock:
-    def __init__(self):
-        self.now = 1000.0
-
-    def __call__(self):
-        return self.now
-
-    def sleep(self, seconds):
-        self.now += seconds
-
-
-class FakeLeader:
-    """A leader in the fake process table. It exits naturally at `exit_at`
-    (becoming a zombie with an unreadable session) or when signalled."""
-
-    def __init__(self, world, exit_at=None, status=0, pipes=True, ignores_term=False):
-        self.world, self.pid, self.exit_at, self.status, self.pipes = world, world.session, exit_at, status, pipes
-        self.reaped = False
-        world.procs[self.pid] = [self.pid, self.pid, "S", ignores_term]
-
-    def exited(self, timeout=0.0):
-        self.world.clock.sleep(timeout)
-        if self.exit_at is not None and self.world.clock() >= self.exit_at and self.pid in self.world.procs:
-            self.world.procs[self.pid] = [self.pid, None, "Z", False]
-        entry = self.world.procs.get(self.pid)
-        return entry is None or entry[2] == "Z"
-
-    def reap(self, timeout):
-        self.world.events.append("reap")
-        self.reaped = True
-        return self.status if self.pid not in self.world.procs or self.world.procs[self.pid][2] == "Z" else -9
-
-    def output_closed(self, timeout):
-        return self.pipes
+# Every fixture starts with this prologue (secondary protection only).
+PROLOGUE = """
+import os, signal, time
+signal.signal(signal.SIGALRM, signal.SIG_DFL)
+signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGALRM})
+_left = (int(os.environ["FIXTURE_DEADLINE_NS"]) - time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)) / 1e9
+if _left <= 0:
+    os.kill(os.getpid(), signal.SIGALRM)
+signal.setitimer(signal.ITIMER_REAL, _left)
+"""
 
 
-class World:
-    def __init__(self, session=500):
-        self.clock = Clock()
-        self.session = session
-        self.procs = {}  # pid -> [pgid, sid, state, ignores TERM ("all" ignores KILL too)]
-        self.signals = []
-        self.events = []
-        self.observe_error = None
-        self.identities = {}
-
-    def observe(self, timeout):
-        assert timeout > 0, "observation called with no budget"
-        self.events.append("observe")
-        if self.observe_error is not None:
-            raise self.observe_error
-        return [(pid, group, sid, state) for pid, (group, sid, state, _) in self.procs.items()]
-
-    def identity(self, pid):
-        if pid in self.identities:
-            return self.identities[pid]
-        if pid not in self.procs:
-            raise ProcessLookupError(pid)
-        return self.procs[pid][0], self.procs[pid][1]
-
-    def killpg(self, group, number):
-        self.signals.append((group, signal.Signals(number).name))
-        members = [pid for pid, entry in self.procs.items() if entry[0] == group]
-        if not members:
-            raise ProcessLookupError(group)
-        for pid in members:
-            ignores = self.procs[pid][3]
-            if ignores == "all" or (ignores and number == signal.SIGTERM):
-                continue
-            if pid == self.session:
-                self.procs[pid] = [pid, None, "Z", False]
-            else:
-                del self.procs[pid]
+def fixture(body):
+    return PROLOGUE + body
 
 
-def fake_supervisor(world, *, free=lambda: 100 * GIB, size=lambda: 0, leader=None, **options):
-    directory = tempfile.mkdtemp(dir=SCRATCH)
-    options.setdefault("limit", 60)
-    options.setdefault("cleanup", 20)
-
-    def sleep(seconds):
-        # The real samplers keep running on threads while closure waits.
-        world.clock.sleep(seconds)
-        for sampler in (getattr(supervisor, "reserve", None), getattr(supervisor, "scratch_sampler", None)):
-            if sampler is not None and not sampler.stop.is_set():
-                sampler.sample_once()
-
-    supervisor = bounded.Supervisor(
-        ["fake"], term_grace=2, kill_grace=2, scratch=directory, owned=options.pop("owned", False),
-        clock=world.clock, sleep=sleep, free_space=lambda _path: free(),
-        scratch_size=lambda _path: size(), observe=world.observe, identity=world.identity,
-        killpg=world.killpg, threaded=False,
-        spawn=lambda command, env: leader if leader is not None else FakeLeader(world, exit_at=world.clock() + 1),
-        **options,
-    )
-    return supervisor, directory
+SLEEPER = fixture("time.sleep(3600)\n")
+TERM_IGNORING = fixture("signal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(3600)\n")
 
 
-class PureMonitorCases(unittest.TestCase):
-    def test_low_initial_reserve_refuses_before_spawn(self):
-        world = World()
-        spawned = []
-        supervisor, _ = fake_supervisor(world, free=lambda: 21 * GIB)
-        supervisor.spawn = lambda *args: spawned.append(args)
-        self.assertEqual(supervisor.run(), 125)
-        self.assertEqual(spawned, [])
-        self.assertEqual(supervisor.receipt["primary"]["kind"], "refused")
-        self.assertIn("abort threshold", supervisor.receipt["primary"]["detail"])
+def spawn_line(code, setsid=False):
+    pre = "os.setsid()" if setsid else "os.setpgid(0, 0)"
+    return (f"import subprocess, sys\nchild = subprocess.Popen([sys.executable, '-c', {code!r}],"
+            f" preexec_fn=lambda: {pre})\nopen(os.environ['CASE_DIR'] + '/child.pid', 'w').write(str(child.pid))\n")
 
-    def test_threshold_is_reserve_plus_margin(self):
-        world = World()
-        supervisor, _ = fake_supervisor(world, free=lambda: 22 * GIB - 1)
-        self.assertEqual(supervisor.run(), 125)
-        world = World()
-        supervisor, _ = fake_supervisor(world, free=lambda: 22 * GIB)
-        self.assertEqual(supervisor.run(), 0)
 
-    def test_initial_measurement_error_refuses(self):
+# Pure cases --------------------------------------------------------------------
+
+
+class PureGuard(unittest.TestCase):
+    def guard(self):
+        return bounded.Guard(start_ns=1000 * NS)
+
+    def test_low_reading_latches_and_never_clears(self):
+        guard = self.guard()
+        guard.reading({"kind": "reserve", "value": 22 * GIB - 1, "at": 1000 * NS})
+        guard.reading({"kind": "reserve", "value": 500 * GIB, "at": 1000 * NS + 1})
+        self.assertIn("below", guard.check(1000 * NS + 2))
+
+    def test_exact_threshold_passes(self):
+        guard = self.guard()
+        guard.reading({"kind": "reserve", "value": 22 * GIB, "at": 1000 * NS})
+        guard.reading({"kind": "scratch", "value": 0, "complete": True, "at": 1000 * NS})
+        self.assertIsNone(guard.check(1000 * NS + NS // 2))
+
+    def test_measurement_error_faults(self):
+        guard = self.guard()
+        guard.reading({"kind": "reserve", "error": "injected statvfs failure", "at": 1000 * NS})
+        self.assertIn("measurement failed", guard.fault)
+
+    def test_stale_reserve_and_scratch(self):
+        guard = self.guard()
+        guard.reading({"kind": "reserve", "value": 500 * GIB, "at": 1000 * NS})
+        guard.reading({"kind": "scratch", "value": 0, "complete": True, "at": 1000 * NS})
+        self.assertIsNone(guard.check(1001 * NS))
+        self.assertIn("reserve readings stale", guard.check(1001 * NS + 1))
+        guard = self.guard()
+        for at in range(1000, 1012):
+            guard.reading({"kind": "reserve", "value": 500 * GIB, "at": at * NS})
+        guard.reading({"kind": "scratch", "value": 0, "complete": True, "at": 1000 * NS})
+        self.assertIn("scratch readings stale", guard.check(1010 * NS + 1))
+
+    def test_incomplete_scratch_reading_does_not_refresh(self):
+        guard = self.guard()
+        guard.reading({"kind": "scratch", "value": 0, "complete": False, "at": 1009 * NS})
+        guard.reading({"kind": "reserve", "value": 500 * GIB, "at": 1010 * NS})
+        self.assertIn("scratch readings stale", guard.check(1010 * NS + 1))
+
+    def test_over_budget(self):
+        guard = self.guard()
+        guard.reading({"kind": "scratch", "value": 513 * 1024 * 1024, "complete": True, "at": 1000 * NS})
+        self.assertIn("over the", guard.fault)
+
+
+class PurePrecedence(unittest.TestCase):
+    def test_order(self):
+        code = bounded.exit_code
+        self.assertEqual(code(True, "fault", False, 0), 124)
+        self.assertEqual(code(False, "fault", True, 0), 125)
+        self.assertEqual(code(False, None, False, 0), 125)
+        self.assertEqual(code(False, None, True, None), 125)
+        self.assertEqual(code(False, None, True, 0), 0)
+        self.assertEqual(code(False, None, True, 3 << 8), 3)
+        self.assertEqual(code(False, None, True, 127 << 8), 127)
+        self.assertEqual(code(False, None, True, 9), 137)
+
+
+def row(pid, start=1, **extra):
+    return dict({"pid": pid, "start": start, "ppid": 1, "pgid": pid, "uid": 501, "zombie": False}, **extra)
+
+
+class FakeTable:
+    def __init__(self, rows, sessions, reread=None):
+        self.rows, self.sessions, self.rereads = rows, sessions, reread or {}
+
+    def snapshot(self):
+        return list(self.rows)
+
+    def getsid(self, pid):
+        value = self.sessions[pid]
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    def reread(self, pid):
+        if pid in self.rereads:
+            return self.rereads[pid]
+        return next((r for r in self.rows if r["pid"] == pid), None)
+
+
+def census(table, sid=100):
+    return bounded.Census(sid, snapshot=table.snapshot, getsid=table.getsid, reread=table.reread)
+
+
+class PureCensus(unittest.TestCase):
+    def test_member_and_foreign(self):
+        table = FakeTable([row(101), row(200)], {101: 100, 200: 7})
+        result = census(table).round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 1, 0))
+
+    def test_identity_change_across_getsid_is_uncertain(self):
+        table = FakeTable([row(101, start=1)], {101: 7}, reread={101: row(101, start=2)})
+        result = census(table).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+
+    def test_first_seen_unreadable_is_uncertain_not_foreign(self):
+        table = FakeTable([row(300)], {300: PermissionError(1, "denied")})
+        self.assertEqual(census(table).round()["uncertain"], 1)
+
+    def test_zombie_is_uncertain_until_gone(self):
+        table = FakeTable([row(102, zombie=True)], {102: ProcessLookupError(3, "no such process")})
+        check = census(table)
+        self.assertEqual(check.round()["uncertain"], 1)
+        table.rows = []
+        self.assertTrue(check.round()["certain"])
+
+    def test_gone_between_snapshot_and_getsid(self):
+        table = FakeTable([row(103)], {103: ProcessLookupError(3, "gone")}, reread={103: None})
+        result = census(table).round()
+        self.assertEqual((result["certain"], result["members"]), (True, 0))
+
+    def test_member_stays_member_after_setsid_or_reparenting(self):
+        table = FakeTable([row(104, ppid=101)], {104: 100})
+        check = census(table)
+        self.assertEqual(check.round()["members"], 1)
+        table.rows, table.sessions = [row(104, ppid=1, uid=0)], {104: 104}  # escaped and reparented
+        self.assertEqual(check.round()["members"], 1)
+        table.rows = []
+        self.assertEqual(check.round()["members"], 0)
+
+    def test_start_time_never_excludes(self):
+        table = FakeTable([row(105, start=-5)], {105: 100})  # clock stepped backwards
+        self.assertEqual(census(table).round()["members"], 1)
+
+    def test_recycled_pid_is_a_new_identity(self):
+        table = FakeTable([row(106, start=1)], {106: 100})
+        check = census(table)
+        check.round()
+        table.rows, table.sessions = [row(106, start=9)], {106: 7}
+        self.assertEqual(check.round()["members"], 0)
+
+    def test_failed_snapshot_is_uncertain(self):
         def broken():
-            raise OSError(5, "injected statvfs failure")
+            raise OSError(12, "injected")
 
-        world = World()
-        supervisor, _ = fake_supervisor(world, free=broken)
-        self.assertEqual(supervisor.run(), 125)
-        self.assertIn("measurement failed", supervisor.receipt["primary"]["detail"])
-        self.assertIsNone(supervisor.receipt["closure"])
-
-    def test_reserve_drop_mid_run_cancels_and_closes(self):
-        world = World()
-        readings = iter([100 * GIB] * 5)
-        leader = FakeLeader(world)
-        supervisor, _ = fake_supervisor(world, free=lambda: next(readings, 21 * GIB), leader=leader)
-        self.assertEqual(supervisor.run(), 125)
-        self.assertEqual(supervisor.receipt["primary"]["kind"], "fault")
-        self.assertEqual(supervisor.receipt["closure"]["state"], "closed")
-        self.assertIn((500, "SIGTERM"), world.signals)
-        self.assertEqual(supervisor.receipt["reserve"]["minimum"], 21 * GIB)
-
-    def test_measurement_error_mid_run_faults(self):
-        world = World()
-        calls = []
-
-        def flaky():
-            calls.append(1)
-            if len(calls) > 3:
-                raise OSError(5, "injected")
-            return 100 * GIB
-
-        supervisor, _ = fake_supervisor(world, free=flaky, leader=FakeLeader(world))
-        self.assertEqual(supervisor.run(), 125)
-        self.assertIn("host free-space measurement failed", supervisor.receipt["primary"]["detail"])
-        self.assertEqual(supervisor.receipt["closure"]["state"], "closed")
-
-    def test_stale_sampler_faults(self):
-        world = World()
-        supervisor, _ = fake_supervisor(world)
-        supervisor.threaded = True  # samples come only from the (absent) thread
-        supervisor.started = world.clock()
-        supervisor.reserve = bounded.Sampler(lambda: 100 * GIB, 0.25, world.clock)
-        supervisor.scratch_sampler = bounded.Sampler(lambda: 0, 2.0, world.clock)
-        supervisor.reserve.sample_once()
-        supervisor.scratch_sampler.sample_once()
-        world.clock.sleep(0.9)
-        self.assertIsNone(supervisor.monitor_fault())
-        world.clock.sleep(0.2)
-        self.assertIn("host free-space sampler stale", supervisor.monitor_fault())
-        world.clock.sleep(0.0)
-        supervisor.reserve.sample_once()
-        self.assertIn("stale", supervisor.monitor_fault(), "a fault never clears")
-
-    def test_dip_between_checks_is_latched(self):
-        world = World()
-        supervisor, _ = fake_supervisor(world)
-        supervisor.threaded = True
-        supervisor.started = world.clock()
-        readings = iter([100 * GIB, 10 * GIB, 100 * GIB])
-        supervisor.reserve = bounded.Sampler(lambda: next(readings), 0.25, world.clock)
-        supervisor.scratch_sampler = bounded.Sampler(lambda: 0, 2.0, world.clock)
-        for _ in range(3):
-            supervisor.reserve.sample_once()
-        supervisor.scratch_sampler.sample_once()
-        self.assertIn("below", supervisor.monitor_fault())
-
-    def test_scratch_over_budget_faults(self):
-        world = World()
-        sizes = iter([0, 0, 0])
-        supervisor, _ = fake_supervisor(
-            world, size=lambda: next(sizes, 600 * 1024 * 1024), leader=FakeLeader(world)
-        )
-        self.assertEqual(supervisor.run(), 125)
-        self.assertIn("over the", supervisor.receipt["primary"]["detail"])
+        result = bounded.Census(100, snapshot=broken).round()
+        self.assertFalse(result["certain"])
 
 
-class PureClosureCases(unittest.TestCase):
-    def test_healthy_status_preserved_and_reaped_after_observation(self):
-        world = World()
-        supervisor, _ = fake_supervisor(world, leader=FakeLeader(world, exit_at=world.clock() + 1, status=7))
-        self.assertEqual(supervisor.run(), 7)
-        self.assertEqual(world.events[-2:], ["observe", "reap"])
-        self.assertEqual(supervisor.receipt["closure"]["state"], "closed")
+class PureProtocol(unittest.TestCase):
+    def custodian(self):
+        custodian = bounded.Custodian(["true"])
+        custodian.run_id = "r"
+        custodian.guard = bounded.Guard(0)
+        read_end, custodian.cmd_w = os.pipe()
+        self.addCleanup(os.close, read_end)
+        self.addCleanup(os.close, custodian.cmd_w)
+        custodian.leader = 4242
+        return custodian
 
-    def test_signal_status_maps_to_128_plus(self):
-        world = World()
-        supervisor, _ = fake_supervisor(world, leader=FakeLeader(world, exit_at=world.clock() + 1, status=-9))
-        self.assertEqual(supervisor.run(), 137)
+    def message(self, custodian, kind, leader=None, **fields):
+        return {"run": "r", "seq": custodian.monitor_seq + 1, "leader": leader, "type": kind, "at": 1, **fields}
 
-    def test_term_then_kill_separate_group_first(self):
-        world = World()
-        leader = FakeLeader(world)
-        world.procs[600] = [600, 500, "S", True]  # Cargo-like group ignoring TERM
-        supervisor, _ = fake_supervisor(world, leader=leader, limit=30, cleanup=20)
-        self.assertEqual(supervisor.run(), 124)
-        self.assertEqual(world.signals, [(600, "SIGTERM"), (500, "SIGTERM"), (600, "SIGKILL")])
-        self.assertEqual(supervisor.receipt["closure"]["state"], "closed")
-        self.assertLessEqual(supervisor.receipt["wall_s"], 30)
+    def test_wrong_run_and_sequence_gap(self):
+        custodian = self.custodian()
+        custodian.accept(dict(self.message(custodian, "ready"), run="other"))
+        self.assertIn("protocol", custodian.guard.fault)
+        custodian = self.custodian()
+        custodian.accept(dict(self.message(custodian, "ready"), seq=5))
+        self.assertIn("protocol", custodian.guard.fault)
 
-    def test_leftover_group_after_normal_exit_is_settled(self):
-        world = World()
-        world.procs[600] = [600, 500, "S", True]
-        supervisor, _ = fake_supervisor(world)
-        self.assertEqual(supervisor.run(), 0)
-        self.assertEqual(world.signals, [(600, "SIGTERM"), (600, "SIGKILL")])
-        self.assertEqual(supervisor.receipt["closure"]["settled"], 1)
+    def test_leader_identity_binding(self):
+        custodian = self.custodian()
+        custodian.accept(self.message(custodian, "output_eof", leader=[4242, 77], stream="stdout"))
+        self.assertIsNone(custodian.guard.fault)
+        custodian.accept(self.message(custodian, "output_eof", leader=None, stream="stderr"))
+        self.assertIn("dropped", custodian.guard.fault)
+        custodian = self.custodian()
+        custodian.accept(self.message(custodian, "output_eof", leader=[4242, 77], stream="stdout"))
+        custodian.accept(self.message(custodian, "output_eof", leader=[4242, 78], stream="stderr"))
+        self.assertIn("not the pinned leader", custodian.guard.fault)
+        custodian = self.custodian()
+        custodian.accept(self.message(custodian, "output_eof", leader=[999, 1], stream="stdout"))
+        self.assertIn("not the pinned leader", custodian.guard.fault)
 
-    def test_survivor_after_kill_is_unclosed_and_scratch_kept(self):
-        world = World()
-        world.procs[600] = [600, 500, "D", "all"]
-        supervisor, directory = fake_supervisor(world, owned=True)
-        self.assertEqual(supervisor.run(), 125)
-        closure = supervisor.receipt["closure"]
-        self.assertEqual(closure["state"], "UNCLOSED")
-        self.assertEqual(closure["survivors"], [[600, 600, 500, "D"]])
-        self.assertTrue(os.path.isdir(directory))
-        self.assertEqual(supervisor.receipt["primary"]["kind"], "exit")
+    def test_ready_needs_received_readings(self):
+        custodian = self.custodian()
+        custodian.accept(self.message(custodian, "ready"))
+        self.assertIn("ready before completed readings", custodian.guard.fault)
 
-    def test_nonzero_status_stays_nonzero_when_unclosed(self):
-        world = World()
-        world.procs[600] = [600, 500, "S", "all"]
-        supervisor, _ = fake_supervisor(world, leader=FakeLeader(world, exit_at=world.clock() + 1, status=4))
-        self.assertEqual(supervisor.run(), 4)
-        self.assertEqual(supervisor.receipt["closure"]["state"], "UNCLOSED")
+    def test_census_before_reap_is_ignored(self):
+        custodian = self.custodian()
+        custodian.reaped_seq = 10
+        custodian.accept(self.message(custodian, "census", after=9, certain=True, members=0, uncertain=0))
+        self.assertFalse(custodian.census_ok)
+        custodian.accept(self.message(custodian, "census", after=10, certain=True, members=0, uncertain=0))
+        self.assertTrue(custodian.census_ok)
 
-    def test_failed_process_listing_is_unclosed_with_primary_preserved(self):
-        world = World()
-        leader = FakeLeader(world)
-        world.observe_error = subprocess.TimeoutExpired("ps", 5)
-        supervisor, directory = fake_supervisor(world, leader=leader, limit=30, cleanup=20, owned=True)
-        self.assertEqual(supervisor.run(), 124)
-        receipt = supervisor.receipt
-        self.assertEqual(receipt["primary"]["kind"], "deadline")
-        self.assertEqual(receipt["closure"]["state"], "UNCLOSED")
-        self.assertIn("observation", receipt["closure"]["errors"][0])
-        # The leader's own group is still positively owned and is stopped.
-        self.assertEqual(world.signals, [(500, "SIGKILL")])
-        self.assertTrue(os.path.isdir(directory))
-        self.assertTrue(any("retained" in error for error in receipt["cleanup_errors"]))
-
-    def test_expired_deadline_makes_no_observation(self):
-        world = World()
-
-        class Stalled(FakeLeader):
-            def exited(self, timeout=0.0):
-                self.world.clock.sleep(1000)  # the main loop stalled past the deadline
-                return super().exited(timeout)
-
-        supervisor, _ = fake_supervisor(world, leader=Stalled(world, exit_at=world.clock() + 1))
-        self.assertEqual(supervisor.run(), 125)
-        self.assertNotIn("observe", world.events)
-        self.assertIn("budget exhausted", supervisor.receipt["closure"]["errors"][0])
-
-    def test_closure_budget_exhausted_mid_escalation(self):
-        world = World()
-        world.procs[600] = [600, 500, "S", "all"]
-        supervisor, _ = fake_supervisor(world, limit=30, cleanup=10, leader=FakeLeader(world, exit_at=world.clock() + 19))
-        supervisor.term_grace = supervisor.kill_grace = 100  # graces cannot exceed the deadline
-        self.assertEqual(supervisor.run(), 125)
-        self.assertEqual(supervisor.receipt["closure"]["state"], "UNCLOSED")
-        self.assertLessEqual(world.clock() - supervisor.started, 30 + 0.2)
-
-    def test_unknown_session_member_is_never_signalled(self):
-        world = World()
-        world.procs[601] = [500, None, "S", "all"]  # session unreadable (permission)
-        supervisor, _ = fake_supervisor(world)
-        self.assertEqual(supervisor.run(), 125)
-        self.assertEqual(world.signals, [])
-        self.assertEqual(supervisor.receipt["closure"]["survivors"], [[601, 500, None, "S"]])
-
-    def test_recycled_group_is_never_signalled(self):
-        world = World()
-        world.procs[700] = [700, 500, "S", False]
-        world.identities[700] = (700, 999)  # pid now belongs to another session
-        supervisor, _ = fake_supervisor(world)
-        self.assertEqual(supervisor.run(), 125)
-        self.assertNotIn(700, [group for group, _ in world.signals])
-
-    def test_pipe_held_outside_session_is_unclosed(self):
-        world = World()
-        supervisor, directory = fake_supervisor(world, leader=FakeLeader(world, exit_at=world.clock() + 1, pipes=False), owned=True)
-        self.assertEqual(supervisor.run(), 125)
-        self.assertIn("pipe", supervisor.receipt["closure"]["errors"][0])
-        self.assertTrue(os.path.isdir(directory))
-
-    def test_post_spawn_exception_still_closes(self):
-        world = World()
-
-        class Broken(bounded.Supervisor):
-            def watch(self, leader):
-                raise RuntimeError("injected")
-
-        supervisor, _ = fake_supervisor(world, leader=FakeLeader(world))
-        supervisor.__class__ = Broken
-        self.assertEqual(supervisor.run(), 125)
-        self.assertEqual(supervisor.receipt["primary"]["kind"], "exception")
-        self.assertEqual(supervisor.receipt["closure"]["state"], "closed")
-        self.assertIn((500, "SIGTERM"), world.signals)
-
-    def test_spawn_failure_reports_without_closure(self):
-        world = World()
-        supervisor, _ = fake_supervisor(world)
-
-        def fail(*_):
-            raise FileNotFoundError("no such command")
-
-        supervisor.spawn = fail
-        self.assertEqual(supervisor.run(), 125)
-        self.assertEqual(supervisor.receipt["primary"]["kind"], "spawn_failed")
-
-    def test_cancellation_before_exit(self):
-        world = World()
-        supervisor, _ = fake_supervisor(world, leader=FakeLeader(world))
-        supervisor.cancel(signal.SIGINT)
-        self.assertEqual(supervisor.run(), 130)
-        self.assertEqual(supervisor.receipt["closure"]["state"], "closed")
+    def test_unpinned_target_is_never_signalled(self):
+        custodian = self.custodian()
+        custodian.leader_status = 0  # reaped: the pin is gone
+        records = []
+        custodian.record = lambda kind, **fields: records.append(fields)
+        custodian.signal_pinned(4242, signal.SIGKILL, group=True)
+        custodian.signal_pinned(5555, signal.SIGKILL, group=True)
+        self.assertEqual([r["result"] for r in records], ["refused: not a pinned child"] * 2)
+        self.assertEqual([r["held_unreaped"] for r in records], [False, False])
 
 
-# Real tiny children ---------------------------------------------------------
-
-SLEEPER = f"import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep({FALLBACK})"
-
-# Leader starting a Cargo-like TERM-ignoring child in its own group, then
-# exiting with the status in argv[2]. The child inherits both output pipes.
-LEAVER = """
-import os, subprocess, sys
-child = subprocess.Popen([sys.executable, "-c", %r], preexec_fn=lambda: os.setpgid(0, 0))
-open(sys.argv[1], "w").write(str(child.pid))
-sys.exit(int(sys.argv[2]))
-""" % SLEEPER
-
-# `oxide`-shaped: forwards TERM to the child's group and waits for it.
-FORWARDER = """
-import os, signal, subprocess, sys
-child = subprocess.Popen([sys.executable, "-c", %r], preexec_fn=lambda: os.setpgid(0, 0))
-open(sys.argv[1], "w").write(str(child.pid))
-signal.signal(signal.SIGTERM, lambda *_: os.killpg(child.pid, signal.SIGTERM))
-child.wait()
-""" % SLEEPER
-
-# The group leader exits at once leaving a TERM-ignoring member; the parent
-# waits for the group to empty, as `oxide` does.
-ORPHAN = """
-import os, signal, subprocess, sys, time
-leader = subprocess.Popen([sys.executable, "-c",
-    "import subprocess, sys; child = subprocess.Popen([sys.executable, '-c', %r]); "
-    "open(sys.argv[1], 'w').write(str(child.pid))", sys.argv[1]],
-    preexec_fn=lambda: os.setpgid(0, 0))
-group = leader.pid
-signal.signal(signal.SIGTERM, lambda *_: os.killpg(group, signal.SIGTERM))
-leader.wait()
-deadline = time.monotonic() + %d
-while time.monotonic() < deadline:
-    try:
-        os.killpg(group, 0)
-    except ProcessLookupError:
-        break
-    time.sleep(0.1)
-""" % (SLEEPER, FALLBACK)
-
-
-class Null:
-    def __init__(self):
-        self.bytes = 0
-
-    def write(self, data):
-        self.bytes += len(data)
-
-    def flush(self):
-        pass
+# Real cases --------------------------------------------------------------------
 
 
 def alive(pid):
@@ -435,126 +284,212 @@ def alive(pid):
     return True
 
 
-class RealChildCases(unittest.TestCase):
+class Real(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp(dir=SCRATCH)).resolve()
-        self.pid_file = self.dir / "child.pid"
+        self.started = now_ns()
 
-    def supervise(self, script, *args, **options):
-        options.setdefault("limit", 30)
-        options.setdefault("cleanup", 10)
-        options.setdefault("term_grace", 1)
-        options.setdefault("kill_grace", 2)
-        self.sinks = (Null(), Null())
-        supervisor = bounded.Supervisor(
-            [sys.executable, "-c", script, str(self.pid_file), *args],
-            scratch=str(self.dir), owned=False, sinks=self.sinks, **options,
-        )
-        started = time.monotonic()
-        code = supervisor.run()
-        self.elapsed = time.monotonic() - started
-        self.receipt = supervisor.receipt
-        return code
-
-    def assert_settled(self):
-        """Closed by the supervisor, not by the fixture's fallback expiry."""
-        self.assertEqual(self.receipt["closure"]["state"], "closed", self.receipt["closure"])
-        self.assertLess(self.elapsed, FALLBACK / 3)
-        if self.pid_file.exists():
-            self.assertFalse(alive(int(self.pid_file.read_text())), "fixture child survived")
-
-    def test_normal_exit_with_live_separate_group(self):
-        self.assertEqual(self.supervise(LEAVER, "0"), 0)
-        self.assert_settled()
-        self.assertIn("SIGKILL", [name for _, name in self.receipt["closure"]["signals"]])
-        self.assertEqual(self.receipt["closure"]["settled"], 1)
-
-    def test_nonzero_exit_with_live_separate_group(self):
-        self.assertEqual(self.supervise(LEAVER, "7"), 7)
-        self.assert_settled()
-
-    def test_timeout_reaches_term_ignoring_cargo_group(self):
-        self.assertEqual(self.supervise(FORWARDER, limit=12, cleanup=10), 124)
-        self.assert_settled()
-        self.assertLessEqual(self.elapsed, 12 + 0.5)
-
-    def test_timeout_reaches_group_after_its_leader_exits(self):
-        self.assertEqual(self.supervise(ORPHAN, limit=12, cleanup=10), 124)
-        self.assert_settled()
-
-    def test_pipe_pressure_is_drained(self):
-        script = (
-            "import os, sys\n"
-            "block = b'x' * 65536\n"
-            "for _ in range(48 * 16): os.write(1, block)\n"
-            "for _ in range(8 * 16): os.write(2, block)\n"
-        )
-        self.assertEqual(self.supervise(script), 0)
-        self.assert_settled()
-        self.assertEqual(self.receipt["output"]["bytes"], 56 * 1024 * 1024)
-        self.assertGreater(self.receipt["output"]["discarded"], 0)
-
-    def test_endless_writer_hits_the_deadline(self):
-        script = "import os\nwhile True: os.write(1, b'y' * 65536)\n"
-        self.assertEqual(self.supervise(script, limit=13, cleanup=10), 124)
-        self.assert_settled()
-
-    def test_injected_low_reserve_stops_a_real_child(self):
-        readings = iter([100 * GIB] * 8)
-        code = self.supervise(FORWARDER, free_space=lambda _path: next(readings, 1 * GIB))
-        self.assertEqual(code, 125)
-        self.assertEqual(self.receipt["primary"]["kind"], "fault")
-        self.assert_settled()
-
-    def test_post_spawn_exception_closes_a_real_child(self):
-        class Broken(bounded.Supervisor):
-            def watch(self, leader):
-                deadline = time.monotonic() + 5
-                while not Path(self.command[3]).exists() and time.monotonic() < deadline:
-                    time.sleep(0.05)
-                raise RuntimeError("injected after spawn")
-
-        original = bounded.Supervisor
-        bounded.Supervisor = Broken
-        try:
-            code = self.supervise(FORWARDER)
-        finally:
-            bounded.Supervisor = original
-        self.assertEqual(code, 125)
-        self.assertEqual(self.receipt["primary"]["kind"], "exception")
-        self.assert_settled()
-
-    def guardian_signal(self, number, script):
-        receipt = self.dir / "receipt.json"
+    def guardian(self, code, inject=(), owned=False, limit=35, signal_after=None, signal_number=None, command=None):
+        env = dict(os.environ, CASE_DIR=str(self.dir), FIXTURE_DEADLINE_NS=str(self.started + FALLBACK_S * NS),
+                   OXIDE_SUPERVISOR_INJECT=",".join(inject))
+        args = [sys.executable, str(SUPERVISOR), "--limit", str(limit), "--evidence", str(self.dir / "evidence")]
+        if owned:
+            env.pop("OXIDE_TASK_SCRATCH_ROOT", None)
+            args += ["--root-parent", str(self.dir)]
+        else:
+            env["OXIDE_TASK_SCRATCH_ROOT"] = str(self.dir)
         with open(self.dir / "guardian.log", "wb") as log:
-            guardian = subprocess.Popen(
-                [sys.executable, str(SUPERVISOR), "--limit", "60", "--receipt", str(receipt), "--",
-                 sys.executable, "-c", script, str(self.pid_file)],
-                stdout=log, stderr=log, env=dict(os.environ, OXIDE_TASK_SCRATCH_ROOT=str(self.dir)),
-            )
+            guardian = subprocess.Popen(args + ["--"] + (command or [sys.executable, "-c", code]), env=env,
+                                        stdout=subprocess.DEVNULL, stderr=log)
             try:
-                deadline = time.monotonic() + 10
-                while not self.pid_file.exists() and time.monotonic() < deadline:
-                    time.sleep(0.05)
-                started = time.monotonic()
-                guardian.send_signal(number)
-                code = guardian.wait(timeout=45)
+                if signal_after is not None:
+                    deadline = time.monotonic() + 10
+                    while not (self.dir / signal_after).exists() and time.monotonic() < deadline:
+                        time.sleep(0.05)
+                    guardian.send_signal(signal_number)
+                self.code = guardian.wait(timeout=VERDICT_S - (now_ns() - self.started) / NS)
             finally:
-                if guardian.poll() is None:
+                if guardian.poll() is None:  # the candidate overran the case verdict
                     guardian.kill()
                     guardian.wait(5)
-        self.elapsed = time.monotonic() - started
-        self.receipt = json.loads(receipt.read_text())
-        return code
+        self.verdict_ns = now_ns()
+        self.assertLess(self.verdict_ns, self.started + FALLBACK_S * NS, "verdict after the fixture fallback")
+        self.receipt = json.loads((self.dir / "evidence" / "receipt.json").read_text())
+        signals = [r for r in self.receipt["custodian"] if r["event"] == "signal"]
+        CASES.append({"case": self.id().rsplit(".", 1)[-1], "exit": self.code, "phase": self.receipt["phase"],
+                      "outcome": self.receipt["outcome"], "census": (self.receipt["census"] or {}).get("members"),
+                      "wall_s": round((self.verdict_ns - self.started) / NS, 3),
+                      "signals": [[s["signal"], s["pin"], s["killpg"], s["held_unreaped"], s["result"]]
+                                  for s in signals]})
+        for entry in signals:  # custody at every signal
+            self.assertTrue(entry["held_unreaped"], entry)
+            self.assertIn(entry["pin"], ("leader", "monitor"))
+        return self.code
 
-    def test_sigterm_to_guardian_closes_term_ignoring_group(self):
-        self.assertEqual(self.guardian_signal(signal.SIGTERM, FORWARDER), 143)
-        self.assertEqual(self.receipt["primary"]["kind"], "signal")
-        self.assert_settled()
+    def outcome(self):
+        return self.receipt["outcome"] or {}
 
-    def test_sigint_to_guardian_closes_the_session(self):
-        self.assertEqual(self.guardian_signal(signal.SIGINT, LEAVER.replace("sys.exit(int(sys.argv[2]))", "child.wait()")), 130)
-        self.assert_settled()
+    def child(self):
+        return int((self.dir / "child.pid").read_text())
+
+    def assert_not_launched(self):
+        self.assertFalse((self.dir / "ran").exists(), "the command ran")
+
+    # Normal paths
+
+    def test_exit_zero_closed(self):
+        self.assertEqual(self.guardian(fixture("open(os.environ['CASE_DIR'] + '/ran', 'w')\n")), 0)
+        self.assertEqual(self.outcome()["closure"], "closed")
+        self.assertEqual(self.receipt["phase"], "monitor_complete: pending_custodian")
+
+    def test_owned_scratch_cleanup(self):
+        self.assertEqual(self.guardian(fixture("open(os.environ['TMPDIR'] + '/w', 'wb').write(bytes(65536))\n"),
+                                       owned=True), 0)
+        roots = list(self.dir.glob("oxide-proof.*"))
+        self.assertEqual(len(roots), 1)
+        self.assertFalse((roots[0] / "scratch").exists())
+        self.assertEqual(self.receipt["phase"], "monitor_complete: pending_custodian")
+
+    def test_nonzero_exit(self):
+        self.assertEqual(self.guardian(fixture("raise SystemExit(3)\n")), 3)
+        self.assertEqual(self.outcome()["closure"], "closed")
+
+    def test_exec_failure_127(self):
+        self.assertEqual(self.guardian(None, command=[str(self.dir / "missing-command")]), 127)
+        self.assertEqual(self.outcome()["status"], 127)
+
+    def test_cascading_group_closes_at_deadline(self):
+        code = fixture("import os\n" + spawn_line(SLEEPER) +
+                       "signal.signal(signal.SIGTERM, lambda *_: os.killpg(child.pid, signal.SIGTERM))\nchild.wait()\n")
+        self.assertEqual(self.guardian(code), 124)
+        self.assertEqual(self.outcome()["closure"], "closed")
+        self.assertFalse(alive(self.child()))
+
+    def test_separate_group_survivor_unclosed_never_signalled(self):
+        code = fixture("import os\n" + spawn_line(TERM_IGNORING))
+        self.assertEqual(self.guardian(code), 125)
+        self.assertEqual(self.outcome()["closure"], "UNCLOSED")
+        self.assertTrue(alive(self.child()), "survivor must still be alive at the verdict")
+        targets = {r["target"] for r in self.receipt["custodian"] if r["event"] == "signal"}
+        self.assertNotIn(self.child(), targets)
+        self.assertGreaterEqual(self.receipt["census"]["members"], 1)
+
+    def test_escaped_pipe_holder_unclosed(self):
+        code = fixture("import os\n" + spawn_line(SLEEPER, setsid=True))
+        self.assertEqual(self.guardian(code), 125)
+        self.assertIn("EOF", self.outcome()["fault"])
+        self.assertTrue(alive(self.child()))
+
+    def test_output_saturation(self):
+        code = fixture("block = b'x' * 65536\nfor _ in range(48 * 16): os.write(1, block)\n"
+                       "for _ in range(10 * 16): os.write(2, block)\n")
+        self.assertEqual(self.guardian(code), 0)
+        out, err = self.receipt["output"]["stdout"], self.receipt["output"]["stderr"]
+        self.assertEqual((out["bytes"], err["bytes"]), (48 << 20, 10 << 20))
+        self.assertEqual((out["persisted"], err["persisted"]), (8 << 20, 8 << 20))
+        self.assertGreater(out["discarded"], 0)
+
+    # Faults and signals
+
+    def test_latched_fault_then_empty_census_keeps(self):
+        self.assertEqual(self.guardian(SLEEPER, inject=["reserve-low-after"]), 125)
+        self.assertIn("below", self.outcome()["fault"])
+        self.assertEqual(self.receipt["phase"], "monitor_complete: pending_custodian")
+        self.assertEqual(self.receipt["census"]["members"], 0)
+        self.assertEqual(self.outcome()["closure"], "UNCLOSED")
+
+    def test_sigterm_to_guardian(self):
+        code = fixture("open(os.environ['CASE_DIR'] + '/ran', 'w')\n"
+                       "signal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(3600)\n")
+        self.assertEqual(self.guardian(code, signal_after="ran", signal_number=signal.SIGTERM), 125)
+        self.assertIn("cancelled", self.outcome()["fault"])
+        sent = [(r["signal"], r["result"]) for r in self.receipt["custodian"] if r["event"] == "signal"]
+        self.assertEqual(sent, [("SIGTERM", "sent"), ("SIGKILL", "sent")])
+
+    def test_sigint_to_guardian(self):
+        code = fixture("open(os.environ['CASE_DIR'] + '/ran', 'w')\ntime.sleep(3600)\n")
+        self.assertEqual(self.guardian(code, signal_after="ran", signal_number=signal.SIGINT), 125)
+        self.assertIn("cancelled", self.outcome()["fault"])
+
+    def gate_case(self, inject):
+        self.assertEqual(self.guardian(fixture("open(os.environ['CASE_DIR'] + '/ran', 'w')\n"), inject=[inject]), 125)
+        self.assert_not_launched()
+        kills = [r for r in self.receipt["custodian"] if r["event"] == "signal"]
+        self.assertEqual([(k["signal"], k["killpg"], k["pin"]) for k in kills], [("SIGKILL", False, "leader")])
+        self.assertEqual(self.outcome()["closure"], "UNCLOSED")
+
+    def test_gate_ack_eof(self):
+        self.gate_case("ack-eof")
+
+    def test_gate_ack_wrong_byte(self):
+        self.gate_case("ack-wrong")
+
+    def test_cancel_before_ack(self):
+        self.gate_case("cancel-before-ack")
+
+    def test_no_detector(self):
+        self.gate_case("no-detector")
+
+    def test_setup_stall_launches_nothing(self):
+        self.assertEqual(self.guardian(fixture("open(os.environ['CASE_DIR'] + '/ran', 'w')\n"),
+                                       inject=["setup-stall"]), 125)
+        self.assert_not_launched()
+        self.assertEqual(self.receipt["phase"], "started: incomplete")
+
+    def test_monitor_death(self):
+        self.assertEqual(self.guardian(SLEEPER, inject=["monitor-die"]), 125)
+        self.assertNotEqual(self.receipt["phase"], "monitor_complete: pending_custodian")
+
+    def test_monitor_stall_goes_stale(self):
+        self.assertNotEqual(self.guardian(fixture("pass\n"), inject=["monitor-stall"]), 0)
+        self.assertNotEqual(self.receipt["phase"], "monitor_complete: pending_custodian")
+
+    def test_census_uncertain_is_unclosed(self):
+        self.assertEqual(self.guardian(fixture("pass\n"), inject=["census-uncertain"]), 125)
+        self.assertEqual(self.outcome()["closure"], "UNCLOSED")
+
+    def test_cleanup_interrupted(self):
+        self.assertEqual(self.guardian(fixture("pass\n"), inject=["cleanup-interrupt"], owned=True), 125)
+        self.assertEqual(self.receipt["phase"], "cleanup_partial_or_unknown")
+
+    def test_monitor_complete_then_custodian_timeout(self):
+        self.assertEqual(self.guardian(fixture("pass\n"), inject=["custodian-timeout-after-monitor"]), 124)
+        self.assertEqual(self.receipt["phase"], "monitor_complete: pending_custodian")
+
+    # Fixture fallback
+
+    def test_fixture_deadline_holds_across_exec_and_late_grandchild(self):
+        env = dict(os.environ, FIXTURE_DEADLINE_NS=str(now_ns() + 2 * NS))
+        inner = PROLOGUE + "time.sleep(3600)\n"
+        outer = PROLOGUE + f"import sys\nos.execv(sys.executable, [sys.executable, '-c', {inner!r}])\n"
+
+        def inherited():
+            signal.signal(signal.SIGALRM, signal.SIG_IGN)
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+
+        start = time.monotonic()
+        result = subprocess.run([sys.executable, "-c", outer], env=env, preexec_fn=inherited, timeout=20)
+        self.assertEqual(result.returncode, -signal.SIGALRM)
+        self.assertLess(time.monotonic() - start, 10)
+        late = subprocess.run([sys.executable, "-c", inner], env=env, preexec_fn=inherited, timeout=20)
+        self.assertEqual(late.returncode, -signal.SIGALRM)
+        CASES.append({"case": "fixture_deadline", "exit": [result.returncode, late.returncode]})
+
+
+class Results(unittest.TextTestResult):
+    outcomes = []
+
+    def addSuccess(self, test):
+        super().addSuccess(test)
+        Results.outcomes.append([test.id(), "pass"])
+
+    def addFailure(self, test, err):
+        super().addFailure(test, err)
+        Results.outcomes.append([test.id(), "fail"])
+
+    def addError(self, test, err):
+        super().addError(test, err)
+        Results.outcomes.append([test.id(), "error"])
 
 
 def write(name, size):
@@ -562,43 +497,27 @@ def write(name, size):
         handle.write(os.urandom(size))
 
 
-class Results(unittest.TextTestResult):
-    cases = []
-
-    def addSuccess(self, test):
-        super().addSuccess(test)
-        Results.cases.append([test.id(), "pass"])
-
-    def addFailure(self, test, err):
-        super().addFailure(test, err)
-        Results.cases.append([test.id(), "fail"])
-
-    def addError(self, test, err):
-        super().addError(test, err)
-        Results.cases.append([test.id(), "error"])
-
-
 def main():
-    signal.alarm(240)  # secondary bound; the supervisor's deadline is primary
+    signal.alarm(250)  # secondary bound; the supervisor's deadline is primary
     loader = unittest.defaultTestLoader
     runner = unittest.TextTestRunner(verbosity=2, resultclass=Results)
-    # Fault injection first: fake clock, table, signals and readings only.
-    pure = unittest.TestSuite(loader.loadTestsFromTestCase(case) for case in (PureMonitorCases, PureClosureCases))
+    pure = unittest.TestSuite(loader.loadTestsFromTestCase(case)
+                              for case in (PureGuard, PurePrecedence, PureCensus, PureProtocol))
     ok = runner.run(pure).wasSuccessful()
     if sys.argv[1:] != ["--pure"]:
-        # Writers before, during and after a simulated staging step, all in
-        # the outer supervisor's scratch so its monitors see them.
+        # Writers before and after a simulated staging step, in the outer
+        # supervisor's scratch so its monitor counts them.
         write("before.bin", 1024 * 1024)
         staged = str(SCRATCH / "staged.bin")
         subprocess.run([sys.executable, "-c", f"open({staged!r}, 'wb').write(bytes(4 * 1024 * 1024))"],
                        check=True, timeout=30)
-        time.sleep(2.5)  # at least one complete scratch sample sees the staging
-        ok = runner.run(loader.loadTestsFromTestCase(RealChildCases)).wasSuccessful() and ok
+        time.sleep(2.5)
+        ok = runner.run(loader.loadTestsFromTestCase(Real)).wasSuccessful() and ok
         write("after.bin", 1024 * 1024)
-        cases_path = os.environ.get("OXIDE_SUPERVISOR_CASES")
-        if cases_path:
-            with open(cases_path, "w") as handle:
-                json.dump(Results.cases, handle, indent=1)
+        path = os.environ.get("OXIDE_SUPERVISOR_CASES")
+        if path:
+            with open(path, "w") as handle:
+                json.dump({"outcomes": Results.outcomes, "cases": CASES}, handle, indent=1)
     return 0 if ok else 1
 
 

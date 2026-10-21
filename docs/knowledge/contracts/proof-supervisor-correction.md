@@ -1,7 +1,11 @@
 # Proposed correction: shared proof supervisor (oxide#109)
 
-Proposed, not implemented; it awaits independent design review. This is
-revision 4. Under Tom's 2026-10-21 ruling on Queue decision `bc874ae7` ("Yeah
+Reviewed design: independent Sol verdict `4a98d7ac` passed revision 4 at
+`29f0950e` with minor implementation conditions. oxide#109's correction phase
+implements it in `scripts/bounded-test.py`, and it qualifies only on a
+passing independent exact-head native. The body below is the reviewed text;
+the [shared proof supervisor](workflow.md#shared-proof-supervisor) section records current
+behaviour and implementation choices. This is revision 4. Under Tom's 2026-10-21 ruling on Queue decision `bc874ae7` ("Yeah
 do it"), it is a final, narrow round that changes only the four P1s from the
 review of revision 3 (`c8ab934f`):
 1. the launch gate passing before the child's `setsid`;
