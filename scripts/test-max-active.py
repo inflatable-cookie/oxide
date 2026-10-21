@@ -57,8 +57,12 @@ def inside_root(path: str) -> bool:
     return os.path.realpath(path).startswith(ROOT + os.sep)
 
 
+def inside_root_directory(path: str) -> bool:
+    return path == ROOT or inside_root(path)
+
+
 def make_dir(path: str) -> None:
-    expect(inside_root(path), f"write path is outside supervisor scratch: {path}")
+    expect(inside_root_directory(path), f"write path is outside supervisor scratch: {path}")
     os.makedirs(path, mode=0o700, exist_ok=True)
 
 
