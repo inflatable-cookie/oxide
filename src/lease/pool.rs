@@ -37,6 +37,83 @@ pub struct LeaseRequest {
     /// at creation. It drives admission and whole-idle-slot eviction only;
     /// nothing enforces it while a build writes.
     pub budget_bytes: Option<u64>,
+    /// Where a new slot goes. `None` keeps the legacy `slots/<id>` path.
+    pub layout: Option<SlotLayout>,
+}
+
+/// Presentation path of a new slot: `slots/<folder>/<profile>-<id>`. It is
+/// recorded in the ledger at creation and never changes; the slot key,
+/// identity and ledger semantics do not depend on it.
+#[derive(Clone, Debug, Default)]
+pub struct SlotLayout {
+    /// Project folder names, preferred first. The first one that holds no
+    /// other repository's slot and no unknown entry is used; when none
+    /// qualifies the slot keeps the legacy path.
+    pub folders: Vec<String>,
+    /// Ledger projects of the same repository: a folder whose slots all
+    /// belong to these is this repository's folder.
+    pub same_repository: Vec<PathBuf>,
+    /// Leaf prefix, the Oxide profile label.
+    pub profile: String,
+}
+
+/// Longest project folder or leaf name.
+const MAX_SLOT_NAME_BYTES: usize = 80;
+
+/// One plain directory name: lowercase ASCII letters, digits, `-`, `_` and
+/// `.`, not starting with `.` (so never `.`, `..`, hidden or Finder
+/// metadata).
+fn valid_slot_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_SLOT_NAME_BYTES
+        && !name.starts_with('.')
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
+}
+
+/// A recorded slot directory: exactly `<folder>/<profile>-<id>` with plain
+/// names. Anything else refuses the ledger.
+fn split_slot_dir(dir: &str, id: u64) -> Option<(&str, &str)> {
+    let (folder, leaf) = dir.split_once('/')?;
+    let profile = leaf.strip_suffix(&format!("-{id}"))?;
+    (valid_slot_name(folder) && valid_slot_name(leaf) && !profile.is_empty())
+        .then_some((folder, leaf))
+}
+
+/// The folder a new slot of `layout` goes into, or `None` for the legacy
+/// path. A folder already holding a slot of another project (or of a
+/// project not known to share this repository) is a display collision and
+/// is skipped; so is an existing folder with no recorded slot that is not
+/// empty apart from Finder metadata (`occupied`). Nothing existing is moved
+/// or adopted.
+fn choose_folder(
+    slots: &[SlotRecord],
+    layout: &SlotLayout,
+    occupied: impl Fn(&str) -> Result<bool, LeaseError>,
+) -> Result<Option<String>, LeaseError> {
+    for folder in &layout.folders {
+        if !valid_slot_name(folder) {
+            return Err(LeaseError::InvalidInput("invalid slot project folder"));
+        }
+        let mut members = slots.iter().filter(|slot| {
+            slot.dir
+                .as_deref()
+                .and_then(|dir| dir.split_once('/'))
+                .is_some_and(|(name, _)| name == folder)
+        });
+        let first = members.next();
+        let usable = match first {
+            Some(first) => std::iter::once(first)
+                .chain(members)
+                .all(|slot| layout.same_repository.contains(&slot.project)),
+            None => !occupied(folder)?,
+        };
+        if usable {
+            return Ok(Some(folder.clone()));
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -87,6 +164,10 @@ struct SlotRecord {
     holder: String,
     lease_id: Option<String>,
     last_lease_id: String,
+    /// Slot directory below `slots`, fixed at creation; absent for the
+    /// legacy `<id>` path, so a legacy ledger reads and writes unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dir: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -383,6 +464,11 @@ impl Pool {
         if ledger.slots.len() > MAX_SLOTS {
             return Err(LeaseError::LedgerExhausted);
         }
+        for slot in &ledger.slots {
+            if let Some(dir) = &slot.dir {
+                split_slot_dir(dir, slot.id).ok_or(LeaseError::UnknownAccounting)?;
+            }
+        }
         let mut pool = Self {
             _lock: lock,
             root,
@@ -560,7 +646,27 @@ impl Pool {
         }
         let incarnation = 1_u64;
         let lease_id = self.mint_lease_id(slot_id, incarnation)?;
-        let slot_path = self.slot_path(slot_id)?;
+        let dir = match &request.layout {
+            Some(layout) if valid_slot_name(&layout.profile) => {
+                let same_repository: Vec<PathBuf> = layout
+                    .same_repository
+                    .iter()
+                    .filter_map(|project| fs::canonicalize(project).ok())
+                    .collect();
+                let layout = SlotLayout {
+                    same_repository,
+                    ..layout.clone()
+                };
+                let slots_root = self.backing.payload_root().join(SLOTS_NAME);
+                choose_folder(&self.ledger.slots, &layout, |folder| {
+                    folder_occupied(&slots_root.join(folder))
+                })?
+                .map(|folder| format!("{folder}/{}-{slot_id}", layout.profile))
+            }
+            Some(_) => return Err(LeaseError::InvalidInput("invalid slot profile name")),
+            None => None,
+        };
+        let slot_path = self.slot_path_in(slot_id, dir.as_deref())?;
         match &self.backing {
             Payload::Volume { binding, fd, .. } => {
                 let create = |dir: std::os::fd::BorrowedFd<'_>, name: &str, new: bool| {
@@ -569,10 +675,19 @@ impl Pool {
                         .map_err(|_| LeaseError::BackingMismatch)
                 };
                 let slots = create(fd.as_fd(), SLOTS_NAME, false)?;
-                let slot = create(slots.as_fd(), &slot_id.to_string(), true)?;
+                let slot = match dir.as_deref().and_then(|dir| dir.split_once('/')) {
+                    Some((folder, leaf)) => {
+                        let folder = create(slots.as_fd(), folder, true)?;
+                        create(folder.as_fd(), leaf, true)?
+                    }
+                    None => create(slots.as_fd(), &slot_id.to_string(), true)?,
+                };
                 create(slot.as_fd(), "build", true)?;
             }
             Payload::Budget(_) => {
+                if let Some(folder) = slot_path.parent() {
+                    ensure_private_dir(folder)?;
+                }
                 ensure_private_dir(&slot_path)?;
                 ensure_private_dir(&slot_path.join("build"))?;
             }
@@ -587,6 +702,7 @@ impl Pool {
             holder: request.holder.clone(),
             lease_id: Some(lease_id.clone()),
             last_lease_id: lease_id,
+            dir,
         });
         self.ledger.next_slot = slot_id.checked_add(1).ok_or(LeaseError::LedgerExhausted)?;
         self.persist()?;
@@ -662,6 +778,7 @@ impl Pool {
                 profile: member.profile,
                 holder: member.holder,
                 lease_id: member.lease_id,
+                dir: member.dir,
                 logical_bytes: sizes.logical,
                 unique_allocated_bytes: sizes.unique,
                 accounting: sizes.scan,
@@ -763,15 +880,26 @@ impl Pool {
         self.ledger.slots.iter_mut().find(|slot| slot.id == id)
     }
 
+    /// A recorded slot's path: its recorded directory, or the legacy
+    /// `slots/<id>`.
     fn slot_path(&self, id: u64) -> Result<PathBuf, LeaseError> {
+        let dir = self.slot(id).and_then(|slot| slot.dir.clone());
+        self.slot_path_in(id, dir.as_deref())
+    }
+
+    fn slot_path_in(&self, id: u64, dir: Option<&str>) -> Result<PathBuf, LeaseError> {
         if id == 0 {
             return Err(LeaseError::UnknownAccounting);
         }
-        Ok(self
-            .backing
-            .payload_root()
-            .join(SLOTS_NAME)
-            .join(id.to_string()))
+        let slots = self.backing.payload_root().join(SLOTS_NAME);
+        match dir {
+            None => Ok(slots.join(id.to_string())),
+            Some(dir) => {
+                let (folder, leaf) =
+                    split_slot_dir(dir, id).ok_or(LeaseError::UnknownAccounting)?;
+                Ok(slots.join(folder).join(leaf))
+            }
+        }
     }
 
     fn evict_idle_until(&mut self, max_slots: usize) -> Result<(), LeaseError> {
@@ -855,11 +983,7 @@ impl Pool {
         let path = self.slot_path(id)?;
         let slots_root = self.backing.payload_root().join(SLOTS_NAME);
         let slots_root = canonical_existing_dir(&slots_root, true)?;
-        if path.parent() != Some(slots_root.as_path()) {
-            return Err(LeaseError::UnsafePath(
-                "deletion is limited to recorded owned slot paths",
-            ));
-        }
+        require_slot_parent(&path, &slots_root)?;
         canonical_existing_dir(&path, true)?;
         let slots_device = fs::symlink_metadata(&slots_root).map_err(io_error)?.dev();
         let slot_device = fs::symlink_metadata(&path).map_err(io_error)?.dev();
@@ -895,11 +1019,7 @@ impl Pool {
         self.backing.verify_volume()?;
         let slots_root = self.backing.payload_root().join(SLOTS_NAME);
         let slots_root = canonical_existing_dir(&slots_root, true)?;
-        if path.parent() != Some(slots_root.as_path()) {
-            return Err(LeaseError::UnsafePath(
-                "deletion is limited to recorded owned slot paths",
-            ));
-        }
+        require_slot_parent(path, &slots_root)?;
         match fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(io_error(error)),
@@ -918,10 +1038,11 @@ impl Pool {
     }
 
     /// The payload root's whole tree: `slots` and any tolerated Finder
-    /// metadata beside it, one `(device, inode)` union. One extra level
-    /// keeps slot contents at the depth bound they had under `slots`.
+    /// metadata beside it, one `(device, inode)` union. Two extra levels
+    /// (`slots` and a project folder) keep slot contents at the depth bound
+    /// they had under `slots`.
     fn payload_accounting(&self) -> Sizes {
-        inventory_sizes_deeper(self.backing.payload_root(), 1)
+        inventory_sizes_deeper(self.backing.payload_root(), 2)
     }
 
     /// A slot's path and no-follow root metadata, `None` when missing. A
@@ -1066,6 +1187,52 @@ fn validate_lease_payload_entries(
     Ok(())
 }
 
+/// Deletion is limited to recorded owned slot paths: directly under the
+/// slots root (legacy), or under one project folder that is a real
+/// owner-only directory of the caller on the slots root's device.
+fn require_slot_parent(path: &Path, slots_root: &Path) -> Result<(), LeaseError> {
+    let refuse = || LeaseError::UnsafePath("deletion is limited to recorded owned slot paths");
+    let parent = path.parent().ok_or_else(refuse)?;
+    if parent == slots_root {
+        return Ok(());
+    }
+    if parent.parent() != Some(slots_root) {
+        return Err(refuse());
+    }
+    let folder = canonical_existing_dir(parent, true)?;
+    if folder != parent {
+        return Err(refuse());
+    }
+    let root_device = fs::symlink_metadata(slots_root).map_err(io_error)?.dev();
+    if fs::symlink_metadata(parent).map_err(io_error)?.dev() != root_device {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    Ok(())
+}
+
+/// Whether a project folder with no recorded slot holds anything: missing
+/// is free, an empty owned directory (Finder metadata aside) is free, and
+/// anything else is occupied.
+fn folder_occupied(folder: &Path) -> Result<bool, LeaseError> {
+    let metadata = match fs::symlink_metadata(folder) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_error(error)),
+        Ok(metadata) => metadata,
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_dir()
+        || metadata.uid() != current_uid()
+    {
+        return Ok(true);
+    }
+    for entry in fs::read_dir(folder).map_err(io_error)? {
+        if !is_finder_metadata(&entry.map_err(io_error)?.file_name()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 struct Sizes {
     logical: Option<u64>,
     unique: Option<u64>,
@@ -1096,6 +1263,7 @@ fn ledger_slot(slot: &SlotRecord) -> LedgerSlot {
         profile: slot.profile,
         holder: (slot.state == SlotPersistState::Held).then(|| slot.holder.clone()),
         lease_id: slot.lease_id.clone(),
+        dir: slot.dir.clone(),
     }
 }
 

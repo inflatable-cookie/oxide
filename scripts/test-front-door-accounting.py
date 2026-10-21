@@ -187,12 +187,18 @@ class Proof:
         self.pool = os.path.join(parent, "pool")
         self.env = {**env, "OXIDE_POOL": self.pool}
         self.logs = 0
+        self.dirs = {}
 
     def payload(self) -> str:
         return os.path.realpath(os.path.join(self.pool, "payload"))
 
     def slot_dir(self, slot: str) -> str:
-        return os.path.join(self.pool, "payload", "slots", slot)
+        # oxide#104: a new slot records `dir` (`<folder>/<profile>-<id>`);
+        # remembered so an evicted slot's path is still checked.
+        record = self.slots().get(slot)
+        if record is not None:
+            self.dirs[slot] = record.get("dir") or slot
+        return os.path.join(self.pool, "payload", "slots", self.dirs.get(slot, slot))
 
     def log_path(self) -> str:
         self.logs += 1
@@ -210,7 +216,10 @@ class Proof:
                 if root == payload:
                     roots.append("payload")
                 elif root.startswith(payload + "/"):
-                    roots.append(root[len(payload) + 1:])
+                    relative = root[len(payload) + 1:]
+                    # A labelled slot root reads as its legacy `slots/<id>`.
+                    labelled = re.fullmatch(r"slots/[^/]+/[a-z0-9_.-]+-(\d+)", relative)
+                    roots.append(f"slots/{labelled.group(1)}" if labelled else relative)
                 else:
                     roots.append(root)
         return roots

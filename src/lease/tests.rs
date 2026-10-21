@@ -5,7 +5,7 @@ use super::pool::{
 };
 use super::{
     AccountingCoverage, AccountingGapKind, AccountingScan, LeaseError, LeaseRequest, Profile,
-    SlotOccupancy, BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME,
+    SlotLayout, SlotOccupancy, BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME,
 };
 use std::fs::{self, File};
 use std::io::Write;
@@ -78,6 +78,7 @@ fn request_with_profile(
         profile,
         holder: holder.to_owned(),
         budget_bytes: None,
+        layout: None,
     }
 }
 
@@ -1420,11 +1421,12 @@ fn pool_bounds_are_separate_from_the_inventory_defaults() {
     managed::init_budget_pool(&pool, 1024 * 1024).expect("init budget pool");
     let status = managed::status(&pool).expect("status");
     let walk = &status.payload_accounting;
-    // The payload walk starts one level above `slots` (oxide#105), so its
-    // depth bound is one deeper: slot contents keep 64.
+    // The payload walk starts one level above `slots` (oxide#105) and a
+    // slot may sit in a project folder (oxide#104), so its depth bound is
+    // two deeper: slot contents keep 64.
     assert_eq!(
         (walk.max_entries, walk.max_depth, walk.max_elapsed_ms),
-        (2_000_000, 65, 60_000)
+        (2_000_000, 66, 60_000)
     );
     assert_eq!(walk.coverage, AccountingCoverage::Complete);
 }
@@ -1658,4 +1660,224 @@ fn ledger_view_refuses_a_foreign_pool_entry_like_status() {
     let expected = unexpected("pool directory", "stray");
     assert_eq!(status_injected(&pool).map(|_| ()), Err(expected.clone()));
     assert_eq!(ledger_injected(&pool).map(|_| ()), Err(expected));
+}
+
+fn labelled(
+    pool: &Path,
+    project: &Path,
+    workspace: &Path,
+    holder: &str,
+    folders: &[&str],
+    same_repository: &[&Path],
+) -> LeaseRequest {
+    let mut request = request(pool, project, workspace, holder);
+    request.layout = Some(SlotLayout {
+        folders: folders.iter().map(|folder| (*folder).to_owned()).collect(),
+        same_repository: same_repository
+            .iter()
+            .map(|path| path.to_path_buf())
+            .collect(),
+        profile: "quick".to_owned(),
+    });
+    request
+}
+
+fn build_dir_below_slots(pool: &Path, grant: &super::LeaseGrant) -> String {
+    grant
+        .env
+        .cargo_build_build_dir
+        .strip_prefix(pool.join("payload").join("slots"))
+        .expect("build dir under slots")
+        .display()
+        .to_string()
+}
+
+/// A new slot goes to `slots/<folder>/<profile>-<id>`; a request without a
+/// layout keeps `slots/<id>`; a legacy ledger record has no `dir` field.
+#[test]
+fn new_slots_use_the_project_folder_and_legacy_keeps_its_path() {
+    let fx = Fixture::new("layout");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024 * 1024).expect("init");
+    let legacy_project = fx.dir("legacy");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let legacy =
+        lease_injected(request(&pool, &legacy_project, &workspace, "legacy")).expect("legacy");
+    assert_eq!(build_dir_below_slots(&pool, &legacy), "1/build");
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
+    assert!(ledger["slots"][0].get("dir").is_none(), "{ledger}");
+
+    let grant = lease_injected(labelled(
+        &pool,
+        &project,
+        &workspace,
+        "new",
+        &["oxide-0123abcd"],
+        &[&project],
+    ))
+    .expect("labelled");
+    assert_eq!(
+        build_dir_below_slots(&pool, &grant),
+        "oxide-0123abcd/quick-2/build"
+    );
+    assert!(pool
+        .join("payload/slots/oxide-0123abcd/quick-2/build")
+        .is_dir());
+    let status = status_injected(&pool).expect("status");
+    assert_eq!(status.slots[0].dir, None);
+    assert_eq!(
+        status.slots[1].dir.as_deref(),
+        Some("oxide-0123abcd/quick-2")
+    );
+    assert_eq!(status.coverage, AccountingCoverage::Complete);
+
+    // A labelled request reusing the legacy slot keeps the legacy path.
+    release_injected(&pool, &legacy.lease_id).expect("release legacy");
+    let reused = lease_injected(labelled(
+        &pool,
+        &legacy_project,
+        &workspace,
+        "again",
+        &["legacy-89abcdef"],
+        &[&legacy_project],
+    ))
+    .expect("reuse");
+    assert_eq!(reused.slot_id, legacy.slot_id);
+    assert_eq!(build_dir_below_slots(&pool, &reused), "1/build");
+    assert!(!pool.join("payload/slots/legacy-89abcdef").exists());
+}
+
+/// Two repositories with the same label and an injected shortened-ID
+/// collision get separate folders; a second slot of the first repository
+/// joins its folder; a folder holding unknown entries is never adopted; with
+/// no usable folder the slot keeps the legacy path.
+#[test]
+fn folder_collisions_are_skipped_before_creation() {
+    let fx = Fixture::new("collide");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024 * 1024).expect("init");
+    let first = fx.dir("first");
+    let first_other = fx.dir("first-other");
+    let second = fx.dir("second");
+    let workspace = fx.dir("workspace");
+    let a = lease_injected(labelled(
+        &pool,
+        &first,
+        &workspace,
+        "a",
+        &["app-aaaaaaaa", "app-aaaaaaaa1111"],
+        &[&first],
+    ))
+    .expect("first");
+    assert_eq!(
+        build_dir_below_slots(&pool, &a),
+        "app-aaaaaaaa/quick-1/build"
+    );
+    // Same short prefix, another repository: the next folder.
+    let b = lease_injected(labelled(
+        &pool,
+        &second,
+        &workspace,
+        "b",
+        &["app-aaaaaaaa", "app-aaaaaaaa2222"],
+        &[&second],
+    ))
+    .expect("second");
+    assert_eq!(
+        build_dir_below_slots(&pool, &b),
+        "app-aaaaaaaa2222/quick-2/build"
+    );
+    // Another record of the first repository shares its folder.
+    let c = lease_injected(labelled(
+        &pool,
+        &first_other,
+        &workspace,
+        "c",
+        &["app-aaaaaaaa"],
+        &[&first, &first_other],
+    ))
+    .expect("same repository");
+    assert_eq!(
+        build_dir_below_slots(&pool, &c),
+        "app-aaaaaaaa/quick-3/build"
+    );
+    // An existing folder with no recorded slot and unknown contents.
+    let stranger = pool.join("payload/slots/stray-00000000");
+    fs::create_dir(&stranger).expect("stray folder");
+    fs::write(stranger.join("note"), b"x").expect("stray entry");
+    let other = fx.dir("other");
+    let d = lease_injected(labelled(
+        &pool,
+        &other,
+        &workspace,
+        "d",
+        &["stray-00000000", "app-aaaaaaaa"],
+        &[&other],
+    ))
+    .expect("legacy fallback");
+    assert_eq!(build_dir_below_slots(&pool, &d), "4/build");
+    assert_eq!(fs::read(stranger.join("note")).expect("untouched"), b"x");
+    // Unsafe names refuse rather than escaping the slots root.
+    let bad = fx.dir("bad");
+    for folder in ["../escape", ".hidden", "Upper", ""] {
+        let error = lease_injected(labelled(&pool, &bad, &workspace, "e", &[folder], &[&bad]))
+            .expect_err(folder);
+        assert_eq!(
+            error,
+            LeaseError::InvalidInput("invalid slot project folder"),
+            "{folder}"
+        );
+    }
+}
+
+/// Idle eviction of a labelled slot removes only that slot; its folder and
+/// neighbours stay. A malformed recorded `dir` refuses the ledger.
+#[test]
+fn labelled_slot_eviction_and_malformed_dir() {
+    let fx = Fixture::new("evict-label");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024 * 1024).expect("init");
+    let one = fx.dir("one");
+    let two = fx.dir("two");
+    let workspace = fx.dir("workspace");
+    let a = lease_injected(labelled(
+        &pool,
+        &one,
+        &workspace,
+        "a",
+        &["p-1"],
+        &[&one, &two],
+    ))
+    .expect("a");
+    let b = lease_injected(labelled(
+        &pool,
+        &two,
+        &workspace,
+        "b",
+        &["p-1"],
+        &[&one, &two],
+    ))
+    .expect("b");
+    fill(&a.env.cargo_build_build_dir, 2);
+    release_injected(&pool, &a.lease_id).expect("release");
+    evict_idle_slot_injected(&pool, &a.slot_id).expect("evict");
+    assert!(!pool.join("payload/slots/p-1/quick-1").exists());
+    assert!(pool.join("payload/slots/p-1/quick-2/build").is_dir());
+    assert_eq!(status_injected(&pool).expect("status").slots.len(), 1);
+    release_injected(&pool, &b.lease_id).expect("release b");
+
+    let ledger_path = pool.join("ledger.json");
+    let mut ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ledger_path).expect("ledger")).expect("json");
+    for bad in ["p-1/quick-9", "../x/quick-2", "p-1/quick-2/extra", "p-1"] {
+        ledger["slots"][0]["dir"] = serde_json::json!(bad);
+        fs::write(&ledger_path, serde_json::to_vec(&ledger).expect("bytes")).expect("write");
+        assert_eq!(
+            status_injected(&pool).expect_err(bad),
+            LeaseError::UnknownAccounting,
+            "{bad}"
+        );
+    }
 }

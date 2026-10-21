@@ -518,7 +518,8 @@ def prove_checkout(oxide: Oxide, q: str, primary: str, other: str) -> None:
         fail("oxide run did not run the binary: %s" % output[-2000:])
 
     for slot in (first_slot, other_slot):
-        build = os.path.join(oxide.pool, "payload", "slots", slot, "build")
+        # oxide#104: a new slot sits at its recorded `dir`.
+        build = os.path.join(oxide.pool, "payload", "slots", oxide.slots()[slot].get("dir") or slot, "build")
         if not os.path.isdir(os.path.join(build, "debug", "deps")):
             fail("slot %s has no build/debug/deps" % slot)
         for legacy in ("oxide-quick", "oxide-debug"):

@@ -20,7 +20,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-pub use pool::{managed, LeaseRequest};
+pub use pool::{managed, LeaseRequest, SlotLayout};
 
 #[cfg(test)]
 mod tests;
@@ -268,6 +268,10 @@ pub struct SlotStatus {
     pub profile: Profile,
     pub holder: Option<String>,
     pub lease_id: Option<String>,
+    /// Slot directory below `slots`, fixed at creation:
+    /// `<project folder>/<profile>-<id>`. `None` is the legacy `<id>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
     pub logical_bytes: Option<u64>,
     pub unique_allocated_bytes: Option<u64>,
     /// This slot's own walk, the one reuse needs complete.
@@ -316,6 +320,8 @@ pub struct LedgerSlot {
     pub profile: Profile,
     pub holder: Option<String>,
     pub lease_id: Option<String>,
+    /// As [`SlotStatus::dir`].
+    pub dir: Option<String>,
 }
 
 impl From<&SlotStatus> for LedgerSlot {
@@ -329,6 +335,7 @@ impl From<&SlotStatus> for LedgerSlot {
             profile: slot.profile,
             holder: slot.holder.clone(),
             lease_id: slot.lease_id.clone(),
+            dir: slot.dir.clone(),
         }
     }
 }

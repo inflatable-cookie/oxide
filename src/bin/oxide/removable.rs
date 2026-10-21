@@ -506,24 +506,37 @@ pub fn coordinate(internal: Option<Store>) -> Result<Option<Store>, String> {
     Ok(Some(internal.with_sibling(&control, false)))
 }
 
-/// `status` lines for the registration and the removable pool. Returns the
-/// removable store when it could be opened, for its slot listing.
-pub fn status(internal: &Store) -> Result<Option<Store>, String> {
+/// A registered removable pool as `status` shows it, before printing.
+pub struct RemovableStatus {
+    /// Registration lines: the first is the pool's identity, the rest are
+    /// indented details.
+    pub lines: Vec<String>,
+    /// The opened store when the volume is usable for the next build, else
+    /// why not. Selection is the same check builds use.
+    pub selected: Result<Store, String>,
+    /// Its control directory, internal, readable while the volume is away.
+    pub control: PathBuf,
+}
+
+/// The registration and selection of the removable pool, `None` when none
+/// is registered. Prints nothing.
+pub fn status(internal: &Store) -> Result<Option<RemovableStatus>, String> {
     let Some(registration) = registration(internal)? else {
-        println!("removable pool: none registered");
         return Ok(None);
     };
-    println!(
-        "removable pool: {} volume {} container {}",
-        registration.mount_point.display(),
-        registration.volume_uuid,
-        registration.container_uuid
-    );
-    println!(
-        "  backend {}: {}",
-        Backend::ApfsVolume.tag(),
-        Backend::ApfsVolume.bound()
-    );
+    let mut lines = vec![
+        format!(
+            "{} volume {} container {}",
+            registration.mount_point.display(),
+            registration.volume_uuid,
+            registration.container_uuid
+        ),
+        format!(
+            "  backend {}: {}",
+            Backend::ApfsVolume.tag(),
+            Backend::ApfsVolume.bound()
+        ),
+    ];
     let quota = registration
         .quota_bytes
         .map_or_else(|| "none".to_owned(), |bytes| format!("{} MiB", bytes / MIB));
@@ -531,35 +544,34 @@ pub fn status(internal: &Store) -> Result<Option<Store>, String> {
         || "unknown".to_owned(),
         |bytes| format!("{} MiB", bytes / MIB),
     );
-    println!(
+    lines.push(format!(
         "  reserve {} MiB, Oxide admission cap {} MiB; at registration: volume capacity {capacity} (shared, not an Oxide quota), APFS quota {quota}",
         registration.reserve_bytes / MIB,
         registration.cap_bytes / MIB
-    );
-    let selection = usable(internal, &registration);
-    match &selection {
-        Ok(_) => {
-            let facts = volume::observe_path(&registration.mount_point).ok();
-            let now = facts.map_or_else(
-                || "unknown".to_owned(),
-                |facts| {
-                    format!(
-                        "{} of {} MiB available",
-                        facts.available_bytes.unwrap_or(0) / MIB,
-                        facts.capacity_bytes.unwrap_or(0) / MIB
-                    )
-                },
-            );
-            println!("  volume now: {now}");
-            println!("selected for the next build: removable pool");
-        }
-        Err(reason) => {
-            println!(
-                "selected for the next build: internal pool (removable volume not used: {reason})"
-            );
-        }
+    ));
+    let selected = usable(internal, &registration);
+    if selected.is_ok() {
+        let facts = volume::observe_path(&registration.mount_point).ok();
+        let now = facts.map_or_else(
+            || "unknown".to_owned(),
+            |facts| {
+                format!(
+                    "{} of {} MiB available",
+                    facts.available_bytes.unwrap_or(0) / MIB,
+                    facts.capacity_bytes.unwrap_or(0) / MIB
+                )
+            },
+        );
+        lines.push(format!("  volume now: {now}"));
     }
-    Ok(selection.ok())
+    Ok(Some(RemovableStatus {
+        lines,
+        selected,
+        control: internal
+            .control()
+            .join(POOL_DIR)
+            .join(oxide_storage::lease::MANAGED_NAME),
+    }))
 }
 
 #[cfg(test)]

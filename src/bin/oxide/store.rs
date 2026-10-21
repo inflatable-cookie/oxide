@@ -23,7 +23,7 @@
 use crate::cli::Profile;
 use crate::config::{self, Backup, Facts, Found, Settings};
 use crate::freshness::{Built, Prior};
-use crate::identity::SlotKey;
+use crate::identity::{self, SlotKey};
 use crate::process;
 use crate::watchdog::Watchdog;
 use oxide_storage::lease::managed::{
@@ -32,8 +32,8 @@ use oxide_storage::lease::managed::{
 };
 use oxide_storage::lease::{
     LeaseError, LeaseRequest, LedgerSlot, LedgerView, PoolStatus, Profile as LeaseProfile,
-    ReuseMeasurement, SlotOccupancy, BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME,
-    VOLUME_BACKEND_APFS_V1,
+    ReuseMeasurement, SlotLayout, SlotOccupancy, SlotStatus, BUDGET_BACKEND_DIRECTORY_V1,
+    MANAGED_NAME, VOLUME_BACKEND_APFS_V1,
 };
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -105,6 +105,12 @@ struct Record {
     /// Why a [`Phase::Retired`] slot was retired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     retired: Option<String>,
+    /// Wall clock of the latest use, milliseconds since the epoch, written
+    /// with `last_used`. `last_used` orders uses within one pool only; this
+    /// lets `status` compare pools. Absent on records last used before it
+    /// existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_used_ms: Option<u64>,
 }
 
 impl Record {
@@ -233,6 +239,7 @@ impl State {
             .checked_add(1)
             .ok_or("Oxide use sequence exhausted")?;
         self.records[index].last_used = use_id;
+        self.records[index].last_used_ms = Some(process::now_ms());
         Ok(())
     }
 
@@ -291,6 +298,11 @@ pub enum Return {
 
 /// The held lease must be the record's own: its lease ID, or before that was
 /// saved, its unique lease holder string.
+/// The pool slot whose ledger project is `project`.
+fn slots_view<'a>(pool: &'a PoolStatus, project: &Path) -> Option<&'a SlotStatus> {
+    pool.slots.iter().find(|slot| slot.project == project)
+}
+
 fn return_path(record: &Record, slot: &LedgerSlot) -> Return {
     let own = match (&record.lease_id, &record.holder) {
         (Some(lease_id), _) => slot.lease_id.as_ref() == Some(lease_id),
@@ -413,10 +425,63 @@ pub struct Report {
     pub cleaning: Vec<PathBuf>,
     pub slots: Vec<SlotView>,
     pub recoveries: Vec<Recovery>,
+    /// This pool's most recently used slot by its use counter.
+    pub last_use: Option<LastUse>,
+}
+
+/// The latest recorded use in one pool, from its control state only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LastUse {
+    /// `None` when the pool's ledger was not read.
+    pub slot_id: Option<String>,
+    pub label: Option<String>,
+    pub checkout: Option<PathBuf>,
+    /// Wall clock of that use; `None` for a use recorded before Oxide kept it.
+    pub at_ms: Option<u64>,
+}
+
+/// Status label of a slot: its recorded folder, else its checkout's
+/// directory name.
+pub fn slot_label(dir: Option<&str>, checkout: Option<&Path>) -> Option<String> {
+    match dir.and_then(|dir| dir.split_once('/')) {
+        Some((folder, _)) => Some(folder.to_owned()),
+        None => checkout
+            .and_then(Path::file_name)
+            .map(|name| crate::identity::sanitize_label(&name.to_string_lossy())),
+    }
+}
+
+/// The latest use recorded in a pool's control state, read-only and with
+/// no ledger or volume access, for a pool status does not open. A missing
+/// or unreadable state is `Err`, never "never used".
+pub fn recorded_last_use(control: &Path) -> Result<Option<LastUse>, String> {
+    let path = control.join("state.json");
+    let file = private_file(&path, false)?.ok_or("no Oxide control state")?;
+    let mut bytes = Vec::new();
+    file.take(MAX_STATE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let state: State = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    Ok(state
+        .records
+        .iter()
+        .filter(|record| record.last_used > 0)
+        .max_by_key(|record| record.last_used)
+        .map(|record| LastUse {
+            slot_id: None,
+            label: slot_label(None, record.checkout.as_deref()),
+            checkout: record.checkout.clone(),
+            at_ms: record.last_used_ms,
+        }))
 }
 
 pub struct SlotView {
     pub slot_id: String,
+    /// Slot directory below `slots`; `None` is the legacy `<id>`.
+    pub dir: Option<String>,
+    /// Project label shown by status: the folder of a labelled slot, else
+    /// the checkout directory name, else `None`.
+    pub label: Option<String>,
     pub state: SlotOccupancy,
     pub profile: Option<String>,
     pub checkout: Option<PathBuf>,
@@ -1071,6 +1136,11 @@ impl Store {
                     .find(|record| slot.project == self.affinity_dir(record.id));
                 SlotView {
                     slot_id: slot.slot_id.clone(),
+                    dir: slot.dir.clone(),
+                    label: slot_label(
+                        slot.dir.as_deref(),
+                        record.and_then(|record| record.checkout.as_deref()),
+                    ),
                     state: slot.state,
                     profile: record.map(|record| record.profile.clone()),
                     checkout: record.and_then(|record| record.checkout.clone()),
@@ -1095,8 +1165,25 @@ impl Store {
                         .and_then(|holder| holder.command.clone()),
                 }
             })
-            .collect();
+            .collect::<Vec<SlotView>>();
+        let last_use = state
+            .records
+            .iter()
+            .filter(|record| record.last_used > 0)
+            .filter_map(|record| {
+                let project = self.affinity_dir(record.id);
+                let slot = slots_view(&pool, &project)?;
+                Some((record, slot))
+            })
+            .max_by_key(|(record, _)| record.last_used)
+            .map(|(record, slot)| LastUse {
+                slot_id: Some(slot.slot_id.clone()),
+                label: slot_label(slot.dir.as_deref(), record.checkout.as_deref()),
+                checkout: record.checkout.clone(),
+                at_ms: record.last_used_ms,
+            });
         Ok(Report {
+            last_use,
             pool,
             flushes: state.flushes,
             waiting: state.tickets.len(),
@@ -1305,6 +1392,7 @@ impl Store {
                     lease_id: None,
                     pending_recovery: None,
                     retired: None,
+                    last_used_ms: None,
                 });
                 state.records.len() - 1
             }
@@ -1336,6 +1424,28 @@ impl Store {
         }
         self.save(&state)?;
 
+        // A new slot joins the folder this repository already uses, which
+        // needs no Git call; otherwise its label comes from the checkout.
+        let same_repository: Vec<PathBuf> = state
+            .records
+            .iter()
+            .filter(|other| other.identity == key.identity)
+            .map(|other| self.affinity_dir(other.id))
+            .collect();
+        let known = view
+            .slots
+            .iter()
+            .filter(|slot| same_repository.contains(&slot.project))
+            .find_map(|slot| {
+                slot.dir
+                    .as_deref()?
+                    .split_once('/')
+                    .map(|(folder, _)| folder)
+            });
+        let folders = match known {
+            Some(folder) => vec![folder.to_owned()],
+            None => identity::slot_folders(&identity::project_label(&key.checkout), &key.identity),
+        };
         let request = LeaseRequest {
             pool: self.pool.clone(),
             project: self.affinity_dir(record),
@@ -1346,6 +1456,11 @@ impl Store {
             },
             holder: lease_holder,
             budget_bytes: self.budget,
+            layout: Some(SlotLayout {
+                folders,
+                same_repository,
+                profile: profile.label().to_owned(),
+            }),
         };
         let outcome = lease_measured(request);
         let (grant, measured) = match outcome {
@@ -2112,6 +2227,7 @@ mod tests {
             lease_id: lease_id.map(str::to_owned),
             pending_recovery: None,
             retired: None,
+            last_used_ms: None,
         }
     }
 
@@ -2125,6 +2241,7 @@ mod tests {
             profile: LeaseProfile::Dev,
             holder: Some(holder.to_owned()),
             lease_id: Some(lease_id.to_owned()),
+            dir: None,
         }
     }
 

@@ -38,6 +38,7 @@ import sys
 # No bytecode files in the counted tree or the repository.
 sys.dont_write_bytecode = True
 
+import glob
 import json
 import os
 import plistlib
@@ -495,6 +496,8 @@ def budget_default(proof, parent: str, home: str, base: dict, oxide_run, expect,
         slots = json.load(handle)["slots"]
     expect(len(slots) == 1 and slots[0]["state"] == "idle", f"ledger after growth {slots}")
     grown = slots[0]["id"]
+    # oxide#104: a new slot sits at its recorded `dir`.
+    grown_dir = slots[0].get("dir") or str(grown)
     excluded = run_owned(["/usr/bin/tmutil", "isexcluded", configured], env=env, timeout=30)
     expect(excluded.stdout.startswith("[Excluded]"), "the configured pool is not excluded from Time Machine")
     code, stdout, _ = call(["status"], "status after growth")
@@ -505,7 +508,7 @@ def budget_default(proof, parent: str, home: str, base: dict, oxide_run, expect,
     with open(os.path.join(configured, "ledger.json"), encoding="utf-8") as handle:
         slots = json.load(handle)["slots"]
     expect(all(slot["id"] != grown for slot in slots), f"the grown idle slot was not evicted: {slots}")
-    expect(not os.path.exists(os.path.join(configured, "payload/slots", str(grown))), "evicted slot bytes remain")
+    expect(not os.path.exists(os.path.join(configured, "payload/slots", grown_dir)), "evicted slot bytes remain")
 
     # Watchdog: an injected low reading stops a running build.
     sleeper = write_tree(os.path.join(parent, "sleeper"), SLEEPER)
@@ -742,7 +745,8 @@ def run(proof: Proof, parent: str) -> None:
     flushes = removable_state()["flushes"]
     expect(len(flushes) == 1 and flushes[0]["micros"] is not None and flushes[0]["slot_id"] == "1", f"flush not recorded: {flushes}")
     print(f"flush cost: {flushes[0]['micros']} us")
-    expect(os.path.isdir(os.path.join(mount, "oxide-pool", "slots", "1", "build")), "slot 1 is not on the volume")
+    # oxide#104: slot 1 is `slots/<project folder>/<profile>-1`.
+    expect(len(glob.glob(os.path.join(mount, "oxide-pool", "slots", "*", "*-1", "build"))) == 1, "slot 1 is not on the volume")
     code, _, stderr = oxide_run(["check"], "removable repeat")
     line = summary(stderr)
     expect(code == 0 and "slot 1 warm" in line and "apfs-volume-v1" in line, f"repeat not warm on the volume: {line}")
