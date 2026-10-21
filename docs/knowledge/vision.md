@@ -142,7 +142,9 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   - In permanent mode, a missing drive gives a **loud** fallback, final outputs
     go to the drive behind a `target` link that Oxide maintains, and per-slot
     test scratch goes to the drive.
-  - `oxide pool describe --json` publishes the drive details for other tools.
+  - `oxide pool describe --json`, to publish the drive details, has a
+    reviewed contract but is held until a tool needs it. Effigy, by Tom's
+    ruling, does not read Oxide; it takes a static, UUID-pinned scratch root.
 - **Slots and accounting:**
   - Finder metadata in the pool is tolerated (#105);
   - project-named paths for new slots are approved and being built (#104),
