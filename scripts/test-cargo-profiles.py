@@ -33,10 +33,13 @@ proof.
      and `oxide build --release` the release profile; full-debug session: an
      explicit `oxide bench --profile debug` builds the bench under `dev`.
 
-Bounds: 300 s and 512 MiB owned scratch including cleanup; the 20 GiB host
-reserve and owned scratch are sampled at phase boundaries only. It runs
-under `scripts/bounded-test.py`. No download, install or live pool. Not a
-benchmark and not full QA. Scratch is removed only after positive completion.
+Every child gets OXIDE_TASK_SCRATCH_ROOT, TMPDIR, TMP and TEMP set to one
+directory inside the owned scratch, so its temporary files are counted and
+removed with it. Bounds: 300 s and 512 MiB owned scratch including cleanup;
+the 20 GiB host reserve and owned scratch are sampled at phase boundaries
+only. It runs under `scripts/bounded-test.py`. No download, install or live
+pool. Not a benchmark and not full QA. Scratch is removed only after positive
+completion.
 
 Usage: python3 scripts/test-cargo-profiles.py --profile oxide-light
 """
@@ -59,6 +62,7 @@ HOST_RESERVE_BYTES = 20 * 1024 * 1024 * 1024
 MIB = 1024 * 1024
 STARTED = time.monotonic()
 PEAK = {"bytes": 0, "phase": "none"}
+TEMP_VARIABLES = ("OXIDE_TASK_SCRATCH_ROOT", "TMPDIR", "TMP", "TEMP")
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROBE_TEST = "profile_backtrace"
 PROBE_TEST_NAME = "profile_probe_keeps_workspace_frames_and_unwind"
@@ -590,6 +594,11 @@ def main() -> int:
                                       "RUSTUP_TOOLCHAIN")}
         cargo_env.update({"RUSTUP_TOOLCHAIN": BUILDER, "RUSTC_WRAPPER": "", "CARGO_NET_OFFLINE": "true",
                           "CARGO_TERM_COLOR": "never"})
+        # Every child's temporary files stay in the counted, removed scratch:
+        # all four variables name the same owned directory.
+        temp = os.path.join(parent, "tmp")
+        os.makedirs(temp, mode=0o700)
+        cargo_env.update({name: temp for name in TEMP_VARIABLES})
         prove_opt_in(args.profile, parent, cargo_env)
         reserve(parent, "after opt-in profile")
 
@@ -602,14 +611,13 @@ def main() -> int:
         reserve(parent, "after staging")
 
         home = os.path.join(parent, "home")
-        for path in (home, os.path.join(parent, "cargo-home"), os.path.join(parent, "tmp")):
+        for path in (home, os.path.join(parent, "cargo-home")):
             os.makedirs(path, mode=0o700)
         env = {name: value for name, value in cargo_env.items()
                if not name.startswith("CARGO_") and name not in ("RUSTUP_TOOLCHAIN", "RUSTC_WRAPPER")}
         env.update({"HOME": home, "CARGO_HOME": os.path.join(parent, "cargo-home"),
                     "RUSTUP_HOME": os.environ.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup"),
                     "CARGO_NET_OFFLINE": "true", "CARGO_TERM_COLOR": "never", "RUSTC_WRAPPER": "",
-                    "TMPDIR": os.path.join(parent, "tmp"),
                     "PATH": os.path.join(parent, "bin") + os.pathsep + os.environ.get("PATH", "")})
         oxide = Oxide(parent, oxide_binary, env)
         q = os.path.join(parent, "checkouts", "q")
