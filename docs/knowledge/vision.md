@@ -706,9 +706,9 @@ Tom, 2026-10-21, "Approved": a single drive mode. Context: Tom mounted the Build
    `ephemeral` keeps the quiet fallback and checkout-local outputs.
 3. **One source of truth:** `oxide pool describe --json` publishes the mount, volume UUID, mode and a suggested scratch root outside the pool. Other tools (Effigy run scratch #244, Queue task workspaces, the sccache directory) may read it, and each keeps its own override.
 4. **Order:**
-   1. the mode and the loud fallback;
-   2. outputs on the drive;
-   3. `describe --json`, then consumer adoption.
+   1. the mode and the loud fallback, with `describe --json` alongside it, both after #110;
+   2. outputs on the drive, after #106;
+   3. consumer adoption through each tool's owner.
 
 ## Authority boundaries
 
