@@ -16,6 +16,6 @@
 
 [Project adoption](contracts/project-adoption.md) owns the consumer integration boundary, the reviewed cross-worktree result and the owner-reported Nucleus lease use. [Rust toolchain and quality](rust-toolchain-and-quality.md) owns the development compiler, initial minimum Rust version and quality-policy routing. [Opt-in stable Cargo profiles](contracts/stable-cargo-profiles.md) owns Oxide's own `oxide-light`/`oxide-full-debug` recipes, their debugging tradeoff, the focused profile-proof selectors and the no-go disposition of the comparison observations.
 
-[Proof supervisor correction](contracts/proof-supervisor-correction.md) holds the proposed, unreviewed correction to oxide#109's shared proof supervisor under Tom's pinned-leader cooperative closure ruling.
+[Proof supervisor correction](contracts/proof-supervisor-correction.md) holds the reviewed correction design (revision 4) for oxide#109's shared proof supervisor under Tom's pinned-leader cooperative closure ruling; [workflow](contracts/workflow.md#shared-proof-supervisor) records the implementation.
 
 [Qualification findings](qualification-readiness.md) preserves the Cargo freshness, compiler path, cross-path, containment and capacity findings the workflow builds on. They grant no execution authority.

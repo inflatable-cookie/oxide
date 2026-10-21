@@ -1,9 +1,8 @@
 # Proposed correction: shared proof supervisor (oxide#109)
 
-**Status, 2026-10-21: not qualified; route B applied.** The design (revision 4) passed prospective review. The implementation at `22d1280` failed closure and deadline review with a new P1 class: nested guardian ownership deletes the scratch and evidence of live `UNCLOSED` sessions. Under Tom's stop rule, elevated tasks use the documented-gap old guard ([vision](../vision.md#authority-boundaries)). This document is kept as the reviewed design for any future qualification.
+**Status, 2026-10-21: not qualified; route B applies meanwhile.** The design (revision 4) passed prospective review: independent Sol verdict `4a98d7ac` at `29f0950e`, with minor implementation conditions. The implementation at `22d1280` failed closure and deadline review `6312725112` with five findings, and route B was applied ([vision](../vision.md#authority-boundaries)). Tom then approved one focused completion phase that fixes exactly those five findings with a regression each. Review `6318598212` of that phase found one more P1, a post-gate custodian exception escaping shutdown, and Tom approved a repair of only that. Review `6319610400` of that repair found its exception handler looking up traceback source (file I/O) before latching. Under Tom's continue-until-qualified ruling (decision `561298b5`) the owner admitted that localized fix. Review `6320463419` then found readings stamped at send time rather than completion, and the custodian's own setup doing blocking filesystem work outside the deadline. The owner admitted both fixes the same way. The supervisor qualifies only on a passing independent exact-head native. The body below is the reviewed text; the [shared proof supervisor](workflow.md#shared-proof-supervisor) section records current behaviour and implementation choices.
 
-Proposed, not implemented; it awaits independent design review. This is
-revision 4. Under Tom's 2026-10-21 ruling on Queue decision `bc874ae7` ("Yeah
+This is revision 4. Under Tom's 2026-10-21 ruling on Queue decision `bc874ae7` ("Yeah
 do it"), it is a final, narrow round that changes only the four P1s from the
 review of revision 3 (`c8ab934f`):
 1. the launch gate passing before the child's `setsid`;

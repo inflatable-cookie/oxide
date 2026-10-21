@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Synthetic fixtures for the dogfood test supervisor and installer.
+"""Synthetic fixtures for the dogfood installer.
+
+The shared session supervisor (`bounded-test.py`) has its own suite,
+`test_supervisor.py`, run by `proof:supervisor:qualify`.
 
 Never builds, never touches the real ~/.local/bin or pool. Fixture roots stay
 inside one fresh mktemp directory. Aggregate budget is 60 seconds.
@@ -11,9 +14,7 @@ import importlib.util
 import json
 import os
 import signal
-import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
@@ -31,79 +32,7 @@ def load(name):
     return module
 
 
-bounded = load("bounded-test")
 installer = load("oxide-install")
-
-# An `oxide`-shaped parent: Cargo-like child in its own group (`setpgid`, as
-# `oxide` does) that ignores TERM, a parent that forwards TERM to that group
-# and waits for it.
-FORWARDER = """
-import os, signal, subprocess, sys
-child = subprocess.Popen([sys.executable, "-c",
-    "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"],
-    preexec_fn=lambda: os.setpgid(0, 0))
-open(sys.argv[1], "w").write(str(child.pid))
-signal.signal(signal.SIGTERM, lambda *_: os.killpg(child.pid, signal.SIGTERM))
-child.wait()
-"""
-
-# The same parent after Cargo itself exits: the group leader spawns a
-# TERM-ignoring child in its group, then exits at once and is reaped; the
-# parent waits for the group to empty, as `oxide` does.
-ORPHAN = """
-import os, signal, subprocess, sys, time
-leader = subprocess.Popen([sys.executable, "-c",
-    "import subprocess, sys, time; child = subprocess.Popen([sys.executable, '-c', "
-    "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)']); "
-    "open(sys.argv[1], 'w').write(str(child.pid))", sys.argv[1]],
-    preexec_fn=lambda: os.setpgid(0, 0))
-group = leader.pid
-signal.signal(signal.SIGTERM, lambda *_: os.killpg(group, signal.SIGTERM))
-leader.wait()
-while True:
-    try:
-        os.killpg(group, 0)
-    except ProcessLookupError:
-        break
-    time.sleep(0.1)
-"""
-
-
-def alive(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
-
-
-class SupervisorTests(unittest.TestCase):
-    def test_normal_exit_passes_through(self):
-        self.assertEqual(bounded.supervise([sys.executable, "-c", "raise SystemExit(3)"]), 3)
-
-    def test_timeout_reaches_the_separate_group(self):
-        pid_file = SCRATCH / "child.pid"
-        code = bounded.supervise(
-            [sys.executable, "-c", FORWARDER, str(pid_file)], limit=1, grace=1, closure=3
-        )
-        self.assertEqual(code, 124)
-        child = int(pid_file.read_text())
-        deadline = time.monotonic() + 3
-        while alive(child) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        self.assertFalse(alive(child), "TERM-ignoring child in Cargo's group survived")
-
-    def test_timeout_reaches_the_group_after_its_leader_exits(self):
-        pid_file = SCRATCH / "orphan.pid"
-        code = bounded.supervise(
-            [sys.executable, "-c", ORPHAN, str(pid_file)], limit=2, grace=1, closure=3
-        )
-        self.assertEqual(code, 124)
-        orphan = int(pid_file.read_text())
-        deadline = time.monotonic() + 3
-        while alive(orphan) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        self.assertFalse(alive(orphan), "orphan in Cargo's group survived its leader's exit")
 
 
 def sha256(data):

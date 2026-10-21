@@ -852,20 +852,301 @@ or global Cargo configuration is involved.
   Use them when `oxide` itself is broken. They build into the checkout's
   `target/` unless `CARGO_TARGET_DIR` points elsewhere, and `oxide init`
   readiness lists them as plain-Cargo lines by design.
-- **Test supervisor.** `oxide` runs Cargo in its own process group and
-  forwards TERM to it, so killing the supervisor's group alone would miss
-  Cargo. `bounded-test.py` starts the command in a new session; `oxide`'s
-  `setpgid` keeps Cargo, its tests and any child orphaned by Cargo's exit in
-  that session. At the 300-second limit, before reaping its child, it
-  records every process group in the session, TERMs its own group, and
-  after ten seconds KILLs the recorded groups and then its own. It reports
-  any session or group member still alive five seconds later. A process
-  that called `setsid` is outside the session and is not seen.
-- **Fixtures.** `effigy dogfood:scripts:test` proves that escalation,
-  including the orphan whose group leader exited, and
-  the installer's refusals (linked or foreign directories, an existing
-  destination, a destination swapped during the build) on synthetic
-  fixtures. It never builds or installs.
+- **Test supervisor.** `test rust`, `test rust-cargo` and `rust:pool-scale`
+  run under the [shared proof supervisor](#shared-proof-supervisor).
+- **Fixtures.** `effigy dogfood:scripts:test` proves the installer's refusals
+  (linked or foreign directories, an existing destination, a destination
+  swapped during the build) on synthetic fixtures. It never builds or
+  installs.
+
+### Shared proof supervisor
+
+`scripts/bounded-test.py` is the shared proof supervisor. It implements the
+reviewed [pinned-leader correction design](proof-supervisor-correction.md)
+(revision 4, `29f0950e`) for oxide#109. It counts as qualified only once
+that task's independent exact-head native passes; until then it is the
+candidate under test. Earlier #109 evidence stays historical: at `f5a998c`,
+the author's two native submissions, the reviewer's failed native and that
+review's closure and deadline findings; at `22d1280`, author and reviewer
+natives that passed 43/43 cases and review `6312725112`, which found five
+defects. Tom's focused completion phase fixes exactly those five, each with
+a regression, and routes nothing else. At `52e4a89` the author native passed
+50/50, the reviewer native timed out in admission without launching, and
+review `6318598212` found one more P1: a post-gate custodian exception
+escaped shutdown. Tom's post-gate exception repair phase fixes only that.
+Its second author native at `2abe9c6` passed 56/56. Review `6319610400`
+then found the exception handler calling `traceback.extract_tb` (source
+file lookup) before latching; the diagnostic repair below fixes only that.
+Its author native at `07ce385` failed 59/60: the exception-during-stop case
+still expected the exception's message text in the fault, which the repair
+deliberately no longer includes. That case now expects the class name and
+the recorded `stop_leader:` location. Author and reviewer natives at
+`3d8e4f2` passed 60/60. Review `6320463419` then found two defects:
+- readings stamped at send time, not completion, so a delayed publication
+  could refresh an old measurement;
+- the custodian's own setup doing blocking filesystem work before any
+  deadline wait.
+
+The owner admitted both fixes under Tom's continue ruling.
+
+```sh
+python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence DIR] [--root-parent DIR] [--] command ...
+```
+
+- **Future proofs.** A proof is one short fixed script that is the whole
+  supervised command, run as an Effigy `heavy` task:
+  `python3 scripts/bounded-test.py python3 scripts/<proof>.py`.
+  - It writes only inside `OXIDE_TASK_SCRATCH_ROOT`.
+  - It may read `OXIDE_PROOF_DEADLINE_NS`, the absolute `CLOCK_UPTIME_RAW`
+    deadline, and write evidence to keep under `OXIDE_PROOF_EVIDENCE`, the
+    evidence directory: counted in owned bytes, never removed by cleanup.
+  - It must leave no process outside its leader's group when it exits: such
+    a process is never signalled and ends the run `UNCLOSED`.
+  - It adds no supervision or accounting of its own.
+- **Processes.**
+  - The single-threaded custodian owns the absolute deadline, the two pins
+    and every signal. The pins are the monitor and the leader, both held
+    unreaped.
+  - The monitor owns all I/O: evidence and receipt phases, output draining,
+    reserve and owned-byte sampling, the census and cleanup.
+  - The leader calls `setsid` and execs the command only after the gate
+    opens.
+  - After setup, the custodian makes only bounded calls and touches no files
+    or stdio.
+- **Setup.** The custodian takes its clock and deadlines first, and its own
+  setup is filesystem-free: attribute capability checks, signal handlers,
+  run ID and environment copy. All blocking setup runs in the monitor,
+  inside the 10 s setup budget:
+  - the `kinfo_proc` layout check;
+  - path resolution;
+  - scratch and evidence creation;
+  - the first receipt.
+
+  The paths arrive in the monitor's `setup` message. The leader opens
+  `/dev/null` itself, before its ack. A stall anywhere in setup, including
+  a blocked filesystem call, leaves `ready` unsent, and the direct
+  invocation is bounded the same way as under the bootstrap. A setup
+  refusal, such as `OXIDE_TASK_SCRATCH_ROOT` not being a directory, is one
+  non-blocking stderr line and exit 125. Python start-up and imports before
+  the entry point are outside the bound.
+- **Launch gate.** Nothing launches unless the custodian has received the
+  monitor's `setup`, `ready` and completed reserve and owned-byte readings
+  within the 10 s setup budget. If that fails, the pinned monitor is KILLed
+  and the exit is 125.
+  - The leader child acknowledges with exactly one byte after `setsid` and
+    `dup2`.
+  - The custodian then registers kqueue `NOTE_EXIT` and writes the gate
+    byte.
+  - A wrong byte, EOF, a missing detector, a fault, or a signal before the
+    gate opens KILLs the pinned PID (never `killpg`). The command never runs.
+  - SIGINT and SIGTERM are held blocked from the final check of recorded
+    cancellation and faults through the gate write. A cancellation recorded
+    or pending at that check wins, including one during or after detector
+    registration.
+  - SIGCHLD is set to default before any fork, so no pin is auto-reaped.
+  - The child resets inherited signal dispositions and the signal mask
+    before `exec`. An exec failure exits 127.
+- **Signals.** Only the pinned leader's group (TERM, then KILL after at most
+  5 s) and, at the end, the pinned monitor are ever signalled. Each signal
+  is recorded with its target, pin and `held_unreaped` custody at that
+  moment. On macOS a group whose only member is the unreaped leader answers
+  `EPERM`, which is recorded and not a fault. Groups other than the
+  leader's are never signalled.
+- **Closure.** The leader is reaped first. Only after that does the custodian
+  send `stopped`, so the final census never sees the leader. Closure is
+  established when all of the following hold:
+  - no fault is latched;
+  - a census started after `stopped` is certain, with zero members and zero
+    uncertain rows, within 10 s (bounded by `exit_at`);
+  - both output pipes have reached EOF.
+
+  The census classifies every host process:
+  - **Member:** `getsid` is the leader's PID, re-validated by a
+    `KERN_PROC_PID` re-read of PID and start token. A member stays tracked
+    until its identity is gone.
+  - **Foreign:** a validated other session that was never a member.
+  - **Gone:** `getsid` failed with `ESRCH` and a later successful
+    `KERN_PROC_PID` read lacks the identity. A zombie still present is
+    re-read within the round, every 50 ms for at most 1 s. A failed read
+    confirms nothing.
+  - **Uncertain:** everything else, including first-seen unreadable rows,
+    failed re-reads and unconfirmed zombies.
+
+  An uncertain or failed census after `stopped` latches a fault at once. A
+  later certain empty census never clears it or authorizes cleanup.
+
+  Start time is only an identity token, never an exclusion. A zombie of an
+  unrelated parent present after the stop therefore yields a false
+  `UNCLOSED`: it fails closed. During development such zombies appeared
+  transiently and once persisted about 30 s. Owned scratch is removed only
+  after established closure.
+- **Faults (latched; none clears).**
+  - Monitor: reserve below 22 GiB (20 GiB reserve + 2 GiB margin); no
+    reserve reading for 1 s; no completed owned-byte reading for 10 s; owned
+    bytes over budget (default 512 MiB); a measurement error; monitor death.
+    Freshness counts from each reading's `completed` stamp, taken when the
+    measurement finished, never from when its message was sent. A
+    completion after the send stamp is a fault.
+  - Protocol: wrong run ID, sequence gap, a leader identity that is not the
+    pinned leader or is dropped after binding, `ready` before readings, line
+    overflow.
+  - Process: signal or reap errors; SIGINT or SIGTERM to the custodian.
+  - Exception: any exception in the custodian after setup, and a monitor
+    message with a missing or ill-typed field (`protocol: malformed`).
+    The fault is latched first, as `custodian exception: <class name>`,
+    with the name read from the C-level type slot. The custodian never
+    converts an exception to text (no `str`, `repr` or format) and never
+    uses `traceback` or `linecache`. Only then is the innermost function
+    and line recorded, read from the traceback object's own fields; a
+    failing record never undoes the latch. OS errors are reported by
+    `errno` name.
+    Each phase after setup (launch, watch, stop, reap, census, finish) runs
+    under its own guard, so the bounded pinned stop (TERM, grace, KILL; the
+    KILL is sent even if the stop itself raises), WNOHANG reap, census and
+    `keep` still run. A kqueue failure degrades the wait to `select` on the
+    control pipe, so monitor messages and sampling continue through
+    shutdown. Exception records are capped at 8. An uncaught top-level
+    error writes one line of at most `PIPE_BUF` bytes only if stderr is
+    writable at once, with no traceback, and exits 125.
+  - Closure: an uncertain census after `stopped`; no certain empty census
+    or a missing EOF witness within the census window.
+  - Clock: a reading stamped later than the custodian's own clock reading
+    when it arrives. Both sides use the same system-wide clock, so such a
+    reading is never fresh.
+- **Clock and deadlines.** One clock everywhere: `CLOCK_UPTIME_RAW` integer
+  nanoseconds. The supervisor refuses before any proof work if that clock,
+  kqueue, macOS or the self-checked `kinfo_proc` layout is missing.
+  - `stop_at` is the limit minus 20 s.
+  - `exit_at` is the limit minus 2 s.
+  - Every wait is a kevent or select timeout within the remaining budget.
+- **Exit and receipt.**
+  - Exit codes: 124 at a deadline; 125 for a fault, refusal or `UNCLOSED`;
+    otherwise the command's status (128+N for signal N).
+  - The monitor publishes `receipt.json` phases by atomic replacement:
+    `started: incomplete`, then `closure_established: cleanup_pending` or
+    `unclosed: scratch_kept`, `cleanup_partial_or_unknown` before deleting,
+    `cleanup_complete`, and `monitor_complete: pending_custodian`.
+  - There is no success phase. Success is `monitor_complete` plus custodian
+    exit 0, recorded by the caller.
+  - Output persists up to 8 MiB per stream in the evidence directory, is
+    forwarded up to 32 MiB, and the rest is counted and discarded.
+- **Scratch.** Without a caller's `OXIDE_TASK_SCRATCH_ROOT`, it owns
+  `<root-parent>/oxide-proof.*/{scratch,evidence}` (default
+  `/private/tmp`). It passes `scratch` as `OXIDE_TASK_SCRATCH_ROOT`,
+  `TMPDIR`, `TMP` and `TEMP`, and counts the whole root, evidence included.
+  A caller's root is adopted and never removed; evidence goes in a
+  `supervisor-evidence.*` directory inside it. Evidence directories are kept
+  for review.
+- **Scope.** Cooperative session only. A `setsid` escape is seen only if
+  already tracked as a member or while it holds an output pipe. Arbitrary
+  same-user writers are outside the promise. The reserve check is a sampled
+  abort threshold, not an instantaneous guarantee. The budget is monitored,
+  not a hard ceiling. No hard real-time scheduling claim. macOS only.
+- **Test hook.** `OXIDE_SUPERVISOR_INJECT` (test-only) injects launch, monitor,
+  census, cleanup and reading faults for the qualification suite.
+
+**Qualification.** `effigy proof:supervisor:qualify` (heavy) is a bootstrap
+around the candidate; the bootstrap is not itself a qualified guard. Its own
+bounds:
+- a clean checkout;
+- reserve readings before and after;
+- a fixed 300 s `CLOCK_UPTIME_RAW` deadline held by a minimal outer actor.
+  The actor forks the whole bootstrap as a pinned worker and makes only
+  WNOHANG reaps, bounded sleeps and signals to that worker. All file,
+  hashing and stdout work runs in the worker. At 298 s the actor KILLs the
+  worker and exits 124, so blocked output or a slow read cannot extend the
+  deadline. A candidate still running then is bounded only by its own
+  280 s limit;
+- on candidate overrun, TERM then KILL of its own unreaped candidate child
+  only, from its own reap loop, so no signal can follow the reap.
+
+It deletes nothing. Real case directories live under the candidate's
+`OXIDE_PROOF_EVIDENCE`, outside the candidate's cleanup. `UNCLOSED` cases
+leave live fixture processes whose only bound is their finite fallback, and
+fallback expiry is not closure. The scratch base is therefore kept, and its
+path is printed for the owner.
+
+It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
+`scripts/test_supervisor.py`. The suite runs in order:
+- 35 pure cases: guard thresholds, staleness and errors, a future-stamped
+  reading, delayed reserve and scratch publications that do not refresh,
+  and a completion after its send stamp; the custodian's setup with every
+  filesystem call forbidden; `ready` before `setup`; exit precedence;
+  census member, foreign, identity change, first-seen unreadable, zombie,
+  gone, `ESRCH` with a failing re-read (uncertain), a zombie confirmed gone
+  within the round, escaped and reparented member, backwards start time,
+  recycled PID, failed snapshot; protocol run, sequence and leader-binding
+  faults; ready before readings; census before reap; an uncertain census
+  latched over a later empty one; malformed and ill-typed monitor
+  messages latched without raising; the top-level report not blocking on a
+  full pipe; the exception handler latching with `linecache`, `traceback`,
+  `open` and `stat` all forbidden, latching when its record raises, and
+  never converting hostile exception text (hostile `__str__`, `__repr__`,
+  `__format__`, metaclass `__name__` and `str`-subclass name); refusal to
+  signal an unpinned target;
+- writers before and after a simulated staging step;
+- 33 real cases with tiny Python fixtures and injected faults:
+  - exit 0, owned cleanup, nonzero, exec 127, output saturation;
+  - a group cascading to `closed` at the deadline;
+  - a separate-group survivor `UNCLOSED`, never signalled and still alive at
+    the verdict, its case directory and receipt outside the outer cleanup;
+  - an escaped pipe holder, kept the same way;
+  - a latched fault with an empty census (kept, not cleaned);
+  - SIGTERM and SIGINT to the custodian;
+  - gate EOF, wrong byte, cancel before the ack, no detector, a real
+    SIGTERM after detector registration, and a SIGTERM pending at the gate
+    decision;
+  - setup stall, monitor death, monitor stall, uncertain census, a first
+    uncertain census followed by empty ones (owned scratch kept),
+    interrupted cleanup, monitor completion followed by a custodian timeout;
+  - a reserve reading delayed 0.5 s under the monitor's I/O lock, and a
+    scratch reading delayed 4 s, each followed by a stalled sampler. The
+    stop must come between the 1 s or 10 s bound and that bound plus
+    0.3 s, measured from completion;
+  - the direct runner, with no bootstrap, whose first receipt open blocks
+    on a FIFO. It exits 125 within 13 s, launches nothing and claims no
+    receipt. No reading arrives while setup is blocked, so the 1 s reserve
+    staleness guard usually stops it first; the 10 s setup deadline is the
+    backstop. The author native at `f3bde11` failed 67/68 only because this
+    case expected at least 10 s; it stopped at 1.13 s;
+  - the bootstrap actor KILLing a worker blocked on an unread stdout pipe
+    at its deadline (exit 124);
+  - post-gate exceptions: an event-loop exception, a failing kqueue, a
+    malformed monitor message, and an exception during the stop. Each has a
+    TERM-ignoring leader and group child: pinned TERM then KILL, the child
+    dead, the leader reaped, the last reserve sample no later than and
+    within 1 s of the monitor's final publication, owned scratch kept,
+    exit 125. The author
+    native at `74f1b65` failed only the earlier, stricter form of that
+    sampling assertion (a sample after the reap) in two cases;
+  - a fixture deadline holding across `exec` and for a late grandchild, with
+    SIGALRM inherited as ignored and blocked.
+
+Every fixture arms SIGALRM to `FIXTURE_DEADLINE_NS`. The order is case
+verdict 45 s < fixture fallback 60 s < qualification 300 s, and fallback
+expiry never counts as closure. The bootstrap requires all of:
+- candidate exit 0;
+- phase `monitor_complete`;
+- established closure with status 0;
+- reserve sampling that began before the gate, with no gap over 1 s;
+- the fixture writers counted;
+- custody at every signal;
+- all 68 cases;
+- every real case directory and receipt still present after the
+  candidate's cleanup.
+
+It prints a receipt binding the commit, SHA-256 of all three sources, the
+platform, each case's exit, phase, outcome and signal custody, the kept base
+and `UNCLOSED` case directories, and the limitations. Admission waits fall outside its 300 s. `effigy
+proof:supervisor:test` runs the pure cases alone.
+
+`test rust`, `test rust-cargo`, the profile proofs, `rust:pool-scale`,
+`rust:oxide-exec` and `rust:front-door-accounting` keep their invocation and
+get this supervisor once oxide#109 merges. Their recorded evidence ran under
+the old guard at `3d947a9` and stays historical; none has run under the new
+one. Pool-scale's own `mktemp` scratch lies outside the supervisor's owned
+bytes.
+`scripts/bounded_runner.py` (oxide#097) stays separate and unqualified.
 
 ### Rollback
 
@@ -1100,7 +1381,8 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
   Host-wide limit 2 commands holding slots (`OXIDE_MAX_ACTIVE`, 1–32). Excess
   commands wait in FIFO order, print one `oxide: waiting for …` line on stderr
   and cancel on Ctrl-C with exit 130. Another command in the same checkout
-  and key waits too.
+  and key takes a compatible spare slot or creates one within budget; it waits
+  when no safe slot or host capacity is available.
 - **Execution.** Cargo runs from the caller's directory as leader of a new
   process group, with `CARGO_BUILD_BUILD_DIR` on the slot and
   `CARGO_TARGET_DIR=<workspace>/target`. SIGINT, SIGTERM and SIGHUP are
@@ -1854,6 +2136,42 @@ A lease records which pool it uses. Each pool stays warm on its own.
 - Spotlight indexing of build locations is a host setting, recommended separately.
 
 **Drive:** the dedicated spare 1 TB SSD (Tom, 2026-10-20), formatted by Tom in Disk Utility as plain APFS volume `Builds` (UUID `A6AC3ED7-33EA-46B4-8082-7254CF291ED2`). Vault and its Time Machine backups stay untouched. **Decided (Tom, 2026-10-20):** a 750 GB Oxide admission cap and a 100 GB free-space reserve, both set at registration. The flush primitive is implemented (`fsync_volume_np` with full sync and wait; see part 1 above); **not yet measured:** its cost on the real drive.
+
+### Proposed: `oxide pool describe --json` (lead `beec4971`)
+
+Proposed, not implemented. This is the stable, read-only interface other tools use to find the Builds drive. Its first consumer is Effigy's opt-in `[scratch] source = "oxide"` (Effigy lead `1a007b5d`). Output on stdout, schema version 1:
+
+```json
+{
+  "schema": "oxide.pool.describe/1",
+  "observed_at": "2026-10-21T16:00:00Z",
+  "internal": { "pool": "/Users/tom/Dev/oxide" },
+  "selected": "removable",
+  "removable": {
+    "mount_point": "/Volumes/Builds",
+    "volume_uuid": "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+    "mode": "ephemeral",
+    "available": true,
+    "unavailable_reason": null,
+    "payload": "/Volumes/Builds/oxide-pool",
+    "suggested_scratch_root": "/Volumes/Builds/scratch"
+  }
+}
+```
+
+- **`removable`** is `null` when no drive is registered, and `selected` is then `"internal"`.
+- **`mode`** is `"permanent"` or `"ephemeral"`. Until the drive-mode lead ships, it is always `"ephemeral"`.
+- **`available`** is **passive eligibility**, not a prediction that the next build will open or be admitted to the pool. It is `true` only when every check below passes, using only read-only observations:
+  - the registered drive passes selection's checks: the `/Volumes` mount-parent rule, the opened mount root with the registered volume UUID, the registered container outside the boot and data container, no APFS role, writability, and available space above the reserve;
+  - the removable pool's existing config and ledger read cleanly with matching identities.
+
+  Every `diskutil` or `plutil` read is bounded by a timeout and an output-size cap, and a timeout, oversize output or parse failure counts as unknown. Anything pending, indeterminate or unknown makes it `false`, with a reason: an `Evicting` record awaiting reconciliation (`"pending_reconciliation"`), missing control directories, unreadable or mismatched metadata (`"metadata_unknown"`, `"identity_mismatch"`), `"absent"` or `"below_reserve"`. `unavailable_reason` is otherwise `null`. Consumers branch on `available`, not on reason strings.
+- **`selected`** is the passive preference: `"removable"` when `available` is true, otherwise `"internal"`. It is not a promise of the next build's selection, which stays authoritative inside the build and may differ, for example after its own reconciliation.
+- **`suggested_scratch_root`** is always outside `payload`. It is a suggestion, not a promise that the directory exists or a grant of write authority. Consumers create their own subdirectory, for example `<root>/effigy/<run-id>`, and never write under `payload`.
+- **Read-only.** Running `describe` mutates nothing. It never uses the build path's pool-opening helpers. It creates no control directories, reconciles no recorded deletion, writes no ledger and walks no accounting. Held records are reported as they are, with no claim about closure or accounting.
+- **A snapshot.** The data is a point-in-time observation. Before writing, consumers still apply their own gate: the volume UUID, the mount root, and a device different from both `/` and `/System/Volumes/Data`.
+- **Exit codes:** 0 whenever the description was produced, whether or not a drive is registered or available. Non-zero only when Oxide itself fails, with the reason on stderr.
+- **Compatibility:** fields may be added in schema 1. Removing or renaming a field needs `oxide.pool.describe/2`.
 
 ## Adaptive sccache location (proposed)
 
