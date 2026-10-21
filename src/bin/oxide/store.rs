@@ -2056,16 +2056,16 @@ fn lease_error(context: &str, error: &LeaseError) -> String {
 mod tests {
     use super::*;
 
-    fn paired_controls() -> (PathBuf, Store, Store) {
+    fn paired_controls(label: &str) -> (PathBuf, Store, Store) {
         let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
         let root = base.join(format!(
-            "oxide-barrier-{}-{}",
+            "oxide-{label}-{}-{}",
             std::process::id(),
             process::now_ms()
         ));
-        fs::create_dir_all(&root).unwrap();
+        fs::create_dir(&root).unwrap();
         let root = fs::canonicalize(root).unwrap();
         let store = |name: &str| Store {
             pool: root.join(name),
@@ -2096,7 +2096,7 @@ mod tests {
     /// attempt sees a live internal clean under the internal admission lock.
     #[test]
     fn clean_barrier_spans_both_pools() {
-        let (root, internal, removable) = paired_controls();
+        let (root, internal, removable) = paired_controls("clean-barrier");
         let checkout = Path::new("/checkout");
         let other = Path::new("/other");
         let mut state = State::default();
@@ -2122,7 +2122,7 @@ mod tests {
 
     #[test]
     fn host_limit_counts_internal_and_removable_activity_in_both_routes() {
-        let (root, internal, removable) = paired_controls();
+        let (root, internal, removable) = paired_controls("host-limit");
         let key = SlotKey {
             checkout: PathBuf::from("/checkout"),
             identity: "identity".to_owned(),
