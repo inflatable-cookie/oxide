@@ -677,6 +677,17 @@ Tom, 2026-10-21, "Yes, (2)" (Queue decision `99ed1d7f`): the shared native-proof
 
 The same day Tom agreed Effigy's run-scratch design, which Effigy owns and which ships in v0.15.
 
+Tom, 2026-10-21, "I'll go with your recommendation C for 109", the native-proof route while #109 is unqualified.
+1. **Standard-tier exception for #110 and #106 only, until #109 qualifies.** Their native proofs run under main's `scripts/bounded-test.py` at `3d947a9`, Effigy heavy admission, a wall-clock limit and the task's own scratch root. Each task's evidence discloses the gaps:
+   - no free-space monitoring of plain-Cargo staging or fixture writes;
+   - no supervisor-enforced scratch budget or scratch cleanup;
+   - on the timeout path, numeric TERM and KILL of recorded session groups without positive identity.
+
+   No probability is assigned to either risk.
+2. **#109 gets one more prospective design revision.** It must be one complete actor, launch-gate and control protocol with a failure table that keeps the original guards and the output and receipt contract. If that revision is again changes required, Tom chooses for elevated tasks between the documented-gap route and a different mechanism, such as a disposable VM as the custody and disk bound.
+
+Elevated tasks keep waiting for a qualified supervisor.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
