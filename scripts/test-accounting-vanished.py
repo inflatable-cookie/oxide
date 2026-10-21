@@ -197,10 +197,12 @@ def wait_for_ready(process: subprocess.Popen, marker: str) -> None:
         time.sleep(0.05)
 
 
-def start_held(binary: str, env: dict[str, str], project: str, root: str, evidence: str, name: str):
+def start_held(binary: str, env: dict[str, str], project: str, evidence: str, name: str):
     remaining()
-    ready = os.path.join(root, "hold.ready")
-    release = os.path.join(root, "hold.release")
+    ready = os.path.join(project, "hold.ready")
+    release = os.path.join(project, "hold.release")
+    if os.path.lexists(ready) or os.path.lexists(release):
+        fail(f"held fixture markers already exist for {name}")
     child_env = env.copy()
     child_env["OXIDE_FIXTURE_READY"] = ready
     child_env["OXIDE_FIXTURE_RELEASE"] = release
@@ -387,7 +389,7 @@ def prepare_pool(
     held_project = fixture(root, held_name, hold=True)
     idle_project = fixture(root, idle_name)
     env = base_env(root, pool, cap)
-    held_process, release, log = start_held(binary, env, held_project, root, evidence, held_name)
+    held_process, release, log = start_held(binary, env, held_project, evidence, held_name)
     held_slots = slot_roots(pool)
     if len(held_slots) != 1:
         fail(f"expected one held slot after first build, found {list(held_slots)}")
