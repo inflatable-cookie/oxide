@@ -490,7 +490,7 @@ def budget_default(proof, parent: str, home: str, base: dict, oxide_run, expect,
     grower = write_tree(os.path.join(parent, "grower"), GROWER)
     code, _, stderr = call(["check"], "build grows past the soft budget", cwd=grower)
     line = summary(stderr)
-    expect(code == 0 and "of 1 MiB budget" in line, f"growth build: {line}")
+    expect(code == 0 and ", 1 MiB budget, pool total: see oxide status" in line, f"growth build: {line}")
     with open(os.path.join(configured, "ledger.json"), encoding="utf-8") as handle:
         slots = json.load(handle)["slots"]
     expect(len(slots) == 1 and slots[0]["state"] == "idle", f"ledger after growth {slots}")

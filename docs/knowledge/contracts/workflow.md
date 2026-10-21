@@ -886,9 +886,13 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
   environment (`CARGO_PKG_*`, dylib paths) is not set. Exit codes are Cargo's,
   or the program's for `run`.
 - **Summary.** One stderr line per leased command: profile, strategy (`build`
-  or `build+execute`), slot, warm/cold, elapsed time, pool use and backend:
-  `pool 12 MiB allocated of 95367 MiB budget (directory-budget-v1, budget-only)`
-  (slot allocation against this command's soft budget).
+  or `build+execute`), slot, warm/cold, elapsed time, the slot's size when
+  leased, this command's soft budget and the backend:
+  `slot 5 was 12 MiB when leased, 95367 MiB budget, pool total: see oxide status (directory-budget-v1, budget-only)`.
+  The size is the library's reuse walk of that exact slot generation; a new
+  slot says `new slot` and a held replay `slot size unknown`. The line walks
+  nothing, so the pool total is in `oxide status`
+  ([ledger-only view](local-lease.md#ledger-only-view-for-front-door-membership-oxide110-lead-e4c74399)).
   When the gate refreshed files, or reconciled another checkout's build, it
   appends the count and the outside-Git limit. A refused gate prints its
   reason on its own line before the cold build.

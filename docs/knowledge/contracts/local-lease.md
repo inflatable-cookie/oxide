@@ -292,61 +292,38 @@ reserve space, constrain writes during a lease, or prevent `ENOSPC`. Other
 slots still count against the budget, so ordinary admission and refusal rules
 apply after the selected generation is removed.
 
-### Proposed: ledger-only view for front-door membership checks (lead `e4c74399`)
+### Ledger-only view for front-door membership (oxide#110, lead `e4c74399`)
 
-Proposed, not implemented. This is a routine correction with no admission, closure, recovery or deletion change.
+Implemented as a routine correction with no admission, closure, recovery or deletion change. The design passed independent prospective review at `edc4f54`. Its focused native proof `rust:front-door-accounting` has not completed a run yet.
 
-**Problem.** The library's `status` runs one whole-payload walk plus one walk per slot. The front door calls it on ordinary commands where it needs only ledger membership. From source at `3842239`:
+**Problem it removed.** The library's `status` runs one whole-payload walk plus one walk per slot. Until oxide#110 the front door called it on ordinary commands where it needed only ledger membership. From source at `3842239`:
 
-| Call site | What it uses from status |
-| --- | --- |
-| `Store::open_at` (internal pool, every command) | `backend` |
-| `Store::open_removable` (selection through `usable`, every command while registered) | `backend` |
-| `Store::attempt` (acquisition affinity, ~store.rs 1131) | `slots[].project` |
-| `Store::recover_settled` (~1349) | held `slots[]` by project |
-| `Store::recover_interrupted` (~1429) | held `slots[]`: `slot_id`, `lease_id`, project |
-| `removable::internal_holds` | held `slots[]` by ID |
-| `Store::payload_use` (the per-command result line) | `payload_unique_allocated_bytes`, `cap_bytes` |
+| Call site | What it used from status | Now |
+| --- | --- | --- |
+| `Store::open_at` (internal pool, every command) | `backend` | ledger view |
+| `Store::open_removable` (selection through `usable`, every command while registered) | `backend` | ledger view |
+| `Store::attempt` (acquisition affinity) | `slots[].project` | ledger view |
+| `Store::recover_settled` | held `slots[]` by project | ledger view |
+| `Store::recover_interrupted` | held `slots[]`: `slot_id`, `lease_id`, project | ledger view |
+| `removable::internal_holds` | held `slots[]` by ID | ledger view |
+| `Store::payload_use` (the per-command result line) | `payload_unique_allocated_bytes`, `cap_bytes` | removed; the lease's own reuse walk |
 
-On a removable pool, one ordinary command therefore pays several full walks. At 201,948 entries one walk took 3.4 s.
+On a removable pool, one ordinary command paid several full walks, and a waiting command paid them on every 200 ms poll. At 201,948 entries one walk took 3.4 s.
 
-**Change.**
-1. **Typed ledger-only view.** The library adds `ledger_view(pool) -> LedgerView`.
-   - **Opening:** through the unchanged `Pool::open`: canonical root, foreign-entry and retired-image refusals, pool lock, config and backing verification, ledger identity checks, the slot limit and `reconcile_evicting`. The view is therefore **not side-effect-free**: existing recorded-deletion reconciliation can run exactly as it does today.
-   - **Per-record checks:** under the same pool lock, for each ledger record it keeps full status's cheap, non-recursive checks, with the same error categories:
-     - `slot_path` rejects a zero slot ID;
-     - the slot root's `symlink_metadata` error, other than `NotFound`, propagates.
+**Ledger view.** `managed::ledger_view(pool) -> LedgerView`:
+- **Opening:** the unchanged `Pool::open`: canonical root, foreign-entry and retired-image refusals, pool lock, config and backing verification, ledger identity checks, the slot limit and `reconcile_evicting`. The view is therefore **not side-effect-free**: recorded-deletion reconciliation runs exactly as for `status`.
+- **Per-record checks:** under the same pool lock and in ledger order, it keeps status's cheap, non-recursive checks with the same errors, through one shared helper: `slot_path` refuses a zero slot ID (`unknown_accounting`), and a slot-root `symlink_metadata` error other than `NotFound` propagates (`io`). A record whose root is missing, held or idle, stays a member: no closure is inferred and no refusal is added. A symlinked root or partial accounting stays non-gating, as in status.
+- **Returns:** `store_id`, `backend`, `cap_bytes`, `reconciliation_blocked` and each slot's `slot_id`, `incarnation`, occupancy, `project`, `workspace`, `profile`, `holder` and `lease_id`, the same values status shows. The type has **no byte or coverage fields**, so a skipped walk cannot read as zero or complete. Selection, affinity, wait and recovery decisions, record-lock probes, process-group checks, retirement checks and admission-lock order are unchanged.
 
-     A record whose root is `NotFound`, held roots included, stays a member as today. No closure is inferred from a missing root, and no refusal is added because former coverage was only partial.
-   - **Returns:**
-     - `backend` and `cap_bytes`;
-     - `reconciliation_blocked`;
-     - each slot's `id`, `incarnation`, occupancy, `project`, `workspace`, `profile`, `holder` and `lease_id`.
+**Full accounting stays** for explicit `oxide status` (`Store::report`, `slot_size` and the recursive reporting), `oxide init`/`new` readiness, which reads its figure and effective budget from its own completed full status, and every library admission, reuse, recycling and eviction walk, with unchanged bounds.
 
-     The type has **no byte or coverage fields**, so a missing walk cannot be read as zero or Complete. Selection and recovery refusal boundaries are unchanged.
-2. **Ledger-view callers:** the first six call sites above switch to it, with identical decisions.
-3. **Full status stays** for:
-   - explicit `oxide status`, including `Store::report`, `slot_size` and the recursive reporting;
-   - `oxide init`/`new` readiness in `adopt.rs`, which keeps its own full status and `payload_use`, or reuses the readiness status it has already completed;
-   - every library admission, eviction and reuse walk. Their behaviour and bounds are unchanged.
+**Result line.** It walks nothing. `managed::lease_measured` returns the grant and, only when the library's reuse walk took an idle slot, that walk's unique allocated bytes with the exact slot ID and incarnation. The line shows that figure with its provenance, `slot 5 was 7900 MiB when leased`; `new slot` after allocation or recycling; `slot size unknown` for a held same-holder replay, where `reused_slot` is true but nothing was measured. It then shows this command's soft budget and `pool total: see oxide status`. Nothing walks a slot after release, when another command may hold it.
 
-   Only the per-command summary stops calling `payload_use`.
-4. **The result line stops walking.** It reports a measurement only when this lease produced one: the library's reuse walk, labelled with its provenance ("slot 5 was 7.9 GiB when leased"). Otherwise it reports none. That covers a new slot ("new slot") and a held same-holder replay, where `reused_slot` does not imply a fresh measurement. It points to `oxide status` for the pool total. No new walk is added, and nothing walks a slot after release, when another command may hold it.
+**Effect.** An ordinary reuse command walks only its target slot, the library's existing reuse walk. New-slot allocation keeps exactly its whole-payload walks before and after eviction. Waits and recovery walk nothing.
 
-**Effect.** An ordinary reuse command walks only its target slot, which is the library's existing reuse walk. New-slot allocation keeps exactly today's authoritative whole-payload walk.
+**Observation hook.** Debug builds only, absent from release builds such as the installed `oxide`: `inventory::walk_observer` records the root of every `inventory_directory` walk, the one entry point of library accounting, `slot_size`, Cargo-home measurement and the stray check, on a per-thread recorder for tests and, when `OXIDE_TEST_WALK_LOG` names an absolute file, one line per walk. It changes no walk. Walk counts show routing only; they are not a resource gate.
 
-**Proof.** Standard tier. A test hook observes **every** inventory entry point and private front-door measurement, counting walks per root. On a fixture pool of at least 200,000 entries:
-- an ordinary reuse command makes zero whole-payload walks and zero walks of unrelated slots;
-- selection and its fallback, affinity, held-unknown recovery and explicit recovery decide identically to before;
-- a zero slot ID and a slot-root metadata error are refused with the same categories as today;
-- a missing held root stays a member;
-- partial accounting stays non-gating wherever it is today;
-- new-slot admission and eviction performs the same walks with the same outcomes;
-- explicit `oxide status` and `init`/`new` readiness still report full accounting;
-- the result line shows its provenance label, or no measurement on a new slot or replay, and never zero or Complete for an unwalked figure;
-- nothing walks after release.
-
-The brief stops if any recovery, closure, deletion or admission semantics would change.
+**Proof.** Standard tier. Library tests show that the view equals status's membership field for field with no walk while status still walks the payload and every slot; that reuse walks only its slot and returns that measurement, a held replay walks and measures nothing, and a new slot keeps its single admission walk; that a zero slot ID, a slot-root lookup error and a foreign pool entry refuse the view and status alike; and that a missing held root stays a member while partial accounting and a symlinked root stay non-gating and reuse still refuses incomplete accounting. Front-door recovery rules take the view's slot type unchanged. The native proof `effigy rust:front-door-accounting` covers, on one private pool with an idle slot of more than 200,000 entries: new-slot, reuse, status and readiness walks; a live-holder and killed-holder `recover-interrupted` refusal with no walk; a waiting build that walks nothing, then recovers, evicts the untrusted slot and builds cold; and new-slot admission with four whole-payload walks around eviction, hard links counted once. Removable selection is covered by the shared refusal tests only: no native session attaches a volume.
 
 ### Parked: cached closed-slot accounting (lead `cbb2824d`)
 

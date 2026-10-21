@@ -1828,7 +1828,7 @@ def prove_group_gone(runner: Runner, app: str) -> None:
 
 def budget_summary(stderr: str, label: str) -> dict:
     found = summary(stderr, label)
-    if not re.search(r"pool \d+ MiB allocated of \d+ MiB budget \(directory-budget-v1, budget-only\)", stderr):
+    if not re.search(r"\d+ MiB budget, pool total: see oxide status \(directory-budget-v1, budget-only\)", stderr):
         fail(f"{label}: summary does not label the budget-only pool: {stderr[-1200:]!r}")
     if "MiB used" in stderr or "ceiling" in stderr.replace("no hard ceiling", ""):
         fail(f"{label}: a budget-only pool claimed a ceiling: {stderr[-1200:]!r}")
