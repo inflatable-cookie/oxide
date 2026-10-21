@@ -696,6 +696,20 @@ Tom, 2026-10-21, "Yeah do it" (Queue decision `bc874ae7`), after the #109 correc
   4. No start-time exclusion.
 - **Stop rule:** if review raises only minor points, they are fixed during implementation. A new P1 class switches elevated tasks to the documented-gap route (B), with no further design rounds.
 
+Tom, 2026-10-21, "Approved": a single drive mode. Context: Tom mounted the Builds SATA drive permanently to the laptop and wanted the features that depend on that to be configurable ("literally just one configuration option for the drive itself to say it's permanent or ephemeral").
+1. **The setting:** `oxide pool register-removable <mount> --mode permanent|ephemeral`, changeable with `oxide pool set-mode`. The default is `ephemeral`, today's behaviour.
+2. **`permanent` changes three things:**
+   - when the drive is missing, the fallback to the internal pool is **loud**: a warning on every command and in `status`;
+   - final outputs go on the drive, with the checkout's `target/` a link that Oxide maintains, folded into the planned "outputs follow the pool" work;
+   - Oxide's per-slot test scratch goes on the drive.
+
+   `ephemeral` keeps the quiet fallback and checkout-local outputs.
+3. **One source of truth:** `oxide pool describe --json` publishes the mount, volume UUID, mode and a suggested scratch root outside the pool. Other tools (Effigy run scratch #244, Queue task workspaces, the sccache directory) may read it, and each keeps its own override.
+4. **Order:**
+   1. the mode and the loud fallback;
+   2. outputs on the drive;
+   3. `describe --json`, then consumer adoption.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
