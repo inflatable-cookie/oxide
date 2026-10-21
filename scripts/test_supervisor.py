@@ -687,7 +687,7 @@ class Real(unittest.TestCase):
 
     # Post-gate exceptions (review 6318598212)
 
-    def exception_case(self, inject, body, fault):
+    def exception_case(self, inject, body, fault, where=None):
         """A TERM-ignoring leader with a TERM-ignoring child in its group: the
         injected exception must still reach the bounded pinned stop (TERM,
         then KILL of the group), WNOHANG reap, census and keep."""
@@ -697,6 +697,9 @@ class Real(unittest.TestCase):
         self.assertIn(fault, outcome["fault"])
         self.assertEqual(self.receipt["phase"], "monitor_complete: pending_custodian")
         records = self.receipt["custodian"]
+        if where:  # the fault carries the class name only; the record carries the location
+            self.assertTrue(any(r["event"] == "exception" and r["where"].startswith(where) for r in records),
+                            [r for r in records if r["event"] == "exception"])
         sent = [(r["signal"], r["killpg"], r["result"]) for r in records if r["event"] == "signal"]
         self.assertIn(("SIGKILL", True, "sent"), sent)
         self.assertFalse(alive(self.child()), "the group member survived the pinned KILL")
@@ -727,7 +730,8 @@ class Real(unittest.TestCase):
 
     def test_exception_during_stop_still_kills(self):
         # The leader exits; the exception lands after TERM, and KILL still follows.
-        self.exception_case("stop-exception", self.GROUP + "time.sleep(1)\n", "injected exception during the stop")
+        self.exception_case("stop-exception", self.GROUP + "time.sleep(1)\n", "custodian exception: RuntimeError",
+                            where="stop_leader:")
 
     # Bootstrap finalization
 

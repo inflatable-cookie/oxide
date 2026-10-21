@@ -763,6 +763,10 @@ escaped shutdown. Tom's post-gate exception repair phase fixes only that.
 Its second author native at `2abe9c6` passed 56/56. Review `6319610400`
 then found the exception handler calling `traceback.extract_tb` (source
 file lookup) before latching; the diagnostic repair below fixes only that.
+Its author native at `07ce385` failed 59/60: the exception-during-stop case
+still expected the exception's message text in the fault, which the repair
+deliberately no longer includes. That case now expects the class name and
+the recorded `stop_leader:` location.
 
 ```sh
 python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence DIR] [--root-parent DIR] [--] command ...
