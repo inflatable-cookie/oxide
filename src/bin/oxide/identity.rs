@@ -16,7 +16,7 @@ pub struct SlotKey {
     pub checkout: PathBuf,
     /// Digest of the inferred repository identity.
     pub identity: String,
-    /// Digest of identity + Cargo profile + `rustc -vV` + target + backend.
+    /// Digest of identity + Oxide recipe key + `rustc -vV` + target + backend.
     /// The compiler comes from the caller's context, never the checkout.
     pub compatibility: String,
 }
@@ -25,7 +25,7 @@ impl SlotKey {
     pub fn resolve(
         cargo: &str,
         manifest_path: Option<&Path>,
-        profile: &str,
+        recipe: &str,
         target: Option<&str>,
     ) -> Result<Self, String> {
         let checkout = locate_workspace(cargo, manifest_path)?;
@@ -48,7 +48,7 @@ impl SlotKey {
                 .ok_or("rustc -vV did not report a host target")?,
         };
         let compatibility = digest(&format!(
-            "{identity}\n{profile}\n{}\n{target}\n{BACKEND}",
+            "{identity}\n{recipe}\n{}\n{target}\n{BACKEND}",
             digest(&rustc)
         ));
         Ok(Self {

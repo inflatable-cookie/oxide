@@ -24,13 +24,6 @@ minimum_effigy_version = "0.14.0"
 # Synthetic fixtures for the test supervisor's timeout escalation and the
 # installer's link, clobber and identity refusals. Never builds or installs.
 "dogfood:scripts:test" = "python3 scripts/test_dogfood_scripts.py"
-# Opt-in stable-Cargo profile proofs (oxide#068). Each verifies the resolved
-# rustc debug settings Cargo actually passed for workspace, dependency and
-# build-time units, then runs the focused native backtrace/unwind probe under
-# the named profile. They are focused proofs, not benchmarks and not aliases
-# for full QA.
-"rust:profile-light" = "python3 scripts/test-cargo-profiles.py --profile oxide-light"
-"rust:profile-full-debug" = "python3 scripts/test-cargo-profiles.py --profile oxide-full-debug"
 # Builds the unpublished oxide-storage-inventory binary and proves the
 # rendered output-byte ceiling on tiny synthetic fixtures. Not a QA alias
 # and not a real project-target scan.
@@ -104,6 +97,25 @@ run = "python3 scripts/test-oxide-removable-pool.py"
 [tasks."rust:oxide-budget-default"]
 admission = "heavy"
 run = "python3 scripts/test-oxide-removable-pool.py --budget-default"
+
+# Profile proofs (oxide#068, oxide#106). Each checks the resolved rustc
+# debug settings Cargo actually passed for workspace, dependency and
+# build-time units: first the opt-in profile with plain Cargo and the
+# backtrace/unwind probe, then this clean HEAD's staged `oxide` on a tiny
+# offline fixture with a private pool: Oxide's quick or debug recipe on
+# Cargo's dev profile, target/debug output, distinct slots per recipe, the
+# test profile, an external subcommand's own Cargo, the deprecated
+# oxide-quick/oxide-debug definitions, bench and release. 300 s and 512 MiB
+# owned scratch including cleanup, under the old session supervisor of
+# `test rust`; reserve and scratch sampled at phase boundaries only. Not
+# benchmarks and not full QA.
+[tasks."rust:profile-light"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py python3 scripts/test-cargo-profiles.py --profile oxide-light"
+
+[tasks."rust:profile-full-debug"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py python3 scripts/test-cargo-profiles.py --profile oxide-full-debug"
 
 # Pool accounting at build-cache scale (oxide#108): stages the candidate and
 # the base commit's `oxide` offline with 1.97.1 and no rustc wrapper, then on

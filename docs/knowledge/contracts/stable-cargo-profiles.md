@@ -104,6 +104,24 @@ inheritance statement:
 The script also refuses to run if a default `dev`/`test`/`release` profile or
 the pinned `1.97.1` toolchain channel changed, so a passing selector is
 evidence that the opt-in profiles were added rather than defaults replaced.
+
+Since oxide#106 the same session then proves Oxide's own `quick` (light
+session) or `debug` (full-debug session) recipe, with the other as the
+second slot, on a tiny offline fixture through this clean HEAD's staged
+`oxide`. These are a different mechanism: environment settings on Cargo's
+`dev` profile, final outputs in `target/debug/` ([workflow](workflow.md#profiles-and-strategies)).
+Oxide's `quick` keeps line tables in dependencies, unlike `oxide-light`, and
+neither opt-in profile is selected by Oxide. The fixture checks the resolved
+flags of workspace, dependency and build-time units for `oxide build`, the
+`test` profile with the same backtrace/unwind probe, an external
+subcommand's own `$CARGO build`, the deprecated `oxide-quick` /
+`oxide-debug` definitions, the default `bench` and `--release` (light) and
+an explicit debug `bench` (full debug), plus `target/debug/` placement,
+distinct slots and latest-build-wins. Each selector runs under Effigy heavy
+admission and `scripts/bounded-test.py`, with 300 s and 512 MiB owned
+scratch including cleanup; the 20 GiB host reserve and owned scratch are
+sampled at phase boundaries only.
+
 The selectors are focused profile proofs, not benchmarks and not an alias for
 full QA.
 

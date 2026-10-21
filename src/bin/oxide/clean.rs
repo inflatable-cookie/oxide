@@ -9,6 +9,7 @@
 //! to Cargo as before. Shared slots are never touched.
 
 use crate::{apply_storage, cargo_home, cli, identity, process, store, CARGO};
+use cli::Profile;
 use std::ffi::{OsStr, OsString};
 use std::fs::Metadata;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -531,7 +532,13 @@ fn run_selected(args: &[OsString], workspace: &Path) -> Result<u8, String> {
     let scratch = private_scratch()?;
     let mut cargo = Command::new(CARGO);
     cargo.arg("clean").args(args);
-    apply_storage(&mut cargo, &scratch.join("build"), workspace);
+    // Clean compiles nothing; the default recipe keeps Cargo's `dev` name.
+    apply_storage(
+        &mut cargo,
+        &scratch.join("build"),
+        workspace,
+        Profile::Quick,
+    );
     // The clean barrier must outlive this process if Cargo does: the child
     // inherits the clean lock and runs as a recorded group whose end is
     // awaited before the barrier lifts.

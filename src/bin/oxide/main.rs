@@ -20,7 +20,7 @@ mod store;
 mod watchdog;
 mod wrapper;
 
-use cli::{Class, Invocation, PROFILE_ENVIRONMENT};
+use cli::{Class, Invocation, Profile, LEGACY_PROFILE_ENVIRONMENT};
 use freshness::{Gate, Refusal};
 use identity::{RunPick, SlotKey};
 use oxide_storage::inventory::{inventory_directory, Category, InventoryLimits};
@@ -56,8 +56,10 @@ USAGE:
     oxide init [cargo init args] [path]  cargo init if no Cargo.toml, then adopt Oxide
     oxide new <path> [cargo new args]    cargo new, then adopt Oxide
 
-Profiles: quick (default, line tables), debug (full debug info), release (the
-project's own). Oxide places build output, so --target-dir and --config
+Profiles: quick (default, line tables) and debug (full debug info) tune Cargo's
+dev profile, so outputs land in target/debug as with plain Cargo; release is the
+project's own. --cargo-profile oxide-quick/oxide-debug still build but are
+deprecated: external tools get the quick recipe without them. Oxide places build output, so --target-dir and --config
 build.build-dir/target-dir are refused. Adoption writes one marked block in the
 workspace-root AGENTS.md and prints readiness; there is no Oxide config file.
 A whole-target clean refuses entries Cargo does not create in target/ unless
@@ -131,12 +133,23 @@ fn exec_cargo(args: &[OsString]) -> String {
     format!("could not start Cargo: {error}")
 }
 
-pub(crate) fn apply_storage(command: &mut Command, build_dir: &Path, checkout: &Path) {
+pub(crate) fn apply_storage(
+    command: &mut Command,
+    build_dir: &Path,
+    checkout: &Path,
+    profile: Profile,
+) {
     command
         .env("CARGO_BUILD_BUILD_DIR", build_dir)
         .env("CARGO_TARGET_DIR", checkout.join("target"))
         .env_remove("CARGO_BUILD_TARGET_DIR");
-    for (name, value) in PROFILE_ENVIRONMENT {
+    for (name, value) in profile.dev_recipe() {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+    for (name, value) in LEGACY_PROFILE_ENVIRONMENT {
         command.env(name, value);
     }
     wrapper::apply(command);
@@ -170,7 +183,7 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     let key = SlotKey::resolve(
         CARGO,
         invocation.manifest_path.as_deref(),
-        invocation.profile.label(),
+        invocation.profile.recipe_key(),
         invocation.target.as_deref(),
     )?;
     process::install_signal_handlers()?;
@@ -203,7 +216,12 @@ fn run_leased(command: &str, args: &[OsString]) -> Result<u8, String> {
     );
     let mut cargo = Command::new(CARGO);
     cargo.args(&invocation.cargo_args);
-    apply_storage(&mut cargo, &held.build_dir, &key.checkout);
+    apply_storage(
+        &mut cargo,
+        &held.build_dir,
+        &key.checkout,
+        invocation.profile,
+    );
     if run {
         cargo.stdout(Stdio::piped());
     }
@@ -887,6 +905,62 @@ fn print_other_pools(settings: &config::Settings) {
                 "other pool path: {} (unrecognised; left alone)",
                 path.display()
             ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::ffi::OsStr;
+
+    fn environment(profile: Profile) -> HashMap<String, Option<String>> {
+        let mut command = Command::new(CARGO);
+        command.env("CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG", "full");
+        apply_storage(
+            &mut command,
+            Path::new("/pool/slot/build"),
+            Path::new("/work"),
+            profile,
+        );
+        command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(OsStr::to_string_lossy).map(Into::into),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn leased_children_get_the_dev_recipe_and_legacy_definitions() {
+        let set = |value: &str| Some(Some(value.to_owned()));
+        let quick = environment(Profile::Quick);
+        assert_eq!(quick.get("CARGO_TARGET_DIR"), set("/work/target").as_ref());
+        assert_eq!(
+            quick.get("CARGO_PROFILE_DEV_DEBUG"),
+            set("line-tables-only").as_ref()
+        );
+        // An outer debug command's build override never reaches quick.
+        assert_eq!(
+            quick.get("CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG"),
+            Some(&None)
+        );
+        let debug = environment(Profile::Debug);
+        assert_eq!(debug.get("CARGO_PROFILE_DEV_DEBUG"), set("full").as_ref());
+        assert_eq!(
+            debug.get("CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG"),
+            set("full").as_ref()
+        );
+        let release = environment(Profile::Release);
+        assert_eq!(release.get("CARGO_PROFILE_DEV_DEBUG"), None);
+        for profile in [quick, debug, release] {
+            for (name, value) in LEGACY_PROFILE_ENVIRONMENT {
+                assert_eq!(profile.get(name), set(value).as_ref(), "{name}");
+            }
         }
     }
 }
