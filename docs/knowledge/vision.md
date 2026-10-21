@@ -710,6 +710,17 @@ Tom, 2026-10-21, "Approved": a single drive mode. Context: Tom mounted the Build
    2. outputs on the drive, after #106;
    3. consumer adoption through each tool's owner.
 
+2026-10-21, applying Tom's conditional ruling on Queue decision `bc874ae7` (no new ask). #109's implementation review (`6312725112` at `22d1280`) recorded genuine author and reviewer native passes, but failed closure and deadlines, with a **new P1 class**: nested guardian ownership. The outer qualification deletes the scratch and evidence of live, deliberately `UNCLOSED` sessions. Other faults: uncertainty not latched, a failed confirmation treated as absent, cancellation after the ack, and unbounded bootstrap finalization. Under the stop rule, elevated tasks therefore take **route B**:
+- **The route:** their native proofs use main's `scripts/bounded-test.py` at `3d947a9`, plus Effigy heavy admission, a wall-clock limit and the task's own scratch root.
+- **Disclosed per task:**
+  - no free-space monitoring of staging or fixture writes;
+  - no supervisor-enforced scratch budget or cleanup;
+  - on the timeout path, numeric TERM and KILL of recorded session groups without positive identity;
+  - the old guard's escalation can run past 300 s.
+- **#109:** stays unqualified, with PR #99 unmerged under its merge hold. No further repair or design rounds.
+- **#107:** loses only its #109 dependency. Product gates, counts and holds are unchanged, and #098 and #100 keep their original holds.
+- New standard-tier leads do not automatically inherit the #110/#106 exception.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus

@@ -1,5 +1,7 @@
 # Proposed correction: shared proof supervisor (oxide#109)
 
+**Status, 2026-10-21: not qualified; route B applied.** The design (revision 4) passed prospective review. The implementation at `22d1280` failed closure and deadline review with a new P1 class: nested guardian ownership deletes the scratch and evidence of live `UNCLOSED` sessions. Under Tom's stop rule, elevated tasks use the documented-gap old guard ([vision](../vision.md#authority-boundaries)). This document is kept as the reviewed design for any future qualification.
+
 Proposed, not implemented; it awaits independent design review. This is
 revision 4. Under Tom's 2026-10-21 ruling on Queue decision `bc874ae7` ("Yeah
 do it"), it is a final, narrow round that changes only the four P1s from the
