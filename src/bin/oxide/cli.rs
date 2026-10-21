@@ -22,6 +22,8 @@ pub enum Class {
     Status,
     /// `pool`: Oxide-owned pool registration; not a Cargo built-in.
     Pool,
+    /// `exec`: a tool that calls Cargo itself, leased; not a Cargo built-in.
+    Exec,
 }
 
 pub fn classify(command: &str) -> Class {
@@ -30,6 +32,7 @@ pub fn classify(command: &str) -> Class {
         "clean" => Class::Clean,
         "status" => Class::Status,
         "pool" => Class::Pool,
+        "exec" => Class::Exec,
         "init" => Class::Init,
         "new" => Class::New,
         "fmt" | "tree" | "metadata" | "add" | "remove" | "update" | "info" | "search"
@@ -138,6 +141,93 @@ pub struct Invocation {
     pub json_messages: bool,
     pub manifest_path: Option<PathBuf>,
     pub target: Option<String>,
+    /// `exec` only: the tool and its arguments, spawned as given.
+    pub tool: Vec<OsString>,
+}
+
+pub const EXEC_USAGE: &str = "\
+USAGE:
+    oxide exec [--manifest-path <Cargo.toml>] [--profile quick|debug|release] -- <command> [args]
+
+Runs one tool that calls Cargo itself (a Tauri CLI, an npm or bun script) for
+one Cargo workspace, with Oxide's storage, profile recipe and rustc-wrapper
+policy in its environment. The workspace comes from the current directory or
+--manifest-path; the tool keeps this working directory and its arguments.
+--profile selects the recipe and slot only: the tool still picks its own
+dev or release build. Final outputs stay in <workspace>/target. The tool runs
+as leader of its own process group; the slot stays held until every process
+in that group has exited. Its exit code is returned (128 + signal when a
+signal ended it). A terminal standard input is not passed: the tool reads
+end-of-file. Cooperative only: a tool that sets its own target or build
+directory, changes workspace or toolchain, or leaves its process group with
+setsid escapes Oxide's storage and closure.
+";
+
+/// Parse `oxide exec`. Oxide's options come before the mandatory `--`; the
+/// command after it is kept exactly. `Ok(None)` asks for help.
+pub fn parse_exec(args: &[OsString]) -> Result<Option<Invocation>, String> {
+    let mut profile = None;
+    let mut manifest_path = None;
+    let mut iter = args.iter();
+    let mut tool = None;
+    while let Some(argument) = iter.next() {
+        let text = argument
+            .to_str()
+            .ok_or("exec options must be valid UTF-8")?;
+        if text == "--" {
+            tool = Some(iter.by_ref().cloned().collect::<Vec<_>>());
+            break;
+        }
+        if text == "-h" || text == "--help" {
+            return Ok(None);
+        }
+        let mut value = |flag: &str| -> Result<Option<String>, String> {
+            if text == flag {
+                return iter
+                    .next()
+                    .and_then(|value| value.to_str())
+                    .map(|value| Some(value.to_owned()))
+                    .ok_or(format!("{flag} requires a value"));
+            }
+            Ok(text.strip_prefix(&format!("{flag}=")).map(str::to_owned))
+        };
+        if let Some(path) = value("--manifest-path")? {
+            if path.is_empty() {
+                return Err("--manifest-path requires a value".to_owned());
+            }
+            if manifest_path.replace(PathBuf::from(path)).is_some() {
+                return Err("--manifest-path may be given only once".to_owned());
+            }
+            continue;
+        }
+        if let Some(name) = value("--profile")? {
+            if profile.replace(Profile::parse(&name)?).is_some() {
+                return Err("--profile may be given only once".to_owned());
+            }
+            continue;
+        }
+        if text == "--release" || text == "-r" {
+            return Err("exec takes --profile release, not --release".to_owned());
+        }
+        refuse_storage_overrides(std::slice::from_ref(argument))?;
+        return Err(format!(
+            "exec does not take {text}; put the command after `--`: oxide exec -- <command>"
+        ));
+    }
+    let tool = tool.ok_or("exec needs `--` before the command: oxide exec -- <command>")?;
+    if tool.first().is_none_or(|program| program.is_empty()) {
+        return Err("exec needs a command after `--`".to_owned());
+    }
+    Ok(Some(Invocation {
+        command: "exec".to_owned(),
+        profile: profile.unwrap_or(Profile::Quick),
+        cargo_args: Vec::new(),
+        program_args: Vec::new(),
+        json_messages: false,
+        manifest_path,
+        target: None,
+        tool,
+    }))
 }
 
 /// Parse a leased command (`Modelled` or `Building`).
@@ -158,6 +248,7 @@ pub fn parse_leased(command: &str, args: &[OsString]) -> Result<Invocation, Stri
             json_messages: false,
             manifest_path,
             target,
+            tool: Vec::new(),
         });
     }
 
@@ -252,6 +343,7 @@ pub fn parse_leased(command: &str, args: &[OsString]) -> Result<Invocation, Stri
         json_messages,
         manifest_path,
         target,
+        tool: Vec::new(),
     })
 }
 
@@ -469,6 +561,7 @@ mod tests {
         assert_eq!(classify("clean"), Class::Clean);
         assert_eq!(classify("status"), Class::Status);
         assert_eq!(classify("pool"), Class::Pool);
+        assert_eq!(classify("exec"), Class::Exec);
         assert_eq!(classify("init"), Class::Init);
         assert_eq!(classify("new"), Class::New);
     }
@@ -629,6 +722,76 @@ mod tests {
         }
         assert!(refuse_storage_overrides(&args(&["--config", "net.offline=true"])).is_ok());
         assert!(refuse_storage_overrides(&args(&["--", "--target-dir", "x"])).is_ok());
+    }
+
+    #[test]
+    fn exec_parses_oxide_options_and_keeps_the_command_exactly() {
+        use std::os::unix::ffi::OsStringExt;
+        let odd = OsString::from_vec(vec![b'a', 0xff, b'b']);
+        let mut given = args(&[
+            "--manifest-path",
+            "app/Cargo.toml",
+            "--profile=debug",
+            "--",
+            "npm",
+            "run",
+            "--profile",
+            "release",
+            "--target-dir=x",
+            "--",
+        ]);
+        given.push(odd.clone());
+        let parsed = parse_exec(&given).unwrap().unwrap();
+        assert_eq!(parsed.command, "exec");
+        assert_eq!(parsed.profile, Profile::Debug);
+        assert_eq!(parsed.manifest_path, Some(PathBuf::from("app/Cargo.toml")));
+        let mut tool = args(&["npm", "run", "--profile", "release", "--target-dir=x", "--"]);
+        tool.push(odd);
+        assert_eq!(parsed.tool, tool);
+        assert!(parsed.cargo_args.is_empty() && parsed.target.is_none());
+        let plain = parse_exec(&args(&["--", "tauri", "build"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain.profile, Profile::Quick);
+        assert_eq!(plain.manifest_path, None);
+        let release = parse_exec(&args(&["--profile", "release", "--", "x"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(release.profile, Profile::Release);
+        assert_eq!(parse_exec(&args(&["--help"])), Ok(None));
+        assert_eq!(parse_exec(&args(&["-h", "--", "x"])), Ok(None));
+        // After `--`, help belongs to the tool.
+        assert!(parse_exec(&args(&["--", "x", "--help"])).unwrap().is_some());
+    }
+
+    #[test]
+    fn exec_refuses_malformed_input_before_any_effect() {
+        for refused in [
+            &[][..],
+            &["tauri", "build"],
+            &["--"],
+            &["--", ""],
+            &["--profile"],
+            &["--profile", "dev", "--", "x"],
+            &["--profile=quick", "--profile=debug", "--", "x"],
+            &["--release", "--", "x"],
+            &["--manifest-path"],
+            &["--manifest-path=", "--", "x"],
+            &[
+                "--manifest-path",
+                "a/Cargo.toml",
+                "--manifest-path=b/Cargo.toml",
+                "--",
+                "x",
+            ],
+            &["--target-dir", "x", "--", "y"],
+            &["--config", "build.build-dir='x'", "--", "y"],
+            &["--offline", "--", "y"],
+        ] {
+            assert!(parse_exec(&args(refused)).is_err(), "{refused:?}");
+        }
+        let storage = parse_exec(&args(&["--target-dir=x", "--", "y"])).unwrap_err();
+        assert!(storage.contains("Oxide places build output"), "{storage}");
     }
 
     #[test]

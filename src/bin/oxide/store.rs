@@ -123,6 +123,10 @@ struct Holder {
     /// Wall-clock start of the holder process, milliseconds since the epoch.
     started_ms: u64,
     lease_holder: String,
+    /// What `oxide status` names as the holder: `exec <program>` for an
+    /// exec command, absent for Cargo commands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
 }
 
 /// A slot's last recorded build. `mark` is the record's use counter when it
@@ -423,6 +427,8 @@ pub struct SlotView {
     pub interrupted: Option<Interrupted>,
     /// Why a removable-volume slot was retired and stays held.
     pub retired: Option<String>,
+    /// The holding command's label (`exec <program>`), while held.
+    pub holder: Option<String>,
 }
 
 pub struct Interrupted {
@@ -704,11 +710,13 @@ impl Store {
     /// Lease this checkout's slot, waiting in FIFO order. Ctrl-C while waiting
     /// cancels without touching any slot.
     /// `share` allows taking another checkout's idle compatible slot.
+    /// `label` names the holder in `oxide status` (`exec <program>`).
     pub fn acquire(
         &self,
         key: &SlotKey,
         profile: Profile,
         share: bool,
+        label: Option<&str>,
     ) -> Result<Acquired, String> {
         let max_active = max_active()?;
         let ticket = self.register_ticket()?;
@@ -718,7 +726,7 @@ impl Store {
                 self.remove_ticket(ticket.0)?;
                 return Ok(Acquired::Interrupted(signal));
             }
-            match self.attempt(ticket.0, key, profile, max_active, share)? {
+            match self.attempt(ticket.0, key, profile, max_active, share, label)? {
                 Ok(lease) => {
                     self.remove_ticket(ticket.0)?;
                     return Ok(Acquired::Lease(lease));
@@ -1081,6 +1089,10 @@ impl Store {
                             path: return_path(record, &LedgerSlot::from(slot)),
                         }),
                     retired: record.and_then(|record| record.retired.clone()),
+                    holder: record
+                        .filter(|_| slot.state == SlotOccupancy::Held)
+                        .and_then(|record| record.holder.as_ref())
+                        .and_then(|holder| holder.command.clone()),
                 }
             })
             .collect();
@@ -1105,6 +1117,7 @@ impl Store {
         profile: Profile,
         max_active: usize,
         share: bool,
+        label: Option<&str>,
     ) -> Result<Result<Lease, Wait>, String> {
         // Internal admission first (removable store only), then this pool's.
         let (_barrier, cleaning) = self.sibling_barrier(&key.checkout)?;
@@ -1161,19 +1174,35 @@ impl Store {
             self.forget_record(&mut state, id);
         }
 
-        let mut existing = state.records.iter().position(|record| matches(record));
+        // Second-slot rule: this checkout may hold several records of one
+        // key. Take an idle one whose lock is free, one with a slot first,
+        // then the most recently used. A busy one (a live command, an
+        // interrupted one whose group may still run, or a lock still held)
+        // is never reused, released, evicted or relabelled here; the
+        // command takes another idle compatible slot or a new one through
+        // the normal admission below, and waits only when neither exists.
+        let mut own: Vec<usize> = (0..state.records.len())
+            .filter(|&index| matches(&state.records[index]))
+            .collect();
+        own.sort_by_key(|&index| {
+            let record = &state.records[index];
+            std::cmp::Reverse((has_slot(record), record.last_used))
+        });
+        let mut existing = None;
         let mut lock = None;
-        if let Some(index) = existing {
+        let mut busy = false;
+        for index in own {
             if state.records[index].phase != Phase::Idle {
-                self.save(&state)?;
-                return Ok(Err(Wait::Checkout));
+                busy = true;
+                continue;
             }
             match probe_lock(&self.lock_path(state.records[index].id), true)? {
-                Probe::Free(file) => lock = Some(file),
-                Probe::Held | Probe::Missing => {
-                    self.save(&state)?;
-                    return Ok(Err(Wait::Checkout));
+                Probe::Free(file) => {
+                    existing = Some(index);
+                    lock = Some(file);
+                    break;
                 }
+                Probe::Held | Probe::Missing => busy = true,
             }
         }
         let mut shared_from = None;
@@ -1217,10 +1246,11 @@ impl Store {
                 .filter(|record| record.identity == key.identity && has_slot(record))
                 .count();
             if project_slots >= PROJECT_SLOT_CAP {
+                let chosen = existing.map(|index| state.records[index].id);
                 candidates.sort();
                 let mut evicted = false;
                 for (_, id, slot_id) in candidates {
-                    if Some(id) == existing.map(|index| state.records[index].id) {
+                    if Some(id) == chosen {
                         continue;
                     }
                     let Probe::Free(_victim) = probe_lock(&self.lock_path(id), false)? else {
@@ -1237,9 +1267,16 @@ impl Store {
                 }
                 if !evicted {
                     self.save(&state)?;
-                    return Ok(Err(Wait::ProjectCap));
+                    return Ok(Err(if busy {
+                        Wait::Checkout
+                    } else {
+                        Wait::ProjectCap
+                    }));
                 }
-                existing = state.records.iter().position(|record| matches(record));
+                // Eviction forgot only an idle record whose lock was free,
+                // never the chosen one; find it again by ID.
+                existing =
+                    chosen.and_then(|id| state.records.iter().position(|record| record.id == id));
             }
         }
 
@@ -1287,6 +1324,7 @@ impl Store {
             pid: std::process::id(),
             started_ms: process::started_ms(),
             lease_holder: lease_holder.clone(),
+            command: label.map(str::to_owned),
         });
         state.touch(index)?;
         // Keep a trusted origin trusted until Cargo starts: written before
@@ -1966,6 +2004,95 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    fn lease(store: &Store, key: &SlotKey, label: Option<&str>) -> Result<Lease, Wait> {
+        let (ticket, _file) = store.register_ticket().unwrap();
+        let outcome = store
+            .attempt(ticket, key, Profile::Quick, 8, false, label)
+            .unwrap();
+        store.remove_ticket(ticket).unwrap();
+        outcome
+    }
+
+    /// Second-slot rule: a busy slot of this checkout's key sends a further
+    /// command to another idle compatible slot or a new one; a slot whose
+    /// holder died while its group lives is never reused; with no safe
+    /// candidate under the project cap the command waits.
+    #[test]
+    fn a_busy_slot_sends_a_further_command_elsewhere() {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!(
+            "oxide-second-slot-{}-{}",
+            std::process::id(),
+            process::now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let pool = fs::canonicalize(&root).unwrap().join("pool");
+        init_budget_pool(&pool, 1 << 30).unwrap();
+        let store = Store {
+            control: pool.join(MANAGED_NAME),
+            payload: pool.join("payload"),
+            pool: pool.clone(),
+            backend: Backend::DirectoryBudget,
+            budget: Some(1 << 30),
+            recorded_budget: 1 << 30,
+            sibling: None,
+        };
+        store.ensure_control().unwrap();
+        let checkout = fs::canonicalize(&root).unwrap().join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let key = SlotKey {
+            checkout,
+            identity: "identity".to_owned(),
+            compatibility: "quick-key".to_owned(),
+        };
+        let Ok(first) = lease(&store, &key, Some("exec tool")) else {
+            panic!("the first command waited");
+        };
+        // The holder's group is this test's own, which is alive.
+        // SAFETY: getpgrp has no preconditions.
+        let group = unsafe { libc::getpgrp() };
+        store.mark_spawning(&first).unwrap();
+        store.mark_running(&first, group).unwrap();
+        let Ok(second) = lease(&store, &key, None) else {
+            panic!("a further command waited behind a busy slot");
+        };
+        assert_ne!(second.slot_id, first.slot_id);
+        let report = store.report().unwrap();
+        let shown = |slot: &str| {
+            report
+                .slots
+                .iter()
+                .find(|view| view.slot_id == slot)
+                .and_then(|view| view.holder.clone())
+        };
+        assert_eq!(shown(&first.slot_id).as_deref(), Some("exec tool"));
+        assert_eq!(shown(&second.slot_id), None);
+        // Both slots of the project are held: the cap leaves no safe slot.
+        assert!(matches!(lease(&store, &key, None), Err(Wait::Checkout)));
+        // The first holder dies while its group lives: its slot stays held
+        // and is never reused; the released second slot is taken instead.
+        let first_slot = first.slot_id.clone();
+        drop(first);
+        let second_slot = second.slot_id.clone();
+        store.release(second, None).unwrap();
+        let Ok(third) = lease(&store, &key, None) else {
+            panic!("an idle compatible slot was not taken");
+        };
+        assert_eq!(third.slot_id, second_slot);
+        let view = store.ledger().unwrap();
+        let held = view
+            .slots
+            .iter()
+            .find(|slot| slot.slot_id == first_slot)
+            .unwrap();
+        assert_eq!(held.state, SlotOccupancy::Held);
+        assert!(matches!(lease(&store, &key, None), Err(Wait::Checkout)));
+        store.release(third, None).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn record(phase: Phase, group: Option<i32>, lease_id: Option<&str>) -> Record {
         Record {
             id: 1,
@@ -1980,6 +2107,7 @@ mod tests {
                 pid: 41,
                 started_ms: 7,
                 lease_holder: "oxide-41-3".to_owned(),
+                command: None,
             }),
             lease_id: lease_id.map(str::to_owned),
             pending_recovery: None,

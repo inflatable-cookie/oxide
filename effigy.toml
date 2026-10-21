@@ -129,6 +129,21 @@ run = "python3 scripts/bounded-test.py python3 scripts/test-cargo-profiles.py --
 admission = "heavy"
 run = "python3 scripts/bounded-test.py python3 scripts/test-pool-scale.py"
 
+# `oxide exec` and the second-slot rule (oxide#107): stages this clean
+# HEAD's `oxide` offline with 1.97.1; on one private directory pool a short
+# fixed fixture tool calls the inherited cargo build and cargo metadata:
+# slot intermediates and <workspace>/target outputs, --manifest-path, quick /
+# debug / release recipes, the #099 fake-wrapper policy, exit codes, Ctrl-C,
+# a surviving group member, oxide killed while the tool group lives, two
+# commands in one checkout on distinct slots, the host limit, the
+# no-safe-slot wait and the clean barrier. 300 s and 512 MiB owned scratch
+# including cleanup, under the old session supervisor of `test rust`
+# (route B, documented gaps); reserve and scratch sampled at phase
+# boundaries only. Not a benchmark and not full QA.
+[tasks."rust:oxide-exec"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py python3 scripts/test-oxide-exec.py"
+
 # Front-door accounting routes (oxide#110): stages this clean HEAD's debug
 # `oxide` offline with 1.97.1; its walk observer logs every inventory walk
 # root. On one private directory pool with an idle slot of more than 200,000
