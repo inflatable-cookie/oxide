@@ -12,9 +12,11 @@ Implements docs/knowledge/contracts/proof-supervisor-correction.md (revision
   select with a zero or remaining-budget timeout, waitpid WNOHANG, kill or
   killpg on a pinned child, and non-blocking pipe I/O. It never touches files
   or stdio after setup and never signals a number it does not hold unreaped.
-- The monitor (first child) owns all I/O: the evidence directory and receipt
-  phases, output draining, reserve and scratch sampling, the session census
-  and cleanup. It reports to the custodian over a control pipe.
+- The monitor (first child) owns all I/O, including all blocking setup (the
+  kinfo_proc check, path resolution, scratch and evidence creation) inside
+  the custodian's setup deadline: the receipt phases, output draining,
+  reserve and scratch sampling (each reading carries its completion stamp),
+  the session census and cleanup. It reports over a control pipe.
 - The leader (second child) calls setsid, acknowledges, and execs the command
   only after the custodian holds its NOTE_EXIT detector and opens the gate.
 
@@ -85,7 +87,9 @@ INJECTIONS = {
     "monitor-stall", "cleanup-interrupt", "custodian-timeout-after-monitor", "census-uncertain",
     "census-uncertain-first", "reserve-low-after", "cancel-after-ack", "cancel-at-gate",
     "pump-exception", "kqueue-exception", "malformed-message", "stop-exception",
+    "reserve-delay-stall", "scratch-delay-stall",
 }
+RESERVE_DELAY_S, SCRATCH_DELAY_S = 0.5, 4.0  # injected publication delays before a sampler stall
 INJECT_AFTER_GATE_NS = 1_500_000_000  # post-gate injections wait for the fixture to start
 EXCEPTION_RECORDS = 8
 FIELDS = {  # required fields per monitor message type; bool is never accepted as int
@@ -93,6 +97,7 @@ FIELDS = {  # required fields per monitor message type; bool is never accepted a
     "ready": {}, "monitor_complete": {}, "cleanup_failed": {},
     "output_eof": {"stream": str},
     "census": {"after": int, "members": int, "uncertain": int, "certain": bool},
+    "setup": {"root": str, "scratch": str, "evidence": str, "owned": bool},
 }
 
 
@@ -168,6 +173,7 @@ def malformed(message):
             required["error"] = str
         else:
             required["value"] = int
+            required["completed"] = int  # when the measurement completed, not when it was sent
         if message.get("kind") == "scratch":
             required["complete"] = bool
         elif message.get("kind") != "reserve":
@@ -183,7 +189,9 @@ def malformed(message):
 
 
 def capability():
-    """Missing primitives; refused before any proof work, with no fallback."""
+    """Missing primitives, from attribute checks only (no I/O); refused before
+    any proof work, with no fallback. The kinfo_proc layout is checked by the
+    monitor during its bounded setup."""
     missing = []
     if sys.platform != "darwin":
         missing.append("macOS")
@@ -191,11 +199,6 @@ def capability():
         missing.append("CLOCK_UPTIME_RAW")
     if not hasattr(select, "kqueue"):
         missing.append("kqueue")
-    if not missing:
-        try:
-            Kinfo.check()
-        except Exception as error:
-            missing.append(f"kinfo_proc ({error})")
     return missing
 
 
@@ -348,19 +351,24 @@ class Guard:
             self.fault = fault
 
     def reading(self, message, now=None):
+        """Freshness counts from `completed`, the moment the measurement
+        finished, never from when it was sent: a delayed publication cannot
+        refresh an old observation. Same system-wide clock on both sides, so
+        a completion after the send stamp, or a send stamp after `now`, is
+        refused rather than trusted."""
         kind = message["kind"]
         if now is not None and message["at"] > now:
-            # Same system-wide clock on both sides: a future stamp is never a
-            # fresh reading, so it cannot keep a stopped sampler looking alive.
             self.latch(f"{kind} reading stamped in the future")
         elif message.get("error"):
             self.latch(f"{kind} measurement failed: {message['error']}")
+        elif message["completed"] > message["at"]:
+            self.latch(f"{kind} reading completed after it was sent")
         elif kind == "reserve":
-            self.reserve_at = max(self.reserve_at or 0, message["at"])
+            self.reserve_at = max(self.reserve_at or 0, message["completed"])
             if message["value"] < self.threshold:
                 self.latch(f"host free {message['value']} bytes below the {self.threshold} byte abort threshold")
         elif message.get("complete"):
-            self.scratch_at = max(self.scratch_at or 0, message["at"])
+            self.scratch_at = max(self.scratch_at or 0, message["completed"])
             if message["value"] > self.budget:
                 self.latch(f"owned bytes {message['value']} over the {self.budget} byte budget")
 
@@ -419,6 +427,31 @@ class Monitor:
         self.census_stop = threading.Event()
         self.inject = set(ctx["inject"])
         self.pipes = [(out_r, "stdout", 1), (err_r, "stderr", 2)]
+        self.receipt = None
+
+    def setup(self):
+        """All blocking setup, inside the custodian's setup deadline: the
+        kinfo_proc layout check, path resolution and scratch/evidence
+        creation. A stall here leaves `ready` unsent; the custodian KILLs
+        this pinned monitor at the setup deadline and launches nothing."""
+        ctx = self.ctx
+        try:
+            Kinfo.check()
+        except Exception as error:
+            raise SetupRefused(f"missing kinfo_proc ({type_name(error)})")
+        if ctx["adopted"]:
+            scratch = os.path.realpath(ctx["adopted"])
+            if not os.path.isdir(scratch):
+                raise SetupRefused(f"OXIDE_TASK_SCRATCH_ROOT {scratch} is not a directory")
+            root, owned, reserve_path = scratch, False, scratch
+            evidence = ctx["evidence_arg"] or tempfile.mkdtemp(prefix="supervisor-evidence.", dir=scratch)
+        else:
+            root = os.path.realpath(tempfile.mkdtemp(prefix="oxide-proof.", dir=ctx["root_parent"]))
+            scratch, owned, reserve_path = os.path.join(root, "scratch"), True, os.path.realpath(ctx["root_parent"])
+            os.mkdir(scratch)
+            evidence = ctx["evidence_arg"] or os.path.join(root, "evidence")
+        ctx.update(root=root, scratch=scratch, evidence=os.path.realpath(evidence), owned=owned,
+                   reserve_path=reserve_path)
         self.receipt = {
             "run_id": ctx["run_id"], "command": ctx["command"], "limit_s": ctx["limit_s"],
             "root": ctx["root"], "scratch": ctx["scratch"], "evidence": ctx["evidence"],
@@ -461,7 +494,14 @@ class Monitor:
                     stats["last_ns"] = at
                     stats["samples"] += 1
                     stats["minimum"] = value if stats["minimum"] is None else min(stats["minimum"], value)
-                self.send("reading", kind="reserve", value=value)
+                stall = "reserve-delay-stall" in self.inject and stats["samples"] >= 8
+                if stall:
+                    with self.lock:  # publication delayed by the shared I/O lock
+                        time.sleep(RESERVE_DELAY_S)
+                self.send("reading", kind="reserve", value=value, completed=at)
+                if stall:
+                    self.stop.wait()  # then the sampler stalls: no further reading
+                    return
             except OSError as error:
                 self.send("reading", kind="reserve", error=str(error))
             self.stop.wait(RESERVE_INTERVAL)
@@ -471,11 +511,18 @@ class Monitor:
         while not self.stop.is_set():
             try:
                 value = tree_bytes(self.ctx["root"])
+                at = now_ns()
                 with self.lock:
                     stats["samples"] += 1
-                    stats["last_ns"] = now_ns()
+                    stats["last_ns"] = at
                     stats["maximum"] = value if stats["maximum"] is None else max(stats["maximum"], value)
-                self.send("reading", kind="scratch", value=value, complete=True)
+                stall = "scratch-delay-stall" in self.inject and stats["samples"] >= 2
+                if stall:
+                    time.sleep(SCRATCH_DELAY_S)  # publication delayed (not under the lock: reserve stays fresh)
+                self.send("reading", kind="scratch", value=value, complete=True, completed=at)
+                if stall:
+                    self.stop.wait()
+                    return
             except OSError as error:
                 self.send("reading", kind="scratch", complete=False, error=str(error))
             self.stop.wait(SCRATCH_INTERVAL)
@@ -534,8 +581,10 @@ class Monitor:
 
     def run(self):
         ctx = self.ctx
+        self.setup()
         os.makedirs(ctx["evidence"], exist_ok=True)
         self.publish("started: incomplete")
+        self.send("setup", root=ctx["root"], scratch=ctx["scratch"], evidence=ctx["evidence"], owned=ctx["owned"])
         if "setup-stall" in self.inject:
             time.sleep(SETUP_S + 5)
         for target in (self.sample_reserve, self.sample_owned):
@@ -611,11 +660,20 @@ class Monitor:
             pass
 
 
+class SetupRefused(Exception):
+    pass
+
+
 def monitor_main(ctx, ctl_w, cmd_r, out_r, err_r):
     code = 1
     try:
         Monitor(ctx, ctl_w, cmd_r, out_r, err_r).run()
         code = 0
+    except SetupRefused as refusal:
+        report(f"bounded-test.py: refused before any proof work: {refusal}\n")
+        code = 2
+    except BaseException:
+        pass
     finally:
         os._exit(code)
 
@@ -650,6 +708,7 @@ class Custodian:
         self.pre_gate_killed = self.leader_killed = False
         self.exceptions = 0
         self.injected = set()
+        self.paths = None  # from the monitor's setup message
 
     def record(self, kind, **fields):
         self.tell("record", record={"at": now_ns(), "event": kind, **fields})
@@ -791,9 +850,20 @@ class Custodian:
         kind = message["type"]
         if kind == "reading":
             self.guard.reading(message, now_ns())
+        elif kind == "setup":
+            if self.paths is not None:
+                self.guard.latch("protocol: second setup message")
+                return
+            self.paths = message
+            if message["owned"]:
+                for name in ("OXIDE_TASK_SCRATCH_ROOT", "TMPDIR", "TMP", "TEMP"):
+                    self.env[name] = message["scratch"]
+            self.env["OXIDE_PROOF_EVIDENCE"] = message["evidence"]  # kept; never removed by cleanup
         elif kind == "ready":
-            # Ready counts only with completed readings already received.
-            if self.guard.reserve_at is None or self.guard.scratch_at is None:
+            # Ready counts only after setup and with completed readings received.
+            if self.paths is None:
+                self.guard.latch("protocol: ready before setup")
+            elif self.guard.reserve_at is None or self.guard.scratch_at is None:
                 self.guard.latch("protocol: ready before completed readings")
             self.ready = True
         elif kind == "output_eof":
@@ -825,31 +895,17 @@ class Custodian:
         self.setup_at = min(self.start + SETUP_S * NS, self.stop_at)
         self.run_id = secrets.token_hex(16)
         self.guard = Guard(self.start, budget=self.budget)
-        adopted = os.environ.get("OXIDE_TASK_SCRATCH_ROOT")
-        if adopted:
-            scratch = os.path.realpath(adopted)
-            if not os.path.isdir(scratch):
-                raise SystemExit(f"bounded-test.py: OXIDE_TASK_SCRATCH_ROOT {scratch} is not a directory")
-            root, owned, reserve_path = scratch, False, scratch
-            evidence = self.evidence_arg or tempfile.mkdtemp(prefix="supervisor-evidence.", dir=scratch)
-        else:
-            root = os.path.realpath(tempfile.mkdtemp(prefix="oxide-proof.", dir=self.root_parent))
-            scratch, owned, reserve_path = os.path.join(root, "scratch"), True, os.path.realpath(self.root_parent)
-            os.mkdir(scratch)
-            evidence = self.evidence_arg or os.path.join(root, "evidence")
+        # No filesystem call here: path resolution and scratch/evidence
+        # creation run in the monitor, inside the setup deadline, and arrive
+        # in its `setup` message. The leader opens /dev/null itself.
         self.env = dict(os.environ)
-        if owned:
-            for name in ("OXIDE_TASK_SCRATCH_ROOT", "TMPDIR", "TMP", "TEMP"):
-                self.env[name] = scratch
         self.env["OXIDE_PROOF_DEADLINE_NS"] = str(self.absolute)
-        self.env["OXIDE_PROOF_EVIDENCE"] = os.path.realpath(evidence)  # kept; never removed by cleanup
         self.ctx = {
-            "run_id": self.run_id, "command": self.command, "limit_s": self.limit_s, "root": root,
-            "scratch": scratch, "evidence": os.path.realpath(evidence), "owned": owned,
-            "budget": self.budget, "reserve_path": reserve_path, "start_ns": self.start,
+            "run_id": self.run_id, "command": self.command, "limit_s": self.limit_s,
+            "adopted": os.environ.get("OXIDE_TASK_SCRATCH_ROOT") or None, "evidence_arg": self.evidence_arg,
+            "root_parent": self.root_parent, "budget": self.budget, "start_ns": self.start,
             "inject": sorted(self.inject),
         }
-        self.devnull = os.open(os.devnull, os.O_RDONLY)
 
     def launch_monitor(self):
         self.ctl_r, ctl_w = os.pipe()
@@ -858,7 +914,7 @@ class Custodian:
         err_r, self.err_w = os.pipe()
         pid = os.fork()
         if pid == 0:
-            for fd in (self.ctl_r, self.cmd_w, self.out_w, self.err_w, self.devnull):
+            for fd in (self.ctl_r, self.cmd_w, self.out_w, self.err_w):
                 os.close(fd)
             monitor_main(self.ctx, ctl_w, cmd_r, out_r, err_r)
         self.monitor = pid
@@ -888,7 +944,7 @@ class Custodian:
         if pid == 0:
             try:
                 os.setsid()
-                os.dup2(self.devnull, 0)
+                os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
                 os.dup2(self.out_w, 1)
                 os.dup2(self.err_w, 2)
                 for fd in range(3, 256):
@@ -911,7 +967,7 @@ class Custodian:
                 pass
             os._exit(127)
         self.leader = pid
-        for fd in (ack_w, gate_r, self.out_w, self.err_w, self.devnull):
+        for fd in (ack_w, gate_r, self.out_w, self.err_w):
             os.close(fd)
         if "cancel-before-ack" in self.inject:
             self.cancelled = signal.SIGTERM

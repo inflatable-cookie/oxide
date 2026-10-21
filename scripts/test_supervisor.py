@@ -85,14 +85,14 @@ class PureGuard(unittest.TestCase):
 
     def test_low_reading_latches_and_never_clears(self):
         guard = self.guard()
-        guard.reading({"kind": "reserve", "value": 22 * GIB - 1, "at": 1000 * NS})
-        guard.reading({"kind": "reserve", "value": 500 * GIB, "at": 1000 * NS + 1})
+        guard.reading({"kind": "reserve", "value": 22 * GIB - 1, "at": 1000 * NS, "completed": 1000 * NS})
+        guard.reading({"kind": "reserve", "value": 500 * GIB, "at": 1000 * NS + 1, "completed": 1000 * NS + 1})
         self.assertIn("below", guard.check(1000 * NS + 2))
 
     def test_exact_threshold_passes(self):
         guard = self.guard()
-        guard.reading({"kind": "reserve", "value": 22 * GIB, "at": 1000 * NS})
-        guard.reading({"kind": "scratch", "value": 0, "complete": True, "at": 1000 * NS})
+        guard.reading({"kind": "reserve", "value": 22 * GIB, "at": 1000 * NS, "completed": 1000 * NS})
+        guard.reading({"kind": "scratch", "value": 0, "complete": True, "at": 1000 * NS, "completed": 1000 * NS})
         self.assertIsNone(guard.check(1000 * NS + NS // 2))
 
     def test_measurement_error_faults(self):
@@ -102,33 +102,61 @@ class PureGuard(unittest.TestCase):
 
     def test_stale_reserve_and_scratch(self):
         guard = self.guard()
-        guard.reading({"kind": "reserve", "value": 500 * GIB, "at": 1000 * NS})
-        guard.reading({"kind": "scratch", "value": 0, "complete": True, "at": 1000 * NS})
+        guard.reading({"kind": "reserve", "value": 500 * GIB, "at": 1000 * NS, "completed": 1000 * NS})
+        guard.reading({"kind": "scratch", "value": 0, "complete": True, "at": 1000 * NS, "completed": 1000 * NS})
         self.assertIsNone(guard.check(1001 * NS))
         self.assertIn("reserve readings stale", guard.check(1001 * NS + 1))
         guard = self.guard()
         for at in range(1000, 1012):
-            guard.reading({"kind": "reserve", "value": 500 * GIB, "at": at * NS})
-        guard.reading({"kind": "scratch", "value": 0, "complete": True, "at": 1000 * NS})
+            guard.reading({"kind": "reserve", "value": 500 * GIB, "at": at * NS, "completed": at * NS})
+        guard.reading({"kind": "scratch", "value": 0, "complete": True, "at": 1000 * NS, "completed": 1000 * NS})
         self.assertIn("scratch readings stale", guard.check(1010 * NS + 1))
 
     def test_incomplete_scratch_reading_does_not_refresh(self):
         guard = self.guard()
-        guard.reading({"kind": "scratch", "value": 0, "complete": False, "at": 1009 * NS})
-        guard.reading({"kind": "reserve", "value": 500 * GIB, "at": 1010 * NS})
+        guard.reading({"kind": "scratch", "value": 0, "complete": False, "at": 1009 * NS, "completed": 1009 * NS})
+        guard.reading({"kind": "reserve", "value": 500 * GIB, "at": 1010 * NS, "completed": 1010 * NS})
         self.assertIn("scratch readings stale", guard.check(1010 * NS + 1))
 
     def test_future_stamped_reading_latches(self):
         # A reading stamped after the custodian's own clock reading is never
         # fresh, so it cannot keep a stopped sampler looking alive.
         guard = self.guard()
-        guard.reading({"kind": "reserve", "value": 500 * GIB, "at": 2000 * NS}, now=1000 * NS)
+        guard.reading({"kind": "reserve", "value": 500 * GIB, "at": 2000 * NS, "completed": 2000 * NS}, now=1000 * NS)
         self.assertIn("future", guard.fault)
+        self.assertIsNone(guard.reserve_at)
+
+    # Review 6320463419: freshness counts from completion, not publication.
+
+    def test_delayed_reserve_publication_does_not_refresh(self):
+        guard = self.guard()
+        guard.reading({"kind": "reserve", "value": 500 * GIB, "completed": 1000 * NS, "at": 1000 * NS + NS // 2},
+                      now=1000 * NS + NS // 2)
+        guard.reading({"kind": "scratch", "value": 0, "complete": True, "completed": 1000 * NS, "at": 1000 * NS})
+        self.assertEqual(guard.reserve_at, 1000 * NS)
+        self.assertIsNone(guard.check(1001 * NS))
+        self.assertIn("reserve readings stale", guard.check(1001 * NS + 1))  # not 1001.5 s
+
+    def test_delayed_scratch_publication_does_not_refresh(self):
+        guard = self.guard()
+        guard.reading({"kind": "scratch", "value": 0, "complete": True, "completed": 1000 * NS, "at": 1004 * NS},
+                      now=1004 * NS)
+        for at in range(1000, 1012):
+            guard.reading({"kind": "reserve", "value": 500 * GIB, "completed": at * NS, "at": at * NS})
+        self.assertEqual(guard.scratch_at, 1000 * NS)
+        self.assertIsNone(guard.check(1010 * NS))
+        self.assertIn("scratch readings stale", guard.check(1010 * NS + 1))  # not 1014 s
+
+    def test_completion_after_send_latches(self):
+        guard = self.guard()
+        guard.reading({"kind": "reserve", "value": 500 * GIB, "completed": 1001 * NS, "at": 1000 * NS},
+                      now=1002 * NS)
+        self.assertIn("completed after it was sent", guard.fault)
         self.assertIsNone(guard.reserve_at)
 
     def test_over_budget(self):
         guard = self.guard()
-        guard.reading({"kind": "scratch", "value": 513 * 1024 * 1024, "complete": True, "at": 1000 * NS})
+        guard.reading({"kind": "scratch", "value": 513 * 1024 * 1024, "complete": True, "at": 1000 * NS, "completed": 1000 * NS})
         self.assertIn("over the", guard.fault)
 
 
@@ -288,6 +316,7 @@ class PureProtocol(unittest.TestCase):
 
     def test_ready_needs_received_readings(self):
         custodian = self.custodian()
+        custodian.paths = {"owned": False}  # setup done; readings missing
         custodian.accept(self.message(custodian, "ready"))
         self.assertIn("ready before completed readings", custodian.guard.fault)
 
@@ -448,6 +477,45 @@ class PureProtocol(unittest.TestCase):
         self.assertEqual(custodian.guard.fault, "custodian exception: Hostile")
         self.assertIs(type(custodian.guard.fault), str)
         self.assertEqual(json.loads(json.dumps(records))[0]["type"], "Hostile")
+
+    def test_custodian_setup_is_filesystem_free(self):
+        # Review 6320463419: blocking setup runs in the monitor, inside the
+        # setup deadline; the custodian's own setup makes no filesystem call.
+        import builtins
+        calls = []
+
+        def forbidden(name):
+            def call(*_args, **_kwargs):
+                calls.append(name)
+                raise AssertionError(f"{name} called")
+            return call
+
+        targets = [(os.path, n) for n in ("realpath", "isdir", "exists", "lexists")]
+        targets += [(os, n) for n in ("mkdir", "makedirs", "open", "stat", "lstat", "statvfs", "scandir", "listdir")]
+        targets += [(tempfile, "mkdtemp"), (builtins, "open"), (bounded.Kinfo, "check"), (bounded.Kinfo, "sysctl")]
+        saved = [(owner, name, getattr(owner, name)) for owner, name in targets]
+        handlers = {n: signal.getsignal(n) for n in (signal.SIGINT, signal.SIGTERM, signal.SIGCHLD)}
+        custodian = bounded.Custodian(["true"], root_parent="/private/tmp/does-not-matter")
+        try:
+            for owner, name in targets:
+                setattr(owner, name, forbidden(name))
+            custodian.setup()
+        finally:
+            for owner, name, value in saved:
+                setattr(owner, name, value)
+            for number, handler in handlers.items():
+                signal.signal(number, handler)
+        self.assertEqual(calls, [])
+        self.assertIsNone(custodian.paths)
+        self.assertNotIn("root", custodian.ctx)
+        self.assertEqual(custodian.absolute - custodian.start, int(custodian.limit_s * NS))
+
+    def test_ready_before_setup_faults(self):
+        custodian = self.custodian()
+        custodian.paths = None
+        custodian.guard.reserve_at = custodian.guard.scratch_at = 1
+        custodian.accept(self.message(custodian, "ready"))
+        self.assertIn("ready before setup", custodian.guard.fault)
 
     def test_unpinned_target_is_never_signalled(self):
         custodian = self.custodian()
@@ -732,6 +800,56 @@ class Real(unittest.TestCase):
         # The leader exits; the exception lands after TERM, and KILL still follows.
         self.exception_case("stop-exception", self.GROUP + "time.sleep(1)\n", "custodian exception: RuntimeError",
                             where="stop_leader:")
+
+    # Freshness from completion and direct setup bound (review 6320463419)
+
+    def delay_stall_case(self, inject, fault, stale_ns):
+        self.assertEqual(self.guardian(SLEEPER, inject=[inject]), 125)
+        self.assertIn(fault, self.outcome()["fault"])
+        kind = "reserve" if inject.startswith("reserve") else "owned_bytes"
+        completed = self.receipt[kind]["last_ns"]  # the stalled sampler's last completion
+        stop = [r["at"] for r in self.receipt["custodian"] if r["event"] == "stop"][0]
+        latency = stop - completed
+        CASES[-1]["stale_latency_ns"] = latency
+        # The fault lands at the original bound measured from completion, not
+        # from the delayed publication (which would add the injected delay).
+        self.assertGreaterEqual(latency, stale_ns)
+        self.assertLess(latency, stale_ns + NS * 3 // 10, latency)
+
+    def test_reserve_delayed_publication_then_stall(self):
+        self.delay_stall_case("reserve-delay-stall", "reserve readings stale", bounded.RESERVE_STALE_NS)
+
+    def test_scratch_delayed_publication_then_stall(self):
+        self.delay_stall_case("scratch-delay-stall", "scratch readings stale", bounded.SCRATCH_STALE_NS)
+
+    def test_direct_runner_setup_blocked_in_filesystem(self):
+        # A real blocking filesystem call in setup: the evidence directory's
+        # receipt.json.tmp is a FIFO, so the first receipt open blocks with
+        # no reader. The direct invocation (no bootstrap) must stop at the
+        # setup deadline, launch nothing and claim no receipt.
+        (self.dir / "evidence").mkdir()
+        os.mkfifo(self.dir / "evidence" / "receipt.json.tmp")
+        env = dict(os.environ, CASE_DIR=str(self.dir), FIXTURE_DEADLINE_NS=str(self.started + FALLBACK_S * NS),
+                   OXIDE_TASK_SCRATCH_ROOT=str(self.dir), OXIDE_SUPERVISOR_INJECT="")
+        command = [sys.executable, "-c", fixture("open(os.environ['CASE_DIR'] + '/ran', 'w')\n")]
+        with open(self.dir / "guardian.log", "wb") as log:
+            guardian = subprocess.Popen([sys.executable, str(SUPERVISOR), "--limit", "35", "--evidence",
+                                         str(self.dir / "evidence"), "--"] + command, env=env,
+                                        stdout=subprocess.DEVNULL, stderr=log)
+            try:
+                self.code = guardian.wait(timeout=VERDICT_S - (now_ns() - self.started) / NS)
+            finally:
+                if guardian.poll() is None:
+                    guardian.kill()
+                    guardian.wait(5)
+        wall = (now_ns() - self.started) / NS
+        CASES.append({"case": "direct_runner_setup_blocked", "exit": self.code, "wall_s": round(wall, 3),
+                      "kept": str(self.dir)})
+        self.assertEqual(self.code, 125)
+        self.assertGreaterEqual(wall, bounded.SETUP_S)
+        self.assertLess(wall, bounded.SETUP_S + 3)
+        self.assert_not_launched()
+        self.assertFalse((self.dir / "evidence" / "receipt.json").exists(), "a receipt was claimed")
 
     # Bootstrap finalization
 

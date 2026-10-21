@@ -766,7 +766,14 @@ file lookup) before latching; the diagnostic repair below fixes only that.
 Its author native at `07ce385` failed 59/60: the exception-during-stop case
 still expected the exception's message text in the fault, which the repair
 deliberately no longer includes. That case now expects the class name and
-the recorded `stop_leader:` location.
+the recorded `stop_leader:` location. Author and reviewer natives at
+`3d8e4f2` passed 60/60. Review `6320463419` then found two defects:
+- readings stamped at send time, not completion, so a delayed publication
+  could refresh an old measurement;
+- the custodian's own setup doing blocking filesystem work before any
+  deadline wait.
+
+The owner admitted both fixes under Tom's continue ruling.
 
 ```sh
 python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence DIR] [--root-parent DIR] [--] command ...
@@ -792,10 +799,26 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
     opens.
   - After setup, the custodian makes only bounded calls and touches no files
     or stdio.
+- **Setup.** The custodian takes its clock and deadlines first, and its own
+  setup is filesystem-free: attribute capability checks, signal handlers,
+  run ID and environment copy. All blocking setup runs in the monitor,
+  inside the 10 s setup budget:
+  - the `kinfo_proc` layout check;
+  - path resolution;
+  - scratch and evidence creation;
+  - the first receipt.
+
+  The paths arrive in the monitor's `setup` message. The leader opens
+  `/dev/null` itself, before its ack. A stall anywhere in setup, including
+  a blocked filesystem call, leaves `ready` unsent, and the direct
+  invocation is bounded the same way as under the bootstrap. A setup
+  refusal, such as `OXIDE_TASK_SCRATCH_ROOT` not being a directory, is one
+  non-blocking stderr line and exit 125. Python start-up and imports before
+  the entry point are outside the bound.
 - **Launch gate.** Nothing launches unless the custodian has received the
-  monitor's `ready` and completed reserve and owned-byte readings within the
-  10 s setup budget. If that fails, the pinned monitor is KILLed and the
-  exit is 125.
+  monitor's `setup`, `ready` and completed reserve and owned-byte readings
+  within the 10 s setup budget. If that fails, the pinned monitor is KILLed
+  and the exit is 125.
   - The leader child acknowledges with exactly one byte after `setsid` and
     `dup2`.
   - The custodian then registers kqueue `NOTE_EXIT` and writes the gate
@@ -847,6 +870,9 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   - Monitor: reserve below 22 GiB (20 GiB reserve + 2 GiB margin); no
     reserve reading for 1 s; no completed owned-byte reading for 10 s; owned
     bytes over budget (default 512 MiB); a measurement error; monitor death.
+    Freshness counts from each reading's `completed` stamp, taken when the
+    measurement finished, never from when its message was sent. A
+    completion after the send stamp is a fault.
   - Protocol: wrong run ID, sequence gap, a leader identity that is not the
     pinned leader or is dropped after binding, `ready` before readings, line
     overflow.
@@ -928,8 +954,10 @@ path is printed for the owner.
 
 It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
 `scripts/test_supervisor.py`. The suite runs in order:
-- 30 pure cases: guard thresholds, staleness and errors, a future-stamped
-  reading; exit precedence;
+- 35 pure cases: guard thresholds, staleness and errors, a future-stamped
+  reading, delayed reserve and scratch publications that do not refresh,
+  and a completion after its send stamp; the custodian's setup with every
+  filesystem call forbidden; `ready` before `setup`; exit precedence;
   census member, foreign, identity change, first-seen unreadable, zombie,
   gone, `ESRCH` with a failing re-read (uncertain), a zombie confirmed gone
   within the round, escaped and reparented member, backwards start time,
@@ -943,7 +971,7 @@ It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
   `__format__`, metaclass `__name__` and `str`-subclass name); refusal to
   signal an unpinned target;
 - writers before and after a simulated staging step;
-- 30 real cases with tiny Python fixtures and injected faults:
+- 33 real cases with tiny Python fixtures and injected faults:
   - exit 0, owned cleanup, nonzero, exec 127, output saturation;
   - a group cascading to `closed` at the deadline;
   - a separate-group survivor `UNCLOSED`, never signalled and still alive at
@@ -957,6 +985,13 @@ It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
   - setup stall, monitor death, monitor stall, uncertain census, a first
     uncertain census followed by empty ones (owned scratch kept),
     interrupted cleanup, monitor completion followed by a custodian timeout;
+  - a reserve reading delayed 0.5 s under the monitor's I/O lock, and a
+    scratch reading delayed 4 s, each followed by a stalled sampler. The
+    stop must come between the 1 s or 10 s bound and that bound plus
+    0.3 s, measured from completion;
+  - the direct runner, with no bootstrap, whose first receipt open blocks
+    on a FIFO. It exits 125 between 10 and 13 s, launches nothing and
+    claims no receipt;
   - the bootstrap actor KILLing a worker blocked on an unread stdout pipe
     at its deadline (exit 124);
   - post-gate exceptions: an event-loop exception, a failing kqueue, a
@@ -979,7 +1014,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 60 cases;
+- all 68 cases;
 - every real case directory and receipt still present after the
   candidate's cleanup.
 
