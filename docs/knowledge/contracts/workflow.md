@@ -250,7 +250,19 @@ and after an ordinary detach. Not a benchmark or real-drive qualification.
 reused the base build for the candidate (both SHA-256 `46db66ce…`), so the
 first candidate `status` printed the old format and the script failed after
 16 s, before any image or product exercise. Its log and 11 MiB scratch are
-kept. The staging correction above has not run. The child runner imported
+kept.
+
+**Guard (#104-only operator exception, 2026-10-21).** The selector runs the
+script under the old `scripts/bounded-test.py`, byte-identical to `3d947a9`
+(SHA-256 `9dffe4f3…c49344`). It gives no continuous reserve monitoring
+across all writes and no supervisor-enforced scratch budget or cleanup;
+phase samples and the script's own cleanup are not equivalent. At 300 s it
+signals recorded numeric process groups with unmeasured reuse risk, and the
+script starts each child in its own session, outside the session the
+supervisor records. A normal leader exit and reap does not establish that
+Cargo's separate groups closed. 300 s plus escalation and blocking calls is
+not an absolute ceiling. This grants no standing rule or shared-runner
+qualification. The child runner imported
 from the #105 script is unqualified: it kills the leader's session and reaps
 the leader, which does not prove Cargo's separate process groups closed.
 
