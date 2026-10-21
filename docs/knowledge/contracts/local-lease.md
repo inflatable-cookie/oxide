@@ -292,6 +292,34 @@ reserve space, constrain writes during a lease, or prevent `ENOSPC`. Other
 slots still count against the budget, so ordinary admission and refusal rules
 apply after the selected generation is removed.
 
+### Proposed: cached closed-slot accounting (lead `cbb2824d`)
+
+Proposed, not implemented; it awaits independent design review. Tom's 2026-10-20 accounting ruling covers the interim limits. This design replaces whole-payload walks at admission, because their cost grows with the pool. Measured on the Builds pool: 95,020 entries in 1.2 s, then 201,948 entries in 3.4 s an hour later. The front door's selection status and the library's admission each walk the payload, on every command.
+
+1. **Measure at close.** When a lease ends (release or recovery) and its process group is positively closed, walk that slot with the existing bounds.
+   - A complete walk is stored in the slot's ledger record, in the same atomic ledger write that marks the slot idle: `{incarnation, closing lease ID, unique bytes, logical bytes, entries, external-link count, measured-at}`.
+   - An incomplete walk stores nothing, and the slot is unknown.
+2. **Validity.** A cached figure is used only while all of these hold:
+   - the slot is idle, has no lease and has the cached incarnation and last lease ID;
+   - the slot root's `(device, inode)` is unchanged;
+   - the record is younger than a maximum age (proposed 24 h).
+
+   Leasing, recycling, eviction and recovery all invalidate it. Writer closure at release is the guarantee that an idle slot does not change. A foreign writer inside an idle slot is outside the contract and is caught at the next measurement (reuse, age expiry or `status --verify`).
+3. **Admission.**
+   - The sum is cached unique bytes for idle slots, plus each held slot's figure from before its lease (zero for a new slot). Held-slot growth is not walked. Budget-only pools are already soft, and the host and volume reserve checks remain the space guard.
+   - An idle slot without a valid figure is measured once at admission, at most one per admission plus any reuse target, and cached if complete. If it is still unknown, admission refuses as today and names the slot. It is never counted as zero and never evicted because it is unknown.
+4. **Reuse.** The matching idle slot is still walked before reuse, which keeps the recycle threshold exact and re-verifies the contents of the slot about to be used.
+5. **Foreign entries.** Every admission does a cheap structural check: the payload root and `slots/` list only known slot directories and the tolerated macOS metadata (oxide#105). Deep foreign entries in other idle slots are detected only when that slot is next measured. That is a deliberate narrowing from today's every-allocation whole walk, and it is stated in `status`.
+6. **Hard links across slots.** A per-slot union cannot see links shared between slots, so a sum may overcount. Overcounting is conservative for admission and eviction. Each record counts its `nlink > 1` inodes whose links were not all found in the slot. A non-zero total makes `status` say the sum may overcount.
+7. **Eviction.** It picks known idle slots and uses cached sizes to decide how many to retire. Each deleted slot's figure is subtracted. The rules are unchanged: whole slots, idle, owned and durably recorded.
+8. **Ledger version.** The new fields need a new ledger version, because the ledger rejects unknown fields.
+   - Reading the previous version upgrades it with no cached figures, so every slot is measured lazily under rule 3.
+   - An older binary refuses the new ledger: a rollback fails closed.
+   - At 32 slots the records stay well inside the 256 KiB ledger bound.
+9. **Status and selection.** Pool selection and plain `status` use cached figures and show each one's age. `oxide status --verify` runs today's full walks and replaces cached figures that it measures completely.
+
+Proof expectations: a fixture pool above 200,000 entries where admission performs no whole-payload walk; cache invalidation on lease, recycle, eviction, recovery and age; an unknown slot that refuses without being zeroed or evicted; a cross-slot hard link reported as possible overcount; ledger upgrade and rollback refusal; and a foreign top-level entry still refused.
+
 History, retired with the image backend (oxide#102): the verified APFS
 sparse-image volume was the hard aggregate bound, the declared cap had to
 equal the image size, and `verified_capacity_bytes` was the effective OS
