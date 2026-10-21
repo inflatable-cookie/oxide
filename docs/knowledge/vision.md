@@ -736,6 +736,19 @@ Tom, 2026-10-21, "Approve", in answer to "get the proof harness sorted out prope
 
 A host check the same day found no kernel-level shortcut: on macOS 26.6.2, `launchctl remove` of a submitted job did not kill a `setsid`-escaped descendant.
 
+Tom, 2026-10-21, "Approve": a derived default for the host-wide build limit (lead `a56002f7`).
+- **Setting:** `[pool] max_active` in the Application Support config. Precedence: `OXIDE_MAX_ACTIVE`, then the config key, then the default. Explicit values of 1 to 32 are kept.
+- **Default:** `min(4, max(2, floor(physical_cores / 4)))`, which is 4 on this 18-core host, up from a fixed 2.
+- **Fallback:** if the physical core count can't be read, the limit is 2 and the provenance says so. Logical cores are never substituted silently.
+- **Reporting:** `oxide status` shows the value and where it came from.
+- **Why:** Praxis's QA hit "2 of 2 host-wide in use" twice once five projects were on Oxide.
+
+Tom, 2026-10-21, "Yeah, keep going" (Queue decision `cd72ed22`): one focused repair of #109's post-gate exception path.
+- **Context:** review `6318598212` at `52e4a89` confirmed the five earlier fixes, but found a new P1. An event-loop or protocol exception after the gate escapes `Custodian.run` without a bounded pinned stop, reap, census or finish, and the monitor's exit then ends resource sampling.
+- **Repair:** any post-gate exception goes through the bounded shutdown itself. Malformed messages are conservative faults. Tracebacks can't block. Tests inject pump and kqueue exceptions and malformed fields, and assert custody, `keep`, continued sampling, exit 125 and the deadline.
+- **Native sessions:** one new session per side. The reviewer's earlier session timed out on capacity, never launched, and stays consumed.
+- Qualification is not guaranteed. A further new P1 class stops again for Tom.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
