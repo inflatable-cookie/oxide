@@ -169,6 +169,18 @@ run = "python3 scripts/bounded-test.py python3 scripts/test-front-door-accountin
 admission = "heavy"
 run = "python3 scripts/test-oxide-finder-metadata.py"
 
+# Project-named slots and pool status (oxide#104): the oxide#105 script's
+# child runner unchanged (deadline before each child from one 300 s budget,
+# 20 GiB reserve sampled every 250 ms while a child runs, owned scratch
+# checked between phases against 512 MiB, ordinary detach). Stages the base
+# commit's and this HEAD's `oxide` offline with 1.97.1; a legacy slot stays
+# in place and warm; new internal and scratch-image removable slots are
+# labelled; status order, grouping and most-recent use with the volume
+# selected and detached. Not a benchmark and not full QA.
+[tasks."rust:oxide-pool-layout"]
+admission = "heavy"
+run = "python3 scripts/test-oxide-pool-layout.py"
+
 # SUSPENDED by oxide#102 (retired image pool provisioning; refuses before
 # any effect until migrated). Cargo version matrix (oxide#091): one logical proof per exact stable
 # release. Each stages `oxide` offline with the builder 1.97.1, then runs the

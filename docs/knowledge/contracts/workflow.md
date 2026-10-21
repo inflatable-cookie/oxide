@@ -168,6 +168,85 @@ Status still labels them `quick` or `debug`. The toolchain is
 whatever rustup resolves where the command runs (see
 [caller context](#cargo-version-matrix)); Oxide does not select or pin it.
 
+### Project-named slots and pool status
+
+oxide#104 (Tom, 2026-10-20: "It would be pretty handy to group them by
+project name so it's obvious what's what"). Presentation only: the slot key,
+identity, ledger semantics, admission, eviction and recovery are unchanged.
+
+- **Layout.** A new slot is created at
+  `slots/<label>-<short-id>/<profile>-<n>`, for example
+  `slots/oxide-3fa2c1d4/quick-7`. `<n>` is the slot ID; `<profile>` is the
+  Oxide profile label (`quick`, `debug`, `release`). The ledger records the
+  path below `slots` (`dir`) at creation, and it never changes.
+- **Label.** The last segment of the normalised `origin` URL, else the
+  repository directory name (`git rev-parse --show-toplevel`), else the
+  workspace directory name. It is sanitised to lowercase ASCII letters,
+  digits, `_` and single `-`, at most 40 bytes; `project` when nothing
+  remains. Origin comes first so worktrees with task-named directories share
+  a readable label.
+- **Short ID and collisions.** The short ID is the first 8 hex digits of the
+  repository identity digest. It is display, not a uniqueness proof. Before
+  creating a slot, Oxide checks the folder: one that already holds a slot of
+  another repository, or of a project not known to be this repository, is
+  skipped, then the 12-, 16- and 64-digit forms are tried. An existing folder
+  with no recorded slot is used only when it is empty apart from
+  [Finder metadata](#finder-metadata-in-pools). When no form qualifies the
+  slot gets the legacy path. A repository's later slots join the folder it
+  already uses, so worktrees with different labels still share one folder.
+- **Existing slots** keep `slots/<id>`. They are never renamed, moved or
+  adopted into a folder: Cargo records absolute paths inside a slot. A
+  ledger without `dir` reads and writes unchanged. A binary older than #104
+  refuses a ledger holding a labelled slot (its ledger records refuse
+  unknown fields) rather than guessing the path.
+- **Eviction** removes only the slot directory. Its project folder stays,
+  possibly empty; nothing removes folders. Deletion stays limited to a
+  recorded slot directly under `slots` or under one owner-only project
+  folder on the same device. Payload accounting allows two levels above the
+  slots, so slot contents keep their depth allowance.
+- **Status.** The first lines say which pool the next build uses, from the
+  same selection check builds make, and the most recently used slot: its
+  pool, slot, project label, checkout and age. Each pool then has one
+  header, with the selected pool first and its own slots beneath it; equal
+  slot numbers in two pools never mix. Every slot line shows its project
+  label (the folder for a labelled slot, else the checkout directory name)
+  and its place, `slots/<dir>` or `slots/<id> (legacy path)`. A registered
+  removable pool that is not usable keeps its registration lines and the
+  reason, and its slots read `not read while the volume is not usable
+  (unknown, not empty)`.
+- **Most recent use.** Within one pool Oxide's use counter orders uses.
+  Across pools it compares the wall-clock time recorded at each use since
+  #104 (`last_used_ms` in the control state). A use recorded before then has
+  no time, so the cross-pool answer is `unknown`, with each pool's latest
+  listed. Equal times name the first listed (selected) pool and say they are
+  tied. For a removable pool that is not usable, status reads its internal
+  control state only: the slot is `unknown` and the label is the checkout
+  directory name. An unreadable state reports `unknown`, never "none".
+  Status still opens only what it did before; it acquires nothing and
+  changes no ledger.
+
+**Proof.** `effigy rust:oxide-pool-layout`
+(`scripts/test-oxide-pool-layout.py`) is a short fixed script under Effigy
+heavy admission that reuses the #105 script's child runner unchanged
+(deadline before each child from one 300 s budget, 20 GiB reserve sampled
+every 250 ms while a child runs, owned scratch checked between phases
+against 512 MiB, sessions killed on breach or deadline, ordinary detach).
+It stages the base commit's and this HEAD's `oxide` offline with 1.97.1.
+Over a private `HOME`, `CARGO_HOME` and pool: the base binary makes a legacy
+`slots/1`, which the candidate reuses warm in place; same-named checkouts
+get separate labelled folders; a debug slot joins its project's folder;
+one 128 MiB scratch APFS image registered as the removable pool gets
+labelled slots, including a slot 1 beside the internal slot 1; status order,
+grouping and most-recent attribution are checked with the volume selected
+and after an ordinary detach. Not a benchmark or real-drive qualification.
+
+The other proof scripts that located a slot at `slots/<id>`
+(`test-front-door-accounting.py`, `test-cargo-profiles.py`,
+`test-oxide-exec.py`, `test-oxide-removable-pool.py`, `test-pool-scale.py`,
+`test-oxide-finder-metadata.py`) now read the ledger's `dir` or find
+`slots/*/<profile>-<id>`. These script changes were not rerun natively under
+#104.
+
 ## Cross-checkout freshness
 
 Reusing one slot across checkouts is not automatically safe. Cargo 1.97.1
@@ -1588,7 +1667,8 @@ Rules:
 ### `directory-budget-v1` as shipped
 
 - **Shape.** `<pool>/payload/slots/` is a plain owner-only directory on the
-  pool's own device; config, ledger and lock sit beside it as for APFS, with
+  pool's own device, holding legacy `<id>` slots and
+  [project-named](#project-named-slots-and-pool-status) `<folder>/<profile>-<id>` slots; config, ledger and lock sit beside it as for APFS, with
   no image or receipt. The config records the backend, store ID and budget
   recorded at creation (`cap_bytes`, default 100 GB; `image_bytes` 0). An
   image or receipt file, any payload entry but `slots` and
@@ -1653,8 +1733,8 @@ Rules:
 oxide#105. Finder writes `.DS_Store` files, and AppleDouble `._<name>` sidecars where a filesystem lacks native extended attributes. Both can appear in a pool directory someone has browsed. Both backends tolerate exactly these two forms and nothing broader. The name is `.DS_Store`, or `._` followed by a nonempty name; the entry is a regular file (no-follow), owned by the caller and on the directory's device. The tolerated places are:
 
 - **Pool root and the removable control root.** Allowed beside config, ledger, lock and `oxide-managed`. These bytes are control-directory bytes, like the ledger, and are not payload.
-- **Payload root** (`<pool>/payload`, or `<mount>/oxide-pool`). Allowed beside `slots`. Payload accounting now walks the payload root, not `slots` alone. The bytes therefore count in the payload figure and the soft-budget admission check, and the `(device, inode)` union counts a hard link once. The depth bound is one level deeper, so slot contents keep their previous allowance.
-- **`slots`, a slot and its build tree.** This is unchanged: these were never name-checked. Every regular file there, metadata included, counts in the slot's own figure.
+- **Payload root** (`<pool>/payload`, or `<mount>/oxide-pool`). Allowed beside `slots`. Payload accounting now walks the payload root, not `slots` alone. The bytes therefore count in the payload figure and the soft-budget admission check, and the `(device, inode)` union counts a hard link once. The depth bound is one level deeper (two since #104 added project folders), so slot contents keep their previous allowance.
+- **`slots`, a project folder, a slot and its build tree.** This is unchanged: these were never name-checked. A [project folder](#project-named-slots-and-pool-status) with no recorded slot is reused only when it holds nothing but Finder metadata. Every regular file there, metadata included, counts in the slot's own figure.
 
 A metadata-named symlink, directory, FIFO or other special file is still refused. So are a file owned by another user, a file on another device, and a near-miss name (`._`, `.ds_store`, `.DS_Store.bak`). Every other unknown entry also refuses wherever it did before. A name never establishes a lease, never makes a slot reusable and never permits a cleanup. Oxide never deletes, moves or rewrites these files. A whole-slot eviction still removes everything inside the slot, as before. Pool creation still requires an empty directory.
 
