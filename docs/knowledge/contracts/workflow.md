@@ -1721,7 +1721,9 @@ oxide#102.
   macOS `~/Library/Application Support/oxide/config/config.toml`; elsewhere
   `$XDG_CONFIG_HOME/oxide/config.toml`, with XDG's `~/.config` when the
   variable is unset; a relative `XDG_CONFIG_HOME` or a missing `HOME`
-  refuses. `OXIDE_CONFIG` (absolute) selects another file; only the selected
+  refuses. (Approved change, not shipped: on adopting Longhorn 0.4.1's
+  per-root resolver (#103), a relative `XDG_*` value for a demanded root is
+  ignored and the default used, per the XDG spec (Tom, 2026-10-21).) `OXIDE_CONFIG` (absolute) selects another file; only the selected
   file is parsed. On macOS `~/.config/oxide/config.toml` is never read;
   `status` says it is ignored, without printing its contents. Parsed with
   `basic-toml` 0.1.10; at most 64 KiB:

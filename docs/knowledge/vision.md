@@ -125,8 +125,12 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   standalone lease tool are retired.
 - **The internal pool** is `~/Dev/oxide`, with a 100 GB budget.
 - **Config** lives at `~/Library/Application Support/oxide/config/config.toml`
-  (XDG on Linux). That follows Longhorn's storage-location policy, mirrored
-  until Longhorn's CLI crate ships in 0.4.0.
+  (XDG on Linux). That follows Longhorn's storage-location policy.
+  - Mirrored today. Oxide adopts Longhorn's per-root resolver in 0.4.1 (#103)
+    once it's tagged.
+  - Relative `XDG_*` values then follow the XDG spec (ignored, default used)
+    rather than refusing.
+  - Missing required facts still refuse.
 - **The Builds drive**, a registered removable APFS volume, is the preferred
   pool:
   - admission cap 750 GB, reserve 100 GB;
