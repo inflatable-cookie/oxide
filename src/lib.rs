@@ -1,6 +1,9 @@
 //! Budget-only build-slot leases, read-only target inventory and a bounded
 //! Cargo dep-info decoder for the `oxide` front door.
 
+#[cfg(all(test, unix))]
+mod test_fs;
+
 /// Bounded read-only inventory of one explicitly selected target directory.
 #[cfg(unix)]
 pub mod inventory;

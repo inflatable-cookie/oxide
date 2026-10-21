@@ -1356,13 +1356,14 @@ fn unreadable_slot_entry_refuses_reuse_admission_and_eviction() {
     .expect("blob");
     let locked = grant.env.cargo_build_build_dir.join("locked");
     fs::create_dir(&locked).expect("locked dir");
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod 000");
     managed::release(&pool, &grant.lease_id).expect("release");
+    let denied = crate::test_fs::PermissionDeniedGuard::read_dir(&locked);
     let reuse = managed::lease(request(&pool, &project, &workspace, "b"));
     // Over the tiny budget with the only idle slot unmeasurable: no eviction.
     let admit = managed::lease(request(&pool, &fx.dir("other"), &workspace, "c"));
     let status = managed::status(&pool);
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("restore");
+    assert!(denied.hits() >= 1, "permission injection was not reached");
+    drop(denied);
     for scan in [incomplete(reuse), incomplete(admit)] {
         assert_eq!(scan.coverage, AccountingCoverage::Partial);
         assert_eq!(gap_kinds(&scan), vec![AccountingGapKind::UnreadableEntry]);
@@ -1600,12 +1601,16 @@ fn ledger_view_keeps_status_refusals_and_non_gating_gaps() {
     let denied = fx.dir("denied-pool");
     create_injected(&denied, 1024 * 1024).expect("init denied");
     let denied_project = fx.dir("denied-project");
-    lease_injected(request(&denied, &denied_project, &workspace, "d")).expect("lease");
+    let denied_grant =
+        lease_injected(request(&denied, &denied_project, &workspace, "d")).expect("lease");
     let slots = denied.join("payload").join("slots");
-    fs::set_permissions(&slots, fs::Permissions::from_mode(0o000)).expect("deny");
+    let denied_slot_root = slots.join(&denied_grant.slot_id);
+    let denied_lookup =
+        crate::test_fs::PermissionDeniedGuard::symlink_metadata(&denied_slot_root);
     let from_status = status_injected(&denied).map(|_| ());
     let from_view = ledger_injected(&denied).map(|_| ());
-    fs::set_permissions(&slots, fs::Permissions::from_mode(0o700)).expect("restore");
+    assert_eq!(denied_lookup.hits(), 2);
+    drop(denied_lookup);
     assert!(
         matches!(from_status, Err(LeaseError::Io(_))),
         "{from_status:?}"

@@ -191,12 +191,18 @@ The library unit tests build fresh fixtures under the task-owned scratch root
 and cover: known category grouping, a real hardlink across two categories with
 union and overlap accounting, a sparse file with apparent greater than
 allocated bytes, dangling and directory symlinks that are counted but never
-followed, an unreadable directory, entry and depth truncation, the cooperative
-deadline, bounded rendering (the 64-byte minimum including truncation
+followed, partial coverage when `read_dir` returns an injected
+`PermissionDenied`, entry and depth truncation, the cooperative deadline,
+bounded rendering (the 64-byte minimum including truncation
 markers and the JSON fallback), long or multibyte root/note fields remaining
 inside the cap with valid UTF-8/JSON, refused roots, invalid limits, concurrent
 mutation without panic, the measured filesystem value and the absence of
 stale or savings claims.
+
+The unreadable-directory case injects `io::ErrorKind::PermissionDenied` at the
+walker's `read_dir` call for one canonical fixture path. It proves partial
+coverage handling; it does not prove kernel permission enforcement or an
+actual operating-system `EACCES` response.
 
 These fixtures do not qualify real project behavior, real savings or a
 performance result. No existing target, Nucleus, Queue or Acow tree is scanned,
