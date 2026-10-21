@@ -163,6 +163,15 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
     - if physical cores can't be read, it falls back to 2 and says so, and
       never silently uses logical cores;
     - `oxide status` reports the value and where it came from.
+- **Approved, not built: more slots** (Tom, 2026-10-21, "Oh yeah, raise
+  the slots!").
+  - The pool-wide slot limit rises from 32 to 128, and the per-project limit
+    from 2 to 8.
+  - Once there are enough slots, the byte budget drives eviction: oldest idle
+    first when space runs short, not when a slot count is reached.
+  - Why: the Builds pool sat at the 32-slot limit with 863 GiB free.
+    Longhorn's prototype workspaces held 17 slots, and Effigy's workers were
+    evicting each other's warm slots under the per-project limit of 2.
 - **Parked:** cached slot accounting. Exact caching needs proof that an idle
   slot is immutable, which doesn't exist yet. Explicit `oxide status` still
   walks the whole pool and is slow.
