@@ -662,6 +662,13 @@ Tom, 2026-10-21, "Approve", answering two questions.
    - Scratch is removed at slot release and covered by crash recovery. That makes it elevated tier, sequenced after the #109 shared supervisor.
    - Motivation: whole-device counters still showed heavy internal-SSD writes after the cutover (742 GB since a 20:43Z boot by 23:50Z, unattributed). Effigy and Queue-worktree scratch are separate decisions, pending attribution data.
 
+Tom, 2026-10-21, "Yes to all your suggestions": the Builds volume may hold non-Oxide scratch **outside** `/Volumes/Builds/oxide-pool`. The case that prompted it is test and QA temporary writes, owned by Effigy for the selectors it runs.
+- The scratch must fall back to the internal default when the registered volume is absent.
+- It must never create `/Volumes/Builds/...` on the internal disk.
+- Oxide's pool keeps refusing unknown entries inside its own payload.
+
+Queue's backup and retention changes from the same ruling are owned by Queue.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
