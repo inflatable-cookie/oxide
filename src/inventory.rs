@@ -1178,7 +1178,17 @@ pub mod walk_observer {
                 let evidence = std::env::var_os("OXIDE_PROOF_EVIDENCE").map(PathBuf::from)?;
                 let scratch = std::fs::canonicalize(scratch).ok()?;
                 let evidence = std::fs::canonicalize(evidence).ok()?;
-                if !scratch.starts_with("/private/tmp") || !evidence.starts_with(&scratch) {
+                // Adopted runs keep evidence inside caller scratch. The
+                // supervisor-owned layout keeps `scratch/` and `evidence/`
+                // as siblings under its monitored root.
+                let evidence_is_nested = evidence.starts_with(&scratch);
+                let evidence_is_supervisor_sibling = scratch.file_name()
+                    == Some(std::ffi::OsStr::new("scratch"))
+                    && evidence.file_name() == Some(std::ffi::OsStr::new("evidence"))
+                    && scratch.parent() == evidence.parent();
+                if !scratch.starts_with("/private/tmp")
+                    || !(evidence_is_nested || evidence_is_supervisor_sibling)
+                {
                     return None;
                 }
                 scratch

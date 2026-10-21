@@ -592,7 +592,17 @@ def main() -> None:
     if not scratch.startswith("/private/tmp/"):
         fail("qualified proof scratch must be a child of /private/tmp")
     evidence = os.path.realpath(os.environ.get("OXIDE_PROOF_EVIDENCE", ""))
-    if not evidence or not os.path.isdir(evidence) or not evidence.startswith(scratch + os.sep):
+    evidence_is_nested = evidence.startswith(scratch + os.sep)
+    evidence_is_supervisor_sibling = (
+        os.path.basename(scratch) == "scratch"
+        and os.path.basename(evidence) == "evidence"
+        and os.path.dirname(scratch) == os.path.dirname(evidence)
+    )
+    if (
+        not evidence
+        or not os.path.isdir(evidence)
+        or not (evidence_is_nested or evidence_is_supervisor_sibling)
+    ):
         fail("the qualified supervisor did not provide OXIDE_PROOF_EVIDENCE")
     if not os.environ.get("OXIDE_PROOF_DEADLINE_NS"):
         fail("the qualified supervisor did not provide its absolute deadline")
