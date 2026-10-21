@@ -986,7 +986,8 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
   Host-wide limit 2 commands holding slots (`OXIDE_MAX_ACTIVE`, 1–32). Excess
   commands wait in FIFO order, print one `oxide: waiting for …` line on stderr
   and cancel on Ctrl-C with exit 130. Another command in the same checkout
-  and key waits too.
+  and key takes a compatible spare slot or creates one within budget; it waits
+  when no safe slot or host capacity is available.
 - **Execution.** Cargo runs from the caller's directory as leader of a new
   process group, with `CARGO_BUILD_BUILD_DIR` on the slot and
   `CARGO_TARGET_DIR=<workspace>/target`. SIGINT, SIGTERM and SIGHUP are
