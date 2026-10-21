@@ -1703,13 +1703,21 @@ oxide#102.
   `unreadable_entry`, `missing_metadata`, a mount boundary or a root
   failure), entries visited, elapsed time and bounds; its bytes are never
   used and never make a slot evictable. The bounds are finite: a larger pool
-  refuses until idle slots are evicted or cleaned. Owning detail:
+  refuses until idle slots are evicted or cleaned. A `NotFound` bound to a
+  non-root path the same walk enumerated at a deferred `read_dir`, `file_type`
+  or no-follow metadata call is reported separately as `vanished xN`, not as
+  a gap. Its complete result can still authorize the existing whole-idle-slot
+  policy. This is a best-effort, non-atomic path observation and does not
+  establish that inode allocation was freed or reclaimable. Root `NotFound`
+  remains `root_missing`, including after the root was opened; iterator errors
+  without a path identity and other errors keep their conservative categories.
+  Status and refusal diagnostics include the separate count. Owning detail:
   [local lease](local-lease.md#capacity-and-eviction). Rust tests cover
   each old bound, an unreadable entry, a symlinked slot root and hard links
   with injected bounds. The native selector `effigy rust:pool-scale` has no
   passing run: its first session staged the reference binary twice and is
-  apparatus evidence only, and the corrected selector is held because no
-  existing guard samples the host reserve during plain-Cargo staging.
+  apparatus evidence only. The selector now uses the qualified shared
+  supervisor; no later passing run is recorded.
 - **Precedence.** Environment, then the user config file, then defaults.
   `OXIDE_POOL` sets the path (relative resolves against the current
   directory); `OXIDE_POOL_CAP` sets the budget. Sizes are whole bytes or a

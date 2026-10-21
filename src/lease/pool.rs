@@ -1158,6 +1158,7 @@ fn scan(
         gaps,
         entries_visited,
         elapsed_ms,
+        0,
     )
 }
 
@@ -1167,10 +1168,12 @@ fn scan_with(
     gaps: Vec<AccountingGap>,
     entries_visited: u64,
     elapsed_ms: u64,
+    vanished: u64,
 ) -> AccountingScan {
     AccountingScan {
         coverage,
         gaps,
+        vanished,
         entries_visited,
         elapsed_ms,
         max_entries: limits.max_entries,
@@ -1198,6 +1201,7 @@ fn root_failure_with(
         vec![gap],
         0,
         elapsed_ms,
+        0,
     )
 }
 
@@ -1254,6 +1258,7 @@ fn inventory_sizes_deeper(path: &Path, extra_depth: usize) -> Sizes {
                     gaps,
                     report.entries_visited,
                     report.elapsed_ms,
+                    report.vanished,
                 ),
             }
         }

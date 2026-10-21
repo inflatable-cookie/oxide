@@ -785,18 +785,25 @@ fn print_pool(store: &Store) -> Result<(), String> {
             slot.slot_id,
             slot.profile.as_deref().unwrap_or("-")
         );
-        let incomplete = report
+        let diagnostic_scan = report
             .pool
             .slots
             .iter()
             .find(|pooled| pooled.slot_id == slot.slot_id)
             .map(|pooled| &pooled.accounting)
-            .filter(|scan| scan.coverage != AccountingCoverage::Complete);
-        if let Some(scan) = incomplete {
-            println!(
-                "    slot {} accounting walk: {scan}; it is not reused while incomplete",
-                slot.slot_id
-            );
+            .filter(|scan| scan.coverage != AccountingCoverage::Complete || scan.vanished > 0);
+        if let Some(scan) = diagnostic_scan {
+            if scan.coverage != AccountingCoverage::Complete {
+                println!(
+                    "    slot {} accounting walk: {scan}; it is not reused while incomplete",
+                    slot.slot_id
+                );
+            } else {
+                println!(
+                    "    slot {} accounting walk: {scan}; this best-effort observation does not infer freed allocation",
+                    slot.slot_id
+                );
+            }
         }
     }
     let now = process::now_ms();
