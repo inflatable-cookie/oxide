@@ -28,6 +28,7 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import glob
 import json
 import os
 import plistlib
@@ -192,6 +193,13 @@ def payload_mib(stdout: str, marker: str) -> int:
     return int(lines[0].split(" MiB allocated by slots")[0].split()[-1])
 
 
+def labelled_slot(slots: str, slot: int) -> str:
+    """oxide#104: a new slot is `slots/<project folder>/<profile>-<id>`."""
+    found = glob.glob(os.path.join(slots, "*", f"*-{slot}"))
+    expect(len(found) == 1, f"slot {slot} not found once under {slots}: {found}")
+    return found[0]
+
+
 def place_metadata(dirs: list) -> list:
     placed = []
     for directory in dirs:
@@ -296,7 +304,7 @@ def run(proof: Proof, repo: str) -> None:
     code, stdout, _ = proof.oxide(["status"], "internal status before metadata", app)
     before = payload_mib(stdout, "soft budget")
     payload = os.path.join(pool, "payload")
-    slot = os.path.join(payload, "slots", "1")
+    slot = labelled_slot(os.path.join(payload, "slots"), 1)
     internal_placed = place_metadata([pool, payload, os.path.join(payload, "slots"), slot, os.path.join(slot, "build")])
     code, stdout, _ = proof.oxide(["status"], "internal status with metadata", app)
     after = payload_mib(stdout, "soft budget")
@@ -327,7 +335,7 @@ def run(proof: Proof, repo: str) -> None:
     code, stdout, _ = proof.oxide(["status"], "removable status before metadata", app)
     before = payload_mib(stdout, "payload ")
     volume_payload = os.path.join(mount, "oxide-pool")
-    volume_slot = os.path.join(volume_payload, "slots", "1")
+    volume_slot = labelled_slot(os.path.join(volume_payload, "slots"), 1)
     removable_control = os.path.join(pool, "oxide-managed", "removable")
     removable_placed = place_metadata(
         [removable_control, volume_payload, os.path.join(volume_payload, "slots"), volume_slot, os.path.join(volume_slot, "build")]

@@ -119,85 +119,42 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 
 ### Storage
 
-- **Pools are budget-only.** Admission is against a soft budget, with
-  whole-idle-slot eviction and the host-reserve watchdog (trigger 22 GiB free,
-  floor 20 GiB). There is no OS-enforced cap. Disk-image pools and the
-  standalone lease tool are retired.
-- **The internal pool** is `~/Dev/oxide`, with a 100 GB budget.
-- **Config** lives at `~/Library/Application Support/oxide/config/config.toml`
-  (XDG on Linux). That follows Longhorn's storage-location policy, mirrored
-  until Longhorn's CLI crate ships in 0.4.0.
-- **The Builds drive**, a registered removable APFS volume, is the preferred
-  pool:
-  - admission cap 750 GB, reserve 100 GB;
-  - since 2026-10-21 it is permanently attached;
-  - its root is `755`;
-  - it is treated as consumable, so Oxide should report its writes;
-  - non-Oxide scratch may live on it **outside** `oxide-pool`, provided it
-    falls back to internal when the drive is absent and never creates
-    `/Volumes/...` on the internal disk.
-- **Final outputs** stay checkout-local unless the drive is in permanent mode.
-- **Approved, not built: the drive mode** (`--mode permanent|ephemeral`,
-  default ephemeral).
-  - In permanent mode, a missing drive gives a **loud** fallback, final outputs
-    go to the drive behind a `target` link that Oxide maintains, and per-slot
-    test scratch goes to the drive.
-  - `oxide pool describe --json` gives agents, scripts and tools a stable,
-    machine-readable description of the drive and pool (#112, being built).
-    Effigy, by Tom's ruling, does not read Oxide; it takes a static,
-    UUID-pinned scratch root.
-- **Slots and accounting:**
-  - Finder metadata in the pool is tolerated (#105);
-  - project-named paths for new slots are approved and being built (#104),
-    not shipped;
-  - pool accounting has pool-specific bounds (#108);
-  - front-door membership checks read only the ledger (#110). New-slot
-    admission and eviction still walk the whole payload, and reuse walks the
-    target slot.
+- **Pools are budget-only:** a soft admission budget, whole-idle-slot eviction
+  and the host-reserve watchdog, with no OS-enforced cap.
+- **Internal pool:** `~/Dev/oxide`, with a 100 GB budget. Config follows
+  Longhorn's storage-location policy, through Longhorn's own resolver once
+  #103 lands.
+- **The Builds drive** is the preferred pool:
+  - a registered removable APFS volume, permanently attached and treated as
+    consumable;
+  - other tools may keep scratch on it outside `oxide-pool`.
+- **Final outputs** stay checkout-local unless the drive is in permanent
+  mode.
+- **Sharing builds:** slots share warm builds across worktrees, sized by the
+  byte budget rather than small fixed counts.
+- **sccache:** Oxide bypasses inherited compiler wrappers. Cargo's own
+  cross-workspace cache is the preferred long-term complement.
 - **Approved, not built:**
-  - per-slot test scratch for processes Oxide launches. An explicit `TMPDIR`
-    still wins;
-  - a configurable host build limit (`[pool] max_active`):
-    - precedence is environment, then config, then the default;
-    - the default is `min(4, max(2, floor(physical cores / 4)))`;
-    - if physical cores can't be read, it falls back to 2 and says so, and
-      never silently uses logical cores;
-    - `oxide status` reports the value and where it came from.
-- **Approved, not built: more slots** (Tom, 2026-10-21, "Oh yeah, raise
-  the slots!").
-  - The pool-wide slot limit rises from 32 to 128, and the per-project limit
-    from 2 to 8.
-  - Once there are enough slots, the byte budget drives eviction: oldest idle
-    first when space runs short, not when a slot count is reached.
-  - Why: the Builds pool sat at the 32-slot limit with 863 GiB free.
-    Longhorn's prototype workspaces held 17 slots, and Effigy's workers were
-    evicting each other's warm slots under the per-project limit of 2.
-- **Parked:** cached slot accounting. Exact caching needs proof that an idle
-  slot is immutable, which doesn't exist yet. Explicit `oxide status` still
-  walks the whole pool and is slow.
-- **sccache:** Oxide bypasses any inherited `rustc-wrapper` (#099). Combining
-  sccache with Oxide is deferred, and revisited only if cold slots prove
-  costly.
+  - the drive's permanent or ephemeral mode;
+  - `oxide pool describe --json`;
+  - per-slot test scratch;
+  - a host build limit derived from core count;
+  - higher slot limits with budget-driven eviction.
+
+  Details live in their Queue leads and, once built, in the
+  [workflow contract](contracts/workflow.md).
+- **Parked:** cached slot accounting.
 
 ### Adoption pattern
 
-- **How a project switches:** its Effigy selectors call `oxide`. Scripts that
-  choose their own `CARGO_TARGET_DIR`, container builds, Queue hooks and tools
-  that run Cargo themselves stay on Cargo (until `oxide exec` covers them).
-- **Approved, Effigy to build: a program fallback.** It replaces per-selector
-  `:cargo` escapes and project-side CI switches.
-  - **Config:** `[programs.oxide] fallback = "cargo"`, with an optional `allow`
-    list and a `force` switch.
-  - **When `oxide` doesn't resolve, or `force` is set:** Effigy runs `cargo`
-    with exact arguments through a run-scoped PATH alias, with an honest notice
-    each run.
-  - **Without `allow`,** Oxide-only commands take Cargo's meaning. For example,
-    `oxide clean` becomes `cargo clean`.
-  - **Documentation condition:** `effigy help` and the Effigy skill must
-    document these conditions.
-- **Parked: the Oxide CI shim** (`setup-oxide`), for Effigy-run CI.
-- **Projects on Oxide** are tracked in Queue lead `f4813b68`. Nucleus adoption
-  is off.
+- **How a project switches:** its Effigy selectors call `oxide`. Anything that
+  owns its own target directory, or runs in a container, stays on Cargo. The
+  full rules are in the
+  [workflow contract](contracts/workflow.md#switching-an-existing-project).
+- **The fallback to Cargo is Effigy's,** through a generic per-program
+  fallback that Effigy owns and documents. It replaces per-selector `:cargo`
+  escapes and project-side CI switches. Oxide ships no CI shim.
+- **Projects on Oxide** are tracked in Queue. Nucleus adoption is off.
 
 ### Toolchain support
 
