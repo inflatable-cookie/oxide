@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Focused proof for `oxide pool describe --json` (oxide#112). HELD.
+"""Focused proof for `oxide pool describe --json` (oxide#112).
 
-Status: NOT RUN. `RUN_BOUND` is False, so the script refuses with exit 2
-before any effect: no staging, no fixture, no child process. `--plan` prints
+Status: gate open (`RUN_BOUND` is True). The owner cleared the apparatus gate
+at 53ec48e4 and the one authorised native run is recorded on PR #104. With the
+gate closed the script refuses with exit 2 before any effect. `--plan` prints
 this docstring and has no effect. A refusal is not a proof.
 
 Binding: the script runs only inside the qualified shared runner (oxide#109),
@@ -30,7 +31,7 @@ session, sends no group signal and runs no per-child supervision. A child
 timeout kills only the direct child PID, records closure unknown and fails.
 The runner then keeps the scratch.
 
-Plan, if the gate is opened and the seed bound is decided by the owner:
+Plan:
 1. Staging: one offline, locked `cargo build --bin oxide` from HEAD, debug
    profile, into owned `target/` and `build/` (CARGO_TARGET_DIR,
    CARGO_BUILD_BUILD_DIR). CARGO_HOME is owned. Its seed is selected from
@@ -101,13 +102,12 @@ import time
 import uuid
 from pathlib import Path
 
-# The gate. Keep False until the owner decides the registry seed bound and
-# opens the gate. Changing it is an owner action, not a fix.
-RUN_BOUND = False
-HOLD = (
-    "HELD: rust:pool-describe has not been run. The lockfile-driven seed awaits "
-    "source inspection and the owner's gate decision (see the script docstring). "
-    "Nothing was staged, built or run."
+# The gate. Opened by the owner after the apparatus PASS (53ec48e4) for the one
+# authorised native run. Setting it back to False is an owner action, not a fix.
+RUN_BOUND = True
+CLOSED = (
+    "CLOSED: RUN_BOUND is False. rust:pool-describe did not run; nothing was "
+    "staged, built or executed."
 )
 OWNED_LIMIT_BYTES = 512 * 1024 * 1024
 # Aggregate bound on every byte the seeder copies, checked before each write.
@@ -668,7 +668,7 @@ def main() -> int:
         print(__doc__)
         return 0
     if not RUN_BOUND:
-        print(HOLD, file=sys.stderr)
+        print(CLOSED, file=sys.stderr)
         return 2
     return run_proof()
 
