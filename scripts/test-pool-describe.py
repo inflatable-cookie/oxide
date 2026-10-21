@@ -71,8 +71,9 @@ Explicit coverage gaps. Not passes:
   volume.
 - Pending reconciliation and missing control through the CLI need the same
   mount. Library tests cover them.
-- Live `diskutil` and `plutil` timeouts and caps are unit-tested with real
-  subprocesses, not through this script.
+- Live `diskutil` and `plutil` output caps are unit-tested with real
+  subprocesses, not through this script. The 5 s timeout has no test anywhere:
+  its code path is written but unexercised, so no timeout behaviour is claimed.
 - Cargo descendants: this script makes no closure claim for them. The runner
   decides closure, and only for the cooperative session. Arbitrary same-user
   writers that leave the session are outside its promise.

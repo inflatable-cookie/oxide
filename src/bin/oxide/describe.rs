@@ -52,6 +52,9 @@ struct Removable {
     mount_point: Option<String>,
     volume_uuid: Option<String>,
     mode: &'static str,
+    /// The registered reserve. A writer rechecks free space against it at use
+    /// time: `available` is only a snapshot.
+    reserve_bytes: Option<u64>,
     available: bool,
     unavailable_reason: Option<&'static str>,
     unavailable_detail: Option<String>,
@@ -156,6 +159,7 @@ fn describe(configured: &Path) -> Result<Description, String> {
                 mount_point: None,
                 volume_uuid: None,
                 mode: MODE,
+                reserve_bytes: None,
                 available: false,
                 unavailable_reason: Some(Reason::MetadataUnknown.tag()),
                 unavailable_detail: Some(detail),
@@ -176,6 +180,7 @@ fn describe(configured: &Path) -> Result<Description, String> {
                 mount_point: Some(lossy(&registration.mount_point)),
                 volume_uuid: Some(registration.volume_uuid.clone()),
                 mode: MODE,
+                reserve_bytes: Some(registration.reserve_bytes),
                 available,
                 unavailable_reason: reason,
                 unavailable_detail: detail,
@@ -479,6 +484,7 @@ mod tests {
             mount_point: None,
             volume_uuid: None,
             mode: MODE,
+            reserve_bytes: None,
             available: false,
             unavailable_reason: Some(Reason::MetadataUnknown.tag()),
             unavailable_detail: Some("bad \"json\"\\\n".to_owned()),
@@ -489,10 +495,28 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert!(json["mount_point"].is_null());
         assert!(json["volume_uuid"].is_null());
+        assert!(json["reserve_bytes"].is_null());
         assert_eq!(json["mode"], "ephemeral");
         assert_eq!(json["available"], false);
         assert_eq!(json["unavailable_reason"], "metadata_unknown");
         assert_eq!(json["unavailable_detail"], "bad \"json\"\\\n");
+    }
+
+    #[test]
+    fn registered_reserve_is_reported_as_a_number() {
+        let removable = Removable {
+            mount_point: Some("/Volumes/Builds".to_owned()),
+            volume_uuid: Some("A6AC3ED7-33EA-46B4-8082-7254CF291ED2".to_owned()),
+            mode: MODE,
+            reserve_bytes: Some(20 * 1024 * 1024 * 1024),
+            available: false,
+            unavailable_reason: Some(Reason::Absent.tag()),
+            unavailable_detail: None,
+            payload: Some("/Volumes/Builds/oxide-pool".to_owned()),
+            suggested_scratch_root: Some("/Volumes/Builds/scratch".to_owned()),
+        };
+        let json: serde_json::Value = serde_json::to_value(&removable).unwrap();
+        assert_eq!(json["reserve_bytes"], 20_u64 * 1024 * 1024 * 1024);
     }
 
     #[test]

@@ -83,7 +83,8 @@ Oxide says the gate refused a slot, it builds cold instead; that is safe.
 - `oxide pool describe --json` (macOS): the registered drive as stable JSON
   (schema `oxide.pool.describe/1`). Branch on `available`, not on reason
   strings. It changes nothing. The answer is a snapshot: before writing into
-  `suggested_scratch_root`, recheck the volume UUID and mount root. The
+  `suggested_scratch_root`, recheck the volume UUID, the mount root and free
+  space above `reserve_bytes`. The
   suggestion is not write permission, and nothing writes under `payload`.
 - `oxide status --launch-check` (macOS) times a new executable's first launch
   against a re-run, in about a second. Above 30 ms it names the app to add
