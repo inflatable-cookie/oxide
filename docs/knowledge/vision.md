@@ -105,9 +105,10 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   consistently reliable.
 - **Adoption** happens through the `oxide init` agent-docs block, the Oxide
   skill and each project's Effigy selectors.
-- **Crash recovery:** Oxide recovers its own interrupted commands. A process
-  that is positively gone (`ESRCH`) can be recovered; an unknown or `EPERM`
-  holder stays held.
+- **Crash recovery:** Oxide recovers its own interrupted commands. A
+  recovery requires a free record lock and matching lease ownership, plus
+  either an empty Cargo process group (`ESRCH`) or a recorded pre-launch
+  state. An unknown or `EPERM` holder stays held.
 - **`oxide exec -- <tool>`** runs Cargo-wrapping tools such as the Tauri CLI
   with Oxide storage (#107). When a checkout's slot is busy, a further command
   in that checkout takes a compatible spare slot. Whether Tauri honours
@@ -131,6 +132,7 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   - admission cap 750 GB, reserve 100 GB;
   - since 2026-10-21 it is permanently attached;
   - its root is `755`;
+  - it is treated as consumable, so Oxide should report its writes;
   - non-Oxide scratch may live on it **outside** `oxide-pool`, provided it
     falls back to internal when the drive is absent and never creates
     `/Volumes/...` on the internal disk.
@@ -141,16 +143,23 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
     go to the drive behind a `target` link that Oxide maintains, and per-slot
     test scratch goes to the drive.
   - `oxide pool describe --json` publishes the drive details for other tools.
-- **Slots:**
+- **Slots and accounting:**
   - Finder metadata in the pool is tolerated (#105);
-  - new slots get project-named paths (#104);
+  - project-named paths for new slots are approved and being built (#104),
+    not shipped;
   - pool accounting has pool-specific bounds (#108);
-  - ordinary commands read only the ledger, with no whole-pool walks (#110).
+  - front-door membership checks read only the ledger (#110). New-slot
+    admission and eviction still walk the whole payload, and reuse walks the
+    target slot.
 - **Approved, not built:**
   - per-slot test scratch for processes Oxide launches. An explicit `TMPDIR`
     still wins;
-  - a host build limit derived from core count, `min(4, max(2, cores/4))`,
-    configurable as `[pool] max_active`.
+  - a configurable host build limit (`[pool] max_active`):
+    - precedence is environment, then config, then the default;
+    - the default is `min(4, max(2, floor(physical cores / 4)))`;
+    - if physical cores can't be read, it falls back to 2 and says so, and
+      never silently uses logical cores;
+    - `oxide status` reports the value and where it came from.
 - **Parked:** cached slot accounting. Exact caching needs proof that an idle
   slot is immutable, which doesn't exist yet. Explicit `oxide status` still
   walks the whole pool and is slow.
@@ -180,9 +189,12 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 
 ### Toolchain support
 
-- **Supported range:** version-sensitive behaviour is qualified for stable Rust
-  1.95 and later. Outside the qualified range those features turn off rather
-  than guessing.
+- **Supported range:** the target is stable Rust 1.95 and later.
+  Version-sensitive behaviour is qualified per exact pinned toolchain.
+  - The qualified pins are listed in the workflow contract's Cargo version
+    matrix.
+  - Newer or patch versions are not assumed to qualify.
+  - Any unqualified version turns those features off rather than guessing.
 - **Next upgrade point:** Rust 1.100. Qualifying on it after release is
   approved.
 
@@ -208,8 +220,9 @@ the operating rules.
 - **Until #109 qualifies,** native proofs use only the task-specific exceptions
   Tom granted: main's old `scripts/bounded-test.py` at `3d947a9`, with its gaps
   disclosed per task.
-  - **Standard tasks:** #110 and #106 (route C), and #104 ("#104 only for
-    now").
+  - **Standard tasks:** #110 and #106 (route C). #104 has one corrected
+    author native session ("#104 only for now"), not a task-wide exception;
+    Queue holds its later counts.
   - **Elevated tasks:** route B covers #107, #098 and #100.
   - **Not covered:** new tasks don't inherit these exceptions.
 
