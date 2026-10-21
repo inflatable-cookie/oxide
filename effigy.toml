@@ -117,6 +117,19 @@ run = "python3 scripts/test-oxide-removable-pool.py --budget-default"
 admission = "heavy"
 run = "python3 scripts/bounded-test.py python3 scripts/test-pool-scale.py"
 
+# Front-door accounting routes (oxide#110): stages this clean HEAD's debug
+# `oxide` offline with 1.97.1; its walk observer logs every inventory walk
+# root. On one private directory pool with an idle slot of more than 200,000
+# entries, ordinary reuse walks only its target slot, status and readiness
+# keep full walks, waits and recovery walk nothing, and new-slot admission
+# keeps its whole-payload walks around eviction (hard links counted once).
+# 300 s and 512 MiB owned scratch including cleanup, under the old session
+# supervisor of `test rust`; reserve and scratch sampled at phase
+# boundaries only. Not a benchmark and not full QA.
+[tasks."rust:front-door-accounting"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py python3 scripts/test-front-door-accounting.py"
+
 # Finder metadata (oxide#105): a short fixed script under heavy admission
 # (deadline checked before each child, 20 GiB reserve sampled every 250 ms
 # while it runs, owned bytes between phases, one 300 s budget, child

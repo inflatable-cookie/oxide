@@ -399,7 +399,7 @@ pub fn previous_registration(internal: &Store) -> Option<PathBuf> {
 
 /// Whether the internal pool holds `slot`; otherwise a removable one may.
 fn internal_holds(internal: &Store, slot: &str) -> Result<bool, String> {
-    Ok(internal.status()?.slots.iter().any(|held| {
+    Ok(internal.ledger()?.slots.iter().any(|held| {
         held.slot_id == slot && held.state == oxide_storage::lease::SlotOccupancy::Held
     }))
 }

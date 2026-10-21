@@ -1428,3 +1428,234 @@ fn pool_bounds_are_separate_from_the_inventory_defaults() {
     );
     assert_eq!(walk.coverage, AccountingCoverage::Complete);
 }
+
+/// Roots `body` walked, relative to the pool's payload, in walk order.
+#[cfg(debug_assertions)]
+fn walked<T>(pool: &Path, body: impl FnOnce() -> T) -> (T, Vec<String>) {
+    let (result, roots) = crate::inventory::walk_observer::observe(body);
+    let payload = pool.join("payload");
+    let roots = roots
+        .iter()
+        .map(|root| match root.strip_prefix(&payload) {
+            Ok(relative) if relative.as_os_str().is_empty() => "payload".to_owned(),
+            Ok(relative) => relative.display().to_string(),
+            Err(_) => root.display().to_string(),
+        })
+        .collect();
+    (result, roots)
+}
+
+fn ledger_injected(pool: &Path) -> Result<super::LedgerView, LeaseError> {
+    managed::ledger_view(pool)
+}
+
+/// The view is status's membership, field for field, with no walk; status
+/// keeps its whole-payload walk and one walk per slot.
+#[cfg(debug_assertions)]
+#[test]
+fn ledger_view_is_status_membership_without_walks() {
+    let fx = Fixture::new("view");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 64 * 1024 * 1024).expect("init");
+    let workspace = fx.dir("workspace");
+    let idle_project = fx.dir("idle-project");
+    let held_project = fx.dir("held-project");
+    let idle = lease_injected(request(&pool, &idle_project, &workspace, "idle")).expect("idle");
+    fill(&idle.env.cargo_build_build_dir, 200);
+    release_injected(&pool, &idle.lease_id).expect("release");
+    let held = lease_injected(request(&pool, &held_project, &workspace, "held")).expect("held");
+
+    let (view, view_walks) = walked(&pool, || ledger_injected(&pool));
+    let view = view.expect("view");
+    assert!(view_walks.is_empty(), "{view_walks:?}");
+    let (status, status_walks) = walked(&pool, || status_injected(&pool));
+    let status = status.expect("status");
+    assert_eq!(
+        status_walks,
+        vec![
+            "payload".to_owned(),
+            format!("slots/{}", idle.slot_id),
+            format!("slots/{}", held.slot_id),
+        ]
+    );
+    let members: Vec<super::LedgerSlot> = status.slots.iter().map(Into::into).collect();
+    assert_eq!(view.slots, members);
+    assert_eq!(
+        (&view.store_id, &view.backend, view.cap_bytes),
+        (&status.store_id, &status.backend, status.cap_bytes)
+    );
+    assert_eq!(view.backend, BUDGET_BACKEND_DIRECTORY_V1);
+    assert!(!view.reconciliation_blocked);
+    let held_member = view
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == held.slot_id)
+        .expect("held member");
+    assert_eq!(held_member.state, SlotOccupancy::Held);
+    assert_eq!(held_member.holder.as_deref(), Some("held"));
+    assert_eq!(
+        held_member.lease_id.as_deref(),
+        Some(held.lease_id.as_str())
+    );
+    let idle_member = view
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == idle.slot_id)
+        .expect("idle member");
+    assert_eq!(
+        (idle_member.holder.as_ref(), idle_member.lease_id.as_ref()),
+        (None, None)
+    );
+}
+
+/// Reuse walks only its target slot and returns that walk; a held replay
+/// walks and measures nothing; a new slot keeps the whole-payload admission
+/// walk and has no measurement.
+#[cfg(debug_assertions)]
+#[test]
+fn reuse_walks_only_its_slot_and_returns_that_measurement() {
+    let fx = Fixture::new("measured");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 64 * 1024 * 1024).expect("init");
+    let workspace = fx.dir("workspace");
+    let target = fx.dir("target-project");
+    let other = fx.dir("other-project");
+    let (first, first_walks) = walked(&pool, || {
+        managed::lease_measured(request(&pool, &target, &workspace, "a"))
+    });
+    let first = first.expect("new slot");
+    assert_eq!(first.measured, None);
+    assert!(!first.grant.reused_slot);
+    assert_eq!(first_walks, vec!["payload".to_owned()]);
+    fs::write(
+        first.grant.env.cargo_build_build_dir.join("blob"),
+        vec![7_u8; 256 * 1024],
+    )
+    .expect("blob");
+    release_injected(&pool, &first.grant.lease_id).expect("release");
+    let unrelated = lease_injected(request(&pool, &other, &workspace, "b")).expect("other");
+    fill(&unrelated.env.cargo_build_build_dir, 300);
+    release_injected(&pool, &unrelated.lease_id).expect("release other");
+    let expected = status_injected(&pool)
+        .expect("status")
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == first.grant.slot_id)
+        .and_then(|slot| slot.unique_allocated_bytes)
+        .expect("target size");
+
+    let (reused, reuse_walks) = walked(&pool, || {
+        managed::lease_measured(request(&pool, &target, &workspace, "c"))
+    });
+    let reused = reused.expect("reuse");
+    assert!(reused.grant.reused_slot);
+    assert_eq!(reuse_walks, vec![format!("slots/{}", first.grant.slot_id)]);
+    assert_eq!(
+        reused.measured,
+        Some(super::ReuseMeasurement {
+            slot_id: first.grant.slot_id.clone(),
+            incarnation: first.grant.incarnation.clone(),
+            unique_allocated_bytes: expected,
+        })
+    );
+
+    let (replay, replay_walks) = walked(&pool, || {
+        managed::lease_measured(request(&pool, &target, &workspace, "c"))
+    });
+    let replay = replay.expect("replay");
+    assert_eq!(replay.grant.lease_id, reused.grant.lease_id);
+    assert!(replay.grant.reused_slot);
+    assert_eq!(replay.measured, None);
+    assert!(replay_walks.is_empty(), "{replay_walks:?}");
+}
+
+/// The view refuses where status does: a zero slot ID and a slot-root
+/// lookup error, with the same errors. A missing held root stays a member,
+/// and partial accounting or a symlinked root does not gate it, as in status.
+#[test]
+fn ledger_view_keeps_status_refusals_and_non_gating_gaps() {
+    let fx = Fixture::new("view-refusals");
+    let workspace = fx.dir("workspace");
+
+    let zero = fx.dir("zero-pool");
+    create_injected(&zero, 1024 * 1024).expect("init zero");
+    let zero_project = fx.dir("zero-project");
+    lease_injected(request(&zero, &zero_project, &workspace, "z")).expect("lease");
+    let ledger_path = zero.join("ledger.json");
+    let mut ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ledger_path).expect("ledger")).expect("ledger json");
+    ledger["slots"][0]["id"] = serde_json::json!(0);
+    fs::write(&ledger_path, serde_json::to_vec(&ledger).expect("encode")).expect("rewrite");
+    assert_eq!(
+        status_injected(&zero).map(|_| ()),
+        Err(LeaseError::UnknownAccounting)
+    );
+    assert_eq!(
+        ledger_injected(&zero).map(|_| ()),
+        Err(LeaseError::UnknownAccounting)
+    );
+
+    let denied = fx.dir("denied-pool");
+    create_injected(&denied, 1024 * 1024).expect("init denied");
+    let denied_project = fx.dir("denied-project");
+    lease_injected(request(&denied, &denied_project, &workspace, "d")).expect("lease");
+    let slots = denied.join("payload").join("slots");
+    fs::set_permissions(&slots, fs::Permissions::from_mode(0o000)).expect("deny");
+    let from_status = status_injected(&denied).map(|_| ());
+    let from_view = ledger_injected(&denied).map(|_| ());
+    fs::set_permissions(&slots, fs::Permissions::from_mode(0o700)).expect("restore");
+    assert!(
+        matches!(from_status, Err(LeaseError::Io(_))),
+        "{from_status:?}"
+    );
+    assert_eq!(from_view, from_status);
+
+    let gaps = fx.dir("gaps-pool");
+    create_injected(&gaps, 64 * 1024 * 1024).expect("init gaps");
+    let missing_project = fx.dir("missing-project");
+    let deep_project = fx.dir("deep-project");
+    let linked_project = fx.dir("linked-project");
+    let missing = lease_injected(request(&gaps, &missing_project, &workspace, "m")).expect("m");
+    let deep = lease_injected(request(&gaps, &deep_project, &workspace, "p")).expect("p");
+    fill(&deep.env.cargo_build_build_dir, 50);
+    release_injected(&gaps, &deep.lease_id).expect("release deep");
+    let linked = lease_injected(request(&gaps, &linked_project, &workspace, "l")).expect("l");
+    release_injected(&gaps, &linked.lease_id).expect("release linked");
+    let gap_slots = gaps.join("payload").join("slots");
+    fs::remove_dir_all(gap_slots.join(&missing.slot_id)).expect("remove held root");
+    let external = fx.dir("external");
+    fs::remove_dir_all(gap_slots.join(&linked.slot_id)).expect("remove linked root");
+    symlink(&external, gap_slots.join(&linked.slot_id)).expect("symlinked root");
+    let (status, view) = with_accounting_limits(10, 64, 5_000, || {
+        (status_injected(&gaps), ledger_injected(&gaps))
+    });
+    let status = status.expect("status stays readable");
+    let view = view.expect("view stays readable");
+    assert_eq!(status.coverage, AccountingCoverage::Unknown);
+    let members: Vec<super::LedgerSlot> = status.slots.iter().map(Into::into).collect();
+    assert_eq!(view.slots, members);
+    let held = view
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == missing.slot_id)
+        .expect("missing held root is still a member");
+    assert_eq!(held.state, SlotOccupancy::Held);
+    assert_eq!(held.lease_id.as_deref(), Some(missing.lease_id.as_str()));
+    // Reuse still needs its own walk complete.
+    let refused = with_accounting_limits(10, 64, 5_000, || {
+        lease_injected(request(&gaps, &deep_project, &workspace, "p2"))
+    });
+    assert_eq!(incomplete(refused).coverage, AccountingCoverage::Partial);
+}
+
+/// A foreign pool entry refuses both before any slot is read.
+#[test]
+fn ledger_view_refuses_a_foreign_pool_entry_like_status() {
+    let fx = Fixture::new("view-foreign");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024).expect("init");
+    fs::write(pool.join("stray"), b"foreign").expect("stray");
+    let expected = unexpected("pool directory", "stray");
+    assert_eq!(status_injected(&pool).map(|_| ()), Err(expected.clone()));
+    assert_eq!(ledger_injected(&pool).map(|_| ()), Err(expected));
+}

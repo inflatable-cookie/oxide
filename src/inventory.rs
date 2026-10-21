@@ -326,6 +326,8 @@ pub fn inventory_directory(
     root: &Path,
     limits: InventoryLimits,
 ) -> Result<InventoryReport, InventoryError> {
+    #[cfg(debug_assertions)]
+    walk_observer::record(root);
     limits.validate()?;
     let canonical = fs::canonicalize(root).map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => InventoryError::RootMissing(root.to_path_buf()),
@@ -950,6 +952,61 @@ fn bound_utf8(text: String, limit: usize) -> Rendered {
     Rendered {
         bytes: bounded,
         truncated: true,
+    }
+}
+
+/// Debug builds only, absent from release: the root of every
+/// [`inventory_directory`] walk, so tests and focused proofs can see which
+/// accounting walks a command made (oxide#110). It never changes a walk.
+#[cfg(debug_assertions)]
+pub mod walk_observer {
+    use std::cell::RefCell;
+    use std::fs::OpenOptions;
+    use std::io::Write as _;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::{Path, PathBuf};
+
+    /// An absolute file path: each walk appends its root as one line.
+    pub const LOG_ENV: &str = "OXIDE_TEST_WALK_LOG";
+
+    thread_local! {
+        static RECORDED: RefCell<Option<Vec<PathBuf>>> = const { RefCell::new(None) };
+    }
+
+    /// Run `body` and return the roots this thread walked during it.
+    pub fn observe<T>(body: impl FnOnce() -> T) -> (T, Vec<PathBuf>) {
+        let outer = RECORDED.with(|cell| cell.replace(Some(Vec::new())));
+        let result = body();
+        let walked = RECORDED
+            .with(|cell| cell.replace(outer))
+            .unwrap_or_default();
+        (result, walked)
+    }
+
+    pub(super) fn record(root: &Path) {
+        RECORDED.with(|cell| {
+            if let Some(walked) = cell.borrow_mut().as_mut() {
+                walked.push(root.to_path_buf());
+            }
+        });
+        let Some(log) = std::env::var_os(LOG_ENV) else {
+            return;
+        };
+        let log = Path::new(&log);
+        let mut line = root.as_os_str().as_bytes().to_vec();
+        line.push(b'\n');
+        let written = log.is_absolute()
+            && OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(log)
+                .and_then(|mut file| file.write_all(&line))
+                .is_ok();
+        if !written {
+            eprintln!("oxide: walk log {} not written", log.display());
+        }
     }
 }
 
