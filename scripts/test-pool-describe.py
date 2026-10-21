@@ -1,90 +1,80 @@
 #!/usr/bin/env python3
 """Focused proof for `oxide pool describe --json` (oxide#112). HELD.
 
-Status: PROPOSED and NOT RUN. The default gate below is `RUN_BOUND = False`.
-With the gate closed the script refuses, exit 2, before any effect: no
-staging, no fixture, no child process. Its `--plan` flag prints this
-docstring and has no effect. Existence of this file is not permission to run
-it, and a refusal is not a proof.
+Status: NOT RUN. `RUN_BOUND` is False, so the script refuses with exit 2
+before any effect: no staging, no fixture, no child process. `--plan` prints
+this docstring and has no effect. A refusal is not a proof.
 
-Activation requires BOTH an owner-bound qualified #109 shared runner, or
-Tom's explicit task-specific exception for oxide#112, AND changing RUN_BOUND.
-Neither has happened. No old-guard exception is granted here.
+Binding: the script runs only inside the qualified shared runner (oxide#109),
+`scripts/bounded-test.py`, delivered at e86906fe with SHA-256
+8e379c93416c6e06b7f06bec7f86dba4fca4c8900b1cc87f1eb6303d39897a9d. The
+selector runs it as
 
-Proposed invocation after binding, as an outer old-guard wrapper (exact
-unchanged `scripts/bounded-test.py`, SHA-256
-9dffe4f3cb8cbb7de33fc50798986cd7a9860cb55b3aee66942b1a0ea9c49344):
+    python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-pool-describe.py
 
-    python3 scripts/bounded-test.py python3 scripts/test-pool-describe.py
+Under the runner the script takes these from the environment:
+- OXIDE_TASK_SCRATCH_ROOT, with the same value in TMPDIR, TMP and TEMP. Every
+  staging, fixture and output write goes under this monitored root. Nothing
+  is created in a sibling /private/tmp tree.
+- OXIDE_PROOF_EVIDENCE, a directory the runner never removes. Child logs,
+  provenance and any unknown-case evidence go here.
+- OXIDE_PROOF_DEADLINE_NS, an absolute CLOCK_UPTIME_RAW deadline. The script
+  reads it directly and keeps a shutdown margin before it. It does not start
+  a fresh 300 s.
+Without these variables the script refuses. It never falls back to its own
+clock or its own root.
 
-Proposed run (300 s wall clock, 512 MiB owned bytes, 20 GiB host reserve,
-heavy admission):
+Closure and cleanup belong to the runner. The script deletes nothing. Its
+children inherit the runner's cooperative session: the script starts no
+session, sends no group signal and runs no per-child supervision. A child
+timeout kills only the direct child PID, records closure unknown and fails.
+The runner then keeps the scratch.
 
-1. Candidate staging. One offline, locked `cargo build --bin oxide` from this
-   checkout's HEAD, debug profile, into an owned `target/` and an owned
-   `build/` directory (CARGO_TARGET_DIR and CARGO_BUILD_BUILD_DIR). CARGO_HOME
-   is owned: Cargo never opens the host CARGO_HOME. The owned copy is seeded
-   from the host registry (read only, 256 MiB bound; over it the run stops).
-   The toolchain is pinned to rust-toolchain.toml's channel through
-   RUSTUP_TOOLCHAIN, with RUSTUP_AUTO_INSTALL=0 so nothing installs or
-   downloads. Inherited CARGO_*, RUSTC*, RUSTFLAGS, RUSTDOC, SCCACHE_* and
-   wrapper routing are scrubbed. Staging inherits the HOME, RUSTUP_HOME and
-   toolchain location of the host: that is an explicit read and lookup
-   exposure, not a private HOME. The commit, tree and artifact SHA-256 are
-   logged, and the artifact must resolve inside the owned root.
-2. Every child, staging included, runs with four canonical temp variables
-   (OXIDE_TASK_SCRATCH_ROOT, TMPDIR, TMP, TEMP) all equal to the owned root.
-   Case children also get a private HOME and OXIDE_POOL and a minimal PATH.
-   Children inherit the outer runner's session and process group. This script
-   starts no session and sends no group signal.
-3. Phase-boundary checks, not continuous: host free space above 20 GiB, and
-   owned bytes at or below 512 MiB (lstat walk, st_blocks), before staging,
-   after staging, after each case and before cleanup. Outputs go to owned
-   files, not pipes, and are counted.
-4. Cases, each with exit code, schema, escaping and before/after nonmutation.
-   The snapshot covers every file's bytes, every directory's presence, every
-   symlink target, and each entry's mode, mtime and ctime, so an empty
-   control-directory creation is caught.
-   a. no registration: `removable` is null, `selected` is "internal", and the
+Plan, if the gate is opened and the seed bound is decided by the owner:
+1. Staging: one offline, locked `cargo build --bin oxide` from HEAD, debug
+   profile, into owned `target/` and `build/` (CARGO_TARGET_DIR,
+   CARGO_BUILD_BUILD_DIR). CARGO_HOME is owned and seeded by a read of the
+   host registry. The seed is refused if it holds any symlink or special
+   entry, and if it exceeds 256 MiB. RUSTUP_TOOLCHAIN is the
+   rust-toolchain.toml channel, RUSTUP_AUTO_INSTALL=0, and inherited
+   CARGO*/RUSTC*/RUSTFLAGS/RUSTDOC/SCCACHE*/OXIDE_* routing is scrubbed.
+   Staging keeps the host HOME and RUSTUP_HOME (explicit read exposure, not
+   private). The commit, tree and artifact SHA-256 go to the evidence
+   directory.
+2. Each case: exit code, schema, escaping, and before/after nonmutation of
+   the case tree (bytes, directories, symlinks, mode and times).
+   a. no registration: `removable` is null, `selected` is "internal", the
       pool directory is not created;
    b. unknown registration (invalid `removable.json`): null identity fields,
       `unavailable_reason` "metadata_unknown", escaped `unavailable_detail`;
    c. absent volume (valid registration to a random unmounted /Volumes name):
-      reason "absent", `available` false, payload `<mount>/oxide-pool`, scratch
-      `<mount>/scratch` outside payload, and no /Volumes path created;
+      reason "absent", `available` false, payload `<mount>/oxide-pool`,
+      scratch `<mount>/scratch` outside payload, no /Volumes path created;
    d. CLI refusal: `oxide pool describe` without `--json` exits nonzero with
       the usage text on stderr and changes nothing.
-5. Cleanup. The owned root is removed only after every case passes and every
-   every child has exited normally. A timeout, exception or unknown closure
-   retains it and prints the path. Retaining is not a closure claim.
+3. Phase checks: host free space above 20 GiB and owned bytes at or below
+   512 MiB, at phase boundaries. These are samples. The runner's monitor is
+   the enforcing check.
 
-Timeouts and custody: each child gets the remaining wall-clock budget as its
-timeout. On expiry this script kills only its direct child PID, then fails
-with closure unknown. Any timeout, exception or unknown closure retains the
-owned root. The outer approved shared runner owns custody and the deadline.
-Without an approved runner this script makes no claim that its children, or
-any Cargo descendant, have closed.
-
-Explicit coverage gaps. These are not passes:
+Explicit coverage gaps. Not passes:
 - `available: true`, and every volume-dependent refusal (identity mismatch,
-  volume_unusable, below_reserve, payload_missing), needs a mounted APFS volume.
-  This proof mounts none, so these are uncovered here. Library and unit tests
-  cover them without a volume.
+  volume_unusable, below_reserve, payload_missing), needs a mounted APFS
+  volume. This proof mounts none. Library and unit tests cover them without a
+  volume.
 - Pending reconciliation and missing control through the CLI need the same
   mount. Library tests cover them.
-- Live diskutil and plutil timeouts and caps are unit-tested with real
+- Live `diskutil` and `plutil` timeouts and caps are unit-tested with real
   subprocesses, not through this script.
-- The host reserve and owned bytes are checked at phase boundaries only. The
-  guard that would watch them continuously (`scripts/bounded_runner.py`) is not
-  wired and is not qualified. The old guard (`scripts/bounded-test.py`) has no
-  reserve or owned-bytes monitor. It only escalates on timeout. Phase checks
-  here are samples, not guarantees.
-- Cargo's descendant processes are not proven closed when the leader exits.
-- Staging seeds CARGO_HOME from the host registry, a read of the global cache.
-  The owner decides whether that read is acceptable.
-- Staging reads the host HOME, RUSTUP_HOME and toolchain location. It is not
-  a private HOME.
-- Exit-nonzero for an Oxide internal failure (not usage) is not exercised.
+- Cargo descendants: this script makes no closure claim for them. The runner
+  decides closure, and only for the cooperative session. Arbitrary same-user
+  writers that leave the session are outside its promise.
+- Seed copy race: the preflight checks and `shutil.copytree` are not one
+  no-follow operation. A concurrent change to the shared cache between them
+  could redirect the copy. Disclosed, not closed.
+- Staging reads the host HOME, RUSTUP_HOME, toolchain and registry seed. That
+  is accepted as offline fixture input.
+- Exit-nonzero for an internal Oxide failure is not exercised. Only the usage
+  refusal is.
 """
 
 from __future__ import annotations
@@ -100,59 +90,75 @@ import re
 import shutil
 import stat
 import subprocess
-import tempfile
 import time
 import uuid
 from pathlib import Path
 
-# The gate. Keep this False until the owner binds a qualified #109 runner or
-# Tom's oxide#112 exception. Changing it is an owner action, not a fix.
+# The gate. Keep False until the owner decides the registry seed bound and
+# opens the gate. Changing it is an owner action, not a fix.
 RUN_BOUND = False
 HOLD = (
-    "HELD: rust:pool-describe is a proposal for oxide#112 and has not been run. "
-    "It runs only after the owner binds a qualified #109 shared runner or Tom's "
-    "task-specific exception, and RUN_BOUND is set to True. Nothing was staged, "
+    "HELD: rust:pool-describe has not been run. The registry seed bound and the "
+    "owner's gate decision are open (see the script docstring). Nothing was staged, "
     "built or run."
 )
-PROOF_SECONDS = 300
 OWNED_LIMIT_BYTES = 512 * 1024 * 1024
+SEED_LIMIT_BYTES = 256 * 1024 * 1024
 HOST_RESERVE_BYTES = 20 * 1024 * 1024 * 1024
+# Shutdown margin kept before the runner's absolute deadline.
+DEADLINE_MARGIN_NS = 30 * 1_000_000_000
 REPO = Path(__file__).resolve().parent.parent
-TEMP_VARS = ("OXIDE_TASK_SCRATCH_ROOT", "TMPDIR", "TMP", "TEMP")
-# Staging and every child run with rustup installs disabled.
-AUTO_INSTALL_OFF = {"RUSTUP_AUTO_INSTALL": "0"}
+ROOT_VAR = "OXIDE_TASK_SCRATCH_ROOT"
+TEMP_VARS = (ROOT_VAR, "TMPDIR", "TMP", "TEMP")
+# Runner-owned values that stay: the evidence directory and the absolute deadline.
+RUNNER_KEEP = ("OXIDE_PROOF_EVIDENCE", "OXIDE_PROOF_DEADLINE_NS")
 SCRUB_PREFIXES = ("CARGO", "RUSTC", "RUSTFLAGS", "RUSTDOC", "SCCACHE", "RUSTUP_TOOLCHAIN", "OXIDE_")
+PATH_BASE = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def now_ns() -> int:
+    """The runner's clock: CLOCK_UPTIME_RAW, the same clock as its deadline."""
+    return time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
 
 
 class Proof:
-    """Shared state: the owned root, the deadline and the phase log."""
+    """Shared state: the runner's root, evidence and absolute deadline."""
 
     def __init__(self) -> None:
-        self.started = time.monotonic()
-        self.deadline = self.started + PROOF_SECONDS
-        self.root = Path(tempfile.mkdtemp(prefix="oxide-pool-describe.", dir="/private/tmp")).resolve()
+        missing = [name for name in (ROOT_VAR,) + RUNNER_KEEP if not os.environ.get(name)]
+        if missing:
+            raise RuntimeError(f"run under the qualified shared runner; missing {', '.join(missing)}")
+        self.root = Path(os.environ[ROOT_VAR])
+        if os.path.realpath(self.root) != str(self.root):
+            raise RuntimeError(f"{ROOT_VAR} must be canonical")
+        self.evidence = Path(os.environ["OXIDE_PROOF_EVIDENCE"])
+        self.deadline_ns = int(os.environ["OXIDE_PROOF_DEADLINE_NS"]) - DEADLINE_MARGIN_NS
         self.phases: list[str] = []
-        self.clean_closure = True
+        self.closure_known = True
 
     def remaining(self) -> float:
-        left = self.deadline - time.monotonic()
+        left = self.deadline_ns - now_ns()
         if left <= 0:
-            raise RuntimeError("300 s wall-clock bound reached")
-        return left
+            raise RuntimeError("runner deadline reached before the next step")
+        return left / 1_000_000_000
 
     def env(self, case: Path | None = None, extra: dict | None = None) -> dict:
-        """Scrubbed host env with the four temp vars set to the owned root.
+        """Scrubbed host env. Runner values stay; temp vars point into the root.
 
-        Every inherited OXIDE_* variable is removed, so no host config file
-        (OXIDE_CONFIG) or debug or test override reaches a child. A case gets
-        a private HOME and OXIDE_POOL under its own directory. Staging gets
-        neither: it keeps the host HOME and RUSTUP_HOME, as disclosed.
+        Every inherited OXIDE_* except the two runner values is removed, so no
+        host OXIDE_CONFIG or debug or test override reaches a child. A case
+        gets a private HOME and OXIDE_POOL. Staging gets neither: it keeps the
+        host HOME and RUSTUP_HOME, as disclosed.
         """
-        env = {key: value for key, value in os.environ.items() if not key.startswith(SCRUB_PREFIXES)}
-        env.update(AUTO_INSTALL_OFF)
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(SCRUB_PREFIXES) or key in RUNNER_KEEP
+        }
         for key in TEMP_VARS:
             env[key] = str(self.root)
-        env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+        env["RUSTUP_AUTO_INSTALL"] = "0"
+        env["PATH"] = PATH_BASE
         if case is not None:
             env["HOME"] = str(case / "home")
             env["OXIDE_POOL"] = str(case / "pool")
@@ -170,21 +176,22 @@ class Proof:
         self.phases.append(f"{label}: owned={owned} free={free}")
 
     def run(self, argv: list[str], env: dict, label: str, cwd: Path | None = None) -> tuple[int, str, str]:
-        """Run one child in the inherited session, output to owned files.
+        """Run one child in the inherited session, logs in the evidence directory.
 
-        Timeout kills only this direct child PID and leaves closure unknown:
-        the root is retained and nothing claims that descendants closed.
+        No session or group is started here. A timeout kills only this direct
+        child PID and leaves closure unknown: nothing is deleted and the runner
+        keeps the scratch.
         """
-        out_path = self.root / f"{label}.stdout"
-        err_path = self.root / f"{label}.stderr"
+        out_path = self.evidence / f"{label}.stdout"
+        err_path = self.evidence / f"{label}.stderr"
         with out_path.open("wb") as out, err_path.open("wb") as err:
             proc = subprocess.Popen(argv, env=env, cwd=cwd, stdout=out, stderr=err)
             try:
                 code = proc.wait(timeout=self.remaining())
             except subprocess.TimeoutExpired:
                 proc.kill()
-                self.clean_closure = False
-                raise RuntimeError(f"{label}: wall-clock bound reached; closure unknown")
+                self.closure_known = False
+                raise RuntimeError(f"{label}: runner deadline reached; closure unknown")
         return code, out_path.read_text(errors="replace"), err_path.read_text(errors="replace")
 
 
@@ -219,18 +226,13 @@ def seed_root_present(seed: Path) -> bool:
 
 
 def refuse_seed_entries(seed: Path) -> None:
-    """Refuse any symlink, or anything else but a file or directory, in the seed.
-
-    Checked before the copy, so no link is followed or copied and no external
-    referent is reached. Walk errors raise.
-    """
+    """Refuse any symlink or special entry in the seed, before the copy."""
     for dirpath, dirnames, filenames in os.walk(seed, onerror=_raise):
         for name in dirnames + filenames:
             path = os.path.join(dirpath, name)
             mode = os.lstat(path).st_mode
             if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
                 raise RuntimeError(f"seed entry is not a plain file or directory: {path}")
-
 
 
 def snapshot(root: Path) -> list[tuple]:
@@ -253,48 +255,45 @@ def snapshot(root: Path) -> list[tuple]:
 
 def stage(proof: Proof) -> Path:
     """One offline, locked build of the candidate from this HEAD."""
-    commit = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
-    tree = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD^{tree}"], capture_output=True, text=True, check=True).stdout.strip()
+    git = ["git", "-C", str(REPO)]
+    commit = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    tree = subprocess.run(git + ["rev-parse", "HEAD^{tree}"], capture_output=True, text=True, check=True).stdout.strip()
     channel = re.search(r'channel\s*=\s*"([^"]+)"', (REPO / "rust-toolchain.toml").read_text()).group(1)
     host_cargo_home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
     cargo_home = proof.root / "cargo-home"
+    cargo_home.mkdir()
     registry = host_cargo_home / "registry"
     if seed_root_present(registry):
         refuse_seed_entries(registry)
-        if owned_bytes(registry) > 256 * 1024 * 1024:
-            raise RuntimeError("host registry cache exceeds the 256 MiB seed bound")
+        if owned_bytes(registry) > SEED_LIMIT_BYTES:
+            raise RuntimeError("host registry cache exceeds the 256 MiB seed bound; owner decision needed")
         # Limitation: the checks above and this copy are not one no-follow
         # operation. A concurrent change to the shared cache between them
         # could redirect the copy. Disclosed, not closed.
         shutil.copytree(registry, cargo_home / "registry", symlinks=False)
-    target = proof.root / "target"
-    build = proof.root / "build"
-    env = proof.env(
-        extra={
-            "CARGO_HOME": str(cargo_home),
-            "CARGO_TARGET_DIR": str(target),
-            "CARGO_BUILD_BUILD_DIR": str(build),
-            "RUSTUP_TOOLCHAIN": channel,
-            "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),
-        }
-    )
-    # Cargo's own invocation, resolved from the host PATH before the scrub.
     cargo = shutil.which("cargo")
     if cargo is None:
         raise RuntimeError("cargo is not on the host PATH")
-    code, _, err = proof.run(
-        [cargo, "build", "--offline", "--locked", "--bin", "oxide"],
-        env,
-        "stage",
-        cwd=REPO,
+    env = proof.env(
+        extra={
+            "CARGO_HOME": str(cargo_home),
+            "CARGO_TARGET_DIR": str(proof.root / "target"),
+            "CARGO_BUILD_BUILD_DIR": str(proof.root / "build"),
+            "RUSTUP_TOOLCHAIN": channel,
+            "RUSTUP_HOME": os.environ.get("RUSTUP_HOME", str(Path.home() / ".rustup")),
+            "PATH": f"{Path(cargo).parent}:{PATH_BASE}",
+        }
     )
+    code, _, err = proof.run([cargo, "build", "--offline", "--locked", "--bin", "oxide"], env, "stage", cwd=REPO)
     if code != 0:
         raise RuntimeError(f"staging failed: {err[-400:]}")
-    artifact = (target / "debug" / "oxide").resolve()
+    artifact = (proof.root / "target" / "debug" / "oxide").resolve()
     if not artifact.is_file() or proof.root not in artifact.parents:
         raise RuntimeError("the staged artifact is not inside the owned root")
     digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
-    proof.phases.append(f"stage: commit={commit} tree={tree} toolchain={channel} sha256={digest}")
+    provenance = {"commit": commit, "tree": tree, "toolchain": channel, "artifact_sha256": digest}
+    (proof.evidence / "provenance.json").write_text(json.dumps(provenance, indent=2))
+    proof.phases.append(f"stage: {provenance}")
     return artifact
 
 
@@ -338,7 +337,7 @@ def case_no_registration(proof: Proof, artifact: Path) -> None:
 
 def case_unknown_registration(proof: Proof, artifact: Path) -> None:
     case = proof.root / "case-b"
-    pool = registration_fixture(case, '{"bad": "quote\\"\n')
+    registration_fixture(case, '{"bad": "quote\\"\n')
     before = snapshot(case)
     text = describe(proof, artifact, "case-b", case)
     removable = text["removable"]
@@ -346,7 +345,6 @@ def case_unknown_registration(proof: Proof, artifact: Path) -> None:
     assert removable["unavailable_reason"] == "metadata_unknown", removable
     assert removable["available"] is False and removable["payload"] is None
     assert snapshot(case) == before, "describe changed the fixture"
-    assert pool.is_dir()
 
 
 def case_absent_volume(proof: Proof, artifact: Path) -> None:
@@ -389,8 +387,9 @@ CASES = [case_no_registration, case_unknown_registration, case_absent_volume, ca
 
 
 def run_proof() -> int:
+    """Run the phases. Nothing is deleted: the runner decides closure and cleanup."""
     proof = Proof()
-    cleanup_ok = False
+    summary: dict = {"status": "running", "cases": {}}
     try:
         proof.check_phase("before-staging")
         artifact = stage(proof)
@@ -398,17 +397,18 @@ def run_proof() -> int:
         for case in CASES:
             case(proof, artifact)
             proof.check_phase(case.__name__)
+            summary["cases"][case.__name__] = "ok"
             print(f"ok {case.__name__}")
-        cleanup_ok = proof.clean_closure
+        summary["status"] = "passed"
+        return 0
+    except Exception as error:  # the runner keeps the root and this evidence
+        summary["status"] = f"failed: {error}"
+        print(f"failed: {error}", file=sys.stderr)
+        return 1
     finally:
-        print("phases:", *proof.phases, sep="\n  ")
-        if cleanup_ok:
-            proof.check_phase("before-cleanup")
-            shutil.rmtree(proof.root)
-            print("owned root removed")
-        else:
-            print(f"owned root retained for inspection: {proof.root}")
-    return 0 if cleanup_ok else 1
+        summary["phases"] = proof.phases
+        summary["closure_known"] = proof.closure_known
+        (proof.evidence / "summary.json").write_text(json.dumps(summary, indent=2))
 
 
 def main() -> int:
