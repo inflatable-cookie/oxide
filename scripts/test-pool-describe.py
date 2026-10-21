@@ -201,6 +201,23 @@ def _raise(error: OSError) -> None:
     raise error
 
 
+def seed_root_present(seed: Path) -> bool:
+    """Lstat the seed root before anything follows it.
+
+    Absent: no seed, staging proceeds without one. A symlink or a non-directory
+    refuses. Only a real directory is traversed.
+    """
+    try:
+        mode = os.lstat(seed).st_mode
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(mode):
+        raise RuntimeError(f"seed root is a symlink, refused before following it: {seed}")
+    if not stat.S_ISDIR(mode):
+        raise RuntimeError(f"seed root is not a directory: {seed}")
+    return True
+
+
 def refuse_seed_entries(seed: Path) -> None:
     """Refuse any symlink, or anything else but a file or directory, in the seed.
 
@@ -242,10 +259,13 @@ def stage(proof: Proof) -> Path:
     host_cargo_home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
     cargo_home = proof.root / "cargo-home"
     registry = host_cargo_home / "registry"
-    if registry.is_dir():
+    if seed_root_present(registry):
         refuse_seed_entries(registry)
         if owned_bytes(registry) > 256 * 1024 * 1024:
             raise RuntimeError("host registry cache exceeds the 256 MiB seed bound")
+        # Limitation: the checks above and this copy are not one no-follow
+        # operation. A concurrent change to the shared cache between them
+        # could redirect the copy. Disclosed, not closed.
         shutil.copytree(registry, cargo_home / "registry", symlinks=False)
     target = proof.root / "target"
     build = proof.root / "build"
