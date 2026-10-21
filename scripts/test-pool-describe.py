@@ -33,9 +33,11 @@ The runner then keeps the scratch.
 Plan, if the gate is opened and the seed bound is decided by the owner:
 1. Staging: one offline, locked `cargo build --bin oxide` from HEAD, debug
    profile, into owned `target/` and `build/` (CARGO_TARGET_DIR,
-   CARGO_BUILD_BUILD_DIR). CARGO_HOME is owned and seeded by a read of the
-   host registry. The seed is refused if it holds any symlink or special
-   entry, and if it exceeds 256 MiB. RUSTUP_TOOLCHAIN is the
+   CARGO_BUILD_BUILD_DIR). CARGO_HOME is owned. Its seed is selected from Cargo.lock at HEAD: one
+   crates.io sparse namespace, one index entry and one .crate archive per
+   registry package, with archive bytes checked against the lock checksum.
+   Workspace packages are skipped. Other sources refuse. Symlinks and special
+   entries refuse. Copies stop before any write past the 256 MiB aggregate. RUSTUP_TOOLCHAIN is the
    rust-toolchain.toml channel, RUSTUP_AUTO_INSTALL=0, and inherited
    CARGO*/RUSTC*/RUSTFLAGS/RUSTDOC/SCCACHE*/OXIDE_* routing is scrubbed.
    Staging keeps the host HOME and RUSTUP_HOME (explicit read exposure, not
@@ -68,8 +70,8 @@ Explicit coverage gaps. Not passes:
 - Cargo descendants: this script makes no closure claim for them. The runner
   decides closure, and only for the cooperative session. Arbitrary same-user
   writers that leave the session are outside its promise.
-- Seed copy race: the preflight checks and `shutil.copytree` are not one
-  no-follow operation. A concurrent change to the shared cache between them
+- Seed copy race: the chain checks and each copy are not one no-follow
+  operation. A concurrent change to the shared cache between them
   could redirect the copy. Disclosed, not closed.
 - Staging reads the host HOME, RUSTUP_HOME, toolchain and registry seed. That
   is accepted as offline fixture input.
@@ -98,12 +100,21 @@ from pathlib import Path
 # opens the gate. Changing it is an owner action, not a fix.
 RUN_BOUND = False
 HOLD = (
-    "HELD: rust:pool-describe has not been run. The registry seed bound and the "
-    "owner's gate decision are open (see the script docstring). Nothing was staged, "
-    "built or run."
+    "HELD: rust:pool-describe has not been run. The lockfile-driven seed awaits "
+    "source inspection and the owner's gate decision (see the script docstring). "
+    "Nothing was staged, built or run."
 )
 OWNED_LIMIT_BYTES = 512 * 1024 * 1024
-SEED_LIMIT_BYTES = 256 * 1024 * 1024
+# Aggregate bound on every byte the seeder copies, checked before each write.
+SEED_AGGREGATE_BYTES = 256 * 1024 * 1024
+SEED_CHUNK_BYTES = 1024 * 1024
+# The only registry sources the seed serves: crates.io, git index or sparse.
+CRATES_SOURCES = ("registry+https://github.com/rust-lang/crates.io-index", "sparse+https://index.crates.io/")
+CRATES_NAMESPACE = "index.crates.io-"
+NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+VERSION_RE = re.compile(r"^[0-9]+[.][0-9]+[.][0-9]+(?:[-+][0-9A-Za-z.+-]+)?$")
+CHECKSUM_RE = re.compile(r"^[0-9a-f]{64}$")
+BACKSLASH = chr(92)
 HOST_RESERVE_BYTES = 20 * 1024 * 1024 * 1024
 # Shutdown margin kept before the runner's absolute deadline.
 DEADLINE_MARGIN_NS = 30 * 1_000_000_000
@@ -208,31 +219,234 @@ def _raise(error: OSError) -> None:
     raise error
 
 
-def seed_root_present(seed: Path) -> bool:
-    """Lstat the seed root before anything follows it.
+class SeedRefusal(RuntimeError):
+    """The seed cannot be built safely from the lock and the host cache."""
 
-    Absent: no seed, staging proceeds without one. A symlink or a non-directory
-    refuses. Only a real directory is traversed.
+
+def parse_lock_packages(text: str) -> list[dict]:
+    """Registry packages of a Cargo.lock as {name, version, source, checksum}.
+
+    Fixed grammar: top-level `version = N`, `[[package]]` tables with basic
+    string keys, and `dependencies` arrays of basic strings, which are
+    skipped. A table without `source` is a workspace or path package and is
+    skipped. Any other source, malformed or path-unsafe name, version or
+    checksum, unknown key, or conflicting duplicate refuses.
+    """
+    tables: list[dict] = []
+    current: dict | None = None
+    in_array = False
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if BACKSLASH in line:
+            raise SeedRefusal(f"Cargo.lock:{lineno}: escapes are not supported")
+        if in_array:
+            if line == "]":
+                in_array = False
+            elif not re.match(r'^"[^"]*",?$', line):
+                raise SeedRefusal(f"Cargo.lock:{lineno}: unsupported dependency entry")
+            continue
+        if not line or line.startswith("#"):
+            continue
+        if line == "[[package]]":
+            if current is not None:
+                tables.append(current)
+            current = {}
+            continue
+        match = re.match(r"^([a-z_]+) = (.*)$", line)
+        if not match:
+            raise SeedRefusal(f"Cargo.lock:{lineno}: unsupported line")
+        key, value = match.groups()
+        if current is None:
+            if key == "version" and value.isdigit():
+                continue
+            raise SeedRefusal(f"Cargo.lock:{lineno}: unsupported top-level key {key}")
+        if key == "dependencies":
+            if value == "[]":
+                continue
+            if value == "[":
+                in_array = True
+                continue
+            raise SeedRefusal(f"Cargo.lock:{lineno}: unsupported dependencies value")
+        if key not in ("name", "version", "source", "checksum"):
+            raise SeedRefusal(f"Cargo.lock:{lineno}: unsupported key {key}")
+        string = re.match(r'^"([^"]*)"$', value)
+        if not string:
+            raise SeedRefusal(f"Cargo.lock:{lineno}: {key} is not a basic string")
+        current[key] = string.group(1)
+    if in_array:
+        raise SeedRefusal("Cargo.lock: unterminated dependencies array")
+    if current is not None:
+        tables.append(current)
+
+    packages: list[dict] = []
+    seen: dict[tuple, dict] = {}
+    for table in tables:
+        if "source" not in table:
+            if "checksum" in table:
+                raise SeedRefusal("a package without a source carries a checksum")
+            continue  # workspace or path package: nothing to seed
+        if table["source"] not in CRATES_SOURCES:
+            raise SeedRefusal(f"unsupported registry source: {table['source']}")
+        name = table.get("name", "")
+        version = table.get("version", "")
+        checksum = table.get("checksum", "")
+        if not NAME_RE.match(name):
+            raise SeedRefusal(f"unsafe crate name: {name!r}")
+        if not VERSION_RE.match(version):
+            raise SeedRefusal(f"unsafe crate version: {version!r}")
+        if not CHECKSUM_RE.match(checksum):
+            raise SeedRefusal(f"malformed checksum for {name} {version}")
+        entry = {"name": name, "version": version, "source": table["source"], "checksum": checksum}
+        key = (name, version)
+        if key in seen:
+            if seen[key] != entry:
+                raise SeedRefusal(f"conflicting duplicate lock entries for {name} {version}")
+            continue
+        seen[key] = entry
+        packages.append(entry)
+    return packages
+
+
+def sparse_index_path(name: str) -> str:
+    """The sparse-index path of a crate, lowercase, as Cargo lays it out."""
+    lower = name.lower()
+    if len(lower) == 1:
+        return f"1/{lower}"
+    if len(lower) == 2:
+        return f"2/{lower}"
+    if len(lower) == 3:
+        return f"3/{lower[0]}/{lower}"
+    return f"{lower[:2]}/{lower[2:4]}/{lower}"
+
+
+def lstat_real_dir(path: Path, label: str) -> None:
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        raise SeedRefusal(f"{label} is missing: {path}")
+    if stat.S_ISLNK(mode):
+        raise SeedRefusal(f"{label} is a symlink, refused before following it: {path}")
+    if not stat.S_ISDIR(mode):
+        raise SeedRefusal(f"{label} is not a directory: {path}")
+
+
+def crates_namespace(kind_dir: Path, label: str) -> Path:
+    """The one crates.io sparse namespace under kind_dir. Zero or several refuse."""
+    lstat_real_dir(kind_dir, label)
+    names = sorted(name for name in os.listdir(kind_dir) if name.startswith(CRATES_NAMESPACE))
+    if len(names) != 1:
+        raise SeedRefusal(f"{label}: expected exactly one crates.io namespace, found {len(names)}")
+    namespace = kind_dir / names[0]
+    lstat_real_dir(namespace, f"{label} namespace")
+    return namespace
+
+
+def check_chain(base: Path, rel: str) -> Path:
+    """Every component from base to rel is a real directory, the last a real file.
+
+    Checked before any copy from that path. Accepted caveat: this is not a
+    no-follow open of the whole chain. A concurrent change could still race it.
+    """
+    current = base
+    parts = rel.split("/")
+    for index, part in enumerate(parts):
+        current = current / part
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            raise SeedRefusal(f"required seed input is missing: {current}")
+        if stat.S_ISLNK(mode):
+            raise SeedRefusal(f"symlink in the seed chain, refused: {current}")
+        if index == len(parts) - 1:
+            if not stat.S_ISREG(mode):
+                raise SeedRefusal(f"seed input is not a regular file: {current}")
+        elif not stat.S_ISDIR(mode):
+            raise SeedRefusal(f"seed chain component is not a directory: {current}")
+    return current
+
+
+class SeedBudget:
+    """Aggregate bytes copied from the host cache: the 256 MiB bound."""
+
+    def __init__(self, limit: int) -> None:
+        self.used = 0
+        self.limit = limit
+
+
+def copy_bounded(source: Path, destination: Path, budget: SeedBudget, expected_sha256: str | None) -> str:
+    """Copy source in bounded chunks, refusing before any write past the budget.
+
+    The source opens with O_NOFOLLOW. The digest covers the bytes actually
+    written, and an expected checksum must match them. Destination is created
+    exclusively under the owned root.
     """
     try:
-        mode = os.lstat(seed).st_mode
-    except FileNotFoundError:
-        return False
-    if stat.S_ISLNK(mode):
-        raise RuntimeError(f"seed root is a symlink, refused before following it: {seed}")
-    if not stat.S_ISDIR(mode):
-        raise RuntimeError(f"seed root is not a directory: {seed}")
-    return True
+        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise SeedRefusal(f"cannot open seed input without following links: {source}: {error}")
+    digest = hashlib.sha256()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with os.fdopen(fd, "rb") as reader, open(destination, "xb") as writer:
+        while True:
+            chunk = reader.read(SEED_CHUNK_BYTES)
+            if not chunk:
+                break
+            if budget.used + len(chunk) > budget.limit:
+                raise SeedRefusal("seed aggregate would exceed the 256 MiB bound; refused before the write")
+            budget.used += len(chunk)
+            writer.write(chunk)
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if expected_sha256 is not None and actual != expected_sha256:
+        raise SeedRefusal(f"checksum mismatch for {source.name}: copied bytes {actual}, lock {expected_sha256}")
+    return actual
 
 
-def refuse_seed_entries(seed: Path) -> None:
-    """Refuse any symlink or special entry in the seed, before the copy."""
-    for dirpath, dirnames, filenames in os.walk(seed, onerror=_raise):
-        for name in dirnames + filenames:
-            path = os.path.join(dirpath, name)
-            mode = os.lstat(path).st_mode
-            if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
-                raise RuntimeError(f"seed entry is not a plain file or directory: {path}")
+def seed_from_lock(host_registry: Path, packages: list[dict], cargo_home: Path) -> dict:
+    """Copy only what Cargo.lock needs from the one crates.io namespace.
+
+    Inputs: the namespace config.json, one sparse index entry per package
+    (under the namespace's .cache), and one .crate archive per package whose
+    bytes must match the lock checksum. Only this function reads the host
+    cache. CARGO_HOME stays owned and offline; nothing falls back to the host.
+    """
+    index_ns = crates_namespace(host_registry / "index", "index")
+    cache_ns = crates_namespace(host_registry / "cache", "cache")
+    budget = SeedBudget(SEED_AGGREGATE_BYTES)
+    dest_index = cargo_home / "registry" / "index" / index_ns.name
+    dest_cache = cargo_home / "registry" / "cache" / cache_ns.name
+    manifest: list[dict] = []
+
+    check_chain(index_ns, "config.json")
+    digest = copy_bounded(index_ns / "config.json", dest_index / "config.json", budget, None)
+    manifest.append({"path": "index/config.json", "sha256": digest})
+    for package in packages:
+        rel = sparse_index_path(package["name"])
+        check_chain(index_ns, f".cache/{rel}")
+        digest = copy_bounded(index_ns / ".cache" / rel, dest_index / ".cache" / rel, budget, None)
+        manifest.append({"path": f"index/.cache/{rel}", "sha256": digest})
+        archive = f"{package['name']}-{package['version']}.crate"
+        check_chain(cache_ns, archive)
+        digest = copy_bounded(cache_ns / archive, dest_cache / archive, budget, package["checksum"])
+        manifest.append({"path": f"cache/{archive}", "sha256": digest})
+    compare_seed(cargo_home, index_ns.name, cache_ns.name, packages)
+    return {"aggregate_bytes": budget.used, "files": manifest}
+
+
+def compare_seed(cargo_home: Path, index_name: str, cache_name: str, packages: list[dict]) -> None:
+    """The owned seed holds exactly the selected files under the fixed roots."""
+    expected = {f"registry/index/{index_name}/config.json"}
+    expected.update(f"registry/index/{index_name}/.cache/{sparse_index_path(p['name'])}" for p in packages)
+    expected.update(f"registry/cache/{cache_name}/{p['name']}-{p['version']}.crate" for p in packages)
+    actual = set()
+    for dirpath, _dirnames, filenames in os.walk(cargo_home / "registry"):
+        for name in filenames:
+            actual.add(str(Path(dirpath, name).relative_to(cargo_home)))
+    if actual != expected:
+        raise SeedRefusal(
+            f"owned seed differs from the lock selection: extra {sorted(actual - expected)[:3]}, "
+            f"missing {sorted(expected - actual)[:3]}"
+        )
 
 
 def snapshot(root: Path) -> list[tuple]:
@@ -259,18 +473,13 @@ def stage(proof: Proof) -> Path:
     commit = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
     tree = subprocess.run(git + ["rev-parse", "HEAD^{tree}"], capture_output=True, text=True, check=True).stdout.strip()
     channel = re.search(r'channel\s*=\s*"([^"]+)"', (REPO / "rust-toolchain.toml").read_text()).group(1)
+    lock_text = subprocess.run(git + ["show", "HEAD:Cargo.lock"], capture_output=True, text=True, check=True).stdout
+    packages = parse_lock_packages(lock_text)
     host_cargo_home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
     cargo_home = proof.root / "cargo-home"
     cargo_home.mkdir()
-    registry = host_cargo_home / "registry"
-    if seed_root_present(registry):
-        refuse_seed_entries(registry)
-        if owned_bytes(registry) > SEED_LIMIT_BYTES:
-            raise RuntimeError("host registry cache exceeds the 256 MiB seed bound; owner decision needed")
-        # Limitation: the checks above and this copy are not one no-follow
-        # operation. A concurrent change to the shared cache between them
-        # could redirect the copy. Disclosed, not closed.
-        shutil.copytree(registry, cargo_home / "registry", symlinks=False)
+    seed = seed_from_lock(host_cargo_home / "registry", packages, cargo_home)
+    (proof.evidence / "seed.json").write_text(json.dumps(seed, indent=2))
     cargo = shutil.which("cargo")
     if cargo is None:
         raise RuntimeError("cargo is not on the host PATH")
