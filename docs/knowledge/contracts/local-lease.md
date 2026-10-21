@@ -311,27 +311,40 @@ Proposed, not implemented. This is a routine correction with no admission, closu
 On a removable pool, one ordinary command therefore pays several full walks. At 201,948 entries one walk took 3.4 s.
 
 **Change.**
-1. **Typed ledger-only view.** The library adds `ledger_view(pool) -> LedgerView`. It is opened through the unchanged `Pool::open`: canonical root, foreign-entry and retired-image refusals, pool lock, config and backing verification, ledger identity checks, the slot limit and `reconcile_evicting`. It returns:
-   - `backend` and `cap_bytes`;
-   - `reconciliation_blocked`;
-   - each slot's `id`, `incarnation`, occupancy, `project`, `workspace`, `profile`, `holder` and `lease_id`.
+1. **Typed ledger-only view.** The library adds `ledger_view(pool) -> LedgerView`.
+   - **Opening:** through the unchanged `Pool::open`: canonical root, foreign-entry and retired-image refusals, pool lock, config and backing verification, ledger identity checks, the slot limit and `reconcile_evicting`. The view is therefore **not side-effect-free**: existing recorded-deletion reconciliation can run exactly as it does today.
+   - **Per-record checks:** under the same pool lock, for each ledger record it keeps full status's cheap, non-recursive checks, with the same error categories:
+     - `slot_path` rejects a zero slot ID;
+     - the slot root's `symlink_metadata` error, other than `NotFound`, propagates.
 
-   The type has **no byte or coverage fields**, so a missing walk cannot be read as zero or Complete.
+     A record whose root is `NotFound`, held roots included, stays a member as today. No closure is inferred from a missing root, and no refusal is added because former coverage was only partial.
+   - **Returns:**
+     - `backend` and `cap_bytes`;
+     - `reconciliation_blocked`;
+     - each slot's `id`, `incarnation`, occupancy, `project`, `workspace`, `profile`, `holder` and `lease_id`.
+
+     The type has **no byte or coverage fields**, so a missing walk cannot be read as zero or Complete. Selection and recovery refusal boundaries are unchanged.
 2. **Ledger-view callers:** the first six call sites above switch to it, with identical decisions.
 3. **Full status stays** for:
    - explicit `oxide status`, including `Store::report`, `slot_size` and the recursive reporting;
-   - `oxide init`/`new` readiness;
+   - `oxide init`/`new` readiness in `adopt.rs`, which keeps its own full status and `payload_use`, or reuses the readiness status it has already completed;
    - every library admission, eviction and reuse walk. Their behaviour and bounds are unchanged.
-4. **The result line stops walking.** It no longer calls `payload_use`. On reuse, it reports the reused slot's size from the reuse walk the library already ran, labelled with its provenance ("slot 5 was 7.9 GiB when leased"). On a new slot it says "new slot". It points to `oxide status` for the pool total. No new walk is added, and nothing walks a slot after release, when another command may hold it.
+
+   Only the per-command summary stops calling `payload_use`.
+4. **The result line stops walking.** It reports a measurement only when this lease produced one: the library's reuse walk, labelled with its provenance ("slot 5 was 7.9 GiB when leased"). Otherwise it reports none. That covers a new slot ("new slot") and a held same-holder replay, where `reused_slot` does not imply a fresh measurement. It points to `oxide status` for the pool total. No new walk is added, and nothing walks a slot after release, when another command may hold it.
 
 **Effect.** An ordinary reuse command walks only its target slot, which is the library's existing reuse walk. New-slot allocation keeps exactly today's authoritative whole-payload walk.
 
-**Proof.** Standard tier. A test hook counts accounting walks per root. On a fixture pool of at least 200,000 entries:
+**Proof.** Standard tier. A test hook observes **every** inventory entry point and private front-door measurement, counting walks per root. On a fixture pool of at least 200,000 entries:
 - an ordinary reuse command makes zero whole-payload walks and zero walks of unrelated slots;
-- selection, affinity, held-unknown recovery and explicit recovery decide identically to before;
-- new-slot admission performs the same walks as today;
-- explicit `oxide status` still runs the full walks;
-- the result line shows its provenance label and never shows zero or Complete for an unwalked figure.
+- selection and its fallback, affinity, held-unknown recovery and explicit recovery decide identically to before;
+- a zero slot ID and a slot-root metadata error are refused with the same categories as today;
+- a missing held root stays a member;
+- partial accounting stays non-gating wherever it is today;
+- new-slot admission and eviction performs the same walks with the same outcomes;
+- explicit `oxide status` and `init`/`new` readiness still report full accounting;
+- the result line shows its provenance label, or no measurement on a new slot or replay, and never zero or Complete for an unwalked figure;
+- nothing walks after release.
 
 The brief stops if any recovery, closure, deletion or admission semantics would change.
 
