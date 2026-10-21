@@ -503,6 +503,49 @@ mod tests {
     }
 
     #[test]
+    fn registration_file_maps_to_the_description() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("oxide-describe-map-{}-{nonce}", std::process::id()));
+        let pool = root.join("pool");
+        fs::create_dir_all(pool.join("oxide-managed")).unwrap();
+        // A mount point that is not mounted: the probe reports absent, and
+        // nothing is created at that path.
+        let mount = format!("/Volumes/oxide-describe-map-{}-{nonce}", std::process::id());
+        let registration = format!(
+            r#"{{"version":1,"mount_point":"{mount}","volume_uuid":"A6AC3ED7-33EA-46B4-8082-7254CF291ED2","container_uuid":"B7BD4FE8-44FB-47C5-9193-8365DF302FE3","reserve_bytes":4096,"cap_bytes":8192,"quota_bytes":null,"capacity_bytes":null,"registered_ms":0}}"#
+        );
+        fs::write(
+            pool.join("oxide-managed").join("removable.json"),
+            registration,
+        )
+        .unwrap();
+        let description = describe(&pool);
+        let _ = fs::remove_dir_all(&root);
+        let json = serde_json::to_value(description.unwrap()).unwrap();
+        assert_eq!(json["selected"], "internal");
+        let removable = &json["removable"];
+        assert_eq!(removable["mount_point"], mount.as_str());
+        assert_eq!(
+            removable["volume_uuid"],
+            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2"
+        );
+        assert_eq!(removable["reserve_bytes"], 4096);
+        assert_eq!(removable["mode"], "ephemeral");
+        assert_eq!(removable["available"], false);
+        assert_eq!(removable["unavailable_reason"], "absent");
+        assert_eq!(removable["payload"], format!("{mount}/oxide-pool").as_str());
+        assert_eq!(
+            removable["suggested_scratch_root"],
+            format!("{mount}/scratch").as_str()
+        );
+        assert!(!std::path::Path::new(&mount).exists());
+    }
+
+    #[test]
     fn registered_reserve_is_reported_as_a_number() {
         let removable = Removable {
             mount_point: Some("/Volumes/Builds".to_owned()),
