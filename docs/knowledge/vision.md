@@ -214,20 +214,15 @@ the operating rules.
 - **Operator acceptance fast path:** Tom can accept a task as-is. It is
   recorded as operator acceptance, never as a review pass. A direct GitHub
   merge needs explicit scoped authorisation.
-- **Native-proof harness:** the shared proof supervisor is #109, under the
-  pinned-leader cooperative-closure contract (Tom, "Yes, (2)").
-  - Its design passed review (revision 4, `29f0950e`).
-  - The implementation is in focused completion under Tom's 2026-10-21
-    standing authority: "Keep going - at this point we may as well keep
-    persevering until its done?"
-- **Until #109 qualifies,** native proofs use only the task-specific exceptions
-  Tom granted: main's old `scripts/bounded-test.py` at `3d947a9`, with its gaps
-  disclosed per task.
-  - **Standard tasks:** #110 and #106 (route C). #104 has one corrected
-    author native session ("#104 only for now"), not a task-wide exception;
-    Queue holds its later counts.
-  - **Elevated tasks:** route B covers #107, #098 and #100.
-  - **Not covered:** new tasks don't inherit these exceptions.
+- **Native-proof harness:** native proofs run under the shared proof
+  supervisor, `scripts/bounded-test.py`. It qualified as #109 (PR #99) on
+  2026-10-21, under the pinned-leader cooperative-closure contract (Tom,
+  "Yes, (2)"), with independent author and reviewer native passes at
+  `018f6e1`.
+  - New tasks use it. They don't need per-task guard exceptions.
+  - The earlier task-specific old-guard exceptions (route C for #110 and #106,
+    route B for #107, and #104's one run) are history, and their disclosed
+    gaps stay with those tasks.
 
 ## Authority boundaries
 
@@ -238,11 +233,6 @@ the operating rules.
   - never resets a running clock or enlarges caps silently;
   - doesn't turn uncertainty into release, or allow evading a host-tool
     denial.
-- **#109 completion authority** (Tom, 2026-10-21): localised, in-scope
-  corrections continue until it qualifies, with no per-defect ask.
-  - Each failed session still stops for owner inspection.
-  - Redesign, new infrastructure or privilege, and any weakening of the safety
-    contract remain Tom's call.
 - **Model routing:** Opus High authors and Sol High reviews. Astra is not used
   for review (Tom, 2026-10-18, "Use Sol").
 - **Still need Tom's scoped approval:**
