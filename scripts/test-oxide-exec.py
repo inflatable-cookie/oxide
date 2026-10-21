@@ -292,7 +292,8 @@ def built(proof: Proof, args: list, label: str, profile: str, cwd: str | None = 
         fail(f"{label}: summary names {shown} profile, {strategy} strategy")
     if env.get("CARGO_TARGET_DIR") != target or metadata["target_directory"] != target:
         fail(f"{label}: target directory {env.get('CARGO_TARGET_DIR')} / {metadata['target_directory']}")
-    slot_dir = os.path.realpath(os.path.join(proof.pool, "payload", "slots", slot))
+    # oxide#104: a new slot sits at its recorded `dir`.
+    slot_dir = os.path.realpath(os.path.join(proof.pool, "payload", "slots", proof.ledger()[slot].get("dir") or slot))
     if not os.path.realpath(build_dir).startswith(slot_dir + "/") and os.path.realpath(build_dir) != slot_dir:
         fail(f"{label}: build dir {build_dir} is not in slot {slot} ({slot_dir})")
     output = "release" if "--release" in (tool_args or []) else "debug"

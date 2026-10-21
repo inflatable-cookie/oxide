@@ -47,6 +47,14 @@ default = false
 run = "python3 scripts/bounded-test.py cargo test --workspace --all-targets --locked"
 default = false
 
+# Enumerated paths that disappear during accounting (oxide#113): the
+# qualified session supervisor bounds one fixed native proof covering the
+# debug-only walk hook, status/refusal diagnostics, whole-slot eviction and
+# conservative refusal for a real accounting gap. No live pool or cache.
+[tasks."rust:accounting-vanished"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-accounting-vanished.py"
+
 # Shared session supervisor qualification (oxide#109): a short bootstrap
 # (healthy reserve readings, fixed 300 s wall limit held by a minimal outer
 # actor) runs the candidate `bounded-test.py` around its synthetic suite:
@@ -182,6 +190,32 @@ run = "python3 scripts/bounded-test.py python3 scripts/test-front-door-accountin
 [tasks."rust:oxide-finder-metadata"]
 admission = "heavy"
 run = "python3 scripts/test-oxide-finder-metadata.py"
+
+# Project-named slots and pool status (oxide#104), under the qualified shared
+# proof supervisor (oxide#109): 300 s absolute, 512 MiB monitored scratch,
+# children kept in its session, writes and evidence under its scratch and
+# evidence directories, work stopped 30 s before its exported deadline,
+# ordinary detach. Stages the base commit's and this HEAD's `oxide` offline
+# with 1.97.1 into separate target and build directories and requires
+# distinct binaries; a legacy slot stays
+# in place and warm; new internal and scratch-image removable slots are
+# labelled; status order, grouping and most-recent use with the volume
+# selected and detached. Not a benchmark and not full QA.
+[tasks."rust:oxide-pool-layout"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-oxide-pool-layout.py"
+
+# Host-wide active-build limit (oxide#111), under the qualified #109 shared
+# supervisor (SHA-256 8e379c93416c6e06b7f06bec7f86dba4fca4c8900b1cc87f1eb6303d39897a9d).
+# Stages oxide offline with 1.97.1; status reports derived/config/environment
+# provenance; tiny exec fixtures prove cap 2 waits for the third, config 3
+# admits the third and waits for the fourth, release admits waiters, and a
+# synthetic unavailable removable registration still counts both pools. No
+# real removable volume or fixture compilation. 300 s absolute, 512 MiB
+# monitored scratch; script stops work 30 s before the supervisor deadline.
+[tasks."rust:max-active"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-max-active.py"
 
 # SUSPENDED by oxide#102 (retired image pool provisioning; refuses before
 # any effect until migrated). Cargo version matrix (oxide#091): one logical proof per exact stable

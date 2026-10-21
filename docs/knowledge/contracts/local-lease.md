@@ -122,6 +122,14 @@ the budget as `cap_bytes` and `image_bytes: 0`; an older build refuses it.
 ([workflow](workflow.md#implemented-foundation-core)); this CLI's
 `init --cap-bytes` and every existing pool's recorded cap are unchanged.
 
+Oxide resolves its host-wide active-build limit once per command from
+`OXIDE_MAX_ACTIVE`, `[pool] max_active`, or the approved default. The limit
+continues to count active commands across internal and removable pools using
+the existing state and admission rules. `oxide status` reports the effective
+value and whether it came from the environment, the selected user config, the
+physical-core formula or its fallback; see the workflow's
+[user configuration](workflow.md#budget-only-default-pool-and-user-configuration).
+
 The library also exports `evict_idle_slot` for Oxide's per-project slot cap.
 It retires one recorded idle slot whole through the same durable eviction path
 as capacity eviction, and returns busy for a held slot. The CLI does not
@@ -264,8 +272,29 @@ names the gap kinds (`entry_limit`, `depth_limit`, `elapsed_deadline`,
 milliseconds and the bounds used. No path or name is printed. An incomplete
 walk's bytes are never used for admission and never make a slot an eviction
 candidate; `status` shows them as a lower bound. A measured zero stays
-distinct from unknown. Only a slot whose own walk completes can be reused;
-other `unknown_accounting` refusals (invalid identities, ledger, ownership or
+distinct from unknown.
+
+**Enumerated paths that vanish (oxide#113).** If a non-root path enumerated by
+the same walk returns `NotFound` at deferred `read_dir`, `file_type` or
+no-follow metadata, the walk increments a separate `vanished` count rather
+than a gap. A walk with only these observations is complete for the names it
+could still read, and its bytes may be used by the existing admission and
+whole-idle-slot eviction rules. The scan and its result remain a best-effort,
+non-atomic path observation; `vanished` does not prove that inode allocation
+was physically freed or is reclaimable. Bytes for other paths already
+observed, including a link to the same inode, remain counted. A root
+`NotFound` is still `root_missing` and refuses even if that root was opened
+earlier in the walk. Iterator errors without a path identity, `EACCES`, other
+metadata errors, bounds, mount boundaries and all ownership, foreign-entry,
+symlink and identity refusals retain their existing categories. `status` and
+`unknown_accounting` refusal text show `vanished xN` even alongside a real
+gap, and state that allocation reclamation is not inferred. The count is not
+part of ledger/config persistence; new readers accept
+older scan JSON with the field absent, while older strict readers may reject a
+new scan that includes a nonzero count.
+
+Only a slot whose own walk completes can be reused; other
+`unknown_accounting` refusals (invalid identities, ledger, ownership or
 backing failures, foreign entries) are unchanged.
 
 The bounds are finite, not an arbitrary-size guarantee. The entry bound
@@ -323,7 +352,7 @@ On a removable pool, one ordinary command paid several full walks, and a waiting
 
 **Observation hook.** Debug builds only, absent from release builds such as the installed `oxide`: `inventory::walk_observer` records the root of every `inventory_directory` walk, the one entry point of library accounting, `slot_size`, Cargo-home measurement and the stray check, on a per-thread recorder for tests and, when `OXIDE_TEST_WALK_LOG` names an absolute file, one line per walk. It changes no walk. Walk counts show routing only; they are not a resource gate.
 
-**Proof.** Standard tier. Library tests show that the view equals status's membership field for field with no walk while status still walks the payload and every slot; that reuse walks only its slot and returns that measurement, a held replay walks and measures nothing, and a new slot keeps its single admission walk; that a zero slot ID, a slot-root lookup error and a foreign pool entry refuse the view and status alike; and that a missing held root stays a member while partial accounting and a symlinked root stay non-gating and reuse still refuses incomplete accounting. Front-door recovery rules take the view's slot type unchanged. The native proof `effigy rust:front-door-accounting` covers, on one private pool with an idle slot of more than 200,000 entries: new-slot, reuse, status and readiness walks; a live-holder and killed-holder `recover-interrupted` refusal with no walk; a waiting build that walks nothing, then recovers, evicts the untrusted slot and builds cold; and new-slot admission with four whole-payload walks around eviction, hard links counted once. Removable selection is covered by the shared refusal tests only: no native session attaches a volume.
+**Proof.** Standard tier. Library tests show that the view equals status's membership field for field with no walk while status still walks the payload and every slot; that reuse walks only its slot and returns that measurement, a held replay walks and measures nothing, and a new slot keeps its single admission walk; that a zero slot ID, a slot-root lookup error and a foreign pool entry refuse the view and status alike; and that a missing held root stays a member while partial accounting and a symlinked root stay non-gating and reuse still refuses incomplete accounting. The unreadable-walk and slot-root refusal cases inject `io::ErrorKind::PermissionDenied` at exact canonical-path `read_dir` and `slot_root` `symlink_metadata` calls with a current-test-thread `cfg(test)` guard and hit assertions. These cases preserve the library's gap and refusal mapping, but do not prove kernel permission enforcement or an operating-system `EACCES` response. Front-door recovery rules take the view's slot type unchanged. The native proof `effigy rust:front-door-accounting` covers, on one private pool with an idle slot of more than 200,000 entries: new-slot, reuse, status and readiness walks; a live-holder and killed-holder `recover-interrupted` refusal with no walk; a waiting build that walks nothing, then recovers, evicts the untrusted slot and builds cold; and new-slot admission with four whole-payload walks around eviction, hard links counted once. Removable selection is covered by the shared refusal tests only: no native session attaches a volume.
 
 ### Parked: cached closed-slot accounting (lead `cbb2824d`)
 

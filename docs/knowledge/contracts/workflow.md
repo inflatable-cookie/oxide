@@ -168,6 +168,113 @@ Status still labels them `quick` or `debug`. The toolchain is
 whatever rustup resolves where the command runs (see
 [caller context](#cargo-version-matrix)); Oxide does not select or pin it.
 
+### Project-named slots and pool status
+
+oxide#104 (Tom, 2026-10-20: "It would be pretty handy to group them by
+project name so it's obvious what's what"). Presentation only: the slot key,
+identity, ledger semantics, admission, eviction and recovery are unchanged.
+
+- **Layout.** A new slot is created at
+  `slots/<label>-<short-id>/<profile>-<n>`, for example
+  `slots/oxide-3fa2c1d4/quick-7`. `<n>` is the slot ID; `<profile>` is the
+  Oxide profile label (`quick`, `debug`, `release`). The ledger records the
+  path below `slots` (`dir`) at creation, and it never changes.
+- **Label.** The last segment of the normalised `origin` URL, else the
+  repository directory name (`git rev-parse --show-toplevel`), else the
+  workspace directory name. It is sanitised to lowercase ASCII letters,
+  digits, `_` and single `-`, at most 40 bytes; `project` when nothing
+  remains. Origin comes first so worktrees with task-named directories share
+  a readable label.
+- **Short ID and collisions.** The short ID is the first 8 hex digits of the
+  repository identity digest. It is display, not a uniqueness proof. Before
+  creating a slot, Oxide checks the folder: one that already holds a slot of
+  another repository, or of a project not known to be this repository, is
+  skipped, then the 12-, 16- and 64-digit forms are tried. An existing folder
+  with no recorded slot is used only when it is empty apart from
+  [Finder metadata](#finder-metadata-in-pools). When no form qualifies the
+  slot gets the legacy path. A repository's later slots join the folder it
+  already uses, so worktrees with different labels still share one folder.
+- **Existing slots** keep `slots/<id>`. They are never renamed, moved or
+  adopted into a folder: Cargo records absolute paths inside a slot. A
+  ledger without `dir` reads and writes unchanged. A binary older than #104
+  refuses a ledger holding a labelled slot (its ledger records refuse
+  unknown fields) rather than guessing the path.
+- **Eviction** removes only the slot directory. Its project folder stays,
+  possibly empty; nothing removes folders. Deletion stays limited to a
+  recorded slot directly under `slots` or under one owner-only project
+  folder on the same device. Payload accounting allows two levels above the
+  slots, so slot contents keep their depth allowance.
+- **Status.** The first lines say which pool the next build uses, from the
+  same selection check builds make, and the most recently used slot: its
+  pool, slot, project label, checkout and age. Each pool then has one
+  header, with the selected pool first and its own slots beneath it; equal
+  slot numbers in two pools never mix. Every slot line shows its project
+  label (the folder for a labelled slot, else the checkout directory name)
+  and its place, `slots/<dir>` or `slots/<id> (legacy path)`. A registered
+  removable pool that is not usable keeps its registration lines and the
+  reason, and its slots read `not read while the volume is not usable
+  (unknown, not empty)`.
+- **Most recent use.** Within one pool Oxide's use counter orders uses.
+  Across pools it compares the wall-clock time recorded at each use since
+  #104 (`last_used_ms` in the control state). A use recorded before then has
+  no time, so the cross-pool answer is `unknown`, with each pool's latest
+  listed. Equal times name the first listed (selected) pool and say they are
+  tied. For a removable pool that is not usable, status reads its internal
+  control state only: the slot is `unknown` and the label is the checkout
+  directory name. An unreadable state reports `unknown`, never "none".
+  Status still opens only what it did before; it acquires nothing and
+  changes no ledger.
+
+**Proof.** `effigy rust:oxide-pool-layout`
+(`scripts/test-oxide-pool-layout.py`) runs under the qualified shared proof
+supervisor: `bounded-test.py --limit 300 --scratch-budget-mib 512 --`
+(oxide#109). The script writes only under the supervisor's scratch
+(`OXIDE_TASK_SCRATCH_ROOT`, equal to the other three temp variables) and
+its evidence directory (`OXIDE_PROOF_EVIDENCE`), keeps every child in the
+supervisor's session, stops work 30 s before the exported absolute
+`OXIDE_PROOF_DEADLINE_NS` (with a `SIGALRM` fallback) and leaves closure and
+scratch cleanup to the supervisor. It reuses the #105 script's phase checks
+and staging helpers; on a child timeout it kills only that child, and an
+unreaped child blocks detach and keeps evidence.
+It stages the base commit's and this HEAD's `oxide` offline with 1.97.1,
+each into its own fresh `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR`
+with inherited build routing scrubbed. It logs both commits, trees,
+manifest and lock digests and binary SHA-256s, and refuses before any pool
+or image exists unless the binaries differ and only the candidate carries a
+#104 status string. Over a private `HOME`, `CARGO_HOME` and pool: the base
+binary makes a legacy `slots/1`, which the candidate reuses warm in place;
+same-named checkouts get separate labelled folders; a debug slot joins its
+project's folder; one 128 MiB scratch APFS image registered as the
+removable pool gets labelled slots, including a slot 1 beside the internal
+slot 1; status order, grouping and most-recent attribution are checked with
+the volume selected and after an ordinary detach. Not a benchmark or
+real-drive qualification.
+
+**Earlier submissions (history).** The first author session at `de7bb8b`
+(2026-10-21) staged both sources into one shared target directory; Cargo
+reused the base build for the candidate (both SHA-256 `46db66ce…`), so the
+first candidate `status` printed the old format and the script failed after
+16 s, before any image or product exercise. Two later submissions under a
+#104-only exception for the old `3d947a9` supervisor never launched: run
+`a5b87b4a…` was withdrawn and settled cancelled, and run `bde2d70a…` hit
+Effigy's capacity timeout. All three are consumed.
+
+**Compatibility of the new records.** Legacy slots and a ledger without
+`dir` serialize byte-for-byte as before; a labelled slot's path is fixed at
+creation and its identity, key and compatibility are unchanged. A binary
+older than #104 refuses a ledger holding `dir` instead of using a wrong
+path. `last_used_ms` is written only with the use counter when a command
+takes a slot, never by `status`; admission, eviction and slot choice still
+order by the counter, never by wall time. Missing times, an unreadable
+state and ties are reported as such.
+
+The other proof scripts that located a slot at `slots/<id>`
+(`test-front-door-accounting.py`, `test-cargo-profiles.py`,
+`test-oxide-exec.py`, `test-oxide-removable-pool.py`, `test-pool-scale.py`,
+`test-oxide-finder-metadata.py`) now read the ledger's `dir` or find
+`slots/*/<profile>-<id>`. These script changes were not rerun natively under
+#104.
+
 ## Cross-checkout freshness
 
 Reusing one slot across checkouts is not automatically safe. Cargo 1.97.1
@@ -1264,9 +1371,15 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
   free space.
 - **Slots and waiting.** Per-project cap 2: a new checkout or key at the cap
   evicts the project's least recently used idle slot whole and builds cold.
-  Host-wide limit 2 commands holding slots (`OXIDE_MAX_ACTIVE`, 1–32). Excess
-  commands wait in FIFO order, print one `oxide: waiting for …` line on stderr
-  and cancel on Ctrl-C with exit 130. Another command in the same checkout
+  The host-wide active-build limit counts commands holding slots across both
+  pools. `OXIDE_MAX_ACTIVE` overrides `[pool] max_active`; both accept integers
+  from 1 to 32. With neither set, macOS uses
+  `min(4, max(2, floor(physical_cores / 4)))` from the native
+  `hw.physicalcpu` query. A missing, failed or implausible result, and every
+  other supported platform, uses 2. The automatic formula is approved policy,
+  not measured optimal capacity. Excess commands wait in FIFO order, print one
+  `oxide: waiting for …` line on stderr and cancel on Ctrl-C with exit 130.
+  Another command in the same checkout
   and key takes a compatible spare slot or creates one within budget; it waits
   when no safe slot or host capacity is available.
 - **Execution.** Cargo runs from the caller's directory as leader of a new
@@ -1703,16 +1816,27 @@ oxide#102.
   `unreadable_entry`, `missing_metadata`, a mount boundary or a root
   failure), entries visited, elapsed time and bounds; its bytes are never
   used and never make a slot evictable. The bounds are finite: a larger pool
-  refuses until idle slots are evicted or cleaned. Owning detail:
+  refuses until idle slots are evicted or cleaned. A `NotFound` bound to a
+  non-root path the same walk enumerated at a deferred `read_dir`, `file_type`
+  or no-follow metadata call is reported separately as `vanished xN`, not as
+  a gap. Its complete result can still authorize the existing whole-idle-slot
+  policy. This is a best-effort, non-atomic path observation and does not
+  establish that inode allocation was freed or reclaimable. Root `NotFound`
+  remains `root_missing`, including after the root was opened; iterator errors
+  without a path identity and other errors keep their conservative categories.
+  Status and refusal diagnostics include the separate count. Owning detail:
   [local lease](local-lease.md#capacity-and-eviction). Rust tests cover
-  each old bound, an unreadable entry, a symlinked slot root and hard links
-  with injected bounds. The native selector `effigy rust:pool-scale` has no
+  each old bound, injected `PermissionDenied` at inventory `read_dir` and
+  slot-root `symlink_metadata` boundaries (not kernel permission enforcement),
+  a symlinked slot root and hard links with injected bounds. The native
+  selector `effigy rust:pool-scale` has no
   passing run: its first session staged the reference binary twice and is
-  apparatus evidence only, and the corrected selector is held because no
-  existing guard samples the host reserve during plain-Cargo staging.
+  apparatus evidence only. The selector now uses the qualified shared
+  supervisor; no later passing run is recorded.
 - **Precedence.** Environment, then the user config file, then defaults.
   `OXIDE_POOL` sets the path (relative resolves against the current
-  directory); `OXIDE_POOL_CAP` sets the budget. Sizes are whole bytes or a
+  directory); `OXIDE_POOL_CAP` sets the budget; `OXIDE_MAX_ACTIVE` sets the
+  host-wide active-build limit. Sizes are whole bytes or a
   whole number of `KB`, `MB`, `GB`, `TB` (decimal) or `KiB`, `MiB`, `GiB`,
   `TiB`, from 1 MiB to 16 TiB; anything else refuses before any effect.
   `OXIDE_POOL_BACKEND` is retired: unset or `directory-budget` only.
@@ -1721,7 +1845,9 @@ oxide#102.
   macOS `~/Library/Application Support/oxide/config/config.toml`; elsewhere
   `$XDG_CONFIG_HOME/oxide/config.toml`, with XDG's `~/.config` when the
   variable is unset; a relative `XDG_CONFIG_HOME` or a missing `HOME`
-  refuses. `OXIDE_CONFIG` (absolute) selects another file; only the selected
+  refuses. (Approved change, not shipped: on adopting Longhorn 0.4.1's
+  per-root resolver (#103), a relative `XDG_*` value for a demanded root is
+  ignored and the default used, per the XDG spec (Tom, 2026-10-21).) `OXIDE_CONFIG` (absolute) selects another file; only the selected
   file is parsed. On macOS `~/.config/oxide/config.toml` is never read;
   `status` says it is ignored, without printing its contents. Parsed with
   `basic-toml` 0.1.10; at most 64 KiB:
@@ -1730,10 +1856,32 @@ oxide#102.
   [pool]
   path = "~/Dev/oxide"   # ~ or ~/ expands to HOME; absolute, no . or ..
   budget = "100GB"       # or a byte count
+  max_active = 3         # optional integer from 1 to 32
   ```
 
   An unknown key, a wrong type or a parse failure refuses with the file
-  named.
+  named. `max_active` is validated only when the config value is selected;
+  therefore a valid `OXIDE_MAX_ACTIVE` overrides a range-invalid config value.
+  TOML parse errors, wrong types and unknown fields still refuse even when an
+  environment override is present, matching the existing config parser.
+- **Automatic active-build limit.** With no environment or config value,
+  macOS queries the native `hw.physicalcpu` sysctl once for the command and
+  applies `min(4, max(2, floor(physical_cores / 4)))`. Counts outside 1–1024,
+  a failed or malformed query, and non-macOS platforms fall back to 2; `status`
+  reports the formula input or fallback reason. This is the approved default,
+  not a throughput measurement. Existing active commands are left running
+  when a lower limit is selected; later admissions wait under the same
+  host-wide accounting and ownership rules.
+  **Proof.** `effigy rust:max-active` runs one fixed script under the
+  qualified shared supervisor. It stages `oxide` offline with 1.97.1, checks
+  status provenance and precedence, then uses tiny `oxide exec` hold tools to
+  show limit 2 waiting for a third command, config limit 3 admitting a third
+  and waiting for a fourth, and a release admitting each waiter. A synthetic
+  unavailable removable registration pairs one active removable record with
+  an internal command; the unit tests exercise both directions of the
+  internal/removable count. No real volume or fixture compilation is used.
+  The supervisor owns its 300 s deadline, 512 MiB monitored scratch and
+  closure; the fixture stops work 30 s before its exported deadline.
 - **Default path.** `~/Library/Caches/oxide/build-pool` on macOS,
   `$XDG_CACHE_HOME/oxide/build-pool` or `~/.cache/oxide/build-pool`
   elsewhere: distinct from the retired image pool's `…/oxide/pool`, so that
@@ -1789,7 +1937,9 @@ oxide#102.
   the user, so Oxide applies no exclusion. `status` says `not excluded by
   Oxide` with that advice. Other platforms: not applicable.
 - **`status`.** The config file and whether it exists or was selected by
-  `OXIDE_CONFIG`, the pool path and budget with their sources, then per
+  `OXIDE_CONFIG`, the pool path and budget with their sources, and the
+  effective host-wide active-build limit with its source, formula input or
+  fallback reason, then per
   pool: backend, soft budget, slot allocation, the pool filesystem's
   available and total space (shared, no Oxide quota or ceiling), Time Machine
   and Spotlight state, legacy and orphaned pools. `slot accounting walk:`
@@ -1870,7 +2020,8 @@ Rules:
 ### `directory-budget-v1` as shipped
 
 - **Shape.** `<pool>/payload/slots/` is a plain owner-only directory on the
-  pool's own device; config, ledger and lock sit beside it as for APFS, with
+  pool's own device, holding legacy `<id>` slots and
+  [project-named](#project-named-slots-and-pool-status) `<folder>/<profile>-<id>` slots; config, ledger and lock sit beside it as for APFS, with
   no image or receipt. The config records the backend, store ID and budget
   recorded at creation (`cap_bytes`, default 100 GB; `image_bytes` 0). An
   image or receipt file, any payload entry but `slots` and
@@ -1935,8 +2086,8 @@ Rules:
 oxide#105. Finder writes `.DS_Store` files, and AppleDouble `._<name>` sidecars where a filesystem lacks native extended attributes. Both can appear in a pool directory someone has browsed. Both backends tolerate exactly these two forms and nothing broader. The name is `.DS_Store`, or `._` followed by a nonempty name; the entry is a regular file (no-follow), owned by the caller and on the directory's device. The tolerated places are:
 
 - **Pool root and the removable control root.** Allowed beside config, ledger, lock and `oxide-managed`. These bytes are control-directory bytes, like the ledger, and are not payload.
-- **Payload root** (`<pool>/payload`, or `<mount>/oxide-pool`). Allowed beside `slots`. Payload accounting now walks the payload root, not `slots` alone. The bytes therefore count in the payload figure and the soft-budget admission check, and the `(device, inode)` union counts a hard link once. The depth bound is one level deeper, so slot contents keep their previous allowance.
-- **`slots`, a slot and its build tree.** This is unchanged: these were never name-checked. Every regular file there, metadata included, counts in the slot's own figure.
+- **Payload root** (`<pool>/payload`, or `<mount>/oxide-pool`). Allowed beside `slots`. Payload accounting now walks the payload root, not `slots` alone. The bytes therefore count in the payload figure and the soft-budget admission check, and the `(device, inode)` union counts a hard link once. The depth bound is one level deeper (two since #104 added project folders), so slot contents keep their previous allowance.
+- **`slots`, a project folder, a slot and its build tree.** This is unchanged: these were never name-checked. A [project folder](#project-named-slots-and-pool-status) with no recorded slot is reused only when it holds nothing but Finder metadata. Every regular file there, metadata included, counts in the slot's own figure.
 
 A metadata-named symlink, directory, FIFO or other special file is still refused. So are a file owned by another user, a file on another device, and a near-miss name (`._`, `.ds_store`, `.DS_Store.bak`). Every other unknown entry also refuses wherever it did before. A name never establishes a lease, never makes a slot reusable and never permits a cleanup. Oxide never deletes, moves or rewrites these files. A whole-slot eviction still removes everything inside the slot, as before. Pool creation still requires an empty directory.
 
@@ -2093,8 +2244,9 @@ Approved design direction (Tom, 2026-10-20). Not implemented. It applies to buil
   budget, refuse below the 20 GiB host reserve
   ([above](#budget-only-default-pool-and-user-configuration)).
 - **W-2 Waiting and concurrency.** Foundation choice above: per-project cap
-  2, host-wide limit 2, strict FIFO waiting, idle-slot eviction before
-  waiting. Coordinates with
+  2, strict FIFO waiting, idle-slot eviction before waiting. The host-wide
+  limit uses the approved physical-core default and 1–32 explicit overrides
+  ([storage and limits](#storage-and-space-management)). Coordinates with
   [Q-011](../questions.md#q-011--how-should-slot-waiting-coordinate-with-host-admission).
 - **W-3 Project file.** Needed only for per-project profile overrides or
   dependency debug-off. Recommendation: none until a real project needs it.

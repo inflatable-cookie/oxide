@@ -317,33 +317,36 @@ fn print_readiness(workspace: &Path) {
         Err(error) => println!("  toolchain: unavailable ({error})"),
     }
     println!("  identity: {}", Identity::infer(workspace).describe());
-    match store::pool_path() {
+    match store::settings() {
         Err(error) => println!("  pool: unknown ({error})"),
-        Ok(path) => match Store::open_existing() {
-            Ok(None) => println!(
-                "  pool: {} not created; the first building oxide command creates it",
-                path.display()
-            ),
-            Ok(Some(store)) => match store.status() {
-                Ok(status) => {
-                    // This full status's own whole-payload walk.
-                    let used = status
-                        .payload_unique_allocated_bytes
-                        .map(|used| {
-                            let total = store.budget(status.cap_bytes);
-                            format!("{} of {} MiB used", used / MIB, total / MIB)
-                        })
-                        .unwrap_or_else(|| "use unknown".to_owned());
-                    println!(
-                        "  pool: {}, cap {} MiB, {used}",
-                        path.display(),
-                        status.cap_bytes / MIB
-                    );
-                }
+        Ok(settings) => {
+            let path = settings.pool.clone();
+            match Store::open_existing_with(&settings) {
+                Ok(None) => println!(
+                    "  pool: {} not created; the first building oxide command creates it",
+                    path.display()
+                ),
+                Ok(Some(store)) => match store.status() {
+                    Ok(status) => {
+                        // This full status's own whole-payload walk.
+                        let used = status
+                            .payload_unique_allocated_bytes
+                            .map(|used| {
+                                let total = store.budget(status.cap_bytes);
+                                format!("{} of {} MiB used", used / MIB, total / MIB)
+                            })
+                            .unwrap_or_else(|| "use unknown".to_owned());
+                        println!(
+                            "  pool: {}, cap {} MiB, {used}",
+                            path.display(),
+                            status.cap_bytes / MIB
+                        );
+                    }
+                    Err(error) => println!("  pool: {} unreadable ({error})", path.display()),
+                },
                 Err(error) => println!("  pool: {} unreadable ({error})", path.display()),
-            },
-            Err(error) => println!("  pool: {} unreadable ({error})", path.display()),
-        },
+            }
+        }
     }
     report_effigy(workspace);
 }

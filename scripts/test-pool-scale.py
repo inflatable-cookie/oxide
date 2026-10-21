@@ -197,6 +197,10 @@ class Pool:
             return json.load(handle)
 
     def slot_dir(self, slot: str) -> str:
+        # oxide#104: a new slot sits at its recorded `dir`.
+        for record in self.ledger()["slots"]:
+            if str(record["id"]) == slot:
+                return os.path.join(self.root, "payload", "slots", record.get("dir") or slot)
         return os.path.join(self.root, "payload", "slots", slot)
 
     def generation(self, slot: str) -> tuple:

@@ -65,10 +65,14 @@ dev profile, so outputs land in target/debug as with plain Cargo; release is the
 project's own. --cargo-profile oxide-quick/oxide-debug still build but are
 deprecated: external tools get the quick recipe without them. Oxide places build output, so --target-dir and --config
 build.build-dir/target-dir are refused. Adoption writes one marked block in the
-workspace-root AGENTS.md and prints readiness; there is no Oxide config file.
+workspace-root AGENTS.md and prints readiness; adoption does not create an
+Oxide config file.
 A whole-target clean refuses entries Cargo does not create in target/ unless
 --include-foreign is given; --dry-run prints every path it would remove.
-OXIDE_POOL selects the pool; OXIDE_MAX_ACTIVE the host-wide build limit (2).
+OXIDE_POOL selects the pool; OXIDE_MAX_ACTIVE sets the host-wide active-build
+limit (1–32), ahead of [pool] max_active in the user config. The automatic
+macOS default is min(4, max(2, floor(physical cores/4))); other platforms and
+unavailable core counts use 2.
 Leased builds bypass any inherited rustc wrapper (such as sccache);
 OXIDE_ALLOW_RUSTC_WRAPPER=1 keeps it, unqualified for Oxide's interruption
 and toolchain identity.
@@ -641,7 +645,7 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
         "{}",
         wrapper::status_line(wrapper::Policy::from_env(), &wrapper::inherited(&[]))
     );
-    match Store::open_existing() {
+    match Store::open_existing_with(&settings) {
         Ok(None) => {
             println!(
                 "  not created; the first building oxide command creates it ({}: {})",
@@ -649,12 +653,7 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
                 Backend::DirectoryBudget.bound()
             );
         }
-        Ok(Some(store)) => {
-            print_pool(&store)?;
-            if let Some(removable) = removable::status(&store)? {
-                print_pool(&removable)?;
-            }
-        }
+        Ok(Some(store)) => print_pools(&store)?,
         Err(error) => println!("  cannot open: {error}"),
     }
     print_other_pools(&settings);
@@ -666,9 +665,189 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
     Ok(0)
 }
 
-/// Backend, use, slots and recoveries of one opened pool.
-fn print_pool(store: &Store) -> Result<(), String> {
-    let report = store.report()?;
+/// The pool selected for the next build first, then the other; the most
+/// recent recorded use across both; each pool's own slots under its header.
+/// Read-only: the same selection check builds use, no acquisition.
+fn print_pools(internal: &Store) -> Result<(), String> {
+    let removable = removable::status(internal)?;
+    let internal_report = internal.report()?;
+    let removable_report = match removable.as_ref().map(|status| &status.selected) {
+        Some(Ok(store)) => Some(store.report()?),
+        _ => None,
+    };
+    let reason = removable
+        .as_ref()
+        .and_then(|status| status.selected.as_ref().err());
+    println!(
+        "{}",
+        selection_line(removable.is_some(), reason.map(String::as_str))
+    );
+    let removable_use = match (&removable, &removable_report) {
+        (None, _) => None,
+        (Some(_), Some(report)) => Some(Ok(report.last_use.clone())),
+        (Some(status), None) => Some(store::recorded_last_use(&status.control)),
+    };
+    let mut uses = vec![("internal", Ok(internal_report.last_use.clone()))];
+    if let Some(removable_use) = removable_use {
+        uses.push(("removable", removable_use));
+    }
+    println!("{}", recent_use_line(&uses, process::now_ms()));
+
+    for section in sections(removable.is_some(), reason.map(String::as_str)) {
+        match section {
+            Section::Internal(note) => {
+                let header = format!("internal pool: {}{note}", internal.pool.display());
+                print_pool(internal, &header, &[], &internal_report)?;
+            }
+            Section::NoRemovable => println!("removable pool: none registered"),
+            Section::Removable => {
+                let (Some(status), Some(report)) = (&removable, &removable_report) else {
+                    return Err("the removable pool was not opened".to_owned());
+                };
+                let Ok(store) = &status.selected else {
+                    return Err("the removable pool was not opened".to_owned());
+                };
+                let header = format!(
+                    "removable pool: {} (selected for the next build)",
+                    status.lines[0]
+                );
+                print_pool(store, &header, &status.lines[1..], report)?;
+            }
+            Section::RemovableUnread(reason) => {
+                let Some(status) = &removable else {
+                    return Err("the removable pool is not registered".to_owned());
+                };
+                println!(
+                    "removable pool: {} (not used for the next build: {reason})",
+                    status.lines[0]
+                );
+                for line in &status.lines[1..] {
+                    println!("{line}");
+                }
+                println!("  slots: not read while the volume is not usable (unknown, not empty)");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One pool block of `status`, in display order.
+#[derive(Debug, Eq, PartialEq)]
+enum Section {
+    /// The internal pool, with its role note.
+    Internal(&'static str),
+    Removable,
+    /// Registered but not selected: its slots are not read.
+    RemovableUnread(String),
+    NoRemovable,
+}
+
+/// The pool selected for the next build comes first; each pool is one
+/// block holding only its own slots.
+fn sections(registered: bool, refused: Option<&str>) -> Vec<Section> {
+    const SELECTED: &str = " (selected for the next build)";
+    match (registered, refused) {
+        (false, _) => vec![Section::Internal(SELECTED), Section::NoRemovable],
+        (true, None) => vec![
+            Section::Removable,
+            Section::Internal(" (fallback while the removable volume is not usable)"),
+        ],
+        (true, Some(reason)) => vec![
+            Section::Internal(SELECTED),
+            Section::RemovableUnread(reason.to_owned()),
+        ],
+    }
+}
+
+/// Which pool the next build uses, from the same check builds make.
+fn selection_line(registered: bool, refused: Option<&str>) -> String {
+    match (registered, refused) {
+        (false, _) => {
+            "selected for the next build: internal pool (no removable volume registered)".to_owned()
+        }
+        (true, None) => "selected for the next build: removable pool".to_owned(),
+        (true, Some(reason)) => format!(
+            "selected for the next build: internal pool (removable volume not used: {reason})"
+        ),
+    }
+}
+
+/// The most recently used slot across pools, from each pool's recorded
+/// latest use. Pools are listed in display order; equal times name the
+/// first and say so. An unreadable pool or a use with no recorded time
+/// makes the cross-pool answer unknown rather than guessed.
+fn recent_use_line(uses: &[(&str, Result<Option<store::LastUse>, String>)], now_ms: u64) -> String {
+    let describe = |pool: &str, last: &store::LastUse| {
+        let slot = last
+            .slot_id
+            .as_deref()
+            .map_or_else(|| "slot unknown".to_owned(), |slot| format!("slot {slot}"));
+        let label = last.label.as_deref().unwrap_or("project unknown");
+        let checkout = last.checkout.as_deref().map_or_else(
+            || "no checkout affinity".to_owned(),
+            |path| path.display().to_string(),
+        );
+        let age = last.at_ms.map_or_else(
+            || "time not recorded".to_owned(),
+            |at| format!("{}s ago", now_ms.saturating_sub(at) / 1000),
+        );
+        format!("{pool} pool {slot}, project {label} ({checkout}), {age}")
+    };
+    let mut known = Vec::new();
+    for (pool, last) in uses {
+        match last {
+            Err(error) => {
+                return format!("most recent use: unknown ({pool} pool use not readable: {error})")
+            }
+            Ok(None) => {}
+            Ok(Some(last)) => known.push((*pool, last)),
+        }
+    }
+    match known.as_slice() {
+        [] => "most recent use: none recorded".to_owned(),
+        [(pool, last)] => format!("most recent use: {}", describe(pool, last)),
+        _ => {
+            if known.iter().any(|(_, last)| last.at_ms.is_none()) {
+                let each: Vec<String> = known
+                    .iter()
+                    .map(|(pool, last)| describe(pool, last))
+                    .collect();
+                return format!(
+                    "most recent use: unknown across pools (a use time was not recorded); latest per pool: {}",
+                    each.join("; ")
+                );
+            }
+            let latest = known
+                .iter()
+                .map(|(_, last)| last.at_ms.unwrap_or(0))
+                .max()
+                .unwrap_or(0);
+            let tied: Vec<&(&str, &store::LastUse)> = known
+                .iter()
+                .filter(|(_, last)| last.at_ms == Some(latest))
+                .collect();
+            let (pool, last) = tied[0];
+            let tie = if tied.len() > 1 {
+                " (tied with the other pool's latest use)"
+            } else {
+                ""
+            };
+            format!("most recent use: {}{tie}", describe(pool, last))
+        }
+    }
+}
+
+/// Backend, use, slots and recoveries of one opened pool, under `header`.
+fn print_pool(
+    store: &Store,
+    header: &str,
+    details: &[String],
+    report: &store::Report,
+) -> Result<(), String> {
+    println!("{header}");
+    for line in details {
+        println!("{line}");
+    }
     println!(
         "  backend {}: {}",
         store.backend.tag(),
@@ -781,24 +960,27 @@ fn print_pool(store: &Store) -> Result<(), String> {
             (None, true) => "no checkout affinity".to_owned(),
             (None, false) => "not managed by oxide".to_owned(),
         };
-        let bytes = slot_size(&store.payload, &slot.slot_id);
-        println!(
-            "  slot {} {state} {} {owner} {bytes}",
-            slot.slot_id,
-            slot.profile.as_deref().unwrap_or("-")
-        );
-        let incomplete = report
+        let bytes = slot_size(&store.payload, &slot.slot_id, slot.dir.as_deref());
+        println!("{}", slot_line(slot, &state, &owner, &bytes));
+        let diagnostic_scan = report
             .pool
             .slots
             .iter()
             .find(|pooled| pooled.slot_id == slot.slot_id)
             .map(|pooled| &pooled.accounting)
-            .filter(|scan| scan.coverage != AccountingCoverage::Complete);
-        if let Some(scan) = incomplete {
-            println!(
-                "    slot {} accounting walk: {scan}; it is not reused while incomplete",
-                slot.slot_id
-            );
+            .filter(|scan| scan.coverage != AccountingCoverage::Complete || scan.vanished > 0);
+        if let Some(scan) = diagnostic_scan {
+            if scan.coverage != AccountingCoverage::Complete {
+                println!(
+                    "    slot {} accounting walk: {scan}; it is not reused while incomplete",
+                    slot.slot_id
+                );
+            } else {
+                println!(
+                    "    slot {} accounting walk: {scan}; this best-effort observation does not infer freed allocation",
+                    slot.slot_id
+                );
+            }
         }
     }
     let now = process::now_ms();
@@ -821,6 +1003,21 @@ fn print_pool(store: &Store) -> Result<(), String> {
     Ok(())
 }
 
+/// One slot under its pool's header: ID, state, profile, project label,
+/// checkout, size and its place below the pool's `slots`.
+fn slot_line(slot: &store::SlotView, state: &str, owner: &str, bytes: &str) -> String {
+    let place = slot.dir.as_deref().map_or_else(
+        || format!("slots/{} (legacy path)", slot.slot_id),
+        |dir| format!("slots/{dir}"),
+    );
+    format!(
+        "  slot {} {state} {} project {} {owner} {bytes}, {place}",
+        slot.slot_id,
+        slot.profile.as_deref().unwrap_or("-"),
+        slot.label.as_deref().unwrap_or("unknown")
+    )
+}
+
 /// Slot allocation from the payload walk; an incomplete walk is a lower
 /// bound and says so.
 fn slot_use(pool: &PoolStatus) -> String {
@@ -840,11 +1037,22 @@ fn slot_use(pool: &PoolStatus) -> String {
 /// one slot. Reporting only: nothing inside a slot is ever deleted. The
 /// slot must resolve to itself under the canonical pool, so a link never
 /// leads the walk elsewhere.
-fn slot_size(payload: &Path, slot_id: &str) -> String {
+fn slot_size(payload: &Path, slot_id: &str, dir: Option<&str>) -> String {
     if slot_id.is_empty() || !slot_id.bytes().all(|byte| byte.is_ascii_digit()) {
         return "size unknown".to_owned();
     }
-    let slot = payload.join("slots").join(slot_id);
+    let slot = match dir {
+        None => payload.join("slots").join(slot_id),
+        Some(dir)
+            if dir.split('/').count() == 2
+                && !dir
+                    .split('/')
+                    .any(|part| part.is_empty() || part.starts_with('.')) =>
+        {
+            payload.join("slots").join(dir)
+        }
+        Some(_) => return "size unknown".to_owned(),
+    };
     match std::fs::canonicalize(&slot) {
         Ok(resolved) if resolved == slot => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return "empty".to_owned(),
@@ -924,7 +1132,7 @@ fn print_settings(settings: &config::Settings) {
         },
         if file.present { "" } else { ", absent" }
     );
-    if let Some(ignored) = config::ignored_legacy_config(&config::Facts::from_env()) {
+    if let Some(ignored) = &settings.ignored_legacy_config {
         println!(
             "  ignored: {} exists but is never read on macOS; move its settings to the file above",
             ignored.display()
@@ -939,6 +1147,11 @@ fn print_settings(settings: &config::Settings) {
         "  soft budget {} MB (from {})",
         settings.budget / 1_000_000,
         settings.budget_source.describe()
+    );
+    println!(
+        "host-wide active-build limit: {} (from {})",
+        settings.active_build_limit.value,
+        settings.active_build_limit.provenance(&settings.file.path)
     );
 }
 
@@ -998,6 +1211,178 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::ffi::OsStr;
+
+    #[test]
+    fn selected_pool_comes_first() {
+        assert_eq!(
+            sections(true, None),
+            vec![
+                Section::Removable,
+                Section::Internal(" (fallback while the removable volume is not usable)")
+            ]
+        );
+        assert_eq!(
+            sections(false, None),
+            vec![
+                Section::Internal(" (selected for the next build)"),
+                Section::NoRemovable
+            ]
+        );
+        assert_eq!(
+            sections(true, Some("volume not mounted")),
+            vec![
+                Section::Internal(" (selected for the next build)"),
+                Section::RemovableUnread("volume not mounted".to_owned())
+            ]
+        );
+        assert_eq!(
+            selection_line(true, None),
+            "selected for the next build: removable pool"
+        );
+        assert!(selection_line(true, Some("below reserve"))
+            .ends_with("(removable volume not used: below reserve)"));
+        assert!(
+            selection_line(false, None).contains("internal pool (no removable volume registered)")
+        );
+    }
+
+    fn view(slot_id: &str, dir: Option<&str>, checkout: &str) -> store::SlotView {
+        store::SlotView {
+            slot_id: slot_id.to_owned(),
+            dir: dir.map(str::to_owned),
+            label: store::slot_label(dir, Some(Path::new(checkout))),
+            state: SlotOccupancy::Idle,
+            profile: Some("quick".to_owned()),
+            checkout: Some(PathBuf::from(checkout)),
+            managed: true,
+            interrupted: None,
+            retired: None,
+            holder: None,
+        }
+    }
+
+    /// Equal slot numbers in two pools stay distinct by label and place;
+    /// a legacy slot shows its checkout's name and legacy path.
+    #[test]
+    fn slot_lines_name_project_and_place() {
+        let internal = view("1", None, "/work/My App");
+        let removable = view("1", Some("underlay-0a1b2c3d/quick-1"), "/work/underlay");
+        let internal_line = slot_line(&internal, "idle", "/work/My App", "empty");
+        let removable_line = slot_line(&removable, "idle", "/work/underlay", "empty");
+        assert!(
+            internal_line.contains("project my-app ")
+                && internal_line.ends_with("slots/1 (legacy path)"),
+            "{internal_line}"
+        );
+        assert!(
+            removable_line.contains("project underlay-0a1b2c3d ")
+                && removable_line.ends_with("slots/underlay-0a1b2c3d/quick-1"),
+            "{removable_line}"
+        );
+        let unknown = store::SlotView {
+            label: None,
+            checkout: None,
+            ..view("2", None, "/x")
+        };
+        assert!(slot_line(&unknown, "idle", "no checkout affinity", "empty")
+            .contains("project unknown"));
+    }
+
+    fn last(slot: &str, label: &str, at_ms: Option<u64>) -> store::LastUse {
+        store::LastUse {
+            slot_id: Some(slot.to_owned()),
+            label: Some(label.to_owned()),
+            checkout: Some(PathBuf::from(format!("/work/{label}"))),
+            at_ms,
+        }
+    }
+
+    #[test]
+    fn most_recent_use_names_pool_and_project() {
+        let now = 100_000;
+        let line = recent_use_line(
+            &[
+                ("internal", Ok(Some(last("1", "oxide-aa", Some(50_000))))),
+                (
+                    "removable",
+                    Ok(Some(last("3", "underlay-bb", Some(90_000)))),
+                ),
+            ],
+            now,
+        );
+        assert_eq!(
+            line,
+            "most recent use: removable pool slot 3, project underlay-bb (/work/underlay-bb), 10s ago"
+        );
+        let line = recent_use_line(
+            &[
+                (
+                    "removable",
+                    Ok(Some(last("3", "underlay-bb", Some(10_000)))),
+                ),
+                ("internal", Ok(Some(last("1", "oxide-aa", Some(50_000))))),
+            ],
+            now,
+        );
+        assert!(
+            line.starts_with("most recent use: internal pool slot 1, project oxide-aa"),
+            "{line}"
+        );
+        // Ties name the first listed pool, the selected one, and say so.
+        let line = recent_use_line(
+            &[
+                ("removable", Ok(Some(last("1", "b", Some(70_000))))),
+                ("internal", Ok(Some(last("1", "a", Some(70_000))))),
+            ],
+            now,
+        );
+        assert!(
+            line.contains("removable pool slot 1, project b")
+                && line.ends_with("(tied with the other pool's latest use)"),
+            "{line}"
+        );
+        // Unknowns are said, never guessed.
+        let line = recent_use_line(
+            &[
+                ("internal", Ok(Some(last("1", "a", Some(70_000))))),
+                ("removable", Ok(Some(last("2", "b", None)))),
+            ],
+            now,
+        );
+        assert!(
+            line.starts_with("most recent use: unknown across pools"),
+            "{line}"
+        );
+        let line = recent_use_line(
+            &[
+                ("internal", Ok(Some(last("1", "a", Some(70_000))))),
+                ("removable", Err("no Oxide control state".to_owned())),
+            ],
+            now,
+        );
+        assert_eq!(
+            line,
+            "most recent use: unknown (removable pool use not readable: no Oxide control state)"
+        );
+        let unread = store::LastUse {
+            slot_id: None,
+            ..last("9", "b", Some(99_000))
+        };
+        let line = recent_use_line(
+            &[("internal", Ok(None)), ("removable", Ok(Some(unread)))],
+            now,
+        );
+        assert!(
+            line.contains("removable pool slot unknown, project b"),
+            "{line}"
+        );
+        assert_eq!(
+            recent_use_line(&[("internal", Ok(None))], now),
+            "most recent use: none recorded"
+        );
+        let legacy = recent_use_line(&[("internal", Ok(Some(last("1", "a", None))))], now);
+        assert!(legacy.ends_with("time not recorded"), "{legacy}");
+    }
 
     fn environment(profile: Profile) -> HashMap<String, Option<String>> {
         let mut command = Command::new(CARGO);

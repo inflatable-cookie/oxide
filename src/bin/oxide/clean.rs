@@ -8,6 +8,7 @@
 //! never follows a symlink. A package, profile or doc selection is passed
 //! to Cargo as before. Shared slots are never touched.
 
+use crate::config::Settings;
 use crate::{apply_storage, cargo_home, cli, identity, process, store, CARGO};
 use cli::Profile;
 use std::ffi::{OsStr, OsString};
@@ -124,14 +125,21 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
         if request.dry_run {
             return Err("clean --dry-run lists paths only for a whole-target clean: Cargo's -p, --workspace, --doc, --profile and --release dry run does not print every path it would remove".to_owned());
         }
-        return run_selected(&request.cargo_args, &workspace);
+        let settings = store::settings()?;
+        return run_selected(&request.cargo_args, &workspace, &settings);
     }
     if let Some(argument) = request.unsupported {
         return Err(format!(
             "clean: {argument} is not supported for a whole-target clean, which Oxide plans and removes itself (accepted: --dry-run, --include-foreign, --manifest-path, -q, -v, --color, --locked, --frozen, --offline)"
         ));
     }
-    run_whole(&workspace, request.dry_run, request.include_foreign)
+    let settings = store::settings()?;
+    run_whole(
+        &workspace,
+        request.dry_run,
+        request.include_foreign,
+        &settings,
+    )
 }
 
 /// One path the plan removes.
@@ -347,8 +355,7 @@ fn summary(plan: &Plan) -> String {
 /// Refuse a pool that lives inside the target, by path text and by real
 /// path (an outside symlink can name a pool inside), and return the pool's
 /// identity for the enumeration's own check.
-fn protect_pool(target: &Path) -> Result<Protected, String> {
-    let pool = store::pool_path()?;
+fn protect_pool(target: &Path, pool: &Path) -> Result<Protected, String> {
     let inside = |pool: &Path| {
         Err(format!(
             "clean refused: the Oxide pool {} is inside {}; shared slots are never cleaned",
@@ -426,9 +433,14 @@ fn remove(plan: &Plan) -> Result<(), String> {
     ))
 }
 
-fn run_whole(workspace: &Path, dry_run: bool, include_foreign: bool) -> Result<u8, String> {
+fn run_whole(
+    workspace: &Path,
+    dry_run: bool,
+    include_foreign: bool,
+    settings: &Settings,
+) -> Result<u8, String> {
     let target = workspace.join("target");
-    let pool = protect_pool(&target)?;
+    let pool = protect_pool(&target, &settings.pool)?;
     // Refusal precedes waiting, deletion and any affinity change.
     let first = checked_plan(&target, pool, include_foreign)?;
     if dry_run {
@@ -458,7 +470,7 @@ fn run_whole(workspace: &Path, dry_run: bool, include_foreign: bool) -> Result<u
         return Ok(0);
     }
     process::install_signal_handlers()?;
-    let store = crate::removable::coordinate(Store::open_existing()?)?;
+    let store = crate::removable::coordinate(Store::open_existing_with(settings)?)?;
     let guard = match &store {
         Some(store) => match store.begin_clean(workspace)? {
             Cleaning::Guard(guard) => Some(guard),
@@ -518,10 +530,10 @@ fn run_whole(workspace: &Path, dry_run: bool, include_foreign: bool) -> Result<u
 /// this checkout's slot affinity. Plain `cargo clean` would delete an
 /// injected slot build directory. It waits for active commands in the
 /// checkout and blocks new ones until it finishes.
-fn run_selected(args: &[OsString], workspace: &Path) -> Result<u8, String> {
-    protect_pool(&workspace.join("target"))?;
+fn run_selected(args: &[OsString], workspace: &Path, settings: &Settings) -> Result<u8, String> {
+    protect_pool(&workspace.join("target"), &settings.pool)?;
     process::install_signal_handlers()?;
-    let store = crate::removable::coordinate(Store::open_existing()?)?;
+    let store = crate::removable::coordinate(Store::open_existing_with(settings)?)?;
     let guard = match &store {
         Some(store) => match store.begin_clean(workspace)? {
             Cleaning::Guard(guard) => Some(guard),

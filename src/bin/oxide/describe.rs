@@ -125,7 +125,7 @@ enum Registered {
 /// `oxide pool describe --json`: print the description on stdout. Returns
 /// an error, and so exit non-zero, only when Oxide itself fails.
 pub fn print_json() -> Result<u8, String> {
-    let configured = store::pool_path()?;
+    let configured = store::settings()?.pool;
     let description = describe(&configured)?;
     let text = serde_json::to_string_pretty(&description).map_err(|error| error.to_string())?;
     println!("{text}");

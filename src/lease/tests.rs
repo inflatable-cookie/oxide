@@ -5,11 +5,11 @@ use super::pool::{
 };
 use super::{
     AccountingCoverage, AccountingGapKind, AccountingScan, LeaseError, LeaseRequest, Profile,
-    SlotOccupancy, BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME,
+    SlotLayout, SlotOccupancy, BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME,
 };
 use std::fs::{self, File};
 use std::io::Write;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
@@ -78,6 +78,7 @@ fn request_with_profile(
         profile,
         holder: holder.to_owned(),
         budget_bytes: None,
+        layout: None,
     }
 }
 
@@ -1355,13 +1356,14 @@ fn unreadable_slot_entry_refuses_reuse_admission_and_eviction() {
     .expect("blob");
     let locked = grant.env.cargo_build_build_dir.join("locked");
     fs::create_dir(&locked).expect("locked dir");
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod 000");
     managed::release(&pool, &grant.lease_id).expect("release");
+    let denied = crate::test_fs::PermissionDeniedGuard::read_dir(&locked);
     let reuse = managed::lease(request(&pool, &project, &workspace, "b"));
     // Over the tiny budget with the only idle slot unmeasurable: no eviction.
     let admit = managed::lease(request(&pool, &fx.dir("other"), &workspace, "c"));
     let status = managed::status(&pool);
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("restore");
+    assert!(denied.hits() >= 1, "permission injection was not reached");
+    drop(denied);
     for scan in [incomplete(reuse), incomplete(admit)] {
         assert_eq!(scan.coverage, AccountingCoverage::Partial);
         assert_eq!(gap_kinds(&scan), vec![AccountingGapKind::UnreadableEntry]);
@@ -1380,6 +1382,176 @@ fn unreadable_slot_entry_refuses_reuse_admission_and_eviction() {
         managed::lease(request(&pool, &fx.dir("third"), &workspace, "d")).expect("admitted");
     assert_ne!(admitted.slot_id, grant.slot_id);
     assert!(!grant.env.cargo_build_build_dir.exists());
+}
+
+#[test]
+fn vanished_diagnostic_reaches_status_and_preserves_seen_hardlink_allocation() {
+    let fx = Fixture::new("vanished-status");
+    let pool = fx.dir("pool");
+    managed::init_budget_pool(&pool, 16 * 1024 * 1024).expect("init budget pool");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let held =
+        managed::lease(request(&pool, &project, &workspace, "held")).expect("create held slot");
+    let stable = held.env.cargo_build_build_dir.join("stable");
+    fs::write(&stable, vec![7_u8; 4096]).expect("stable inode");
+    let vanished_dir = held.env.cargo_build_build_dir.join("nested");
+    fs::create_dir(&vanished_dir).expect("nested dir");
+    let vanished_link = vanished_dir.join("hardlink");
+    fs::hard_link(&stable, &vanished_link).expect("hardlink into nested dir");
+    let expected = fs::symlink_metadata(&stable).unwrap().blocks() * 512;
+
+    let status = crate::inventory::walk_observer::with_mutations(
+        fx.path(),
+        serde_json::json!([
+            {"path": vanished_link, "action": "remove_before_symlink_metadata"}
+        ])
+        .to_string(),
+        || managed::status(&pool),
+    )
+    .expect("status completes after a path vanishes");
+
+    assert_eq!(status.coverage, AccountingCoverage::Complete);
+    assert_eq!(status.payload_accounting.vanished, 1);
+    assert_eq!(status.payload_accounting.gaps, Vec::new());
+    assert_eq!(status.payload_unique_allocated_bytes, Some(expected));
+    assert_eq!(status.payload_logical_bytes, Some(4096));
+    assert!(status
+        .payload_accounting
+        .to_string()
+        .contains("vanished x1"));
+    assert!(stable.exists());
+    assert!(!vanished_link.exists());
+
+    let mut old_status = serde_json::to_value(&status).expect("serialize status");
+    old_status["payload_accounting"]
+        .as_object_mut()
+        .unwrap()
+        .remove("vanished");
+    let decoded: super::PoolStatus =
+        serde_json::from_value(old_status).expect("new reader accepts old scan JSON");
+    assert_eq!(decoded.payload_accounting.vanished, 0);
+}
+
+#[test]
+fn vanished_paths_allow_only_the_needed_whole_idle_slot_eviction() {
+    let fx = Fixture::new("vanished-eviction");
+    let pool = fx.dir("pool");
+    let budget = 1024 * 1024;
+    managed::init_budget_pool(&pool, budget).expect("init budget pool");
+    let workspace = fx.dir("workspace");
+    let held_project = fx.dir("held-project");
+    let idle_project = fx.dir("idle-project");
+    let held = managed::lease(request(&pool, &held_project, &workspace, "held"))
+        .expect("create held slot");
+    let idle = managed::lease(request(&pool, &idle_project, &workspace, "idle"))
+        .expect("create idle slot beside held");
+    let held_stable = held.env.cargo_build_build_dir.join("stable");
+    fs::write(&held_stable, vec![1_u8; 600 * 1024]).expect("held stable occupancy");
+    let vanished_file = held.env.cargo_build_build_dir.join("temporary");
+    fs::write(&vanished_file, vec![2_u8; 128 * 1024]).expect("held temporary file");
+    let vanished_dir = held.env.cargo_build_build_dir.join("temporary-dir");
+    fs::create_dir(&vanished_dir).expect("held temporary directory");
+    fs::write(vanished_dir.join("payload"), vec![3_u8; 64 * 1024])
+        .expect("held temporary directory payload");
+    let idle_file = idle.env.cargo_build_build_dir.join("occupancy");
+    fs::write(&idle_file, vec![4_u8; 512 * 1024]).expect("idle occupancy");
+    managed::release(&pool, &idle.lease_id).expect("release idle slot");
+
+    let held_stable_bytes = fs::symlink_metadata(&held_stable).unwrap().blocks() * 512;
+    let idle_bytes = fs::symlink_metadata(&idle_file).unwrap().blocks() * 512;
+    assert!(held_stable_bytes < budget);
+    assert!(held_stable_bytes + idle_bytes > budget);
+    let next_project = fx.dir("next-project");
+    let admitted = crate::inventory::walk_observer::with_mutations(
+        fx.path(),
+        serde_json::json!([
+            {"path": vanished_file, "action": "remove_before_symlink_metadata"},
+            {"path": vanished_dir, "action": "remove_before_read_dir"}
+        ])
+        .to_string(),
+        || managed::lease(request(&pool, &next_project, &workspace, "next")),
+    )
+    .expect("complete observation permits admission");
+
+    assert!(!admitted.reused_slot);
+    assert_ne!(admitted.slot_id, held.slot_id);
+    assert_ne!(admitted.slot_id, idle.slot_id);
+    assert!(held.env.cargo_build_build_dir.exists());
+    assert!(held_stable.exists());
+    assert!(!vanished_file.exists());
+    assert!(!vanished_dir.exists());
+    assert!(!idle.env.cargo_build_build_dir.parent().unwrap().exists());
+    let status = managed::status(&pool).expect("status after admission");
+    let ids: Vec<_> = status
+        .slots
+        .iter()
+        .map(|slot| slot.slot_id.as_str())
+        .collect();
+    assert_eq!(ids, vec![held.slot_id.as_str(), admitted.slot_id.as_str()]);
+    assert_eq!(
+        status.slots[0].state,
+        SlotOccupancy::Held,
+        "the held slot remains in place"
+    );
+}
+
+#[test]
+fn a_real_gap_still_refuses_before_whole_idle_slot_deletion() {
+    let fx = Fixture::new("vanished-gap");
+    let pool = fx.dir("pool");
+    let budget = 1024 * 1024;
+    managed::init_budget_pool(&pool, budget).expect("init budget pool");
+    let workspace = fx.dir("workspace");
+    let held_project = fx.dir("held-project");
+    let idle_project = fx.dir("idle-project");
+    let held = managed::lease(request(&pool, &held_project, &workspace, "held"))
+        .expect("create held slot");
+    let idle = managed::lease(request(&pool, &idle_project, &workspace, "idle"))
+        .expect("create idle slot beside held");
+    let held_stable = held.env.cargo_build_build_dir.join("stable");
+    fs::write(&held_stable, vec![1_u8; 600 * 1024]).expect("held stable occupancy");
+    let blocked_dir = held.env.cargo_build_build_dir.join("blocked");
+    fs::create_dir(&blocked_dir).expect("blocked directory");
+    fs::write(blocked_dir.join("payload"), vec![2_u8; 64 * 1024])
+        .expect("blocked directory payload");
+    let vanished_file = held.env.cargo_build_build_dir.join("vanished");
+    fs::write(&vanished_file, vec![3_u8; 32 * 1024]).expect("vanished fixture file");
+    let idle_file = idle.env.cargo_build_build_dir.join("occupancy");
+    fs::write(&idle_file, vec![3_u8; 512 * 1024]).expect("idle occupancy");
+    managed::release(&pool, &idle.lease_id).expect("release idle slot");
+    let next_project = fx.dir("next-project");
+
+    let refused = crate::inventory::walk_observer::with_mutations(
+        fx.path(),
+        serde_json::json!([
+            {"path": blocked_dir, "action": "permission_denied_before_read_dir"},
+            {"path": vanished_file, "action": "remove_before_symlink_metadata"}
+        ])
+        .to_string(),
+        || managed::lease(request(&pool, &next_project, &workspace, "next")),
+    );
+    let scan = incomplete(refused);
+    assert_eq!(scan.coverage, AccountingCoverage::Partial);
+    assert_eq!(gap_kinds(&scan), vec![AccountingGapKind::UnreadableEntry]);
+    assert_eq!(scan.vanished, 1);
+    assert!(scan.to_string().contains("unreadable_entry x1"));
+    assert!(scan.to_string().contains("vanished x1"));
+    assert!(idle.env.cargo_build_build_dir.exists());
+    assert!(held.env.cargo_build_build_dir.exists());
+    assert!(blocked_dir.exists());
+    assert!(!vanished_file.exists());
+
+    let status = managed::status(&pool).expect("status after conservative refusal");
+    assert_eq!(status.slots.len(), 2);
+    assert!(status
+        .slots
+        .iter()
+        .any(|slot| { slot.slot_id == idle.slot_id && slot.state == SlotOccupancy::Idle }));
+    assert!(status
+        .slots
+        .iter()
+        .any(|slot| { slot.slot_id == held.slot_id && slot.state == SlotOccupancy::Held }));
 }
 
 #[test]
@@ -1420,11 +1592,12 @@ fn pool_bounds_are_separate_from_the_inventory_defaults() {
     managed::init_budget_pool(&pool, 1024 * 1024).expect("init budget pool");
     let status = managed::status(&pool).expect("status");
     let walk = &status.payload_accounting;
-    // The payload walk starts one level above `slots` (oxide#105), so its
-    // depth bound is one deeper: slot contents keep 64.
+    // The payload walk starts one level above `slots` (oxide#105) and a
+    // slot may sit in a project folder (oxide#104), so its depth bound is
+    // two deeper: slot contents keep 64.
     assert_eq!(
         (walk.max_entries, walk.max_depth, walk.max_elapsed_ms),
-        (2_000_000, 65, 60_000)
+        (2_000_000, 66, 60_000)
     );
     assert_eq!(walk.coverage, AccountingCoverage::Complete);
 }
@@ -1598,12 +1771,15 @@ fn ledger_view_keeps_status_refusals_and_non_gating_gaps() {
     let denied = fx.dir("denied-pool");
     create_injected(&denied, 1024 * 1024).expect("init denied");
     let denied_project = fx.dir("denied-project");
-    lease_injected(request(&denied, &denied_project, &workspace, "d")).expect("lease");
+    let denied_grant =
+        lease_injected(request(&denied, &denied_project, &workspace, "d")).expect("lease");
     let slots = denied.join("payload").join("slots");
-    fs::set_permissions(&slots, fs::Permissions::from_mode(0o000)).expect("deny");
+    let denied_slot_root = slots.join(&denied_grant.slot_id);
+    let denied_lookup = crate::test_fs::PermissionDeniedGuard::symlink_metadata(&denied_slot_root);
     let from_status = status_injected(&denied).map(|_| ());
     let from_view = ledger_injected(&denied).map(|_| ());
-    fs::set_permissions(&slots, fs::Permissions::from_mode(0o700)).expect("restore");
+    assert_eq!(denied_lookup.hits(), 2);
+    drop(denied_lookup);
     assert!(
         matches!(from_status, Err(LeaseError::Io(_))),
         "{from_status:?}"
@@ -1733,5 +1909,225 @@ fn volume_description_refuses_other_backends_and_mismatched_ledgers() {
         );
         assert_eq!(snapshot_tree(&control), before);
         fs::remove_dir_all(&control).expect("remove fixture control");
+    }
+}
+
+fn labelled(
+    pool: &Path,
+    project: &Path,
+    workspace: &Path,
+    holder: &str,
+    folders: &[&str],
+    same_repository: &[&Path],
+) -> LeaseRequest {
+    let mut request = request(pool, project, workspace, holder);
+    request.layout = Some(SlotLayout {
+        folders: folders.iter().map(|folder| (*folder).to_owned()).collect(),
+        same_repository: same_repository
+            .iter()
+            .map(|path| path.to_path_buf())
+            .collect(),
+        profile: "quick".to_owned(),
+    });
+    request
+}
+
+fn build_dir_below_slots(pool: &Path, grant: &super::LeaseGrant) -> String {
+    grant
+        .env
+        .cargo_build_build_dir
+        .strip_prefix(pool.join("payload").join("slots"))
+        .expect("build dir under slots")
+        .display()
+        .to_string()
+}
+
+/// A new slot goes to `slots/<folder>/<profile>-<id>`; a request without a
+/// layout keeps `slots/<id>`; a legacy ledger record has no `dir` field.
+#[test]
+fn new_slots_use_the_project_folder_and_legacy_keeps_its_path() {
+    let fx = Fixture::new("layout");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024 * 1024).expect("init");
+    let legacy_project = fx.dir("legacy");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let legacy =
+        lease_injected(request(&pool, &legacy_project, &workspace, "legacy")).expect("legacy");
+    assert_eq!(build_dir_below_slots(&pool, &legacy), "1/build");
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
+    assert!(ledger["slots"][0].get("dir").is_none(), "{ledger}");
+
+    let grant = lease_injected(labelled(
+        &pool,
+        &project,
+        &workspace,
+        "new",
+        &["oxide-0123abcd"],
+        &[&project],
+    ))
+    .expect("labelled");
+    assert_eq!(
+        build_dir_below_slots(&pool, &grant),
+        "oxide-0123abcd/quick-2/build"
+    );
+    assert!(pool
+        .join("payload/slots/oxide-0123abcd/quick-2/build")
+        .is_dir());
+    let status = status_injected(&pool).expect("status");
+    assert_eq!(status.slots[0].dir, None);
+    assert_eq!(
+        status.slots[1].dir.as_deref(),
+        Some("oxide-0123abcd/quick-2")
+    );
+    assert_eq!(status.coverage, AccountingCoverage::Complete);
+
+    // A labelled request reusing the legacy slot keeps the legacy path.
+    release_injected(&pool, &legacy.lease_id).expect("release legacy");
+    let reused = lease_injected(labelled(
+        &pool,
+        &legacy_project,
+        &workspace,
+        "again",
+        &["legacy-89abcdef"],
+        &[&legacy_project],
+    ))
+    .expect("reuse");
+    assert_eq!(reused.slot_id, legacy.slot_id);
+    assert_eq!(build_dir_below_slots(&pool, &reused), "1/build");
+    assert!(!pool.join("payload/slots/legacy-89abcdef").exists());
+}
+
+/// Two repositories with the same label and an injected shortened-ID
+/// collision get separate folders; a second slot of the first repository
+/// joins its folder; a folder holding unknown entries is never adopted; with
+/// no usable folder the slot keeps the legacy path.
+#[test]
+fn folder_collisions_are_skipped_before_creation() {
+    let fx = Fixture::new("collide");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024 * 1024).expect("init");
+    let first = fx.dir("first");
+    let first_other = fx.dir("first-other");
+    let second = fx.dir("second");
+    let workspace = fx.dir("workspace");
+    let a = lease_injected(labelled(
+        &pool,
+        &first,
+        &workspace,
+        "a",
+        &["app-aaaaaaaa", "app-aaaaaaaa1111"],
+        &[&first],
+    ))
+    .expect("first");
+    assert_eq!(
+        build_dir_below_slots(&pool, &a),
+        "app-aaaaaaaa/quick-1/build"
+    );
+    // Same short prefix, another repository: the next folder.
+    let b = lease_injected(labelled(
+        &pool,
+        &second,
+        &workspace,
+        "b",
+        &["app-aaaaaaaa", "app-aaaaaaaa2222"],
+        &[&second],
+    ))
+    .expect("second");
+    assert_eq!(
+        build_dir_below_slots(&pool, &b),
+        "app-aaaaaaaa2222/quick-2/build"
+    );
+    // Another record of the first repository shares its folder.
+    let c = lease_injected(labelled(
+        &pool,
+        &first_other,
+        &workspace,
+        "c",
+        &["app-aaaaaaaa"],
+        &[&first, &first_other],
+    ))
+    .expect("same repository");
+    assert_eq!(
+        build_dir_below_slots(&pool, &c),
+        "app-aaaaaaaa/quick-3/build"
+    );
+    // An existing folder with no recorded slot and unknown contents.
+    let stranger = pool.join("payload/slots/stray-00000000");
+    fs::create_dir(&stranger).expect("stray folder");
+    fs::write(stranger.join("note"), b"x").expect("stray entry");
+    let other = fx.dir("other");
+    let d = lease_injected(labelled(
+        &pool,
+        &other,
+        &workspace,
+        "d",
+        &["stray-00000000", "app-aaaaaaaa"],
+        &[&other],
+    ))
+    .expect("legacy fallback");
+    assert_eq!(build_dir_below_slots(&pool, &d), "4/build");
+    assert_eq!(fs::read(stranger.join("note")).expect("untouched"), b"x");
+    // Unsafe names refuse rather than escaping the slots root.
+    let bad = fx.dir("bad");
+    for folder in ["../escape", ".hidden", "Upper", ""] {
+        let error = lease_injected(labelled(&pool, &bad, &workspace, "e", &[folder], &[&bad]))
+            .expect_err(folder);
+        assert_eq!(
+            error,
+            LeaseError::InvalidInput("invalid slot project folder"),
+            "{folder}"
+        );
+    }
+}
+
+/// Idle eviction of a labelled slot removes only that slot; its folder and
+/// neighbours stay. A malformed recorded `dir` refuses the ledger.
+#[test]
+fn labelled_slot_eviction_and_malformed_dir() {
+    let fx = Fixture::new("evict-label");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 1024 * 1024 * 1024).expect("init");
+    let one = fx.dir("one");
+    let two = fx.dir("two");
+    let workspace = fx.dir("workspace");
+    let a = lease_injected(labelled(
+        &pool,
+        &one,
+        &workspace,
+        "a",
+        &["p-1"],
+        &[&one, &two],
+    ))
+    .expect("a");
+    let b = lease_injected(labelled(
+        &pool,
+        &two,
+        &workspace,
+        "b",
+        &["p-1"],
+        &[&one, &two],
+    ))
+    .expect("b");
+    fill(&a.env.cargo_build_build_dir, 2);
+    release_injected(&pool, &a.lease_id).expect("release");
+    evict_idle_slot_injected(&pool, &a.slot_id).expect("evict");
+    assert!(!pool.join("payload/slots/p-1/quick-1").exists());
+    assert!(pool.join("payload/slots/p-1/quick-2/build").is_dir());
+    assert_eq!(status_injected(&pool).expect("status").slots.len(), 1);
+    release_injected(&pool, &b.lease_id).expect("release b");
+
+    let ledger_path = pool.join("ledger.json");
+    let mut ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ledger_path).expect("ledger")).expect("json");
+    for bad in ["p-1/quick-9", "../x/quick-2", "p-1/quick-2/extra", "p-1"] {
+        ledger["slots"][0]["dir"] = serde_json::json!(bad);
+        fs::write(&ledger_path, serde_json::to_vec(&ledger).expect("bytes")).expect("write");
+        assert_eq!(
+            status_injected(&pool).expect_err(bad),
+            LeaseError::UnknownAccounting,
+            "{bad}"
+        );
     }
 }

@@ -260,6 +260,72 @@ impl Identity {
     }
 }
 
+/// Longest project label in a slot folder name.
+const MAX_LABEL_BYTES: usize = 40;
+
+/// Human-readable project label for a new slot's folder: the last segment
+/// of the normalised `origin` URL, else the repository directory name,
+/// else the workspace directory name; sanitised by [`sanitize_label`].
+/// Presentation only: never part of the slot key.
+pub fn project_label(workspace: &Path) -> String {
+    let origin = git(workspace, &["config", "--get", "remote.origin.url"])
+        .map(|origin| normalize_origin(&origin))
+        .and_then(|origin| {
+            origin
+                .rsplit(['/', ':'])
+                .next()
+                .filter(|segment| !segment.is_empty())
+                .map(str::to_owned)
+        });
+    let directory = || {
+        git(workspace, &["rev-parse", "--show-toplevel"])
+            .map(PathBuf::from)
+            .unwrap_or_else(|| workspace.to_path_buf())
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    };
+    sanitize_label(&origin.or_else(directory).unwrap_or_default())
+}
+
+/// Lowercase ASCII letters and digits, `_` kept; every other run becomes
+/// one `-`; no leading or trailing `-`; at most [`MAX_LABEL_BYTES`];
+/// `project` when nothing remains.
+pub fn sanitize_label(name: &str) -> String {
+    let mut label = String::new();
+    for character in name.chars() {
+        let character = character.to_ascii_lowercase();
+        if character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_' {
+            label.push(character);
+        } else if !label.is_empty() && !label.ends_with('-') {
+            label.push('-');
+        }
+    }
+    label.truncate(MAX_LABEL_BYTES);
+    let label = label.trim_end_matches('-');
+    if label.is_empty() {
+        "project".to_owned()
+    } else {
+        label.to_owned()
+    }
+}
+
+/// Folder names for a new slot of one repository, preferred first:
+/// `<label>-<identity digest prefix>` with 8, 12, 16 and all 64 hex digits.
+/// A short prefix is display, not a uniqueness proof: the pool skips a
+/// folder that holds another repository's slot and tries the next.
+pub fn slot_folders(label: &str, identity: &str) -> Vec<String> {
+    [8, 12, 16, identity.len()]
+        .into_iter()
+        .filter_map(|digits| identity.get(..digits))
+        .map(|prefix| format!("{label}-{prefix}"))
+        .fold(Vec::new(), |mut folders, folder| {
+            if !folders.contains(&folder) {
+                folders.push(folder);
+            }
+            folders
+        })
+}
+
 fn git(workspace: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .args(args)
@@ -303,6 +369,80 @@ pub fn digest(value: &str) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn labels_are_sanitized_plain_names() {
+        assert_eq!(sanitize_label("Oxide"), "oxide");
+        assert_eq!(sanitize_label("my app (copy).rs"), "my-app-copy-rs");
+        assert_eq!(sanitize_label("--__weird__--"), "__weird__");
+        assert_eq!(sanitize_label("../.."), "project");
+        assert_eq!(sanitize_label("日本"), "project");
+        assert_eq!(sanitize_label(""), "project");
+        let long = sanitize_label(&"a-".repeat(60));
+        assert!(
+            long.len() <= MAX_LABEL_BYTES && !long.ends_with('-'),
+            "{long}"
+        );
+        for label in [
+            "oxide",
+            "my-app-copy-rs",
+            "__weird__",
+            "project",
+            long.as_str(),
+        ] {
+            assert!(!label.starts_with('.') && !label.contains('/'), "{label}");
+        }
+    }
+
+    /// Same-name repositories differ by identity; an injected collision of
+    /// the shortest prefix still differs at a longer one, ending at the full
+    /// digest.
+    #[test]
+    fn folders_disambiguate_same_name_repositories() {
+        let first = digest("git:aaa:");
+        let second = digest("git:bbb:");
+        assert_ne!(
+            slot_folders("app", &first)[0],
+            slot_folders("app", &second)[0]
+        );
+        let collide_a = format!("deadbeef1111{}", "0".repeat(52));
+        let collide_b = format!("deadbeef2222{}", "0".repeat(52));
+        let a = slot_folders("app", &collide_a);
+        let b = slot_folders("app", &collide_b);
+        assert_eq!(a[0], "app-deadbeef");
+        assert_eq!(a[0], b[0]);
+        assert_ne!(a[1], b[1]);
+        assert_eq!(a.last().unwrap(), &format!("app-{collide_a}"));
+        assert_eq!(a.len(), 4);
+    }
+
+    #[test]
+    fn label_prefers_the_origin_segment_then_the_directory() {
+        let dir = scratch("label");
+        let checkout = dir.join("My Checkout");
+        fs::create_dir(&checkout).expect("checkout");
+        assert_eq!(project_label(&checkout), "my-checkout");
+        let git_ok = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&checkout)
+            .status()
+            .is_ok_and(|status| status.success());
+        if git_ok {
+            assert_eq!(project_label(&checkout), "my-checkout");
+            Command::new("git")
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "git@GitHub.com:owner/Some.Repo.git",
+                ])
+                .current_dir(&checkout)
+                .status()
+                .expect("git remote");
+            assert_eq!(project_label(&checkout), "some-repo");
+        }
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
 
     fn scratch(label: &str) -> PathBuf {
         let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")

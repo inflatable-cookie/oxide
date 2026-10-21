@@ -264,6 +264,10 @@ pub struct PolicyHint {
 pub struct InventoryReport {
     pub root: PathBuf,
     pub coverage: Coverage,
+    /// Enumerated non-root paths that disappeared before a deferred read.
+    /// This diagnostic does not claim their inode allocation was reclaimed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub vanished: u64,
     pub limits: InventoryLimits,
     pub elapsed_ms: u64,
     pub entries_visited: u64,
@@ -293,6 +297,10 @@ pub enum InventoryError {
     RootNotDirectory(PathBuf),
     RootUnreadable { root: PathBuf, reason: String },
     InvalidLimits(&'static str),
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl fmt::Display for InventoryError {
@@ -336,18 +344,25 @@ pub fn inventory_directory(
             reason: error.to_string(),
         },
     })?;
-    let root_metadata =
-        fs::metadata(&canonical).map_err(|error| InventoryError::RootUnreadable {
-            root: canonical.clone(),
-            reason: error.to_string(),
-        })?;
+    let root_metadata = fs::metadata(&canonical).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            InventoryError::RootMissing(canonical.clone())
+        } else {
+            InventoryError::RootUnreadable {
+                root: canonical.clone(),
+                reason: error.to_string(),
+            }
+        }
+    })?;
     if !root_metadata.is_dir() {
         return Err(InventoryError::RootNotDirectory(canonical));
     }
     let root_device = root_metadata.dev();
+    let root_inode = root_metadata.ino();
     let started = Instant::now();
-    let mut walker = Walker::new(&canonical, root_device, limits, started);
-    walker.run();
+    let mut walker = Walker::new(&canonical, root_device, root_inode, limits, started);
+    walker.run()?;
+    walker.verify_root()?;
     let filesystem_free = probe_filesystem_free(&canonical, root_device);
     Ok(walker.finish(filesystem_free))
 }
@@ -358,11 +373,19 @@ struct InodeRecord {
     categories: u8,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WalkPoint {
+    BeforeReadDir,
+    BeforeFileType,
+    BeforeSymlinkMetadata,
+}
+
 struct Walker<'a> {
     root: &'a Path,
     limits: InventoryLimits,
     started: Instant,
     root_device: u64,
+    root_inode: u64,
     deadline_exceeded: bool,
     entries_visited: u64,
     directories_visited: u64,
@@ -374,15 +397,25 @@ struct Walker<'a> {
     other: [u64; 5],
     logical_by_name: [u64; 5],
     inodes: HashMap<(u64, u64), InodeRecord>,
+    vanished: u64,
+    #[cfg(debug_assertions)]
+    test_hook: Option<walk_observer::WalkHook>,
 }
 
 impl<'a> Walker<'a> {
-    fn new(root: &'a Path, root_device: u64, limits: InventoryLimits, started: Instant) -> Self {
+    fn new(
+        root: &'a Path,
+        root_device: u64,
+        root_inode: u64,
+        limits: InventoryLimits,
+        started: Instant,
+    ) -> Self {
         Self {
             root,
             limits,
             started,
             root_device,
+            root_inode,
             deadline_exceeded: false,
             entries_visited: 0,
             directories_visited: 0,
@@ -394,6 +427,9 @@ impl<'a> Walker<'a> {
             other: [0; 5],
             logical_by_name: [0; 5],
             inodes: HashMap::new(),
+            vanished: 0,
+            #[cfg(debug_assertions)]
+            test_hook: walk_observer::WalkHook::from_environment(),
         }
     }
 
@@ -413,20 +449,51 @@ impl<'a> Walker<'a> {
         false
     }
 
-    fn run(&mut self) {
+    fn run(&mut self) -> Result<(), InventoryError> {
         let mut stack: Vec<(PathBuf, usize)> = vec![(self.root.to_path_buf(), 0)];
         while let Some((directory, depth)) = stack.pop() {
             if self.check_deadline() {
-                return;
+                return Ok(());
             }
             if self.entries_visited >= self.limits.max_entries {
                 self.gap(GapKind::EntryLimit);
-                return;
+                return Ok(());
             }
-            let Ok(entries) = fs::read_dir(&directory) else {
-                self.gap(GapKind::UnreadableEntry);
-                continue;
+            let read_dir = self
+                .test_hook_error(&directory, WalkPoint::BeforeReadDir)
+                .map_or_else(
+                    || {
+                        #[cfg(test)]
+                        {
+                            crate::test_fs::read_dir(&directory)
+                        }
+                        #[cfg(not(test))]
+                        {
+                            fs::read_dir(&directory)
+                        }
+                    },
+                    Err,
+                );
+            let entries = match read_dir {
+                Ok(entries) => entries,
+                Err(error)
+                    if directory == self.root && error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return Err(InventoryError::RootMissing(self.root.to_path_buf()));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.vanished += 1;
+                    continue;
+                }
+                Err(_) => {
+                    self.gap(GapKind::UnreadableEntry);
+                    continue;
+                }
             };
+            #[cfg(debug_assertions)]
+            if directory == self.root {
+                self.test_hook_remove_after_open(&directory);
+            }
             self.directories_visited += 1;
             if depth > self.max_depth_reached {
                 self.max_depth_reached = depth;
@@ -434,10 +501,10 @@ impl<'a> Walker<'a> {
             for entry in entries {
                 if self.entries_visited >= self.limits.max_entries {
                     self.gap(GapKind::EntryLimit);
-                    return;
+                    return Ok(());
                 }
                 if self.check_deadline() {
-                    return;
+                    return Ok(());
                 }
                 let Ok(entry) = entry else {
                     self.gap(GapKind::UnreadableEntry);
@@ -445,9 +512,19 @@ impl<'a> Walker<'a> {
                 };
                 self.entries_visited += 1;
                 let path = entry.path();
-                let Ok(file_type) = entry.file_type() else {
-                    self.gap(GapKind::MissingMetadata);
-                    continue;
+                let file_type_result = self
+                    .test_hook_error(&path, WalkPoint::BeforeFileType)
+                    .map_or_else(|| entry.file_type(), Err);
+                let file_type = match file_type_result {
+                    Ok(file_type) => file_type,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        self.vanished += 1;
+                        continue;
+                    }
+                    Err(_) => {
+                        self.gap(GapKind::MissingMetadata);
+                        continue;
+                    }
                 };
                 let relative = path.strip_prefix(self.root).unwrap_or(&path);
                 let class_path = if file_type.is_dir() {
@@ -459,12 +536,19 @@ impl<'a> Walker<'a> {
                 if file_type.is_symlink() {
                     self.symlinks[index] += 1;
                 } else if file_type.is_dir() {
-                    match fs::symlink_metadata(&path) {
+                    let metadata = self
+                        .test_hook_error(&path, WalkPoint::BeforeSymlinkMetadata)
+                        .map_or_else(|| fs::symlink_metadata(&path), Err);
+                    match metadata {
                         Ok(metadata) if metadata.dev() != self.root_device => {
                             self.gap(GapKind::MountBoundary);
                             continue;
                         }
                         Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            self.vanished += 1;
+                            continue;
+                        }
                         Err(_) => {
                             self.gap(GapKind::MissingMetadata);
                             continue;
@@ -483,12 +567,23 @@ impl<'a> Walker<'a> {
                 }
             }
         }
+        Ok(())
     }
 
     fn record_file(&mut self, path: &Path, index: usize) {
-        let Ok(metadata) = fs::symlink_metadata(path) else {
-            self.gap(GapKind::MissingMetadata);
-            return;
+        let metadata = self
+            .test_hook_error(path, WalkPoint::BeforeSymlinkMetadata)
+            .map_or_else(|| fs::symlink_metadata(path), Err);
+        let metadata = match metadata {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.vanished += 1;
+                return;
+            }
+            Err(_) => {
+                self.gap(GapKind::MissingMetadata);
+                return;
+            }
         };
         if metadata.dev() != self.root_device {
             self.gap(GapKind::MountBoundary);
@@ -515,6 +610,46 @@ impl<'a> Walker<'a> {
                     },
                 );
             }
+        }
+    }
+
+    fn verify_root(&self) -> Result<(), InventoryError> {
+        let metadata = fs::symlink_metadata(self.root).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                InventoryError::RootMissing(self.root.to_path_buf())
+            } else {
+                InventoryError::RootUnreadable {
+                    root: self.root.to_path_buf(),
+                    reason: error.to_string(),
+                }
+            }
+        })?;
+        if !metadata.is_dir() {
+            return Err(InventoryError::RootNotDirectory(self.root.to_path_buf()));
+        }
+        if metadata.dev() != self.root_device || metadata.ino() != self.root_inode {
+            return Err(InventoryError::RootUnreadable {
+                root: self.root.to_path_buf(),
+                reason: "root identity changed during traversal".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn test_hook_error(&mut self, path: &Path, point: WalkPoint) -> Option<std::io::Error> {
+        self.test_hook.as_mut()?.before(path, point)
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn test_hook_error(&mut self, _path: &Path, _point: WalkPoint) -> Option<std::io::Error> {
+        None
+    }
+
+    #[cfg(debug_assertions)]
+    fn test_hook_remove_after_open(&mut self, path: &Path) {
+        if let Some(hook) = self.test_hook.as_mut() {
+            hook.after_root_open(path);
         }
     }
 
@@ -589,12 +724,13 @@ impl<'a> Walker<'a> {
             complete: gaps.is_empty(),
             gaps,
         };
-        let notes = build_notes(&coverage, &total, &hardlink_overlap);
+        let notes = build_notes(&coverage, self.vanished, &total, &hardlink_overlap);
         let policy = build_policy(dominant_category);
 
         InventoryReport {
             root: self.root.to_path_buf(),
             coverage,
+            vanished: self.vanished,
             limits: self.limits,
             elapsed_ms,
             entries_visited: self.entries_visited,
@@ -636,6 +772,7 @@ fn dominant_category(categories: &[CategoryInventory]) -> Option<Category> {
 
 fn build_notes(
     coverage: &Coverage,
+    vanished: u64,
     total: &TreeAccounting,
     overlap: &HardlinkOverlap,
 ) -> Vec<String> {
@@ -646,6 +783,13 @@ fn build_notes(
         notes.push(
             "Coverage is partial: unvisited or unreadable entries are not represented, so the \
              reported totals are lower bounds and not an exact total."
+                .to_owned(),
+        );
+    }
+    if vanished > 0 {
+        notes.push(
+            "Enumerated paths vanished during this best-effort walk. The observation is not \
+             atomic and does not establish that their inode allocation was freed or reclaimable."
                 .to_owned(),
         );
     }
@@ -812,6 +956,7 @@ impl InventoryReport {
                 .join(", ");
             let _ = writeln!(text, "coverage: partial ({gaps})");
         }
+        let _ = writeln!(text, "vanished paths: {}", self.vanished);
         let _ = writeln!(
             text,
             "elapsed: {} ms, entries visited: {}, directories visited: {}, max depth: {}",
@@ -955,11 +1100,13 @@ fn bound_utf8(text: String, limit: usize) -> Rendered {
     }
 }
 
-/// Debug builds only, absent from release: the root of every
-/// [`inventory_directory`] walk, so tests and focused proofs can see which
-/// accounting walks a command made (oxide#110). It never changes a walk.
+/// Debug builds only, absent from release: walk observation and deterministic
+/// mutation fixtures. Production accounting is unchanged unless a debug
+/// fixture explicitly opts in through its bounded scratch environment.
 #[cfg(debug_assertions)]
 pub mod walk_observer {
+    use super::WalkPoint;
+    use serde::Deserialize;
     use std::cell::RefCell;
     use std::fs::OpenOptions;
     use std::io::Write as _;
@@ -969,9 +1116,211 @@ pub mod walk_observer {
 
     /// An absolute file path: each walk appends its root as one line.
     pub const LOG_ENV: &str = "OXIDE_TEST_WALK_LOG";
+    #[cfg(not(test))]
+    const MUTATIONS_ENV: &str = "OXIDE_TEST_WALK_MUTATIONS";
 
     thread_local! {
         static RECORDED: RefCell<Option<Vec<PathBuf>>> = const { RefCell::new(None) };
+        #[cfg(test)]
+        static TEST_MUTATIONS: RefCell<Option<String>> = const { RefCell::new(None) };
+        #[cfg(test)]
+        static TEST_SCRATCH_ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    enum Action {
+        RemoveBeforeReadDir,
+        RemoveBeforeFileType,
+        RemoveBeforeSymlinkMetadata,
+        RemoveAfterRootOpen,
+        PermissionDeniedBeforeReadDir,
+        PermissionDeniedBeforeSymlinkMetadata,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MutationSpec {
+        path: PathBuf,
+        action: Action,
+    }
+
+    struct Mutation {
+        path: PathBuf,
+        action: Action,
+        fired: bool,
+    }
+
+    pub(super) struct WalkHook {
+        mutations: Vec<Mutation>,
+    }
+
+    impl WalkHook {
+        pub(super) fn from_environment() -> Option<Self> {
+            #[cfg(test)]
+            let test_value = TEST_MUTATIONS.with(|cell| cell.borrow().clone());
+            #[cfg(not(test))]
+            let test_value: Option<String> = None;
+            #[cfg(test)]
+            let value = test_value.clone()?;
+            #[cfg(not(test))]
+            let value = {
+                std::env::var("OXIDE_PROOF_DEADLINE_NS")
+                    .ok()?
+                    .parse::<u64>()
+                    .ok()?;
+                std::env::var(MUTATIONS_ENV).ok()?
+            };
+            if value.len() > 8192 {
+                return None;
+            }
+            let specs: Vec<MutationSpec> = serde_json::from_str(&value).ok()?;
+            if specs.is_empty() || specs.len() > 4 {
+                return None;
+            }
+            #[cfg(test)]
+            let scratch = if test_value.is_some() {
+                TEST_SCRATCH_ROOT.with(|cell| cell.borrow().clone())?
+            } else {
+                std::env::var_os("OXIDE_TASK_SCRATCH_ROOT").map(PathBuf::from)?
+            };
+            #[cfg(not(test))]
+            let scratch = {
+                let scratch = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT").map(PathBuf::from)?;
+                let evidence = std::env::var_os("OXIDE_PROOF_EVIDENCE").map(PathBuf::from)?;
+                let scratch = std::fs::canonicalize(scratch).ok()?;
+                let evidence = std::fs::canonicalize(evidence).ok()?;
+                // Adopted runs keep evidence inside caller scratch. The
+                // supervisor-owned layout keeps `scratch/` and `evidence/`
+                // as siblings under its monitored root.
+                let evidence_is_nested = evidence.starts_with(&scratch);
+                let evidence_is_supervisor_sibling = scratch.file_name()
+                    == Some(std::ffi::OsStr::new("scratch"))
+                    && evidence.file_name() == Some(std::ffi::OsStr::new("evidence"))
+                    && scratch.parent() == evidence.parent();
+                if !scratch.starts_with("/private/tmp")
+                    || !(evidence_is_nested || evidence_is_supervisor_sibling)
+                {
+                    return None;
+                }
+                scratch
+            };
+            let scratch = std::fs::canonicalize(scratch).ok()?;
+            let mut mutations = Vec::with_capacity(specs.len());
+            for spec in specs {
+                let candidate = if test_value.is_some() {
+                    std::fs::canonicalize(&spec.path).ok()?
+                } else {
+                    spec.path
+                };
+                if !candidate.is_absolute() || candidate == scratch {
+                    return None;
+                }
+                let canonical = std::fs::canonicalize(&candidate).ok()?;
+                if canonical != candidate || !canonical.starts_with(&scratch) {
+                    return None;
+                }
+                mutations.push(Mutation {
+                    path: canonical,
+                    action: spec.action,
+                    fired: false,
+                });
+            }
+            Some(Self { mutations })
+        }
+
+        pub(super) fn before(&mut self, path: &Path, point: WalkPoint) -> Option<std::io::Error> {
+            let mutation = self.mutations.iter_mut().find(|mutation| {
+                !mutation.fired
+                    && mutation.path == path
+                    && matches!(
+                        (mutation.action, point),
+                        (Action::RemoveBeforeReadDir, WalkPoint::BeforeReadDir)
+                            | (Action::RemoveBeforeFileType, WalkPoint::BeforeFileType)
+                            | (
+                                Action::RemoveBeforeSymlinkMetadata,
+                                WalkPoint::BeforeSymlinkMetadata
+                            )
+                            | (
+                                Action::PermissionDeniedBeforeReadDir,
+                                WalkPoint::BeforeReadDir
+                            )
+                            | (
+                                Action::PermissionDeniedBeforeSymlinkMetadata,
+                                WalkPoint::BeforeSymlinkMetadata
+                            )
+                    )
+            })?;
+            mutation.fired = true;
+            match mutation.action {
+                Action::PermissionDeniedBeforeReadDir
+                | Action::PermissionDeniedBeforeSymlinkMetadata => Some(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected permission denial",
+                )),
+                Action::RemoveBeforeReadDir
+                | Action::RemoveBeforeFileType
+                | Action::RemoveBeforeSymlinkMetadata => {
+                    remove_fixture_path(path).err().or_else(|| {
+                        Some(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "fixture path disappeared",
+                        ))
+                    })
+                }
+                Action::RemoveAfterRootOpen => None,
+            }
+        }
+
+        pub(super) fn after_root_open(&mut self, path: &Path) {
+            let Some(mutation) = self.mutations.iter_mut().find(|mutation| {
+                !mutation.fired
+                    && mutation.path == path
+                    && mutation.action == Action::RemoveAfterRootOpen
+            }) else {
+                return;
+            };
+            mutation.fired = true;
+            if let Err(error) = remove_fixture_path(path) {
+                eprintln!("oxide: debug walk fixture could not remove its scratch path: {error}");
+            }
+        }
+    }
+
+    fn remove_fixture_path(path: &Path) -> std::io::Result<()> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_mutations<T>(
+        scratch_root: &Path,
+        value: String,
+        body: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore {
+            value: Option<String>,
+            scratch_root: Option<PathBuf>,
+        }
+
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TEST_MUTATIONS.with(|cell| cell.replace(self.value.take()));
+                TEST_SCRATCH_ROOT.with(|cell| cell.replace(self.scratch_root.take()));
+            }
+        }
+
+        let scratch_root =
+            std::fs::canonicalize(scratch_root).expect("test mutation scratch root must exist");
+        let _restore = Restore {
+            value: TEST_MUTATIONS.with(|cell| cell.replace(Some(value))),
+            scratch_root: TEST_SCRATCH_ROOT.with(|cell| cell.replace(Some(scratch_root))),
+        };
+        body()
     }
 
     /// Run `body` and return the roots this thread walked during it.
@@ -1014,7 +1363,7 @@ pub mod walk_observer {
 mod tests {
     use super::*;
     use std::io::Write as _;
-    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{symlink, MetadataExt};
     use std::path::Path as StdPath;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1082,6 +1431,14 @@ mod tests {
             .sum()
     }
 
+    fn with_walk_mutations<T>(
+        scratch_root: &StdPath,
+        value: serde_json::Value,
+        body: impl FnOnce() -> T,
+    ) -> T {
+        walk_observer::with_mutations(scratch_root, value.to_string(), body)
+    }
+
     #[test]
     fn categories_group_known_target_subdirectories() {
         let fixture = Fixture::new("categories");
@@ -1131,6 +1488,135 @@ mod tests {
             report.hardlink_overlap.allocated_bytes_shared,
             expected_allocated
         );
+    }
+
+    #[test]
+    fn enumerated_paths_that_vanish_are_separate_from_gaps_and_keep_seen_bytes() {
+        let fixture = Fixture::new("vanished");
+        let kept = fixture.file("debug/deps/kept.rlib", 37);
+        let gone_dir = fixture.path().join("debug/deps/gone");
+        fs::create_dir_all(&gone_dir).unwrap();
+        fs::write(gone_dir.join("never-read"), b"temporary directory bytes").unwrap();
+        fs::hard_link(&kept, gone_dir.join("same-inode.rlib")).unwrap();
+        let gone_file = fixture.file("debug/incremental/gone.o", 211);
+        let kept_allocated = fs::symlink_metadata(&kept).unwrap().blocks() * 512;
+
+        let report = with_walk_mutations(
+            fixture.path(),
+            serde_json::json!([
+                {"path": gone_dir, "action": "remove_before_read_dir"},
+                {"path": gone_file, "action": "remove_before_symlink_metadata"}
+            ]),
+            || inventory_directory(fixture.path(), InventoryLimits::default()),
+        )
+        .unwrap();
+
+        assert!(report.coverage.complete);
+        assert_eq!(report.coverage.gaps, Vec::new());
+        assert_eq!(report.vanished, 2);
+        assert_eq!(report.total.files, 1);
+        assert_eq!(report.total.logical_bytes_by_name, 37);
+        assert_eq!(report.total.allocated_bytes, kept_allocated);
+        assert!(!gone_dir.exists());
+        assert!(!gone_file.exists());
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| { note.contains("not atomic") && note.contains("not establish") }));
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["vanished"],
+            serde_json::json!(2)
+        );
+        let mut old_report = serde_json::to_value(&report).unwrap();
+        old_report.as_object_mut().unwrap().remove("vanished");
+        let decoded: InventoryReport = serde_json::from_value(old_report).unwrap();
+        assert_eq!(decoded.vanished, 0);
+        assert!(String::from_utf8(report.render_human().bytes)
+            .unwrap()
+            .contains("vanished paths: 2"));
+    }
+
+    #[test]
+    fn not_found_at_file_type_is_counted_after_the_entry_was_enumerated() {
+        let fixture = Fixture::new("vanished-file-type");
+        let gone = fixture.file("debug/deps/gone.rlib", 99);
+        let report = with_walk_mutations(
+            fixture.path(),
+            serde_json::json!([
+                {"path": gone, "action": "remove_before_file_type"}
+            ]),
+            || inventory_directory(fixture.path(), InventoryLimits::default()),
+        )
+        .unwrap();
+
+        assert!(report.coverage.complete);
+        assert_eq!(report.vanished, 1);
+        assert_eq!(report.total.files, 0);
+        assert_eq!(report.total.allocated_bytes, 0);
+    }
+
+    #[test]
+    fn not_found_at_directory_metadata_is_counted_as_vanished() {
+        let fixture = Fixture::new("vanished-directory-metadata");
+        let gone = fixture.path().join("debug/build/gone");
+        fs::create_dir_all(&gone).unwrap();
+        fs::write(gone.join("payload"), b"not reached").unwrap();
+
+        let report = with_walk_mutations(
+            fixture.path(),
+            serde_json::json!([
+                {"path": gone, "action": "remove_before_symlink_metadata"}
+            ]),
+            || inventory_directory(fixture.path(), InventoryLimits::default()),
+        )
+        .unwrap();
+
+        assert!(report.coverage.complete);
+        assert_eq!(report.vanished, 1);
+        assert_eq!(report.total.directories, 2);
+        assert!(!gone.exists());
+    }
+
+    #[test]
+    fn permission_errors_keep_their_existing_gap_categories() {
+        let fixture = Fixture::new("vanished-errors");
+        let blocked_dir = fixture.path().join("debug/build/blocked");
+        fs::create_dir_all(&blocked_dir).unwrap();
+        let blocked_file = fixture.file("debug/deps/blocked.rlib", 99);
+        let report = with_walk_mutations(
+            fixture.path(),
+            serde_json::json!([
+                {"path": blocked_dir, "action": "permission_denied_before_read_dir"},
+                {"path": blocked_file, "action": "permission_denied_before_symlink_metadata"}
+            ]),
+            || inventory_directory(fixture.path(), InventoryLimits::default()),
+        )
+        .unwrap();
+
+        assert!(!report.coverage.complete);
+        assert_eq!(gap(&report, GapKind::UnreadableEntry), 1);
+        assert_eq!(gap(&report, GapKind::MissingMetadata), 1);
+        assert_eq!(report.vanished, 0);
+    }
+
+    #[test]
+    fn a_root_removed_after_open_is_a_root_missing_refusal() {
+        let fixture = Fixture::new("root-vanished-after-open");
+        fixture.file("kept-until-open", 11);
+        let scratch_root = fixture.path().parent().unwrap();
+        let result = with_walk_mutations(
+            scratch_root,
+            serde_json::json!([
+                {"path": fixture.path(), "action": "remove_after_root_open"}
+            ]),
+            || inventory_directory(fixture.path(), InventoryLimits::default()),
+        );
+
+        assert!(matches!(
+            result,
+            Err(InventoryError::RootMissing(ref root)) if root == fixture.path()
+        ));
+        assert!(!fixture.path().exists());
     }
 
     #[test]
@@ -1184,17 +1670,13 @@ mod tests {
         fixture.file("debug/deps/ok.rlib", 10);
         let locked = fixture.path().join("debug/incremental");
         fixture.file("debug/incremental/hidden.o", 10);
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-        let still_readable = fs::read_dir(&locked).is_ok();
+        let denied = crate::test_fs::PermissionDeniedGuard::read_dir(&locked);
         let report = inventory_directory(fixture.path(), InventoryLimits::default()).unwrap();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
-
-        if still_readable {
-            // Privileged environments can read a 0o000 directory.
-            return;
-        }
+        assert_eq!(denied.hits(), 1);
         assert!(!report.coverage.complete);
-        assert!(gap(&report, GapKind::UnreadableEntry) >= 1);
+        assert_eq!(gap(&report, GapKind::UnreadableEntry), 1);
+        assert_eq!(report.total.files, 1);
+        assert_eq!(report.total.logical_bytes_by_name, 10);
     }
 
     #[test]

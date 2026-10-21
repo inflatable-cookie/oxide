@@ -114,10 +114,26 @@ explicit gaps with occurrence counts: `entry_limit`, `depth_limit`,
 `elapsed_deadline`, `mount_boundary`, `unreadable_entry`, `missing_metadata`,
 `unsupported_metadata` and `output_limit`.
 
-Concurrent mutation, unreadable entries and unsupported metadata produce a
+The walk is a best-effort, non-atomic observation. When a non-root path that
+this same walk enumerated returns `NotFound` at a deferred `read_dir`,
+`file_type` or no-follow metadata call, the report increments the separate
+`vanished` diagnostic. That path contributes no bytes; other inode bytes
+already observed remain in the union. This scoped exception does not create a
+coverage gap, so coverage may remain complete. It does not establish that the
+path's inode allocation was freed or is reclaimable: rename, open-unlinked
+files and hardlinks may retain it. A missing root remains a refusal, including
+when the root disappears after it was opened. Iterator errors without an
+associated enumerated path and all other errors keep their existing
+conservative gap categories.
+
+Unreadable entries, unsupported metadata and finite-bound stops produce a
 partial report, not a panic and not a false exact total. Because unvisited
 entries cannot be counted, a partial report is a lower bound and never claims
-exactness or nonzero savings.
+exactness or nonzero savings. Human and JSON reports include the separate
+`vanished` count when it is nonzero; zero is omitted on the wire. New readers
+default an absent count to zero. Older strict readers may reject a report that
+contains a nonzero `vanished` field. This diagnostic is not persisted in the
+pool ledger or configuration.
 
 ## Output and exit semantics
 
@@ -191,12 +207,18 @@ The library unit tests build fresh fixtures under the task-owned scratch root
 and cover: known category grouping, a real hardlink across two categories with
 union and overlap accounting, a sparse file with apparent greater than
 allocated bytes, dangling and directory symlinks that are counted but never
-followed, an unreadable directory, entry and depth truncation, the cooperative
-deadline, bounded rendering (the 64-byte minimum including truncation
+followed, partial coverage when `read_dir` returns an injected
+`PermissionDenied`, entry and depth truncation, the cooperative deadline,
+bounded rendering (the 64-byte minimum including truncation
 markers and the JSON fallback), long or multibyte root/note fields remaining
 inside the cap with valid UTF-8/JSON, refused roots, invalid limits, concurrent
 mutation without panic, the measured filesystem value and the absence of
 stale or savings claims.
+
+The unreadable-directory case injects `io::ErrorKind::PermissionDenied` at the
+walker's `read_dir` call for one canonical fixture path. It proves partial
+coverage handling; it does not prove kernel permission enforcement or an
+actual operating-system `EACCES` response.
 
 These fixtures do not qualify real project behavior, real savings or a
 performance result. No existing target, Nucleus, Queue or Acow tree is scanned,

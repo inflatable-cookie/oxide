@@ -20,7 +20,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-pub use pool::{managed, LeaseRequest};
+pub use pool::{managed, LeaseRequest, SlotLayout};
 
 #[cfg(test)]
 mod tests;
@@ -283,6 +283,10 @@ pub struct SlotStatus {
     pub profile: Profile,
     pub holder: Option<String>,
     pub lease_id: Option<String>,
+    /// Slot directory below `slots`, fixed at creation:
+    /// `<project folder>/<profile>-<id>`. `None` is the legacy `<id>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
     pub logical_bytes: Option<u64>,
     pub unique_allocated_bytes: Option<u64>,
     /// This slot's own walk, the one reuse needs complete.
@@ -331,6 +335,8 @@ pub struct LedgerSlot {
     pub profile: Profile,
     pub holder: Option<String>,
     pub lease_id: Option<String>,
+    /// As [`SlotStatus::dir`].
+    pub dir: Option<String>,
 }
 
 impl From<&SlotStatus> for LedgerSlot {
@@ -344,6 +350,7 @@ impl From<&SlotStatus> for LedgerSlot {
             profile: slot.profile,
             holder: slot.holder.clone(),
             lease_id: slot.lease_id.clone(),
+            dir: slot.dir.clone(),
         }
     }
 }
@@ -472,6 +479,10 @@ pub struct AccountingGap {
 pub struct AccountingScan {
     pub coverage: AccountingCoverage,
     pub gaps: Vec<AccountingGap>,
+    /// Enumerated paths that disappeared before a deferred read. This does
+    /// not establish that their inode allocation was freed or reclaimable.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub vanished: u64,
     pub entries_visited: u64,
     pub elapsed_ms: u64,
     /// The bounds this walk used.
@@ -497,6 +508,13 @@ impl std::fmt::Display for AccountingScan {
                 gap.occurrences
             )?;
         }
+        if self.vanished > 0 {
+            write!(
+                formatter,
+                ", vanished x{} (allocation reclamation not inferred)",
+                self.vanished
+            )?;
+        }
         write!(
             formatter,
             ", {} entries in {} ms (bounds {} entries, depth {}, {} ms)",
@@ -507,6 +525,10 @@ impl std::fmt::Display for AccountingScan {
             self.max_elapsed_ms
         )
     }
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 fn current_uid() -> u32 {
