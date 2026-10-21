@@ -721,6 +721,8 @@ Tom, 2026-10-21, "Approved": a single drive mode. Context: Tom mounted the Build
 - **#107:** loses only its #109 dependency. Product gates, counts and holds are unchanged, and #098 and #100 keep their original holds.
 - New standard-tier leads do not automatically inherit the #110/#106 exception.
 
+Tom, 2026-10-21, on Queue decision `b44b106a`: **"#104 only for now"**. #104 (standard tier) may use the documented-gap old guard (main's `scripts/bounded-test.py` at `3d947a9`) for one corrected author native session. That run must use separate fresh target and build directories, record source and binary hashes, and assert that the binaries differ. All gaps are disclosed. This is not a standing validation-policy change. The same day Tom approved `chmod 755 /Volumes/Builds`, which removed the volume root's group write; Effigy's trusted-binary check had refused slot-resident test executables under the group-writable root (Oxide papercut `297e082b`).
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
