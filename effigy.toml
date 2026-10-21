@@ -173,7 +173,8 @@ run = "python3 scripts/test-oxide-finder-metadata.py"
 # child runner unchanged (deadline before each child from one 300 s budget,
 # 20 GiB reserve sampled every 250 ms while a child runs, owned scratch
 # checked between phases against 512 MiB, ordinary detach). Stages the base
-# commit's and this HEAD's `oxide` offline with 1.97.1; a legacy slot stays
+# commit's and this HEAD's `oxide` offline with 1.97.1 into separate target
+# and build directories and requires distinct binaries; a legacy slot stays
 # in place and warm; new internal and scratch-image removable slots are
 # labelled; status order, grouping and most-recent use with the volume
 # selected and detached. Not a benchmark and not full QA.

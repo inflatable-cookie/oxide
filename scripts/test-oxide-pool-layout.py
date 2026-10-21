@@ -28,7 +28,9 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import hashlib
 import importlib.util
+import json
 import os
 import re
 import secrets
@@ -46,12 +48,67 @@ BASE = "850260c"
 FIXTURE = runner.FIXTURE
 
 
-def stage_at(proof: Proof, repo: str, label: str) -> str:
-    built = runner.stage(proof, repo)
+# A string only the candidate's status prints; checked in the staged bytes
+# before any pool or image fixture exists.
+CANDIDATE_MARKER = b"selected for the next build: internal pool (no removable volume registered)"
+
+
+def stage_at(proof: Proof, source: str, label: str) -> str:
+    """Build `oxide` from `source` into its own fresh target and build
+    directories under the owned scratch, never shared with another source
+    tree: one shared target let Cargo reuse the base binary for the
+    candidate in the first session (identical SHA-256 46db66ce...)."""
+    stage_root = os.path.join(proof.root, f"stage-{label}")
+    os.makedirs(stage_root)
+    env = dict(os.environ)
+    for name in list(env):
+        if name.startswith(("SCCACHE_", "CARGO_BUILD_", "CARGO_TARGET_")) or name in ("CARGO", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"):
+            env.pop(name)
+    env.update(
+        {
+            "RUSTUP_TOOLCHAIN": runner.BUILDER,
+            "RUSTUP_AUTO_INSTALL": "0",
+            "RUSTC_WRAPPER": "",
+            "RUSTC_WORKSPACE_WRAPPER": "",
+            "CARGO_BUILD_RUSTC_WRAPPER": "",
+            "CARGO_TARGET_DIR": os.path.join(stage_root, "target"),
+            "CARGO_BUILD_BUILD_DIR": os.path.join(stage_root, "build"),
+            "CARGO_PROFILE_DEV_DEBUG": "0",
+            "CARGO_INCREMENTAL": "0",
+        }
+    )
+    result = proof.run(
+        ["cargo", "build", "--locked", "--offline", "--bin", "oxide", "--message-format=json-render-diagnostics"],
+        cwd=source,
+        env=env,
+        timeout=200,
+    )
+    print(result.stderr.decode(errors="replace")[-4000:])
+    expect(result.returncode == 0, f"{label} staging exit {result.returncode}")
+    built = None
+    for line in result.stdout.decode(errors="replace").splitlines():
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if message.get("reason") == "compiler-artifact" and message.get("target", {}).get("name") == "oxide" and message.get("executable"):
+            built = message["executable"]
+    expect(built is not None and os.path.realpath(built).startswith(stage_root + "/"), f"{label} executable {built} is not in {stage_root}")
     copy = os.path.join(proof.root, "bin", label)
     os.makedirs(os.path.dirname(copy), exist_ok=True)
     shutil.copy2(built, copy)
+    shutil.rmtree(stage_root)
     return copy
+
+
+def sha256(path: str) -> str:
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def source_facts(source: str) -> str:
+    """Manifest and lock digests of a staged source tree."""
+    return ", ".join(f"{name} {sha256(os.path.join(source, name))[:16]}" for name in ("Cargo.toml", "Cargo.lock"))
 
 
 def sections(stdout: str) -> list:
@@ -85,10 +142,22 @@ def run(proof: Proof, repo: str) -> None:
     os.makedirs(base_src)
     archive = proof.run(["/bin/sh", "-c", f'git -C "$0" archive {BASE} | tar -x -C "$1"', repo, base_src], timeout=60)
     expect(archive.returncode == 0, f"base archive failed: {archive.stderr!r}")
+    base_tree = proof.run(["git", "rev-parse", f"{BASE}^{{commit}}", f"{BASE}^{{tree}}"], cwd=repo, timeout=30).stdout.decode().split()
+    head_tree = proof.run(["git", "rev-parse", "HEAD^{tree}"], cwd=repo, timeout=30).stdout.decode().strip()
+    dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
+    expect(not dirty, f"candidate checkout is not clean: {dirty}")
+    print(f"base commit {base_tree[0]} tree {base_tree[1]} ({source_facts(base_src)})")
+    print(f"candidate commit {source} tree {head_tree} ({source_facts(repo)})")
     base = stage_at(proof, base_src, "oxide-base")
     candidate = stage_at(proof, repo, "oxide-candidate")
-    shutil.rmtree(os.path.join(root, "stage-target"))
     shutil.rmtree(base_src)
+    base_hash, candidate_hash = sha256(base), sha256(candidate)
+    print(f"staged binaries: base sha256 {base_hash}, candidate sha256 {candidate_hash}")
+    expect(base_hash != candidate_hash, "base and candidate binaries are identical; no pool or image is touched")
+    with open(candidate, "rb") as handle:
+        expect(CANDIDATE_MARKER in handle.read(), "candidate binary lacks the #104 status marker")
+    with open(base, "rb") as handle:
+        expect(CANDIDATE_MARKER not in handle.read(), "base binary carries the #104 status marker")
     proof.phase("after staging")
 
     pool = os.path.join(root, "pool")

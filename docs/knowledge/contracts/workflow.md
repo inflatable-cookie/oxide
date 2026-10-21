@@ -231,7 +231,12 @@ heavy admission that reuses the #105 script's child runner unchanged
 (deadline before each child from one 300 s budget, 20 GiB reserve sampled
 every 250 ms while a child runs, owned scratch checked between phases
 against 512 MiB, sessions killed on breach or deadline, ordinary detach).
-It stages the base commit's and this HEAD's `oxide` offline with 1.97.1.
+It stages the base commit's and this HEAD's `oxide` offline with 1.97.1,
+each into its own fresh `CARGO_TARGET_DIR` and `CARGO_BUILD_BUILD_DIR`
+under the owned scratch with inherited build routing scrubbed. It logs both
+commits, trees, manifest and lock digests and binary SHA-256s, and refuses
+before any pool or image exists unless the binaries differ and only the
+candidate carries a #104 status string.
 Over a private `HOME`, `CARGO_HOME` and pool: the base binary makes a legacy
 `slots/1`, which the candidate reuses warm in place; same-named checkouts
 get separate labelled folders; a debug slot joins its project's folder;
@@ -239,6 +244,24 @@ one 128 MiB scratch APFS image registered as the removable pool gets
 labelled slots, including a slot 1 beside the internal slot 1; status order,
 grouping and most-recent attribution are checked with the volume selected
 and after an ordinary detach. Not a benchmark or real-drive qualification.
+
+**Native status: not passed.** The single author session at `de7bb8b`
+(2026-10-21) staged both sources into one shared target directory; Cargo
+reused the base build for the candidate (both SHA-256 `46db66ce…`), so the
+first candidate `status` printed the old format and the script failed after
+16 s, before any image or product exercise. Its log and 11 MiB scratch are
+kept. The staging correction above has not run. The child runner imported
+from the #105 script is unqualified: it kills the leader's session and reaps
+the leader, which does not prove Cargo's separate process groups closed.
+
+**Compatibility of the new records.** Legacy slots and a ledger without
+`dir` serialize byte-for-byte as before; a labelled slot's path is fixed at
+creation and its identity, key and compatibility are unchanged. A binary
+older than #104 refuses a ledger holding `dir` instead of using a wrong
+path. `last_used_ms` is written only with the use counter when a command
+takes a slot, never by `status`; admission, eviction and slot choice still
+order by the counter, never by wall time. Missing times, an unreadable
+state and ties are reported as such.
 
 The other proof scripts that located a slot at `slots/<id>`
 (`test-front-door-accounting.py`, `test-cargo-profiles.py`,
