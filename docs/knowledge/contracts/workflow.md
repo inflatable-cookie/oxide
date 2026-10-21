@@ -1371,9 +1371,15 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
   free space.
 - **Slots and waiting.** Per-project cap 2: a new checkout or key at the cap
   evicts the project's least recently used idle slot whole and builds cold.
-  Host-wide limit 2 commands holding slots (`OXIDE_MAX_ACTIVE`, 1–32). Excess
-  commands wait in FIFO order, print one `oxide: waiting for …` line on stderr
-  and cancel on Ctrl-C with exit 130. Another command in the same checkout
+  The host-wide active-build limit counts commands holding slots across both
+  pools. `OXIDE_MAX_ACTIVE` overrides `[pool] max_active`; both accept integers
+  from 1 to 32. With neither set, macOS uses
+  `min(4, max(2, floor(physical_cores / 4)))` from the native
+  `hw.physicalcpu` query. A missing, failed or implausible result, and every
+  other supported platform, uses 2. The automatic formula is approved policy,
+  not measured optimal capacity. Excess commands wait in FIFO order, print one
+  `oxide: waiting for …` line on stderr and cancel on Ctrl-C with exit 130.
+  Another command in the same checkout
   and key takes a compatible spare slot or creates one within budget; it waits
   when no safe slot or host capacity is available.
 - **Execution.** Cargo runs from the caller's directory as leader of a new
@@ -1819,7 +1825,8 @@ oxide#102.
   existing guard samples the host reserve during plain-Cargo staging.
 - **Precedence.** Environment, then the user config file, then defaults.
   `OXIDE_POOL` sets the path (relative resolves against the current
-  directory); `OXIDE_POOL_CAP` sets the budget. Sizes are whole bytes or a
+  directory); `OXIDE_POOL_CAP` sets the budget; `OXIDE_MAX_ACTIVE` sets the
+  host-wide active-build limit. Sizes are whole bytes or a
   whole number of `KB`, `MB`, `GB`, `TB` (decimal) or `KiB`, `MiB`, `GiB`,
   `TiB`, from 1 MiB to 16 TiB; anything else refuses before any effect.
   `OXIDE_POOL_BACKEND` is retired: unset or `directory-budget` only.
@@ -1839,10 +1846,32 @@ oxide#102.
   [pool]
   path = "~/Dev/oxide"   # ~ or ~/ expands to HOME; absolute, no . or ..
   budget = "100GB"       # or a byte count
+  max_active = 3         # optional integer from 1 to 32
   ```
 
   An unknown key, a wrong type or a parse failure refuses with the file
-  named.
+  named. `max_active` is validated only when the config value is selected;
+  therefore a valid `OXIDE_MAX_ACTIVE` overrides a range-invalid config value.
+  TOML parse errors, wrong types and unknown fields still refuse even when an
+  environment override is present, matching the existing config parser.
+- **Automatic active-build limit.** With no environment or config value,
+  macOS queries the native `hw.physicalcpu` sysctl once for the command and
+  applies `min(4, max(2, floor(physical_cores / 4)))`. Counts outside 1–1024,
+  a failed or malformed query, and non-macOS platforms fall back to 2; `status`
+  reports the formula input or fallback reason. This is the approved default,
+  not a throughput measurement. Existing active commands are left running
+  when a lower limit is selected; later admissions wait under the same
+  host-wide accounting and ownership rules.
+  **Proof.** `effigy rust:max-active` runs one fixed script under the
+  qualified shared supervisor. It stages `oxide` offline with 1.97.1, checks
+  status provenance and precedence, then uses tiny `oxide exec` hold tools to
+  show limit 2 waiting for a third command, config limit 3 admitting a third
+  and waiting for a fourth, and a release admitting each waiter. A synthetic
+  unavailable removable registration pairs one active removable record with
+  an internal command; the unit tests exercise both directions of the
+  internal/removable count. No real volume or fixture compilation is used.
+  The supervisor owns its 300 s deadline, 512 MiB monitored scratch and
+  closure; the fixture stops work 30 s before its exported deadline.
 - **Default path.** `~/Library/Caches/oxide/build-pool` on macOS,
   `$XDG_CACHE_HOME/oxide/build-pool` or `~/.cache/oxide/build-pool`
   elsewhere: distinct from the retired image pool's `…/oxide/pool`, so that
@@ -1898,7 +1927,9 @@ oxide#102.
   the user, so Oxide applies no exclusion. `status` says `not excluded by
   Oxide` with that advice. Other platforms: not applicable.
 - **`status`.** The config file and whether it exists or was selected by
-  `OXIDE_CONFIG`, the pool path and budget with their sources, then per
+  `OXIDE_CONFIG`, the pool path and budget with their sources, and the
+  effective host-wide active-build limit with its source, formula input or
+  fallback reason, then per
   pool: backend, soft budget, slot allocation, the pool filesystem's
   available and total space (shared, no Oxide quota or ceiling), Time Machine
   and Spotlight state, legacy and orphaned pools. `slot accounting walk:`
@@ -2194,8 +2225,9 @@ Approved design direction (Tom, 2026-10-20). Not implemented. It applies to buil
   budget, refuse below the 20 GiB host reserve
   ([above](#budget-only-default-pool-and-user-configuration)).
 - **W-2 Waiting and concurrency.** Foundation choice above: per-project cap
-  2, host-wide limit 2, strict FIFO waiting, idle-slot eviction before
-  waiting. Coordinates with
+  2, strict FIFO waiting, idle-slot eviction before waiting. The host-wide
+  limit uses the approved physical-core default and 1–32 explicit overrides
+  ([storage and limits](#storage-and-space-management)). Coordinates with
   [Q-011](../questions.md#q-011--how-should-slot-waiting-coordinate-with-host-admission).
 - **W-3 Project file.** Needed only for per-project profile overrides or
   dependency debug-off. Recommendation: none until a real project needs it.

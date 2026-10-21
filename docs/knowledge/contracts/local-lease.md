@@ -122,6 +122,14 @@ the budget as `cap_bytes` and `image_bytes: 0`; an older build refuses it.
 ([workflow](workflow.md#implemented-foundation-core)); this CLI's
 `init --cap-bytes` and every existing pool's recorded cap are unchanged.
 
+Oxide resolves its host-wide active-build limit once per command from
+`OXIDE_MAX_ACTIVE`, `[pool] max_active`, or the approved default. The limit
+continues to count active commands across internal and removable pools using
+the existing state and admission rules. `oxide status` reports the effective
+value and whether it came from the environment, the selected user config, the
+physical-core formula or its fallback; see the workflow's
+[user configuration](workflow.md#budget-only-default-pool-and-user-configuration).
+
 The library also exports `evict_idle_slot` for Oxide's per-project slot cap.
 It retires one recorded idle slot whole through the same durable eviction path
 as capacity eviction, and returns busy for a held slot. The CLI does not

@@ -47,8 +47,6 @@ use std::time::Duration;
 pub const GIB: u64 = 1024 * 1024 * 1024;
 /// Automatic creation refuses below this host free space.
 pub const HOST_RESERVE_BYTES: u64 = 20 * GIB;
-const DEFAULT_MAX_ACTIVE: usize = 2;
-const MAX_ACTIVE_LIMIT: usize = 32;
 /// Slots one project identity may keep; a new checkout at the cap evicts the
 /// least recently used idle one.
 const PROJECT_SLOT_CAP: usize = 2;
@@ -514,6 +512,8 @@ pub struct Store {
     budget: Option<u64>,
     /// The budget the pool recorded at creation, read when it opened.
     recorded_budget: u64,
+    /// The command's resolved host-wide active-build limit.
+    max_active: usize,
     /// The other pool's control directory when a removable pool is
     /// registered: the host-wide limit counts both pools and a checkout's
     /// clean barrier spans both.
@@ -604,11 +604,6 @@ pub fn settings() -> Result<Settings, String> {
     config::settings(&Facts::from_env())
 }
 
-/// The internal pool path from the effective settings.
-pub fn pool_path() -> Result<PathBuf, String> {
-    settings().map(|settings| settings.pool)
-}
-
 /// The soft budget for the next admission. Debug builds accept
 /// `OXIDE_TEST_BUDGET_BYTES` above everything else, so fixture proofs can
 /// exercise admission on a tiny budget.
@@ -622,18 +617,6 @@ pub fn admission_budget(settings: &Settings) -> u64 {
         return bytes;
     }
     settings.budget
-}
-
-/// `OXIDE_MAX_ACTIVE`, else 2.
-pub fn max_active() -> Result<usize, String> {
-    let Some(value) = std::env::var_os("OXIDE_MAX_ACTIVE") else {
-        return Ok(DEFAULT_MAX_ACTIVE);
-    };
-    value
-        .to_str()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| (1..=MAX_ACTIVE_LIMIT).contains(value))
-        .ok_or_else(|| format!("OXIDE_MAX_ACTIVE must be an integer from 1 to {MAX_ACTIVE_LIMIT}"))
 }
 
 impl Store {
@@ -674,7 +657,11 @@ impl Store {
     /// `root` (internal) and whose payload is `payload` on the volume. The
     /// library verifies the volume on every open. The pool-creation
     /// environment does not apply to it.
-    pub fn open_removable(root: &Path, payload: PathBuf) -> Result<Self, String> {
+    pub fn open_removable(
+        root: &Path,
+        payload: PathBuf,
+        max_active: usize,
+    ) -> Result<Self, String> {
         let pool = fs::canonicalize(root)
             .map_err(|error| format!("cannot open the removable pool: {error}"))?;
         let view = ledger_view(&pool)
@@ -689,6 +676,7 @@ impl Store {
             payload,
             budget: None,
             recorded_budget: view.cap_bytes,
+            max_active,
             sibling: None,
         };
         store.ensure_control()?;
@@ -705,12 +693,18 @@ impl Store {
     /// refuses without being touched.
     pub fn open_existing() -> Result<Option<Self>, String> {
         let settings = settings()?;
+        Self::open_existing_with(&settings)
+    }
+
+    /// Open an existing internal pool using settings already resolved for
+    /// this command.
+    pub fn open_existing_with(settings: &Settings) -> Result<Option<Self>, String> {
         match config::inspect(&settings.pool) {
             Found::Absent => Ok(None),
             Found::LegacyImage => Err(legacy_refusal()),
             Found::Directory | Found::Unknown => {
                 config::refuse_unsafe_pool_path(&settings.pool)?;
-                Self::open_at(&settings.pool, &settings).map(Some)
+                Self::open_at(&settings.pool, settings).map(Some)
             }
         }
     }
@@ -736,6 +730,7 @@ impl Store {
             control,
             budget: Some(admission_budget(settings)),
             recorded_budget: view.cap_bytes,
+            max_active: settings.active_build_limit.value,
             sibling: None,
         })
     }
@@ -758,6 +753,11 @@ impl Store {
     /// This command's soft admission budget.
     pub fn command_budget(&self) -> u64 {
         self.budget(self.recorded_budget)
+    }
+
+    /// The host-wide limit resolved for this command.
+    pub fn max_active(&self) -> usize {
+        self.max_active
     }
 
     /// Full accounting: the whole-payload walk and one walk per slot, for
@@ -783,7 +783,7 @@ impl Store {
         share: bool,
         label: Option<&str>,
     ) -> Result<Acquired, String> {
-        let max_active = max_active()?;
+        let max_active = self.max_active;
         let ticket = self.register_ticket()?;
         let mut announced = false;
         loop {
@@ -2074,6 +2074,7 @@ mod tests {
             control: root.join(name).join(MANAGED_NAME),
             budget: None,
             recorded_budget: 1,
+            max_active: 2,
             sibling: None,
         };
         let (internal, removable) = (store("internal"), store("removable"));
@@ -2119,6 +2120,43 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn host_limit_counts_internal_and_removable_activity_in_both_routes() {
+        let (root, internal, removable) = paired_controls();
+        let key = SlotKey {
+            checkout: PathBuf::from("/checkout"),
+            identity: "identity".to_owned(),
+            compatibility: "quick-key".to_owned(),
+        };
+        // SAFETY: getpgrp has no preconditions.
+        let group = unsafe { libc::getpgrp() };
+        let mut active = State::default();
+        active.records = vec![
+            record(Phase::Running, Some(group), Some("v1.a.1.1.1")),
+            record(Phase::Running, Some(group), Some("v1.a.2.1.2")),
+        ];
+
+        // A removable admission sees two active internal records.
+        internal.save(&active).unwrap();
+        let (ticket, _file) = removable.register_ticket().unwrap();
+        assert!(matches!(
+            removable.attempt(ticket, &key, Profile::Quick, 2, false, None),
+            Ok(Err(Wait::HostLimit(2)))
+        ));
+        removable.remove_ticket(ticket).unwrap();
+
+        // An internal admission sees two active removable records.
+        internal.save(&State::default()).unwrap();
+        removable.save(&active).unwrap();
+        let (ticket, _file) = internal.register_ticket().unwrap();
+        assert!(matches!(
+            internal.attempt(ticket, &key, Profile::Quick, 2, false, None),
+            Ok(Err(Wait::HostLimit(2)))
+        ));
+        internal.remove_ticket(ticket).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn lease(store: &Store, key: &SlotKey, label: Option<&str>) -> Result<Lease, Wait> {
         let (ticket, _file) = store.register_ticket().unwrap();
         let outcome = store
@@ -2152,6 +2190,7 @@ mod tests {
             backend: Backend::DirectoryBudget,
             budget: Some(1 << 30),
             recorded_budget: 1 << 30,
+            max_active: 2,
             sibling: None,
         };
         store.ensure_control().unwrap();

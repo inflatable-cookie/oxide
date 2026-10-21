@@ -115,6 +115,7 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
                     registration(&internal)?
                         .map(|registration| registration.mount_point.join(PAYLOAD_DIR))
                         .ok_or("the registration disappeared")?,
+                    internal.max_active(),
                 )?,
                 _ => internal,
             };
@@ -486,6 +487,7 @@ fn usable(internal: &Store, registration: &Registration) -> Result<Store, String
     Store::open_removable(
         &internal.control().join(POOL_DIR),
         registration.mount_point.join(PAYLOAD_DIR),
+        internal.max_active(),
     )
 }
 
