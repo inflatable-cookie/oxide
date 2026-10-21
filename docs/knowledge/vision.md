@@ -758,6 +758,7 @@ Tom, 2026-10-21, "Approve.. can the allow list be optional?" (Queue decision `b8
 - **Coverage:** the PATH alias covers name lookup only, not absolute paths, PATH resets or shell aliases, and `force` covers Effigy-run resolution only.
 - **Effigy owns the design**, including trust, argument boundaries, config precedence and `$CARGO` without recursion.
 - **CI shim leads:** both are parked for Effigy-run CI. Consumers remove their `:cargo` escapes and CI switches after it ships.
+- **Documentation condition.** Tom, the same day: "I think this is fine, so long as the conditions are well documented in effigy help and the effigy skill". Acceptance requires both `effigy help` and the shipped Effigy skill to document the trigger, `force`, the PATH scope, optional `allow`, exact argv with no translation and no retry, and the `clean` and plugin differences.
 
 ## Authority boundaries
 
