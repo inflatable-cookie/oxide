@@ -294,7 +294,7 @@ apply after the selected generation is removed.
 
 ### Ledger-only view for front-door membership (oxide#110, lead `e4c74399`)
 
-Implemented as a routine correction with no admission, closure, recovery or deletion change. The design passed independent prospective review at `edc4f54`. Its focused native proof `rust:front-door-accounting` has not completed a run yet.
+Implemented as a routine correction with no admission, closure, recovery or deletion change. The design passed independent prospective review at `edc4f54`. Its focused native proof `rust:front-door-accounting` passed once at source `38f79ac` (host run `9d11cd31`, exit 0, 169 s wall; script 168 s including cleanup, sampled peak scratch 125 MiB) under the old `scripts/bounded-test.py` exception route. The Effigy client lost the scheduler (`scheduler_unreachable`, exit 75) and truncated the stream; the full output was recovered from the scheduler afterwards. An earlier submission was cancelled before launch.
 
 **Problem it removed.** The library's `status` runs one whole-payload walk plus one walk per slot. Until oxide#110 the front door called it on ordinary commands where it needed only ledger membership. From source at `3842239`:
 
