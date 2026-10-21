@@ -749,6 +749,26 @@ Tom, 2026-10-21, "Yeah, keep going" (Queue decision `cd72ed22`): one focused rep
 - **Native sessions:** one new session per side. The reviewer's earlier session timed out on capacity, never launched, and stays consumed.
 - Qualification is not guaranteed. A further new P1 class stops again for Tom.
 
+Tom, 2026-10-21, "Approve.. can the allow list be optional?" (Queue decision `b8c28d74`): Effigy gets a **program fallback** in place of per-selector `:cargo` escapes and project-side CI switches.
+- **Config:** `[programs.oxide] fallback = "cargo"`, optional `allow = [...]`, and `force`.
+- **When it applies:** a selector program `oxide` that does not resolve, or `force = true`, runs `cargo` with exact argv through a run-scoped PATH alias. There is no translation and no retry, and an honest notice says Oxide storage management is not applied.
+- **`allow` is optional:**
+  - present: only the listed subcommands pass, and others are refused;
+  - omitted: everything passes through, so an Oxide-only command takes Cargo's meaning or plugin (for example `oxide clean` becomes `cargo clean` without Oxide's ownership refusals). The docs and notice state this.
+- **Coverage:** the PATH alias covers name lookup only, not absolute paths, PATH resets or shell aliases, and `force` covers Effigy-run resolution only.
+- **Effigy owns the design**, including trust, argument boundaries, config precedence and `$CARGO` without recursion.
+- **CI shim leads:** both are parked for Effigy-run CI. Consumers remove their `:cargo` escapes and CI switches after it ships.
+- **Documentation condition.** Tom, the same day: "I think this is fine, so long as the conditions are well documented in effigy help and the effigy skill". Acceptance requires both `effigy help` and the shipped Effigy skill to document the trigger, `force`, the PATH scope, optional `allow`, exact argv with no translation and no retry, and the `clean` and plugin differences.
+
+Tom, 2026-10-21, "Keep going - at this point we may as well keep persevering until its done?" (Queue decision `561298b5`). Context: review `6319610400` at `2abe9c6` found a new localized P1: exception handling formatted a traceback through blocking source lookup before latching the fault. **Standing authority for #109:** continue bounded, localized, in-scope corrections and qualification until it qualifies, without re-asking Tom for each new localized P1.
+- **Each failed or new-defect session still stops for owner inspection and amendment.** There are no unlimited submissions, no clock resets and no product acceptance by default.
+- **Still Tom's call:** material scope changes, redesign, new infrastructure or privilege, and any weakening of the safety contract.
+- **The current repair:**
+  - latch the fault first;
+  - no traceback formatting, linecache or source I/O, and no exception `str`/`repr`, in the custodian;
+  - rich diagnostics in the monitor;
+  - regression tests for lookup failure, diagnostic failure and hostile formatting, keeping the 56-case coverage.
+
 ## Authority boundaries
 
 Tom's model-selection ruling, 2026-10-18: use frontier **Astra High and Opus
