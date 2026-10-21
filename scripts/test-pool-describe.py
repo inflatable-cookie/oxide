@@ -23,14 +23,20 @@ heavy admission):
 1. Candidate staging. One offline, locked `cargo build --bin oxide` from this
    checkout's HEAD, debug profile, into an owned `target/` and an owned
    `build/` directory (CARGO_TARGET_DIR and CARGO_BUILD_BUILD_DIR). CARGO_HOME
-   is owned too, seeded by copying the host registry cache (read only). The
-   toolchain is pinned to rust-toolchain.toml's channel through RUSTUP_TOOLCHAIN.
-   Inherited CARGO_*, RUSTC*, RUSTFLAGS, RUSTDOC, SCCACHE_* and wrapper
-   routing are scrubbed. The commit, tree and artifact SHA-256 are logged, and
-   the artifact must resolve inside the owned root.
+   is owned: Cargo never opens the host CARGO_HOME. The owned copy is seeded
+   from the host registry (read only, 256 MiB bound; over it the run stops).
+   The toolchain is pinned to rust-toolchain.toml's channel through
+   RUSTUP_TOOLCHAIN, with RUSTUP_AUTO_INSTALL=0 so nothing installs or
+   downloads. Inherited CARGO_*, RUSTC*, RUSTFLAGS, RUSTDOC, SCCACHE_* and
+   wrapper routing are scrubbed. Staging inherits the HOME, RUSTUP_HOME and
+   toolchain location of the host: that is an explicit read and lookup
+   exposure, not a private HOME. The commit, tree and artifact SHA-256 are
+   logged, and the artifact must resolve inside the owned root.
 2. Every child, staging included, runs with four canonical temp variables
-   (OXIDE_TASK_SCRATCH_ROOT, TMPDIR, TMP, TEMP) all equal to the owned root,
-   plus a private HOME, a private OXIDE_POOL and a minimal PATH.
+   (OXIDE_TASK_SCRATCH_ROOT, TMPDIR, TMP, TEMP) all equal to the owned root.
+   Case children also get a private HOME and OXIDE_POOL and a minimal PATH.
+   Children inherit the outer runner's session and process group. This script
+   starts no session and sends no group signal.
 3. Phase-boundary checks, not continuous: host free space above 20 GiB, and
    owned bytes at or below 512 MiB (lstat walk, st_blocks), before staging,
    after staging, after each case and before cleanup. Outputs go to owned
@@ -49,12 +55,15 @@ heavy admission):
    d. CLI refusal: `oxide pool describe` without `--json` exits nonzero with
       the usage text on stderr and changes nothing.
 5. Cleanup. The owned root is removed only after every case passes and every
-   child has been waited for or killed. On any failure it is retained and its
-   path is printed.
+   every child has exited normally. A timeout, exception or unknown closure
+   retains it and prints the path. Retaining is not a closure claim.
 
-Timeouts: each child gets the remaining wall-clock budget. On expiry the
-child's own process group (started by this script) is killed, and the run
-fails. This is not a closure proof for Cargo's own descendants.
+Timeouts and custody: each child gets the remaining wall-clock budget as its
+timeout. On expiry this script kills only its direct child PID, then fails
+with closure unknown. Any timeout, exception or unknown closure retains the
+owned root. The outer approved shared runner owns custody and the deadline.
+Without an approved runner this script makes no claim that its children, or
+any Cargo descendant, have closed.
 
 Explicit coverage gaps. These are not passes:
 - `available: true`, and every volume-dependent refusal (identity mismatch,
@@ -67,11 +76,14 @@ Explicit coverage gaps. These are not passes:
   subprocesses, not through this script.
 - The host reserve and owned bytes are checked at phase boundaries only. The
   guard that would watch them continuously (`scripts/bounded_runner.py`) is not
-  wired and is not qualified. The old guard is periodic and has no absolute
-  deadline guarantee.
+  wired and is not qualified. The old guard (`scripts/bounded-test.py`) has no
+  reserve or owned-bytes monitor. It only escalates on timeout. Phase checks
+  here are samples, not guarantees.
 - Cargo's descendant processes are not proven closed when the leader exits.
 - Staging seeds CARGO_HOME from the host registry, a read of the global cache.
   The owner decides whether that read is acceptable.
+- Staging reads the host HOME, RUSTUP_HOME and toolchain location. It is not
+  a private HOME.
 - Exit-nonzero for an Oxide internal failure (not usage) is not exercised.
 """
 
@@ -86,7 +98,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import tempfile
 import time
@@ -107,6 +118,8 @@ OWNED_LIMIT_BYTES = 512 * 1024 * 1024
 HOST_RESERVE_BYTES = 20 * 1024 * 1024 * 1024
 REPO = Path(__file__).resolve().parent.parent
 TEMP_VARS = ("OXIDE_TASK_SCRATCH_ROOT", "TMPDIR", "TMP", "TEMP")
+# Staging and every child run with rustup installs disabled.
+AUTO_INSTALL_OFF = {"RUSTUP_AUTO_INSTALL": "0"}
 SCRUB_PREFIXES = ("CARGO", "RUSTC", "RUSTFLAGS", "RUSTDOC", "SCCACHE", "RUSTUP_TOOLCHAIN")
 
 
@@ -127,11 +140,13 @@ class Proof:
         return left
 
     def env(self, case: Path | None = None, extra: dict | None = None) -> dict:
-        """Scrubbed host env plus the four temp vars and a private HOME and pool.
+        """Scrubbed host env with the four temp vars set to the owned root.
 
-        A case gets its own directory under the owned root. Staging uses none.
+        A case gets a private HOME and pool under its own directory. Staging
+        gets none: it keeps the host HOME and RUSTUP_HOME, as disclosed.
         """
         env = {key: value for key, value in os.environ.items() if not key.startswith(SCRUB_PREFIXES)}
+        env.update(AUTO_INSTALL_OFF)
         for key in TEMP_VARS:
             env[key] = str(self.root)
         env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
@@ -152,18 +167,21 @@ class Proof:
         self.phases.append(f"{label}: owned={owned} free={free}")
 
     def run(self, argv: list[str], env: dict, label: str, cwd: Path | None = None) -> tuple[int, str, str]:
-        """Run one child in its own session, outputs to owned files."""
+        """Run one child in the inherited session, output to owned files.
+
+        Timeout kills only this direct child PID and leaves closure unknown:
+        the root is retained and nothing claims that descendants closed.
+        """
         out_path = self.root / f"{label}.stdout"
         err_path = self.root / f"{label}.stderr"
         with out_path.open("wb") as out, err_path.open("wb") as err:
-            proc = subprocess.Popen(argv, env=env, cwd=cwd, stdout=out, stderr=err, start_new_session=True)
+            proc = subprocess.Popen(argv, env=env, cwd=cwd, stdout=out, stderr=err)
             try:
                 code = proc.wait(timeout=self.remaining())
             except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)  # our own session, started here
-                proc.wait()
+                proc.kill()
                 self.clean_closure = False
-                raise RuntimeError(f"{label}: killed at the wall-clock bound")
+                raise RuntimeError(f"{label}: wall-clock bound reached; closure unknown")
         return code, out_path.read_text(errors="replace"), err_path.read_text(errors="replace")
 
 
