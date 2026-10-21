@@ -988,8 +988,7 @@ mod tests {
         fs::write(&file, "[pool]\nmax_active = 9223372036854775808\n").expect("overflow config");
         let refused = settings(&chosen).expect_err("overflow config value");
         assert!(refused.contains(&file.display().to_string()), "{refused}");
-        fs::write(&file, "[pool]\nmax_active = 3\n")
-            .expect("valid file before environment checks");
+        fs::write(&file, "[pool]\nmax_active = 3\n").expect("valid file before environment checks");
         for invalid in ["0", "33", "-1", "1.5", "18446744073709551616"] {
             chosen.oxide_max_active = Some(invalid.into());
             let refused = settings(&chosen).expect_err(invalid);
