@@ -1,122 +1,152 @@
 # Proposed correction: shared proof supervisor (oxide#109)
 
-Proposed, not implemented; it awaits independent design review. It corrects
-`scripts/bounded-test.py` at `f5a998c` (branch
-`ns-7413c9ec-bcca-4c84-9808-3079ac34764a`) after its independent review returned
-changes required. That review's findings, the extra author submission, the
-fixed `/tmp` logs and the failed native evidence all stand as recorded. This
-document doesn't re-score them, and it qualifies nothing.
+Proposed, not implemented; it awaits independent design review. This is
+revision 2. It answers Sol's prospective review of `b9efc9aa` (changes
+required: the stop path could block, custody of the proof leader, partial
+construction, census rules and receipt phases). It corrects
+`scripts/bounded-test.py` at `f5a998c`. The earlier review findings, the extra
+author submission, the fixed `/tmp` logs and the failed native evidence all
+stand as recorded. This document doesn't re-score them, and it qualifies
+nothing.
 
 ## Contract: pinned-leader cooperative closure
 
-Tom's ruling, 2026-10-21, "Yes, (2)", Queue decision `99ed1d7f`
-([vision](../vision.md#authority-boundaries)).
+Tom's ruling, 2026-10-21, "Yes, (2)", Queue decision `99ed1d7f`.
 
-**Why.** macOS has no positive-identity signal for a process group that the
-supervisor doesn't pin: no pidfd and no subreaper. A recheck followed by
-`killpg` is still check-then-act, so the group can dissolve and its number can
-be reissued in between. Rechecking narrows that window but doesn't close it,
-and this design never presents it as closing it.
+macOS has no positive-identity signal for a group the supervisor doesn't pin,
+and a recheck doesn't close the reuse race. So the only number the supervisor
+ever signals is the proof leader's pinned group, and survivors leave the run
+`UNCLOSED`.
 
-**Leader.** The supervised command starts in a new session. Until finalization
-the supervisor holds it unreaped: exit is detected without reaping, through
-kqueue `NOTE_EXIT`, or `waitid(WEXITED | WNOHANG | WNOWAIT)` if kqueue setup
-fails. Its PID is therefore pinned, and so are its group ID and session ID. It
-is the only number the supervisor ever signals.
+## Actors
 
-**Membership.** Each observation classifies processes under the observing user
-ID:
+There are two processes, with no general framework.
 
-- **Member:** `getsid == SID`.
-- **Uncertain:** the session can't be read for a process that started at or
-  after the leader. An exiting process, or one whose `getsid` fails, is an
-  example.
+- **Custodian.** The process Effigy starts. It owns the absolute deadline and
+  custody of the actual proof leader. It spawns the leader directly with
+  `os.posix_spawn(..., setsid=True)`, which is available in the host's Python
+  3.9.6. That call returns the PID, and there's no `Popen` constructor that can
+  hang after the child exists. The leader stays the custodian's unreaped
+  child until the custodian's last signal, so its PID, group ID and session ID
+  stay pinned however the monitor fares. The custodian's stop path makes only
+  non-blocking system calls: `killpg` on the pinned SID, `kill` on the monitor,
+  `kevent`, and `waitpid` after the final signal. It never writes files or
+  stdio on the stop path.
+- **Monitor.** The custodian's second child. It does all the I/O: reserve and
+  scratch sampling, the census, output forwarding, receipt phases and cleanup.
+  It reports to the custodian over a pipe. If the monitor dies, the custodian
+  still holds the pin. It never signals any PID the monitor reported. It stops
+  through the pinned group alone and ends `UNCLOSED`.
 
-Uncertain processes are never treated as absent. They block `closed` and
-appear in the receipt. Processes of other users, and processes that called
-`setsid` (unless they still hold an output pipe), are outside the observable
-scope. That scope boundary is stated in the receipt.
+## Start order
 
-**Closure sequence.** It runs on every path: exit, timeout, fault, a signal to
-the supervisor, or an exception after spawn.
+1. The custodian creates the evidence directory, which sits outside scratch,
+   and writes the receipt as phase `started: incomplete` with `fsync`. That
+   happens before any writer exists. Every later failure leaves at least that
+   artifact.
+2. It starts the monitor and waits for its first reserve and scratch readings,
+   within a bounded wait. A missing or low first reading refuses before spawn.
+3. It spawns the leader. stdout and stderr go to files in the evidence
+   directory, not pipes, so the custodian never drains output. The monitor
+   tails those files with bounded, non-blocking reads.
+4. It registers kqueue `NOTE_EXIT` for the leader.
+   - `ESRCH` means the leader is already a zombie.
+   - Any other registration failure means **no detector**. The custodian
+     immediately `killpg`s the pinned group with SIGTERM, then SIGKILL, while
+     the leader is still unreaped. The outcome is `UNCLOSED`, and scratch is
+     kept. It is never reported as "nothing launched".
 
-1. TERM the pinned group (`killpg(SID)`). This is safe while the leader is
-   unreaped, including after its exit.
-2. A cooperative window of up to `term_grace`. Descendants close through their
-   own parents' cascade: `oxide` forwards TERM to Cargo's group, which it holds
-   unreaped, and nextest closes its test groups. The supervisor observes until
-   no member or uncertain process remains.
-3. KILL the pinned group.
-4. A settle window of up to `kill_grace`.
-5. Any member left in another group, and any uncertain process, is reported.
-   The state is `UNCLOSED`. No numeric signal is ever sent to an unpinned
-   group or PID.
-6. Reap the leader and check both output pipes for EOF.
+## Deadlines
 
-The state is `closed` only when the final observation has no members and no
-uncertain processes, the leader is reaped, both pipes reached EOF and no
-error was recorded. Otherwise it is `UNCLOSED`, the exit is non-zero, and owned
-scratch is kept.
+`absolute = start + limit`, and `work_end = absolute - stop_reserve`. The stop
+reserve is proposed at 15 s: TERM grace, KILL grace and the final non-blocking
+steps.
 
-## Construction
+| Moment | Custodian (non-blocking only) | Monitor |
+| --- | --- | --- |
+| Leader exits, a fault latches, `work_end` passes, or the custodian is signalled | Starts closure: TERM the pinned group | Census continues |
+| + `term_grace` | KILL the pinned group | Census continues |
+| + `kill_grace` | `waitpid` the leader; tell the monitor "stop" | Final census, receipt phase, cleanup |
+| `absolute` | If the monitor hasn't confirmed, KILL the monitor (its own child, also pinned), reap it, exit non-zero | Killed |
 
-Assign the `Popen` handle to the supervisor before any `Drain` thread or kqueue
-setup. A later setup failure, `Drain` construction included, doesn't skip
-closure. It runs the closure sequence with whichever exit detection is
-available. While closure is unknown, ownership and scratch are kept.
+At `absolute` the custodian writes nothing. The last fsynced receipt phase
+is the truth, and it is never final success unless the monitor reached that
+phase.
 
-## Bounded finalization
+## Census (monitor)
 
-Timeout parameters can't interrupt blocking filesystem or stdio calls in
-Python. The bound therefore comes from process structure:
+- **Enumeration:** one complete process-table snapshot per round through
+  `sysctl` `KERN_PROC_ALL`, giving PID, PPID, PGID, UID and start time, plus
+  `getsid` for each PID. A failed, truncated or timed-out snapshot, or missing
+  metadata for any process, makes the round uncertain. An uncertain round
+  blocks `closed`; nothing is discarded.
+- **Identity:** `(PID, start time)`. A process seen once in the session stays a
+  tracked member, whatever its UID or later parent, until a later snapshot
+  positively shows that identity gone. Reparenting doesn't erase membership.
+- **The leader** is excluded only once it is positively exited, unreaped, by
+  `NOTE_EXIT` or `ESRCH`.
+- **Uncertain:** a process that started at or after the leader whose session
+  can't be read.
+- **Out of scope:** processes never seen in the session. That includes
+  `setsid` escapes and unrelated processes of any UID. The receipt says so.
+- **`closed`:** requires the final round to be certain, with no tracked members
+  and no uncertain processes.
 
-- **Bootstrap.** A minimal outer process owns the absolute deadline. It starts
-  the supervisor as its own child and pins it unreaped. Before the start it
-  opens the incomplete-receipt path.
-- **Supervisor.** The supervisor writes its receipt atomically, through a
-  temporary file and rename, and only then removes scratch.
-- **Deadline.** If the supervisor hasn't exited by the deadline, the bootstrap:
-  1. writes a small, fixed incomplete receipt through its pre-opened
-     descriptor;
-  2. SIGKILLs its pinned child;
-  3. exits non-zero.
+## Receipt phases
 
-  It never deletes scratch, and scratch whose removal was interrupted is
-  reported as kept.
-- **Output.** Forwarding uses non-blocking writes with a bounded buffer.
-  Output past the buffer is discarded and counted, so a stalled consumer can't
-  block finalization.
+Each phase is a whole-file atomic replacement (temporary file, `fsync`,
+`rename`) in the evidence directory, outside scratch:
+
+1. `started: incomplete`
+2. `closure_established: cleanup_pending`, or `unclosed: scratch_kept`
+3. `cleanup_complete`, or `cleanup_partial_or_unknown`
+
+   An interrupted removal is reported as partial or unknown, not as kept.
+4. `final_success`
+
+   Only after `cleanup_complete`, with the command's status and evidence
+   recorded.
+
+A timeout, the monitor's death or a custodian exit leaves the last phase in
+place, and a phase earlier than `final_success` is never success.
 
 ## Fixtures
 
-Every real fixture child has its own finite monotonic self-exit. For example,
-the endless writer loops only while `monotonic() < start + fixture_max`, where
-`fixture_max` is longer than the supervisor's deadline plus its finalization
-budget.
+Every real fixture child, including nested guardians and pressure consumers,
+calls `signal.alarm(fixture_max)` first and leaves SIGALRM's default action in
+place. The kernel then ends it after `fixture_max` even while it is blocked in
+`write`. A fixture that can't do that may use only bounded, non-blocking
+operations.
 
-The proof asserts:
+`fixture_max` is greater than `absolute` plus a margin, so the expected
+`UNCLOSED` verdict is recorded before any fallback fires. The proof checks the
+eventual exit inside the overall qualification bound. Fallback expiry never
+counts as closure.
 
-- the supervisor reported its verdict (`UNCLOSED` where expected) before that
-  fallback fired;
-- a fixture exiting by its own fallback is never counted as closure.
+## Time
 
-## Timestamps
-
-- One monotonic clock for intervals.
-- One wall-clock source for stamps.
-- Integer milliseconds throughout the receipt.
+One origin is captured at start: `(monotonic, wall)`. Every stamp is
+`wall_origin + (monotonic - mono_origin)`, in integer milliseconds. Intervals
+use monotonic time only.
 
 ## Proof (elevated, after independent review of this design)
 
-A hook records every `killpg` and `kill` target. It proves each of:
+A hook records every `kill` and `killpg` target, which must only ever be the
+pinned SID or the monitor. The proof covers:
 
-- A child group that cascades on TERM ends `closed`.
-- A separate group that ignores TERM and outlives the leader's KILL ends
-  `UNCLOSED`, with scratch kept. No signal reaches that group. The fixture's
-  own fallback ends it later.
-- A kqueue or `Drain` setup failure after `Popen` still runs closure.
-- An uncertain process blocks `closed`.
-- A finalization that overruns produces the bootstrap's incomplete receipt
-  inside the bound.
-- A stalled output consumer can't block finalization.
-- Receipt timestamps are consistent.
+- a group that cascades on TERM: `closed` and `final_success`;
+- a separate group that outlives the leader's KILL: `UNCLOSED`, scratch kept,
+  never signalled;
+- a kqueue registration failure: immediate pinned stop and `UNCLOSED`;
+- the monitor killed mid-run: the custodian stops the pinned group, the last
+  phase stays non-success, and no reported PID is signalled;
+- a blocked monitor write at the deadline: the custodian exits inside the
+  bound;
+- a truncated or failed census round: uncertain;
+- a reparented member still tracked;
+- an interrupted cleanup reported as `cleanup_partial_or_unknown`;
+- a fixture blocked in `write` that `alarm` still ends after the verdict;
+- consistent timestamps.
+
+If any of this can't be met inside the approved scope, the brief stops and
+names the missing mechanism.
