@@ -9,7 +9,7 @@ use super::{
 };
 use std::fs::{self, File};
 use std::io::Write;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
@@ -1382,6 +1382,176 @@ fn unreadable_slot_entry_refuses_reuse_admission_and_eviction() {
         managed::lease(request(&pool, &fx.dir("third"), &workspace, "d")).expect("admitted");
     assert_ne!(admitted.slot_id, grant.slot_id);
     assert!(!grant.env.cargo_build_build_dir.exists());
+}
+
+#[test]
+fn vanished_diagnostic_reaches_status_and_preserves_seen_hardlink_allocation() {
+    let fx = Fixture::new("vanished-status");
+    let pool = fx.dir("pool");
+    managed::init_budget_pool(&pool, 16 * 1024 * 1024).expect("init budget pool");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let held =
+        managed::lease(request(&pool, &project, &workspace, "held")).expect("create held slot");
+    let stable = held.env.cargo_build_build_dir.join("stable");
+    fs::write(&stable, vec![7_u8; 4096]).expect("stable inode");
+    let vanished_dir = held.env.cargo_build_build_dir.join("nested");
+    fs::create_dir(&vanished_dir).expect("nested dir");
+    let vanished_link = vanished_dir.join("hardlink");
+    fs::hard_link(&stable, &vanished_link).expect("hardlink into nested dir");
+    let expected = fs::symlink_metadata(&stable).unwrap().blocks() * 512;
+
+    let status = crate::inventory::walk_observer::with_mutations(
+        fx.path(),
+        serde_json::json!([
+            {"path": vanished_link, "action": "remove_before_symlink_metadata"}
+        ])
+        .to_string(),
+        || managed::status(&pool),
+    )
+    .expect("status completes after a path vanishes");
+
+    assert_eq!(status.coverage, AccountingCoverage::Complete);
+    assert_eq!(status.payload_accounting.vanished, 1);
+    assert_eq!(status.payload_accounting.gaps, Vec::new());
+    assert_eq!(status.payload_unique_allocated_bytes, Some(expected));
+    assert_eq!(status.payload_logical_bytes, Some(4096));
+    assert!(status
+        .payload_accounting
+        .to_string()
+        .contains("vanished x1"));
+    assert!(stable.exists());
+    assert!(!vanished_link.exists());
+
+    let mut old_status = serde_json::to_value(&status).expect("serialize status");
+    old_status["payload_accounting"]
+        .as_object_mut()
+        .unwrap()
+        .remove("vanished");
+    let decoded: super::PoolStatus =
+        serde_json::from_value(old_status).expect("new reader accepts old scan JSON");
+    assert_eq!(decoded.payload_accounting.vanished, 0);
+}
+
+#[test]
+fn vanished_paths_allow_only_the_needed_whole_idle_slot_eviction() {
+    let fx = Fixture::new("vanished-eviction");
+    let pool = fx.dir("pool");
+    let budget = 1024 * 1024;
+    managed::init_budget_pool(&pool, budget).expect("init budget pool");
+    let workspace = fx.dir("workspace");
+    let held_project = fx.dir("held-project");
+    let idle_project = fx.dir("idle-project");
+    let held = managed::lease(request(&pool, &held_project, &workspace, "held"))
+        .expect("create held slot");
+    let idle = managed::lease(request(&pool, &idle_project, &workspace, "idle"))
+        .expect("create idle slot beside held");
+    let held_stable = held.env.cargo_build_build_dir.join("stable");
+    fs::write(&held_stable, vec![1_u8; 600 * 1024]).expect("held stable occupancy");
+    let vanished_file = held.env.cargo_build_build_dir.join("temporary");
+    fs::write(&vanished_file, vec![2_u8; 128 * 1024]).expect("held temporary file");
+    let vanished_dir = held.env.cargo_build_build_dir.join("temporary-dir");
+    fs::create_dir(&vanished_dir).expect("held temporary directory");
+    fs::write(vanished_dir.join("payload"), vec![3_u8; 64 * 1024])
+        .expect("held temporary directory payload");
+    let idle_file = idle.env.cargo_build_build_dir.join("occupancy");
+    fs::write(&idle_file, vec![4_u8; 512 * 1024]).expect("idle occupancy");
+    managed::release(&pool, &idle.lease_id).expect("release idle slot");
+
+    let held_stable_bytes = fs::symlink_metadata(&held_stable).unwrap().blocks() * 512;
+    let idle_bytes = fs::symlink_metadata(&idle_file).unwrap().blocks() * 512;
+    assert!(held_stable_bytes < budget);
+    assert!(held_stable_bytes + idle_bytes > budget);
+    let next_project = fx.dir("next-project");
+    let admitted = crate::inventory::walk_observer::with_mutations(
+        fx.path(),
+        serde_json::json!([
+            {"path": vanished_file, "action": "remove_before_symlink_metadata"},
+            {"path": vanished_dir, "action": "remove_before_read_dir"}
+        ])
+        .to_string(),
+        || managed::lease(request(&pool, &next_project, &workspace, "next")),
+    )
+    .expect("complete observation permits admission");
+
+    assert!(!admitted.reused_slot);
+    assert_ne!(admitted.slot_id, held.slot_id);
+    assert_ne!(admitted.slot_id, idle.slot_id);
+    assert!(held.env.cargo_build_build_dir.exists());
+    assert!(held_stable.exists());
+    assert!(!vanished_file.exists());
+    assert!(!vanished_dir.exists());
+    assert!(!idle.env.cargo_build_build_dir.parent().unwrap().exists());
+    let status = managed::status(&pool).expect("status after admission");
+    let ids: Vec<_> = status
+        .slots
+        .iter()
+        .map(|slot| slot.slot_id.as_str())
+        .collect();
+    assert_eq!(ids, vec![held.slot_id.as_str(), admitted.slot_id.as_str()]);
+    assert_eq!(
+        status.slots[0].state,
+        SlotOccupancy::Held,
+        "the held slot remains in place"
+    );
+}
+
+#[test]
+fn a_real_gap_still_refuses_before_whole_idle_slot_deletion() {
+    let fx = Fixture::new("vanished-gap");
+    let pool = fx.dir("pool");
+    let budget = 1024 * 1024;
+    managed::init_budget_pool(&pool, budget).expect("init budget pool");
+    let workspace = fx.dir("workspace");
+    let held_project = fx.dir("held-project");
+    let idle_project = fx.dir("idle-project");
+    let held = managed::lease(request(&pool, &held_project, &workspace, "held"))
+        .expect("create held slot");
+    let idle = managed::lease(request(&pool, &idle_project, &workspace, "idle"))
+        .expect("create idle slot beside held");
+    let held_stable = held.env.cargo_build_build_dir.join("stable");
+    fs::write(&held_stable, vec![1_u8; 600 * 1024]).expect("held stable occupancy");
+    let blocked_dir = held.env.cargo_build_build_dir.join("blocked");
+    fs::create_dir(&blocked_dir).expect("blocked directory");
+    fs::write(blocked_dir.join("payload"), vec![2_u8; 64 * 1024])
+        .expect("blocked directory payload");
+    let vanished_file = held.env.cargo_build_build_dir.join("vanished");
+    fs::write(&vanished_file, vec![3_u8; 32 * 1024]).expect("vanished fixture file");
+    let idle_file = idle.env.cargo_build_build_dir.join("occupancy");
+    fs::write(&idle_file, vec![3_u8; 512 * 1024]).expect("idle occupancy");
+    managed::release(&pool, &idle.lease_id).expect("release idle slot");
+    let next_project = fx.dir("next-project");
+
+    let refused = crate::inventory::walk_observer::with_mutations(
+        fx.path(),
+        serde_json::json!([
+            {"path": blocked_dir, "action": "permission_denied_before_read_dir"},
+            {"path": vanished_file, "action": "remove_before_symlink_metadata"}
+        ])
+        .to_string(),
+        || managed::lease(request(&pool, &next_project, &workspace, "next")),
+    );
+    let scan = incomplete(refused);
+    assert_eq!(scan.coverage, AccountingCoverage::Partial);
+    assert_eq!(gap_kinds(&scan), vec![AccountingGapKind::UnreadableEntry]);
+    assert_eq!(scan.vanished, 1);
+    assert!(scan.to_string().contains("unreadable_entry x1"));
+    assert!(scan.to_string().contains("vanished x1"));
+    assert!(idle.env.cargo_build_build_dir.exists());
+    assert!(held.env.cargo_build_build_dir.exists());
+    assert!(blocked_dir.exists());
+    assert!(!vanished_file.exists());
+
+    let status = managed::status(&pool).expect("status after conservative refusal");
+    assert_eq!(status.slots.len(), 2);
+    assert!(status
+        .slots
+        .iter()
+        .any(|slot| { slot.slot_id == idle.slot_id && slot.state == SlotOccupancy::Idle }));
+    assert!(status
+        .slots
+        .iter()
+        .any(|slot| { slot.slot_id == held.slot_id && slot.state == SlotOccupancy::Held }));
 }
 
 #[test]

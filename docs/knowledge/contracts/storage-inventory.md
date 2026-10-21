@@ -114,10 +114,26 @@ explicit gaps with occurrence counts: `entry_limit`, `depth_limit`,
 `elapsed_deadline`, `mount_boundary`, `unreadable_entry`, `missing_metadata`,
 `unsupported_metadata` and `output_limit`.
 
-Concurrent mutation, unreadable entries and unsupported metadata produce a
+The walk is a best-effort, non-atomic observation. When a non-root path that
+this same walk enumerated returns `NotFound` at a deferred `read_dir`,
+`file_type` or no-follow metadata call, the report increments the separate
+`vanished` diagnostic. That path contributes no bytes; other inode bytes
+already observed remain in the union. This scoped exception does not create a
+coverage gap, so coverage may remain complete. It does not establish that the
+path's inode allocation was freed or is reclaimable: rename, open-unlinked
+files and hardlinks may retain it. A missing root remains a refusal, including
+when the root disappears after it was opened. Iterator errors without an
+associated enumerated path and all other errors keep their existing
+conservative gap categories.
+
+Unreadable entries, unsupported metadata and finite-bound stops produce a
 partial report, not a panic and not a false exact total. Because unvisited
 entries cannot be counted, a partial report is a lower bound and never claims
-exactness or nonzero savings.
+exactness or nonzero savings. Human and JSON reports include the separate
+`vanished` count when it is nonzero; zero is omitted on the wire. New readers
+default an absent count to zero. Older strict readers may reject a report that
+contains a nonzero `vanished` field. This diagnostic is not persisted in the
+pool ledger or configuration.
 
 ## Output and exit semantics
 

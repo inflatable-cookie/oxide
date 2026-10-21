@@ -272,8 +272,29 @@ names the gap kinds (`entry_limit`, `depth_limit`, `elapsed_deadline`,
 milliseconds and the bounds used. No path or name is printed. An incomplete
 walk's bytes are never used for admission and never make a slot an eviction
 candidate; `status` shows them as a lower bound. A measured zero stays
-distinct from unknown. Only a slot whose own walk completes can be reused;
-other `unknown_accounting` refusals (invalid identities, ledger, ownership or
+distinct from unknown.
+
+**Enumerated paths that vanish (oxide#113).** If a non-root path enumerated by
+the same walk returns `NotFound` at deferred `read_dir`, `file_type` or
+no-follow metadata, the walk increments a separate `vanished` count rather
+than a gap. A walk with only these observations is complete for the names it
+could still read, and its bytes may be used by the existing admission and
+whole-idle-slot eviction rules. The scan and its result remain a best-effort,
+non-atomic path observation; `vanished` does not prove that inode allocation
+was physically freed or is reclaimable. Bytes for other paths already
+observed, including a link to the same inode, remain counted. A root
+`NotFound` is still `root_missing` and refuses even if that root was opened
+earlier in the walk. Iterator errors without a path identity, `EACCES`, other
+metadata errors, bounds, mount boundaries and all ownership, foreign-entry,
+symlink and identity refusals retain their existing categories. `status` and
+`unknown_accounting` refusal text show `vanished xN` even alongside a real
+gap, and state that allocation reclamation is not inferred. The count is not
+part of ledger/config persistence; new readers accept
+older scan JSON with the field absent, while older strict readers may reject a
+new scan that includes a nonzero count.
+
+Only a slot whose own walk completes can be reused; other
+`unknown_accounting` refusals (invalid identities, ledger, ownership or
 backing failures, foreign entries) are unchanged.
 
 The bounds are finite, not an arbitrary-size guarantee. The entry bound
