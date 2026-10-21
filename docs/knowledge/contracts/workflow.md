@@ -990,8 +990,11 @@ It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
     stop must come between the 1 s or 10 s bound and that bound plus
     0.3 s, measured from completion;
   - the direct runner, with no bootstrap, whose first receipt open blocks
-    on a FIFO. It exits 125 between 10 and 13 s, launches nothing and
-    claims no receipt;
+    on a FIFO. It exits 125 within 13 s, launches nothing and claims no
+    receipt. No reading arrives while setup is blocked, so the 1 s reserve
+    staleness guard usually stops it first; the 10 s setup deadline is the
+    backstop. The author native at `f3bde11` failed 67/68 only because this
+    case expected at least 10 s; it stopped at 1.13 s;
   - the bootstrap actor KILLing a worker blocked on an unread stdout pipe
     at its deadline (exit 124);
   - post-gate exceptions: an event-loop exception, a failing kqueue, a

@@ -846,7 +846,9 @@ class Real(unittest.TestCase):
         CASES.append({"case": "direct_runner_setup_blocked", "exit": self.code, "wall_s": round(wall, 3),
                       "kept": str(self.dir)})
         self.assertEqual(self.code, 125)
-        self.assertGreaterEqual(wall, bounded.SETUP_S)
+        # Bounded inside the setup window. No reading arrives while setup is
+        # blocked, so the 1 s reserve staleness guard usually stops it first
+        # (native f3bde11: 1.13 s); the 10 s setup deadline is the backstop.
         self.assertLess(wall, bounded.SETUP_S + 3)
         self.assert_not_launched()
         self.assertFalse((self.dir / "evidence" / "receipt.json").exists(), "a receipt was claimed")
