@@ -1741,6 +1741,37 @@ A lease records which pool it uses. Each pool stays warm on its own.
 
 **Drive:** the dedicated spare 1 TB SSD (Tom, 2026-10-20), formatted by Tom in Disk Utility as plain APFS volume `Builds` (UUID `A6AC3ED7-33EA-46B4-8082-7254CF291ED2`). Vault and its Time Machine backups stay untouched. **Decided (Tom, 2026-10-20):** a 750 GB Oxide admission cap and a 100 GB free-space reserve, both set at registration. The flush primitive is implemented (`fsync_volume_np` with full sync and wait; see part 1 above); **not yet measured:** its cost on the real drive.
 
+### Proposed: `oxide pool describe --json` (lead `beec4971`)
+
+Proposed, not implemented. This is the stable, read-only interface other tools use to find the Builds drive. Its first consumer is Effigy's opt-in `[scratch] source = "oxide"` (Effigy lead `1a007b5d`). Output on stdout, schema version 1:
+
+```json
+{
+  "schema": "oxide.pool.describe/1",
+  "observed_at": "2026-10-21T16:00:00Z",
+  "internal": { "pool": "/Users/tom/Dev/oxide" },
+  "selected": "removable",
+  "removable": {
+    "mount_point": "/Volumes/Builds",
+    "volume_uuid": "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+    "mode": "ephemeral",
+    "available": true,
+    "unavailable_reason": null,
+    "payload": "/Volumes/Builds/oxide-pool",
+    "suggested_scratch_root": "/Volumes/Builds/scratch"
+  }
+}
+```
+
+- **`removable`** is `null` when no drive is registered. `selected` is then `"internal"`.
+- **`mode`** is `"permanent"` or `"ephemeral"`. Until the drive-mode lead ships, it is always `"ephemeral"`.
+- **`available`** is the same selection decision a build starting now would make. `unavailable_reason` is the same short reason `status` prints, for example `"absent"`, `"below_reserve"`, `"identity_mismatch"`, `"unknown_accounting"` or `"metadata_unknown"`. Otherwise it is `null`. Consumers branch on `available`, not on reason strings.
+- **`suggested_scratch_root`** is always outside `payload`. It is a suggestion, not a promise that the directory exists or a grant of write authority. Consumers create their own subdirectory, for example `<root>/effigy/<run-id>`, and never write under `payload`.
+- **Read-only.** Running `describe` mutates nothing. It creates no directories, reconciles no recorded deletion and walks no accounting.
+- **A snapshot.** The data is a point-in-time observation. Before writing, consumers still apply their own gate: the volume UUID, the mount root, and a device different from both `/` and `/System/Volumes/Data`.
+- **Exit codes:** 0 whenever the description was produced, whether or not a drive is registered or available. Non-zero only when Oxide itself fails, with the reason on stderr.
+- **Compatibility:** fields may be added in schema 1. Removing or renaming a field needs `oxide.pool.describe/2`.
+
 ## Adaptive sccache location (proposed)
 
 Approved design direction (Tom, 2026-10-20). Not implemented. It applies to builds that do **not** go through Oxide; Oxide-managed builds bypass inherited wrappers.
