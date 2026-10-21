@@ -597,8 +597,12 @@ class Real(unittest.TestCase):
         self.assertFalse(alive(self.child()), "the group member survived the pinned KILL")
         reaped = [r for r in records if r["event"] == "leader_reaped"]
         self.assertTrue(reaped and reaped[0]["status"] is not None, "leader not reaped")
-        self.assertGreaterEqual(self.receipt["reserve"]["last_ns"], reaped[0]["at"],
-                                "reserve sampling ended before the shutdown")
+        # Sampling stays fresh through shutdown: the last reserve sample is
+        # within the guard's 1 s staleness window of the monitor's final
+        # publication. (Shutdown can finish inside one 0.25 s interval, so a
+        # sample after the reap itself is not required; native 74f1b65.)
+        self.assertLess(self.receipt["published_ns"] - self.receipt["reserve"]["last_ns"],
+                        bounded.RESERVE_STALE_NS, "reserve sampling went stale before the shutdown ended")
         [root] = list(self.dir.glob("oxide-proof.*"))
         self.assertTrue((root / "scratch").is_dir(), "scratch removed after an exception")
 

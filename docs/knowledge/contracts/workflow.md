@@ -940,8 +940,10 @@ It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
   - post-gate exceptions: an event-loop exception, a failing kqueue, a
     malformed monitor message, and an exception during the stop. Each has a
     TERM-ignoring leader and group child: pinned TERM then KILL, the child
-    dead, the leader reaped, sampling past the reap, owned scratch kept,
-    exit 125;
+    dead, the leader reaped, the last reserve sample within 1 s of the
+    monitor's final publication, owned scratch kept, exit 125. The author
+    native at `74f1b65` failed only the earlier, stricter form of that
+    sampling assertion (a sample after the reap) in two cases;
   - a fixture deadline holding across `exec` and for a late grandchild, with
     SIGALRM inherited as ignored and blocked.
 
