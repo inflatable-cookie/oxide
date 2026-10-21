@@ -98,6 +98,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -120,7 +121,7 @@ REPO = Path(__file__).resolve().parent.parent
 TEMP_VARS = ("OXIDE_TASK_SCRATCH_ROOT", "TMPDIR", "TMP", "TEMP")
 # Staging and every child run with rustup installs disabled.
 AUTO_INSTALL_OFF = {"RUSTUP_AUTO_INSTALL": "0"}
-SCRUB_PREFIXES = ("CARGO", "RUSTC", "RUSTFLAGS", "RUSTDOC", "SCCACHE", "RUSTUP_TOOLCHAIN")
+SCRUB_PREFIXES = ("CARGO", "RUSTC", "RUSTFLAGS", "RUSTDOC", "SCCACHE", "RUSTUP_TOOLCHAIN", "OXIDE_")
 
 
 class Proof:
@@ -142,8 +143,10 @@ class Proof:
     def env(self, case: Path | None = None, extra: dict | None = None) -> dict:
         """Scrubbed host env with the four temp vars set to the owned root.
 
-        A case gets a private HOME and pool under its own directory. Staging
-        gets none: it keeps the host HOME and RUSTUP_HOME, as disclosed.
+        Every inherited OXIDE_* variable is removed, so no host config file
+        (OXIDE_CONFIG) or debug or test override reaches a child. A case gets
+        a private HOME and OXIDE_POOL under its own directory. Staging gets
+        neither: it keeps the host HOME and RUSTUP_HOME, as disclosed.
         """
         env = {key: value for key, value in os.environ.items() if not key.startswith(SCRUB_PREFIXES)}
         env.update(AUTO_INSTALL_OFF)
@@ -198,15 +201,30 @@ def _raise(error: OSError) -> None:
     raise error
 
 
+def refuse_seed_entries(seed: Path) -> None:
+    """Refuse any symlink, or anything else but a file or directory, in the seed.
+
+    Checked before the copy, so no link is followed or copied and no external
+    referent is reached. Walk errors raise.
+    """
+    for dirpath, dirnames, filenames in os.walk(seed, onerror=_raise):
+        for name in dirnames + filenames:
+            path = os.path.join(dirpath, name)
+            mode = os.lstat(path).st_mode
+            if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+                raise RuntimeError(f"seed entry is not a plain file or directory: {path}")
+
+
+
 def snapshot(root: Path) -> list[tuple]:
     """Every entry's type, mode, times and contents, so no change is hidden."""
     entries = []
     for dirpath, dirnames, filenames in os.walk(root):
         for name in sorted(dirnames + filenames):
             path = Path(dirpath, name)
-            stat = os.lstat(path)
+            info = os.lstat(path)
             rel = str(path.relative_to(root))
-            base = (rel, stat.st_mode, stat.st_mtime_ns, stat.st_ctime_ns)
+            base = (rel, info.st_mode, info.st_mtime_ns, info.st_ctime_ns)
             if path.is_symlink():
                 entries.append(base + ("link", os.readlink(path)))
             elif path.is_dir():
@@ -225,9 +243,10 @@ def stage(proof: Proof) -> Path:
     cargo_home = proof.root / "cargo-home"
     registry = host_cargo_home / "registry"
     if registry.is_dir():
+        refuse_seed_entries(registry)
         if owned_bytes(registry) > 256 * 1024 * 1024:
             raise RuntimeError("host registry cache exceeds the 256 MiB seed bound")
-        shutil.copytree(registry, cargo_home / "registry", symlinks=True)
+        shutil.copytree(registry, cargo_home / "registry", symlinks=False)
     target = proof.root / "target"
     build = proof.root / "build"
     env = proof.env(
