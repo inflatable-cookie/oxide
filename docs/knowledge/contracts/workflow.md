@@ -1763,11 +1763,16 @@ Proposed, not implemented. This is the stable, read-only interface other tools u
 }
 ```
 
-- **`removable`** is `null` when no drive is registered. `selected` is then `"internal"`.
+- **`removable`** is `null` when no drive is registered, and `selected` is then `"internal"`.
 - **`mode`** is `"permanent"` or `"ephemeral"`. Until the drive-mode lead ships, it is always `"ephemeral"`.
-- **`available`** is the same selection decision a build starting now would make. `unavailable_reason` is the same short reason `status` prints, for example `"absent"`, `"below_reserve"`, `"identity_mismatch"`, `"unknown_accounting"` or `"metadata_unknown"`. Otherwise it is `null`. Consumers branch on `available`, not on reason strings.
+- **`available`** is **passive eligibility**, not a prediction that the next build will open or be admitted to the pool. It is `true` only when every check below passes, using only read-only observations:
+  - the registered drive passes selection's checks: the `/Volumes` mount-parent rule, the opened mount root with the registered volume UUID, the registered container outside the boot and data container, no APFS role, writability, and available space above the reserve;
+  - the removable pool's existing config and ledger read cleanly with matching identities.
+
+  Every `diskutil` or `plutil` read is bounded by a timeout and an output-size cap, and a timeout, oversize output or parse failure counts as unknown. Anything pending, indeterminate or unknown makes it `false`, with a reason: an `Evicting` record awaiting reconciliation (`"pending_reconciliation"`), missing control directories, unreadable or mismatched metadata (`"metadata_unknown"`, `"identity_mismatch"`), `"absent"` or `"below_reserve"`. `unavailable_reason` is otherwise `null`. Consumers branch on `available`, not on reason strings.
+- **`selected`** is the passive preference: `"removable"` when `available` is true, otherwise `"internal"`. It is not a promise of the next build's selection, which stays authoritative inside the build and may differ, for example after its own reconciliation.
 - **`suggested_scratch_root`** is always outside `payload`. It is a suggestion, not a promise that the directory exists or a grant of write authority. Consumers create their own subdirectory, for example `<root>/effigy/<run-id>`, and never write under `payload`.
-- **Read-only.** Running `describe` mutates nothing. It creates no directories, reconciles no recorded deletion and walks no accounting.
+- **Read-only.** Running `describe` mutates nothing. It never uses the build path's pool-opening helpers. It creates no control directories, reconciles no recorded deletion, writes no ledger and walks no accounting. Held records are reported as they are, with no claim about closure or accounting.
 - **A snapshot.** The data is a point-in-time observation. Before writing, consumers still apply their own gate: the volume UUID, the mount root, and a device different from both `/` and `/System/Volumes/Data`.
 - **Exit codes:** 0 whenever the description was produced, whether or not a drive is registered or available. Non-zero only when Oxide itself fails, with the reason on stderr.
 - **Compatibility:** fields may be added in schema 1. Removing or renaming a field needs `oxide.pool.describe/2`.
