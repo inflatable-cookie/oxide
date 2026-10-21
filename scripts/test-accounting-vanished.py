@@ -181,12 +181,61 @@ def run_oxide(
 
 
 def slot_roots(pool: str) -> dict[str, str]:
-    root = os.path.join(pool, "payload", "slots")
-    return {
-        name: os.path.join(root, name)
-        for name in sorted(os.listdir(root), key=int)
-        if name.isdigit()
-    }
+    payload = os.path.join(pool, "payload")
+    slots = os.path.join(payload, "slots")
+    if os.path.islink(payload) or os.path.islink(slots):
+        fail("fixture payload or slots root is a symlink")
+    payload_root = os.path.realpath(payload)
+    slots_root = os.path.realpath(slots)
+    if os.path.commonpath((payload_root, slots_root)) != payload_root or slots_root == payload_root:
+        fail("fixture slots root escapes the payload")
+
+    with open(os.path.join(pool, "ledger.json"), encoding="utf-8") as ledger_file:
+        ledger = json.load(ledger_file)
+    records = ledger.get("slots")
+    if not isinstance(records, list):
+        fail("fixture ledger has no slot records")
+
+    result: dict[str, str] = {}
+    for record in records:
+        slot_id = record.get("id") if isinstance(record, dict) else None
+        if isinstance(slot_id, bool) or not isinstance(slot_id, int) or slot_id <= 0:
+            fail(f"fixture ledger has an invalid slot id: {slot_id!r}")
+        key = str(slot_id)
+        if key in result:
+            fail(f"fixture ledger repeats slot id {key}")
+
+        recorded_dir = record.get("dir")
+        if recorded_dir is None:
+            parts = [key]
+        elif isinstance(recorded_dir, str):
+            parts = recorded_dir.split("/")
+            suffix = f"-{key}"
+            valid_name = lambda part: (
+                0 < len(part) <= 80
+                and not part.startswith(".")
+                and all(char in "abcdefghijklmnopqrstuvwxyz0123456789-_." for char in part)
+            )
+            if (
+                len(parts) != 2
+                or not all(valid_name(part) for part in parts)
+                or not parts[1].endswith(suffix)
+                or not parts[1][: -len(suffix)]
+            ):
+                fail(f"fixture ledger has an invalid directory for slot {key}: {recorded_dir!r}")
+        else:
+            fail(f"fixture ledger has a non-string directory for slot {key}")
+
+        path = slots_root
+        for part in parts:
+            path = os.path.join(path, part)
+            if os.path.islink(path) or not os.path.isdir(path):
+                fail(f"recorded fixture slot path is missing or unsafe for slot {key}")
+        canonical = os.path.realpath(path)
+        if os.path.commonpath((slots_root, canonical)) != slots_root or canonical == slots_root:
+            fail(f"recorded fixture slot path escapes slots for slot {key}")
+        result[key] = canonical
+    return result
 
 
 def wait_for_ready(process: subprocess.Popen, marker: str) -> None:
