@@ -13,6 +13,10 @@ timer to FIXTURE_DEADLINE_NS, an absolute CLOCK_UPTIME_RAW deadline in the
 environment, so a late descendant exits at once. Ordering: case verdict
 (45 s) < fixture fallback (60 s) < qualification (300 s). A case asserts its
 verdict before the fallback; fallback expiry never counts as closure.
+
+Real case directories go in the outer supervisor's evidence directory
+(OXIDE_PROOF_EVIDENCE), outside its cleanup, and are never deleted: an
+UNCLOSED case's live fixtures and receipts are kept for the owner.
 """
 from __future__ import annotations
 
@@ -29,7 +33,9 @@ from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent
 SUPERVISOR = SCRIPTS / "bounded-test.py"
+BOOTSTRAP = SCRIPTS / "qualify-supervisor.py"
 SCRATCH = Path(tempfile.mkdtemp(prefix="suite.", dir=os.environ.get("OXIDE_TASK_SCRATCH_ROOT") or None)).resolve()
+OUTER_EVIDENCE = os.environ.get("OXIDE_PROOF_EVIDENCE")
 NS = 1_000_000_000
 GIB = 1024 ** 3
 VERDICT_S, FALLBACK_S = 45, 60
@@ -138,6 +144,7 @@ def row(pid, start=1, **extra):
 class FakeTable:
     def __init__(self, rows, sessions, reread=None):
         self.rows, self.sessions, self.rereads = rows, sessions, reread or {}
+        self.reads = 0
 
     def snapshot(self):
         return list(self.rows)
@@ -149,13 +156,20 @@ class FakeTable:
         return value
 
     def reread(self, pid):
-        if pid in self.rereads:
-            return self.rereads[pid]
+        self.reads += 1
+        value = self.rereads.get(pid, "rows")
+        if callable(value):
+            value = value(self.reads)
+        if isinstance(value, BaseException):
+            raise value
+        if value != "rows":
+            return value
         return next((r for r in self.rows if r["pid"] == pid), None)
 
 
 def census(table, sid=100):
-    return bounded.Census(sid, snapshot=table.snapshot, getsid=table.getsid, reread=table.reread)
+    return bounded.Census(sid, snapshot=table.snapshot, getsid=table.getsid, reread=table.reread,
+                          pause=lambda _seconds: None)
 
 
 class PureCensus(unittest.TestCase):
@@ -184,6 +198,21 @@ class PureCensus(unittest.TestCase):
         table = FakeTable([row(103)], {103: ProcessLookupError(3, "gone")}, reread={103: None})
         result = census(table).round()
         self.assertEqual((result["certain"], result["members"]), (True, 0))
+
+    def test_gone_needs_successful_confirmation(self):
+        # Review 6312725112 finding 4: ESRCH then a failing KERN_PROC_PID
+        # re-read is missing metadata, not absence.
+        table = FakeTable([row(107)], {107: ProcessLookupError(3, "gone")}, reread={107: PermissionError(1, "denied")})
+        result = census(table).round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (False, 0, 1))
+        self.assertIn("reread", result["uncertain_rows"][0]["reason"])
+
+    def test_zombie_confirmed_gone_within_round(self):
+        # Present at the first re-read, absent at a later successful one.
+        table = FakeTable([row(108, zombie=True)], {108: ProcessLookupError(3, "gone")},
+                          reread={108: lambda reads: row(108, zombie=True) if reads < 3 else None})
+        result = census(table).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (True, 0))
 
     def test_member_stays_member_after_setsid_or_reparenting(self):
         table = FakeTable([row(104, ppid=101)], {104: 100})
@@ -262,6 +291,18 @@ class PureProtocol(unittest.TestCase):
         custodian.accept(self.message(custodian, "census", after=10, certain=True, members=0, uncertain=0))
         self.assertTrue(custodian.census_ok)
 
+    def test_uncertain_census_latches_over_later_empty(self):
+        # Review 6312725112 finding 3: an uncertain census after the stop
+        # latches; a later certain empty census never restores closure.
+        custodian = self.custodian()
+        custodian.reaped_seq = 10
+        custodian.eof = {"stdout", "stderr"}
+        custodian.accept(self.message(custodian, "census", after=10, certain=False, members=0, uncertain=1))
+        custodian.accept(self.message(custodian, "census", after=10, certain=True, members=0, uncertain=0))
+        self.assertIn("census uncertain", custodian.guard.fault)
+        self.assertFalse(custodian.census_ok)
+        self.assertFalse(custodian.closure(True))
+
     def test_unpinned_target_is_never_signalled(self):
         custodian = self.custodian()
         custodian.leader_status = 0  # reaped: the pin is gone
@@ -284,9 +325,18 @@ def alive(pid):
     return True
 
 
+def nested_root():
+    """Outside the outer supervisor's cleanup; never deleted here."""
+    if not OUTER_EVIDENCE:
+        return SCRATCH
+    root = Path(OUTER_EVIDENCE) / "nested"
+    root.mkdir(exist_ok=True)
+    return root.resolve()
+
+
 class Real(unittest.TestCase):
     def setUp(self):
-        self.dir = Path(tempfile.mkdtemp(dir=SCRATCH)).resolve()
+        self.dir = Path(tempfile.mkdtemp(prefix=self.id().rsplit(".", 1)[-1] + ".", dir=nested_root())).resolve()
         self.started = now_ns()
 
     def guardian(self, code, inject=(), owned=False, limit=35, signal_after=None, signal_number=None, command=None):
@@ -316,7 +366,9 @@ class Real(unittest.TestCase):
         self.assertLess(self.verdict_ns, self.started + FALLBACK_S * NS, "verdict after the fixture fallback")
         self.receipt = json.loads((self.dir / "evidence" / "receipt.json").read_text())
         signals = [r for r in self.receipt["custodian"] if r["event"] == "signal"]
+        closure = (self.receipt["outcome"] or {}).get("closure")
         CASES.append({"case": self.id().rsplit(".", 1)[-1], "exit": self.code, "phase": self.receipt["phase"],
+                      "dir": str(self.dir), "retained_unclosed": closure != "closed",
                       "outcome": self.receipt["outcome"], "census": (self.receipt["census"] or {}).get("members"),
                       "wall_s": round((self.verdict_ns - self.started) / NS, 3),
                       "signals": [[s["signal"], s["pin"], s["killpg"], s["held_unreaped"], s["result"]]
@@ -334,6 +386,14 @@ class Real(unittest.TestCase):
 
     def assert_not_launched(self):
         self.assertFalse((self.dir / "ran").exists(), "the command ran")
+
+    def assert_kept_outside_outer_cleanup(self):
+        # Review 6312725112 finding 1: an UNCLOSED case's resources are not
+        # inside the outer supervisor's cleanup root.
+        outer = os.environ.get("OXIDE_TASK_SCRATCH_ROOT")
+        if OUTER_EVIDENCE and outer:
+            self.assertFalse(str(self.dir).startswith(os.path.realpath(outer) + os.sep), self.dir)
+        self.assertTrue((self.dir / "evidence" / "receipt.json").exists())
 
     # Normal paths
 
@@ -373,12 +433,14 @@ class Real(unittest.TestCase):
         targets = {r["target"] for r in self.receipt["custodian"] if r["event"] == "signal"}
         self.assertNotIn(self.child(), targets)
         self.assertGreaterEqual(self.receipt["census"]["members"], 1)
+        self.assert_kept_outside_outer_cleanup()
 
     def test_escaped_pipe_holder_unclosed(self):
         code = fixture("import os\n" + spawn_line(SLEEPER, setsid=True))
         self.assertEqual(self.guardian(code), 125)
         self.assertIn("EOF", self.outcome()["fault"])
         self.assertTrue(alive(self.child()))
+        self.assert_kept_outside_outer_cleanup()
 
     def test_output_saturation(self):
         code = fixture("block = b'x' * 65536\nfor _ in range(48 * 16): os.write(1, block)\n"
@@ -430,6 +492,17 @@ class Real(unittest.TestCase):
     def test_no_detector(self):
         self.gate_case("no-detector")
 
+    def test_cancel_after_ack_before_gate(self):
+        # Review 6312725112 finding 5: a real SIGTERM after detector
+        # registration, before the gate write.
+        self.gate_case("cancel-after-ack")
+        self.assertIn("signal", self.outcome()["fault"])
+
+    def test_cancel_pending_at_gate(self):
+        # A SIGTERM arriving while the gate decision holds INT and TERM blocked.
+        self.gate_case("cancel-at-gate")
+        self.assertIn("signal", self.outcome()["fault"])
+
     def test_setup_stall_launches_nothing(self):
         self.assertEqual(self.guardian(fixture("open(os.environ['CASE_DIR'] + '/ran', 'w')\n"),
                                        inject=["setup-stall"]), 125)
@@ -448,6 +521,16 @@ class Real(unittest.TestCase):
         self.assertEqual(self.guardian(fixture("pass\n"), inject=["census-uncertain"]), 125)
         self.assertEqual(self.outcome()["closure"], "UNCLOSED")
 
+    def test_uncertain_then_empty_census_keeps_scratch(self):
+        # Review 6312725112 finding 3: only the first census is uncertain;
+        # later certain empty censuses must not restore closure or cleanup.
+        self.assertEqual(self.guardian(fixture("pass\n"), inject=["census-uncertain-first"], owned=True), 125)
+        self.assertEqual(self.outcome()["closure"], "UNCLOSED")
+        self.assertIn("census uncertain", self.outcome()["fault"])
+        [root] = list(self.dir.glob("oxide-proof.*"))
+        self.assertTrue((root / "scratch").is_dir(), "scratch removed after an uncertain census")
+        self.assertEqual(self.receipt["phase"], "monitor_complete: pending_custodian")
+
     def test_cleanup_interrupted(self):
         self.assertEqual(self.guardian(fixture("pass\n"), inject=["cleanup-interrupt"], owned=True), 125)
         self.assertEqual(self.receipt["phase"], "cleanup_partial_or_unknown")
@@ -455,6 +538,46 @@ class Real(unittest.TestCase):
     def test_monitor_complete_then_custodian_timeout(self):
         self.assertEqual(self.guardian(fixture("pass\n"), inject=["custodian-timeout-after-monitor"]), 124)
         self.assertEqual(self.receipt["phase"], "monitor_complete: pending_custodian")
+
+    # Bootstrap finalization
+
+    def test_bootstrap_deadline_bounds_blocked_stdout(self):
+        # Review 6312725112 finding 2: a worker blocked writing to a stdout
+        # nobody reads cannot extend the bootstrap's absolute deadline.
+        code = PROLOGUE + f"""
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("qualify", {str(BOOTSTRAP)!r})
+qualify = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(qualify)
+
+def work():
+    # Timers do not survive fork: re-arm the fallback in the worker.
+    signal.setitimer(signal.ITIMER_REAL, max(0.01, (int(os.environ["FIXTURE_DEADLINE_NS"])
+                                                    - time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)) / 1e9))
+    open(os.environ["CASE_DIR"] + "/worker.pid", "w").write(str(os.getpid()))
+    os.write(1, bytes(1 << 20))  # blocks: the pipe is never read
+    return 0
+
+start = time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+sys.exit(qualify.bounded(work, start + 2 * 10**9, start + 3 * 10**9))
+"""
+        env = dict(os.environ, CASE_DIR=str(self.dir), FIXTURE_DEADLINE_NS=str(self.started + FALLBACK_S * NS))
+        with open(self.dir / "actor.log", "wb") as log:
+            actor = subprocess.Popen([sys.executable, "-c", code], env=env, stdout=subprocess.PIPE, stderr=log)
+            try:
+                self.code = actor.wait(timeout=15)
+            finally:
+                if actor.poll() is None:
+                    actor.kill()
+                    actor.wait(5)
+                actor.stdout.close()
+        wall = (now_ns() - self.started) / NS
+        self.assertLess(now_ns(), self.started + FALLBACK_S * NS, "verdict after the fixture fallback")
+        CASES.append({"case": "bootstrap_deadline_blocked_stdout", "exit": self.code, "wall_s": round(wall, 3)})
+        self.assertEqual(self.code, 124)
+        self.assertLess(wall, 6)
+        self.assertIn(b"KILLed (reaped True)", (self.dir / "actor.log").read_bytes())
+        self.assertFalse(alive(int((self.dir / "worker.pid").read_text())))
 
     # Fixture fallback
 

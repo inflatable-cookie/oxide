@@ -20,9 +20,11 @@ Implements docs/knowledge/contracts/proof-supervisor-correction.md (revision
 
 Closure is established only with no latched fault, the leader reaped, a
 census started after the leader was reaped that is certain with no members
-and no uncertain rows, and EOF on both output pipes. Anything else is
-UNCLOSED and scratch is kept. Groups other than the pinned leader's are never
-signalled.
+and no uncertain rows, and EOF on both output pipes. An uncertain census
+after the stop latches a fault that no later census clears. Anything else is
+UNCLOSED and scratch is kept. The command gets OXIDE_PROOF_EVIDENCE, the
+evidence directory, which cleanup never removes. Groups other than the
+pinned leader's are never signalled.
 
 One clock: CLOCK_UPTIME_RAW integer nanoseconds. Exit: 124 deadline; 125
 fault (including SIGINT or SIGTERM to the custodian), refusal or UNCLOSED;
@@ -71,11 +73,12 @@ SCRATCH_BUDGET = 512 * MIB
 PERSIST = 8 * MIB
 FORWARD = 32 * MIB
 CENSUS_INTERVAL = 0.2
+CONFIRM_TRIES, CONFIRM_PAUSE = 20, 0.05  # gone confirmation within one round, at most 1 s
 MAX_LINE = 64 * 1024
 INJECTIONS = {
     "setup-stall", "no-detector", "ack-eof", "ack-wrong", "cancel-before-ack", "monitor-die",
     "monitor-stall", "cleanup-interrupt", "custodian-timeout-after-monitor", "census-uncertain",
-    "reserve-low-after",
+    "census-uncertain-first", "reserve-low-after", "cancel-after-ack", "cancel-at-gate",
 }
 
 
@@ -166,14 +169,29 @@ class Census:
     the call (KERN_PROC_PID re-read). A member stays tracked by (PID, start)
     until a snapshot lacks that identity, whatever its later session, UID or
     parent. Positively foreign: a validated other session, never a member.
-    Gone: getsid ESRCH and the re-read lacks the identity. Everything else
-    (other getsid errors, identity change, missing metadata, zombies, a failed
-    snapshot) is uncertain and blocks closure, first-seen rows included.
-    Start time is never used to exclude a process."""
+    Gone: getsid ESRCH and a later successful KERN_PROC_PID read lacks the
+    identity; a zombie still present is re-read within the round, at most
+    CONFIRM_TRIES times. A failed read confirms nothing. Everything else
+    (other getsid errors, identity change, failed or missing metadata,
+    unconfirmed zombies, a failed snapshot) is uncertain and blocks closure,
+    first-seen rows included. Start time is never used to exclude a process."""
 
-    def __init__(self, sid, snapshot=Kinfo.all, getsid=os.getsid, reread=Kinfo.one):
-        self.sid, self.snapshot, self.getsid, self.reread = sid, snapshot, getsid, reread
+    def __init__(self, sid, snapshot=Kinfo.all, getsid=os.getsid, reread=Kinfo.one, pause=time.sleep):
+        self.sid, self.snapshot, self.getsid, self.reread, self.pause = sid, snapshot, getsid, reread, pause
         self.tracked = {}
+
+    def confirm_gone(self, row):
+        """True only on a successful read that lacks the identity."""
+        for attempt in range(CONFIRM_TRIES):
+            if attempt:
+                self.pause(CONFIRM_PAUSE)
+            try:
+                again = self.reread(row["pid"])
+            except Exception:
+                return False
+            if again is None or again["start"] != row["start"]:
+                return True
+        return False
 
     def round(self):
         try:
@@ -195,14 +213,17 @@ class Census:
                 session, failure = None, "gone"
             except OSError as error:
                 session, failure = None, f"getsid: {error}"
+            if failure == "gone" and self.confirm_gone(row):
+                self.tracked.pop(identity, None)
+                continue
             try:
                 again = self.reread(row["pid"])
             except Exception as error:
-                again, failure = None, failure or f"reread: {error}"
+                again, failure = None, f"reread: {error}" if failure in (None, "gone") else failure
             stable = again is not None and again["start"] == row["start"]
-            if failure == "gone" and not stable:
-                self.tracked.pop(identity, None)
-            elif failure is None and stable and session == self.sid:
+            if failure == "gone":
+                failure = "getsid ESRCH, absence not confirmed"
+            if failure is None and stable and session == self.sid:
                 self.tracked[identity] = row
                 members.append(row)
             elif identity in self.tracked:
@@ -390,7 +411,8 @@ class Monitor:
         census = Census(self.leader[0])
         while not self.census_stop.is_set():
             result = census.round()
-            if "census-uncertain" in self.inject:
+            if "census-uncertain" in self.inject or (
+                    "census-uncertain-first" in self.inject and not self.receipt["census_rounds"]):
                 result = dict(result, certain=False, uncertain=max(1, result["uncertain"]))
             with self.lock:
                 self.receipt["census"] = result
@@ -517,6 +539,7 @@ class Custodian:
         self.ready = False
         self.eof = set()
         self.census_ok = False
+        self.census_uncertain = False
         self.reaped_seq = None
         self.monitor_complete = False
         self.deadline_hit = False
@@ -626,7 +649,12 @@ class Custodian:
             self.eof.add(message["stream"])
         elif kind == "census":
             if self.reaped_seq is not None and message["after"] >= self.reaped_seq:
-                self.census_ok = message["certain"] and message["members"] == 0 and message["uncertain"] == 0
+                if not message["certain"] or message["uncertain"]:
+                    # Latched: a later certain empty census never clears it.
+                    self.census_uncertain = True
+                    self.guard.latch(f"census uncertain: {message['uncertain']} unvalidated rows")
+                self.census_ok = (not self.census_uncertain and message["certain"]
+                                  and message["members"] == 0 and message["uncertain"] == 0)
         elif kind == "monitor_complete":
             self.monitor_complete = True
         elif kind == "cleanup_failed":
@@ -663,6 +691,7 @@ class Custodian:
             for name in ("OXIDE_TASK_SCRATCH_ROOT", "TMPDIR", "TMP", "TEMP"):
                 self.env[name] = scratch
         self.env["OXIDE_PROOF_DEADLINE_NS"] = str(self.absolute)
+        self.env["OXIDE_PROOF_EVIDENCE"] = os.path.realpath(evidence)  # kept; never removed by cleanup
         self.ctx = {
             "run_id": self.run_id, "command": self.command, "limit_s": self.limit_s, "root": root,
             "scratch": scratch, "evidence": os.path.realpath(evidence), "owned": owned,
@@ -760,6 +789,27 @@ class Custodian:
                             detector = False
             except OSError:
                 detector = False
+        if detector and "cancel-after-ack" in self.inject:
+            os.kill(os.getpid(), signal.SIGTERM)  # a real signal through the handler, after registration
+        # The gate decision: INT and TERM are held blocked from the final check
+        # through the gate write, so a cancellation recorded or pending before
+        # the write always wins and none can land between check and write.
+        held = {signal.SIGINT, signal.SIGTERM}
+        signal.pthread_sigmask(signal.SIG_BLOCK, held)
+        try:
+            if detector and "cancel-at-gate" in self.inject:
+                os.kill(os.getpid(), signal.SIGTERM)  # arrives while blocked: pending at the decision
+            if detector:
+                self.pump(0)
+                pending = signal.sigpending() & held
+                if pending and not self.cancelled:
+                    self.cancelled = int(min(pending))
+                if self.cancelled or self.guard.fault is not None:
+                    detector = False
+            if detector:
+                os.write(gate_w, b"G")
+        finally:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, held)
         if not detector:
             reason = (f"signal {self.cancelled}" if self.cancelled else self.guard.fault) or (
                 "no exit detector" if ack == b"R" else f"session-ready ack {ack!r}")
@@ -768,7 +818,6 @@ class Custodian:
             os.close(gate_w)
             self.guard.latch(f"launch cancelled: {reason}")
             return False
-        os.write(gate_w, b"G")
         os.close(gate_w)
         self.tell("leader", pid=pid)
         self.record("gate_open", leader=pid)
@@ -819,7 +868,7 @@ class Custodian:
         self.record("leader_reaped", status=self.leader_status)
         if launched:
             census_end = min(now_ns() + CENSUS_GRACE_S * NS, self.exit_at)
-            while not (self.census_ok and len(self.eof) == 2) and now_ns() < census_end:
+            while not (self.census_uncertain or (self.census_ok and len(self.eof) == 2)) and now_ns() < census_end:
                 self.pump(census_end - now_ns())
             if not self.census_ok:
                 self.guard.latch("closure not established: no certain empty census after the leader was reaped")
@@ -827,8 +876,12 @@ class Custodian:
                 self.guard.latch("closure not established: output EOF witness missing")
         return self.finish(launched)
 
+    def closure(self, launched):
+        return (launched and self.guard.fault is None and not self.census_uncertain and self.census_ok
+                and len(self.eof) == 2)
+
     def finish(self, launched):
-        self.closed = launched and self.guard.fault is None and self.census_ok and len(self.eof) == 2
+        self.closed = self.closure(launched)
         status = self.leader_status
         decoded = None if status is None else (
             os.WEXITSTATUS(status) if os.WIFEXITED(status) else -os.WTERMSIG(status) if os.WIFSIGNALED(status) else None)

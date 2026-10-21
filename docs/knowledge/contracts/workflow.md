@@ -751,9 +751,12 @@ or global Cargo configuration is involved.
 reviewed [pinned-leader correction design](proof-supervisor-correction.md)
 (revision 4, `29f0950e`) for oxide#109. It counts as qualified only once
 that task's independent exact-head native passes; until then it is the
-candidate under test. Earlier #109 evidence at `f5a998c` stays historical:
+candidate under test. Earlier #109 evidence stays historical: at `f5a998c`,
 the author's two native submissions, the reviewer's failed native and that
-review's closure and deadline findings.
+review's closure and deadline findings; at `22d1280`, author and reviewer
+natives that passed 43/43 cases and review `6312725112`, which found five
+defects. Tom's focused completion phase fixes exactly those five, each with
+a regression, and routes nothing else.
 
 ```sh
 python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence DIR] [--root-parent DIR] [--] command ...
@@ -764,7 +767,8 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   `python3 scripts/bounded-test.py python3 scripts/<proof>.py`.
   - It writes only inside `OXIDE_TASK_SCRATCH_ROOT`.
   - It may read `OXIDE_PROOF_DEADLINE_NS`, the absolute `CLOCK_UPTIME_RAW`
-    deadline.
+    deadline, and write evidence to keep under `OXIDE_PROOF_EVIDENCE`, the
+    evidence directory: counted in owned bytes, never removed by cleanup.
   - It must leave no process outside its leader's group when it exits: such
     a process is never signalled and ends the run `UNCLOSED`.
   - It adds no supervision or accounting of its own.
@@ -788,6 +792,10 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
     byte.
   - A wrong byte, EOF, a missing detector, a fault, or a signal before the
     gate opens KILLs the pinned PID (never `killpg`). The command never runs.
+  - SIGINT and SIGTERM are held blocked from the final check of recorded
+    cancellation and faults through the gate write. A cancellation recorded
+    or pending at that check wins, including one during or after detector
+    registration.
   - SIGCHLD is set to default before any fork, so no pin is auto-reaped.
   - The child resets inherited signal dispositions and the signal mask
     before `exec`. An exec failure exits 127.
@@ -810,8 +818,15 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
     `KERN_PROC_PID` re-read of PID and start token. A member stays tracked
     until its identity is gone.
   - **Foreign:** a validated other session that was never a member.
-  - **Uncertain:** everything else, including first-seen unreadable rows and
-    zombies.
+  - **Gone:** `getsid` failed with `ESRCH` and a later successful
+    `KERN_PROC_PID` read lacks the identity. A zombie still present is
+    re-read within the round, every 50 ms for at most 1 s. A failed read
+    confirms nothing.
+  - **Uncertain:** everything else, including first-seen unreadable rows,
+    failed re-reads and unconfirmed zombies.
+
+  An uncertain or failed census after `stopped` latches a fault at once. A
+  later certain empty census never clears it or authorizes cleanup.
 
   Start time is only an identity token, never an exclusion. A zombie of an
   unrelated parent present after the stop therefore yields a false
@@ -826,6 +841,8 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
     pinned leader or is dropped after binding, `ready` before readings, line
     overflow.
   - Process: signal or reap errors; SIGINT or SIGTERM to the custodian.
+  - Closure: an uncertain census after `stopped`; no certain empty census
+    or a missing EOF witness within the census window.
 - **Clock and deadlines.** One clock everywhere: `CLOCK_UPTIME_RAW` integer
   nanoseconds. The supervisor refuses before any proof work if that clock,
   kqueue, macOS or the self-checked `kinfo_proc` layout is missing.
@@ -863,29 +880,48 @@ around the candidate; the bootstrap is not itself a qualified guard. Its own
 bounds:
 - a clean checkout;
 - reserve readings before and after;
-- a fixed 300 s `CLOCK_UPTIME_RAW` deadline that covers its own finish;
-- on overrun, TERM then KILL of its own unreaped candidate child only.
+- a fixed 300 s `CLOCK_UPTIME_RAW` deadline held by a minimal outer actor.
+  The actor forks the whole bootstrap as a pinned worker and makes only
+  WNOHANG reaps, bounded sleeps and signals to that worker. All file,
+  hashing and stdout work runs in the worker. At 298 s the actor KILLs the
+  worker and exits 124, so blocked output or a slow read cannot extend the
+  deadline. A candidate still running then is bounded only by its own
+  280 s limit;
+- on candidate overrun, TERM then KILL of its own unreaped candidate child
+  only, from its own reap loop, so no signal can follow the reap.
+
+It deletes nothing. Real case directories live under the candidate's
+`OXIDE_PROOF_EVIDENCE`, outside the candidate's cleanup. `UNCLOSED` cases
+leave live fixture processes whose only bound is their finite fallback, and
+fallback expiry is not closure. The scratch base is therefore kept, and its
+path is printed for the owner.
 
 It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
 `scripts/test_supervisor.py`. The suite runs in order:
-- 21 pure cases: guard thresholds, staleness and errors; exit precedence;
+- 24 pure cases: guard thresholds, staleness and errors; exit precedence;
   census member, foreign, identity change, first-seen unreadable, zombie,
-  gone, escaped and reparented member, backwards start time, recycled PID,
-  failed snapshot; protocol run, sequence and leader-binding faults; ready
-  before readings; census before reap; refusal to signal an unpinned
-  target;
+  gone, `ESRCH` with a failing re-read (uncertain), a zombie confirmed gone
+  within the round, escaped and reparented member, backwards start time,
+  recycled PID, failed snapshot; protocol run, sequence and leader-binding
+  faults; ready before readings; census before reap; an uncertain census
+  latched over a later empty one; refusal to signal an unpinned target;
 - writers before and after a simulated staging step;
-- 22 real cases with tiny Python fixtures and injected faults:
+- 26 real cases with tiny Python fixtures and injected faults:
   - exit 0, owned cleanup, nonzero, exec 127, output saturation;
   - a group cascading to `closed` at the deadline;
   - a separate-group survivor `UNCLOSED`, never signalled and still alive at
-    the verdict;
-  - an escaped pipe holder;
+    the verdict, its case directory and receipt outside the outer cleanup;
+  - an escaped pipe holder, kept the same way;
   - a latched fault with an empty census (kept, not cleaned);
   - SIGTERM and SIGINT to the custodian;
-  - gate EOF, wrong byte, cancel before the ack, no detector;
-  - setup stall, monitor death, monitor stall, uncertain census,
+  - gate EOF, wrong byte, cancel before the ack, no detector, a real
+    SIGTERM after detector registration, and a SIGTERM pending at the gate
+    decision;
+  - setup stall, monitor death, monitor stall, uncertain census, a first
+    uncertain census followed by empty ones (owned scratch kept),
     interrupted cleanup, monitor completion followed by a custodian timeout;
+  - the bootstrap actor KILLing a worker blocked on an unread stdout pipe
+    at its deadline (exit 124);
   - a fixture deadline holding across `exec` and for a late grandchild, with
     SIGALRM inherited as ignored and blocked.
 
@@ -898,15 +934,21 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 43 cases.
+- all 50 cases;
+- every real case directory and receipt still present after the
+  candidate's cleanup.
 
 It prints a receipt binding the commit, SHA-256 of all three sources, the
-platform, each case's exit, phase, outcome and signal custody, and the
-limitations. Admission waits fall outside its 300 s. `effigy
+platform, each case's exit, phase, outcome and signal custody, the kept base
+and `UNCLOSED` case directories, and the limitations. Admission waits fall outside its 300 s. `effigy
 proof:supervisor:test` runs the pure cases alone.
 
-`test rust`, `test rust-cargo` and `rust:pool-scale` keep their invocation.
-Pool-scale's own `mktemp` scratch lies outside the supervisor's owned bytes.
+`test rust`, `test rust-cargo`, the profile proofs, `rust:pool-scale`,
+`rust:oxide-exec` and `rust:front-door-accounting` keep their invocation and
+get this supervisor once oxide#109 merges. Their recorded evidence ran under
+the old guard at `3d947a9` and stays historical; none has run under the new
+one. Pool-scale's own `mktemp` scratch lies outside the supervisor's owned
+bytes.
 `scripts/bounded_runner.py` (oxide#097) stays separate and unqualified.
 
 ### Rollback

@@ -48,11 +48,12 @@ run = "python3 scripts/bounded-test.py cargo test --workspace --all-targets --lo
 default = false
 
 # Shared session supervisor qualification (oxide#109): a short bootstrap
-# (healthy reserve readings, fixed 300 s wall limit) runs the candidate
-# `bounded-test.py` around its synthetic suite: pure fault injection first,
-# then tiny real Python children and fixture writers in owned scratch. Prints
-# a receipt binding sources, platform, cases and limitations. 512 MiB
-# monitored scratch. Not a benchmark and not full QA.
+# (healthy reserve readings, fixed 300 s wall limit held by a minimal outer
+# actor) runs the candidate `bounded-test.py` around its synthetic suite:
+# pure fault injection first, then tiny real Python children and fixture
+# writers in owned scratch. Prints a receipt binding sources, platform, cases,
+# kept resources and limitations. Deletes nothing. 512 MiB monitored scratch.
+# Not a benchmark and not full QA.
 [tasks."proof:supervisor:qualify"]
 admission = "heavy"
 run = "python3 scripts/qualify-supervisor.py"
