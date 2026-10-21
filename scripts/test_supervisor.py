@@ -303,6 +303,47 @@ class PureProtocol(unittest.TestCase):
         self.assertFalse(custodian.census_ok)
         self.assertFalse(custodian.closure(True))
 
+    def test_malformed_fields_latch_instead_of_raising(self):
+        # Review 6318598212: missing or ill-typed fields latch a protocol fault.
+        cases = [
+            {"type": "census"},  # every census field missing
+            {"type": "census", "after": 1, "members": 0, "uncertain": 0, "certain": "yes"},
+            {"type": "census", "after": True, "members": 0, "uncertain": 0, "certain": True},
+            {"type": "output_eof", "stream": "bogus"},
+            {"type": "output_eof"},
+            {"type": "reading", "kind": "reserve", "value": "big"},
+            {"type": "reading", "kind": "scratch", "value": 1},
+            {"type": "reading", "kind": "other", "value": 1},
+            {"type": "ready", "leader": "abc"},
+            {"type": "ready", "at": "now"},
+            {"type": None},
+        ]
+        for fields in cases:
+            custodian = self.custodian()
+            custodian.reaped_seq = 0
+            custodian.accept(dict(self.message(custodian, "ready"), **fields))
+            self.assertIn("protocol: malformed", custodian.guard.fault or "", fields)
+            self.assertFalse(custodian.census_ok)
+            self.assertEqual(custodian.eof, set())
+        custodian = self.custodian()
+        custodian.accept(["not", "an", "object"])
+        self.assertIn("protocol: malformed", custodian.guard.fault)
+
+    def test_report_never_blocks_on_a_full_pipe(self):
+        read_end, write_end = os.pipe()
+        self.addCleanup(os.close, read_end)
+        self.addCleanup(os.close, write_end)
+        os.set_blocking(write_end, False)
+        try:
+            while True:
+                os.write(write_end, bytes(65536))
+        except BlockingIOError:
+            pass
+        os.set_blocking(write_end, True)  # a blocking write would now hang
+        start = now_ns()
+        bounded.report("x" * 10000, fd=write_end)
+        self.assertLess(now_ns() - start, NS)
+
     def test_unpinned_target_is_never_signalled(self):
         custodian = self.custodian()
         custodian.leader_status = 0  # reaped: the pin is gone
@@ -538,6 +579,45 @@ class Real(unittest.TestCase):
     def test_monitor_complete_then_custodian_timeout(self):
         self.assertEqual(self.guardian(fixture("pass\n"), inject=["custodian-timeout-after-monitor"]), 124)
         self.assertEqual(self.receipt["phase"], "monitor_complete: pending_custodian")
+
+    # Post-gate exceptions (review 6318598212)
+
+    def exception_case(self, inject, body, fault):
+        """A TERM-ignoring leader with a TERM-ignoring child in its group: the
+        injected exception must still reach the bounded pinned stop (TERM,
+        then KILL of the group), WNOHANG reap, census and keep."""
+        self.assertEqual(self.guardian(fixture(body), inject=[inject], owned=True), 125)
+        outcome = self.outcome()
+        self.assertEqual(outcome["closure"], "UNCLOSED")
+        self.assertIn(fault, outcome["fault"])
+        self.assertEqual(self.receipt["phase"], "monitor_complete: pending_custodian")
+        records = self.receipt["custodian"]
+        sent = [(r["signal"], r["killpg"], r["result"]) for r in records if r["event"] == "signal"]
+        self.assertIn(("SIGKILL", True, "sent"), sent)
+        self.assertFalse(alive(self.child()), "the group member survived the pinned KILL")
+        reaped = [r for r in records if r["event"] == "leader_reaped"]
+        self.assertTrue(reaped and reaped[0]["status"] is not None, "leader not reaped")
+        self.assertGreaterEqual(self.receipt["reserve"]["last_ns"], reaped[0]["at"],
+                                "reserve sampling ended before the shutdown")
+        [root] = list(self.dir.glob("oxide-proof.*"))
+        self.assertTrue((root / "scratch").is_dir(), "scratch removed after an exception")
+
+    GROUP = ("import subprocess, sys\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+             "child = subprocess.Popen([sys.executable, '-c', {child!r}])\n"
+             "open(os.environ['CASE_DIR'] + '/child.pid', 'w').write(str(child.pid))\n").format(child=TERM_IGNORING)
+
+    def test_event_loop_exception_stops_pinned_group(self):
+        self.exception_case("pump-exception", self.GROUP + "time.sleep(3600)\n", "custodian exception: RuntimeError")
+
+    def test_kqueue_exception_stops_pinned_group(self):
+        self.exception_case("kqueue-exception", self.GROUP + "time.sleep(3600)\n", "custodian exception: OSError")
+
+    def test_malformed_message_stops_pinned_group(self):
+        self.exception_case("malformed-message", self.GROUP + "time.sleep(3600)\n", "protocol: malformed missing")
+
+    def test_exception_during_stop_still_kills(self):
+        # The leader exits; the exception lands after TERM, and KILL still follows.
+        self.exception_case("stop-exception", self.GROUP + "time.sleep(1)\n", "injected exception during the stop")
 
     # Bootstrap finalization
 

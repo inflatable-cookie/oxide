@@ -26,6 +26,11 @@ UNCLOSED and scratch is kept. The command gets OXIDE_PROOF_EVIDENCE, the
 evidence directory, which cleanup never removes. Groups other than the
 pinned leader's are never signalled.
 
+An exception in any phase after setup, or a monitor message with a missing
+or ill-typed field, latches a fault; the bounded pinned stop, WNOHANG reap,
+census and keep still run, each phase under its own guard. An uncaught
+error at the top level gets one bounded, non-blocking line, no traceback.
+
 One clock: CLOCK_UPTIME_RAW integer nanoseconds. Exit: 124 deadline; 125
 fault (including SIGINT or SIGTERM to the custodian), refusal or UNCLOSED;
 otherwise the command's status (128+N for signal N). The receipt has no success phase: success is phase `monitor_complete`
@@ -56,6 +61,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 
 NS = 1_000_000_000
 GIB = 1024 ** 3
@@ -79,11 +85,65 @@ INJECTIONS = {
     "setup-stall", "no-detector", "ack-eof", "ack-wrong", "cancel-before-ack", "monitor-die",
     "monitor-stall", "cleanup-interrupt", "custodian-timeout-after-monitor", "census-uncertain",
     "census-uncertain-first", "reserve-low-after", "cancel-after-ack", "cancel-at-gate",
+    "pump-exception", "kqueue-exception", "malformed-message", "stop-exception",
+}
+INJECT_AFTER_GATE_NS = 1_500_000_000  # post-gate injections wait for the fixture to start
+EXCEPTION_RECORDS = 8
+FIELDS = {  # required fields per monitor message type; bool is never accepted as int
+    "reading": {"kind": str},
+    "ready": {}, "monitor_complete": {}, "cleanup_failed": {},
+    "output_eof": {"stream": str},
+    "census": {"after": int, "members": int, "uncertain": int, "certain": bool},
 }
 
 
 def now_ns():
     return time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+
+
+def report(text, fd=2):
+    """Best effort and never blocking: writes at most PIPE_BUF bytes, and only
+    when `fd` is writable now (a pipe then has at least PIPE_BUF free)."""
+    try:
+        if select.select([], [fd], [], 0)[1]:
+            os.write(fd, text.encode()[: select.PIPE_BUF])
+    except (OSError, ValueError):
+        pass
+
+
+def typed(value, kind):
+    return isinstance(value, bool) if kind is bool else isinstance(value, kind) and not isinstance(value, bool)
+
+
+def malformed(message):
+    """Why a monitor message is malformed, or None. Checked before any use."""
+    if not isinstance(message, dict):
+        return "not an object"
+    kind = message.get("type")
+    if kind not in FIELDS:
+        return f"unknown type {kind!r}"
+    leader = message.get("leader")
+    if leader is not None and not (isinstance(leader, list) and len(leader) == 2 and typed(leader[0], int)
+                                   and (leader[1] is None or typed(leader[1], int))):
+        return "ill-typed leader"
+    required = dict(FIELDS[kind], run=str, seq=int, at=int)
+    if kind == "reading":
+        if "error" in message:
+            required["error"] = str
+        else:
+            required["value"] = int
+        if message.get("kind") == "scratch":
+            required["complete"] = bool
+        elif message.get("kind") != "reserve":
+            return "unknown reading kind"
+    if kind == "output_eof" and message.get("stream") not in ("stdout", "stderr"):
+        return "unknown stream"
+    for name, kind_ in required.items():
+        if name not in message:
+            return f"missing {name}"
+        if not typed(message[name], kind_):
+            return f"ill-typed {name}"
+    return None
 
 
 def capability():
@@ -456,6 +516,8 @@ class Monitor:
                 with self.lock:
                     self.leader = [command["pid"], None if row is None else row["start"]]
                     self.receipt["leader"] = self.leader
+                if "malformed-message" in self.inject:  # a census with every field missing
+                    threading.Timer(INJECT_AFTER_GATE_NS / NS, lambda: self.send("census")).start()
             elif kind == "record":
                 with self.lock:
                     self.receipt["custodian"].append(command["record"])
@@ -543,6 +605,11 @@ class Custodian:
         self.reaped_seq = None
         self.monitor_complete = False
         self.deadline_hit = False
+        self.gate_opened = False
+        self.gate_at = None
+        self.pre_gate_killed = self.leader_killed = False
+        self.exceptions = 0
+        self.injected = set()
 
     def record(self, kind, **fields):
         self.tell("record", record={"at": now_ns(), "event": kind, **fields})
@@ -584,15 +651,54 @@ class Custodian:
             return None
         return status if done == pid else None
 
+    def exception(self, error):
+        """Latch an exception as a fault (the first fault is kept) and record
+        the first few. Never raises."""
+        try:
+            frames = traceback.extract_tb(error.__traceback__)
+            where = f"{frames[-1].name}:{frames[-1].lineno}" if frames else "?"
+            self.guard.latch(f"custodian exception: {type(error).__name__}: {error} at {where}")
+            self.exceptions += 1
+            if self.exceptions <= EXCEPTION_RECORDS:
+                self.record("exception", error=repr(error)[:500], where=where)
+        except BaseException:
+            pass
+
+    def inject_once(self, name):
+        if (name in self.inject and name not in self.injected and self.gate_at is not None
+                and now_ns() >= self.gate_at + INJECT_AFTER_GATE_NS):
+            self.injected.add(name)
+            return True
+        return False
+
     def pump(self, timeout_ns):
+        """One bounded wait for events and messages. A kqueue or message
+        failure is latched and the wait degrades to select on the control
+        pipe, so shutdown keeps reading the monitor and stays bounded."""
         timeout = max(0, min(timeout_ns, 50_000_000)) / NS
-        for event in self.kq.control(None, 8, timeout):
+        if self.inject_once("pump-exception"):
+            raise RuntimeError("injected event-loop exception")
+        if self.inject_once("kqueue-exception"):
+            self.kq = BrokenQueue()
+        try:
+            events = self.kq.control(None, 8, timeout)
+        except Exception as error:
+            self.exception(error)
+            events = []
+            try:
+                select.select([self.ctl_r], [], [], timeout)
+            except Exception:
+                time.sleep(timeout)
+        for event in events:
             if event.filter == select.KQ_FILTER_PROC:
                 if event.ident == self.leader:
                     self.leader_exited = True
                 elif event.ident == self.monitor:
                     self.monitor_exited = True
-        self.read_messages()
+        try:
+            self.read_messages()
+        except Exception as error:
+            self.exception(error)
         if self.cancelled:
             self.guard.latch(f"cancelled by signal {self.cancelled}")
         if self.monitor_exited and not self.monitor_complete:
@@ -623,6 +729,12 @@ class Custodian:
             self.ctl_buffer = b""
 
     def accept(self, message):
+        problem = malformed(message)
+        if problem:
+            self.guard.latch(f"protocol: malformed {problem} ({message.get('type') if isinstance(message, dict) else '?'})")
+            if isinstance(message, dict) and typed(message.get("seq"), int):
+                self.monitor_seq = max(self.monitor_seq, message["seq"])
+            return
         if message.get("run") != self.run_id or message.get("seq") != self.monitor_seq + 1:
             self.guard.latch(f"protocol: unexpected run or sequence ({message.get('type')})")
             return
@@ -808,12 +920,14 @@ class Custodian:
                     detector = False
             if detector:
                 os.write(gate_w, b"G")
+                self.gate_opened, self.gate_at = True, now_ns()
         finally:
             signal.pthread_sigmask(signal.SIG_UNBLOCK, held)
         if not detector:
             reason = (f"signal {self.cancelled}" if self.cancelled else self.guard.fault) or (
                 "no exit detector" if ack == b"R" else f"session-ready ack {ack!r}")
             self.record("cancel_before_gate", reason=reason, ack=ack.decode(errors="replace"))
+            self.pre_gate_killed = True
             self.signal_pinned(pid, signal.SIGKILL, group=False)  # pinned PID; never killpg before the gate
             os.close(gate_w)
             self.guard.latch(f"launch cancelled: {reason}")
@@ -824,21 +938,58 @@ class Custodian:
         return True
 
     def stop_leader(self, trigger):
-        self.record("stop", trigger=trigger, fault=self.guard.fault)
-        end = min(now_ns() + TERM_GRACE_S * NS, self.exit_at)
-        self.signal_pinned(self.leader, signal.SIGTERM, group=True)
-        while now_ns() < end:
-            try:
-                os.killpg(self.leader, 0)  # the pinned group: unreaped leader
-            except OSError:
-                break  # no member a signal could reach
-            self.pump(end - now_ns())
-        self.signal_pinned(self.leader, signal.SIGKILL, group=True)
+        """TERM, bounded grace, then KILL of the pinned leader group. The KILL
+        is sent even if anything before it raises."""
+        try:
+            self.record("stop", trigger=trigger, fault=self.guard.fault)
+            end = min(now_ns() + TERM_GRACE_S * NS, self.exit_at)
+            self.signal_pinned(self.leader, signal.SIGTERM, group=True)
+            if "stop-exception" in self.inject:
+                raise RuntimeError("injected exception during the stop")
+            while now_ns() < end:
+                try:
+                    os.killpg(self.leader, 0)  # the pinned group: unreaped leader
+                except OSError:
+                    break  # no member a signal could reach
+                self.pump(end - now_ns())
+        finally:
+            if not self.leader_killed:
+                self.leader_killed = True
+                self.signal_pinned(self.leader, signal.SIGKILL, group=True)
 
     def run(self):
+        """Every phase after setup runs under an exception guard: an exception
+        is latched as a fault and the bounded pinned stop, WNOHANG reap,
+        census and finish (keep, never cleanup) still run."""
         self.setup()
-        if not self.launch_monitor():
-            # Setup slow or failed: launch nothing, stop the pinned monitor now.
+        try:
+            ready = self.launch_monitor()
+        except BaseException as error:
+            self.exception(error)
+            ready = False
+        if not ready:
+            return self.abandon_launch()
+        try:
+            self.launch_leader()
+            if self.gate_opened:
+                self.watch()
+        except BaseException as error:
+            self.exception(error)
+        launched = self.gate_opened
+        for step in (self.stop, self.reap_leader, self.settle):
+            try:
+                step(launched)
+            except BaseException as error:
+                self.exception(error)
+        try:
+            return self.finish(launched)
+        except BaseException as error:
+            self.exception(error)
+            return self.last_resort()
+
+    def abandon_launch(self):
+        """Setup slow or failed: launch nothing, stop the pinned monitor now."""
+        try:
             self.signal_pinned(self.monitor, signal.SIGKILL, group=False)
             status, end = None, min(now_ns() + NS, self.exit_at)
             while status is None and now_ns() < end:
@@ -846,16 +997,33 @@ class Custodian:
                 if status is None:
                     self.pump(min(end - now_ns(), 20_000_000))
             self.monitor_reaped = status is not None
-            return 125
-        launched = self.launch_leader()
-        if launched:
-            while not (self.leader_exited or self.cancelled or self.guard.fault):
-                if now_ns() >= self.stop_at:
-                    self.deadline_hit = True
-                    break
-                self.pump(self.stop_at - now_ns())
+        except BaseException as error:
+            self.exception(error)
+        return 125
+
+    def watch(self):
+        while not (self.leader_exited or self.cancelled or self.guard.fault):
+            if now_ns() >= self.stop_at:
+                self.deadline_hit = True
+                break
+            self.pump(self.stop_at - now_ns())
+
+    def stop(self, launched):
+        if self.leader is None or self.leader_status is not None:
+            return
+        if not launched:  # the gate never opened: the pinned PID only, never killpg
+            if not self.pre_gate_killed:
+                self.pre_gate_killed = True
+                self.record("cancel_before_gate", reason=self.guard.fault, ack="")
+                self.signal_pinned(self.leader, signal.SIGKILL, group=False)
+            return
+        if not self.leader_killed:
             self.stop_leader("leader exit" if self.leader_exited else "stop_at deadline" if self.deadline_hit
                              else f"signal {self.cancelled}" if self.cancelled else "fault")
+
+    def reap_leader(self, launched):
+        if self.leader is None:
+            return
         while self.leader_status is None and now_ns() < self.exit_at:
             self.leader_status = self.reap(self.leader)
             if self.leader_status is None:
@@ -863,6 +1031,8 @@ class Custodian:
         if self.leader_status is None:
             self.guard.latch("reap: leader not reaped by exit_at; pin kept, no further signal")
             self.deadline_hit = True
+
+    def settle(self, launched):
         self.tell("stopped")
         self.reaped_seq = self.seq
         self.record("leader_reaped", status=self.leader_status)
@@ -874,7 +1044,17 @@ class Custodian:
                 self.guard.latch("closure not established: no certain empty census after the leader was reaped")
             elif len(self.eof) != 2:
                 self.guard.latch("closure not established: output EOF witness missing")
-        return self.finish(launched)
+
+    def last_resort(self):
+        """finish raised: KILL the pinned monitor if still held, one WNOHANG
+        reap, and exit non-zero. Never raises."""
+        try:
+            if self.monitor is not None and not self.monitor_reaped:
+                self.signal_pinned(self.monitor, signal.SIGKILL, group=False)
+                self.monitor_reaped = self.reap(self.monitor) is not None
+        except BaseException:
+            pass
+        return 124 if self.deadline_hit else 125
 
     def closure(self, launched):
         return (launched and self.guard.fault is None and not self.census_uncertain and self.census_ok
@@ -916,6 +1096,13 @@ class Custodian:
         return exit_code(self.deadline_hit, self.guard.fault, self.closed, self.leader_status)
 
 
+class BrokenQueue:
+    """Test-only stand-in for a kqueue whose every call fails."""
+
+    def control(self, *_args):
+        raise OSError(errno.EBADF, "injected kqueue failure")
+
+
 def parse(argv):
     options = {"limit": LIMIT_S, "budget": SCRATCH_BUDGET, "evidence": None, "root_parent": "/private/tmp"}
     while argv and argv[0].startswith("--"):
@@ -946,4 +1133,11 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    try:
+        code = main(sys.argv[1:])
+    except SystemExit:
+        raise
+    except BaseException as error:  # no traceback: bounded, non-blocking report only
+        report(f"bounded-test.py: internal error, exit 125: {error!r}\n")
+        code = 125
+    sys.exit(code)

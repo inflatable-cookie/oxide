@@ -756,7 +756,10 @@ the author's two native submissions, the reviewer's failed native and that
 review's closure and deadline findings; at `22d1280`, author and reviewer
 natives that passed 43/43 cases and review `6312725112`, which found five
 defects. Tom's focused completion phase fixes exactly those five, each with
-a regression, and routes nothing else.
+a regression, and routes nothing else. At `52e4a89` the author native passed
+50/50, the reviewer native timed out in admission without launching, and
+review `6318598212` found one more P1: a post-gate custodian exception
+escaped shutdown. Tom's post-gate exception repair phase fixes only that.
 
 ```sh
 python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence DIR] [--root-parent DIR] [--] command ...
@@ -841,6 +844,16 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
     pinned leader or is dropped after binding, `ready` before readings, line
     overflow.
   - Process: signal or reap errors; SIGINT or SIGTERM to the custodian.
+  - Exception: any exception in the custodian after setup, and a monitor
+    message with a missing or ill-typed field (`protocol: malformed`).
+    Each phase after setup (launch, watch, stop, reap, census, finish) runs
+    under its own guard, so the bounded pinned stop (TERM, grace, KILL; the
+    KILL is sent even if the stop itself raises), WNOHANG reap, census and
+    `keep` still run. A kqueue failure degrades the wait to `select` on the
+    control pipe, so monitor messages and sampling continue through
+    shutdown. Exception records are capped at 8. An uncaught top-level
+    error writes one line of at most `PIPE_BUF` bytes only if stderr is
+    writable at once, with no traceback, and exits 125.
   - Closure: an uncertain census after `stopped`; no certain empty census
     or a missing EOF witness within the census window.
 - **Clock and deadlines.** One clock everywhere: `CLOCK_UPTIME_RAW` integer
@@ -898,15 +911,17 @@ path is printed for the owner.
 
 It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
 `scripts/test_supervisor.py`. The suite runs in order:
-- 24 pure cases: guard thresholds, staleness and errors; exit precedence;
+- 26 pure cases: guard thresholds, staleness and errors; exit precedence;
   census member, foreign, identity change, first-seen unreadable, zombie,
   gone, `ESRCH` with a failing re-read (uncertain), a zombie confirmed gone
   within the round, escaped and reparented member, backwards start time,
   recycled PID, failed snapshot; protocol run, sequence and leader-binding
   faults; ready before readings; census before reap; an uncertain census
-  latched over a later empty one; refusal to signal an unpinned target;
+  latched over a later empty one; malformed and ill-typed monitor
+  messages latched without raising; the top-level report not blocking on a
+  full pipe; refusal to signal an unpinned target;
 - writers before and after a simulated staging step;
-- 26 real cases with tiny Python fixtures and injected faults:
+- 30 real cases with tiny Python fixtures and injected faults:
   - exit 0, owned cleanup, nonzero, exec 127, output saturation;
   - a group cascading to `closed` at the deadline;
   - a separate-group survivor `UNCLOSED`, never signalled and still alive at
@@ -922,6 +937,11 @@ It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
     interrupted cleanup, monitor completion followed by a custodian timeout;
   - the bootstrap actor KILLing a worker blocked on an unread stdout pipe
     at its deadline (exit 124);
+  - post-gate exceptions: an event-loop exception, a failing kqueue, a
+    malformed monitor message, and an exception during the stop. Each has a
+    TERM-ignoring leader and group child: pinned TERM then KILL, the child
+    dead, the leader reaped, sampling past the reap, owned scratch kept,
+    exit 125;
   - a fixture deadline holding across `exec` and for a late grandchild, with
     SIGALRM inherited as ignored and blocked.
 
@@ -934,7 +954,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 50 cases;
+- all 56 cases;
 - every real case directory and receipt still present after the
   candidate's cleanup.
 
