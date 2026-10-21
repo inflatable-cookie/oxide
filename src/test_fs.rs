@@ -68,7 +68,9 @@ impl PermissionDeniedGuard {
     pub(crate) fn hits(&self) -> usize {
         ACTIVE.with(|active| {
             let active = active.borrow();
-            let injection = active.as_ref().expect("injection guard is no longer active");
+            let injection = active
+                .as_ref()
+                .expect("injection guard is no longer active");
             assert_eq!(injection.id, self.id, "injection guard identity changed");
             injection.hits
         })
