@@ -1108,6 +1108,35 @@ fn bind_with_receipt(context: &Context, receipt: Receipt) -> Result<Outcome, Str
     }
 }
 
+/// The final-output destination, as a component of a slot's compatibility
+/// identity: the selected real root's kind, path, bound volume and its
+/// creation generation. Empty for an ephemeral or detached checkout, so those
+/// checkouts keep exactly the slot keys they had before this feature.
+pub fn destination_facts(control: Option<&Path>, checkout: &Path) -> Result<String, String> {
+    let Some(control) = control else {
+        return Ok(String::new());
+    };
+    let context = Context::new(Some(control.to_path_buf()), checkout.to_path_buf());
+    let Some(receipt) = context.receipt()? else {
+        return Ok(String::new());
+    };
+    // A prepared transition is replayed by `bind_for_command`; keying from the
+    // last committed selection never blocks a build on a crash record.
+    let Some(selected) = receipt.selected.as_ref() else {
+        return Ok(String::new());
+    };
+    let generation = read_marker(&selected.root).map_or(0, |marker| marker.generation);
+    Ok(format!(
+        "outputs-1 {} {} {} g{generation}",
+        match selected.kind {
+            RootKind::External => "external",
+            RootKind::Local => "local",
+        },
+        selected.root.display(),
+        selected.volume_uuid.as_deref().unwrap_or("-")
+    ))
+}
+
 /// The internal pool paired with a registered removable pool, so the clean
 /// barrier an output transition takes spans a checkout's builds in either
 /// pool (the same pairing `oxide clean` uses).
@@ -2369,6 +2398,29 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded.state, ReceiptState::Prepared);
+    }
+
+    #[test]
+    fn the_slot_destination_is_empty_until_a_checkout_is_converted() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        assert_eq!(
+            destination_facts(Some(&fixture.control), &fixture.checkout).unwrap(),
+            ""
+        );
+        let receipt = transition(&context, &fixture.receipt(), &fixture.local()).unwrap();
+        let first = destination_facts(Some(&fixture.control), &fixture.checkout).unwrap();
+        assert!(first.starts_with("outputs-1 local "), "{first}");
+        assert!(first.ends_with("g1"), "{first}");
+        // Relinking to the same root keeps the same destination identity, so
+        // a warm slot survives a relink.
+        let again = transition(&context, &receipt, &fixture.local()).unwrap();
+        assert_eq!(again.generation, 2);
+        assert_eq!(
+            destination_facts(Some(&fixture.control), &fixture.checkout).unwrap(),
+            first
+        );
+        assert_eq!(destination_facts(None, &fixture.checkout).unwrap(), "");
     }
 
     #[test]

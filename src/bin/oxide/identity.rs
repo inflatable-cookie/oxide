@@ -22,13 +22,18 @@ pub struct SlotKey {
 }
 
 impl SlotKey {
-    pub fn resolve(
-        cargo: &str,
-        manifest_path: Option<&Path>,
+    /// Resolve for an already-located workspace. `destination` is the
+    /// owned-output destination identity (kind, real root, volume and root
+    /// generation) from [`crate::outputs::destination_facts`]; it enters the
+    /// key only when it is non-empty, so an ephemeral or detached checkout
+    /// keeps exactly the slot keys it had.
+    pub fn resolve_in(
+        checkout: &Path,
         recipe: &str,
         target: Option<&str>,
+        destination: &str,
     ) -> Result<Self, String> {
-        let checkout = locate_workspace(cargo, manifest_path)?;
+        let checkout = checkout.to_path_buf();
         let identity = digest(&Identity::infer(&checkout).key());
         // The guarded Cargo inherits this process's working directory and
         // environment, so rustup selects its toolchain there, not at the
@@ -47,8 +52,13 @@ impl SlotKey {
                 })
                 .ok_or("rustc -vV did not report a host target")?,
         };
+        let destination = if destination.is_empty() {
+            String::new()
+        } else {
+            format!("\n{destination}")
+        };
         let compatibility = digest(&format!(
-            "{identity}\n{recipe}\n{}\n{target}\n{BACKEND}",
+            "{identity}\n{recipe}\n{}\n{target}\n{BACKEND}{destination}",
             digest(&rustc)
         ));
         Ok(Self {
@@ -495,13 +505,9 @@ mod tests {
         )
         .expect("manifest");
         fs::write(workspace.join("src/lib.rs"), "").expect("lib");
-        let key = SlotKey::resolve(
-            crate::CARGO,
-            Some(&workspace.join("Cargo.toml")),
-            "quick",
-            Some("x-target"),
-        )
-        .expect("slot key");
+        let owned =
+            locate_workspace(crate::CARGO, Some(&workspace.join("Cargo.toml"))).expect("workspace");
+        let key = SlotKey::resolve_in(&owned, "quick", Some("x-target"), "").expect("slot key");
         assert_eq!(key.checkout, workspace);
         assert!(matches!(Identity::infer(&workspace), Identity::Path(path) if path == workspace));
         let identity = digest(&format!("path:{}", workspace.display()));
@@ -514,6 +520,33 @@ mod tests {
                 digest(&rustc)
             ))
         );
+        fs::remove_dir_all(&dir).expect("remove scratch");
+    }
+
+    /// A real final-output destination is part of the compatibility key; an
+    /// empty one leaves the key exactly as it was.
+    #[test]
+    fn a_destination_partitions_the_compatibility_key() {
+        let dir = scratch("destination");
+        let workspace = dir.join("app");
+        fs::create_dir_all(workspace.join("src")).expect("package dir");
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        fs::write(workspace.join("src/lib.rs"), "").expect("lib");
+        let owned =
+            locate_workspace(crate::CARGO, Some(&workspace.join("Cargo.toml"))).expect("workspace");
+        let ephemeral =
+            SlotKey::resolve_in(&owned, "quick", Some("x-target"), "").expect("slot key");
+        let external = SlotKey::resolve_in(&owned, "quick", Some("x-target"), "outputs-1 x")
+            .expect("slot key");
+        let local = SlotKey::resolve_in(&owned, "quick", Some("x-target"), "outputs-1 y")
+            .expect("slot key");
+        assert_eq!(ephemeral.identity, external.identity);
+        assert_ne!(ephemeral.compatibility, external.compatibility);
+        assert_ne!(external.compatibility, local.compatibility);
         fs::remove_dir_all(&dir).expect("remove scratch");
     }
 

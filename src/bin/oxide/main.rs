@@ -227,15 +227,20 @@ fn exec_stdin() -> Stdio {
 
 fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     let exec = invocation.command == "exec";
-    let key = SlotKey::resolve(
-        CARGO,
-        invocation.manifest_path.as_deref(),
-        invocation.profile.recipe_key(),
-        invocation.target.as_deref(),
-    )?;
     process::install_signal_handlers()?;
     let internal = Store::open_or_create()?;
     let output_control = internal.control().to_path_buf();
+    let checkout = identity::locate_workspace(CARGO, invocation.manifest_path.as_deref())?;
+    // The final-output destination is part of the slot's compatibility
+    // identity: a slot's uplifted artifacts belong to one real root. An
+    // ephemeral or detached checkout adds nothing, so its keys are unchanged.
+    let destination = outputs::destination_facts(Some(&output_control), &checkout)?;
+    let key = SlotKey::resolve_in(
+        &checkout,
+        invocation.profile.recipe_key(),
+        invocation.target.as_deref(),
+        &destination,
+    )?;
     let selected = removable::select(internal)?;
     let selection_mode = selected.mode;
     let fallback_reason = selected.fallback_reason.clone();
