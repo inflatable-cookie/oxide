@@ -157,7 +157,10 @@ Identity chooses which warm slot to try:
 3. Outside Git: the canonical workspace root, with no cross-checkout reuse.
 
 The slot compatibility key is repository identity + Oxide recipe key +
-resolved toolchain (`rustc -vV`) + target triple + codegen backend. The
+resolved toolchain (`rustc -vV`) + target triple + codegen backend, plus an
+owned checkout's final-output destination (its selected root's kind, real
+path, bound volume and creation generation). An ephemeral or detached
+checkout adds no destination, so its keys are exactly what they were. The
 recipe key is `quick:dev-recipe-2`, `debug:dev-recipe-2` or `release`.
 Version 1 keys were the bare `quick` and `debug` of the custom-profile
 recipes, so a slot built by them is never reused for the `dev` recipes: the
@@ -2365,7 +2368,10 @@ migration and consumer adoption remain separate gates.
 
 - **One owned link.** A converted checkout has one Oxide-owned
   `<checkout>/target` symlink. `CARGO_TARGET_DIR` stays that lexical path, so
-  `target/debug` and the #106 profile rules are unchanged.
+  `target/debug` and the #106 profile rules are unchanged. Switching the
+  registered drive back to ephemeral does not move or unlink a converted
+  checkout: it keeps building through its owned link, and refuses when the
+  link no longer matches the receipt (run `oxide outputs adopt`).
 - **Roots.** The real root lives outside the pool payload:
   `<mount>/oxide-outputs/<project>-<checkout id>/` on the registered volume,
   else the checkout-local fallback `<checkout>/.oxide-outputs/local/`.
@@ -2396,6 +2402,11 @@ migration and consumer adoption remain separate gates.
   link is committed; a preparation that published nothing rolls back to the
   old selection and keeps any root it created. Any other state stops, keeps
   both roots and the link, and says so.
+- **Slot identity.** An owned checkout's selected destination (kind, real
+  root, volume and root creation generation) enters the slot compatibility
+  key, so one slot's uplifted artifacts belong to one real root. Relinking to
+  the same root keeps the key; a destination change partitions it cold. An
+  ephemeral or detached checkout adds nothing to the key.
 - **Selection.** A command binds its root once, after taking its own exclusive
   checkout lease and before Cargo starts: the external root only when the
   volume is present, registered, writable, above its reserve and the root is
