@@ -791,6 +791,10 @@ def run(proof: Proof, repo: str) -> None:
     expect(not os.path.islink(link), "a detached build re-created the owned link")
     # 14. A prepared first conversion never renames over a link that appeared
     #     after the crash, even when a matching sibling is live.
+    code, _, stderr = proof.oxide(
+        ["pool", "set-mode", "permanent"], "permanent mode for the crafted replay", app
+    )
+    expect(code == 0, stderr)
     crafted = json.loads(committed_bytes.decode())
     crafted["state"] = "prepared"
     generation = crafted["generation"] + 1
