@@ -791,7 +791,7 @@ def run(proof: Proof, repo: str) -> None:
     # 8e. A replaced output-directory ancestor refuses an unchanged
     #     destination, so Cargo never writes onto internal disk.
     volume_outputs = os.path.join(mount, "oxide-outputs")
-    saved_outputs = os.path.join(root, "saved-outputs")
+    saved_outputs = os.path.join(mount, "saved-oxide-outputs")
     internal_outputs = os.path.join(root, "internal-outputs")
     os.rename(volume_outputs, saved_outputs)
     shutil.copytree(saved_outputs, internal_outputs)
@@ -810,6 +810,7 @@ def run(proof: Proof, repo: str) -> None:
     )
     os.remove(volume_outputs)
     os.rename(saved_outputs, volume_outputs)
+    shutil.rmtree(internal_outputs)
     code, _, stderr = proof.oxide(["build", "--bin", "poutputs"], "build after restoring the ancestor", app)
     expect(code == 0 and link_target(link) == external_root, f"ancestor restore failed: {stderr}")
     proof.phase("after the barrier and ancestor controls")
