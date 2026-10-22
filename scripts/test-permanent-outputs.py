@@ -1528,8 +1528,11 @@ def auto_run(proof: Proof, repo: str) -> None:
     #    refuses before any slot is taken, and the missing target stays missing.
     bad = fresh_checkout(proof, root, "bad-receipt")
     os.makedirs(os.path.dirname(receipt_file(pool, bad)), exist_ok=True)
-    with open(receipt_file(pool, bad), "wb") as handle:
+    corrupt = receipt_file(pool, bad)
+    with open(corrupt, "wb") as handle:
         handle.write(b"{not a receipt")
+    # Owner-only, so the product reaches its parse refusal, not the mode check.
+    os.chmod(corrupt, 0o600)
     code, _, stderr = proof.oxide(["build"], "a corrupt receipt refuses, never adopts", bad)
     expect(code != 0 and "is invalid" in stderr and not auto_notices(stderr), stderr)
     expect(not os.path.lexists(os.path.join(bad, "target")), "a corrupt receipt let a target appear")
@@ -1647,6 +1650,26 @@ def record(name: str, contents: str) -> None:
         handle.write(contents)
 
 
+def cleanup_after_failure(proof: Proof) -> str:
+    """Ordinary detach of this run's own mount after a failure, through
+    Proof.detach's checks: refused while any child is unclosed, never forced,
+    and bounded by the proof's own clock. A closed process group is not taken
+    as a detached device; the mount path is checked afterwards."""
+    # The alarm would cut the cleanup short; the proof clock still bounds it.
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    image = os.path.join(proof.root, "volume.sparseimage")
+    mount = proof.mount
+    if not mount:
+        return f"no mount attached by this run (image {image})"
+    try:
+        proof.detach()
+    except BaseException as error:
+        return f"detach of {mount} (image {image}) not completed: {error!r}"
+    if os.path.ismount(mount):
+        return f"detach of {mount} (image {image}) returned but the mount is still present"
+    return f"ordinary detach of {mount} (image {image}) confirmed; mount no longer present"
+
+
 def main() -> int:
     if sys.platform != "darwin":
         fail("the permanent-outputs proof requires macOS")
@@ -1671,14 +1694,17 @@ def main() -> int:
     try:
         scenario(proof, repo)
     except BaseException as failure:
+        cleanup = cleanup_after_failure(proof)
         record(
             "result.txt",
-            f"failed: {failure!r}\nunclosed children: {sorted(proof.unclosed)}\nroot: {root}\n",
+            f"failed: {failure!r}\nunclosed children: {sorted(proof.unclosed)}\n"
+            f"root: {root}\ncleanup: {cleanup}\n",
         )
         print(
             f"{label} proof failed; scratch {root} left to the shared supervisor",
             file=sys.stderr,
         )
+        # The first fault is re-raised; a cleanup failure is only recorded.
         raise
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
