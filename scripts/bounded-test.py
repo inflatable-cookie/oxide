@@ -455,14 +455,20 @@ def _terminal_fields(terminal_count, unaccountable, failed):
         return ("invalid", None)
 
 
-def _fixed_sysctl_reader():
-    """One fixed-buffer sysctlbyname read per name. No size probe, no retry."""
-    libc = ctypes.CDLL(None, use_errno=True)
+def _fixed_sysctl_reader(sysctlbyname=None, get_errno=None):
+    """One fixed-buffer sysctlbyname read per name. No size probe, no retry.
+
+    The libc entry points are injectable for deterministic tests; production
+    passes the loaded libc. A reported length above the fixed capacity is
+    rejected, never silently sliced."""
+    if sysctlbyname is None:
+        _libc = ctypes.CDLL(None, use_errno=True)
+        sysctlbyname, get_errno = _libc.sysctlbyname, ctypes.get_errno
     def read(name, size):
         buf = ctypes.create_string_buffer(size)
         length = ctypes.c_size_t(size)
-        if libc.sysctlbyname(name.encode("ascii"), buf, ctypes.byref(length), None, 0) != 0:
-            raise OSError(ctypes.get_errno(), "sysctlbyname " + name)
+        if sysctlbyname(name.encode("ascii"), buf, ctypes.pointer(length), None, 0) != 0:
+            raise OSError(get_errno(), "sysctlbyname " + name)
         if length.value > size:
             raise OSError(errno.ENOMEM, "sysctlbyname " + name + " exceeds fixed buffer")
         return bytes(buf.raw[:length.value])
@@ -507,6 +513,8 @@ def _decide_terminal_mode(reader=None):
             reader = _fixed_sysctl_reader()
         try:
             uuid_raw = reader("kern.uuid", 64)
+            if len(uuid_raw) > 64:
+                return {"mode": "strict", "reason": "identity_malformed", "evidence": ALLOW_EVIDENCE_ID}
         except Exception as error:
             reason = "identity_malformed" if _is_oversize(error) else "identity_read_error"
             return {"mode": "strict", "reason": reason, "evidence": ALLOW_EVIDENCE_ID}
@@ -530,6 +538,8 @@ def _decide_terminal_mode(reader=None):
             return {"mode": "strict", "reason": "identity_malformed", "evidence": ALLOW_EVIDENCE_ID}
         try:
             build_raw = reader("kern.osversion", 64)
+            if len(build_raw) > 64:
+                return {"mode": "strict", "reason": "identity_malformed", "evidence": ALLOW_EVIDENCE_ID}
         except Exception as error:
             reason = "identity_malformed" if _is_oversize(error) else "identity_read_error"
             return {"mode": "strict", "reason": reason, "evidence": ALLOW_EVIDENCE_ID}
@@ -541,6 +551,8 @@ def _decide_terminal_mode(reader=None):
             return {"mode": "strict", "reason": "identity_malformed", "evidence": ALLOW_EVIDENCE_ID}
         try:
             version_raw = reader("kern.version", 1024)
+            if len(version_raw) > 1024:
+                return {"mode": "strict", "reason": "identity_malformed", "evidence": ALLOW_EVIDENCE_ID}
         except Exception as error:
             reason = "identity_malformed" if _is_oversize(error) else "identity_read_error"
             return {"mode": "strict", "reason": reason, "evidence": ALLOW_EVIDENCE_ID}
@@ -644,7 +656,8 @@ class Census:
     accountable count alone. A successful getsid keeps the old
     member/foreign/tracked paths and other session errors can never
     qualify. In strict mode terminal acceptance never fires and every
-    ESRCH row keeps the old uncertain handling.
+    ESRCH row keeps the old uncertain handling, while the terminal count
+    stays the accountably known valid 0.
 
     Everything else (other getsid errors, identity change, failed or
     missing metadata, unconfirmed zombies, a failed snapshot) is uncertain
@@ -790,7 +803,7 @@ class Census:
                     except BaseException:
                         pass
                     try:
-                        if row.get("zombie") is True:
+                        if self.terminal_allowed is True and row.get("zombie") is True:
                             terminal_tainted = True
                     except BaseException:
                         pass
@@ -825,11 +838,13 @@ class Census:
                     if not terminal:
                         # An actual-ESRCH row with a SZOMB snapshot that is
                         # neither Gone nor terminal-accepted stays
-                        # unaccounted and taints the terminal count. Rows that
+                        # unaccounted and taints the terminal count, but only
+                        # when terminal acceptance is possible at all. In
+                        # strict mode the count is accountably zero; rows that
                         # were never terminal candidates (no SZOMB snapshot)
                         # leave an accountable count alone.
                         try:
-                            if row.get("zombie") is True:
+                            if self.terminal_allowed is True and row.get("zombie") is True:
                                 terminal_tainted = True
                         except BaseException:
                             pass

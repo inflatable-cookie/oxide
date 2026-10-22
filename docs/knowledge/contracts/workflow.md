@@ -980,14 +980,16 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
     member; tracked attribution is kept and eligibility is recomputed
     every round with no exemption cache. A nonqualifying first read is
     never salvaged by later reads; any failed, missing, malformed,
-    identity/state or non-zombie observation disqualifies terminal and
-    taints the round's terminal count as unaccountable, while rows that
-    were never terminal candidates leave an accountable count alone. A
-    successful `getsid` keeps the old member/foreign/tracked paths and
-    other session errors can never qualify. In strict mode terminal
+    identity/state or non-zombie observation disqualifies terminal and,
+    in allowlisted mode, taints the round's terminal count as
+    unaccountable, while rows that were never terminal candidates leave an
+    accountable count alone. A successful `getsid` keeps the old
+    member/foreign/tracked paths and other session errors (including a
+    non-`ESRCH` `errno`) can never qualify. In strict mode terminal
     acceptance never fires and every `ESRCH` row keeps the old uncertain
-    handling. No live process is excluded by parent, and a replacement
-    identity is never declared foreign or member by inference.
+    handling, while the terminal count stays the accountably known valid
+    0. No live process is excluded by parent, and a replacement identity
+    is never declared foreign or member by inference.
 
   An uncertain or failed census after `stopped` latches a fault at once. A
   later certain empty census never clears it or authorizes cleanup.
@@ -1123,7 +1125,7 @@ path is printed for the owner.
 
 It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
 `scripts/test_supervisor.py`. The suite runs in order:
-- 85 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 88 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -1153,8 +1155,9 @@ It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
   counted, diagnostics saturation never driving the count); the
   exact-kernel allowlist (match, ASCII form, build mismatch, malformed
   UUID length, wrong UUID value, read error, oversize, interior-NUL and
-  missing-NUL versions, contradiction, missing token, fixed-reader
-  oversize rejection) and terminal eligibility (allowlisted zombie
+  missing-NUL versions, contradiction, missing token, deterministic
+  fake-libc fixed-reader success/oversize/error) and terminal eligibility
+  (allowlisted zombie
   accepted with exact witness and kept attribution, strict/live/
   first-read-failure/intermediate-failure/intermediate-live/final-failure/
   final-live/non-`ESRCH`/non-`ESRCH`-errno/replacement never terminal,
@@ -1212,7 +1215,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 120 cases;
+- all 123 cases;
 - every real case directory and receipt still present after the
   candidate's cleanup.
 

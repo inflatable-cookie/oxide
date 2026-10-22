@@ -178,6 +178,34 @@ def row(pid, start=1, **extra):
     return dict({"pid": pid, "start": start, "ppid": 1, "pgid": pid, "uid": 501, "zombie": False}, **extra)
 
 
+def _fake_libc(entries, errors=None):
+    """Deterministic fake libc for the fixed sysctl reader: no host calls.
+
+    entries maps sysctl name to (value bytes, reported length); errors maps
+    name to an errno for a failing call."""
+    class FakeLibc:
+        def __init__(self):
+            self.values = dict(entries)
+            self.errors = dict(errors or {})
+            self.call_errno = 0
+
+        def sysctlbyname(self, name, oldp, oldlenp, _newp, _newlen):
+            key = bytes(name).decode("ascii")
+            if key in self.errors:
+                self.call_errno = self.errors[key]
+                return -1
+            value, reported = self.values[key]
+            clipped = value[:len(oldp)]
+            oldp[:len(clipped)] = clipped
+            oldlenp.contents.value = reported
+            return 0
+
+        def get_errno(self):
+            return self.call_errno
+
+    return FakeLibc()
+
+
 class FakeTable:
     def __init__(self, rows, sessions, reread=None):
         self.rows, self.sessions, self.rereads = rows, sessions, reread or {}
@@ -583,13 +611,37 @@ class PureAllowlist(unittest.TestCase):
         self.assertEqual(bounded._decide_terminal_mode(self.reader(values))["reason"],
                          "identity_malformed")
 
-    def test_fixed_reader_rejects_reported_oversize(self):
-        if sys.platform != "darwin":
-            self.skipTest("macOS sysctl only")
-        reader = bounded._fixed_sysctl_reader()
-        with self.assertRaises(OSError):
-            reader("kern.version", 8)  # true value is 104 bytes: must not slice
+    def test_fixed_reader_exact_bytes(self):
+        lib = _fake_libc({"kern.osversion": (b"25G83\x00", 6)})
+        reader = bounded._fixed_sysctl_reader(lib.sysctlbyname, lib.get_errno)
         self.assertEqual(reader("kern.osversion", 64), b"25G83\x00")
+
+    def test_fixed_reader_rejects_reported_oversize(self):
+        # Success with a reported length above capacity must raise, never
+        # silently slice the buffer.
+        lib = _fake_libc({"kern.osversion": (b"25G83\x00", 65)})
+        reader = bounded._fixed_sysctl_reader(lib.sysctlbyname, lib.get_errno)
+        with self.assertRaises(OSError) as raised:
+            reader("kern.osversion", 64)
+        self.assertEqual(raised.exception.errno, errno.ENOMEM)
+
+    def test_fixed_reader_propagates_error(self):
+        lib = _fake_libc({})
+        lib.errors = {"kern.uuid": 2}
+        reader = bounded._fixed_sysctl_reader(lib.sysctlbyname, lib.get_errno)
+        with self.assertRaises(OSError) as raised:
+            reader("kern.uuid", 64)
+        self.assertEqual(raised.exception.errno, 2)
+
+    def test_decide_through_fixed_reader(self):
+        lib = _fake_libc({
+            "kern.uuid": (bytes.fromhex("8D3E13A001FC381D9DA37F0AF537CB32"), 16),
+            "kern.osversion": (b"25G83\x00", 6),
+            "kern.version": (b"root:xnu-12377.161.14~5/RELEASE_ARM64_T6050\x00", 44),
+        })
+        mode = bounded._decide_terminal_mode(bounded._fixed_sysctl_reader(
+            lib.sysctlbyname, lib.get_errno))
+        self.assertEqual(mode["mode"], "allowlisted")
 
 
 class PureTerminalCounts(unittest.TestCase):
@@ -630,12 +682,14 @@ class PureTerminalCounts(unittest.TestCase):
         self.assertEqual(witness[0], {"pid": 140, "start": 5, "snapshot_zombie": True,
                                       "first_zombie": True, "tracked": False})
 
-    def test_terminal_zombie_strict_blocks(self):
+    def test_terminal_zombie_strict_blocks_but_count_known_zero(self):
+        # Strict mode can never accept terminal, so the count is
+        # accountably known 0 even though the zombie row still blocks.
         table = FakeTable([zombie_row(141, 5)], {141: ProcessLookupError(3, "gone")})
         result = census(table).round()
         self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
         self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
-                         ("invalid", None))
+                         ("valid", 0))
         self.assertNotIn("terminal_witnesses", result)
 
     def test_live_snapshot_unrelated_valid_zero(self):
