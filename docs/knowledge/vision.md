@@ -141,7 +141,8 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   own cross-workspace cache is the preferred long-term complement.
 - **Approved, not built:**
   - per-slot test scratch;
-  - submodule-aware cross-worktree reuse.
+  - broader submodule-aware cross-worktree reuse beyond the narrow
+    two-state coverage in the workflow contract.
 
   Details live in their Queue leads and, once built, in the
   [workflow contract](contracts/workflow.md).

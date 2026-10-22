@@ -16,7 +16,8 @@
 
 use crate::cli::Resolution;
 use crate::MIB;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsString};
 use std::fs;
@@ -25,13 +26,37 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Dirty files in one checkout and uncertain paths per slot. Beyond this the
 /// gate refuses and the slot stays checkout-affine.
 pub const MAX_PATHS: usize = 4096;
-/// Files listed for the path-change step.
+/// Files listed for the path-change step, counted across the superproject and
+/// every initialized submodule.
 const MAX_LISTED: usize = 200_000;
+/// Declared submodules (gitlinks) the gate classifies. Depth is one.
+pub const MAX_SUBMODULES: usize = 32;
+/// Each `git` call: stdout bytes and lifetime. Runaway output or a call that
+/// outlives its slice refuses the slot rather than yielding a partial
+/// fingerprint.
+const MAX_GIT_BYTES: u64 = 16 * MIB;
+const GIT_CALL_TIME: Duration = Duration::from_secs(30);
+/// Time after the child is reaped for pipes still held by anything it started
+/// to close. A reader that misses it is detached: the gate refuses the slot
+/// rather than waiting past its own clock.
+const GIT_SETTLE_TIME: Duration = Duration::from_secs(2);
+/// One snapshot or prepare: cumulative `git` work. The invocation count can
+/// bind before the submodule cap; exhaustion refuses the slot.
+const MAX_GIT_CALLS: usize = 64;
+const GIT_TOTAL_TIME: Duration = Duration::from_secs(60);
+/// A submodule's `.git` file, a `gitdir:` pointer.
+const MAX_DOT_GIT_BYTES: u64 = 64 * 1024;
+/// The mode Git records for a submodule in the index and in a tree.
+const GITLINK_MODE: &str = "160000";
+/// Version written with a content record that includes submodule state.
+/// Version 0 (or a missing field) predates submodule coverage.
+pub const CONTENT_VERSION: u32 = 1;
 /// `cargo metadata` output and lifetime for the path-change step.
 pub(crate) const MAX_METADATA_BYTES: u64 = 64 * MIB;
 const MAX_METADATA_ERROR_BYTES: u64 = 64 * 1024;
@@ -79,14 +104,62 @@ impl From<&str> for Refusal {
     }
 }
 
-/// One checkout's content: HEAD's tree plus the Git blob digest of every
-/// file that differs from it (tracked changes and untracked files Git does
-/// not ignore). Paths are relative to the repository top level.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// One declared Git submodule's worktree state at snapshot time. Only these
+/// two states are covered; anything else refuses the slot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum SubmoduleState {
+    /// Positively absent, or an empty real directory with no `.git` entry:
+    /// the gitlink was never initialized.
+    #[serde(rename = "uninit")]
+    Uninitialized,
+    /// Initialized at the declared commit. `head` is the child's `HEAD` and
+    /// `raw` a framed digest of its ordered cached paths and raw blob IDs,
+    /// so the same commit reached through different bytes still differs.
+    Exact { head: String, raw: String },
+}
+
+/// One checkout's content: HEAD's tree, the Git blob digest of every file
+/// that differs from it (tracked changes and untracked files Git does not
+/// ignore), and the state of every declared submodule. Paths are relative to
+/// the repository top level.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct Content {
     pub tree: String,
     pub dirty: BTreeMap<String, String>,
+    /// Every gitlink the index and `HEAD` declare, in path order. A written
+    /// record always carries this field, even when it is empty. Legacy
+    /// records that lack it parse as empty but never vouch for a checkout
+    /// that declares submodules.
+    pub submodules: BTreeMap<String, SubmoduleState>,
+    /// Whether the parsed record carried submodule state at all. Every fresh
+    /// snapshot sets it; only a record that predates the field leaves it
+    /// false. Never serialized, because writing always includes the field.
+    #[serde(skip)]
+    has_submodules: bool,
+}
+
+/// A content record's on-disk shape, kept apart only to tell a missing
+/// `submodules` field apart from an empty one.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContentRecord {
+    tree: String,
+    dirty: BTreeMap<String, String>,
+    #[serde(default)]
+    submodules: Option<BTreeMap<String, SubmoduleState>>,
+}
+
+impl<'de> Deserialize<'de> for Content {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let record = ContentRecord::deserialize(deserializer)?;
+        Ok(Self {
+            tree: record.tree,
+            dirty: record.dirty,
+            has_submodules: record.submodules.is_some(),
+            submodules: record.submodules.unwrap_or_default(),
+        })
+    }
 }
 
 /// What a slot last compiled.
@@ -96,6 +169,10 @@ pub struct Origin {
     /// Canonical workspace root of the compiling checkout.
     pub checkout: PathBuf,
     pub content: Content,
+    /// The record's content schema. Version 0 (or a missing field) predates
+    /// submodule state, so it never vouches for a checkout with gitlinks.
+    #[serde(default)]
+    pub content_version: u32,
     /// Nanoseconds since the epoch, taken after Cargo's group was empty, so
     /// no unit in the slot has a newer dep-info.
     pub anchor_ns: u64,
@@ -210,16 +287,18 @@ impl Gate {
         let Some((top, before)) = self.before else {
             return Some(Built::Affine(checkout.to_path_buf()));
         };
-        let (_, after) = snapshot(&top).ok()?;
+        let mut git = Git::new();
+        let after = snapshot_with(&top, &mut git).ok()?.content;
         let mut uncertain = self.carried;
         uncertain.extend(self.changed);
-        uncertain.extend(differing(&top, &before, &after).ok()?);
+        uncertain.extend(differing(&mut git, &top, &before, &after).ok()?);
         if uncertain.len() > MAX_PATHS {
             return None;
         }
         Some(Built::Content(Origin {
             checkout: checkout.to_path_buf(),
             content: after,
+            content_version: CONTENT_VERSION,
             anchor_ns,
             uncertain,
         }))
@@ -246,16 +325,18 @@ pub fn prepare(checkout: &Path, prior: &Prior, request: &Resolution) -> Result<G
                 ..Gate::affine()
             },
             Ok(_) => match snapshot(checkout) {
-                Ok(before) => Gate {
-                    before: Some(before),
+                Ok(snapshot) => Gate {
+                    before: Some((snapshot.top, snapshot.content)),
                     ..Gate::affine()
                 },
                 Err(_) => Gate::affine(),
             },
         }),
         Prior::Known(Built::Content(origin)) => {
-            let (top, content) = snapshot(checkout)?;
-            let changed = differing(&top, &origin.content, &content)?;
+            let mut git = Git::new();
+            let current = snapshot_with(checkout, &mut git)?;
+            compatible(&origin, &current.content)?;
+            let changed = differing(&mut git, &current.top, &origin.content, &current.content)?;
             let cross = origin.checkout != checkout;
             // Refreshing relies on Cargo's rules; an unchanged repeat does not.
             if cross || !changed.is_empty() {
@@ -265,16 +346,37 @@ pub fn prepare(checkout: &Path, prior: &Prior, request: &Resolution) -> Result<G
             if cross {
                 stale.extend(&origin.uncertain);
             }
-            let mut refreshed = refresh(&top, stale, origin.anchor_ns)?;
+            // A changed gitlink is a directory: its path is skipped below,
+            // and an initialized child's own tracked files carry the change.
+            let mut refresh_paths: BTreeSet<String> =
+                stale.iter().map(|path| (*path).clone()).collect();
+            for path in &changed {
+                if let Some(SubmoduleState::Exact { .. }) = current.content.submodules.get(path) {
+                    if let Some(files) = current.children.get(path) {
+                        refresh_paths.extend(files.iter().cloned());
+                    }
+                }
+            }
+            let mut refreshed = refresh(
+                &current.top,
+                &refresh_paths,
+                origin.anchor_ns,
+                &current.content.submodules,
+            )?;
             let mut packages = 0;
             if cross {
                 let metadata = cargo_metadata(checkout, request)?;
-                let (count, files) = local_package_files(&top, &metadata)?;
+                let (count, files) = local_package_files(&mut git, &current, &metadata)?;
                 packages = count;
-                refreshed += refresh(&top, files.iter(), origin.anchor_ns)?;
+                refreshed += refresh(
+                    &current.top,
+                    &files,
+                    origin.anchor_ns,
+                    &current.content.submodules,
+                )?;
             }
             Ok(Gate {
-                before: Some((top, content)),
+                before: Some((current.top, current.content)),
                 changed,
                 carried: origin.uncertain.clone(),
                 cross,
@@ -284,6 +386,23 @@ pub fn prepare(checkout: &Path, prior: &Prior, request: &Resolution) -> Result<G
             })
         }
     }
+}
+
+/// A content record vouches for a checkout only when its schema covers what
+/// the checkout declares. A record without submodule state, and a checkout
+/// with gitlinks, are not equivalent even when both maps are empty: version 0
+/// predates the field, and a version-1 record that omitted it is treated the
+/// same way.
+fn compatible(origin: &Origin, current: &Content) -> Result<(), Refusal> {
+    if !matches!(origin.content_version, 0 | CONTENT_VERSION) {
+        return Err("the slot's content record has an unknown version".into());
+    }
+    if !current.submodules.is_empty()
+        && !(origin.content_version == CONTENT_VERSION && origin.content.has_submodules)
+    {
+        return Err("the slot's origin lacks submodule state".into());
+    }
+    Ok(())
 }
 
 /// `cargo -V` in the inherited working directory, where the guarded Cargo
@@ -333,23 +452,172 @@ fn now_ns() -> u64 {
         })
 }
 
-fn git(top: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let output = Command::new("git")
+/// Bounded access to the `git` binary for one snapshot or prepare.
+///
+/// Every call carries `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`,
+/// `-c submodule.recurse=0` and `-c core.fsmonitor=false`: reading the index
+/// never rewrites it, no credential prompt can block, no Git command descends
+/// into a submodule, and no configured fsmonitor hook or daemon runs (and so
+/// none can inherit the pipes or extend the call). Each call is bound in
+/// lifetime; the whole context is bound in wall wait, total stdout and
+/// invocation count. Output readers are attached to channels and share one
+/// settle window drawn from that budget, so a pipe held by a process Git
+/// started can never hold the gate past its clock. Exhaustion is a refusal,
+/// never a partial fingerprint. There is no `submodule` subcommand, network or
+/// config write.
+struct Git {
+    calls: usize,
+    waited: Duration,
+    bytes: u64,
+    call_time: Duration,
+    total_time: Duration,
+    settle_time: Duration,
+}
+
+/// One `git` invocation: no index write, no prompt, no submodule recursion and
+/// no configured fsmonitor hook or daemon.
+fn git_command(dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command
+        .args(["-c", "submodule.recurse=0", "-c", "core.fsmonitor=false"])
         .args(args)
-        .current_dir(top)
-        // Status must not rewrite the index while reading it.
+        .current_dir(dir)
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("could not start git: {error}"))?;
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        Err(format!(
-            "git {} failed: {}",
-            args.first().unwrap_or(&""),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
+impl Git {
+    fn new() -> Self {
+        Self {
+            calls: 0,
+            waited: Duration::ZERO,
+            bytes: 0,
+            call_time: GIT_CALL_TIME,
+            total_time: GIT_TOTAL_TIME,
+            settle_time: GIT_SETTLE_TIME,
+        }
+    }
+
+    /// Charge one call's stdout against the cumulative budget. The design's
+    /// 16 MiB is a limit for one snapshot or prepare, not only a per-call cap.
+    fn charge(&mut self, bytes: u64) -> Result<(), String> {
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.bytes > MAX_GIT_BYTES {
+            return Err(format!(
+                "the gate's git output exceeded {MAX_GIT_BYTES} bytes"
+            ));
+        }
+        Ok(())
+    }
+
+    fn run(&mut self, dir: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>, String> {
+        let name = args.first().copied().unwrap_or("");
+        if self.calls >= MAX_GIT_CALLS {
+            return Err(format!(
+                "the gate needs more than {MAX_GIT_CALLS} git calls"
+            ));
+        }
+        let remaining = self.total_time.saturating_sub(self.waited);
+        if remaining.is_zero() {
+            return Err("the gate's git time budget is exhausted".to_owned());
+        }
+        self.calls += 1;
+        // One absolute deadline covers execution and settlement: the
+        // per-call cap intersected with the cumulative remainder.
+        let limit = self.call_time.min(remaining);
+        let mut child = git_command(dir, args)
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("could not start git: {error}"))?;
+        let writer = match input {
+            None => None,
+            Some(bytes) => {
+                let mut stdin = child.stdin.take().ok_or("git stdin was not captured")?;
+                let bytes = bytes.to_vec();
+                let (sender, receiver) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = sender.send(stdin.write_all(&bytes));
+                });
+                Some(receiver)
+            }
+        };
+        let stdout = child.stdout.take().ok_or("git stdout was not captured")?;
+        let stderr = child.stderr.take().ok_or("git stderr was not captured")?;
+        let (out_sender, out_receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = out_sender.send(read_capped(stdout, MAX_GIT_BYTES));
+        });
+        let (err_sender, err_receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = err_sender.send(read_capped(stderr, MAX_METADATA_ERROR_BYTES));
+        });
+        let started = Instant::now();
+        let deadline = started + limit;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) if Instant::now() >= deadline => {
+                    // Our own child; reaping it closes the pipes unless
+                    // something it started still holds them. Those readers
+                    // are detached, so the gate keeps its own clock.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(format!("git {name} did not finish in time"));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                Err(error) => break Err(format!("could not wait for git: {error}")),
+            }
+        };
+        self.waited = self.waited.saturating_add(started.elapsed());
+        let status = status?;
+        // One settle window for all three readers, never past the call's own
+        // deadline: each wait takes only what remains of the same window, so
+        // sequential waits cannot overrun it.
+        let settle_deadline = (Instant::now() + self.settle_time).min(deadline);
+        let left = || settle_deadline.saturating_duration_since(Instant::now());
+        let settling = Instant::now();
+        let out = out_receiver.recv_timeout(left());
+        let err = err_receiver.recv_timeout(left());
+        let written = writer
+            .as_ref()
+            .map(|receiver| receiver.recv_timeout(left()));
+        self.waited = self.waited.saturating_add(settling.elapsed());
+        if Instant::now() > deadline {
+            return Err(format!("git {name} did not finish in time"));
+        }
+        let (stdout, overflow) = out
+            .map_err(|_| format!("git {name} did not close its output in time"))?
+            .map_err(|error| format!("cannot read git output: {error}"))?;
+        let stderr = err
+            .map_err(|_| format!("git {name} did not close its errors in time"))?
+            .map(|(bytes, _)| bytes)
+            .unwrap_or_default();
+        let written = match written {
+            None => Ok(()),
+            Some(result) => {
+                result.map_err(|_| format!("git {name} did not finish its input in time"))?
+            }
+        };
+        self.charge(stdout.len() as u64)?;
+        if !status.success() || written.is_err() {
+            return Err(format!(
+                "git {name} failed: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            ));
+        }
+        if overflow {
+            return Err(format!(
+                "git {name} printed more than {MAX_GIT_BYTES} bytes"
+            ));
+        }
+        Ok(stdout)
     }
 }
 
@@ -366,15 +634,41 @@ fn nul_separated(bytes: Vec<u8>) -> Result<Vec<String>, String> {
     })
 }
 
-/// Repository top level and content for the checkout containing `path`.
-fn snapshot(path: &Path) -> Result<(PathBuf, Content), String> {
-    let top = utf8(git(path, &["rev-parse", "--show-toplevel"])?)?;
-    let top = fs::canonicalize(top.trim())
-        .map_err(|error| format!("cannot resolve the repository: {error}"))?;
-    let tree = utf8(git(&top, &["rev-parse", "--verify", "HEAD^{tree}"])?)?
-        .trim()
-        .to_owned();
-    let status = git(
+/// Repository top level, content and the tracked files of every initialized
+/// submodule, for the checkout containing `path`.
+struct Snapshot {
+    top: PathBuf,
+    content: Content,
+    /// Each `Exact` gitlink's cached tracked files, prefixed with its path.
+    children: BTreeMap<String, Vec<String>>,
+}
+
+/// The repository's top level, its common Git directory and whether this
+/// checkout is a linked worktree.
+struct Roots {
+    top: PathBuf,
+    common: PathBuf,
+    linked: bool,
+}
+
+/// Content for the checkout containing `path`, with a fresh Git budget.
+fn snapshot(path: &Path) -> Result<Snapshot, String> {
+    snapshot_with(path, &mut Git::new())
+}
+
+/// Content for the checkout containing `path`, on a caller's bounded Git
+/// context so one prepare or finish shares one cumulative budget.
+fn snapshot_with(path: &Path, git: &mut Git) -> Result<Snapshot, String> {
+    let roots = roots(path, git)?;
+    let top = roots.top.clone();
+    let tree = utf8(git.run(&top, &["rev-parse", "--verify", "HEAD^{tree}"], None)?)?;
+    let tree = tree.trim().to_owned();
+    if tree.is_empty() {
+        return Err("git printed no tree for HEAD".to_owned());
+    }
+    // Reading status never rewrites the index, and `--ignore-submodules=none`
+    // reports a submodule whose content, HEAD or index state differs.
+    let status = git.run(
         &top,
         &[
             "status",
@@ -384,8 +678,26 @@ fn snapshot(path: &Path) -> Result<(PathBuf, Content), String> {
             "--no-renames",
             "--ignore-submodules=none",
         ],
+        None,
     )?;
     let paths = status_paths(&nul_separated(status)?)?;
+    let index = nul_separated(git.run(&top, &["ls-files", "-z", "-v", "--stage"], None)?)?;
+    let listing = nul_separated(git.run(&top, &["ls-tree", "-r", "-z", "HEAD"], None)?)?;
+    let declared = declared_gitlinks(&index, &listing)?;
+    let mut submodules = BTreeMap::new();
+    let mut children = BTreeMap::new();
+    let mut listed = 0usize;
+    for (path, expected) in &declared {
+        let (state, files) = classify_submodule(git, &roots, path, expected)?;
+        if let Some(files) = files {
+            listed = listed.saturating_add(files.len());
+            if listed > MAX_LISTED {
+                return Err(format!("more than {MAX_LISTED} tracked submodule files"));
+            }
+            children.insert(path.clone(), files);
+        }
+        submodules.insert(path.clone(), state);
+    }
     let mut dirty = BTreeMap::new();
     let mut present = Vec::new();
     for path in paths {
@@ -395,6 +707,11 @@ fn snapshot(path: &Path) -> Result<(PathBuf, Content), String> {
             }
             Err(error) => return Err(format!("cannot read {path}: {error}")),
             Ok(metadata) if metadata.is_dir() => {
+                if submodules.contains_key(&path) {
+                    return Err(format!(
+                        "{path} is a submodule with content the gate does not cover"
+                    ));
+                }
                 return Err(format!(
                     "{path} is a submodule or directory the gate does not cover"
                 ));
@@ -402,10 +719,383 @@ fn snapshot(path: &Path) -> Result<(PathBuf, Content), String> {
             Ok(_) => present.push(path),
         }
     }
-    for (path, digest) in present.iter().zip(hash_objects(&top, &present)?) {
+    for (path, digest) in present.iter().zip(hash_objects(git, &top, &present)?) {
         dirty.insert(path.clone(), digest);
     }
-    Ok((top, Content { tree, dirty }))
+    Ok(Snapshot {
+        top,
+        content: Content {
+            tree,
+            dirty,
+            submodules,
+            has_submodules: true,
+        },
+        children,
+    })
+}
+
+/// The canonical top level and Git directories of the repository containing
+/// `path`. A linked worktree has a different Git directory from its common
+/// directory; the common directory owns the submodule module store.
+fn roots(path: &Path, git: &mut Git) -> Result<Roots, String> {
+    let output = git.run(
+        path,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-dir",
+            "--git-common-dir",
+        ],
+        None,
+    )?;
+    let text = utf8(output)?;
+    let mut lines = text.lines();
+    let (Some(top), Some(git_dir), Some(common)) = (lines.next(), lines.next(), lines.next())
+    else {
+        return Err("git printed unexpected repository paths".to_owned());
+    };
+    if lines.next().is_some() {
+        return Err("git printed unexpected repository paths".to_owned());
+    }
+    let resolve = |name: &str| {
+        fs::canonicalize(name.trim())
+            .map_err(|error| format!("cannot resolve the repository ({error})"))
+    };
+    let top = resolve(top)?;
+    let git_dir = resolve(git_dir)?;
+    let common = resolve(common)?;
+    Ok(Roots {
+        linked: git_dir != common,
+        top,
+        common,
+    })
+}
+
+/// Every gitlink the index and `HEAD` declare, by path and committed id.
+/// Each declared path must be the same regular cached entry at stage 0 in
+/// both: a differing id, an extra stage, an unmerged entry, assume-unchanged,
+/// skip-worktree or sparse exclusion refuses the whole checkout.
+fn declared_gitlinks(
+    index: &[String],
+    listing: &[String],
+) -> Result<BTreeMap<String, String>, String> {
+    let mut head = BTreeMap::new();
+    for entry in listing {
+        let (meta, path) = entry
+            .split_once('\t')
+            .ok_or_else(|| format!("unexpected git tree entry {entry:?}"))?;
+        let fields: Vec<&str> = meta.split(' ').collect();
+        let [mode, kind, oid] = fields.as_slice() else {
+            return Err(format!("unexpected git tree entry {entry:?}"));
+        };
+        if *mode != GITLINK_MODE {
+            continue;
+        }
+        if *kind != "commit" || !valid_repo_path(path) {
+            return Err(format!("unexpected gitlink entry {entry:?}"));
+        }
+        if head.insert(path.to_owned(), (*oid).to_owned()).is_some() {
+            return Err(format!("git listed {path} more than once"));
+        }
+    }
+    let mut committed = BTreeMap::new();
+    for entry in parse_index(index)? {
+        if entry.mode != GITLINK_MODE {
+            continue;
+        }
+        if entry.stage != "0" {
+            return Err(format!("submodule {} is unmerged", entry.path));
+        }
+        if entry.flag != 'H' {
+            return Err(format!(
+                "submodule {} has index flags the gate does not cover",
+                entry.path
+            ));
+        }
+        if !valid_repo_path(&entry.path) {
+            return Err(format!(
+                "submodule {} is not a plain repository path",
+                entry.path
+            ));
+        }
+        if committed
+            .insert(entry.path.clone(), entry.oid.clone())
+            .is_some()
+        {
+            return Err(format!("git listed {} more than once", entry.path));
+        }
+    }
+    if head != committed {
+        return Err("the index and HEAD disagree about their submodules".to_owned());
+    }
+    if head.len() > MAX_SUBMODULES {
+        return Err(format!("more than {MAX_SUBMODULES} submodules"));
+    }
+    Ok(head)
+}
+
+/// One index entry from `git ls-files -z -v --stage`.
+struct IndexEntry {
+    flag: char,
+    mode: String,
+    oid: String,
+    stage: String,
+    path: String,
+}
+
+/// Parse `git ls-files -z -v --stage` entries (`<flag> <mode> <oid>
+/// <stage>\t<path>`). A malformed or unexpected field refuses.
+fn parse_index(entries: &[String]) -> Result<Vec<IndexEntry>, String> {
+    entries
+        .iter()
+        .map(|entry| {
+            let (meta, path) = entry
+                .split_once('\t')
+                .ok_or_else(|| format!("unexpected git index entry {entry:?}"))?;
+            let fields: Vec<&str> = meta.split(' ').collect();
+            let [flag, mode, oid, stage] = fields.as_slice() else {
+                return Err(format!("unexpected git index entry {entry:?}"));
+            };
+            let mut flags = flag.chars();
+            let flag = flags
+                .next()
+                .ok_or_else(|| format!("unexpected git index entry {entry:?}"))?;
+            let plausible = flags.next().is_none()
+                && mode.len() == 6
+                && mode.bytes().all(|byte| byte.is_ascii_digit())
+                && !oid.is_empty()
+                && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && !stage.is_empty()
+                && stage.bytes().all(|byte| byte.is_ascii_digit())
+                && !path.is_empty();
+            if !plausible {
+                return Err(format!("unexpected git index entry {entry:?}"));
+            }
+            Ok(IndexEntry {
+                flag,
+                mode: (*mode).to_owned(),
+                oid: (*oid).to_owned(),
+                stage: (*stage).to_owned(),
+                path: path.to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// A repository-relative path the gate will join to a checkout: relative,
+/// without `.`/`..`, and without the separators its line protocols use.
+fn valid_repo_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\n')
+        && !path.contains('\0')
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+/// Classify one declared gitlink: `Uninitialized`, or `Exact` with this
+/// checkout's prefixed tracked files. Anything else refuses.
+fn classify_submodule(
+    git: &mut Git,
+    roots: &Roots,
+    path: &str,
+    expected: &str,
+) -> Result<(SubmoduleState, Option<Vec<String>>), String> {
+    let full = roots.top.join(path);
+    let metadata = match fs::symlink_metadata(&full) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((SubmoduleState::Uninitialized, None));
+        }
+        Err(error) => return Err(format!("cannot read {path}: {error}")),
+        Ok(metadata) => metadata,
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{path} is a symlink, not a submodule directory"));
+    }
+    if !metadata.is_dir() {
+        return Err(format!("{path} is not a submodule directory"));
+    }
+    let mut entries =
+        fs::read_dir(&full).map_err(|error| format!("cannot read {path}: {error}"))?;
+    match entries.next() {
+        None => return Ok((SubmoduleState::Uninitialized, None)),
+        Some(Err(error)) => return Err(format!("cannot read {path}: {error}")),
+        Some(Ok(_)) => {}
+    }
+    // A linked worktree of the superproject never owns the module store, so
+    // an initialized child cannot be vouched for there. Positive absence and
+    // an empty directory were handled above without a child Git call.
+    if roots.linked {
+        return Err(format!(
+            "{path} is initialized in a linked worktree, which the gate does not cover"
+        ));
+    }
+    check_child_gitdir(roots, &full, path)?;
+    let head = utf8(git.run(&full, &["rev-parse", "--verify", "HEAD"], None)?)?;
+    let head = head.trim().to_owned();
+    if head != expected {
+        return Err(format!("{path} is at {head}, not the committed {expected}"));
+    }
+    // The child's own worktree root must be this directory: a `.git` pointer
+    // may name any module directory under the repository, so the boundary is
+    // checked rather than inferred.
+    let toplevel = utf8(git.run(
+        &full,
+        &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+        None,
+    )?)?;
+    let toplevel = fs::canonicalize(toplevel.trim())
+        .map_err(|error| format!("cannot resolve {path}'s top level: {error}"))?;
+    let child =
+        fs::canonicalize(&full).map_err(|error| format!("cannot resolve {path}: {error}"))?;
+    if toplevel != child {
+        return Err(format!("{path} is not the root of its own repository"));
+    }
+    let status = git.run(
+        &full,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+        None,
+    )?;
+    if !nul_separated(status)?.is_empty() {
+        return Err(format!("{path} has changes the gate does not cover"));
+    }
+    let entries = parse_index(&nul_separated(git.run(
+        &full,
+        &["ls-files", "-z", "-v", "--stage"],
+        None,
+    )?)?)?;
+    let mut files = Vec::new();
+    for entry in &entries {
+        if entry.flag != 'H' || entry.stage != "0" {
+            return Err(format!(
+                "{path}/{} has index flags the gate does not cover",
+                entry.path
+            ));
+        }
+        if entry.mode == GITLINK_MODE {
+            return Err(format!(
+                "{path}/{} is a nested submodule, which the gate does not cover",
+                entry.path
+            ));
+        }
+        if !is_regular_mode(&entry.mode) {
+            return Err(format!(
+                "{path}/{} has mode {} the gate does not cover",
+                entry.path, entry.mode
+            ));
+        }
+        if !valid_repo_path(&entry.path) {
+            return Err(format!(
+                "{path}/{} is not a plain repository path",
+                entry.path
+            ));
+        }
+        files.push(entry.path.clone());
+    }
+    if files.len() > MAX_LISTED {
+        return Err(format!("{path} tracks more than {MAX_LISTED} files"));
+    }
+    let digests = hash_objects(git, &full, &files)?;
+    let raw = raw_digest(&files, &digests);
+    let prefixed = files.iter().map(|file| format!("{path}/{file}")).collect();
+    Ok((SubmoduleState::Exact { head, raw }, Some(prefixed)))
+}
+
+/// The child's `.git` must point into this repository's module store under
+/// the common Git directory, component-aware, with no symlink indirection.
+fn check_child_gitdir(roots: &Roots, full: &Path, path: &str) -> Result<(), String> {
+    let dot = full.join(".git");
+    let metadata =
+        fs::symlink_metadata(&dot).map_err(|error| format!("cannot read {path}/.git: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{path}/.git is a symlink the gate does not follow"));
+    }
+    let target = if metadata.is_dir() {
+        dot
+    } else if metadata.is_file() {
+        let mut bytes = Vec::new();
+        fs::File::open(&dot)
+            .and_then(|file| file.take(MAX_DOT_GIT_BYTES + 1).read_to_end(&mut bytes))
+            .map_err(|error| format!("cannot read {path}/.git: {error}"))?;
+        if bytes.len() as u64 > MAX_DOT_GIT_BYTES {
+            return Err(format!("{path}/.git is larger than the gate covers"));
+        }
+        let text = String::from_utf8(bytes)
+            .map_err(|_| format!("{path}/.git is not a UTF-8 gitdir pointer"))?;
+        let line = text.trim_end_matches(['\n', '\r']);
+        if line.contains(['\n', '\r']) {
+            return Err(format!("{path}/.git is not a single gitdir pointer"));
+        }
+        let pointer = line
+            .strip_prefix("gitdir: ")
+            .ok_or_else(|| format!("{path}/.git is not a gitdir pointer"))?;
+        let pointer = PathBuf::from(pointer.trim());
+        if pointer.as_os_str().is_empty() {
+            return Err(format!("{path}/.git names no gitdir"));
+        }
+        if pointer.is_absolute() {
+            pointer
+        } else {
+            full.join(pointer)
+        }
+    } else {
+        return Err(format!("{path}/.git is not a file or directory"));
+    };
+    let resolved = fs::canonicalize(&target)
+        .map_err(|error| format!("cannot resolve {path}/.git: {error}"))?;
+    let modules = module_store(&roots.common)?;
+    if !resolved.starts_with(&modules) || resolved == modules {
+        return Err(format!(
+            "{path}/.git resolves outside this repository's module store"
+        ));
+    }
+    Ok(())
+}
+
+/// `<common>/modules` as the trust fence. The common directory is already
+/// canonical; the store itself must be a real directory, never followed
+/// through a symlink, so the fence cannot be redirected outside it.
+fn module_store(common: &Path) -> Result<PathBuf, String> {
+    let modules = common.join("modules");
+    let metadata = fs::symlink_metadata(&modules)
+        .map_err(|error| format!("cannot read {}: {error}", modules.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "{} is not a real directory the gate trusts",
+            modules.display()
+        ));
+    }
+    Ok(modules)
+}
+
+/// Modes a submodule's tracked file may have. A gitlink here is nested.
+fn is_regular_mode(mode: &str) -> bool {
+    matches!(mode, "100644" | "100755" | "120000")
+}
+
+/// A deterministic digest of ordered tracked paths and raw blob ids. Filters
+/// and smudge normalization never enter it.
+fn raw_digest(paths: &[String], digests: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"oxide-submodule-raw-v1\0");
+    for (path, digest) in paths.iter().zip(digests) {
+        hasher.update((path.len() as u64).to_be_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update((digest.len() as u64).to_be_bytes());
+        hasher.update(digest.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Paths from `git status --porcelain=v1 -z --no-renames` entries.
@@ -426,35 +1116,20 @@ fn status_paths(entries: &[String]) -> Result<Vec<String>, String> {
 }
 
 /// Git blob digests of the raw file bytes, in order.
-fn hash_objects(top: &Path, paths: &[String]) -> Result<Vec<String>, String> {
+fn hash_objects(git: &mut Git, dir: &Path, paths: &[String]) -> Result<Vec<String>, String> {
     if paths.is_empty() {
         return Ok(Vec::new());
     }
     if paths.iter().any(|path| path.contains('\n')) {
-        return Err("a changed path contains a newline".to_owned());
+        return Err("a listed path contains a newline".to_owned());
     }
-    let mut child = Command::new("git")
-        .args(["hash-object", "--no-filters", "--stdin-paths"])
-        .current_dir(top)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("could not start git: {error}"))?;
-    let mut input = child.stdin.take().ok_or("git stdin was not captured")?;
     let list = paths.join("\n") + "\n";
-    let writer = std::thread::spawn(move || input.write_all(list.as_bytes()));
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("could not wait for git: {error}"))?;
-    let written = writer.join().map_err(|_| "git input writer panicked")?;
-    if !output.status.success() || written.is_err() {
-        return Err(format!(
-            "git hash-object failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let digests: Vec<String> = utf8(output.stdout)?.lines().map(str::to_owned).collect();
+    let output = git.run(
+        dir,
+        &["hash-object", "--no-filters", "--stdin-paths"],
+        Some(list.as_bytes()),
+    )?;
+    let digests: Vec<String> = utf8(output)?.lines().map(str::to_owned).collect();
     if digests.len() == paths.len() {
         Ok(digests)
     } else {
@@ -463,11 +1138,17 @@ fn hash_objects(top: &Path, paths: &[String]) -> Result<Vec<String>, String> {
 }
 
 /// Every path whose content may differ between two snapshots of the same
-/// repository. Run in the checkout whose object store must hold both trees.
-fn differing(top: &Path, a: &Content, b: &Content) -> Result<BTreeSet<String>, String> {
+/// repository: tree entries, dirty digests and declared submodule states. Run
+/// in the checkout whose object store must hold both trees.
+fn differing(
+    git: &mut Git,
+    top: &Path,
+    a: &Content,
+    b: &Content,
+) -> Result<BTreeSet<String>, String> {
     let mut paths = BTreeSet::new();
     if a.tree != b.tree {
-        let diff = git(
+        let diff = git.run(
             top,
             &[
                 "diff",
@@ -477,10 +1158,12 @@ fn differing(top: &Path, a: &Content, b: &Content) -> Result<BTreeSet<String>, S
                 &a.tree,
                 &b.tree,
             ],
+            None,
         )?;
         paths.extend(nul_separated(diff)?);
     }
     paths.extend(dirty_differences(a, b));
+    paths.extend(submodule_differences(a, b));
     Ok(paths)
 }
 
@@ -494,16 +1177,33 @@ fn dirty_differences(a: &Content, b: &Content) -> BTreeSet<String> {
         .collect()
 }
 
+/// A declared submodule differs unless both sides classify it identically: an
+/// uninitialized and an initialized worktree at the same gitlink still differ.
+fn submodule_differences(a: &Content, b: &Content) -> BTreeSet<String> {
+    a.submodules
+        .keys()
+        .chain(b.submodules.keys())
+        .filter(|path| a.submodules.get(*path) != b.submodules.get(*path))
+        .cloned()
+        .collect()
+}
+
 /// Set mtime to now on each listed checkout file that is not newer than the
 /// anchor. Missing files are skipped: Cargo rebuilds a unit whose input is
-/// gone. A symlink is followed only inside the checkout.
+/// gone. A symlink is followed only inside the checkout. A directory is
+/// skipped only when this snapshot classified it as a declared submodule; any
+/// other directory still refuses, and no gitlink directory is ever touched.
 fn refresh<'a>(
     top: &Path,
     paths: impl IntoIterator<Item = &'a String>,
     anchor_ns: u64,
+    submodules: &BTreeMap<String, SubmoduleState>,
 ) -> Result<usize, String> {
     let mut refreshed = 0;
     for path in paths {
+        if submodules.contains_key(path) {
+            continue;
+        }
         let full = top.join(path);
         let target = match fs::symlink_metadata(&full) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -567,14 +1267,17 @@ fn touch(path: &Path) -> Result<(), String> {
 /// names the packages: local ones have no registry or Git source, workspace
 /// members and in-repo path dependencies alike. Every Git-listed file under
 /// the checkout is refreshed unless its deepest package directory belongs to
-/// a registry or Git package (vendored sources). So a local unit rebuilds
-/// whatever it reads, inside or outside its own directory. A local target or
-/// a followed symlink inside a vendored package is ambiguous and refused.
-/// Returns the local package count and the files.
+/// a registry or Git package (vendored sources), including the tracked files
+/// of an initialized submodule. So a local unit rebuilds whatever it reads,
+/// inside or outside its own directory. A local target or a followed symlink
+/// inside a vendored package is ambiguous and refused. Returns the local
+/// package count and the files.
 fn local_package_files(
-    top: &Path,
+    git: &mut Git,
+    snapshot: &Snapshot,
     metadata: &serde_json::Value,
 ) -> Result<(usize, Vec<String>), String> {
+    let top = &snapshot.top;
     let graph = resolve_graph(metadata)?;
     let canonical = |paths: &[PathBuf]| {
         paths
@@ -591,7 +1294,7 @@ fn local_package_files(
         return Err(format!("two packages claim {dir:?}"));
     }
     let targets = contained(top, &canonical(&graph.targets)?)?;
-    let listed = nul_separated(git(
+    let mut listed = nul_separated(git.run(
         top,
         &[
             "ls-files",
@@ -600,7 +1303,13 @@ fn local_package_files(
             "--others",
             "--exclude-standard",
         ],
+        None,
     )?)?;
+    // An initialized submodule's tracked sources are local inputs too. Its
+    // ignored files stay out, as before.
+    for files in snapshot.children.values() {
+        listed.extend(files.iter().cloned());
+    }
     if listed.len() > MAX_LISTED {
         return Err(format!("more than {MAX_LISTED} repository files"));
     }
@@ -995,6 +1704,18 @@ mod tests {
                 .iter()
                 .map(|(path, digest)| ((*path).to_owned(), (*digest).to_owned()))
                 .collect(),
+            submodules: BTreeMap::new(),
+            has_submodules: true,
+        }
+    }
+
+    fn origin_with(version: u32, content: Content) -> Origin {
+        Origin {
+            checkout: PathBuf::from("/a"),
+            content,
+            content_version: version,
+            anchor_ns: 0,
+            uncertain: BTreeSet::new(),
         }
     }
 
@@ -1379,15 +2100,304 @@ mod tests {
         let origin = Origin {
             checkout: PathBuf::from("/a"),
             content: content("t", &[("x", "1")]),
+            content_version: CONTENT_VERSION,
             anchor_ns: 7,
             uncertain: BTreeSet::from(["x".to_owned()]),
         };
         let bytes = serde_json::to_vec(&origin).expect("serialise");
         let back: Origin = serde_json::from_slice(&bytes).expect("parse");
         assert_eq!(back.content, origin.content);
+        assert_eq!(back.content_version, CONTENT_VERSION);
+        // A legacy record parses with an empty schema and version 0.
+        let legacy: Origin = serde_json::from_str(
+            r#"{"checkout":"/a","content":{"tree":"t","dirty":{}},"anchor_ns":1,"uncertain":[]}"#,
+        )
+        .expect("legacy");
+        assert_eq!(legacy.content_version, 0);
+        assert!(legacy.content.submodules.is_empty());
+        assert!(!legacy.content.has_submodules);
         assert!(serde_json::from_str::<Origin>(
             r#"{"checkout":"/a","content":{"tree":"t","dirty":{}},"anchor_ns":1,"uncertain":[],"extra":1}"#
         )
         .is_err());
+        assert!(serde_json::from_str::<Origin>(
+            r#"{"checkout":"/a","content":{"tree":"t","dirty":{},"extra":1},"anchor_ns":1,"uncertain":[]}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn submodule_states_serialize_both_supported_shapes() {
+        let states = BTreeMap::from([
+            ("absent".to_owned(), SubmoduleState::Uninitialized),
+            (
+                "pinned".to_owned(),
+                SubmoduleState::Exact {
+                    head: "abc".to_owned(),
+                    raw: "def".to_owned(),
+                },
+            ),
+        ]);
+        let json = serde_json::to_value(&states).expect("serialise");
+        assert_eq!(json["absent"], serde_json::json!("uninit"));
+        assert_eq!(
+            json["pinned"],
+            serde_json::json!({"exact": {"head": "abc", "raw": "def"}})
+        );
+        let back: BTreeMap<String, SubmoduleState> = serde_json::from_value(json).expect("parse");
+        assert_eq!(back, states);
+        assert!(serde_json::from_str::<SubmoduleState>(r#"{"exact":{"head":"h"}}"#).is_err());
+        assert!(serde_json::from_str::<SubmoduleState>(r#"{"dirty":true}"#).is_err());
+    }
+
+    #[test]
+    fn a_legacy_record_never_vouches_for_a_checkout_with_gitlinks() {
+        let mut current = content("t", &[]);
+        assert!(compatible(&origin_with(0, current.clone()), &current).is_ok());
+        assert!(compatible(&origin_with(CONTENT_VERSION, current.clone()), &current).is_ok());
+        assert!(compatible(&origin_with(CONTENT_VERSION + 1, current.clone()), &current).is_err());
+        current
+            .submodules
+            .insert("sub".to_owned(), SubmoduleState::Uninitialized);
+        assert!(compatible(&origin_with(0, current.clone()), &current).is_err());
+        assert!(compatible(&origin_with(CONTENT_VERSION, current.clone()), &current).is_ok());
+        assert!(compatible(&origin_with(2, current.clone()), &current).is_err());
+    }
+
+    #[test]
+    fn a_version_one_record_without_submodule_state_refuses_gitlinks() {
+        // The field is absent from this record even though it claims version
+        // 1; it must not be treated as an empty, equivalent state.
+        let legacy: Origin = serde_json::from_str(
+            r#"{"checkout":"/a","content":{"tree":"t","dirty":{}},"content_version":1,"anchor_ns":1,"uncertain":[]}"#,
+        )
+        .expect("parses");
+        assert!(!legacy.content.has_submodules);
+        let mut current = content("t", &[]);
+        assert!(compatible(&legacy, &current).is_ok());
+        current
+            .submodules
+            .insert("sub".to_owned(), SubmoduleState::Uninitialized);
+        assert!(compatible(&legacy, &current).is_err());
+        // A written record always carries the field, even when empty.
+        let written = serde_json::to_value(origin_with(CONTENT_VERSION, content("t", &[])))
+            .expect("serialise");
+        assert!(written["content"].get("submodules").is_some());
+    }
+
+    #[test]
+    fn git_calls_disable_submodule_recursion_and_fsmonitor() {
+        let command = git_command(Path::new("/w"), &["status"]);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "-c",
+                "submodule.recurse=0",
+                "-c",
+                "core.fsmonitor=false",
+                "status"
+            ]
+        );
+        assert_eq!(command.get_current_dir(), Some(Path::new("/w")));
+        let envs: Vec<_> = command.get_envs().collect();
+        for (name, value) in [("GIT_OPTIONAL_LOCKS", "0"), ("GIT_TERMINAL_PROMPT", "0")] {
+            assert!(
+                envs.iter()
+                    .any(|(key, env)| *key == std::ffi::OsStr::new(name)
+                        && *env == Some(std::ffi::OsStr::new(value))),
+                "{name} missing from {envs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_stdout_is_capped_cumulatively() {
+        let mut git = Git::new();
+        assert!(git.charge(MAX_GIT_BYTES / 2).is_ok());
+        assert!(git.charge(MAX_GIT_BYTES / 2).is_ok());
+        assert!(git.charge(1).is_err());
+        let mut exhausted = Git::new();
+        assert!(exhausted.charge(MAX_GIT_BYTES).is_ok());
+        assert!(exhausted.charge(0).is_ok());
+        assert!(exhausted.charge(1).is_err());
+    }
+
+    #[test]
+    fn retained_git_pipe_refuses_within_the_call_deadline() {
+        // An owned helper Git started keeps stdout and stderr open after Git
+        // exits; settlement must stop at the call's deadline, not after it.
+        let mut git = Git::new();
+        git.call_time = Duration::from_millis(500);
+        git.settle_time = Duration::from_secs(5);
+        let started = Instant::now();
+        let result = git.run(
+            Path::new("/"),
+            &["-c", "alias.hold=!sleep 2 &", "hold"],
+            None,
+        );
+        let elapsed = started.elapsed();
+        let error = result.expect_err("a retained pipe must refuse");
+        assert!(error.contains("in time"), "{error}");
+        assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+        assert!(git.waited < Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn submodule_state_changes_differ_without_a_tree_change() {
+        let mut a = content("t", &[("same", "1")]);
+        let mut b = content("t", &[("same", "1")]);
+        assert!(submodule_differences(&a, &b).is_empty());
+        let uninit = SubmoduleState::Uninitialized;
+        let exact = SubmoduleState::Exact {
+            head: "h".to_owned(),
+            raw: "r".to_owned(),
+        };
+        a.submodules.insert("sub".to_owned(), uninit.clone());
+        assert_eq!(
+            submodule_differences(&a, &b)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["sub"]
+        );
+        b.submodules.insert("sub".to_owned(), exact.clone());
+        assert_eq!(
+            submodule_differences(&a, &b)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["sub"]
+        );
+        a.submodules.insert("sub".to_owned(), exact);
+        assert!(submodule_differences(&a, &b).is_empty());
+        let other = SubmoduleState::Exact {
+            head: "h".to_owned(),
+            raw: "other".to_owned(),
+        };
+        b.submodules.insert("sub".to_owned(), other);
+        assert_eq!(
+            submodule_differences(&a, &b)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            ["sub"]
+        );
+    }
+
+    #[test]
+    fn declared_gitlinks_come_from_a_matching_index_and_head() {
+        let oid = "1111111111111111111111111111111111111111";
+        let file = "2222222222222222222222222222222222222222";
+        let index = [
+            format!("H 160000 {oid} 0\tsub"),
+            format!("H 100644 {file} 0\tCargo.toml"),
+        ];
+        let tree = [
+            format!("160000 commit {oid}\tsub"),
+            format!("100644 blob {file}\tCargo.toml"),
+        ];
+        assert_eq!(
+            declared_gitlinks(&index, &tree).expect("declares"),
+            BTreeMap::from([("sub".to_owned(), oid.to_owned())])
+        );
+        // Any disagreement, index flag or stage refuses.
+        let changed = [format!("H 160000 {file} 0\tsub")];
+        assert!(declared_gitlinks(&changed, &tree).is_err());
+        let assume = [format!("h 160000 {oid} 0\tsub")];
+        assert!(declared_gitlinks(&assume, &tree).is_err());
+        let sparse = [format!("S 160000 {oid} 0\tsub")];
+        assert!(declared_gitlinks(&sparse, &tree).is_err());
+        let unmerged = [format!("M 160000 {oid} 1\tsub")];
+        assert!(declared_gitlinks(&unmerged, &tree).is_err());
+        assert!(declared_gitlinks(&[], &tree).is_err());
+        assert!(declared_gitlinks(&index, &tree[1..]).is_err());
+        let escaped = [format!("H 160000 {oid} 0\t../sub")];
+        let escaped_tree = [format!("160000 commit {oid}\t../sub")];
+        assert!(declared_gitlinks(&escaped, &escaped_tree).is_err());
+        let many: Vec<String> = (0..=MAX_SUBMODULES)
+            .map(|index| format!("H 160000 {oid} 0\tsub{index}"))
+            .collect();
+        let many_tree: Vec<String> = (0..=MAX_SUBMODULES)
+            .map(|index| format!("160000 commit {oid}\tsub{index}"))
+            .collect();
+        assert!(declared_gitlinks(&many, &many_tree).is_err());
+    }
+
+    #[test]
+    fn only_plain_repository_paths_are_covered() {
+        for path in ["sub", "a/b", "a b", "ü"] {
+            assert!(valid_repo_path(path), "{path}");
+        }
+        for path in ["", "/abs", "../x", "a/../b", "a/./b", "a\nb", "."] {
+            assert!(!valid_repo_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn raw_digest_is_ordered_and_deterministic() {
+        let paths = ["a".to_owned(), "b".to_owned()];
+        let digests = ["1".to_owned(), "2".to_owned()];
+        assert_eq!(raw_digest(&paths, &digests), raw_digest(&paths, &digests));
+        assert_ne!(
+            raw_digest(&paths, &digests),
+            raw_digest(
+                &["b".to_owned(), "a".to_owned()],
+                &["2".to_owned(), "1".to_owned()]
+            )
+        );
+        assert_eq!(raw_digest(&[], &[]).len(), 64);
+    }
+
+    #[test]
+    fn module_store_refuses_a_redirected_modules_root() {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("modules-{:x}", std::process::id()));
+        let real = dir.join("real");
+        let redirected = dir.join("redirected");
+        let outside = dir.join("outside");
+        for common in [&real, &redirected, &outside] {
+            fs::create_dir_all(common).expect("scratch dir");
+        }
+        fs::create_dir(real.join("modules")).expect("modules dir");
+        std::os::unix::fs::symlink(&outside, redirected.join("modules")).expect("modules link");
+        assert_eq!(module_store(&real), Ok(real.join("modules")));
+        let error = module_store(&redirected).expect_err("a symlinked store must refuse");
+        assert!(error.contains("not a real directory"), "{error}");
+        assert!(module_store(&outside).is_err());
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn refresh_skips_only_declared_gitlink_directories() {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("refresh-{:x}", std::process::id()));
+        fs::create_dir(&dir).expect("scratch dir");
+        let declared = dir.join("sub");
+        let plain = dir.join("plain");
+        fs::create_dir(&declared).expect("declared dir");
+        fs::create_dir(&plain).expect("plain dir");
+        fs::write(declared.join("inner.rs"), b"fn main() {}").expect("inner file");
+        let anchor = now_ns();
+        let mut states = BTreeMap::new();
+        states.insert("sub".to_owned(), SubmoduleState::Uninitialized);
+        let before = mtime_ns(&fs::symlink_metadata(&declared).expect("stat"));
+        assert_eq!(
+            refresh(&dir, &["sub".to_owned()], anchor, &states).expect("skips"),
+            0
+        );
+        assert_eq!(
+            mtime_ns(&fs::symlink_metadata(&declared).expect("stat")),
+            before
+        );
+        // A declared child's own tracked file is an ordinary file input.
+        assert_eq!(
+            refresh(&dir, &["sub/inner.rs".to_owned()], anchor, &states).expect("touches"),
+            1
+        );
+        // Any other directory keeps the old refusal.
+        assert!(refresh(&dir, &["plain".to_owned()], anchor, &states).is_err());
+        fs::remove_dir_all(&dir).expect("cleanup");
     }
 }

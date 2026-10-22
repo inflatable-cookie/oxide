@@ -318,6 +318,23 @@ run = "python3 scripts/test-oxide-wrapper-bypass.py"
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-pool-describe.py"
 
+# Declared-submodule freshness (oxide#119), under the qualified shared proof
+# supervisor (bounded-test.py SHA-256
+# d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e): 300 s
+# absolute, 512 MiB monitored scratch, closure and cleanup. Stages this clean
+# HEAD's `oxide` offline with 1.97.1 and, only with owned local Git
+# repositories and submodule layouts, proves the narrow two-state contract:
+# initialized-clean at the declared gitlink versus positively absent or empty
+# uninitialized, both directions rebuilding the executed marker without a
+# stale binary, a different gitlink invalidating old innermost files,
+# stale-mtime/local-package/limit-note regressions, and dirty, untracked,
+# different-HEAD, unmerged, unreadable and nested submodules refusing the
+# slot with source bytes and mtimes untouched. No live Effigy checkout, no
+# network or removable volume. Not a benchmark and not full QA.
+[tasks."rust:freshness-submodules"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-freshness-submodules.py"
+
 # Slot headroom (oxide#118): under the qualified shared proof supervisor
 # (oxide#109/#114, bounded-test.py SHA-256
 # d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e), stages
