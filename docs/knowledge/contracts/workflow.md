@@ -2383,6 +2383,13 @@ migration and consumer adoption remain separate gates.
   it: the check runs before ownership is established, including inside a
   `.oxide-outputs` directory that already exists and for an already-present
   empty `.oxide-outputs/local`, which is then left unchanged.
+- **Keyed state and the binding mutex.** A command keys its slot with or
+  without an owned destination when it starts. If the checkout was converted
+  or detached while it waited for admission, binding refuses before Cargo
+  and the command is run again. Every command in a converted checkout, in
+  either drive mode, holds the checkout's binding mutex from its receipt and
+  root checks until it is recorded as running, so a permanent-mode relink
+  never repoints the link during another command's startup.
 - **Unconverted links.** In permanent mode a checkout with no committed
   receipt (never converted, or detached) keeps a real `target`. A link there
   (a foreign link, or a marked root linked without its receipt) is never

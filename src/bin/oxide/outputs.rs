@@ -1053,11 +1053,22 @@ pub fn bind_for_command(
     .with_pool_fallback(pool_fallback);
     let mode = context.mode()?;
     if mode != Some(DriveMode::Permanent) {
-        return Ok(OutputBinding::unchecked(bind_ephemeral(
-            &context, expected,
-        )?));
+        if context.receipt()?.is_none() {
+            keyed_state_matches(None, expected)?;
+            return Ok(OutputBinding::unchecked(Outcome::default()));
+        }
+        // A converted checkout's command holds the binding mutex until it is
+        // recorded as running, in either mode, so a permanent-mode relink
+        // never repoints the link between this check and Cargo's start.
+        let lock = store.lock_binding(checkout)?;
+        let outcome = bind_ephemeral(&context, expected)?;
+        return Ok(OutputBinding {
+            outcome,
+            _lock: Some(lock),
+        });
     }
     if context.receipt()?.is_none() {
+        keyed_state_matches(None, expected)?;
         refuse_unowned_link(&context, "outputs")?;
         return Ok(OutputBinding::unchecked(unconverted_outcome()));
     }
@@ -1070,12 +1081,14 @@ pub fn bind_for_command(
         }
         let lock = store.lock_binding(checkout)?;
         let Some(receipt) = context.receipt()? else {
+            keyed_state_matches(None, expected)?;
             refuse_unowned_link(&context, "outputs")?;
             return Ok(OutputBinding {
                 outcome: unconverted_outcome(),
                 _lock: Some(lock),
             });
         };
+        keyed_state_matches(Some(&receipt), expected)?;
         let receipt = match gated_replay(&context, store, own_record, receipt)? {
             Some(receipt) => receipt,
             None => {
@@ -1136,6 +1149,25 @@ fn gated_replay(
     }
 }
 
+/// A slot is keyed with or without an owned destination when its command
+/// starts. If the checkout was converted (or detached) while the command
+/// waited for admission, the slot's key no longer describes where Cargo
+/// would write: refuse before Cargo so the next attempt keys afresh.
+fn keyed_state_matches(
+    receipt: Option<&Receipt>,
+    expected: Option<&Selected>,
+) -> Result<(), String> {
+    let converted = receipt.is_some_and(|receipt| receipt.state != ReceiptState::Detached);
+    if converted == expected.is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "outputs: this checkout was {} while this command waited, so its slot was keyed for {}; nothing was built. Run the command again",
+        if converted { "converted to owned outputs" } else { "detached from owned outputs" },
+        if converted { "an unconverted target" } else { "an owned root" }
+    ))
+}
+
 /// In permanent mode a checkout without a committed owned link keeps a real
 /// `target`: a link there was never established as owned (a foreign link, or
 /// a marked link whose receipt is missing), so Cargo is never handed it and
@@ -1169,7 +1201,14 @@ fn unconverted_outcome() -> Outcome {
 /// refuses when the link no longer matches the receipt or the root's full
 /// identity.
 fn bind_ephemeral(context: &Context, expected: Option<&Selected>) -> Result<Outcome, String> {
-    let Some(receipt) = context.receipt()? else {
+    let receipt = context.receipt()?;
+    if receipt
+        .as_ref()
+        .is_none_or(|receipt| receipt.state != ReceiptState::Prepared)
+    {
+        keyed_state_matches(receipt.as_ref(), expected)?;
+    }
+    let Some(receipt) = receipt else {
         return Ok(Outcome::default());
     };
     match receipt.state {
@@ -3693,6 +3732,84 @@ mod tests {
         let refused = bind("marked").unwrap_err();
         assert!(refused.contains("never follows"), "{refused}");
         assert!(context.receipt().unwrap().is_none());
+    }
+
+    /// A command keyed while its checkout was unconverted (no destination)
+    /// refuses if the checkout was converted while it waited, in either
+    /// mode; keyed for the owned root it binds normally.
+    #[test]
+    fn a_conversion_while_a_command_waits_refuses_its_unconverted_key() {
+        for mode in [DriveMode::Permanent, DriveMode::Ephemeral] {
+            let fixture = Fixture::new();
+            let store = Store::for_tests(&fixture.root.join("pool"));
+            register_at(&fixture, store.owner_control(), mode);
+            let context = Context::new(
+                Some(store.owner_control().to_path_buf()),
+                fixture.checkout.clone(),
+            );
+            // Keyed before conversion: no destination.
+            let keyed =
+                planned_destination(Some(store.owner_control()), &fixture.checkout, None).unwrap();
+            assert!(keyed.is_none());
+            // Adoption completes while the command waits.
+            transition(&context, &fixture.receipt(), &fixture.local()).unwrap();
+            match bind_for_command(&store, &fixture.checkout, 0, keyed.as_ref(), None) {
+                Ok(_) => panic!("{mode:?}: bound an owned root with an unconverted slot key"),
+                Err(reason) => assert!(reason.contains("converted to owned outputs"), "{reason}"),
+            }
+            // Control: a command keyed after conversion binds that root.
+            let rekeyed =
+                planned_destination(Some(store.owner_control()), &fixture.checkout, None).unwrap();
+            assert!(rekeyed.is_some());
+            match bind_for_command(&store, &fixture.checkout, 0, rekeyed.as_ref(), None) {
+                Ok(binding) => assert_eq!(
+                    binding.outcome.root.as_deref(),
+                    Some(fixture.local().root())
+                ),
+                Err(reason) => panic!("{mode:?}: {reason}"),
+            }
+        }
+    }
+
+    /// A converted command in ephemeral mode holds the binding mutex until
+    /// it drops its binding (after it is recorded running), so a relinker
+    /// started by a switch to permanent mode waits for it.
+    #[test]
+    fn a_converted_ephemeral_command_holds_the_binding_mutex() {
+        let fixture = Fixture::new();
+        let store = Store::for_tests(&fixture.root.join("pool"));
+        register_at(&fixture, store.owner_control(), DriveMode::Ephemeral);
+        let context = Context::new(
+            Some(store.owner_control().to_path_buf()),
+            fixture.checkout.clone(),
+        );
+        transition(&context, &fixture.receipt(), &fixture.local()).unwrap();
+        let keyed =
+            planned_destination(Some(store.owner_control()), &fixture.checkout, None).unwrap();
+        let binding = bind_for_command(&store, &fixture.checkout, 0, keyed.as_ref(), None)
+            .unwrap_or_else(|reason| panic!("{reason}"));
+        // The mode switches to permanent and a relinker starts.
+        register_at(&fixture, store.owner_control(), DriveMode::Permanent);
+        let acquired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let relinker = {
+            let acquired = acquired.clone();
+            let root = fixture.root.join("pool");
+            let checkout = fixture.checkout.clone();
+            std::thread::spawn(move || {
+                let store = Store::for_tests(&root);
+                let _lock = store.lock_binding(&checkout).unwrap();
+                acquired.store(true, Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "a relinker took the binding mutex while the converted command was starting"
+        );
+        // Control: once the command's binding is dropped, the relinker runs.
+        drop(binding);
+        relinker.join().unwrap();
+        assert!(acquired.load(Ordering::SeqCst));
     }
 
     #[test]
