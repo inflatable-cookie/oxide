@@ -1074,10 +1074,19 @@ pub fn bind_for_command(
                 _lock: Some(lock),
             });
         };
-        let receipt = if receipt.state == ReceiptState::Prepared {
-            replay(&context, receipt)?
-        } else {
-            receipt
+        let receipt = match gated_replay(&context, store, own_record, receipt)? {
+            Some(receipt) => receipt,
+            None => {
+                drop(lock);
+                if !announced {
+                    eprintln!(
+                        "oxide: waiting for another oxide command in this checkout (a build, an exec tool or a program `oxide run` started) to finish before relinking outputs"
+                    );
+                    announced = true;
+                }
+                std::thread::sleep(BINDING_POLL);
+                continue;
+            }
         };
         match bind_under_binding(&context, store, own_record, &receipt, expected) {
             Bind::Bound(outcome) => {
@@ -1098,6 +1107,30 @@ pub fn bind_for_command(
                 std::thread::sleep(BINDING_POLL);
             }
         }
+    }
+}
+
+/// Replay a prepared receipt under the binding mutex only after the same
+/// cross-pool custody rule as a fresh transition: unknown writer custody
+/// refuses with the link, sibling, receipt and roots unchanged, and a
+/// command that may be writing must close first (`None`: wait). A committed
+/// or detached receipt passes through untouched.
+fn gated_replay(
+    context: &Context,
+    store: &Store,
+    own_record: u64,
+    receipt: Receipt,
+) -> Result<Option<Receipt>, String> {
+    if receipt.state != ReceiptState::Prepared {
+        return Ok(Some(receipt));
+    }
+    match store.checkout_custody(&context.workspace, own_record)? {
+        CheckoutCustody::Unknown(reason) => Err(format!(
+            "outputs: refusing to replay the interrupted transition for {}: {reason}. The link, the prepared receipt and both roots are kept until that custody is resolved",
+            context.link().display()
+        )),
+        CheckoutCustody::Writers => Ok(None),
+        CheckoutCustody::Clear => replay(context, receipt).map(Some),
     }
 }
 
@@ -3375,6 +3408,44 @@ mod tests {
             fs::read_link(context.link()).unwrap(),
             committed.selected().unwrap().root
         );
+    }
+
+    /// Automatic replay is gated on cross-pool custody: with a quarantined
+    /// writer in the other pool it refuses before committing (or renaming),
+    /// and the link, prepared receipt and root stay unchanged. Without the
+    /// gate this prepared state commits at once.
+    #[test]
+    fn automatic_replay_refuses_unknown_custody_in_the_other_pool() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let committed = transition(&context, &fixture.receipt(), &fixture.local()).unwrap();
+        let root = committed.selected().unwrap().root.clone();
+        let mut receipt = committed.clone();
+        receipt.state = ReceiptState::Prepared;
+        receipt.prepared = Some(Prepared {
+            generation: committed.generation + 1,
+            to: committed.selected().unwrap().clone(),
+            link: context.link(),
+        });
+        write_receipt(&fixture.control, &receipt).unwrap();
+        let path = receipt_path(&fixture.control, &context.checkout_id);
+        let receipt_bytes = fs::read(&path).unwrap();
+
+        let managed = oxide_storage::lease::MANAGED_NAME;
+        let removable = Store::for_tests(&fixture.root.join("removable"));
+        removable.quarantine_for_tests(&fixture.checkout);
+        let internal = Store::for_tests(&fixture.root.join("internal"))
+            .with_sibling(&fixture.root.join("removable").join(managed), false);
+        let refused = gated_replay(&context, &internal, 0, receipt.clone()).unwrap_err();
+        assert!(refused.contains("never confirmed closed"), "{refused}");
+        assert_eq!(fs::read_link(context.link()).unwrap(), root);
+        assert_eq!(fs::read(&path).unwrap(), receipt_bytes);
+        assert!(root.join(MARKER).is_file());
+
+        // The control: with clear custody the same state commits.
+        let clear = Store::for_tests(&fixture.root.join("clear"));
+        let replayed = gated_replay(&context, &clear, 0, receipt).unwrap().unwrap();
+        assert_eq!(replayed.state, ReceiptState::Committed);
     }
 
     #[test]

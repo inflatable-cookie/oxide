@@ -2423,7 +2423,11 @@ migration and consumer adoption remain separate gates.
   checkout until it is resolved. Record IDs are per pool, so a command is
   exempt only from its own record in its own pool; an equal ID in the other
   pool is another command.
-- **Crash replay.** Only the exact prepared/old generations replay. A live
+- **Crash replay.** Only the exact prepared/old generations replay, and a
+  building command replays only under the same cross-pool custody rule as a
+  fresh transition: unknown writer custody refuses with the link, sibling,
+  prepared receipt and roots unchanged, and a command that may be writing
+  must close first. A live
   prepared sibling is renamed and committed; an already-published prepared
   link is committed — in both cases only after the prepared root passes the
   full check (marker kind, volume UUID, generation, live registered device,

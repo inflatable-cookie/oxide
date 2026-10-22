@@ -1513,7 +1513,8 @@ impl Store {
     /// A store over `root` for other modules' unit tests.
     #[cfg(test)]
     pub fn for_tests(root: &Path) -> Store {
-        Store {
+        fs::create_dir_all(root).unwrap();
+        let store = Store {
             pool: root.to_path_buf(),
             backend: Backend::DirectoryBudget,
             payload: root.join("payload"),
@@ -1522,7 +1523,39 @@ impl Store {
             recorded_budget: 1,
             max_active: 2,
             sibling: None,
-        }
+        };
+        store.ensure_control().unwrap();
+        store
+    }
+
+    /// Record a lost slot whose writers were never confirmed closed, for
+    /// other modules' unit tests of unknown custody.
+    #[cfg(test)]
+    pub fn quarantine_for_tests(&self, checkout: &Path) {
+        let mut state = self.load().unwrap();
+        let id = state.take_id().unwrap();
+        let lost = Lost {
+            slot_id: "1".to_owned(),
+            at_ms: 1,
+            unclosed: Some("a test writer was never confirmed closed".to_owned()),
+        };
+        state.records.push(Record {
+            id,
+            identity: "identity".to_owned(),
+            compatibility: "compatibility".to_owned(),
+            profile: "quick".to_owned(),
+            checkout: Some(checkout.to_path_buf()),
+            phase: Phase::Retired,
+            process_group: None,
+            last_used: 1,
+            holder: None,
+            lease_id: None,
+            pending_recovery: None,
+            retired: Some(lost.describe()),
+            lost: Some(lost),
+            last_used_ms: Some(1),
+        });
+        self.save(&state).unwrap();
     }
 
     pub fn with_sibling(mut self, control: &Path, barrier: bool) -> Self {
