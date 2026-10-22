@@ -902,6 +902,12 @@ def run(proof: Proof, repo: str) -> None:
     try:
         time.sleep(1.0)
         expect(holder.poll() is None, "the clean-wait holder exited early")
+        code, status_out, status_err = proof.oxide(["status"], "status during the clean holder", app)
+        expect(code == 0, status_err)
+        expect(
+            any("held by exec /bin/sh" in line for line in status_out.splitlines()),
+            f"the exec holder is not recorded as active: {status_out}",
+        )
         waiting = start_child(proof, [proof.binary, "clean", "-p", "poutputs"], app, env)
         time.sleep(1.5)
         if waiting.poll() is not None:
