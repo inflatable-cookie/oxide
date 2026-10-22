@@ -1070,6 +1070,16 @@ impl Store {
         &self.control
     }
 
+    /// The internal pool's control directory. Owned-output receipts live
+    /// there for every checkout, including a command whose slots come from
+    /// the removable pool, so one checkout never has two receipts.
+    pub fn owner_control(&self) -> &Path {
+        match &self.sibling {
+            Some(sibling) if sibling.barrier => &sibling.control,
+            _ => &self.control,
+        }
+    }
+
     /// Open an existing pool. Never creates one; a retired image pool
     /// refuses without being touched.
     pub fn open_existing() -> Result<Option<Self>, String> {
@@ -2963,6 +2973,16 @@ mod tests {
             internal.with_sibling(&removable_control, false),
             removable.with_sibling(&internal_control, true),
         )
+    }
+
+    /// Output receipts are keyed in the internal pool's control directory,
+    /// whichever pool a command's slots come from.
+    #[test]
+    fn owned_output_receipts_live_in_the_internal_control_directory() {
+        let (root, internal, removable) = paired_controls("owner-control");
+        assert_eq!(internal.owner_control(), internal.control());
+        assert_eq!(removable.owner_control(), internal.control());
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// The checkout clean barrier spans both pools: an internal clean waits

@@ -988,7 +988,10 @@ pub fn bind_for_command(
     own_record: u64,
     expected: Option<&Selected>,
 ) -> Result<Outcome, String> {
-    let context = Context::new(Some(store.control().to_path_buf()), checkout.to_path_buf());
+    let context = Context::new(
+        Some(store.owner_control().to_path_buf()),
+        checkout.to_path_buf(),
+    );
     let mode = context.mode()?;
     if mode != Some(DriveMode::Permanent) {
         return bind_ephemeral(&context, expected);
@@ -1003,7 +1006,9 @@ pub fn bind_for_command(
         }
     };
     let outcome = (|| {
-        let _admission = store::lock_admission(store.control())?;
+        // The receipt lives in the internal control directory; the barrier
+        // above already released the lock it took to publish its mark.
+        let _admission = store::lock_admission(store.owner_control())?;
         let Some(receipt) = context.receipt()? else {
             return Ok(Outcome {
                 warnings: vec![
