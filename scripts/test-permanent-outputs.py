@@ -197,6 +197,12 @@ def finish_child(proof: Proof, child: subprocess.Popen, label: str) -> tuple[int
     return child.returncode, stdout, stderr
 
 
+def reset_gate(gate: str) -> None:
+    """Start each gated build from a clean gate, so a previous case's
+    `started`/`release` file cannot make the next one run ungated."""
+    shutil.rmtree(gate, ignore_errors=True)
+
+
 def wait_for(path: str, label: str) -> None:
     deadline = time.monotonic() + min(60, work_left())
     while not os.path.exists(path):
@@ -558,6 +564,7 @@ def run(proof: Proof, repo: str) -> None:
     gate_env = dict(env)
     gate_env["OXIDE_OUTPUT_GATE"] = gate
     expect(link_target(link) == local_root, f"the pre-writer link is {os.readlink(link)}")
+    reset_gate(gate)
     first = start_child(proof, [proof.binary, "check"], app, gate_env)
     try:
         wait_for(os.path.join(gate, "started"), "first gated build script")
@@ -607,6 +614,7 @@ def run(proof: Proof, repo: str) -> None:
     expect(code == 0 and link_target(link) == external_root, f"pre-adopt relink failed: {stderr}")
     gate_env = dict(env)
     gate_env["OXIDE_OUTPUT_GATE"] = gate
+    reset_gate(gate)
     writer = start_child(proof, [proof.binary, "check"], app, gate_env)
     try:
         wait_for(os.path.join(gate, "started"), "gated build script")
