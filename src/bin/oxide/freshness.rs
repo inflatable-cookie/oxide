@@ -454,19 +454,34 @@ fn now_ns() -> u64 {
 
 /// Bounded access to the `git` binary for one snapshot or prepare.
 ///
-/// Every call carries `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0` and
-/// `-c submodule.recurse=0`: reading the index never rewrites it, no
-/// credential prompt can block, and no Git command descends into a
-/// submodule. Each call is bound in lifetime; the whole context is bound in
-/// wall wait, total stdout and invocation count. Output readers are attached
-/// to channels and only waited for within that budget, so a pipe held by a
-/// process Git started can never hold the gate past its clock. Exhaustion is a
-/// refusal, never a partial fingerprint. There is no `submodule` subcommand,
-/// network or config write.
+/// Every call carries `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`,
+/// `-c submodule.recurse=0` and `-c core.fsmonitor=false`: reading the index
+/// never rewrites it, no credential prompt can block, no Git command descends
+/// into a submodule, and no configured fsmonitor hook or daemon runs (and so
+/// none can inherit the pipes or extend the call). Each call is bound in
+/// lifetime; the whole context is bound in wall wait, total stdout and
+/// invocation count. Output readers are attached to channels and share one
+/// settle window drawn from that budget, so a pipe held by a process Git
+/// started can never hold the gate past its clock. Exhaustion is a refusal,
+/// never a partial fingerprint. There is no `submodule` subcommand, network or
+/// config write.
 struct Git {
     calls: usize,
     waited: Duration,
     bytes: u64,
+}
+
+/// One `git` invocation: no index write, no prompt, no submodule recursion and
+/// no configured fsmonitor hook or daemon.
+fn git_command(dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command
+        .args(["-c", "submodule.recurse=0", "-c", "core.fsmonitor=false"])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command
 }
 
 impl Git {
@@ -503,12 +518,7 @@ impl Git {
         }
         self.calls += 1;
         let limit = GIT_CALL_TIME.min(remaining);
-        let mut child = Command::new("git")
-            .args(["-c", "submodule.recurse=0"])
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .env("GIT_TERMINAL_PROMPT", "0")
+        let mut child = git_command(dir, args)
             .stdin(if input.is_some() {
                 Stdio::piped()
             } else {
@@ -559,13 +569,17 @@ impl Git {
         };
         self.waited = self.waited.saturating_add(started.elapsed());
         let status = status?;
-        let settle = GIT_SETTLE_TIME.min(GIT_TOTAL_TIME.saturating_sub(self.waited));
+        // One settle window for all three readers: each wait takes only what
+        // remains of the same window, so sequential waits cannot overrun it.
+        let settle_deadline =
+            Instant::now() + GIT_SETTLE_TIME.min(GIT_TOTAL_TIME.saturating_sub(self.waited));
+        let left = || settle_deadline.saturating_duration_since(Instant::now());
         let settling = Instant::now();
-        let out = out_receiver.recv_timeout(settle);
-        let err = err_receiver.recv_timeout(settle);
+        let out = out_receiver.recv_timeout(left());
+        let err = err_receiver.recv_timeout(left());
         let written = writer
             .as_ref()
-            .map(|receiver| receiver.recv_timeout(settle));
+            .map(|receiver| receiver.recv_timeout(left()));
         self.waited = self.waited.saturating_add(settling.elapsed());
         let (stdout, overflow) = out
             .map_err(|_| format!("git {name} did not close its output in time"))?
@@ -2144,6 +2158,31 @@ mod tests {
         let written = serde_json::to_value(origin_with(CONTENT_VERSION, content("t", &[])))
             .expect("serialise");
         assert!(written["content"].get("submodules").is_some());
+    }
+
+    #[test]
+    fn git_calls_disable_submodule_recursion_and_fsmonitor() {
+        let command = git_command(Path::new("/w"), &["status"]);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "-c",
+                "submodule.recurse=0",
+                "-c",
+                "core.fsmonitor=false",
+                "status"
+            ]
+        );
+        assert_eq!(command.get_current_dir(), Some(Path::new("/w")));
+        let envs: Vec<_> = command.get_envs().collect();
+        for (name, value) in [("GIT_OPTIONAL_LOCKS", "0"), ("GIT_TERMINAL_PROMPT", "0")] {
+            assert!(
+                envs.iter()
+                    .any(|(key, env)| *key == std::ffi::OsStr::new(name)
+                        && *env == Some(std::ffi::OsStr::new(value))),
+                "{name} missing from {envs:?}"
+            );
+        }
     }
 
     #[test]
