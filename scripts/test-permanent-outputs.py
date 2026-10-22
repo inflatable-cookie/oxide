@@ -801,7 +801,9 @@ def run(proof: Proof, repo: str) -> None:
     code, _, stderr = proof.oxide(["build", "--bin", "poutputs"], "replaced ancestor refuses", app)
     expect(code != 0, "a replaced output ancestor was written through")
     expect(
-        "not on the registered volume" in stderr or "does not resolve to itself" in stderr,
+        "not on the registered volume" in stderr
+        or "does not resolve to itself" in stderr
+        or "is a mount point" in stderr,
         stderr,
     )
     expect(
