@@ -5,10 +5,20 @@
 //! then built-in defaults.
 //! The file sits at the platform-native location: on macOS
 //! `~/Library/Application Support/oxide/config/config.toml`, elsewhere
-//! `$XDG_CONFIG_HOME/oxide/config.toml` (XDG's `~/.config` when unset).
-//! `OXIDE_CONFIG` selects another file. On macOS `~/.config/oxide/config.toml`
-//! is never read; `status` says it is ignored.
+//! `$XDG_CONFIG_HOME/oxide/config.toml` (XDG's `~/.config` when unset or
+//! relative). `OXIDE_CONFIG` selects another file. On macOS
+//! `~/.config/oxide/config.toml` is never read; `status` says it is ignored.
+//!
+//! Config, cache and state roots come from `longhorn-storage-layout`
+//! (`platform-native-v1`, leaf `oxide`), one root at a time when it is
+//! needed, so an explicit `OXIDE_CONFIG` or `OXIDE_POOL` reads no platform
+//! directory variable.
 
+use longhorn_storage_layout::{
+    native_platform_directory_fact, native_platform_directory_fact_from, resolve_storage_root,
+    PlatformDirectoryFact, PlatformEnvironment, RootKind, StorageIdentity, StorageLayoutError,
+    StorageLayoutRequest, TargetPlatform,
+};
 use serde::Deserialize;
 use std::ffi::OsString;
 use std::fs;
@@ -35,15 +45,31 @@ const MAX_KNOWN_POOLS_BYTES: u64 = 64 * 1024;
 #[derive(Clone, Debug, Default)]
 pub struct Facts {
     pub macos: bool,
+    /// For `~` in config paths and the ignored macOS legacy config.
     pub home: Option<OsString>,
+    pub directories: Directories,
     pub oxide_config: Option<OsString>,
-    pub xdg_config_home: Option<OsString>,
-    pub xdg_cache_home: Option<OsString>,
-    pub xdg_state_home: Option<OsString>,
     pub oxide_pool: Option<OsString>,
     pub oxide_pool_cap: Option<OsString>,
     pub oxide_max_active: Option<OsString>,
     pub physical_cores: PhysicalCoreCount,
+}
+
+/// Where platform directory facts come from.
+#[derive(Clone, Debug)]
+pub enum Directories {
+    /// Longhorn reads only the variables of the one fact a root needs, when
+    /// that root is resolved.
+    Process,
+    /// An injected snapshot for tests; the platform follows `Facts::macos`.
+    Injected(PlatformEnvironment),
+}
+
+impl Default for Directories {
+    /// Nothing ambient: an empty snapshot reports every fact missing.
+    fn default() -> Self {
+        Self::Injected(PlatformEnvironment::default())
+    }
 }
 
 /// The physical-core fact used by the automatic active-build default.
@@ -83,10 +109,8 @@ impl Facts {
         Self {
             macos: cfg!(target_os = "macos"),
             home: var("HOME"),
+            directories: Directories::Process,
             oxide_config: var("OXIDE_CONFIG"),
-            xdg_config_home: var("XDG_CONFIG_HOME"),
-            xdg_cache_home: var("XDG_CACHE_HOME"),
-            xdg_state_home: var("XDG_STATE_HOME"),
             oxide_pool: var("OXIDE_POOL"),
             oxide_pool_cap: std::env::var_os("OXIDE_POOL_CAP"),
             oxide_max_active: std::env::var_os("OXIDE_MAX_ACTIVE"),
@@ -107,38 +131,51 @@ impl Facts {
         }
     }
 
-    /// An XDG base directory: the variable when set (it must be absolute),
-    /// else XDG's documented default under HOME.
-    fn xdg(&self, value: Option<&OsString>, name: &str, default: &str) -> Result<PathBuf, String> {
-        match value {
-            Some(value) if Path::new(value).is_absolute() => Ok(PathBuf::from(value)),
-            Some(_) => Err(format!("{name} must be an absolute path")),
-            None => Ok(self.home()?.join(default)),
+    /// One platform-native root under the `oxide` leaf. Only this root's
+    /// platform fact is read; Oxide's file names stay beneath it.
+    fn storage_root(&self, kind: RootKind) -> Result<PathBuf, String> {
+        let fact = match kind {
+            RootKind::Config => PlatformDirectoryFact::Config,
+            RootKind::Cache => PlatformDirectoryFact::Cache,
+            RootKind::State => PlatformDirectoryFact::State,
+            _ => return Err(format!("{kind:?} is not an Oxide storage root")),
+        };
+        let facts = match &self.directories {
+            // Longhorn also has a Windows policy; Oxide keeps to the two
+            // platforms it resolved before.
+            Directories::Process if !cfg!(any(target_os = "macos", target_os = "linux")) => {
+                return Err("no Oxide storage-root policy for this platform".to_owned());
+            }
+            Directories::Process => {
+                native_platform_directory_fact(fact).map_err(|error| error.to_string())?
+            }
+            Directories::Injected(environment) => {
+                let platform = if self.macos {
+                    TargetPlatform::MacOs
+                } else {
+                    TargetPlatform::Linux
+                };
+                native_platform_directory_fact_from(platform, fact, environment)
+            }
+        };
+        let identity = StorageIdentity::new("oxide").map_err(|error| error.to_string())?;
+        match resolve_storage_root(&StorageLayoutRequest::new(identity, facts), kind) {
+            Ok(Some(root)) => Ok(root.path().to_path_buf()),
+            Ok(None) => Err(format!("no {kind:?} root resolved")),
+            Err(StorageLayoutError::MissingPlatformFact { .. }) => Err(
+                "HOME is unset or not an absolute path; set OXIDE_CONFIG and OXIDE_POOL explicitly"
+                    .to_owned(),
+            ),
+            Err(error) => Err(error.to_string()),
         }
     }
 
     fn cache_dir(&self) -> Result<PathBuf, String> {
-        if self.macos {
-            Ok(self.home()?.join("Library/Caches/oxide"))
-        } else {
-            Ok(self
-                .xdg(self.xdg_cache_home.as_ref(), "XDG_CACHE_HOME", ".cache")?
-                .join("oxide"))
-        }
+        self.storage_root(RootKind::Cache)
     }
 
     fn state_dir(&self) -> Result<PathBuf, String> {
-        if self.macos {
-            Ok(self.home()?.join("Library/Application Support/oxide/state"))
-        } else {
-            Ok(self
-                .xdg(
-                    self.xdg_state_home.as_ref(),
-                    "XDG_STATE_HOME",
-                    ".local/state",
-                )?
-                .join("oxide"))
-        }
+        self.storage_root(RootKind::State)
     }
 }
 
@@ -212,16 +249,8 @@ pub fn config_file(facts: &Facts) -> Result<ConfigFile, String> {
             }
             (path, true)
         }
-        None if facts.macos => (
-            facts
-                .home()?
-                .join("Library/Application Support/oxide/config/config.toml"),
-            false,
-        ),
         None => (
-            facts
-                .xdg(facts.xdg_config_home.as_ref(), "XDG_CONFIG_HOME", ".config")?
-                .join("oxide/config.toml"),
+            facts.storage_root(RootKind::Config)?.join("config.toml"),
             false,
         ),
     };
@@ -805,12 +834,30 @@ mod tests {
     use super::*;
 
     fn facts(macos: bool) -> Facts {
+        at_home(macos, Some("/home/user"))
+    }
+
+    /// `home` feeds both `~` expansion and the injected directory snapshot.
+    fn at_home(macos: bool, home: Option<&str>) -> Facts {
         Facts {
             macos,
-            home: Some("/home/user".into()),
+            home: home.map(OsString::from),
+            directories: Directories::Injected(
+                PlatformEnvironment::default().with_home_dir(home.map(PathBuf::from)),
+            ),
             physical_cores: PhysicalCoreCount::Unavailable("injected unsupported query".to_owned()),
             ..Facts::default()
         }
+    }
+
+    fn environment(
+        facts: &mut Facts,
+        change: impl FnOnce(PlatformEnvironment) -> PlatformEnvironment,
+    ) {
+        let Directories::Injected(environment) = &mut facts.directories else {
+            panic!("tests inject their directory facts");
+        };
+        *environment = change(std::mem::take(environment));
     }
 
     #[test]
@@ -826,13 +873,21 @@ mod tests {
             config_file(&linux).expect("XDG default").path,
             Path::new("/home/user/.config/oxide/config.toml")
         );
-        linux.xdg_config_home = Some("/xdg/config".into());
+        environment(&mut linux, |env| {
+            env.with_xdg_config_home(Some("/xdg/config".into()))
+        });
         assert_eq!(
             config_file(&linux).expect("XDG").path,
             Path::new("/xdg/config/oxide/config.toml")
         );
-        linux.xdg_config_home = Some("relative".into());
-        assert!(config_file(&linux).is_err());
+        // XDG: a relative value is ignored in favour of the default.
+        environment(&mut linux, |env| {
+            env.with_xdg_config_home(Some("relative".into()))
+        });
+        assert_eq!(
+            config_file(&linux).expect("relative XDG").path,
+            Path::new("/home/user/.config/oxide/config.toml")
+        );
         let mut explicit = facts(true);
         explicit.oxide_config = Some("/elsewhere/oxide.toml".into());
         let chosen = config_file(&explicit).expect("explicit");
@@ -840,11 +895,142 @@ mod tests {
         assert!(chosen.explicit);
         explicit.oxide_config = Some("oxide.toml".into());
         assert!(config_file(&explicit).is_err());
-        let mut homeless = facts(false);
-        homeless.home = None;
+        let mut homeless = at_home(false, None);
         assert!(config_file(&homeless).is_err());
         homeless.oxide_config = Some("/explicit.toml".into());
         assert!(config_file(&homeless).is_ok());
+    }
+
+    /// Golden parity with the paths Oxide resolved before adopting
+    /// `longhorn-storage-layout` (oxide#103). Literal on purpose.
+    #[test]
+    fn storage_roots_match_the_former_layout() {
+        let home = "/Users/Zoë Ünïcode/with space";
+        let mac = at_home(true, Some(home));
+        assert_eq!(
+            config_file(&mac).expect("config").path,
+            Path::new(
+                "/Users/Zoë Ünïcode/with space/Library/Application Support/oxide/config/config.toml"
+            )
+        );
+        assert_eq!(
+            default_pool(&mac).expect("pool"),
+            Path::new("/Users/Zoë Ünïcode/with space/Library/Caches/oxide/build-pool")
+        );
+        assert_eq!(
+            legacy_default_pool(&mac).expect("legacy"),
+            Path::new("/Users/Zoë Ünïcode/with space/Library/Caches/oxide/pool")
+        );
+        assert_eq!(
+            known_pools_file(&mac).expect("state"),
+            Path::new(
+                "/Users/Zoë Ünïcode/with space/Library/Application Support/oxide/state/pools.json"
+            )
+        );
+        // XDG variables do not apply on macOS.
+        let mut mac_xdg = mac.clone();
+        environment(&mut mac_xdg, |env| {
+            env.with_xdg_cache_home(Some("/xdg/cache".into()))
+                .with_xdg_state_home(Some("/xdg/state".into()))
+                .with_xdg_config_home(Some("/xdg/config".into()))
+        });
+        assert_eq!(default_pool(&mac_xdg), default_pool(&mac));
+        assert_eq!(known_pools_file(&mac_xdg), known_pools_file(&mac));
+        assert_eq!(
+            config_file(&mac_xdg).expect("config"),
+            config_file(&mac).expect("config")
+        );
+
+        // Linux defaults with no XDG_RUNTIME_DIR (never needed).
+        let linux = at_home(false, Some(home));
+        assert_eq!(
+            config_file(&linux).expect("config").path,
+            Path::new("/Users/Zoë Ünïcode/with space/.config/oxide/config.toml")
+        );
+        assert_eq!(
+            default_pool(&linux).expect("pool"),
+            Path::new("/Users/Zoë Ünïcode/with space/.cache/oxide/build-pool")
+        );
+        assert_eq!(
+            known_pools_file(&linux).expect("state"),
+            Path::new("/Users/Zoë Ünïcode/with space/.local/state/oxide/pools.json")
+        );
+        let mut xdg = linux.clone();
+        environment(&mut xdg, |env| {
+            env.with_xdg_cache_home(Some("/x dg/cåche".into()))
+                .with_xdg_state_home(Some("/x dg/state".into()))
+        });
+        assert_eq!(
+            default_pool(&xdg).expect("pool"),
+            Path::new("/x dg/cåche/oxide/build-pool")
+        );
+        assert_eq!(
+            legacy_default_pool(&xdg).expect("legacy"),
+            Path::new("/x dg/cåche/oxide/pool")
+        );
+        assert_eq!(
+            known_pools_file(&xdg).expect("state"),
+            Path::new("/x dg/state/oxide/pools.json")
+        );
+        // A demanded relative XDG value falls back to the default.
+        let mut relative = linux.clone();
+        environment(&mut relative, |env| {
+            env.with_xdg_cache_home(Some("cache".into()))
+                .with_xdg_state_home(Some("state".into()))
+        });
+        assert_eq!(default_pool(&relative), default_pool(&linux));
+        assert_eq!(known_pools_file(&relative), known_pools_file(&linux));
+    }
+
+    #[test]
+    fn missing_facts_refuse_only_when_demanded() {
+        // Absolute XDG values supply their own root without HOME.
+        let mut linux = at_home(false, None);
+        assert!(default_pool(&linux).is_none());
+        assert!(known_pools_file(&linux).is_err());
+        assert!(settings(&linux).is_err());
+        environment(&mut linux, |env| {
+            env.with_xdg_cache_home(Some("/xdg/cache".into()))
+                .with_xdg_config_home(Some("/xdg/config".into()))
+        });
+        assert_eq!(
+            default_pool(&linux).expect("pool"),
+            Path::new("/xdg/cache/oxide/build-pool")
+        );
+        assert_eq!(
+            settings(&linux).expect("XDG only").pool,
+            Path::new("/xdg/cache/oxide/build-pool")
+        );
+        // Relative XDG and no HOME: the fact is missing.
+        environment(&mut linux, |env| {
+            env.with_xdg_cache_home(Some("cache".into()))
+        });
+        let refused = default_pool(&linux);
+        assert!(refused.is_none());
+        let error = settings(&linux).expect_err("no cache root");
+        assert!(error.contains("HOME is unset"), "{error}");
+
+        // Overrides without HOME: unused facts, relative or missing, never gate.
+        for macos in [true, false] {
+            let mut overridden = at_home(macos, None);
+            environment(&mut overridden, |env| {
+                env.with_xdg_config_home(Some("relative".into()))
+                    .with_xdg_cache_home(Some("relative".into()))
+                    .with_xdg_state_home(Some("relative".into()))
+            });
+            overridden.oxide_config = Some("/explicit/oxide.toml".into());
+            overridden.oxide_pool = Some("/explicit/pool".into());
+            let resolved = settings(&overridden).expect("overrides suffice");
+            assert_eq!(resolved.pool, Path::new("/explicit/pool"));
+            assert_eq!(resolved.pool_source, Source::Environment("OXIDE_POOL"));
+            assert_eq!(resolved.file.path, Path::new("/explicit/oxide.toml"));
+            assert!(known_pools(&overridden).is_empty());
+        }
+
+        // A relative HOME is not a home.
+        let relative_home = at_home(true, Some("Users/someone"));
+        assert!(config_file(&relative_home).is_err());
+        assert!(default_pool(&relative_home).is_none());
     }
 
     #[test]
@@ -1078,8 +1264,7 @@ mod tests {
         let legacy = scratch.0.join(".config/oxide");
         fs::create_dir_all(&legacy).expect("legacy dir");
         fs::write(legacy.join("config.toml"), "[pool]\npath = \"/never\"\n").expect("legacy");
-        let mut mac = facts(true);
-        mac.home = Some(scratch.0.clone().into());
+        let mac = at_home(true, scratch.0.to_str());
         assert_eq!(
             ignored_legacy_config(&mac),
             Some(legacy.join("config.toml"))
@@ -1154,7 +1339,9 @@ mod tests {
     fn known_pools_are_bounded_and_deduplicated() {
         let scratch = Scratch::new("known");
         let mut linux = facts(false);
-        linux.xdg_state_home = Some(scratch.0.clone().into());
+        environment(&mut linux, |env| {
+            env.with_xdg_state_home(Some(scratch.0.clone()))
+        });
         for index in 0..20 {
             remember_pool(&linux, Path::new(&format!("/pools/{index}"))).expect("remember");
         }

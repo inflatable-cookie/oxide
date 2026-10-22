@@ -2056,6 +2056,31 @@ fn lease_error(context: &str, error: &LeaseError) -> String {
 mod tests {
     use super::*;
 
+    /// A ledger as an earlier Oxide wrote it reads back, keeps its stored
+    /// digests and serializes to the same bytes (oxide#103 sha2 0.11.0).
+    #[test]
+    fn frozen_ledger_reads_back_unchanged() {
+        let frozen = concat!(
+            r#"{"version":1,"next_id":2,"next_use":4,"tickets":[],"cleans":[],"records":[{"#,
+            r#""id":1,"identity":"4344f9285b31bb4b9e695c75b8af04a5f4a97a99705393e8d0126c94832eec4f","#,
+            r#""compatibility":"12d9fc45c5c84a2e41a4e96d4918b08d421b41fd92114cbecd1eecb4b0a16936","#,
+            r#""profile":"quick","checkout":"/Users/Zoë/work space/oxide","phase":"idle","#,
+            r#""process_group":null,"last_used":3,"holder":null,"lease_id":null,"#,
+            r#""pending_recovery":null,"last_used_ms":1760000000000}],"recoveries":[]}"#
+        );
+        let state: State = serde_json::from_str(frozen).expect("frozen ledger");
+        let record = &state.records[0];
+        assert_eq!(
+            record.identity,
+            crate::identity::digest("git:https://github.com/inflatable-cookie/oxide:")
+        );
+        assert_eq!(
+            record.compatibility,
+            "12d9fc45c5c84a2e41a4e96d4918b08d421b41fd92114cbecd1eecb4b0a16936"
+        );
+        assert_eq!(serde_json::to_string(&state).expect("serialize"), frozen);
+    }
+
     fn paired_controls(label: &str) -> (PathBuf, Store, Store) {
         let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
             .map(PathBuf::from)

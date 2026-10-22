@@ -593,4 +593,64 @@ mod tests {
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
     }
+
+    /// FIPS 180-2 vectors through every sha2 entry point Oxide relies on:
+    /// one-shot, bytes, hex and streaming (oxide#103, sha2 0.10.9 to 0.11.0).
+    #[test]
+    fn sha256_published_vectors() {
+        assert_eq!(
+            digest("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            digest("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        let bytes = Sha256::digest(b"abc");
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(&bytes[..4], &[0xba, 0x78, 0x16, 0xbf]);
+        let mut streaming = Sha256::new();
+        let block = [b'a'; 1000];
+        for _ in 0..1000 {
+            streaming.update(block);
+        }
+        let million: String = streaming
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            million,
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    /// Slot identity and compatibility keys already stored in ledgers keep
+    /// their values, so existing slots and their folders stay warm.
+    /// Expected values are independent hashlib digests of these exact keys.
+    #[test]
+    fn stored_slot_keys_are_unchanged() {
+        let identity = digest("git:https://github.com/inflatable-cookie/oxide:");
+        assert_eq!(
+            identity,
+            "4344f9285b31bb4b9e695c75b8af04a5f4a97a99705393e8d0126c94832eec4f"
+        );
+        assert_eq!(
+            digest("path:/Users/Zoë/work space/app"),
+            "ee1f4d90c2ba0b15755ecf407d5adede49f2162bdf5fe849275ef7cb2f992480"
+        );
+        let rustc = "rustc 1.97.1 (5f8b4d3a5 2026-09-17)\nbinary: rustc\nhost: aarch64-apple-darwin\nrelease: 1.97.1\n";
+        assert_eq!(
+            digest(rustc),
+            "8a4dd343d46011358e461397f0686700184525ab1e416ced746b5bef64c87fd7"
+        );
+        assert_eq!(
+            digest(&format!(
+                "{identity}\nquick\n{}\naarch64-apple-darwin\n{BACKEND}",
+                digest(rustc)
+            )),
+            "12d9fc45c5c84a2e41a4e96d4918b08d421b41fd92114cbecd1eecb4b0a16936"
+        );
+        assert_eq!(slot_folders("oxide", &identity)[0], "oxide-4344f928");
+    }
 }

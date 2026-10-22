@@ -14,6 +14,9 @@ minimum_effigy_version = "0.14.0"
 # not Linux runtime validation.
 "rust:compile-linux" = "oxide check --locked --offline --target x86_64-unknown-linux-gnu"
 "rust:compile-linux:cargo" = "cargo check --locked --offline --target x86_64-unknown-linux-gnu"
+# Duplicate packages in the normal dependency closure for every target
+# (oxide#103: exactly one sha2). Reads the lock; builds nothing.
+"rust:tree-duplicates" = "oxide tree --locked --offline -e normal -d --target all"
 # Build `oxide` with plain Cargo from origin main's tip (or
 # OXIDE_INSTALL_PIN, a commit on it) and install it at ~/.local/bin/oxide
 # with a hash receipt under ~/.local/state/oxide/install. `oxide:install`
@@ -216,6 +219,18 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 [tasks."rust:max-active"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-max-active.py"
+
+# Storage roots from longhorn-storage-layout (oxide#103), under the qualified
+# #109 shared supervisor. Copies only the locked crates and the tagged Longhorn
+# git checkout into a private CARGO_HOME, records the normal dependency tree
+# (exactly one sha2), stages oxide offline with 1.97.1 and runs `oxide status`
+# on a private HOME with spaces and Unicode: default macOS config and pool
+# paths, XDG ignored, overrides without HOME, refusal without HOME, legacy
+# registration and known-pools routing, nothing created. macOS only; Linux
+# XDG behaviour is unit-tested with injected facts. 300 s, 512 MiB monitored.
+[tasks."rust:storage-layout"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-storage-layout.py"
 
 # SUSPENDED by oxide#102 (retired image pool provisioning; refuses before
 # any effect until migrated). Cargo version matrix (oxide#091): one logical proof per exact stable
