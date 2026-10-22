@@ -106,7 +106,8 @@ an arbitrary symlink: a nonempty real target and a foreign symlink refuse
 without any change. Only an explicit `adopt` converts an empty target. A
 missing target converts by `adopt` or on the first leased build of a fresh
 checkout (no receipt of any state) on the registered permanent drive, with
-one notice. `detach` refuses while the drive mode is still permanent.";
+one notice. `detach` works in either mode: it restores this checkout's real
+target and keeps every root, and automatic conversion never re-links it.";
 
 /// Which real root a link selects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1064,15 +1065,10 @@ pub fn auto_adopt(
 }
 
 /// `oxide outputs detach`: back to a real target directory, keeping roots.
+/// It is a per-checkout opt-out in either drive mode (oxide#124): the
+/// detached receipt stays, so automatic first conversion never follows it.
 fn detach_command() -> Result<u8, String> {
     let context = Context::open()?;
-    let mode = context.mode()?;
-    if mode == Some(DriveMode::Permanent) {
-        return Err(
-            "outputs detach refused while the drive mode is still permanent: a permanent checkout would only relink. Set `oxide pool set-mode ephemeral` first, then detach"
-                .to_owned(),
-        );
-    }
     let Some(control) = context.control().map(Path::to_path_buf) else {
         return Err("no internal pool exists; there is no owned output state".to_owned());
     };
@@ -4332,6 +4328,24 @@ mod tests {
             Err(reason) => reason,
         };
         assert!(refused.contains("would not be supervised"), "{refused}");
+    }
+
+    /// A detached checkout stays detached under permanent mode (oxide#124):
+    /// its receipt plans no owned root, so a command is keyed unconverted and
+    /// the auto-adoption rule (any receipt blocks it) keeps it that way.
+    #[test]
+    fn a_detached_receipt_plans_no_root_in_permanent_mode() {
+        let fixture = Fixture::new();
+        register(&fixture, DriveMode::Permanent);
+        let (mut receipt, _) = committed_external(&fixture);
+        receipt.state = ReceiptState::Detached;
+        receipt.selected = None;
+        write_receipt(&fixture.control, &receipt).unwrap();
+        let planned = planned_destination(Some(&fixture.control), &fixture.checkout, None).unwrap();
+        assert!(planned.is_none(), "{planned:?}");
+        let mut facts = all_facts();
+        facts.receipt_absent = false;
+        assert!(!auto_adopts(&facts));
     }
 
     /// Permanent mode never selects the external root for a command whose

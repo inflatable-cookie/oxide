@@ -99,6 +99,19 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py auto-adopt"
 
+# Per-checkout detach under permanent mode (oxide#124): the focused
+# `detach-permanent` mode of the #117/#121 fixture under the same qualified
+# shared supervisor and one owned 128 MiB scratch image. Detach waits for an
+# active build and restores a real empty target while keeping every root byte;
+# the next builds use the real target with no relink or notice; a refused
+# adopt of a nonempty target and a missing target beside a detached receipt
+# change nothing; explicit adopt re-converts an empty detached target to the
+# same root; a foreign link refuses detach. Not a benchmark, real-drive
+# qualification or an alias for full QA.
+[tasks."rust:outputs-detach-permanent"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py detach-permanent"
+
 # The first conversion's Git ignore prerequisite (oxide#125): the focused
 # `ignore-safety` mode of the #117 fixture, under the same qualified shared
 # supervisor (300 s, 512 MiB monitored scratch, ordinary detach) and one owned
@@ -109,8 +122,8 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # roots unchanged, for explicit adopt, automatic adoption and prepared
 # first-conversion replay; accepted automatic, explicit and nested
 # publications stay invisible to `git status` and `git ls-files`; detach still
-# works. It is not a benchmark, real-drive qualification or an alias for full
-# QA. Its native run needs an owner activation before submission.
+# works. Its native run needs an owner activation before submission. It is not
+# a benchmark, real-drive qualification or an alias for full QA.
 [tasks."rust:outputs-ignore-safety"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py ignore-safety"

@@ -2729,8 +2729,9 @@ migration and consumer adoption remain separate gates.
   holders in either pool and the next generation). `adopt` converts only a missing or empty
   real target; a nonempty real target and a foreign symlink refuse without
   mutation, and an owned correct link is a no-op. `detach` restores a real
-  empty `<checkout>/target` directory, keeps every root and refuses while the
-  drive mode is still permanent. `status` is read-only.
+  empty `<checkout>/target` directory and keeps every root in either drive
+  mode (oxide#124): it is the per-checkout opt-out, and it refuses a foreign
+  link or unknown writer custody without change. `status` is read-only.
 - **Automatic first conversion (oxide#121).** A leased command (build, run,
   test, exec) converts a fresh checkout before its destination is keyed and
   before its slot is taken, when all of these hold: the command's selected pool is the
@@ -2756,7 +2757,12 @@ migration and consumer adoption remain separate gates.
   commit; replays and later builds print none. A committed adoption persists
   when a later admission, build or cancellation fails. No persisted format
   changes: the receipt, marker and fence are as before. `oxide outputs
-  detach` remains the way back under its mode rules.
+  detach` is the per-checkout opt-out in either mode (oxide#124). A
+  detached receipt is a receipt of any state, so automatic adoption never
+  follows it, and `oxide outputs adopt` converts it again through the
+  existing preconditions. To opt a checkout out before its first build, create
+  a real empty `<workspace>/target` directory first: it is never adopted, and
+  Oxide never converts an existing real target automatically.
 - **Clean.** Resolves the receipt to the selected real root, requires it to be
   the current owned link and to sit on the volume the receipt names *now*
   (a replaced drive at the same mount point is refused), and applies the
@@ -2814,8 +2820,8 @@ relink and clean; selected clean refusing after its link turned foreign while
 it waited, and selected and whole clean refusing a replaced or unusable
 volume while preserving the root, marker and inactive roots; a second
 fallback command reusing its slot warm; a pre-created empty local root
-refused when Git would track it; and `detach` refusing while permanent and
-restoring a real directory afterwards. Not a benchmark, real-drive
+refused when Git would track it; and `detach` restoring a real directory in
+ephemeral mode (permanent mode: oxide#124). Not a benchmark, real-drive
 qualification or an alias for full QA.
 
 **Proof (oxide#121).** `effigy rust:auto-adopt-outputs` runs
@@ -2851,6 +2857,23 @@ invisible to `git status` and `git ls-files`, and `detach` still restores a
 real directory. Not a benchmark, real-drive qualification or an alias for
 full QA. The native run is held for owner activation; the guard's rule
 parsing and decisions are unit-tested in `effigy test rust`.
+
+**Proof (oxide#124).** `effigy rust:outputs-detach-permanent` runs
+`scripts/test-permanent-outputs.py detach-permanent`, the focused mode of the
+same fixture, as the whole command of the qualified shared supervisor (300 s,
+512 MiB monitored scratch, ordinary detach) over one owned 128 MiB scratch
+image. It covers: a fresh checkout's first-build adoption; `detach` waiting
+for an active gated build and then restoring a real empty target, with the
+root's every entry hashed before and after unchanged, a recorded `detached`
+receipt, and a plan reporting `state` detached, `current_target` `real-empty`
+and no selected root; a second detach changing nothing; the next builds using
+the real target with no relink or notice and no write into the detached root;
+explicit adopt refusing the nonempty real target; a missing target beside a
+detached receipt staying unadopted; explicit adopt re-converting an empty
+detached target to the same root; and a foreign link refusing detach with the
+receipt still committed, plus a detach with no receipt refusing. Unit tests
+cover the detached receipt planning no root in permanent mode. Not a
+benchmark, real-drive qualification or an alias for full QA.
 
 ### `oxide pool describe --json`
 

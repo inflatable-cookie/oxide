@@ -135,6 +135,17 @@ fails, Oxide reports that the wait duration is unavailable.
   when one is produced. Ephemeral mode keeps the existing fallback line.
   `oxide status` shows configured mode separately from the pool selected for
   the next build, including its fallback reason.
+- In permanent mode a checkout's `<workspace>/target` becomes an owned link
+  into the drive, after its first build (one notice) or an explicit `oxide
+  outputs adopt`. To keep one checkout's outputs in place, run `oxide outputs
+  detach` in that checkout: it restores a real empty `target`, keeps the
+  drive's output root and its bytes, and records the checkout as detached.
+  Detach works in either mode. A detached checkout stays unconverted
+  automatically; the next builds use its real `target`. Before its first
+  build, create a real empty `<workspace>/target` directory to opt that
+  checkout out. Oxide never converts an existing real `target` automatically.
+  `oxide outputs adopt` converts a detached checkout again, but only when its
+  `target` is missing or empty; a nonempty real target is refused and kept.
 - A first conversion (`oxide outputs adopt`, or the automatic one on a fresh
   checkout's first build in permanent mode) publishes the owned
   `<workspace>/target` link only when Git ignores that exact non-directory
