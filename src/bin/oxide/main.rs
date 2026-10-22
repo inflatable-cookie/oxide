@@ -442,25 +442,44 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     }
     let note = notes.join(", ");
     let note = (!note.is_empty()).then_some(note);
-    // A program `run` executes from an owned output root keeps the checkout's
-    // output custody after the slot is released: it is registered while this
-    // command's record still runs, so no relink or clean can slip in between.
-    let run_custody = match (&outcome, &output_root) {
-        (Ok((Some(status), Some(Ok(_)))), Some(root))
+    let origin = gate.finish(&key.checkout);
+    // A converted checkout's `run` keeps its lease through the program: the
+    // program runs as this command's own process group from the real root
+    // it bound, under the same custody (a relink waits, a clean waits),
+    // removal watchdog and positive group closure as Cargo, and the slot is
+    // released only once that group is empty.
+    let owned_program = match (&outcome, &output_root) {
+        (Ok((Some(status), Some(Ok((program, manifest_dir))))), Some(root))
             if run && status.success() && stopped.is_none() =>
         {
-            match outputs::hold_for_run(store.owner_control(), &key.checkout, root) {
-                Ok(custody) => Some(custody),
-                Err(reason) => {
-                    let origin = gate.finish(&key.checkout);
-                    store.release(held, origin)?;
-                    return Err(reason);
-                }
-            }
+            let program = match program.strip_prefix(key.checkout.join("target")) {
+                Ok(rest) => root.join(rest),
+                Err(_) => program.clone(),
+            };
+            Some((program, manifest_dir.clone()))
         }
         _ => None,
     };
-    let origin = gate.finish(&key.checkout);
+    if let Some((program, manifest_dir)) = owned_program {
+        print_summary(
+            &store,
+            &invocation,
+            &slot,
+            warm,
+            measured.as_ref(),
+            started,
+            note.as_deref(),
+            &waits,
+        );
+        return run_owned_program(
+            &store,
+            held,
+            origin,
+            &program,
+            &manifest_dir,
+            &invocation.program_args,
+        );
+    }
     store.release(held, origin)?;
     let (status, executable) = outcome?;
     let status = status.ok_or("Cargo ended without a status")?;
@@ -498,23 +517,11 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     }
     match executable.unwrap_or_else(|| Err("no run target was recorded".to_owned())) {
         Ok((program, manifest_dir)) => {
-            // Lease released: the program runs from the private target dir,
-            // or from the real owned root this command bound, never through a
-            // link a later relink could repoint.
-            let program = match (
-                &output_root,
-                program.strip_prefix(key.checkout.join("target")),
-            ) {
-                (Some(root), Ok(rest)) => root.join(rest),
-                _ => program,
-            };
+            // Lease released: the program runs from the private target dir.
             let error = Command::new(&program)
                 .args(&invocation.program_args)
                 .env("CARGO_MANIFEST_DIR", manifest_dir)
                 .exec();
-            if let Some(custody) = run_custody {
-                custody.abandon();
-            }
             Err(format!("could not execute {}: {error}", program.display()))
         }
         Err(message) => {
@@ -522,6 +529,79 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
             Ok(101)
         }
     }
+}
+
+/// Run a converted checkout's program under the held lease, as `oxide exec`
+/// runs a tool: its own process group, the record naming that group (so a
+/// crash leaves the slot held until the group is empty), signals forwarded,
+/// the removable pool's removal watchdog polled, and the slot released only
+/// after the group is observed empty. A removal stop whose group cannot be
+/// confirmed closed quarantines the slot as unknown custody.
+fn run_owned_program(
+    store: &Store,
+    held: store::Lease,
+    origin: Option<freshness::Built>,
+    program: &Path,
+    manifest_dir: &Path,
+    args: &[OsString],
+) -> Result<u8, String> {
+    let mut command = Command::new(program);
+    command.args(args).env("CARGO_MANIFEST_DIR", manifest_dir);
+    if let Err(error) = store.mark_spawning(&held) {
+        store.release(held, origin)?;
+        return Err(error);
+    }
+    let (mut group, foreground) = match process::start_foreground_group(&mut command) {
+        Ok(started) => started,
+        Err(error) => {
+            store.release(held, origin)?;
+            return Err(format!("could not execute {}: {error}", program.display()));
+        }
+    };
+    // Only a removable slot is watched, and only for removal: a program on
+    // the internal disk is never stopped for host free space.
+    let mut watchdog = match store.backend {
+        Backend::ApfsVolume => store.watchdog(),
+        Backend::DirectoryBudget => None,
+    };
+    if let Err(error) = store.mark_running(&held, group.id) {
+        // SAFETY: the negative PID addresses the group this command created.
+        unsafe {
+            libc::kill(-group.id, libc::SIGTERM);
+        }
+        let _ = process::wait_leader(&mut group);
+        process::wait_group_empty(group.id);
+        drop(foreground);
+        store.release(held, None)?;
+        return Err(error);
+    }
+    let status = match watchdog.as_mut() {
+        Some(watchdog) => process::wait_leader_watched(&mut group, watchdog)?,
+        None => Some(process::wait_leader(&mut group)?),
+    };
+    let closed = match (watchdog.as_mut(), status) {
+        (Some(_), None) => None,
+        (Some(watchdog), Some(_)) => process::wait_group_empty_watched(group.id, watchdog),
+        (None, _) => {
+            process::wait_group_empty(group.id);
+            Some(Instant::now())
+        }
+    };
+    drop(foreground);
+    let stopped = watchdog.as_ref().filter(|watchdog| watchdog.stopped());
+    if let Some(watchdog) = stopped {
+        eprintln!("{}", watchdog.report(group.id, closed));
+    }
+    if closed.is_none() {
+        store.quarantine_lost(
+            &held,
+            &format!("run program group {} did not close after KILL", group.id),
+        )?;
+        return Ok(1);
+    }
+    store.release(held, origin)?;
+    let code = status.map_or(1, process::exit_code);
+    Ok(if stopped.is_some() { code.max(1) } else { code })
 }
 
 /// Why the leased child did not start.

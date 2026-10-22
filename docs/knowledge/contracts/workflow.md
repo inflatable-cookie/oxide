@@ -2447,15 +2447,18 @@ migration and consumer adoption remain separate gates.
   than binding a root its slot was not keyed for. No command is redirected
   mid-run. A checkout that is not converted keeps ephemeral behaviour with a
   warning in permanent mode.
-- **`run` custody.** `oxide run` releases its slot before it replaces itself
-  with the program, so before release it registers the process (PID and
-  kernel start time, which `exec` keeps) as a reader in
-  `<internal pool>/oxide-managed/outputs/<checkout id>.readers/` and executes
-  the binary by its path in the bound real root, not through the link. While
-  that process lives a relink waits, and `adopt`, `detach` and clean refuse.
-  A reader whose PID is gone or names a process with another start time is
-  stale and pruned; a malformed entry or more than 64 is unknown custody and
-  refuses.
+- **`run` custody.** For a converted checkout, `oxide run` keeps its lease
+  through the program instead of replacing itself with it: the program runs
+  from its path in the bound real root (not through the link) as the
+  command's own process group, which takes the terminal's foreground while it
+  runs. The record names that group, so a relink waits and a clean waits
+  until the whole group (including ordinary children that outlive the
+  program) is observed empty; a crash of Oxide leaves the slot held until the
+  group is gone. On a removable slot the removal watchdog runs through the
+  program phase: a vanished drive stops the group (TERM, then KILL), the
+  command fails, and a group that cannot be confirmed closed quarantines the
+  slot as unknown custody. A program on the internal disk is never stopped
+  for host free space. Unconverted checkouts keep `exec` after release.
 - **Explicit commands.** `oxide outputs plan` is effect-free bounded JSON
   (`oxide.outputs.plan/1`, always `data_move: false`, with cooperative
   holders and the next generation). `adopt` converts only a missing or empty
@@ -2505,7 +2508,10 @@ and a crafted link that appeared after a crash; a same-device symlinked
 `.oxide-outputs` refused by build and clean with the tree it names unchanged;
 a pool fallback (container mismatch) with the drive present moving outputs
 to the local root and redocking; a gated `oxide run` program executing from
-the real external root while a relink waits for it and clean refuses; a build
+the real external root whose ordinary child outlives it, keeping `run` held
+(a relink waits, `plan` names the holder) until the child exits; a forced
+detach of the owned image while a program runs from the external root,
+stopped by the removal watchdog, then re-attach and redock; a build
 in ephemeral mode before detach through the committed link; a crafted quarantined writer blocking both
 relink and clean; selected clean refusing after its link turned foreign while
 it waited, and selected and whole clean refusing a replaced or unusable

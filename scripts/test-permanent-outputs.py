@@ -96,11 +96,24 @@ fn main() {
 use std::time::{Duration, Instant};
 
 fn main() {
-    // A gated run records the executable it was started as, then waits.
+    // A gated run records the executable it was started as, then waits, or
+    // leaves an ordinary child (same process group) waiting and exits first.
     if let Ok(gate) = std::env::var("OXIDE_RUN_GATE") {
         let gate = PathBuf::from(gate);
         let exe = std::env::current_exe().unwrap();
         std::fs::write(gate.join("exe"), exe.to_string_lossy().as_bytes()).unwrap();
+        if std::env::var_os("OXIDE_RUN_CHILD").is_some() {
+            let release = gate.join("release");
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("n=0; while [ ! -f \"$1\" ] && [ $n -lt 1800 ]; do sleep 0.05; n=$((n+1)); done")
+                .arg("sh")
+                .arg(&release)
+                .spawn()
+                .unwrap();
+            std::fs::write(gate.join("leader-exited"), b"exited").unwrap();
+            return;
+        }
         let deadline = Instant::now() + Duration::from_secs(90);
         while !gate.join("release").exists() {
             assert!(Instant::now() < deadline, "proof did not release the run");
@@ -207,6 +220,34 @@ def set_container_uuid(pool: str, uuid: str) -> None:
     with open(path, "wb") as handle:
         handle.write(json.dumps(current, indent=2).encode() + b"\n")
     os.chmod(path, 0o600)
+
+
+def force_detach(proof: Proof, image: str, mount: str, uuid: str) -> None:
+    """Surprise removal of the owned image only: positive identity of this
+    image path's own whole device, its mount and its volume UUID immediately
+    before `hdiutil detach -force` of that device."""
+    info = plistlib.loads(proof.run(["/usr/bin/hdiutil", "info", "-plist"], timeout=30).stdout)
+    own = [
+        entry
+        for entry in info.get("images", [])
+        if os.path.realpath(entry.get("image-path", "")) == os.path.realpath(image)
+    ]
+    expect(len(own) == 1, f"image {image} attached {len(own)} times")
+    entities = own[0]["system-entities"]
+    mounts = {entity.get("mount-point") for entity in entities} - {None}
+    expect(mounts == {mount}, f"image {image} is mounted at {mounts}, not {mount}")
+    wholes = sorted(
+        (entity["dev-entry"] for entity in entities if re.fullmatch(r"/dev/disk\d+", entity.get("dev-entry", ""))),
+        key=lambda dev: int(dev[len("/dev/disk"):]),
+    )
+    expect(bool(wholes), f"no whole-disk device in {entities}")
+    volume = plistlib.loads(proof.run(["/usr/sbin/diskutil", "info", "-plist", mount], timeout=30).stdout)
+    expect(volume.get("VolumeUUID") == uuid, f"{mount} is not volume {uuid}")
+    result = proof.run(["/usr/bin/hdiutil", "detach", "-force", wholes[0]], timeout=60)
+    expect(result.returncode == 0, f"forced detach of {wholes[0]} failed; evidence kept: {result.stderr!r}")
+    proof.mount = None
+    expect(not os.path.lexists(mount), f"{mount} still exists after the forced detach")
+    print(f"forced detach of {wholes[0]} ({mount})", flush=True)
 
 
 def real_uuid(pool: str) -> str:
@@ -940,41 +981,69 @@ def run(proof: Proof, repo: str) -> None:
     code, _, stderr = proof.oxide(["check"], "redock after the split selection", app)
     expect(code == 0 and link_target(link) == external_root, stderr)
 
-    # 9d. A program `oxide run` started keeps the checkout's output custody:
-    #     it runs from the real external root, a relink waits for it and
-    #     clean refuses until it exits.
+    # 9d. A program `oxide run` started keeps the checkout's output custody
+    #     until its whole process group closes: it runs from the real external
+    #     root, its leader exits first leaving an ordinary child, and `run`
+    #     stays held (a relink waits, plan names the holder) until the child
+    #     ends too.
     run_gate = os.path.join(root, "run-gate")
     os.makedirs(run_gate)
     run_env = dict(env)
     run_env["OXIDE_RUN_GATE"] = run_gate
+    run_env["OXIDE_RUN_CHILD"] = "1"
     runner = start_child(proof, [proof.binary, "run", "--bin", "poutputs"], app, run_env)
     relinker = None
     try:
-        wait_for(os.path.join(run_gate, "exe"), "gated run")
+        wait_for(os.path.join(run_gate, "leader-exited"), "run leader exit")
         exe = read_bytes(os.path.join(run_gate, "exe")).decode()
         expect(
             os.path.realpath(exe).startswith(external_root + os.sep) and not exe.startswith(link),
             f"the run did not execute from the bound real root: {exe}",
         )
+        time.sleep(0.5)
+        expect(runner.poll() is None, "oxide run returned while its program's child still runs")
+        held = plan(proof, app, "plan while a run child lives")
+        expect(held["cooperative_holders"], f"plan names no holder for the run: {held}")
         set_recorded_uuid(pool, wrong)
         relinker = start_child(proof, [proof.binary, "check"], app, env)
         time.sleep(1.5)
-        expect(relinker.poll() is None, "a relink did not wait for the running program")
+        expect(relinker.poll() is None, "a relink did not wait for the run program's child")
         expect(link_target(link) == external_root, "the link moved under a running program")
-        code, _, stderr = proof.oxide(["clean"], "clean while a run program lives", app)
-        expect(code != 0 and "still runs" in stderr, stderr)
-        expect(os.path.isfile(exe), "clean removed the running program")
     finally:
         open(os.path.join(run_gate, "release"), "wb").close()
-    code, stdout, stderr = finish_child(proof, runner, "gated run")
-    expect(code == 0 and "permanent-outputs-ok 7" in stdout, stdout + stderr)
-    code, _, stderr = finish_child(proof, relinker, "relink after the run program exits")
+    code, stdout, stderr = finish_child(proof, runner, "run with an outliving child")
+    expect(code == 0 and "permanent-outputs-ok" not in stdout, stdout + stderr)
+    code, _, stderr = finish_child(proof, relinker, "relink after the run group closes")
     expect(code == 0 and link_target(link) == local_root, stderr)
-    expect("or a program `oxide run` started" in stderr, stderr)
+    expect("a program `oxide run` started" in stderr, stderr)
     set_recorded_uuid(pool, good)
     code, _, stderr = proof.oxide(["check"], "redock after the run custody case", app)
     expect(code == 0 and link_target(link) == external_root, stderr)
-    proof.phase("after the split selection and run custody cases")
+
+    # 9e. Removal while the program runs from the external root: the removal
+    #     watchdog stops the program's group, `run` fails, and after
+    #     re-attaching the next command redocks.
+    removal_gate = os.path.join(root, "removal-gate")
+    os.makedirs(removal_gate)
+    removal_env = dict(env)
+    removal_env["OXIDE_RUN_GATE"] = removal_gate
+    runner = start_child(proof, [proof.binary, "run", "--bin", "poutputs"], app, removal_env)
+    try:
+        wait_for(os.path.join(removal_gate, "exe"), "gated run before removal")
+        force_detach(proof, os.path.join(root, "volume.sparseimage"), mount, good)
+        code, stdout, stderr = finish_child(proof, runner, "run program stopped by removal")
+    finally:
+        open(os.path.join(removal_gate, "release"), "wb").close()
+    expect(code != 0, f"a run whose drive vanished succeeded: {stdout}{stderr}")
+    expect(
+        re.search(rf"removable volume {re.escape(mount)} is gone; stopped Cargo group \d+: TERM", stderr)
+        is not None,
+        f"no removal stop during the program phase: {stderr}",
+    )
+    expect(attach_image(proof, root, name) == mount, "the drive re-attached elsewhere")
+    code, _, stderr = proof.oxide(["check"], "redock after the program-phase removal", app)
+    expect(code == 0 and link_target(link) == external_root, stderr)
+    proof.phase("after the split selection, run custody and removal cases")
 
     # 10. A foreign live link refuses and is left untouched.
     os.remove(os.path.join(app, "target"))

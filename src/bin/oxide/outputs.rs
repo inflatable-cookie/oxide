@@ -797,7 +797,6 @@ fn adopt_command() -> Result<u8, String> {
     let guard = barrier(&internal, &context.workspace, &mut waits)?;
     let outcome = (|| {
         refuse_unknown_custody(&internal, &context.workspace, "relink")?;
-        refuse_run_readers(&context, "outputs adopt")?;
         let _admission = store::lock_admission(&control)?;
         let receipt = match read_receipt(&control, &context.workspace, &context.checkout_id)? {
             None => Receipt::first(&context.workspace, &context.checkout_id),
@@ -926,7 +925,6 @@ fn detach_command() -> Result<u8, String> {
     let guard = barrier(&internal, &context.workspace, &mut waits)?;
     let outcome = (|| {
         refuse_unknown_custody(&internal, &context.workspace, "detach")?;
-        refuse_run_readers(&context, "outputs detach")?;
         let _admission = store::lock_admission(&control)?;
         let receipt = read_receipt(&control, &context.workspace, &context.checkout_id)?
             .ok_or("this checkout has no owned-output receipt; nothing to detach")?;
@@ -1079,7 +1077,7 @@ pub fn bind_for_command(
                 drop(lock);
                 if !announced {
                     eprintln!(
-                        "oxide: waiting for another oxide command (or a program `oxide run` started) in this checkout to finish before relinking outputs"
+                        "oxide: waiting for another oxide command in this checkout (a build, an exec tool or a program `oxide run` started) to finish before relinking outputs"
                     );
                     announced = true;
                 }
@@ -1240,22 +1238,6 @@ fn bind_under_binding(
             context.link().display(),
             target.label()
         ));
-    }
-    // A program `oxide run` executed from the current root is custody too: it
-    // reads (and may write) through the link after its slot was released.
-    let readers = match context.control() {
-        Some(control) => live_run_readers(control, &context.checkout_id, true),
-        None => Ok(Vec::new()),
-    };
-    match readers {
-        Err(reason) => {
-            return Bind::Refuse(format!(
-                "outputs: refusing to relink {}: {reason}",
-                context.link().display()
-            ))
-        }
-        Ok(readers) if !readers.is_empty() => return Bind::Wait,
-        Ok(_) => {}
     }
     match store.checkout_custody(&context.workspace, own_record) {
         Err(reason) => Bind::Refuse(reason),
@@ -1490,138 +1472,6 @@ fn refuse_unknown_custody(store: &Store, checkout: &Path, action: &str) -> Resul
             checkout.join("target").display()
         )),
         CheckoutCustody::Clear | CheckoutCustody::Writers => Ok(()),
-    }
-}
-
-/// A program `oxide run` executes from a converted checkout's outputs. Oxide
-/// replaces itself with the program, so the program keeps Oxide's PID and
-/// kernel start time; this file names that process and is the checkout's
-/// output custody while it runs, after the slot is released. Relinks wait for
-/// it; `adopt`, `detach` and clean refuse. A file whose process has gone (or
-/// whose PID now names another process) is stale and is removed.
-#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RunReader {
-    version: String,
-    pid: u32,
-    start: Option<u64>,
-    root: PathBuf,
-}
-
-const READER_VERSION: &str = "oxide.outputs.reader/1";
-/// At most this many run readers per checkout; beyond it custody is unknown.
-const MAX_READERS: usize = 64;
-const MAX_READER_BYTES: u64 = 4 * 1024;
-
-fn readers_directory(control: &Path, checkout_id: &str) -> PathBuf {
-    control
-        .join("outputs")
-        .join(format!("{checkout_id}.readers"))
-}
-
-/// The registered run reader for this process, removed again if the program
-/// could not be executed.
-pub struct RunCustody {
-    path: PathBuf,
-}
-
-impl RunCustody {
-    pub fn abandon(self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-/// Register this process as a reader of `root` before its slot is released,
-/// so the checkout's output custody is continuous from the build through the
-/// executed program.
-pub fn hold_for_run(control: &Path, checkout: &Path, root: &Path) -> Result<RunCustody, String> {
-    let checkout_id = identity::digest(&checkout.to_string_lossy());
-    let directory = readers_directory(control, &checkout_id);
-    create_owned_directory(&control.join("outputs"))?;
-    create_owned_directory(&directory)?;
-    let live = live_run_readers(control, &checkout_id, true)?;
-    if live.len() >= MAX_READERS {
-        return Err(format!(
-            "outputs: {} programs already run from this checkout's outputs; refusing to start another",
-            live.len()
-        ));
-    }
-    let pid = std::process::id();
-    let reader = RunReader {
-        version: READER_VERSION.to_owned(),
-        pid,
-        start: process::start_identity(pid),
-        root: root.to_path_buf(),
-    };
-    let bytes = serde_json::to_vec(&reader)
-        .map_err(|error| format!("cannot encode the run reader: {error}"))?;
-    let path = directory.join(format!("{pid}.json"));
-    let _ = fs::remove_file(&path);
-    write_private(&path, &bytes)?;
-    sync_directory(&directory)?;
-    Ok(RunCustody { path })
-}
-
-/// PIDs of programs `oxide run` executed from this checkout's outputs that
-/// still run. `prune` removes stale entries; any unreadable, malformed or
-/// excess entry is unknown custody and refuses.
-fn live_run_readers(control: &Path, checkout_id: &str, prune: bool) -> Result<Vec<u32>, String> {
-    let directory = readers_directory(control, checkout_id);
-    let entries = match fs::read_dir(&directory) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(format!("cannot read {}: {error}", directory.display())),
-        Ok(entries) => entries,
-    };
-    let mut live = Vec::new();
-    for (index, entry) in entries.enumerate() {
-        if index >= MAX_READERS * 2 {
-            return Err(format!(
-                "{} holds more run readers than Oxide tracks; custody is unknown",
-                directory.display()
-            ));
-        }
-        let path = entry
-            .map_err(|error| format!("cannot read {}: {error}", directory.display()))?
-            .path();
-        let unknown =
-            |why: &str| format!("run reader {} {why}; custody is unknown", path.display());
-        let metadata = fs::symlink_metadata(&path).map_err(|error| unknown(&error.to_string()))?;
-        if !metadata.is_file() || metadata.len() > MAX_READER_BYTES {
-            return Err(unknown("is not a bounded regular file"));
-        }
-        let bytes = fs::read(&path).map_err(|error| unknown(&error.to_string()))?;
-        let reader: RunReader =
-            serde_json::from_slice(&bytes).map_err(|error| unknown(&error.to_string()))?;
-        if reader.version != READER_VERSION {
-            return Err(unknown("has an unsupported version"));
-        }
-        let alive = match (reader.start, process::start_identity(reader.pid)) {
-            (Some(recorded), Some(current)) => recorded == current,
-            // Without a readable start time a live PID stays custody.
-            _ => process::pid_exists(reader.pid),
-        };
-        if alive {
-            live.push(reader.pid);
-        } else if prune {
-            let _ = fs::remove_file(&path);
-        }
-    }
-    live.sort_unstable();
-    Ok(live)
-}
-
-/// Refuse an explicit output command or a clean while a program started by
-/// `oxide run` still runs from this checkout's outputs.
-fn refuse_run_readers(context: &Context, action: &str) -> Result<(), String> {
-    let Some(control) = context.control() else {
-        return Ok(());
-    };
-    let live = live_run_readers(control, &context.checkout_id, true)?;
-    match live.first() {
-        None => Ok(()),
-        Some(pid) => Err(format!(
-            "{action} refused: a program started by `oxide run` (pid {pid}) still runs from this checkout's outputs; nothing was changed. Let it exit first"
-        )),
     }
 }
 
@@ -2620,7 +2470,6 @@ pub fn clean_placement(workspace: &Path) -> Result<Option<CleanPlacement>, Strin
                 .to_owned(),
         ),
         ReceiptState::Committed => {
-            refuse_run_readers(&context, "clean")?;
             let selected = receipt
                 .selected()
                 .cloned()
@@ -3421,66 +3270,6 @@ mod tests {
         .unwrap();
         assert_eq!(planned.kind, RootKind::Local);
         assert_ne!(planned.root, external);
-    }
-
-    /// A run reader names one live process by PID and start time. A stale
-    /// entry is pruned, a malformed one is unknown custody, and adopt,
-    /// detach and clean refuse while a live reader exists.
-    #[test]
-    fn run_readers_hold_custody_until_their_process_ends() {
-        let fixture = Fixture::new();
-        let context = fixture.context();
-        let id = context.checkout_id.clone();
-        assert!(live_run_readers(&fixture.control, &id, true)
-            .unwrap()
-            .is_empty());
-        let custody = hold_for_run(&fixture.control, &fixture.checkout, &fixture.root).unwrap();
-        assert_eq!(
-            live_run_readers(&fixture.control, &id, true).unwrap(),
-            vec![std::process::id()]
-        );
-        let refused = refuse_run_readers(&context, "clean").unwrap_err();
-        assert!(refused.contains("still runs"), "{refused}");
-
-        // This PID with another start time is a reused PID: stale.
-        let directory = readers_directory(&fixture.control, &id);
-        let reused = RunReader {
-            version: READER_VERSION.to_owned(),
-            pid: std::process::id(),
-            start: process::start_identity(std::process::id()).map(|start| start + 1),
-            root: fixture.root.clone(),
-        };
-        custody.abandon();
-        let reused_path = directory.join("reused.json");
-        fs::write(&reused_path, serde_json::to_vec(&reused).unwrap()).unwrap();
-        if reused.start.is_some() {
-            assert!(live_run_readers(&fixture.control, &id, true)
-                .unwrap()
-                .is_empty());
-            assert!(!reused_path.exists(), "a stale reader was not pruned");
-        }
-        let _ = fs::remove_file(&reused_path);
-
-        // An exited child's PID is gone.
-        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
-        let pid = child.id();
-        child.wait().unwrap();
-        let gone = RunReader {
-            version: READER_VERSION.to_owned(),
-            pid,
-            start: Some(1),
-            root: fixture.root.clone(),
-        };
-        fs::write(
-            directory.join("gone.json"),
-            serde_json::to_vec(&gone).unwrap(),
-        )
-        .unwrap();
-        assert!(refuse_run_readers(&context, "clean").is_ok());
-
-        fs::write(directory.join("bad.json"), b"{").unwrap();
-        let unknown = live_run_readers(&fixture.control, &id, true).unwrap_err();
-        assert!(unknown.contains("custody is unknown"), "{unknown}");
     }
 
     #[test]
