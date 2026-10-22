@@ -640,8 +640,8 @@ def run(proof: Proof, repo: str) -> None:
     expect(code == 0 and "already selects" in stdout, stdout)
     proof.phase("after crash replay")
 
-    # 10. A contradictory prepared state stops and keeps both roots.
-    shutil.rmtree(os.path.join(app, "target"))
+    # 10. A foreign live link refuses and is left untouched.
+    os.remove(os.path.join(app, "target"))
     os.symlink(os.path.join(root, "outside"), os.path.join(app, "target"))
     code, _, stderr = proof.oxide(["build", "--bin", "poutputs"], "foreign live link refuses", app)
     expect(code != 0 and "not this checkout's owned link" in stderr, stderr)
