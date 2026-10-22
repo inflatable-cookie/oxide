@@ -842,13 +842,36 @@ or global Cargo configuration is involved.
   any directory from `HOME` to `~/.local/bin` is a link, is owned by another
   user or (below `HOME`) is group or world writable. It writes only through
   the opened directory, with no-follow opens.
-- **Updating.** After a reviewed merge, the planner runs
-  `effigy oxide:reinstall`. It replaces only a regular, user-owned binary
-  whose hash matches the newest receipt. Directly before the rename it
-  rechecks that the destination is still that file (type, owner, inode and
-  hash) and refuses otherwise. Earlier receipts are kept. `OXIDE_INSTALL_PIN=<commit>` selects an older commit on main, for
-  example to roll back. Effigy does not forward selector arguments, so the
+- **Updating.** After a reviewed or explicitly operator-accepted merge, the
+  planner runs `effigy oxide:reinstall`. It replaces only a regular,
+  user-owned binary whose hash matches the newest receipt. Directly before
+  the atomic rename it rechecks that the destination is still that file
+  (type, owner, inode and hash) and refuses otherwise. Earlier receipts are
+  kept. `OXIDE_INSTALL_PIN=<commit>` selects a commit on pushed main; it does
+  not roll back ledger or control state, and an older binary may refuse
+  forward-only fields. Effigy does not forward selector arguments, so the
   pin travels in the environment.
+- **Install compatibility window.** Before an update, classify whether its
+  ledger or control-state format adds a forward-only fence that older
+  binaries refuse. For such updates, the planner obtains a fresh supported
+  Queue observation showing no milestone or project QA running before
+  installing. Inspect Queue's QA index together with host-run records and
+  exact QA details, including queued, admitted, running and capacity-retaining
+  runs; an empty latest-run list alone is insufficient. Queue currently has
+  no bounded QA-launch deferral: these observations cannot atomically exclude
+  preparing requests or a new launch between the check and swap. Coordinate
+  that short window with Queue's owner and retain the capability gap. If a
+  supported bounded deferral becomes available, use it and release it when
+  the install settles. Do not substitute a global pause, cancellation,
+  preemption or an unapproved scheduler setting. Preserve the observation
+  and install receipt. This is a state-compatibility condition, not a
+  quiet-machine or CPU-load gate. Updates with no state-format change keep
+  the atomic install with no idle wait. Atomic replacement preserves an
+  already-running binary's inode, but cannot make it understand newly
+  written state: old commands can refuse an early state read as well as a
+  final release. Keep those failures and any held records for the existing
+  positive-closure recovery path; do not overwrite the new format or infer
+  writer closure from the refusal.
 - **Default pool.** The first leased command created
   `~/Library/Caches/oxide/pool` under the then-shipped rules: a 24 GiB
   `apfs-sparse-image-v1` image, refused below the 20 GiB host reserve. That
