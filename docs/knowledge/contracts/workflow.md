@@ -1840,14 +1840,47 @@ oxide#102.
   whole number of `KB`, `MB`, `GB`, `TB` (decimal) or `KiB`, `MiB`, `GiB`,
   `TiB`, from 1 MiB to 16 TiB; anything else refuses before any effect.
   `OXIDE_POOL_BACKEND` is retired: unset or `directory-budget` only.
-- **Config file.** Machine configuration, never a project file. Platform
-  location (Longhorn platform-native-v1 policy, mirrored, no dependency):
-  macOS `~/Library/Application Support/oxide/config/config.toml`; elsewhere
-  `$XDG_CONFIG_HOME/oxide/config.toml`, with XDG's `~/.config` when the
-  variable is unset; a relative `XDG_CONFIG_HOME` or a missing `HOME`
-  refuses. (Approved change, not shipped: on adopting Longhorn 0.4.1's
-  per-root resolver (#103), a relative `XDG_*` value for a demanded root is
-  ignored and the default used, per the XDG spec (Tom, 2026-10-21).) `OXIDE_CONFIG` (absolute) selects another file; only the selected
+- **Storage roots.** The config, cache and state roots come from
+  `longhorn-storage-layout` (git tag `v0.4.1`, commit `5caf1e2c`,
+  `platform-native-v1`, leaf `oxide`; oxide#103). Each root is resolved
+  only when needed and reads only its own platform fact, so an explicit
+  `OXIDE_CONFIG` or `OXIDE_POOL` reads no unused directory variable; no
+  directory is created by resolution. Paths are unchanged: macOS
+  `~/Library/Application Support/oxide/config`, `~/Library/Caches/oxide`
+  and `~/Library/Application Support/oxide/state`, with `XDG_*` ignored;
+  Linux `$XDG_CONFIG_HOME/oxide`, `$XDG_CACHE_HOME/oxide` and
+  `$XDG_STATE_HOME/oxide`, defaulting to `~/.config`, `~/.cache` and
+  `~/.local/state`. A relative or empty `XDG_*` value for a demanded root is
+  ignored and the default used, per the XDG spec (Tom, 2026-10-21; it
+  formerly refused). An absolute `XDG_*` value supplies its root without
+  `HOME`; `XDG_RUNTIME_DIR` is never needed. A demanded root with no usable
+  fact (no absolute `HOME` and no absolute `XDG_*`) refuses with `HOME is
+  unset or not an absolute path`. Any host other than macOS or Linux now
+  refuses a demanded root (formerly XDG); Longhorn's Windows policy is not
+  adopted.
+  Oxide keeps its own file names beneath the roots and its own TOML parsing
+  and overrides; it uses no Longhorn config store or layout digest.
+  **Proof.** Unit tests pin literal former paths for both platforms
+  (Unicode and spaces), demanded and unused relative XDG, overrides without
+  `HOME` and missing facts with injected facts; they do not prove native
+  Linux behaviour. `effigy rust:storage-layout` runs one fixed script under
+  the qualified shared supervisor: it records the normal dependency tree
+  (exactly one `sha2`), stages `oxide` offline with 1.97.1 and runs `oxide
+  status` on a private macOS `HOME` for the default paths, ignored XDG,
+  overrides without `HOME`, refusal without `HOME`, and legacy-pool
+  registration and known-pools routing through the cache and state roots,
+  with nothing created. 300 s, 512 MiB monitored scratch.
+- **Digests.** `sha2` is pinned `=0.11.0`, the one version in the
+  dependency closure (Longhorn requires `^0.11.0`); `effigy
+  rust:tree-duplicates` lists duplicate packages. Slot identity and
+  compatibility digests are unchanged: unit tests check FIPS 180-2 vectors
+  (one-shot, bytes, streaming), literal stored slot keys and a frozen
+  ledger that reads back and serializes to the same bytes.
+- **Config file.** Machine configuration, never a project file, at
+  `config.toml` in the config root: macOS
+  `~/Library/Application Support/oxide/config/config.toml`; elsewhere
+  `$XDG_CONFIG_HOME/oxide/config.toml` (`~/.config` by default).
+  `OXIDE_CONFIG` (absolute) selects another file; only the selected
   file is parsed. On macOS `~/.config/oxide/config.toml` is never read;
   `status` says it is ignored, without printing its contents. Parsed with
   `basic-toml` 0.1.10; at most 64 KiB:
