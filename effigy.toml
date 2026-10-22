@@ -112,6 +112,19 @@ run = "python3 scripts/test-oxide-cli.py --toolchain-context"
 admission = "heavy"
 run = "python3 scripts/test-oxide-removable-pool.py"
 
+# Removable build volume, part 2 (oxide#098), under the qualified #109 shared
+# supervisor: 300 s absolute, 512 MiB monitored scratch (the scratch image's
+# backing file carries the mounted payload). Stages oxide offline with 1.97.1;
+# one owned 128 MiB scratch APFS image at a unique /Volumes/<name>, removed by
+# `hdiutil detach -force` of its own positively bound device in three cases:
+# idle slot kept warm, held build fails cleanly and its lost slot is deleted
+# whole after re-attach, wrapper-allowed build quarantined. No internal spill,
+# checkout-local outputs, run/test after fallback. Ordinary detach at the end.
+# Not a benchmark, real-drive qualification or full QA.
+[tasks."rust:oxide-removable-removal"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-oxide-removable-removal.py"
+
 # Budget-only default pool (oxide#102): the removable-pool proof's guarded
 # session, preceded by the default-pool cases over a scratch HOME (legacy
 # image pool detection untouched, creation at the new path with a verified

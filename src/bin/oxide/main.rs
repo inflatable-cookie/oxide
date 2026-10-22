@@ -378,6 +378,9 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
                     "oxide: flushed the removable volume before releasing slot {slot} in {:.1} ms",
                     micros as f64 / 1000.0
                 ),
+                None if flush.lost => eprintln!(
+                    "oxide: slot {slot} was lost with the removable volume; the next command uses the internal pool until it returns"
+                ),
                 None => eprintln!("oxide: slot {slot} is retired: its flush failed"),
             },
             _ => {}
@@ -723,6 +726,18 @@ fn print_pools(internal: &Store) -> Result<(), String> {
                     println!("{line}");
                 }
                 println!("  slots: not read while the volume is not usable (unknown, not empty)");
+                match store::recorded_lost(&status.control) {
+                    Ok(lost) => {
+                        for (slot, checkout, what) in lost {
+                            let checkout = checkout.map_or_else(
+                                || "no checkout affinity".to_owned(),
+                                |checkout| checkout.display().to_string(),
+                            );
+                            println!("  slot {slot} ({checkout}): {what}");
+                        }
+                    }
+                    Err(error) => println!("  lost slots: unknown ({error})"),
+                }
             }
         }
     }
