@@ -40,6 +40,7 @@ import importlib.util
 import json
 import os
 import plistlib
+import re
 import secrets
 import shutil
 import signal
@@ -78,6 +79,11 @@ fn main() {
     let gate = PathBuf::from(gate);
     fs::create_dir_all(&gate).unwrap();
     fs::write(gate.join("started"), b"started").unwrap();
+    fs::write(
+        gate.join(format!("started-{}", std::process::id())),
+        b"started",
+    )
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(90);
     while !gate.join("release").exists() {
         assert!(Instant::now() < deadline, "proof did not release the build");
@@ -133,6 +139,23 @@ def oxide_env(proof: Proof, args: list, label: str, cwd: str, env: dict) -> tupl
 def read_bytes(path: str) -> bytes:
     with open(path, "rb") as handle:
         return handle.read()
+
+
+def slot_state(stderr: str) -> tuple[str, str]:
+    """The leased slot id and whether it was warm, from the summary line."""
+    line = summary(stderr)
+    match = re.search(r"slot (\S+) (cold|warm)", line)
+    expect(match is not None, f"no slot state in {line}")
+    return match.group(1), match.group(2)
+
+
+def started_markers(gate: str) -> list[str]:
+    return sorted(glob.glob(os.path.join(gate, "started-*")))
+
+
+def stop_gate(gate: str, release: str) -> None:
+    with open(release, "wb") as handle:
+        handle.write(b"release")
 
 
 def read_json(path: str) -> dict:
@@ -502,6 +525,21 @@ def run(proof: Proof, repo: str) -> None:
         os.path.realpath(binary).startswith(local_root + "/"),
         "the fallback binary is not in the local root",
     )
+    # The first fallback leased the generation the local root was then created
+    # at, so an identical command reuses the same slot warm. A lease keyed from
+    # a marker-less g0 would take a second cold slot here.
+    fallback_slot, fallback_warmth = slot_state(stderr)
+    expect(fallback_warmth == "cold", f"the first fallback was not cold: {fallback_slot} {fallback_warmth}")
+    code, _, stderr = proof.oxide(["build", "--bin", "poutputs"], "second fallback build", app)
+    expect(code == 0, f"second fallback build failed: {stderr}")
+    expect(
+        slot_state(stderr) == (fallback_slot, "warm"),
+        f"the fallback destination did not keep its slot: {stderr}",
+    )
+    expect(
+        os.path.realpath(binary).startswith(local_root + "/"),
+        "the reused fallback binary left the local root",
+    )
     with open(os.path.join(local_root, "local-sentinel"), "wb") as handle:
         handle.write(b"local kept")
     proof.phase("after fallback")
@@ -542,6 +580,18 @@ def run(proof: Proof, repo: str) -> None:
     expect(link_target(untracked_link) == untracked_root, "the refused fallback changed the link")
     set_recorded_uuid(pool, good)
     code, _, stderr = proof.oxide(["check"], "roll the refused fallback back", untracked)
+    expect(code == 0 and link_target(untracked_link) == untracked_root, stderr)
+    # A local root that already exists (empty) is still refused and left
+    # untouched when Git would track it.
+    empty_local = os.path.join(untracked, ".oxide-outputs", "local")
+    os.makedirs(empty_local)
+    set_recorded_uuid(pool, "00000000-0000-0000-0000-000000000000")
+    code, _, stderr = proof.oxide(["check"], "pre-created empty local root", untracked)
+    expect(code != 0 and "Git would track it" in stderr, stderr)
+    expect(os.path.isdir(empty_local) and os.listdir(empty_local) == [], "the empty local root changed")
+    expect(link_target(untracked_link) == untracked_root, "the refused fallback changed the link")
+    set_recorded_uuid(pool, good)
+    code, _, stderr = proof.oxide(["check"], "roll the empty-local-root refusal back", untracked)
     expect(code == 0 and link_target(untracked_link) == untracked_root, stderr)
     proof.phase("after the tracked-fallback refusal")
 
@@ -653,6 +703,102 @@ def run(proof: Proof, repo: str) -> None:
     set_recorded_uuid(pool, good)
     proof.phase("after the writer barrier")
 
+    # 8c. A long-lived exec in the checkout does not block a second command
+    #     whose destination is unchanged (the second-slot rule), and the exec
+    #     is not redirected.
+    code, _, stderr = proof.oxide(["build", "--bin", "poutputs"], "relink before the exec case", app)
+    expect(code == 0 and link_target(link) == external_root, f"pre-exec relink failed: {stderr}")
+    exec_release = os.path.join(root, "exec-release")
+    exec_child = start_child(
+        proof,
+        [
+            proof.binary,
+            "exec",
+            "--",
+            "/bin/sh",
+            "-c",
+            f"while [ ! -f {exec_release} ]; do sleep 0.05; done",
+        ],
+        app,
+        env,
+    )
+    try:
+        time.sleep(1.0)
+        expect(exec_child.poll() is None, "the long-lived exec exited early")
+        code, _, stderr = proof.oxide(["build", "--bin", "poutputs"], "command beside a long-lived exec", app)
+        expect(
+            code == 0 and link_target(link) == external_root,
+            f"a command was blocked by the checkout's exec: {stderr}",
+        )
+        expect(exec_child.poll() is None, "the exec ended before the second command")
+    finally:
+        with open(exec_release, "wb") as handle:
+            handle.write(b"go")
+    exec_code, _, exec_stderr = finish_child(proof, exec_child, "long-lived exec")
+    expect(exec_code == 0, f"the long-lived exec failed: {exec_stderr}")
+
+    # 8d. Two commands started together with the same destination both reach
+    #     Cargo: no post-lease deadlock between starters.
+    reset_gate(gate)
+    starter_one = start_child(proof, [proof.binary, "check"], app, gate_env)
+    starter_two = start_child(proof, [proof.binary, "check"], app, gate_env)
+    try:
+        deadline = time.monotonic() + min(60, work_left())
+        while len(started_markers(gate)) < 2:
+            if time.monotonic() >= deadline:
+                fail(
+                    "only "
+                    f"{len(started_markers(gate))} of two simultaneous commands reached Cargo"
+                )
+            time.sleep(0.05)
+        expect(
+            starter_one.poll() is None and starter_two.poll() is None,
+            "a simultaneous command finished before the gate",
+        )
+        stop_gate(gate, os.path.join(gate, "release"))
+        first_code, _, first_stderr = finish_child(proof, starter_one, "simultaneous command one")
+        second_code, _, second_stderr = finish_child(proof, starter_two, "simultaneous command two")
+        expect(
+            first_code == 0 and second_code == 0,
+            f"a simultaneous command failed: {first_stderr}{second_stderr}",
+        )
+    finally:
+        os.makedirs(gate, exist_ok=True)
+        stop_gate(gate, os.path.join(gate, "release"))
+        for child in (starter_one, starter_two):
+            if child.poll() is None:
+                child.kill()
+    expect(
+        os.path.isdir(os.path.join(external_root, "debug")),
+        "the simultaneous commands did not use the external root",
+    )
+
+    # 8e. A replaced output-directory ancestor refuses an unchanged
+    #     destination, so Cargo never writes onto internal disk.
+    volume_outputs = os.path.join(mount, "oxide-outputs")
+    saved_outputs = os.path.join(root, "saved-outputs")
+    internal_outputs = os.path.join(root, "internal-outputs")
+    os.rename(volume_outputs, saved_outputs)
+    shutil.copytree(saved_outputs, internal_outputs)
+    os.symlink(internal_outputs, volume_outputs)
+    leaf = os.path.basename(external_root)
+    before = sorted(os.listdir(os.path.join(internal_outputs, leaf)))
+    code, _, stderr = proof.oxide(["build", "--bin", "poutputs"], "replaced ancestor refuses", app)
+    expect(code != 0, "a replaced output ancestor was written through")
+    expect(
+        "not on the registered volume" in stderr or "does not resolve to itself" in stderr,
+        stderr,
+    )
+    expect(
+        sorted(os.listdir(os.path.join(internal_outputs, leaf))) == before,
+        "the refused build wrote into the internal copy",
+    )
+    os.remove(volume_outputs)
+    os.rename(saved_outputs, volume_outputs)
+    code, _, stderr = proof.oxide(["build", "--bin", "poutputs"], "build after restoring the ancestor", app)
+    expect(code == 0 and link_target(link) == external_root, f"ancestor restore failed: {stderr}")
+    proof.phase("after the barrier and ancestor controls")
+
     # 9. Crash replay at each write-ahead point.
     expect(receipt_path(pool, app) and read_json(receipt_path(pool, app))["state"] == "committed", read_json(receipt_path(pool, app)))
     crash_env = dict(env)
@@ -713,6 +859,59 @@ def run(proof: Proof, repo: str) -> None:
 
     # 11. Clean resolves the receipt to the real root and preserves it.
     committed_bytes = read_bytes(receipt_path(pool, app))
+    # 11a. A selected clean revalidates ownership after its barrier: a link
+    #      that turns foreign while it waits is never cleaned through.
+    clean_release = os.path.join(root, "clean-release")
+    holder = start_child(
+        proof,
+        [
+            proof.binary,
+            "exec",
+            "--",
+            "/bin/sh",
+            "-c",
+            f"while [ ! -f {clean_release} ]; do sleep 0.05; done",
+        ],
+        app,
+        env,
+    )
+    try:
+        time.sleep(1.0)
+        expect(holder.poll() is None, "the clean-wait holder exited early")
+        waiting = start_child(proof, [proof.binary, "clean", "-p", "poutputs"], app, env)
+        time.sleep(1.5)
+        if waiting.poll() is not None:
+            early_out, early_err = waiting.communicate(timeout=5)
+            proof.unclosed.discard(waiting.pid)
+            fail(
+                "selected clean did not wait for the checkout's active command: "
+                f"exit {waiting.returncode}\n{early_out.decode(errors='replace')}"
+                f"{early_err.decode(errors='replace')}"
+            )
+        os.remove(link)
+        os.symlink(os.path.join(root, "outside"), link)
+        with open(clean_release, "wb") as handle:
+            handle.write(b"go")
+        holder_code, _, holder_stderr = finish_child(proof, holder, "clean-wait holder")
+        expect(holder_code == 0, f"the clean-wait holder failed: {holder_stderr}")
+        clean_code, clean_out, clean_err = finish_child(
+            proof, waiting, "selected clean after the link changed"
+        )
+        expect(
+            clean_code != 0 and "not the owned link" in clean_err,
+            f"selected clean ran after its ownership changed: {clean_out}{clean_err}",
+        )
+        expect(
+            read_bytes(os.path.join(outside, "sentinel")) == b"foreign",
+            "the refused selected clean removed bytes through the foreign link",
+        )
+    finally:
+        with open(clean_release, "wb") as handle:
+            handle.write(b"go")
+        if holder.poll() is None:
+            holder.kill()
+    os.remove(link)
+    os.symlink(external_root, link)
     code, _, stderr = proof.oxide(
         ["clean", "-p", "poutputs"], "selected clean through the owned link", app
     )
@@ -789,7 +988,51 @@ def run(proof: Proof, repo: str) -> None:
     expect(code == 0, f"detached build failed: {stderr}")
     expect(os.path.isdir(os.path.join(app, "target", "debug")), "detached build wrote no target/debug")
     expect(not os.path.islink(link), "a detached build re-created the owned link")
-    # 14. A prepared first conversion never renames over a link that appeared
+    # 14. Unknown writer custody (a lost slot never positively closed) blocks
+    #     relinking and cleaning for this checkout, in either pool.
+    state_paths = [
+        os.path.join(pool, "oxide-managed", "state.json"),
+        os.path.join(pool, "oxide-managed", "removable", "oxide-managed", "state.json"),
+    ]
+    saved_states = {}
+    crafted = False
+    for path in state_paths:
+        if not os.path.exists(path) or crafted:
+            continue
+        saved_states[path] = read_bytes(path)
+        data = json.loads(saved_states[path])
+        record = next(
+            (entry for entry in data.get("records", []) if entry.get("checkout") == app), None
+        )
+        if record is None:
+            continue
+        record["phase"] = "retired"
+        record["retired"] = "quarantined: crafted proof writer"
+        record["lost"] = {"slot_id": "77", "at_ms": 1, "unclosed": "crafted unknown writer"}
+        data["next_id"] = max(int(data.get("next_id", 1)), 1000)
+        with open(path, "wb") as handle:
+            handle.write(json.dumps(data).encode())
+        os.chmod(path, 0o600)
+        crafted = True
+    expect(crafted, "no checkout record to quarantine in the proof state")
+    try:
+        code, _, stderr = proof.oxide(
+            ["pool", "set-mode", "permanent"], "permanent mode for the custody case", app
+        )
+        expect(code == 0, stderr)
+        code, _, stderr = proof.oxide(["outputs", "adopt"], "adopt refused on quarantined custody", app)
+        expect(code != 0 and "never confirmed closed" in stderr, stderr)
+        code, _, stderr = proof.oxide(["clean"], "clean refused on quarantined custody", app)
+        expect(code != 0 and "unknown writer custody" in stderr, stderr)
+        expect(os.path.isdir(local_root) and os.path.isdir(external_root), "a refused clean removed a root")
+    finally:
+        for path, contents in saved_states.items():
+            with open(path, "wb") as handle:
+                handle.write(contents)
+            os.chmod(path, 0o600)
+    proof.phase("after the quarantined-custody refusal")
+
+    # 15. A prepared first conversion never renames over a link that appeared
     #     after the crash, even when a matching sibling is live.
     code, _, stderr = proof.oxide(
         ["pool", "set-mode", "permanent"], "permanent mode for the crafted replay", app
