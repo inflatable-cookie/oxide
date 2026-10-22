@@ -790,6 +790,48 @@ pub fn recorded_lost(control: &Path) -> Result<Vec<(String, Option<PathBuf>, Str
         .collect())
 }
 
+/// Cooperative holders of one checkout, read-only: active records and clean
+/// barriers, newest state only. Used by `oxide outputs plan`; an empty list
+/// means no cooperative Oxide command holds the checkout right now, never
+/// that no external writer exists.
+pub fn active_holders(control: &Path, checkout: &Path) -> Result<Vec<String>, String> {
+    let path = control.join("state.json");
+    let Some(file) = private_file(&path, false)? else {
+        return Ok(Vec::new());
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_STATE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read Oxide state: {error}"))?;
+    if bytes.len() as u64 > MAX_STATE_BYTES {
+        return Err("Oxide state exceeds its byte limit".to_owned());
+    }
+    let state: State = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Oxide state is invalid: {error}"))?;
+    let mut holders = Vec::new();
+    for record in &state.records {
+        if record.checkout.as_deref() != Some(checkout) || !record.active() {
+            continue;
+        }
+        let name = record
+            .holder
+            .as_ref()
+            .and_then(|holder| holder.command.as_deref())
+            .unwrap_or("command");
+        let pid = record
+            .holder
+            .as_ref()
+            .map_or_else(|| "unknown".to_owned(), |holder| holder.pid.to_string());
+        holders.push(format!("oxide pid {pid}: {name}"));
+    }
+    for clean in &state.cleans {
+        if clean.checkout == checkout {
+            holders.push("oxide clean barrier".to_owned());
+        }
+    }
+    Ok(holders)
+}
+
 pub struct SlotView {
     pub slot_id: String,
     /// Slot directory below `slots`; `None` is the legacy `<id>`.
@@ -2504,21 +2546,39 @@ pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
     let directory = open_control_directory(control)?
         .ok_or_else(|| format!("{} does not exist", control.display()))?;
     let name = CString::new("admission.lock").map_err(|error| error.to_string())?;
-    // SAFETY: `name` is a live CString with initialized bytes through its
-    // terminator, and `directory` owns a live descriptor until `openat` ends.
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
-        )
-    };
+    // Oxide never removes a control directory, so an `ENOENT` for this create
+    // in the verified directory is transient: a concurrent create of the same
+    // lock was observed to report it on macOS APFS (oxide#117 fixture). Retry
+    // a bounded number of times on the same verified descriptor; a directory
+    // that is really gone still fails after the attempts.
+    let mut fd = -1;
+    for attempt in 0..3 {
+        // SAFETY: `name` is a live CString with initialized bytes through its
+        // terminator, and `directory` owns a live descriptor for this call.
+        fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd >= 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::NotFound || attempt == 2 {
+            return Err(format!(
+                "cannot open admission lock in {}: {error}",
+                control.display()
+            ));
+        }
+        std::thread::yield_now();
+    }
     if fd < 0 {
         return Err(format!(
-            "cannot open admission lock in {}: {}",
-            control.display(),
-            std::io::Error::last_os_error()
+            "cannot open admission lock in {}: the create did not succeed",
+            control.display()
         ));
     }
     // SAFETY: `fd` is a newly opened descriptor owned by this function.
@@ -2537,7 +2597,7 @@ pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
 }
 
 /// Open an owner-only regular control file without following symlinks.
-fn private_file(path: &Path, create: bool) -> Result<Option<File>, String> {
+pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, String> {
     let mut options = OpenOptions::new();
     options
         .read(true)

@@ -2344,8 +2344,8 @@ A lease records which pool it uses. Each pool stays warm on its own.
 - After an unclean disappearance, slots held at that moment are non-reusable. Discard them only after positive writer closure; otherwise quarantine and retain accounting. A vanished device, or Oxide's Cargo group ending while an inherited sccache server may still write, is not sufficient closure. Idle, flushed slots are kept.
 - The ledger never lives on the removable volume.
 
-**Final outputs stay checkout-local by default.** `CARGO_TARGET_DIR` remains `<checkout>/target` regardless of where slot intermediates live, keeping built binaries at the expected checkout path when undocked (Tom, 2026-10-20).
-- **Following the pool is not implemented.** oxide#098 kept outputs checkout-local; any output placement on the volume belongs to the separate output-link lead (`fe95800b`). Docking alone never moves final outputs, and an interrupted command is never automatically replayed.
+**Final outputs stay checkout-local by default.** `CARGO_TARGET_DIR` remains `<checkout>/target` regardless of where slot intermediates live, keeping built binaries at the expected checkout path when undocked (Tom, 2026-10-20). The one exception is an explicit per-checkout conversion under permanent drive mode, below: `target` stays the lexical `CARGO_TARGET_DIR`, but it becomes an Oxide-owned link whose real root may be on the volume.
+- **Following the pool is implemented as an owned link, never a move.** oxide#098 kept outputs checkout-local; oxide#117 adds the opt-in permanent-drive placement described under [final outputs on the permanent drive](#final-outputs-on-the-permanent-drive-oxide117). Docking alone never moves final outputs, and an interrupted command is never automatically replayed.
 
 **What moves and what doesn't:**
 - **Moves by default:** slot intermediates. Final outputs stay checkout-local.
@@ -2354,6 +2354,92 @@ A lease records which pool it uses. Each pool stays warm on its own.
 - Spotlight indexing of build locations is a host setting, recommended separately.
 
 **Drive:** the dedicated spare 1 TB SSD (Tom, 2026-10-20), formatted by Tom in Disk Utility as plain APFS volume `Builds` (UUID `A6AC3ED7-33EA-46B4-8082-7254CF291ED2`). Vault and its Time Machine backups stay untouched. **Decided (Tom, 2026-10-20):** a 750 GB Oxide admission cap and a 100 GB free-space reserve, both set at registration. The flush primitive is implemented (`fsync_volume_np` with full sync and wait; see part 1 above); **not yet measured:** its cost on the real drive.
+
+### Final outputs on the permanent drive (oxide#117)
+
+Implemented for permanent drive mode; ephemeral drive mode is unchanged.
+This owns final-output placement only: not compiler fingerprints,
+intermediate slot limits, sccache, scheduling or admission. Device
+qualification on the real drive, conversion of Tom's checkouts, data
+migration and consumer adoption remain separate gates.
+
+- **One owned link.** A converted checkout has one Oxide-owned
+  `<checkout>/target` symlink. `CARGO_TARGET_DIR` stays that lexical path, so
+  `target/debug` and the #106 profile rules are unchanged.
+- **Roots.** The real root lives outside the pool payload:
+  `<mount>/oxide-outputs/<project>-<checkout id>/` on the registered volume,
+  else the checkout-local fallback `<checkout>/.oxide-outputs/local/`.
+  `oxide init` idempotently adds `/.oxide-outputs/` to the workspace
+  `.gitignore`, and creating the local root refuses when Git would track it.
+- **Ownership.** A root carries `.oxide-output.json`
+  (`oxide.outputs.root/1`: checkout, checkout id, project label, placement
+  recipe, kind, volume UUID, creation generation). A link whose target is
+  not a real directory carrying this checkout's marker is foreign: never
+  followed, adopted, swapped or cleaned through. A marker for another
+  checkout, kind or volume refuses.
+- **Receipt.** `<pool>/oxide-managed/outputs/<checkout id>.json`
+  (`oxide.outputs.transition/1`) is strict, bounded (64 KiB) and holds the
+  committed selection and generation, a bounded history of at most eight
+  known roots, or exactly one prepared transition. An unknown version or
+  field refuses.
+- **Transition.** Under the checkout's existing clean/admission barrier and
+  the internal admission lock, after positive cooperative writer/reader
+  closure and a fresh volume, device, marker and generation check: publish
+  `prepared`, create the destination root and marker on the verified volume,
+  create the unique sibling `.target.oxide-new-<generation>` link and sync,
+  validate it, atomically rename it onto `target`, then publish `committed`.
+  Generations are exact `u64`s; receipt paths are absolute and `..`-free. No
+  step recreates an absent mount point, follows a link, or unlinks by path
+  text.
+- **Crash replay.** Only the exact prepared/old generations replay. A live
+  prepared sibling is renamed and committed; an already-published prepared
+  link is committed; a preparation that published nothing rolls back to the
+  old selection and keeps any root it created. Any other state stops, keeps
+  both roots and the link, and says so.
+- **Selection.** A command binds its root once, after taking its own exclusive
+  checkout lease and before Cargo starts: the external root only when the
+  volume is present, registered, writable, above its reserve and the root is
+  on its device with a matching marker; otherwise the local fallback. No
+  command is redirected mid-run; a command waiting behind the barrier sees
+  the new selection. A checkout that is not converted keeps ephemeral
+  behaviour with a warning in permanent mode.
+- **Explicit commands.** `oxide outputs plan` is effect-free bounded JSON
+  (`oxide.outputs.plan/1`, always `data_move: false`, with cooperative
+  holders and the next generation). `adopt` converts only a missing or empty
+  real target; a nonempty real target and a foreign symlink refuse without
+  mutation, and an owned correct link is a no-op. `detach` restores a real
+  empty `<checkout>/target` directory, keeps every root and refuses while the
+  drive mode is still permanent. `status` is read-only.
+- **Clean.** Resolves the receipt to the selected real root, requires it to be
+  the current owned link, and applies the existing
+  enumeration/foreign/symlink/device predicates there. The root, its marker
+  and the link are kept, inactive roots are reported, and a missing identity
+  or a pending transition refuses. `--include-foreign` cannot override that.
+  Ephemeral clean is unchanged.
+- **Removal.** A volume that vanishes fails the running build through #098's
+  stop/lost/quarantine path. The link is never swapped mid-command, and
+  neither root is copied or deleted. The next command transitions to the
+  selected root once the checkout is quiescent; an unknown or contradictory
+  state refuses rather than overwrites.
+- **Limits.** Tools that bypass Oxide stay outside cooperative custody; no
+  universal reader containment is claimed.
+
+**Proof.** `effigy rust:permanent-outputs` runs
+`scripts/test-permanent-outputs.py` as the whole command of the qualified
+shared proof supervisor (`bounded-test.py --limit 300 --scratch-budget-mib
+512`, oxide#109). It stages this clean HEAD's `oxide` offline with 1.97.1,
+models the permanent drive as one owned 128 MiB APFS sparse image at a unique
+`/Volumes/<name>`, and covers: the effect-free plan; refusals for a nonempty
+real target and a foreign symlink with no mutation; explicit conversion and
+builds, `run`, `test`, `--profile debug` and `target/debug` binaries through
+the link; the local fallback while the drive is absent and redocking with
+both roots kept; the git-tracked local-root refusal; a wrong recorded volume
+UUID with no external write and no recreated mount point; an active build
+script blocking the swap; crash replay at the prepared, sibling and renamed
+points plus the contradictory-state stop; clean's resolved root and preserved
+link, marker and inactive roots; and `detach` refusing while permanent and
+restoring a real directory afterwards. Not a benchmark, real-drive
+qualification or an alias for full QA.
 
 ### Proposed: `oxide pool describe --json` (lead `beec4971`)
 

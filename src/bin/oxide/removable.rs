@@ -605,7 +605,7 @@ pub fn registration(internal: &Store) -> Result<Option<Registration>, String> {
     read_registration(internal.control())
 }
 
-fn read_registration(control: &Path) -> Result<Option<Registration>, String> {
+pub(crate) fn read_registration(control: &Path) -> Result<Option<Registration>, String> {
     let Some(directory) = store::open_control_directory(control)? else {
         return Ok(None);
     };

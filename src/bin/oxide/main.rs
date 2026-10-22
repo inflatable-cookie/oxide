@@ -14,6 +14,7 @@ mod config;
 mod freshness;
 mod identity;
 mod launch;
+mod outputs;
 mod process;
 mod removable;
 mod store;
@@ -51,6 +52,9 @@ USAGE:
                                          remove <workspace>/target and slot affinity; slots stay
     oxide clean <-p|--doc|--profile ...> Cargo's selected clean, same storage rules
     oxide clean --cargo-cache            one pass of Cargo's own home cleanup, no network
+    oxide outputs plan|adopt|detach|status
+                                         permanent drive: plan, explicitly convert or
+                                         detach the owned <checkout>/target link
     oxide status                         pool, slots, waits, stray output and Cargo home
     oxide status --launch-check          macOS: time a new executable's first launch
     oxide pool register-removable <mount-point> --reserve <size> --cap <size> [--mode ...]
@@ -128,6 +132,7 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
         Class::Plain => Err(exec_cargo(&args)),
         Class::Status => run_status(rest),
         Class::Pool => removable::run(rest),
+        Class::Outputs => outputs::run(rest),
         Class::Clean => clean::run(rest),
         Class::Init => adopt::run_init(rest),
         Class::New => adopt::run_new(rest),
@@ -229,7 +234,9 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         invocation.target.as_deref(),
     )?;
     process::install_signal_handlers()?;
-    let selected = removable::select(Store::open_or_create()?)?;
+    let internal = Store::open_or_create()?;
+    let output_control = internal.control().to_path_buf();
+    let selected = removable::select(internal)?;
     let selection_mode = selected.mode;
     let fallback_reason = selected.fallback_reason.clone();
     let store = selected.store;
@@ -265,6 +272,22 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         store.release(held, origin)?;
         return Ok(process::signal_exit_code(signal));
     }
+    // Bind the checkout's owned output root once, before Cargo starts. The
+    // lease just taken is this checkout's exclusive barrier: `oxide clean`
+    // and another command wait for it, so the swap cannot redirect a running
+    // command.
+    let bound = match outputs::bind_for_command(Some(&output_control), &key.checkout) {
+        Ok(bound) => bound,
+        Err(reason) => {
+            let origin = held.prior.unchanged();
+            store.release(held, origin)?;
+            return Err(reason);
+        }
+    };
+    for warning in &bound.warnings {
+        eprintln!("oxide: WARNING: {warning}");
+    }
+    let output_note = bound.note;
     let run = invocation.command == "run";
     let config_args = if cli::reads_config_args(&invocation.command) {
         &invocation.cargo_args[..]
@@ -374,7 +397,7 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     let slot = held.slot_id.clone();
     let warm = held.reused;
     let measured = held.measured.clone();
-    let mut notes = [gate.describe(), wrapper_note]
+    let mut notes = [gate.describe(), wrapper_note, output_note]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
@@ -692,7 +715,17 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
     }
     print_other_pools(&settings);
     match identity::locate_workspace(CARGO, None) {
-        Ok(workspace) => report_stray(&workspace),
+        Ok(workspace) => {
+            report_stray(&workspace);
+            match outputs::status_lines(&workspace) {
+                Ok(lines) => {
+                    for line in lines {
+                        println!("{line}");
+                    }
+                }
+                Err(reason) => println!("outputs: unknown ({reason})"),
+            }
+        }
         Err(_) => println!("stray Cargo output: no Cargo workspace here"),
     }
     cargo_home::report_status();
