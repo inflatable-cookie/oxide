@@ -640,8 +640,9 @@ fn lease_with_gate(
 ) -> Result<Result<(store::Lease, Gate), Stop>, String> {
     let mut share = true;
     // A refusal leaves this checkout without a record, so the next lease is
-    // a new or evicted slot; the bound only guards against a defect.
-    for _ in 0..4 {
+    // a new or evicted slot. At most nine grants: the eight project slots a
+    // refused command can try plus one cold fallback (oxide#118).
+    for _ in 0..9 {
         let mut held = match store.acquire(key, profile, share, label, waits)? {
             Acquired::Lease(held) => held,
             Acquired::Interrupted(signal) => return Ok(Err(Stop::Signal(signal))),

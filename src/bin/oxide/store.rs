@@ -49,15 +49,48 @@ use std::time::{Duration, Instant, SystemTime};
 pub const GIB: u64 = 1024 * 1024 * 1024;
 /// Automatic creation refuses below this host free space.
 pub const HOST_RESERVE_BYTES: u64 = 20 * GIB;
-/// Slots one project identity may keep; a new checkout at the cap evicts the
-/// least recently used idle one.
-const PROJECT_SLOT_CAP: usize = 2;
+/// Slots one project identity may keep; a new checkout or a command with no
+/// idle compatible slot replaces the least-recently-used eligible idle whole
+/// slot of that project (oxide#118).
+const PROJECT_SLOT_CAP: usize = 8;
 const MAX_TICKETS: usize = 128;
-const MAX_RECORDS: usize = 64;
+const MAX_CLEANS: usize = 128;
+const MAX_RECORDS: usize = 256;
 /// Automatic recoveries kept for `oxide status`, newest last.
 const MAX_RECOVERIES: usize = 16;
-const MAX_STATE_BYTES: u64 = 256 * 1024;
-const STATE_VERSION: u32 = 1;
+/// Finite control-state file size including the atomic temp.
+const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
+/// Legacy control-state files keep their original read limit until the
+/// permanent version-2 fence is actually written.
+const LEGACY_MAX_STATE_BYTES: u64 = 256 * 1024;
+/// Permanent control-state fence for revised Store mutations (oxide#118).
+const STATE_VERSION: u32 = 2;
+const LEGACY_STATE_VERSION: u32 = 1;
+
+/// UTF-8 byte caps for control-state fields (oxide#118).
+const MAX_IDENTITY_BYTES: usize = 64;
+const MAX_COMPATIBILITY_BYTES: usize = 64;
+const MAX_PROFILE_BYTES: usize = 16;
+const MAX_PATH_TEXT_BYTES: usize = 1024;
+const MAX_LEASE_HOLDER_BYTES: usize = 128;
+/// `exec_label` can carry 160 four-byte characters plus its prefix and
+/// ellipsis.
+const MAX_COMMAND_BYTES: usize = 648;
+const MAX_STATE_LEASE_ID_BYTES: usize = 160;
+const MAX_STATE_SLOT_ID_BYTES: usize = 160;
+const MAX_DIAGNOSTIC_BYTES: usize = 1024;
+
+/// Compact serialized object ceilings, so the record-count bound and the
+/// byte bound hold together: 256*40960 + 128*128 + 128*7168 + 16*9216 +
+/// 16*8192 + 4096 = 11,702,272 bytes < MAX_STATE_BYTES.
+const MAX_RECORD_OBJECT_BYTES: usize = 40 * 1024;
+const MAX_TICKET_OBJECT_BYTES: usize = 128;
+const MAX_CLEAN_OBJECT_BYTES: usize = 7 * 1024;
+const MAX_RECOVERY_OBJECT_BYTES: usize = 9 * 1024;
+const MAX_FLUSH_OBJECT_BYTES: usize = 8 * 1024;
+const MAX_LOST_OBJECT_BYTES: usize = 8 * 1024;
+const MAX_HOLDER_OBJECT_BYTES: usize = 5 * 1024;
+const MAX_STATE_HEADER_BYTES: usize = 4 * 1024;
 /// The owned-outputs fence value; see [`State::owned_outputs`].
 const OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/1";
 const MAX_ORIGIN_BYTES: u64 = 8 * 1024 * 1024;
@@ -411,11 +444,13 @@ fn settle(record: &Record, held: Option<&LedgerSlot>, group_empty: impl Fn(i32) 
 }
 
 /// The exclusive admission reason returned by one attempt.
+#[derive(Debug)]
 enum Wait {
     Queue(usize),
     HostLimit(usize),
     Checkout,
     Clean,
+    #[allow(dead_code)]
     ProjectCap,
     Uncertain,
     Capacity,
@@ -2040,6 +2075,9 @@ impl Store {
         }
         let mut shared_from = None;
         let mut shared_origin = None;
+        // A project-cap replacement the library performs as part of the
+        // admission below; choosing it never deletes anything itself.
+        let mut replace: Option<(u64, String)> = None;
         let shared = if share && !existing.is_some_and(|index| has_slot(&state.records[index])) {
             self.shared_candidate(&state, key, &view)?
         } else {
@@ -2060,56 +2098,79 @@ impl Store {
             lock = Some(file);
             existing = Some(index);
         } else if !existing.is_some_and(|index| has_slot(&state.records[index])) {
-            let mut candidates: Vec<(u64, u64, String)> = state
+            // Replace the least-recently-used eligible idle whole slot of
+            // this project by ledger rank. A record that is held, retired
+            // or uncertain (a live or unattributable lock) is never a
+            // candidate; foreign and unmeasurable slots fail the library's
+            // own ownership and accounting checks.
+            let mut candidates: Vec<(u64, u64, u64, String)> = state
                 .records
                 .iter()
-                .filter(|record| record.identity == key.identity && has_slot(record))
+                .filter(|record| {
+                    record.phase == Phase::Idle
+                        && record.identity == key.identity
+                        && has_slot(record)
+                })
                 .filter_map(|record| {
                     let project = self.affinity_dir(record.id);
                     view.slots
                         .iter()
                         .find(|slot| slot.project == project && slot.state == SlotOccupancy::Idle)
-                        .map(|slot| (record.last_used, record.id, slot.slot_id.clone()))
+                        .map(|slot| {
+                            (
+                                slot.rank,
+                                slot.slot_id.parse::<u64>().unwrap_or(u64::MAX),
+                                record.id,
+                                slot.slot_id.clone(),
+                            )
+                        })
                 })
                 .collect();
             let project_slots = state
                 .records
                 .iter()
-                .filter(|record| record.phase != Phase::Retired)
                 .filter(|record| record.identity == key.identity && has_slot(record))
                 .count();
+            // A specific held compatible slot of any checkout of this
+            // repository can become reusable under the existing identity and
+            // freshness rules; only such a slot justifies waiting.
+            let compatible_busy = state.records.iter().any(|record| {
+                record.identity == key.identity
+                    && record.compatibility == key.compatibility
+                    && matches!(
+                        record.phase,
+                        Phase::Acquiring | Phase::Spawning | Phase::Running
+                    )
+            });
             if project_slots >= PROJECT_SLOT_CAP {
                 let chosen = existing.map(|index| state.records[index].id);
                 candidates.sort();
-                let mut evicted = false;
-                for (_, id, slot_id) in candidates {
+                for (_, _, id, slot_id) in candidates {
                     if Some(id) == chosen {
                         continue;
                     }
+                    // Only an idle record whose lock is free can be replaced;
+                    // the library rechecks its identity, ownership, occupancy
+                    // and complete accounting under the pool lock.
                     let Probe::Free(_victim) = probe_lock(&self.lock_path(id), false)? else {
                         continue;
                     };
-                    evict_idle_slot(&self.pool, &slot_id)
-                        .map_err(|error| lease_error("cannot evict an idle slot", &error))?;
-                    eprintln!(
-                        "oxide: evicted idle slot {slot_id} (project slot cap {PROJECT_SLOT_CAP})"
-                    );
-                    self.forget_record(&mut state, id);
-                    evicted = true;
+                    replace = Some((id, slot_id));
                     break;
                 }
-                if !evicted {
+                if replace.is_none() {
                     self.save(&state)?;
-                    return Ok(Err(if busy {
-                        Wait::Checkout
-                    } else {
-                        Wait::ProjectCap
-                    }));
+                    // Wait only for a specific held compatible slot of this
+                    // checkout. With no such slot and no safely evictable
+                    // idle one, refuse honestly instead of promising a
+                    // deletion that a safety gate forbids.
+                    if busy || compatible_busy {
+                        return Ok(Err(Wait::Checkout));
+                    }
+                    return Err(format!(
+                        "the project already holds {PROJECT_SLOT_CAP} slots and none is a safely evictable idle whole slot; no compatible slot can be reused. Wait for one to become idle or free one with `oxide clean` in another checkout, then retry"
+                    ));
                 }
-                // Eviction forgot only an idle record whose lock was free,
-                // never the chosen one; find it again by ID.
-                existing =
-                    chosen.and_then(|id| state.records.iter().position(|record| record.id == id));
             }
         }
 
@@ -2193,6 +2254,13 @@ impl Store {
             Some(folder) => vec![folder.to_owned()],
             None => identity::slot_folders(&identity::project_label(&key.checkout), &key.identity),
         };
+        let replace_slot =
+            match &replace {
+                Some((_, slot_id)) => Some(slot_id.parse::<u64>().map_err(|_| {
+                    format!("recorded replacement slot ID {slot_id:?} is not numeric")
+                })?),
+                None => None,
+            };
         let request = LeaseRequest {
             pool: self.pool.clone(),
             project: self.affinity_dir(record),
@@ -2208,8 +2276,27 @@ impl Store {
                 same_repository,
                 profile: profile.label().to_owned(),
             }),
+            replace_slot,
         };
         let outcome = lease_measured(request);
+        // The library deletes the requested victim only after complete
+        // accounting and rank headroom, and it may still refuse afterwards.
+        // Drop that record's metadata only when the ledger no longer holds
+        // the slot; an untouched victim keeps its record.
+        if let Some((victim_record, victim_slot)) = replace {
+            let view = self.ledger()?;
+            if !view.slots.iter().any(|slot| slot.slot_id == victim_slot) {
+                eprintln!(
+                    "oxide: evicted idle slot {victim_slot} (project slot cap {PROJECT_SLOT_CAP})"
+                );
+                self.forget_record(&mut state, victim_record);
+            }
+        }
+        let index = state
+            .records
+            .iter()
+            .position(|entry| entry.id == record)
+            .ok_or("Oxide slot record disappeared")?;
         let (grant, measured) = match outcome {
             Ok(leased) => (leased.grant, leased.measured),
             Err(error) => {
@@ -2220,7 +2307,12 @@ impl Store {
                 self.save(&state)?;
                 return match error {
                     LeaseError::Busy => Ok(Err(Wait::Uncertain)),
-                    LeaseError::Full if active > 0 => Ok(Err(Wait::Capacity)),
+                    // Wait only for a specific held compatible slot of this
+                    // checkout. Nothing promises that an unrelated build's
+                    // completion frees a count or byte ceiling.
+                    LeaseError::Full | LeaseError::LedgerExhausted if busy => {
+                        Ok(Err(Wait::Capacity))
+                    }
                     error => Err(lease_error("cannot lease a slot", &error)),
                 };
             }
@@ -2614,23 +2706,34 @@ impl Store {
         }
         let state: State = serde_json::from_slice(&bytes)
             .map_err(|error| format!("Oxide state is invalid: {error}"))?;
-        if state.version != STATE_VERSION
-            || state.tickets.len() > MAX_TICKETS
-            || state.cleans.len() > MAX_TICKETS
-            || state.records.len() > MAX_RECORDS
-            || state.recoveries.len() > MAX_RECOVERIES
-            || state
-                .owned_outputs
-                .as_deref()
-                .is_some_and(|fence| fence != OWNED_OUTPUTS_FENCE)
+        let legacy = match state.version {
+            LEGACY_STATE_VERSION => true,
+            STATE_VERSION => false,
+            _ => return Err("Oxide state has an unsupported version or exceeds a limit".to_owned()),
+        };
+        if legacy && bytes.len() as u64 > LEGACY_MAX_STATE_BYTES {
+            return Err("Oxide state exceeds its byte limit".to_owned());
+        }
+        if state
+            .owned_outputs
+            .as_deref()
+            .is_some_and(|fence| fence != OWNED_OUTPUTS_FENCE)
         {
             return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
         }
+        validate_state(&state, legacy)?;
         Ok(state)
     }
 
     fn save(&self, state: &State) -> Result<(), String> {
-        let bytes = serde_json::to_vec(state).map_err(|error| error.to_string())?;
+        // Every Store-controlled mutation writes the permanent version-2
+        // fence. A legacy state is validated against the new field and
+        // object caps first; an oversized legacy field refuses with the
+        // original file untouched.
+        let mut fenced = state.clone();
+        fenced.version = STATE_VERSION;
+        validate_state(&fenced, false)?;
+        let bytes = serde_json::to_vec(&fenced).map_err(|error| error.to_string())?;
         if bytes.len() as u64 > MAX_STATE_BYTES {
             return Err("Oxide state reached its byte limit".to_owned());
         }
@@ -2651,6 +2754,142 @@ impl Store {
             .and_then(|()| File::open(&self.control)?.sync_all())
             .map_err(|error| format!("cannot replace Oxide state: {error}"))
     }
+}
+
+/// Validate one control-state document. A legacy version-1 document keeps
+/// the legacy read limits (its byte cap is checked by `load`); a version-2
+/// document must satisfy every field cap and compact-object ceiling, so the
+/// record-count and byte bounds hold together.
+fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
+    if state.version != STATE_VERSION && !(legacy && state.version == LEGACY_STATE_VERSION) {
+        return Err("Oxide state has an unsupported version".to_owned());
+    }
+    if state.tickets.len() > MAX_TICKETS
+        || state.cleans.len() > MAX_CLEANS
+        || state.records.len() > MAX_RECORDS
+        || state.recoveries.len() > MAX_RECOVERIES
+        || state.flushes.len() > MAX_FLUSHES
+    {
+        return Err("Oxide state exceeds a collection limit".to_owned());
+    }
+    if legacy {
+        return Ok(());
+    }
+    if state.next_id == 0 || state.next_use == 0 {
+        return Err("Oxide state has an exhausted or invalid ID sequence".to_owned());
+    }
+    let header = State {
+        tickets: Vec::new(),
+        cleans: Vec::new(),
+        records: Vec::new(),
+        recoveries: Vec::new(),
+        flushes: Vec::new(),
+        ..state.clone()
+    };
+    object_fits(&header, MAX_STATE_HEADER_BYTES, "state header")?;
+    for ticket in &state.tickets {
+        if ticket.id == 0 {
+            return Err("Oxide wait ticket has no ID".to_owned());
+        }
+        object_fits(ticket, MAX_TICKET_OBJECT_BYTES, "wait ticket")?;
+    }
+    for clean in &state.cleans {
+        if clean.id == 0 || !path_text(&clean.checkout) {
+            return Err("Oxide clean mark exceeds its field bounds".to_owned());
+        }
+        object_fits(clean, MAX_CLEAN_OBJECT_BYTES, "clean mark")?;
+    }
+    for record in &state.records {
+        if record.id == 0
+            || !bounded_text(&record.identity, MAX_IDENTITY_BYTES)
+            || !bounded_text(&record.compatibility, MAX_COMPATIBILITY_BYTES)
+            || !bounded_text(&record.profile, MAX_PROFILE_BYTES)
+            || record
+                .checkout
+                .as_ref()
+                .is_some_and(|path| !path_text(path))
+            || record
+                .lease_id
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_STATE_LEASE_ID_BYTES)
+            || record
+                .retired
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_DIAGNOSTIC_BYTES)
+        {
+            return Err("Oxide record exceeds its field bounds".to_owned());
+        }
+        if let Some(holder) = &record.holder {
+            if !bounded_text(&holder.lease_holder, MAX_LEASE_HOLDER_BYTES)
+                || holder
+                    .command
+                    .as_ref()
+                    .is_some_and(|value| value.len() > MAX_COMMAND_BYTES)
+            {
+                return Err("Oxide holder exceeds its field bounds".to_owned());
+            }
+            object_fits(holder, MAX_HOLDER_OBJECT_BYTES, "holder")?;
+        }
+        if let Some(lost) = &record.lost {
+            if !bounded_text(&lost.slot_id, MAX_STATE_SLOT_ID_BYTES)
+                || lost
+                    .unclosed
+                    .as_ref()
+                    .is_some_and(|value| value.len() > MAX_DIAGNOSTIC_BYTES)
+            {
+                return Err("Oxide lost slot exceeds its field bounds".to_owned());
+            }
+            object_fits(lost, MAX_LOST_OBJECT_BYTES, "lost slot")?;
+        }
+        if let Some(recovery) = &record.pending_recovery {
+            validate_recovery(recovery)?;
+        }
+        object_fits(record, MAX_RECORD_OBJECT_BYTES, "record")?;
+    }
+    for recovery in &state.recoveries {
+        validate_recovery(recovery)?;
+    }
+    for flush in &state.flushes {
+        if !bounded_text(&flush.slot_id, MAX_STATE_SLOT_ID_BYTES)
+            || flush
+                .error
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_DIAGNOSTIC_BYTES)
+        {
+            return Err("Oxide flush record exceeds its field bounds".to_owned());
+        }
+        object_fits(flush, MAX_FLUSH_OBJECT_BYTES, "flush record")?;
+    }
+    Ok(())
+}
+
+fn validate_recovery(recovery: &Recovery) -> Result<(), String> {
+    if !bounded_text(&recovery.slot_id, MAX_STATE_SLOT_ID_BYTES)
+        || !bounded_text(&recovery.lease_id, MAX_STATE_LEASE_ID_BYTES)
+        || recovery
+            .checkout
+            .as_ref()
+            .is_some_and(|path| !path_text(path))
+    {
+        return Err("Oxide recovery exceeds its field bounds".to_owned());
+    }
+    object_fits(recovery, MAX_RECOVERY_OBJECT_BYTES, "recovery")
+}
+
+fn bounded_text(value: &str, max: usize) -> bool {
+    !value.is_empty() && value.len() <= max
+}
+
+fn path_text(path: &Path) -> bool {
+    path.as_os_str().as_bytes().len() <= MAX_PATH_TEXT_BYTES
+}
+
+fn object_fits<T: Serialize>(value: &T, max: usize, what: &str) -> Result<(), String> {
+    let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    if bytes.len() > max {
+        return Err(format!("Oxide {what} exceeds its {max}-byte object limit"));
+    }
+    Ok(())
 }
 
 fn create_pool(path: &Path, budget: u64) -> Result<(), String> {
@@ -2768,34 +3007,48 @@ pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
     let directory = open_control_directory(control)?
         .ok_or_else(|| format!("{} does not exist", control.display()))?;
     let name = CString::new("admission.lock").map_err(|error| error.to_string())?;
-    // Oxide never removes a control directory, so an `ENOENT` for this create
-    // in the verified directory is transient: a concurrent create of the same
-    // lock was observed to report it on macOS APFS (oxide#117 fixture). Retry
-    // a bounded number of times on the same verified descriptor; a directory
-    // that is really gone still fails after the attempts.
+    // Create exclusively, then open the existing lock without `O_CREAT`.
+    // Repeating `O_CREAT | O_NOFOLLOW` for every contender races with the
+    // creator on this platform and can report a spurious `ENOENT`, refusing
+    // a valid admission. Both steps keep `O_NOFOLLOW`, so a symlink is never
+    // followed, and creation is exclusive so no second file is ever written.
     let mut fd = -1;
-    for attempt in 0..3 {
+    for _ in 0..3 {
         // SAFETY: `name` is a live CString with initialized bytes through its
-        // terminator, and `directory` owns a live descriptor for this call.
+        // terminator, and `directory` owns a live descriptor until `openat`
+        // ends.
         fd = unsafe {
             libc::openat(
                 directory.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 0o600,
             )
         };
         if fd >= 0 {
             break;
         }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::NotFound || attempt == 2 {
+        let create_error = std::io::Error::last_os_error();
+        if create_error.kind() != std::io::ErrorKind::AlreadyExists {
             return Err(format!(
-                "cannot open admission lock in {}: {error}",
+                "cannot create admission lock in {}: {create_error}",
                 control.display()
             ));
         }
-        std::thread::yield_now();
+        // SAFETY: as above; the existing lock must still be a regular file.
+        fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            break;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
+            break;
+        }
     }
     if fd < 0 {
         return Err(format!(
@@ -3376,7 +3629,7 @@ mod tests {
     fn lease(store: &Store, key: &SlotKey, label: Option<&str>) -> Result<Lease, Wait> {
         let (ticket, _file) = store.register_ticket().unwrap();
         let outcome = store
-            .attempt(ticket, key, Profile::Quick, 8, false, label)
+            .attempt(ticket, key, Profile::Quick, 16, false, label)
             .unwrap();
         store.remove_ticket(ticket).unwrap();
         outcome
@@ -3384,8 +3637,9 @@ mod tests {
 
     /// Second-slot rule: a busy slot of this checkout's key sends a further
     /// command to another idle compatible slot or a new one; a slot whose
-    /// holder died while its group lives is never reused; with no safe
-    /// candidate under the project cap the command waits.
+    /// holder died while its group lives is never reused; with no safely
+    /// evictable idle slot under the project cap, a command waits only for a
+    /// specific held compatible slot.
     #[test]
     fn a_busy_slot_sends_a_further_command_elsewhere() {
         let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
@@ -3406,7 +3660,7 @@ mod tests {
             backend: Backend::DirectoryBudget,
             budget: Some(1 << 30),
             recorded_budget: 1 << 30,
-            max_active: 2,
+            max_active: 16,
             sibling: None,
         };
         store.ensure_control().unwrap();
@@ -3417,17 +3671,13 @@ mod tests {
             identity: "identity".to_owned(),
             compatibility: "quick-key".to_owned(),
         };
-        let Ok(first) = lease(&store, &key, Some("exec tool")) else {
-            panic!("the first command waited");
-        };
+        let first = lease(&store, &key, Some("exec tool")).expect("the first command leased");
         // The holder's group is this test's own, which is alive.
         // SAFETY: getpgrp has no preconditions.
         let group = unsafe { libc::getpgrp() };
         store.mark_spawning(&first).unwrap();
         store.mark_running(&first, group).unwrap();
-        let Ok(second) = lease(&store, &key, None) else {
-            panic!("a further command waited behind a busy slot");
-        };
+        let second = lease(&store, &key, None).expect("a further command leased");
         assert_ne!(second.slot_id, first.slot_id);
         let report = store.report().unwrap();
         let shown = |slot: &str| {
@@ -3439,27 +3689,40 @@ mod tests {
         };
         assert_eq!(shown(&first.slot_id).as_deref(), Some("exec tool"));
         assert_eq!(shown(&second.slot_id), None);
-        // Both slots of the project are held: the cap leaves no safe slot.
+
+        // Fill the project to its cap with held records; each further lease
+        // takes a new slot because the earlier ones are not idle.
+        let mut held = vec![first];
+        held.push(second);
+        while held.len() < PROJECT_SLOT_CAP {
+            held.push(lease(&store, &key, None).expect("a slot below the project cap"));
+        }
+        // Every project slot is held: a further command waits for a specific
+        // held compatible slot, and no slot is evicted.
         assert!(matches!(lease(&store, &key, None), Err(Wait::Checkout)));
-        // The first holder dies while its group lives: its slot stays held
-        // and is never reused; the released second slot is taken instead.
-        let first_slot = first.slot_id.clone();
-        drop(first);
-        let second_slot = second.slot_id.clone();
-        store.release(second, None).unwrap();
-        let Ok(third) = lease(&store, &key, None) else {
-            panic!("an idle compatible slot was not taken");
-        };
-        assert_eq!(third.slot_id, second_slot);
+
+        // Release the newest held slot: it is the specific slot that can
+        // become reusable, and the waiting rule takes it instead of a new one.
+        let released = held.pop().expect("newest lease");
+        let released_slot = released.slot_id.clone();
+        store.release(released, None).unwrap();
+        let reused = lease(&store, &key, None).expect("the released slot is taken");
+        assert_eq!(reused.slot_id, released_slot);
+
+        // The first holder's group is still alive: its slot stays held and is
+        // never reused while the cap admits nothing else.
         let view = store.ledger().unwrap();
-        let held = view
+        let held_first = view
             .slots
             .iter()
-            .find(|slot| slot.slot_id == first_slot)
+            .find(|slot| slot.slot_id == held[0].slot_id)
             .unwrap();
-        assert_eq!(held.state, SlotOccupancy::Held);
+        assert_eq!(held_first.state, SlotOccupancy::Held);
         assert!(matches!(lease(&store, &key, None), Err(Wait::Checkout)));
-        store.release(third, None).unwrap();
+        store.release(reused, None).unwrap();
+        for lease in held {
+            drop(lease);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3550,6 +3813,7 @@ mod tests {
             holder: Some(holder.to_owned()),
             lease_id: Some(lease_id.to_owned()),
             dir: None,
+            rank: 0,
         }
     }
 
@@ -3698,5 +3962,275 @@ mod tests {
         }
         assert_eq!(state.recoveries.len(), MAX_RECOVERIES);
         assert_eq!(state.recoveries[0].slot_id, "3");
+    }
+
+    fn worst_record(id: u64) -> Record {
+        Record {
+            id,
+            identity: "i".repeat(MAX_IDENTITY_BYTES),
+            compatibility: "c".repeat(MAX_COMPATIBILITY_BYTES),
+            profile: "p".repeat(MAX_PROFILE_BYTES),
+            checkout: Some(PathBuf::from(format!(
+                "/{}",
+                "x".repeat(MAX_PATH_TEXT_BYTES - 1)
+            ))),
+            phase: Phase::Retired,
+            process_group: Some(i32::MAX),
+            last_used: u64::MAX,
+            holder: Some(Holder {
+                pid: u32::MAX,
+                started_ms: u64::MAX,
+                lease_holder: "h".repeat(MAX_LEASE_HOLDER_BYTES),
+                command: Some("c".repeat(MAX_COMMAND_BYTES)),
+            }),
+            lease_id: Some("l".repeat(MAX_STATE_LEASE_ID_BYTES)),
+            pending_recovery: Some(Recovery {
+                slot_id: "s".repeat(MAX_STATE_SLOT_ID_BYTES),
+                lease_id: "l".repeat(MAX_STATE_LEASE_ID_BYTES),
+                checkout: Some(PathBuf::from(format!(
+                    "/{}",
+                    "x".repeat(MAX_PATH_TEXT_BYTES - 1)
+                ))),
+                holder_pid: 1,
+                holder_started_ms: 2,
+                process_group: Some(3),
+                recovered_ms: 4,
+                recovered_by: 5,
+            }),
+            retired: Some("r".repeat(MAX_DIAGNOSTIC_BYTES)),
+            lost: Some(Lost {
+                slot_id: "s".repeat(MAX_STATE_SLOT_ID_BYTES),
+                at_ms: u64::MAX,
+                unclosed: Some("u".repeat(MAX_DIAGNOSTIC_BYTES)),
+            }),
+            last_used_ms: Some(u64::MAX),
+        }
+    }
+
+    fn escaped(value: usize) -> String {
+        "\u{1}".repeat(value)
+    }
+
+    fn escaped_path(bytes: usize) -> PathBuf {
+        PathBuf::from(format!("/{}", escaped(bytes - 1)))
+    }
+
+    fn escaped_record(id: u64) -> Record {
+        Record {
+            id,
+            identity: escaped(MAX_IDENTITY_BYTES),
+            compatibility: escaped(MAX_COMPATIBILITY_BYTES),
+            profile: escaped(MAX_PROFILE_BYTES),
+            checkout: Some(escaped_path(MAX_PATH_TEXT_BYTES)),
+            phase: Phase::Retired,
+            process_group: Some(i32::MAX),
+            last_used: u64::MAX,
+            holder: Some(Holder {
+                pid: u32::MAX,
+                started_ms: u64::MAX,
+                lease_holder: escaped(MAX_LEASE_HOLDER_BYTES),
+                command: Some(escaped(MAX_COMMAND_BYTES)),
+            }),
+            lease_id: Some(escaped(MAX_STATE_LEASE_ID_BYTES)),
+            pending_recovery: Some(Recovery {
+                slot_id: escaped(MAX_STATE_SLOT_ID_BYTES),
+                lease_id: escaped(MAX_STATE_LEASE_ID_BYTES),
+                checkout: Some(escaped_path(MAX_PATH_TEXT_BYTES)),
+                holder_pid: 1,
+                holder_started_ms: 2,
+                process_group: Some(3),
+                recovered_ms: 4,
+                recovered_by: 5,
+            }),
+            retired: Some(escaped(MAX_DIAGNOSTIC_BYTES)),
+            lost: Some(Lost {
+                slot_id: escaped(MAX_STATE_SLOT_ID_BYTES),
+                at_ms: u64::MAX,
+                unclosed: Some(escaped(MAX_DIAGNOSTIC_BYTES)),
+            }),
+            last_used_ms: Some(u64::MAX),
+        }
+    }
+
+    #[test]
+    fn worst_escaped_control_state_roundtrips_through_save_and_load() {
+        let (root, store, _removable) = paired_controls("control-escaped");
+        let mut state = State::default();
+        for id in 1..=MAX_RECORDS as u64 {
+            state.records.push(escaped_record(id));
+        }
+        for id in 1..=MAX_TICKETS as u64 {
+            state.tickets.push(Ticket { id, pid: u32::MAX });
+        }
+        for id in 1..=MAX_CLEANS as u64 {
+            state.cleans.push(Clean {
+                id,
+                checkout: escaped_path(MAX_PATH_TEXT_BYTES),
+                process_group: Some(i32::MAX),
+            });
+        }
+        for _ in 0..MAX_RECOVERIES {
+            state.recoveries.push(Recovery {
+                slot_id: escaped(MAX_STATE_SLOT_ID_BYTES),
+                lease_id: escaped(MAX_STATE_LEASE_ID_BYTES),
+                checkout: Some(escaped_path(MAX_PATH_TEXT_BYTES)),
+                holder_pid: u32::MAX,
+                holder_started_ms: u64::MAX,
+                process_group: Some(i32::MAX),
+                recovered_ms: u64::MAX,
+                recovered_by: u32::MAX,
+            });
+            state.flushes.push(Flush {
+                slot_id: escaped(MAX_STATE_SLOT_ID_BYTES),
+                at_ms: u64::MAX,
+                micros: None,
+                error: Some(escaped(MAX_DIAGNOSTIC_BYTES)),
+                lost: true,
+            });
+        }
+        let before = serde_json::to_vec(&state).expect("serialize escaped worst valid state");
+        assert!(
+            before.len() as u64 <= MAX_STATE_BYTES,
+            "escaped worst valid state {} exceeds {MAX_STATE_BYTES}",
+            before.len()
+        );
+        assert!(
+            before.len() > 4_000_000,
+            "escaped fixture is not substantial: {}",
+            before.len()
+        );
+        assert!(before.windows(6).any(|window| window == b"\\u0001"));
+
+        store
+            .save(&state)
+            .expect("the escaped worst valid state saves");
+        let loaded = store.load().expect("the escaped worst valid state loads");
+        assert_eq!(loaded.version, STATE_VERSION);
+        assert_eq!(
+            serde_json::to_vec(&loaded).expect("reserialize loaded"),
+            before,
+            "the escaped worst valid state did not round-trip byte for byte"
+        );
+        assert_eq!(loaded.records.len(), MAX_RECORDS);
+        assert_eq!(loaded.records[0].checkout, state.records[0].checkout);
+        assert_eq!(loaded.flushes.len(), MAX_FLUSHES);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worst_valid_control_state_fits_its_object_and_byte_caps() {
+        let mut state = State::default();
+        for id in 1..=MAX_RECORDS as u64 {
+            state.records.push(worst_record(id));
+        }
+        for id in 1..=MAX_TICKETS as u64 {
+            state.tickets.push(Ticket { id, pid: u32::MAX });
+        }
+        for id in 1..=MAX_CLEANS as u64 {
+            state.cleans.push(Clean {
+                id,
+                checkout: PathBuf::from(format!("/{}", "x".repeat(MAX_PATH_TEXT_BYTES - 1))),
+                process_group: Some(i32::MAX),
+            });
+        }
+        for index in 0..MAX_RECOVERIES {
+            state.recoveries.push(Recovery {
+                slot_id: "s".repeat(MAX_STATE_SLOT_ID_BYTES),
+                lease_id: "l".repeat(MAX_STATE_LEASE_ID_BYTES),
+                checkout: None,
+                holder_pid: u32::MAX,
+                holder_started_ms: u64::MAX,
+                process_group: Some(i32::MAX),
+                recovered_ms: u64::MAX,
+                recovered_by: u32::MAX,
+            });
+            state.flushes.push(Flush {
+                slot_id: "s".repeat(MAX_STATE_SLOT_ID_BYTES),
+                at_ms: u64::MAX,
+                micros: Some(u64::MAX),
+                error: Some("e".repeat(MAX_DIAGNOSTIC_BYTES)),
+                lost: index % 2 == 0,
+            });
+        }
+        state.next_id = u64::MAX;
+        state.next_use = u64::MAX;
+        validate_state(&state, false).expect("the worst valid control state is accepted");
+        let bytes = serde_json::to_vec(&state).expect("serialize");
+        assert!(
+            bytes.len() as u64 <= MAX_STATE_BYTES,
+            "worst valid control state {} exceeds {MAX_STATE_BYTES}",
+            bytes.len()
+        );
+        assert!(
+            bytes.len() > 1_000_000,
+            "fixture is not substantial: {}",
+            bytes.len()
+        );
+        let object = serde_json::to_vec(&worst_record(1)).expect("record");
+        assert!(object.len() <= MAX_RECORD_OBJECT_BYTES);
+    }
+
+    #[test]
+    fn legacy_control_reads_keep_their_limits_and_save_installs_the_fence() {
+        let (root, store, _removable) = paired_controls("control-fence");
+        let mut legacy = State {
+            version: LEGACY_STATE_VERSION,
+            ..State::default()
+        };
+        legacy.records.push(Record {
+            checkout: Some(PathBuf::from(format!(
+                "/{}",
+                "x".repeat(MAX_PATH_TEXT_BYTES + 64)
+            ))),
+            ..worst_record(1)
+        });
+        let bytes = serde_json::to_vec(&legacy).expect("legacy state");
+        let path = store.control.join("state.json");
+        write_private(&path, &bytes);
+        let loaded = store.load().expect("legacy oversized field still reads");
+        assert_eq!(loaded.version, LEGACY_STATE_VERSION);
+        // A revised mutation validates every legacy field against the raised
+        // caps and refuses with the original file untouched.
+        let error = store.save(&loaded).unwrap_err();
+        assert!(error.contains("field bounds"), "{error}");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "the original state was rewritten"
+        );
+        // Within the caps, the same save installs the permanent version-2
+        // fence.
+        let mut bounded = legacy.clone();
+        bounded.records[0].checkout = Some(PathBuf::from("/checkout"));
+        store.save(&bounded).expect("bounded legacy state saves");
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["version"], serde_json::json!(STATE_VERSION));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_control_reads_keep_the_legacy_byte_limit() {
+        let (root, store, _removable) = paired_controls("control-legacy-bytes");
+        let mut legacy = State {
+            version: LEGACY_STATE_VERSION,
+            ..State::default()
+        };
+        legacy.records.push(Record {
+            retired: Some("r".repeat(LEGACY_MAX_STATE_BYTES as usize)),
+            ..worst_record(1)
+        });
+        let bytes = serde_json::to_vec(&legacy).expect("legacy state");
+        assert!(bytes.len() as u64 > LEGACY_MAX_STATE_BYTES);
+        write_private(&store.control.join("state.json"), &bytes);
+        let error = store.load().unwrap_err();
+        assert!(error.contains("byte limit"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn write_private(path: &Path, bytes: &[u8]) {
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true).mode(0o600);
+        let mut file = options.open(path).unwrap();
+        file.write_all(bytes).unwrap();
     }
 }

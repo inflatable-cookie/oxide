@@ -134,14 +134,13 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   one explicit, per-checkout owned `target` link; it never moves existing
   output, and ephemeral mode is unchanged
   ([workflow](contracts/workflow.md#final-outputs-on-the-permanent-drive-oxide117)).
-- **Sharing builds:** slots share warm builds across worktrees, sized by the
-  byte budget rather than small fixed counts.
+- **Sharing builds:** slots share warm builds across worktrees, up to 8 per
+  project, with least-recently-used idle slots evicted under the byte budget.
 - **sccache:** Oxide bypasses inherited compiler wrappers and doesn't manage
   sccache. Integration is revisited once the current work is done. Cargo's
   own cross-workspace cache is the preferred long-term complement.
 - **Approved, not built:**
   - per-slot test scratch;
-  - higher slot limits with budget-driven eviction;
   - submodule-aware cross-worktree reuse.
 
   Details live in their Queue leads and, once built, in the
