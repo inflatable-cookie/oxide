@@ -34,10 +34,17 @@ pub const BUDGET_BACKEND_DIRECTORY_V1: &str = "directory-budget-v1";
 /// lock internal, payload in a directory on a registered external APFS
 /// volume. Budget-only like the directory backend.
 pub const VOLUME_BACKEND_APFS_V1: &str = "apfs-volume-v1";
-/// Finite slot count. Exhaustion refuses a new slot.
-pub const MAX_SLOTS: usize = 32;
-/// Finite ledger file size including the atomic temp.
-pub const MAX_LEDGER_BYTES: u64 = 256 * 1024;
+/// Finite slot count. Exhaustion refuses a new slot. Slot headroom only:
+/// it does not raise build concurrency or `max_active` (oxide#118).
+pub const MAX_SLOTS: usize = 128;
+/// Finite ledger file size including the atomic temp. The worst valid
+/// 128-slot ledger with every bounded field at its ceiling, escaped by
+/// compact JSON, fits this cap with no truncation (oxide#118).
+pub const MAX_LEDGER_BYTES: u64 = 2 * 1024 * 1024;
+/// Permanent capacity-policy fence in the library ledger (oxide#118). Its
+/// presence tells an older binary that this ledger uses ranked idle
+/// replacement; the fence is never removed.
+pub const CAPACITY_POLICY_VERSION: u32 = 1;
 /// Finite holder identity.
 pub const MAX_HOLDER_BYTES: usize = 128;
 /// Finite canonical path.
@@ -287,6 +294,10 @@ pub struct SlotStatus {
     /// `<project folder>/<profile>-<id>`. `None` is the legacy `<id>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<String>,
+    /// The pool's idle rank (oxide#118): higher is more recently granted or
+    /// released. Legacy records have rank 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rank: u64,
     pub logical_bytes: Option<u64>,
     pub unique_allocated_bytes: Option<u64>,
     /// This slot's own walk, the one reuse needs complete.
@@ -337,6 +348,8 @@ pub struct LedgerSlot {
     pub lease_id: Option<String>,
     /// As [`SlotStatus::dir`].
     pub dir: Option<String>,
+    /// As [`SlotStatus::rank`].
+    pub rank: u64,
 }
 
 impl From<&SlotStatus> for LedgerSlot {
@@ -351,6 +364,7 @@ impl From<&SlotStatus> for LedgerSlot {
             holder: slot.holder.clone(),
             lease_id: slot.lease_id.clone(),
             dir: slot.dir.clone(),
+            rank: slot.rank,
         }
     }
 }
