@@ -131,15 +131,14 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   with a loud warning when a build falls back to the internal pool.
   `oxide pool describe --json` reports it to other tools.
 - **Final outputs** stay checkout-local. Drive mode alone does not move them.
-- **Sharing builds:** slots share warm builds across worktrees, sized by the
-  byte budget rather than small fixed counts.
+- **Sharing builds:** slots share warm builds across worktrees, up to 8 per
+  project, with least-recently-used idle slots evicted under the byte budget.
 - **sccache:** Oxide bypasses inherited compiler wrappers and doesn't manage
   sccache. Integration is revisited once the current work is done. Cargo's
   own cross-workspace cache is the preferred long-term complement.
 - **Approved, not built:**
   - final outputs following the pool when the drive is permanent;
   - per-slot test scratch;
-  - higher slot limits with budget-driven eviction;
   - submodule-aware cross-worktree reuse.
 
   Details live in their Queue leads and, once built, in the
