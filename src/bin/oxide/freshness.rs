@@ -1050,15 +1050,29 @@ fn check_child_gitdir(roots: &Roots, full: &Path, path: &str) -> Result<(), Stri
     };
     let resolved = fs::canonicalize(&target)
         .map_err(|error| format!("cannot resolve {path}/.git: {error}"))?;
-    let modules = roots.common.join("modules");
-    let modules = fs::canonicalize(&modules)
-        .map_err(|error| format!("cannot resolve {}: {error}", modules.display()))?;
+    let modules = module_store(&roots.common)?;
     if !resolved.starts_with(&modules) || resolved == modules {
         return Err(format!(
             "{path}/.git resolves outside this repository's module store"
         ));
     }
     Ok(())
+}
+
+/// `<common>/modules` as the trust fence. The common directory is already
+/// canonical; the store itself must be a real directory, never followed
+/// through a symlink, so the fence cannot be redirected outside it.
+fn module_store(common: &Path) -> Result<PathBuf, String> {
+    let modules = common.join("modules");
+    let metadata = fs::symlink_metadata(&modules)
+        .map_err(|error| format!("cannot read {}: {error}", modules.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "{} is not a real directory the gate trusts",
+            modules.display()
+        ));
+    }
+    Ok(modules)
 }
 
 /// Modes a submodule's tracked file may have. A gitlink here is nested.
@@ -2330,6 +2344,27 @@ mod tests {
             )
         );
         assert_eq!(raw_digest(&[], &[]).len(), 64);
+    }
+
+    #[test]
+    fn module_store_refuses_a_redirected_modules_root() {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("modules-{:x}", std::process::id()));
+        let real = dir.join("real");
+        let redirected = dir.join("redirected");
+        let outside = dir.join("outside");
+        for common in [&real, &redirected, &outside] {
+            fs::create_dir_all(common).expect("scratch dir");
+        }
+        fs::create_dir(real.join("modules")).expect("modules dir");
+        std::os::unix::fs::symlink(&outside, redirected.join("modules")).expect("modules link");
+        assert_eq!(module_store(&real), Ok(real.join("modules")));
+        let error = module_store(&redirected).expect_err("a symlinked store must refuse");
+        assert!(error.contains("not a real directory"), "{error}");
+        assert!(module_store(&outside).is_err());
+        fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]

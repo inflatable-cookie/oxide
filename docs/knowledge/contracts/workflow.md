@@ -381,7 +381,8 @@ Two worktree states are covered and persisted as distinct content:
   with no `.git` entry.
 - **Exact**: a directory whose own `HEAD` is the declared commit, whose
   tracked files are clean and whose `.git` file or directory resolves inside
-  this repository's module store under the common Git directory. It also
+  this repository's module store, `<common Git directory>/modules`, which
+  must be a real directory rather than a symlink to elsewhere. It also
   records a framed digest of the child's ordered cached paths and raw blob
   IDs, so the same commit reached through different bytes still differs.
 
