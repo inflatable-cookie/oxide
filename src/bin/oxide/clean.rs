@@ -16,7 +16,7 @@ use std::fs::Metadata;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use store::{Cleaning, Store};
+use store::{Cleaning, Store, WaitAccounting};
 
 /// Enumeration bounds: past either, the plan refuses instead of truncating.
 const MAX_ENTRIES: usize = 1_000_000;
@@ -470,9 +470,10 @@ fn run_whole(
         return Ok(0);
     }
     process::install_signal_handlers()?;
+    let mut waits = WaitAccounting::default();
     let store = crate::removable::coordinate(Store::open_existing_with(settings)?)?;
     let guard = match &store {
-        Some(store) => match store.begin_clean(workspace)? {
+        Some(store) => match store.begin_clean(workspace, &mut waits)? {
             Cleaning::Guard(guard) => Some(guard),
             Cleaning::Interrupted(signal) => return Ok(process::signal_exit_code(signal)),
         },
@@ -501,10 +502,11 @@ fn run_whole(
         }
         (Err(reason), _, _) => return Err(reason),
     };
+    let wait = waits.summary_suffix().unwrap_or_default();
     match plan {
         None => eprintln!(
-            "oxide: {} does not exist; nothing removed",
-            target.display()
+            "oxide: {} does not exist; nothing removed{wait}",
+            target.display(),
         ),
         Some(plan) => {
             let foreign = if plan.foreign.is_empty() {
@@ -516,7 +518,7 @@ fn run_whole(
                 )
             };
             eprintln!(
-                "oxide: removed {} ({}){foreign}",
+                "oxide: removed {} ({}){foreign}{wait}",
                 target.display(),
                 summary(&plan)
             );
@@ -533,9 +535,10 @@ fn run_whole(
 fn run_selected(args: &[OsString], workspace: &Path, settings: &Settings) -> Result<u8, String> {
     protect_pool(&workspace.join("target"), &settings.pool)?;
     process::install_signal_handlers()?;
+    let mut waits = WaitAccounting::default();
     let store = crate::removable::coordinate(Store::open_existing_with(settings)?)?;
     let guard = match &store {
-        Some(store) => match store.begin_clean(workspace)? {
+        Some(store) => match store.begin_clean(workspace, &mut waits)? {
             Cleaning::Guard(guard) => Some(guard),
             Cleaning::Interrupted(signal) => return Ok(process::signal_exit_code(signal)),
         },
