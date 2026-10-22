@@ -2376,9 +2376,10 @@ migration and consumer adoption remain separate gates.
   `<mount>/oxide-outputs/<project>-<checkout id>/` on the registered volume,
   else the checkout-local fallback `<checkout>/.oxide-outputs/local/`.
   `oxide init` idempotently adds `/.oxide-outputs/` to the workspace
-  `.gitignore`, and creating the local root refuses when Git would track it:
-  the check runs on every creation, including inside a `.oxide-outputs`
-  directory that already exists.
+  `.gitignore`, and establishing the local root refuses when Git would track
+  it: the check runs before ownership is established, including inside a
+  `.oxide-outputs` directory that already exists and for an already-present
+  empty `.oxide-outputs/local`, which is then left unchanged.
 - **Ownership.** A root carries `.oxide-output.json`
   (`oxide.outputs.root/1`: checkout, checkout id, project label, placement
   recipe, kind, volume UUID, creation generation). A link whose target is
@@ -2391,18 +2392,20 @@ migration and consumer adoption remain separate gates.
   known roots, or exactly one prepared transition. It lives in the internal
   pool's control directory whichever pool a command's slots come from, so one
   checkout never has two receipts. An unknown version or field refuses.
-- **Transition.** Under the checkout's own output barrier — the existing
-  checkout barrier, which waits for every other cooperative command in the
-  checkout to close (a checkout may run a second command on a spare
-  compatible slot) and stops a new one from starting until the guard is
-  released — and the internal admission lock, after a fresh volume, device,
-  marker and generation check: publish
+- **Transition.** Under a per-checkout binding mutex — a plain lock that no
+  holder waits on, so second-slot commands still start concurrently when
+  their destination is unchanged and two starters can never block each other
+  — the transition waits, without the mutex, until no other command in the
+  checkout may be running Cargo, then rechecks the receipt, volume, device,
+  marker and generation and publishes
   `prepared`, create the destination root and marker on the verified volume,
   create the unique sibling `.target.oxide-new-<generation>` link and sync,
   validate it, atomically rename it onto `target`, then publish `committed`.
   Generations are exact `u64`s; receipt paths are absolute and `..`-free. No
   step recreates an absent mount point, follows a link, or unlinks by path
-  text.
+  text. Unknown writer custody — a lost slot whose writers were never
+  positively closed, in either pool — refuses any relink or clean for that
+  checkout until it is resolved.
 - **Crash replay.** Only the exact prepared/old generations replay. A live
   prepared sibling is renamed and committed; an already-published prepared
   link is committed; a preparation that published nothing rolls back to the
@@ -2411,20 +2414,25 @@ migration and consumer adoption remain separate gates.
   exact old owned link: a link that appeared after the crash, even a dangling
   one, is never renamed over. Any other state stops, keeps both roots and the
   link, and says so.
-- **Slot identity.** An owned checkout's selected destination (kind, real
-  root, volume and root creation generation) enters the slot compatibility
-  key, so one slot's uplifted artifacts belong to one real root. Relinking to
-  the same root keeps the key; a destination change partitions it cold. An
-  ephemeral or detached checkout adds nothing to the key.
+- **Slot identity.** An owned checkout's selected destination enters the slot
+  compatibility key: kind, real root, volume and the generation that root has
+  or will be created at (its marker's creation generation, else the next
+  transition's). The binding must produce that exact root and generation, or
+  the command refuses and asks to be run again. Relinking to the same root
+  keeps the key; a destination change partitions it cold. An ephemeral or
+  detached checkout adds nothing to the key.
 - **Selection.** A command selects its destination once, when it starts (the
   external root only when the volume is present, registered, writable, above
   its reserve and the root is on its device with a matching marker; otherwise
   the local fallback), keys its slot from that destination, and then binds
-  exactly it under the output barrier above before Cargo starts. If the drive
-  changed while the command waited, the command refuses and asks to be run
-  again rather than binding a root its slot was not keyed for. No command is
-  redirected mid-run. A checkout that is not converted keeps ephemeral
-  behaviour with a warning in permanent mode.
+  exactly it before Cargo starts. Every reused root is revalidated in full —
+  this checkout's marker, kind, volume, creation generation, device and
+  ancestry, so a replaced `oxide-outputs` ancestor or a mismatched marker
+  refuses instead of writing onto another disk. If the drive changed while
+  the command waited, the command refuses and asks to be run again rather
+  than binding a root its slot was not keyed for. No command is redirected
+  mid-run. A checkout that is not converted keeps ephemeral behaviour with a
+  warning in permanent mode.
 - **Explicit commands.** `oxide outputs plan` is effect-free bounded JSON
   (`oxide.outputs.plan/1`, always `data_move: false`, with cooperative
   holders and the next generation). `adopt` converts only a missing or empty
@@ -2437,10 +2445,12 @@ migration and consumer adoption remain separate gates.
   (a replaced drive at the same mount point is refused), and applies the
   existing enumeration/foreign/symlink/device predicates there. A selected
   (`-p`, `--doc`, `--profile`, `--release`) clean follows the same receipt and
-  link check before Cargo runs, so a foreign or replaced link is never
-  cleaned through. The root, its marker and the link are kept, inactive roots
-  are reported, and a missing identity or a pending transition refuses.
-  `--include-foreign` cannot override that. Ephemeral clean is unchanged.
+  link check, repeated after its barrier is granted and immediately before
+  Cargo runs, so a foreign, replaced or prepared link is never cleaned
+  through. The root, its marker and the link are kept, inactive roots are
+  reported, and a missing identity, a pending transition or unknown writer
+  custody refuses. `--include-foreign` cannot override that. Ephemeral clean
+  is unchanged.
 - **Removal.** A volume that vanishes fails the running build through #098's
   stop/lost/quarantine path. The link is never swapped mid-command, and
   neither root is copied or deleted. The next command transitions to the
@@ -2461,13 +2471,20 @@ the link; the local fallback while the drive is absent and redocking with
 both roots kept; the git-tracked local-root refusal; a wrong recorded volume
 UUID with no external write and no recreated mount point; a second command
 waiting for a running build and then binding its own destination while the
-running build keeps the root it selected; an active build script blocking the
-output barrier; crash replay at the prepared, sibling and renamed points plus
-the contradictory-state stop and a crafted link that appeared after a crash;
-selected and whole clean refusing a replaced or unusable volume and a foreign
-link while preserving the root, marker and inactive roots; and `detach`
-refusing while permanent and restoring a real directory afterwards. Not a
-benchmark, real-drive qualification or an alias for full QA.
+running build keeps the root it selected; a long-lived `exec` and two
+simultaneous commands that both reach Cargo, so the second-slot rule and a
+non-blocking starter path hold; an active build script blocking an explicit
+relink; a replaced `oxide-outputs` ancestor refused for an unchanged
+destination with no write onto internal disk; crash replay at the prepared,
+sibling and renamed points plus the contradictory-state stop and a crafted
+link that appeared after a crash; a crafted quarantined writer blocking both
+relink and clean; selected clean refusing after its link turned foreign while
+it waited, and selected and whole clean refusing a replaced or unusable
+volume while preserving the root, marker and inactive roots; a second
+fallback command reusing its slot warm; a pre-created empty local root
+refused when Git would track it; and `detach` refusing while permanent and
+restoring a real directory afterwards. Not a benchmark, real-drive
+qualification or an alias for full QA.
 
 ### Proposed: `oxide pool describe --json` (lead `beec4971`)
 
