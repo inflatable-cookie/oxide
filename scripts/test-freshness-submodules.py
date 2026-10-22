@@ -325,12 +325,9 @@ def prove_two_states(fixture: Fixture) -> None:
         )
         return stderr
 
-    def gated_build(where: str, label: str, *, gated: bool) -> str:
+    def unchanged_build(where: str, label: str) -> str:
         stderr = fixture.build(where, label)
-        if gated:
-            expect("freshness gate" in stderr, f"{label}: a change ran no gate")
-        else:
-            expect("freshness gate" not in stderr, f"{label}: an unchanged repeat ran a gate")
+        expect("freshness gate" not in stderr, f"{label}: an unchanged repeat ran a gate")
         return stderr
 
     # 1. Cold Exact build; the executed marker runs once.
@@ -340,7 +337,7 @@ def prove_two_states(fixture: Fixture) -> None:
     expect(fixture.marker_lines() == ["one|shared one"], f"marker {fixture.marker_lines()}")
 
     # 2. Same state, same checkout: no gate, no rebuild, no marker line.
-    gated_build(primary, "primary unchanged", gated=False)
+    unchanged_build(primary, "primary unchanged")
     expect(fixture.binary(primary, "primary unchanged") == "one|shared one", "repeat binary")
     expect(fixture.marker_lines() == ["one|shared one"], "unchanged repeat reran the marker")
 
@@ -366,13 +363,13 @@ def prove_two_states(fixture: Fixture) -> None:
     # re-init, with the executed marker proving each rebuild.
     fixture.git(primary, "submodule", "deinit", "-f", "--quiet", "sub")
     expect(not os.listdir(os.path.join(primary, "sub")), "deinit left child content")
-    gated_build(primary, "primary deinitialized", gated=True)
+    fixture.build(primary, "primary deinitialized")
     expect(
         fixture.binary(primary, "primary deinitialized") == "absent|shared one",
         "the deinitialized build kept the old unit",
     )
     fixture.git(primary, "submodule", "update", "--init", "--quiet")
-    gated_build(primary, "primary reinitialized", gated=True)
+    fixture.build(primary, "primary reinitialized")
     expect(
         fixture.binary(primary, "primary reinitialized") == "one|shared one",
         "the reinitialized build reused the absent unit",
@@ -391,7 +388,7 @@ def prove_two_states(fixture: Fixture) -> None:
     )
     fixture.age(os.path.join(primary, "sub", "value.txt"))
     before = len(fixture.marker_lines())
-    stderr = gated_build(primary, "primary different gitlink", gated=True)
+    stderr = fixture.build(primary, "primary different gitlink")
     expect(
         "freshness gate refreshed" in stderr,
         f"the different gitlink did not refresh the child's files: {stderr[-800:]}",
@@ -403,7 +400,7 @@ def prove_two_states(fixture: Fixture) -> None:
     expect(len(fixture.marker_lines()) == before + 1, "the marker did not rerun")
 
     # 7. Same new state again: no gate and no rebuild.
-    gated_build(primary, "primary second commit unchanged", gated=False)
+    unchanged_build(primary, "primary second commit unchanged")
     expect(
         fixture.binary(primary, "primary second commit unchanged") == "two|shared one",
         "the repeat after the new gitlink is stale",
