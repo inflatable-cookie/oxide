@@ -45,8 +45,10 @@ use std::os::fd::AsFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Directory under the volume mount that holds every checkout's output root.
 pub const EXTERNAL_DIR: &str = "oxide-outputs";
@@ -73,6 +75,22 @@ const MAX_ROOTS: usize = 8;
 const MAX_HOLDERS: usize = 16;
 /// Debug-only crash injection, naming a write-ahead point.
 const CRASH_ENVIRONMENT: &str = "OXIDE_TEST_OUTPUTS_CRASH";
+/// One bounded Git probe's time limit.
+const GIT_PROBE_TIME: Duration = Duration::from_secs(5);
+/// Byte cap for one Git probe's stdout.
+const MAX_GIT_PROBE_BYTES: usize = 64 * 1024;
+/// Repository-addressing variables a probe removes: a first conversion asks
+/// about this checkout's real work tree, never an inherited one.
+const GIT_REPOSITORY_ENVIRONMENT: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+    "GIT_CEILING_DIRECTORIES",
+];
 
 const USAGE: &str = "\
 usage: oxide outputs plan      effect-free JSON plan for this checkout (oxide.outputs.plan/1)
@@ -2241,6 +2259,16 @@ fn transition(
     // Only the receipt's own owned link, a missing target, or (for the
     // explicit conversion) an empty real directory may be replaced.
     let target = context.target()?;
+    // A first conversion publishes an owned link, so Git must ignore that
+    // exact non-directory path first — before the prepared receipt, the root
+    // or either link exists. Later generations keep their committed link's
+    // eligibility and are not re-guarded.
+    let first_link = receipt.selected.is_none()
+        && (target == TargetState::Missing
+            || (target == TargetState::RealEmpty && start == Start::Any));
+    if first_link {
+        refuse_link_git_exposure(context)?;
+    }
     // The publish below replaces nothing when the link was absent (or an empty
     // directory was just removed): a creator that appears in between is kept.
     let exclusive = matches!(target, TargetState::Missing | TargetState::RealEmpty);
@@ -2476,6 +2504,12 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
         .prepared
         .clone()
         .ok_or("the prepared receipt names no transition")?;
+    // A first conversion publishes its link during replay too: the same
+    // prerequisite is rechecked under the caller's binding mutex, with no
+    // recovery bypass. A receipt that already committed a root keeps it.
+    if receipt.selected.is_none() {
+        refuse_link_git_exposure(context)?;
+    }
     let control = context
         .control()
         .ok_or("no internal pool exists; there is no place for an output receipt")?;
@@ -2750,6 +2784,294 @@ fn sync_directory(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("cannot sync {}: {error}", path.display()))
 }
 
+/// The first conversion's ignore prerequisite (oxide#125).
+///
+/// Before any receipt, root or link effect, positively establish this
+/// checkout's real Git work tree and the exact repository-relative
+/// non-directory link path, then ask Git itself about that path. The index
+/// must not already track it, and Git's winning ignore rule for it must be
+/// neither a negation nor a trailing-slash (directory-only) rule: an
+/// existing real empty target lets Git answer for a directory, so the losing
+/// answer would wrongly cover a link. Trailing-slash and unsupported rule
+/// forms are refused even when that is a false negative. Missing Git, a
+/// non-repository, a timeout, a command error and malformed, oversized or
+/// ambiguous output all refuse: unknown is never permission.
+fn refuse_link_git_exposure(context: &Context) -> Result<(), String> {
+    let link = context.link();
+    let (root, relative) =
+        git_link_path(context).map_err(|reason| link_git_unknown_refusal(&link, &reason, None))?;
+    let gitignore = root.join(".gitignore");
+    let fix = format!(
+        "Ignore the non-directory path: add `/{relative}` (or `{relative}`), not `{relative}/`, to {}",
+        gitignore.display()
+    );
+    // A tracked path would publish a tracked symlink once the link is there.
+    let tracked = git_probe(&root, &["ls-files", "-z", "--", &relative], &[], true)
+        .map_err(|reason| link_git_unknown_refusal(&link, &reason, Some(&fix)))?;
+    if tracked.code != Some(0) {
+        return Err(link_git_unknown_refusal(
+            &link,
+            &format!("git ls-files did not answer ({})", exit_label(tracked.code)),
+            Some(&fix),
+        ));
+    }
+    if !tracked.stdout.is_empty() {
+        return Err(format!(
+            "outputs: refusing to convert {} to an owned link: Git already tracks `{relative}`, so the published link would be a tracked path. Remove it from the index (`git rm --cached {relative}`) and {fix}; nothing was changed",
+            link.display()
+        ));
+    }
+    // The exact non-directory path, decided by Git itself: `--no-index`
+    // reads the rules rather than the index (tracked is refused above), and
+    // `-v` names the winning rule, whose form is part of the answer.
+    let input = format!("{relative}\0");
+    let check = git_probe(
+        &root,
+        &["check-ignore", "--no-index", "-v", "-z", "--stdin"],
+        input.as_bytes(),
+        false,
+    )
+    .map_err(|reason| link_git_unknown_refusal(&link, &reason, Some(&fix)))?;
+    let rule = match check.code {
+        Some(0) => parse_ignore_rule(&check.stdout, &relative)
+            .map_err(|reason| link_git_unknown_refusal(&link, &reason, Some(&fix)))?,
+        Some(1) => {
+            return Err(format!(
+                "outputs: refusing to convert {} to an owned link: Git does not ignore `{relative}`, so the published link would appear as an untracked path. {fix}; nothing was changed",
+                link.display()
+            ))
+        }
+        code => {
+            return Err(link_git_unknown_refusal(
+                &link,
+                &format!("git check-ignore did not answer ({})", exit_label(code)),
+                Some(&fix),
+            ))
+        }
+    };
+    if rule.pattern.starts_with('!') {
+        return Err(format!(
+            "outputs: refusing to convert {} to an owned link: Git's winning rule `{}` ({}:{}) re-includes `{relative}`. {fix}; nothing was changed",
+            link.display(),
+            rule.pattern,
+            rule.source,
+            rule.line
+        ));
+    }
+    if rule.pattern.ends_with('/') || rule.pattern.ends_with("\\/") {
+        return Err(format!(
+            "outputs: refusing to convert {} to an owned link: Git's winning rule `{}` ({}:{}) matches directories only, so it would not cover the published link. {fix}; nothing was changed",
+            link.display(),
+            rule.pattern,
+            rule.source,
+            rule.line
+        ));
+    }
+    Ok(())
+}
+
+fn link_git_unknown_refusal(link: &Path, reason: &str, fix: Option<&str>) -> String {
+    match fix {
+        Some(fix) => format!(
+            "outputs: refusing to convert {} to an owned link: Git could not confirm its decision for the exact non-directory path ({reason}), which the first conversion needs. {fix}; nothing was changed",
+            link.display()
+        ),
+        None => format!(
+            "outputs: refusing to convert {} to an owned link: Git could not confirm this checkout's work tree and the exact non-directory path to ignore ({reason}), which the first conversion needs. Nothing was changed",
+            link.display()
+        ),
+    }
+}
+
+fn exit_label(code: Option<i32>) -> String {
+    code.map_or_else(|| "by signal".to_owned(), |code| format!("exit {code}"))
+}
+
+/// The real work tree and the exact repository-relative path of this
+/// checkout's owned link: positively inside that work tree, no `..`, no
+/// escape and no trailing slash.
+fn git_link_path(context: &Context) -> Result<(PathBuf, String), String> {
+    let workspace = fs::canonicalize(&context.workspace)
+        .map_err(|error| format!("cannot resolve {}: {error}", context.workspace.display()))?;
+    let probe = git_probe(&workspace, &["rev-parse", "--show-toplevel"], &[], false)?;
+    if probe.code != Some(0) {
+        return Err(format!(
+            "git rev-parse did not confirm a work tree ({})",
+            exit_label(probe.code)
+        ));
+    }
+    let text = std::str::from_utf8(&probe.stdout)
+        .map_err(|_| "Git reported a work tree root that is not UTF-8".to_owned())?;
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    if text.is_empty() || text.contains('\n') {
+        return Err("Git reported an empty or multiple work tree roots".to_owned());
+    }
+    let root = fs::canonicalize(text)
+        .map_err(|error| format!("cannot resolve the Git work tree root {text}: {error}"))?;
+    let relative = workspace
+        .strip_prefix(&root)
+        .map_err(|_| "the checkout is not inside the Git work tree Git reported".to_owned())?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err("the checkout path is not a plain relative path".to_owned());
+        };
+        let name = name
+            .to_str()
+            .ok_or("the checkout path is not valid UTF-8")?;
+        if name.is_empty() || name.contains('/') || name.contains('\0') {
+            return Err("the checkout path has an unusable component".to_owned());
+        }
+        parts.push(name.to_owned());
+    }
+    parts.push("target".to_owned());
+    Ok((root, parts.join("/")))
+}
+
+/// One winning ignore rule from `git check-ignore --no-index -v -z --stdin`:
+/// `<source>\0<line>\0<pattern>\0<pathname>\0`.
+struct IgnoreRule {
+    source: String,
+    line: u64,
+    pattern: String,
+}
+
+fn parse_ignore_rule(output: &[u8], expected: &str) -> Result<IgnoreRule, String> {
+    let fields: Vec<&[u8]> = output.split(|byte| *byte == 0).collect();
+    // Exactly one complete record, ending with its NUL separator.
+    if fields.len() != 5 || !fields[4].is_empty() {
+        return Err("Git's verbose ignore output is not one complete record".to_owned());
+    }
+    let text = |index: usize, what: &str| -> Result<&str, String> {
+        let bytes = fields[index];
+        if bytes.is_empty() || bytes.contains(&b'\n') || bytes.contains(&b'\0') {
+            return Err(format!("Git's ignore output has an unusable {what}"));
+        }
+        std::str::from_utf8(bytes)
+            .map_err(|_| format!("Git's ignore output has a non-UTF-8 {what}"))
+    };
+    let source = text(0, "rule source")?;
+    let line = text(1, "rule line")?;
+    let pattern = text(2, "rule pattern")?;
+    let pathname = text(3, "pathname")?;
+    if pathname != expected {
+        return Err("Git answered for another path".to_owned());
+    }
+    if !line.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("Git's ignore output has an unusable rule line".to_owned());
+    }
+    let line = line
+        .parse::<u64>()
+        .map_err(|_| "Git's ignore output has an unusable rule line".to_owned())?;
+    Ok(IgnoreRule {
+        source: source.to_owned(),
+        line,
+        pattern: pattern.to_owned(),
+    })
+}
+
+/// One bounded, effect-free Git call in `dir`, with `input` on stdin.
+/// Optional locks and prompts are off, repository overrides are removed,
+/// output is capped and a child that outlives the probe is killed. Every
+/// failure is an error, never an answer. `literal_pathspecs` makes `--` paths
+/// literal for `ls-files`; commands that reject that magic (check-ignore's
+/// stdin paths) are called without it.
+fn git_probe(
+    dir: &Path,
+    args: &[&str],
+    input: &[u8],
+    literal_pathspecs: bool,
+) -> Result<GitProbe, String> {
+    let name = args.first().copied().unwrap_or("git");
+    let mut command = Command::new("git");
+    command
+        .arg("--no-optional-locks")
+        .args(["-c", "submodule.recurse=0", "-c", "core.fsmonitor=false"])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    for variable in GIT_REPOSITORY_ENVIRONMENT {
+        command.env_remove(variable);
+    }
+    // Inherited config injection could change the ignore decision (for
+    // example `core.excludesFile`) from the one a plain `git status` in the
+    // same checkout would make.
+    for (name, _) in std::env::vars_os() {
+        let Some(name) = name.to_str() else { continue };
+        if name == "GIT_CONFIG_COUNT"
+            || name == "GIT_CONFIG_PARAMETERS"
+            || name.starts_with("GIT_CONFIG_KEY_")
+            || name.starts_with("GIT_CONFIG_VALUE_")
+        {
+            command.env_remove(name);
+        }
+    }
+    if literal_pathspecs {
+        command.env("GIT_LITERAL_PATHSPECS", "1");
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("cannot run git {name}: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("git {name} kept no stdout"))?;
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let read = stdout
+            .take(MAX_GIT_PROBE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = sender.send(read);
+    });
+    if let Some(mut stdin) = child.stdin.take() {
+        let input = input.to_vec();
+        thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
+    }
+    let deadline = Instant::now() + GIT_PROBE_TIME;
+    let code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("git {name} did not finish in time"));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("cannot wait for git {name}: {error}"));
+            }
+        }
+    };
+    let settle = Duration::from_secs(1);
+    let bytes = receiver
+        .recv_timeout(settle)
+        .map_err(|_| format!("git {name} did not close its output in time"))?
+        .map_err(|error| format!("cannot read git {name} output: {error}"))?;
+    if bytes.len() > MAX_GIT_PROBE_BYTES {
+        return Err(format!("git {name} output is over its byte cap"));
+    }
+    Ok(GitProbe {
+        code,
+        stdout: bytes,
+    })
+}
+
+/// One bounded Git probe's answer; a non-zero exit is an answer, not an error.
+struct GitProbe {
+    code: Option<i32>,
+    stdout: Vec<u8>,
+}
+
 /// Whether Git would track a path inside the checkout. A checkout that is
 /// not a work tree has no tracking risk.
 fn git_would_track(checkout: &Path, relative: &str) -> Result<bool, String> {
@@ -2938,6 +3260,37 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::in_tree("", "/target\n/.oxide-outputs/\n")
+        }
+
+        /// A checkout `relative` inside its own Git work tree whose
+        /// `.gitignore` holds exactly `ignore`. A first conversion needs Git to
+        /// ignore the exact non-directory link path (oxide#125).
+        fn in_tree(relative: &str, ignore: &str) -> Self {
+            let mut fixture = Self::without_git();
+            let repo = fixture.root.join("repo");
+            fs::create_dir(&repo).unwrap();
+            let status = Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .current_dir(&repo)
+                .status()
+                .expect("git init in the fixture");
+            assert!(status.success(), "git init failed: {status}");
+            fs::write(repo.join(".gitignore"), ignore).unwrap();
+            let checkout = if relative.is_empty() {
+                repo
+            } else {
+                let checkout = repo.join(relative);
+                fs::create_dir_all(&checkout).unwrap();
+                checkout
+            };
+            fixture.checkout = checkout;
+            fixture
+        }
+
+        /// A checkout that is not inside any Git work tree this fixture made.
+        fn without_git() -> Self {
             let id = SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let root = std::env::temp_dir()
                 .canonicalize()
@@ -2959,6 +3312,11 @@ mod tests {
 
         fn context(&self) -> Context {
             Context::new(Some(self.control.clone()), self.checkout.clone())
+        }
+
+        /// The Git work tree `in_tree` made for this fixture.
+        fn repo(&self) -> PathBuf {
+            self.root.join("repo")
         }
 
         fn local(&self) -> RootSpec {
@@ -3144,6 +3502,280 @@ mod tests {
             fs::read_link(linked.checkout.join("target")).unwrap(),
             outside
         );
+    }
+
+    #[test]
+    fn a_first_conversion_refuses_a_rule_that_would_not_cover_the_link() {
+        // A trailing-slash rule matches directories only, so it never covers
+        // the link. A missing target leaves Git answering "not ignored"; a
+        // real empty target makes Git answer for a *directory* with that rule,
+        // and that answer must not be read as eligibility either.
+        for (label, rule, empty, reason) in [
+            (
+                "missing target, /target/",
+                "/target/",
+                false,
+                "does not ignore",
+            ),
+            (
+                "empty target, /target/",
+                "/target/",
+                true,
+                "directories only",
+            ),
+            (
+                "missing target, target/",
+                "target/",
+                false,
+                "does not ignore",
+            ),
+            (
+                "missing target, **/target/",
+                "**/target/",
+                false,
+                "does not ignore",
+            ),
+            ("empty target, target/", "target/", true, "directories only"),
+            (
+                "empty target, **/target/",
+                "**/target/",
+                true,
+                "directories only",
+            ),
+        ] {
+            let fixture = Fixture::in_tree("", &format!("{rule}\n/.oxide-outputs/\n"));
+            if empty {
+                fs::create_dir(fixture.checkout.join("target")).unwrap();
+            }
+            let refused = transition(
+                &fixture.context(),
+                &fixture.receipt(),
+                &fixture.local(),
+                Start::Any,
+            )
+            .unwrap_err();
+            assert!(refused.contains(reason), "{label}: {refused}");
+            assert!(refused.contains("not `target/`"), "{label}: {refused}");
+            assert!(
+                refused.ends_with("nothing was changed"),
+                "{label}: {refused}"
+            );
+            // No receipt, no root and no link.
+            let loaded = read_receipt(
+                &fixture.control,
+                &fixture.checkout,
+                &fixture.context().checkout_id,
+            )
+            .unwrap();
+            assert!(
+                loaded.is_none(),
+                "{label}: a refused conversion wrote a receipt"
+            );
+            assert!(
+                !fixture.local().root().exists(),
+                "{label}: a refused conversion created a root"
+            );
+            let link = fixture.checkout.join("target");
+            if empty {
+                // The real empty directory is exactly as it was.
+                assert!(
+                    fs::symlink_metadata(&link).unwrap().is_dir(),
+                    "{label}: the empty target was removed or replaced"
+                );
+                assert!(
+                    fs::read_dir(&link).unwrap().next().is_none(),
+                    "{label}: the empty target changed"
+                );
+            } else {
+                assert!(!os_symlink_exists(&link), "{label}: a target appeared");
+            }
+        }
+
+        for (label, ignore) in [
+            ("negated", "target\n!/target\n/.oxide-outputs/\n"),
+            ("unignored", "/.oxide-outputs/\n"),
+        ] {
+            let fixture = Fixture::in_tree("", ignore);
+            let refused = transition(
+                &fixture.context(),
+                &fixture.receipt(),
+                &fixture.local(),
+                Start::Any,
+            )
+            .unwrap_err();
+            let expected = if label == "negated" {
+                "re-includes"
+            } else {
+                "does not ignore"
+            };
+            assert!(refused.contains(expected), "{label}: {refused}");
+            assert!(
+                refused.contains("nothing was changed"),
+                "{label}: {refused}"
+            );
+            assert!(
+                !fixture.local().root().exists(),
+                "{label}: a refused conversion created a root"
+            );
+        }
+    }
+
+    #[test]
+    fn a_first_conversion_accepts_a_non_directory_ignore_rule() {
+        for rule in ["/target", "target"] {
+            let fixture = Fixture::in_tree("", &format!("{rule}\n/.oxide-outputs/\n"));
+            let receipt = transition(
+                &fixture.context(),
+                &fixture.receipt(),
+                &fixture.local(),
+                Start::Any,
+            )
+            .unwrap();
+            assert_eq!(receipt.state, ReceiptState::Committed, "{rule}");
+            assert!(
+                os_symlink_exists(&fixture.checkout.join("target")),
+                "{rule}"
+            );
+            let repo = fixture.repo();
+            let ignore = fs::read(repo.join(".gitignore")).unwrap();
+            let listed = status_entries_naming(&fixture.checkout, "target");
+            assert!(
+                listed.is_empty(),
+                "{rule}: Git status lists the owned link: {listed:?}"
+            );
+            // The check is non-vacuous: with the rule gone the published link
+            // is detected at its exact path.
+            fs::write(repo.join(".gitignore"), b"").unwrap();
+            let exposed = status_entries_naming(&fixture.checkout, "target");
+            assert!(
+                exposed.iter().any(|entry| entry.get(3..) == Some("target")),
+                "{rule}: the detector missed an exposed link: {exposed:?}"
+            );
+            fs::write(repo.join(".gitignore"), &ignore).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_nested_first_conversion_uses_the_exact_repository_relative_path() {
+        let relative = "apps/farmyard/target";
+        let allowed = Fixture::in_tree("apps/farmyard", "/apps/farmyard/target\n.oxide-outputs/\n");
+        transition(
+            &allowed.context(),
+            &allowed.receipt(),
+            &allowed.local(),
+            Start::Any,
+        )
+        .unwrap();
+        assert!(os_symlink_exists(&allowed.checkout.join("target")));
+        let repo = allowed.repo();
+        let ignore = fs::read(repo.join(".gitignore")).unwrap();
+        let listed = status_entries_naming(&allowed.checkout, relative);
+        assert!(
+            listed.is_empty(),
+            "Git status lists the nested link: {listed:?}"
+        );
+        // A wholly untracked workspace collapses to one entry such as `apps/`
+        // in plain `git status`; every untracked file is listed here, so the
+        // control detects the exact exposed nested link.
+        fs::write(repo.join(".gitignore"), b"").unwrap();
+        let exposed = status_entries_naming(&allowed.checkout, relative);
+        assert!(
+            exposed.iter().any(|entry| entry.get(3..) == Some(relative)),
+            "the nested detector missed an exposed link: {exposed:?}"
+        );
+        fs::write(repo.join(".gitignore"), &ignore).unwrap();
+
+        // The same rule with a real empty target makes Git answer for a
+        // directory, which the winning rule's form then exposes.
+        let empty = Fixture::in_tree("apps/farmyard", "/apps/farmyard/target/\n.oxide-outputs/\n");
+        fs::create_dir(empty.checkout.join("target")).unwrap();
+        let reason = transition(
+            &empty.context(),
+            &empty.receipt(),
+            &empty.local(),
+            Start::Any,
+        )
+        .unwrap_err();
+        assert!(reason.contains("directories only"), "{reason}");
+        assert!(
+            reason.contains(&format!("not `{relative}/`"))
+                && reason.contains(&format!("`/{relative}`")),
+            "{reason}"
+        );
+        assert!(!empty.local().root().exists());
+
+        // A missing target with the trailing-slash form refuses as unignored.
+        let refused =
+            Fixture::in_tree("apps/farmyard", "/apps/farmyard/target/\n.oxide-outputs/\n");
+        let reason = transition(
+            &refused.context(),
+            &refused.receipt(),
+            &refused.local(),
+            Start::Any,
+        )
+        .unwrap_err();
+        assert!(reason.contains("does not ignore"), "{reason}");
+        assert!(
+            reason.contains(&format!("not `{relative}/`"))
+                && reason.contains(&format!("`/{relative}`")),
+            "{reason}"
+        );
+        assert!(!refused.local().root().exists());
+    }
+
+    #[test]
+    fn a_tracked_or_nongit_checkout_refuses_a_first_conversion() {
+        // Tracked in the index but absent from the working tree: a link there
+        // would be a tracked path.
+        let tracked = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        fs::write(tracked.checkout.join("target"), b"tracked").unwrap();
+        let added = Command::new("git")
+            .args(["add", "-f", "target"])
+            .current_dir(&tracked.checkout)
+            .status()
+            .unwrap();
+        assert!(added.success());
+        fs::remove_file(tracked.checkout.join("target")).unwrap();
+        let refused = transition(
+            &tracked.context(),
+            &tracked.receipt(),
+            &tracked.local(),
+            Start::Any,
+        )
+        .unwrap_err();
+        assert!(refused.contains("already tracks"), "{refused}");
+        assert!(refused.contains("git rm --cached target"), "{refused}");
+        assert!(!tracked.local().root().exists());
+
+        let plain = Fixture::without_git();
+        let refused = transition(
+            &plain.context(),
+            &plain.receipt(),
+            &plain.local(),
+            Start::Any,
+        )
+        .unwrap_err();
+        assert!(refused.contains("could not confirm"), "{refused}");
+        assert!(!plain.local().root().exists());
+        assert!(!os_symlink_exists(&plain.checkout.join("target")));
+    }
+
+    #[test]
+    fn the_verbose_ignore_record_parser_is_strict() {
+        let rule =
+            parse_ignore_rule(b".gitignore\x0010\x00/target\x00target\x00", "target").unwrap();
+        assert_eq!(rule.source, ".gitignore");
+        assert_eq!(rule.line, 10);
+        assert_eq!(rule.pattern, "/target");
+        // Another pathname, a missing terminator, extra records and empty
+        // fields are all malformed, never a rule.
+        assert!(parse_ignore_rule(b".gitignore\x001\x00/target\x00other\x00", "target").is_err());
+        assert!(parse_ignore_rule(b".gitignore\x001\x00/target\x00target", "target").is_err());
+        assert!(
+            parse_ignore_rule(b".gitignore\x001\x00/target\x00target\x00x\x00", "target").is_err()
+        );
+        assert!(parse_ignore_rule(b"\x001\x00/target\x00target\x00", "target").is_err());
+        assert!(parse_ignore_rule(b".gitignore\x00x\x00/target\x00target\x00", "target").is_err());
     }
 
     #[test]
@@ -3374,6 +4006,35 @@ mod tests {
 
     fn os_symlink_exists(path: &Path) -> bool {
         fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    }
+
+    /// Exact `git status` entries naming `relative`, read NUL delimited with
+    /// every untracked file listed: a wholly untracked workspace would
+    /// otherwise collapse to one entry such as `apps/` and hide an exposed
+    /// `apps/farmyard/target`. Paths are compared exactly, never by suffix.
+    fn status_entries_naming(checkout: &Path, relative: &str) -> Vec<String> {
+        let output = Command::new("git")
+            .args([
+                "status",
+                "--porcelain",
+                "-z",
+                "--untracked-files=all",
+                "--no-renames",
+            ])
+            .current_dir(checkout)
+            .output()
+            .expect("git status in the fixture");
+        assert!(output.status.success(), "git status: {output:?}");
+        output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| String::from_utf8_lossy(entry).into_owned())
+            .filter(|entry| {
+                entry.get(2..3) == Some(" ")
+                    && (entry.get(3..) == Some(relative) || entry.get(3..) == Some("target"))
+            })
+            .collect()
     }
 
     /// A prepared receipt replacing a committed external root rolls back when
