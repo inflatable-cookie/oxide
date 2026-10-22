@@ -1867,11 +1867,13 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
     let owned_new = owned_root(&context.workspace, &context.checkout_id, &prepared.to.root).is_ok();
     // A first conversion has no committed selection, so its only valid old
     // state is a missing target: a link that appeared after the crash (even a
-    // dangling one) is not this receipt's and is never renamed over.
-    let old_live = match (&target, receipt.selected()) {
+    // dangling one) is not this receipt's and is never renamed over. A
+    // prepared receipt keeps the selection it is replacing in `selected`,
+    // which is why the stored field is read here rather than the accessor.
+    let old_live = match (&target, receipt.selected.as_ref()) {
         (TargetState::Missing, None) => true,
-        (_, Some(selected)) if target.link_root() == Some(selected.root.as_path()) => true,
         (TargetState::Missing, Some(_)) => true,
+        (_, Some(selected)) if target.link_root() == Some(selected.root.as_path()) => true,
         _ => false,
     };
     // 1. The rename already happened: commit.
@@ -2565,6 +2567,38 @@ mod tests {
 
     fn os_symlink_exists(path: &Path) -> bool {
         fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    }
+
+    /// A prepared receipt replacing a committed external root rolls back when
+    /// its target is still the exact old link (the ordinary crash-before-work
+    /// case), and never touches a different link.
+    #[test]
+    fn a_prepared_replacement_of_a_committed_root_rolls_back_only_over_its_old_link() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let spec = fixture.local();
+        let first = transition(&context, &fixture.receipt(), &spec).unwrap();
+        let old = first.selected().unwrap().root.clone();
+        let mut receipt = first.clone();
+        let prepared = Prepared {
+            generation: first.generation + 1,
+            to: spec.selected(first.generation + 1),
+            link: context.link(),
+        };
+        receipt.state = ReceiptState::Prepared;
+        receipt.prepared = Some(prepared);
+        write_receipt(&fixture.control, &receipt).unwrap();
+        // The old link is still live: roll back to it.
+        let replayed = replay(&context, receipt.clone()).unwrap();
+        assert_eq!(replayed.state, ReceiptState::Committed);
+        assert_eq!(replayed.selected().unwrap().root, old);
+        // A foreign dangling link in its place is not the old generation.
+        fs::remove_file(context.link()).unwrap();
+        let foreign = fixture.root.join("elsewhere");
+        symlink(&foreign, context.link()).unwrap();
+        let refused = replay(&context, receipt).unwrap_err();
+        assert!(refused.contains("cannot be replayed"), "{refused}");
+        assert_eq!(fs::read_link(context.link()).unwrap(), foreign);
     }
 
     /// With a committed selection, a dangling link that is not that selection
