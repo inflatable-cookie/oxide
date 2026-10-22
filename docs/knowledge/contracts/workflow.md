@@ -2435,7 +2435,9 @@ migration and consumer adoption remain separate gates.
   roots and the prepared receipt unchanged; a preparation that published nothing (the sibling
   positively absent) rolls back to the old selection and keeps any root it
   created; a sibling of another kind, selecting another root or unreadable
-  stops with the receipt, links and roots unchanged. The old state is a missing
+  stops with the receipt, links and roots unchanged. The sibling is classified
+  before every replay mutation, so an already-renamed target commits only
+  when the sibling is positively absent. The old state is a missing
   target (a first conversion has no committed selection) or the receipt's
   exact old owned link: a link that appeared after the crash, even a dangling
   one, is never renamed over. Any other state stops, keeps both roots and the

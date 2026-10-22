@@ -2234,10 +2234,60 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
     }
     let target = context.target()?;
     let sibling = sibling_link(link, prepared.generation);
-    let sibling_read = fs::read_link(&sibling).ok();
+    // The sibling is classified before any replay mutation: positively
+    // absent, or exactly the prepared link. Anything else (another kind, a
+    // link to another root, unreadable) is unknown transition state and
+    // stops with the receipt, links and roots unchanged.
+    let sibling_live = match fs::symlink_metadata(&sibling) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Ok(metadata) if metadata.file_type().is_symlink() => match fs::read_link(&sibling) {
+            Ok(read) if read == prepared.to.root => true,
+            Ok(read) => {
+                return Err(stop_unknown(
+                    context,
+                    &prepared,
+                    &format!(
+                        "{} selects {}, not the prepared root {}",
+                        sibling.display(),
+                        read.display(),
+                        prepared.to.root.display()
+                    ),
+                ))
+            }
+            Err(error) => {
+                return Err(stop_unknown(
+                    context,
+                    &prepared,
+                    &format!("cannot read {}: {error}", sibling.display()),
+                ))
+            }
+        },
+        Ok(_) => {
+            return Err(stop_unknown(
+                context,
+                &prepared,
+                &format!("{} exists and is not a link", sibling.display()),
+            ))
+        }
+        Err(error) => {
+            return Err(stop_unknown(
+                context,
+                &prepared,
+                &format!("cannot inspect {}: {error}", sibling.display()),
+            ))
+        }
+    };
     let owned_new = owned_root(&context.workspace, &context.checkout_id, &prepared.to.root).is_ok();
-    let sibling_live = sibling_read.as_deref() == Some(prepared.to.root.as_path());
     let renamed = target.link_root() == Some(prepared.to.root.as_path());
+    // After the rename the sibling no longer exists: a live sibling beside an
+    // already-renamed target is contradictory.
+    if renamed && sibling_live {
+        return Err(stop_unknown(
+            context,
+            &prepared,
+            "the target already selects the prepared root but the prepared sibling still exists",
+        ));
+    }
     // A first conversion has no committed selection, so its only valid old
     // state is a missing target: a link that appeared after the crash (even a
     // dangling one) is not this receipt's and is never renamed over. A
@@ -2287,29 +2337,13 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
     }
     // 3. Nothing was published: roll the preparation back, keeping the old
     //    selection and any root the attempt created. Only a positively absent
-    //    sibling means nothing was published; a sibling of another kind, one
-    //    selecting another root, or one that cannot be inspected is unknown
-    //    transition state and stops with everything kept.
-    match fs::symlink_metadata(&sibling) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Ok(_) => {
-            return Err(stop_unknown(
-                context,
-                &prepared,
-                &format!(
-                    "{} exists but is not the prepared link to {}",
-                    sibling.display(),
-                    prepared.to.root.display()
-                ),
-            ))
-        }
-        Err(error) => {
-            return Err(stop_unknown(
-                context,
-                &prepared,
-                &format!("cannot inspect {}: {error}", sibling.display()),
-            ))
-        }
+    //    sibling means nothing was published.
+    if sibling_live {
+        return Err(stop_unknown(
+            context,
+            &prepared,
+            "the prepared sibling exists but neither its rename nor a rollback is safe",
+        ));
     }
     if !old_live {
         return Err(stop_unknown(
@@ -3523,6 +3557,70 @@ mod tests {
                 _ => assert_eq!(fs::read(&sibling).unwrap(), b"occupied"),
             }
             assert!(old.join(MARKER).is_file());
+        }
+    }
+
+    /// With the target already selecting the prepared root, the commit runs
+    /// only when the sibling is positively absent: a sibling selecting
+    /// another root, a regular file, or the prepared link itself (which a
+    /// rename would have consumed) stops with receipt bytes, target, sibling
+    /// and both roots unchanged. An absent sibling still commits.
+    #[test]
+    fn an_already_renamed_replay_commits_only_without_a_sibling() {
+        for occupant in ["other-link", "file", "prepared-link", "absent"] {
+            let fixture = Fixture::new();
+            let context = fixture.context();
+            let old_root = fixture.root.join("old-root");
+            fs::create_dir(&old_root).unwrap();
+            let spec = fixture.local();
+            ensure_root(&context, &spec, 2).unwrap();
+            let new_root = spec.root().to_path_buf();
+            let mut receipt = fixture.receipt();
+            receipt.state = ReceiptState::Prepared;
+            receipt.generation = 1;
+            receipt.selected = Some(Selected {
+                kind: RootKind::Local,
+                root: old_root.clone(),
+                volume_uuid: None,
+                generation: 1,
+            });
+            receipt.prepared = Some(Prepared {
+                generation: 2,
+                to: spec.selected(2),
+                link: context.link(),
+            });
+            write_receipt(&fixture.control, &receipt).unwrap();
+            symlink(&new_root, context.link()).unwrap();
+            let path = receipt_path(&fixture.control, &context.checkout_id);
+            let bytes = fs::read(&path).unwrap();
+            let sibling = sibling_link(&context.link(), 2);
+            let elsewhere = fixture.root.join("elsewhere");
+            match occupant {
+                "other-link" => symlink(&elsewhere, &sibling).unwrap(),
+                "file" => fs::write(&sibling, b"occupied").unwrap(),
+                "prepared-link" => symlink(&new_root, &sibling).unwrap(),
+                _ => {}
+            }
+            let result = replay(&context, receipt);
+            if occupant == "absent" {
+                let committed = result.unwrap();
+                assert_eq!(committed.state, ReceiptState::Committed);
+                assert_eq!(committed.selected().unwrap().root, new_root);
+                continue;
+            }
+            let refused = result.unwrap_err();
+            assert!(
+                refused.contains("cannot be replayed"),
+                "{occupant}: {refused}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{occupant}");
+            assert_eq!(fs::read_link(context.link()).unwrap(), new_root);
+            match occupant {
+                "other-link" => assert_eq!(fs::read_link(&sibling).unwrap(), elsewhere),
+                "prepared-link" => assert_eq!(fs::read_link(&sibling).unwrap(), new_root),
+                _ => assert_eq!(fs::read(&sibling).unwrap(), b"occupied"),
+            }
+            assert!(old_root.is_dir() && new_root.join(MARKER).is_file());
         }
     }
 
