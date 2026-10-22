@@ -58,6 +58,14 @@ default = false
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-accounting-vanished.py"
 
+# Removable drive modes (oxide#116): under the qualified shared supervisor,
+# stages oxide offline and exercises versioned registration metadata,
+# absent-drive fallback reporting and an active build's stable selection.
+# It creates no mounted drive and never relocates checkout outputs.
+[tasks."rust:drive-mode"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-drive-mode.py"
+
 # Shared session supervisor qualification (oxide#109): a short bootstrap
 # (healthy reserve readings, fixed 300 s wall limit held by a minimal outer
 # actor) runs the candidate `bounded-test.py` around its synthetic suite:

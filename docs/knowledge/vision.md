@@ -127,15 +127,14 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   - a registered removable APFS volume, permanently attached and treated as
     consumable;
   - other tools may keep scratch on it outside `oxide-pool`.
-- **Final outputs** stay checkout-local unless the drive is in permanent
-  mode.
+- **Final outputs** stay checkout-local. Drive mode does not move or relocate
+  outputs; output following is a separate, unimplemented behavior.
 - **Sharing builds:** slots share warm builds across worktrees, sized by the
   byte budget rather than small fixed counts.
 - **sccache:** Oxide bypasses inherited compiler wrappers and doesn't manage
   sccache. Integration is revisited once the current work is done. Cargo's
   own cross-workspace cache is the preferred long-term complement.
 - **Approved, not built:**
-  - the drive's permanent or ephemeral mode;
   - `oxide pool describe --json`;
   - per-slot test scratch;
   - a host build limit derived from core count;
