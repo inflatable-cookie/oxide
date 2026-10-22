@@ -3318,6 +3318,11 @@ mod tests {
             Context::new(Some(self.control.clone()), self.checkout.clone())
         }
 
+        /// The Git work tree `in_tree` made for this fixture.
+        fn repo(&self) -> PathBuf {
+            self.root.join("repo")
+        }
+
         fn local(&self) -> RootSpec {
             local_spec(&self.checkout)
         }
@@ -3534,6 +3539,7 @@ mod tests {
                 false,
                 "does not ignore",
             ),
+            ("empty target, target/", "target/", true, "directories only"),
             (
                 "empty target, **/target/",
                 "**/target/",
@@ -3573,7 +3579,20 @@ mod tests {
                 !fixture.local().root().exists(),
                 "{label}: a refused conversion created a root"
             );
-            assert!(!os_symlink_exists(&fixture.checkout.join("target")));
+            let link = fixture.checkout.join("target");
+            if empty {
+                // The real empty directory is exactly as it was.
+                assert!(
+                    fs::symlink_metadata(&link).unwrap().is_dir(),
+                    "{label}: the empty target was removed or replaced"
+                );
+                assert!(
+                    fs::read_dir(&link).unwrap().next().is_none(),
+                    "{label}: the empty target changed"
+                );
+            } else {
+                assert!(!os_symlink_exists(&link), "{label}: a target appeared");
+            }
         }
 
         for (label, ignore) in [
@@ -3621,16 +3640,22 @@ mod tests {
                 os_symlink_exists(&fixture.checkout.join("target")),
                 "{rule}"
             );
-            let status = Command::new("git")
-                .args(["status", "--porcelain"])
-                .current_dir(&fixture.checkout)
-                .output()
-                .unwrap();
-            let status = String::from_utf8_lossy(&status.stdout);
+            let repo = fixture.repo();
+            let ignore = fs::read(repo.join(".gitignore")).unwrap();
+            let listed = status_entries_naming(&fixture.checkout, "target");
             assert!(
-                !status.lines().any(|line| line.contains("target")),
-                "{rule}: Git status lists the owned link: {status}"
+                listed.is_empty(),
+                "{rule}: Git status lists the owned link: {listed:?}"
             );
+            // The check is non-vacuous: with the rule gone the published link
+            // is detected at its exact path.
+            fs::write(repo.join(".gitignore"), b"").unwrap();
+            let exposed = status_entries_naming(&fixture.checkout, "target");
+            assert!(
+                exposed.iter().any(|entry| entry.get(3..) == Some("target")),
+                "{rule}: the detector missed an exposed link: {exposed:?}"
+            );
+            fs::write(repo.join(".gitignore"), &ignore).unwrap();
         }
     }
 
@@ -3646,6 +3671,23 @@ mod tests {
         )
         .unwrap();
         assert!(os_symlink_exists(&allowed.checkout.join("target")));
+        let repo = allowed.repo();
+        let ignore = fs::read(repo.join(".gitignore")).unwrap();
+        let listed = status_entries_naming(&allowed.checkout, relative);
+        assert!(
+            listed.is_empty(),
+            "Git status lists the nested link: {listed:?}"
+        );
+        // A wholly untracked workspace collapses to one entry such as `apps/`
+        // in plain `git status`; every untracked file is listed here, so the
+        // control detects the exact exposed nested link.
+        fs::write(repo.join(".gitignore"), b"").unwrap();
+        let exposed = status_entries_naming(&allowed.checkout, relative);
+        assert!(
+            exposed.iter().any(|entry| entry.get(3..) == Some(relative)),
+            "the nested detector missed an exposed link: {exposed:?}"
+        );
+        fs::write(repo.join(".gitignore"), &ignore).unwrap();
 
         // The same rule with a real empty target makes Git answer for a
         // directory, which the winning rule's form then exposes.
@@ -3968,6 +4010,35 @@ mod tests {
 
     fn os_symlink_exists(path: &Path) -> bool {
         fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    }
+
+    /// Exact `git status` entries naming `relative`, read NUL delimited with
+    /// every untracked file listed: a wholly untracked workspace would
+    /// otherwise collapse to one entry such as `apps/` and hide an exposed
+    /// `apps/farmyard/target`. Paths are compared exactly, never by suffix.
+    fn status_entries_naming(checkout: &Path, relative: &str) -> Vec<String> {
+        let output = Command::new("git")
+            .args([
+                "status",
+                "--porcelain",
+                "-z",
+                "--untracked-files=all",
+                "--no-renames",
+            ])
+            .current_dir(checkout)
+            .output()
+            .expect("git status in the fixture");
+        assert!(output.status.success(), "git status: {output:?}");
+        output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| String::from_utf8_lossy(entry).into_owned())
+            .filter(|entry| {
+                entry.get(2..3) == Some(" ")
+                    && (entry.get(3..) == Some(relative) || entry.get(3..) == Some("target"))
+            })
+            .collect()
     }
 
     /// A prepared receipt replacing a committed external root rolls back when

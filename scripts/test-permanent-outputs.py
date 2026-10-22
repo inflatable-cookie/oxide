@@ -1663,15 +1663,38 @@ def roots_on(mount: str) -> list[str]:
     return sorted(os.listdir(root)) if os.path.isdir(root) else []
 
 
+def repo_relative_target(proof: Proof, checkout: str) -> str:
+    """This checkout's `target` relative to its repository root."""
+    result = proof.run(["git", "rev-parse", "--show-prefix"], cwd=checkout, timeout=30)
+    expect(result.returncode == 0, f"git rev-parse --show-prefix failed: {result.stderr!r}")
+    return result.stdout.decode(errors="replace").strip() + "target"
+
+
 def git_status_names_target(proof: Proof, checkout: str) -> list[str]:
-    """`git status --porcelain` entries naming this checkout's `target`."""
-    result = proof.run(["git", "status", "--porcelain"], cwd=checkout, timeout=30)
+    """Exact `git status` entries naming this checkout's `target`.
+
+    NUL delimited, with every untracked file listed: a wholly untracked
+    workspace would otherwise collapse to one entry such as `rust/` and hide an
+    exposed `rust/target`. The path is compared exactly (repository-relative,
+    or the checkout-relative form some Git versions print), never by suffix."""
+    expected = repo_relative_target(proof, checkout)
+    result = proof.run(
+        ["git", "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames"],
+        cwd=checkout,
+        timeout=30,
+    )
     expect(result.returncode == 0, f"git status failed in {checkout}: {result.stderr!r}")
     named = []
-    for line in result.stdout.decode(errors="replace").splitlines():
-        path = line[3:].strip().strip('"')
-        if re.search(r"(^|/)target/?$", path):
-            named.append(line)
+    for part in result.stdout.split(b"\0"):
+        if not part:
+            continue
+        entry = part.decode(errors="replace")
+        expect(
+            len(entry) > 3 and entry[2] == " ",
+            f"unexpected git status entry {entry!r}",
+        )
+        if entry[3:] in (expected, "target"):
+            named.append(entry)
     return named
 
 
@@ -1868,7 +1891,7 @@ def ignore_run(proof: Proof, repo: str) -> None:
             "not `target/`" in stderr and "`/target`" in stderr,
             f"{rule!r}: no non-slash fix: {stderr}",
         )
-    for index, rule in enumerate(("/target/", "**/target/")):
+    for index, rule in enumerate(("/target/", "target/", "**/target/")):
         _, checkout = ignore_fixture(
             proof, root, f"empty-{index}", rule + "\n/.oxide-outputs/\n", empty=True
         )
@@ -2125,12 +2148,30 @@ def ignore_run(proof: Proof, repo: str) -> None:
     expect(code == 0 and "now selects" in stdout, stdout + stderr)
     explicit_root = expect_published(proof, pool, mount, explicit, "the explicit first conversion")
 
-    _, nested_ok = ignore_fixture(
+    nested_repo, nested_ok = ignore_fixture(
         proof, root, "nested-accepted", "/rust/target\n.oxide-outputs/\n", relative="rust"
     )
     code, stdout, stderr = proof.oxide(["outputs", "adopt"], "nested /rust/target", nested_ok)
     expect(code == 0 and "now selects" in stdout, stdout + stderr)
     expect_published(proof, pool, mount, nested_ok, "the nested first conversion")
+    # The nested check is non-vacuous: a wholly untracked workspace collapses to
+    # `rust/` in plain `git status`, but with every untracked file listed and
+    # exact NUL-delimited paths, removing the rule exposes `rust/target`.
+    nested_ignore = os.path.join(nested_repo, ".gitignore")
+    nested_saved = read_bytes(nested_ignore)
+    with open(nested_ignore, "wb") as handle:
+        handle.write(b"")
+    try:
+        expected = repo_relative_target(proof, nested_ok)
+        exposed = git_status_names_target(proof, nested_ok)
+        expect(
+            any(entry[3:] == expected for entry in exposed),
+            f"the nested detector missed an exposed target: {exposed}",
+        )
+    finally:
+        with open(nested_ignore, "wb") as handle:
+            handle.write(nested_saved)
+    expect_published(proof, pool, mount, nested_ok, "the nested first conversion restored")
     proof.phase("after accepted publications")
 
     # 9. Detach still works for an existing owned link.
