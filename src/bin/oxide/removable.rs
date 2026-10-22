@@ -25,14 +25,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Registration file in the internal control directory.
-const REGISTRATION: &str = "removable.json";
+pub(crate) const REGISTRATION: &str = "removable.json";
 /// The removable pool's internal root (config, ledger, lock, Oxide state).
 pub const POOL_DIR: &str = "removable";
 /// The payload directory directly under the volume's mount root.
 pub const PAYLOAD_DIR: &str = "oxide-pool";
 const LEGACY_REGISTRATION_VERSION: u32 = 1;
-const REGISTRATION_VERSION: u32 = 2;
-const MAX_REGISTRATION_BYTES: u64 = 16 * 1024;
+pub(crate) const REGISTRATION_VERSION: u32 = 2;
+pub(crate) const MAX_REGISTRATION_BYTES: u64 = 16 * 1024;
 pub const MAX_PLIST_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

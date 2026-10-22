@@ -887,8 +887,12 @@ or global Cargo configuration is involved.
   a private `/private/tmp/oxide-install.*` staging directory, installs through
   a sibling temporary file and `link` (no clobber), and writes a JSON receipt
   under `~/.local/state/oxide/install/`. The receipt records pin, tree,
-  toolchain, build command, path, owner, mode, size, time and SHA-256. It
-  refuses when any `oxide` is on `PATH` or the destination exists, and when
+  toolchain, build command, path, owner, mode, size, time and SHA-256, plus
+  that build's own `control_state_version` and `registration_version` (read by
+  the effect-free hidden probe described under
+  [installed-binary hand-off](#installed-binary-hand-off-oxide122); a build
+  that cannot report them is refused before installation). It refuses when any
+  `oxide` is on `PATH` or the destination exists, and when
   any directory from `HOME` to `~/.local/bin` is a link, is owned by another
   user or (below `HOME`) is group or world writable. It writes only through
   the opened directory, with no-follow opens.
@@ -921,7 +925,10 @@ or global Cargo configuration is involved.
   written state: old commands can refuse an early state read as well as a
   final release. Keep those failures and any held records for the existing
   positive-closure recovery path; do not overwrite the new format or infer
-  writer closure from the refusal.
+  writer closure from the refusal. The
+  [installed-binary hand-off](#installed-binary-hand-off-oxide122) adds a
+  bounded recovery for commands that do run under an older binary, but it
+  cannot repair a binary built without it, so this window policy stands.
 - **Default pool.** The first leased command created
   `~/Library/Caches/oxide/pool` under the then-shipped rules: a 24 GiB
   `apfs-sparse-image-v1` image, refused below the 20 GiB host reserve. That
@@ -944,6 +951,101 @@ or global Cargo configuration is involved.
   (linked or foreign directories, an existing destination, a destination
   swapped during the build) on synthetic fixtures. It never builds or
   installs.
+
+### Installed-binary hand-off (oxide#122)
+
+A command whose binary is older than the control state it finds can hand off
+once to the installed binary instead of only refusing. It is a front-door
+compatibility step, not a repair for binaries that lack it: an older `oxide`
+still refuses newer state, so the
+[install compatibility window](#dogfooding-in-oxides-repository) remains
+necessary.
+
+- **Trigger.** Before any classified arm opens a store, the front door reads at
+  most three control documents and creates nothing: the internal `state.json`,
+  the removable pool's `removable/state.json` and `removable.json`. Each is
+  parsed as a bounded `serde_json::Value`, and only a numeric `u32` `version`
+  above this binary's `STATE_VERSION` or `REGISTRATION_VERSION` triggers,
+  whatever other fields the document carries. A missing pool or file, an IO or
+  permission error, an oversized document, a non-object, and a missing, non-numeric,
+  negative or wider-than-`u32` version are not proof of a newer format: those
+  keep the existing errors and never execute anything. Plain passthrough
+  commands, usage-only `exec` and the `status --launch-check` probe skip the
+  check.
+- **Pre-effect boundary.** The check runs after empty-argument, help,
+  `--version`/`--list` and leading-`+toolchain` handling and before any arm may
+  open a store, create a pool, exclude it from Time Machine, remember a pool,
+  install a signal handler, take the admission lock or start Cargo or a tool.
+  Nothing before the decision has an effect. `Store::load` errors are never
+  caught and no later phase replays the command: an incompatibility found at a
+  final release keeps the existing refusal without a hand-off.
+- **Candidate.** Exactly one: the newest timestamp-sort receipt under
+  `~/.local/state/oxide/install/*.json` (at most 4096 directory entries, 64 KiB
+  per receipt) must name `installed.path` = `~/.local/bin/oxide`, carry
+  `installed.sha256`, `installed.size`, `control_state_version` and
+  `registration_version`, and cover every newer version observed. Its
+  directories from `HOME` down must be real, owned by this user and, below
+  `HOME`, not group or world writable. Every `oxide` on `PATH` must be the same
+  device and inode, so the candidate is reached through `PATH` and no other
+  entry shadows it. The file is opened `O_RDONLY|O_NOFOLLOW`, must be a
+  regular, user-owned, executable file, is hashed from that descriptor (bounded
+  to 64 MiB) and must match the receipt's SHA-256 and size. The running binary
+  itself, another `oxide` on `PATH`, a receipt for another path and an older
+  receipt are refused. No arbitrary, older or unknown executable is searched,
+  fetched or installed, no flags are translated, and no environment value
+  forces a hand-off.
+- **Exactly one.** An approved hand-off prints one stderr notice,
+  `oxide: handing off to the installed binary (state is newer than this one).`,
+  then `exec`s the candidate with the caller's byte-exact arguments (including
+  `argv[0]`) and environment, adding only `OXIDE_INTERNAL_HANDED_OFF=1`. That
+  name at any value prohibits a second hand-off and is inert without newer
+  state; it never authorizes one or bypasses a check. A successor preserves it,
+  so one original invocation executes at most once even if a third binary or a
+  later state version appears. Signals and exit codes are the executed
+  binary's.
+- **Refusals.** With newer state but no candidate, a marker already present, or
+  any candidate, ownership, path, hash, size or capability mismatch, the
+  command prints `oxide: oxide was upgraded during this command; re-run.` and
+  exits 75. A failed `exec` prints
+  `oxide: could not start the installed oxide: <error>` and exits 1; it never
+  retries. Without newer state the previous behaviour and exit codes are
+  unchanged, and Cargo's own exit 75 is propagated untouched and is not a
+  trigger.
+- **Capabilities.** A receipt is capability proof only for the numbers it
+  records, read from the authenticated pinned build by the hidden
+  `oxide __oxide-build-capabilities` probe before the installer writes
+  anything. A pin that cannot report them is refused before installation; a
+  receipt without them, or lower than an observed file version, cannot prove
+  the installed binary understands the state. Build hash, pin, tree, mtime and
+  display version alone prove nothing. A future incompatible control or
+  registration format must bump its numeric version to participate; this does
+  not catch origin-only or ledger-only fences or every future field.
+- **Exec residual.** The last check re-`fstat`s the opened descriptor and
+  `lstat`s the destination path, requiring the same device, inode, size and
+  mtime immediately before `exec`. The `exec` itself is by path, so a same-user
+  rename in the remaining interval can still substitute the executed inode:
+  the check is a check, not an atomic bind to the executed bytes. Darwin
+  fd-execution is not established and is not used. This weakens neither the
+  receipt, `PATH` nor ownership checks, and it is not adversarial same-user
+  exclusion.
+- **Proof.** `effigy rust:installed-handoff` (heavy) is one fixed script and
+  whole command: `bounded-test.py` around `scripts/test-installed-handoff.py`
+  with a 120 s wall limit and 64 MiB monitored scratch. Inside that scratch
+  the script stages this HEAD's debug `oxide` with plain Cargo offline and the
+  pinned 1.97.1, then deletes the staged target before the fixtures, so it
+  creates no Oxide pool and touches no live pool, installed binary, install
+  receipt or host state. The stage fits the 64 MiB gate by building with one
+  job, one codegen unit, no debug info, stripped symbols and size-optimised
+  codegen: the staged tree peaks near 58 MiB, the fixtures near 2 MiB, and
+  staging takes about 37 s. Over private HOME, receipt and directory-pool
+  fixtures with a compiled stub candidate, it covers newer state
+  and registration versions; malformed, older and non-`u32` documents that must
+  not trigger; one hand-off with exact argv and environment plus the marker;
+  marker refusal and inertness; foreign, path, hash, size, capability,
+  ownership, `PATH`, same-inode and replacement refusals; skipped commands; and
+  a final-release error after effects that never executes anything. It never
+  touches the real `~/.local/bin/oxide`, a real install receipt or a live pool,
+  and is not a benchmark or an alias for full QA.
 
 ### Shared proof supervisor
 

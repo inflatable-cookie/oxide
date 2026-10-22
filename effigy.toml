@@ -50,6 +50,19 @@ default = false
 run = "python3 scripts/bounded-test.py cargo test --workspace --all-targets --locked"
 default = false
 
+# Installed-binary hand-off (oxide#122): one author proof, one fixed script
+# and the whole command under the qualified shared supervisor, within the
+# approved 120 s / 64 MiB bounds. Inside that scratch it stages this HEAD's
+# debug `oxide` with plain Cargo offline and 1.97.1 (-j1, one codegen unit,
+# debug-free, symbol-stripped, size-optimised), deletes the staged target,
+# then runs private HOME, receipt and directory-pool fixtures. It creates no
+# Oxide pool and touches no live pool, ~/.local/bin/oxide, install receipt or
+# host state. Measured peak: 58.3 MiB of the 64 MiB gate, staging ~37 s. Not
+# a benchmark, a real-install qualification or an alias for full QA.
+[tasks."rust:installed-handoff"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 64 -- python3 scripts/test-installed-handoff.py"
+
 # Enumerated paths that disappear during accounting (oxide#113): the
 # qualified session supervisor bounds one fixed native proof covering the
 # debug-only walk hook, status/refusal diagnostics, whole-slot eviction and

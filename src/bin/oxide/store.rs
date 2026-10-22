@@ -59,12 +59,12 @@ const MAX_RECORDS: usize = 256;
 /// Automatic recoveries kept for `oxide status`, newest last.
 const MAX_RECOVERIES: usize = 16;
 /// Finite control-state file size including the atomic temp.
-const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
 /// Legacy control-state files keep their original read limit until the
 /// permanent version-2 fence is actually written.
 const LEGACY_MAX_STATE_BYTES: u64 = 256 * 1024;
 /// Permanent control-state fence for revised Store mutations (oxide#118).
-const STATE_VERSION: u32 = 2;
+pub(crate) const STATE_VERSION: u32 = 2;
 const LEGACY_STATE_VERSION: u32 = 1;
 
 /// UTF-8 byte caps for control-state fields (oxide#118).

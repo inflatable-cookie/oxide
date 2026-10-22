@@ -117,6 +117,34 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(installed["sha256"], sha256(b"new oxide"))
         self.assertEqual(installer.DESTINATION.read_bytes(), b"new oxide")
 
+    def capability_binary(self, output, code=0):
+        stub = self.home / "capability-stub"
+        stub.write_text("#!/bin/sh\nprintf '%s\\n' '" + output + "'\nexit " + str(code) + "\n")
+        stub.chmod(0o755)
+        return stub
+
+    def test_capability_probe_records_the_built_binary_numbers(self):
+        built = self.capability_binary('{"control_state_version": 2, "registration_version": 3}')
+        self.assertEqual(
+            installer.state_capabilities(built),
+            {"control_state_version": 2, "registration_version": 3},
+        )
+
+    def test_capability_probe_refuses_missing_or_invalid_numbers(self):
+        for output in (
+            '{"control_state_version": 2}',
+            '{"control_state_version": "2", "registration_version": 2}',
+            '{"control_state_version": true, "registration_version": 2}',
+            '{"control_state_version": 4294967296, "registration_version": 2}',
+            '{"control_state_version": 2, "registration_version": -1}',
+            "not json",
+            "[]",
+        ):
+            with self.assertRaises(installer.Refusal):
+                installer.state_capabilities(self.capability_binary(output))
+        with self.assertRaises(installer.Refusal):
+            installer.state_capabilities(self.capability_binary('{"control_state_version": 2, "registration_version": 2}', code=1))
+
     def test_replace_refuses_an_unmatched_or_linked_destination(self):
         self.receipt(b"old oxide")
         installer.DESTINATION.write_bytes(b"something else")
