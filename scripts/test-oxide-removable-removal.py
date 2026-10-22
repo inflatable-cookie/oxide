@@ -213,6 +213,22 @@ class Volume:
         expect(os.path.lexists(self.mount) == present, f"{label}: the mount point changed after a refused write")
 
 
+def late_writes(out_dir: str, label: str) -> None:
+    """An unprivileged writer that kept the slot path: a file write and a
+    directory creation both fail and create nothing."""
+    try:
+        with open(os.path.join(out_dir, "after"), "w", encoding="utf-8") as handle:
+            handle.write("late")
+        fail(f"{label}: a late file write into {out_dir} succeeded")
+    except OSError as error:
+        print(f"{label}: late file write refused: {error}")
+    try:
+        os.makedirs(os.path.join(out_dir, "late-dir"))
+        fail(f"{label}: a late directory creation under {out_dir} succeeded")
+    except OSError as error:
+        print(f"{label}: late directory creation refused: {error}")
+
+
 def run(proof: Proof, repo: str) -> None:
     source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
     dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
@@ -320,10 +336,16 @@ def run(proof: Proof, repo: str) -> None:
     expect(code != 0, "the build survived the removal")
     expect("slot 2 is lost with the removable volume; deleted whole when the volume returns" in stderr, "lost-volume not recorded")
     expect("slot 2 was lost with the removable volume" in stderr, "no lost-volume summary line")
-    with open(os.path.join(gate, "held", "report"), encoding="utf-8") as handle:
-        report = handle.read()
-    print(f"build script after removal:\n{report}")
-    expect("write None" not in report and "create None" not in report, f"a late write succeeded: {report}")
+    expect(re.search(rf"removable volume {re.escape(mount)} is gone; stopped Cargo group \d+: TERM", stderr) is not None, "no removal stop")
+    report_path = os.path.join(gate, "held", "report")
+    if os.path.exists(report_path):
+        with open(report_path, encoding="utf-8") as handle:
+            report = handle.read()
+        print(f"build script after removal:\n{report}")
+        expect("write None" not in report and "create None" not in report, f"a late write succeeded: {report}")
+    else:
+        print("build script was stopped before its late writes")
+    late_writes(out_dir, "held removal")
     volume.no_spill("after held build")
     expect(not os.path.lexists(out_dir), "the slot's OUT_DIR exists after removal")
     code, stdout, _ = proof.oxide(["status"], "status, volume gone", app)
@@ -366,6 +388,7 @@ def run(proof: Proof, repo: str) -> None:
         handle.write("go")
     code, _, stderr = proof.finish(child, "kept build after removal", WAIT_SECONDS)
     expect(code != 0, "the kept build survived the removal")
+    late_writes(kept_out, "quarantine removal")
     found = re.search(r"slot (\d+) is quarantined: lost with the removable volume and an inherited rustc wrapper was allowed", stderr)
     expect(found is not None, "quarantine not recorded")
     kept_id = found.group(1)

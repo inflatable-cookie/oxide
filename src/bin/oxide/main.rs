@@ -343,6 +343,13 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         eprintln!("{}", watchdog.report(group.id, closed));
     }
     if closed.is_none() {
+        if stopped.is_some_and(Watchdog::removal) {
+            store.quarantine_lost(
+                &held,
+                &format!("Cargo group {} did not close after KILL", group.id),
+            )?;
+            return Ok(1);
+        }
         eprintln!(
             "oxide: could not confirm Cargo group {} closed after the reserve stop; slot {} stays held, and a later oxide command recovers it once the group is empty",
             group.id, held.slot_id

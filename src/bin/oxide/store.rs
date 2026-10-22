@@ -839,7 +839,7 @@ impl Store {
     /// when a build starts.
     pub fn watchdog(&self) -> Option<Watchdog> {
         match self.backend {
-            Backend::ApfsVolume => None,
+            Backend::ApfsVolume => self.payload.parent().map(Watchdog::for_volume),
             Backend::DirectoryBudget => Some(Watchdog::for_pool(&self.payload)),
         }
     }
@@ -1038,6 +1038,33 @@ impl Store {
         };
         self.save(&state)?;
         Ok(flushed)
+    }
+
+    /// The removal stop could not confirm the group closed: quarantine the
+    /// slot as lost, held and never reused or deleted.
+    pub fn quarantine_lost(&self, held: &Lease, why: &str) -> Result<(), String> {
+        let _admission = self.admission()?;
+        let mut state = self.load()?;
+        if let Some(entry) = state
+            .records
+            .iter_mut()
+            .find(|entry| entry.id == held.record)
+        {
+            let found = Lost {
+                slot_id: held.slot_id.clone(),
+                at_ms: process::now_ms(),
+                unclosed: Some(why.to_owned()),
+            };
+            eprintln!(
+                "oxide: removable volume gone; slot {} is {}",
+                held.slot_id,
+                found.describe()
+            );
+            entry.phase = Phase::Retired;
+            entry.retired = Some(found.describe());
+            entry.lost = Some(found);
+        }
+        self.save(&state)
     }
 
     /// Whether the removable pool's mount root still opens as a mount root.
