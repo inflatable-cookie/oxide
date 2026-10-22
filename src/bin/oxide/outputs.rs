@@ -2286,7 +2286,31 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
         return finish_commit(context, &receipt, &prepared);
     }
     // 3. Nothing was published: roll the preparation back, keeping the old
-    //    selection and any root the attempt created.
+    //    selection and any root the attempt created. Only a positively absent
+    //    sibling means nothing was published; a sibling of another kind, one
+    //    selecting another root, or one that cannot be inspected is unknown
+    //    transition state and stops with everything kept.
+    match fs::symlink_metadata(&sibling) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(stop_unknown(
+                context,
+                &prepared,
+                &format!(
+                    "{} exists but is not the prepared link to {}",
+                    sibling.display(),
+                    prepared.to.root.display()
+                ),
+            ))
+        }
+        Err(error) => {
+            return Err(stop_unknown(
+                context,
+                &prepared,
+                &format!("cannot inspect {}: {error}", sibling.display()),
+            ))
+        }
+    }
     if !old_live {
         return Err(stop_unknown(
             context,
@@ -3446,6 +3470,60 @@ mod tests {
         let clear = Store::for_tests(&fixture.root.join("clear"));
         let replayed = gated_replay(&context, &clear, 0, receipt).unwrap().unwrap();
         assert_eq!(replayed.state, ReceiptState::Committed);
+    }
+
+    /// Rollback needs a positively absent sibling: a sibling selecting
+    /// another root, or a regular file in its place, stops with the receipt,
+    /// target, sibling and roots unchanged. A genuinely absent sibling still
+    /// rolls back.
+    #[test]
+    fn a_contradictory_sibling_with_the_old_link_live_is_never_rolled_back() {
+        for occupant in ["other-link", "file", "absent"] {
+            let fixture = Fixture::new();
+            let context = fixture.context();
+            let committed = transition(&context, &fixture.receipt(), &fixture.local()).unwrap();
+            let old = committed.selected().unwrap().root.clone();
+            let new_root = fixture.root.join("new-root");
+            let mut receipt = committed.clone();
+            receipt.state = ReceiptState::Prepared;
+            receipt.prepared = Some(Prepared {
+                generation: committed.generation + 1,
+                to: Selected {
+                    kind: RootKind::Local,
+                    root: new_root.clone(),
+                    volume_uuid: None,
+                    generation: committed.generation + 1,
+                },
+                link: context.link(),
+            });
+            write_receipt(&fixture.control, &receipt).unwrap();
+            let path = receipt_path(&fixture.control, &context.checkout_id);
+            let bytes = fs::read(&path).unwrap();
+            let sibling = sibling_link(&context.link(), committed.generation + 1);
+            let elsewhere = fixture.root.join("elsewhere");
+            match occupant {
+                "other-link" => symlink(&elsewhere, &sibling).unwrap(),
+                "file" => fs::write(&sibling, b"occupied").unwrap(),
+                _ => {}
+            }
+            let result = replay(&context, receipt);
+            if occupant == "absent" {
+                assert_eq!(result.unwrap().state, ReceiptState::Committed);
+                continue;
+            }
+            let refused = result.unwrap_err();
+            assert!(
+                refused.contains("cannot be replayed"),
+                "{occupant}: {refused}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{occupant}");
+            assert_eq!(fs::read_link(context.link()).unwrap(), old);
+            match occupant {
+                "other-link" => assert_eq!(fs::read_link(&sibling).unwrap(), elsewhere),
+                _ => assert_eq!(fs::read(&sibling).unwrap(), b"occupied"),
+            }
+            assert!(old.join(MARKER).is_file());
+        }
     }
 
     #[test]
