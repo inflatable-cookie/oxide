@@ -222,6 +222,16 @@ class Fixture:
         expect(result.returncode == 0, f"{label}: build failed: {stderr[-1200:]}")
         return stderr
 
+    def clean(self, cwd: str) -> None:
+        result = self.proof.run(
+            [self.candidate, "clean"], cwd=cwd, env=self.env, timeout=120
+        )
+        print(f"clean {cwd}: exit {result.returncode}", flush=True)
+        expect(
+            result.returncode == 0,
+            f"oxide clean failed: {result.stderr.decode(errors='replace')[-800:]}",
+        )
+
     def binary(self, cwd: str, label: str) -> str:
         path = os.path.join(cwd, "target", "debug", "app")
         expect(os.path.isfile(path), f"{label}: no binary at {path}")
@@ -461,6 +471,10 @@ def prove_refusals(fixture: Fixture) -> None:
     print(f"refusal fixture: {committed(fixture, top)}, child {r1}", flush=True)
 
     def assert_refused(label: str, mutate, revert) -> None:
+        # Evict this checkout's slots so the baseline records a trusted
+        # content origin instead of the affine origin a refused cold build
+        # leaves when its own post-build snapshot cannot vouch.
+        fixture.clean(top)
         fixture.build(top, f"{label} baseline")
         mutate()
         before = fixture.fingerprint(top)
@@ -521,6 +535,7 @@ def prove_refusals(fixture: Fixture) -> None:
     )
     # Nested gitlink last: advancing the child to a commit with its own
     # submodule needs no revert after this proof's final refusal.
+    fixture.clean(top)
     fixture.build(top, "nested baseline")
     fixture.git(
         child, "submodule", "add", "--quiet", nested_origin, "nested", allow_file=True
