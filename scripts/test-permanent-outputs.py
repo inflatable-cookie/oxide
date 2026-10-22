@@ -547,6 +547,21 @@ def run(proof: Proof, repo: str) -> None:
     # 6. Redocking relinks without copying or deleting either root.
     mounted = attach_image(proof, root, name)
     expect(mounted == mount, f"re-attached at {mounted}, not {mount}")
+    before_redock = read_json(receipt_path(pool, app))
+    report = plan(proof, app, "plan after redocking")
+    expect(report["action"] in ("relink", "noop"), report)
+    expect(
+        report["proposed_root"]["generation"]
+        == read_json(os.path.join(external_root, MARKER))["generation"],
+        report,
+    )
+    print(
+        "redock before: receipt "
+        f"gen {before_redock['generation']} {before_redock['state']}, "
+        f"external marker {read_json(os.path.join(external_root, MARKER))['generation']}, "
+        f"local marker {read_json(os.path.join(local_root, MARKER))['generation']}, "
+        f"plan {report['proposed_root']}"
+    )
     code, _, stderr = proof.oxide(["build", "--bin", "poutputs"], "build after redocking", app)
     expect(code == 0, f"redocked build failed: {stderr}")
     expect(link_target(link) == external_root, f"redock did not relink: {os.readlink(link)}")

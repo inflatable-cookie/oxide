@@ -528,11 +528,16 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
         }
     };
     let usable = usable_external(context);
+    let next = next_generation;
     let external = usable
         .as_ref()
         .ok()
         .map(|registration| external_spec(registration, &context.workspace));
     let local = local_spec(&context.workspace);
+    let proposed = external
+        .as_ref()
+        .map(|spec| spec.selected(destination_generation(spec.root(), next)));
+    let fallback = local.selected(destination_generation(local.root(), next));
     let mut report = PlanReport {
         version: PLAN_VERSION,
         checkout: context.workspace.clone(),
@@ -544,10 +549,8 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
             .as_ref()
             .and_then(Receipt::selected)
             .map(Selected::view),
-        proposed_root: external
-            .as_ref()
-            .map(|spec| spec.selected(next_generation).view()),
-        proposed_fallback_root: local.selected(next_generation).view(),
+        proposed_root: proposed.as_ref().map(Selected::view),
+        proposed_fallback_root: fallback.view(),
         action: "refuse",
         reason: None,
         data_move: false,
@@ -1383,8 +1386,14 @@ fn desired_selection(context: &Context, receipt: &Receipt) -> Result<Option<Sele
         Ok(registration) => external_spec(&registration, &context.workspace),
         Err(_) => local_spec(&context.workspace),
     };
-    let generation = read_marker(spec.root()).map_or(next, |marker| marker.generation);
+    let generation = destination_generation(spec.root(), next);
     Ok(Some(spec.selected(generation)))
+}
+
+/// The generation a destination root has, or will be created at: its marker's
+/// creation generation, else the generation the next transition would use.
+fn destination_generation(root: &Path, next: u64) -> u64 {
+    read_marker(root).map_or(next, |marker| marker.generation)
 }
 
 /// The final-output destination, as a component of a slot's compatibility
