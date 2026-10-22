@@ -294,10 +294,11 @@ def prove_two_states(fixture: Fixture) -> None:
 
     primary = os.path.join(scratch, "super")
     fixture.repo(primary, APP, "fixture one")
-    fixture.git(
-        primary, "submodule", "add", "--quiet", "../sub-origin/work", "sub", allow_file=True
-    )
-    fixture.git(primary, "commit", "--quiet", "-m", "add submodule")
+    fixture.git(primary, "submodule", "add", "--quiet", child, "sub", allow_file=True)
+    # Pin the declared gitlink to the first child commit.
+    fixture.git(os.path.join(primary, "sub"), "checkout", "--quiet", c1)
+    fixture.git(primary, "add", "sub")
+    fixture.git(primary, "commit", "--quiet", "-m", "add submodule at child one")
     fixture.git(primary, "submodule", "update", "--init", "--quiet")
     baseline = committed(fixture, primary)
     other = os.path.join(scratch, "wt-b")
@@ -454,10 +455,10 @@ def prove_refusals(fixture: Fixture) -> None:
 
     top = os.path.join(scratch, "refuse-super")
     fixture.repo(top, REFUSAL, "refusal fixture")
-    fixture.git(
-        top, "submodule", "add", "--quiet", "../refuse-child/work", "sub", allow_file=True
-    )
-    fixture.git(top, "commit", "--quiet", "-m", "add refusal submodule")
+    fixture.git(top, "submodule", "add", "--quiet", child, "sub", allow_file=True)
+    fixture.git(os.path.join(top, "sub"), "checkout", "--quiet", r1)
+    fixture.git(top, "add", "sub")
+    fixture.git(top, "commit", "--quiet", "-m", "add refusal submodule at r1")
     fixture.git(top, "submodule", "update", "--init", "--quiet")
     sub = os.path.join(top, "sub")
     print(f"refusal fixture: {committed(fixture, top)}, child {r1}", flush=True)
@@ -525,11 +526,12 @@ def prove_refusals(fixture: Fixture) -> None:
     # submodule needs no revert after this proof's final refusal.
     fixture.build(top, "nested baseline")
     fixture.git(
-        child, "submodule", "add", "--quiet", "../nested-origin", "nested", allow_file=True
+        child, "submodule", "add", "--quiet", nested_origin, "nested", allow_file=True
     )
     fixture.git(child, "add", "-A")
     fixture.git(child, "commit", "--quiet", "-m", "nested child")
     r3 = committed(fixture, child)
+    fixture.git(sub, "fetch", "--quiet", "origin")
     fixture.git(sub, "checkout", "--quiet", r3)
     fixture.git(top, "add", "sub")
     fixture.git(top, "commit", "--quiet", "-m", "nested gitlink")
