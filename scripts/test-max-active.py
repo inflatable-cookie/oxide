@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused host-wide active-build limit proof (oxide#111).
+"""Focused host-wide active-build limit proof (oxide#115).
 
 The qualified shared supervisor owns the deadline, host reserve, scratch
 budget, process closure and cleanup. This fixed fixture script keeps every
@@ -433,6 +433,15 @@ def prove_cap_two(binary: str, env: dict[str, str], workspaces: dict[str, str], 
     waiter = start_command(binary, limited, workspaces["c"], hold_script, "cap2-waiter")
     wait_for_log(waiter, "waiting for a build slot (2 of 2 host-wide in use)")
     expect(not os.path.exists(waiter.marker), "third command started while the limit was 2")
+    status_output = status(binary, limited, workspaces["c"], "status-cap2-waiter")
+    ticket_line = next(
+        (line for line in status_output.splitlines() if f"recorded lease-ticket waiter PID {waiter.process.pid}," in line),
+        "",
+    )
+    expect(
+        re.search(r"age approximately \d+s \(file (creation time|modification time fallback)\)", ticket_line) is not None,
+        f"status did not show the waiter's approximate ticket age and source: {status_output}",
+    )
     RESULTS.append({"case": "cap-2-waits-third", "waiting": True})
     release_hold(first)
     while not os.path.exists(waiter.marker):
@@ -441,8 +450,42 @@ def prove_cap_two(binary: str, env: dict[str, str], workspaces: dict[str, str], 
             fail(f"released cap-2 waiter exited: {read_text(waiter.log)[-2000:]}")
         time.sleep(0.05)
     RESULTS.append({"case": "cap-2-release-admits-waiter", "admitted": True})
+    waiter_output = read_text(waiter.log)
+    ready_at = waiter_output.find("oxide: waited ")
+    marker_at = waiter_output.find("tool marker")
+    expect(ready_at >= 0 and marker_at > ready_at, f"wait completion was not printed before the tool marker: {waiter_output[-3000:]}")
+    expect(
+        re.search(
+            r"oxide: waited \d+\.\d+s \([^)]*host limit \d+\.\d+s[^)]*\); slot ready",
+            waiter_output[ready_at:marker_at],
+        )
+        is not None,
+        f"wait completion lacked a measured total and host-limit component: {waiter_output[-3000:]}",
+    )
     release_hold(second)
     release_hold(waiter)
+    waiter_output = read_text(waiter.log)
+    summary = next((line for line in waiter_output.splitlines() if line.startswith("oxide: quick profile,")), "")
+    expect(re.search(r", waited \d+\.\d+s(?:,|$)", summary) is not None, f"waited summary suffix is missing: {waiter_output[-3000:]}")
+    for holder in (first, second):
+        output = read_text(holder.log)
+        expect("oxide: waited " not in output and ", waited " not in output, f"a command with no wait printed a wait diagnostic: {output[-2000:]}")
+
+
+def prove_clean_wait(binary: str, env: dict[str, str], workspace: str, hold_script: str) -> None:
+    holder = start_hold(binary, env, workspace, hold_script, "clean-wait-holder")
+    process, log = launch([binary, "clean"], cwd=workspace, env=env, label="clean-waiter")
+    clean = Holder(process, log, "", "", "clean-waiter")
+    wait_for_log(clean, "waiting for active oxide commands in this checkout")
+    release_hold(holder)
+    code = wait_process(clean.process, "clean-waiter")
+    output = read_text(clean.log)
+    expect(code == 0, f"clean waiter exited {code}: {output[-3000:]}")
+    ready_at = output.find("oxide: waited ")
+    summary_at = output.find(" does not exist; nothing removed, waited ")
+    expect(ready_at >= 0 and summary_at > ready_at, f"clean wait completion or summary suffix is missing or out of order: {output[-3000:]}")
+    expect("; clean barrier acquired" in output[ready_at:summary_at], f"clean completion did not name the barrier: {output[-3000:]}")
+    RESULTS.append({"case": "clean-barrier-wait-and-summary", "exit": code})
 
 
 def prove_configured_three(binary: str, env: dict[str, str], workspaces: dict[str, str], hold_script: str) -> None:
@@ -525,15 +568,17 @@ def main() -> None:
         hold_script,
         "import pathlib, sys, time\n"
         "pathlib.Path(sys.argv[1]).write_text(str(__import__('os').getpid()))\n"
+        "print('tool marker', flush=True)\n"
         "release = pathlib.Path(sys.argv[2])\n"
         "while not release.exists(): time.sleep(0.02)\n",
     )
     prove_cap_two(binary, env, workspaces, hold_script)
+    prove_clean_wait(binary, env, workspaces["d"], hold_script)
     prove_configured_three(binary, env, workspaces, hold_script)
     prove_cross_pool(binary, env, workspaces, hold_script, env["OXIDE_POOL"])
     work_left()
     receipt = {
-        "task": "oxide#111",
+        "task": "oxide#115",
         "source_commit": source,
         "source_tree": tree,
         "binary_sha256": RESULTS[0].get("binary_sha256"),

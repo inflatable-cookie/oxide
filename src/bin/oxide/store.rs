@@ -42,7 +42,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 pub const GIB: u64 = 1024 * 1024 * 1024;
 /// Automatic creation refuses below this host free space.
@@ -331,7 +331,7 @@ fn settle(record: &Record, held: Option<&LedgerSlot>, group_empty: impl Fn(i32) 
     }
 }
 
-/// Why a command is waiting. Only the first reason is printed.
+/// The exclusive admission reason returned by one attempt.
 enum Wait {
     Queue(usize),
     HostLimit(usize),
@@ -343,6 +343,18 @@ enum Wait {
 }
 
 impl Wait {
+    fn category(&self) -> WaitCategory {
+        match self {
+            Self::Queue(_) => WaitCategory::Queue,
+            Self::HostLimit(_) => WaitCategory::HostLimit,
+            Self::Checkout => WaitCategory::Checkout,
+            Self::Clean => WaitCategory::Clean,
+            Self::ProjectCap => WaitCategory::ProjectCap,
+            Self::Uncertain => WaitCategory::Uncertain,
+            Self::Capacity => WaitCategory::Capacity,
+        }
+    }
+
     fn describe(&self, max_active: usize) -> String {
         match self {
             Self::Queue(position) => format!("earlier oxide commands (position {position})"),
@@ -415,16 +427,224 @@ pub enum Cleaning {
     Interrupted(i32),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WaitCategory {
+    Queue,
+    HostLimit,
+    Checkout,
+    Clean,
+    ProjectCap,
+    Uncertain,
+    Capacity,
+}
+
+impl WaitCategory {
+    const ALL: [Self; 7] = [
+        Self::Queue,
+        Self::HostLimit,
+        Self::Checkout,
+        Self::Clean,
+        Self::ProjectCap,
+        Self::Uncertain,
+        Self::Capacity,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Queue => 0,
+            Self::HostLimit => 1,
+            Self::Checkout => 2,
+            Self::Clean => 3,
+            Self::ProjectCap => 4,
+            Self::Uncertain => 5,
+            Self::Capacity => 6,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Queue => "queue",
+            Self::HostLimit => "host limit",
+            Self::Checkout => "checkout",
+            Self::Clean => "clean",
+            Self::ProjectCap => "project cap",
+            Self::Uncertain => "uncertain slot",
+            Self::Capacity => "capacity",
+        }
+    }
+}
+
+/// Measured monotonic waiting observed by one Oxide command.
+#[derive(Debug)]
+pub(crate) struct WaitAccounting {
+    totals: [Duration; WaitCategory::ALL.len()],
+    total: Duration,
+    active: Option<(WaitCategory, Instant)>,
+    observed: bool,
+    observed_categories: [bool; WaitCategory::ALL.len()],
+    duration_available: bool,
+    last_announced: Option<WaitCategory>,
+    reason_lines: usize,
+    suppression_announced: bool,
+}
+
+impl Default for WaitAccounting {
+    fn default() -> Self {
+        Self {
+            totals: [Duration::ZERO; WaitCategory::ALL.len()],
+            total: Duration::ZERO,
+            active: None,
+            observed: false,
+            observed_categories: [false; WaitCategory::ALL.len()],
+            duration_available: true,
+            last_announced: None,
+            reason_lines: 0,
+            suppression_announced: false,
+        }
+    }
+}
+
+impl WaitAccounting {
+    fn observe(&mut self, wait: &Wait, max_active: usize, now: Instant) {
+        let category = wait.category();
+        self.observed = true;
+        self.account_active_until(now);
+        self.observed_categories[category.index()] = true;
+        self.active = Some((category, now));
+
+        if self.last_announced == Some(category) || self.suppression_announced {
+            return;
+        }
+        if self.reason_lines < 8 {
+            eprintln!(
+                "oxide: waiting for {}; Ctrl-C cancels",
+                wait.describe(max_active)
+            );
+            self.reason_lines += 1;
+            self.last_announced = Some(category);
+        } else {
+            eprintln!("oxide: waiting reasons changed; (further changes not shown)");
+            self.suppression_announced = true;
+        }
+    }
+
+    /// End a measured interval at a grant, refusal, cancellation or error.
+    pub(crate) fn stop(&mut self, now: Instant) {
+        self.account_active_until(now);
+    }
+
+    fn account_active_until(&mut self, now: Instant) {
+        let Some((category, started)) = self.active.take() else {
+            return;
+        };
+        let Some(elapsed) = now.checked_duration_since(started) else {
+            self.duration_available = false;
+            return;
+        };
+        if !self.duration_available {
+            return;
+        }
+        let Some(category_total) = self.totals[category.index()].checked_add(elapsed) else {
+            self.duration_available = false;
+            return;
+        };
+        let Some(total) = self.total.checked_add(elapsed) else {
+            self.duration_available = false;
+            return;
+        };
+        self.totals[category.index()] = category_total;
+        self.total = total;
+    }
+
+    fn completion_line(&self, ending: &str) -> Option<String> {
+        if !self.observed {
+            return None;
+        }
+        if !self.duration_available {
+            return Some(format!("oxide: wait duration unavailable; {ending}"));
+        }
+        let Some(total) = format_duration(self.total) else {
+            return Some(format!("oxide: wait duration unavailable; {ending}"));
+        };
+        let Some(categories) = WaitCategory::ALL
+            .into_iter()
+            .filter(|category| self.observed_categories[category.index()])
+            .map(|category| {
+                format_duration(self.totals[category.index()])
+                    .map(|duration| format!("{} {duration}", category.label()))
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Some(format!("oxide: wait duration unavailable; {ending}"));
+        };
+        let categories = categories.join(", ");
+        Some(format!("oxide: waited {total} ({categories}); {ending}"))
+    }
+
+    pub(crate) fn print_completion(&self, ending: &str) {
+        if let Some(line) = self.completion_line(ending) {
+            eprintln!("{line}");
+        }
+    }
+
+    pub(crate) fn summary_suffix(&self) -> Option<String> {
+        if !self.observed {
+            return None;
+        }
+        if !self.duration_available {
+            return Some(", wait duration unavailable".to_owned());
+        }
+        Some(format_duration(self.total).map_or_else(
+            || ", wait duration unavailable".to_owned(),
+            |duration| format!(", waited {duration}"),
+        ))
+    }
+}
+
+fn format_duration(duration: Duration) -> Option<String> {
+    let tenths = duration.as_nanos().checked_add(50_000_000)? / 100_000_000;
+    Some(format!("{}.{:01}s", tenths / 10, tenths % 10))
+}
+
 /// Pool and slot view for `oxide status`.
 pub struct Report {
     pub pool: PoolStatus,
     pub flushes: Vec<Flush>,
     pub waiting: usize,
+    pub(crate) waiters: Vec<Waiter>,
     pub cleaning: Vec<PathBuf>,
     pub slots: Vec<SlotView>,
     pub recoveries: Vec<Recovery>,
     /// This pool's most recently used slot by its use counter.
     pub last_use: Option<LastUse>,
+}
+
+/// An existing lease-ticket record shown by `oxide status`.
+#[derive(Debug)]
+pub(crate) struct Waiter {
+    pub(crate) pid: u32,
+    pub(crate) age: Option<WaitAge>,
+}
+
+#[derive(Debug)]
+pub(crate) struct WaitAge {
+    pub(crate) seconds: u64,
+    pub(crate) source: WaitAgeSource,
+}
+
+#[derive(Debug)]
+pub(crate) enum WaitAgeSource {
+    Created,
+    Modified,
+}
+
+impl WaitAgeSource {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Created => "file creation time",
+            Self::Modified => "file modification time fallback",
+        }
+    }
 }
 
 /// The latest recorded use in one pool, from its control state only.
@@ -782,28 +1002,29 @@ impl Store {
         profile: Profile,
         share: bool,
         label: Option<&str>,
+        waits: &mut WaitAccounting,
     ) -> Result<Acquired, String> {
         let max_active = self.max_active;
         let ticket = self.register_ticket()?;
-        let mut announced = false;
         loop {
             if let Some(signal) = process::received_signal() {
+                waits.stop(Instant::now());
                 self.remove_ticket(ticket.0)?;
                 return Ok(Acquired::Interrupted(signal));
             }
-            match self.attempt(ticket.0, key, profile, max_active, share, label)? {
-                Ok(lease) => {
+            let attempt = self.attempt(ticket.0, key, profile, max_active, share, label);
+            match attempt {
+                Err(error) => {
+                    waits.stop(Instant::now());
+                    return Err(error);
+                }
+                Ok(Ok(lease)) => {
+                    waits.stop(Instant::now());
                     self.remove_ticket(ticket.0)?;
                     return Ok(Acquired::Lease(lease));
                 }
-                Err(wait) => {
-                    if !announced {
-                        eprintln!(
-                            "oxide: waiting for {}; Ctrl-C cancels",
-                            wait.describe(max_active)
-                        );
-                        announced = true;
-                    }
+                Ok(Err(wait)) => {
+                    waits.observe(&wait, max_active, Instant::now());
                     std::thread::sleep(WAIT_POLL);
                 }
             }
@@ -1035,14 +1256,18 @@ impl Store {
     /// Wait until no live or unsettled command for this checkout holds a
     /// record, then mark the checkout as cleaning. Ctrl-C while waiting
     /// cancels.
-    pub fn begin_clean(&self, checkout: &Path) -> Result<Cleaning, String> {
+    pub fn begin_clean(
+        &self,
+        checkout: &Path,
+        waits: &mut WaitAccounting,
+    ) -> Result<Cleaning, String> {
         self.ensure_control()?;
-        let mut announced = false;
         loop {
             if let Some(signal) = process::received_signal() {
+                waits.stop(Instant::now());
                 return Ok(Cleaning::Interrupted(signal));
             }
-            {
+            let attempt = (|| {
                 let _admission = self.admission()?;
                 let mut state = self.load()?;
                 self.drop_dead_tickets(&mut state)?;
@@ -1066,17 +1291,26 @@ impl Store {
                         process_group: None,
                     });
                     self.save(&state)?;
-                    return Ok(Cleaning::Guard(CleanGuard { id, lock }));
+                    return Ok(Some(CleanGuard { id, lock }));
                 }
                 self.save(&state)?;
+                Ok(None)
+            })();
+            match attempt {
+                Err(error) => {
+                    waits.stop(Instant::now());
+                    return Err(error);
+                }
+                Ok(Some(guard)) => {
+                    waits.stop(Instant::now());
+                    waits.print_completion("clean barrier acquired");
+                    return Ok(Cleaning::Guard(guard));
+                }
+                Ok(None) => {
+                    waits.observe(&Wait::Clean, self.max_active, Instant::now());
+                    std::thread::sleep(WAIT_POLL);
+                }
             }
-            if !announced {
-                eprintln!(
-                    "oxide: waiting for active oxide commands in this checkout; Ctrl-C cancels"
-                );
-                announced = true;
-            }
-            std::thread::sleep(WAIT_POLL);
         }
     }
 
@@ -1182,11 +1416,21 @@ impl Store {
                 checkout: record.checkout.clone(),
                 at_ms: record.last_used_ms,
             });
+        let now = SystemTime::now();
+        let waiters = state
+            .tickets
+            .iter()
+            .map(|ticket| Waiter {
+                pid: ticket.pid,
+                age: ticket_age(&self.ticket_path(ticket.id), now),
+            })
+            .collect();
         Ok(Report {
             last_use,
             pool,
             flushes: state.flushes,
             waiting: state.tickets.len(),
+            waiters,
             cleaning: state
                 .cleans
                 .iter()
@@ -2001,6 +2245,36 @@ fn private_file(path: &Path, create: bool) -> Result<Option<File>, String> {
     Ok(Some(file))
 }
 
+/// Approximate age from the existing ticket file's metadata only.
+fn ticket_age(path: &Path, now: SystemTime) -> Option<WaitAge> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    if !metadata.is_file() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        return None;
+    }
+    let created = metadata.created().ok();
+    let modified = if created.is_none() {
+        metadata.modified().ok()
+    } else {
+        None
+    };
+    wait_age_from_times(created, modified, now)
+}
+
+fn wait_age_from_times(
+    created: Option<SystemTime>,
+    modified: Option<SystemTime>,
+    now: SystemTime,
+) -> Option<WaitAge> {
+    let (timestamp, source) = match created {
+        Some(timestamp) => (timestamp, WaitAgeSource::Created),
+        None => (modified?, WaitAgeSource::Modified),
+    };
+    let seconds = now.duration_since(timestamp).ok()?.as_secs();
+    Some(WaitAge { seconds, source })
+}
+
 enum Probe {
     Free(File),
     Held,
@@ -2081,6 +2355,125 @@ mod tests {
         assert_eq!(serde_json::to_string(&state).expect("serialize"), frozen);
     }
 
+    #[test]
+    fn wait_accounting_partitions_observed_intervals_and_pauses_between_grants() {
+        let start = Instant::now();
+        let mut waits = WaitAccounting::default();
+        waits.observe(&Wait::Queue(1), 2, start);
+        waits.observe(&Wait::Queue(2), 2, start + Duration::from_millis(200));
+        waits.stop(start + Duration::from_millis(300));
+
+        // Freshness work between lease attempts is outside measured waiting.
+        waits.observe(&Wait::HostLimit(2), 2, start + Duration::from_secs(10));
+        waits.stop(start + Duration::from_millis(11_100));
+
+        assert_eq!(
+            waits.completion_line("slot ready").as_deref(),
+            Some("oxide: waited 1.4s (queue 0.3s, host limit 1.1s); slot ready")
+        );
+        assert_eq!(waits.summary_suffix().as_deref(), Some(", waited 1.4s"));
+    }
+
+    #[test]
+    fn wait_accounting_reports_unavailable_after_a_backward_clock() {
+        let start = Instant::now();
+        let mut waits = WaitAccounting::default();
+        waits.observe(&Wait::Queue(1), 2, start);
+        waits.stop(start + Duration::from_secs(1));
+        waits.observe(&Wait::Capacity, 2, start + Duration::from_secs(3));
+        waits.stop(start + Duration::from_secs(2));
+
+        assert_eq!(
+            waits.completion_line("slot ready").as_deref(),
+            Some("oxide: wait duration unavailable; slot ready")
+        );
+        assert_eq!(
+            waits.summary_suffix().as_deref(),
+            Some(", wait duration unavailable")
+        );
+    }
+
+    #[test]
+    fn wait_accounting_closes_intervals_on_cancellation_and_error() {
+        let start = Instant::now();
+        for ending in ["cancelled", "refused"] {
+            let mut waits = WaitAccounting::default();
+            waits.observe(&Wait::Clean, 2, start);
+            waits.stop(start + Duration::from_millis(250));
+            let expected = format!("oxide: waited 0.3s (clean 0.3s); {ending}");
+            assert_eq!(
+                waits.completion_line(ending).as_deref(),
+                Some(expected.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn wait_accounting_bounds_reason_announcements_and_omits_unobserved_waits() {
+        let mut waits = WaitAccounting::default();
+        assert_eq!(waits.summary_suffix(), None);
+        let start = Instant::now();
+        let reasons = [
+            Wait::Queue(1),
+            Wait::HostLimit(2),
+            Wait::Checkout,
+            Wait::Clean,
+            Wait::ProjectCap,
+            Wait::Uncertain,
+            Wait::Capacity,
+        ];
+        for reason in reasons {
+            waits.observe(&reason, 2, start);
+        }
+        waits.observe(&Wait::Queue(2), 2, start + Duration::from_millis(7));
+        assert_eq!(waits.reason_lines, 8);
+        waits.observe(&Wait::HostLimit(1), 2, start + Duration::from_millis(8));
+        assert_eq!(waits.reason_lines, 8);
+        assert!(waits.suppression_announced);
+        waits.observe(&Wait::Checkout, 2, start + Duration::from_millis(9));
+        assert_eq!(waits.reason_lines, 8);
+        assert!(waits.suppression_announced);
+    }
+
+    #[test]
+    fn wait_age_prefers_creation_and_uses_modification_only_when_unavailable() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let created = now - Duration::from_secs(10);
+        let modified = now - Duration::from_secs(20);
+        let age = wait_age_from_times(Some(created), Some(modified), now).unwrap();
+        assert_eq!(age.seconds, 10);
+        assert!(matches!(age.source, WaitAgeSource::Created));
+
+        let age = wait_age_from_times(None, Some(modified), now).unwrap();
+        assert_eq!(age.seconds, 20);
+        assert!(matches!(age.source, WaitAgeSource::Modified));
+        assert!(
+            wait_age_from_times(Some(now + Duration::from_secs(1)), Some(modified), now).is_none()
+        );
+        assert!(wait_age_from_times(None, None, now).is_none());
+    }
+
+    #[test]
+    fn wait_ticket_age_requires_private_regular_nonsymlink_metadata() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let (root, _, _) = paired_controls("wait-ticket-age");
+        let ticket = root.join("ticket.lock");
+        fs::write(&ticket, b"").unwrap();
+        fs::set_permissions(&ticket, fs::Permissions::from_mode(0o600)).unwrap();
+        let age = ticket_age(&ticket, SystemTime::now()).unwrap();
+        assert!(age.seconds <= 1);
+
+        fs::set_permissions(&ticket, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(ticket_age(&ticket, SystemTime::now()).is_none());
+        fs::set_permissions(&ticket, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = root.join("ticket-link.lock");
+        symlink(&ticket, &link).unwrap();
+        assert!(ticket_age(&link, SystemTime::now()).is_none());
+        assert!(ticket_age(&root.join("missing.lock"), SystemTime::now()).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn paired_controls(label: &str) -> (PathBuf, Store, Store) {
         let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
             .map(PathBuf::from)
@@ -2131,7 +2524,10 @@ mod tests {
         removable.save(&state).unwrap();
         assert!(internal.sibling_busy(checkout));
         assert!(!internal.sibling_busy(other));
-        let Cleaning::Guard(guard) = internal.begin_clean(other).unwrap() else {
+        let Cleaning::Guard(guard) = internal
+            .begin_clean(other, &mut WaitAccounting::default())
+            .unwrap()
+        else {
             panic!("clean of an idle checkout was interrupted");
         };
         let (lock, cleaning) = removable.sibling_barrier(other).unwrap();

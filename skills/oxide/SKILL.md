@@ -59,10 +59,25 @@ another checkout's idle slot: the line then adds what the freshness gate
 refreshed and that inputs outside Git or ignored by it are not checked. If
 Oxide says the gate refused a slot, it builds cold instead; that is safe.
 
+If admission waited, Oxide prints `oxide: waited …; slot ready` after the
+final freshness gate and cancellation check, before spawning Cargo or a tool.
+The summary adds the cumulative monotonic wait duration across reacquisitions.
+The existing elapsed value keeps its whole-invocation meaning, including
+freshness-gate and execution work. The measured wait is attributed to the last
+observed exclusive reason (queue, host limit, checkout, clean, project cap,
+uncertain slot or capacity); polling and admission work after that observation
+stays with the category. These reasons are observations, not root causes, and
+do not include Cargo-lock, Cargo or execution time. If checked monotonic timing
+fails, Oxide reports that the wait duration is unavailable.
+
 ## Waits and refusals
 
-- `oxide: waiting for …` means the host limit is reached, or this checkout's
-  slots are all busy with no room for another. A second command in a busy
+- `oxide: waiting for …` reports the current observed admission reason. A
+  command prints a changed reason up to eight times, then one notice that
+  further changes are omitted; queue-position changes alone do not print
+  another reason line. The reason categories and measured durations are
+  approximate observations of waiting state, not simultaneous root causes.
+  A second command in a busy
   checkout normally takes another slot instead of waiting. Let it wait; do not kill it or fall back to `cargo`. Ctrl-C cancels a wait
   (exit 130).
 - Oxide places build output, so it refuses `--target-dir`, a leading
@@ -78,7 +93,17 @@ Oxide says the gate refused a slot, it builds cold instead; that is safe.
 ## Status and cleaning
 
 - `oxide status`: pool use, slots (size and file counts), waiting commands,
-  plain-Cargo output in this checkout's `target/`, and the Cargo home's size.
+  and each recorded lease-ticket PID with an approximate age from the
+  owner-private ticket file's creation time (or modification time if creation
+  time is unavailable). Missing, symlinked, foreign, unreadable or future
+  timestamps remain unknown. The lookup reads metadata without opening or
+  mutating the ticket; wall-clock jumps cannot all be detected, and age never
+  affects admission or recovery. A ticket can be stale, so its PID and age do
+  not prove that a command is still alive. Clean commands waiting for the
+  checkout barrier have no ticket yet and are not listed. Ticket age is a
+  wall-clock file age, not the measured monotonic wait.
+  Also reports plain-Cargo output in this checkout's `target/` and the Cargo
+  home's size.
   It never creates the pool.
 - `oxide status --launch-check` (macOS) times a new executable's first launch
   against a re-run, in about a second. Above 30 ms it names the app to add
