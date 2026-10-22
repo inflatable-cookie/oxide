@@ -139,6 +139,10 @@ def read_json(path: str) -> dict:
     return json.loads(read_bytes(path).decode())
 
 
+def handover_absent(root: str) -> bool:
+    return not os.path.exists(os.path.join(root, "handover"))
+
+
 def receipt_path(pool: str, checkout: str) -> str:
     """The receipt is keyed by the canonical checkout's SHA-256 digest."""
     key = hashlib.sha256(checkout.encode()).hexdigest()
@@ -548,10 +552,59 @@ def run(proof: Proof, repo: str) -> None:
     set_recorded_uuid(pool, good)
     proof.phase("after wrong UUID")
 
-    # 8. An active writer blocks the swap until it closes; the running build
-    #    keeps the root it selected.
-    code, _, stderr = proof.oxide(["build", "--bin", "poutputs"], "relink to external before the writer", app)
-    expect(code == 0 and link_target(link) == external_root, f"pre-writer relink failed: {stderr}")
+    # 8a. A second command in the same checkout waits for the running build,
+    #     then binds its own destination: the first build keeps the root it
+    #     selected and no swap reaches it.
+    gate_env = dict(env)
+    gate_env["OXIDE_OUTPUT_GATE"] = gate
+    expect(link_target(link) == local_root, f"the pre-writer link is {os.readlink(link)}")
+    first = start_child(proof, [proof.binary, "check"], app, gate_env)
+    try:
+        wait_for(os.path.join(gate, "started"), "first gated build script")
+        expect(link_target(link) == external_root, "the first command did not bind external outputs")
+        set_recorded_uuid(pool, wrong)
+        second = start_child(proof, [proof.binary, "check"], app, env)
+        time.sleep(2.0)
+        if second.poll() is not None:
+            early_out, early_err = second.communicate(timeout=5)
+            proof.unclosed.discard(second.pid)
+            fail(
+                "a second command did not wait for the running build in its checkout: "
+                f"exit {second.returncode}\n{early_out.decode(errors='replace')}"
+                f"{early_err.decode(errors='replace')}"
+            )
+        expect(link_target(link) == external_root, "a swap reached the running command")
+        with open(os.path.join(gate, "release"), "wb") as handle:
+            handle.write(b"release")
+        first_code, _, first_stderr = finish_child(proof, first, "first gated build")
+        expect(first_code == 0, f"the first gated build failed: {first_stderr}")
+        expect(
+            os.path.isdir(os.path.join(external_root, "debug")),
+            "the first build did not write to the root it selected",
+        )
+        second_code, second_stdout, second_stderr = finish_child(
+            proof, second, "second command after the writer closed"
+        )
+        expect(
+            second_code == 0,
+            f"the second command failed: {second_stdout}{second_stderr}",
+        )
+        expect(
+            link_target(link) == local_root,
+            "the second command did not transition to its own destination",
+        )
+    finally:
+        os.makedirs(gate, exist_ok=True)
+        with open(os.path.join(gate, "release"), "wb") as handle:
+            handle.write(b"release")
+        if first.poll() is None:
+            first.kill()
+    set_recorded_uuid(pool, good)
+    proof.phase("after the second-command transition")
+
+    # 8b. An active writer blocks the output barrier until it closes.
+    code, _, stderr = proof.oxide(["build", "--bin", "poutputs"], "relink to external before the adopt", app)
+    expect(code == 0 and link_target(link) == external_root, f"pre-adopt relink failed: {stderr}")
     gate_env = dict(env)
     gate_env["OXIDE_OUTPUT_GATE"] = gate
     writer = start_child(proof, [proof.binary, "check"], app, gate_env)
@@ -651,6 +704,36 @@ def run(proof: Proof, repo: str) -> None:
     os.symlink(external_root, os.path.join(app, "target"))
 
     # 11. Clean resolves the receipt to the real root and preserves it.
+    committed_bytes = read_bytes(receipt_path(pool, app))
+    code, _, stderr = proof.oxide(
+        ["clean", "-p", "poutputs"], "selected clean through the owned link", app
+    )
+    expect(code == 0, f"selected clean failed: {stderr}")
+    expect(os.path.islink(link) and link_target(link) == external_root, "selected clean lost the link")
+    expect(os.path.isfile(os.path.join(external_root, MARKER)), "selected clean lost the marker")
+    # A selected clean never runs against a replaced or unusable volume.
+    set_recorded_uuid(pool, wrong)
+    code, _, stderr = proof.oxide(
+        ["clean", "-p", "poutputs"], "selected clean with an unusable volume", app
+    )
+    expect(code != 0 and "registered volume" in stderr, stderr)
+    code, stdout, stderr = proof.oxide(
+        ["clean", "--dry-run"], "whole clean with an unusable volume", app
+    )
+    expect(code != 0 and "registered volume" in stderr, stderr)
+    expect(stdout.strip() == "" and handover_absent(external_root), "a refused clean printed or removed paths")
+    set_recorded_uuid(pool, good)
+    # A foreign live link is never cleaned through, selected or whole.
+    os.remove(link)
+    os.symlink(os.path.join(root, "outside"), link)
+    code, _, stderr = proof.oxide(
+        ["clean", "-p", "poutputs"], "selected clean through a foreign link", app
+    )
+    expect(code != 0 and "not the owned link" in stderr, stderr)
+    expect(os.readlink(link) == os.path.join(root, "outside"), "a refused selected clean replaced the link")
+    expect(os.path.isfile(os.path.join(outside, "sentinel")), "a refused selected clean removed bytes")
+    os.remove(link)
+    os.symlink(external_root, link)
     os.remove(os.path.join(external_root, "external-sentinel"))
     with open(os.path.join(external_root, "handover"), "wb") as handle:
         handle.write(b"foreign")
@@ -698,6 +781,38 @@ def run(proof: Proof, repo: str) -> None:
     expect(code == 0, f"detached build failed: {stderr}")
     expect(os.path.isdir(os.path.join(app, "target", "debug")), "detached build wrote no target/debug")
     expect(not os.path.islink(link), "a detached build re-created the owned link")
+    # 14. A prepared first conversion never renames over a link that appeared
+    #     after the crash, even when a matching sibling is live.
+    crafted = json.loads(committed_bytes.decode())
+    crafted["state"] = "prepared"
+    generation = crafted["generation"] + 1
+    crafted["prepared"] = {
+        "generation": generation,
+        "to": {
+            "kind": "local",
+            "root": local_root,
+            "generation": generation,
+        },
+        "link": link,
+    }
+    with open(receipt_path(pool, app), "wb") as handle:
+        handle.write(json.dumps(crafted).encode())
+    os.chmod(receipt_path(pool, app), 0o600)
+    sibling = os.path.join(app, f".target.oxide-new-{generation}")
+    os.symlink(local_root, sibling)
+    os.remove(link)
+    os.symlink(os.path.join(app, "absent-foreign"), link)
+    code, stdout, stderr = proof.oxide(
+        ["outputs", "adopt"], "replay never renames over a foreign dangling link", app
+    )
+    expect(code != 0 and "cannot be replayed" in stderr, stdout + stderr)
+    expect(
+        os.readlink(link) == os.path.join(app, "absent-foreign"),
+        "replay replaced a link that appeared after the crash",
+    )
+    expect(os.path.islink(sibling), "replay removed the prepared sibling")
+    expect(os.path.isdir(local_root), "replay removed an output root")
+    proof.phase("after the crafted replay refusal")
     proof.phase("before the ordinary detach")
     proof.detach()
     proof.phase("end")

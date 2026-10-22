@@ -232,9 +232,12 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     let output_control = internal.control().to_path_buf();
     let checkout = identity::locate_workspace(CARGO, invocation.manifest_path.as_deref())?;
     // The final-output destination is part of the slot's compatibility
-    // identity: a slot's uplifted artifacts belong to one real root. An
-    // ephemeral or detached checkout adds nothing, so its keys are unchanged.
-    let destination = outputs::destination_facts(Some(&output_control), &checkout)?;
+    // identity: a slot's uplifted artifacts belong to one real root. The
+    // destination is the one the binding below will select, so the key and the
+    // bound root cannot disagree. An ephemeral or detached checkout adds
+    // nothing, so its keys are unchanged.
+    let planned = outputs::planned_destination(Some(&output_control), &checkout)?;
+    let destination = outputs::destination_facts(planned.as_ref());
     let key = SlotKey::resolve_in(
         &checkout,
         invocation.profile.recipe_key(),
@@ -281,7 +284,16 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     // lease just taken is this checkout's exclusive barrier: `oxide clean`
     // and another command wait for it, so the swap cannot redirect a running
     // command.
-    let bound = match outputs::bind_for_command(Some(&output_control), &key.checkout) {
+    // The transition runs under this checkout's output barrier, which waits
+    // for every other cooperative command in the checkout to close and blocks
+    // new ones until the link is published. It binds exactly the destination
+    // the slot was keyed for, or refuses.
+    let bound = match outputs::bind_for_command(
+        &store,
+        &key.checkout,
+        held.record_id(),
+        planned.as_ref(),
+    ) {
         Ok(bound) => bound,
         Err(reason) => {
             let origin = held.prior.unchanged();

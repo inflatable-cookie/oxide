@@ -216,8 +216,18 @@ struct Ticket {
     pid: u32,
 }
 
-/// A running `oxide clean`; commands for the same checkout wait while it
-/// exists. Its lock (in `waiters/`) is shared with the `cargo clean` child, so
+/// Why a checkout barrier exists. `Clean` removes the checkout's outputs;
+/// `Outputs` binds or changes its owned output link for one command.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BarrierPurpose {
+    #[default]
+    Clean,
+    Outputs,
+}
+
+/// A running checkout barrier; commands for the same checkout wait while it
+/// exists. Its lock (in `waiters/`) is shared with a `cargo clean` child, so
 /// it stays held while either lives. The mark is dropped only when the lock is
 /// free and the recorded Cargo group, if any, is empty.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -227,6 +237,10 @@ struct Clean {
     checkout: PathBuf,
     #[serde(default)]
     process_group: Option<i32>,
+    /// Absent in state written before this field existed: those marks are
+    /// cleans, which is the default.
+    #[serde(default)]
+    purpose: BarrierPurpose,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -460,6 +474,14 @@ pub struct Lease {
     lease_id: String,
     record: u64,
     _lock: File,
+}
+
+impl Lease {
+    /// This command's own slot record, for the checkout barrier that excludes
+    /// every other command in the same checkout.
+    pub fn record_id(&self) -> u64 {
+        self.record
+    }
 }
 
 pub enum Acquired {
@@ -1474,6 +1496,18 @@ impl Store {
         })
     }
 
+    /// The sibling pool's admission lock, when this store is the removable
+    /// one. Always internal first, as slot attempts and cleans do.
+    fn sibling_admission(&self) -> Result<Option<File>, String> {
+        let Some(sibling) = self.sibling.as_ref().filter(|sibling| sibling.barrier) else {
+            return Ok(None);
+        };
+        let file = private_file(&sibling.control.join("admission.lock"), true)?
+            .ok_or("the internal admission lock is missing")?;
+        flock(&file, libc::LOCK_EX)?;
+        Ok(Some(file))
+    }
+
     /// The internal pool's admission lock, for the removable store's slot
     /// attempts, plus whether a live internal clean covers `checkout`. A
     /// clean mark counts while its lock is held or its Cargo group lives.
@@ -1538,6 +1572,44 @@ impl Store {
         checkout: &Path,
         waits: &mut WaitAccounting,
     ) -> Result<Cleaning, String> {
+        self.begin_barrier(
+            checkout,
+            None,
+            BarrierPurpose::Clean,
+            "clean barrier acquired",
+            waits,
+        )
+    }
+
+    /// The same exclusive checkout barrier for an output transition. `own` is
+    /// the caller's own active record: a command that already holds a slot for
+    /// this checkout is the only record allowed to remain. Every other
+    /// cooperative writer for the checkout must be closed, and the mark stops
+    /// a new command from starting until the guard is released, so a link
+    /// swap can never redirect a running command.
+    pub fn begin_output_barrier(
+        &self,
+        checkout: &Path,
+        own: u64,
+        waits: &mut WaitAccounting,
+    ) -> Result<Cleaning, String> {
+        self.begin_barrier(
+            checkout,
+            Some(own),
+            BarrierPurpose::Outputs,
+            "output transition ready",
+            waits,
+        )
+    }
+
+    fn begin_barrier(
+        &self,
+        checkout: &Path,
+        own: Option<u64>,
+        purpose: BarrierPurpose,
+        completion: &str,
+        waits: &mut WaitAccounting,
+    ) -> Result<Cleaning, String> {
         self.ensure_control()?;
         loop {
             if let Some(signal) = process::received_signal() {
@@ -1545,13 +1617,20 @@ impl Store {
                 return Ok(Cleaning::Interrupted(signal));
             }
             let attempt = (|| {
+                // A removable store's barrier covers both pools, so it takes
+                // the internal admission lock first (the same order slot
+                // attempts and cleans use) and checks the sibling's live state
+                // under it.
+                let _sibling = self.sibling_admission()?;
                 let _admission = self.admission()?;
                 let mut state = self.load()?;
                 self.drop_dead_tickets(&mut state)?;
                 self.recover_settled(&mut state)?;
                 let busy = state.cleans.iter().any(|clean| clean.checkout == checkout)
                     || state.records.iter().any(|record| {
-                        record.checkout.as_deref() == Some(checkout) && record.active()
+                        record.checkout.as_deref() == Some(checkout)
+                            && record.active()
+                            && own != Some(record.id)
                     })
                     || self.sibling_busy(checkout);
                 if !busy {
@@ -1566,6 +1645,7 @@ impl Store {
                         id,
                         checkout: checkout.to_path_buf(),
                         process_group: None,
+                        purpose,
                     });
                     self.save(&state)?;
                     return Ok(Some(CleanGuard { id, lock }));
@@ -1580,7 +1660,7 @@ impl Store {
                 }
                 Ok(Some(guard)) => {
                     waits.stop(Instant::now());
-                    waits.print_completion("clean barrier acquired");
+                    waits.print_completion(completion);
                     return Ok(Cleaning::Guard(guard));
                 }
                 Ok(None) => {
@@ -1715,6 +1795,7 @@ impl Store {
             cleaning: state
                 .cleans
                 .iter()
+                .filter(|clean| clean.purpose == BarrierPurpose::Clean)
                 .map(|clean| clean.checkout.clone())
                 .collect(),
             slots,

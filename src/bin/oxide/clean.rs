@@ -126,6 +126,11 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
         if request.dry_run {
             return Err("clean --dry-run lists paths only for a whole-target clean: Cargo's -p, --workspace, --doc, --profile and --release dry run does not print every path it would remove".to_owned());
         }
+        // A selected clean runs Cargo, which follows `<workspace>/target`. For
+        // an owned checkout that path is a link, so the receipt and the live
+        // volume identity are rechecked first: a foreign or replaced link is
+        // never cleaned through. Ephemeral checkouts are unchanged.
+        outputs::clean_placement(&workspace)?;
         let settings = store::settings()?;
         return run_selected(&request.cargo_args, &workspace, &settings);
     }

@@ -379,6 +379,13 @@ pub struct Outcome {
     pub note: Option<String>,
 }
 
+impl Outcome {
+    fn with_note(mut self, note: String) -> Self {
+        self.note = Some(note);
+        self
+    }
+}
+
 /// `oxide outputs ...`
 pub fn run(args: &[OsString]) -> Result<u8, String> {
     let args: Vec<&str> = args
@@ -965,18 +972,38 @@ fn detach_command() -> Result<u8, String> {
 }
 
 /// A build binds its checkout's output root once, after taking its exclusive
-/// checkout lease and before Cargo starts. A transition never redirects a
-/// running command: another command in the same checkout waits for that
-/// lease, and `oxide clean` and `oxide outputs adopt|detach` wait for it
-/// through the clean barrier.
-pub fn bind_for_command(control: Option<&Path>, checkout: &Path) -> Result<Outcome, String> {
-    let context = Context::new(control.map(Path::to_path_buf), checkout.to_path_buf());
+/// checkout lease and before Cargo starts. The transition runs under the
+/// checkout's own output barrier: every other cooperative command in the same
+/// checkout must have closed (a checkout may otherwise run a second command on
+/// a spare compatible slot), and the mark stops a new one from starting until
+/// the link is published. A swap therefore never redirects a running command,
+/// and `oxide clean` and `oxide outputs adopt|detach` cannot interleave.
+///
+/// `expected` is the destination the slot key was computed from. The transition
+/// always binds exactly that root, or refuses when it is no longer usable, so
+/// the slot and its uplifted artifacts never belong to different roots.
+pub fn bind_for_command(
+    store: &Store,
+    checkout: &Path,
+    own_record: u64,
+    expected: Option<&Selected>,
+) -> Result<Outcome, String> {
+    let context = Context::new(Some(store.control().to_path_buf()), checkout.to_path_buf());
     let mode = context.mode()?;
-    if mode == Some(DriveMode::Permanent) {
-        let Some(control) = context.control() else {
-            return Ok(Outcome::default());
-        };
-        let _admission = store::lock_admission(control)?;
+    if mode != Some(DriveMode::Permanent) {
+        return bind_ephemeral(&context, expected);
+    }
+    let mut waits = WaitAccounting::default();
+    let guard = match store.begin_output_barrier(checkout, own_record, &mut waits)? {
+        Cleaning::Guard(guard) => guard,
+        Cleaning::Interrupted(signal) => {
+            return Err(format!(
+                "interrupted by signal {signal} while waiting for this checkout's other commands to finish; nothing was changed"
+            ))
+        }
+    };
+    let outcome = (|| {
+        let _admission = store::lock_admission(store.control())?;
         let Some(receipt) = context.receipt()? else {
             return Ok(Outcome {
                 warnings: vec![
@@ -991,10 +1018,16 @@ pub fn bind_for_command(control: Option<&Path>, checkout: &Path) -> Result<Outco
         } else {
             receipt
         };
-        return bind_with_receipt(&context, receipt);
-    }
-    // Ephemeral mode keeps today's real checkout/target. A checkout that was
-    // converted keeps its owned link but is never relinked automatically.
+        bind_under_barrier(&context, receipt, expected)
+    })();
+    release_barrier(store, guard)?;
+    outcome
+}
+
+/// Ephemeral mode keeps today's real checkout/target. A checkout that was
+/// converted keeps its owned link, is never relinked automatically, and
+/// refuses when the link no longer matches the receipt.
+fn bind_ephemeral(context: &Context, expected: Option<&Selected>) -> Result<Outcome, String> {
     let Some(receipt) = context.receipt()? else {
         return Ok(Outcome::default());
     };
@@ -1005,9 +1038,9 @@ pub fn bind_for_command(control: Option<&Path>, checkout: &Path) -> Result<Outco
                 .to_owned(),
         ),
         ReceiptState::Committed => {
-            let selected = receipt
-                .selected()
+            let selected = expected
                 .cloned()
+                .or_else(|| receipt.selected().cloned())
                 .ok_or("outputs: the receipt selects no root")?;
             let target = context.target()?;
             if target.root() == Some(selected.root.as_path()) {
@@ -1026,56 +1059,55 @@ pub fn bind_for_command(control: Option<&Path>, checkout: &Path) -> Result<Outco
     }
 }
 
-impl Outcome {
-    fn with_note(mut self, note: String) -> Self {
-        self.note = Some(note);
-        self
-    }
-}
-
-fn bind_with_receipt(context: &Context, receipt: Receipt) -> Result<Outcome, String> {
+fn bind_under_barrier(
+    context: &Context,
+    receipt: Receipt,
+    expected: Option<&Selected>,
+) -> Result<Outcome, String> {
     match receipt.state {
-        ReceiptState::Detached => Ok(Outcome {
-            warnings: vec![
-                "permanent drive mode: this checkout is detached from owned outputs; `oxide outputs adopt` converts it again. Nothing was moved"
-                    .to_owned(),
-            ],
-            note: Some("outputs detached".to_owned()),
-        }),
+        ReceiptState::Detached => {
+            if expected.is_some() {
+                return Err(
+                    "outputs: the receipt says this checkout is detached but its slot was keyed for an owned root; run the command again"
+                        .to_owned(),
+                );
+            }
+            Ok(Outcome {
+                warnings: vec![
+                    "permanent drive mode: this checkout is detached from owned outputs; `oxide outputs adopt` converts it again. Nothing was moved"
+                        .to_owned(),
+                ],
+                note: Some("outputs detached".to_owned()),
+            })
+        }
         ReceiptState::Prepared => Err(
             "outputs: an interrupted owned-output transition is pending; run `oxide outputs adopt` to replay it before building"
                 .to_owned(),
         ),
         ReceiptState::Committed => {
-            let target = context.target()?;
-            let usable = usable_external(context);
-            let spec = match &usable {
-                Ok(registration) => external_spec(registration, &context.workspace),
-                Err(_) => local_spec(&context.workspace),
+            let generation = receipt.generation.saturating_add(1);
+            let wanted = match expected {
+                Some(expected) => expected.at(generation),
+                None => desired_selection(context, &receipt)?
+                    .ok_or("outputs: the receipt selects no root")?,
             };
+            let usable = usable_external(context);
+            if wanted.kind == RootKind::External {
+                if let Err(reason) = &usable {
+                    return Err(format!(
+                        "outputs: this command's slot is keyed for the external root {} but the registered volume is no longer usable ({reason}); nothing was changed. Run the command again to select the checkout-local root",
+                        wanted.root.display()
+                    ));
+                }
+            }
+            let target = context.target()?;
+            if matches!(&target, TargetState::OwnedLink(root) if *root == wanted.root) {
+                return Ok(bound_outcome(&usable, &wanted, false));
+            }
             let selected = receipt
                 .selected()
                 .cloned()
                 .ok_or("outputs: the receipt selects no root")?;
-            let wanted = spec.selected(receipt.generation.saturating_add(1));
-            if matches!(&target, TargetState::OwnedLink(root) if *root == wanted.root) {
-                let mut outcome = Outcome::default();
-                if let Err(reason) = &usable {
-                    outcome.warnings.push(format!(
-                        "permanent drive mode: outputs use the checkout-local fallback root {} ({reason})",
-                        wanted.root.display()
-                    ));
-                }
-                return Ok(outcome.with_note(format!(
-                    "{} outputs {}",
-                    if wanted.kind == RootKind::Local {
-                        "fallback"
-                    } else {
-                        "owned"
-                    },
-                    wanted.root.display()
-                )));
-            }
             match &target {
                 TargetState::Missing => {}
                 _ if target.link_root() == Some(selected.root.as_path()) => {}
@@ -1087,46 +1119,95 @@ fn bind_with_receipt(context: &Context, receipt: Receipt) -> Result<Outcome, Str
                     ))
                 }
             }
+            let spec = spec_for(&wanted);
             let committed = transition(context, &receipt, &spec)?;
-            let to = committed
+            let bound = committed
                 .selected()
                 .cloned()
                 .ok_or("outputs: the transition committed no root")?;
-            let mut outcome = Outcome::default();
-            if let Err(reason) = &usable {
-                outcome.warnings.push(format!(
-                    "permanent drive mode: outputs fell back to the checkout-local root {} ({reason}); the external root is kept",
-                    to.root.display()
+            if !bound.same_place(&wanted) {
+                return Err(format!(
+                    "outputs: the transition bound {} but this command's slot was keyed for {}; nothing is built into the wrong root. Run the command again",
+                    bound.root.display(),
+                    wanted.root.display()
                 ));
             }
-            Ok(outcome.with_note(format!(
-                "outputs relinked to the {} root {}",
-                to.kind.label(),
-                to.root.display()
-            )))
+            Ok(bound_outcome(&usable, &bound, true))
         }
     }
+}
+
+fn bound_outcome(
+    usable: &Result<removable::Registration, String>,
+    bound: &Selected,
+    relinked: bool,
+) -> Outcome {
+    let mut outcome = Outcome::default();
+    if let Err(reason) = usable {
+        if bound.kind == RootKind::Local {
+            outcome.warnings.push(format!(
+                "permanent drive mode: outputs use the checkout-local fallback root {} ({reason}){}",
+                bound.root.display(),
+                if relinked { "; the external root is kept" } else { "" }
+            ));
+        }
+    }
+    outcome.with_note(format!(
+        "{} outputs {}{}",
+        if bound.kind == RootKind::Local {
+            "fallback"
+        } else {
+            "owned"
+        },
+        bound.root.display(),
+        if relinked { " (relinked)" } else { "" }
+    ))
+}
+
+/// The root the next command must select, read-only and without any barrier:
+/// the external root when the registered volume is usable now, else the
+/// checkout-local fallback. `None` when this checkout has no owned output link
+/// (never converted, or detached). The same rule the binding applies, so the
+/// slot key and the bound root agree (see [`destination_facts`]).
+pub fn planned_destination(
+    control: Option<&Path>,
+    checkout: &Path,
+) -> Result<Option<Selected>, String> {
+    let Some(control) = control else {
+        return Ok(None);
+    };
+    let context = Context::new(Some(control.to_path_buf()), checkout.to_path_buf());
+    let Some(receipt) = context.receipt()? else {
+        return Ok(None);
+    };
+    desired_selection(&context, &receipt)
+}
+
+/// The destination rule itself: external when the volume is usable, else the
+/// local fallback. `None` for a detached or absent receipt.
+fn desired_selection(context: &Context, receipt: &Receipt) -> Result<Option<Selected>, String> {
+    let generation = receipt.generation.saturating_add(1);
+    Ok(match receipt.state {
+        ReceiptState::Detached => None,
+        ReceiptState::Committed | ReceiptState::Prepared => Some(match usable_external(context) {
+            Ok(registration) => {
+                external_spec(&registration, &context.workspace).selected(generation)
+            }
+            Err(_) => local_spec(&context.workspace).selected(generation),
+        }),
+    })
 }
 
 /// The final-output destination, as a component of a slot's compatibility
 /// identity: the selected real root's kind, path, bound volume and its
 /// creation generation. Empty for an ephemeral or detached checkout, so those
 /// checkouts keep exactly the slot keys they had before this feature.
-pub fn destination_facts(control: Option<&Path>, checkout: &Path) -> Result<String, String> {
-    let Some(control) = control else {
-        return Ok(String::new());
-    };
-    let context = Context::new(Some(control.to_path_buf()), checkout.to_path_buf());
-    let Some(receipt) = context.receipt()? else {
-        return Ok(String::new());
-    };
-    // A prepared transition is replayed by `bind_for_command`; keying from the
-    // last committed selection never blocks a build on a crash record.
-    let Some(selected) = receipt.selected.as_ref() else {
-        return Ok(String::new());
+pub fn destination_facts(selected: Option<&Selected>) -> String {
+    let Some(selected) = selected else {
+        return String::new();
     };
     let generation = read_marker(&selected.root).map_or(0, |marker| marker.generation);
-    Ok(format!(
+    format!(
         "outputs-1 {} {} {} g{generation}",
         match selected.kind {
             RootKind::External => "external",
@@ -1134,7 +1215,7 @@ pub fn destination_facts(control: Option<&Path>, checkout: &Path) -> Result<Stri
         },
         selected.root.display(),
         selected.volume_uuid.as_deref().unwrap_or("-")
-    ))
+    )
 }
 
 /// The internal pool paired with a registered removable pool, so the clean
@@ -1492,11 +1573,11 @@ fn create_root(
         (RootSpec::Local { root }, _) => {
             let checkout = &context.workspace;
             let outer = checkout.join(LOCAL_DIR);
-            // Ask about a path *inside* the fallback root: Git only matches a
-            // trailing-slash directory pattern when the path is a directory,
-            // which `.oxide-outputs` is not yet.
+            // Every creation is checked, including one inside a fallback
+            // parent that already exists: an existing `.oxide-outputs` never
+            // proves Git ignores what goes in it.
             let probe = format!("{LOCAL_DIR}/{LOCAL_ROOT}");
-            if !outer.exists() && git_would_track(checkout, &probe)? {
+            if !root.exists() && git_would_track(checkout, &probe)? {
                 return Err(format!(
                     "outputs: refusing to create the checkout-local root {} because Git would track it; add `{GITIGNORE_LINE}` to {} (oxide init does this) and re-run",
                     root.display(),
@@ -1779,10 +1860,13 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
     let sibling = sibling_link(link, prepared.generation);
     let sibling_read = fs::read_link(&sibling).ok();
     let owned_new = owned_root(&context.workspace, &context.checkout_id, &prepared.to.root).is_ok();
+    // A first conversion has no committed selection, so its only valid old
+    // state is a missing target: a link that appeared after the crash (even a
+    // dangling one) is not this receipt's and is never renamed over.
     let old_live = match (&target, receipt.selected()) {
-        (TargetState::Missing, _) => true,
+        (TargetState::Missing, None) => true,
         (_, Some(selected)) if target.link_root() == Some(selected.root.as_path()) => true,
-        (TargetState::OwnedLink(_) | TargetState::Dangling(_), None) => true,
+        (TargetState::Missing, Some(_)) => true,
         _ => false,
     };
     // 1. The rename already happened: commit.
@@ -2070,6 +2154,21 @@ pub fn clean_placement(workspace: &Path) -> Result<Option<CleanPlacement>, Strin
                     receipt.generation
                 ));
             }
+            // The root must be on the volume the receipt names *now*: a
+            // replaced drive at the same mount point never lends its contents
+            // to a clean.
+            let binding = match selected.kind {
+                RootKind::External => Some(binding_for(&context, selected.volume_uuid.as_deref().unwrap_or_default()).map_err(|reason| {
+                    format!(
+                        "clean refused: the registered volume for {} is not usable ({reason})",
+                        selected.root.display()
+                    )
+                })?),
+                RootKind::Local => None,
+            };
+            validate_root_device(workspace, &selected, binding.as_ref()).map_err(|reason| {
+                format!("clean refused: {reason}")
+            })?;
             let inactive = receipt
                 .roots
                 .iter()
@@ -2404,23 +2503,78 @@ mod tests {
     fn the_slot_destination_is_empty_until_a_checkout_is_converted() {
         let fixture = Fixture::new();
         let context = fixture.context();
-        assert_eq!(
-            destination_facts(Some(&fixture.control), &fixture.checkout).unwrap(),
-            ""
-        );
+        let planned = planned_destination(Some(&fixture.control), &fixture.checkout).unwrap();
+        assert!(planned.is_none());
+        assert_eq!(destination_facts(None), "");
         let receipt = transition(&context, &fixture.receipt(), &fixture.local()).unwrap();
-        let first = destination_facts(Some(&fixture.control), &fixture.checkout).unwrap();
+        let planned = planned_destination(Some(&fixture.control), &fixture.checkout)
+            .unwrap()
+            .unwrap();
+        assert_eq!(planned.kind, RootKind::Local);
+        assert_eq!(planned.root, fixture.local().root());
+        let first = destination_facts(Some(&planned));
         assert!(first.starts_with("outputs-1 local "), "{first}");
         assert!(first.ends_with("g1"), "{first}");
         // Relinking to the same root keeps the same destination identity, so
         // a warm slot survives a relink.
         let again = transition(&context, &receipt, &fixture.local()).unwrap();
         assert_eq!(again.generation, 2);
-        assert_eq!(
-            destination_facts(Some(&fixture.control), &fixture.checkout).unwrap(),
-            first
+        let planned = planned_destination(Some(&fixture.control), &fixture.checkout)
+            .unwrap()
+            .unwrap();
+        assert_eq!(destination_facts(Some(&planned)), first);
+    }
+
+    /// A crash during the first conversion leaves a prepared receipt with no
+    /// committed selection. A link that appeared afterwards is not this
+    /// receipt's: replay never renames over it, even when it dangles and a
+    /// matching prepared sibling exists.
+    #[test]
+    fn a_first_conversion_never_renames_over_a_link_that_appeared_after_the_crash() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let spec = fixture.local();
+        ensure_root(&context, &spec, 1).unwrap();
+        let mut receipt = fixture.receipt();
+        let prepared = Prepared {
+            generation: 1,
+            to: spec.selected(1),
+            link: context.link(),
+        };
+        receipt.state = ReceiptState::Prepared;
+        receipt.prepared = Some(prepared.clone());
+        write_receipt(&fixture.control, &receipt).unwrap();
+        symlink(&prepared.to.root, sibling_link(&prepared.link, 1)).unwrap();
+        let foreign = fixture.root.join("foreign-absent");
+        symlink(&foreign, context.link()).unwrap();
+
+        let refused = replay(&context, receipt).unwrap_err();
+        assert!(refused.contains("cannot be replayed"), "{refused}");
+        assert_eq!(fs::read_link(context.link()).unwrap(), foreign);
+        assert!(
+            os_symlink_exists(&sibling_link(&prepared.link, 1)),
+            "the prepared sibling was removed"
         );
-        assert_eq!(destination_facts(None, &fixture.checkout).unwrap(), "");
+        assert!(spec.root().is_dir());
+    }
+
+    fn os_symlink_exists(path: &Path) -> bool {
+        fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    }
+
+    /// With a committed selection, a dangling link that is not that selection
+    /// is foreign for a transition too.
+    #[test]
+    fn a_committed_receipt_refuses_a_dangling_link_that_is_not_its_own() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let receipt = transition(&context, &fixture.receipt(), &fixture.local()).unwrap();
+        let foreign = fixture.root.join("foreign-absent");
+        fs::remove_file(context.link()).unwrap();
+        symlink(&foreign, context.link()).unwrap();
+        let refused = transition(&context, &receipt, &fixture.local()).unwrap_err();
+        assert!(refused.contains("never moves"), "{refused}");
+        assert_eq!(fs::read_link(context.link()).unwrap(), foreign);
     }
 
     #[test]
