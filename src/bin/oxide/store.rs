@@ -1815,6 +1815,9 @@ impl Store {
         }
         let mut shared_from = None;
         let mut shared_origin = None;
+        // A project-cap replacement the library performs as part of the
+        // admission below; choosing it never deletes anything itself.
+        let mut replace: Option<(u64, String)> = None;
         let shared = if share && !existing.is_some_and(|index| has_slot(&state.records[index])) {
             self.shared_candidate(&state, key, &view)?
         } else {
@@ -1882,29 +1885,20 @@ impl Store {
             if project_slots >= PROJECT_SLOT_CAP {
                 let chosen = existing.map(|index| state.records[index].id);
                 candidates.sort();
-                let mut evicted = false;
                 for (_, _, id, slot_id) in candidates {
                     if Some(id) == chosen {
                         continue;
                     }
+                    // Only an idle record whose lock is free can be replaced;
+                    // the library rechecks its identity, ownership, occupancy
+                    // and complete accounting under the pool lock.
                     let Probe::Free(_victim) = probe_lock(&self.lock_path(id), false)? else {
                         continue;
                     };
-                    match evict_idle_slot(&self.pool, &slot_id) {
-                        Ok(()) => {}
-                        // A concurrent change made this slot ineligible; the
-                        // next candidate is still a safe idle whole slot.
-                        Err(LeaseError::Busy) => continue,
-                        Err(error) => return Err(lease_error("cannot evict an idle slot", &error)),
-                    }
-                    eprintln!(
-                        "oxide: evicted idle slot {slot_id} (project slot cap {PROJECT_SLOT_CAP})"
-                    );
-                    self.forget_record(&mut state, id);
-                    evicted = true;
+                    replace = Some((id, slot_id));
                     break;
                 }
-                if !evicted {
+                if replace.is_none() {
                     self.save(&state)?;
                     // Wait only for a specific held compatible slot of this
                     // checkout. With no such slot and no safely evictable
@@ -1917,10 +1911,6 @@ impl Store {
                         "the project already holds {PROJECT_SLOT_CAP} slots and none is a safely evictable idle whole slot; no compatible slot can be reused. Wait for one to become idle or free one with `oxide clean` in another checkout, then retry"
                     ));
                 }
-                // Eviction forgot only an idle record whose lock was free,
-                // never the chosen one; find it again by ID.
-                existing =
-                    chosen.and_then(|id| state.records.iter().position(|record| record.id == id));
             }
         }
 
@@ -2004,6 +1994,13 @@ impl Store {
             Some(folder) => vec![folder.to_owned()],
             None => identity::slot_folders(&identity::project_label(&key.checkout), &key.identity),
         };
+        let replace_slot =
+            match &replace {
+                Some((_, slot_id)) => Some(slot_id.parse::<u64>().map_err(|_| {
+                    format!("recorded replacement slot ID {slot_id:?} is not numeric")
+                })?),
+                None => None,
+            };
         let request = LeaseRequest {
             pool: self.pool.clone(),
             project: self.affinity_dir(record),
@@ -2019,8 +2016,27 @@ impl Store {
                 same_repository,
                 profile: profile.label().to_owned(),
             }),
+            replace_slot,
         };
         let outcome = lease_measured(request);
+        // The library deletes the requested victim only after complete
+        // accounting and rank headroom, and it may still refuse afterwards.
+        // Drop that record's metadata only when the ledger no longer holds
+        // the slot; an untouched victim keeps its record.
+        if let Some((victim_record, victim_slot)) = replace {
+            let view = self.ledger()?;
+            if !view.slots.iter().any(|slot| slot.slot_id == victim_slot) {
+                eprintln!(
+                    "oxide: evicted idle slot {victim_slot} (project slot cap {PROJECT_SLOT_CAP})"
+                );
+                self.forget_record(&mut state, victim_record);
+            }
+        }
+        let index = state
+            .records
+            .iter()
+            .position(|entry| entry.id == record)
+            .ok_or("Oxide slot record disappeared")?;
         let (grant, measured) = match outcome {
             Ok(leased) => (leased.grant, leased.measured),
             Err(error) => {
@@ -3525,6 +3541,116 @@ mod tests {
             }),
             last_used_ms: Some(u64::MAX),
         }
+    }
+
+    fn escaped(value: usize) -> String {
+        "\u{1}".repeat(value)
+    }
+
+    fn escaped_path(bytes: usize) -> PathBuf {
+        PathBuf::from(format!("/{}", escaped(bytes - 1)))
+    }
+
+    fn escaped_record(id: u64) -> Record {
+        Record {
+            id,
+            identity: escaped(MAX_IDENTITY_BYTES),
+            compatibility: escaped(MAX_COMPATIBILITY_BYTES),
+            profile: escaped(MAX_PROFILE_BYTES),
+            checkout: Some(escaped_path(MAX_PATH_TEXT_BYTES)),
+            phase: Phase::Retired,
+            process_group: Some(i32::MAX),
+            last_used: u64::MAX,
+            holder: Some(Holder {
+                pid: u32::MAX,
+                started_ms: u64::MAX,
+                lease_holder: escaped(MAX_LEASE_HOLDER_BYTES),
+                command: Some(escaped(MAX_COMMAND_BYTES)),
+            }),
+            lease_id: Some(escaped(MAX_STATE_LEASE_ID_BYTES)),
+            pending_recovery: Some(Recovery {
+                slot_id: escaped(MAX_STATE_SLOT_ID_BYTES),
+                lease_id: escaped(MAX_STATE_LEASE_ID_BYTES),
+                checkout: Some(escaped_path(MAX_PATH_TEXT_BYTES)),
+                holder_pid: 1,
+                holder_started_ms: 2,
+                process_group: Some(3),
+                recovered_ms: 4,
+                recovered_by: 5,
+            }),
+            retired: Some(escaped(MAX_DIAGNOSTIC_BYTES)),
+            lost: Some(Lost {
+                slot_id: escaped(MAX_STATE_SLOT_ID_BYTES),
+                at_ms: u64::MAX,
+                unclosed: Some(escaped(MAX_DIAGNOSTIC_BYTES)),
+            }),
+            last_used_ms: Some(u64::MAX),
+        }
+    }
+
+    #[test]
+    fn worst_escaped_control_state_roundtrips_through_save_and_load() {
+        let (root, store, _removable) = paired_controls("control-escaped");
+        let mut state = State::default();
+        for id in 1..=MAX_RECORDS as u64 {
+            state.records.push(escaped_record(id));
+        }
+        for id in 1..=MAX_TICKETS as u64 {
+            state.tickets.push(Ticket { id, pid: u32::MAX });
+        }
+        for id in 1..=MAX_CLEANS as u64 {
+            state.cleans.push(Clean {
+                id,
+                checkout: escaped_path(MAX_PATH_TEXT_BYTES),
+                process_group: Some(i32::MAX),
+            });
+        }
+        for _ in 0..MAX_RECOVERIES {
+            state.recoveries.push(Recovery {
+                slot_id: escaped(MAX_STATE_SLOT_ID_BYTES),
+                lease_id: escaped(MAX_STATE_LEASE_ID_BYTES),
+                checkout: Some(escaped_path(MAX_PATH_TEXT_BYTES)),
+                holder_pid: u32::MAX,
+                holder_started_ms: u64::MAX,
+                process_group: Some(i32::MAX),
+                recovered_ms: u64::MAX,
+                recovered_by: u32::MAX,
+            });
+            state.flushes.push(Flush {
+                slot_id: escaped(MAX_STATE_SLOT_ID_BYTES),
+                at_ms: u64::MAX,
+                micros: None,
+                error: Some(escaped(MAX_DIAGNOSTIC_BYTES)),
+                lost: true,
+            });
+        }
+        let before = serde_json::to_vec(&state).expect("serialize escaped worst valid state");
+        assert!(
+            before.len() as u64 <= MAX_STATE_BYTES,
+            "escaped worst valid state {} exceeds {MAX_STATE_BYTES}",
+            before.len()
+        );
+        assert!(
+            before.len() > 4_000_000,
+            "escaped fixture is not substantial: {}",
+            before.len()
+        );
+        assert!(before.windows(6).any(|window| window == b"\\u0001"));
+
+        store
+            .save(&state)
+            .expect("the escaped worst valid state saves");
+        let loaded = store.load().expect("the escaped worst valid state loads");
+        assert_eq!(loaded.version, STATE_VERSION);
+        assert_eq!(
+            serde_json::to_vec(&loaded).expect("reserialize loaded"),
+            before,
+            "the escaped worst valid state did not round-trip byte for byte"
+        );
+        assert_eq!(loaded.records.len(), MAX_RECORDS);
+        assert_eq!(loaded.records[0].checkout, state.records[0].checkout);
+        assert_eq!(loaded.flushes.len(), MAX_FLUSHES);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

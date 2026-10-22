@@ -39,6 +39,12 @@ pub struct LeaseRequest {
     pub budget_bytes: Option<u64>,
     /// Where a new slot goes. `None` keeps the legacy `slots/<id>` path.
     pub layout: Option<SlotLayout>,
+    /// A front-door count replacement, never byte pressure: retire this idle
+    /// whole slot as part of this admission, after complete whole-payload
+    /// accounting and before the new slot is allocated. The front door
+    /// chooses the victim by recorded rank; the library rechecks its
+    /// identity, ownership, occupancy and accounting under the pool lock.
+    pub replace_slot: Option<u64>,
 }
 
 /// Presentation path of a new slot: `slots/<folder>/<profile>-<id>`. It is
@@ -768,6 +774,9 @@ impl Pool {
         workspace: PathBuf,
         request: &LeaseRequest,
     ) -> Result<LeaseGrant, LeaseError> {
+        if let Some(victim) = request.replace_slot {
+            self.replace_idle_slot_for_admission(victim)?;
+        }
         // Slot headroom only: the pool ceiling is replaced, never exceeded.
         // Every allocated entry counts, including held, idle, retired-backed
         // and unresolved Evicting records.
@@ -1056,6 +1065,28 @@ impl Pool {
                 Ok(slots.join(folder).join(leaf))
             }
         }
+    }
+
+    /// A count replacement requested by the front door. Complete accounting
+    /// is required before the deletion, and the rank sequence was already
+    /// checked before this admission changed anything. A victim that is no
+    /// longer idle refuses as busy without touching it.
+    fn replace_idle_slot_for_admission(&mut self, id: u64) -> Result<(), LeaseError> {
+        if id == 0 {
+            return Err(LeaseError::InvalidInput(
+                "replacement slot ID must be a positive integer",
+            ));
+        }
+        // The whole-payload walk must be complete before any deletion.
+        self.payload_accounting().require_complete()?;
+        let Some((incarnation, project, profile)) = self
+            .slot(id)
+            .filter(|slot| slot.state == SlotPersistState::Idle && slot.lease_id.is_none())
+            .map(|slot| (slot.incarnation, slot.project.clone(), slot.profile))
+        else {
+            return Err(LeaseError::Busy);
+        };
+        self.retire_idle_slot(id, incarnation, &project, profile)
     }
 
     fn evict_idle_until(&mut self, max_slots: usize) -> Result<(), LeaseError> {

@@ -407,6 +407,10 @@ stops admission instead of skipping to another slot. With no safely eligible
 idle slot, the lease refuses honestly; it does not promise a deletion through
 a failed safety gate. At the eight-slot project ceiling Oxide replaces that
 project's oldest eligible idle whole slot, which also frees pool capacity.
+The front door chooses that victim by recorded rank but asks the library to
+retire it as part of the same admission: complete whole-payload accounting and
+rank headroom are checked before any deletion, and a refusal leaves the victim
+and every metadata record in place.
 A command waits only when a specific held compatible slot of its own checkout
 exists under the existing identity and freshness rules; an unrelated build's
 completion is not assumed to free a count or byte ceiling. The freshness loop
@@ -419,11 +423,15 @@ supervisor covers the fences, no-migration reads, rank exhaustion, a 128-slot
 pool's 129th and 130th replacements, the eight-slot project cap with a specific
 held-slot wait and one LRU idle replacement, compatible reuse, no eviction
 below both ceilings, byte-pressure LRU with a held slot excluded, and a
-foreign payload-entry refusal. The worst-valid ledger/control serialization,
-round-trip and oversized-field refusals are unit tests in `effigy test rust`.
-Not covered natively: the nine-grant freshness bound is a bounded-loop
-inspection, and no large live inventory or physical multi-million-entry
-performance is claimed.
+foreign payload-entry refusal. It also drives a project replacement whose
+payload walk is incomplete (a depth-bound gap) and checks that the victim
+survives and membership is unchanged; every fixture child stays in the
+qualified supervisor's session and the script starts no session or group of
+its own, so the runner owns closure on any fault. The worst-valid
+ledger/control serialization, escaped round-trip and oversized-field refusals
+are unit tests in `effigy test rust`. Not covered natively: the nine-grant
+freshness bound is a bounded-loop inspection, and no large live inventory or
+physical multi-million-entry performance is claimed.
 
 ### Parked: cached closed-slot accounting (lead `cbb2824d`)
 

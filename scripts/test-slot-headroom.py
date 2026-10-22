@@ -42,6 +42,7 @@ fm = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fm)
 Proof = fm.Proof
 expect, fail, summary, MIB = fm.expect, fm.fail, fm.summary, fm.MIB
+BINARY = ""
 labelled_slot = fm.labelled_slot
 
 REPO = os.path.dirname(HERE)
@@ -149,19 +150,86 @@ def base_env(proof: Proof, pool: str, **extra: str) -> dict:
     return env
 
 
+def spawn(command: list, *, cwd: str, env: dict, log: str) -> subprocess.Popen:
+    """Start one child in the supervisor's own session. Nothing here calls
+    setsid or start_new_session, so the qualified runner can close every
+    descendant on a fault; on a script-side failure only this direct child
+    PID is killed and the runner closes the rest of its session."""
+    work_left()
+    os.makedirs(os.path.dirname(log), mode=0o700, exist_ok=True)
+    with open(log, "wb") as output:
+        return subprocess.Popen(
+            command, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT
+        )
+
+
+def settle(child: subprocess.Popen, log: str) -> tuple:
+    try:
+        while child.poll() is None:
+            work_left()
+            time.sleep(0.02)
+    except BaseException:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
+        raise
+    code = child.wait()
+    with open(log, "r", encoding="utf-8", errors="replace") as handle:
+        return code, handle.read()
+
+
+def stage(proof: Proof, repo: str) -> str:
+    """The reviewed staging recipe: one offline, locked debug build of
+    `oxide` into owned target/build directories, on the host Cargo cache."""
+    env = dict(os.environ)
+    for name in list(env):
+        if name.startswith(("SCCACHE_", "OXIDE_", "XDG_")) or name in (
+            "CARGO", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR",
+            "CARGO_BUILD_BUILD_DIR", "RUSTC", "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER",
+            "RUSTUP_TOOLCHAIN",
+        ):
+            env.pop(name, None)
+    target = os.path.join(ROOT, "stage-target")
+    env.update(
+        {
+            "CARGO_TARGET_DIR": target,
+            "CARGO_BUILD_BUILD_DIR": os.path.join(ROOT, "stage-build"),
+            "CARGO_PROFILE_DEV_DEBUG": "0",
+            "CARGO_INCREMENTAL": "0",
+            "RUSTC_WRAPPER": "",
+            "RUSTC_WORKSPACE_WRAPPER": "",
+            "CARGO_BUILD_RUSTC_WRAPPER": "",
+            "RUSTUP_TOOLCHAIN": fm.BUILDER,
+            "RUSTUP_AUTO_INSTALL": "0",
+            "CARGO_NET_OFFLINE": "true",
+        }
+    )
+    log = os.path.join(ROOT, "logs", "stage-oxide.log")
+    child = spawn(
+        ["cargo", "build", "--locked", "--offline", "--bin", "oxide"],
+        cwd=repo,
+        env=env,
+        log=log,
+    )
+    code, text = settle(child, log)
+    print(text[-4000:], flush=True)
+    expect(code == 0, f"staging exit {code}: {text[-4000:]}")
+    binary = os.path.join(target, "debug", "oxide")
+    expect(os.path.isfile(binary), f"staging produced no {binary}")
+    return binary
+
+
 def run(proof: Proof, args: list, label: str, cwd: str, env: dict, code: int = 0) -> tuple:
     global COUNTER
     COUNTER += 1
-    result = proof.run([proof.binary, *args], cwd=cwd, env=env, timeout=120)
-    stdout = result.stdout.decode(errors="replace")
-    stderr = result.stderr.decode(errors="replace")
-    print(f"----- {label}: exit {result.returncode} -----\n{stdout}{stderr}", flush=True)
-    expect(
-        result.returncode == code,
-        f"{label} exited {result.returncode}, expected {code}: {stdout[-2000:]}{stderr[-3000:]}",
-    )
-    RESULTS.append({"case": label, "exit": result.returncode})
-    return stdout, stderr
+    log = os.path.join(ROOT, "logs", f"{COUNTER:03d}-{label}.log")
+    child = spawn([BINARY, *args], cwd=cwd, env=env, log=log)
+    actual, text = settle(child, log)
+    print(f"----- {label}: exit {actual} -----\n{text}", flush=True)
+    expect(actual == code, f"{label} exited {actual}, expected {code}: {text[-4000:]}")
+    RESULTS.append({"case": label, "exit": actual})
+    return text, text
 
 
 class Child:
@@ -186,14 +254,10 @@ def start(proof: Proof, args: list, name: str, cwd: str, env: dict, hold: bool =
             os.remove(path)
         except FileNotFoundError:
             pass
-    program = [proof.binary, *args]
+    program = [BINARY, *args]
     if hold:
         program += ["--", sys.executable, os.path.join(ROOT, "hold.py"), marker, release]
-    with open(log, "wb") as output:
-        process = subprocess.Popen(
-            program, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+    process = spawn(program, cwd=cwd, env=env, log=log)
     child = Child(name, process, log, marker, release)
     CHILDREN.append(child)
     return child
@@ -239,16 +303,13 @@ def release(child: Child) -> None:
 
 
 def close_all() -> None:
+    # Only direct child PIDs we started. Every child stays in the qualified
+    # supervisor's session, so its descendants are the runner's to close; no
+    # session or process-group signal is sent from here.
     for child in list(CHILDREN):
         if child.process.poll() is None:
-            try:
-                os.killpg(child.process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        try:
-            child.process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            fail(f"{child.name} was not positively closed")
+            child.process.kill()
+        child.process.wait()
         CHILDREN.remove(child)
 
 
@@ -432,6 +493,30 @@ def prove_project_cap(proof: Proof, pool: str, env: dict, workdir: str) -> None:
     victim_record = min(idle, key=lambda record: (record["rank"], record["id"]))
     victim = slot_dir(pool, str(victim_record["id"]))
     run(proof, ["clean"], "project-cap-clean", app, env)
+
+    # A victim whose tree exceeds the accounting depth bound must refuse the
+    # replacement before deleting anything: the empty payload walk is not
+    # complete, so no idle slot is removed.
+    deep = os.path.join(victim, "build", "deep")
+    current = deep
+    for _ in range(70):
+        current = os.path.join(current, "d")
+        os.makedirs(current, mode=0o700, exist_ok=True)
+    _, refused = run(
+        proof, ["exec", "--", sys.executable, "-c", "pass"], "project-cap-unknown", app, env, code=1
+    )
+    expect(
+        "unknown_accounting" in refused and "depth_limit" in refused,
+        f"the project replacement refused without naming its accounting gap: {refused}",
+    )
+    expect(os.path.isdir(victim), "the victim was deleted before complete accounting")
+    expect(
+        len(read_json(os.path.join(pool, "ledger.json"))["slots"]) == 8,
+        "an incomplete-accounting refusal changed the project membership",
+    )
+    RESULTS.append({"case": "project-cap-unknown-refuses-before-deletion", "victim": victim_record["id"]})
+    shutil.rmtree(deep)
+
     _, stderr = run(proof, ["exec", "--", sys.executable, "-c", "pass"], "project-cap-9th", app, env)
     expect(f"evicted idle slot {victim_record['id']} (project slot cap 8)" in stderr,
            f"the project cap did not evict the rank-LRU idle slot: {stderr}")
@@ -512,9 +597,10 @@ def main() -> None:
     write_file(os.path.join(ROOT, "hold.py"), HOLD_SCRIPT)
     proof = Proof(ROOT)
     proof.phase("start")
-    proof.binary = fm.stage(proof, REPO)
+    global BINARY
+    BINARY = stage(proof, REPO)
     import hashlib
-    with open(proof.binary, "rb") as handle:
+    with open(BINARY, "rb") as handle:
         binary_sha256 = hashlib.sha256(handle.read()).hexdigest()
     print(f"staged oxide sha256 {binary_sha256}", flush=True)
     proof.phase("after staging")

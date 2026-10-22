@@ -80,6 +80,7 @@ fn request_with_profile(
         holder: holder.to_owned(),
         budget_bytes: None,
         layout: None,
+        replace_slot: None,
     }
 }
 
@@ -2344,4 +2345,102 @@ fn worst_valid_ledger_roundtrips_within_the_byte_cap() {
         "an oversized legacy field was truncated or rewritten"
     );
     fs::write(pool.join("ledger.json"), &before).expect("restore");
+}
+
+#[test]
+fn project_replacement_requires_complete_accounting_before_deletion() {
+    let fx = Fixture::new("replace-accounting");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    let workspace = fx.dir("workspace");
+    let idle = lease_injected(request(&pool, &fx.dir("project-a"), &workspace, "a")).expect("a");
+    release_injected(&pool, &idle.lease_id).expect("release");
+    let idle_root = pool.join("payload").join("slots").join(&idle.slot_id);
+    let mut replace = request(&pool, &fx.dir("project-b"), &workspace, "b");
+    replace.replace_slot = Some(idle.slot_id.parse().expect("slot id"));
+    // The whole-payload walk hits the entry bound: the replacement must not
+    // delete its victim before the accounting gate refuses.
+    let refused = with_accounting_limits(1, 64, 60_000, || lease_injected(replace.clone()));
+    let scan = incomplete(refused);
+    assert_eq!(scan.coverage, AccountingCoverage::Partial);
+    assert_eq!(gap_kinds(&scan), vec![AccountingGapKind::EntryLimit]);
+    assert!(
+        idle_root.exists(),
+        "the victim was deleted before complete accounting"
+    );
+    let status = status_injected(&pool).expect("status");
+    assert!(status.slots.iter().any(|slot| slot.slot_id == idle.slot_id));
+
+    // With complete accounting the same request retires the victim as part
+    // of admission and allocates a fresh slot.
+    let granted = lease_injected(replace).expect("replacement admission");
+    assert!(!granted.reused_slot);
+    assert_ne!(granted.slot_id, idle.slot_id);
+    assert!(
+        !idle_root.exists(),
+        "the requested idle whole slot was not retired"
+    );
+    let status = status_injected(&pool).expect("status after replacement");
+    assert_eq!(status.slots.len(), 1);
+    assert!(status.slots.iter().all(|slot| slot.slot_id != idle.slot_id));
+    assert!(status
+        .slots
+        .iter()
+        .any(|slot| slot.slot_id == granted.slot_id));
+}
+
+#[test]
+fn project_replacement_checks_rank_exhaustion_before_deletion() {
+    let fx = Fixture::new("replace-rank");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    let workspace = fx.dir("workspace");
+    let idle = lease_injected(request(&pool, &fx.dir("project-a"), &workspace, "a")).expect("a");
+    release_injected(&pool, &idle.lease_id).expect("release");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
+    stored["next_rank"] = serde_json::json!(u64::MAX);
+    let bytes = serde_json::to_vec(&stored).expect("exhausted");
+    fs::write(pool.join("ledger.json"), &bytes).expect("write exhausted");
+    let idle_root = pool.join("payload").join("slots").join(&idle.slot_id);
+    let mut replace = request(&pool, &fx.dir("project-b"), &workspace, "b");
+    replace.replace_slot = Some(idle.slot_id.parse().expect("slot id"));
+    assert!(matches!(
+        lease_injected(replace),
+        Err(LeaseError::LedgerExhausted)
+    ));
+    assert!(
+        idle_root.exists(),
+        "the victim was deleted after rank exhaustion"
+    );
+    assert_eq!(
+        fs::read(pool.join("ledger.json")).expect("unchanged"),
+        bytes
+    );
+}
+
+#[test]
+fn project_replacement_refuses_a_no_longer_idle_victim() {
+    let fx = Fixture::new("replace-held");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    let workspace = fx.dir("workspace");
+    let held = lease_injected(request(&pool, &fx.dir("project-a"), &workspace, "a")).expect("a");
+    let mut replace = request(&pool, &fx.dir("project-b"), &workspace, "b");
+    replace.replace_slot = Some(held.slot_id.parse().expect("slot id"));
+    assert!(matches!(lease_injected(replace), Err(LeaseError::Busy)));
+    assert!(
+        pool.join("payload")
+            .join("slots")
+            .join(&held.slot_id)
+            .exists(),
+        "a held slot was deleted"
+    );
+    let status = status_injected(&pool).expect("status");
+    let held_status = status
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == held.slot_id)
+        .expect("held slot");
+    assert_eq!(held_status.state, SlotOccupancy::Held);
 }
