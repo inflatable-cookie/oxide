@@ -2444,3 +2444,39 @@ fn project_replacement_refuses_a_no_longer_idle_victim() {
         .expect("held slot");
     assert_eq!(held_status.state, SlotOccupancy::Held);
 }
+
+#[test]
+fn explicit_idle_eviction_checks_rank_headroom_before_deleting() {
+    let fx = Fixture::new("explicit-evict-rank");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    let workspace = fx.dir("workspace");
+    let idle = lease_injected(request(&pool, &fx.dir("project"), &workspace, "a")).expect("a");
+    release_injected(&pool, &idle.lease_id).expect("release");
+    let slot_root = pool.join("payload").join("slots").join(&idle.slot_id);
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(pool.join("ledger.json")).expect("ledger")).expect("json");
+    stored["next_rank"] = serde_json::json!(u64::MAX);
+    let bytes = serde_json::to_vec(&stored).expect("exhausted");
+    fs::write(pool.join("ledger.json"), &bytes).expect("write exhausted ledger");
+    assert!(matches!(
+        evict_idle_slot_injected(&pool, &idle.slot_id),
+        Err(LeaseError::LedgerExhausted)
+    ));
+    assert!(
+        slot_root.exists(),
+        "an exhausted sequence deleted an idle slot"
+    );
+    assert_eq!(
+        fs::read(pool.join("ledger.json")).expect("unchanged"),
+        bytes,
+        "an exhausted sequence changed the ledger"
+    );
+    let status = status_injected(&pool).expect("status still reads");
+    let slot = status
+        .slots
+        .iter()
+        .find(|slot| slot.slot_id == idle.slot_id)
+        .expect("idle slot remains a member");
+    assert_eq!(slot.state, SlotOccupancy::Idle);
+}

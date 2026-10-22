@@ -389,7 +389,8 @@ grant and a first held-to-idle release or recovery stamp a fresh rank in the
 same atomic ledger write; holder/grant replay and release/recovery replay do
 not advance it. Legacy ranks are 0 and sort oldest. Eviction order is
 ascending `(rank, numeric slot id)`. Counter exhaustion refuses before any
-deletion or transition; there is no wrap, rebase or cross-pool comparison.
+deletion or transition, including the explicit `evict_idle_slot` path used for
+an untrusted or lost slot; there is no wrap, rebase or cross-pool comparison.
 Store spawn touches stay separate freshness-origin marks and the wall-clock
 `last_used_ms` remains an observation.
 

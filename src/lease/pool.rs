@@ -1165,6 +1165,12 @@ impl Pool {
         project: &Path,
         profile: Profile,
     ) -> Result<(), LeaseError> {
+        // Every durable idle deletion, including the explicit
+        // `evict_idle_slot` path, checks the rank sequence before its first
+        // transition: an exhausted or missing-headroom sequence refuses
+        // without deleting anything.
+        self.ensure_capacity_policy()?;
+        self.next_rank()?;
         let path = self.validate_idle_slot_scope(id, incarnation, project, profile)?;
         {
             let slot = self.slot_mut(id).ok_or(LeaseError::UnknownAccounting)?;
