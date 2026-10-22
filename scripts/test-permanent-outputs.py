@@ -468,9 +468,11 @@ def run(proof: Proof, repo: str) -> None:
     )
 
     # 5. Detaching the drive: the checkout-local fallback root.
+    external_before = sorted(os.listdir(external_root))
+    with open(os.path.join(external_root, "external-sentinel"), "wb") as handle:
+        handle.write(b"external kept")
     proof.detach()
     expect(not os.path.lexists(mount), "the detached mount point still exists")
-    external_before = sorted(os.listdir(external_root))
     code, stdout, stderr = proof.oxide(["build", "--bin", "poutputs"], "build with the drive absent", app)
     expect(code == 0, f"fallback build failed: {stderr}")
     expect("WARNING: permanent drive mode" in stderr, stderr)
@@ -484,11 +486,8 @@ def run(proof: Proof, repo: str) -> None:
         os.path.realpath(binary).startswith(local_root + "/"),
         "the fallback binary is not in the local root",
     )
-    with open(os.path.join(external_root, "external-sentinel"), "wb") as handle:
-        handle.write(b"external kept")
     with open(os.path.join(local_root, "local-sentinel"), "wb") as handle:
         handle.write(b"local kept")
-    expect(sorted(os.listdir(external_root)) == sorted(external_before), "the absent drive's root changed")
     proof.phase("after fallback")
 
     # 6. Redocking relinks without copying or deleting either root.
@@ -498,6 +497,10 @@ def run(proof: Proof, repo: str) -> None:
     expect(code == 0, f"redocked build failed: {stderr}")
     expect(link_target(link) == external_root, f"redock did not relink: {os.readlink(link)}")
     expect(read_bytes(os.path.join(external_root, "external-sentinel")) == b"external kept", "root lost")
+    expect(
+        sorted(os.listdir(external_root)) == sorted(external_before + ["external-sentinel"]),
+        "the absent drive's root changed",
+    )
     expect(read_bytes(os.path.join(local_root, "local-sentinel")) == b"local kept", "fallback lost")
     expect(
         os.path.realpath(binary).startswith(external_root + "/"),
@@ -569,8 +572,7 @@ def run(proof: Proof, repo: str) -> None:
         expect(adopt_code == 0, f"adopt after the writer failed: {adopt_stdout}{adopt_stderr}")
         expect(link_target(link) == local_root, "adopt did not relink after the writer closed")
         expect(
-            os.path.isfile(os.path.join(external_root, "debug", "deps"))
-            or os.path.isdir(os.path.join(external_root, "debug")),
+            os.path.isdir(os.path.join(external_root, "debug")),
             "the running build did not write to the external root",
         )
     finally:
@@ -641,6 +643,7 @@ def run(proof: Proof, repo: str) -> None:
     os.symlink(external_root, os.path.join(app, "target"))
 
     # 11. Clean resolves the receipt to the real root and preserves it.
+    os.remove(os.path.join(external_root, "external-sentinel"))
     with open(os.path.join(external_root, "handover"), "wb") as handle:
         handle.write(b"foreign")
     code, _, stderr = proof.oxide(["clean"], "clean refuses a foreign root entry", app)
