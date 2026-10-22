@@ -132,6 +132,9 @@ pub struct Selected {
     /// The reason this command selected the internal pool, from the same
     /// registration snapshot as `mode`.
     pub fallback_reason: Option<String>,
+    /// The registration this command selected the removable pool under, the
+    /// snapshot its `store` was opened for. `None` unless `removable`.
+    pub registration: Option<Registration>,
 }
 
 const USAGE: &str = "\
@@ -738,6 +741,7 @@ pub fn select(internal: Store) -> Result<Selected, String> {
             removable: false,
             mode: None,
             fallback_reason: None,
+            registration: None,
         });
     };
     let control = internal
@@ -756,6 +760,7 @@ pub fn select(internal: Store) -> Result<Selected, String> {
                 removable: true,
                 mode: Some(registration.mode),
                 fallback_reason: None,
+                registration: Some(registration),
             })
         }
         Err(reason) => Ok(Selected {
@@ -766,6 +771,7 @@ pub fn select(internal: Store) -> Result<Selected, String> {
             removable: false,
             mode: Some(registration.mode),
             fallback_reason: Some(reason),
+            registration: None,
         }),
     }
 }

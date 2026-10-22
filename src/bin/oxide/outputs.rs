@@ -35,10 +35,14 @@ use crate::store::{self, CheckoutCustody, CleanGuard, Cleaning, Store, WaitAccou
 use crate::CARGO;
 use oxide_storage::volume::{self, Binding};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -81,8 +85,10 @@ Permanent drive mode owns one `<checkout>/target` symlink. Its real root is
 usable, else the checkout-local fallback <checkout>/.oxide-outputs/local/.
 `plan` and `adopt` never move, copy or delete an existing target directory or
 an arbitrary symlink: a nonempty real target and a foreign symlink refuse
-without any change. Only an explicit `adopt` converts a missing or empty
-target. `detach` refuses while the drive mode is still permanent.";
+without any change. Only an explicit `adopt` converts an empty target. A
+missing target converts by `adopt` or on the first leased build of a fresh
+checkout (no receipt of any state) on the registered permanent drive, with
+one notice. `detach` refuses while the drive mode is still permanent.";
 
 /// Which real root a link selects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -873,7 +879,7 @@ fn adopt_under_barrier(
         // A committed receipt whose owned link selects another known place:
         // relink under the barrier.
         (_, Some(selected)) if target.link_root() == Some(selected.root.as_path()) => {
-            let committed = transition(context, &receipt, &spec)?;
+            let committed = transition(context, &receipt, &spec, Start::Any)?;
             let selected = committed
                 .selected()
                 .cloned()
@@ -882,7 +888,7 @@ fn adopt_under_barrier(
         }
         // A committed receipt whose link is missing: recreate it.
         (TargetState::Missing, Some(_)) => {
-            let committed = transition(context, &receipt, &spec)?;
+            let committed = transition(context, &receipt, &spec, Start::Any)?;
             let selected = committed
                 .selected()
                 .cloned()
@@ -891,7 +897,7 @@ fn adopt_under_barrier(
         }
         // Explicit first conversion, or one after `detach`.
         (TargetState::Missing | TargetState::RealEmpty, _) => {
-            let committed = transition(context, &receipt, &spec)?;
+            let committed = transition(context, &receipt, &spec, Start::Any)?;
             let selected = committed
                 .selected()
                 .cloned()
@@ -916,6 +922,127 @@ fn refuse_existing_target(context: &Context, target: &TargetState) -> String {
                 "Remove or restore it yourself, then re-run `oxide outputs adopt`.",
         }
     )
+}
+
+/// The facts the automatic first conversion decides on. Every field must hold;
+/// any other state keeps today's behaviour.
+#[derive(Debug, Eq, PartialEq)]
+struct AutoFacts {
+    /// This command's intermediate slot came from the removable pool under a
+    /// registration in permanent mode, as selected at its start.
+    selected_permanent: bool,
+    /// The external root the registration in force now selects is the one the
+    /// command's selection captured: same volume UUID and root.
+    same_selection: bool,
+    /// The registered permanent volume is usable right now.
+    external_usable: bool,
+    /// The registration in force now is in permanent mode.
+    permanent: bool,
+    /// No owned-output receipt of any state, including `detached`.
+    receipt_absent: bool,
+    /// `<checkout>/target` is positively absent: no file, directory or link.
+    target_absent: bool,
+}
+
+fn auto_adopts(facts: &AutoFacts) -> bool {
+    facts.selected_permanent
+        && facts.same_selection
+        && facts.external_usable
+        && facts.permanent
+        && facts.receipt_absent
+        && facts.target_absent
+}
+
+/// Whether the external root a registration selects is the one a command
+/// captured at its selection (same volume, same root).
+fn selection_matches(captured: &Selected, current: &Selected) -> bool {
+    captured.same_place(current)
+}
+
+/// Automatic first conversion (oxide#121), run once per leased command before
+/// its destination is planned, its key is built or its slot is taken. The
+/// command's own selection must be a removable permanent one, and the volume
+/// in force now must be the one that selection captured. A checkout with no
+/// receipt of any state and a positively absent target then converts under the
+/// same barrier, fences, admission lock and receipt as `oxide outputs adopt`,
+/// with the missing-target-only transition. Any other state is left to the
+/// existing paths untouched. A metadata error refuses; it is never read as
+/// absence.
+pub fn auto_adopt(
+    store: &Store,
+    checkout: &Path,
+    selection: &removable::Selected,
+) -> Result<(), String> {
+    let selected_permanent = selection.removable && selection.mode == Some(DriveMode::Permanent);
+    let Some(captured_registration) = selection
+        .registration
+        .as_ref()
+        .filter(|_| selected_permanent)
+    else {
+        return Ok(());
+    };
+    let captured = external_spec(captured_registration, checkout).selected(0);
+    let context = Context::new(
+        Some(store.owner_control().to_path_buf()),
+        checkout.to_path_buf(),
+    );
+    let current = usable_external(&context);
+    let facts = AutoFacts {
+        selected_permanent,
+        same_selection: current.as_ref().is_ok_and(|registration| {
+            selection_matches(
+                &captured,
+                &external_spec(registration, checkout).selected(0),
+            )
+        }),
+        external_usable: current.is_ok(),
+        permanent: context.mode()? == Some(DriveMode::Permanent),
+        receipt_absent: context.receipt()?.is_none(),
+        target_absent: context.target()? == TargetState::Missing,
+    };
+    if !auto_adopts(&facts) {
+        return Ok(());
+    }
+    let mut waits = WaitAccounting::default();
+    let guard = barrier(store, checkout, &mut waits)?;
+    let outcome = (|| {
+        refuse_unknown_custody(store, checkout, "auto-adopt")?;
+        // Fence a pre-feature Oxide out of both pools before any link can be
+        // published, as an explicit adopt does for a missing target.
+        store.fence_owned_outputs()?;
+        let control = context
+            .control()
+            .ok_or("no internal pool exists, so no removable drive is registered")?;
+        let _admission = store::lock_admission(control)?;
+        // Every fact is rechecked under the admission lock: a concurrent
+        // creator, receipt, mode or volume switch makes this a no-op.
+        if context.receipt()?.is_some() || context.target()? != TargetState::Missing {
+            return Ok(None);
+        }
+        let Ok(registration) = usable_external(&context) else {
+            return Ok(None);
+        };
+        let spec = external_spec(&registration, checkout);
+        if !selection_matches(&captured, &spec.selected(0)) {
+            return Ok(None);
+        }
+        let receipt = Receipt::first(checkout, &context.checkout_id);
+        let committed = transition(&context, &receipt, &spec, Start::MissingOnly)?;
+        committed
+            .selected()
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| "the transition committed no root".to_owned())
+    })();
+    release_barrier(store, guard)?;
+    if let Some(selected) = outcome? {
+        eprintln!(
+            "oxide: auto-adopted {} -> {} for permanent-drive outputs; no existing outputs moved",
+            context.link().display(),
+            selected.root.display()
+        );
+    }
+    Ok(())
 }
 
 /// `oxide outputs detach`: back to a real target directory, keeping roots.
@@ -1367,7 +1494,7 @@ fn bind_under_binding(
         )),
         Ok(CheckoutCustody::Writers) => Bind::Wait,
         Ok(CheckoutCustody::Clear) => {
-            let committed = match transition(context, receipt, &spec_for(&wanted)) {
+            let committed = match transition(context, receipt, &spec_for(&wanted), Start::Any) {
                 Ok(committed) => committed,
                 Err(reason) => return Bind::Refuse(reason),
             };
@@ -2089,8 +2216,24 @@ fn create_marker(
     Ok(marker)
 }
 
+/// What a transition may do with `<checkout>/target` when it starts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Start {
+    /// `adopt`, relink and restore: a missing target, an empty real directory
+    /// (explicit conversion only) or the receipt's own link.
+    Any,
+    /// The automatic first conversion of oxide#121: a positively absent target
+    /// only. An empty directory, a link and anything else refuse.
+    MissingOnly,
+}
+
 /// Write the committed receipt for one transition.
-fn transition(context: &Context, receipt: &Receipt, spec: &RootSpec) -> Result<Receipt, String> {
+fn transition(
+    context: &Context,
+    receipt: &Receipt,
+    spec: &RootSpec,
+    start: Start,
+) -> Result<Receipt, String> {
     let control = context
         .control()
         .ok_or("no internal pool exists; there is no place for an output receipt")?;
@@ -2102,9 +2245,12 @@ fn transition(context: &Context, receipt: &Receipt, spec: &RootSpec) -> Result<R
     // Only the receipt's own owned link, a missing target, or (for the
     // explicit conversion) an empty real directory may be replaced.
     let target = context.target()?;
-    match (&target, receipt.selected()) {
-        (TargetState::Missing, _) => {}
-        (TargetState::RealEmpty, _) => {
+    // The publish below replaces nothing when the link was absent (or an empty
+    // directory was just removed): a creator that appears in between is kept.
+    let exclusive = matches!(target, TargetState::Missing | TargetState::RealEmpty);
+    match (&target, receipt.selected(), start) {
+        (TargetState::Missing, _, _) => {}
+        (TargetState::RealEmpty, _, Start::Any) => {
             refuse_mount_root(&link)?;
             fs::remove_dir(&link).map_err(|error| {
                 format!(
@@ -2113,7 +2259,15 @@ fn transition(context: &Context, receipt: &Receipt, spec: &RootSpec) -> Result<R
                 )
             })?;
         }
-        (_, Some(selected)) if target.link_root() == Some(selected.root.as_path()) => {}
+        (_, Some(selected), Start::Any)
+            if target.link_root() == Some(selected.root.as_path()) => {}
+        (_, _, Start::MissingOnly) => {
+            return Err(format!(
+                "outputs: auto-adopt refused: {} is {}; Oxide never moves, adopts or deletes it. Nothing was changed",
+                link.display(),
+                target.label()
+            ))
+        }
         _ => return Err(refuse_existing_target(context, &target)),
     }
     let to = spec.selected(generation);
@@ -2172,10 +2326,15 @@ fn transition(context: &Context, receipt: &Receipt, spec: &RootSpec) -> Result<R
     sync_directory(&context.workspace)?;
     crash_point("linked")?;
 
-    fs::rename(&sibling, &link).map_err(|error| {
+    publish_link(&sibling, &link, exclusive).map_err(|error| {
         format!(
-            "cannot publish the owned link {}: {error}; the previous link is unchanged",
-            link.display()
+            "cannot publish the owned link {}: {error}; the previous link is unchanged{}",
+            link.display(),
+            if exclusive {
+                "; nothing that appeared at the target was replaced"
+            } else {
+                ""
+            }
         )
     })?;
     sync_directory(&context.workspace)?;
@@ -2256,6 +2415,47 @@ fn sibling_link(link: &Path, generation: u64) -> PathBuf {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "target".to_owned());
     link.with_file_name(format!(".{name}.oxide-new-{generation}"))
+}
+
+/// Publish a staged link at `link`. An `exclusive` publish is for a link that
+/// was positively absent when classified: it fails rather than replacing
+/// anything that has appeared since, and has no replacing fallback.
+fn publish_link(sibling: &Path, link: &Path, exclusive: bool) -> std::io::Result<()> {
+    if exclusive {
+        rename_no_replace(sibling, link)
+    } else {
+        fs::rename(sibling, link)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    let from = path_c_string(from)?;
+    let to = path_c_string(to)?;
+    // SAFETY: both pointers come from live NUL-terminated strings that outlive
+    // the call, and RENAME_EXCL never replaces an existing entry.
+    let status = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn rename_no_replace(_from: &Path, _to: &Path) -> std::io::Result<()> {
+    // The removable backend is macOS-only, so no automatic conversion reaches
+    // here elsewhere; an explicit refusal, never a replacing rename.
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "a no-replace rename is unavailable on this platform",
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn path_c_string(path: &Path) -> std::io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
 }
 
 /// Debug-only crash injection: stop at a write-ahead point without further
@@ -2378,7 +2578,10 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
     }
     // 2. The sibling link is live: retry the rename under the barrier.
     if owned_new && sibling_live && old_live {
-        fs::rename(&sibling, link).map_err(|error| {
+        // A link that was absent when classified is published without
+        // replacement: a creator that appeared since the crash is kept.
+        let exclusive = matches!(target, TargetState::Missing);
+        publish_link(&sibling, link, exclusive).map_err(|error| {
             format!(
                 "cannot replay the prepared link rename {}: {error}; both roots are kept",
                 link.display()
@@ -2878,7 +3081,13 @@ mod tests {
     #[test]
     fn a_transition_publishes_an_owned_link_and_keeps_the_root() {
         let fixture = Fixture::new();
-        let receipt = transition(&fixture.context(), &fixture.receipt(), &fixture.local()).unwrap();
+        let receipt = transition(
+            &fixture.context(),
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::Any,
+        )
+        .unwrap();
         let link = fixture.checkout.join("target");
         assert!(fs::symlink_metadata(&link)
             .unwrap()
@@ -2894,7 +3103,8 @@ mod tests {
         assert_eq!(receipt.roots.len(), 1);
         // A second transition to the same place is a new generation, not a
         // new root.
-        let second = transition(&fixture.context(), &receipt, &fixture.local()).unwrap();
+        let second =
+            transition(&fixture.context(), &receipt, &fixture.local(), Start::Any).unwrap();
         assert_eq!(second.generation, 2);
         assert_eq!(second.roots.len(), 1);
         assert!(!sibling_link(&link, 2).exists());
@@ -2907,8 +3117,13 @@ mod tests {
         let target = fixture.checkout.join("target");
         fs::create_dir(&target).unwrap();
         fs::write(target.join("keep"), b"content").unwrap();
-        let refused =
-            transition(&fixture.context(), &fixture.receipt(), &fixture.local()).unwrap_err();
+        let refused = transition(
+            &fixture.context(),
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::Any,
+        )
+        .unwrap_err();
         assert!(refused.contains("never moves"), "{refused}");
         assert_eq!(fs::read(target.join("keep")).unwrap(), b"content");
         assert!(fs::symlink_metadata(&target).unwrap().is_dir());
@@ -2919,8 +3134,13 @@ mod tests {
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("sentinel"), b"keep").unwrap();
         symlink(&outside, linked.checkout.join("target")).unwrap();
-        let refused =
-            transition(&linked.context(), &linked.receipt(), &linked.local()).unwrap_err();
+        let refused = transition(
+            &linked.context(),
+            &linked.receipt(),
+            &linked.local(),
+            Start::Any,
+        )
+        .unwrap_err();
         assert!(refused.contains("never moves"), "{refused}");
         assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"keep");
         assert!(!linked.local().root().exists());
@@ -2934,7 +3154,13 @@ mod tests {
     fn an_empty_real_target_is_converted_explicitly() {
         let fixture = Fixture::new();
         fs::create_dir(fixture.checkout.join("target")).unwrap();
-        let receipt = transition(&fixture.context(), &fixture.receipt(), &fixture.local()).unwrap();
+        let receipt = transition(
+            &fixture.context(),
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::Any,
+        )
+        .unwrap();
         assert_eq!(receipt.generation, 1);
         assert!(fs::symlink_metadata(fixture.checkout.join("target"))
             .unwrap()
@@ -3045,7 +3271,8 @@ mod tests {
         let planned = planned_destination(Some(&fixture.control), &fixture.checkout, None).unwrap();
         assert!(planned.is_none());
         assert_eq!(destination_facts(None), "");
-        let receipt = transition(&context, &fixture.receipt(), &fixture.local()).unwrap();
+        let receipt =
+            transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
         let planned = planned_destination(Some(&fixture.control), &fixture.checkout, None)
             .unwrap()
             .unwrap();
@@ -3056,7 +3283,7 @@ mod tests {
         assert!(first.ends_with("g1"), "{first}");
         // Relinking to the same root keeps the same destination identity, so
         // a warm slot survives a relink.
-        let again = transition(&context, &receipt, &fixture.local()).unwrap();
+        let again = transition(&context, &receipt, &fixture.local(), Start::Any).unwrap();
         assert_eq!(again.generation, 2);
         let planned = planned_destination(Some(&fixture.control), &fixture.checkout, None)
             .unwrap()
@@ -3161,7 +3388,7 @@ mod tests {
         let fixture = Fixture::new();
         let context = fixture.context();
         let spec = fixture.local();
-        let first = transition(&context, &fixture.receipt(), &spec).unwrap();
+        let first = transition(&context, &fixture.receipt(), &spec, Start::Any).unwrap();
         let old = first.selected().unwrap().root.clone();
         let mut receipt = first.clone();
         let prepared = Prepared {
@@ -3191,11 +3418,12 @@ mod tests {
     fn a_committed_receipt_refuses_a_dangling_link_that_is_not_its_own() {
         let fixture = Fixture::new();
         let context = fixture.context();
-        let receipt = transition(&context, &fixture.receipt(), &fixture.local()).unwrap();
+        let receipt =
+            transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
         let foreign = fixture.root.join("foreign-absent");
         fs::remove_file(context.link()).unwrap();
         symlink(&foreign, context.link()).unwrap();
-        let refused = transition(&context, &receipt, &fixture.local()).unwrap_err();
+        let refused = transition(&context, &receipt, &fixture.local(), Start::Any).unwrap_err();
         assert!(refused.contains("never moves"), "{refused}");
         assert_eq!(fs::read_link(context.link()).unwrap(), foreign);
     }
@@ -3231,7 +3459,7 @@ mod tests {
         receipt.roots = vec![previous];
         write_receipt(&fixture.control, &receipt).unwrap();
         symlink(&absent, context.link()).unwrap();
-        let committed = transition(&context, &receipt, &fixture.local()).unwrap();
+        let committed = transition(&context, &receipt, &fixture.local(), Start::Any).unwrap();
         assert_eq!(committed.generation, 2);
         assert_eq!(
             fs::read_link(context.link()).unwrap(),
@@ -3246,7 +3474,8 @@ mod tests {
         let context = fixture.context();
         let absent = fixture.root.join("absent-root");
         symlink(&absent, context.link()).unwrap();
-        let refused = transition(&context, &fixture.receipt(), &fixture.local()).unwrap_err();
+        let refused =
+            transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap_err();
         assert!(refused.contains("never moves"), "{refused}");
         assert_eq!(fs::read_link(context.link()).unwrap(), absent);
     }
@@ -3345,7 +3574,7 @@ mod tests {
         let fixture = Fixture::new();
         let context = fixture.context();
         let spec = fixture.local();
-        let receipt = transition(&context, &fixture.receipt(), &spec).unwrap();
+        let receipt = transition(&context, &fixture.receipt(), &spec, Start::Any).unwrap();
         let selected = receipt.selected().unwrap().clone();
         let outer = fixture.checkout.join(LOCAL_DIR);
         let moved = fixture.root.join("moved-outputs");
@@ -3477,7 +3706,7 @@ mod tests {
     fn a_link_restored_to_an_older_owned_root_is_refused() {
         let fixture = Fixture::new();
         let context = fixture.context();
-        let local = transition(&context, &fixture.receipt(), &fixture.local()).unwrap();
+        let local = transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
         let expected = local.selected().unwrap().clone();
         let mut receipt = local.clone();
         receipt.selected = Some(Selected {
@@ -3511,7 +3740,8 @@ mod tests {
         let fixture = Fixture::new();
         let other = Fixture::new();
         let context = fixture.context();
-        let committed = transition(&context, &fixture.receipt(), &fixture.local()).unwrap();
+        let committed =
+            transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
         let mut receipt = committed.clone();
         let foreign_link = other.checkout.join("target");
         receipt.state = ReceiptState::Prepared;
@@ -3548,7 +3778,8 @@ mod tests {
     fn automatic_replay_refuses_unknown_custody_in_the_other_pool() {
         let fixture = Fixture::new();
         let context = fixture.context();
-        let committed = transition(&context, &fixture.receipt(), &fixture.local()).unwrap();
+        let committed =
+            transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
         let root = committed.selected().unwrap().root.clone();
         let mut receipt = committed.clone();
         receipt.state = ReceiptState::Prepared;
@@ -3587,7 +3818,8 @@ mod tests {
         for occupant in ["other-link", "file", "absent"] {
             let fixture = Fixture::new();
             let context = fixture.context();
-            let committed = transition(&context, &fixture.receipt(), &fixture.local()).unwrap();
+            let committed =
+                transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
             let old = committed.selected().unwrap().root.clone();
             let new_root = fixture.root.join("new-root");
             let mut receipt = committed.clone();
@@ -3752,7 +3984,7 @@ mod tests {
                 planned_destination(Some(store.owner_control()), &fixture.checkout, None).unwrap();
             assert!(keyed.is_none());
             // Adoption completes while the command waits.
-            transition(&context, &fixture.receipt(), &fixture.local()).unwrap();
+            transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
             match bind_for_command(&store, &fixture.checkout, 0, keyed.as_ref(), None) {
                 Ok(_) => panic!("{mode:?}: bound an owned root with an unconverted slot key"),
                 Err(reason) => assert!(reason.contains("converted to owned outputs"), "{reason}"),
@@ -3783,7 +4015,7 @@ mod tests {
             Some(store.owner_control().to_path_buf()),
             fixture.checkout.clone(),
         );
-        transition(&context, &fixture.receipt(), &fixture.local()).unwrap();
+        transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
         let keyed =
             planned_destination(Some(store.owner_control()), &fixture.checkout, None).unwrap();
         let binding = bind_for_command(&store, &fixture.checkout, 0, keyed.as_ref(), None)
@@ -3817,5 +4049,239 @@ mod tests {
         assert!(safe_absolute(Path::new("/work/app/target")));
         assert!(!safe_absolute(Path::new("target")));
         assert!(!safe_absolute(Path::new("/work/../target")));
+    }
+
+    fn all_facts() -> AutoFacts {
+        AutoFacts {
+            selected_permanent: true,
+            same_selection: true,
+            external_usable: true,
+            permanent: true,
+            receipt_absent: true,
+            target_absent: true,
+        }
+    }
+
+    #[test]
+    fn auto_adoption_needs_every_fact_and_nothing_else() {
+        for bits in 0..64u8 {
+            let facts = AutoFacts {
+                selected_permanent: bits & 1 != 0,
+                same_selection: bits & 2 != 0,
+                external_usable: bits & 4 != 0,
+                permanent: bits & 8 != 0,
+                receipt_absent: bits & 16 != 0,
+                target_absent: bits & 32 != 0,
+            };
+            assert_eq!(auto_adopts(&facts), bits == 63, "{facts:?}");
+        }
+    }
+
+    /// A command whose slot came from the internal pool, or from a registration
+    /// that was ephemeral when it selected, never converts, even when the drive
+    /// is permanent by the time it checks. The all-true facts are the control.
+    #[test]
+    fn an_ephemeral_selection_never_converts_after_a_switch_to_permanent() {
+        let switched = AutoFacts {
+            selected_permanent: false,
+            ..all_facts()
+        };
+        assert!(!auto_adopts(&switched));
+        assert!(auto_adopts(&all_facts()), "positive control");
+    }
+
+    /// A command whose slot came from volume A never converts for volume B,
+    /// even when B is the usable permanent registration now. The same volume
+    /// in force now is the positive control.
+    #[test]
+    fn a_selection_of_one_volume_never_converts_another_registration() {
+        let external = |volume: &str, uuid: &str| Selected {
+            kind: RootKind::External,
+            root: PathBuf::from(format!("/Volumes/{volume}/oxide-outputs/app-0000")),
+            volume_uuid: Some(uuid.to_owned()),
+            generation: 0,
+        };
+        let captured = external("a", "uuid-a");
+        let switched = external("b", "uuid-b");
+        assert!(!selection_matches(&captured, &switched));
+        assert!(!auto_adopts(&AutoFacts {
+            same_selection: selection_matches(&captured, &switched),
+            ..all_facts()
+        }));
+        assert!(selection_matches(&captured, &captured.clone()));
+        assert!(auto_adopts(&AutoFacts {
+            same_selection: selection_matches(&captured, &captured.clone()),
+            ..all_facts()
+        }));
+    }
+
+    /// A `detached` receipt is a receipt: a missing target beside it is never
+    /// a fresh checkout, and the receipt is read, not treated as absent.
+    #[test]
+    fn a_detached_receipt_blocks_auto_adoption_of_a_missing_target() {
+        let fixture = Fixture::new();
+        let mut receipt = fixture.receipt();
+        receipt.state = ReceiptState::Detached;
+        write_receipt(&fixture.control, &receipt).unwrap();
+        let context = fixture.context();
+        let receipt_absent = context.receipt().unwrap().is_none();
+        assert!(!receipt_absent);
+        assert!(!auto_adopts(&AutoFacts {
+            selected_permanent: true,
+            same_selection: true,
+            external_usable: true,
+            permanent: true,
+            receipt_absent,
+            target_absent: context.target().unwrap() == TargetState::Missing,
+        }));
+    }
+
+    #[test]
+    fn an_automatic_conversion_converts_only_an_absent_target() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let committed = transition(
+            &context,
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::MissingOnly,
+        )
+        .unwrap();
+        assert_eq!(committed.generation, 1);
+        assert_eq!(
+            fs::read_link(context.link()).unwrap(),
+            fixture.local().root()
+        );
+    }
+
+    /// Every present target (empty directory, file, dangling link) refuses
+    /// before any receipt or sibling is written.
+    #[test]
+    fn an_automatic_conversion_refuses_every_present_target_unchanged() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let link = context.link();
+        let dangling = fixture.root.join("absent-root");
+
+        fs::create_dir(&link).unwrap();
+        let refused = transition(
+            &context,
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::MissingOnly,
+        )
+        .unwrap_err();
+        assert!(refused.contains("auto-adopt refused"), "{refused}");
+        assert!(fs::symlink_metadata(&link).unwrap().is_dir());
+        fs::remove_dir(&link).unwrap();
+
+        fs::write(&link, b"kept").unwrap();
+        assert!(transition(
+            &context,
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::MissingOnly
+        )
+        .is_err());
+        assert_eq!(fs::read(&link).unwrap(), b"kept");
+        fs::remove_file(&link).unwrap();
+
+        symlink(&dangling, &link).unwrap();
+        assert!(transition(
+            &context,
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::MissingOnly
+        )
+        .is_err());
+        assert_eq!(fs::read_link(&link).unwrap(), dangling);
+        assert!(
+            read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A staged link never replaces a file, directory or link that appeared
+    /// after the target was classified absent.
+    #[test]
+    fn a_no_replace_publish_keeps_whatever_appeared_at_the_link() {
+        let fixture = Fixture::new();
+        let sibling = fixture.root.join("staged");
+        symlink(fixture.root.join("new-root"), &sibling).unwrap();
+        let link = fixture.root.join("target");
+        for creator in ["file", "directory", "link"] {
+            match creator {
+                "file" => fs::write(&link, b"kept").unwrap(),
+                "directory" => fs::create_dir(&link).unwrap(),
+                _ => symlink(fixture.root.join("foreign"), &link).unwrap(),
+            }
+            assert!(publish_link(&sibling, &link, true).is_err(), "{creator}");
+            assert!(os_symlink_exists(&sibling), "{creator}: staged link lost");
+            assert!(fs::symlink_metadata(&link).is_ok(), "{creator} removed");
+            if creator == "directory" {
+                fs::remove_dir(&link).unwrap();
+            } else {
+                fs::remove_file(&link).unwrap();
+            }
+        }
+        // Control: with nothing at the link, the exclusive publish succeeds on
+        // macOS; elsewhere it refuses (no replacing fallback).
+        let published = publish_link(&sibling, &link, true);
+        assert_eq!(published.is_ok(), cfg!(target_os = "macos"));
+    }
+
+    #[test]
+    fn a_changed_volume_or_root_is_not_the_captured_destination() {
+        let captured = Selected {
+            kind: RootKind::External,
+            root: PathBuf::from("/Volumes/a/oxide-outputs/app-0000"),
+            volume_uuid: Some("uuid-a".to_owned()),
+            generation: 0,
+        };
+        assert!(captured.same_place(&captured));
+        let other_volume = Selected {
+            volume_uuid: Some("uuid-b".to_owned()),
+            ..captured.clone()
+        };
+        let other_root = Selected {
+            root: PathBuf::from("/Volumes/b/oxide-outputs/app-0000"),
+            ..captured.clone()
+        };
+        assert!(!captured.same_place(&other_volume));
+        assert!(!captured.same_place(&other_root));
+    }
+
+    /// The automatic conversion's destination is the one a later command keys:
+    /// the planned destination is the committed selection itself.
+    #[test]
+    fn an_automatic_conversion_keys_the_committed_destination() {
+        let fixture = Fixture::new();
+        let committed = transition(
+            &fixture.context(),
+            &fixture.receipt(),
+            &fixture.local(),
+            Start::MissingOnly,
+        )
+        .unwrap();
+        let planned = planned_destination(Some(&fixture.control), &fixture.checkout, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(Some(&planned), committed.selected());
+    }
+
+    /// A metadata error on the target is an error, never a missing target.
+    #[test]
+    fn an_unreadable_checkout_is_an_error_not_an_absent_target() {
+        // SAFETY: geteuid has no preconditions. Root reads through mode 000.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let fixture = Fixture::new();
+        let id = fixture.context().checkout_id;
+        fs::set_permissions(&fixture.checkout, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = target_state(&fixture.checkout, &id);
+        fs::set_permissions(&fixture.checkout, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err(), "{result:?}");
     }
 }
