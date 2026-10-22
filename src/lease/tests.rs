@@ -1889,6 +1889,32 @@ fn volume_description_reports_missing_config_as_not_found() {
     assert!(fs::read_dir(&control).expect("read").next().is_none());
 }
 
+/// An unreadable control file is unknown metadata, not a missing file. The
+/// existing test-only seam leaves permissions and the control tree unchanged.
+#[test]
+fn volume_description_reports_unreadable_control_metadata_as_io() {
+    let fixture = Fixture::new("describe-unreadable");
+    let control = control_fixture(&fixture, VOLUME_CONFIG, LEDGER_WITH_EVICTING);
+    let before = snapshot_tree(&control);
+    for name in ["config.json", "ledger.json"] {
+        let denied = crate::test_fs::PermissionDeniedGuard::symlink_metadata(&control.join(name));
+        assert_eq!(
+            managed::describe_volume(&control),
+            Err(LeaseError::Io(
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied).to_string()
+            ))
+        );
+        assert_eq!(
+            denied.hits(),
+            1,
+            "the control-file lookup must be exercised"
+        );
+        drop(denied);
+        assert_eq!(snapshot_tree(&control), before);
+    }
+    assert!(managed::describe_volume(&control).is_ok());
+}
+
 /// Records that are not an apfs-volume-v1 pool, or whose config and ledger
 /// disagree, refuse without touching anything.
 #[test]

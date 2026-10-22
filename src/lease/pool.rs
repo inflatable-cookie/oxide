@@ -226,10 +226,10 @@ pub(super) struct Pool {
 pub mod managed {
     use super::super::backing::BackingPaths;
     use super::super::{
-        canonical_existing_dir, ensure_private_dir, LeaseError, LeaseGrant, Leased, LedgerView,
-        PoolInfo, PoolStatus, ReleaseReceipt, VolumeDescription, BUDGET_BACKEND_DIRECTORY_V1,
-        CONFIG_NAME, LEASE_VERSION, LEDGER_NAME, MAX_SLOTS, PAYLOAD_NAME, SLOTS_NAME,
-        VOLUME_BACKEND_APFS_V1,
+        canonical_existing_dir, ensure_private_dir, io_error, LeaseError, LeaseGrant, Leased,
+        LedgerView, PoolInfo, PoolStatus, ReleaseReceipt, VolumeDescription,
+        BUDGET_BACKEND_DIRECTORY_V1, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME, MAX_SLOTS,
+        PAYLOAD_NAME, SLOTS_NAME, VOLUME_BACKEND_APFS_V1,
     };
     use super::LeaseRequest;
     use super::{
@@ -399,8 +399,17 @@ pub mod managed {
     pub fn describe_volume(pool: &Path) -> Result<VolumeDescription, LeaseError> {
         let root = canonical_existing_dir(pool, true)?;
         for name in [CONFIG_NAME, LEDGER_NAME] {
-            if root.join(name).symlink_metadata().is_err() {
-                return Err(LeaseError::NotFound);
+            let path = root.join(name);
+            #[cfg(test)]
+            let metadata = crate::test_fs::symlink_metadata(&path);
+            #[cfg(not(test))]
+            let metadata = path.symlink_metadata();
+            match metadata {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(LeaseError::NotFound);
+                }
+                Err(error) => return Err(io_error(error)),
+                Ok(_) => {}
             }
         }
         refuse_foreign_pool_entries(&root)?;
