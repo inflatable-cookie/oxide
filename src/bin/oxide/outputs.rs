@@ -236,7 +236,7 @@ impl Receipt {
             (ReceiptState::Prepared, _, Some(prepared))
                 if prepared.generation == self.generation.saturating_add(1)
                     && prepared.generation > 0
-                    && safe_absolute(&prepared.link)
+                    && prepared.link == checkout.join("target")
                     && safe_absolute(&prepared.to.root) => {}
             _ => {
                 return Err(
@@ -803,6 +803,14 @@ fn adopt_command() -> Result<u8, String> {
     let guard = barrier(&internal, &context.workspace, &mut waits)?;
     let outcome = (|| {
         refuse_unknown_custody(&internal, &context.workspace, "relink")?;
+        // Fence a pre-feature Oxide out of both pools before any link can be
+        // published; a target adopt refuses outright changes nothing.
+        if !matches!(
+            context.target()?,
+            TargetState::RealNonEmpty | TargetState::Foreign
+        ) {
+            internal.fence_owned_outputs()?;
+        }
         let _admission = store::lock_admission(&control)?;
         let receipt = match read_receipt(&control, &context.workspace, &context.checkout_id)? {
             None => Receipt::first(&context.workspace, &context.checkout_id),
@@ -1219,7 +1227,19 @@ fn bind_under_binding(
         Ok(target) => target,
         Err(reason) => return Bind::Refuse(reason),
     };
+    // The live link must agree with the committed selection: a link to
+    // another owned root (an older selection restored by hand) is foreign,
+    // even when that root's marker is valid.
+    let committed_root = receipt.selected().map(|selected| selected.root.as_path());
     let link_selects_wanted = target.link_root() == Some(wanted.root.as_path());
+    if link_selects_wanted && committed_root != Some(wanted.root.as_path()) {
+        return Bind::Refuse(format!(
+            "outputs: {} selects {}, but the committed receipt selects {}; Oxide treats the link as foreign and changes nothing. Run `oxide outputs status` and restore the link",
+            context.link().display(),
+            wanted.root.display(),
+            committed_root.map_or_else(|| "no root".to_owned(), |root| root.display().to_string())
+        ));
+    }
     match check_root(context, generation, &wanted) {
         RootCheck::Valid if link_selects_wanted => {
             return Bind::Bound(bound_outcome(&usable, &wanted, false));
@@ -2169,7 +2189,16 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
     let control = context
         .control()
         .ok_or("no internal pool exists; there is no place for an output receipt")?;
-    let link = &prepared.link;
+    // The receipt's link is validated to be this checkout's own target; the
+    // rename destination is derived from the checkout, never from the file.
+    let link = &context.link();
+    if prepared.link != *link {
+        return Err(stop_unknown(
+            context,
+            &prepared,
+            "its link is not this checkout's target",
+        ));
+    }
     let target = context.target()?;
     let sibling = sibling_link(link, prepared.generation);
     let sibling_read = fs::read_link(&sibling).ok();
@@ -3276,6 +3305,76 @@ mod tests {
         .unwrap();
         assert_eq!(planned.kind, RootKind::Local);
         assert_ne!(planned.root, external);
+    }
+
+    /// A live link to another owned root (an older selection restored by
+    /// hand) disagrees with the committed receipt: binding refuses, even
+    /// though that root's marker is valid, and nothing changes.
+    #[test]
+    fn a_link_restored_to_an_older_owned_root_is_refused() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let local = transition(&context, &fixture.receipt(), &fixture.local()).unwrap();
+        let expected = local.selected().unwrap().clone();
+        let mut receipt = local.clone();
+        receipt.selected = Some(Selected {
+            kind: RootKind::External,
+            root: fixture.root.join("volume/oxide-outputs/checkout-0000"),
+            volume_uuid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
+            generation: 1,
+        });
+        write_receipt(&fixture.control, &receipt).unwrap();
+        let store = Store::for_tests(&fixture.root.join("pool"));
+        match bind_under_binding(&context, &store, 0, &receipt, Some(&expected)) {
+            Bind::Refuse(reason) => {
+                assert!(reason.contains("committed receipt selects"), "{reason}")
+            }
+            Bind::Bound(_) => panic!("a link contradicting the committed receipt was bound"),
+            Bind::Wait => panic!("a contradictory link waited instead of refusing"),
+        }
+        assert_eq!(fs::read_link(context.link()).unwrap(), expected.root);
+        assert_eq!(
+            read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+                .unwrap()
+                .unwrap(),
+            receipt
+        );
+    }
+
+    /// A prepared receipt whose link names another checkout's target is
+    /// refused when read, and replay never renames over that target.
+    #[test]
+    fn a_prepared_link_outside_this_checkout_is_never_renamed() {
+        let fixture = Fixture::new();
+        let other = Fixture::new();
+        let context = fixture.context();
+        let committed = transition(&context, &fixture.receipt(), &fixture.local()).unwrap();
+        let mut receipt = committed.clone();
+        let foreign_link = other.checkout.join("target");
+        receipt.state = ReceiptState::Prepared;
+        receipt.prepared = Some(Prepared {
+            generation: committed.generation + 1,
+            to: committed.selected().unwrap().clone(),
+            link: foreign_link.clone(),
+        });
+        assert!(receipt
+            .validate(&fixture.checkout, &context.checkout_id)
+            .is_err());
+        let elsewhere = other.root.join("elsewhere");
+        symlink(&elsewhere, &foreign_link).unwrap();
+        let sibling = sibling_link(&foreign_link, committed.generation + 1);
+        symlink(&committed.selected().unwrap().root, &sibling).unwrap();
+        let refused = replay(&context, receipt).unwrap_err();
+        assert!(refused.contains("not this checkout's target"), "{refused}");
+        assert_eq!(fs::read_link(&foreign_link).unwrap(), elsewhere);
+        assert_eq!(
+            fs::read_link(&sibling).unwrap(),
+            committed.selected().unwrap().root
+        );
+        assert_eq!(
+            fs::read_link(context.link()).unwrap(),
+            committed.selected().unwrap().root
+        );
     }
 
     #[test]

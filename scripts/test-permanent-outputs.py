@@ -60,6 +60,8 @@ expect, fail, summary, MIB = layout.expect, layout.fail, layout.summary, layout.
 BUILDER = "1.97.1"
 SHUTDOWN_MARGIN_S = 30
 MARKER = ".oxide-output.json"
+# The last main commit without owned outputs: its state parser has no fence.
+PRE_FEATURE = "8c9b5aeab57b8d0ca285b5358e07c89606724c8d"
 
 APP = {
     "Cargo.toml": (
@@ -248,6 +250,11 @@ def force_detach(proof: Proof, image: str, mount: str, uuid: str) -> None:
     proof.mount = None
     expect(not os.path.lexists(mount), f"{mount} still exists after the forced detach")
     print(f"forced detach of {wholes[0]} ({mount})", flush=True)
+
+
+def sha256_file(path: str) -> str:
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
 
 
 def real_uuid(pool: str) -> str:
@@ -545,6 +552,33 @@ def run(proof: Proof, repo: str) -> None:
     )
     expect(not os.path.exists(os.path.join(app, ".oxide-outputs")), "adopt created a local root")
     proof.phase("after first conversion")
+
+    # 4b. Downgrade fence: the last pre-feature Oxide refuses both pools'
+    #     fenced state, so it never builds or cleans through the owned link.
+    pre_src = os.path.join(root, "pre-feature-src")
+    os.makedirs(pre_src)
+    archive = proof.run(
+        ["/bin/sh", "-c", f'git -C "$0" archive {PRE_FEATURE} | tar -x -C "$1"', repo, pre_src],
+        timeout=60,
+    )
+    expect(archive.returncode == 0, f"pre-feature archive failed: {archive.stderr!r}")
+    pre_feature = layout.stage_at(proof, pre_src, "oxide-pre-feature")
+    shutil.rmtree(pre_src)
+    expect(sha256_file(pre_feature) != sha256_file(proof.binary), "the pre-feature binary is the candidate")
+    for state_dir in (os.path.join(pool, "oxide-managed"), os.path.join(pool, "oxide-managed", "removable", "oxide-managed")):
+        fenced = read_json(os.path.join(state_dir, "state.json"))
+        expect(fenced.get("owned_outputs") == "oxide.outputs/1", f"{state_dir} is not fenced: {fenced}")
+    external_before = sorted(os.listdir(external_root))
+    for args, label in (
+        (["check"], "pre-feature check refuses the fenced pool"),
+        (["clean", "-p", "poutputs"], "pre-feature selected clean refuses the fenced pool"),
+    ):
+        child = start_child(proof, [pre_feature] + args, app, env)
+        code, _, stderr = finish_child(proof, child, label)
+        expect(code != 0 and "Oxide state is invalid" in stderr and "owned_outputs" in stderr, stderr)
+        expect(link_target(link) == external_root, f"{label} moved the link")
+        expect(sorted(os.listdir(external_root)) == external_before, f"{label} changed the owned root")
+    proof.phase("after the downgrade fence")
 
     # 4. Builds, run, test and profiles through the owned link.
     code, _, stderr = proof.oxide(["build", "--bin", "poutputs"], "build through the link", app)

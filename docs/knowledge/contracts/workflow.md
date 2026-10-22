@@ -2383,6 +2383,10 @@ migration and consumer adoption remain separate gates.
   it: the check runs before ownership is established, including inside a
   `.oxide-outputs` directory that already exists and for an already-present
   empty `.oxide-outputs/local`, which is then left unchanged.
+- **Committed link.** A live link must select the receipt's committed root.
+  A link to another owned root (an older selection restored by hand) is
+  foreign even when that root's marker is valid: binding refuses and changes
+  nothing.
 - **Ownership.** A root carries `.oxide-output.json`
   (`oxide.outputs.root/1`: checkout, checkout id, project label, placement
   recipe, kind, volume UUID, creation generation). A link whose target is
@@ -2394,7 +2398,15 @@ migration and consumer adoption remain separate gates.
   committed selection and generation, a bounded history of at most eight
   known roots, or exactly one prepared transition. It lives in the internal
   pool's control directory whichever pool a command's slots come from, so one
-  checkout never has two receipts. An unknown version or field refuses.
+  checkout never has two receipts. An unknown version or field refuses, and a
+  prepared transition's link must be exactly this checkout's `target`; the
+  rename destination is derived from the checkout, never from the file.
+- **Downgrade fence.** Before `adopt` can publish a first link it writes the
+  forward-only `owned_outputs` fence into both pools' state (creating a
+  state that is absent). Every pre-feature Oxide parses state strictly, so it
+  refuses the pool ("Oxide state is invalid") instead of building, running or
+  cleaning through an owned link without its binding, custody and clean
+  checks. The fence is never cleared; an unknown fence value refuses.
 - **Transition.** Under a per-checkout binding mutex — a plain lock that no
   holder waits on, so second-slot commands still start concurrently when
   their destination is unchanged and two starters can never block each other
@@ -2511,7 +2523,9 @@ to the local root and redocking; a gated `oxide run` program executing from
 the real external root whose ordinary child outlives it, keeping `run` held
 (a relink waits, `plan` names the holder) until the child exits; a forced
 detach of the owned image while a program runs from the external root,
-stopped by the removal watchdog, then re-attach and redock; a build
+stopped by the removal watchdog, then re-attach and redock; the last
+pre-feature Oxide (`8c9b5ae`, staged offline) refusing `check` and a selected
+clean on the fenced pools with the link and root unchanged; a build
 in ephemeral mode before detach through the committed link; a crafted quarantined writer blocking both
 relink and clean; selected clean refusing after its link turned foreign while
 it waited, and selected and whole clean refusing a replaced or unusable

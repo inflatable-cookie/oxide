@@ -58,6 +58,8 @@ const MAX_RECORDS: usize = 64;
 const MAX_RECOVERIES: usize = 16;
 const MAX_STATE_BYTES: u64 = 256 * 1024;
 const STATE_VERSION: u32 = 1;
+/// The owned-outputs fence value; see [`State::owned_outputs`].
+const OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/1";
 const MAX_ORIGIN_BYTES: u64 = 8 * 1024 * 1024;
 const ORIGIN_VERSION: u32 = 1;
 const WAIT_POLL: Duration = Duration::from_millis(200);
@@ -243,6 +245,13 @@ struct State {
     recoveries: Vec<Recovery>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     flushes: Vec<Flush>,
+    /// Forward-only downgrade fence, set before any checkout's first owned
+    /// output link is published and never cleared. An Oxide without owned
+    /// outputs parses state strictly, so it refuses this pool rather than
+    /// building through an owned link without its binding, custody and
+    /// clean checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owned_outputs: Option<String>,
 }
 
 impl Default for State {
@@ -256,6 +265,7 @@ impl Default for State {
             records: Vec::new(),
             recoveries: Vec::new(),
             flushes: Vec::new(),
+            owned_outputs: None,
         }
     }
 }
@@ -1466,6 +1476,55 @@ impl Store {
     /// state is replaced atomically and read without its own lock; for the
     /// host-wide limit, a command starting in the other pool at the same
     /// moment may briefly exceed it by one.
+    /// Publish the owned-outputs downgrade fence in this pool's state and in
+    /// its paired pool's (internal first), creating either state when absent
+    /// so a pre-feature Oxide cannot start from a fresh unfenced one.
+    pub fn fence_owned_outputs(&self) -> Result<(), String> {
+        let mut controls = vec![self.control.clone()];
+        controls.extend(self.sibling.as_ref().map(|sibling| sibling.control.clone()));
+        for control in controls {
+            let store = Store {
+                pool: self.pool.clone(),
+                backend: self.backend,
+                payload: self.payload.clone(),
+                control,
+                budget: self.budget,
+                recorded_budget: self.recorded_budget,
+                max_active: self.max_active,
+                sibling: None,
+            };
+            store.ensure_control()?;
+            let _admission = store.admission()?;
+            let mut state = store.load()?;
+            if state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
+                if state.owned_outputs.is_some() {
+                    return Err(format!(
+                        "Oxide state in {} carries an unknown owned-outputs fence; refusing",
+                        store.control.display()
+                    ));
+                }
+                state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
+                store.save(&state)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A store over `root` for other modules' unit tests.
+    #[cfg(test)]
+    pub fn for_tests(root: &Path) -> Store {
+        Store {
+            pool: root.to_path_buf(),
+            backend: Backend::DirectoryBudget,
+            payload: root.join("payload"),
+            control: root.join(MANAGED_NAME),
+            budget: None,
+            recorded_budget: 1,
+            max_active: 2,
+            sibling: None,
+        }
+    }
+
     pub fn with_sibling(mut self, control: &Path, barrier: bool) -> Self {
         self.sibling = Some(Sibling {
             control: control.to_path_buf(),
@@ -2527,6 +2586,10 @@ impl Store {
             || state.cleans.len() > MAX_TICKETS
             || state.records.len() > MAX_RECORDS
             || state.recoveries.len() > MAX_RECOVERIES
+            || state
+                .owned_outputs
+                .as_deref()
+                .is_some_and(|fence| fence != OWNED_OUTPUTS_FENCE)
         {
             return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
         }
@@ -3157,6 +3220,54 @@ mod tests {
             }
             other => panic!("expected unknown custody, got {other:?}"),
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The fence is written to both pools' state (created when absent), a
+    /// state parser without the field (as every pre-feature Oxide has)
+    /// refuses it, the current one keeps loading it, and an unknown fence
+    /// value refuses.
+    #[test]
+    fn the_owned_outputs_fence_refuses_a_pre_feature_parser() {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct PreFeatureState {
+            version: u32,
+            next_id: u64,
+            next_use: u64,
+            tickets: Vec<serde_json::Value>,
+            #[serde(default)]
+            cleans: Vec<serde_json::Value>,
+            records: Vec<serde_json::Value>,
+            #[serde(default)]
+            recoveries: Vec<serde_json::Value>,
+            #[serde(default)]
+            flushes: Vec<serde_json::Value>,
+        }
+        let (root, internal, removable) = paired_controls("fence");
+        let before = fs::read(internal.control.join("state.json")).ok();
+        if let Some(bytes) = &before {
+            assert!(serde_json::from_slice::<PreFeatureState>(bytes).is_ok());
+        }
+        let _ = fs::remove_file(removable.control.join("state.json"));
+        internal.fence_owned_outputs().unwrap();
+        internal.fence_owned_outputs().unwrap();
+        for control in [&internal.control, &removable.control] {
+            let bytes = fs::read(control.join("state.json")).unwrap();
+            let refused = serde_json::from_slice::<PreFeatureState>(&bytes)
+                .err()
+                .expect("a pre-feature parser accepted the fenced state");
+            assert!(refused.to_string().contains("owned_outputs"), "{refused}");
+        }
+        assert_eq!(
+            internal.load().unwrap().owned_outputs.as_deref(),
+            Some(OWNED_OUTPUTS_FENCE)
+        );
+        let mut state = internal.load().unwrap();
+        state.owned_outputs = Some("oxide.outputs/9".to_owned());
+        internal.save(&state).unwrap();
+        assert!(internal.load().is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
