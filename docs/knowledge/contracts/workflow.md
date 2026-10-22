@@ -2461,7 +2461,7 @@ migration and consumer adoption remain separate gates.
   for host free space. Unconverted checkouts keep `exec` after release.
 - **Explicit commands.** `oxide outputs plan` is effect-free bounded JSON
   (`oxide.outputs.plan/1`, always `data_move: false`, with cooperative
-  holders and the next generation). `adopt` converts only a missing or empty
+  holders in either pool and the next generation). `adopt` converts only a missing or empty
   real target; a nonempty real target and a foreign symlink refuse without
   mutation, and an owned correct link is a no-op. `detach` restores a real
   empty `<checkout>/target` directory, keeps every root and refuses while the

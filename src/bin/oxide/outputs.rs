@@ -536,7 +536,13 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
     let holders = match context.control() {
         None => Vec::new(),
         Some(control) => {
+            // Holders in either pool: a removable command's record lives in
+            // the removable pool's control directory.
             let mut holders = store::active_holders(control, &context.workspace)?;
+            holders.extend(store::active_holders(
+                &removable::removable_control(control),
+                &context.workspace,
+            )?);
             holders.truncate(MAX_HOLDERS);
             holders
         }
