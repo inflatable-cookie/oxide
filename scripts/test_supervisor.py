@@ -493,6 +493,63 @@ class PureDiagnostics(unittest.TestCase):
         self.assertNotIn("diagnostics", census(table).round())
 
 
+class PureTerminalCounts(unittest.TestCase):
+    """Mandatory receipt terminal_count_status / terminal_nonwriters."""
+
+    def test_strict_clean_round_valid_zero(self):
+        table = FakeTable([row(101), row(200)], {101: 100, 200: 7})
+        result = census(table).round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 1, 0))
+        self.assertEqual(result["terminal_count_status"], "valid")
+        self.assertEqual(result["terminal_nonwriters"], 0)
+        self.assertIs(type(result["terminal_nonwriters"]), int)
+
+    def test_resolved_gone_valid_count(self):
+        table = FakeTable([row(103)], {103: ProcessLookupError(3, "gone")}, reread={103: None})
+        result = census(table).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (True, 0))
+        self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]), ("valid", 1))
+
+    def test_two_resolved_gone_valid_two(self):
+        rows = [row(130, start=1), row(131, start=1)]
+        table = FakeTable(rows, {130: ProcessLookupError(3, "gone"), 131: ProcessLookupError(3, "gone")},
+                           reread={130: None, 131: None})
+        result = census(table).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (True, 0))
+        self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]), ("valid", 2))
+
+    def test_uncertain_round_invalid_null(self):
+        table = FakeTable([row(132, start=5)], {132: ProcessLookupError(3, "gone")})
+        result = census(table).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertGreaterEqual(result["uncertain"], 1)
+        self.assertEqual(result["terminal_count_status"], "invalid")
+        self.assertIsNone(result["terminal_nonwriters"])
+        blob = json.dumps(result, ensure_ascii=True, separators=(',', ':'))
+        self.assertIn('"terminal_nonwriters":null', blob)
+
+    def test_snapshot_failure_invalid_null(self):
+        def broken():
+            raise OSError(12, "injected")
+        result = bounded.Census(100, snapshot=broken).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]), ("invalid", None))
+
+    def test_helper_rejects_bool_and_overflow(self):
+        self.assertEqual(bounded._terminal_fields(True, False, False), ("invalid", None))
+        self.assertEqual(bounded._terminal_fields(0, False, False), ("valid", 0))
+        self.assertEqual(bounded._terminal_fields(bounded.U64MAX, False, False), ("valid", bounded.U64MAX))
+        self.assertEqual(bounded._terminal_fields(bounded.U64MAX + 1, False, False), ("overflow", None))
+        self.assertEqual(bounded._terminal_fields(3, False, False, saturated=True), ("overflow", None))
+        self.assertEqual(bounded._terminal_fields(3, True, False), ("invalid", None))
+        self.assertEqual(bounded._terminal_fields(-1, False, False), ("invalid", None))
+
+    def test_ipc_schema_unchanged(self):
+        self.assertEqual(set(bounded.FIELDS["census"]), {"after", "members", "uncertain", "certain"})
+        self.assertNotIn("terminal_count_status", bounded.FIELDS["census"])
+        self.assertNotIn("terminal_nonwriters", bounded.FIELDS["census"])
+
+
 class PureProtocol(unittest.TestCase):
     def custodian(self):
         custodian = bounded.Custodian(["true"])
@@ -1155,7 +1212,7 @@ def main():
     runner = unittest.TextTestRunner(verbosity=2, resultclass=Results)
     pure = unittest.TestSuite(loader.loadTestsFromTestCase(case)
                               for case in (PureGuard, PurePrecedence, PureCensus, PureCensusFinalAbsence,
-                                           PureDiagnostics, PureProtocol))
+                                           PureDiagnostics, PureTerminalCounts, PureProtocol))
     ok = runner.run(pure).wasSuccessful()
     if sys.argv[1:] != ["--pure"]:
         # Writers before and after a simulated staging step, in the outer

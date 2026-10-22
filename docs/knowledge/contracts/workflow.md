@@ -986,6 +986,16 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   compact UTF-8 JSON (`ensure_ascii`, no whitespace) of at most 16384
   bytes with at most 20 rows and fixed enums only; overflow drops whole
   rows first with an explicit omitted count, or omits the object.
+
+  Every receipt census object also carries mandatory `terminal_count_status`
+  (`valid`/`invalid`/`overflow`) and `terminal_nonwriters` (the exact
+  non-bool count 0..2^64-1 of this round's positively resolved Gone rows
+  when valid, else JSON null; a strictly completed round with none is
+  `valid` 0). A snapshot or census failure without a countable set, like
+  any uncertain round, is `invalid` with null and keeps `uncertain`>=1
+  with `certain` false in the unchanged IPC fields; saturation is
+  `overflow` with null. Output-witness loss never touches these fields
+  and they never change classification.
 - **Faults (latched; none clears).**
   - Monitor: reserve below 22 GiB (20 GiB reserve + 2 GiB margin); no
     reserve reading for 1 s; no completed owned-byte reading for 10 s; owned
@@ -1074,7 +1084,7 @@ path is printed for the owner.
 
 It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
 `scripts/test_supervisor.py`. The suite runs in order:
-- 53 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 60 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -1097,7 +1107,9 @@ It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
   bounded receipt diagnostics (fixed enums, 20 maximum-width rows, row
   overflow with an exact omitted count, byte-ceiling trimming and
   serialization failure leaving classifications, counts and faults
-  unchanged);
+  unchanged) and mandatory receipt terminal counts (`valid` 0 for a
+  strictly completed round, exact Gone count when valid, `invalid`/`overflow`
+  with null and `uncertain`>=1 otherwise, IPC schema unchanged);
 - writers before and after a simulated staging step;
 - 33 real cases with tiny Python fixtures and injected faults:
   - exit 0, owned cleanup, nonzero, exec 127, output saturation;
@@ -1145,7 +1157,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 86 cases;
+- all 93 cases;
 - every real case directory and receipt still present after the
   candidate's cleanup.
 

@@ -83,6 +83,7 @@ CENSUS_INTERVAL = 0.2
 CONFIRM_TRIES, CONFIRM_PAUSE = 20, 0.05  # gone confirmation within one round, at most 1 s
 DIAG_MAX_BYTES = 16384  # compact UTF-8 JSON ceiling for the optional receipt census diagnostics
 DIAG_MAX_ROWS = 20  # at most 20 diagnostic summary rows; the rest count as omitted
+TERMINAL_STATUS_VALUES = ("valid", "invalid", "overflow")
 U64MAX = 2 ** 64 - 1
 CONFIRM_VALUES = ("absent", "replaced", "matching_exhausted", "read_failed")
 FINAL_VALUES = ("not_read", "absent", "replaced", "same_identity", "read_failed")
@@ -390,6 +391,32 @@ def _diag_object(attempted, rows, saturated):
         return None
 
 
+def _terminal_fields(gone_count, has_uncertain, failed, saturated=False):
+    """Mandatory receipt-only terminal count fields.
+
+    Returns (status, value) with status in valid/invalid/overflow and
+    value an exact non-bool int 0..U64MAX when valid, else None (JSON
+    null). Valid counts this round's positively resolved Gone rows; a
+    strictly completed round with none is valid 0. Any uncertain row or
+    a failure without a countable set is invalid with null, never a raw
+    bad value, false zero or lower bound; saturation/overflow is likewise
+    null. Never raises."""
+    try:
+        if failed:
+            return ("invalid", None)
+        if saturated:
+            return ("overflow", None)
+        if type(gone_count) is int and gone_count > U64MAX:
+            return ("overflow", None)
+        if has_uncertain:
+            return ("invalid", None)
+        if type(gone_count) is int and 0 <= gone_count <= U64MAX:
+            return ("valid", gone_count)
+        return ("invalid", None)
+    except BaseException:
+        return ("invalid", None)
+
+
 class Census:
     """Classifies every process against session `sid` (the leader's PID).
 
@@ -415,7 +442,19 @@ class Census:
     round's return value: the census IPC message keeps only
     after/members/uncertain/certain, and the diagnostics never change
     classification, membership, authoritative counts, first fault, closure
-    or cleanup, nor consume extra reads, time or retry budget."""
+    or cleanup, nor consume extra reads, time or retry budget.
+
+    Every round also carries mandatory receipt-only terminal fields:
+    `terminal_count_status` (valid/invalid/overflow) and
+    `terminal_nonwriters` (exact non-bool int 0..U64MAX when valid, else
+    JSON null). The value counts this round's ESRCH rows positively
+    resolved Gone (confirm or final read); a strictly completed round
+    with none is valid 0. Any uncertain row or a snapshot/census failure
+    without a countable set is invalid with null (never a raw bad value,
+    false zero or lower bound); overflow is likewise null. Invalid and
+    overflow always coincide with uncertain>=1 and certain False in the
+    unchanged IPC fields. Output-witness loss never touches these fields
+    and they never change classification."""
 
     def __init__(self, sid, snapshot=Kinfo.all, getsid=os.getsid, reread=Kinfo.one, pause=time.sleep):
         self.sid, self.snapshot, self.getsid, self.reread, self.pause = sid, snapshot, getsid, reread, pause
@@ -454,13 +493,15 @@ class Census:
             rows = self.snapshot()
         except Exception as error:
             return {"certain": False, "members": len(self.tracked), "uncertain": 1,
-                    "error": f"snapshot: {error}", "member_rows": [], "uncertain_rows": []}
+                    "error": f"snapshot: {error}", "member_rows": [], "uncertain_rows": [],
+                    "terminal_count_status": "invalid", "terminal_nonwriters": None}
         present = {(row["pid"], row["start"]) for row in rows}
         for identity in list(self.tracked):
             if identity not in present:
                 del self.tracked[identity]
         members, uncertain = [], []
         diag_attempted, diag_saturated, diag_rows = 0, False, []
+        gone_count = 0
         for row in rows:
             identity = (row["pid"], row["start"])
             failure, getsid_error = None, None
@@ -478,6 +519,7 @@ class Census:
                 gone, tries, confirm_outcome, _confirm_error = self.confirm_gone_info(row)
                 if gone:
                     self.tracked.pop(identity, None)
+                    gone_count += 1
                     try:
                         diag_rows.append(_diag_row(row, tries, confirm_outcome, "not_read", "none", None))
                     except BaseException:
@@ -497,6 +539,7 @@ class Census:
                 else:
                     if again is None:
                         self.tracked.pop(identity, None)
+                        gone_count += 1
                         try:
                             diag_rows.append(_diag_row(row, tries, confirm_outcome, "absent", "none", None))
                         except BaseException:
@@ -504,6 +547,7 @@ class Census:
                         continue
                     if again["start"] != row["start"]:
                         self.tracked.pop(identity, None)
+                        gone_count += 1
                         try:
                             diag_rows.append(_diag_row(row, tries, confirm_outcome, "replaced", "none", None))
                         except BaseException:
@@ -544,6 +588,13 @@ class Census:
                 uncertain.append(dict(row, reason=failure or "identity changed across getsid"))
         result = {"certain": not uncertain, "members": len(members), "uncertain": len(uncertain),
                 "member_rows": members[:20], "uncertain_rows": uncertain[:20]}
+        try:
+            status, value = _terminal_fields(gone_count, len(uncertain) > 0, False, diag_saturated)
+        except BaseException:
+            status, value = "invalid", None
+        result["terminal_count_status"] = status if status in TERMINAL_STATUS_VALUES else "invalid"
+        result["terminal_nonwriters"] = value if (
+            status == "valid" and type(value) is int and 0 <= value <= U64MAX) else None
         if diag_attempted:
             try:
                 diagnostics = _diag_object(diag_attempted, diag_rows, diag_saturated)
