@@ -155,10 +155,15 @@ def private_environment(proof: Proof) -> dict:
             "RUSTC_WORKSPACE_WRAPPER",
         ):
             env.pop(name)
+    # A private HOME must not move rustup's toolchain store.
+    rustup = os.environ.get("RUSTUP_HOME") or os.path.join(
+        os.path.expanduser("~"), ".rustup"
+    )
     env.update(
         {
             "HOME": os.path.join(proof.root, "home"),
             "CARGO_HOME": os.path.join(proof.root, "cargo-home"),
+            "RUSTUP_HOME": rustup,
             "OXIDE_POOL": os.path.join(proof.root, "pool"),
             "OXIDE_POOL_CAP": POOL_CAP,
             "RUSTUP_TOOLCHAIN": BUILDER,
