@@ -92,11 +92,24 @@ fn main() {
 }
 ''',
     "src/lib.rs": "pub fn value() -> u32 {\n    7\n}\n",
-    "src/main.rs": (
-        "fn main() {\n"
-        '    println!("permanent-outputs-ok {}", poutputs::value());\n'
-        "}\n"
-    ),
+    "src/main.rs": r'''use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+fn main() {
+    // A gated run records the executable it was started as, then waits.
+    if let Ok(gate) = std::env::var("OXIDE_RUN_GATE") {
+        let gate = PathBuf::from(gate);
+        let exe = std::env::current_exe().unwrap();
+        std::fs::write(gate.join("exe"), exe.to_string_lossy().as_bytes()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while !gate.join("release").exists() {
+            assert!(Instant::now() < deadline, "proof did not release the run");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    println!("permanent-outputs-ok {}", poutputs::value());
+}
+''',
     "tests/smoke.rs": (
         "#[test]\nfn smoke() {\n    assert_eq!(poutputs::value(), 7);\n}\n"
     ),
@@ -182,6 +195,15 @@ def set_recorded_uuid(pool: str, uuid: str) -> None:
     path = registration_path(pool)
     current = read_json(path)
     current["volume_uuid"] = uuid
+    with open(path, "wb") as handle:
+        handle.write(json.dumps(current, indent=2).encode() + b"\n")
+    os.chmod(path, 0o600)
+
+
+def set_container_uuid(pool: str, uuid: str) -> None:
+    path = registration_path(pool)
+    current = read_json(path)
+    current["container_uuid"] = uuid
     with open(path, "wb") as handle:
         handle.write(json.dumps(current, indent=2).encode() + b"\n")
     os.chmod(path, 0o600)
@@ -905,6 +927,55 @@ def run(proof: Proof, repo: str) -> None:
     expect(code == 0 and link_target(link) == external_root, stderr)
     proof.phase("after the local ancestor control")
 
+    # 9c. Split selection: the drive is present and its output root valid, but
+    #     the intermediate pool falls back (container mismatch). Outputs follow
+    #     the pool to the local root, so nothing writes to the drive without
+    #     its removal watchdog; restoring the container redocks.
+    good_container = read_json(registration_path(pool))["container_uuid"]
+    set_container_uuid(pool, "00000000-0000-0000-0000-00000000C0DE")
+    code, _, stderr = proof.oxide(["check"], "pool fallback with the drive present", app)
+    expect(code == 0 and link_target(link) == local_root, f"split selection kept the drive: {stderr}")
+    expect("fell back to the internal pool" in stderr, stderr)
+    set_container_uuid(pool, good_container)
+    code, _, stderr = proof.oxide(["check"], "redock after the split selection", app)
+    expect(code == 0 and link_target(link) == external_root, stderr)
+
+    # 9d. A program `oxide run` started keeps the checkout's output custody:
+    #     it runs from the real external root, a relink waits for it and
+    #     clean refuses until it exits.
+    run_gate = os.path.join(root, "run-gate")
+    os.makedirs(run_gate)
+    run_env = dict(env)
+    run_env["OXIDE_RUN_GATE"] = run_gate
+    runner = start_child(proof, [proof.binary, "run", "--bin", "poutputs"], app, run_env)
+    relinker = None
+    try:
+        wait_for(os.path.join(run_gate, "exe"), "gated run")
+        exe = read_bytes(os.path.join(run_gate, "exe")).decode()
+        expect(
+            os.path.realpath(exe).startswith(external_root + os.sep) and not exe.startswith(link),
+            f"the run did not execute from the bound real root: {exe}",
+        )
+        set_recorded_uuid(pool, wrong)
+        relinker = start_child(proof, [proof.binary, "check"], app, env)
+        time.sleep(1.5)
+        expect(relinker.poll() is None, "a relink did not wait for the running program")
+        expect(link_target(link) == external_root, "the link moved under a running program")
+        code, _, stderr = proof.oxide(["clean"], "clean while a run program lives", app)
+        expect(code != 0 and "still runs" in stderr, stderr)
+        expect(os.path.isfile(exe), "clean removed the running program")
+    finally:
+        open(os.path.join(run_gate, "release"), "wb").close()
+    code, stdout, stderr = finish_child(proof, runner, "gated run")
+    expect(code == 0 and "permanent-outputs-ok 7" in stdout, stdout + stderr)
+    code, _, stderr = finish_child(proof, relinker, "relink after the run program exits")
+    expect(code == 0 and link_target(link) == local_root, stderr)
+    expect("or a program `oxide run` started" in stderr, stderr)
+    set_recorded_uuid(pool, good)
+    code, _, stderr = proof.oxide(["check"], "redock after the run custody case", app)
+    expect(code == 0 and link_target(link) == external_root, stderr)
+    proof.phase("after the split selection and run custody cases")
+
     # 10. A foreign live link refuses and is left untouched.
     os.remove(os.path.join(app, "target"))
     os.symlink(os.path.join(root, "outside"), os.path.join(app, "target"))
@@ -1038,6 +1109,11 @@ def run(proof: Proof, repo: str) -> None:
     expect(os.path.islink(link), "a refused detach removed the link")
     code, _, stderr = proof.oxide(["pool", "set-mode", "ephemeral"], "set ephemeral mode", app)
     expect(code == 0, stderr)
+    # A converted checkout keeps building through its owned link in
+    # ephemeral mode until it is detached; nothing is relinked.
+    code, _, stderr = proof.oxide(["build", "--bin", "poutputs"], "ephemeral build before detach", app)
+    expect(code == 0 and link_target(link) == external_root, f"ephemeral build refused: {stderr}")
+    expect(os.path.isfile(os.path.join(external_root, "debug", "poutputs")), "no binary in the bound root")
     code, stdout, stderr = proof.oxide(["outputs", "detach"], "detach in ephemeral mode", app)
     expect(code == 0 and "real empty directory again" in stdout, stdout + stderr)
     expect(os.path.isdir(link) and not os.path.islink(link), "detach did not restore a real directory")

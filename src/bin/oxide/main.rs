@@ -236,7 +236,20 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     // destination is the one the binding below will select, so the key and the
     // bound root cannot disagree. An ephemeral or detached checkout adds
     // nothing, so its keys are unchanged.
-    let planned = outputs::planned_destination(Some(&output_control), &checkout)?;
+    // The intermediate pool is selected first: outputs select the external
+    // root only when this command's slot comes from the removable pool, whose
+    // watchdog supervises the drive's removal.
+    let selected = removable::select(internal)?;
+    let selection_mode = selected.mode;
+    let fallback_reason = selected.fallback_reason.clone();
+    let pool_fallback = (!selected.removable && selection_mode.is_some()).then(|| {
+        fallback_reason
+            .clone()
+            .unwrap_or_else(|| "the removable pool is not selected".to_owned())
+    });
+    let store = selected.store;
+    let planned =
+        outputs::planned_destination(Some(&output_control), &checkout, pool_fallback.as_deref())?;
     let destination = outputs::destination_facts(planned.as_ref());
     let key = SlotKey::resolve_in(
         &checkout,
@@ -244,10 +257,6 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         invocation.target.as_deref(),
         &destination,
     )?;
-    let selected = removable::select(internal)?;
-    let selection_mode = selected.mode;
-    let fallback_reason = selected.fallback_reason.clone();
-    let store = selected.store;
     if !selected.removable {
         if selection_mode == Some(removable::DriveMode::Permanent) {
             if let Some(reason) = fallback_reason.as_deref() {
@@ -293,6 +302,7 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         &key.checkout,
         held.record_id(),
         planned.as_ref(),
+        pool_fallback.as_deref(),
     ) {
         Ok(binding) => binding,
         Err(reason) => {
@@ -305,6 +315,7 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         eprintln!("oxide: WARNING: {warning}");
     }
     let output_note = binding.outcome.note.clone();
+    let output_root = binding.outcome.root.clone();
     let run = invocation.command == "run";
     let config_args = if cli::reads_config_args(&invocation.command) {
         &invocation.cargo_args[..]
@@ -431,6 +442,24 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     }
     let note = notes.join(", ");
     let note = (!note.is_empty()).then_some(note);
+    // A program `run` executes from an owned output root keeps the checkout's
+    // output custody after the slot is released: it is registered while this
+    // command's record still runs, so no relink or clean can slip in between.
+    let run_custody = match (&outcome, &output_root) {
+        (Ok((Some(status), Some(Ok(_)))), Some(root))
+            if run && status.success() && stopped.is_none() =>
+        {
+            match outputs::hold_for_run(store.owner_control(), &key.checkout, root) {
+                Ok(custody) => Some(custody),
+                Err(reason) => {
+                    let origin = gate.finish(&key.checkout);
+                    store.release(held, origin)?;
+                    return Err(reason);
+                }
+            }
+        }
+        _ => None,
+    };
     let origin = gate.finish(&key.checkout);
     store.release(held, origin)?;
     let (status, executable) = outcome?;
@@ -469,11 +498,23 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     }
     match executable.unwrap_or_else(|| Err("no run target was recorded".to_owned())) {
         Ok((program, manifest_dir)) => {
-            // Lease released: the program runs from the private target dir.
+            // Lease released: the program runs from the private target dir,
+            // or from the real owned root this command bound, never through a
+            // link a later relink could repoint.
+            let program = match (
+                &output_root,
+                program.strip_prefix(key.checkout.join("target")),
+            ) {
+                (Some(root), Ok(rest)) => root.join(rest),
+                _ => program,
+            };
             let error = Command::new(&program)
                 .args(&invocation.program_args)
                 .env("CARGO_MANIFEST_DIR", manifest_dir)
                 .exec();
+            if let Some(custody) = run_custody {
+                custody.abandon();
+            }
             Err(format!("could not execute {}: {error}", program.display()))
         }
         Err(message) => {

@@ -189,6 +189,58 @@ pub fn group_empty(group: i32) -> bool {
     result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
+/// A process's kernel start time in microseconds, which `exec` keeps: with
+/// the PID it names exactly one process. `None` when the process does not
+/// exist or its start time cannot be read.
+#[cfg(target_os = "macos")]
+pub fn start_identity(pid: u32) -> Option<u64> {
+    let pid = i32::try_from(pid).ok()?;
+    // SAFETY: an all-zero proc_bsdinfo is a valid plain-data value.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: the buffer is one proc_bsdinfo of the size passed.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        )
+    };
+    (read == size).then(|| {
+        info.pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.pbi_start_tvusec)
+    })
+}
+
+/// [`start_identity`] from `/proc/<pid>/stat`'s start time, in clock ticks.
+#[cfg(target_os = "linux")]
+pub fn start_identity(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = &stat[stat.rfind(')')? + 1..];
+    fields.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn start_identity(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// True when a process with this PID exists, whoever owns it.
+pub fn pid_exists(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks that the process exists.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 /// Cargo's exit code, or 128 + signal when the leader died on a signal.
 pub fn exit_code(status: ExitStatus) -> u8 {
     match status.code() {

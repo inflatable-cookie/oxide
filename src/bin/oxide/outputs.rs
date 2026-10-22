@@ -378,6 +378,9 @@ pub struct Outcome {
     pub warnings: Vec<String>,
     /// One clause for the command's summary line.
     pub note: Option<String>,
+    /// The real owned root the checkout's owned link selects for this
+    /// command; `None` for a real `target` directory.
+    pub root: Option<PathBuf>,
 }
 
 impl Outcome {
@@ -412,6 +415,11 @@ struct Context {
     control: Option<PathBuf>,
     workspace: PathBuf,
     checkout_id: String,
+    /// Why this command's intermediate slot comes from the internal pool
+    /// although a removable drive is registered. Outputs then never select
+    /// the external root: only a removable store supervises the drive's
+    /// removal, so a command never writes to it unwatched.
+    pool_fallback: Option<String>,
 }
 
 impl Context {
@@ -429,7 +437,13 @@ impl Context {
             control,
             workspace,
             checkout_id,
+            pool_fallback: None,
         }
+    }
+
+    fn with_pool_fallback(mut self, reason: Option<&str>) -> Self {
+        self.pool_fallback = reason.map(str::to_owned);
+        self
     }
 
     fn control(&self) -> Option<&Path> {
@@ -783,6 +797,7 @@ fn adopt_command() -> Result<u8, String> {
     let guard = barrier(&internal, &context.workspace, &mut waits)?;
     let outcome = (|| {
         refuse_unknown_custody(&internal, &context.workspace, "relink")?;
+        refuse_run_readers(&context, "outputs adopt")?;
         let _admission = store::lock_admission(&control)?;
         let receipt = match read_receipt(&control, &context.workspace, &context.checkout_id)? {
             None => Receipt::first(&context.workspace, &context.checkout_id),
@@ -911,6 +926,7 @@ fn detach_command() -> Result<u8, String> {
     let guard = barrier(&internal, &context.workspace, &mut waits)?;
     let outcome = (|| {
         refuse_unknown_custody(&internal, &context.workspace, "detach")?;
+        refuse_run_readers(&context, "outputs detach")?;
         let _admission = store::lock_admission(&control)?;
         let receipt = read_receipt(&control, &context.workspace, &context.checkout_id)?
             .ok_or("this checkout has no owned-output receipt; nothing to detach")?;
@@ -1016,11 +1032,13 @@ pub fn bind_for_command(
     checkout: &Path,
     own_record: u64,
     expected: Option<&Selected>,
+    pool_fallback: Option<&str>,
 ) -> Result<OutputBinding, String> {
     let context = Context::new(
         Some(store.owner_control().to_path_buf()),
         checkout.to_path_buf(),
-    );
+    )
+    .with_pool_fallback(pool_fallback);
     let mode = context.mode()?;
     if mode != Some(DriveMode::Permanent) {
         return Ok(OutputBinding::unchecked(bind_ephemeral(
@@ -1061,7 +1079,7 @@ pub fn bind_for_command(
                 drop(lock);
                 if !announced {
                     eprintln!(
-                        "oxide: waiting for another oxide command in this checkout to finish before relinking outputs"
+                        "oxide: waiting for another oxide command (or a program `oxide run` started) in this checkout to finish before relinking outputs"
                     );
                     announced = true;
                 }
@@ -1078,6 +1096,7 @@ fn unconverted_outcome() -> Outcome {
                 .to_owned(),
         ],
         note: Some("outputs not converted".to_owned()),
+        root: None,
     }
 }
 
@@ -1101,17 +1120,30 @@ fn bind_ephemeral(context: &Context, expected: Option<&Selected>) -> Result<Outc
                 None => desired_selection(context, &receipt)?
                     .ok_or("outputs: the receipt selects no root")?,
             };
+            if wanted.kind == RootKind::External {
+                if let Some(reason) = context.pool_fallback.as_deref() {
+                    return Err(format!(
+                        "outputs: {} selects the external root {}, but this command's intermediate slot fell back to the internal pool ({reason}) and the drive's removal would not be supervised; the drive mode is ephemeral, so Oxide will not relink it. Restore the drive or run `oxide outputs detach`",
+                        context.link().display(),
+                        wanted.root.display()
+                    ));
+                }
+            }
             let target = context.target()?;
             if target.root() != Some(wanted.root.as_path()) {
                 return Err(format!(
-                    "outputs: {} is {}, not the owned link selecting {}; the drive mode is ephemeral, so Oxide will not relink it. Run `oxide outputs adopt` (or set the drive mode to permanent) before building",
+                    "outputs: {} is {}, not the owned link selecting {}; the drive mode is ephemeral, so Oxide will not relink it. Run `oxide outputs detach` for a real target directory, or set the drive mode to permanent and run `oxide outputs adopt`",
                     context.link().display(),
                     target.label(),
                     wanted.root.display()
                 ));
             }
             check_bound_root(context, receipt.generation, &wanted)?;
-            Ok(Outcome::default().with_note(format!(
+            let outcome = Outcome {
+                root: Some(wanted.root.clone()),
+                ..Outcome::default()
+            };
+            Ok(outcome.with_note(format!(
                 "owned outputs {} through an owned link",
                 wanted.root.display()
             )))
@@ -1149,6 +1181,7 @@ fn bind_under_binding(
                             .to_owned(),
                     ],
                     note: Some("outputs detached".to_owned()),
+                    root: None,
                 }),
             }
         }
@@ -1207,6 +1240,22 @@ fn bind_under_binding(
             context.link().display(),
             target.label()
         ));
+    }
+    // A program `oxide run` executed from the current root is custody too: it
+    // reads (and may write) through the link after its slot was released.
+    let readers = match context.control() {
+        Some(control) => live_run_readers(control, &context.checkout_id, true),
+        None => Ok(Vec::new()),
+    };
+    match readers {
+        Err(reason) => {
+            return Bind::Refuse(format!(
+                "outputs: refusing to relink {}: {reason}",
+                context.link().display()
+            ))
+        }
+        Ok(readers) if !readers.is_empty() => return Bind::Wait,
+        Ok(_) => {}
     }
     match store.checkout_custody(&context.workspace, own_record) {
         Err(reason) => Bind::Refuse(reason),
@@ -1345,6 +1394,7 @@ fn bound_outcome(
             ));
         }
     }
+    outcome.root = Some(bound.root.clone());
     outcome.with_note(format!(
         "{} outputs {}{}",
         if bound.kind == RootKind::Local {
@@ -1365,28 +1415,39 @@ fn bound_outcome(
 pub fn planned_destination(
     control: Option<&Path>,
     checkout: &Path,
+    pool_fallback: Option<&str>,
 ) -> Result<Option<Selected>, String> {
     let Some(control) = control else {
         return Ok(None);
     };
-    let context = Context::new(Some(control.to_path_buf()), checkout.to_path_buf());
+    let context = Context::new(Some(control.to_path_buf()), checkout.to_path_buf())
+        .with_pool_fallback(pool_fallback);
     let Some(receipt) = context.receipt()? else {
         return Ok(None);
     };
     desired_selection(&context, &receipt)
 }
 
-/// The destination rule itself: external when the volume is usable, else the
-/// local fallback, each with the generation its root has or will be created
-/// at. `None` for a detached or absent receipt.
+/// The destination rule itself: in permanent mode, external when the volume
+/// is usable, else the local fallback; in any other mode, the committed
+/// selection, which is never relinked automatically. Each comes with the
+/// generation its root has or will be created at. `None` for a detached or
+/// absent receipt.
 fn desired_selection(context: &Context, receipt: &Receipt) -> Result<Option<Selected>, String> {
     if receipt.state == ReceiptState::Detached {
         return Ok(None);
     }
     let next = receipt.generation.saturating_add(1);
-    let spec = match usable_external(context) {
-        Ok(registration) => external_spec(&registration, &context.workspace),
-        Err(_) => local_spec(&context.workspace),
+    let spec = if context.mode()? == Some(DriveMode::Permanent) {
+        match usable_external(context) {
+            Ok(registration) => external_spec(&registration, &context.workspace),
+            Err(_) => local_spec(&context.workspace),
+        }
+    } else {
+        match receipt.selected() {
+            Some(selected) => spec_for(selected),
+            None => return Ok(None),
+        }
     };
     let generation = destination_generation(spec.root(), next);
     Ok(Some(spec.selected(generation)))
@@ -1432,6 +1493,138 @@ fn refuse_unknown_custody(store: &Store, checkout: &Path, action: &str) -> Resul
     }
 }
 
+/// A program `oxide run` executes from a converted checkout's outputs. Oxide
+/// replaces itself with the program, so the program keeps Oxide's PID and
+/// kernel start time; this file names that process and is the checkout's
+/// output custody while it runs, after the slot is released. Relinks wait for
+/// it; `adopt`, `detach` and clean refuse. A file whose process has gone (or
+/// whose PID now names another process) is stale and is removed.
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunReader {
+    version: String,
+    pid: u32,
+    start: Option<u64>,
+    root: PathBuf,
+}
+
+const READER_VERSION: &str = "oxide.outputs.reader/1";
+/// At most this many run readers per checkout; beyond it custody is unknown.
+const MAX_READERS: usize = 64;
+const MAX_READER_BYTES: u64 = 4 * 1024;
+
+fn readers_directory(control: &Path, checkout_id: &str) -> PathBuf {
+    control
+        .join("outputs")
+        .join(format!("{checkout_id}.readers"))
+}
+
+/// The registered run reader for this process, removed again if the program
+/// could not be executed.
+pub struct RunCustody {
+    path: PathBuf,
+}
+
+impl RunCustody {
+    pub fn abandon(self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Register this process as a reader of `root` before its slot is released,
+/// so the checkout's output custody is continuous from the build through the
+/// executed program.
+pub fn hold_for_run(control: &Path, checkout: &Path, root: &Path) -> Result<RunCustody, String> {
+    let checkout_id = identity::digest(&checkout.to_string_lossy());
+    let directory = readers_directory(control, &checkout_id);
+    create_owned_directory(&control.join("outputs"))?;
+    create_owned_directory(&directory)?;
+    let live = live_run_readers(control, &checkout_id, true)?;
+    if live.len() >= MAX_READERS {
+        return Err(format!(
+            "outputs: {} programs already run from this checkout's outputs; refusing to start another",
+            live.len()
+        ));
+    }
+    let pid = std::process::id();
+    let reader = RunReader {
+        version: READER_VERSION.to_owned(),
+        pid,
+        start: process::start_identity(pid),
+        root: root.to_path_buf(),
+    };
+    let bytes = serde_json::to_vec(&reader)
+        .map_err(|error| format!("cannot encode the run reader: {error}"))?;
+    let path = directory.join(format!("{pid}.json"));
+    let _ = fs::remove_file(&path);
+    write_private(&path, &bytes)?;
+    sync_directory(&directory)?;
+    Ok(RunCustody { path })
+}
+
+/// PIDs of programs `oxide run` executed from this checkout's outputs that
+/// still run. `prune` removes stale entries; any unreadable, malformed or
+/// excess entry is unknown custody and refuses.
+fn live_run_readers(control: &Path, checkout_id: &str, prune: bool) -> Result<Vec<u32>, String> {
+    let directory = readers_directory(control, checkout_id);
+    let entries = match fs::read_dir(&directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("cannot read {}: {error}", directory.display())),
+        Ok(entries) => entries,
+    };
+    let mut live = Vec::new();
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_READERS * 2 {
+            return Err(format!(
+                "{} holds more run readers than Oxide tracks; custody is unknown",
+                directory.display()
+            ));
+        }
+        let path = entry
+            .map_err(|error| format!("cannot read {}: {error}", directory.display()))?
+            .path();
+        let unknown =
+            |why: &str| format!("run reader {} {why}; custody is unknown", path.display());
+        let metadata = fs::symlink_metadata(&path).map_err(|error| unknown(&error.to_string()))?;
+        if !metadata.is_file() || metadata.len() > MAX_READER_BYTES {
+            return Err(unknown("is not a bounded regular file"));
+        }
+        let bytes = fs::read(&path).map_err(|error| unknown(&error.to_string()))?;
+        let reader: RunReader =
+            serde_json::from_slice(&bytes).map_err(|error| unknown(&error.to_string()))?;
+        if reader.version != READER_VERSION {
+            return Err(unknown("has an unsupported version"));
+        }
+        let alive = match (reader.start, process::start_identity(reader.pid)) {
+            (Some(recorded), Some(current)) => recorded == current,
+            // Without a readable start time a live PID stays custody.
+            _ => process::pid_exists(reader.pid),
+        };
+        if alive {
+            live.push(reader.pid);
+        } else if prune {
+            let _ = fs::remove_file(&path);
+        }
+    }
+    live.sort_unstable();
+    Ok(live)
+}
+
+/// Refuse an explicit output command or a clean while a program started by
+/// `oxide run` still runs from this checkout's outputs.
+fn refuse_run_readers(context: &Context, action: &str) -> Result<(), String> {
+    let Some(control) = context.control() else {
+        return Ok(());
+    };
+    let live = live_run_readers(control, &context.checkout_id, true)?;
+    match live.first() {
+        None => Ok(()),
+        Some(pid) => Err(format!(
+            "{action} refused: a program started by `oxide run` (pid {pid}) still runs from this checkout's outputs; nothing was changed. Let it exit first"
+        )),
+    }
+}
+
 /// The internal pool paired with a registered removable pool, so the clean
 /// barrier an output transition takes spans a checkout's builds in either
 /// pool (the same pairing `oxide clean` uses).
@@ -1470,6 +1663,11 @@ fn usable_external(context: &Context) -> Result<removable::Registration, String>
         removable::read_registration(control)?.ok_or("no removable drive is registered")?;
     if registration.mode != DriveMode::Permanent {
         return Err("the drive is not in permanent mode".to_owned());
+    }
+    if let Some(reason) = context.pool_fallback.as_deref() {
+        return Err(format!(
+            "this command's intermediate slot fell back to the internal pool ({reason}), so the drive's removal is not supervised"
+        ));
     }
     if !cfg!(target_os = "macos") {
         return Err("the removable backend is macOS-only".to_owned());
@@ -2422,6 +2620,7 @@ pub fn clean_placement(workspace: &Path) -> Result<Option<CleanPlacement>, Strin
                 .to_owned(),
         ),
         ReceiptState::Committed => {
+            refuse_run_readers(&context, "clean")?;
             let selected = receipt
                 .selected()
                 .cloned()
@@ -2800,11 +2999,11 @@ mod tests {
     fn the_slot_destination_is_empty_until_a_checkout_is_converted() {
         let fixture = Fixture::new();
         let context = fixture.context();
-        let planned = planned_destination(Some(&fixture.control), &fixture.checkout).unwrap();
+        let planned = planned_destination(Some(&fixture.control), &fixture.checkout, None).unwrap();
         assert!(planned.is_none());
         assert_eq!(destination_facts(None), "");
         let receipt = transition(&context, &fixture.receipt(), &fixture.local()).unwrap();
-        let planned = planned_destination(Some(&fixture.control), &fixture.checkout)
+        let planned = planned_destination(Some(&fixture.control), &fixture.checkout, None)
             .unwrap()
             .unwrap();
         assert_eq!(planned.kind, RootKind::Local);
@@ -2816,7 +3015,7 @@ mod tests {
         // a warm slot survives a relink.
         let again = transition(&context, &receipt, &fixture.local()).unwrap();
         assert_eq!(again.generation, 2);
-        let planned = planned_destination(Some(&fixture.control), &fixture.checkout)
+        let planned = planned_destination(Some(&fixture.control), &fixture.checkout, None)
             .unwrap()
             .unwrap();
         assert_eq!(destination_facts(Some(&planned)), first);
@@ -3139,6 +3338,149 @@ mod tests {
         symlink(&elsewhere, fresh.checkout.join(LOCAL_DIR)).unwrap();
         assert!(ensure_root(&context, &fresh.local(), 1).is_err());
         assert!(listing(&elsewhere.join(LOCAL_ROOT)).is_empty());
+    }
+
+    fn register(fixture: &Fixture, mode: DriveMode) {
+        let registration = removable::Registration {
+            version: 2,
+            mount_point: fixture.root.join("absent-volume"),
+            volume_uuid: "11111111-2222-3333-4444-555555555555".to_owned(),
+            container_uuid: "66666666-7777-8888-9999-000000000000".to_owned(),
+            reserve_bytes: 1,
+            cap_bytes: 1 << 30,
+            quota_bytes: None,
+            capacity_bytes: None,
+            registered_ms: 1,
+            mode,
+        };
+        let path = fixture.control.join("removable.json");
+        fs::write(&path, serde_json::to_vec(&registration).unwrap()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn committed_external(fixture: &Fixture) -> (Receipt, PathBuf) {
+        let root = fixture.root.join("volume/oxide-outputs/checkout-0000");
+        let mut receipt = fixture.receipt();
+        receipt.state = ReceiptState::Committed;
+        receipt.generation = 1;
+        receipt.selected = Some(Selected {
+            kind: RootKind::External,
+            root: root.clone(),
+            volume_uuid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
+            generation: 1,
+        });
+        write_receipt(&fixture.control, &receipt).unwrap();
+        (receipt, root)
+    }
+
+    /// Ephemeral mode never relinks, so a converted checkout plans the root
+    /// its committed link selects (here external), not the local fallback.
+    #[test]
+    fn ephemeral_mode_plans_the_committed_root() {
+        let fixture = Fixture::new();
+        register(&fixture, DriveMode::Ephemeral);
+        let (_, external) = committed_external(&fixture);
+        let planned = planned_destination(Some(&fixture.control), &fixture.checkout, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(planned.kind, RootKind::External);
+        assert_eq!(planned.root, external);
+        // With the intermediate slot on the internal pool, the external root
+        // would be written unsupervised: ephemeral binding refuses.
+        let context = fixture
+            .context()
+            .with_pool_fallback(Some("container mismatch"));
+        let refused = match bind_ephemeral(&context, Some(&planned)) {
+            Ok(_) => panic!("an unsupervised external root was bound"),
+            Err(reason) => reason,
+        };
+        assert!(refused.contains("would not be supervised"), "{refused}");
+    }
+
+    /// Permanent mode never selects the external root for a command whose
+    /// intermediate slot fell back to the internal pool.
+    #[test]
+    fn a_pool_fallback_never_selects_the_external_root() {
+        let fixture = Fixture::new();
+        register(&fixture, DriveMode::Permanent);
+        let context = fixture
+            .context()
+            .with_pool_fallback(Some("container mismatch"));
+        let refused = usable_external(&context).unwrap_err();
+        assert!(
+            refused.contains("fell back to the internal pool"),
+            "{refused}"
+        );
+        let (_, external) = committed_external(&fixture);
+        let planned = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            Some("container mismatch"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(planned.kind, RootKind::Local);
+        assert_ne!(planned.root, external);
+    }
+
+    /// A run reader names one live process by PID and start time. A stale
+    /// entry is pruned, a malformed one is unknown custody, and adopt,
+    /// detach and clean refuse while a live reader exists.
+    #[test]
+    fn run_readers_hold_custody_until_their_process_ends() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let id = context.checkout_id.clone();
+        assert!(live_run_readers(&fixture.control, &id, true)
+            .unwrap()
+            .is_empty());
+        let custody = hold_for_run(&fixture.control, &fixture.checkout, &fixture.root).unwrap();
+        assert_eq!(
+            live_run_readers(&fixture.control, &id, true).unwrap(),
+            vec![std::process::id()]
+        );
+        let refused = refuse_run_readers(&context, "clean").unwrap_err();
+        assert!(refused.contains("still runs"), "{refused}");
+
+        // This PID with another start time is a reused PID: stale.
+        let directory = readers_directory(&fixture.control, &id);
+        let reused = RunReader {
+            version: READER_VERSION.to_owned(),
+            pid: std::process::id(),
+            start: process::start_identity(std::process::id()).map(|start| start + 1),
+            root: fixture.root.clone(),
+        };
+        custody.abandon();
+        let reused_path = directory.join("reused.json");
+        fs::write(&reused_path, serde_json::to_vec(&reused).unwrap()).unwrap();
+        if reused.start.is_some() {
+            assert!(live_run_readers(&fixture.control, &id, true)
+                .unwrap()
+                .is_empty());
+            assert!(!reused_path.exists(), "a stale reader was not pruned");
+        }
+        let _ = fs::remove_file(&reused_path);
+
+        // An exited child's PID is gone.
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let gone = RunReader {
+            version: READER_VERSION.to_owned(),
+            pid,
+            start: Some(1),
+            root: fixture.root.clone(),
+        };
+        fs::write(
+            directory.join("gone.json"),
+            serde_json::to_vec(&gone).unwrap(),
+        )
+        .unwrap();
+        assert!(refuse_run_readers(&context, "clean").is_ok());
+
+        fs::write(directory.join("bad.json"), b"{").unwrap();
+        let unknown = live_run_readers(&fixture.control, &id, true).unwrap_err();
+        assert!(unknown.contains("custody is unknown"), "{unknown}");
     }
 
     #[test]

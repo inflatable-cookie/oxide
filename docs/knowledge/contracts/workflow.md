@@ -2370,8 +2370,11 @@ migration and consumer adoption remain separate gates.
   `<checkout>/target` symlink. `CARGO_TARGET_DIR` stays that lexical path, so
   `target/debug` and the #106 profile rules are unchanged. Switching the
   registered drive back to ephemeral does not move or unlink a converted
-  checkout: it keeps building through its owned link, and refuses when the
-  link no longer matches the receipt (run `oxide outputs adopt`).
+  checkout: it keeps building through the committed root its owned link
+  selects, never relinked, and refuses when the link no longer matches the
+  receipt, or when that root is external and the command's intermediate slot
+  fell back to the internal pool (run `oxide outputs detach`, or return to
+  permanent mode and run `oxide outputs adopt`).
 - **Roots.** The real root lives outside the pool payload:
   `<mount>/oxide-outputs/<project>-<checkout id>/` on the registered volume,
   else the checkout-local fallback `<checkout>/.oxide-outputs/local/`.
@@ -2428,8 +2431,11 @@ migration and consumer adoption remain separate gates.
   detached checkout adds nothing to the key.
 - **Selection.** A command selects its destination once, when it starts (the
   external root only when the volume is present, registered, writable, above
-  its reserve and the root is on its device with a matching marker; otherwise
-  the local fallback), keys its slot from that destination, and then binds
+  its reserve, the root is on its device with a matching marker and the
+  command's intermediate slot comes from the removable pool, whose watchdog
+  supervises the drive's removal; otherwise the local fallback. The pool is
+  selected first, so a pool fallback (for example a container mismatch with
+  the drive still mounted) moves outputs to the local root too), keys its slot from that destination, and then binds
   exactly it before Cargo starts. Every reused root is revalidated in full —
   this checkout's marker, kind, volume, creation generation, device and
   ancestry, so a replaced `oxide-outputs` ancestor or a mismatched marker
@@ -2441,6 +2447,15 @@ migration and consumer adoption remain separate gates.
   than binding a root its slot was not keyed for. No command is redirected
   mid-run. A checkout that is not converted keeps ephemeral behaviour with a
   warning in permanent mode.
+- **`run` custody.** `oxide run` releases its slot before it replaces itself
+  with the program, so before release it registers the process (PID and
+  kernel start time, which `exec` keeps) as a reader in
+  `<internal pool>/oxide-managed/outputs/<checkout id>.readers/` and executes
+  the binary by its path in the bound real root, not through the link. While
+  that process lives a relink waits, and `adopt`, `detach` and clean refuse.
+  A reader whose PID is gone or names a process with another start time is
+  stale and pruned; a malformed entry or more than 64 is unknown custody and
+  refuses.
 - **Explicit commands.** `oxide outputs plan` is effect-free bounded JSON
   (`oxide.outputs.plan/1`, always `data_move: false`, with cooperative
   holders and the next generation). `adopt` converts only a missing or empty
@@ -2487,7 +2502,11 @@ destination with no write onto internal disk; crash replay at the prepared,
 sibling and renamed points plus the contradictory-state stop, a sibling-point
 replay refused before its rename when the registration names another volume,
 and a crafted link that appeared after a crash; a same-device symlinked
-`.oxide-outputs` refused by build and clean with the tree it names unchanged; a crafted quarantined writer blocking both
+`.oxide-outputs` refused by build and clean with the tree it names unchanged;
+a pool fallback (container mismatch) with the drive present moving outputs
+to the local root and redocking; a gated `oxide run` program executing from
+the real external root while a relink waits for it and clean refuses; a build
+in ephemeral mode before detach through the committed link; a crafted quarantined writer blocking both
 relink and clean; selected clean refusing after its link turned foreign while
 it waited, and selected and whole clean refusing a replaced or unusable
 volume while preserving the root, marker and inactive roots; a second
