@@ -210,12 +210,13 @@ def plan(proof: Proof, cwd: str, label: str) -> dict:
 
 def attach_image(proof: Proof, root: str, name: str) -> str:
     image = os.path.join(root, "volume.sparseimage")
-    created = proof.run(
-        ["/usr/bin/hdiutil", "create", "-size", "128m", "-fs", "APFS", "-volname", name]
-        + ["-type", "SPARSE", image],
-        timeout=60,
-    )
-    expect(created.returncode == 0, f"image creation failed: {created.stderr!r}")
+    if not os.path.exists(image):
+        created = proof.run(
+            ["/usr/bin/hdiutil", "create", "-size", "128m", "-fs", "APFS", "-volname", name]
+            + ["-type", "SPARSE", image],
+            timeout=60,
+        )
+        expect(created.returncode == 0, f"image creation failed: {created.stderr!r}")
     attached = proof.run(["/usr/bin/hdiutil", "attach", "-nobrowse", "-plist", image], timeout=60)
     expect(
         attached.returncode == 0,
