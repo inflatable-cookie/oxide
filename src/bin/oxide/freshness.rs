@@ -16,7 +16,7 @@
 
 use crate::cli::Resolution;
 use crate::MIB;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsString};
@@ -26,6 +26,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Dirty files in one checkout and uncertain paths per slot. Beyond this the
@@ -41,6 +42,10 @@ pub const MAX_SUBMODULES: usize = 32;
 /// fingerprint.
 const MAX_GIT_BYTES: u64 = 16 * MIB;
 const GIT_CALL_TIME: Duration = Duration::from_secs(30);
+/// Time after the child is reaped for pipes still held by anything it started
+/// to close. A reader that misses it is detached: the gate refuses the slot
+/// rather than waiting past its own clock.
+const GIT_SETTLE_TIME: Duration = Duration::from_secs(2);
 /// One snapshot or prepare: cumulative `git` work. The invocation count can
 /// bind before the submodule cap; exhaustion refuses the slot.
 const MAX_GIT_CALLS: usize = 64;
@@ -118,16 +123,43 @@ pub enum SubmoduleState {
 /// that differs from it (tracked changes and untracked files Git does not
 /// ignore), and the state of every declared submodule. Paths are relative to
 /// the repository top level.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct Content {
     pub tree: String,
     pub dirty: BTreeMap<String, String>,
-    /// Every gitlink the index and `HEAD` declare, in path order. Legacy
-    /// records default to empty; a record that lacks it never vouches for a
-    /// checkout that declares submodules.
-    #[serde(default)]
+    /// Every gitlink the index and `HEAD` declare, in path order. A written
+    /// record always carries this field, even when it is empty. Legacy
+    /// records that lack it parse as empty but never vouch for a checkout
+    /// that declares submodules.
     pub submodules: BTreeMap<String, SubmoduleState>,
+    /// Whether the parsed record carried submodule state at all. Every fresh
+    /// snapshot sets it; only a record that predates the field leaves it
+    /// false. Never serialized, because writing always includes the field.
+    #[serde(skip)]
+    has_submodules: bool,
+}
+
+/// A content record's on-disk shape, kept apart only to tell a missing
+/// `submodules` field apart from an empty one.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContentRecord {
+    tree: String,
+    dirty: BTreeMap<String, String>,
+    #[serde(default)]
+    submodules: Option<BTreeMap<String, SubmoduleState>>,
+}
+
+impl<'de> Deserialize<'de> for Content {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let record = ContentRecord::deserialize(deserializer)?;
+        Ok(Self {
+            tree: record.tree,
+            dirty: record.dirty,
+            has_submodules: record.submodules.is_some(),
+            submodules: record.submodules.unwrap_or_default(),
+        })
+    }
 }
 
 /// What a slot last compiled.
@@ -303,7 +335,7 @@ pub fn prepare(checkout: &Path, prior: &Prior, request: &Resolution) -> Result<G
         Prior::Known(Built::Content(origin)) => {
             let mut git = Git::new();
             let current = snapshot_with(checkout, &mut git)?;
-            compatible(origin.content_version, &current.content)?;
+            compatible(&origin, &current.content)?;
             let changed = differing(&mut git, &current.top, &origin.content, &current.content)?;
             let cross = origin.checkout != checkout;
             // Refreshing relies on Cargo's rules; an unchanged repeat does not.
@@ -357,15 +389,20 @@ pub fn prepare(checkout: &Path, prior: &Prior, request: &Resolution) -> Result<G
 }
 
 /// A content record vouches for a checkout only when its schema covers what
-/// the checkout declares. A legacy record and a checkout with gitlinks are
-/// not equivalent even when both submodule maps are empty.
-fn compatible(version: u32, current: &Content) -> Result<(), Refusal> {
-    match version {
-        0 if current.submodules.is_empty() => Ok(()),
-        0 => Err("the slot's origin lacks submodule state".into()),
-        CONTENT_VERSION => Ok(()),
-        _ => Err("the slot's content record has an unknown version".into()),
+/// the checkout declares. A record without submodule state, and a checkout
+/// with gitlinks, are not equivalent even when both maps are empty: version 0
+/// predates the field, and a version-1 record that omitted it is treated the
+/// same way.
+fn compatible(origin: &Origin, current: &Content) -> Result<(), Refusal> {
+    if !matches!(origin.content_version, 0 | CONTENT_VERSION) {
+        return Err("the slot's content record has an unknown version".into());
     }
+    if !current.submodules.is_empty()
+        && !(origin.content_version == CONTENT_VERSION && origin.content.has_submodules)
+    {
+        return Err("the slot's origin lacks submodule state".into());
+    }
+    Ok(())
 }
 
 /// `cargo -V` in the inherited working directory, where the guarded Cargo
@@ -420,13 +457,16 @@ fn now_ns() -> u64 {
 /// Every call carries `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0` and
 /// `-c submodule.recurse=0`: reading the index never rewrites it, no
 /// credential prompt can block, and no Git command descends into a
-/// submodule. Each call is bound in output and lifetime; the whole context is
-/// bound in wall wait and invocation count. Exhaustion is a refusal, never a
-/// partial fingerprint. There is no `submodule` subcommand, network or config
-/// write.
+/// submodule. Each call is bound in lifetime; the whole context is bound in
+/// wall wait, total stdout and invocation count. Output readers are attached
+/// to channels and only waited for within that budget, so a pipe held by a
+/// process Git started can never hold the gate past its clock. Exhaustion is a
+/// refusal, never a partial fingerprint. There is no `submodule` subcommand,
+/// network or config write.
 struct Git {
     calls: usize,
     waited: Duration,
+    bytes: u64,
 }
 
 impl Git {
@@ -434,10 +474,24 @@ impl Git {
         Self {
             calls: 0,
             waited: Duration::ZERO,
+            bytes: 0,
         }
     }
 
+    /// Charge one call's stdout against the cumulative budget. The design's
+    /// 16 MiB is a limit for one snapshot or prepare, not only a per-call cap.
+    fn charge(&mut self, bytes: u64) -> Result<(), String> {
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.bytes > MAX_GIT_BYTES {
+            return Err(format!(
+                "the gate's git output exceeded {MAX_GIT_BYTES} bytes"
+            ));
+        }
+        Ok(())
+    }
+
     fn run(&mut self, dir: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>, String> {
+        let name = args.first().copied().unwrap_or("");
         if self.calls >= MAX_GIT_CALLS {
             return Err(format!(
                 "the gate needs more than {MAX_GIT_CALLS} git calls"
@@ -469,52 +523,73 @@ impl Git {
             Some(bytes) => {
                 let mut stdin = child.stdin.take().ok_or("git stdin was not captured")?;
                 let bytes = bytes.to_vec();
-                Some(std::thread::spawn(move || stdin.write_all(&bytes)))
+                let (sender, receiver) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = sender.send(stdin.write_all(&bytes));
+                });
+                Some(receiver)
             }
         };
         let stdout = child.stdout.take().ok_or("git stdout was not captured")?;
         let stderr = child.stderr.take().ok_or("git stderr was not captured")?;
-        let out = std::thread::spawn(move || read_capped(stdout, MAX_GIT_BYTES));
-        let err = std::thread::spawn(move || read_capped(stderr, MAX_METADATA_ERROR_BYTES));
+        let (out_sender, out_receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = out_sender.send(read_capped(stdout, MAX_GIT_BYTES));
+        });
+        let (err_sender, err_receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = err_sender.send(read_capped(stderr, MAX_METADATA_ERROR_BYTES));
+        });
         let started = Instant::now();
         let deadline = started + limit;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break Ok(status),
                 Ok(None) if Instant::now() >= deadline => {
-                    // Our own child; reaping it closes the pipes.
+                    // Our own child; reaping it closes the pipes unless
+                    // something it started still holds them. Those readers
+                    // are detached, so the gate keeps its own clock.
                     let _ = child.kill();
                     let _ = child.wait();
-                    break Err(format!(
-                        "git {} did not finish in time",
-                        args.first().unwrap_or(&"")
-                    ));
+                    break Err(format!("git {name} did not finish in time"));
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(5)),
                 Err(error) => break Err(format!("could not wait for git: {error}")),
             }
         };
-        let out = out.join().map_err(|_| "git output reader panicked")?;
-        let err = err.join().map_err(|_| "git error reader panicked")?;
         self.waited = self.waited.saturating_add(started.elapsed());
         let status = status?;
-        let written = match writer {
+        let settle = GIT_SETTLE_TIME.min(GIT_TOTAL_TIME.saturating_sub(self.waited));
+        let settling = Instant::now();
+        let out = out_receiver.recv_timeout(settle);
+        let err = err_receiver.recv_timeout(settle);
+        let written = writer
+            .as_ref()
+            .map(|receiver| receiver.recv_timeout(settle));
+        self.waited = self.waited.saturating_add(settling.elapsed());
+        let (stdout, overflow) = out
+            .map_err(|_| format!("git {name} did not close its output in time"))?
+            .map_err(|error| format!("cannot read git output: {error}"))?;
+        let stderr = err
+            .map_err(|_| format!("git {name} did not close its errors in time"))?
+            .map(|(bytes, _)| bytes)
+            .unwrap_or_default();
+        let written = match written {
             None => Ok(()),
-            Some(writer) => writer.join().map_err(|_| "git input writer panicked")?,
+            Some(result) => {
+                result.map_err(|_| format!("git {name} did not finish its input in time"))?
+            }
         };
-        let (stdout, overflow) = out.map_err(|error| format!("cannot read git output: {error}"))?;
-        let stderr = err.map(|(bytes, _)| bytes).unwrap_or_default();
+        self.charge(stdout.len() as u64)?;
         if !status.success() || written.is_err() {
             return Err(format!(
-                "git {} failed: {}",
-                args.first().unwrap_or(&""),
+                "git {name} failed: {}",
                 String::from_utf8_lossy(&stderr).trim()
             ));
         }
         if overflow {
             return Err(format!(
-                "git {} printed more than {MAX_GIT_BYTES} bytes",
-                args.first().unwrap_or(&"")
+                "git {name} printed more than {MAX_GIT_BYTES} bytes"
             ));
         }
         Ok(stdout)
@@ -628,6 +703,7 @@ fn snapshot_with(path: &Path, git: &mut Git) -> Result<Snapshot, String> {
             tree,
             dirty,
             submodules,
+            has_submodules: true,
         },
         children,
     })
@@ -1590,6 +1666,17 @@ mod tests {
                 .map(|(path, digest)| ((*path).to_owned(), (*digest).to_owned()))
                 .collect(),
             submodules: BTreeMap::new(),
+            has_submodules: true,
+        }
+    }
+
+    fn origin_with(version: u32, content: Content) -> Origin {
+        Origin {
+            checkout: PathBuf::from("/a"),
+            content,
+            content_version: version,
+            anchor_ns: 0,
+            uncertain: BTreeSet::new(),
         }
     }
 
@@ -1989,6 +2076,7 @@ mod tests {
         .expect("legacy");
         assert_eq!(legacy.content_version, 0);
         assert!(legacy.content.submodules.is_empty());
+        assert!(!legacy.content.has_submodules);
         assert!(serde_json::from_str::<Origin>(
             r#"{"checkout":"/a","content":{"tree":"t","dirty":{}},"anchor_ns":1,"uncertain":[],"extra":1}"#
         )
@@ -2026,15 +2114,48 @@ mod tests {
     #[test]
     fn a_legacy_record_never_vouches_for_a_checkout_with_gitlinks() {
         let mut current = content("t", &[]);
-        assert!(compatible(0, &current).is_ok());
-        assert!(compatible(CONTENT_VERSION, &current).is_ok());
-        assert!(compatible(CONTENT_VERSION + 1, &current).is_err());
+        assert!(compatible(&origin_with(0, current.clone()), &current).is_ok());
+        assert!(compatible(&origin_with(CONTENT_VERSION, current.clone()), &current).is_ok());
+        assert!(compatible(&origin_with(CONTENT_VERSION + 1, current.clone()), &current).is_err());
         current
             .submodules
             .insert("sub".to_owned(), SubmoduleState::Uninitialized);
-        assert!(compatible(0, &current).is_err());
-        assert!(compatible(CONTENT_VERSION, &current).is_ok());
-        assert!(compatible(2, &current).is_err());
+        assert!(compatible(&origin_with(0, current.clone()), &current).is_err());
+        assert!(compatible(&origin_with(CONTENT_VERSION, current.clone()), &current).is_ok());
+        assert!(compatible(&origin_with(2, current.clone()), &current).is_err());
+    }
+
+    #[test]
+    fn a_version_one_record_without_submodule_state_refuses_gitlinks() {
+        // The field is absent from this record even though it claims version
+        // 1; it must not be treated as an empty, equivalent state.
+        let legacy: Origin = serde_json::from_str(
+            r#"{"checkout":"/a","content":{"tree":"t","dirty":{}},"content_version":1,"anchor_ns":1,"uncertain":[]}"#,
+        )
+        .expect("parses");
+        assert!(!legacy.content.has_submodules);
+        let mut current = content("t", &[]);
+        assert!(compatible(&legacy, &current).is_ok());
+        current
+            .submodules
+            .insert("sub".to_owned(), SubmoduleState::Uninitialized);
+        assert!(compatible(&legacy, &current).is_err());
+        // A written record always carries the field, even when empty.
+        let written = serde_json::to_value(origin_with(CONTENT_VERSION, content("t", &[])))
+            .expect("serialise");
+        assert!(written["content"].get("submodules").is_some());
+    }
+
+    #[test]
+    fn git_stdout_is_capped_cumulatively() {
+        let mut git = Git::new();
+        assert!(git.charge(MAX_GIT_BYTES / 2).is_ok());
+        assert!(git.charge(MAX_GIT_BYTES / 2).is_ok());
+        assert!(git.charge(1).is_err());
+        let mut exhausted = Git::new();
+        assert!(exhausted.charge(MAX_GIT_BYTES).is_ok());
+        assert!(exhausted.charge(0).is_ok());
+        assert!(exhausted.charge(1).is_err());
     }
 
     #[test]

@@ -400,13 +400,17 @@ current state is Exact, the child's own tracked files; a checkout-path change
 refreshes those files too, so a local package inside a submodule rebuilds like
 any other local input. Submodule ignored files stay outside the limit.
 
-Legacy content records without submodule state never vouch for a checkout that
-declares gitlinks. Records are written with content version 1, and the added
-fields make an older Oxide discard the slot rather than guess. One
-snapshot or prepare is bound to 64 `git` invocations and 60 s of cumulative
-wait; each call to 16 MiB and 30 s. Exceeding any bound, more than 32
-gitlinks, 200,000 listed files or 4,096 dirty-and-uncertain paths refuses the
-slot without a partial fingerprint.
+A record without submodule state never vouches for a checkout that declares
+gitlinks: version 0 predates the field, and a version-1 record that omits it is
+refused the same way rather than read as an empty, equivalent map. Records are
+written with content version 1 and always carry the field; the added fields
+make an older Oxide discard the slot rather than guess. One snapshot or
+prepare is bound to 64 `git` invocations, 60 s of cumulative wait and 16 MiB
+of cumulative stdout; each call is a 30 s subcap. A call that ends while a
+process Git started still holds its pipes is waited for only briefly and then
+refused, so no reader can hold the gate past its clock. Exceeding any bound,
+more than 32 gitlinks, 200,000 listed files or 4,096 dirty-and-uncertain paths
+refuses the slot without a partial fingerprint.
 
 The origin is trusted only when the record's use counter still equals the
 value stamped when it was written. Leasing re-stamps a trusted origin before
