@@ -256,6 +256,21 @@ pub struct PoolInfo {
     pub verified_capacity_bytes: u64,
 }
 
+/// What [`managed::describe_volume`] read from an `apfs-volume-v1` pool's
+/// config and ledger. The volume itself is probed by the caller.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolumeDescription {
+    pub store_id: String,
+    pub cap_bytes: u64,
+    /// The volume the config records. The caller compares it with its own
+    /// registration; nothing here re-verifies it.
+    pub mount_point: PathBuf,
+    pub volume_uuid: String,
+    pub payload_dir: String,
+    /// Recorded slot deletions an open would reconcile. Read, not run.
+    pub evicting_slots: usize,
+}
+
 /// Status of one slot. No payload or secret content.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

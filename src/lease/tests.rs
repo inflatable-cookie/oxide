@@ -1836,6 +1836,108 @@ fn ledger_view_refuses_a_foreign_pool_entry_like_status() {
     assert_eq!(ledger_injected(&pool).map(|_| ()), Err(expected));
 }
 
+const VOLUME_UUID: &str = "A6AC3ED7-33EA-46B4-8082-7254CF291ED2";
+
+const VOLUME_CONFIG: &str = r#"{"version":1,"backend":"apfs-volume-v1","store_id":"store","cap_bytes":1000,"image_bytes":0,"volume":{"mount_point":"/Volumes/Builds","volume_uuid":"A6AC3ED7-33EA-46B4-8082-7254CF291ED2","payload_dir":"oxide-pool"}}"#;
+
+const LEDGER_WITH_EVICTING: &str = r#"{"version":1,"store_id":"store","cap_bytes":1000,"next_slot":3,"next_lease":3,"slots":[{"id":1,"incarnation":1,"state":"evicting","project":"/p","workspace":"/p","profile":"dev","holder":"h","lease_id":null,"last_lease_id":"l1"},{"id":2,"incarnation":1,"state":"idle","project":"/p","workspace":"/p","profile":"dev","holder":"h","lease_id":null,"last_lease_id":"l2"}]}"#;
+
+/// A control directory with private config and ledger files, as init writes.
+fn control_fixture(fixture: &Fixture, config: &str, ledger: &str) -> PathBuf {
+    let control = fixture.dir("control");
+    fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).expect("private control");
+    for (name, text) in [("config.json", config), ("ledger.json", ledger)] {
+        let path = control.join(name);
+        fs::write(&path, text).expect("fixture file");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private file");
+    }
+    control
+}
+
+/// The read-only description reads config and ledger and changes nothing,
+/// pending eviction records included: no lock, no reconciliation, no write.
+#[test]
+fn volume_description_reads_config_and_ledger_without_mutation() {
+    let fixture = Fixture::new("describe");
+    let control = control_fixture(&fixture, VOLUME_CONFIG, LEDGER_WITH_EVICTING);
+    let before = snapshot_tree(&control);
+    let description = managed::describe_volume(&control).expect("describe");
+    assert_eq!(description.evicting_slots, 1);
+    assert_eq!(description.volume_uuid, VOLUME_UUID);
+    assert_eq!(description.mount_point, PathBuf::from("/Volumes/Builds"));
+    assert_eq!(description.payload_dir, "oxide-pool");
+    assert_eq!(description.cap_bytes, 1000);
+    assert_eq!(description.store_id, "store");
+    assert_eq!(
+        snapshot_tree(&control),
+        before,
+        "describe must not change the control directory"
+    );
+    assert!(!control.join("lock").exists(), "describe takes no lock");
+}
+
+/// A missing control directory's files are `NotFound`, not a guess.
+#[test]
+fn volume_description_reports_missing_config_as_not_found() {
+    let fixture = Fixture::new("describe-missing");
+    let control = fixture.dir("control");
+    fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).expect("private control");
+    assert_eq!(
+        managed::describe_volume(&control),
+        Err(LeaseError::NotFound)
+    );
+    assert!(fs::read_dir(&control).expect("read").next().is_none());
+}
+
+/// An unreadable control file is unknown metadata, not a missing file. The
+/// existing test-only seam leaves permissions and the control tree unchanged.
+#[test]
+fn volume_description_reports_unreadable_control_metadata_as_io() {
+    let fixture = Fixture::new("describe-unreadable");
+    let control = control_fixture(&fixture, VOLUME_CONFIG, LEDGER_WITH_EVICTING);
+    let before = snapshot_tree(&control);
+    for name in ["config.json", "ledger.json"] {
+        let denied = crate::test_fs::PermissionDeniedGuard::symlink_metadata(&control.join(name));
+        assert_eq!(
+            managed::describe_volume(&control),
+            Err(LeaseError::Io(
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied).to_string()
+            ))
+        );
+        assert_eq!(
+            denied.hits(),
+            1,
+            "the control-file lookup must be exercised"
+        );
+        drop(denied);
+        assert_eq!(snapshot_tree(&control), before);
+    }
+    assert!(managed::describe_volume(&control).is_ok());
+}
+
+/// Records that are not an apfs-volume-v1 pool, or whose config and ledger
+/// disagree, refuse without touching anything.
+#[test]
+fn volume_description_refuses_other_backends_and_mismatched_ledgers() {
+    let fixture = Fixture::new("describe-refuse");
+    let budget_config = VOLUME_CONFIG.replace("apfs-volume-v1", BUDGET_BACKEND_DIRECTORY_V1);
+    let other_store =
+        LEDGER_WITH_EVICTING.replace("\"store_id\":\"store\"", "\"store_id\":\"other\"");
+    for (config, ledger) in [
+        (budget_config.as_str(), LEDGER_WITH_EVICTING),
+        (VOLUME_CONFIG, other_store.as_str()),
+    ] {
+        let control = control_fixture(&fixture, config, ledger);
+        let before = snapshot_tree(&control);
+        assert_eq!(
+            managed::describe_volume(&control),
+            Err(LeaseError::BackingMismatch)
+        );
+        assert_eq!(snapshot_tree(&control), before);
+        fs::remove_dir_all(&control).expect("remove fixture control");
+    }
+}
+
 fn labelled(
     pool: &Path,
     project: &Path,

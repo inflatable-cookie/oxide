@@ -2541,9 +2541,9 @@ refused when Git would track it; and `detach` refusing while permanent and
 restoring a real directory afterwards. Not a benchmark, real-drive
 qualification or an alias for full QA.
 
-### Proposed: `oxide pool describe --json` (lead `beec4971`)
+### `oxide pool describe --json`
 
-Proposed, not implemented. This is the stable, read-only interface other tools use to find the Builds drive. Its first consumer is Effigy's opt-in `[scratch] source = "oxide"` (Effigy lead `1a007b5d`). Output on stdout, schema version 1:
+The stable, read-only interface other tools use to find the registered Builds drive. Oxide#112 implements it. The recorded fixed native proof passed at `ade4d51` under the qualified runner `d89115f1` (run `7bca5d80c0242754ec72b928a86f84b4`), including the `reserve_bytes` assertions. That source predates describe's registration-v2/mode integration and does not validate the integrated source. Earlier passes at `1f9607c1` (run `5711ac9a89310c08052f3929e9198a20`), `034f9ac4` under the qualified #109 runner (run `580419035311c3a1ee3061c0a7a95ed6`), and `89aa9b2e` remain historical; the last two predate the host commit prefilter. Output on stdout, schema version 1:
 
 ```json
 {
@@ -2555,6 +2555,7 @@ Proposed, not implemented. This is the stable, read-only interface other tools u
     "mount_point": "/Volumes/Builds",
     "volume_uuid": "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
     "mode": "ephemeral",
+    "reserve_bytes": 21474836480,
     "available": true,
     "unavailable_reason": null,
     "payload": "/Volumes/Builds/oxide-pool",
@@ -2563,19 +2564,27 @@ Proposed, not implemented. This is the stable, read-only interface other tools u
 }
 ```
 
-- **`removable`** is `null` when no drive is registered, and `selected` is then `"internal"`.
-- **`mode`** is `"permanent"` or `"ephemeral"`, from the removable registration. A legacy version 1 registration without a mode reports `"ephemeral"`; reads never migrate it. The describe implementation will use the same version-aware registration parser as `oxide status`.
-- **`available`** is **passive eligibility**, not a prediction that the next build will open or be admitted to the pool. It is `true` only when every check below passes, using only read-only observations:
-  - the registered drive passes selection's checks: the `/Volumes` mount-parent rule, the opened mount root with the registered volume UUID, the registered container outside the boot and data container, no APFS role, writability, and available space above the reserve;
-  - the removable pool's existing config and ledger read cleanly with matching identities.
+- **`removable`** is `null` when no drive is registered, and `selected` is then `"internal"`. When the registration file exists but cannot be read, `removable` is an object whose `mount_point`, `volume_uuid`, `payload` and `suggested_scratch_root` are `null`, with `available: false` and reason `"metadata_unknown"`. Nothing identifies the drive then, so no identity is invented.
+- **`mode`** comes from the same version-aware registration parser as `oxide status`: legacy version 1 without a mode means `"ephemeral"`; version 2 reports its registered `"ephemeral"` or `"permanent"` mode, even when the volume is unavailable. Reads never migrate the registration. An unreadable registration retains the schema-1 `"ephemeral"` placeholder; it does not establish the registered mode, and `available` is false.
+- **`available`** is **passive eligibility**, not a prediction that the next build will open or be admitted to the pool. It is `true` only when every check passes, using read-only observations:
+  - the mount point holds the registered volume's root: `facts.mounted_on` is the path and the UUID matches, so a stale directory on the internal disk never qualifies;
+  - the `Binding` opens with the registered UUID, which applies the `/Volumes` mount-parent rule, and the volume is writable;
+  - `diskutil` reports the registered container, outside the boot/data container, with no APFS role;
+  - available space is above the registered reserve;
+  - the payload directory exists;
+  - the removable pool's config and ledger read cleanly, and the config matches the registration (volume, UUID, payload directory and budget).
 
-  Every `diskutil` or `plutil` read is bounded by a timeout and an output-size cap, and a timeout, oversize output or parse failure counts as unknown. Anything pending, indeterminate or unknown makes it `false`, with a reason: an `Evicting` record awaiting reconciliation (`"pending_reconciliation"`), missing control directories, unreadable or mismatched metadata (`"metadata_unknown"`, `"identity_mismatch"`), `"absent"` or `"below_reserve"`. `unavailable_reason` is otherwise `null`. Consumers branch on `available`, not on reason strings.
+  Every `diskutil` or `plutil` call is bounded: 5 s each and a 4 MiB output cap. A timeout, oversize output or parse failure counts as unknown. An `Evicting` record in the ledger makes the drive unavailable, because a build's open would reconcile it; `describe` reconciles nothing and reports it.
+- **`unavailable_reason`** is `null` when available. Otherwise one of: `absent` (nothing mounted at the registered path), `identity_mismatch` (a different volume, container or budget than registered), `volume_unusable` (refused by a selection rule such as the mount parent, read-only, a role or the boot container), `below_reserve`, `metadata_unknown` (a probe failed, timed out, was over cap or could not be parsed), `control_missing` (no internal control directory, config or ledger), `payload_missing`, or `pending_reconciliation`. Consumers branch on `available`, not on reason strings.
+- **`unavailable_detail`** is a human-readable explanation, added in schema 1. Its text is not stable.
+- **`reserve_bytes`** is the registered reserve in bytes, added in schema 1, and `null` when the registration cannot be read. `available` is only a snapshot of free space above it. A writer rechecks the mount, the volume UUID and free space against this value at use time.
 - **`selected`** is the passive preference: `"removable"` when `available` is true, otherwise `"internal"`. It is not a promise of the next build's selection, which stays authoritative inside the build and may differ, for example after its own reconciliation.
-- **`suggested_scratch_root`** is always outside `payload`. It is a suggestion, not a promise that the directory exists or a grant of write authority. Consumers create their own subdirectory, for example `<root>/effigy/<run-id>`, and never write under `payload`.
-- **Read-only.** Running `describe` mutates nothing. It never uses the build path's pool-opening helpers. It creates no control directories, reconciles no recorded deletion, writes no ledger and walks no accounting. Held records are reported as they are, with no claim about closure or accounting.
+- **`suggested_scratch_root`** is always outside `payload`. It is a suggestion, not a promise that the directory exists or a grant of write authority. Consumers create their own subdirectory, for example `<root>/<tool>/<run-id>`, and never write under `payload`.
+- **Read-only.** Running `describe` mutates nothing. It never uses the build path's pool openers (`Store::open_removable`, `Pool::open`), because those reconcile recorded deletions and create control directories. It reads the removable pool's config and ledger directly (`managed::describe_volume`): no lock, no control directory, no ledger write, no accounting walk. Held records are reported as they are, with no claim about closure or accounting.
 - **A snapshot.** The data is a point-in-time observation. Before writing, consumers still apply their own gate: the volume UUID, the mount root, and a device different from both `/` and `/System/Volumes/Data`.
-- **Exit codes:** 0 whenever the description was produced, whether or not a drive is registered or available. Non-zero only when Oxide itself fails, with the reason on stderr.
+- **Exit codes:** 0 whenever the description was produced, whether or not a drive is registered or available. Non-zero only when Oxide itself fails (for example, settings cannot be read), with the reason on stderr.
 - **Compatibility:** fields may be added in schema 1. Removing or renaming a field needs `oxide.pool.describe/2`.
+- **Proof.** Library tests read a private config and ledger fixture, including a pending record, and check the directory tree is unchanged afterwards. Refusals (other backends, mismatched store IDs, missing files) leave the tree unchanged. Unit tests use the existing thread-local permission-denied seam on both control files to verify that non-missing metadata failures propagate as I/O errors, rather than missing files, without changing the fixture. CLI unit tests cover legacy v1 and both v2 modes, malformed and unsupported registrations, byte/metadata/directory nonmutation, the RFC 3339 timestamp, null and unknown-registration JSON with escaping, reason tags, bounded reads and their output cap. Not yet proven: a real or tiny APFS volume. The fixed proof `rust:pool-describe` (`scripts/test-pool-describe.py`) passed at `ade4d51` (run `7bca5d80c0242754ec72b928a86f84b4`), and earlier at `1f9607c1` and `034f9ac4`. It covers four CLI case meanings, each with nonmutation: no registration, an unknown registration, an absent volume, and the usage refusal without `--json`. The absent-volume fixture now checks legacy v1 plus v2 ephemeral and permanent; the recorded native passes predate that extension. It runs inside the qualified shared runner (#109, `scripts/bounded-test.py` SHA-256 `d89115f1…`) with a 300 s limit and a 512 MiB monitored budget. Offline staging does not copy the host registry whole. The one locked Longhorn Git source seeds its bare database candidates (one to eight `longhorn-<16 hex>` directories, refused above eight), bounded by the same 256 MiB aggregate, each with a private config. A read-only prefilter checks the full locked commit in each host candidate before any copy, and only commit-bearing candidates are copied. Each private copy must resolve the locked commit again, and a refusal keeps the per-candidate record and charged bytes. After staging, exactly one checkout at the locked rev must exist, with exactly the full locked HEAD; Cargo chooses its identifier. The seed is selected from HEAD's `Cargo.lock`: one supported crates.io namespace, matched on index and cache, with at most 256 MiB aggregate of lock-selected cached inputs. Seed preflight plus copy is not one no-follow operation; that race is disclosed. It does not cover `available: true`, the volume-dependent refusals, pending reconciliation through the CLI, or live diskutil bounds. Those gaps are listed in the script.
 
 ## Adaptive sccache location (proposed)
 

@@ -105,6 +105,15 @@ fails, Oxide reports that the wait duration is unavailable.
   Also reports plain-Cargo output in this checkout's `target/` and the Cargo
   home's size.
   It never creates the pool.
+- `oxide pool describe --json` (macOS): the registered drive as stable JSON
+  (schema `oxide.pool.describe/1`). Branch on `available`, not on reason
+  strings. It reports the registered mode even when the volume is unavailable.
+  It changes nothing. The answer is a snapshot: before writing into
+  `suggested_scratch_root`, recheck the volume UUID, the mount root, that the
+  device differs from both `/` and `/System/Volumes/Data`, and free space above
+  `reserve_bytes`. The suggestion is not write permission, and nothing writes
+  under `payload`. The full contract is in `docs/knowledge/contracts/workflow.md`,
+  section `oxide pool describe --json`.
 - A registered removable drive has `ephemeral` or `permanent` mode. Register
   one with `oxide pool register-removable <mount> --reserve <size> --cap
   <size> [--mode ephemeral|permanent]`; the default is `ephemeral`. Change an
