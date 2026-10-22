@@ -25,6 +25,16 @@ permanent drive as one owned 128 MiB APFS sparse image attached at a unique
 - `oxide outputs detach` restoring a real directory and refusing while the
   drive mode is permanent.
 
+The focused modes reuse this fixture and staging helpers:
+
+- `auto-adopt`: automatic first conversion (oxide#121).
+- `ignore-safety`: the first conversion's Git ignore prerequisite
+  (oxide#125): a target link is published only when Git ignores its exact
+  non-directory repository-relative path, proven for explicit adopt, automatic
+  adoption and prepared first-conversion replay, with trailing-slash,
+  negated, unignored, tracked, missing-Git, timeout and malformed-answer
+  refusals that change nothing.
+
 Not a benchmark, not real-drive qualification and not full QA.
 """
 
@@ -428,6 +438,10 @@ def run(proof: Proof, repo: str) -> None:
     untracked = write_plain(os.path.join(root, "untracked"))
     for fixture in (app, keep, foreign, untracked):
         proof.run(["git", "init", "-q"], cwd=fixture, timeout=30)
+        # A first conversion needs Git to ignore the exact non-directory link
+        # path (oxide#125); `/.oxide-outputs/` is still left to `oxide init`.
+        with open(os.path.join(fixture, ".gitignore"), "w", encoding="utf-8") as handle:
+            handle.write("/target\n")
     expect(
         proof.run(["git", "check-ignore", "-q", "--", ".oxide-outputs"], cwd=app).returncode != 0,
         "the fixture already ignored .oxide-outputs before oxide init",
@@ -1372,9 +1386,15 @@ def receipt_file(pool: str, checkout: str) -> str:
     return os.path.join(pool, "oxide-managed", "outputs", key + ".json")
 
 
-def fresh_checkout(proof: Proof, root: str, name: str) -> str:
+def fresh_checkout(proof: Proof, root: str, name: str, ignore: str | None = "/target\n") -> str:
+    """A fresh checkout in its own Git work tree. `ignore` is its whole
+    `.gitignore`; a first conversion needs Git to ignore the exact
+    non-directory link path (oxide#125)."""
     path = write_tree(os.path.join(root, "checkouts", name), APP)
     proof.run(["git", "init", "-q"], cwd=path, timeout=30)
+    if ignore is not None:
+        with open(os.path.join(path, ".gitignore"), "w", encoding="utf-8") as handle:
+            handle.write(ignore)
     expect(not os.path.lexists(os.path.join(path, "target")), f"{name} already has a target")
     return path
 
@@ -1637,9 +1657,497 @@ def auto_run(proof: Proof, repo: str) -> None:
     proof.detach()
 
 
+def roots_on(mount: str) -> list[str]:
+    """The output roots currently on the drive's oxide-outputs directory."""
+    root = os.path.join(mount, "oxide-outputs")
+    return sorted(os.listdir(root)) if os.path.isdir(root) else []
+
+
+def git_status_names_target(proof: Proof, checkout: str) -> list[str]:
+    """`git status --porcelain` entries naming this checkout's `target`."""
+    result = proof.run(["git", "status", "--porcelain"], cwd=checkout, timeout=30)
+    expect(result.returncode == 0, f"git status failed in {checkout}: {result.stderr!r}")
+    named = []
+    for line in result.stdout.decode(errors="replace").splitlines():
+        path = line[3:].strip().strip('"')
+        if re.search(r"(^|/)target/?$", path):
+            named.append(line)
+    return named
+
+
+def git_index_names_target(proof: Proof, checkout: str) -> bytes:
+    result = proof.run(["git", "ls-files", "-z", "--", "target"], cwd=checkout, timeout=30)
+    expect(result.returncode == 0, f"git ls-files failed in {checkout}: {result.stderr!r}")
+    return result.stdout
+
+
+def ignore_fixture(
+    proof: Proof,
+    root: str,
+    name: str,
+    ignore: str | None,
+    *,
+    empty: bool = False,
+    relative: str = "",
+    git: bool = True,
+) -> tuple[str, str]:
+    """A tiny Cargo checkout in its own Git work tree. `ignore` is the whole
+    repository `.gitignore`; `relative` nests the checkout under that root so
+    its owned link has a nested repository-relative path."""
+    repo = os.path.join(root, "ignore", name)
+    os.makedirs(repo)
+    checkout = write_tree(os.path.join(repo, relative) if relative else repo, APP)
+    if git:
+        proof.run(["git", "init", "-q"], cwd=repo, timeout=30)
+    if ignore is not None:
+        with open(os.path.join(repo, ".gitignore"), "w", encoding="utf-8") as handle:
+            handle.write(ignore)
+    if empty:
+        os.makedirs(os.path.join(checkout, "target"))
+    expect(not os.path.islink(os.path.join(checkout, "target")), f"{name}: target is already a link")
+    return repo, checkout
+
+
+def refused_untouched(
+    proof: Proof,
+    pool: str,
+    mount: str,
+    checkout: str,
+    label: str,
+    args: list,
+    reasons: tuple,
+    *,
+    empty: bool = False,
+    env: dict | None = None,
+    keeps_target: bool = False,
+) -> str:
+    """One refused conversion: the reason names the fix and the target, the
+    receipt and the drive's roots are exactly as they were."""
+    before = roots_on(mount)
+    if env is None:
+        code, stdout, stderr = proof.oxide(args, label, checkout)
+    else:
+        code, stdout, stderr = oxide_env(proof, args, label, checkout, env)
+    expect(code != 0, f"{label}: nothing was refused (exit {code})\n{stdout}{stderr}")
+    expect(
+        any(reason in stderr for reason in reasons),
+        f"{label}: unexpected refusal for {reasons}: {stderr}",
+    )
+    expect("nothing was changed" in stderr, f"{label}: the refusal omits the no-change promise: {stderr}")
+    link = os.path.join(checkout, "target")
+    if empty:
+        expect(
+            os.path.isdir(link) and not os.path.islink(link) and os.listdir(link) == [],
+            f"{label}: the real empty target changed",
+        )
+    elif not keeps_target:
+        expect(not os.path.lexists(link), f"{label}: a target appeared")
+    expect(not os.path.exists(receipt_file(pool, checkout)), f"{label}: a receipt was written")
+    expect(roots_on(mount) == before, f"{label}: the drive's roots changed")
+    return stderr
+
+
+def expect_published(proof: Proof, pool: str, mount: str, checkout: str, label: str) -> str:
+    """One accepted conversion's owned link, receipt and Git invisibility."""
+    link = os.path.join(checkout, "target")
+    expect(os.path.islink(link), f"{label}: target is not an owned link")
+    root = os.readlink(link)
+    expect(
+        root.startswith(os.path.join(mount, "oxide-outputs") + os.sep),
+        f"{label}: the link selects {root}, not a root on the drive",
+    )
+    expect(os.path.isfile(os.path.join(root, MARKER)), f"{label}: the root has no marker")
+    receipt = read_json(receipt_file(pool, checkout))
+    expect(
+        receipt["state"] == "committed" and receipt["generation"] >= 1,
+        f"{label}: the receipt is not a committed first conversion: {receipt}",
+    )
+    expect(
+        git_status_names_target(proof, checkout) == [],
+        f"{label}: git status lists the published target",
+    )
+    expect(
+        git_index_names_target(proof, checkout) == b"",
+        f"{label}: git ls-files shows target tracked",
+    )
+    return root
+
+
+def fake_git(root: str, kind: str, script: str) -> str:
+    """A private `git` first on PATH for one oxide invocation."""
+    directory = os.path.join(root, "fake-git", kind)
+    os.makedirs(directory)
+    path = os.path.join(directory, "git")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(script)
+    os.chmod(path, 0o755)
+    return directory
+
+
+def private_path(root: str) -> str:
+    """A PATH with the tools oxide needs before its first Git call, and no
+    git at all."""
+    directory = os.path.join(root, "no-git-bin")
+    os.makedirs(directory)
+    for tool in ("cargo", "rustc", "rustup"):
+        found = shutil.which(tool)
+        expect(found is not None, f"{tool} is not on the host PATH")
+        os.symlink(found, os.path.join(directory, tool))
+    return directory
+
+
+def ignore_run(proof: Proof, repo: str) -> None:
+    """Focused ignore-safety proof (oxide#125): a first conversion publishes an
+    owned `<checkout>/target` link only when Git ignores that exact
+    non-directory repository-relative path, and refuses — changing nothing —
+    for a trailing-slash (directory-only) rule, an unignored or negated path, a
+    tracked path, no Git, no repository, a timeout, a command error and a
+    malformed answer. Explicit adopt, automatic adoption and the replay of a
+    prepared first conversion are all covered, and detach still works."""
+    source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
+    dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
+    expect(not dirty, f"candidate checkout is not clean: {dirty}")
+    name = "OxIg" + secrets.token_hex(4)
+    mount = f"/Volumes/{name}"
+    expect(not os.path.lexists(mount), f"{mount} exists before the proof; never touched")
+    print(
+        f"ignore-safety proof {os.getpid()} source {source} "
+        f"({layout.source_facts(repo)}) mount {mount}"
+    )
+    proof.phase("start")
+    proof.binary = layout.stage_at(proof, repo, "oxide-ignore-safety")
+    proof.phase("after staging")
+
+    root = proof.root
+    pool = os.path.join(root, "pool")
+    home = os.path.join(root, "home")
+    cargo_home = os.path.join(root, "cargo-home")
+    for path in (home, cargo_home):
+        os.makedirs(path, mode=0o700)
+    proof.env = proof_env(pool, home, cargo_home)
+
+    maker = fresh_checkout(proof, root, "pool-maker")
+    code, _, stderr = proof.oxide(["build"], "internal pool before the drive", maker)
+    expect(code == 0, stderr)
+
+    mounted = attach_image(proof, root, name)
+    expect(mounted == mount, f"scratch volume mounted at {mounted}, not {mount}")
+    code, stdout, stderr = proof.oxide(
+        [
+            "pool",
+            "register-removable",
+            mount,
+            "--reserve",
+            "16MiB",
+            "--cap",
+            "64MiB",
+            "--mode",
+            "permanent",
+        ],
+        "register permanent drive",
+        maker,
+    )
+    expect(code == 0 and "registered removable pool" in stdout, stderr)
+    proof.phase("after drive registration")
+
+    # 1. A trailing-slash rule never covers the link. With a missing target Git
+    #    answers "not ignored"; with a real empty target it answers for a
+    #    *directory*, and that answer must not be read as eligibility either.
+    for index, rule in enumerate(("/target/", "target/", "**/target/")):
+        _, checkout = ignore_fixture(proof, root, f"missing-{index}", rule + "\n/.oxide-outputs/\n")
+        stderr = refused_untouched(
+            proof,
+            pool,
+            mount,
+            checkout,
+            f"explicit adopt with {rule!r} and a missing target",
+            ["outputs", "adopt"],
+            ("does not ignore", "matches directories only"),
+        )
+        expect(
+            "not `target/`" in stderr and "`/target`" in stderr,
+            f"{rule!r}: no non-slash fix: {stderr}",
+        )
+    for index, rule in enumerate(("/target/", "**/target/")):
+        _, checkout = ignore_fixture(
+            proof, root, f"empty-{index}", rule + "\n/.oxide-outputs/\n", empty=True
+        )
+        refused_untouched(
+            proof,
+            pool,
+            mount,
+            checkout,
+            f"explicit adopt with {rule!r} and a real empty target",
+            ["outputs", "adopt"],
+            ("matches directories only",),
+            empty=True,
+        )
+    for index, rule in enumerate(("/target/", "target/")):
+        _, checkout = ignore_fixture(proof, root, f"auto-{index}", rule + "\n/.oxide-outputs/\n")
+        stderr = refused_untouched(
+            proof,
+            pool,
+            mount,
+            checkout,
+            f"automatic adoption with {rule!r}",
+            ["build"],
+            ("does not ignore", "matches directories only"),
+        )
+        expect(not auto_notices(stderr), f"{rule!r}: a refused adoption printed its notice")
+    proof.phase("after the trailing-slash matrix")
+
+    # 2. A nested workspace names its exact repository-relative path.
+    _, nested = ignore_fixture(
+        proof,
+        root,
+        "nested-empty",
+        "/rust/target/\n.oxide-outputs/\n",
+        relative="rust",
+        empty=True,
+    )
+    stderr = refused_untouched(
+        proof,
+        pool,
+        mount,
+        nested,
+        "nested /rust/target/ with a real empty target",
+        ["outputs", "adopt"],
+        ("matches directories only",),
+        empty=True,
+    )
+    expect(
+        "`/rust/target`" in stderr and "not `rust/target/`" in stderr,
+        f"the nested refusal does not name the exact rule: {stderr}",
+    )
+    _, nested_missing = ignore_fixture(
+        proof, root, "nested-missing", "**/target/\n.oxide-outputs/\n", relative="rust"
+    )
+    refused_untouched(
+        proof,
+        pool,
+        mount,
+        nested_missing,
+        "nested **/target/ with a missing target",
+        ["outputs", "adopt"],
+        ("does not ignore",),
+    )
+
+    # 3. Negated and unignored paths refuse; nothing links.
+    _, negated = ignore_fixture(proof, root, "negated", "target\n!/target\n/.oxide-outputs/\n")
+    refused_untouched(
+        proof,
+        pool,
+        mount,
+        negated,
+        "a negated target rule",
+        ["outputs", "adopt"],
+        ("re-includes",),
+    )
+    _, unignored = ignore_fixture(proof, root, "unignored", "/.oxide-outputs/\n")
+    refused_untouched(
+        proof,
+        pool,
+        mount,
+        unignored,
+        "an unignored target",
+        ["outputs", "adopt"],
+        ("does not ignore",),
+    )
+
+    # 4. A tracked path refuses even when the working tree has no target.
+    _, tracked = ignore_fixture(proof, root, "tracked", "/target\n/.oxide-outputs/\n")
+    with open(os.path.join(tracked, "target"), "wb") as handle:
+        handle.write(b"tracked")
+    added = proof.run(["git", "add", "-f", "target"], cwd=tracked, timeout=30)
+    expect(added.returncode == 0, f"git add failed: {added.stderr!r}")
+    os.remove(os.path.join(tracked, "target"))
+    refused_untouched(
+        proof,
+        pool,
+        mount,
+        tracked,
+        "a tracked target path",
+        ["outputs", "adopt"],
+        ("already tracks",),
+    )
+
+    # 5. Unknown Git is never permission: no repository, no Git binary, a
+    #    timeout, a command error and a malformed answer all refuse.
+    _, no_repo = ignore_fixture(proof, root, "no-repository", "/target\n", git=False)
+    refused_untouched(
+        proof,
+        pool,
+        mount,
+        no_repo,
+        "no Git repository",
+        ["outputs", "adopt"],
+        ("could not confirm",),
+    )
+    no_git_env = dict(proof.env, PATH=private_path(root))
+    _, no_git = ignore_fixture(proof, root, "no-git", "/target\n/.oxide-outputs/\n")
+    refused_untouched(
+        proof,
+        pool,
+        mount,
+        no_git,
+        "no Git binary on PATH",
+        ["build"],
+        ("could not confirm", "cannot run git"),
+        env=no_git_env,
+    )
+    _, slow = ignore_fixture(proof, root, "slow-git", "/target\n/.oxide-outputs/\n")
+    slow_dir = fake_git(root, "timeout", "#!/bin/sh\nexec sleep 30\n")
+    refused_untouched(
+        proof,
+        pool,
+        mount,
+        slow,
+        "a Git that does not answer in time",
+        ["outputs", "adopt"],
+        ("did not finish in time",),
+        env=dict(proof.env, PATH=slow_dir + ":" + proof.env["PATH"]),
+    )
+    real_git = shutil.which("git")
+    expect(real_git is not None, "git is not on the host PATH")
+    _, invalid = ignore_fixture(proof, root, "invalid-git", "/target\n/.oxide-outputs/\n")
+    invalid_dir = fake_git(
+        root,
+        "invalid",
+        "#!/bin/sh\ncase \"$*\" in\n  *check-ignore*) printf 'not-a-rule'; exit 0 ;;\nesac\n"
+        f'exec "{real_git}" "$@"\n',
+    )
+    refused_untouched(
+        proof,
+        pool,
+        mount,
+        invalid,
+        "a malformed Git ignore answer",
+        ["outputs", "adopt"],
+        ("not one complete record",),
+        env=dict(proof.env, PATH=invalid_dir + ":" + proof.env["PATH"]),
+    )
+    _, failing = ignore_fixture(proof, root, "failing-git", "/target\n/.oxide-outputs/\n")
+    failing_dir = fake_git(
+        root,
+        "error",
+        "#!/bin/sh\ncase \"$*\" in\n  *check-ignore*) exit 128 ;;\nesac\n"
+        f'exec "{real_git}" "$@"\n',
+    )
+    refused_untouched(
+        proof,
+        pool,
+        mount,
+        failing,
+        "a failing Git ignore call",
+        ["outputs", "adopt"],
+        ("did not answer",),
+        env=dict(proof.env, PATH=failing_dir + ":" + proof.env["PATH"]),
+    )
+    proof.phase("after the unknown-Git controls")
+
+    # 6. Present but unadoptable targets keep their content and are not
+    #    covered by this guard.
+    _, nonempty = ignore_fixture(proof, root, "nonempty", "/target\n/.oxide-outputs/\n")
+    os.makedirs(os.path.join(nonempty, "target"))
+    with open(os.path.join(nonempty, "target", "keep.txt"), "wb") as handle:
+        handle.write(b"warm build")
+    before_roots = roots_on(mount)
+    code, _, stderr = proof.oxide(["outputs", "adopt"], "a nonempty target is kept", nonempty)
+    expect(code != 0 and "never moves" in stderr, stderr)
+    expect(read_bytes(os.path.join(nonempty, "target", "keep.txt")) == b"warm build", "target mutated")
+    expect(os.path.isdir(os.path.join(nonempty, "target")), "the real target was replaced")
+    expect(not os.path.exists(receipt_file(pool, nonempty)), "a refused adopt wrote a receipt")
+    expect(roots_on(mount) == before_roots, "a refused adopt created a root")
+
+    outside = os.path.join(root, "outside")
+    os.makedirs(outside)
+    with open(os.path.join(outside, "sentinel"), "wb") as handle:
+        handle.write(b"foreign")
+    _, foreign = ignore_fixture(proof, root, "foreign", "/target\n/.oxide-outputs/\n")
+    os.symlink(outside, os.path.join(foreign, "target"))
+    code, _, stderr = proof.oxide(["outputs", "adopt"], "a foreign link is kept", foreign)
+    expect(code != 0 and "never moves" in stderr, stderr)
+    expect(os.readlink(os.path.join(foreign, "target")) == outside, "the foreign link was replaced")
+    expect(read_bytes(os.path.join(outside, "sentinel")) == b"foreign", "the referent mutated")
+
+    absent = os.path.join(root, "absent-root")
+    _, dangling = ignore_fixture(proof, root, "dangling", "/target\n/.oxide-outputs/\n")
+    os.symlink(absent, os.path.join(dangling, "target"))
+    code, _, stderr = proof.oxide(["outputs", "adopt"], "a dangling link is kept", dangling)
+    expect(code != 0 and "never moves" in stderr, stderr)
+    expect(os.readlink(os.path.join(dangling, "target")) == absent, "the dangling link was replaced")
+    expect(not os.path.lexists(absent), "the dangling link's root was created")
+    proof.phase("after present-target controls")
+
+    # 7. Prepared first-conversion replay rechecks the prerequisite: a rule
+    #    removed after the crash refuses to replay and keeps the prepared
+    #    receipt; restoring the rule replays and commits.
+    _, replay = ignore_fixture(proof, root, "replay", "/target\n/.oxide-outputs/\n")
+    crash_env = dict(proof.env, OXIDE_TEST_OUTPUTS_CRASH="prepared")
+    code, _, stderr = oxide_env(proof, ["outputs", "adopt"], "crash after the prepared receipt", replay, crash_env)
+    expect(code != 0 and "injected transition stop at prepared" in stderr, stderr)
+    link = os.path.join(replay, "target")
+    expect(not os.path.lexists(link), "the crash published a link")
+    prepared = read_json(receipt_file(pool, replay))
+    expect(prepared["state"] == "prepared", prepared)
+    before_roots = roots_on(mount)
+    with open(os.path.join(replay, ".gitignore"), "w", encoding="utf-8") as handle:
+        handle.write("/.oxide-outputs/\n")
+    code, _, stderr = proof.oxide(["outputs", "adopt"], "replay refuses an unignored target", replay)
+    expect(code != 0 and "does not ignore" in stderr, stderr)
+    expect(not os.path.lexists(link), "the refused replay published a link")
+    expect(
+        read_json(receipt_file(pool, replay))["state"] == "prepared",
+        "the refused replay rewrote the prepared receipt",
+    )
+    expect(roots_on(mount) == before_roots, "the refused replay created a root")
+    with open(os.path.join(replay, ".gitignore"), "w", encoding="utf-8") as handle:
+        handle.write("/target\n/.oxide-outputs/\n")
+    code, stdout, stderr = proof.oxide(["outputs", "adopt"], "replay after restoring the rule", replay)
+    expect(code == 0 and "now selects" in stdout, stdout + stderr)
+    replay_root = expect_published(proof, pool, mount, replay, "the replayed first conversion")
+    expect(os.path.isdir(replay_root), "the replayed root is missing")
+    proof.phase("after the replay case")
+
+    # 8. Accepted publications: an automatic first conversion, an explicit one
+    #    and a nested workspace all hide the link from Git.
+    _, automatic = ignore_fixture(proof, root, "auto-accepted", "/target\n/.oxide-outputs/\n")
+    code, _, stderr = proof.oxide(["build"], "automatic adoption publishes an ignored link", automatic)
+    expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+    expect_published(proof, pool, mount, automatic, "the automatic first conversion")
+    expect(
+        os.path.isfile(os.path.join(automatic, "target", "debug", "poutputs")),
+        "the automatic conversion built nothing through the link",
+    )
+
+    _, explicit = ignore_fixture(proof, root, "explicit-accepted", "target\n/.oxide-outputs/\n")
+    code, stdout, stderr = proof.oxide(["outputs", "adopt"], "explicit adoption with `target`", explicit)
+    expect(code == 0 and "now selects" in stdout, stdout + stderr)
+    explicit_root = expect_published(proof, pool, mount, explicit, "the explicit first conversion")
+
+    _, nested_ok = ignore_fixture(
+        proof, root, "nested-accepted", "/rust/target\n.oxide-outputs/\n", relative="rust"
+    )
+    code, stdout, stderr = proof.oxide(["outputs", "adopt"], "nested /rust/target", nested_ok)
+    expect(code == 0 and "now selects" in stdout, stdout + stderr)
+    expect_published(proof, pool, mount, nested_ok, "the nested first conversion")
+    proof.phase("after accepted publications")
+
+    # 9. Detach still works for an existing owned link.
+    set_mode(proof, "ephemeral", explicit)
+    code, stdout, stderr = proof.oxide(["outputs", "detach"], "detach an owned ignored link", explicit)
+    expect(code == 0 and "real empty directory again" in stdout, stdout + stderr)
+    detached = os.path.join(explicit, "target")
+    expect(os.path.isdir(detached) and not os.path.islink(detached), "detach left a link")
+    expect(os.listdir(detached) == [], "the detached target is not empty")
+    expect(os.path.isdir(explicit_root), "detach deleted the output root")
+    set_mode(proof, "permanent", explicit)
+    proof.phase("after detach")
+    proof.detach()
+
+
 def terminated(signum, frame) -> None:
     raise KeyboardInterrupt(f"signal {signum}")
-
 
 def overdue(signum, frame) -> None:
     raise RuntimeError("work deadline reached (SIGALRM fallback)")
@@ -1688,9 +2196,12 @@ def main() -> int:
     signal.signal(signal.SIGALRM, overdue)
     signal.setitimer(signal.ITIMER_REAL, work_left())
     proof = Proof(root)
-    # `auto-adopt` selects the focused oxide#121 scenario on the same fixture.
-    focused = sys.argv[1:] == ["auto-adopt"]
-    scenario, label = (auto_run, "auto-adopt") if focused else (run, "permanent-outputs")
+    # The optional argument selects a focused scenario on the same fixture.
+    modes = {
+        "auto-adopt": (auto_run, "auto-adopt"),
+        "ignore-safety": (ignore_run, "ignore-safety"),
+    }
+    scenario, label = modes.get(" ".join(sys.argv[1:]), (run, "permanent-outputs"))
     try:
         scenario(proof, repo)
     except BaseException as failure:

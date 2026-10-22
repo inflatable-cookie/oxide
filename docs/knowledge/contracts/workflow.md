@@ -2591,6 +2591,28 @@ migration and consumer adoption remain separate gates.
   it: the check runs before ownership is established, including inside a
   `.oxide-outputs` directory that already exists and for an already-present
   empty `.oxide-outputs/local`, which is then left unchanged.
+- **First-conversion ignore prerequisite (oxide#125).** Before a first
+  conversion — explicit `adopt`, automatic adoption or the replay of a
+  prepared first conversion — writes any receipt, root or link, Oxide
+  positively establishes this checkout's real Git work tree and the exact
+  repository-relative path of the `<checkout>/target` link (no trailing slash,
+  no escape). It asks Git itself, through bounded, effect-free calls with
+  optional locks and prompts off and inherited repository overrides removed:
+  `rev-parse --show-toplevel` for the work tree, `ls-files` for an already
+  tracked path, and `check-ignore --no-index -v -z --stdin` for the ignore
+  decision and its winning rule. The link path must be untracked and its
+  winning rule must be neither a negation nor a trailing-slash
+  (directory-only) rule. A real empty target makes Git answer for a
+  *directory* with a trailing-slash rule, so that answer is never read as
+  eligibility; slash and unsupported rule forms refuse even when that is a
+  false negative. Unknown is never permission: missing Git, a
+  non-repository, a timeout, a command error and malformed, oversized or
+  ambiguous output all refuse, leaving the absent or real target, the receipt
+  and the roots unchanged and naming the fix: use `/target` (or `target`), not
+  `target/`, in the repository `.gitignore` (a nested workspace names its
+  exact repository-relative rule). A committed link, `detach`, `status`,
+  `plan` and ordinary builds are unaffected, and no already-created link is
+  cleaned up automatically.
 - **Keyed state and the binding mutex.** A command keys its slot with or
   without an owned destination when it starts. If the checkout was converted
   or detached while it waited for admission, binding refuses before Cargo
@@ -2807,8 +2829,28 @@ target missing; ephemeral mode; an absent drive; a recorded-UUID fallback);
 crash replay after the sibling point, where a creator at the target is
 refused and kept, and after the prepared point, which rolls back to detached;
 and a committed adoption that survives a failed build. The no-replace publish
-is a macOS unit test in `effigy test rust`. Not a benchmark, real-drive
-qualification or an alias for full QA.
+is a macOS unit test in `effigy test rust`. Its fixtures ignore `/target`
+(not `target/`) because a first conversion requires Git to ignore the exact
+non-directory link path. Not a benchmark, real-drive qualification or an
+alias for full QA.
+
+**Proof (oxide#125).** `effigy rust:outputs-ignore-safety` runs
+`scripts/test-permanent-outputs.py ignore-safety`, the focused ignore-safety
+mode of the same fixture, as the whole command of the qualified shared
+supervisor (300 s, 512 MiB monitored scratch, ordinary detach) over one owned
+128 MiB scratch image. It covers, for explicit adopt, automatic adoption and
+prepared first-conversion replay: `/target/`, `target/` and `**/target/`
+refusing for missing and real empty targets (a real empty target proving the
+directory-only winning rule is recognised), `/target` and `target` publishing
+an owned link, a nested workspace's `/rust/target` accepted while its slash
+forms refuse, and negated, unignored and tracked paths, no repository, no
+Git on `PATH`, a Git that does not answer in time, a failing Git call and a
+malformed verbose answer all refusing with the target, receipt and drive
+roots unchanged and the non-slash fix named. Accepted publications are
+invisible to `git status` and `git ls-files`, and `detach` still restores a
+real directory. Not a benchmark, real-drive qualification or an alias for
+full QA. The native run is held for owner activation; the guard's rule
+parsing and decisions are unit-tested in `effigy test rust`.
 
 ### `oxide pool describe --json`
 

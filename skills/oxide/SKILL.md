@@ -135,6 +135,17 @@ fails, Oxide reports that the wait duration is unavailable.
   when one is produced. Ephemeral mode keeps the existing fallback line.
   `oxide status` shows configured mode separately from the pool selected for
   the next build, including its fallback reason.
+- A first conversion (`oxide outputs adopt`, or the automatic one on a fresh
+  checkout's first build in permanent mode) publishes the owned
+  `<workspace>/target` link only when Git ignores that exact non-directory
+  path. A `target/`, `/target/` or `**/target/` rule ignores directories only
+  and refuses; add `/target` (or `target`), not `target/`, to the repository
+  `.gitignore`. A nested workspace needs its exact repository-relative rule,
+  for example `/rust/target`. A tracked `target`, an unignored or negated
+  path, or a Git decision Oxide cannot confirm (no repository, no `git`, a
+  timeout, an error or a bad answer) also refuse, and nothing changes.
+  Already-created links, `detach`, `status`, `plan` and ordinary builds are
+  unaffected.
 - Old version 1 registrations without a mode read as ephemeral and remain
   unchanged until an explicit mode update. An update writes version 2 with a
   required mode. Older Oxide binaries refuse version 2; reinstalling a binary
