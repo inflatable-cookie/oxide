@@ -20,6 +20,7 @@ UNCLOSED case's live fixtures and receipts are kept for the owner.
 """
 from __future__ import annotations
 
+import errno
 import importlib.util
 import json
 import os
@@ -203,9 +204,9 @@ class FakeTable:
         return next((r for r in self.rows if r["pid"] == pid), None)
 
 
-def census(table, sid=100):
+def census(table, sid=100, terminal_allowed=False):
     return bounded.Census(sid, snapshot=table.snapshot, getsid=table.getsid, reread=table.reread,
-                          pause=lambda _seconds: None)
+                          pause=lambda _seconds: None, terminal_allowed=terminal_allowed)
 
 
 class PureCensus(unittest.TestCase):
@@ -493,8 +494,89 @@ class PureDiagnostics(unittest.TestCase):
         self.assertNotIn("diagnostics", census(table).round())
 
 
+def zombie_row(pid, start):
+    return row(pid, start=start, zombie=True)
+
+
+class PureAllowlist(unittest.TestCase):
+    """One-shot exact-kernel allowlist decision (no live kernel change)."""
+
+    def reader(self, values=(), errors=()):
+        table, failures = dict(values), dict(errors)
+        def read(name, _size):
+            if name in failures:
+                raise failures[name]
+            return table[name]
+        return read
+
+    def exact_triple(self):
+        return {
+            "kern.uuid": bytes.fromhex("8D3E13A001FC381D9DA37F0AF537CB32"),
+            "kern.osversion": b"25G83\x00",
+            "kern.version": (b"Darwin Kernel Version 25.6.0: Fri Jul 31 19:19:08 PDT 2026; "
+                               b"root:xnu-12377.161.14~5/RELEASE_ARM64_T6050\x00"),
+        }
+
+    def test_exact_match_allowlisted(self):
+        mode = bounded._decide_terminal_mode(self.reader(self.exact_triple()))
+        self.assertEqual(mode, {"mode": "allowlisted", "reason": "allowlisted",
+                                "evidence": bounded.ALLOW_EVIDENCE_ID})
+
+    def test_ascii_uuid_form_allowlisted(self):
+        values = self.exact_triple()
+        values["kern.uuid"] = b"8D3E13A0-01FC-381D-9DA3-7F0AF537CB32\x00"
+        self.assertEqual(bounded._decide_terminal_mode(self.reader(values))["mode"], "allowlisted")
+
+    def test_build_mismatch_strict(self):
+        values = self.exact_triple()
+        values["kern.osversion"] = b"25G84\x00"
+        self.assertEqual(bounded._decide_terminal_mode(self.reader(values)),
+                         {"mode": "strict", "reason": "identity_mismatch",
+                          "evidence": bounded.ALLOW_EVIDENCE_ID})
+
+    def test_uuid_wrong_length_malformed(self):
+        values = self.exact_triple()
+        values["kern.uuid"] = b"short"
+        self.assertEqual(bounded._decide_terminal_mode(self.reader(values))["reason"],
+                         "identity_malformed")
+
+    def test_uuid_wrong_value_mismatch(self):
+        values = self.exact_triple()
+        values["kern.uuid"] = bytes(16)
+        self.assertEqual(bounded._decide_terminal_mode(self.reader(values))["reason"],
+                         "identity_mismatch")
+
+    def test_read_error_strict(self):
+        self.assertEqual(bounded._decide_terminal_mode(
+            self.reader({}, {"kern.uuid": OSError(2, "no such entry")}))["reason"],
+            "identity_read_error")
+
+    def test_oversize_malformed(self):
+        values = self.exact_triple()
+        del values["kern.osversion"]
+        self.assertEqual(bounded._decide_terminal_mode(
+            self.reader(values, {"kern.osversion": OSError(errno.ENOMEM, "too big")}))["reason"],
+            "identity_malformed")
+
+    def test_version_contradiction_malformed(self):
+        values = self.exact_triple()
+        values["kern.version"] = (b"root:xnu-12377.161.14~5/RELEASE_ARM64_T6050 "
+                                    b"root:xnu-9.9.9/RELEASE_ARM64_T9999\x00")
+        self.assertEqual(bounded._decide_terminal_mode(self.reader(values))["reason"],
+                         "identity_malformed")
+
+    def test_version_without_token_mismatch(self):
+        values = self.exact_triple()
+        values["kern.version"] = b"Darwin Kernel Version 25.6.0\x00"
+        self.assertEqual(bounded._decide_terminal_mode(self.reader(values))["reason"],
+                         "identity_mismatch")
+
+
 class PureTerminalCounts(unittest.TestCase):
-    """Mandatory receipt terminal_count_status / terminal_nonwriters."""
+    """Mandatory receipt terminal_count_status / terminal_nonwriters.
+
+    Terminal counts positively verified still-present SZOMB identities
+    accepted by the ESRCH-only terminal rule, never Gone rows."""
 
     def test_strict_clean_round_valid_zero(self):
         table = FakeTable([row(101), row(200)], {101: 100, 200: 7})
@@ -503,20 +585,113 @@ class PureTerminalCounts(unittest.TestCase):
         self.assertEqual(result["terminal_count_status"], "valid")
         self.assertEqual(result["terminal_nonwriters"], 0)
         self.assertIs(type(result["terminal_nonwriters"]), int)
+        self.assertNotIn("terminal_witnesses", result)
 
-    def test_resolved_gone_valid_count(self):
-        table = FakeTable([row(103)], {103: ProcessLookupError(3, "gone")}, reread={103: None})
-        result = census(table).round()
-        self.assertEqual((result["certain"], result["uncertain"]), (True, 0))
-        self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]), ("valid", 1))
+    def test_gone_never_counts_even_allowlisted(self):
+        for allowed in (False, True):
+            table = FakeTable([row(103)], {103: ProcessLookupError(3, "gone")}, reread={103: None})
+            result = census(table, terminal_allowed=allowed).round()
+            self.assertEqual((result["certain"], result["uncertain"]), (True, 0))
+            self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
+                             ("valid", 0))
+            self.assertNotIn("terminal_witnesses", result)
+            self.assertEqual(table.reads, 1)
 
-    def test_two_resolved_gone_valid_two(self):
-        rows = [row(130, start=1), row(131, start=1)]
-        table = FakeTable(rows, {130: ProcessLookupError(3, "gone"), 131: ProcessLookupError(3, "gone")},
-                           reread={130: None, 131: None})
+    def test_terminal_zombie_allowlisted(self):
+        table = FakeTable([zombie_row(140, 5)], {140: ProcessLookupError(3, "gone")})
+        check = census(table, terminal_allowed=True)
+        result = check.round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
+        self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
+                         ("valid", 1))
+        self.assertEqual(table.reads, 21)
+        witness = result["terminal_witnesses"]
+        self.assertEqual(len(witness), 1)
+        self.assertEqual(witness[0], {"pid": 140, "start": 5, "snapshot_zombie": True,
+                                      "first_zombie": True, "tracked": False})
+
+    def test_terminal_zombie_strict_blocks(self):
+        table = FakeTable([zombie_row(141, 5)], {141: ProcessLookupError(3, "gone")})
         result = census(table).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
+                         ("invalid", None))
+        self.assertNotIn("terminal_witnesses", result)
+
+    def test_live_snapshot_never_terminal(self):
+        table = FakeTable([row(142, start=5)], {142: ProcessLookupError(3, "gone")})
+        result = census(table, terminal_allowed=True).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
+                         ("invalid", None))
+
+    def test_first_read_failure_no_terminal(self):
+        def flaky(reads):
+            if reads == 1:
+                raise PermissionError(13, "denied")
+            return zombie_row(143, 5)
+        table = FakeTable([zombie_row(143, 5)], {143: ProcessLookupError(3, "gone")},
+                           reread={143: flaky})
+        result = census(table, terminal_allowed=True).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
+                         ("invalid", None))
+
+    def test_final_failure_no_terminal(self):
+        table = FakeTable([zombie_row(144, 5)], {144: ProcessLookupError(3, "gone")},
+                           reread={144: lambda reads: zombie_row(144, 5) if reads <= 20
+                           else (_ for _ in ()).throw(PermissionError(13, "denied"))})
+        result = census(table, terminal_allowed=True).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
+                         ("invalid", None))
+
+    def test_tracked_member_terminal_recomputed(self):
+        table = FakeTable([row(145, start=5)], {145: 100})
+        check = census(table, terminal_allowed=True)
+        self.assertEqual(check.round()["members"], 1)
+        table.rows = [zombie_row(145, 5)]
+        table.sessions = {145: ProcessLookupError(3, "gone")}
+        table.reads = 0
+        result = check.round()
+        self.assertEqual((result["certain"], result["members"], result["uncertain"]), (True, 0, 0))
+        self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
+                         ("valid", 1))
+        self.assertIn((145, 5), check.tracked)
+        self.assertTrue(result["terminal_witnesses"][0]["tracked"])
+        table.reads = 0
+        again = check.round()  # recomputed, no exemption cache
+        self.assertEqual((again["terminal_count_status"], again["terminal_nonwriters"]),
+                         ("valid", 1))
+
+    def test_non_esrch_never_terminal(self):
+        table = FakeTable([zombie_row(146, 5)], {146: PermissionError(1, "denied")})
+        result = census(table, terminal_allowed=True).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
+                         ("invalid", None))
+
+    def test_replacement_is_gone_not_terminal(self):
+        table = FakeTable([zombie_row(147, 5)], {147: ProcessLookupError(3, "gone")},
+                           reread={147: lambda reads: zombie_row(147, 5) if reads == 1
+                           else zombie_row(147, 9)})
+        result = census(table, terminal_allowed=True).round()
         self.assertEqual((result["certain"], result["uncertain"]), (True, 0))
-        self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]), ("valid", 2))
+        self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
+                         ("valid", 0))
+        self.assertNotIn("terminal_witnesses", result)
+
+    def test_combined_budget_truncation_keeps_count(self):
+        pids = list(range(150, 165))
+        rows = [zombie_row(pid, pid) for pid in pids]
+        sessions = {pid: ProcessLookupError(3, "gone") for pid in pids}
+        table = FakeTable(rows, sessions)
+        result = census(table, terminal_allowed=True).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (True, 0))
+        self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
+                         ("valid", 15))
+        self.assertEqual(len(result["terminal_witnesses"]), 5)  # 15 diag + 15 witness > 20
+        self.assertEqual(len(result["diagnostics"]["rows"]), 15)
 
     def test_uncertain_round_invalid_null(self):
         table = FakeTable([row(132, start=5)], {132: ProcessLookupError(3, "gone")})
@@ -928,6 +1103,70 @@ class Real(unittest.TestCase):
         self.assertTrue(alive(self.child()))
         self.assert_kept_outside_outer_cleanup()
 
+    def test_terminal_zombie_witness_closed(self):
+        # Positive TERMINALNONWRITER fixture: this suite process forks one
+        # direct child that exits at once and stays an unreaped zombie (no
+        # extra setsid/setpgid) while a nested guardian runs a trivial
+        # command. The nested terminal census must witness the exact held
+        # (PID, start) as terminal and close with status 0 and no fault;
+        # the suite reaps its own child in finally so nothing leaks.
+        held = os.fork()
+        if held == 0:
+            os._exit(0)
+        try:
+            deadline = time.monotonic() + 5
+            start_row = None
+            while time.monotonic() < deadline:
+                start_row = bounded.Kinfo.one(held)
+                if start_row is not None and start_row.get("zombie") is True:
+                    break
+                time.sleep(0.01)
+            self.assertIsNotNone(start_row, "held child left the process table")
+            self.assertTrue(start_row.get("zombie"), "held child is not yet a zombie")
+            held_start = start_row["start"]
+            self.assertEqual(
+                self.guardian(fixture("open(os.environ['CASE_DIR'] + '/ran', 'w')\n")), 0)
+            self.assertEqual(self.outcome()["closure"], "closed")
+            self.assertIsNone(self.outcome()["fault"])
+            nested = self.receipt["census"]
+            self.assertEqual(self.receipt.get("terminal_mode", {}).get("mode"), "allowlisted")
+            self.assertGreaterEqual(nested["terminal_nonwriters"], 1)
+            self.assertEqual(nested["terminal_count_status"], "valid")
+            witnesses = nested.get("terminal_witnesses", [])
+            self.assertTrue(
+                any(w.get("pid") == held and w.get("start") == held_start for w in witnesses),
+                f"exact held (PID, start) witness missing for {held}")
+        finally:
+            try:
+                os.waitpid(held, 0)
+            except OSError:
+                pass
+
+    def test_live_real_child_injected_error_blocks(self):
+        # Contrast: a genuinely LIVE owned child whose session lookup is
+        # explicitly INJECTED to fail (not a naturally failing getsid) can
+        # never qualify as terminal (not ESRCH, zombie False). Uses the
+        # existing Census DI callbacks with real Kinfo.one against the real
+        # child PID; the injected error is reported, not natural.
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            live = bounded.Kinfo.one(child.pid)
+            self.assertIsNotNone(live, "owned child left the process table")
+            self.assertFalse(live.get("zombie"), "owned child is unexpectedly a zombie")
+            live_rows = [dict(live)]
+            def injected_getsid(_pid):
+                raise PermissionError(1, "injected session error")
+            check = bounded.Census(100, snapshot=lambda: list(live_rows),
+                                   getsid=injected_getsid, reread=bounded.Kinfo.one,
+                                   pause=lambda _seconds: None, terminal_allowed=True)
+            result = check.round()
+            self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+            self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
+                             ("invalid", None))
+        finally:
+            child.kill()
+            child.wait(timeout=10)
+
     def test_output_saturation(self):
         code = fixture("block = b'x' * 65536\nfor _ in range(48 * 16): os.write(1, block)\n"
                        "for _ in range(10 * 16): os.write(2, block)\n")
@@ -1212,7 +1451,7 @@ def main():
     runner = unittest.TextTestRunner(verbosity=2, resultclass=Results)
     pure = unittest.TestSuite(loader.loadTestsFromTestCase(case)
                               for case in (PureGuard, PurePrecedence, PureCensus, PureCensusFinalAbsence,
-                                           PureDiagnostics, PureTerminalCounts, PureProtocol))
+                                           PureDiagnostics, PureAllowlist, PureTerminalCounts, PureProtocol))
     ok = runner.run(pure).wasSuccessful()
     if sys.argv[1:] != ["--pure"]:
         # Writers before and after a simulated staging step, in the outer

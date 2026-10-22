@@ -968,15 +968,36 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
     foreign or member by inference.
   - **Uncertain:** everything else, including first-seen unreadable rows,
     failed re-reads and unconfirmed zombies.
+  - **Terminal nonwriter** (allowlisted kernels only): an actual `getsid`
+    `ESRCH` whose snapshot row and FIRST existing confirmation re-read
+    show the complete same (PID, start) with exact `SZOMB` state in both.
+    A terminal row is neither Gone nor Foreign nor a blocking member;
+    tracked attribution is kept and eligibility is recomputed every round
+    with no exemption cache. No extra reads, sleeps or timers; a
+    nonqualifying first read is never salvaged by later reads, and any
+    failed, missing or contradictory observation in the round disqualifies.
+    A successful `getsid` keeps the old member/foreign/tracked paths and
+    other session errors can never qualify. In strict mode terminal
+    acceptance never fires and every `ESRCH` row keeps the old uncertain
+    handling. No live process is excluded by parent, and a replacement
+    identity is never declared foreign or member by inference.
 
   An uncertain or failed census after `stopped` latches a fault at once. A
   later certain empty census never clears it or authorizes cleanup.
 
-  Start time is only an identity token, never an exclusion. A zombie of an
-  unrelated parent present after the stop therefore yields a false
-  `UNCLOSED`: it fails closed. During development such zombies appeared
-  transiently and once persisted about 30 s. Owned scratch is removed only
-  after established closure.
+  Start time is only an identity token, never an exclusion. Owned scratch
+  is removed only after established closure.
+
+  Kernel allowlist: once in monitor setup, three fixed-buffer `sysctlbyname`
+  reads (`kern.uuid` 64 B, `kern.osversion` 64 B, `kern.version` 1024 B)
+  decide the frozen mode. Only the exact reviewed build (UUID
+  `8D3E13A0-01FC-381D-9DA3-7F0AF537CB32`, build `25G83`, version token
+  `root:xnu-12377.161.14~5/RELEASE_ARM64_T6050`) enables terminal
+  acceptance; any read failure, oversize, malformed value or mismatch
+  freezes to strict mode. The receipt records the frozen mode, the reason
+  (`allowlisted`/`identity_read_error`/`identity_malformed`/`identity_mismatch`)
+  and the evidence ID. No setting can force terminal acceptance on an
+  unverified kernel, and an OS update returns to strict until reviewed.
 
   Receipt-only diagnostics summarize `ESRCH` rows (confirm attempts and
   outcome with the final read result and an enumerated error category).
@@ -989,13 +1010,17 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
 
   Every receipt census object also carries mandatory `terminal_count_status`
   (`valid`/`invalid`/`overflow`) and `terminal_nonwriters` (the exact
-  non-bool count 0..2^64-1 of this round's positively resolved Gone rows
-  when valid, else JSON null; a strictly completed round with none is
-  `valid` 0). A snapshot or census failure without a countable set, like
-  any uncertain round, is `invalid` with null and keeps `uncertain`>=1
-  with `certain` false in the unchanged IPC fields; saturation is
-  `overflow` with null. Output-witness loss never touches these fields
-  and they never change classification.
+  non-bool count 0..2^64-1 of this round's terminal-accepted still-present
+  `SZOMB` identities, never Gone rows, when valid, else JSON null; a
+  strictly completed round with none is `valid` 0). A snapshot or census
+  failure without a countable set, like any uncertain round, is `invalid`
+  with null and keeps `uncertain`>=1 with `certain` false in the unchanged
+  IPC fields; saturation is `overflow` with null. Output-witness loss
+  never touches these fields and they never change classification.
+  Optional terminal witness rows (PID, start, both qualifying `SZOMB`
+  states, prior tracking) share one combined cap with the diagnostics of
+  at most 20 rows and 16384 compact bytes; witness loss only ever means
+  missing qualification evidence.
 - **Faults (latched; none clears).**
   - Monitor: reserve below 22 GiB (20 GiB reserve + 2 GiB margin); no
     reserve reading for 1 s; no completed owned-byte reading for 10 s; owned
@@ -1084,7 +1109,7 @@ path is printed for the owner.
 
 It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
 `scripts/test_supervisor.py`. The suite runs in order:
-- 60 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 77 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -1107,12 +1132,23 @@ It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
   bounded receipt diagnostics (fixed enums, 20 maximum-width rows, row
   overflow with an exact omitted count, byte-ceiling trimming and
   serialization failure leaving classifications, counts and faults
-  unchanged) and mandatory receipt terminal counts (`valid` 0 for a
-  strictly completed round, exact Gone count when valid, `invalid`/`overflow`
-  with null and `uncertain`>=1 otherwise, IPC schema unchanged);
+  unchanged); mandatory receipt terminal counts (`valid` 0 for a strictly
+  completed round, exact terminal-`SZOMB` count when valid, `invalid`/
+  `overflow` with null and `uncertain`>=1 otherwise, IPC schema unchanged,
+  Gone rows never counted); the exact-kernel allowlist (match, build
+  mismatch, malformed UUID length, wrong UUID value, read error, oversize,
+  version contradiction, version without token) and terminal eligibility
+  (allowlisted zombie accepted with exact witness and kept attribution,
+  strict/live/first-read-failure/final-failure/non-`ESRCH`/replacement
+  never terminal, tracked recompute, combined witness budget keeping the
+  count);
 - writers before and after a simulated staging step;
-- 33 real cases with tiny Python fixtures and injected faults:
+- 35 real cases with tiny Python fixtures and injected faults:
   - exit 0, owned cleanup, nonzero, exec 127, output saturation;
+  - a held direct-fork zombie child witnessed as the exact (PID, start)
+    terminal nonwriter with `CLOSED` status 0 and no fault, reaped only
+    in `finally`; a live owned child with an explicitly injected session
+    error blocking with terminal `invalid`/null;
   - a group cascading to `closed` at the deadline;
   - a separate-group survivor `UNCLOSED`, never signalled and still alive at
     the verdict, its case directory and receipt outside the outer cleanup;
@@ -1157,7 +1193,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 93 cases;
+- all 112 cases;
 - every real case directory and receipt still present after the
   candidate's cleanup.
 
