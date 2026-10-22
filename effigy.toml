@@ -274,7 +274,7 @@ run = "python3 scripts/test-oxide-wrapper-bypass.py"
 # Focused proof for `oxide pool describe --json` (oxide#112). The script's gate
 # RUN_BOUND is True after the apparatus PASS (53ec48e4). It runs inside the
 # qualified shared runner (oxide#109, bounded-test.py SHA-256
-# 8e379c93416c6e06b7f06bec7f86dba4fca4c8900b1cc87f1eb6303d39897a9d), which owns
+# d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e), which owns
 # closure, cleanup and the absolute deadline. The seed is selected from the lock
 # (256 MiB aggregate); the host registry is not copied whole. Coverage gaps are
 # listed in the script's docstring (`--plan`).
