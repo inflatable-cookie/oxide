@@ -2,14 +2,14 @@
 """Focused installed-binary hand-off proof for oxide#122.
 
 One fixed script and whole command under the qualified shared supervisor
-(`bounded-test.py`): a 120 s wall limit and a 128 MiB monitored scratch budget
-including cleanup. It stages this clean HEAD's debug `oxide` itself with plain
-Cargo and the pinned 1.97.1, offline, into its own scratch target, copies the
-binary and deletes the target before the fixtures. No Oxide pool, no installed
-binary, no host state and no network are involved; the 128 MiB figure is
-measured (a staged build peaks near 64 MiB, the fixtures near 2 MiB), because
-the brief's 64 MiB assumed a build-free fixture, which cannot exercise the
-real front door.
+(`bounded-test.py`): the brief's 120 s wall limit and 64 MiB monitored scratch
+budget including cleanup. It stages this clean HEAD's debug `oxide` itself with
+plain Cargo and the pinned 1.97.1, offline, into its own scratch target, copies
+the binary and deletes the target before the fixtures. No Oxide pool, no
+installed binary, no host state and no network are involved. The stage is kept
+inside the 64 MiB gate by single-threaded, single-codegen-unit, debug-free,
+symbol-stripped, size-optimised codegen: the staged tree peaks near 58 MiB,
+the fixtures near 2 MiB, and staging takes about 37 s.
 
 Every fixture has a private HOME with receipts and a candidate stub, a private
 `OXIDE_POOL` directory pool with planted control files, a private CARGO_HOME,
@@ -200,6 +200,9 @@ def stage_subject(root: str) -> str:
             "CARGO_TARGET_DIR": os.path.join(stage, "target"),
             "CARGO_BUILD_BUILD_DIR": os.path.join(stage, "build"),
             "CARGO_PROFILE_DEV_DEBUG": "0",
+            "CARGO_PROFILE_DEV_DEBUG_ASSERTIONS": "true",
+            "CARGO_PROFILE_DEV_OPT_LEVEL": "s",
+            "CARGO_PROFILE_DEV_CODEGEN_UNITS": "1",
             "CARGO_PROFILE_DEV_PANIC": "abort",
             "CARGO_INCREMENTAL": "0",
             "RUSTFLAGS": "-C strip=symbols",

@@ -1030,14 +1030,15 @@ necessary.
   exclusion.
 - **Proof.** `effigy rust:installed-handoff` (heavy) is one fixed script and
   whole command: `bounded-test.py` around `scripts/test-installed-handoff.py`
-  with a 120 s wall limit and 128 MiB monitored scratch. Inside that scratch
+  with a 120 s wall limit and 64 MiB monitored scratch. Inside that scratch
   the script stages this HEAD's debug `oxide` with plain Cargo offline and the
   pinned 1.97.1, then deletes the staged target before the fixtures, so it
   creates no Oxide pool and touches no live pool, installed binary, install
-  receipt or host state. The 128 MiB figure is measured: a `-j1`, debug-free,
-  stripped staged build peaks near 64 MiB and the fixtures near 2 MiB. Over
-  private HOME, receipt and directory-pool fixtures with a compiled stub
-  candidate, it covers newer state
+  receipt or host state. The stage fits the 64 MiB gate by building with one
+  job, one codegen unit, no debug info, stripped symbols and size-optimised
+  codegen: the staged tree peaks near 58 MiB, the fixtures near 2 MiB, and
+  staging takes about 37 s. Over private HOME, receipt and directory-pool
+  fixtures with a compiled stub candidate, it covers newer state
   and registration versions; malformed, older and non-`u32` documents that must
   not trigger; one hand-off with exact argv and environment plus the marker;
   marker refusal and inertness; foreign, path, hash, size, capability,
