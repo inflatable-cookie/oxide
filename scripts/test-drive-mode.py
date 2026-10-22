@@ -294,7 +294,10 @@ def run(proof: Proof, repo: str) -> None:
         expect(child.poll() is None, "active build exited before mode update")
         code, status_before, stderr = proof.oxide(["status"], "status during active command", active_app)
         expect(code == 0, f"active status failed: {stderr}")
-        expect(any("drive-mode-active" in line and "held by" in line for line in status_before.splitlines()), status_before)
+        expect(
+            any("active-app-" in line and " held " in line for line in status_before.splitlines()),
+            status_before,
+        )
 
         code, stdout, stderr = proof.oxide(
             ["pool", "set-mode", "permanent"], "change mode during active command", active_app
@@ -303,7 +306,10 @@ def run(proof: Proof, repo: str) -> None:
         expect(child.poll() is None, "mode update ended the active command")
         code, status_after, stderr = proof.oxide(["status"], "status after active mode update", active_app)
         expect(code == 0, f"post-update active status failed: {stderr}")
-        expect(any("drive-mode-active" in line and "held by" in line for line in status_after.splitlines()), status_after)
+        expect(
+            any("active-app-" in line and " held " in line for line in status_after.splitlines()),
+            status_after,
+        )
     finally:
         os.makedirs(gate, exist_ok=True)
         with open(os.path.join(gate, "release"), "wb") as handle:
