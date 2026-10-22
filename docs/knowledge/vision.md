@@ -140,7 +140,8 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   - final outputs following the pool when the drive is permanent;
   - per-slot test scratch;
   - higher slot limits with budget-driven eviction;
-  - submodule-aware cross-worktree reuse.
+  - broader submodule-aware cross-worktree reuse beyond the narrow
+    two-state coverage in the workflow contract.
 
   Details live in their Queue leads and, once built, in the
   [workflow contract](contracts/workflow.md).

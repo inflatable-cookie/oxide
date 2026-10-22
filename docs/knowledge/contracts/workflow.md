@@ -299,13 +299,15 @@ slot has a recorded origin:
 
 1. After each leased command whose Cargo ran, the slot records its last
    compile origin: canonical checkout path, Git tree of `HEAD`, the Git blob
-   digest of every dirty or untracked non-ignored file, and the build anchor
-   (the time after Cargo's process group is empty).
-2. Oxide diffs the two content sets with Git (`git diff` of the trees plus the
-   dirty digests). Each differing checkout file whose mtime is not newer than
-   the anchor gets its mtime set to now, so Cargo's own invalidation rebuilds
-   it. Content stays untouched; only the checkout's own files change; Cargo
-   fingerprints and the slot are never edited.
+   digest of every dirty or untracked non-ignored file, the state of every
+   declared Git submodule (initialized-clean at its gitlink, or positively
+   absent or empty uninitialized), and the build anchor (the time after
+   Cargo's process group is empty).
+2. Oxide diffs the two content sets with Git (`git diff` of the trees, the
+   dirty digests and the submodule states). Each differing checkout file whose
+   mtime is not newer than the anchor gets its mtime set to now, so Cargo's
+   own invalidation rebuilds it. Content stays untouched; only the checkout's
+   own files change; Cargo fingerprints and the slot are never edited.
 3. On a checkout-path change, every local package under the checkout is
    path-sensitive, with no detection. `cargo metadata --format-version 1`
    names the packages: each one with no registry or Git
@@ -367,9 +369,44 @@ slot has a recorded origin:
    from other content, so a repeat in the same checkout refreshes nothing. The
    set only resets when the slot is evicted; past 4096 paths the slot stops
    being shared.
-5. Inputs outside Git or ignored by it, and submodule contents, are not
-   covered. The summary line says so whenever the gate reconciled another
-   checkout's build. A differing submodule refuses the gate.
+5. Inputs outside Git or ignored by it are not covered. The summary line says
+   so whenever the gate reconciled another checkout's build.
+
+Declared Git submodules (gitlinks) come from the index **and** `HEAD`: both
+must name the same commit at stage 0, with no assume-unchanged or
+skip-worktree bit and no sparse exclusion, at most 32 of them, one level deep.
+Two worktree states are covered and persisted as distinct content:
+
+- **Uninitialized**: the gitlink path is absent or an empty real directory
+  with no `.git` entry.
+- **Exact**: a directory whose own `HEAD` is the declared commit, whose
+  tracked files are clean and whose `.git` file or directory resolves inside
+  this repository's module store under the common Git directory. It also
+  records a framed digest of the child's ordered cached paths and raw blob
+  IDs, so the same commit reached through different bytes still differs.
+
+Same tree, same dirty digests and same submodule states is a warm no-op. An
+uninitialized worktree and an initialized one at the same gitlink never match.
+Everything else refuses the slot and the command builds cold: dirty or
+untracked child content, a different child `HEAD`, an unmerged or
+flag-marked gitlink, a non-empty directory without a `.git` pointer into the
+module store, a nested gitlink, an unreadable path, a symlink, or an unknown
+state. A linked worktree supports only the uninitialized state; an initialized
+child there is not vouched for, because it never owns the module store. The
+gate never runs a `submodule` command, never initializes, updates or fetches,
+and never writes a submodule's config, index or content. A differing submodule
+refreshes the gitlink path without setting a directory mtime and, when the
+current state is Exact, the child's own tracked files; a checkout-path change
+refreshes those files too, so a local package inside a submodule rebuilds like
+any other local input. Submodule ignored files stay outside the limit.
+
+Legacy content records without submodule state never vouch for a checkout that
+declares gitlinks. Records are written with content version 1, and the added
+fields make an older Oxide discard the slot rather than guess. One
+snapshot or prepare is bound to 64 `git` invocations and 60 s of cumulative
+wait; each call to 16 MiB and 30 s. Exceeding any bound, more than 32
+gitlinks, 200,000 listed files or 4,096 dirty-and-uncertain paths refuses the
+slot without a partial fingerprint.
 
 The origin is trusted only when the record's use counter still equals the
 value stamped when it was written. Leasing re-stamps a trusted origin before
