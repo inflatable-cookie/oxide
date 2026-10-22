@@ -1756,7 +1756,12 @@ def refused_untouched(
         any(reason in stderr for reason in reasons),
         f"{label}: unexpected refusal for {reasons}: {stderr}",
     )
-    expect("nothing was changed" in stderr, f"{label}: the refusal omits the no-change promise: {stderr}")
+    # Presentation-insensitive: the product closes some refusals with
+    # "Nothing was changed" and others with "; nothing was changed".
+    expect(
+        "nothing was changed" in stderr.casefold(),
+        f"{label}: the refusal omits the no-change promise: {stderr}",
+    )
     link = os.path.join(checkout, "target")
     if empty:
         expect(
