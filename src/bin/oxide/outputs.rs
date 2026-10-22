@@ -1058,6 +1058,7 @@ pub fn bind_for_command(
         )?));
     }
     if context.receipt()?.is_none() {
+        refuse_unowned_link(&context, "outputs")?;
         return Ok(OutputBinding::unchecked(unconverted_outcome()));
     }
     let mut announced = false;
@@ -1069,6 +1070,7 @@ pub fn bind_for_command(
         }
         let lock = store.lock_binding(checkout)?;
         let Some(receipt) = context.receipt()? else {
+            refuse_unowned_link(&context, "outputs")?;
             return Ok(OutputBinding {
                 outcome: unconverted_outcome(),
                 _lock: Some(lock),
@@ -1131,6 +1133,23 @@ fn gated_replay(
         )),
         CheckoutCustody::Writers => Ok(None),
         CheckoutCustody::Clear => replay(context, receipt).map(Some),
+    }
+}
+
+/// In permanent mode a checkout without a committed owned link keeps a real
+/// `target`: a link there was never established as owned (a foreign link, or
+/// a marked link whose receipt is missing), so Cargo is never handed it and
+/// clean never follows it. Ephemeral mode keeps today's behaviour.
+fn refuse_unowned_link(context: &Context, action: &str) -> Result<(), String> {
+    let link = context.link();
+    match fs::symlink_metadata(&link) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "{action} refused: {} is a link that no committed owned-output receipt established; permanent drive mode never follows it. Nothing was changed. Replace it with a real directory, or remove it and run `oxide outputs adopt`",
+            link.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("{action} refused: cannot inspect {}: {error}", link.display())),
     }
 }
 
@@ -1220,7 +1239,9 @@ fn bind_under_binding(
                     "outputs: the receipt says this checkout is detached but its slot was keyed for an owned root; run the command again"
                         .to_owned(),
                 ),
-                None => Bind::Bound(Outcome {
+                None => match refuse_unowned_link(context, "outputs") {
+                    Err(reason) => Bind::Refuse(reason),
+                    Ok(()) => Bind::Bound(Outcome {
                     warnings: vec![
                         "permanent drive mode: this checkout is detached from owned outputs; `oxide outputs adopt` converts it again. Nothing was moved"
                             .to_owned(),
@@ -1228,6 +1249,7 @@ fn bind_under_binding(
                     note: Some("outputs detached".to_owned()),
                     root: None,
                 }),
+                },
             }
         }
         ReceiptState::Prepared => {
@@ -2586,7 +2608,14 @@ pub fn clean_placement(workspace: &Path) -> Result<Option<CleanPlacement>, Strin
     let settings = store::settings()?;
     let control = Store::open_existing_with(&settings)?.map(|store| store.control().to_path_buf());
     let context = Context::new(control, workspace.to_path_buf());
-    let Some(receipt) = context.receipt()? else {
+    let receipt = context.receipt()?;
+    let unconverted = receipt
+        .as_ref()
+        .is_none_or(|receipt| receipt.state == ReceiptState::Detached);
+    if unconverted && context.mode()? == Some(DriveMode::Permanent) {
+        refuse_unowned_link(&context, "clean")?;
+    }
+    let Some(receipt) = receipt else {
         return Ok(None);
     };
     match receipt.state {
@@ -3316,6 +3345,10 @@ mod tests {
     }
 
     fn register(fixture: &Fixture, mode: DriveMode) {
+        register_at(fixture, &fixture.control, mode);
+    }
+
+    fn register_at(fixture: &Fixture, control: &Path, mode: DriveMode) {
         let registration = removable::Registration {
             version: 2,
             mount_point: fixture.root.join("absent-volume"),
@@ -3328,7 +3361,7 @@ mod tests {
             registered_ms: 1,
             mode,
         };
-        let path = fixture.control.join("removable.json");
+        let path = control.join("removable.json");
         fs::write(&path, serde_json::to_vec(&registration).unwrap()).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     }
@@ -3622,6 +3655,44 @@ mod tests {
             }
             assert!(old_root.is_dir() && new_root.join(MARKER).is_file());
         }
+    }
+
+    /// In permanent mode a checkout with no receipt never hands Cargo a
+    /// link: a foreign link and a marked link whose receipt is missing both
+    /// refuse with nothing written through them, while a real or missing
+    /// target keeps the unconverted behaviour.
+    #[test]
+    fn a_receiptless_link_is_never_followed_in_permanent_mode() {
+        let fixture = Fixture::new();
+        let store = Store::for_tests(&fixture.root.join("pool"));
+        register_at(&fixture, store.owner_control(), DriveMode::Permanent);
+        let context = fixture.context();
+        let bind = |label: &str| match bind_for_command(&store, &fixture.checkout, 0, None, None) {
+            Ok(_) => Ok(()),
+            Err(reason) => Err(format!("{label}: {reason}")),
+        };
+        assert!(bind("missing").is_ok());
+        fs::create_dir(context.link()).unwrap();
+        assert!(bind("real").is_ok());
+        fs::remove_dir(context.link()).unwrap();
+
+        let foreign = fixture.root.join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("sentinel"), b"foreign").unwrap();
+        symlink(&foreign, context.link()).unwrap();
+        let refused = bind("foreign").unwrap_err();
+        assert!(refused.contains("never follows"), "{refused}");
+        assert_eq!(fs::read_link(context.link()).unwrap(), foreign);
+        assert_eq!(fs::read_dir(&foreign).unwrap().count(), 1);
+
+        // A marked root linked without its receipt is not owned either.
+        fs::remove_file(context.link()).unwrap();
+        let spec = fixture.local();
+        ensure_root(&context, &spec, 1).unwrap();
+        symlink(spec.root(), context.link()).unwrap();
+        let refused = bind("marked").unwrap_err();
+        assert!(refused.contains("never follows"), "{refused}");
+        assert!(context.receipt().unwrap().is_none());
     }
 
     #[test]

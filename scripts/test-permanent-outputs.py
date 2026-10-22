@@ -518,6 +518,31 @@ def run(proof: Proof, repo: str) -> None:
     expect(code != 0 and "never moves" in stderr, stderr)
     expect(os.readlink(os.path.join(foreign, "target")) == outside, "foreign link was replaced")
     expect(read_bytes(os.path.join(outside, "sentinel")) == b"foreign", "foreign target mutated")
+    # 2b. Without a receipt, permanent mode never hands Cargo the foreign link:
+    #     a build and a selected clean refuse with nothing written or removed
+    #     through it, including a Cargo-shaped artifact planted behind it.
+    os.makedirs(os.path.join(outside, "debug"))
+    with open(os.path.join(outside, "debug", "plain"), "wb") as handle:
+        handle.write(b"planted")
+    outside_before = sorted(
+        os.path.relpath(os.path.join(base, name), outside)
+        for base, dirs, files in os.walk(outside)
+        for name in dirs + files
+    )
+    for args, label in (
+        (["build"], "build through a receiptless foreign link"),
+        (["clean", "-p", "plain"], "selected clean through a receiptless foreign link"),
+    ):
+        code, _, stderr = proof.oxide(args, label, foreign)
+        expect(code != 0 and "never follows" in stderr, stderr)
+        after = sorted(
+            os.path.relpath(os.path.join(base, name), outside)
+            for base, dirs, files in os.walk(outside)
+            for name in dirs + files
+        )
+        expect(after == outside_before, f"{label} changed the link's referent: {after}")
+        expect(os.readlink(os.path.join(foreign, "target")) == outside, f"{label} replaced the link")
+    expect(read_bytes(os.path.join(outside, "debug", "plain")) == b"planted", "the planted artifact changed")
 
     # 3. Explicit conversion of an empty real target.
     shutil.rmtree(os.path.join(app, "target"))

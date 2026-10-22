@@ -2383,6 +2383,11 @@ migration and consumer adoption remain separate gates.
   it: the check runs before ownership is established, including inside a
   `.oxide-outputs` directory that already exists and for an already-present
   empty `.oxide-outputs/local`, which is then left unchanged.
+- **Unconverted links.** In permanent mode a checkout with no committed
+  receipt (never converted, or detached) keeps a real `target`. A link there
+  (a foreign link, or a marked root linked without its receipt) is never
+  handed to Cargo or followed by clean: builds and selected or whole cleans
+  refuse with nothing changed. Ephemeral mode keeps today's behaviour.
 - **Committed link.** A live link must select the receipt's committed root.
   A link to another owned root (an older selection restored by hand) is
   foreign even when that root's marker is valid: binding refuses and changes
@@ -2526,6 +2531,8 @@ sibling and renamed points plus the contradictory-state stop, a sibling-point
 replay refused before its rename when the registration names another volume,
 and a crafted link that appeared after a crash; a same-device symlinked
 `.oxide-outputs` refused by build and clean with the tree it names unchanged;
+a build and a selected clean refused through a receiptless foreign link with
+its referent (including a planted Cargo-shaped artifact) unchanged;
 a pool fallback (container mismatch) with the drive present moving outputs
 to the local root and redocking; a gated `oxide run` program executing from
 the real external root whose ordinary child outlives it, keeping `run` held
