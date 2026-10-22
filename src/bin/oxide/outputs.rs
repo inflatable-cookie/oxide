@@ -321,6 +321,10 @@ enum TargetState {
     /// A symlink whose target is a real directory carrying this checkout's
     /// ownership marker.
     OwnedLink(PathBuf),
+    /// A symlink whose target does not exist at all (the registered volume is
+    /// away, or a fresh fallback root has not been created yet). Its text is
+    /// only acted on when it matches the receipt's committed selection.
+    Dangling(PathBuf),
     /// Any other symlink or non-directory.
     Foreign,
 }
@@ -332,6 +336,7 @@ impl TargetState {
             Self::RealEmpty => "an empty directory",
             Self::RealNonEmpty => "a directory with content",
             Self::OwnedLink(_) => "an owned Oxide link",
+            Self::Dangling(_) => "a link whose root is not available",
             Self::Foreign => "a symlink or file Oxide does not own",
         }
     }
@@ -342,10 +347,21 @@ impl TargetState {
             Self::RealEmpty => "real-empty",
             Self::RealNonEmpty => "real-nonempty",
             Self::OwnedLink(_) => "owned-link",
+            Self::Dangling(_) => "dangling-link",
             Self::Foreign => "foreign",
         }
     }
 
+    /// The root the link names when it is this checkout's owned link, whether
+    /// or not that root is available right now.
+    fn link_root(&self) -> Option<&Path> {
+        match self {
+            Self::OwnedLink(root) | Self::Dangling(root) => Some(root),
+            _ => None,
+        }
+    }
+
+    /// The verified real root: an owned link whose root is available.
     fn root(&self) -> Option<&Path> {
         match self {
             Self::OwnedLink(root) => Some(root),
@@ -515,7 +531,7 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
         mode: mode_label(mode),
         state,
         current_target: target.code(),
-        current_root: target.root().map(Path::to_path_buf),
+        current_root: target.link_root().map(Path::to_path_buf),
         selected: receipt
             .as_ref()
             .and_then(Receipt::selected)
@@ -559,9 +575,9 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
                         .to_owned(),
                 );
             }
-            TargetState::OwnedLink(_) => {
+            TargetState::OwnedLink(_) | TargetState::Dangling(_) => {
                 report.reason = Some(
-                    "the target is an owned link but this checkout has no receipt; remove it yourself before adopting"
+                    "the target is a link but this checkout has no receipt; remove it yourself before adopting"
                         .to_owned(),
                 );
             }
@@ -591,8 +607,8 @@ fn plan_report(context: &Context) -> Result<PlanReport, String> {
         );
         return Ok(report);
     };
-    match (&target, target.root()) {
-        (TargetState::OwnedLink(root), _) if *root == selected.root => {
+    match (&target, target.link_root()) {
+        (_, Some(root)) if root == selected.root.as_path() => {
             let wanted = match &usable {
                 Ok(registration) => {
                     external_spec(registration, &context.workspace).selected(next_generation)
@@ -720,7 +736,7 @@ fn output_status_lines(context: &Context) -> Result<Vec<String>, String> {
             ));
         }
         if let Some(selected) = receipt.selected() {
-            if target.root() != Some(selected.root.as_path()) {
+            if target.link_root() != Some(selected.root.as_path()) {
                 lines.push(format!(
                     "outputs: the target is {} rather than the owned link selecting {}; run `oxide outputs adopt`",
                     target.label(),
@@ -806,8 +822,9 @@ fn adopt_under_barrier(
     let current = receipt.selected().cloned();
     match (&target, &current) {
         // Already converted to the place this command would select.
-        (TargetState::OwnedLink(root), Some(selected))
-            if *root == selected.root && spec.selected(0).same_place(selected) =>
+        (_, Some(selected))
+            if target.link_root() == Some(selected.root.as_path())
+                && spec.selected(0).same_place(selected) =>
         {
             ensure_root(context, &spec, receipt.generation)?;
             let selected = selected.clone();
@@ -815,7 +832,7 @@ fn adopt_under_barrier(
         }
         // A committed receipt whose owned link selects another known place:
         // relink under the barrier.
-        (TargetState::OwnedLink(root), Some(selected)) if *root == selected.root => {
+        (_, Some(selected)) if target.link_root() == Some(selected.root.as_path()) => {
             let committed = transition(context, &receipt, &spec)?;
             let selected = committed
                 .selected()
@@ -841,9 +858,7 @@ fn adopt_under_barrier(
                 .ok_or("the transition committed no root")?;
             Ok((committed, selected, true))
         }
-        (TargetState::RealNonEmpty | TargetState::Foreign | TargetState::OwnedLink(_), _) => {
-            Err(refuse_existing_target(context, &target))
-        }
+        _ => Err(refuse_existing_target(context, &target)),
     }
 }
 
@@ -855,7 +870,7 @@ fn refuse_existing_target(context: &Context, target: &TargetState) -> String {
         match target {
             TargetState::RealNonEmpty =>
                 "Move it aside yourself if you accept losing its warm build, then re-run `oxide outputs adopt`.",
-            TargetState::OwnedLink(_) =>
+            TargetState::OwnedLink(_) | TargetState::Dangling(_) =>
                 "Its receipt does not select this root, so Oxide will not touch it.",
             _ =>
                 "Remove or restore it yourself, then re-run `oxide outputs adopt`.",
@@ -895,7 +910,7 @@ fn detach_command() -> Result<u8, String> {
             .cloned()
             .ok_or("the receipt selects no root; nothing to detach")?;
         let target = context.target()?;
-        if target.root() != Some(selected.root.as_path()) {
+        if target.link_root() != Some(selected.root.as_path()) {
             return Err(format!(
                 "outputs detach refused: {} is {}, not the owned link selecting {}; it is left untouched",
                 context.link().display(),
@@ -1043,7 +1058,7 @@ fn bind_with_receipt(context: &Context, receipt: Receipt) -> Result<Outcome, Str
                 .cloned()
                 .ok_or("outputs: the receipt selects no root")?;
             let wanted = spec.selected(receipt.generation.saturating_add(1));
-            if target.root() == Some(wanted.root.as_path()) {
+            if matches!(&target, TargetState::OwnedLink(root) if *root == wanted.root) {
                 let mut outcome = Outcome::default();
                 if let Err(reason) = &usable {
                     outcome.warnings.push(format!(
@@ -1063,7 +1078,7 @@ fn bind_with_receipt(context: &Context, receipt: Receipt) -> Result<Outcome, Str
             }
             match &target {
                 TargetState::Missing => {}
-                TargetState::OwnedLink(root) if *root == selected.root => {}
+                _ if target.link_root() == Some(selected.root.as_path()) => {}
                 _ => {
                     return Err(format!(
                         "outputs: {} is {}, not this checkout's owned link; Oxide will not replace it. Run `oxide outputs detach` or restore the link yourself",
@@ -1177,6 +1192,7 @@ fn target_state(checkout: &Path, checkout_id: &str) -> Result<TargetState, Strin
             .map_err(|error| format!("cannot read the link {}: {error}", target.display()))?;
         return Ok(match owned_root(checkout, checkout_id, &root) {
             Ok(()) => TargetState::OwnedLink(root),
+            Err(_) if fs::symlink_metadata(&root).is_err() => TargetState::Dangling(root),
             Err(_) => TargetState::Foreign,
         });
     }
@@ -1551,7 +1567,7 @@ fn transition(context: &Context, receipt: &Receipt, spec: &RootSpec) -> Result<R
                 )
             })?;
         }
-        (TargetState::OwnedLink(root), Some(selected)) if *root == selected.root => {}
+        (_, Some(selected)) if target.link_root() == Some(selected.root.as_path()) => {}
         _ => return Err(refuse_existing_target(context, &target)),
     }
     let to = spec.selected(generation);
@@ -1728,12 +1744,12 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
     let owned_new = owned_root(&context.workspace, &context.checkout_id, &prepared.to.root).is_ok();
     let old_live = match (&target, receipt.selected()) {
         (TargetState::Missing, _) => true,
-        (TargetState::OwnedLink(root), Some(selected)) => *root == selected.root,
-        (TargetState::OwnedLink(_), None) => true,
+        (_, Some(selected)) if target.link_root() == Some(selected.root.as_path()) => true,
+        (TargetState::OwnedLink(_) | TargetState::Dangling(_), None) => true,
         _ => false,
     };
     // 1. The rename already happened: commit.
-    if owned_new && target.root() == Some(prepared.to.root.as_path()) {
+    if owned_new && target.link_root() == Some(prepared.to.root.as_path()) {
         return finish_commit(context, &receipt, &prepared);
     }
     // 2. The sibling link is live: retry the rename under the barrier.
@@ -2345,6 +2361,57 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded.state, ReceiptState::Prepared);
+    }
+
+    #[test]
+    fn a_dangling_link_names_its_root_but_is_not_owned() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let absent = fixture.root.join("absent-root");
+        symlink(&absent, context.link()).unwrap();
+        let state = context.target().unwrap();
+        assert_eq!(state, TargetState::Dangling(absent.clone()));
+        assert_eq!(state.link_root(), Some(absent.as_path()));
+        assert_eq!(state.root(), None);
+        assert!(state.label().contains("not available"), "{}", state.label());
+    }
+
+    #[test]
+    fn a_transition_away_from_the_receipts_dangling_link_is_allowed() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let mut receipt = fixture.receipt();
+        let absent = fixture.root.join("absent-root");
+        let previous = Selected {
+            kind: RootKind::Local,
+            root: absent.clone(),
+            volume_uuid: None,
+            generation: 1,
+        };
+        receipt.state = ReceiptState::Committed;
+        receipt.generation = 1;
+        receipt.selected = Some(previous.clone());
+        receipt.roots = vec![previous];
+        write_receipt(&fixture.control, &receipt).unwrap();
+        symlink(&absent, context.link()).unwrap();
+        let committed = transition(&context, &receipt, &fixture.local()).unwrap();
+        assert_eq!(committed.generation, 2);
+        assert_eq!(
+            fs::read_link(context.link()).unwrap(),
+            fixture.local().root()
+        );
+        assert!(!absent.exists(), "the absent root was created");
+    }
+
+    #[test]
+    fn a_dangling_link_without_the_receipts_selection_is_never_replaced() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let absent = fixture.root.join("absent-root");
+        symlink(&absent, context.link()).unwrap();
+        let refused = transition(&context, &fixture.receipt(), &fixture.local()).unwrap_err();
+        assert!(refused.contains("never moves"), "{refused}");
+        assert_eq!(fs::read_link(context.link()).unwrap(), absent);
     }
 
     #[test]
