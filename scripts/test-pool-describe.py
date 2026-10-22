@@ -39,7 +39,7 @@ Plan:
    matched exactly on index and cache. Each registry package takes one index
    entry and one .crate archive, with archive bytes checked against the lock
    checksum. Workspace packages are skipped. The one locked Longhorn Git package
-   seeds only its bare database candidates (1 to 8, one shared aggregate), each with a private config, and its full locked
+   seeds only its bare database candidates (1 to 8, one shared aggregate; a read-only host commit prefilter copies only commit-bearing ones), each with a private config, and its full locked
    commit must resolve before staging; the private checkout's HEAD is checked
    after staging. Other sources, duplicate keys and duplicate packages refuse.
    The host CARGO_HOME and registry roots are checked
@@ -497,14 +497,23 @@ def git_commit_present(proof: "Proof", git_dir: Path, rev: str, home: Path, labe
     return code == 0 and out.strip() == rev
 
 
-def seed_git(proof: "Proof", host_cargo_home: Path, cargo_home: Path, budget: SeedBudget) -> dict:
-    """Seed every locked-source Longhorn bare database candidate, bounded.
+def write_git_refusal(proof: "Proof", records: list[dict], budget: SeedBudget, reason: str) -> None:
+    """Keep the candidate record of a refused seed: bytes, budget and presence so far."""
+    (proof.evidence / "git-seed-refusal.json").write_text(
+        json.dumps({"reason": reason, "budget_used": budget.used, "candidates": records}, indent=2)
+    )
 
-    One to GIT_CANDIDATE_LIMIT candidates are accepted; more refuse before any
-    copy. All candidates share the one aggregate budget, and no charged byte is
-    removed. Each copy has a private config, and each records whether the
-    locked full commit is present. At least one candidate must have it. Cargo
-    chooses its own identifier later; nothing here guesses it.
+
+def seed_git(proof: "Proof", host_cargo_home: Path, cargo_home: Path, budget: SeedBudget) -> dict:
+    """Seed the locked-source Longhorn bare database candidates, bounded.
+
+    One to GIT_CANDIDATE_LIMIT host candidates are accepted; more refuse before
+    any copy. Each is lstat-validated, and then a read-only prefilter checks
+    the full locked commit with Proof.run. Only commit-bearing candidates are
+    copied, through the shared bounded copier, and each private copy must
+    resolve the locked commit again. Charged bytes are never removed. A refusal
+    keeps the per-candidate record in git-seed-refusal.json. Cargo chooses its
+    identifier later; nothing here guesses it.
     """
     host_git = host_cargo_home / "git"
     lstat_real_dir(host_git, "host git root")
@@ -513,40 +522,62 @@ def seed_git(proof: "Proof", host_cargo_home: Path, cargo_home: Path, budget: Se
     names = [name for name in sorted(os.listdir(host_db_root)) if GIT_DB_RE.match(name)]
     if not 1 <= len(names) <= GIT_CANDIDATE_LIMIT:
         raise SeedRefusal(f"expected 1 to {GIT_CANDIDATE_LIMIT} longhorn bare databases, found {len(names)}")
-    candidates: list[dict] = []
+    records: list[dict] = []
     files: list[dict] = []
-    for index, name in enumerate(names):
-        source = host_db_root / name
-        lstat_real_dir(source, "host longhorn bare database")
-        if not stat.S_ISREG(os.lstat(source / "HEAD").st_mode):
-            raise SeedRefusal(f"longhorn database {name} HEAD is not a regular file")
-        if os.path.lexists(source / "objects" / "info" / "alternates"):
-            raise SeedRefusal(f"longhorn database {name} uses alternates; refused")
-        base = f"git/db/{name}"
-        destination = cargo_home / "git" / "db" / name
-        destination.mkdir(parents=True, exist_ok=True)
-        before = budget.used
-        candidate_files: list[dict] = []
-        copy_git_tree(source, destination, budget, "", base, candidate_files)
-        if budget.used + len(GIT_CONFIG) > budget.limit:
-            raise SeedRefusal("seed aggregate would exceed the 256 MiB bound; refused before the write")
-        budget.used += len(GIT_CONFIG)
-        (destination / "config").write_bytes(GIT_CONFIG)
-        digest = hashlib.sha256(GIT_CONFIG).hexdigest()
-        candidate_files.append({"path": f"{base}/config", "sha256": digest, "generated": True})
-        present = git_commit_present(proof, destination, LONGHORN_REV, destination, f"git-rev-commit-{index}")
-        candidates.append({
-            "database": name,
-            "bytes": budget.used - before,
-            "filecount": len(candidate_files),
-            "commit_present": present,
-            "config_sha256": digest,
-            "generated": True,
-        })
-        files.extend(candidate_files)
-    if not any(candidate["commit_present"] for candidate in candidates):
-        raise SeedRefusal(f"no private longhorn database resolves the locked commit {LONGHORN_REV}")
-    return {"source": LONGHORN_SOURCE, "rev": LONGHORN_REV, "candidates": candidates, "files": files}
+    try:
+        for index, name in enumerate(names):
+            source = host_db_root / name
+            lstat_real_dir(source, "host longhorn bare database")
+            if not stat.S_ISREG(os.lstat(source / "HEAD").st_mode):
+                raise SeedRefusal(f"longhorn database {name} HEAD is not a regular file")
+            if os.path.lexists(source / "objects" / "info" / "alternates"):
+                raise SeedRefusal(f"longhorn database {name} uses alternates; refused")
+            present = git_commit_present(proof, source, LONGHORN_REV, proof.root, f"git-host-prefilter-{index}")
+            records.append({
+                "database": name,
+                "host_commit_present": present,
+                "copied": False,
+                "bytes": 0,
+                "filecount": 0,
+                "commit_present": None,
+                "config_sha256": None,
+                "generated": True,
+                "budget_used_after": budget.used,
+            })
+        if not any(record["host_commit_present"] for record in records):
+            raise SeedRefusal(f"no host longhorn database resolves the locked commit {LONGHORN_REV}")
+        for index, record in enumerate(records):
+            if not record["host_commit_present"]:
+                continue
+            name = record["database"]
+            base = f"git/db/{name}"
+            destination = cargo_home / "git" / "db" / name
+            destination.mkdir(parents=True, exist_ok=True)
+            before = budget.used
+            candidate_files: list[dict] = []
+            copy_git_tree(host_db_root / name, destination, budget, "", base, candidate_files)
+            if budget.used + len(GIT_CONFIG) > budget.limit:
+                raise SeedRefusal("seed aggregate would exceed the 256 MiB bound; refused before the write")
+            budget.used += len(GIT_CONFIG)
+            (destination / "config").write_bytes(GIT_CONFIG)
+            digest = hashlib.sha256(GIT_CONFIG).hexdigest()
+            candidate_files.append({"path": f"{base}/config", "sha256": digest, "generated": True})
+            record.update(
+                copied=True,
+                bytes=budget.used - before,
+                filecount=len(candidate_files),
+                config_sha256=digest,
+                budget_used_after=budget.used,
+            )
+            files.extend(candidate_files)
+            present = git_commit_present(proof, destination, LONGHORN_REV, proof.root, f"git-rev-commit-{index}")
+            record["commit_present"] = present
+            if not present:
+                raise SeedRefusal(f"private copy of {name} does not resolve the locked commit {LONGHORN_REV}")
+    except SeedRefusal as error:
+        write_git_refusal(proof, records, budget, str(error))
+        raise
+    return {"source": LONGHORN_SOURCE, "rev": LONGHORN_REV, "candidates": records, "files": files}
 
 
 def verify_private_checkout(proof: "Proof", cargo_home: Path, idents: list[str]) -> str:
