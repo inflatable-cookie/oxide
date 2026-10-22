@@ -235,6 +235,7 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         eprintln!("oxide: {note}");
     }
     let started = Instant::now();
+    let mut waits = store::WaitAccounting::default();
     let resolution = cli::resolution(&invocation.cargo_args);
     let label = exec_label(&invocation.tool);
     let (held, gate) = match lease_with_gate(
@@ -243,6 +244,7 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         invocation.profile,
         &resolution,
         label.as_deref(),
+        &mut waits,
     )? {
         Ok(leased) => leased,
         Err(Stop::Signal(signal)) => return Ok(process::signal_exit_code(signal)),
@@ -284,6 +286,7 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     if run {
         cargo.stdout(Stdio::piped());
     }
+    waits.print_completion("slot ready");
     let started_group = store
         .mark_spawning(&held)
         .map_err(Unstarted::Record)
@@ -372,6 +375,7 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         measured.as_ref(),
         started,
         note.as_deref(),
+        &waits,
     );
     if store.backend == Backend::ApfsVolume {
         match store.last_flush() {
@@ -438,12 +442,13 @@ fn lease_with_gate(
     profile: cli::Profile,
     resolution: &cli::Resolution,
     label: Option<&str>,
+    waits: &mut store::WaitAccounting,
 ) -> Result<Result<(store::Lease, Gate), Stop>, String> {
     let mut share = true;
     // A refusal leaves this checkout without a record, so the next lease is
     // a new or evicted slot; the bound only guards against a defect.
     for _ in 0..4 {
-        let mut held = match store.acquire(key, profile, share, label)? {
+        let mut held = match store.acquire(key, profile, share, label, waits)? {
             Acquired::Lease(held) => held,
             Acquired::Interrupted(signal) => return Ok(Err(Stop::Signal(signal))),
         };
@@ -598,6 +603,7 @@ fn print_summary(
     measured: Option<&ReuseMeasurement>,
     started: Instant,
     note: Option<&str>,
+    waits: &store::WaitAccounting,
 ) {
     let strategy = match invocation.command.as_str() {
         "run" | "test" | "exec" => "build+execute",
@@ -625,8 +631,9 @@ fn print_summary(
         ),
     };
     let note = note.map(|note| format!(", {note}")).unwrap_or_default();
+    let wait = waits.summary_suffix().unwrap_or_default();
     eprintln!(
-        "oxide: {} profile, {strategy} strategy, slot {slot} {}, {:.1}s, {pool}{backend}{note}",
+        "oxide: {} profile, {strategy} strategy, slot {slot} {}, {:.1}s, {pool}{backend}{note}{wait}",
         invocation.profile.label(),
         if warm { "warm" } else { "cold" },
         started.elapsed().as_secs_f64()
@@ -917,6 +924,22 @@ fn print_pool(
         report.slots.len(),
         report.waiting
     );
+    for waiter in &report.waiters {
+        let age = waiter.age.as_ref().map_or_else(
+            || "age unknown".to_owned(),
+            |age| {
+                format!(
+                    "age approximately {}s ({})",
+                    age.seconds,
+                    age.source.label()
+                )
+            },
+        );
+        println!(
+            "  recorded lease-ticket waiter PID {}, {age} (may be stale)",
+            waiter.pid
+        );
+    }
     for checkout in &report.cleaning {
         println!("  cleaning {}", checkout.display());
     }

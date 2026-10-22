@@ -81,6 +81,21 @@ PERSIST = 8 * MIB
 FORWARD = 32 * MIB
 CENSUS_INTERVAL = 0.2
 CONFIRM_TRIES, CONFIRM_PAUSE = 20, 0.05  # gone confirmation within one round, at most 1 s
+DIAG_MAX_BYTES = 16384  # compact UTF-8 JSON ceiling for the optional receipt census diagnostics
+DIAG_MAX_ROWS = 20  # at most 20 diagnostic summary rows; the rest count as omitted
+TERMINAL_STATUS_VALUES = ("valid", "invalid", "overflow")
+TERMINAL_MODE_REASONS = ("allowlisted", "identity_read_error", "identity_malformed", "identity_mismatch")
+# One-shot exact-kernel allowlist for TERMINALNONWRITER acceptance (owner activation
+# 3c6f543a v2 / Tom accept 9f497184; static trace c8677574 with disclosed gaps).
+ALLOW_KERNEL_UUID_STR = "8D3E13A0-01FC-381D-9DA3-7F0AF537CB32"
+ALLOW_KERNEL_UUID_BIN = bytes.fromhex("8D3E13A001FC381D9DA37F0AF537CB32")
+ALLOW_KERNEL_BUILD = b"25G83\x00"
+ALLOW_KERNEL_VERSION_TOKEN = "root:xnu-12377.161.14~5/RELEASE_ARM64_T6050"
+ALLOW_EVIDENCE_ID = "kdk25G83-8D3E13A0-c8677574-TomAccept9f497184"
+U64MAX = 2 ** 64 - 1
+CONFIRM_VALUES = ("absent", "replaced", "matching_exhausted", "read_failed")
+FINAL_VALUES = ("not_read", "absent", "replaced", "same_identity", "read_failed")
+DIAG_ERROR_VALUES = ("none", "permission", "not_found", "io", "other")
 MAX_LINE = 64 * 1024
 INJECTIONS = {
     "setup-stall", "no-detector", "ack-eof", "ack-wrong", "cancel-before-ack", "monitor-die",
@@ -261,6 +276,351 @@ class Kinfo:
             raise ValueError("layout does not match this process")
 
 
+def _diag_u64(value):
+    """Valid unsigned 64-bit diagnostic integer, else None (omitted, never sanitized)."""
+    return value if type(value) is int and 0 <= value <= U64MAX else None
+
+
+def _diag_small(value, low, high):
+    return value if type(value) is int and low <= value <= high else None
+
+
+def _diag_classify(error):
+    """Map an exception to (enumerated category, bounded errno or None).
+
+    Reads only the C-level errno slot; never converts the exception to
+    text. Unknown or unbounded values become omitted, never widened."""
+    if error is None:
+        return ("none", None)
+    try:
+        code = _ERRNO.__get__(error)
+    except BaseException:
+        code = None
+    if type(code) is not int:
+        return ("other", None)
+    bounded = code if 0 <= code <= 4095 else None
+    try:
+        if code == errno.ESRCH:
+            return ("not_found", bounded)
+        if code == errno.EACCES or code == errno.EPERM:
+            return ("permission", bounded)
+        if code == errno.EIO:
+            return ("io", bounded)
+    except BaseException:
+        return ("other", bounded)
+    return ("other", bounded)
+
+
+def _diag_row(row, tries, confirm, final, error, err_no):
+    """One bounded diagnostic summary row with fixed enums only.
+
+    Allowed keys only: initial pid/start/ppid/pgid/uid/zombie plus
+    confirm_tries/confirm/final/error and an optional bounded errno.
+    Invalid numerics are omitted (absent), never sanitized."""
+    out = {}
+    source = row if isinstance(row, dict) else {}
+    for key in ("pid", "start", "ppid", "pgid", "uid"):
+        try:
+            valid = _diag_u64(source.get(key))
+        except BaseException:
+            valid = None
+        if valid is not None:
+            out[key] = valid
+    try:
+        zombie = source.get("zombie")
+    except BaseException:
+        zombie = None
+    if zombie is True:
+        out["zombie"] = True
+    elif zombie is False:
+        out["zombie"] = False
+    valid_tries = _diag_small(tries, 0, CONFIRM_TRIES)
+    if valid_tries is not None:
+        out["confirm_tries"] = valid_tries
+    if confirm in CONFIRM_VALUES:
+        out["confirm"] = confirm
+    if final in FINAL_VALUES:
+        out["final"] = final
+    if error in DIAG_ERROR_VALUES:
+        out["error"] = error
+    if type(err_no) is int and 0 <= err_no <= 4095:
+        out["errno"] = err_no
+    return out
+
+
+def _diag_object(attempted, rows, saturated):
+    """Build the optional diagnostics object under the byte ceiling.
+
+    Drops complete rows from the end first with an explicit omitted count;
+    if even the minimal object cannot fit, returns None (omit entirely).
+    Never raises; serialization failure also returns None."""
+    try:
+        if type(attempted) is not int or attempted < 0:
+            attempted = U64MAX
+            saturated = True
+        elif attempted > U64MAX:
+            attempted = U64MAX
+            saturated = True
+        kept = list(rows[:DIAG_MAX_ROWS])
+        omitted = len(rows) - len(kept)
+        if omitted < 0:
+            omitted = 0
+        if omitted > U64MAX:
+            omitted = U64MAX
+            saturated = True
+        retained = len(kept)
+        if retained > U64MAX:
+            retained = U64MAX
+            saturated = True
+        obj = {"attempted": attempted, "retained": retained, "omitted": omitted,
+               "saturated": bool(saturated), "rows": kept}
+        compact = json.dumps(obj, ensure_ascii=True, separators=(',', ':')).encode("utf-8")
+        if len(compact) <= DIAG_MAX_BYTES:
+            return obj
+        while kept:
+            kept = kept[:-1]
+            omitted = len(rows) - len(kept)
+            if omitted < 0:
+                omitted = 0
+            if omitted > U64MAX:
+                omitted = U64MAX
+                saturated = True
+            retained = len(kept)
+            obj = {"attempted": attempted, "retained": retained, "omitted": omitted,
+                   "saturated": bool(saturated), "rows": kept}
+            compact = json.dumps(obj, ensure_ascii=True, separators=(',', ':')).encode("utf-8")
+            if len(compact) <= DIAG_MAX_BYTES:
+                return obj
+        minimal = {"attempted": attempted, "retained": 0, "omitted": len(rows) if len(rows) <= U64MAX else U64MAX,
+                   "saturated": bool(saturated or len(rows) > U64MAX), "rows": []}
+        compact = json.dumps(minimal, ensure_ascii=True, separators=(',', ':')).encode("utf-8")
+        return minimal if len(compact) <= DIAG_MAX_BYTES else None
+    except BaseException:
+        return None
+
+
+def _same_complete_zombie(ref, cand):
+    """Whether two observations show the same complete SZOMB identity.
+
+    Requires both to be dicts with exact non-bool bounded ints (positive
+    PID, start in range) equal across both, and exact SZOMB state in
+    both. Pure predicate, never raises."""
+    try:
+        if not isinstance(ref, dict) or not isinstance(cand, dict):
+            return False
+        ref_pid, ref_start = ref.get("pid"), ref.get("start")
+        cand_pid, cand_start = cand.get("pid"), cand.get("start")
+        if not (type(ref_pid) is int and 1 <= ref_pid <= U64MAX):
+            return False
+        if not (type(ref_start) is int and 0 <= ref_start <= U64MAX):
+            return False
+        if not (type(cand_pid) is int and 1 <= cand_pid <= U64MAX):
+            return False
+        if not (type(cand_start) is int and 0 <= cand_start <= U64MAX):
+            return False
+        return (ref_pid == cand_pid and ref_start == cand_start
+                and ref.get("zombie") is True and cand.get("zombie") is True)
+    except BaseException:
+        return False
+
+
+def _terminal_fields(terminal_count, unaccountable, failed):
+    """Mandatory receipt-only terminal count fields.
+
+    Returns (status, value) with status in valid/invalid/overflow and
+    value an exact non-bool int 0..U64MAX when valid, else None (JSON
+    null). Valid counts this round's positively verified still-present
+    SZOMB identities accepted by the terminal rule, never Gone rows.
+    Unaccountable terminal candidacy (an actual-ESRCH row that could not
+    be fully adjudicated as terminal or Gone), a failure without a
+    countable set, or a malformed count is invalid with null, never a raw
+    bad value, false zero or lower bound; genuine count overflow is
+    likewise null. Invalid and overflow always coincide with uncertain>=1
+    and certain False in the unchanged IPC fields (enforced by the
+    caller). Uncertainty of unrelated rows (never terminal candidates)
+    does not itself invalidate an accountable count. Optional
+    diagnostics saturation never feeds this helper and must not change
+    authoritative counts or classification. Never raises."""
+    try:
+        if failed:
+            return ("invalid", None)
+        if type(terminal_count) is int and terminal_count > U64MAX:
+            return ("overflow", None)
+        if unaccountable:
+            return ("invalid", None)
+        if type(terminal_count) is int and 0 <= terminal_count <= U64MAX:
+            return ("valid", terminal_count)
+        return ("invalid", None)
+    except BaseException:
+        return ("invalid", None)
+
+
+def _fixed_sysctl_reader(sysctlbyname=None, get_errno=None):
+    """One fixed-buffer sysctlbyname read per name. No size probe, no retry.
+
+    The libc entry points are injectable for deterministic tests; production
+    passes the loaded libc. A reported length above the fixed capacity is
+    rejected, never silently sliced."""
+    if sysctlbyname is None:
+        _libc = ctypes.CDLL(None, use_errno=True)
+        sysctlbyname, get_errno = _libc.sysctlbyname, ctypes.get_errno
+    def read(name, size):
+        buf = ctypes.create_string_buffer(size)
+        length = ctypes.c_size_t(size)
+        if sysctlbyname(name.encode("ascii"), buf, ctypes.pointer(length), None, 0) != 0:
+            raise OSError(get_errno(), "sysctlbyname " + name)
+        if length.value > size:
+            raise OSError(errno.ENOMEM, "sysctlbyname " + name + " exceeds fixed buffer")
+        return bytes(buf.raw[:length.value])
+    return read
+
+
+def _is_oversize(error):
+    """Whether a sysctlbyname failure means the value exceeds the fixed buffer."""
+    try:
+        return _ERRNO.__get__(error) == errno.ENOMEM
+    except BaseException:
+        return False
+
+
+def _ascii_nul_text(raw):
+    """Complete ASCII NUL-terminated string body, else None.
+
+    Exactly one NUL, in terminal position; interior NULs are malformed."""
+    try:
+        if not raw or raw[-1:] != b"\x00":
+            return None
+        body = raw[:-1]
+        if not body or b"\x00" in body:
+            return None
+        return body.decode("ascii")
+    except BaseException:
+        return None
+
+
+def _decide_terminal_mode(reader=None):
+    """Decide terminal acceptance mode once. Never raises.
+
+    Uses at most 3 fixed-buffer sysctlbyname reads (kern.uuid 64B,
+    kern.osversion 64B, kern.version 1024B) via the loaded libc; no size
+    probes, retries, subprocess, files, hashes or new actors. Returns
+    {mode, reason, evidence} with mode allowlisted/strict, reason one of
+    allowlisted/identity_read_error/identity_malformed/identity_mismatch,
+    and the fixed evidence ID. Any failure, oversize, malformed value or
+    mismatch freezes to STRICT."""
+    try:
+        if reader is None:
+            reader = _fixed_sysctl_reader()
+        try:
+            uuid_raw = reader("kern.uuid", 64)
+            if len(uuid_raw) > 64:
+                return {"mode": "strict", "reason": "identity_malformed", "evidence": ALLOW_EVIDENCE_ID}
+        except Exception as error:
+            reason = "identity_malformed" if _is_oversize(error) else "identity_read_error"
+            return {"mode": "strict", "reason": reason, "evidence": ALLOW_EVIDENCE_ID}
+        if len(uuid_raw) == 16:
+            if uuid_raw != ALLOW_KERNEL_UUID_BIN:
+                return {"mode": "strict", "reason": "identity_mismatch", "evidence": ALLOW_EVIDENCE_ID}
+        elif len(uuid_raw) == 37 and uuid_raw[-1:] == b"\x00":
+            try:
+                uuid_text = uuid_raw[:-1].decode("ascii")
+            except BaseException:
+                return {"mode": "strict", "reason": "identity_malformed", "evidence": ALLOW_EVIDENCE_ID}
+            if "\x00" in uuid_text:
+                return {"mode": "strict", "reason": "identity_malformed", "evidence": ALLOW_EVIDENCE_ID}
+            if uuid_text == ALLOW_KERNEL_UUID_STR:
+                pass
+            elif len(uuid_text) == 36:
+                return {"mode": "strict", "reason": "identity_mismatch", "evidence": ALLOW_EVIDENCE_ID}
+            else:
+                return {"mode": "strict", "reason": "identity_malformed", "evidence": ALLOW_EVIDENCE_ID}
+        else:
+            return {"mode": "strict", "reason": "identity_malformed", "evidence": ALLOW_EVIDENCE_ID}
+        try:
+            build_raw = reader("kern.osversion", 64)
+            if len(build_raw) > 64:
+                return {"mode": "strict", "reason": "identity_malformed", "evidence": ALLOW_EVIDENCE_ID}
+        except Exception as error:
+            reason = "identity_malformed" if _is_oversize(error) else "identity_read_error"
+            return {"mode": "strict", "reason": reason, "evidence": ALLOW_EVIDENCE_ID}
+        if build_raw == ALLOW_KERNEL_BUILD:
+            pass
+        elif _ascii_nul_text(build_raw) is not None:
+            return {"mode": "strict", "reason": "identity_mismatch", "evidence": ALLOW_EVIDENCE_ID}
+        else:
+            return {"mode": "strict", "reason": "identity_malformed", "evidence": ALLOW_EVIDENCE_ID}
+        try:
+            version_raw = reader("kern.version", 1024)
+            if len(version_raw) > 1024:
+                return {"mode": "strict", "reason": "identity_malformed", "evidence": ALLOW_EVIDENCE_ID}
+        except Exception as error:
+            reason = "identity_malformed" if _is_oversize(error) else "identity_read_error"
+            return {"mode": "strict", "reason": reason, "evidence": ALLOW_EVIDENCE_ID}
+        if not version_raw or version_raw[-1:] != b"\x00" or version_raw.count(b"\x00") != 1:
+            return {"mode": "strict", "reason": "identity_malformed", "evidence": ALLOW_EVIDENCE_ID}
+        try:
+            version_text = version_raw[:-1].decode("ascii")
+        except BaseException:
+            return {"mode": "strict", "reason": "identity_malformed", "evidence": ALLOW_EVIDENCE_ID}
+        tokens = version_text.split()
+        if not tokens:
+            return {"mode": "strict", "reason": "identity_malformed", "evidence": ALLOW_EVIDENCE_ID}
+        exact = sum(1 for token in tokens if token == ALLOW_KERNEL_VERSION_TOKEN)
+        others = [token for token in tokens
+                  if token != ALLOW_KERNEL_VERSION_TOKEN and ("xnu-" in token or "RELEASE_" in token)]
+        if exact == 1 and not others:
+            return {"mode": "allowlisted", "reason": "allowlisted", "evidence": ALLOW_EVIDENCE_ID}
+        if exact >= 1:
+            return {"mode": "strict", "reason": "identity_malformed", "evidence": ALLOW_EVIDENCE_ID}
+        return {"mode": "strict", "reason": "identity_mismatch", "evidence": ALLOW_EVIDENCE_ID}
+    except BaseException:
+        return {"mode": "strict", "reason": "identity_read_error", "evidence": ALLOW_EVIDENCE_ID}
+
+
+def _terminal_witness_row(row, was_tracked):
+    """Optional witness row for a terminal-accepted identity.
+
+    Fixed keys only: pid/start plus both qualifying SZOMB states and
+    prior tracking, all fixed enums/bools and bounded ints. Returns None
+    when the identity is not exactly witnessable (never sanitized)."""
+    try:
+        pid = _diag_u64(row.get("pid")) if isinstance(row, dict) else None
+        start = _diag_u64(row.get("start")) if isinstance(row, dict) else None
+        if pid is None or start is None:
+            return None
+        snapshot_zombie = row.get("zombie") if isinstance(row, dict) else None
+        if snapshot_zombie is not True:
+            return None
+        return {"pid": pid, "start": start, "snapshot_zombie": True,
+                "first_zombie": True, "tracked": bool(was_tracked)}
+    except BaseException:
+        return None
+
+
+def _fit_witnesses(witnesses, diag_kept_count, diag_compact_len):
+    """Fit optional witness rows into the remainder of the combined budget.
+
+    The combined cap is at most 20 rows and 16384 compact bytes shared
+    with diagnostics; witnesses take only the remainder after the
+    diagnostics object built under its own rule. Drops whole witness
+    rows from the end first (loss is missing qualification evidence
+    only); never changes classification or counts. Never raises."""
+    try:
+        budget_rows = DIAG_MAX_ROWS - diag_kept_count
+        if budget_rows < 0:
+            budget_rows = 0
+        kept = list(witnesses[:budget_rows])
+        blob = json.dumps({"terminal_witnesses": kept},
+                          ensure_ascii=True, separators=(',', ':')).encode("utf-8")
+        while kept and diag_compact_len + len(blob) > DIAG_MAX_BYTES:
+            kept = kept[:-1]
+            blob = json.dumps({"terminal_witnesses": kept},
+                              ensure_ascii=True, separators=(',', ':')).encode("utf-8")
+        return kept
+    except BaseException:
+        return []
+
+
 class Census:
     """Classifies every process against session `sid` (the leader's PID).
 
@@ -270,50 +630,243 @@ class Census:
     parent. Positively foreign: a validated other session, never a member.
     Gone: getsid ESRCH and a later successful KERN_PROC_PID read lacks the
     identity; a zombie still present is re-read within the round, at most
-    CONFIRM_TRIES times. A failed read confirms nothing. Everything else
-    (other getsid errors, identity change, failed or missing metadata,
-    unconfirmed zombies, a failed snapshot) is uncertain and blocks closure,
-    first-seen rows included. Start time is never used to exclude a process."""
+    CONFIRM_TRIES times. When that confirmation does not establish absence,
+    the round's existing final KERN_PROC_PID read for the same PID is still
+    checked under the same rule: a successful read showing None or a
+    different start token establishes Gone and drops only the old tracked
+    (PID, start) identity. A replacement identity is never declared foreign
+    or member by inference. A failed read confirms nothing.
 
-    def __init__(self, sid, snapshot=Kinfo.all, getsid=os.getsid, reread=Kinfo.one, pause=time.sleep):
+    Terminal (allowlisted kernels only): an actual getsid ESRCH (errno-
+    checked, not any ProcessLookupError) whose snapshot row and FIRST
+    existing confirmation read show the same complete SZOMB identity
+    (exact non-bool bounded ints, positive PID, exact SZOMB state in
+    both) is accepted as a terminal nonwriter without claiming
+    disappearance, provided every actually performed read in the round
+    (all confirmation reads plus the existing final read, same 20+final
+    bounds, no early short-circuit) shows the same complete SZOMB
+    identity with no failure. Terminal is neither Gone (which keeps
+    priority) nor Foreign nor a blocking member; tracked attribution is
+    kept and eligibility is recomputed every round with no exemption
+    cache. A nonqualifying first read is never salvaged by later reads;
+    any failed, missing, malformed, identity/state or non-zombie
+    observation in the round disqualifies terminal and taints the round's
+    terminal count as unaccountable. Rows that were never terminal
+    candidates (no SZOMB snapshot, non-ESRCH failures) leave an
+    accountable count alone. A successful getsid keeps the old
+    member/foreign/tracked paths and other session errors can never
+    qualify. In strict mode terminal acceptance never fires and every
+    ESRCH row keeps the old uncertain handling, while the terminal count
+    stays the accountably known valid 0.
+
+    Everything else (other getsid errors, identity change, failed or
+    missing metadata, unconfirmed zombies, a failed snapshot) is uncertain
+    and blocks closure, first-seen rows included. Start time is never used
+    to exclude a process.
+
+    The round also builds an optional, monitor-receipt-only diagnostics
+    object summarizing ESRCH rows (confirm attempts/outcome and the final
+    read result with an enumerated error category). It never leaves this
+    round's return value: the census IPC message keeps only
+    after/members/uncertain/certain, and the diagnostics never change
+    classification, membership, authoritative counts, first fault, closure
+    or cleanup, nor consume extra reads, time or retry budget.
+
+    Every round also carries mandatory receipt-only terminal fields:
+    `terminal_count_status` (valid/invalid/overflow) and
+    `terminal_nonwriters` (exact non-bool int 0..U64MAX when valid, else
+    JSON null). The value counts this round's positively verified
+    still-present SZOMB identities accepted by the terminal rule, never
+    Gone rows; a strictly completed round with none is valid 0. Any
+    uncertain row or a snapshot/census failure without a countable set
+    is invalid with null (never a raw bad value, false zero or lower
+    bound); overflow is likewise null. Invalid and
+    overflow always coincide with uncertain>=1 and certain False in the
+    unchanged IPC fields. Output-witness loss never touches these fields
+    and they never change classification."""
+
+    def __init__(self, sid, snapshot=Kinfo.all, getsid=os.getsid, reread=Kinfo.one, pause=time.sleep,
+                 terminal_allowed=False):
         self.sid, self.snapshot, self.getsid, self.reread, self.pause = sid, snapshot, getsid, reread, pause
+        self.terminal_allowed = terminal_allowed if terminal_allowed is True else False
         self.tracked = {}
 
-    def confirm_gone(self, row):
-        """True only on a successful read that lacks the identity."""
+    def confirm_gone_info(self, row):
+        """Confirm absence, reporting how. Returns (gone, tries, outcome,
+        error, first_row, first_error, all_clean).
+
+        `gone` follows the existing Gone rule (a successful read lacking the
+        identity); `tries` is the bounded 1..20 re-read count; `outcome` is
+        one of absent/replaced/matching_exhausted/read_failed; `error` is
+        the reread exception or None. `first_row`/`first_error` carry the
+        FIRST existing confirmation read (a dict, None when absent, or the
+        exception). `all_clean` reports whether every actually performed
+        non-terminal read showed the same complete SZOMB identity (a later
+        Gone still takes priority and ends the confirmation). The terminal
+        rule reuses all of this with no added reads. Same reads, pauses
+        and budget as confirm_gone; no early short-circuit."""
+        tries, first_row, first_error, all_clean = 0, "unset", None, True
         for attempt in range(CONFIRM_TRIES):
             if attempt:
                 self.pause(CONFIRM_PAUSE)
+            tries += 1
             try:
                 again = self.reread(row["pid"])
-            except Exception:
+            except Exception as error:
+                if attempt == 0:
+                    first_error = error
+                return (False, tries, "read_failed", error, first_row, first_error, False)
+            if attempt == 0:
+                first_row, first_error = again, None
+            if again is None:
+                return (True, tries, "absent", None, first_row, first_error, all_clean)
+            if again["start"] != row["start"]:
+                return (True, tries, "replaced", None, first_row, first_error, all_clean)
+            if not _same_complete_zombie(row, again):
+                all_clean = False
+        return (False, tries, "matching_exhausted", None, first_row, first_error, all_clean)
+
+    def confirm_gone(self, row):
+        """True only on a successful read that lacks the identity."""
+        gone, _t, _o, _e, _fr, _fe, _ac = self.confirm_gone_info(row)
+        return gone
+
+    def terminal_eligible(self, row, first_row, first_error):
+        """Whether an actual-ESRCH row qualifies as terminal nonwriter.
+
+        Requires allowlisted mode plus the snapshot row and the FIRST
+        existing confirmation read showing the same complete SZOMB
+        identity (exact non-bool bounded ints, positive PID, exact SZOMB
+        state in both). Pure predicate: no reads, no writes, never
+        raises. Later-read contradictions are tracked separately by the
+        caller; this predicate covers only the snapshot/first-read pair."""
+        try:
+            if self.terminal_allowed is not True:
                 return False
-            if again is None or again["start"] != row["start"]:
-                return True
-        return False
+            if first_error is not None:
+                return False
+            return _same_complete_zombie(row, first_row)
+        except BaseException:
+            return False
 
     def round(self):
         try:
             rows = self.snapshot()
         except Exception as error:
             return {"certain": False, "members": len(self.tracked), "uncertain": 1,
-                    "error": f"snapshot: {error}", "member_rows": [], "uncertain_rows": []}
+                    "error": f"snapshot: {error}", "member_rows": [], "uncertain_rows": [],
+                    "terminal_count_status": "invalid", "terminal_nonwriters": None}
         present = {(row["pid"], row["start"]) for row in rows}
         for identity in list(self.tracked):
             if identity not in present:
                 del self.tracked[identity]
         members, uncertain = [], []
+        diag_attempted, diag_saturated, diag_rows = 0, False, []
+        terminal_count, terminal_witnesses, terminal_tainted = 0, [], False
         for row in rows:
             identity = (row["pid"], row["start"])
-            failure = None
+            failure, getsid_error = None, None
             try:
                 session = self.getsid(row["pid"])
-            except ProcessLookupError:
-                session, failure = None, "gone"
+            except ProcessLookupError as error:
+                try:
+                    actual_esrch = _ERRNO.__get__(error) == errno.ESRCH
+                except BaseException:
+                    actual_esrch = False
+                if actual_esrch:
+                    session, failure, getsid_error = None, "gone", error
+                else:
+                    session, failure = None, f"getsid: {error}"
             except OSError as error:
                 session, failure = None, f"getsid: {error}"
-            if failure == "gone" and self.confirm_gone(row):
-                self.tracked.pop(identity, None)
+            if failure == "gone":
+                if diag_attempted >= U64MAX:
+                    diag_saturated = True
+                else:
+                    diag_attempted += 1
+                gone, tries, confirm_outcome, _cerr, first_row, first_error, all_clean = self.confirm_gone_info(row)
+                if gone:
+                    self.tracked.pop(identity, None)
+                    try:
+                        diag_rows.append(_diag_row(row, tries, confirm_outcome, "not_read", "none", None))
+                    except BaseException:
+                        pass
+                    continue
+                try:
+                    again = self.reread(row["pid"])
+                except Exception as error:
+                    again = None
+                    failure = f"reread: {error}" if failure in (None, "gone") else failure
+                    try:
+                        category, number = _diag_classify(error)
+                        diag_rows.append(_diag_row(row, tries, confirm_outcome, "read_failed", category, number))
+                    except BaseException:
+                        pass
+                    try:
+                        if self.terminal_allowed is True and row.get("zombie") is True:
+                            terminal_tainted = True
+                    except BaseException:
+                        pass
+                    stable = False
+                else:
+                    if again is None:
+                        self.tracked.pop(identity, None)
+                        try:
+                            diag_rows.append(_diag_row(row, tries, confirm_outcome, "absent", "none", None))
+                        except BaseException:
+                            pass
+                        continue
+                    if again["start"] != row["start"]:
+                        self.tracked.pop(identity, None)
+                        try:
+                            diag_rows.append(_diag_row(row, tries, confirm_outcome, "replaced", "none", None))
+                        except BaseException:
+                            pass
+                        continue
+                    stable = True
+                    try:
+                        category, number = _diag_classify(getsid_error)
+                        diag_rows.append(_diag_row(row, tries, confirm_outcome, "same_identity", category, number))
+                    except BaseException:
+                        pass
+                    try:
+                        terminal = (confirm_outcome == "matching_exhausted" and all_clean
+                                    and self.terminal_eligible(row, first_row, first_error)
+                                    and _same_complete_zombie(row, again))
+                    except BaseException:
+                        terminal = False
+                    if not terminal:
+                        # An actual-ESRCH row with a SZOMB snapshot that is
+                        # neither Gone nor terminal-accepted stays
+                        # unaccounted and taints the terminal count, but only
+                        # when terminal acceptance is possible at all. In
+                        # strict mode the count is accountably zero; rows that
+                        # were never terminal candidates (no SZOMB snapshot)
+                        # leave an accountable count alone.
+                        try:
+                            if self.terminal_allowed is True and row.get("zombie") is True:
+                                terminal_tainted = True
+                        except BaseException:
+                            pass
+                    if terminal:
+                        try:
+                            witness = _terminal_witness_row(row, identity in self.tracked)
+                        except BaseException:
+                            witness = None
+                        if witness is not None:
+                            terminal_witnesses.append(witness)
+                        terminal_count += 1
+                        continue  # kept tracked attribution; neither member nor uncertain
+                    failure = "getsid ESRCH, absence not confirmed"
+                if failure is None and stable and session == self.sid:
+                    self.tracked[identity] = row
+                    members.append(row)
+                elif identity in self.tracked:
+                    members.append(row)
+                elif failure is None and stable:
+                    continue  # positively foreign
+                else:
+                    uncertain.append(dict(row, reason=failure or "identity changed across getsid"))
                 continue
             try:
                 again = self.reread(row["pid"])
@@ -331,8 +884,43 @@ class Census:
                 continue  # positively foreign
             else:
                 uncertain.append(dict(row, reason=failure or "identity changed across getsid"))
-        return {"certain": not uncertain, "members": len(members), "uncertain": len(uncertain),
+        try:
+            status, value = _terminal_fields(terminal_count, terminal_tainted, False)
+        except BaseException:
+            status, value = "invalid", None
+        if status not in TERMINAL_STATUS_VALUES:
+            status, value = "invalid", None
+        if status in ("invalid", "overflow") and not uncertain:
+            # An unaccountable terminal count must block closure through
+            # the unchanged IPC fields, even if no row was uncertain.
+            uncertain.append({"reason": "terminal count not countable"})
+        result = {"certain": not uncertain, "members": len(members), "uncertain": len(uncertain),
                 "member_rows": members[:20], "uncertain_rows": uncertain[:20]}
+        result["terminal_count_status"] = status
+        result["terminal_nonwriters"] = value if (
+            status == "valid" and type(value) is int and 0 <= value <= U64MAX) else None
+        diag_compact_len, diag_kept = 0, 0
+        if diag_attempted:
+            try:
+                diagnostics = _diag_object(diag_attempted, diag_rows, diag_saturated)
+            except BaseException:
+                diagnostics = None
+            if diagnostics is not None:
+                try:
+                    check = json.dumps(diagnostics, ensure_ascii=True, separators=(',', ':')).encode("utf-8")
+                    if len(check) <= DIAG_MAX_BYTES and len(diagnostics.get("rows", [])) <= DIAG_MAX_ROWS:
+                        result["diagnostics"] = diagnostics
+                        diag_compact_len, diag_kept = len(check), len(diagnostics.get("rows", []))
+                except BaseException:
+                    pass
+        if terminal_witnesses:
+            try:
+                fitted = _fit_witnesses(terminal_witnesses, diag_kept, diag_compact_len)
+            except BaseException:
+                fitted = []
+            if fitted:
+                result["terminal_witnesses"] = fitted
+        return result
 
 
 # Guard and precedence (custodian side, pure) -------------------------------------
@@ -452,10 +1040,22 @@ class Monitor:
             evidence = ctx["evidence_arg"] or os.path.join(root, "evidence")
         ctx.update(root=root, scratch=scratch, evidence=os.path.realpath(evidence), owned=owned,
                    reserve_path=reserve_path)
+        try:
+            terminal_mode = _decide_terminal_mode()
+        except BaseException:
+            terminal_mode = {"mode": "strict", "reason": "identity_read_error",
+                             "evidence": ALLOW_EVIDENCE_ID}
+        if (not isinstance(terminal_mode, dict) or terminal_mode.get("mode") not in ("allowlisted", "strict")
+                or terminal_mode.get("reason") not in TERMINAL_MODE_REASONS
+                or terminal_mode.get("evidence") != ALLOW_EVIDENCE_ID):
+            terminal_mode = {"mode": "strict", "reason": "identity_read_error",
+                             "evidence": ALLOW_EVIDENCE_ID}
+        ctx["terminal_mode"] = terminal_mode
         self.receipt = {
             "run_id": ctx["run_id"], "command": ctx["command"], "limit_s": ctx["limit_s"],
             "root": ctx["root"], "scratch": ctx["scratch"], "evidence": ctx["evidence"],
             "scratch_owned": ctx["owned"], "start_ns": ctx["start_ns"], "abort_threshold": THRESHOLD,
+            "terminal_mode": dict(terminal_mode),
             "phase": None, "leader": None, "custodian": [], "outcome": None,
             "reserve": {"samples": 0, "minimum": None, "max_gap_ns": 0, "first_ns": None, "last_ns": None},
             "owned_bytes": {"samples": 0, "maximum": None, "budget": ctx["budget"], "last_ns": None},
@@ -555,7 +1155,8 @@ class Monitor:
         self.send("output_eof", stream=name)
 
     def census_loop(self, after):
-        census = Census(self.leader[0])
+        census = Census(self.leader[0], terminal_allowed=(
+            self.ctx.get("terminal_mode", {}).get("mode") == "allowlisted"))
         while not self.census_stop.is_set():
             result = census.round()
             if "census-uncertain" in self.inject or (

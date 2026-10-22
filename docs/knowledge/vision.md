@@ -122,8 +122,7 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 - **Pools are budget-only:** a soft admission budget, whole-idle-slot eviction
   and the host-reserve watchdog, with no OS-enforced cap.
 - **Internal pool:** `~/Dev/oxide`, with a 100 GB budget. Config follows
-  Longhorn's storage-location policy, through Longhorn's own resolver once
-  #103 lands.
+  Longhorn's storage-location policy, through Longhorn's own resolver.
 - **The Builds drive** is the preferred pool:
   - a registered removable APFS volume, permanently attached and treated as
     consumable;
@@ -132,8 +131,9 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   mode.
 - **Sharing builds:** slots share warm builds across worktrees, sized by the
   byte budget rather than small fixed counts.
-- **sccache:** Oxide bypasses inherited compiler wrappers. Cargo's own
-  cross-workspace cache is the preferred long-term complement.
+- **sccache:** Oxide bypasses inherited compiler wrappers and doesn't manage
+  sccache. Integration is revisited once the current work is done. Cargo's
+  own cross-workspace cache is the preferred long-term complement.
 - **Approved, not built:**
   - the drive's permanent or ephemeral mode;
   - `oxide pool describe --json`;
@@ -199,8 +199,8 @@ the operating rules.
   - never resets a running clock or enlarges caps silently;
   - doesn't turn uncertainty into release, or allow evading a host-tool
     denial.
-- **Model routing:** Opus High authors and Sol High reviews. Astra is not used
-  for review (Tom, 2026-10-18, "Use Sol").
+- **Model routing:** briefs declare task complexity; Queue selects the author
+  and reviewer models.
 - **Still need Tom's scoped approval:**
   - switching a new consumer project;
   - host installs beyond the planner's receipt-matched `oxide` reinstall;
