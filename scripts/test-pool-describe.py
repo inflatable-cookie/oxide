@@ -38,8 +38,11 @@ Plan:
    Cargo.lock at HEAD. Only the supported crates.io sparse namespace is served,
    matched exactly on index and cache. Each registry package takes one index
    entry and one .crate archive, with archive bytes checked against the lock
-   checksum. Workspace packages are skipped. Other sources, duplicate keys and
-   duplicate packages refuse. The host CARGO_HOME and registry roots are checked
+   checksum. Workspace packages are skipped. The one locked Longhorn Git package
+   seeds only its bare database, with a private config, and its full locked
+   commit must resolve before staging; the private checkout's HEAD is checked
+   after staging. Other sources, duplicate keys and duplicate packages refuse.
+   The host CARGO_HOME and registry roots are checked
    before descent; symlinks and special entries refuse. Copies stop before any
    write past the 256 MiB aggregate. seed.json records the SHA-256 of the exact
    lock bytes, the namespace, the aggregate bytes and each copied file's digest.
@@ -116,6 +119,15 @@ SEED_AGGREGATE_BYTES = 256 * 1024 * 1024
 SEED_CHUNK_BYTES = 1024 * 1024
 # The only registry sources the seed serves: crates.io, git index or sparse.
 CRATES_SOURCES = ("registry+https://github.com/rust-lang/crates.io-index", "sparse+https://index.crates.io/")
+# The one locked Git package (oxide#112): exact source, name, version and full
+# commit. Only its bare database is seeded, never a host checkout.
+LONGHORN_SOURCE = "git+https://github.com/inflatable-cookie/longhorn.git?tag=v0.4.1#5caf1e2c763588d6b7b73bbf9c24cc2d83cffe41"
+LONGHORN_NAME = "longhorn-storage-layout"
+LONGHORN_VERSION = "0.4.1"
+LONGHORN_REV = "5caf1e2c763588d6b7b73bbf9c24cc2d83cffe41"
+GIT_DB_RE = re.compile(r"^longhorn-[0-9a-f]{16}$")
+# Host config, hooks and alternates are never copied. The private config is this.
+GIT_CONFIG = b"[core]\n\trepositoryformatversion = 0\n\tbare = true\n"
 # The one supported crates.io sparse namespace: the name Cargo gives this host's
 # sparse index and cache, as build_context_comparison.CARGO_REGISTRY_NAMESPACE.
 CRATES_NAMESPACE = "index.crates.io-1949cf8c6b5b557f"
@@ -231,7 +243,7 @@ class SeedRefusal(RuntimeError):
     """The seed cannot be built safely from the lock and the host cache."""
 
 
-def parse_lock_packages(text: str) -> list[dict]:
+def parse_lock_packages(text: str) -> tuple[list[dict], dict]:
     """Registry packages of a Cargo.lock as {name, version, source, checksum}.
 
     Fixed grammar: top-level `version = N`, `[[package]]` tables with basic
@@ -296,6 +308,7 @@ def parse_lock_packages(text: str) -> list[dict]:
         tables.append(current)
 
     packages: list[dict] = []
+    git_found: list[dict] = []
     seen: set[tuple[str, str]] = set()
     for table in tables:
         if "name" not in table or "version" not in table:
@@ -304,6 +317,11 @@ def parse_lock_packages(text: str) -> list[dict]:
             if "checksum" in table:
                 raise SeedRefusal(f"{table['name']} carries a checksum but no source")
             continue  # workspace or path package: nothing to seed
+        if table["source"] == LONGHORN_SOURCE:
+            if (table.get("name"), table.get("version")) != (LONGHORN_NAME, LONGHORN_VERSION):
+                raise SeedRefusal("the locked Git source names an unexpected package")
+            git_found.append(table)
+            continue
         if table["source"] not in CRATES_SOURCES:
             raise SeedRefusal(f"unsupported registry source: {table['source']}")
         name = table["name"]
@@ -319,7 +337,9 @@ def parse_lock_packages(text: str) -> list[dict]:
             raise SeedRefusal(f"duplicate lock entry for {name} {version}")
         seen.add((name, version))
         packages.append({"name": name, "version": version, "source": table["source"], "checksum": checksum})
-    return packages
+    if len(git_found) != 1:
+        raise SeedRefusal(f"expected exactly one locked Longhorn Git package, found {len(git_found)}")
+    return packages, git_found[0]
 
 
 def sparse_index_path(name: str) -> str:
@@ -422,7 +442,103 @@ def copy_bounded(source: Path, destination: Path, budget: SeedBudget, expected_s
     return actual
 
 
-def seed_from_lock(host_registry: Path, packages: list[dict], cargo_home: Path, lock_sha256: str) -> dict:
+def git_env(home: Path) -> dict[str, str]:
+    """A git environment built from nothing: no inherited GIT_* or host config."""
+    return {
+        "PATH": PATH_BASE,
+        "HOME": str(home),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+
+def git_rev_parse(git_dir: Path, spec: str, home: Path) -> str:
+    """Read-only: the object name `spec` resolves to in `git_dir`."""
+    git = shutil.which("git")
+    if git is None:
+        raise SeedRefusal("git is not on the host PATH")
+    result = subprocess.run(
+        [git, "--git-dir", str(git_dir), "rev-parse", "--verify", spec],
+        env=git_env(home), capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise SeedRefusal(f"git rev-parse {spec} failed in the private Longhorn database")
+    return result.stdout.strip()
+
+
+def copy_git_tree(source: Path, destination: Path, budget: SeedBudget, rel: str, base: str, files: list[dict]) -> None:
+    """Copy regular files and real directories of a bare database, bounded.
+
+    Symlinks and special entries refuse. The top-level config and hooks are
+    skipped: config is regenerated, hooks are never copied.
+    """
+    for entry in sorted(os.scandir(source / rel), key=lambda item: item.name):
+        if not rel and entry.name in ("config", "hooks"):
+            continue
+        child = f"{rel}/{entry.name}" if rel else entry.name
+        info = os.lstat(source / child)
+        if stat.S_ISDIR(info.st_mode):
+            (destination / child).mkdir(parents=True, exist_ok=True)
+            copy_git_tree(source, destination, budget, child, base, files)
+        elif stat.S_ISREG(info.st_mode):
+            digest = copy_bounded(source / child, destination / child, budget, None)
+            files.append({"path": f"{base}/{child}", "sha256": digest})
+        else:
+            raise SeedRefusal(f"longhorn database entry is a symlink or special file: {child}")
+
+
+def seed_git(host_cargo_home: Path, cargo_home: Path, budget: SeedBudget) -> dict:
+    """Seed the one locked Longhorn bare database, and verify the locked commit.
+
+    Exactly one host database directory must match. It is copied through the
+    registry's bounded copier, into the owned Cargo home, with a private config.
+    The full locked commit must resolve in that private copy before staging.
+    """
+    host_git = host_cargo_home / "git"
+    lstat_real_dir(host_git, "host git root")
+    host_db_root = host_git / "db"
+    lstat_real_dir(host_db_root, "host git database root")
+    names = [name for name in sorted(os.listdir(host_db_root)) if GIT_DB_RE.match(name)]
+    if len(names) != 1:
+        raise SeedRefusal(f"expected exactly one longhorn bare database, found {len(names)}")
+    name = names[0]
+    source = host_db_root / name
+    lstat_real_dir(source, "host longhorn bare database")
+    if not stat.S_ISREG(os.lstat(source / "HEAD").st_mode):
+        raise SeedRefusal("longhorn database HEAD is not a regular file")
+    if os.path.lexists(source / "objects" / "info" / "alternates"):
+        raise SeedRefusal("longhorn database uses alternates; refused")
+    base = f"git/db/{name}"
+    destination = cargo_home / "git" / "db" / name
+    destination.mkdir(parents=True, exist_ok=True)
+    files: list[dict] = []
+    copy_git_tree(source, destination, budget, "", base, files)
+    if budget.used + len(GIT_CONFIG) > budget.limit:
+        raise SeedRefusal("seed aggregate would exceed the 256 MiB bound; refused before the write")
+    budget.used += len(GIT_CONFIG)
+    (destination / "config").write_bytes(GIT_CONFIG)
+    files.append({"path": f"{base}/config", "sha256": hashlib.sha256(GIT_CONFIG).hexdigest()})
+    commit = git_rev_parse(destination, f"{LONGHORN_REV}^{{commit}}", destination)
+    if commit != LONGHORN_REV:
+        raise SeedRefusal(f"private longhorn database resolves {commit}, not the locked {LONGHORN_REV}")
+    return {"source": LONGHORN_SOURCE, "database": name, "rev": LONGHORN_REV, "files": files}
+
+
+def verify_private_checkout(cargo_home: Path, name: str) -> None:
+    """After staging: the checkout Cargo made at the locked rev has that HEAD."""
+    checkout = cargo_home / "git" / "checkouts" / name / LONGHORN_REV[:7]
+    lstat_real_dir(checkout, "private longhorn checkout")
+    git_dir = checkout / ".git"
+    if not os.path.lexists(git_dir):
+        raise SeedRefusal("private checkout has no .git, so its HEAD cannot be verified")
+    lstat_real_dir(git_dir, "private checkout git directory")
+    head = git_rev_parse(git_dir, "HEAD", checkout)
+    if head != LONGHORN_REV:
+        raise SeedRefusal(f"private checkout HEAD is {head}, not the locked {LONGHORN_REV}")
+
+
+def seed_from_lock(host_cargo_home: Path, packages: list[dict], git_package: dict, cargo_home: Path, lock_sha256: str) -> dict:
     """Copy only what Cargo.lock needs from the one supported crates.io namespace.
 
     Inputs: the namespace config.json, one sparse index entry per package
@@ -436,6 +552,7 @@ def seed_from_lock(host_registry: Path, packages: list[dict], cargo_home: Path, 
     operation. A concurrent change to the host cache between them could still
     redirect a copy.
     """
+    host_registry = host_cargo_home / "registry"
     lstat_real_dir(host_registry, "host registry root")
     namespace = crates_namespace(host_registry)
     index_ns = host_registry / "index" / namespace
@@ -459,24 +576,31 @@ def seed_from_lock(host_registry: Path, packages: list[dict], cargo_home: Path, 
         check_chain(cache_ns, archive)
         digest = copy_bounded(cache_ns / archive, dest_cache / archive, budget, package["checksum"])
         manifest.append({"path": f"cache/{archive}", "sha256": digest})
-    compare_seed(cargo_home, namespace, packages)
+    git = seed_git(host_cargo_home, cargo_home, budget)
+    compare_seed(cargo_home, namespace, packages, [entry["path"] for entry in git["files"]])
     return {
         "lock_sha256": lock_sha256,
         "namespace": namespace,
         "aggregate_bytes": budget.used,
         "files": manifest,
+        "git": git,
     }
 
 
-def compare_seed(cargo_home: Path, namespace: str, packages: list[dict]) -> None:
-    """The owned seed holds exactly the selected files under the fixed roots."""
+def compare_seed(cargo_home: Path, namespace: str, packages: list[dict], git_paths: list[str]) -> None:
+    """The owned seed holds exactly the selected files under the fixed roots.
+
+    Checkouts are absent at this point: Cargo creates them only when staging.
+    """
     expected = {f"registry/index/{namespace}/config.json"}
     expected.update(f"registry/index/{namespace}/.cache/{sparse_index_path(p['name'])}" for p in packages)
     expected.update(f"registry/cache/{namespace}/{p['name']}-{p['version']}.crate" for p in packages)
+    expected.update(git_paths)
     actual = set()
-    for dirpath, _dirnames, filenames in os.walk(cargo_home / "registry"):
-        for name in filenames:
-            actual.add(str(Path(dirpath, name).relative_to(cargo_home)))
+    for root in ("registry", "git"):
+        for dirpath, _dirnames, filenames in os.walk(cargo_home / root):
+            for name in filenames:
+                actual.add(str(Path(dirpath, name).relative_to(cargo_home)))
     if actual != expected:
         raise SeedRefusal(
             f"owned seed differs from the lock selection: extra {sorted(actual - expected)[:3]}, "
@@ -510,12 +634,12 @@ def stage(proof: Proof) -> Path:
     channel = re.search(r'channel\s*=\s*"([^"]+)"', (REPO / "rust-toolchain.toml").read_text()).group(1)
     lock_bytes = subprocess.run(git + ["show", "HEAD:Cargo.lock"], capture_output=True, check=True).stdout
     lock_sha256 = hashlib.sha256(lock_bytes).hexdigest()
-    packages = parse_lock_packages(lock_bytes.decode())
+    packages, git_package = parse_lock_packages(lock_bytes.decode())
     host_cargo_home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
     lstat_real_dir(host_cargo_home, "host CARGO_HOME")
     cargo_home = proof.root / "cargo-home"
     cargo_home.mkdir()
-    seed = seed_from_lock(host_cargo_home / "registry", packages, cargo_home, lock_sha256)
+    seed = seed_from_lock(host_cargo_home, packages, git_package, cargo_home, lock_sha256)
     (proof.evidence / "seed.json").write_text(json.dumps(seed, indent=2))
     cargo = shutil.which("cargo")
     if cargo is None:
@@ -533,6 +657,7 @@ def stage(proof: Proof) -> Path:
     code, _, err = proof.run([cargo, "build", "--offline", "--locked", "--bin", "oxide"], env, "stage", cwd=REPO)
     if code != 0:
         raise RuntimeError(f"staging failed: {err[-400:]}")
+    verify_private_checkout(cargo_home, seed["git"]["database"])
     artifact = (proof.root / "target" / "debug" / "oxide").resolve()
     if not artifact.is_file() or proof.root not in artifact.parents:
         raise RuntimeError("the staged artifact is not inside the owned root")
