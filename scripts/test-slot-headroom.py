@@ -113,6 +113,9 @@ def write_evidence(name: str, contents: str) -> None:
 
 def base_env(proof: Proof, pool: str, **extra: str) -> dict:
     env = dict(os.environ)
+    # A private HOME must not hide the installed toolchain: keep the real
+    # RUSTUP_HOME and the project's exact channel.
+    real_rustup = env.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")
     for name in list(env):
         if name in ("OXIDE_PROOF_EVIDENCE", "OXIDE_PROOF_DEADLINE_NS", "OXIDE_TASK_SCRATCH_ROOT"):
             continue
@@ -133,6 +136,7 @@ def base_env(proof: Proof, pool: str, **extra: str) -> dict:
             "RUSTC_WRAPPER": "",
             "RUSTC_WORKSPACE_WRAPPER": "",
             "CARGO_BUILD_RUSTC_WRAPPER": "",
+            "RUSTUP_HOME": real_rustup,
             "RUSTUP_TOOLCHAIN": fm.BUILDER,
             "RUSTUP_AUTO_INSTALL": "0",
             "OXIDE_TASK_SCRATCH_ROOT": ROOT,
