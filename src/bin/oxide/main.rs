@@ -288,23 +288,23 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     // for every other cooperative command in the checkout to close and blocks
     // new ones until the link is published. It binds exactly the destination
     // the slot was keyed for, or refuses.
-    let bound = match outputs::bind_for_command(
+    let binding = match outputs::bind_for_command(
         &store,
         &key.checkout,
         held.record_id(),
         planned.as_ref(),
     ) {
-        Ok(bound) => bound,
+        Ok(binding) => binding,
         Err(reason) => {
             let origin = held.prior.unchanged();
             store.release(held, origin)?;
             return Err(reason);
         }
     };
-    for warning in &bound.warnings {
+    for warning in &binding.outcome.warnings {
         eprintln!("oxide: WARNING: {warning}");
     }
-    let output_note = bound.note;
+    let output_note = binding.outcome.note.clone();
     let run = invocation.command == "run";
     let config_args = if cli::reads_config_args(&invocation.command) {
         &invocation.cargo_args[..]
@@ -365,7 +365,11 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         }
     };
     let mut watchdog = store.watchdog();
-    let outcome = match store.mark_running(&held, group.id) {
+    // The binding mutex is released only once this command is recorded as
+    // running, so no peer can repoint the link between the check and Cargo.
+    let marked = store.mark_running(&held, group.id);
+    drop(binding);
+    let outcome = match marked {
         Ok(()) if run => collect_run(&mut group, &invocation, watchdog.as_mut()),
         Ok(()) => match watchdog.as_mut() {
             Some(watchdog) => {

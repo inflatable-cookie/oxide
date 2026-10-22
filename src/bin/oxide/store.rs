@@ -216,18 +216,8 @@ struct Ticket {
     pid: u32,
 }
 
-/// Why a checkout barrier exists. `Clean` removes the checkout's outputs;
-/// `Outputs` binds or changes its owned output link for one command.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BarrierPurpose {
-    #[default]
-    Clean,
-    Outputs,
-}
-
-/// A running checkout barrier; commands for the same checkout wait while it
-/// exists. Its lock (in `waiters/`) is shared with a `cargo clean` child, so
+/// A running `oxide clean`; commands for the same checkout wait while it
+/// exists. Its lock (in `waiters/`) is shared with the `cargo clean` child, so
 /// it stays held while either lives. The mark is dropped only when the lock is
 /// free and the recorded Cargo group, if any, is empty.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -237,10 +227,6 @@ struct Clean {
     checkout: PathBuf,
     #[serde(default)]
     process_group: Option<i32>,
-    /// Absent in state written before this field existed: those marks are
-    /// cleans, which is the default.
-    #[serde(default)]
-    purpose: BarrierPurpose,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -852,6 +838,19 @@ pub fn active_holders(control: &Path, checkout: &Path) -> Result<Vec<String>, St
         }
     }
     Ok(holders)
+}
+
+/// What a checkout's cooperative custody allows; see
+/// [`Store::checkout_custody`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CheckoutCustody {
+    /// No command may be writing and no unknown writer custody remains.
+    Clear,
+    /// A command in this checkout may be running Cargo now.
+    Writers,
+    /// A lost slot's writers were never positively closed. Nothing may be
+    /// relinked or cleaned through this checkout until that is resolved.
+    Unknown(String),
 }
 
 pub struct SlotView {
@@ -1506,6 +1505,79 @@ impl Store {
         })
     }
 
+    /// A per-checkout binding mutex: not state-dependent, so two commands can
+    /// never wait on each other through it. It serialises only the short
+    /// window in which a command validates or replaces its checkout's owned
+    /// output link and starts Cargo. The file lives in the internal pool's
+    /// control directory, so both pools share it.
+    pub fn lock_binding(&self, checkout: &Path) -> Result<File, String> {
+        let directory = self.owner_control().join("bindings");
+        ensure_private_dir(&directory)?;
+        let id = identity::digest(&checkout.to_string_lossy());
+        let file = private_file(&directory.join(format!("{id}.lock")), true)?
+            .ok_or("the checkout binding lock is missing")?;
+        flock(&file, libc::LOCK_EX)?;
+        Ok(file)
+    }
+
+    /// One checkout's cooperative custody for an output transition or a clean.
+    /// A command that may be writing counts while it is spawning or running; a
+    /// record that has not started Cargo cannot write through the link and
+    /// binds again after a transition. A retired slot whose lost writers were
+    /// never positively closed is unknown custody, not activity: it blocks
+    /// every relink and clean until it is resolved.
+    pub fn checkout_custody(&self, checkout: &Path, own: u64) -> Result<CheckoutCustody, String> {
+        let _sibling = self.sibling_admission()?;
+        let _admission = self.admission()?;
+        let own_state = if self.control.exists() {
+            Some(self.load()?)
+        } else {
+            None
+        };
+        // A sibling with no state file has no records; an unreadable one is
+        // unknown custody, never "clear".
+        let other_state = match &self.sibling {
+            None => None,
+            Some(sibling) => match self.sibling_state() {
+                Some(state) => Some(state),
+                None if !sibling.control.join("state.json").exists() => None,
+                None => {
+                    return Ok(CheckoutCustody::Unknown(
+                        "the other pool's record state is unreadable".to_owned(),
+                    ))
+                }
+            },
+        };
+        let mut writers = false;
+        for (pool, state) in [("this", own_state), ("the other", other_state)] {
+            let Some(state) = state else { continue };
+            for record in &state.records {
+                if record.checkout.as_deref() != Some(checkout) || record.id == own {
+                    continue;
+                }
+                if record.phase == Phase::Retired {
+                    if let Some(lost) = record.lost.as_ref() {
+                        if let Some(why) = lost.unclosed.as_deref() {
+                            return Ok(CheckoutCustody::Unknown(format!(
+                                "slot {} in the {pool} pool is lost with writers that were never confirmed closed ({why})",
+                                lost.slot_id
+                            )));
+                        }
+                    }
+                    continue;
+                }
+                if matches!(record.phase, Phase::Spawning | Phase::Running) {
+                    writers = true;
+                }
+            }
+        }
+        Ok(if writers {
+            CheckoutCustody::Writers
+        } else {
+            CheckoutCustody::Clear
+        })
+    }
+
     /// The sibling pool's admission lock, when this store is the removable
     /// one. Always internal first, as slot attempts and cleans do.
     fn sibling_admission(&self) -> Result<Option<File>, String> {
@@ -1582,44 +1654,6 @@ impl Store {
         checkout: &Path,
         waits: &mut WaitAccounting,
     ) -> Result<Cleaning, String> {
-        self.begin_barrier(
-            checkout,
-            None,
-            BarrierPurpose::Clean,
-            "clean barrier acquired",
-            waits,
-        )
-    }
-
-    /// The same exclusive checkout barrier for an output transition. `own` is
-    /// the caller's own active record: a command that already holds a slot for
-    /// this checkout is the only record allowed to remain. Every other
-    /// cooperative writer for the checkout must be closed, and the mark stops
-    /// a new command from starting until the guard is released, so a link
-    /// swap can never redirect a running command.
-    pub fn begin_output_barrier(
-        &self,
-        checkout: &Path,
-        own: u64,
-        waits: &mut WaitAccounting,
-    ) -> Result<Cleaning, String> {
-        self.begin_barrier(
-            checkout,
-            Some(own),
-            BarrierPurpose::Outputs,
-            "output transition ready",
-            waits,
-        )
-    }
-
-    fn begin_barrier(
-        &self,
-        checkout: &Path,
-        own: Option<u64>,
-        purpose: BarrierPurpose,
-        completion: &str,
-        waits: &mut WaitAccounting,
-    ) -> Result<Cleaning, String> {
         self.ensure_control()?;
         loop {
             if let Some(signal) = process::received_signal() {
@@ -1638,9 +1672,7 @@ impl Store {
                 self.recover_settled(&mut state)?;
                 let busy = state.cleans.iter().any(|clean| clean.checkout == checkout)
                     || state.records.iter().any(|record| {
-                        record.checkout.as_deref() == Some(checkout)
-                            && record.active()
-                            && own != Some(record.id)
+                        record.checkout.as_deref() == Some(checkout) && record.active()
                     })
                     || self.sibling_busy(checkout);
                 if !busy {
@@ -1655,7 +1687,6 @@ impl Store {
                         id,
                         checkout: checkout.to_path_buf(),
                         process_group: None,
-                        purpose,
                     });
                     self.save(&state)?;
                     return Ok(Some(CleanGuard { id, lock }));
@@ -1670,7 +1701,7 @@ impl Store {
                 }
                 Ok(Some(guard)) => {
                     waits.stop(Instant::now());
-                    waits.print_completion(completion);
+                    waits.print_completion("clean barrier acquired");
                     return Ok(Cleaning::Guard(guard));
                 }
                 Ok(None) => {
@@ -1805,7 +1836,6 @@ impl Store {
             cleaning: state
                 .cleans
                 .iter()
-                .filter(|clean| clean.purpose == BarrierPurpose::Clean)
                 .map(|clean| clean.checkout.clone())
                 .collect(),
             slots,
@@ -2448,7 +2478,7 @@ impl Store {
     }
 
     fn ensure_control(&self) -> Result<(), String> {
-        for directory in ["", "affinity", "locks", "waiters"] {
+        for directory in ["", "affinity", "locks", "waiters", "bindings"] {
             ensure_private_dir(&self.control.join(directory))?;
         }
         Ok(())
@@ -2982,6 +3012,97 @@ mod tests {
         let (root, internal, removable) = paired_controls("owner-control");
         assert_eq!(internal.owner_control(), internal.control());
         assert_eq!(removable.owner_control(), internal.control());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn custody_record(id: u64, checkout: &Path, phase: Phase, lost: Option<Lost>) -> Record {
+        Record {
+            id,
+            identity: "identity".to_owned(),
+            compatibility: "compatibility".to_owned(),
+            profile: "quick".to_owned(),
+            checkout: Some(checkout.to_path_buf()),
+            phase,
+            process_group: None,
+            last_used: 1,
+            holder: None,
+            lease_id: None,
+            pending_recovery: None,
+            retired: lost.as_ref().map(Lost::describe),
+            lost,
+            last_used_ms: Some(1),
+        }
+    }
+
+    fn state_with(records: Vec<Record>) -> State {
+        State {
+            records,
+            ..State::default()
+        }
+    }
+
+    /// Only a possibly-writing command or an unresolved lost writer blocks a
+    /// relink or clean; a retired slot that closed positively does not, and a
+    /// caller never blocks on its own record.
+    #[test]
+    fn checkout_custody_separates_writers_unknown_and_retired_storage() {
+        let (root, internal, removable) = paired_controls("custody");
+        let checkout = Path::new("/checkout/custody");
+        internal
+            .save(&state_with(vec![custody_record(
+                1,
+                checkout,
+                Phase::Running,
+                None,
+            )]))
+            .unwrap();
+        assert_eq!(
+            internal.checkout_custody(checkout, 0).unwrap(),
+            CheckoutCustody::Writers
+        );
+        assert_eq!(
+            internal.checkout_custody(checkout, 1).unwrap(),
+            CheckoutCustody::Clear
+        );
+
+        let unknown = Lost {
+            slot_id: "3".to_owned(),
+            at_ms: 2,
+            unclosed: Some("exec may have started processes outside its group".to_owned()),
+        };
+        removable
+            .save(&state_with(vec![custody_record(
+                2,
+                checkout,
+                Phase::Retired,
+                Some(unknown),
+            )]))
+            .unwrap();
+        internal.save(&State::default()).unwrap();
+        match internal.checkout_custody(checkout, 0).unwrap() {
+            CheckoutCustody::Unknown(reason) => {
+                assert!(reason.contains("never confirmed closed"), "{reason}")
+            }
+            other => panic!("expected unknown custody, got {other:?}"),
+        }
+
+        // A retired slot whose writers closed positively is not unknown.
+        removable
+            .save(&state_with(vec![custody_record(
+                3,
+                checkout,
+                Phase::Retired,
+                Some(Lost {
+                    slot_id: "4".to_owned(),
+                    at_ms: 3,
+                    unclosed: None,
+                }),
+            )]))
+            .unwrap();
+        assert_eq!(
+            internal.checkout_custody(checkout, 0).unwrap(),
+            CheckoutCustody::Clear
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -17,7 +17,7 @@ use std::fs::Metadata;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use store::{Cleaning, Store, WaitAccounting};
+use store::{CheckoutCustody, Cleaning, Store, WaitAccounting};
 
 /// Enumeration bounds: past either, the plan refuses instead of truncating.
 const MAX_ENTRIES: usize = 1_000_000;
@@ -516,20 +516,22 @@ fn run_whole(
     };
     // Plan again under the clean barrier: what is removed is what this plan
     // lists, from the root the receipt selects now.
-    let outcome = outputs::clean_placement(workspace).and_then(|placement| {
-        let target = placement.as_ref().map_or_else(
-            || workspace.join("target"),
-            |place| place.target().to_path_buf(),
-        );
-        let keep_root = placement
-            .as_ref()
-            .is_some_and(outputs::CleanPlacement::keep_root);
-        let pool = protect_pool(&target, &settings.pool)?;
-        checked_plan(&target, pool, include_foreign, keep_root).and_then(|plan| match plan {
-            None => Ok(None),
-            Some(plan) => remove(&plan).map(|()| Some((target.clone(), plan))),
-        })
-    });
+    let outcome = refuse_unknown_custody_opt(&store, workspace)
+        .and_then(|()| outputs::clean_placement(workspace))
+        .and_then(|placement| {
+            let target = placement.as_ref().map_or_else(
+                || workspace.join("target"),
+                |place| place.target().to_path_buf(),
+            );
+            let keep_root = placement
+                .as_ref()
+                .is_some_and(outputs::CleanPlacement::keep_root);
+            let pool = protect_pool(&target, &settings.pool)?;
+            checked_plan(&target, pool, include_foreign, keep_root).and_then(|plan| match plan {
+                None => Ok(None),
+                Some(plan) => remove(&plan).map(|()| Some((target.clone(), plan))),
+            })
+        });
     let plan = match (outcome, &store, guard) {
         (Ok(plan), Some(store), Some(guard)) => {
             let detached = store.finish_clean(guard, workspace)?;
@@ -588,13 +590,25 @@ fn run_selected(args: &[OsString], workspace: &Path, settings: &Settings) -> Res
     process::install_signal_handlers()?;
     let mut waits = WaitAccounting::default();
     let store = crate::removable::coordinate(Store::open_existing_with(settings)?)?;
-    let guard = match &store {
+    let mut guard = match &store {
         Some(store) => match store.begin_clean(workspace, &mut waits)? {
             Cleaning::Guard(guard) => Some(guard),
             Cleaning::Interrupted(signal) => return Ok(process::signal_exit_code(signal)),
         },
         None => None,
     };
+    // Recheck ownership, the live volume identity and writer custody now that
+    // the barrier is held: an output transition may have failed or left a
+    // preparation while this clean waited, and Cargo must not clean through a
+    // link the protocol would refuse.
+    let rechecked = refuse_unknown_custody_opt(&store, workspace)
+        .and_then(|()| outputs::clean_placement(workspace).map(|_| ()));
+    if let Err(reason) = rechecked {
+        if let (Some(store), Some(guard)) = (&store, guard.take()) {
+            store.abandon_clean(guard)?;
+        }
+        return Err(reason);
+    }
     let scratch = private_scratch()?;
     let mut cargo = Command::new(CARGO);
     cargo.arg("clean").args(args);
@@ -633,6 +647,26 @@ fn run_selected(args: &[OsString], workspace: &Path, settings: &Settings) -> Res
         );
     }
     Ok(process::exit_code(status))
+}
+
+/// Refuse a clean while this checkout still has unknown writer custody: a
+/// lost slot whose writers were never positively closed may still write
+/// through the output front door. Runs under the clean barrier, so nothing can
+/// start or finish in between.
+fn refuse_unknown_custody_opt(store: &Option<Store>, workspace: &Path) -> Result<(), String> {
+    match store {
+        Some(store) => refuse_unknown_custody(store, workspace),
+        None => Ok(()),
+    }
+}
+
+fn refuse_unknown_custody(store: &Store, workspace: &Path) -> Result<(), String> {
+    match store.checkout_custody(workspace, 0)? {
+        CheckoutCustody::Unknown(reason) => Err(format!(
+            "clean refused: this checkout has unknown writer custody ({reason}); nothing was removed"
+        )),
+        CheckoutCustody::Clear | CheckoutCustody::Writers => Ok(()),
+    }
 }
 
 fn private_scratch() -> Result<PathBuf, String> {

@@ -31,7 +31,7 @@
 use crate::identity;
 use crate::process;
 use crate::removable::{self, DriveMode};
-use crate::store::{self, CleanGuard, Cleaning, Store, WaitAccounting};
+use crate::store::{self, CheckoutCustody, CleanGuard, Cleaning, Store, WaitAccounting};
 use crate::CARGO;
 use oxide_storage::volume::{self, Binding};
 use serde::{Deserialize, Serialize};
@@ -42,6 +42,7 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 /// Directory under the volume mount that holds every checkout's output root.
 pub const EXTERNAL_DIR: &str = "oxide-outputs";
@@ -778,6 +779,7 @@ fn adopt_command() -> Result<u8, String> {
     let mut waits = WaitAccounting::default();
     let guard = barrier(&internal, &context.workspace, &mut waits)?;
     let outcome = (|| {
+        refuse_unknown_custody(&internal, &context.workspace, "relink")?;
         let _admission = store::lock_admission(&control)?;
         let receipt = match read_receipt(&control, &context.workspace, &context.checkout_id)? {
             None => Receipt::first(&context.workspace, &context.checkout_id),
@@ -905,6 +907,7 @@ fn detach_command() -> Result<u8, String> {
     let mut waits = WaitAccounting::default();
     let guard = barrier(&internal, &context.workspace, &mut waits)?;
     let outcome = (|| {
+        refuse_unknown_custody(&internal, &context.workspace, "detach")?;
         let _admission = store::lock_admission(&control)?;
         let receipt = read_receipt(&control, &context.workspace, &context.checkout_id)?
             .ok_or("this checkout has no owned-output receipt; nothing to detach")?;
@@ -971,51 +974,71 @@ fn detach_command() -> Result<u8, String> {
     Ok(0)
 }
 
-/// A build binds its checkout's output root once, after taking its exclusive
-/// checkout lease and before Cargo starts. The transition runs under the
-/// checkout's own output barrier: every other cooperative command in the same
-/// checkout must have closed (a checkout may otherwise run a second command on
-/// a spare compatible slot), and the mark stops a new one from starting until
-/// the link is published. A swap therefore never redirects a running command,
-/// and `oxide clean` and `oxide outputs adopt|detach` cannot interleave.
+/// A command's bound output destination for the life of its start-up. The
+/// lock is the checkout binding mutex, held from the committed link check (or
+/// the transition) until Cargo has started, so a peer's transition cannot
+/// repoint the link in between.
+pub struct OutputBinding {
+    pub outcome: Outcome,
+    _lock: Option<File>,
+}
+
+impl OutputBinding {
+    fn unchecked(outcome: Outcome) -> Self {
+        Self {
+            outcome,
+            _lock: None,
+        }
+    }
+}
+
+/// How long a command waits before re-checking a checkout whose other command
+/// must finish before an output relink.
+const BINDING_POLL: Duration = Duration::from_millis(200);
+
+/// A build binds its checkout's output root once, before Cargo starts. The
+/// check and any transition run under the checkout's binding mutex, a plain
+/// per-checkout lock that no holder can wait on: second-slot commands still
+/// start concurrently when their destination is unchanged, and two commands
+/// can never block each other through it. A relink waits (without the mutex)
+/// until no other command in the checkout may be writing Cargo, and refuses
+/// outright on unknown writer custody.
 ///
-/// `expected` is the destination the slot key was computed from. The transition
-/// always binds exactly that root, or refuses when it is no longer usable, so
-/// the slot and its uplifted artifacts never belong to different roots.
+/// `expected` is the destination the slot key was computed from, including the
+/// root generation. The command binds exactly that root and generation or
+/// refuses, so a slot and its uplifted artifacts never belong to different
+/// roots.
 pub fn bind_for_command(
     store: &Store,
     checkout: &Path,
     own_record: u64,
     expected: Option<&Selected>,
-) -> Result<Outcome, String> {
+) -> Result<OutputBinding, String> {
     let context = Context::new(
         Some(store.owner_control().to_path_buf()),
         checkout.to_path_buf(),
     );
     let mode = context.mode()?;
     if mode != Some(DriveMode::Permanent) {
-        return bind_ephemeral(&context, expected);
+        return Ok(OutputBinding::unchecked(bind_ephemeral(
+            &context, expected,
+        )?));
     }
-    let mut waits = WaitAccounting::default();
-    let guard = match store.begin_output_barrier(checkout, own_record, &mut waits)? {
-        Cleaning::Guard(guard) => guard,
-        Cleaning::Interrupted(signal) => {
+    if context.receipt()?.is_none() {
+        return Ok(OutputBinding::unchecked(unconverted_outcome()));
+    }
+    let mut announced = false;
+    loop {
+        if let Some(signal) = process::received_signal() {
             return Err(format!(
-                "interrupted by signal {signal} while waiting for this checkout's other commands to finish; nothing was changed"
-            ))
+                "interrupted by signal {signal} while waiting for this checkout's other commands; nothing was changed"
+            ));
         }
-    };
-    let outcome = (|| {
-        // The receipt lives in the internal control directory; the barrier
-        // above already released the lock it took to publish its mark.
-        let _admission = store::lock_admission(store.owner_control())?;
+        let lock = store.lock_binding(checkout)?;
         let Some(receipt) = context.receipt()? else {
-            return Ok(Outcome {
-                warnings: vec![
-                    "permanent drive mode: this checkout is not converted to owned outputs; `oxide outputs plan` shows the conversion plan and `oxide outputs adopt` performs it. Nothing was moved"
-                        .to_owned(),
-                ],
-                note: Some("outputs not converted".to_owned()),
+            return Ok(OutputBinding {
+                outcome: unconverted_outcome(),
+                _lock: Some(lock),
             });
         };
         let receipt = if receipt.state == ReceiptState::Prepared {
@@ -1023,15 +1046,42 @@ pub fn bind_for_command(
         } else {
             receipt
         };
-        bind_under_barrier(&context, receipt, expected)
-    })();
-    release_barrier(store, guard)?;
-    outcome
+        match bind_under_binding(&context, store, own_record, &receipt, expected) {
+            Bind::Bound(outcome) => {
+                return Ok(OutputBinding {
+                    outcome,
+                    _lock: Some(lock),
+                })
+            }
+            Bind::Refuse(reason) => return Err(reason),
+            Bind::Wait => {
+                drop(lock);
+                if !announced {
+                    eprintln!(
+                        "oxide: waiting for another oxide command in this checkout to finish before relinking outputs"
+                    );
+                    announced = true;
+                }
+                std::thread::sleep(BINDING_POLL);
+            }
+        }
+    }
+}
+
+fn unconverted_outcome() -> Outcome {
+    Outcome {
+        warnings: vec![
+            "permanent drive mode: this checkout is not converted to owned outputs; `oxide outputs plan` shows the conversion plan and `oxide outputs adopt` performs it. Nothing was moved"
+                .to_owned(),
+        ],
+        note: Some("outputs not converted".to_owned()),
+    }
 }
 
 /// Ephemeral mode keeps today's real checkout/target. A checkout that was
 /// converted keeps its owned link, is never relinked automatically, and
-/// refuses when the link no longer matches the receipt.
+/// refuses when the link no longer matches the receipt or the root's full
+/// identity.
 fn bind_ephemeral(context: &Context, expected: Option<&Selected>) -> Result<Outcome, String> {
     let Some(receipt) = context.receipt()? else {
         return Ok(Outcome::default());
@@ -1043,103 +1093,236 @@ fn bind_ephemeral(context: &Context, expected: Option<&Selected>) -> Result<Outc
                 .to_owned(),
         ),
         ReceiptState::Committed => {
-            let selected = expected
-                .cloned()
-                .or_else(|| receipt.selected().cloned())
-                .ok_or("outputs: the receipt selects no root")?;
+            let wanted = match expected {
+                Some(expected) => expected.clone(),
+                None => desired_selection(context, &receipt)?
+                    .ok_or("outputs: the receipt selects no root")?,
+            };
             let target = context.target()?;
-            if target.root() == Some(selected.root.as_path()) {
-                return Ok(Outcome::default().with_note(format!(
-                    "owned outputs {} through an owned link",
-                    selected.root.display()
-                )));
+            if target.root() != Some(wanted.root.as_path()) {
+                return Err(format!(
+                    "outputs: {} is {}, not the owned link selecting {}; the drive mode is ephemeral, so Oxide will not relink it. Run `oxide outputs adopt` (or set the drive mode to permanent) before building",
+                    context.link().display(),
+                    target.label(),
+                    wanted.root.display()
+                ));
             }
-            Err(format!(
-                "outputs: {} is {}, not the owned link selecting {}; the drive mode is ephemeral, so Oxide will not relink it. Run `oxide outputs adopt` (or set the drive mode to permanent) before building",
-                context.link().display(),
-                target.label(),
-                selected.root.display()
-            ))
+            check_bound_root(context, receipt.generation, &wanted)?;
+            Ok(Outcome::default().with_note(format!(
+                "owned outputs {} through an owned link",
+                wanted.root.display()
+            )))
         }
     }
 }
 
-fn bind_under_barrier(
+/// The result of one binding attempt under the mutex.
+enum Bind {
+    Bound(Outcome),
+    Refuse(String),
+    /// Another command may be writing in this checkout; release the mutex,
+    /// wait, and try again.
+    Wait,
+}
+
+fn bind_under_binding(
     context: &Context,
-    receipt: Receipt,
+    store: &Store,
+    own_record: u64,
+    receipt: &Receipt,
     expected: Option<&Selected>,
-) -> Result<Outcome, String> {
-    match receipt.state {
+) -> Bind {
+    let generation = receipt.generation;
+    let wanted = match receipt.state {
         ReceiptState::Detached => {
-            if expected.is_some() {
-                return Err(
+            return match expected {
+                Some(_) => Bind::Refuse(
                     "outputs: the receipt says this checkout is detached but its slot was keyed for an owned root; run the command again"
                         .to_owned(),
-                );
+                ),
+                None => Bind::Bound(Outcome {
+                    warnings: vec![
+                        "permanent drive mode: this checkout is detached from owned outputs; `oxide outputs adopt` converts it again. Nothing was moved"
+                            .to_owned(),
+                    ],
+                    note: Some("outputs detached".to_owned()),
+                }),
             }
-            Ok(Outcome {
-                warnings: vec![
-                    "permanent drive mode: this checkout is detached from owned outputs; `oxide outputs adopt` converts it again. Nothing was moved"
-                        .to_owned(),
-                ],
-                note: Some("outputs detached".to_owned()),
-            })
         }
-        ReceiptState::Prepared => Err(
-            "outputs: an interrupted owned-output transition is pending; run `oxide outputs adopt` to replay it before building"
-                .to_owned(),
-        ),
-        ReceiptState::Committed => {
-            let generation = receipt.generation.saturating_add(1);
-            let wanted = match expected {
-                Some(expected) => expected.at(generation),
-                None => desired_selection(context, &receipt)?
-                    .ok_or("outputs: the receipt selects no root")?,
+        ReceiptState::Prepared => {
+            return Bind::Refuse(
+                "outputs: an interrupted owned-output transition is pending; run `oxide outputs adopt` to replay it before building"
+                    .to_owned(),
+            )
+        }
+        ReceiptState::Committed => match expected {
+            Some(expected) => expected.clone(),
+            None => match desired_selection(context, receipt) {
+                Ok(Some(wanted)) => wanted,
+                Ok(None) => {
+                    return Bind::Refuse("outputs: the receipt selects no root".to_owned());
+                }
+                Err(reason) => return Bind::Refuse(reason),
+            },
+        },
+    };
+    let usable = usable_external(context);
+    if wanted.kind == RootKind::External {
+        if let Err(reason) = &usable {
+            return Bind::Refuse(format!(
+                "outputs: this command's slot is keyed for the external root {} but the registered volume is no longer usable ({reason}); nothing was changed. Run the command again to select the checkout-local root",
+                wanted.root.display()
+            ));
+        }
+    }
+    let target = match context.target() {
+        Ok(target) => target,
+        Err(reason) => return Bind::Refuse(reason),
+    };
+    let link_selects_wanted = target.link_root() == Some(wanted.root.as_path());
+    match check_root(context, generation, &wanted) {
+        RootCheck::Valid if link_selects_wanted => {
+            return Bind::Bound(bound_outcome(&usable, &wanted, false));
+        }
+        RootCheck::Valid => {}
+        RootCheck::Missing => {}
+        RootCheck::Contradiction(reason) => {
+            return Bind::Refuse(format!(
+                "outputs: {reason}; nothing was changed. Run `oxide outputs adopt` to recheck this checkout's owned outputs"
+            ))
+        }
+    }
+    // A transition is needed: only this checkout's own link may be replaced.
+    let old_link = match (&target, receipt.selected.as_ref()) {
+        (TargetState::Missing, _) => true,
+        (_, Some(selected)) => target.link_root() == Some(selected.root.as_path()),
+        _ => false,
+    };
+    if !old_link {
+        return Bind::Refuse(format!(
+            "outputs: {} is {}, not this checkout's owned link; Oxide will not replace it. Run `oxide outputs detach` or restore the link yourself",
+            context.link().display(),
+            target.label()
+        ));
+    }
+    match store.checkout_custody(&context.workspace, own_record) {
+        Err(reason) => Bind::Refuse(reason),
+        Ok(CheckoutCustody::Unknown(reason)) => Bind::Refuse(format!(
+            "outputs: refusing to relink {}: {reason}. The owned link and both roots are kept until that custody is resolved",
+            context.link().display()
+        )),
+        Ok(CheckoutCustody::Writers) => Bind::Wait,
+        Ok(CheckoutCustody::Clear) => {
+            let committed = match transition(context, receipt, &spec_for(&wanted)) {
+                Ok(committed) => committed,
+                Err(reason) => return Bind::Refuse(reason),
             };
-            let usable = usable_external(context);
-            if wanted.kind == RootKind::External {
-                if let Err(reason) = &usable {
-                    return Err(format!(
-                        "outputs: this command's slot is keyed for the external root {} but the registered volume is no longer usable ({reason}); nothing was changed. Run the command again to select the checkout-local root",
-                        wanted.root.display()
-                    ));
-                }
-            }
-            let target = context.target()?;
-            if matches!(&target, TargetState::OwnedLink(root) if *root == wanted.root) {
-                return Ok(bound_outcome(&usable, &wanted, false));
-            }
-            let selected = receipt
-                .selected()
-                .cloned()
-                .ok_or("outputs: the receipt selects no root")?;
-            match &target {
-                TargetState::Missing => {}
-                _ if target.link_root() == Some(selected.root.as_path()) => {}
-                _ => {
-                    return Err(format!(
-                        "outputs: {} is {}, not this checkout's owned link; Oxide will not replace it. Run `oxide outputs detach` or restore the link yourself",
-                        context.link().display(),
-                        target.label()
-                    ))
-                }
-            }
-            let spec = spec_for(&wanted);
-            let committed = transition(context, &receipt, &spec)?;
-            let bound = committed
-                .selected()
-                .cloned()
-                .ok_or("outputs: the transition committed no root")?;
+            let bound = match committed.selected() {
+                Some(bound) => bound.clone(),
+                None => return Bind::Refuse("outputs: the transition committed no root".to_owned()),
+            };
             if !bound.same_place(&wanted) {
-                return Err(format!(
+                return Bind::Refuse(format!(
                     "outputs: the transition bound {} but this command's slot was keyed for {}; nothing is built into the wrong root. Run the command again",
                     bound.root.display(),
                     wanted.root.display()
                 ));
             }
-            Ok(bound_outcome(&usable, &bound, true))
+            match check_root(context, committed.generation, &bound) {
+                RootCheck::Valid => Bind::Bound(bound_outcome(&usable, &bound, true)),
+                RootCheck::Missing => Bind::Refuse(format!(
+                    "outputs: the transition bound {} but its root is missing; run the command again",
+                    bound.root.display()
+                )),
+                RootCheck::Contradiction(reason) => Bind::Refuse(format!(
+                    "outputs: the transition bound {} but {reason}; run the command again",
+                    bound.root.display()
+                )),
+            }
         }
     }
+}
+
+/// Whether a root can be used as the keyed destination right now.
+#[derive(Debug)]
+enum RootCheck {
+    /// A real, fully owned root with the expected generation and device.
+    Valid,
+    /// The root does not exist yet, or is an empty directory with no marker; a
+    /// transition may create it.
+    Missing,
+    /// Ownership, kind, volume, generation or device contradicts the receipt.
+    Contradiction(String),
+}
+
+/// The complete check a reused-root command performs: marker identity, kind,
+/// volume, generation and current device/ancestry. Any contradiction refuses
+/// without mutation; only a wholly absent or empty unmarked root may be
+/// created by a transition.
+fn check_root(context: &Context, receipt_generation: u64, wanted: &Selected) -> RootCheck {
+    let root = &wanted.root;
+    match fs::symlink_metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return RootCheck::Missing,
+        Err(error) => {
+            return RootCheck::Contradiction(format!("cannot inspect {}: {error}", root.display()))
+        }
+        Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+            return RootCheck::Contradiction(format!("{} is not a real directory", root.display()))
+        }
+        Ok(_) => {}
+    }
+    if fs::symlink_metadata(root.join(MARKER)).is_err() {
+        let empty = fs::read_dir(root)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+        return if empty {
+            RootCheck::Missing
+        } else {
+            RootCheck::Contradiction(format!(
+                "{} holds content and carries no Oxide owner marker",
+                root.display()
+            ))
+        };
+    }
+    match check_bound_root(context, receipt_generation, wanted) {
+        Ok(()) => RootCheck::Valid,
+        Err(reason) => RootCheck::Contradiction(reason),
+    }
+}
+
+/// Validate a selected real root in full: this checkout's marker, the root
+/// kind and volume, the generation it was created at, its device and that it
+/// is not a mount root. Refuses any contradiction.
+fn check_bound_root(
+    context: &Context,
+    receipt_generation: u64,
+    wanted: &Selected,
+) -> Result<(), String> {
+    let root = &wanted.root;
+    let binding = match wanted.kind {
+        RootKind::External => Some(binding_for(
+            context,
+            wanted.volume_uuid.as_deref().unwrap_or_default(),
+        )?),
+        RootKind::Local => None,
+    };
+    validate_selected(
+        &context.workspace,
+        &context.checkout_id,
+        wanted,
+        binding.as_ref(),
+        receipt_generation,
+    )?;
+    let marker = read_marker(root)?;
+    if marker.generation != wanted.generation {
+        return Err(format!(
+            "{} was created at generation {}, not the keyed {}; run the command again",
+            root.display(),
+            marker.generation,
+            wanted.generation
+        ));
+    }
+    Ok(())
 }
 
 fn bound_outcome(
@@ -1169,11 +1352,11 @@ fn bound_outcome(
     ))
 }
 
-/// The root the next command must select, read-only and without any barrier:
-/// the external root when the registered volume is usable now, else the
-/// checkout-local fallback. `None` when this checkout has no owned output link
-/// (never converted, or detached). The same rule the binding applies, so the
-/// slot key and the bound root agree (see [`destination_facts`]).
+/// The root the next command must select, read-only and without any lock: the
+/// external root when the registered volume is usable now, else the
+/// checkout-local fallback. Its `generation` is the generation the root has or
+/// will be created at, so the slot key and the binding agree. `None` when this
+/// checkout has no owned output link (never converted, or detached).
 pub fn planned_destination(
     control: Option<&Path>,
     checkout: &Path,
@@ -1189,38 +1372,53 @@ pub fn planned_destination(
 }
 
 /// The destination rule itself: external when the volume is usable, else the
-/// local fallback. `None` for a detached or absent receipt.
+/// local fallback, each with the generation its root has or will be created
+/// at. `None` for a detached or absent receipt.
 fn desired_selection(context: &Context, receipt: &Receipt) -> Result<Option<Selected>, String> {
-    let generation = receipt.generation.saturating_add(1);
-    Ok(match receipt.state {
-        ReceiptState::Detached => None,
-        ReceiptState::Committed | ReceiptState::Prepared => Some(match usable_external(context) {
-            Ok(registration) => {
-                external_spec(&registration, &context.workspace).selected(generation)
-            }
-            Err(_) => local_spec(&context.workspace).selected(generation),
-        }),
-    })
+    if receipt.state == ReceiptState::Detached {
+        return Ok(None);
+    }
+    let next = receipt.generation.saturating_add(1);
+    let spec = match usable_external(context) {
+        Ok(registration) => external_spec(&registration, &context.workspace),
+        Err(_) => local_spec(&context.workspace),
+    };
+    let generation = read_marker(spec.root()).map_or(next, |marker| marker.generation);
+    Ok(Some(spec.selected(generation)))
 }
 
 /// The final-output destination, as a component of a slot's compatibility
-/// identity: the selected real root's kind, path, bound volume and its
-/// creation generation. Empty for an ephemeral or detached checkout, so those
-/// checkouts keep exactly the slot keys they had before this feature.
+/// identity: the selected real root's kind, path, bound volume and the
+/// generation it has or will be created at. Empty for an ephemeral or
+/// detached checkout, so those checkouts keep exactly the slot keys they had
+/// before this feature.
 pub fn destination_facts(selected: Option<&Selected>) -> String {
     let Some(selected) = selected else {
         return String::new();
     };
-    let generation = read_marker(&selected.root).map_or(0, |marker| marker.generation);
     format!(
-        "outputs-1 {} {} {} g{generation}",
+        "outputs-1 {} {} {} g{}",
         match selected.kind {
             RootKind::External => "external",
             RootKind::Local => "local",
         },
         selected.root.display(),
-        selected.volume_uuid.as_deref().unwrap_or("-")
+        selected.volume_uuid.as_deref().unwrap_or("-"),
+        selected.generation
     )
+}
+
+/// Refuse an explicit output command while this checkout has unknown writer
+/// custody: a lost slot whose writers were never positively closed may still
+/// write through the output front door, so no link is replaced or restored.
+fn refuse_unknown_custody(store: &Store, checkout: &Path, action: &str) -> Result<(), String> {
+    match store.checkout_custody(checkout, 0)? {
+        CheckoutCustody::Unknown(reason) => Err(format!(
+            "outputs: refusing to {action} {}: {reason}. The owned link and both roots are kept until that custody is resolved",
+            checkout.join("target").display()
+        )),
+        CheckoutCustody::Clear | CheckoutCustody::Writers => Ok(()),
+    }
 }
 
 /// The internal pool paired with a registered removable pool, so the clean
@@ -1506,6 +1704,11 @@ fn ensure_root(context: &Context, spec: &RootSpec, generation: u64) -> Result<Ma
                             root.display()
                         ));
                     }
+                    // Ownership is about to be established here, whether the
+                    // empty directory was just created or already existed.
+                    if matches!(spec, RootSpec::Local { .. }) {
+                        refuse_tracked_local_root(context)?;
+                    }
                     create_marker(context, spec, generation, binding.as_ref())?
                 }
             };
@@ -1576,23 +1779,31 @@ fn create_root(
             "the registered volume is not usable; refusing to create an external root".to_owned(),
         ),
         (RootSpec::Local { root }, _) => {
-            let checkout = &context.workspace;
-            let outer = checkout.join(LOCAL_DIR);
-            // Every creation is checked, including one inside a fallback
-            // parent that already exists: an existing `.oxide-outputs` never
-            // proves Git ignores what goes in it.
-            let probe = format!("{LOCAL_DIR}/{LOCAL_ROOT}");
-            if !root.exists() && git_would_track(checkout, &probe)? {
-                return Err(format!(
-                    "outputs: refusing to create the checkout-local root {} because Git would track it; add `{GITIGNORE_LINE}` to {} (oxide init does this) and re-run",
-                    root.display(),
-                    checkout.join(".gitignore").display()
-                ));
-            }
-            create_owned_directory(&outer)?;
+            refuse_tracked_local_root(context)?;
+            create_owned_directory(&context.workspace.join(LOCAL_DIR))?;
             create_owned_directory(root)
         }
     }
+}
+
+/// Refuse to establish or write into a checkout-local output root that Git
+/// would track. Checked whenever ownership is about to be established, so an
+/// empty `.oxide-outputs/local` that already exists (and is not ignored) is
+/// refused and left unchanged.
+fn refuse_tracked_local_root(context: &Context) -> Result<(), String> {
+    let checkout = &context.workspace;
+    // Ask about a path *inside* the fallback root: Git only matches a
+    // trailing-slash directory pattern when the path is a directory, which
+    // `.oxide-outputs` may not be yet.
+    let probe = format!("{LOCAL_DIR}/{LOCAL_ROOT}");
+    if git_would_track(checkout, &probe)? {
+        return Err(format!(
+            "outputs: refusing to create the checkout-local root {} because Git would track it; add `{GITIGNORE_LINE}` to {} (oxide init does this) and re-run",
+            checkout.join(LOCAL_DIR).join(LOCAL_ROOT).display(),
+            checkout.join(".gitignore").display()
+        ));
+    }
+    Ok(())
 }
 
 /// Create one owner-only real directory, refusing a symlink or another kind.
@@ -2536,6 +2747,58 @@ mod tests {
     /// committed selection. A link that appeared afterwards is not this
     /// receipt's: replay never renames over it, even when it dangles and a
     /// matching prepared sibling exists.
+    /// The complete reused-root check: marker identity, kind, volume and the
+    /// generation the slot was keyed with. A root that does not exist (or is
+    /// empty and unmarked) may be created; anything contradictory refuses.
+    #[test]
+    fn the_reused_root_check_refuses_contradictions_and_allows_creation() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let spec = fixture.local();
+        assert!(matches!(
+            check_root(&context, 1, &spec.selected(1)),
+            RootCheck::Missing
+        ));
+        fs::create_dir_all(spec.root()).unwrap();
+        assert!(matches!(
+            check_root(&context, 1, &spec.selected(1)),
+            RootCheck::Missing
+        ));
+        fs::write(spec.root().join("content"), b"x").unwrap();
+        assert!(matches!(
+            check_root(&context, 1, &spec.selected(1)),
+            RootCheck::Contradiction(_)
+        ));
+        fs::remove_file(spec.root().join("content")).unwrap();
+        ensure_root(&context, &spec, 1).unwrap();
+        assert!(matches!(
+            check_root(&context, 1, &spec.selected(1)),
+            RootCheck::Valid
+        ));
+        // A slot keyed for another generation, kind or volume refuses.
+        assert!(matches!(
+            check_root(&context, 1, &spec.selected(2)),
+            RootCheck::Contradiction(_)
+        ));
+        let mut external = spec.selected(1);
+        external.kind = RootKind::External;
+        assert!(matches!(
+            check_root(&context, 1, &external),
+            RootCheck::Contradiction(_)
+        ));
+        let mut other = spec.selected(1);
+        other.volume_uuid = Some("00000000-0000-0000-0000-000000000000".to_owned());
+        assert!(matches!(
+            check_root(&context, 1, &other),
+            RootCheck::Contradiction(_)
+        ));
+        // A marker ahead of the receipt refuses even at the keyed generation.
+        assert!(matches!(
+            check_root(&context, 0, &spec.selected(1)),
+            RootCheck::Contradiction(_)
+        ));
+    }
+
     #[test]
     fn a_first_conversion_never_renames_over_a_link_that_appeared_after_the_crash() {
         let fixture = Fixture::new();
