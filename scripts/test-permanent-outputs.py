@@ -819,6 +819,12 @@ def run(proof: Proof, repo: str) -> None:
 
     # 9. Crash replay at each write-ahead point.
     expect(receipt_path(pool, app) and read_json(receipt_path(pool, app))["state"] == "committed", read_json(receipt_path(pool, app)))
+    # Start from the checkout-local root so the first injection has a
+    # transition to stop in.
+    set_recorded_uuid(pool, wrong)
+    code, _, stderr = proof.oxide(["check"], "local root before the first crash", app)
+    expect(code == 0 and link_target(link) == local_root, stderr)
+    set_recorded_uuid(pool, good)
     crash_env = dict(env)
     crash_env["OXIDE_TEST_OUTPUTS_CRASH"] = "prepared"
     code, _, stderr = oxide_env(
