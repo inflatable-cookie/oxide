@@ -382,6 +382,8 @@ def run(proof: Proof, repo: str) -> None:
         app,
     )
     expect(code == 0 and "registered removable pool" in stdout, stderr)
+    wrong = "00000000-0000-0000-0000-000000000000"
+    good = real_uuid(pool)
     proof.phase("after drive registration")
 
     # 1. A nonempty real target refuses, with no mutation.
@@ -532,8 +534,6 @@ def run(proof: Proof, repo: str) -> None:
 
     # 7. A wrong recorded volume UUID selects the local root and never writes
     #    to the external one, and no absent mount point is recreated.
-    wrong = "00000000-0000-0000-0000-000000000000"
-    good = real_uuid(pool)
     marker_before = read_bytes(os.path.join(external_root, MARKER))
     entries_before = sorted(os.listdir(external_root))
     set_recorded_uuid(pool, wrong)
