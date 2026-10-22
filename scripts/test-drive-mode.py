@@ -247,8 +247,13 @@ def run(proof: Proof, repo: str) -> None:
     expect(code == 0 and "mode set to permanent" in stdout, f"permanent update failed: {stdout}{stderr}")
     current = json.loads(fs_read(registration_path))
     expect(current["version"] == 2 and current["mode"] == "permanent", f"not a v2 permanent registration: {current}")
-    for key, value in json.loads(legacy).items():
-        expect(current[key] == value, f"mode update changed registration field {key}: {current[key]} != {value}")
+    legacy_fields = json.loads(legacy)
+    legacy_fields.pop("version")
+    for key, value in legacy_fields.items():
+        expect(
+            current[key] == value,
+            f"mode update changed registration field {key}: {current[key]} != {value}",
+        )
     expect(not os.path.lexists(mount), "set-mode touched the absent mount point")
 
     code, permanent_stdout, permanent_stderr = proof.oxide(["status"], "permanent status", app)
