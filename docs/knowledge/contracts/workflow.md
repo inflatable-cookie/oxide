@@ -753,9 +753,13 @@ explicit `recover` unless they adopt it.
   may grow past it while real free space holds. Only whole idle slots are
   evicted. The APFS sparse-image backend is retired (oxide#102).
 - The first command creates the pool automatically ([W-1](#open-decisions)).
-- Per-project slot cap, recommended 2 to start, plus a host-wide limit on
-  concurrent Cargo invocations ([W-2](#open-decisions)). Queue/Nucleus still
-  decide which tasks run. Oxide only orders the Rust work they launch.
+- Slot headroom (oxide#118): up to 128 slots per pool and eight per project
+  identity, with compatible reuse first and the oldest eligible idle whole
+  slot replaced under count or byte pressure
+  ([local lease](local-lease.md#slot-headroom-and-ranked-idle-replacement-oxide118)).
+  A host-wide limit still bounds concurrent Cargo invocations
+  ([W-2](#open-decisions)). Queue/Nucleus still decide which tasks run. Oxide
+  only orders the Rust work they launch.
 - `oxide status` reuses the read-only [storage inventory](storage-inventory.md).
   It reports pool and slot use (each slot's file names, distinct inodes and
   allocation counted once per inode), the Cargo home's allocation, and stray
@@ -884,13 +888,36 @@ or global Cargo configuration is involved.
   any directory from `HOME` to `~/.local/bin` is a link, is owned by another
   user or (below `HOME`) is group or world writable. It writes only through
   the opened directory, with no-follow opens.
-- **Updating.** After a reviewed merge, the planner runs
-  `effigy oxide:reinstall`. It replaces only a regular, user-owned binary
-  whose hash matches the newest receipt. Directly before the rename it
-  rechecks that the destination is still that file (type, owner, inode and
-  hash) and refuses otherwise. Earlier receipts are kept. `OXIDE_INSTALL_PIN=<commit>` selects an older commit on main, for
-  example to roll back. Effigy does not forward selector arguments, so the
+- **Updating.** After a reviewed or explicitly operator-accepted merge, the
+  planner runs `effigy oxide:reinstall`. It replaces only a regular,
+  user-owned binary whose hash matches the newest receipt. Directly before
+  the atomic rename it rechecks that the destination is still that file
+  (type, owner, inode and hash) and refuses otherwise. Earlier receipts are
+  kept. `OXIDE_INSTALL_PIN=<commit>` selects a commit on pushed main; it does
+  not roll back ledger or control state, and an older binary may refuse
+  forward-only fields. Effigy does not forward selector arguments, so the
   pin travels in the environment.
+- **Install compatibility window.** Before an update, classify whether its
+  ledger or control-state format adds a forward-only fence that older
+  binaries refuse. For such updates, the planner obtains a fresh supported
+  Queue observation showing no milestone or project QA running before
+  installing. Inspect Queue's QA index together with host-run records and
+  exact QA details, including queued, admitted, running and capacity-retaining
+  runs; an empty latest-run list alone is insufficient. Queue currently has
+  no bounded QA-launch deferral: these observations cannot atomically exclude
+  preparing requests or a new launch between the check and swap. Coordinate
+  that short window with Queue's owner and retain the capability gap. If a
+  supported bounded deferral becomes available, use it and release it when
+  the install settles. Do not substitute a global pause, cancellation,
+  preemption or an unapproved scheduler setting. Preserve the observation
+  and install receipt. This is a state-compatibility condition, not a
+  quiet-machine or CPU-load gate. Updates with no state-format change keep
+  the atomic install with no idle wait. Atomic replacement preserves an
+  already-running binary's inode, but cannot make it understand newly
+  written state: old commands can refuse an early state read as well as a
+  final release. Keep those failures and any held records for the existing
+  positive-closure recovery path; do not overwrite the new format or infer
+  writer closure from the refusal.
 - **Default pool.** The first leased command created
   `~/Library/Caches/oxide/pool` under the then-shipped rules: a 24 GiB
   `apfs-sparse-image-v1` image, refused below the 20 GiB host reserve. That
@@ -2241,12 +2268,19 @@ Rules:
   image or receipt file, any payload entry but `slots` and
   [Finder metadata](#finder-metadata-in-pools), or a payload on another
   device refuses.
-- **Admission.** The ledger's existing rules with this command's soft budget
-  (`LeaseRequest.budget_bytes`, else the recorded one) as the cap:
-  owned slots' unique allocated bytes at lease time, whole-idle-slot
-  eviction until under budget, `Full` when only held slots remain, and
-  half-budget idle recycling. Nothing enforces the budget while a build
-  writes; a build can pass it, and the next new slot evicts.
+- **Admission.** The ledger's rules with this command's soft budget
+  (`LeaseRequest.budget_bytes`, else the recorded one) as the cap, and the
+  raised `MAX_SLOTS` 128 / 2 MiB ledger representation
+  ([local lease](local-lease.md#slot-headroom-and-ranked-idle-replacement-oxide118)).
+  A compatible idle slot is reused first and kept warm; the half-budget
+  recycling rule is retired. A new slot replaces the least-recently-used
+  eligible idle whole slot only at the 128-slot pool ceiling, the eight-slot
+  project ceiling, or when the whole-payload union is at or above the budget;
+  it remeasures after each deletion and refuses `Full` when only held slots
+  remain. Held, uncertain, foreign and unmeasurable slots are never eligible,
+  and a safety failure stops admission instead of skipping. Nothing enforces
+  the budget while a build writes; a build can pass it, and the next new slot
+  evicts.
 - **Watchdog.** Only on a directory pool, only while Oxide supervises a
   leased Cargo group (build and `run` build, `test` execution, building
   passthrough). It samples `statfs` `f_bavail` of the payload directory
@@ -2270,6 +2304,17 @@ Rules:
   overrides the soft budget above every other source. Release builds ignore
   both. The reserve and
   margin have no override.
+- **Slot headroom proof (oxide#118).** `effigy rust:slot-headroom` under the
+  qualified shared proof supervisor stages `oxide` offline with 1.97.1 and
+  proves the permanent ledger/control fences, a legacy read without migration,
+  rank exhaustion before any transition, a 128-slot pool whose 129th and 130th
+  admissions replace the rank-LRU idle whole slot without churn, the eight-slot
+  project cap with a specific held-slot wait and one LRU idle replacement,
+  compatible reuse first, no eviction below both ceilings, byte-pressure LRU
+  with a held slot excluded, and a foreign payload-entry refusal. Worst-valid
+  ledger/control serialization, round-trip and oversized-field refusals are
+  unit tests. The nine-grant freshness bound is a bounded-loop inspection, not
+  a separately induced native case.
 - **Proof.** Current: `effigy rust:oxide-budget-default`
   ([above](#budget-only-default-pool-and-user-configuration)). Historical,
   before the CLI's retirement: `effigy rust:oxide-cli` added a macOS case on two scratch

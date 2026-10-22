@@ -319,3 +319,18 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 [tasks."rust:freshness-submodules"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-freshness-submodules.py"
+
+# Slot headroom (oxide#118): under the qualified shared proof supervisor
+# (oxide#109/#114, bounded-test.py SHA-256
+# d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e), stages
+# `oxide` offline with 1.97.1 and proves the permanent ledger/control fences,
+# legacy read without migration, rank exhaustion, a 128-slot pool whose 129th
+# and 130th admissions replace the rank-LRU idle whole slot, the 8-slot
+# project cap with a specific held-slot wait and one LRU idle replacement,
+# compatible reuse first, no eviction below both ceilings, byte-pressure LRU
+# with a held slot excluded, and a foreign payload-entry refusal. Tiny owned
+# fixtures only: no live pool, real drive or large inventory; representation
+# worst cases are unit tests. 300 s and 512 MiB monitored scratch.
+[tasks."rust:slot-headroom"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-slot-headroom.py"
