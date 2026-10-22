@@ -22,8 +22,13 @@ permanent drive as one owned 128 MiB APFS sparse image attached at a unique
   rename; and a contradictory state that stops and keeps both roots;
 - `oxide clean` resolving the receipt to the real root and preserving the
   link, the marker and inactive roots;
-- `oxide outputs detach` restoring a real directory and refusing while the
-  drive mode is permanent.
+- `oxide outputs detach` restoring a real directory in ephemeral mode.
+
+The `detach-permanent` mode (oxide#124) proves the per-checkout opt-out under
+permanent mode: detach keeps the roots and records a detached receipt, the next
+command builds into the real target without relinking or a notice, automatic
+adoption stays off for it, and an explicit later adopt re-converts an empty
+target through the existing preconditions.
 
 Not a benchmark, not real-drive qualification and not full QA.
 """
@@ -1247,10 +1252,8 @@ def run(proof: Proof, repo: str) -> None:
     expect("preserved local fallback root" in stdout, stdout)
     proof.phase("after clean")
 
-    # 12. Detach: refuse while permanent, then restore a real directory.
-    code, _, stderr = proof.oxide(["outputs", "detach"], "detach while permanent", app)
-    expect(code != 0 and "still permanent" in stderr, stderr)
-    expect(os.path.islink(link), "a refused detach removed the link")
+    # 12. Detach in ephemeral mode, then restore a real directory. Permanent
+    #     mode detaches too (oxide#124): `detach-permanent` proves that.
     code, _, stderr = proof.oxide(["pool", "set-mode", "ephemeral"], "set ephemeral mode", app)
     expect(code == 0, stderr)
     # A converted checkout keeps building through its owned link in
@@ -1360,6 +1363,223 @@ def run(proof: Proof, repo: str) -> None:
 
 
 AUTO_NOTICE = "oxide: auto-adopted "
+
+
+def tree_digest(root: str) -> dict:
+    """Every entry under `root`: file hashes, link texts and directories, so
+    a root's bytes compare exactly before and after a command."""
+    digest = {}
+    for current, dirs, files in os.walk(root):
+        for name in dirs + files:
+            full = os.path.join(current, name)
+            relative = os.path.relpath(full, root)
+            if os.path.islink(full):
+                digest[relative] = "link:" + os.readlink(full)
+            elif os.path.isfile(full):
+                digest[relative] = sha256_file(full)
+            else:
+                digest[relative] = "dir"
+    return digest
+
+
+def receipt_state(pool: str, checkout: str) -> str:
+    with open(receipt_file(pool, checkout), "rb") as handle:
+        return json.load(handle)["state"]
+
+
+def detach_run(proof: Proof, repo: str) -> None:
+    """Focused per-checkout detach proof under permanent mode (oxide#124): the
+    #121 fixture and staging, one owned 128 MiB scratch image, ordinary detach.
+    Only the fixture commands' stderr, exit codes, link, receipt, plan and
+    root bytes are checked."""
+    source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
+    dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
+    expect(not dirty, f"candidate checkout is not clean: {dirty}")
+    name = "OxDp" + secrets.token_hex(4)
+    mount = f"/Volumes/{name}"
+    expect(not os.path.lexists(mount), f"{mount} exists before the proof; never touched")
+    print(
+        f"detach-permanent proof {os.getpid()} source {source} "
+        f"({layout.source_facts(repo)}) mount {mount}"
+    )
+    proof.phase("start")
+    proof.binary = layout.stage_at(proof, repo, "oxide-detach-permanent")
+    proof.phase("after staging")
+
+    root = proof.root
+    pool = os.path.join(root, "pool")
+    home = os.path.join(root, "home")
+    cargo_home = os.path.join(root, "cargo-home")
+    for path in (home, cargo_home):
+        os.makedirs(path, mode=0o700)
+    proof.env = proof_env(pool, home, cargo_home)
+    image = os.path.join(root, "volume.sparseimage")
+
+    maker = fresh_checkout(proof, root, "pool-maker")
+    code, _, stderr = proof.oxide(["build"], "unregistered build keeps a real target", maker)
+    expect(code == 0 and not auto_notices(stderr), stderr)
+
+    mounted = attach_image(proof, root, name)
+    expect(mounted == mount, f"scratch volume mounted at {mounted}, not {mount}")
+    code, stdout, stderr = proof.oxide(
+        [
+            "pool",
+            "register-removable",
+            mount,
+            "--reserve",
+            "16MiB",
+            "--cap",
+            "64MiB",
+            "--mode",
+            "permanent",
+        ],
+        "register permanent drive",
+        maker,
+    )
+    expect(code == 0 and "registered removable pool" in stdout, stderr)
+    proof.phase("after drive registration")
+
+    # 1. The precondition: a fresh checkout adopts on its first build.
+    app = fresh_checkout(proof, root, "detach-adopted")
+    link = os.path.join(app, "target")
+    code, _, stderr = proof.oxide(["build"], "fresh checkout adopts on its first build", app)
+    expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+    adopted = os.readlink(link)
+    expect(
+        adopted.startswith(os.path.join(mount, "oxide-outputs") + os.sep),
+        f"the adopted root {adopted} is not on the drive",
+    )
+    expect(os.path.isfile(os.path.join(adopted, MARKER)), "the adopted root has no marker")
+    expect(os.path.isfile(os.path.join(link, "debug", "poutputs")), "binary not reachable through the link")
+    proof.phase("after adoption")
+
+    # 2. Detach waits for an active build in the checkout, then restores the
+    #    real directory once that build has closed. The root keeps the build.
+    gate = os.path.join(root, "gate")
+    gate_env = dict(proof.env, OXIDE_OUTPUT_GATE=gate)
+    reset_gate(gate)
+    writer = start_child(proof, [proof.binary, "check"], app, gate_env)
+    waiting = None
+    try:
+        wait_for(os.path.join(gate, "started"), "gated build script")
+        expect(writer.poll() is None, "the gated build exited early")
+        waiting = start_child(proof, [proof.binary, "outputs", "detach"], app, proof.env)
+        time.sleep(2.0)
+        if waiting.poll() is not None:
+            early_out, early_err = waiting.communicate(timeout=5)
+            proof.unclosed.discard(waiting.pid)
+            fail(
+                "outputs detach did not wait for the active build in the checkout: "
+                f"exit {waiting.returncode}\n{early_out.decode(errors='replace')}"
+                f"{early_err.decode(errors='replace')}"
+            )
+        expect(os.readlink(link) == adopted, "the owned link moved while a build was running")
+        with open(os.path.join(gate, "release"), "wb") as handle:
+            handle.write(b"release")
+        writer_code, _, writer_stderr = finish_child(proof, writer, "gated build")
+        expect(writer_code == 0, f"the gated build failed: {writer_stderr}")
+        expect(os.path.isdir(os.path.join(adopted, "debug")), "the build wrote nothing to the root")
+        before = tree_digest(adopted)
+        detach_code, detach_stdout, detach_stderr = finish_child(proof, waiting, "detach after the build")
+        waiting = None
+        expect(detach_code == 0, f"detach after the build failed: {detach_stdout}{detach_stderr}")
+    finally:
+        os.makedirs(gate, exist_ok=True)
+        with open(os.path.join(gate, "release"), "wb") as handle:
+            handle.write(b"release")
+        if writer.poll() is None:
+            writer.kill()
+        if waiting is not None and waiting.poll() is None:
+            waiting.kill()
+    proof.phase("after the gated detach")
+
+    # 3. The detach restored a real empty directory, kept every root byte and
+    #    recorded a detached receipt. Plan and status agree.
+    expect("real empty directory again" in detach_stdout, detach_stdout)
+    expect(os.path.isdir(link) and not os.path.islink(link), "detach did not restore a real directory")
+    expect(os.listdir(link) == [], "the detached target is not empty")
+    expect(tree_digest(adopted) == before, "detach changed the owned root")
+    expect(receipt_state(pool, app) == "detached", "the receipt is not detached")
+    code, stdout, stderr = proof.oxide(["outputs", "status"], "status after detach", app)
+    expect(code == 0 and "detached" in stdout and "permanent" in stdout, stdout + stderr)
+    report = plan(proof, app, "plan after detach")
+    expect(report["mode"] == "permanent" and report["state"] == "detached", report)
+    expect(report["current_target"] == "real-empty", report)
+    expect("selected" not in report and "current_root" not in report, report)
+    expect("detached" in (report.get("reason") or ""), report)
+    code, stdout, stderr = proof.oxide(["outputs", "detach"], "a second detach changes nothing", app)
+    expect(code == 0 and "already detached" in stdout, stdout + stderr)
+    proof.phase("after the detach")
+
+    # 4. The next leased builds use the real target: no relink, no notice, and
+    #    the detached root is never written.
+    code, _, stderr = proof.oxide(["build"], "the next build uses the real target", app)
+    expect(code == 0 and not auto_notices(stderr), stderr)
+    expect(os.path.isdir(link) and not os.path.islink(link), "a build relinked the target")
+    expect(os.path.isfile(os.path.join(link, "debug", "poutputs")), "no binary in the real target")
+    expect(tree_digest(adopted) == before, "a build wrote into the detached root")
+    code, _, stderr = proof.oxide(["build"], "a repeated build stays real, no notice", app)
+    expect(code == 0 and not auto_notices(stderr) and not os.path.islink(link), stderr)
+    report = plan(proof, app, "plan after real-target builds")
+    expect(report["state"] == "detached" and report["current_target"] == "real-nonempty", report)
+    proof.phase("after the real-target builds")
+
+    # 5. Controls. Explicit adopt refuses the nonempty real target without any
+    #    change; a missing target beside a detached receipt is never adopted.
+    code, _, stderr = proof.oxide(["outputs", "adopt"], "adopt refuses the nonempty real target", app)
+    expect(code != 0 and "never moves, adopts or deletes" in stderr, stderr)
+    expect(os.path.isfile(os.path.join(link, "debug", "poutputs")), "adopt moved the real target")
+    expect(tree_digest(adopted) == before, "a refused adopt wrote into the root")
+    shutil.rmtree(link)
+    code, _, stderr = proof.oxide(["build"], "a detached receipt with an absent target is never adopted", app)
+    expect(code == 0 and not auto_notices(stderr), stderr)
+    expect(os.path.isdir(link) and not os.path.islink(link), "a detached checkout was adopted")
+    expect(receipt_state(pool, app) == "detached", "the receipt left detached state")
+    proof.phase("after the absent-target control")
+
+    # 6. Explicit adopt re-converts an empty detached target, to the same root
+    #    the checkout already had, through the existing preconditions.
+    again = fresh_checkout(proof, root, "detach-readopt")
+    code, _, stderr = proof.oxide(["build"], "re-adopt fixture adopts on its first build", again)
+    expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+    first = os.readlink(os.path.join(again, "target"))
+    code, _, stderr = proof.oxide(["outputs", "detach"], "detach the re-adopt fixture", again)
+    expect(code == 0, stderr)
+    expect(os.listdir(os.path.join(again, "target")) == [], "the re-adopt target is not empty")
+    code, stdout, stderr = proof.oxide(["outputs", "adopt"], "explicit adopt converts the empty target", again)
+    expect(code == 0 and "now selects the owned external root" in stdout, stdout + stderr)
+    expect(os.readlink(os.path.join(again, "target")) == first, "re-adopt chose another root")
+    expect(receipt_state(pool, again) == "committed", "re-adopt did not commit")
+    code, _, stderr = proof.oxide(["build"], "the re-adopted checkout builds through its link", again)
+    expect(code == 0 and not auto_notices(stderr), stderr)
+    expect(os.readlink(os.path.join(again, "target")) == first, "a build relinked the re-adopted target")
+    proof.phase("after explicit re-adoption")
+
+    # 7. Errors stay errors: a foreign link refuses the detach with no change
+    #    and the receipt stays committed; a checkout never converted has no
+    #    receipt to detach.
+    foreign = fresh_checkout(proof, root, "detach-foreign")
+    code, _, stderr = proof.oxide(["build"], "foreign fixture adopts on its first build", foreign)
+    expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+    outside = os.path.join(root, "outside-detach")
+    os.makedirs(outside)
+    with open(os.path.join(outside, "sentinel"), "wb") as handle:
+        handle.write(b"foreign")
+    os.remove(os.path.join(foreign, "target"))
+    os.symlink(outside, os.path.join(foreign, "target"))
+    code, stdout, stderr = proof.oxide(["outputs", "detach"], "detach refuses a foreign link", foreign)
+    expect(code != 0 and "left untouched" in stderr, stdout + stderr)
+    expect(os.readlink(os.path.join(foreign, "target")) == outside, "the foreign link was replaced")
+    expect(read_bytes(os.path.join(outside, "sentinel")) == b"foreign", "the foreign referent changed")
+    expect(receipt_state(pool, foreign) == "committed", "a refused detach changed the receipt")
+
+    never = fresh_checkout(proof, root, "detach-never-converted")
+    code, stdout, stderr = proof.oxide(["outputs", "detach"], "detach without a receipt refuses", never)
+    expect(code != 0 and "nothing to detach" in stderr, stdout + stderr)
+    expect(not os.path.lexists(os.path.join(never, "target")), "a refused detach created a target")
+    proof.phase("after the error controls")
+
+    proof.detach()
 
 
 def auto_notices(stderr: str) -> list[str]:
@@ -1682,15 +1902,22 @@ def main() -> int:
         and "OXIDE_PROOF_DEADLINE_NS" in os.environ,
         "not under the qualified shared proof supervisor",
     )
+    # Each focused mode is one scenario on the same fixture: `auto-adopt`
+    # (oxide#121) and `detach-permanent` (oxide#124). No argument runs the full
+    # #117 scenario.
+    modes = {
+        (): (run, "permanent-outputs"),
+        ("auto-adopt",): (auto_run, "auto-adopt"),
+        ("detach-permanent",): (detach_run, "detach-permanent"),
+    }
+    expect(tuple(sys.argv[1:]) in modes, f"unknown mode {sys.argv[1:]!r}")
+    scenario, label = modes[tuple(sys.argv[1:])]
     root = tempfile.mkdtemp(prefix="permanent-outputs.", dir=scratch)
     repo = os.path.dirname(HERE)
     signal.signal(signal.SIGTERM, terminated)
     signal.signal(signal.SIGALRM, overdue)
     signal.setitimer(signal.ITIMER_REAL, work_left())
     proof = Proof(root)
-    # `auto-adopt` selects the focused oxide#121 scenario on the same fixture.
-    focused = sys.argv[1:] == ["auto-adopt"]
-    scenario, label = (auto_run, "auto-adopt") if focused else (run, "permanent-outputs")
     try:
         scenario(proof, repo)
     except BaseException as failure:
