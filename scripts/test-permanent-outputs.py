@@ -338,34 +338,8 @@ def attach_image(proof: Proof, root: str, name: str) -> str:
     return mounts[0]
 
 
-def run(proof: Proof, repo: str) -> None:
-    source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
-    dirty = (
-        proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30)
-        .stdout.decode()
-        .strip()
-    )
-    expect(not dirty, f"candidate checkout is not clean: {dirty}")
-    name = "OxPo" + secrets.token_hex(4)
-    mount = f"/Volumes/{name}"
-    expect(not os.path.lexists(mount), f"{mount} exists before the proof; never touched")
-    print(
-        f"permanent-outputs proof {os.getpid()} source {source} "
-        f"({layout.source_facts(repo)}) mount {mount}"
-    )
-    proof.phase("start")
-
-    candidate = layout.stage_at(proof, repo, "oxide-permanent-outputs")
-    proof.binary = candidate
-    proof.phase("after staging")
-
-    root = proof.root
-    pool = os.path.join(root, "pool")
-    home = os.path.join(root, "home")
-    cargo_home = os.path.join(root, "cargo-home")
-    gate = os.path.join(root, "gate")
-    for path in (home, cargo_home):
-        os.makedirs(path, mode=0o700)
+def proof_env(pool: str, home: str, cargo_home: str) -> dict:
+    """The host-isolated environment every fixture command runs under."""
     env = dict(os.environ)
     real_rustup = env.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup")
     for key in list(env):
@@ -414,6 +388,38 @@ def run(proof: Proof, repo: str) -> None:
             "GIT_COMMITTER_EMAIL": "proof@example.invalid",
         }
     )
+    return env
+
+
+def run(proof: Proof, repo: str) -> None:
+    source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
+    dirty = (
+        proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30)
+        .stdout.decode()
+        .strip()
+    )
+    expect(not dirty, f"candidate checkout is not clean: {dirty}")
+    name = "OxPo" + secrets.token_hex(4)
+    mount = f"/Volumes/{name}"
+    expect(not os.path.lexists(mount), f"{mount} exists before the proof; never touched")
+    print(
+        f"permanent-outputs proof {os.getpid()} source {source} "
+        f"({layout.source_facts(repo)}) mount {mount}"
+    )
+    proof.phase("start")
+
+    candidate = layout.stage_at(proof, repo, "oxide-permanent-outputs")
+    proof.binary = candidate
+    proof.phase("after staging")
+
+    root = proof.root
+    pool = os.path.join(root, "pool")
+    home = os.path.join(root, "home")
+    cargo_home = os.path.join(root, "cargo-home")
+    gate = os.path.join(root, "gate")
+    for path in (home, cargo_home):
+        os.makedirs(path, mode=0o700)
+    env = proof_env(pool, home, cargo_home)
     proof.env = env
 
     app = write_tree(os.path.join(root, "app"), APP)
@@ -1353,6 +1359,281 @@ def run(proof: Proof, repo: str) -> None:
     expect(not os.path.lexists(mount), "the scratch mount point is still present")
 
 
+AUTO_NOTICE = "oxide: auto-adopted "
+
+
+def auto_notices(stderr: str) -> list[str]:
+    return [line for line in stderr.splitlines() if line.startswith(AUTO_NOTICE)]
+
+
+def receipt_file(pool: str, checkout: str) -> str:
+    """Where a receipt is, present or not (`receipt_path` requires it)."""
+    key = hashlib.sha256(checkout.encode()).hexdigest()
+    return os.path.join(pool, "oxide-managed", "outputs", key + ".json")
+
+
+def fresh_checkout(proof: Proof, root: str, name: str) -> str:
+    path = write_tree(os.path.join(root, "checkouts", name), APP)
+    proof.run(["git", "init", "-q"], cwd=path, timeout=30)
+    expect(not os.path.lexists(os.path.join(path, "target")), f"{name} already has a target")
+    return path
+
+
+def set_mode(proof: Proof, mode: str, cwd: str) -> None:
+    code, _, stderr = proof.oxide(["pool", "set-mode", mode], f"drive mode {mode}", cwd)
+    expect(code == 0, stderr)
+
+
+def auto_run(proof: Proof, repo: str) -> None:
+    """Focused auto-adopt proof (oxide#121): one fixture, one volume, the
+    #117 scenario's staging and helpers. Only the fixture commands' stderr,
+    exit codes and link, root, receipt and source bytes are checked."""
+    source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
+    dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
+    expect(not dirty, f"candidate checkout is not clean: {dirty}")
+    name = "OxAd" + secrets.token_hex(4)
+    mount = f"/Volumes/{name}"
+    expect(not os.path.lexists(mount), f"{mount} exists before the proof; never touched")
+    print(
+        f"auto-adopt proof {os.getpid()} source {source} "
+        f"({layout.source_facts(repo)}) mount {mount}"
+    )
+    proof.phase("start")
+    proof.binary = layout.stage_at(proof, repo, "oxide-auto-adopt")
+    proof.phase("after staging")
+
+    root = proof.root
+    pool = os.path.join(root, "pool")
+    home = os.path.join(root, "home")
+    cargo_home = os.path.join(root, "cargo-home")
+    for path in (home, cargo_home):
+        os.makedirs(path, mode=0o700)
+    proof.env = proof_env(pool, home, cargo_home)
+    image = os.path.join(root, "volume.sparseimage")
+
+    # The internal pool exists before any drive is registered: a build then
+    # keeps its real target, as it always has.
+    maker = fresh_checkout(proof, root, "pool-maker")
+    code, _, stderr = proof.oxide(["build"], "unregistered build keeps a real target", maker)
+    expect(code == 0 and not auto_notices(stderr), stderr)
+    expect(not os.path.islink(os.path.join(maker, "target")), "unregistered build linked target")
+
+    mounted = attach_image(proof, root, name)
+    expect(mounted == mount, f"scratch volume mounted at {mounted}, not {mount}")
+    code, stdout, stderr = proof.oxide(
+        [
+            "pool",
+            "register-removable",
+            mount,
+            "--reserve",
+            "16MiB",
+            "--cap",
+            "64MiB",
+            "--mode",
+            "permanent",
+        ],
+        "register permanent drive",
+        maker,
+    )
+    expect(code == 0 and "registered removable pool" in stdout, stderr)
+    uuid = real_uuid(pool)
+    wrong = "00000000-0000-0000-0000-000000000000"
+    proof.phase("after drive registration")
+
+    # 1. Eligible: a fresh checkout adopts on its first leased build. One
+    #    notice, an owned link into the drive's root, output through it, a
+    #    receipt, then a warm rebuild with no notice and the same link.
+    fresh = fresh_checkout(proof, root, "fresh")
+    link = os.path.join(fresh, "target")
+    code, _, stderr = proof.oxide(["build"], "fresh checkout adopts on its first build", fresh)
+    expect(code == 0, stderr)
+    notes = auto_notices(stderr)
+    expect(len(notes) == 1, f"expected exactly one auto notice: {stderr}")
+    expect(link in notes[0] and "no existing outputs moved" in notes[0], notes[0])
+    expect(os.path.islink(link), "the fresh target is not an owned link")
+    fresh_root = os.readlink(link)
+    expect(
+        fresh_root.startswith(os.path.join(mount, "oxide-outputs") + os.sep),
+        f"the adopted root {fresh_root} is not on the drive",
+    )
+    expect(os.path.isfile(os.path.join(fresh_root, MARKER)), "the adopted root has no marker")
+    binary = os.path.join(link, "debug", "poutputs")
+    expect(os.path.isfile(binary), "the binary is not reachable through the adopted link")
+    expect(os.path.realpath(binary).startswith(mount + os.sep), "the binary is not on the drive")
+    expect(os.path.isfile(receipt_file(pool, fresh)), "adoption wrote no receipt")
+    expect(slot_state(stderr)[1] == "cold", stderr)
+    code, stdout, stderr = proof.oxide(["status"], "status shows the adopted root", fresh)
+    expect(code == 0 and fresh_root in stdout, stdout + stderr)
+    code, _, stderr = proof.oxide(["build"], "adopted checkout rebuilds warm, no notice", fresh)
+    expect(code == 0 and not auto_notices(stderr), stderr)
+    expect(slot_state(stderr)[1] == "warm", f"adopted destination key did not reuse: {stderr}")
+    expect(os.readlink(link) == fresh_root, "a warm build relinked the target")
+    proof.phase("after eligible adoption")
+
+    # A second fresh checkout gets its own root, leaf and receipt.
+    second = fresh_checkout(proof, root, "second")
+    code, _, stderr = proof.oxide(["build"], "second fresh checkout adopts its own root", second)
+    expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+    expect(os.readlink(os.path.join(second, "target")) != fresh_root, "two checkouts share a root")
+
+    # 2. Controls: every present target is kept, and no notice is printed.
+    keep = fresh_checkout(proof, root, "real-target")
+    os.makedirs(os.path.join(keep, "target"))
+    with open(os.path.join(keep, "target", "keep.txt"), "wb") as handle:
+        handle.write(b"warm build")
+    code, _, stderr = proof.oxide(["build"], "a non-empty real target is never adopted", keep)
+    expect(not auto_notices(stderr), stderr)
+    expect(
+        os.path.isdir(os.path.join(keep, "target"))
+        and not os.path.islink(os.path.join(keep, "target")),
+        "the real target was replaced",
+    )
+    expect(read_bytes(os.path.join(keep, "target", "keep.txt")) == b"warm build", "target mutated")
+    expect(not os.path.exists(receipt_file(pool, keep)), "a control wrote a receipt")
+
+    empty = fresh_checkout(proof, root, "empty-target")
+    os.makedirs(os.path.join(empty, "target"))
+    code, _, stderr = proof.oxide(["build"], "an empty real target is never adopted", empty)
+    expect(not auto_notices(stderr) and not os.path.islink(os.path.join(empty, "target")), stderr)
+    expect(not os.path.exists(receipt_file(pool, empty)), "an empty target got a receipt")
+
+    outside = os.path.join(root, "outside")
+    os.makedirs(outside)
+    with open(os.path.join(outside, "sentinel"), "wb") as handle:
+        handle.write(b"foreign")
+    foreign = fresh_checkout(proof, root, "foreign-link")
+    os.symlink(outside, os.path.join(foreign, "target"))
+    code, _, stderr = proof.oxide(["build"], "a foreign link is refused, not adopted", foreign)
+    expect(code != 0 and not auto_notices(stderr), stderr)
+    expect(os.readlink(os.path.join(foreign, "target")) == outside, "foreign link was replaced")
+    expect(read_bytes(os.path.join(outside, "sentinel")) == b"foreign", "foreign referent mutated")
+
+    absent = os.path.join(root, "absent-root")
+    dangling = fresh_checkout(proof, root, "dangling-link")
+    os.symlink(absent, os.path.join(dangling, "target"))
+    code, _, stderr = proof.oxide(["build"], "a dangling link is refused, not adopted", dangling)
+    expect(code != 0 and not auto_notices(stderr), stderr)
+    expect(os.readlink(os.path.join(dangling, "target")) == absent, "dangling link was replaced")
+    expect(not os.path.lexists(absent), "the dangling link's root was created")
+
+    filed = fresh_checkout(proof, root, "file-target")
+    with open(os.path.join(filed, "target"), "wb") as handle:
+        handle.write(b"not a directory")
+    code, _, stderr = proof.oxide(["build"], "a file at target is never adopted", filed)
+    expect(not auto_notices(stderr), stderr)
+    expect(read_bytes(os.path.join(filed, "target")) == b"not a directory", "file target mutated")
+    proof.phase("after controls")
+
+    # 3. A corrupt receipt is an error, never an absent receipt: the command
+    #    refuses before any slot is taken, and the missing target stays missing.
+    bad = fresh_checkout(proof, root, "bad-receipt")
+    os.makedirs(os.path.dirname(receipt_file(pool, bad)), exist_ok=True)
+    with open(receipt_file(pool, bad), "wb") as handle:
+        handle.write(b"{not a receipt")
+    code, _, stderr = proof.oxide(["build"], "a corrupt receipt refuses, never adopts", bad)
+    expect(code != 0 and "is invalid" in stderr and not auto_notices(stderr), stderr)
+    expect(not os.path.lexists(os.path.join(bad, "target")), "a corrupt receipt let a target appear")
+    os.remove(receipt_file(pool, bad))
+
+    # 4. A detached checkout with its target missing is excluded: the receipt
+    #    of any state refuses automatic adoption.
+    det = fresh_checkout(proof, root, "detached")
+    code, _, stderr = proof.oxide(["build"], "detached checkout starts adopted", det)
+    expect(code == 0 and len(auto_notices(stderr)) == 1, stderr)
+    set_mode(proof, "ephemeral", det)
+    code, _, stderr = proof.oxide(["outputs", "detach"], "detach the checkout", det)
+    expect(code == 0, stderr)
+    shutil.rmtree(os.path.join(det, "target"))
+    set_mode(proof, "permanent", det)
+    code, _, stderr = proof.oxide(["build"], "missing target with a detached receipt is excluded", det)
+    expect(code == 0 and not auto_notices(stderr), stderr)
+    expect(
+        os.path.isdir(os.path.join(det, "target")) and not os.path.islink(os.path.join(det, "target")),
+        "a detached checkout was adopted",
+    )
+    with open(receipt_file(pool, det), "rb") as handle:
+        expect(json.load(handle)["state"] == "detached", "the receipt left detached state")
+    proof.phase("after detached exclusion")
+
+    # 5. Ephemeral registration: no adoption, a real target, then permanent.
+    set_mode(proof, "ephemeral", fresh)
+    eph = fresh_checkout(proof, root, "ephemeral-drive")
+    code, _, stderr = proof.oxide(["build"], "ephemeral registration never adopts", eph)
+    expect(code == 0 and not auto_notices(stderr), stderr)
+    expect(not os.path.islink(os.path.join(eph, "target")), "ephemeral build linked its target")
+    set_mode(proof, "permanent", fresh)
+
+    # 6. Absent drive: no adoption, the internal real target. The drive is
+    #    then re-attached at the same mount point.
+    force_detach(proof, image, mount, uuid)
+    gone = fresh_checkout(proof, root, "absent-drive")
+    code, _, stderr = proof.oxide(["build"], "an absent drive never adopts", gone)
+    expect(code == 0 and not auto_notices(stderr), stderr)
+    expect(not os.path.islink(os.path.join(gone, "target")), "absent drive linked its target")
+    expect(not os.path.exists(receipt_file(pool, gone)), "absent drive wrote a receipt")
+    mounted = attach_image(proof, root, name)
+    expect(mounted == mount, f"re-attached at {mounted}, not {mount}")
+    proof.phase("after absent drive")
+
+    # 7. Internal fallback (recorded volume UUID mismatch): no adoption.
+    set_recorded_uuid(pool, wrong)
+    mismatch = fresh_checkout(proof, root, "uuid-mismatch")
+    code, _, stderr = proof.oxide(["build"], "a fallback to the internal pool never adopts", mismatch)
+    expect(code == 0 and not auto_notices(stderr), stderr)
+    expect(not os.path.islink(os.path.join(mismatch, "target")), "fallback linked its target")
+    set_recorded_uuid(pool, uuid)
+    proof.phase("after fallback control")
+
+    # 8. Crash replay. A stop after the sibling link leaves a prepared receipt;
+    #    a creator that appears at the target afterwards is never replaced.
+    crashed = fresh_checkout(proof, root, "crash-linked")
+    crash_env = dict(proof.env, OXIDE_TEST_OUTPUTS_CRASH="linked")
+    code, _, stderr = oxide_env(proof, ["build"], "crash after the sibling link", crashed, crash_env)
+    expect(code != 0 and "injected transition stop at linked" in stderr, stderr)
+    expect(not auto_notices(stderr), "a crashed adoption printed its notice")
+    sibling = os.path.join(crashed, ".target.oxide-new-1")
+    expect(os.path.islink(sibling), "the crash left no sibling link")
+    with open(os.path.join(crashed, "target"), "wb") as handle:
+        handle.write(b"creator")
+    code, _, stderr = proof.oxide(["build"], "replay refuses a creator at the target", crashed)
+    expect(code != 0 and "cannot be replayed" in stderr, stderr)
+    expect(read_bytes(os.path.join(crashed, "target")) == b"creator", "the creator was replaced")
+    expect(os.path.islink(sibling), "the prepared sibling was removed")
+
+    # A stop before any link is published: the next command's replay rolls the
+    # preparation back to detached and refuses once (its slot was keyed for the
+    # root). The command after it builds as an unconverted checkout.
+    prepared = fresh_checkout(proof, root, "crash-prepared")
+    crash_env = dict(proof.env, OXIDE_TEST_OUTPUTS_CRASH="prepared")
+    code, _, stderr = oxide_env(proof, ["build"], "crash before publication", prepared, crash_env)
+    expect(code != 0 and "injected transition stop at prepared" in stderr, stderr)
+    expect(not os.path.lexists(os.path.join(prepared, "target")), "a stop published a link")
+    code, _, stderr = proof.oxide(["build"], "replay rolls back an unpublished adoption", prepared)
+    expect(code != 0 and "run the command again" in stderr and not auto_notices(stderr), stderr)
+    code, _, stderr = proof.oxide(["build"], "the command after the rollback is unconverted", prepared)
+    expect(code == 0 and not auto_notices(stderr), stderr)
+    expect(not os.path.islink(os.path.join(prepared, "target")), "rollback left a link")
+    with open(receipt_file(pool, prepared), "rb") as handle:
+        expect(json.load(handle)["state"] == "detached", "rollback did not detach")
+    proof.phase("after crash replay")
+
+    # 9. Committed adoption survives a failed build: one notice, the link and
+    #    receipt stay, and a repaired source builds through them.
+    failing = fresh_checkout(proof, root, "build-fails")
+    with open(os.path.join(failing, "src", "main.rs"), "w", encoding="utf-8") as handle:
+        handle.write('fn main() { let value: u32 = "not a number"; }\n')
+    code, _, stderr = proof.oxide(["build"], "adoption survives a failed build", failing)
+    expect(code != 0 and len(auto_notices(stderr)) == 1, stderr)
+    expect(os.path.islink(os.path.join(failing, "target")), "the committed link was lost")
+    with open(os.path.join(failing, "src", "main.rs"), "w", encoding="utf-8") as handle:
+        handle.write(APP["src/main.rs"])
+    code, _, stderr = proof.oxide(["build"], "the repaired source builds through the link", failing)
+    expect(code == 0 and not auto_notices(stderr), stderr)
+    proof.phase("after failed build")
+
+    proof.detach()
+
+
 def terminated(signum, frame) -> None:
     raise KeyboardInterrupt(f"signal {signum}")
 
@@ -1384,15 +1665,18 @@ def main() -> int:
     signal.signal(signal.SIGALRM, overdue)
     signal.setitimer(signal.ITIMER_REAL, work_left())
     proof = Proof(root)
+    # `auto-adopt` selects the focused oxide#121 scenario on the same fixture.
+    focused = sys.argv[1:] == ["auto-adopt"]
+    scenario, label = (auto_run, "auto-adopt") if focused else (run, "permanent-outputs")
     try:
-        run(proof, repo)
+        scenario(proof, repo)
     except BaseException as failure:
         record(
             "result.txt",
             f"failed: {failure!r}\nunclosed children: {sorted(proof.unclosed)}\nroot: {root}\n",
         )
         print(
-            f"permanent-outputs proof failed; scratch {root} left to the shared supervisor",
+            f"{label} proof failed; scratch {root} left to the shared supervisor",
             file=sys.stderr,
         )
         raise
@@ -1400,7 +1684,7 @@ def main() -> int:
         signal.setitimer(signal.ITIMER_REAL, 0)
     elapsed = time.monotonic() - layout.runner.STARTED
     summary_line = (
-        f"permanent-outputs proof held: {elapsed:.0f} s script time, peak owned "
+        f"{label} proof held: {elapsed:.0f} s script time, peak owned "
         f"{proof.peak // MIB} MiB at phase checks, phase-sampled host free minimum "
         f"{proof.low // MIB} MiB; one owned 128 MiB scratch image, ordinary detach, "
         f"shared supervisor owns cleanup"

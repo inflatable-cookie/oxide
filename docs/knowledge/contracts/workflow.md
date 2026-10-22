@@ -2519,7 +2519,10 @@ migration and consumer adoption remain separate gates.
   marker and generation and publishes
   `prepared`, create the destination root and marker on the verified volume,
   create the unique sibling `.target.oxide-new-<generation>` link and sync,
-  validate it, atomically rename it onto `target`, then publish `committed`.
+  validate it, atomically rename it onto `target` (a no-replace `RENAME_EXCL`
+  rename when `target` was absent at classification, so a creator that appears
+  in between is kept and the publish fails with no replacing fallback), then
+  publish `committed`.
   Generations are exact `u64`s; receipt paths are absolute and `..`-free. No
   step recreates an absent mount point, follows a link, or unlinks by path
   text. Unknown writer custody — a lost slot whose writers were never
@@ -2590,6 +2593,30 @@ migration and consumer adoption remain separate gates.
   mutation, and an owned correct link is a no-op. `detach` restores a real
   empty `<checkout>/target` directory, keeps every root and refuses while the
   drive mode is still permanent. `status` is read-only.
+- **Automatic first conversion (oxide#121).** A leased command (build, run,
+  test, exec) converts a fresh checkout before its destination is keyed and
+  before its slot is taken, when all of these hold: the selected pool is the
+  registered permanent drive (not the internal fallback), the drive is usable
+  now (writable, above its reserve, live UUID and device); the checkout has no
+  owned-output receipt of any state; and `<checkout>/target` is positively
+  absent (no file, directory or link, dangling links included). It runs the
+  adopt barrier, downgrade fence, admission lock, roots, marker and receipt,
+  with a missing-target-only transition, and releases the barrier before the
+  slot is taken. Every fact is rechecked under the admission lock. A concurrent
+  receipt, creator, mode or volume change makes it a no-op, and the existing
+  path decides. Everything else keeps today's behaviour and is never touched:
+  a real target (empty or not), a foreign or dangling link, a file, an
+  unreadable or corrupt receipt (an error, never absence), a detached
+  checkout (its receipt stays, so a missing target beside it is excluded),
+  ephemeral mode, an absent or unusable drive and internal fallback. A
+  preparation that published nothing rolls back to a detached receipt, which
+  excludes it from automatic adoption; `oxide outputs adopt` still converts
+  it. Exactly one stderr notice, `oxide: auto-adopted <target> -> <root> for
+  permanent-drive outputs; no existing outputs moved`, follows the durable
+  commit; replays and later builds print none. A committed adoption persists
+  when a later admission, build or cancellation fails. No persisted format
+  changes: the receipt, marker and fence are as before. `oxide outputs
+  detach` remains the way back under its mode rules.
 - **Clean.** Resolves the receipt to the selected real root, requires it to be
   the current owned link and to sit on the volume the receipt names *now*
   (a replaced drive at the same mount point is refused), and applies the
@@ -2649,6 +2676,20 @@ volume while preserving the root, marker and inactive roots; a second
 fallback command reusing its slot warm; a pre-created empty local root
 refused when Git would track it; and `detach` refusing while permanent and
 restoring a real directory afterwards. Not a benchmark, real-drive
+qualification or an alias for full QA.
+
+**Proof (oxide#121).** `effigy rust:auto-adopt-outputs` runs
+`scripts/test-permanent-outputs.py auto-adopt`, the focused mode of the same
+fixture, as the whole command of the qualified shared supervisor (300 s,
+512 MiB monitored scratch, ordinary detach) over one owned 128 MiB scratch
+image. It covers eligible fresh adoption with one notice, a warm rebuild and
+a second checkout's own root; the controls (non-empty, empty, foreign,
+dangling and file targets; a corrupt receipt; a detached checkout with its
+target missing; ephemeral mode; an absent drive; a recorded-UUID fallback);
+crash replay after the sibling point, where a creator at the target is
+refused and kept, and after the prepared point, which rolls back to detached;
+and a committed adoption that survives a failed build. The no-replace publish
+is a macOS unit test in `effigy test rust`. Not a benchmark, real-drive
 qualification or an alias for full QA.
 
 ### `oxide pool describe --json`

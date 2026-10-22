@@ -35,10 +35,13 @@ use crate::store::{self, CheckoutCustody, CleanGuard, Cleaning, Store, WaitAccou
 use crate::CARGO;
 use oxide_storage::volume::{self, Binding};
 use serde::{Deserialize, Serialize};
-use std::ffi::{CString, OsString};
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
+#[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -82,8 +85,10 @@ Permanent drive mode owns one `<checkout>/target` symlink. Its real root is
 usable, else the checkout-local fallback <checkout>/.oxide-outputs/local/.
 `plan` and `adopt` never move, copy or delete an existing target directory or
 an arbitrary symlink: a nonempty real target and a foreign symlink refuse
-without any change. Only an explicit `adopt` converts a missing or empty
-target. `detach` refuses while the drive mode is still permanent.";
+without any change. Only an explicit `adopt` converts an empty target. A
+missing target converts by `adopt` or on the first leased build of a fresh
+checkout (no receipt of any state) on the registered permanent drive, with
+one notice. `detach` refuses while the drive mode is still permanent.";
 
 /// Which real root a link selects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

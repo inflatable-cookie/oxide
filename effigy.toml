@@ -73,6 +73,19 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py"
 
+# Automatic first conversion (oxide#121): the focused `auto-adopt` mode of the
+# #117 fixture, under the same qualified shared supervisor (300 s, 512 MiB
+# monitored scratch, ordinary detach) and one owned 128 MiB scratch image.
+# Eligible fresh adoption with warm reuse; every non-adoption control (real,
+# empty, foreign, dangling and file targets, detached and corrupt receipts,
+# ephemeral mode, absent drive, internal fallback); crash replay with a
+# creator refused and an unpublished preparation rolled back; and a committed
+# adoption that survives a failed build. Not a benchmark, real-drive
+# qualification or an alias for full QA.
+[tasks."rust:auto-adopt-outputs"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py auto-adopt"
+
 # Removable drive modes (oxide#116): under the qualified shared supervisor,
 # stages oxide offline and exercises versioned registration metadata,
 # absent-drive fallback reporting and an active build's stable selection.
