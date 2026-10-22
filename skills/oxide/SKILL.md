@@ -105,6 +105,22 @@ fails, Oxide reports that the wait duration is unavailable.
   Also reports plain-Cargo output in this checkout's `target/` and the Cargo
   home's size.
   It never creates the pool.
+- A registered removable drive has `ephemeral` or `permanent` mode. Register
+  one with `oxide pool register-removable <mount> --reserve <size> --cap
+  <size> [--mode ephemeral|permanent]`; the default is `ephemeral`. Change an
+  existing registration with `oxide pool set-mode <ephemeral|permanent>`.
+  The setting can be changed while the drive is absent. Both modes use the
+  same availability checks and pool preference, and final outputs stay in
+  `<workspace>/target`.
+- If a permanent drive cannot be used, Oxide warns before admission with the
+  actual fallback reason, then includes that reason in the command summary
+  when one is produced. Ephemeral mode keeps the existing fallback line.
+  `oxide status` shows configured mode separately from the pool selected for
+  the next build, including its fallback reason.
+- Old version 1 registrations without a mode read as ephemeral and remain
+  unchanged until an explicit mode update. An update writes version 2 with a
+  required mode. Older Oxide binaries refuse version 2; reinstalling a binary
+  does not restore registration metadata.
 - `oxide status --launch-check` (macOS) times a new executable's first launch
   against a re-run, in about a second. Above 30 ms it names the app to add
   under Privacy & Security → Developer Tools. It changes no setting; leave

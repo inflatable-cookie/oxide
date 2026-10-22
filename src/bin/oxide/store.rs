@@ -37,9 +37,10 @@ use oxide_storage::lease::{
 };
 use oxide_storage::volume::Binding;
 use serde::{Deserialize, Serialize};
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -1021,6 +1022,28 @@ impl Store {
             Found::Directory | Found::Unknown => {
                 config::refuse_unsafe_pool_path(&settings.pool)?;
                 Self::open_at(&settings.pool, settings).map(Some)
+            }
+        }
+    }
+
+    /// The existing internal pool's private control directory, without
+    /// opening its ledger or reconciling any pool state.
+    pub fn existing_control() -> Result<Option<PathBuf>, String> {
+        let settings = settings()?;
+        config::refuse_unsafe_pool_path(&settings.pool)?;
+        match config::inspect(&settings.pool) {
+            Found::Absent => Ok(None),
+            Found::LegacyImage => Err(legacy_refusal()),
+            Found::Unknown => Err(format!(
+                "cannot open the existing pool at {}: unrecognized pool",
+                settings.pool.display()
+            )),
+            Found::Directory => {
+                let pool = fs::canonicalize(&settings.pool)
+                    .map_err(|error| format!("cannot resolve the existing pool: {error}"))?;
+                let control = pool.join(MANAGED_NAME);
+                verify_private_dir(&control)?;
+                Ok(Some(control))
             }
         }
     }
@@ -2315,10 +2338,7 @@ impl Store {
     }
 
     fn admission(&self) -> Result<File, String> {
-        let file = private_file(&self.control.join("admission.lock"), true)?
-            .ok_or("admission lock is missing")?;
-        flock(&file, libc::LOCK_EX)?;
-        Ok(file)
+        lock_admission(&self.control)
     }
 
     fn load(&self) -> Result<State, String> {
@@ -2429,16 +2449,91 @@ fn ensure_private_dir(path: &Path) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(format!("cannot create {}: {error}", path.display())),
     }
-    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    verify_private_dir(path)
+}
+
+/// Open an existing owner-only control directory without following its final
+/// path component. The descriptor is suitable for relative control-file I/O.
+pub(crate) fn open_control_directory(path: &Path) -> Result<Option<File>, String> {
+    let named = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+    };
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
-    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+    if !named.is_dir() || named.uid() != uid || named.mode() & 0o077 != 0 {
         return Err(format!(
             "{} must be an owner-only directory",
             path.display()
         ));
     }
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    let opened = directory
+        .metadata()
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if !opened.is_dir()
+        || opened.uid() != uid
+        || opened.mode() & 0o077 != 0
+        || opened.dev() != named.dev()
+        || opened.ino() != named.ino()
+    {
+        return Err(format!(
+            "{} changed while it was being opened",
+            path.display()
+        ));
+    }
+    Ok(Some(directory))
+}
+
+fn verify_private_dir(path: &Path) -> Result<(), String> {
+    if open_control_directory(path)?.is_none() {
+        return Err(format!("{} does not exist", path.display()));
+    }
     Ok(())
+}
+
+/// Take the internal pool's existing admission lock for metadata updates and
+/// command admission. Only the lock file may be created; the control
+/// directory must already exist.
+pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
+    let directory = open_control_directory(control)?
+        .ok_or_else(|| format!("{} does not exist", control.display()))?;
+    let name = CString::new("admission.lock").map_err(|error| error.to_string())?;
+    // SAFETY: `name` is a live CString with initialized bytes through its
+    // terminator, and `directory` owns a live descriptor until `openat` ends.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "cannot open admission lock in {}: {}",
+            control.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `fd` is a newly opened descriptor owned by this function.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    if !metadata.is_file() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{} must be an owner-only file",
+            control.join("admission.lock").display()
+        ));
+    }
+    flock(&file, libc::LOCK_EX)?;
+    Ok(file)
 }
 
 /// Open an owner-only regular control file without following symlinks.

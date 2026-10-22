@@ -53,8 +53,10 @@ USAGE:
     oxide clean --cargo-cache            one pass of Cargo's own home cleanup, no network
     oxide status                         pool, slots, waits, stray output and Cargo home
     oxide status --launch-check          macOS: time a new executable's first launch
-    oxide pool register-removable <mount-point> --reserve <size> --cap <size>
-                                         macOS: prefer a dedicated APFS volume under /Volumes
+    oxide pool register-removable <mount-point> --reserve <size> --cap <size> [--mode ...]
+                                         macOS: register an APFS volume; mode defaults to ephemeral
+    oxide pool set-mode <ephemeral|permanent>
+                                         change mode on an existing removable registration
     oxide init [cargo init args] [path]  cargo init if no Cargo.toml, then adopt Oxide
     oxide new <path> [cargo new args]    cargo new, then adopt Oxide
 
@@ -228,9 +230,19 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     )?;
     process::install_signal_handlers()?;
     let selected = removable::select(Store::open_or_create()?)?;
+    let selection_mode = selected.mode;
+    let fallback_reason = selected.fallback_reason.clone();
     let store = selected.store;
-    if let (false, Some(note)) = (selected.removable, &selected.note) {
-        eprintln!("oxide: {note}");
+    if !selected.removable {
+        if selection_mode == Some(removable::DriveMode::Permanent) {
+            if let Some(reason) = fallback_reason.as_deref() {
+                eprintln!(
+                    "oxide: WARNING: permanent removable mode fell back to the internal pool ({reason})"
+                );
+            }
+        } else if let Some(note) = &selected.note {
+            eprintln!("oxide: {note}");
+        }
     }
     let started = Instant::now();
     let mut waits = store::WaitAccounting::default();
@@ -362,11 +374,18 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     let slot = held.slot_id.clone();
     let warm = held.reused;
     let measured = held.measured.clone();
-    let note = [gate.describe(), wrapper_note]
+    let mut notes = [gate.describe(), wrapper_note]
         .into_iter()
         .flatten()
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect::<Vec<_>>();
+    if selection_mode == Some(removable::DriveMode::Permanent) {
+        if let Some(reason) = fallback_reason.as_deref() {
+            notes.push(format!(
+                "permanent removable fallback to internal pool: {reason}"
+            ));
+        }
+    }
+    let note = notes.join(", ");
     let note = (!note.is_empty()).then_some(note);
     let origin = gate.finish(&key.checkout);
     store.release(held, origin)?;
