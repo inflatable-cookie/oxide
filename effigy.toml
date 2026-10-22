@@ -291,3 +291,14 @@ run = "python3 scripts/test-oxide-cli.py --cargo-matrix 1.99.1"
 [tasks."rust:oxide-wrapper-bypass"]
 admission = "heavy"
 run = "python3 scripts/test-oxide-wrapper-bypass.py"
+
+# Focused proof for `oxide pool describe --json` (oxide#112). The script's gate
+# RUN_BOUND is True after the apparatus PASS (53ec48e4). It runs inside the
+# qualified shared runner (oxide#109, bounded-test.py SHA-256
+# d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e), which owns
+# closure, cleanup and the absolute deadline. The seed is selected from the lock
+# (256 MiB aggregate); the host registry is not copied whole. Coverage gaps are
+# listed in the script's docstring (`--plan`).
+[tasks."rust:pool-describe"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-pool-describe.py"

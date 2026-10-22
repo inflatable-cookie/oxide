@@ -11,6 +11,7 @@ mod cargo_home;
 mod clean;
 mod cli;
 mod config;
+mod describe;
 mod freshness;
 mod identity;
 mod launch;
@@ -57,6 +58,7 @@ USAGE:
                                          macOS: register an APFS volume; mode defaults to ephemeral
     oxide pool set-mode <ephemeral|permanent>
                                          change mode on an existing removable registration
+    oxide pool describe --json           the registered drive as read-only JSON
     oxide init [cargo init args] [path]  cargo init if no Cargo.toml, then adopt Oxide
     oxide new <path> [cargo new args]    cargo new, then adopt Oxide
 
