@@ -444,7 +444,14 @@ fn verify_owned_directories(home: &Path, destination: &Path) -> Result<(), Refus
     // SAFETY: geteuid has no preconditions.
     let uid = unsafe { libc::geteuid() };
     for count in 0..=parts.len() {
-        let directory = home.join(parts[..count].iter().collect::<PathBuf>());
+        // `HOME` itself is checked without a trailing separator, so a
+        // symlinked home is inspected rather than followed (as the installer
+        // does).
+        let directory = if count == 0 {
+            home.to_path_buf()
+        } else {
+            home.join(parts[..count].iter().collect::<PathBuf>())
+        };
         let metadata = fs::symlink_metadata(&directory)
             .map_err(|_| Refusal("a destination directory is missing"))?;
         let writable = count > 0 && metadata.mode() & 0o022 != 0;
@@ -911,6 +918,25 @@ mod tests {
         let moved = fixture.root.join("moved-bin");
         fs::rename(&bin, &moved).unwrap();
         std::os::unix::fs::symlink(&moved, &bin).unwrap();
+        assert!(attempt(&fixture.inputs(), newer_state()).is_err());
+    }
+
+    #[test]
+    fn a_symlinked_home_refuses() {
+        let fixture = Fixture::new();
+        let bytes = b"candidate";
+        fixture.candidate(bytes, 0o755);
+        fixture.receipt_for(
+            "1.json",
+            &hash(bytes),
+            bytes.len() as u64,
+            STATE_VERSION + 1,
+            REGISTRATION_VERSION,
+        );
+        let home = fixture.home();
+        let real = fixture.root.join("real-home");
+        fs::rename(&home, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &home).unwrap();
         assert!(attempt(&fixture.inputs(), newer_state()).is_err());
     }
 }

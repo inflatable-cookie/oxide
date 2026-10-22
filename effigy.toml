@@ -50,18 +50,19 @@ default = false
 run = "python3 scripts/bounded-test.py cargo test --workspace --all-targets --locked"
 default = false
 
-# Installed-binary hand-off (oxide#122): one author proof under the qualified
-# shared supervisor. The selector builds the debug subject first; the proof
-# then runs with a 120 s wall limit and 64 MiB monitored scratch and writes
-# only tiny private HOME, receipt and directory-pool fixtures. It never
-# touches ~/.local/bin/oxide, a real install receipt or a live pool. Not a
-# benchmark, a real-install qualification or an alias for full QA.
+# Installed-binary hand-off (oxide#122): one author proof, one fixed script
+# and the whole command under the qualified shared supervisor. Inside its own
+# 120 s / 128 MiB monitored scratch it stages this HEAD's debug `oxide` with
+# plain Cargo offline and 1.97.1, deletes the staged target, then runs private
+# HOME, receipt and directory-pool fixtures. It creates no Oxide pool and
+# touches no live pool, ~/.local/bin/oxide, install receipt or host state. The
+# 128 MiB figure is measured (a -j1, debug-free, stripped build peaks near
+# 64 MiB; the fixtures near 2 MiB); the design's 64 MiB assumed a build-free
+# fixture, which cannot exercise the real front door. Not a benchmark, a
+# real-install qualification or an alias for full QA.
 [tasks."rust:installed-handoff"]
 admission = "heavy"
-run = [
-  "oxide build --bin oxide --locked",
-  "python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 64 -- python3 scripts/test-installed-handoff.py --binary target/debug/oxide",
-]
+run = "python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 128 -- python3 scripts/test-installed-handoff.py"
 
 # Enumerated paths that disappear during accounting (oxide#113): the
 # qualified session supervisor bounds one fixed native proof covering the

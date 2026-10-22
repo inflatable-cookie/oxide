@@ -965,13 +965,13 @@ necessary.
   most three control documents and creates nothing: the internal `state.json`,
   the removable pool's `removable/state.json` and `removable.json`. Each is
   parsed as a bounded `serde_json::Value`, and only a numeric `u32` `version`
-  above this binary's `STATE_VERSION` or `REGISTRATION_VERSION` triggers. A
-  missing pool or file, an IO or permission error, an oversized document, a
-  non-object, a missing, non-numeric or wider-than-`u32` version, an unknown
-  field, a foreign `owned_outputs` fence or a collection overflow is not proof
-  of a newer format: those keep the existing errors and never execute
-  anything. Plain passthrough commands, usage-only `exec` and the
-  `status --launch-check` probe skip the check.
+  above this binary's `STATE_VERSION` or `REGISTRATION_VERSION` triggers,
+  whatever other fields the document carries. A missing pool or file, an IO or
+  permission error, an oversized document, a non-object, and a missing, non-numeric,
+  negative or wider-than-`u32` version are not proof of a newer format: those
+  keep the existing errors and never execute anything. Plain passthrough
+  commands, usage-only `exec` and the `status --launch-check` probe skip the
+  check.
 - **Pre-effect boundary.** The check runs after empty-argument, help,
   `--version`/`--list` and leading-`+toolchain` handling and before any arm may
   open a store, create a pool, exclude it from Time Machine, remember a pool,
@@ -1028,11 +1028,16 @@ necessary.
   fd-execution is not established and is not used. This weakens neither the
   receipt, `PATH` nor ownership checks, and it is not adversarial same-user
   exclusion.
-- **Proof.** `effigy rust:installed-handoff` (heavy) first builds the debug
-  subject with `oxide build --bin oxide`, then runs
-  `scripts/test-installed-handoff.py` under the shared supervisor with a 120 s
-  wall limit and 64 MiB monitored scratch. Over private HOME, receipt and
-  directory-pool fixtures with a compiled stub candidate, it covers newer state
+- **Proof.** `effigy rust:installed-handoff` (heavy) is one fixed script and
+  whole command: `bounded-test.py` around `scripts/test-installed-handoff.py`
+  with a 120 s wall limit and 128 MiB monitored scratch. Inside that scratch
+  the script stages this HEAD's debug `oxide` with plain Cargo offline and the
+  pinned 1.97.1, then deletes the staged target before the fixtures, so it
+  creates no Oxide pool and touches no live pool, installed binary, install
+  receipt or host state. The 128 MiB figure is measured: a `-j1`, debug-free,
+  stripped staged build peaks near 64 MiB and the fixtures near 2 MiB. Over
+  private HOME, receipt and directory-pool fixtures with a compiled stub
+  candidate, it covers newer state
   and registration versions; malformed, older and non-`u32` documents that must
   not trigger; one hand-off with exact argv and environment plus the marker;
   marker refusal and inertness; foreign, path, hash, size, capability,

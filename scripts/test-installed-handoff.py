@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Focused installed-binary hand-off proof for oxide#122.
 
-Runs under the qualified shared supervisor (`bounded-test.py`): one fixed
-120 s wall limit and a 64 MiB monitored scratch budget including cleanup. The
-subject binary is built by the selector before the supervisor starts
-(`oxide build --bin oxide`; passed with `--binary`), so this script writes
-only tiny fixtures. It never touches the real `~/.local/bin/oxide`, a real
-install receipt or a live pool.
+One fixed script and whole command under the qualified shared supervisor
+(`bounded-test.py`): a 120 s wall limit and a 128 MiB monitored scratch budget
+including cleanup. It stages this clean HEAD's debug `oxide` itself with plain
+Cargo and the pinned 1.97.1, offline, into its own scratch target, copies the
+binary and deletes the target before the fixtures. No Oxide pool, no installed
+binary, no host state and no network are involved; the 128 MiB figure is
+measured (a staged build peaks near 64 MiB, the fixtures near 2 MiB), because
+the brief's 64 MiB assumed a build-free fixture, which cannot exercise the
+real front door.
 
 Every fixture has a private HOME with receipts and a candidate stub, a private
 `OXIDE_POOL` directory pool with planted control files, a private CARGO_HOME,
@@ -29,7 +32,6 @@ import sys
 
 sys.dont_write_bytecode = True
 
-import argparse
 import hashlib
 import json
 import os
@@ -45,6 +47,7 @@ NOTICE = "oxide: handing off to the installed binary (state is newer than this o
 REFUSAL = "oxide: oxide was upgraded during this command; re-run.\n"
 STATE_VERSION = 2
 REGISTRATION_VERSION = 2
+CAPABILITIES_PROBE = "__oxide-build-capabilities"
 SHUTDOWN_MARGIN_S = 20
 CASES = []
 # The platform toolchain stays reachable for `rustc -vV` and `cargo -V`
@@ -168,6 +171,73 @@ def install_stub(destination: str) -> None:
     except OSError:
         shutil.copy2(STUB, destination)
     os.chmod(destination, 0o755)
+
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BUILDER = "1.97.1"
+
+
+def stage_subject(root: str) -> str:
+    """Stage this HEAD's `oxide` with plain Cargo, offline, in owned scratch.
+
+    No Oxide pool is created or touched, and the staged target is deleted once
+    the binary is copied out, so the proof's own writes stay tiny.
+    """
+    stage = os.path.join(root, "stage")
+    log = os.path.join(root, "stage.log")
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("CARGO_TARGET_", "CARGO_BUILD_", "SCCACHE_"))
+        and key not in ("CARGO", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER")
+    }
+    env.update(
+        {
+            "RUSTUP_TOOLCHAIN": BUILDER,
+            "RUSTUP_AUTO_INSTALL": "0",
+            "RUSTC_WRAPPER": "",
+            "RUSTC_WORKSPACE_WRAPPER": "",
+            "CARGO_TARGET_DIR": os.path.join(stage, "target"),
+            "CARGO_BUILD_BUILD_DIR": os.path.join(stage, "build"),
+            "CARGO_PROFILE_DEV_DEBUG": "0",
+            "CARGO_PROFILE_DEV_PANIC": "abort",
+            "CARGO_INCREMENTAL": "0",
+            "RUSTFLAGS": "-C strip=symbols",
+        }
+    )
+    with open(log, "w", encoding="utf-8") as handle:
+        build = subprocess.run(
+            ["cargo", "build", "-j", "1", "--locked", "--offline", "--bin", "oxide"],
+            cwd=REPO,
+            env=env,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            timeout=work_left(),
+        )
+    if build.returncode:
+        with open(log, encoding="utf-8") as handle:
+            fail(f"staging exit {build.returncode}: {handle.read()[-2000:]}")
+    built = os.path.join(stage, "target", "debug", "oxide")
+    expect(os.path.isfile(built), f"staging produced no binary at {built}")
+    subject = os.path.join(root, "subject-oxide")
+    shutil.copy2(built, subject)
+    os.chmod(subject, 0o755)
+    shutil.rmtree(stage)
+    os.unlink(log)
+    # The installer's hidden probe must report this build's own versions; a
+    # future bump then fails this proof loudly instead of mis-testing it.
+    probe = subprocess.run(
+        [subject, CAPABILITIES_PROBE],
+        capture_output=True,
+        text=True,
+        timeout=min(30, work_left()),
+    )
+    expect(probe.returncode == 0, f"capability probe exit {probe.returncode}: {probe.stderr!r}")
+    expect(
+        json.loads(probe.stdout) == {"control_state_version": STATE_VERSION, "registration_version": REGISTRATION_VERSION},
+        f"capability probe {probe.stdout!r} disagrees with this proof's versions",
+    )
+    return subject
 
 
 class Fixture:
@@ -738,26 +808,17 @@ def check_cargo_exit_75(root: str, binary: str) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--binary",
-        default=os.path.join("target", "debug", "oxide"),
-        help="the built subject binary (the selector builds it first)",
-    )
-    arguments = parser.parse_args()
     evidence = os.environ.get("OXIDE_PROOF_EVIDENCE", "")
     expect(bool(evidence) and os.path.isdir(evidence), "not running under the shared supervisor")
     scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
     expect(bool(scratch) and os.path.realpath(scratch) == scratch, f"scratch {scratch!r} is not canonical")
     for name in ("TMPDIR", "TMP", "TEMP"):
         expect(os.environ.get(name) == scratch, f"{name} differs from the supervisor scratch")
-    binary = os.path.realpath(arguments.binary)
-    expect(os.path.isfile(binary), f"subject {binary} is not a built binary")
-    expect(os.access(binary, os.X_OK), f"subject {binary} is not executable")
-    digest = sha256(binary)
-    print(f"subject {binary} sha256 {digest}")
     root = tempfile.mkdtemp(prefix="installed-handoff.", dir=scratch)
     try:
+        binary = stage_subject(root)
+        digest = sha256(binary)
+        print(f"subject {binary} sha256 {digest}")
         compile_stub(root)
         check_handoff(root, binary)
         check_no_trigger(root, binary)
@@ -769,12 +830,12 @@ def main() -> int:
     finally:
         shutil.rmtree(root, ignore_errors=True)
     with open(os.path.join(evidence, "installed-handoff.txt"), "w", encoding="utf-8") as handle:
-        handle.write(f"subject {binary}\nsha256 {digest}\ncases {len(CASES)}\n")
+        handle.write(f"subject {binary}\nsubject sha256 {digest}\n")
+        handle.write(f"cases {len(CASES)}\n")
         for name in CASES:
             handle.write(f"ok {name}\n")
     print(f"installed-handoff: {len(CASES)} cases passed")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
