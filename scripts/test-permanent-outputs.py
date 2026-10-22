@@ -35,6 +35,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import glob
+import hashlib
 import importlib.util
 import json
 import os
@@ -138,10 +139,12 @@ def read_json(path: str) -> dict:
     return json.loads(read_bytes(path).decode())
 
 
-def receipt_path(pool: str) -> str:
-    found = glob.glob(os.path.join(pool, "oxide-managed", "outputs", "*.json"))
-    expect(len(found) == 1, f"expected one output receipt under {pool}: {found}")
-    return found[0]
+def receipt_path(pool: str, checkout: str) -> str:
+    """The receipt is keyed by the canonical checkout's SHA-256 digest."""
+    key = hashlib.sha256(checkout.encode()).hexdigest()
+    path = os.path.join(pool, "oxide-managed", "outputs", key + ".json")
+    expect(os.path.isfile(path), f"no output receipt for {checkout} under {pool}")
+    return path
 
 
 def registration_path(pool: str) -> str:
@@ -437,7 +440,7 @@ def run(proof: Proof, repo: str) -> None:
     marker = read_json(os.path.join(external_root, MARKER))
     expect(marker["version"] == "oxide.outputs.root/1", marker)
     expect(marker["checkout"] == app and marker["kind"] == "external", marker)
-    receipt = read_json(receipt_path(pool))
+    receipt = read_json(receipt_path(pool, app))
     expect(
         receipt["version"] == "oxide.outputs.transition/1"
         and receipt["state"] == "committed"
@@ -590,19 +593,19 @@ def run(proof: Proof, repo: str) -> None:
     proof.phase("after the writer barrier")
 
     # 9. Crash replay at each write-ahead point.
-    expect(receipt_path(pool) and read_json(receipt_path(pool))["state"] == "committed", read_json(receipt_path(pool)))
+    expect(receipt_path(pool, app) and read_json(receipt_path(pool, app))["state"] == "committed", read_json(receipt_path(pool, app)))
     crash_env = dict(env)
     crash_env["OXIDE_TEST_OUTPUTS_CRASH"] = "prepared"
     code, _, stderr = oxide_env(
         proof, ["outputs", "adopt"], "injected stop after the prepared receipt", app, crash_env
     )
     expect(code != 0 and "injected transition stop" in stderr, stderr)
-    prepared = read_json(receipt_path(pool))
+    prepared = read_json(receipt_path(pool, app))
     expect(prepared["state"] == "prepared" and prepared["prepared"], prepared)
     expect(link_target(link) == local_root, "the prepared receipt changed the live link")
     code, stdout, stderr = proof.oxide(["outputs", "adopt"], "replay a prepared receipt", app)
     expect(code == 0 and link_target(link) == external_root, f"replay failed: {stdout}{stderr}")
-    replay = read_json(receipt_path(pool))
+    replay = read_json(receipt_path(pool, app))
     expect(replay["state"] == "committed" and replay["generation"] == prepared["prepared"]["generation"], replay)
 
     for point in ("linked", "renamed"):
@@ -615,7 +618,7 @@ def run(proof: Proof, repo: str) -> None:
             proof, ["outputs", "adopt"], f"injected stop after {point}", app, crash_env
         )
         expect(code != 0 and "injected transition stop" in stderr, stderr)
-        prepared = read_json(receipt_path(pool))
+        prepared = read_json(receipt_path(pool, app))
         expect(prepared["state"] == "prepared", prepared)
         if point == "linked":
             expect(link_target(link) == local_root, "the linked crash moved the live link")
@@ -626,7 +629,7 @@ def run(proof: Proof, repo: str) -> None:
         code, stdout, stderr = proof.oxide(["outputs", "adopt"], f"replay after {point}", app)
         expect(code == 0 and link_target(link) == external_root, f"{point} replay failed: {stdout}{stderr}")
         expect(
-            read_json(receipt_path(pool))["state"] == "committed",
+            read_json(receipt_path(pool, app))["state"] == "committed",
             f"{point} replay did not commit",
         )
         expect(
