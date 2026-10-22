@@ -7,8 +7,15 @@
 //! after a bounded grace. It never walks the slot. Sampling cannot stop a
 //! faster writer, or another process, from going past the trigger or even
 //! the reserve; the report states what was observed.
+//!
+//! On a removable pool the same stop runs when the volume disappears: about
+//! once a second it checks that the mount root still opens as the device the
+//! build started on. A build script or other program whose executable lived
+//! on a forcibly removed volume can spin instead of exiting, so without the
+//! stop the wait for Cargo's group would never end (oxide#098).
 
 use crate::store::{GIB, HOST_RESERVE_BYTES};
+use oxide_storage::volume::Binding;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -22,6 +29,12 @@ const CLOSE_BOUND: Duration = Duration::from_secs(10);
 
 enum Source {
     Statfs(PathBuf),
+    /// A removable pool's mount root and the device bound when the build
+    /// started (`None`: it did not bind, so the first poll stops).
+    Volume {
+        mount: PathBuf,
+        device: Option<String>,
+    },
     /// Debug builds only: `OXIDE_TEST_WATCHDOG_READINGS` names a file holding
     /// the available-bytes reading, so the fixture proof never consumes host
     /// space to reach a trigger.
@@ -57,6 +70,30 @@ impl Watchdog {
             );
         }
         Self::new(Source::Statfs(payload.to_path_buf()), GRACE, CLOSE_BOUND)
+    }
+
+    /// The removal stop for a removable pool mounted at `mount`.
+    pub fn for_volume(mount: &Path) -> Self {
+        let device = Binding::open(mount, None)
+            .ok()
+            .map(|binding| binding.device().to_owned());
+        let mut watchdog = Self::new(
+            Source::Volume {
+                mount: mount.to_path_buf(),
+                device,
+            },
+            GRACE,
+            CLOSE_BOUND,
+        );
+        // Only a failed sample stops: there is no space trigger.
+        watchdog.trigger = 0;
+        watchdog
+    }
+
+    /// Whether this watchdog stops on removal of a removable volume rather
+    /// than on host free space.
+    pub fn removal(&self) -> bool {
+        matches!(self.source, Source::Volume { .. })
     }
 
     fn new(source: Source, grace: Duration, close_bound: Duration) -> Self {
@@ -121,6 +158,23 @@ impl Watchdog {
         let Some(stop) = &self.stop else {
             return String::new();
         };
+        let signals = match stop.killed {
+            Some(killed) => format!(
+                "TERM, then KILL after {} ms",
+                killed.duration_since(stop.at).as_millis()
+            ),
+            None => "TERM".to_owned(),
+        };
+        let latency = closed.map_or_else(
+            || "closure not confirmed".to_owned(),
+            |closed| format!("{} ms", closed.duration_since(stop.at).as_millis()),
+        );
+        if let Source::Volume { mount, .. } = &self.source {
+            return format!(
+                "oxide: removable volume {} is gone; stopped Cargo group {group}: {signals}, stop latency {latency}",
+                mount.display()
+            );
+        }
         let cause = match stop.reading {
             Some(bytes) => format!(
                 "pool filesystem available {bytes} bytes fell below the {} byte trigger",
@@ -131,13 +185,6 @@ impl Watchdog {
                 self.trigger
             ),
         };
-        let signals = match stop.killed {
-            Some(killed) => format!(
-                "TERM, then KILL after {} ms",
-                killed.duration_since(stop.at).as_millis()
-            ),
-            None => "TERM".to_owned(),
-        };
         let minimum = self
             .minimum
             .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string());
@@ -145,12 +192,8 @@ impl Watchdog {
             || "unknown".to_owned(),
             |bytes| self.trigger.saturating_sub(bytes).to_string(),
         );
-        let latency = closed.map_or_else(
-            || "closure not confirmed".to_owned(),
-            |closed| format!("{} ms", closed.duration_since(stop.at).as_millis()),
-        );
         let source = match self.source {
-            Source::Statfs(_) => "",
+            Source::Statfs(_) | Source::Volume { .. } => "",
             #[cfg(debug_assertions)]
             Source::Injected(_) => " (injected test readings)",
         };
@@ -164,6 +207,10 @@ impl Watchdog {
     fn sample(&self) -> Option<u64> {
         match &self.source {
             Source::Statfs(path) => available_bytes(path),
+            Source::Volume { mount, device } => Binding::open(mount, None)
+                .ok()
+                .filter(|binding| Some(binding.device()) == device.as_deref())
+                .map(|_| u64::MAX),
             #[cfg(debug_assertions)]
             Source::Injected(path) => std::fs::read_to_string(path)
                 .ok()
@@ -232,6 +279,22 @@ mod tests {
         let path = scratch("statfs");
         assert!(available_bytes(&path).is_some_and(|bytes| bytes > 0));
         std::fs::remove_dir_all(path).expect("cleanup");
+    }
+
+    #[test]
+    fn an_absent_removable_volume_stops_at_the_first_poll() {
+        let mount = PathBuf::from(format!("/Volumes/oxide-absent-{}", std::process::id()));
+        let mut watchdog = Watchdog::for_volume(&mount);
+        assert!(watchdog.removal() && !watchdog.stopped());
+        // Group 0 is never signalled; the stop is recorded.
+        watchdog.poll(0);
+        assert!(watchdog.stopped());
+        let report = watchdog.report(0, None);
+        assert!(
+            report.contains("is gone") && report.contains("closure not confirmed"),
+            "{report}"
+        );
+        assert!(!Watchdog::for_pool(Path::new("/")).removal());
     }
 
     #[test]

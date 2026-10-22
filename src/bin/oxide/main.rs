@@ -346,6 +346,13 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         eprintln!("{}", watchdog.report(group.id, closed));
     }
     if closed.is_none() {
+        if stopped.is_some_and(Watchdog::removal) {
+            store.quarantine_lost(
+                &held,
+                &format!("Cargo group {} did not close after KILL", group.id),
+            )?;
+            return Ok(1);
+        }
         eprintln!(
             "oxide: could not confirm Cargo group {} closed after the reserve stop; slot {} stays held, and a later oxide command recovers it once the group is empty",
             group.id, held.slot_id
@@ -381,6 +388,9 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
                 Some(micros) => eprintln!(
                     "oxide: flushed the removable volume before releasing slot {slot} in {:.1} ms",
                     micros as f64 / 1000.0
+                ),
+                None if flush.lost => eprintln!(
+                    "oxide: slot {slot} was lost with the removable volume; the next command uses the internal pool until it returns"
                 ),
                 None => eprintln!("oxide: slot {slot} is retired: its flush failed"),
             },
@@ -730,6 +740,18 @@ fn print_pools(internal: &Store) -> Result<(), String> {
                     println!("{line}");
                 }
                 println!("  slots: not read while the volume is not usable (unknown, not empty)");
+                match store::recorded_lost(&status.control) {
+                    Ok(lost) => {
+                        for (slot, checkout, what) in lost {
+                            let checkout = checkout.map_or_else(
+                                || "no checkout affinity".to_owned(),
+                                |checkout| checkout.display().to_string(),
+                            );
+                            println!("  slot {slot} ({checkout}): {what}");
+                        }
+                    }
+                    Err(error) => println!("  lost slots: unknown ({error})"),
+                }
             }
         }
     }

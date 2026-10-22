@@ -47,7 +47,7 @@ impl Policy {
         }
     }
 
-    fn bypasses(self) -> bool {
+    pub fn bypasses(self) -> bool {
         self != Self::Keep
     }
 }
