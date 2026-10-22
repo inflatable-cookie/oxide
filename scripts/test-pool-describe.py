@@ -764,8 +764,6 @@ def describe(proof: Proof, artifact: Path, label: str, case: Path) -> dict:
     text = json.loads(out)
     assert text["schema"] == "oxide.pool.describe/1", text
     assert text["observed_at"].endswith("Z"), text
-    if text["removable"] is not None:
-        assert text["removable"]["mode"] == "ephemeral", text
     return text
 
 
@@ -785,6 +783,7 @@ def case_unknown_registration(proof: Proof, artifact: Path) -> None:
     before = snapshot(case)
     text = describe(proof, artifact, "case-b", case)
     removable = text["removable"]
+    assert removable["mode"] == "ephemeral", removable
     assert removable["mount_point"] is None and removable["volume_uuid"] is None
     assert removable["unavailable_reason"] == "metadata_unknown", removable
     assert removable["available"] is False and removable["payload"] is None
@@ -793,6 +792,7 @@ def case_unknown_registration(proof: Proof, artifact: Path) -> None:
 
 
 def case_absent_volume(proof: Proof, artifact: Path) -> None:
+    """Absent legacy and v2 drives retain their registered mode without writes."""
     mount = f"/Volumes/oxide-describe-{uuid.uuid4().hex[:12]}"
     registration = {
         "version": 1,
@@ -805,19 +805,28 @@ def case_absent_volume(proof: Proof, artifact: Path) -> None:
         "capacity_bytes": None,
         "registered_ms": 0,
     }
-    case = proof.root / "case-c"
-    registration_fixture(case, json.dumps(registration))
-    before = snapshot(case)
-    text = describe(proof, artifact, "case-c", case)
-    removable = text["removable"]
-    assert removable["unavailable_reason"] == "absent", removable
-    assert removable["available"] is False and text["selected"] == "internal"
-    assert removable["payload"] == f"{mount}/oxide-pool"
-    assert removable["suggested_scratch_root"] == f"{mount}/scratch"
-    reserve = removable["reserve_bytes"]
-    assert type(reserve) is int and reserve == 1024, removable
-    assert not os.path.exists(mount), "describe created a /Volumes path"
-    assert snapshot(case) == before, "describe changed the fixture"
+    for label, version, mode in [
+        ("legacy", 1, "ephemeral"),
+        ("ephemeral", 2, "ephemeral"),
+        ("permanent", 2, "permanent"),
+    ]:
+        variant = dict(registration, version=version)
+        if version == 2:
+            variant["mode"] = mode
+        case = proof.root / f"case-c-{label}"
+        registration_fixture(case, json.dumps(variant))
+        before = snapshot(case)
+        text = describe(proof, artifact, f"case-c-{label}", case)
+        removable = text["removable"]
+        assert removable["mode"] == mode, removable
+        assert removable["unavailable_reason"] == "absent", removable
+        assert removable["available"] is False and text["selected"] == "internal"
+        assert removable["payload"] == f"{mount}/oxide-pool"
+        assert removable["suggested_scratch_root"] == f"{mount}/scratch"
+        reserve = removable["reserve_bytes"]
+        assert type(reserve) is int and reserve == 1024, removable
+        assert not os.path.exists(mount), "describe created a /Volumes path"
+        assert snapshot(case) == before, "describe changed the fixture"
 
 
 def case_cli_refusal(proof: Proof, artifact: Path) -> None:

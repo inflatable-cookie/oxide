@@ -9,7 +9,7 @@
 //! any of them is unknown, never available.
 
 use crate::process;
-use crate::removable::{self, Registration, MAX_PLIST_BYTES, POOL_DIR};
+use crate::removable::{self, DriveMode, Registration, MAX_PLIST_BYTES, POOL_DIR};
 use crate::store;
 use oxide_storage::lease::{managed, LeaseError, VolumeDescription, MANAGED_NAME};
 use oxide_storage::volume::{self, Binding};
@@ -23,8 +23,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const SCHEMA: &str = "oxide.pool.describe/1";
-/// Until the drive-mode feature ships, every registration is ephemeral.
-const MODE: &str = "ephemeral";
 /// The volume-root directory suggested for a consumer's own scratch. It is
 /// a sibling of the payload, never inside it.
 const SCRATCH_DIR: &str = "scratch";
@@ -51,7 +49,7 @@ struct Internal {
 struct Removable {
     mount_point: Option<String>,
     volume_uuid: Option<String>,
-    mode: &'static str,
+    mode: DriveMode,
     /// The registered reserve. A writer rechecks free space against it at use
     /// time: `available` is only a snapshot.
     reserve_bytes: Option<u64>,
@@ -158,7 +156,7 @@ fn describe(configured: &Path) -> Result<Description, String> {
             Some(Removable {
                 mount_point: None,
                 volume_uuid: None,
-                mode: MODE,
+                mode: DriveMode::Ephemeral,
                 reserve_bytes: None,
                 available: false,
                 unavailable_reason: Some(Reason::MetadataUnknown.tag()),
@@ -179,7 +177,7 @@ fn describe(configured: &Path) -> Result<Description, String> {
             let removable = Removable {
                 mount_point: Some(lossy(&registration.mount_point)),
                 volume_uuid: Some(registration.volume_uuid.clone()),
-                mode: MODE,
+                mode: registration.mode,
                 reserve_bytes: Some(registration.reserve_bytes),
                 available,
                 unavailable_reason: reason,
@@ -483,7 +481,7 @@ mod tests {
         let removable = Removable {
             mount_point: None,
             volume_uuid: None,
-            mode: MODE,
+            mode: DriveMode::Ephemeral,
             reserve_bytes: None,
             available: false,
             unavailable_reason: Some(Reason::MetadataUnknown.tag()),
@@ -503,7 +501,9 @@ mod tests {
     }
 
     #[test]
-    fn registration_file_maps_to_the_description() {
+    fn registration_versions_and_modes_are_read_only_snapshots() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -511,38 +511,112 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("oxide-describe-map-{}-{nonce}", std::process::id()));
         let pool = root.join("pool");
-        fs::create_dir_all(pool.join("oxide-managed")).unwrap();
-        // A mount point that is not mounted: the probe reports absent, and
-        // nothing is created at that path.
+        let control = pool.join("oxide-managed");
+        fs::create_dir_all(&control).unwrap();
+        for path in [&root, &pool, &control] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let mount = format!("/Volumes/oxide-describe-map-{}-{nonce}", std::process::id());
-        let registration = format!(
-            r#"{{"version":1,"mount_point":"{mount}","volume_uuid":"A6AC3ED7-33EA-46B4-8082-7254CF291ED2","container_uuid":"B7BD4FE8-44FB-47C5-9193-8365DF302FE3","reserve_bytes":4096,"cap_bytes":8192,"quota_bytes":null,"capacity_bytes":null,"registered_ms":0}}"#
-        );
-        fs::write(
-            pool.join("oxide-managed").join("removable.json"),
-            registration,
-        )
-        .unwrap();
-        let description = describe(&pool);
-        let _ = fs::remove_dir_all(&root);
-        let json = serde_json::to_value(description.unwrap()).unwrap();
-        assert_eq!(json["selected"], "internal");
-        let removable = &json["removable"];
-        assert_eq!(removable["mount_point"], mount.as_str());
-        assert_eq!(
-            removable["volume_uuid"],
-            "A6AC3ED7-33EA-46B4-8082-7254CF291ED2"
-        );
-        assert_eq!(removable["reserve_bytes"], 4096);
-        assert_eq!(removable["mode"], "ephemeral");
-        assert_eq!(removable["available"], false);
-        assert_eq!(removable["unavailable_reason"], "absent");
-        assert_eq!(removable["payload"], format!("{mount}/oxide-pool").as_str());
-        assert_eq!(
-            removable["suggested_scratch_root"],
-            format!("{mount}/scratch").as_str()
-        );
-        assert!(!std::path::Path::new(&mount).exists());
+        assert!(!Path::new(&mount).exists());
+        let legacy = serde_json::json!({
+            "version": 1,
+            "mount_point": mount,
+            "volume_uuid": "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+            "container_uuid": "B7BD4FE8-44FB-47C5-9193-8365DF302FE3",
+            "reserve_bytes": 4096,
+            "cap_bytes": 8192,
+            "quota_bytes": null,
+            "capacity_bytes": null,
+            "registered_ms": 0
+        });
+        let mut ephemeral = legacy.clone();
+        ephemeral["version"] = 2.into();
+        ephemeral["mode"] = "ephemeral".into();
+        let mut permanent = ephemeral.clone();
+        permanent["mode"] = "permanent".into();
+        let mut unknown_version = permanent.clone();
+        unknown_version["version"] = 3.into();
+        let mut missing_mode = legacy.clone();
+        missing_mode["version"] = 2.into();
+        let mut unknown_mode = permanent.clone();
+        unknown_mode["mode"] = "sometimes".into();
+        let mut legacy_mode = legacy.clone();
+        legacy_mode["mode"] = "permanent".into();
+        let mut unknown_field = permanent.clone();
+        unknown_field["unknown"] = true.into();
+        let mut cases = vec![(b"{malformed".to_vec(), None)];
+        for (registration, mode) in [
+            (legacy, Some("ephemeral")),
+            (ephemeral, Some("ephemeral")),
+            (permanent, Some("permanent")),
+            (unknown_version, None),
+            (missing_mode, None),
+            (unknown_mode, None),
+            (legacy_mode, None),
+            (unknown_field, None),
+        ] {
+            cases.push((serde_json::to_vec(&registration).unwrap(), mode));
+        }
+        let registration_path = control.join("removable.json");
+        let snapshot = || {
+            let metadata = [&root, &pool, &control, &registration_path].map(|path| {
+                let metadata = fs::symlink_metadata(path).unwrap();
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.mode(),
+                    metadata.len(),
+                    metadata.modified().unwrap(),
+                )
+            });
+            let entries = [&root, &pool, &control].map(|path| {
+                let mut names: Vec<_> = fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect();
+                names.sort();
+                names
+            });
+            (fs::read(&registration_path).unwrap(), metadata, entries)
+        };
+        for (bytes, mode) in cases {
+            fs::write(&registration_path, &bytes).unwrap();
+            fs::set_permissions(&registration_path, fs::Permissions::from_mode(0o600)).unwrap();
+            let before = snapshot();
+            let json = serde_json::to_value(describe(&pool).unwrap()).unwrap();
+            assert_eq!(snapshot(), before, "describe changed {bytes:?}");
+            assert_eq!(json["selected"], "internal");
+            let removable = &json["removable"];
+            assert_eq!(removable["available"], false);
+            if let Some(mode) = mode {
+                assert_eq!(removable["mode"], mode);
+                assert_eq!(removable["mount_point"], mount.as_str());
+                assert_eq!(
+                    removable["volume_uuid"],
+                    "A6AC3ED7-33EA-46B4-8082-7254CF291ED2"
+                );
+                assert_eq!(removable["reserve_bytes"], 4096);
+                assert_eq!(removable["unavailable_reason"], "absent");
+                assert_eq!(removable["payload"], format!("{mount}/oxide-pool"));
+                assert_eq!(
+                    removable["suggested_scratch_root"],
+                    format!("{mount}/scratch")
+                );
+            } else {
+                assert_eq!(removable["unavailable_reason"], "metadata_unknown");
+                for field in [
+                    "mount_point",
+                    "volume_uuid",
+                    "reserve_bytes",
+                    "payload",
+                    "suggested_scratch_root",
+                ] {
+                    assert!(removable[field].is_null(), "{field}: {removable}");
+                }
+            }
+            assert!(!Path::new(&mount).exists());
+        }
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -550,7 +624,7 @@ mod tests {
         let removable = Removable {
             mount_point: Some("/Volumes/Builds".to_owned()),
             volume_uuid: Some("A6AC3ED7-33EA-46B4-8082-7254CF291ED2".to_owned()),
-            mode: MODE,
+            mode: DriveMode::Ephemeral,
             reserve_bytes: Some(20 * 1024 * 1024 * 1024),
             available: false,
             unavailable_reason: Some(Reason::Absent.tag()),

@@ -35,10 +35,12 @@ use oxide_storage::lease::{
     ReuseMeasurement, SlotLayout, SlotOccupancy, SlotStatus, BUDGET_BACKEND_DIRECTORY_V1,
     MANAGED_NAME, VOLUME_BACKEND_APFS_V1,
 };
+use oxide_storage::volume::Binding;
 use serde::{Deserialize, Serialize};
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -103,6 +105,10 @@ struct Record {
     /// Why a [`Phase::Retired`] slot was retired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     retired: Option<String>,
+    /// Set when the slot was retired because its removable volume vanished
+    /// while the record held it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lost: Option<Lost>,
     /// Wall clock of the latest use, milliseconds since the epoch, written
     /// with `last_used`. `last_used` orders uses within one pool only; this
     /// lets `status` compare pools. Absent on records last used before it
@@ -115,6 +121,33 @@ impl Record {
     /// Holds a command now: neither idle nor retired.
     fn active(&self) -> bool {
         !matches!(self.phase, Phase::Idle | Phase::Retired)
+    }
+}
+
+/// A slot held when its removable volume vanished (surprise removal). It is
+/// never reused. Once the volume returns it is deleted whole only if every
+/// writer is positively closed; otherwise it is quarantined: held, bytes
+/// counted, never reused or deleted.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Lost {
+    slot_id: String,
+    at_ms: u64,
+    /// Why closure of every writer is not established; `None` when the
+    /// holding command saw its own group empty and started nothing Oxide
+    /// knows may outlive it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unclosed: Option<String>,
+}
+
+impl Lost {
+    fn describe(&self) -> String {
+        match &self.unclosed {
+            None => "lost with the removable volume; deleted whole when the volume returns".to_owned(),
+            Some(why) => format!(
+                "quarantined: lost with the removable volume and {why}; kept with its bytes, never reused or deleted"
+            ),
+        }
     }
 }
 
@@ -171,6 +204,9 @@ pub struct Flush {
     pub micros: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The flush failed because the volume was gone (surprise removal).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lost: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -315,6 +351,39 @@ fn return_path(record: &Record, slot: &LedgerSlot) -> Return {
             Return::GroupUnrecorded
         }
     }
+}
+
+/// Why the writers of a record retired by a lost volume cannot be taken as
+/// positively closed, from this process's view; `None` when they can. The
+/// holder waited for its own group to be empty before releasing; a record of
+/// another process, an exec tool (which may start processes outside its
+/// group) or a rustc wrapper Cargo was allowed to run (a server may outlive
+/// the group) is not closed. A record whose Cargo never started has no
+/// writer.
+fn unclosed_writers(record: &Record) -> Option<String> {
+    if record.phase == Phase::Acquiring {
+        return None;
+    }
+    let holder = record.holder.as_ref()?;
+    if holder.pid != std::process::id() {
+        return Some(format!("its writers belong to oxide pid {}", holder.pid));
+    }
+    if let Some(command) = &holder.command {
+        return Some(format!(
+            "{command} may have started processes outside its group"
+        ));
+    }
+    if !crate::wrapper::Policy::from_env().bypasses() {
+        return Some("an inherited rustc wrapper was allowed and may outlive the build".to_owned());
+    }
+    let workspace_wrapper = [
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
+    workspace_wrapper
+        .then(|| "a workspace rustc wrapper was set and may outlive the build".to_owned())
 }
 
 /// The own-command recovery rule. `held` is the held slot on the record's
@@ -695,6 +764,32 @@ pub fn recorded_last_use(control: &Path) -> Result<Option<LastUse>, String> {
         }))
 }
 
+/// Slots lost with the removable volume, from its control state read-only
+/// and without the volume: slot ID, checkout and what happens to it.
+pub fn recorded_lost(control: &Path) -> Result<Vec<(String, Option<PathBuf>, String)>, String> {
+    let path = control.join("state.json");
+    let Some(file) = private_file(&path, false)? else {
+        return Ok(Vec::new());
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_STATE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    let state: State = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    Ok(state
+        .records
+        .iter()
+        .filter_map(|record| {
+            let lost = record.lost.as_ref()?;
+            Some((
+                lost.slot_id.clone(),
+                record.checkout.clone(),
+                lost.describe(),
+            ))
+        })
+        .collect())
+}
+
 pub struct SlotView {
     pub slot_id: String,
     /// Slot directory below `slots`; `None` is the legacy `<id>`.
@@ -931,6 +1026,28 @@ impl Store {
         }
     }
 
+    /// The existing internal pool's private control directory, without
+    /// opening its ledger or reconciling any pool state.
+    pub fn existing_control() -> Result<Option<PathBuf>, String> {
+        let settings = settings()?;
+        config::refuse_unsafe_pool_path(&settings.pool)?;
+        match config::inspect(&settings.pool) {
+            Found::Absent => Ok(None),
+            Found::LegacyImage => Err(legacy_refusal()),
+            Found::Unknown => Err(format!(
+                "cannot open the existing pool at {}: unrecognized pool",
+                settings.pool.display()
+            )),
+            Found::Directory => {
+                let pool = fs::canonicalize(&settings.pool)
+                    .map_err(|error| format!("cannot resolve the existing pool: {error}"))?;
+                let control = pool.join(MANAGED_NAME);
+                verify_private_dir(&control)?;
+                Ok(Some(control))
+            }
+        }
+    }
+
     fn open_at(path: &Path, settings: &Settings) -> Result<Self, String> {
         let pool =
             fs::canonicalize(path).map_err(|error| format!("cannot open the pool: {error}"))?;
@@ -967,7 +1084,7 @@ impl Store {
     /// when a build starts.
     pub fn watchdog(&self) -> Option<Watchdog> {
         match self.backend {
-            Backend::ApfsVolume => None,
+            Backend::ApfsVolume => self.payload.parent().map(Watchdog::for_volume),
             Backend::DirectoryBudget => Some(Watchdog::for_pool(&self.payload)),
         }
     }
@@ -1109,8 +1226,10 @@ impl Store {
     /// idle; any other backend returns `true` at once. A failed or unknown
     /// flush retires the slot: the record becomes [`Phase::Retired`], the
     /// lease stays held, and `false` tells the caller not to release. This is
-    /// a durability step after writer closure, not a closure proof. The
-    /// caller holds the admission lock.
+    /// a durability step after writer closure, not a closure proof. When the
+    /// volume itself is gone the retirement also records [`Lost`], so the
+    /// slot is deleted or quarantined once the volume returns. The caller
+    /// holds the admission lock.
     fn flush_before_idle(&self, slot_id: &str, record: u64) -> Result<bool, String> {
         if self.backend != Backend::ApfsVolume {
             return Ok(true);
@@ -1124,30 +1243,144 @@ impl Store {
                     at_ms: process::now_ms(),
                     micros: Some(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)),
                     error: None,
+                    lost: false,
                 });
                 true
             }
             Err(error) => {
-                let reason = format!("flush before release failed: {error}");
-                eprintln!(
-                    "oxide: removable volume flush failed for slot {slot_id} ({error}); the slot is retired and stays held, never reused"
-                );
+                let lost = !self.volume_present();
                 state.log_flush(Flush {
                     slot_id: slot_id.to_owned(),
                     at_ms: process::now_ms(),
                     micros: None,
                     error: Some(error.to_string()),
+                    lost,
                 });
                 if let Some(entry) = state.records.iter_mut().find(|entry| entry.id == record) {
+                    if lost {
+                        let unclosed = unclosed_writers(entry);
+                        let found = Lost {
+                            slot_id: slot_id.to_owned(),
+                            at_ms: process::now_ms(),
+                            unclosed,
+                        };
+                        eprintln!(
+                            "oxide: removable volume gone; slot {slot_id} is {}",
+                            found.describe()
+                        );
+                        entry.retired = Some(found.describe());
+                        entry.lost = Some(found);
+                    } else {
+                        eprintln!(
+                            "oxide: removable volume flush failed for slot {slot_id} ({error}); the slot is retired and stays held, never reused"
+                        );
+                        entry.process_group = None;
+                        entry.retired = Some(format!("flush before release failed: {error}"));
+                    }
                     entry.phase = Phase::Retired;
-                    entry.process_group = None;
-                    entry.retired = Some(reason);
                 }
                 false
             }
         };
         self.save(&state)?;
         Ok(flushed)
+    }
+
+    /// The removal stop could not confirm the group closed: quarantine the
+    /// slot as lost, held and never reused or deleted.
+    pub fn quarantine_lost(&self, held: &Lease, why: &str) -> Result<(), String> {
+        let _admission = self.admission()?;
+        let mut state = self.load()?;
+        if let Some(entry) = state
+            .records
+            .iter_mut()
+            .find(|entry| entry.id == held.record)
+        {
+            let found = Lost {
+                slot_id: held.slot_id.clone(),
+                at_ms: process::now_ms(),
+                unclosed: Some(why.to_owned()),
+            };
+            eprintln!(
+                "oxide: removable volume gone; slot {} is {}",
+                held.slot_id,
+                found.describe()
+            );
+            entry.phase = Phase::Retired;
+            entry.retired = Some(found.describe());
+            entry.lost = Some(found);
+        }
+        self.save(&state)
+    }
+
+    /// Whether the removable pool's mount root still opens as a mount root.
+    /// A failed flush with the mount gone is a surprise removal.
+    fn volume_present(&self) -> bool {
+        self.payload
+            .parent()
+            .is_some_and(|mount| Binding::open(mount, None).is_ok())
+    }
+
+    /// Delete whole every slot lost with the removable volume whose writers
+    /// are positively closed: no live Oxide holds its record, the recorded
+    /// group (if Cargo started) is still empty and nothing known could
+    /// outlive it. Runs when the volume is selected again, under the
+    /// admission lock. Anything else stays quarantined.
+    fn discard_lost(&self, state: &mut State) -> Result<(), String> {
+        let candidates: Vec<u64> = state
+            .records
+            .iter()
+            .filter(|record| {
+                record.phase == Phase::Retired
+                    && record
+                        .lost
+                        .as_ref()
+                        .is_some_and(|lost| lost.unclosed.is_none())
+            })
+            .map(|record| record.id)
+            .collect();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let view = self.ledger()?;
+        for id in candidates {
+            let Some(record) = state.records.iter().find(|record| record.id == id) else {
+                continue;
+            };
+            if !matches!(probe_lock(&self.lock_path(id), true)?, Probe::Free(_)) {
+                continue;
+            }
+            if record
+                .process_group
+                .is_some_and(|group| !process::group_empty(group))
+            {
+                continue;
+            }
+            let project = self.affinity_dir(id);
+            if let Some(slot) = view.slots.iter().find(|slot| slot.project == project) {
+                if slot.state == SlotOccupancy::Held {
+                    let lease_id = slot
+                        .lease_id
+                        .as_deref()
+                        .ok_or("held slot has no lease ID")?;
+                    recover(&self.pool, lease_id)
+                        .map_err(|error| lease_error("cannot release a lost slot", &error))?;
+                }
+                evict_idle_slot(&self.pool, &slot.slot_id)
+                    .map_err(|error| lease_error("cannot delete a lost slot", &error))?;
+                eprintln!(
+                    "oxide: deleted slot {} held when the removable volume was lost ({})",
+                    slot.slot_id,
+                    record.process_group.map_or_else(
+                        || "Cargo never started".to_owned(),
+                        |group| format!("Cargo group {group} empty")
+                    )
+                );
+            }
+            self.forget_record(state, id);
+            self.save(state)?;
+        }
+        Ok(())
     }
 
     /// The last flush of this pool, for the summary line.
@@ -1480,6 +1713,9 @@ impl Store {
             return Ok(Err(Wait::Clean));
         }
         self.recover_settled(&mut state)?;
+        if self.backend == Backend::ApfsVolume {
+            self.discard_lost(&mut state)?;
+        }
         let active = state
             .records
             .iter()
@@ -1642,6 +1878,7 @@ impl Store {
                     lease_id: None,
                     pending_recovery: None,
                     retired: None,
+                    lost: None,
                     last_used_ms: None,
                 });
                 state.records.len() - 1
@@ -2101,10 +2338,7 @@ impl Store {
     }
 
     fn admission(&self) -> Result<File, String> {
-        let file = private_file(&self.control.join("admission.lock"), true)?
-            .ok_or("admission lock is missing")?;
-        flock(&file, libc::LOCK_EX)?;
-        Ok(file)
+        lock_admission(&self.control)
     }
 
     fn load(&self) -> Result<State, String> {
@@ -2215,16 +2449,91 @@ fn ensure_private_dir(path: &Path) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(format!("cannot create {}: {error}", path.display())),
     }
-    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    verify_private_dir(path)
+}
+
+/// Open an existing owner-only control directory without following its final
+/// path component. The descriptor is suitable for relative control-file I/O.
+pub(crate) fn open_control_directory(path: &Path) -> Result<Option<File>, String> {
+    let named = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+    };
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
-    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+    if !named.is_dir() || named.uid() != uid || named.mode() & 0o077 != 0 {
         return Err(format!(
             "{} must be an owner-only directory",
             path.display()
         ));
     }
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    let opened = directory
+        .metadata()
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if !opened.is_dir()
+        || opened.uid() != uid
+        || opened.mode() & 0o077 != 0
+        || opened.dev() != named.dev()
+        || opened.ino() != named.ino()
+    {
+        return Err(format!(
+            "{} changed while it was being opened",
+            path.display()
+        ));
+    }
+    Ok(Some(directory))
+}
+
+fn verify_private_dir(path: &Path) -> Result<(), String> {
+    if open_control_directory(path)?.is_none() {
+        return Err(format!("{} does not exist", path.display()));
+    }
     Ok(())
+}
+
+/// Take the internal pool's existing admission lock for metadata updates and
+/// command admission. Only the lock file may be created; the control
+/// directory must already exist.
+pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
+    let directory = open_control_directory(control)?
+        .ok_or_else(|| format!("{} does not exist", control.display()))?;
+    let name = CString::new("admission.lock").map_err(|error| error.to_string())?;
+    // SAFETY: `name` is a live CString with initialized bytes through its
+    // terminator, and `directory` owns a live descriptor until `openat` ends.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "cannot open admission lock in {}: {}",
+            control.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `fd` is a newly opened descriptor owned by this function.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    if !metadata.is_file() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{} must be an owner-only file",
+            control.join("admission.lock").display()
+        ));
+    }
+    flock(&file, libc::LOCK_EX)?;
+    Ok(file)
 }
 
 /// Open an owner-only regular control file without following symlinks.
@@ -2693,8 +3002,61 @@ mod tests {
             lease_id: lease_id.map(str::to_owned),
             pending_recovery: None,
             retired: None,
+            lost: None,
             last_used_ms: None,
         }
+    }
+
+    #[test]
+    fn lost_volume_closure_needs_the_own_closed_group() {
+        let mut own = record(Phase::Running, Some(77), Some("lease"));
+        own.holder.as_mut().unwrap().pid = std::process::id();
+        let bypassed = crate::wrapper::Policy::from_env().bypasses()
+            && [
+                "RUSTC_WORKSPACE_WRAPPER",
+                "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+            ]
+            .iter()
+            .all(|name| std::env::var_os(name).is_none_or(|value| value.is_empty()));
+        if bypassed {
+            assert_eq!(unclosed_writers(&own), None);
+        }
+        // Another process's record, an exec tool or no holder: not closed.
+        let other = record(Phase::Running, Some(77), Some("lease"));
+        assert!(unclosed_writers(&other).unwrap().contains("oxide pid 41"));
+        let mut exec = own.clone();
+        exec.holder.as_mut().unwrap().command = Some("exec tool".to_owned());
+        assert!(unclosed_writers(&exec).unwrap().contains("exec tool"));
+        // Cargo never started: no writer.
+        let acquiring = record(Phase::Acquiring, None, Some("lease"));
+        assert_eq!(unclosed_writers(&acquiring), None);
+    }
+
+    #[test]
+    fn a_lost_slot_is_never_active_or_reused() {
+        let mut lost = record(Phase::Retired, Some(77), Some("lease"));
+        lost.lost = Some(Lost {
+            slot_id: "3".to_owned(),
+            at_ms: 1,
+            unclosed: None,
+        });
+        assert!(!lost.active());
+        assert!(lost
+            .lost
+            .as_ref()
+            .unwrap()
+            .describe()
+            .contains("deleted whole"));
+        lost.lost.as_mut().unwrap().unclosed = Some("why".to_owned());
+        assert!(lost
+            .lost
+            .as_ref()
+            .unwrap()
+            .describe()
+            .starts_with("quarantined"));
+        let encoded = serde_json::to_string(&lost).unwrap();
+        let decoded: Record = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.lost.unwrap().unclosed.as_deref(), Some("why"));
     }
 
     fn held(holder: &str, lease_id: &str) -> LedgerSlot {

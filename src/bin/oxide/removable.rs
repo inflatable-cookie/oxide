@@ -16,10 +16,11 @@ use crate::MIB;
 use oxide_storage::lease::managed::init_volume_pool;
 use oxide_storage::volume::{self, Binding};
 use serde::{Deserialize, Serialize};
-use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::ffi::{CString, OsString};
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -29,9 +30,38 @@ const REGISTRATION: &str = "removable.json";
 pub const POOL_DIR: &str = "removable";
 /// The payload directory directly under the volume's mount root.
 pub const PAYLOAD_DIR: &str = "oxide-pool";
-const REGISTRATION_VERSION: u32 = 1;
+const LEGACY_REGISTRATION_VERSION: u32 = 1;
+const REGISTRATION_VERSION: u32 = 2;
 const MAX_REGISTRATION_BYTES: u64 = 16 * 1024;
 pub const MAX_PLIST_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriveMode {
+    Ephemeral,
+    Permanent,
+}
+
+impl DriveMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "ephemeral" => Ok(Self::Ephemeral),
+            "permanent" => Ok(Self::Permanent),
+            _ => Err(format!(
+                "unknown drive mode {value:?}; use ephemeral or permanent"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for DriveMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Ephemeral => "ephemeral",
+            Self::Permanent => "permanent",
+        })
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -51,6 +81,45 @@ pub struct Registration {
     /// other directory on it.
     pub capacity_bytes: Option<u64>,
     pub registered_ms: u64,
+    pub mode: DriveMode,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRegistration {
+    version: u32,
+    mount_point: PathBuf,
+    volume_uuid: String,
+    container_uuid: String,
+    reserve_bytes: u64,
+    cap_bytes: u64,
+    quota_bytes: Option<u64>,
+    capacity_bytes: Option<u64>,
+    registered_ms: u64,
+}
+
+impl From<LegacyRegistration> for Registration {
+    fn from(registration: LegacyRegistration) -> Self {
+        Self {
+            version: registration.version,
+            mount_point: registration.mount_point,
+            volume_uuid: registration.volume_uuid,
+            container_uuid: registration.container_uuid,
+            reserve_bytes: registration.reserve_bytes,
+            cap_bytes: registration.cap_bytes,
+            quota_bytes: registration.quota_bytes,
+            capacity_bytes: registration.capacity_bytes,
+            registered_ms: registration.registered_ms,
+            mode: DriveMode::Ephemeral,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredRegistration {
+    Legacy(LegacyRegistration),
+    Current(Registration),
 }
 
 /// Which pool a build uses, and why.
@@ -59,18 +128,27 @@ pub struct Selected {
     /// `None` when nothing is registered: the internal pool, unchanged.
     pub note: Option<String>,
     pub removable: bool,
+    pub mode: Option<DriveMode>,
+    /// The reason this command selected the internal pool, from the same
+    /// registration snapshot as `mode`.
+    pub fallback_reason: Option<String>,
 }
 
 const USAGE: &str = "\
-usage: oxide pool register-removable <mount-point> --reserve <size> --cap <size>
+usage: oxide pool register-removable <mount-point> --reserve <size> --cap <size> [--mode ephemeral|permanent]
+       oxide pool set-mode <ephemeral|permanent>
        oxide pool recover-interrupted <slot>
        oxide pool describe --json
 
 register-removable registers a dedicated APFS volume mounted directly under
-/Volumes as the preferred build pool. <size> is bytes or a whole number of
+/Volumes as the preferred build pool. The default mode is ephemeral. <size> is bytes or a whole number of
 KB, MB, GB, TB, KiB, MiB, GiB or TiB. --reserve is the free space a build
 start must find above it; --cap is Oxide's admission budget on the volume.
 Both are required.
+
+set-mode updates the existing removable registration only. Permanent mode
+warns when a build falls back to the internal pool; ephemeral mode keeps the
+existing fallback diagnostic.
 
 recover-interrupted releases a slot `oxide status` shows held by an
 interrupted command whose Cargo group was not recorded or whose lease is not
@@ -92,11 +170,17 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
             let mut mount = None;
             let mut reserve = None;
             let mut cap = None;
+            let mut mode = None;
             let mut rest = rest.iter();
             while let Some(arg) = rest.next() {
                 match *arg {
                     "--reserve" => reserve = Some(*rest.next().ok_or("--reserve needs a size")?),
                     "--cap" => cap = Some(*rest.next().ok_or("--cap needs a size")?),
+                    "--mode" => {
+                        mode = Some(DriveMode::parse(
+                            rest.next().ok_or("--mode needs ephemeral or permanent")?,
+                        )?)
+                    }
                     other if other.starts_with('-') => {
                         return Err(format!("unknown option {other}\n{USAGE}"))
                     }
@@ -109,8 +193,15 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
             };
             let reserve = size("--reserve", reserve)?;
             let cap = size("--cap", cap)?;
-            register(Path::new(mount), reserve, cap)
+            register(
+                Path::new(mount),
+                reserve,
+                cap,
+                mode.unwrap_or(DriveMode::Ephemeral),
+            )
         }
+        ["set-mode", mode] => set_mode(DriveMode::parse(mode)?),
+        ["set-mode", ..] => Err(USAGE.to_owned()),
         ["recover-interrupted", slot] => {
             let Some(internal) = Store::open_existing()? else {
                 return Err("no pool exists".to_owned());
@@ -155,7 +246,7 @@ fn size(flag: &str, value: &str) -> Result<u64, String> {
         .map_err(|error| error.replace("OXIDE_POOL_CAP", flag))
 }
 
-fn register(mount: &Path, reserve: u64, cap: u64) -> Result<u8, String> {
+fn register(mount: &Path, reserve: u64, cap: u64, mode: DriveMode) -> Result<u8, String> {
     if !cfg!(target_os = "macos") {
         return Err("the removable apfs-volume-v1 backend is macOS-only".to_owned());
     }
@@ -167,11 +258,12 @@ fn register(mount: &Path, reserve: u64, cap: u64) -> Result<u8, String> {
     let identity = disk_identity(binding.mount_point(), binding.uuid(), &plist)?;
     check_identity(&identity, None)?;
     let internal = Store::open_or_create()?;
+    let control = internal.control().to_path_buf();
+    let _admission = store::lock_admission(&control)?;
     if let Some(previous) = previous_registration(&internal) {
         return Err(previous_registration_refusal(&previous));
     }
-    let control = internal.control().to_path_buf();
-    if fs::symlink_metadata(control.join(REGISTRATION)).is_ok()
+    if read_registration(&control)?.is_some()
         || fs::symlink_metadata(control.join(POOL_DIR)).is_ok()
     {
         return Err(format!(
@@ -192,6 +284,7 @@ fn register(mount: &Path, reserve: u64, cap: u64) -> Result<u8, String> {
         quota_bytes: identity.quota_bytes,
         capacity_bytes: facts.capacity_bytes,
         registered_ms: process::now_ms(),
+        mode,
     };
     write_registration(&control, &registration)?;
     println!(
@@ -204,6 +297,24 @@ fn register(mount: &Path, reserve: u64, cap: u64) -> Result<u8, String> {
         registration.mount_point.display()
     );
     Ok(0)
+}
+
+fn set_mode(mode: DriveMode) -> Result<u8, String> {
+    let Some(control) = Store::existing_control()? else {
+        return Err("no pool exists".to_owned());
+    };
+    set_mode_in_control(&control, mode)?;
+    println!("removable pool mode set to {mode}");
+    Ok(0)
+}
+
+fn set_mode_in_control(control: &Path, mode: DriveMode) -> Result<(), String> {
+    let _admission = store::lock_admission(control)?;
+    let mut registration =
+        read_registration(control)?.ok_or_else(|| "no removable pool is registered".to_owned())?;
+    registration.version = REGISTRATION_VERSION;
+    registration.mode = mode;
+    write_registration(control, &registration)
 }
 
 /// What `diskutil` reports about a mounted volume, as checked at
@@ -355,46 +466,221 @@ fn path_str(path: &Path) -> Result<&str, String> {
 }
 
 fn write_registration(control: &Path, registration: &Registration) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(registration).map_err(|error| error.to_string())?;
-    let temp = control.join("removable.json.tmp");
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&temp)
-        .map_err(|error| format!("cannot write the registration: {error}"))?;
-    file.write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .and_then(|()| fs::rename(&temp, control.join(REGISTRATION)))
-        .map_err(|error| format!("cannot write the registration: {error}"))
+    let temp_name = format!(
+        "{REGISTRATION}.tmp.{}.{}.{}",
+        std::process::id(),
+        process::now_ms(),
+        std::sync::atomic::AtomicU64::fetch_add(
+            &REGISTRATION_TEMP_SEQUENCE,
+            1,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+    );
+    write_registration_with_temp_name(control, registration, &temp_name)
+}
+
+static REGISTRATION_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn write_registration_with_temp_name(
+    control: &Path,
+    registration: &Registration,
+    temp_name: &str,
+) -> Result<(), String> {
+    if temp_name.is_empty() || temp_name.contains('/') || temp_name.len() > 240 {
+        return Err("the registration temporary name is invalid".to_owned());
+    }
+    let mut current = registration.clone();
+    current.version = REGISTRATION_VERSION;
+    let bytes = serde_json::to_vec_pretty(&current)
+        .map_err(|error| format!("cannot encode the removable registration: {error}"))?;
+    if bytes.len() as u64 > MAX_REGISTRATION_BYTES {
+        return Err("the removable registration exceeds its byte limit".to_owned());
+    }
+    let directory = store::open_control_directory(control)?
+        .ok_or_else(|| format!("{} does not exist", control.display()))?;
+    let temp = CString::new(temp_name).map_err(|error| error.to_string())?;
+    let destination = CString::new(REGISTRATION).map_err(|error| error.to_string())?;
+    validate_registration_destination(&directory, &destination)?;
+    // SAFETY: `temp` is a live CString with initialized bytes through its
+    // terminator, and `directory` owns a live descriptor for this call.
+    // O_EXCL and O_NOFOLLOW make temporary creation exclusive and owned.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            temp.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "cannot create the registration temporary file: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `fd` is a newly opened descriptor owned by this function.
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let write_result = file.write_all(&bytes).and_then(|()| file.sync_all());
+    if let Err(error) = write_result {
+        drop(file);
+        return Err(with_temp_cleanup(
+            &directory,
+            &temp,
+            format!("cannot sync the removable registration: {error}"),
+        ));
+    }
+    drop(file);
+    if let Err(error) = validate_registration_destination(&directory, &destination) {
+        return Err(with_temp_cleanup(&directory, &temp, error));
+    }
+    // SAFETY: both live CStrings contain initialized bytes through their
+    // terminators, and `directory` owns a live descriptor. Both paths are
+    // relative to the same already-open private control directory.
+    if unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            temp.as_ptr(),
+            directory.as_raw_fd(),
+            destination.as_ptr(),
+        )
+    } != 0
+    {
+        let error = format!(
+            "cannot publish the removable registration: {}",
+            std::io::Error::last_os_error()
+        );
+        return Err(with_temp_cleanup(&directory, &temp, error));
+    }
+    directory.sync_all().map_err(|error| {
+        format!(
+            "the registration was published, but syncing its directory failed; durability is uncertain: {error}"
+        )
+    })
+}
+
+fn validate_registration_destination(
+    directory: &File,
+    destination: &CString,
+) -> Result<(), String> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `destination` is a live CString with initialized bytes through
+    // its terminator; `directory` owns a live descriptor; and `metadata` is
+    // aligned writable storage for one libc::stat. AT_SYMLINK_NOFOLLOW checks
+    // the leaf without following it.
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            destination.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(format!(
+                "cannot inspect the removable registration: {error}"
+            ))
+        };
+    }
+    // SAFETY: fstatat initialized metadata after returning 0.
+    let metadata = unsafe { metadata.assume_init() };
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFREG
+        || metadata.st_uid != uid
+        || metadata.st_mode & 0o077 != 0
+    {
+        return Err("the removable registration is not an owner-only regular file".to_owned());
+    }
+    Ok(())
+}
+
+fn with_temp_cleanup(directory: &File, temp: &CString, error: String) -> String {
+    // SAFETY: `temp` is a live CString with initialized bytes through its
+    // terminator, and `directory` owns a live descriptor. The caller created
+    // this exclusive temporary entry in that directory.
+    if unsafe { libc::unlinkat(directory.as_raw_fd(), temp.as_ptr(), 0) } == 0 {
+        error
+    } else {
+        format!(
+            "{error}; cannot remove the registration temporary file: {}",
+            std::io::Error::last_os_error()
+        )
+    }
 }
 
 pub fn registration(internal: &Store) -> Result<Option<Registration>, String> {
     read_registration(internal.control())
 }
 
-/// The registration in an internal pool's control directory, read only.
-/// `None` when nothing is registered; an unreadable one is an error.
-pub fn read_registration(control: &Path) -> Result<Option<Registration>, String> {
-    let path = control.join(REGISTRATION);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("cannot read the removable registration: {error}")),
+/// Read an existing private registration without creating or migrating it.
+pub(crate) fn read_registration(control: &Path) -> Result<Option<Registration>, String> {
+    let Some(directory) = store::open_control_directory(control)? else {
+        return Ok(None);
     };
-    if !metadata.is_file() || metadata.len() > MAX_REGISTRATION_BYTES {
-        return Err("the removable registration is not a small regular file".to_owned());
+    let name = CString::new(REGISTRATION).map_err(|error| error.to_string())?;
+    // SAFETY: `name` is a live CString with initialized bytes through its
+    // terminator, and `directory` owns a live descriptor that anchors this
+    // lookup inside the verified private control directory.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(format!("cannot read the removable registration: {error}"))
+        };
     }
-    let bytes = fs::read(&path)
+    // SAFETY: `fd` is a newly opened descriptor owned by this function.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file
+        .metadata()
         .map_err(|error| format!("cannot read the removable registration: {error}"))?;
-    let registration: Registration = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("the removable registration is invalid: {error}"))?;
-    if registration.version != REGISTRATION_VERSION {
-        return Err("the removable registration has an unsupported version".to_owned());
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    if !metadata.is_file()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o077 != 0
+        || metadata.len() > MAX_REGISTRATION_BYTES
+    {
+        return Err("the removable registration is not a small owner-only regular file".to_owned());
     }
-    Ok(Some(registration))
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_REGISTRATION_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read the removable registration: {error}"))?;
+    if bytes.len() as u64 > MAX_REGISTRATION_BYTES {
+        return Err("the removable registration exceeds its byte limit".to_owned());
+    }
+    parse_registration(&bytes).map(Some)
+}
+
+fn parse_registration(bytes: &[u8]) -> Result<Registration, String> {
+    let stored: StoredRegistration = serde_json::from_slice(bytes)
+        .map_err(|error| format!("the removable registration is invalid: {error}"))?;
+    match stored {
+        StoredRegistration::Legacy(registration)
+            if registration.version == LEGACY_REGISTRATION_VERSION =>
+        {
+            Ok(registration.into())
+        }
+        StoredRegistration::Current(registration)
+            if registration.version == REGISTRATION_VERSION =>
+        {
+            Ok(registration)
+        }
+        _ => Err("the removable registration has an unsupported version".to_owned()),
+    }
 }
 
 /// A removable registration (or its pool state) under another pool Oxide
@@ -450,6 +736,8 @@ pub fn select(internal: Store) -> Result<Selected, String> {
             store: internal,
             note,
             removable: false,
+            mode: None,
+            fallback_reason: None,
         });
     };
     let control = internal
@@ -466,6 +754,8 @@ pub fn select(internal: Store) -> Result<Selected, String> {
                 store: store.with_sibling(internal.control(), true),
                 note: Some(note),
                 removable: true,
+                mode: Some(registration.mode),
+                fallback_reason: None,
             })
         }
         Err(reason) => Ok(Selected {
@@ -474,6 +764,8 @@ pub fn select(internal: Store) -> Result<Selected, String> {
                 "internal pool: removable volume not used ({reason})"
             )),
             removable: false,
+            mode: Some(registration.mode),
+            fallback_reason: Some(reason),
         }),
     }
 }
@@ -546,10 +838,11 @@ pub fn status(internal: &Store) -> Result<Option<RemovableStatus>, String> {
     };
     let mut lines = vec![
         format!(
-            "{} volume {} container {}",
+            "{} volume {} container {} (mode: {})",
             registration.mount_point.display(),
             registration.volume_uuid,
-            registration.container_uuid
+            registration.container_uuid,
+            registration.mode
         ),
         format!(
             "  backend {}: {}",
@@ -597,6 +890,78 @@ pub fn status(internal: &Store) -> Result<Option<RemovableStatus>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    static TEST_DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestControl(PathBuf);
+
+    impl TestControl {
+        fn new() -> Self {
+            loop {
+                let id = TEST_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
+                let root = std::env::temp_dir()
+                    .join(format!("oxide-drive-mode-{}-{id}", std::process::id()));
+                match fs::create_dir(&root) {
+                    Ok(()) => {
+                        let control = root.join("oxide-managed");
+                        fs::create_dir(&control).unwrap();
+                        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+                        fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
+                        return Self(control);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("cannot create drive-mode test fixture: {error}"),
+                }
+            }
+        }
+    }
+
+    impl Drop for TestControl {
+        fn drop(&mut self) {
+            if let Some(root) = self.0.parent() {
+                let _ = fs::remove_dir_all(root);
+            }
+        }
+    }
+
+    fn legacy_registration_bytes() -> Vec<u8> {
+        br#"{
+            "version": 1,
+            "mount_point": "/Volumes/OxideDriveModeTest",
+            "volume_uuid": "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+            "container_uuid": "A6AC3ED7-33EA-46B4-8082-7254CF291ED2",
+            "reserve_bytes": 1048576,
+            "cap_bytes": 1048576,
+            "quota_bytes": null,
+            "capacity_bytes": null,
+            "registered_ms": 17
+        }"#
+        .to_vec()
+    }
+
+    fn registration(mode: DriveMode) -> Registration {
+        Registration {
+            version: REGISTRATION_VERSION,
+            mount_point: PathBuf::from("/Volumes/OxideDriveModeTest"),
+            volume_uuid: "A6AC3ED7-33EA-46B4-8082-7254CF291ED2".to_owned(),
+            container_uuid: "A6AC3ED7-33EA-46B4-8082-7254CF291ED2".to_owned(),
+            reserve_bytes: 1 << 20,
+            cap_bytes: 1 << 20,
+            quota_bytes: None,
+            capacity_bytes: None,
+            registered_ms: 17,
+            mode,
+        }
+    }
+
+    fn store_registration(control: &Path, bytes: &[u8]) {
+        let path = control.join(REGISTRATION);
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
 
     #[test]
     fn only_role_less_volumes_register() {
@@ -653,5 +1018,144 @@ mod tests {
             let error = size("--reserve", invalid).unwrap_err();
             assert!(error.contains("--reserve"), "{error}");
         }
+    }
+
+    #[test]
+    fn legacy_v1_reads_as_ephemeral_without_migrating_bytes() {
+        let control = TestControl::new();
+        let bytes = legacy_registration_bytes();
+        store_registration(&control.0, &bytes);
+
+        let loaded = read_registration(&control.0).unwrap().unwrap();
+        assert_eq!(loaded.version, LEGACY_REGISTRATION_VERSION);
+        assert_eq!(loaded.mode, DriveMode::Ephemeral);
+        assert_eq!(fs::read(control.0.join(REGISTRATION)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn v2_requires_a_known_mode_and_rejects_legacy_mode_fields() {
+        let current = serde_json::to_value(registration(DriveMode::Permanent)).unwrap();
+        let parsed = parse_registration(&serde_json::to_vec(&current).unwrap()).unwrap();
+        assert_eq!(parsed.mode, DriveMode::Permanent);
+
+        let mut missing_mode = current.clone();
+        missing_mode.as_object_mut().unwrap().remove("mode");
+        assert!(parse_registration(&serde_json::to_vec(&missing_mode).unwrap()).is_err());
+
+        let mut unknown_mode = current.clone();
+        unknown_mode["mode"] = serde_json::Value::String("sometimes".to_owned());
+        assert!(parse_registration(&serde_json::to_vec(&unknown_mode).unwrap()).is_err());
+
+        let mut unknown_version = current.clone();
+        unknown_version["version"] = serde_json::Value::Number(3.into());
+        let error = parse_registration(&serde_json::to_vec(&unknown_version).unwrap()).unwrap_err();
+        assert!(error.contains("unsupported version"), "{error}");
+
+        let mut unknown_field = current;
+        unknown_field["new_field"] = serde_json::Value::Bool(true);
+        assert!(parse_registration(&serde_json::to_vec(&unknown_field).unwrap()).is_err());
+
+        let mut legacy_with_mode: serde_json::Value =
+            serde_json::from_slice(&legacy_registration_bytes()).unwrap();
+        legacy_with_mode["mode"] = serde_json::Value::String("permanent".to_owned());
+        assert!(parse_registration(&serde_json::to_vec(&legacy_with_mode).unwrap()).is_err());
+
+        let v2_bytes = serde_json::to_vec(&registration(DriveMode::Permanent)).unwrap();
+        assert!(serde_json::from_slice::<LegacyRegistration>(&v2_bytes).is_err());
+    }
+
+    #[test]
+    fn writing_a_legacy_record_publishes_v2_with_explicit_mode() {
+        let control = TestControl::new();
+        let legacy = parse_registration(&legacy_registration_bytes()).unwrap();
+        write_registration(&control.0, &legacy).unwrap();
+
+        let bytes = fs::read(control.0.join(REGISTRATION)).unwrap();
+        let persisted: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(persisted["version"], REGISTRATION_VERSION);
+        assert_eq!(persisted["mode"], "ephemeral");
+        assert_eq!(read_registration(&control.0).unwrap().unwrap().version, 2);
+    }
+
+    #[test]
+    fn failed_update_before_rename_preserves_registration_and_temp_bytes() {
+        let control = TestControl::new();
+        let original = serde_json::to_vec_pretty(&registration(DriveMode::Ephemeral)).unwrap();
+        store_registration(&control.0, &original);
+        let blocked_temp = control.0.join("removable.json.tmp.blocked");
+        fs::write(&blocked_temp, b"owned by a prior attempt").unwrap();
+        fs::set_permissions(&blocked_temp, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = write_registration_with_temp_name(
+            &control.0,
+            &registration(DriveMode::Permanent),
+            "removable.json.tmp.blocked",
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot create"), "{error}");
+        assert_eq!(fs::read(control.0.join(REGISTRATION)).unwrap(), original);
+        assert_eq!(fs::read(blocked_temp).unwrap(), b"owned by a prior attempt");
+    }
+
+    #[test]
+    fn registration_writer_refuses_to_replace_a_symlink() {
+        let control = TestControl::new();
+        let target = control.0.join("registration-target");
+        fs::write(&target, b"outside registration bytes").unwrap();
+        let destination = control.0.join(REGISTRATION);
+        std::os::unix::fs::symlink(&target, &destination).unwrap();
+
+        let error =
+            write_registration(&control.0, &registration(DriveMode::Permanent)).unwrap_err();
+        assert!(error.contains("owner-only regular file"), "{error}");
+        assert!(fs::symlink_metadata(&destination)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), b"outside registration bytes");
+    }
+
+    #[test]
+    fn set_mode_refuses_missing_registration_without_creating_one() {
+        let control = TestControl::new();
+        let error = set_mode_in_control(&control.0, DriveMode::Permanent).unwrap_err();
+        assert!(error.contains("no removable pool is registered"), "{error}");
+        assert!(!control.0.join(REGISTRATION).exists());
+    }
+
+    #[test]
+    fn concurrent_mode_updates_publish_one_complete_v2_record() {
+        let control = TestControl::new();
+        let initial = serde_json::to_vec_pretty(&registration(DriveMode::Ephemeral)).unwrap();
+        store_registration(&control.0, &initial);
+        let path = Arc::new(control.0.clone());
+        let start = Arc::new(Barrier::new(3));
+        let mut writers = Vec::new();
+        for mode in [DriveMode::Permanent, DriveMode::Ephemeral] {
+            let path = Arc::clone(&path);
+            let start = Arc::clone(&start);
+            writers.push(std::thread::spawn(move || {
+                start.wait();
+                set_mode_in_control(&path, mode)
+            }));
+        }
+        start.wait();
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+
+        let final_registration = read_registration(&control.0).unwrap().unwrap();
+        assert_eq!(final_registration.version, REGISTRATION_VERSION);
+        assert!(matches!(
+            final_registration.mode,
+            DriveMode::Permanent | DriveMode::Ephemeral
+        ));
+        assert_eq!(
+            final_registration.mount_point,
+            registration(DriveMode::Ephemeral).mount_point
+        );
+        assert_eq!(final_registration.reserve_bytes, 1 << 20);
+        assert_eq!(final_registration.cap_bytes, 1 << 20);
+        assert!(parse_registration(&fs::read(control.0.join(REGISTRATION)).unwrap()).is_ok());
     }
 }
