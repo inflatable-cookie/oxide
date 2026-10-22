@@ -122,8 +122,7 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 - **Pools are budget-only:** a soft admission budget, whole-idle-slot eviction
   and the host-reserve watchdog, with no OS-enforced cap.
 - **Internal pool:** `~/Dev/oxide`, with a 100 GB budget. Config follows
-  Longhorn's storage-location policy, through Longhorn's own resolver once
-  #103 lands.
+  Longhorn's storage-location policy, through Longhorn's own resolver.
 - **The Builds drive** is the preferred pool:
   - a registered removable APFS volume, permanently attached and treated as
     consumable;
