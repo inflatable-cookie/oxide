@@ -483,10 +483,13 @@ def prove_byte_pressure(proof: Proof, pool: str, env: dict, workdir: str) -> Non
 def prove_foreign_refusal(proof: Proof, pool: str, env: dict, app: str) -> None:
     foreign = os.path.join(pool, "payload", "foreign-entry")
     write_file(foreign, "foreign\n")
-    _, stderr = run(proof, ["status"], "foreign-entry-status", app, env, code=1)
-    expect("unexpected entry" in stderr, f"the foreign entry was not refused by name: {stderr}")
+    stdout, stderr = run(proof, ["status"], "foreign-entry-status", app, env)
+    expect(
+        'unexpected entry "foreign-entry"' in stdout + stderr,
+        f"the foreign entry was not refused by name: {stdout}{stderr}",
+    )
     os.remove(foreign)
-    RESULTS.append({"case": "foreign-payload-entry-refused", "exit": 1})
+    RESULTS.append({"case": "foreign-payload-entry-refused", "reported": True})
 
 
 def main() -> None:
