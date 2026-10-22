@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Focused proof for `oxide pool describe --json` (oxide#112).
 
-Status: gate open (`RUN_BOUND` is True). The owner cleared the apparatus gate
-at 53ec48e4 and the one authorised native run is recorded on PR #104. With the
-gate closed the script refuses with exit 2 before any effect. `--plan` prints
-this docstring and has no effect. A refusal is not a proof.
+Status: gate open (`RUN_BOUND` is True). Each native run is a separate owner
+activation. The run history is kept in the owning contract and on PR #104, and
+its counts and outcomes are not reset here. With the gate closed the script
+refuses with exit 2 before any effect. `--plan` prints this docstring and has
+no effect. A refusal is not a proof.
 
 Binding: the script runs only inside the qualified shared runner (oxide#109),
-`scripts/bounded-test.py`, delivered at e86906fe with SHA-256
-8e379c93416c6e06b7f06bec7f86dba4fca4c8900b1cc87f1eb6303d39897a9d. The
+`scripts/bounded-test.py`, delivered at e86906fe. Main's current copy (merged
+at 5ac62f9f) has SHA-256 d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e,
+which is the runner this proof is pinned to. The
 selector runs it as
 
     python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-pool-describe.py
