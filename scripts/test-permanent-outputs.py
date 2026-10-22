@@ -808,7 +808,8 @@ def run(proof: Proof, repo: str) -> None:
     os.chmod(receipt_path(pool, app), 0o600)
     sibling = os.path.join(app, f".target.oxide-new-{generation}")
     os.symlink(local_root, sibling)
-    os.remove(link)
+    # After the detached build the target is a real directory again.
+    shutil.rmtree(link)
     os.symlink(os.path.join(app, "absent-foreign"), link)
     code, stdout, stderr = proof.oxide(
         ["outputs", "adopt"], "replay never renames over a foreign dangling link", app
