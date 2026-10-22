@@ -9,9 +9,9 @@ recommend deleting anything. Product distribution naming remains unchosen under
 stays `publish = false`.
 
 This is distinct from the [local lease](local-lease.md) `status` command, which
-reads managed slot cap, state and lease identity. The target-directory inventory has
-no lease, slot key or ownership semantics and is not a claim on Oxide-managed
-storage.
+reads managed slot membership (up to 128 slots in a 2 MiB ledger), state and
+lease identity. The target-directory inventory has no lease, slot key or
+ownership semantics and is not a claim on Oxide-managed storage.
 
 ## Purpose
 

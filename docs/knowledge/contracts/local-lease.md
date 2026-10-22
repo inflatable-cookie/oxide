@@ -130,7 +130,8 @@ value and whether it came from the environment, the selected user config, the
 physical-core formula or its fallback; see the workflow's
 [user configuration](workflow.md#budget-only-default-pool-and-user-configuration).
 
-The library also exports `evict_idle_slot` for Oxide's per-project slot cap.
+The library also exports `evict_idle_slot` for Oxide's per-project slot cap
+(eight slots per project identity; [workflow](workflow.md#storage-and-space-management)).
 It retires one recorded idle slot whole through the same durable eviction path
 as capacity eviction, and returns busy for a held slot. The CLI does not
 expose it. Ledger v1, receipt v2, JSON and exits are unchanged. An earlier
@@ -239,8 +240,9 @@ the recorded one) and the [storage inventory](storage-inventory.md)
 unique-allocated figure for owned slots, a `(device, inode)` union so a hard
 link counts once; filesystem metadata directories remain outside that slot
 accounting. Control/ledger headroom stays outside the payload and is bounded
-(`MAX_LEDGER_BYTES` 256 KiB, `MAX_SLOTS` 32). Eviction happens only at lease
-time and only for known owned idle whole slots. Held occupancy, foreign
+(`MAX_LEDGER_BYTES` 2 MiB, `MAX_SLOTS` 128). Eviction happens only at lease
+time and only for known owned idle whole slots, in the pool's recorded
+least-recently-used order (oxide#118, [below](#slot-headroom-and-ranked-idle-replacement-oxide118)). Held occupancy, foreign
 entries, symlinked pool/payload/slots/slot roots, unknown accounting and
 mismatched backing refuse. During a durably recorded whole-slot deletion, an
 owned nested symlink entry may be unlinked as a leaf after its parent and
@@ -257,7 +259,7 @@ defaults, which are unchanged. The callers:
 
 | Walk | Gate |
 | --- | --- |
-| The matching idle slot's own walk before reuse or recycling | Must be complete, or the lease refuses |
+| The matching idle slot's own walk before reuse | Must be complete, or the lease refuses |
 | The whole-payload walk before a new slot, and again after eviction | Must be complete, or the lease refuses |
 | The whole-payload walk before each idle eviction in the loop | Must be complete, or the lease refuses |
 | `status`: the whole payload and each slot | Observational; reports coverage, causes and time |
@@ -298,9 +300,9 @@ Only a slot whose own walk completes can be reused; other
 backing failures, foreign entries) are unchanged.
 
 The bounds are finite, not an arbitrary-size guarantee. The entry bound
-covers 32 slots of 60,657 entries, the largest single-project slot reported
-(Farmyard, 2026-10-20); a pool beyond it refuses until idle slots are
-evicted or cleaned. A walk over a slow or cold volume can reach the deadline;
+covers 128 slots of about 15,600 entries each, not the 60,657-entry
+single-project slot reported for Farmyard (2026-10-20); a pool beyond it
+refuses until idle slots are evicted or cleaned. A walk over a slow or cold volume can reach the deadline;
 `status` reports each walk's elapsed time. One admission may walk the payload
 more than once (the front door's `status`, then the library's admission
 walk), so its cost grows with pool size. The 50,000-entry, depth-24, 5 s
@@ -309,17 +311,15 @@ Farmyard's 60,657-entry trees, Supervisor report), including reuse of an
 existing slot above 50,000 entries.
 
 Before leasing a compatible idle slot, the library inventories that exact
-slot's complete unique allocated bytes. At `ceil(budget / 2)` or above, it
-durably retires that idle generation and allocates a fresh monotonic slot and
-lease; the grant reports `reused_slot: false`. Below the threshold, it keeps
-the warm slot. Incomplete or unknown accounting refuses the lease. A held
-same-holder replay keeps its exact lease and path, and another holder remains
-busy without recycling the held slot. This policy can make an acquisition pay
-a cold-build cost to discard a large idle cache. The threshold supplies
-headroom at acquisition; it does not guarantee that a particular build fits,
-reserve space, constrain writes during a lease, or prevent `ENOSPC`. Other
-slots still count against the budget, so ordinary admission and refusal rules
-apply after the selected generation is removed.
+slot's complete unique allocated bytes and keeps the warm generation; the
+half-budget recycling rule is retired (oxide#118). Incomplete or unknown
+accounting refuses the lease. A held same-holder replay keeps its exact lease
+and path, and another holder remains busy without touching the held slot.
+Byte pressure is handled by admitting a new slot, not by discarding a
+compatible warm one: with the whole-payload union at or above the budget, the
+oldest eligible idle whole slot is removed until the union is under it, and
+`Full` refuses when only held slots remain.
+
 
 ### Ledger-only view for front-door membership (oxide#110, lead `e4c74399`)
 
@@ -353,6 +353,86 @@ On a removable pool, one ordinary command paid several full walks, and a waiting
 **Observation hook.** Debug builds only, absent from release builds such as the installed `oxide`: `inventory::walk_observer` records the root of every `inventory_directory` walk, the one entry point of library accounting, `slot_size`, Cargo-home measurement and the stray check, on a per-thread recorder for tests and, when `OXIDE_TEST_WALK_LOG` names an absolute file, one line per walk. It changes no walk. Walk counts show routing only; they are not a resource gate.
 
 **Proof.** Standard tier. Library tests show that the view equals status's membership field for field with no walk while status still walks the payload and every slot; that reuse walks only its slot and returns that measurement, a held replay walks and measures nothing, and a new slot keeps its single admission walk; that a zero slot ID, a slot-root lookup error and a foreign pool entry refuse the view and status alike; and that a missing held root stays a member while partial accounting and a symlinked root stay non-gating and reuse still refuses incomplete accounting. The unreadable-walk and slot-root refusal cases inject `io::ErrorKind::PermissionDenied` at exact canonical-path `read_dir` and `slot_root` `symlink_metadata` calls with a current-test-thread `cfg(test)` guard and hit assertions. These cases preserve the library's gap and refusal mapping, but do not prove kernel permission enforcement or an operating-system `EACCES` response. Front-door recovery rules take the view's slot type unchanged. The native proof `effigy rust:front-door-accounting` covers, on one private pool with an idle slot of more than 200,000 entries: new-slot, reuse, status and readiness walks; a live-holder and killed-holder `recover-interrupted` refusal with no walk; a waiting build that walks nothing, then recovers, evicts the untrusted slot and builds cold; and new-slot admission with four whole-payload walks around eviction, hard links counted once. Removable selection is covered by the shared refusal tests only: no native session attaches a volume.
+
+### Slot headroom and ranked idle replacement (oxide#118)
+
+Implemented from the approved Queue brief (Tom, 2026-10-26: "Oh yeah, raise
+the slots!", then "Ah yeah, switch to your solution"). Slot headroom only:
+`MAX_SLOTS` is 128 and Oxide's project cap is eight; neither build concurrency
+nor `max_active` changed, and there is no new configuration.
+
+**Representation.** `MAX_LEDGER_BYTES` is 2 MiB. Every bounded field keeps its
+cap: paths 1024 bytes, holder 128, lease ID 160, slot directory component 80.
+A compact JSON ledger with every field at its ceiling, escaped sixfold and
+with 20-digit integers, is proven by a unit test to fit the cap and round-trip.
+Control state is bounded separately: 256 records, 128 wait tickets, 128 clean
+marks, 16 recoveries, 16 flushes, per-object compact ceilings (record 40 KiB,
+recovery 9 KiB, holder 5 KiB, lost 8 KiB, flush 8 KiB, clean 7 KiB, ticket
+128 B, state header 4 KiB) and a 16 MiB file, whose gross object sum is
+11,702,272 bytes. The two representations are envelopes for valid state, not
+a total control-directory bound: preexisting orphan origins and crash-left
+`ledger.tmp-*` files stay outside them, and nothing here authorizes cleanup.
+
+**Permanent fences.** A legacy ledger (no `capacity_policy`/`next_rank`, rank
+0) and a version-1 control state stay readable and are never migrated by
+`status`. The first revised grant, release or recovery, or an explicit
+eviction, installs the library ledger's `capacity_policy: 1` fence and rank
+sequence atomically with that mutation; every Store-controlled mutation writes
+control `version: 2`. A completed legacy `Evicting` reconciliation may still
+finish in the legacy representation. Old binaries refuse the fenced
+representations. Before a revised write, every stored field is validated
+against the raised caps; an oversized legacy field refuses with the original
+file, ownership and quarantine bytes untouched, never truncated or dropped.
+
+**Ranked LRU.** Each pool keeps one monotonic idle-rank sequence. A new actual
+grant and a first held-to-idle release or recovery stamp a fresh rank in the
+same atomic ledger write; holder/grant replay and release/recovery replay do
+not advance it. Legacy ranks are 0 and sort oldest. Eviction order is
+ascending `(rank, numeric slot id)`. Counter exhaustion refuses before any
+deletion or transition, including the explicit `evict_idle_slot` path used for
+an untrusted or lost slot; there is no wrap, rebase or cross-pool comparison.
+Store spawn touches stay separate freshness-origin marks and the wall-clock
+`last_used_ms` remains an observation.
+
+**Admission.** Every allocated ledger entry counts: held, idle,
+retired-backed and unresolved `Evicting`. Compatible idle reuse stays first,
+with its complete target walk. Below both count ceilings and without byte
+pressure nothing is evicted, so the old 32/2 counts no longer churn slots.
+At the pool ceiling, the least-recently-used *eligible* idle whole slot is
+replaced and the new slot is built cold; a byte-pressure admission does the
+same using the global idle order and remeasures the inode union after each
+deletion. Each deletion must reduce membership and an admission is bounded by
+the entries it saw initially. Held, retired, uncertain (live or unattributable
+lock), foreign and unmeasurable slots are never eligible, and a safety failure
+stops admission instead of skipping to another slot. With no safely eligible
+idle slot, the lease refuses honestly; it does not promise a deletion through
+a failed safety gate. At the eight-slot project ceiling Oxide replaces that
+project's oldest eligible idle whole slot, which also frees pool capacity.
+The front door chooses that victim by recorded rank but asks the library to
+retire it as part of the same admission: complete whole-payload accounting and
+rank headroom are checked before any deletion, and a refusal leaves the victim
+and every metadata record in place.
+A command waits only when a specific held compatible slot of its own checkout
+exists under the existing identity and freshness rules; an unrelated build's
+completion is not assumed to free a count or byte ceiling. The freshness loop
+is bounded at nine grants: the eight project slots a refusal can try plus one
+cold fallback, with sharing off after the first refusal and the existing
+discard/unshare before reacquisition.
+
+**Proof and evidence.** `effigy rust:slot-headroom` under the qualified shared
+supervisor covers the fences, no-migration reads, rank exhaustion, a 128-slot
+pool's 129th and 130th replacements, the eight-slot project cap with a specific
+held-slot wait and one LRU idle replacement, compatible reuse, no eviction
+below both ceilings, byte-pressure LRU with a held slot excluded, and a
+foreign payload-entry refusal. It also drives a project replacement whose
+payload walk is incomplete (a depth-bound gap) and checks that the victim
+survives and membership is unchanged; every fixture child stays in the
+qualified supervisor's session and the script starts no session or group of
+its own, so the runner owns closure on any fault. The worst-valid
+ledger/control serialization, escaped round-trip and oversized-field refusals
+are unit tests in `effigy test rust`. Not covered natively: the nine-grant
+freshness bound is a bounded-loop inspection, and no large live inventory or
+physical multi-million-entry performance is claimed.
 
 ### Parked: cached closed-slot accounting (lead `cbb2824d`)
 
@@ -524,7 +604,7 @@ symlinks. These limits are separate from its observed reuse result.
 - Holder ≤ 128 printable ASCII bytes without `/`
 - Paths ≤ 1024 bytes, absolute, canonical, no symlinks
 - Status output default 65536 bytes (minimum 64)
-- Finite slots 32; new slots refuse at exhaustion rather than dropping active state
+- Finite slots 128 and a 2 MiB ledger; new slots refuse at exhaustion rather than dropping active state
 - Init refuses a declared cap that differs from the image size; pre-rule pools
   refuse as mismatched backing without migration
 

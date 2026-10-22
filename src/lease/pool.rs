@@ -7,9 +7,9 @@ use super::{
     remove_tree_owned, unexpected_entry, AccountingCoverage, AccountingGap, AccountingGapKind,
     AccountingScan, LeaseEnvironment, LeaseError, LeaseGrant, Leased, LedgerSlot, LedgerView,
     PoolStatus, Profile, ReleaseReceipt, ReuseMeasurement, SlotOccupancy, SlotStatus,
-    ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES, CONFIG_NAME,
-    LEASE_VERSION, LEDGER_NAME, LOCK_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_PATH_BYTES,
-    MAX_SLOTS, SLOTS_NAME,
+    ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES,
+    CAPACITY_POLICY_VERSION, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME, LOCK_NAME, MAX_HOLDER_BYTES,
+    MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, SLOTS_NAME,
 };
 use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
 use crate::inventory::{inventory_directory, GapKind, InventoryError, InventoryLimits};
@@ -39,6 +39,12 @@ pub struct LeaseRequest {
     pub budget_bytes: Option<u64>,
     /// Where a new slot goes. `None` keeps the legacy `slots/<id>` path.
     pub layout: Option<SlotLayout>,
+    /// A front-door count replacement, never byte pressure: retire this idle
+    /// whole slot as part of this admission, after complete whole-payload
+    /// accounting and before the new slot is allocated. The front door
+    /// chooses the victim by recorded rank; the library rechecks its
+    /// identity, ownership, occupancy and accounting under the pool lock.
+    pub replace_slot: Option<u64>,
 }
 
 /// Presentation path of a new slot: `slots/<folder>/<profile>-<id>`. It is
@@ -149,6 +155,14 @@ struct Ledger {
     cap_bytes: u64,
     next_slot: u64,
     next_lease: u64,
+    /// Permanent revised-capacity fence (oxide#118). Absent means the
+    /// legacy representation; once written it is never removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capacity_policy: Option<u32>,
+    /// The pool's monotonic idle-rank sequence. Legacy ledgers keep no
+    /// sequence and every record's rank is 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_rank: Option<u64>,
     slots: Vec<SlotRecord>,
 }
 
@@ -168,6 +182,14 @@ struct SlotRecord {
     /// legacy `<id>` path, so a legacy ledger reads and writes unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dir: Option<String>,
+    /// Idle rank from this pool's monotonic sequence (oxide#118). Legacy
+    /// records keep 0 and sort oldest.
+    #[serde(default, skip_serializing_if = "is_zero_rank")]
+    rank: u64,
+}
+
+fn is_zero_rank(rank: &u64) -> bool {
+    *rank == 0
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -294,6 +316,8 @@ pub mod managed {
             cap_bytes: budget_bytes,
             next_slot: 1,
             next_lease: 1,
+            capacity_policy: None,
+            next_rank: None,
             slots: Vec::new(),
         };
         write_config(&pool, &config)?;
@@ -350,6 +374,8 @@ pub mod managed {
             cap_bytes: budget_bytes,
             next_slot: 1,
             next_lease: 1,
+            capacity_policy: None,
+            next_rank: None,
             slots: Vec::new(),
         };
         write_config(&pool, &config)?;
@@ -551,6 +577,59 @@ impl Pool {
         write_ledger(&self.root, &self.ledger)
     }
 
+    /// A revised mutation: install the permanent capacity-policy fence if
+    /// this ledger predates it, validate every stored field against the
+    /// raised caps, then replace the ledger atomically. Legacy representation
+    /// is never migrated by a read-only observer or by reconciliation alone.
+    fn persist_revised(&mut self) -> Result<(), LeaseError> {
+        self.ensure_capacity_policy()?;
+        validate_ledger_write(&self.ledger)?;
+        self.persist()
+    }
+
+    /// Add the permanent capacity-policy fence to an in-memory ledger that
+    /// predates it. The next revised write persists it atomically with the
+    /// mutation that needed it.
+    fn ensure_capacity_policy(&mut self) -> Result<(), LeaseError> {
+        if self.ledger.capacity_policy.is_none() {
+            let next = self
+                .ledger
+                .slots
+                .iter()
+                .map(|slot| slot.rank)
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or(LeaseError::LedgerExhausted)?;
+            self.ledger.capacity_policy = Some(CAPACITY_POLICY_VERSION);
+            self.ledger.next_rank = Some(next.max(1));
+        }
+        if self.ledger.capacity_policy != Some(CAPACITY_POLICY_VERSION) {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        Ok(())
+    }
+
+    /// The next idle rank. Checked before any deletion or transition; a
+    /// sequence with no headroom refuses instead of wrapping or rebasing.
+    fn next_rank(&self) -> Result<u64, LeaseError> {
+        match self.ledger.next_rank {
+            Some(next) if next != 0 && next != u64::MAX => Ok(next),
+            Some(_) => Err(LeaseError::LedgerExhausted),
+            None => Ok(1),
+        }
+    }
+
+    /// Stamp a new actual grant or a first held-to-idle release/recovery.
+    /// Replays never call this.
+    fn stamp_rank(&mut self, id: u64) -> Result<(), LeaseError> {
+        let rank = self.next_rank()?;
+        let slot = self.slot_mut(id).ok_or(LeaseError::UnknownAccounting)?;
+        slot.rank = rank;
+        self.ledger.next_rank = Some(rank + 1);
+        Ok(())
+    }
+
     fn lease(&mut self, request: &LeaseRequest) -> Result<Leased, LeaseError> {
         if self.reconciliation_blocked {
             return Err(LeaseError::UnknownAccounting);
@@ -607,21 +686,24 @@ impl Pool {
         {
             let slot_path =
                 self.validate_idle_slot_scope(idle, incarnation, &project, request.profile)?;
-            // Reuse and recycling both need this slot's own walk complete.
-            let unique = inventory_sizes(&slot_path).require_complete()?;
-            if should_recycle_slot(unique, self.budget) {
-                self.retire_idle_slot(idle, incarnation, &project, request.profile)?;
-                return self.allocate_unmeasured(project, workspace, request);
-            }
+            // Compatible reuse needs this slot's own walk complete.
+            let _unique = inventory_sizes(&slot_path).require_complete()?;
+            // The idle-rank sequence must have headroom before any grant
+            // transition; exhaustion refuses without changing the pool.
+            self.ensure_capacity_policy()?;
+            self.next_rank()?;
+            let grant = self.take_idle(idle, incarnation, project, workspace, request)?;
             return Ok(Leased {
-                grant: self.take_idle(idle, incarnation, project, workspace, request)?,
+                grant,
                 measured: Some(ReuseMeasurement {
                     slot_id: idle.to_string(),
                     incarnation: incarnation.to_string(),
-                    unique_allocated_bytes: unique,
+                    unique_allocated_bytes: _unique,
                 }),
             });
         }
+        self.ensure_capacity_policy()?;
+        self.next_rank()?;
         self.allocate_unmeasured(project, workspace, request)
     }
 
@@ -680,7 +762,8 @@ impl Pool {
             slot.lease_id = Some(lease_id.clone());
             slot.last_lease_id = lease_id;
         }
-        self.persist()?;
+        self.stamp_rank(slot_id)?;
+        self.persist_revised()?;
         let slot = self.slot(slot_id).ok_or(LeaseError::UnknownAccounting)?;
         self.grant_from(slot, true)
     }
@@ -691,14 +774,21 @@ impl Pool {
         workspace: PathBuf,
         request: &LeaseRequest,
     ) -> Result<LeaseGrant, LeaseError> {
+        if let Some(victim) = request.replace_slot {
+            self.replace_idle_slot_for_admission(victim)?;
+        }
+        // Slot headroom only: the pool ceiling is replaced, never exceeded.
+        // Every allocated entry counts, including held, idle, retired-backed
+        // and unresolved Evicting records.
         if self.ledger.slots.len() >= MAX_SLOTS {
-            self.evict_idle_until(self.ledger.slots.len().saturating_sub(1))?;
+            self.evict_idle_until(MAX_SLOTS - 1)?;
             if self.ledger.slots.len() >= MAX_SLOTS {
                 return Err(LeaseError::LedgerExhausted);
             }
         }
         // New-slot admission needs the whole-payload walk complete, before
-        // and after any eviction.
+        // and after any eviction. Below both count ceilings and without byte
+        // pressure nothing is evicted.
         if self.payload_accounting().require_complete()? >= self.budget {
             self.evict_idle_until_under_cap()?;
             if self.payload_accounting().require_complete()? >= self.budget {
@@ -768,9 +858,11 @@ impl Pool {
             lease_id: Some(lease_id.clone()),
             last_lease_id: lease_id,
             dir,
+            rank: 0,
         });
         self.ledger.next_slot = slot_id.checked_add(1).ok_or(LeaseError::LedgerExhausted)?;
-        self.persist()?;
+        self.stamp_rank(slot_id)?;
+        self.persist_revised()?;
         let slot = self.slot(slot_id).ok_or(LeaseError::UnknownAccounting)?;
         self.grant_from(slot, false)
     }
@@ -801,9 +893,16 @@ impl Pool {
         if slot.state == SlotPersistState::Evicting {
             return Err(LeaseError::UnknownAccounting);
         }
+        // A real release is a ranked transition: the fence and the rank
+        // sequence must be available before anything changes. A replay above
+        // returns without writing, so read-only use never migrates.
+        self.ensure_capacity_policy()?;
+        self.next_rank()?;
         self.ledger.slots[index].state = SlotPersistState::Idle;
         self.ledger.slots[index].lease_id = None;
-        self.persist()?;
+        let released = self.ledger.slots[index].id;
+        self.stamp_rank(released)?;
+        self.persist_revised()?;
         Ok(ReleaseReceipt {
             version: LEASE_VERSION,
             lease_id: lease_id.to_owned(),
@@ -844,6 +943,7 @@ impl Pool {
                 holder: member.holder,
                 lease_id: member.lease_id,
                 dir: member.dir,
+                rank: member.rank,
                 logical_bytes: sizes.logical,
                 unique_allocated_bytes: sizes.unique,
                 accounting: sizes.scan,
@@ -967,32 +1067,82 @@ impl Pool {
         }
     }
 
+    /// A count replacement requested by the front door. Complete accounting
+    /// is required before the deletion, and the rank sequence was already
+    /// checked before this admission changed anything. A victim that is no
+    /// longer idle refuses as busy without touching it.
+    fn replace_idle_slot_for_admission(&mut self, id: u64) -> Result<(), LeaseError> {
+        if id == 0 {
+            return Err(LeaseError::InvalidInput(
+                "replacement slot ID must be a positive integer",
+            ));
+        }
+        // The whole-payload walk must be complete before any deletion.
+        self.payload_accounting().require_complete()?;
+        let Some((incarnation, project, profile)) = self
+            .slot(id)
+            .filter(|slot| slot.state == SlotPersistState::Idle && slot.lease_id.is_none())
+            .map(|slot| (slot.incarnation, slot.project.clone(), slot.profile))
+        else {
+            return Err(LeaseError::Busy);
+        };
+        self.retire_idle_slot(id, incarnation, &project, profile)
+    }
+
     fn evict_idle_until(&mut self, max_slots: usize) -> Result<(), LeaseError> {
-        while self.ledger.slots.len() > max_slots {
+        // Bound admission to the allocated entries it saw when it began, so
+        // concurrent-looking state cannot extend the loop.
+        let mut remaining = self.ledger.slots.len();
+        while self.ledger.slots.len() > max_slots && remaining > 0 {
+            // A count replacement still needs complete accounting first; an
+            // incomplete walk refuses instead of deleting blindly.
+            self.payload_accounting().require_complete()?;
+            let before = self.ledger.slots.len();
             if !self.evict_one_idle()? {
                 break;
             }
+            if self.ledger.slots.len() >= before {
+                return Err(LeaseError::UnknownAccounting);
+            }
+            remaining -= 1;
         }
         Ok(())
     }
 
     fn evict_idle_until_under_cap(&mut self) -> Result<(), LeaseError> {
+        let mut remaining = self.ledger.slots.len();
         loop {
+            // Byte pressure remeasures the whole payload union after each
+            // deletion and stops when it is under budget or no safe idle
+            // whole slot remains.
             if self.payload_accounting().require_complete()? < self.budget {
                 return Ok(());
             }
+            if remaining == 0 {
+                return Ok(());
+            }
+            let before = self.ledger.slots.len();
             if !self.evict_one_idle()? {
                 return Ok(());
             }
+            if self.ledger.slots.len() >= before {
+                return Err(LeaseError::UnknownAccounting);
+            }
+            remaining -= 1;
         }
     }
 
+    /// The least-recently-used eligible idle whole slot: ascending
+    /// `(rank, numeric slot id)`. Held, retired-backed and unresolved
+    /// `Evicting` records are never candidates. A safety failure on the
+    /// selected victim stops admission; it never skips to another slot.
     fn evict_one_idle(&mut self) -> Result<bool, LeaseError> {
         let Some((id, incarnation, project, profile)) = self
             .ledger
             .slots
             .iter()
-            .find(|slot| slot.state == SlotPersistState::Idle && slot.lease_id.is_none())
+            .filter(|slot| slot.state == SlotPersistState::Idle && slot.lease_id.is_none())
+            .min_by_key(|slot| (slot.rank, slot.id))
             .map(|slot| {
                 (
                     slot.id,
@@ -1015,15 +1165,21 @@ impl Pool {
         project: &Path,
         profile: Profile,
     ) -> Result<(), LeaseError> {
+        // Every durable idle deletion, including the explicit
+        // `evict_idle_slot` path, checks the rank sequence before its first
+        // transition: an exhausted or missing-headroom sequence refuses
+        // without deleting anything.
+        self.ensure_capacity_policy()?;
+        self.next_rank()?;
         let path = self.validate_idle_slot_scope(id, incarnation, project, profile)?;
         {
             let slot = self.slot_mut(id).ok_or(LeaseError::UnknownAccounting)?;
             slot.state = SlotPersistState::Evicting;
         }
-        self.persist()?;
+        self.persist_revised()?;
         self.remove_owned_slot(&path)?;
         self.ledger.slots.retain(|slot| slot.id != id);
-        self.persist()?;
+        self.persist_revised()?;
         Ok(())
     }
 
@@ -1333,6 +1489,7 @@ fn ledger_slot(slot: &SlotRecord) -> LedgerSlot {
         holder: (slot.state == SlotPersistState::Held).then(|| slot.holder.clone()),
         lease_id: slot.lease_id.clone(),
         dir: slot.dir.clone(),
+        rank: slot.rank,
     }
 }
 
@@ -1517,14 +1674,6 @@ fn inventory_sizes_deeper(path: &Path, extra_depth: usize) -> Sizes {
     }
 }
 
-pub(super) fn recycle_threshold(cap_bytes: u64) -> u64 {
-    cap_bytes / 2 + cap_bytes % 2
-}
-
-pub(super) fn should_recycle_slot(allocated_bytes: u64, cap_bytes: u64) -> bool {
-    allocated_bytes >= recycle_threshold(cap_bytes)
-}
-
 fn require_holder(holder: &str) -> Result<(), LeaseError> {
     super::require_bounded_text(holder, MAX_HOLDER_BYTES, "holder")
 }
@@ -1655,6 +1804,73 @@ fn write_ledger(pool: &Path, ledger: &Ledger) -> Result<(), LeaseError> {
     persist_private_file(&pool.join(LEDGER_NAME), &bytes)
 }
 
+/// Read-side shape checks: identities, the recorded slot path and the
+/// capacity-policy/rank fields. Legacy ledgers have no policy fence and rank
+/// 0 everywhere; a rank without its fence is not a representation this
+/// version wrote.
+fn validate_ledger_read(ledger: &Ledger) -> Result<(), LeaseError> {
+    match (ledger.capacity_policy, ledger.next_rank) {
+        (None, None) => {
+            if ledger.slots.iter().any(|slot| slot.rank != 0) {
+                return Err(LeaseError::UnknownAccounting);
+            }
+        }
+        (Some(policy), Some(next)) => {
+            if policy != CAPACITY_POLICY_VERSION || next == 0 {
+                return Err(LeaseError::UnknownAccounting);
+            }
+            if ledger.slots.iter().any(|slot| slot.rank >= next) {
+                return Err(LeaseError::UnknownAccounting);
+            }
+        }
+        (None, Some(_)) | (Some(_), None) => return Err(LeaseError::UnknownAccounting),
+    }
+    for slot in &ledger.slots {
+        if slot.id == 0 || slot.incarnation == 0 {
+            return Err(LeaseError::UnknownAccounting);
+        }
+        if let Some(dir) = &slot.dir {
+            split_slot_dir(dir, slot.id).ok_or(LeaseError::UnknownAccounting)?;
+        }
+    }
+    Ok(())
+}
+
+/// Write-side checks: everything `validate_ledger_read` checks, plus every
+/// stored field against the raised bounds. An oversized legacy field
+/// refuses the revised write with the original file untouched; nothing is
+/// truncated or dropped.
+fn validate_ledger_write(ledger: &Ledger) -> Result<(), LeaseError> {
+    validate_ledger_read(ledger)?;
+    if ledger.slots.len() > MAX_SLOTS {
+        return Err(LeaseError::LedgerExhausted);
+    }
+    if ledger.next_slot == 0 || ledger.next_lease == 0 {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    if ledger.next_rank.is_some_and(|next| next == 0) {
+        return Err(LeaseError::UnknownAccounting);
+    }
+    for slot in &ledger.slots {
+        if slot.project.as_os_str().as_bytes().len() > MAX_PATH_BYTES
+            || !slot.project.is_absolute()
+            || slot.workspace.as_os_str().as_bytes().len() > MAX_PATH_BYTES
+            || !slot.workspace.is_absolute()
+            || slot.holder.is_empty()
+            || slot.holder.len() > MAX_HOLDER_BYTES
+            || slot.last_lease_id.is_empty()
+            || slot.last_lease_id.len() > MAX_LEASE_ID_BYTES
+            || slot
+                .lease_id
+                .as_ref()
+                .is_some_and(|lease| lease.is_empty() || lease.len() > MAX_LEASE_ID_BYTES)
+        {
+            return Err(LeaseError::UnknownAccounting);
+        }
+    }
+    Ok(())
+}
+
 fn read_config(pool: &Path) -> Result<PoolConfig, LeaseError> {
     let bytes = read_private_file(&pool.join(CONFIG_NAME))?;
     serde_json::from_slice(&bytes).map_err(|_| LeaseError::BackingMismatch)
@@ -1662,7 +1878,23 @@ fn read_config(pool: &Path) -> Result<PoolConfig, LeaseError> {
 
 fn read_ledger(pool: &Path) -> Result<Ledger, LeaseError> {
     let bytes = read_private_file(&pool.join(LEDGER_NAME))?;
-    serde_json::from_slice(&bytes).map_err(|_| LeaseError::UnknownAccounting)
+    let ledger: Ledger =
+        serde_json::from_slice(&bytes).map_err(|_| LeaseError::UnknownAccounting)?;
+    validate_ledger_read(&ledger)?;
+    Ok(ledger)
+}
+
+#[cfg(test)]
+pub(super) fn write_ledger_bytes_injected(
+    pool: &Path,
+    bytes: &[u8],
+) -> Result<Vec<u8>, LeaseError> {
+    let ledger: Ledger =
+        serde_json::from_slice(bytes).map_err(|_| LeaseError::UnknownAccounting)?;
+    validate_ledger_write(&ledger)?;
+    write_ledger(pool, &ledger)?;
+    let stored = read_ledger(pool)?;
+    serde_json::to_vec(&stored).map_err(|error| LeaseError::Io(error.to_string()))
 }
 
 /// Read-only, before the pool lock is created or taken: a pool holding the
