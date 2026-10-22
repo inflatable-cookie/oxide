@@ -189,6 +189,64 @@ pub fn group_empty(group: i32) -> bool {
     result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
+/// Start `command` as the leader of a new process group that owns the
+/// terminal's foreground while it runs, as a shell starts a job: the program
+/// reads the terminal and gets Ctrl-C itself. Without a terminal in the
+/// foreground this is [`start_group`]. Drop the returned guard after the group
+/// closes to take the foreground back.
+pub fn start_foreground_group(
+    command: &mut Command,
+) -> std::io::Result<(Group, Option<Foreground>)> {
+    // SAFETY: isatty, tcgetpgrp and getpgrp only inspect descriptor 0 and
+    // this process.
+    let foreground = unsafe { libc::isatty(0) == 1 && libc::tcgetpgrp(0) == libc::getpgrp() };
+    if !foreground {
+        return Ok((start_group(command)?, None));
+    }
+    // SAFETY: the closure runs in the child between fork and exec and only
+    // calls async-signal-safe functions: the child takes the foreground for
+    // its own new group (ignoring SIGTTOU for that call) before exec.
+    unsafe {
+        command.pre_exec(|| {
+            let previous = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            libc::tcsetpgrp(0, libc::getpid());
+            libc::signal(libc::SIGTTOU, previous);
+            Ok(())
+        });
+    }
+    // SAFETY: getpgrp has no preconditions.
+    let previous = unsafe { libc::getpgrp() };
+    let group = start_group(command)?;
+    let guard = Foreground { previous };
+    // The parent hands the foreground over too, so whichever runs first wins
+    // the race and the program never reads the terminal from the background.
+    guard.give(group.id);
+    Ok((group, Some(guard)))
+}
+
+/// The terminal's foreground, handed to a program group; restored on drop.
+pub struct Foreground {
+    previous: i32,
+}
+
+impl Foreground {
+    fn give(&self, group: i32) {
+        // SAFETY: SIGTTOU is ignored only around tcsetpgrp on descriptor 0,
+        // then the previous disposition is restored.
+        unsafe {
+            let previous = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            libc::tcsetpgrp(0, group);
+            libc::signal(libc::SIGTTOU, previous);
+        }
+    }
+}
+
+impl Drop for Foreground {
+    fn drop(&mut self) {
+        self.give(self.previous);
+    }
+}
+
 /// Cargo's exit code, or 128 + signal when the leader died on a signal.
 pub fn exit_code(status: ExitStatus) -> u8 {
     match status.code() {

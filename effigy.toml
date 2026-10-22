@@ -58,6 +58,21 @@ default = false
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-accounting-vanished.py"
 
+# Final outputs on the permanent drive (oxide#117), under the qualified
+# shared supervisor (oxide#109; 300 s absolute, 512 MiB monitored scratch,
+# ordinary detach). Stages this HEAD's debug `oxide` offline with 1.97.1 and
+# models the drive as one owned 128 MiB scratch APFS image at a unique
+# /Volumes name: effect-free plan, refusals without mutation, explicit
+# conversion to an owned link, builds/run/test/profiles through it, the
+# checkout-local fallback and redock with both roots kept, the git-tracked
+# refusal, a wrong volume UUID with no shadow write, an active writer
+# blocking the swap, crash replay after prepared/sibling/renamed, clean
+# preserving the link, marker and inactive roots, and detach. Not a
+# benchmark, real-drive qualification or an alias for full QA.
+[tasks."rust:permanent-outputs"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py"
+
 # Removable drive modes (oxide#116): under the qualified shared supervisor,
 # stages oxide offline and exercises versioned registration metadata,
 # absent-drive fallback reporting and an active build's stable selection.

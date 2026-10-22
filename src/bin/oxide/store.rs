@@ -91,6 +91,8 @@ const MAX_FLUSH_OBJECT_BYTES: usize = 8 * 1024;
 const MAX_LOST_OBJECT_BYTES: usize = 8 * 1024;
 const MAX_HOLDER_OBJECT_BYTES: usize = 5 * 1024;
 const MAX_STATE_HEADER_BYTES: usize = 4 * 1024;
+/// The owned-outputs fence value; see [`State::owned_outputs`].
+const OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/1";
 const MAX_ORIGIN_BYTES: u64 = 8 * 1024 * 1024;
 const ORIGIN_VERSION: u32 = 1;
 const WAIT_POLL: Duration = Duration::from_millis(200);
@@ -276,6 +278,13 @@ struct State {
     recoveries: Vec<Recovery>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     flushes: Vec<Flush>,
+    /// Forward-only downgrade fence, set before any checkout's first owned
+    /// output link is published and never cleared. An Oxide without owned
+    /// outputs parses state strictly, so it refuses this pool rather than
+    /// building through an owned link without its binding, custody and
+    /// clean checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owned_outputs: Option<String>,
 }
 
 impl Default for State {
@@ -289,6 +298,7 @@ impl Default for State {
             records: Vec::new(),
             recoveries: Vec::new(),
             flushes: Vec::new(),
+            owned_outputs: None,
         }
     }
 }
@@ -495,6 +505,14 @@ pub struct Lease {
     lease_id: String,
     record: u64,
     _lock: File,
+}
+
+impl Lease {
+    /// This command's own slot record, for the checkout barrier that excludes
+    /// every other command in the same checkout.
+    pub fn record_id(&self) -> u64 {
+        self.record
+    }
 }
 
 pub enum Acquired {
@@ -825,6 +843,61 @@ pub fn recorded_lost(control: &Path) -> Result<Vec<(String, Option<PathBuf>, Str
         .collect())
 }
 
+/// Cooperative holders of one checkout, read-only: active records and clean
+/// barriers, newest state only. Used by `oxide outputs plan`; an empty list
+/// means no cooperative Oxide command holds the checkout right now, never
+/// that no external writer exists.
+pub fn active_holders(control: &Path, checkout: &Path) -> Result<Vec<String>, String> {
+    let path = control.join("state.json");
+    let Some(file) = private_file(&path, false)? else {
+        return Ok(Vec::new());
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_STATE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read Oxide state: {error}"))?;
+    if bytes.len() as u64 > MAX_STATE_BYTES {
+        return Err("Oxide state exceeds its byte limit".to_owned());
+    }
+    let state: State = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Oxide state is invalid: {error}"))?;
+    let mut holders = Vec::new();
+    for record in &state.records {
+        if record.checkout.as_deref() != Some(checkout) || !record.active() {
+            continue;
+        }
+        let name = record
+            .holder
+            .as_ref()
+            .and_then(|holder| holder.command.as_deref())
+            .unwrap_or("command");
+        let pid = record
+            .holder
+            .as_ref()
+            .map_or_else(|| "unknown".to_owned(), |holder| holder.pid.to_string());
+        holders.push(format!("oxide pid {pid}: {name}"));
+    }
+    for clean in &state.cleans {
+        if clean.checkout == checkout {
+            holders.push("oxide clean barrier".to_owned());
+        }
+    }
+    Ok(holders)
+}
+
+/// What a checkout's cooperative custody allows; see
+/// [`Store::checkout_custody`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CheckoutCustody {
+    /// No command may be writing and no unknown writer custody remains.
+    Clear,
+    /// A command in this checkout may be running Cargo now.
+    Writers,
+    /// A lost slot's writers were never positively closed. Nothing may be
+    /// relinked or cleaned through this checkout until that is resolved.
+    Unknown(String),
+}
+
 pub struct SlotView {
     pub slot_id: String,
     /// Slot directory below `slots`; `None` is the legacy `<id>`.
@@ -1039,6 +1112,16 @@ impl Store {
     /// registration and pool of an internal pool.
     pub fn control(&self) -> &Path {
         &self.control
+    }
+
+    /// The internal pool's control directory. Owned-output receipts live
+    /// there for every checkout, including a command whose slots come from
+    /// the removable pool, so one checkout never has two receipts.
+    pub fn owner_control(&self) -> &Path {
+        match &self.sibling {
+            Some(sibling) if sibling.barrier => &sibling.control,
+            _ => &self.control,
+        }
     }
 
     /// Open an existing pool. Never creates one; a retired image pool
@@ -1428,6 +1511,88 @@ impl Store {
     /// state is replaced atomically and read without its own lock; for the
     /// host-wide limit, a command starting in the other pool at the same
     /// moment may briefly exceed it by one.
+    /// Publish the owned-outputs downgrade fence in this pool's state and in
+    /// its paired pool's (internal first), creating either state when absent
+    /// so a pre-feature Oxide cannot start from a fresh unfenced one.
+    pub fn fence_owned_outputs(&self) -> Result<(), String> {
+        let mut controls = vec![self.control.clone()];
+        controls.extend(self.sibling.as_ref().map(|sibling| sibling.control.clone()));
+        for control in controls {
+            let store = Store {
+                pool: self.pool.clone(),
+                backend: self.backend,
+                payload: self.payload.clone(),
+                control,
+                budget: self.budget,
+                recorded_budget: self.recorded_budget,
+                max_active: self.max_active,
+                sibling: None,
+            };
+            store.ensure_control()?;
+            let _admission = store.admission()?;
+            let mut state = store.load()?;
+            if state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
+                if state.owned_outputs.is_some() {
+                    return Err(format!(
+                        "Oxide state in {} carries an unknown owned-outputs fence; refusing",
+                        store.control.display()
+                    ));
+                }
+                state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
+                store.save(&state)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A store over `root` for other modules' unit tests.
+    #[cfg(test)]
+    pub fn for_tests(root: &Path) -> Store {
+        fs::create_dir_all(root).unwrap();
+        let store = Store {
+            pool: root.to_path_buf(),
+            backend: Backend::DirectoryBudget,
+            payload: root.join("payload"),
+            control: root.join(MANAGED_NAME),
+            budget: None,
+            recorded_budget: 1,
+            max_active: 2,
+            sibling: None,
+        };
+        store.ensure_control().unwrap();
+        store
+    }
+
+    /// Record a lost slot whose writers were never confirmed closed, for
+    /// other modules' unit tests of unknown custody.
+    #[cfg(test)]
+    pub fn quarantine_for_tests(&self, checkout: &Path) {
+        let mut state = self.load().unwrap();
+        let id = state.take_id().unwrap();
+        let lost = Lost {
+            slot_id: "1".to_owned(),
+            at_ms: 1,
+            unclosed: Some("a test writer was never confirmed closed".to_owned()),
+        };
+        state.records.push(Record {
+            id,
+            identity: "identity".to_owned(),
+            compatibility: "compatibility".to_owned(),
+            profile: "quick".to_owned(),
+            checkout: Some(checkout.to_path_buf()),
+            phase: Phase::Retired,
+            process_group: None,
+            last_used: 1,
+            holder: None,
+            lease_id: None,
+            pending_recovery: None,
+            retired: Some(lost.describe()),
+            lost: Some(lost),
+            last_used_ms: Some(1),
+        });
+        self.save(&state).unwrap();
+    }
+
     pub fn with_sibling(mut self, control: &Path, barrier: bool) -> Self {
         self.sibling = Some(Sibling {
             control: control.to_path_buf(),
@@ -1465,6 +1630,96 @@ impl Store {
                 .iter()
                 .any(|record| record.checkout.as_deref() == Some(checkout) && record.active())
         })
+    }
+
+    /// A per-checkout binding mutex: not state-dependent, so two commands can
+    /// never wait on each other through it. It serialises only the short
+    /// window in which a command validates or replaces its checkout's owned
+    /// output link and starts Cargo. The file lives in the internal pool's
+    /// control directory, so both pools share it.
+    pub fn lock_binding(&self, checkout: &Path) -> Result<File, String> {
+        let directory = self.owner_control().join("bindings");
+        ensure_private_dir(&directory)?;
+        let id = identity::digest(&checkout.to_string_lossy());
+        let file = private_file(&directory.join(format!("{id}.lock")), true)?
+            .ok_or("the checkout binding lock is missing")?;
+        flock(&file, libc::LOCK_EX)?;
+        Ok(file)
+    }
+
+    /// One checkout's cooperative custody for an output transition or a clean.
+    /// A command that may be writing counts while it is spawning or running; a
+    /// record that has not started Cargo cannot write through the link and
+    /// binds again after a transition. A retired slot whose lost writers were
+    /// never positively closed is unknown custody, not activity: it blocks
+    /// every relink and clean until it is resolved.
+    pub fn checkout_custody(&self, checkout: &Path, own: u64) -> Result<CheckoutCustody, String> {
+        let _sibling = self.sibling_admission()?;
+        let _admission = self.admission()?;
+        let own_state = if self.control.exists() {
+            Some(self.load()?)
+        } else {
+            None
+        };
+        // A sibling with no state file has no records; an unreadable one is
+        // unknown custody, never "clear".
+        let other_state = match &self.sibling {
+            None => None,
+            Some(sibling) => match self.sibling_state() {
+                Some(state) => Some(state),
+                None if !sibling.control.join("state.json").exists() => None,
+                None => {
+                    return Ok(CheckoutCustody::Unknown(
+                        "the other pool's record state is unreadable".to_owned(),
+                    ))
+                }
+            },
+        };
+        let mut writers = false;
+        // Record IDs are per pool, so the caller's own ID is exempt only in
+        // this store's state; an equal ID in the other pool is another command.
+        for (pool, state, exempt) in [
+            ("this", own_state, Some(own)),
+            ("the other", other_state, None),
+        ] {
+            let Some(state) = state else { continue };
+            for record in &state.records {
+                if record.checkout.as_deref() != Some(checkout) || Some(record.id) == exempt {
+                    continue;
+                }
+                if record.phase == Phase::Retired {
+                    if let Some(lost) = record.lost.as_ref() {
+                        if let Some(why) = lost.unclosed.as_deref() {
+                            return Ok(CheckoutCustody::Unknown(format!(
+                                "slot {} in the {pool} pool is lost with writers that were never confirmed closed ({why})",
+                                lost.slot_id
+                            )));
+                        }
+                    }
+                    continue;
+                }
+                if matches!(record.phase, Phase::Spawning | Phase::Running) {
+                    writers = true;
+                }
+            }
+        }
+        Ok(if writers {
+            CheckoutCustody::Writers
+        } else {
+            CheckoutCustody::Clear
+        })
+    }
+
+    /// The sibling pool's admission lock, when this store is the removable
+    /// one. Always internal first, as slot attempts and cleans do.
+    fn sibling_admission(&self) -> Result<Option<File>, String> {
+        let Some(sibling) = self.sibling.as_ref().filter(|sibling| sibling.barrier) else {
+            return Ok(None);
+        };
+        let file = private_file(&sibling.control.join("admission.lock"), true)?
+            .ok_or("the internal admission lock is missing")?;
+        flock(&file, libc::LOCK_EX)?;
+        Ok(Some(file))
     }
 
     /// The internal pool's admission lock, for the removable store's slot
@@ -1538,6 +1793,11 @@ impl Store {
                 return Ok(Cleaning::Interrupted(signal));
             }
             let attempt = (|| {
+                // A removable store's barrier covers both pools, so it takes
+                // the internal admission lock first (the same order slot
+                // attempts and cleans use) and checks the sibling's live state
+                // under it.
+                let _sibling = self.sibling_admission()?;
                 let _admission = self.admission()?;
                 let mut state = self.load()?;
                 self.drop_dead_tickets(&mut state)?;
@@ -2407,7 +2667,7 @@ impl Store {
     }
 
     fn ensure_control(&self) -> Result<(), String> {
-        for directory in ["", "affinity", "locks", "waiters"] {
+        for directory in ["", "affinity", "locks", "waiters", "bindings"] {
             ensure_private_dir(&self.control.join(directory))?;
         }
         Ok(())
@@ -2453,6 +2713,13 @@ impl Store {
         };
         if legacy && bytes.len() as u64 > LEGACY_MAX_STATE_BYTES {
             return Err("Oxide state exceeds its byte limit".to_owned());
+        }
+        if state
+            .owned_outputs
+            .as_deref()
+            .is_some_and(|fence| fence != OWNED_OUTPUTS_FENCE)
+        {
+            return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
         }
         validate_state(&state, legacy)?;
         Ok(state)
@@ -2785,9 +3052,8 @@ pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
     }
     if fd < 0 {
         return Err(format!(
-            "cannot open admission lock in {}: {}",
-            control.display(),
-            std::io::Error::last_os_error()
+            "cannot open admission lock in {}: the create did not succeed",
+            control.display()
         ));
     }
     // SAFETY: `fd` is a newly opened descriptor owned by this function.
@@ -2806,7 +3072,7 @@ pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
 }
 
 /// Open an owner-only regular control file without following symlinks.
-fn private_file(path: &Path, create: bool) -> Result<Option<File>, String> {
+pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, String> {
     let mut options = OpenOptions::new();
     options
         .read(true)
@@ -3091,6 +3357,204 @@ mod tests {
             internal.with_sibling(&removable_control, false),
             removable.with_sibling(&internal_control, true),
         )
+    }
+
+    /// Output receipts are keyed in the internal pool's control directory,
+    /// whichever pool a command's slots come from.
+    #[test]
+    fn owned_output_receipts_live_in_the_internal_control_directory() {
+        let (root, internal, removable) = paired_controls("owner-control");
+        assert_eq!(internal.owner_control(), internal.control());
+        assert_eq!(removable.owner_control(), internal.control());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn custody_record(id: u64, checkout: &Path, phase: Phase, lost: Option<Lost>) -> Record {
+        Record {
+            id,
+            identity: "identity".to_owned(),
+            compatibility: "compatibility".to_owned(),
+            profile: "quick".to_owned(),
+            checkout: Some(checkout.to_path_buf()),
+            phase,
+            process_group: None,
+            last_used: 1,
+            holder: None,
+            lease_id: None,
+            pending_recovery: None,
+            retired: lost.as_ref().map(Lost::describe),
+            lost,
+            last_used_ms: Some(1),
+        }
+    }
+
+    fn state_with(records: Vec<Record>) -> State {
+        State {
+            records,
+            ..State::default()
+        }
+    }
+
+    /// Only a possibly-writing command or an unresolved lost writer blocks a
+    /// relink or clean; a retired slot that closed positively does not, and a
+    /// caller never blocks on its own record.
+    #[test]
+    fn checkout_custody_separates_writers_unknown_and_retired_storage() {
+        let (root, internal, removable) = paired_controls("custody");
+        let checkout = Path::new("/checkout/custody");
+        internal
+            .save(&state_with(vec![custody_record(
+                1,
+                checkout,
+                Phase::Running,
+                None,
+            )]))
+            .unwrap();
+        assert_eq!(
+            internal.checkout_custody(checkout, 0).unwrap(),
+            CheckoutCustody::Writers
+        );
+        assert_eq!(
+            internal.checkout_custody(checkout, 1).unwrap(),
+            CheckoutCustody::Clear
+        );
+
+        let unknown = Lost {
+            slot_id: "3".to_owned(),
+            at_ms: 2,
+            unclosed: Some("exec may have started processes outside its group".to_owned()),
+        };
+        removable
+            .save(&state_with(vec![custody_record(
+                2,
+                checkout,
+                Phase::Retired,
+                Some(unknown),
+            )]))
+            .unwrap();
+        internal.save(&State::default()).unwrap();
+        match internal.checkout_custody(checkout, 0).unwrap() {
+            CheckoutCustody::Unknown(reason) => {
+                assert!(reason.contains("never confirmed closed"), "{reason}")
+            }
+            other => panic!("expected unknown custody, got {other:?}"),
+        }
+
+        // A retired slot whose writers closed positively is not unknown.
+        removable
+            .save(&state_with(vec![custody_record(
+                3,
+                checkout,
+                Phase::Retired,
+                Some(Lost {
+                    slot_id: "4".to_owned(),
+                    at_ms: 3,
+                    unclosed: None,
+                }),
+            )]))
+            .unwrap();
+        assert_eq!(
+            internal.checkout_custody(checkout, 0).unwrap(),
+            CheckoutCustody::Clear
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Record IDs are per pool: the caller's own ID exempts only its record in
+    /// its own pool, never an equal ID in the other pool, in either direction
+    /// and for running and quarantined records alike.
+    #[test]
+    fn checkout_custody_exempts_own_id_only_in_its_own_pool() {
+        let (root, internal, removable) = paired_controls("custody-ids");
+        let checkout = Path::new("/checkout/custody-ids");
+        let id_seven = |phase| state_with(vec![custody_record(7, checkout, phase, None)]);
+
+        internal.save(&id_seven(Phase::Acquiring)).unwrap();
+        removable.save(&id_seven(Phase::Running)).unwrap();
+        assert_eq!(
+            internal.checkout_custody(checkout, 7).unwrap(),
+            CheckoutCustody::Writers
+        );
+        assert_eq!(
+            removable.checkout_custody(checkout, 7).unwrap(),
+            CheckoutCustody::Clear
+        );
+
+        removable.save(&id_seven(Phase::Acquiring)).unwrap();
+        internal.save(&id_seven(Phase::Spawning)).unwrap();
+        assert_eq!(
+            removable.checkout_custody(checkout, 7).unwrap(),
+            CheckoutCustody::Writers
+        );
+
+        let quarantined = Lost {
+            slot_id: "9".to_owned(),
+            at_ms: 4,
+            unclosed: Some("an allowed compiler wrapper may still run".to_owned()),
+        };
+        internal
+            .save(&state_with(vec![custody_record(
+                7,
+                checkout,
+                Phase::Retired,
+                Some(quarantined),
+            )]))
+            .unwrap();
+        match removable.checkout_custody(checkout, 7).unwrap() {
+            CheckoutCustody::Unknown(reason) => {
+                assert!(reason.contains("the other pool"), "{reason}")
+            }
+            other => panic!("expected unknown custody, got {other:?}"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The fence is written to both pools' state (created when absent), a
+    /// state parser without the field (as every pre-feature Oxide has)
+    /// refuses it, the current one keeps loading it, and an unknown fence
+    /// value refuses.
+    #[test]
+    fn the_owned_outputs_fence_refuses_a_pre_feature_parser() {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct PreFeatureState {
+            version: u32,
+            next_id: u64,
+            next_use: u64,
+            tickets: Vec<serde_json::Value>,
+            #[serde(default)]
+            cleans: Vec<serde_json::Value>,
+            records: Vec<serde_json::Value>,
+            #[serde(default)]
+            recoveries: Vec<serde_json::Value>,
+            #[serde(default)]
+            flushes: Vec<serde_json::Value>,
+        }
+        let (root, internal, removable) = paired_controls("fence");
+        let before = fs::read(internal.control.join("state.json")).ok();
+        if let Some(bytes) = &before {
+            assert!(serde_json::from_slice::<PreFeatureState>(bytes).is_ok());
+        }
+        let _ = fs::remove_file(removable.control.join("state.json"));
+        internal.fence_owned_outputs().unwrap();
+        internal.fence_owned_outputs().unwrap();
+        for control in [&internal.control, &removable.control] {
+            let bytes = fs::read(control.join("state.json")).unwrap();
+            let refused = serde_json::from_slice::<PreFeatureState>(&bytes)
+                .err()
+                .expect("a pre-feature parser accepted the fenced state");
+            assert!(refused.to_string().contains("owned_outputs"), "{refused}");
+        }
+        assert_eq!(
+            internal.load().unwrap().owned_outputs.as_deref(),
+            Some(OWNED_OUTPUTS_FENCE)
+        );
+        let mut state = internal.load().unwrap();
+        state.owned_outputs = Some("oxide.outputs/9".to_owned());
+        internal.save(&state).unwrap();
+        assert!(internal.load().is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// The checkout clean barrier spans both pools: an internal clean waits

@@ -130,14 +130,16 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 - **Drive mode:** the Builds drive is registered as permanent or ephemeral,
   with a loud warning when a build falls back to the internal pool.
   `oxide pool describe --json` reports it to other tools.
-- **Final outputs** stay checkout-local. Drive mode alone does not move them.
+- **Final outputs** stay checkout-local by default. Permanent drive mode adds
+  one explicit, per-checkout owned `target` link; it never moves existing
+  output, and ephemeral mode is unchanged
+  ([workflow](contracts/workflow.md#final-outputs-on-the-permanent-drive-oxide117)).
 - **Sharing builds:** slots share warm builds across worktrees, up to 8 per
   project, with least-recently-used idle slots evicted under the byte budget.
 - **sccache:** Oxide bypasses inherited compiler wrappers and doesn't manage
   sccache. Integration is revisited once the current work is done. Cargo's
   own cross-workspace cache is the preferred long-term complement.
 - **Approved, not built:**
-  - final outputs following the pool when the drive is permanent;
   - per-slot test scratch;
   - submodule-aware cross-worktree reuse.
 

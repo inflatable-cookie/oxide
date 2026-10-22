@@ -811,11 +811,16 @@ pub fn coordinate(internal: Option<Store>) -> Result<Option<Store>, String> {
     if registration(&internal)?.is_none() {
         return Ok(Some(internal));
     }
-    let control = internal
-        .control()
-        .join(POOL_DIR)
-        .join(oxide_storage::lease::MANAGED_NAME);
+    let control = removable_control(internal.control());
     Ok(Some(internal.with_sibling(&control, false)))
+}
+
+/// The removable pool's control directory, kept in the internal pool's
+/// control directory so it stays readable while the volume is away.
+pub fn removable_control(internal_control: &Path) -> PathBuf {
+    internal_control
+        .join(POOL_DIR)
+        .join(oxide_storage::lease::MANAGED_NAME)
 }
 
 /// A registered removable pool as `status` shows it, before printing.

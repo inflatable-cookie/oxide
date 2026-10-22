@@ -22,6 +22,8 @@ pub enum Class {
     Status,
     /// `pool`: Oxide-owned pool registration; not a Cargo built-in.
     Pool,
+    /// `outputs`: Oxide-owned final-output placement; not a Cargo built-in.
+    Outputs,
     /// `exec`: a tool that calls Cargo itself, leased; not a Cargo built-in.
     Exec,
 }
@@ -32,6 +34,7 @@ pub fn classify(command: &str) -> Class {
         "clean" => Class::Clean,
         "status" => Class::Status,
         "pool" => Class::Pool,
+        "outputs" => Class::Outputs,
         "exec" => Class::Exec,
         "init" => Class::Init,
         "new" => Class::New,
@@ -562,6 +565,7 @@ mod tests {
         assert_eq!(classify("status"), Class::Status);
         assert_eq!(classify("pool"), Class::Pool);
         assert_eq!(classify("exec"), Class::Exec);
+        assert_eq!(classify("outputs"), Class::Outputs);
         assert_eq!(classify("init"), Class::Init);
         assert_eq!(classify("new"), Class::New);
     }

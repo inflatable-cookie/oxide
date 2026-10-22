@@ -15,6 +15,7 @@ mod describe;
 mod freshness;
 mod identity;
 mod launch;
+mod outputs;
 mod process;
 mod removable;
 mod store;
@@ -52,6 +53,9 @@ USAGE:
                                          remove <workspace>/target and slot affinity; slots stay
     oxide clean <-p|--doc|--profile ...> Cargo's selected clean, same storage rules
     oxide clean --cargo-cache            one pass of Cargo's own home cleanup, no network
+    oxide outputs plan|adopt|detach|status
+                                         permanent drive: plan, explicitly convert or
+                                         detach the owned <checkout>/target link
     oxide status                         pool, slots, waits, stray output and Cargo home
     oxide status --launch-check          macOS: time a new executable's first launch
     oxide pool register-removable <mount-point> --reserve <size> --cap <size> [--mode ...]
@@ -130,6 +134,7 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
         Class::Plain => Err(exec_cargo(&args)),
         Class::Status => run_status(rest),
         Class::Pool => removable::run(rest),
+        Class::Outputs => outputs::run(rest),
         Class::Clean => clean::run(rest),
         Class::Init => adopt::run_init(rest),
         Class::New => adopt::run_new(rest),
@@ -224,17 +229,36 @@ fn exec_stdin() -> Stdio {
 
 fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     let exec = invocation.command == "exec";
-    let key = SlotKey::resolve(
-        CARGO,
-        invocation.manifest_path.as_deref(),
-        invocation.profile.recipe_key(),
-        invocation.target.as_deref(),
-    )?;
     process::install_signal_handlers()?;
-    let selected = removable::select(Store::open_or_create()?)?;
+    let internal = Store::open_or_create()?;
+    let output_control = internal.control().to_path_buf();
+    let checkout = identity::locate_workspace(CARGO, invocation.manifest_path.as_deref())?;
+    // The final-output destination is part of the slot's compatibility
+    // identity: a slot's uplifted artifacts belong to one real root. The
+    // destination is the one the binding below will select, so the key and the
+    // bound root cannot disagree. An ephemeral or detached checkout adds
+    // nothing, so its keys are unchanged.
+    // The intermediate pool is selected first: outputs select the external
+    // root only when this command's slot comes from the removable pool, whose
+    // watchdog supervises the drive's removal.
+    let selected = removable::select(internal)?;
     let selection_mode = selected.mode;
     let fallback_reason = selected.fallback_reason.clone();
+    let pool_fallback = (!selected.removable && selection_mode.is_some()).then(|| {
+        fallback_reason
+            .clone()
+            .unwrap_or_else(|| "the removable pool is not selected".to_owned())
+    });
     let store = selected.store;
+    let planned =
+        outputs::planned_destination(Some(&output_control), &checkout, pool_fallback.as_deref())?;
+    let destination = outputs::destination_facts(planned.as_ref());
+    let key = SlotKey::resolve_in(
+        &checkout,
+        invocation.profile.recipe_key(),
+        invocation.target.as_deref(),
+        &destination,
+    )?;
     if !selected.removable {
         if selection_mode == Some(removable::DriveMode::Permanent) {
             if let Some(reason) = fallback_reason.as_deref() {
@@ -267,6 +291,33 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         store.release(held, origin)?;
         return Ok(process::signal_exit_code(signal));
     }
+    // Bind the checkout's owned output root once, before Cargo starts. The
+    // lease just taken is this checkout's exclusive barrier: `oxide clean`
+    // and another command wait for it, so the swap cannot redirect a running
+    // command.
+    // The transition runs under this checkout's output barrier, which waits
+    // for every other cooperative command in the checkout to close and blocks
+    // new ones until the link is published. It binds exactly the destination
+    // the slot was keyed for, or refuses.
+    let binding = match outputs::bind_for_command(
+        &store,
+        &key.checkout,
+        held.record_id(),
+        planned.as_ref(),
+        pool_fallback.as_deref(),
+    ) {
+        Ok(binding) => binding,
+        Err(reason) => {
+            let origin = held.prior.unchanged();
+            store.release(held, origin)?;
+            return Err(reason);
+        }
+    };
+    for warning in &binding.outcome.warnings {
+        eprintln!("oxide: WARNING: {warning}");
+    }
+    let output_note = binding.outcome.note.clone();
+    let output_root = binding.outcome.root.clone();
     let run = invocation.command == "run";
     let config_args = if cli::reads_config_args(&invocation.command) {
         &invocation.cargo_args[..]
@@ -327,7 +378,11 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         }
     };
     let mut watchdog = store.watchdog();
-    let outcome = match store.mark_running(&held, group.id) {
+    // The binding mutex is released only once this command is recorded as
+    // running, so no peer can repoint the link between the check and Cargo.
+    let marked = store.mark_running(&held, group.id);
+    drop(binding);
+    let outcome = match marked {
         Ok(()) if run => collect_run(&mut group, &invocation, watchdog.as_mut()),
         Ok(()) => match watchdog.as_mut() {
             Some(watchdog) => {
@@ -376,7 +431,7 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     let slot = held.slot_id.clone();
     let warm = held.reused;
     let measured = held.measured.clone();
-    let mut notes = [gate.describe(), wrapper_note]
+    let mut notes = [gate.describe(), wrapper_note, output_note]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
@@ -390,6 +445,43 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     let note = notes.join(", ");
     let note = (!note.is_empty()).then_some(note);
     let origin = gate.finish(&key.checkout);
+    // A converted checkout's `run` keeps its lease through the program: the
+    // program runs as this command's own process group from the real root
+    // it bound, under the same custody (a relink waits, a clean waits),
+    // removal watchdog and positive group closure as Cargo, and the slot is
+    // released only once that group is empty.
+    let owned_program = match (&outcome, &output_root) {
+        (Ok((Some(status), Some(Ok((program, manifest_dir))))), Some(root))
+            if run && status.success() && stopped.is_none() =>
+        {
+            let program = match program.strip_prefix(key.checkout.join("target")) {
+                Ok(rest) => root.join(rest),
+                Err(_) => program.clone(),
+            };
+            Some((program, manifest_dir.clone()))
+        }
+        _ => None,
+    };
+    if let Some((program, manifest_dir)) = owned_program {
+        print_summary(
+            &store,
+            &invocation,
+            &slot,
+            warm,
+            measured.as_ref(),
+            started,
+            note.as_deref(),
+            &waits,
+        );
+        return run_owned_program(
+            &store,
+            held,
+            origin,
+            &program,
+            &manifest_dir,
+            &invocation.program_args,
+        );
+    }
     store.release(held, origin)?;
     let (status, executable) = outcome?;
     let status = status.ok_or("Cargo ended without a status")?;
@@ -439,6 +531,79 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
             Ok(101)
         }
     }
+}
+
+/// Run a converted checkout's program under the held lease, as `oxide exec`
+/// runs a tool: its own process group, the record naming that group (so a
+/// crash leaves the slot held until the group is empty), signals forwarded,
+/// the removable pool's removal watchdog polled, and the slot released only
+/// after the group is observed empty. A removal stop whose group cannot be
+/// confirmed closed quarantines the slot as unknown custody.
+fn run_owned_program(
+    store: &Store,
+    held: store::Lease,
+    origin: Option<freshness::Built>,
+    program: &Path,
+    manifest_dir: &Path,
+    args: &[OsString],
+) -> Result<u8, String> {
+    let mut command = Command::new(program);
+    command.args(args).env("CARGO_MANIFEST_DIR", manifest_dir);
+    if let Err(error) = store.mark_spawning(&held) {
+        store.release(held, origin)?;
+        return Err(error);
+    }
+    let (mut group, foreground) = match process::start_foreground_group(&mut command) {
+        Ok(started) => started,
+        Err(error) => {
+            store.release(held, origin)?;
+            return Err(format!("could not execute {}: {error}", program.display()));
+        }
+    };
+    // Only a removable slot is watched, and only for removal: a program on
+    // the internal disk is never stopped for host free space.
+    let mut watchdog = match store.backend {
+        Backend::ApfsVolume => store.watchdog(),
+        Backend::DirectoryBudget => None,
+    };
+    if let Err(error) = store.mark_running(&held, group.id) {
+        // SAFETY: the negative PID addresses the group this command created.
+        unsafe {
+            libc::kill(-group.id, libc::SIGTERM);
+        }
+        let _ = process::wait_leader(&mut group);
+        process::wait_group_empty(group.id);
+        drop(foreground);
+        store.release(held, None)?;
+        return Err(error);
+    }
+    let status = match watchdog.as_mut() {
+        Some(watchdog) => process::wait_leader_watched(&mut group, watchdog)?,
+        None => Some(process::wait_leader(&mut group)?),
+    };
+    let closed = match (watchdog.as_mut(), status) {
+        (Some(_), None) => None,
+        (Some(watchdog), Some(_)) => process::wait_group_empty_watched(group.id, watchdog),
+        (None, _) => {
+            process::wait_group_empty(group.id);
+            Some(Instant::now())
+        }
+    };
+    drop(foreground);
+    let stopped = watchdog.as_ref().filter(|watchdog| watchdog.stopped());
+    if let Some(watchdog) = stopped {
+        eprintln!("{}", watchdog.report(group.id, closed));
+    }
+    if closed.is_none() {
+        store.quarantine_lost(
+            &held,
+            &format!("run program group {} did not close after KILL", group.id),
+        )?;
+        return Ok(1);
+    }
+    store.release(held, origin)?;
+    let code = status.map_or(1, process::exit_code);
+    Ok(if stopped.is_some() { code.max(1) } else { code })
 }
 
 /// Why the leased child did not start.
@@ -695,7 +860,17 @@ fn run_status(args: &[OsString]) -> Result<u8, String> {
     }
     print_other_pools(&settings);
     match identity::locate_workspace(CARGO, None) {
-        Ok(workspace) => report_stray(&workspace),
+        Ok(workspace) => {
+            report_stray(&workspace);
+            match outputs::status_lines(&workspace) {
+                Ok(lines) => {
+                    for line in lines {
+                        println!("{line}");
+                    }
+                }
+                Err(reason) => println!("outputs: unknown ({reason})"),
+            }
+        }
         Err(_) => println!("stray Cargo output: no Cargo workspace here"),
     }
     cargo_home::report_status();

@@ -43,6 +43,9 @@ const VALUE_OPTIONS: [&str; 7] = [
 /// Bounded read of an `effigy.toml`; larger files are reported, not scanned.
 const EFFIGY_LIMIT: u64 = 1024 * 1024;
 const AGENTS: &str = "AGENTS.md";
+const GITIGNORE: &str = ".gitignore";
+/// Bounded read of a workspace `.gitignore`.
+const GITIGNORE_LIMIT: u64 = 1024 * 1024;
 
 /// The directory argument and every other argument of `cargo init`/`new`.
 struct Parsed {
@@ -156,8 +159,94 @@ fn adopt(manifest: &Path) -> Result<u8, String> {
     let agents = workspace.join(AGENTS);
     let outcome = write_block(&agents)?;
     println!("oxide: {outcome} {}", agents.display());
+    let ignored = ensure_local_outputs_ignored(&workspace)?;
+    println!(
+        "oxide: {} {} (the checkout-local fallback output root of permanent drive mode)",
+        ignored.describe(),
+        workspace.join(GITIGNORE).display()
+    );
     print_readiness(&workspace);
     Ok(0)
+}
+
+/// What [`ensure_local_outputs_ignored`] did.
+#[derive(Debug, Eq, PartialEq)]
+enum Ignored {
+    Created,
+    Added,
+    Present,
+}
+
+impl Ignored {
+    fn describe(&self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Added => "added the local-output ignore entry to",
+            Self::Present => "local-output ignore entry already present in",
+        }
+    }
+}
+
+/// Idempotently add [`crate::outputs::GITIGNORE_LINE`] to the workspace
+/// `.gitignore`, so a checkout-local fallback output root is never tracked.
+/// A symlink or oversized file is refused rather than rewritten.
+fn ensure_local_outputs_ignored(workspace: &Path) -> Result<Ignored, String> {
+    let path = workspace.join(GITIGNORE);
+    let existing = match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            if metadata.len() > GITIGNORE_LIMIT {
+                return Err(format!(
+                    "{} is larger than {GITIGNORE_LIMIT} bytes; not edited",
+                    path.display()
+                ));
+            }
+            fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?
+        }
+        Ok(_) => {
+            return Err(format!(
+                "{} is not a regular file; left alone",
+                path.display()
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+    };
+    let text = String::from_utf8_lossy(&existing);
+    if text.lines().any(|line| ignores_local_outputs(line.trim())) {
+        return Ok(Ignored::Present);
+    }
+    let mut bytes = existing.clone();
+    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    bytes.extend_from_slice(crate::outputs::GITIGNORE_LINE.as_bytes());
+    bytes.push(b'\n');
+    let temporary = workspace.join(format!(".{GITIGNORE}.oxide-{}.tmp", std::process::id()));
+    let written = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .and_then(|mut file| {
+            file.write_all(&bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&temporary, &path));
+    written.map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!("cannot write {}: {error}", path.display())
+    })?;
+    Ok(if existing.is_empty() {
+        Ignored::Created
+    } else {
+        Ignored::Added
+    })
+}
+
+fn ignores_local_outputs(line: &str) -> bool {
+    matches!(
+        line,
+        "/.oxide-outputs/" | ".oxide-outputs/" | "/.oxide-outputs" | ".oxide-outputs"
+    )
 }
 
 /// The workspace root's `AGENTS.md` holds one ordered Oxide marker pair.
