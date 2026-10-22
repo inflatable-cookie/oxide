@@ -764,7 +764,7 @@ fn adopt_command() -> Result<u8, String> {
                 .to_owned(),
         );
     };
-    let Some(internal) = Store::open_existing()? else {
+    let Some(internal) = output_store()? else {
         return Err("no internal pool exists; there is no owned output state".to_owned());
     };
     process::install_signal_handlers()?;
@@ -891,7 +891,7 @@ fn detach_command() -> Result<u8, String> {
     let Some(control) = context.control().map(Path::to_path_buf) else {
         return Err("no internal pool exists; there is no owned output state".to_owned());
     };
-    let Some(internal) = Store::open_existing()? else {
+    let Some(internal) = output_store()? else {
         return Err("no internal pool exists; there is no owned output state".to_owned());
     };
     process::install_signal_handlers()?;
@@ -1106,6 +1106,14 @@ fn bind_with_receipt(context: &Context, receipt: Receipt) -> Result<Outcome, Str
             )))
         }
     }
+}
+
+/// The internal pool paired with a registered removable pool, so the clean
+/// barrier an output transition takes spans a checkout's builds in either
+/// pool (the same pairing `oxide clean` uses).
+fn output_store() -> Result<Option<Store>, String> {
+    let settings = store::settings()?;
+    removable::coordinate(Store::open_existing_with(&settings)?)
 }
 
 /// Acquire the checkout's clean barrier: no other command in this checkout

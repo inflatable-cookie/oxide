@@ -560,10 +560,14 @@ def run(proof: Proof, repo: str) -> None:
             proof, [proof.binary, "outputs", "adopt"], app, env
         )
         time.sleep(2.0)
-        expect(
-            waiting.poll() is None,
-            "outputs adopt did not wait for the active writer in the checkout",
-        )
+        if waiting.poll() is not None:
+            early_out, early_err = waiting.communicate(timeout=5)
+            proof.unclosed.discard(waiting.pid)
+            fail(
+                "outputs adopt did not wait for the active writer in the checkout: "
+                f"exit {waiting.returncode}\n{early_out.decode(errors='replace')}"
+                f"{early_err.decode(errors='replace')}"
+            )
         expect(link_target(link) == external_root, "a swap redirected the running build")
         with open(os.path.join(gate, "release"), "wb") as handle:
             handle.write(b"release")
