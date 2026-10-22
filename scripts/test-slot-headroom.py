@@ -398,6 +398,10 @@ def prove_pool_ceiling(proof: Proof, app: str, pool: str, env: dict) -> None:
 
 def prove_project_cap(proof: Proof, pool: str, env: dict, workdir: str) -> None:
     app = write_tree(os.path.join(workdir, "project-app"), FIXTURE)
+    # Create the pool with one sequential command first: eight simultaneous
+    # first commands race the pool's own one-time creation, which is a
+    # separate pre-existing issue and not what this case measures.
+    run(proof, ["exec", "--", sys.executable, "-c", "pass"], "project-priming", app, env)
     holds = []
     for index in range(8):
         holds.append(start(proof, ["exec"], f"project-hold-{index}", app, env, hold=True))
