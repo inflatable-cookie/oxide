@@ -469,6 +469,9 @@ struct Git {
     calls: usize,
     waited: Duration,
     bytes: u64,
+    call_time: Duration,
+    total_time: Duration,
+    settle_time: Duration,
 }
 
 /// One `git` invocation: no index write, no prompt, no submodule recursion and
@@ -490,6 +493,9 @@ impl Git {
             calls: 0,
             waited: Duration::ZERO,
             bytes: 0,
+            call_time: GIT_CALL_TIME,
+            total_time: GIT_TOTAL_TIME,
+            settle_time: GIT_SETTLE_TIME,
         }
     }
 
@@ -512,12 +518,14 @@ impl Git {
                 "the gate needs more than {MAX_GIT_CALLS} git calls"
             ));
         }
-        let remaining = GIT_TOTAL_TIME.saturating_sub(self.waited);
+        let remaining = self.total_time.saturating_sub(self.waited);
         if remaining.is_zero() {
             return Err("the gate's git time budget is exhausted".to_owned());
         }
         self.calls += 1;
-        let limit = GIT_CALL_TIME.min(remaining);
+        // One absolute deadline covers execution and settlement: the
+        // per-call cap intersected with the cumulative remainder.
+        let limit = self.call_time.min(remaining);
         let mut child = git_command(dir, args)
             .stdin(if input.is_some() {
                 Stdio::piped()
@@ -569,10 +577,10 @@ impl Git {
         };
         self.waited = self.waited.saturating_add(started.elapsed());
         let status = status?;
-        // One settle window for all three readers: each wait takes only what
-        // remains of the same window, so sequential waits cannot overrun it.
-        let settle_deadline =
-            Instant::now() + GIT_SETTLE_TIME.min(GIT_TOTAL_TIME.saturating_sub(self.waited));
+        // One settle window for all three readers, never past the call's own
+        // deadline: each wait takes only what remains of the same window, so
+        // sequential waits cannot overrun it.
+        let settle_deadline = (Instant::now() + self.settle_time).min(deadline);
         let left = || settle_deadline.saturating_duration_since(Instant::now());
         let settling = Instant::now();
         let out = out_receiver.recv_timeout(left());
@@ -581,6 +589,9 @@ impl Git {
             .as_ref()
             .map(|receiver| receiver.recv_timeout(left()));
         self.waited = self.waited.saturating_add(settling.elapsed());
+        if Instant::now() > deadline {
+            return Err(format!("git {name} did not finish in time"));
+        }
         let (stdout, overflow) = out
             .map_err(|_| format!("git {name} did not close its output in time"))?
             .map_err(|error| format!("cannot read git output: {error}"))?;
@@ -2195,6 +2206,27 @@ mod tests {
         assert!(exhausted.charge(MAX_GIT_BYTES).is_ok());
         assert!(exhausted.charge(0).is_ok());
         assert!(exhausted.charge(1).is_err());
+    }
+
+    #[test]
+    fn retained_git_pipe_refuses_within_the_call_deadline() {
+        // An owned helper Git started keeps stdout and stderr open after Git
+        // exits; settlement must stop at the call's deadline, not after it.
+        let mut git = Git::new();
+        git.call_time = Duration::from_millis(500);
+        git.settle_time = Duration::from_secs(5);
+        let started = Instant::now();
+        let result = git.run(
+            Path::new("/"),
+            &["-c", "alias.hold=!sleep 2 &", "hold"],
+            None,
+        );
+        let elapsed = started.elapsed();
+        let error = result.expect_err("a retained pipe must refuse");
+        assert!(error.contains("in time"), "{error}");
+        assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+        assert!(git.waited < Duration::from_millis(1500));
     }
 
     #[test]

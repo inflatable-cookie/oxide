@@ -409,8 +409,9 @@ prepare is bound to 64 `git` invocations, 60 s of cumulative wait and 16 MiB
 of cumulative stdout; each call is a 30 s subcap. Every invocation runs with
 `submodule.recurse=0` and `core.fsmonitor=false`, so no configured fsmonitor
 hook or daemon inherits its pipes, and the reads and input writer share one
-short settle window drawn from the remaining budget. A call that ends while a
-process Git started still holds its pipes is waited for only within that one
+short settle window that never extends past the call's own deadline (the
+30 s subcap intersected with the cumulative remainder). A call that ends while
+a process Git started still holds its pipes is waited for only within that one
 window and then refused, so no reader can hold the gate past its clock.
 Exceeding any bound,
 more than 32 gitlinks, 200,000 listed files or 4,096 dirty-and-uncertain paths
