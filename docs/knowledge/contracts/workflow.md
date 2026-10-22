@@ -947,6 +947,20 @@ or global Cargo configuration is involved.
 
 ### Shared proof supervisor
 
+**Interim admission allowance (Tom, 2026-10-22).** Until Queue #381's
+admission-hook adapter lands, Oxide native proofs may use Effigy `heavy`
+inline, with a fresh owner scheduler headroom receipt immediately before
+activation and the qualified supervisor's wall-clock limit, scratch budget,
+continuous 20 GiB reserve watchdog and cleanup. This is not host admission or
+a reservation. Every receipt bundle and evidence record must state:
+"Effigy heavy admission unavailable (f6b3b50 retired host-run client; Queue
+#381 pending); not host-admitted". Keep raw qualified-supervisor receipts
+unchanged and link that disclosure in their evidence envelope. The allowance
+ends when #381 lands; prior non-admitted runs are not retrospectively waived.
+Operator source: Supervisor `7cc9444d-a355-463d-a2ca-3c135645a042`, Tom's
+verbatim "1. Yes 2. Yes 3. Yes", item 3. Existing proof bounds, unknown-writer
+handling, failure history and separate adoption/install gates remain.
+
 `scripts/bounded-test.py` is the shared proof supervisor. It implements the
 reviewed [pinned-leader correction design](proof-supervisor-correction.md)
 (revision 4, `29f0950e`) for oxide#109. It counts as qualified only once
