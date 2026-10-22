@@ -131,8 +131,9 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   mode.
 - **Sharing builds:** slots share warm builds across worktrees, sized by the
   byte budget rather than small fixed counts.
-- **sccache:** Oxide bypasses inherited compiler wrappers. Cargo's own
-  cross-workspace cache is the preferred long-term complement.
+- **sccache:** Oxide bypasses inherited compiler wrappers and doesn't manage
+  sccache. Integration is revisited once the current work is done. Cargo's
+  own cross-workspace cache is the preferred long-term complement.
 - **Approved, not built:**
   - the drive's permanent or ephemeral mode;
   - `oxide pool describe --json`;
