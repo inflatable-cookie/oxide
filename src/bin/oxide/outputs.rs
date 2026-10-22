@@ -1231,7 +1231,9 @@ fn bind_under_binding(
                     wanted.root.display()
                 ));
             }
-            match check_root(context, committed.generation, &bound) {
+            // The root must carry exactly the generation this command's slot
+            // was keyed with, whichever generation the transition committed.
+            match check_root(context, committed.generation, &wanted) {
                 RootCheck::Valid => Bind::Bound(bound_outcome(&usable, &bound, true)),
                 RootCheck::Missing => Bind::Refuse(format!(
                     "outputs: the transition bound {} but its root is missing; run the command again",
