@@ -6,6 +6,11 @@ the newest install receipt. Each run writes a new receipt; earlier receipts
 are kept for rollback. `--check` stops after the preflight and builds nothing.
 Effigy does not forward selector arguments, so `OXIDE_INSTALL_PIN` also names
 the pin.
+
+The receipt records the pinned build's own `control_state_version` and
+`registration_version` capabilities, read by an effect-free probe of the
+built binary (oxide#122). A build that cannot report them is refused before
+anything is installed, so no receipt wrongly claims a hand-off target.
 """
 import argparse
 import datetime
@@ -24,6 +29,7 @@ HOME = Path(os.environ["HOME"])
 DESTINATION = HOME / ".local/bin/oxide"
 RECEIPTS = HOME / ".local/state/oxide/install"
 BUILD = ["cargo", "build", "--release", "--locked", "--offline", "--bin", "oxide"]
+CAPABILITIES_ARGUMENT = "__oxide-build-capabilities"
 REPOSITORY = Path(__file__).resolve().parent.parent
 REMOTE_MAIN = "refs/heads/main"
 
@@ -171,6 +177,32 @@ def build(pin, staging):
     return staging / "target/release/oxide", versions
 
 
+def state_capabilities(built):
+    """The built binary's own control-state and registration versions.
+
+    The probe is effect-free and runs before installation. A pin that cannot
+    report them is refused: a receipt without capabilities cannot prove a
+    hand-off target, and this script never guesses from host settings.
+    """
+    try:
+        result = subprocess.run(
+            [str(built), CAPABILITIES_ARGUMENT], check=True, capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise Refusal(f"the built oxide cannot report its state capabilities: {error}")
+    try:
+        reported = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise Refusal(f"the built oxide printed no capability JSON: {error}")
+    values = {}
+    for name in ("control_state_version", "registration_version"):
+        value = reported.get(name) if isinstance(reported, dict) else None
+        if type(value) is not int or not 0 <= value <= 0xFFFFFFFF:
+            raise Refusal(f"the built oxide reported no valid {name}")
+        values[name] = value
+    return values
+
+
 def install(built, expected):
     """Copy through a private sibling, then link (initial) or rename (replace).
 
@@ -240,6 +272,7 @@ def main():
         staging = Path(tempfile.mkdtemp(prefix="oxide-install.", dir="/private/tmp"))
         print(f"staging {staging}")
         built, versions = build(pin, staging)
+        capabilities = state_capabilities(built)
         built_hash, installed = install(built, expected)
     except (Refusal, subprocess.CalledProcessError, OSError) as error:
         print(f"oxide:install refused: {error}", file=sys.stderr)
@@ -254,6 +287,8 @@ def main():
         "build": " ".join(BUILD),
         "toolchain": versions,
         "built_sha256": built_hash,
+        "control_state_version": capabilities["control_state_version"],
+        "registration_version": capabilities["registration_version"],
         "installed": installed,
         "prior": "absent" if previous is None else {
             "receipt": previous[0].name, "sha256": previous[1]["installed"]["sha256"],

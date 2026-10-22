@@ -84,7 +84,16 @@ fails, Oxide reports that the wait duration is unavailable.
   `+toolchain`, `--config` keys for `build.build-dir` / `build.target-dir`, and
   `--config` file paths. Drop the flag; do not work around it.
 - Exit codes are Cargo's, or the program's for `oxide run` and `oxide exec`
-  (127: program not found).
+  (127: program not found). Exit 75 with
+  `oxide: oxide was upgraded during this command; re-run.` means this `oxide`
+  is older than the pool's state and could not prove the installed binary
+  understands it. Run the command again from a shell that resolves the new
+  `oxide`; do not retry in a loop, delete state or fall back to plain `cargo`
+  for a slot build.
+- `oxide: handing off to the installed binary (state is newer than this one).`
+  means this `oxide` was older than the pool's state, so the command was
+  re-run once as the installed binary with the same arguments. That is normal
+  after an upgrade; the next command starts on the new binary.
 - `oxide: reserve stop: …` on a directory pool means host free space fell
   below about 22 GiB, so Oxide stopped the build to protect the 20 GiB
   reserve. Free disk space before retrying; do not loop. If it says closure

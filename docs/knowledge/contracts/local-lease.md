@@ -384,6 +384,17 @@ representations. Before a revised write, every stored field is validated
 against the raised caps; an oversized legacy field refuses with the original
 file, ownership and quarantine bytes untouched, never truncated or dropped.
 
+**Hand-off trigger.** The numeric `version` of a control `state.json` (the
+internal pool's and the removable pool's) and of `removable.json` is also the
+front-door hand-off trigger (oxide#122). A newer binary that writes version 3,
+for example, lets an older binary hand off once to a receipt-matching
+installed successor whose recorded capabilities cover that version, instead of
+only refusing. Only a numeric `u32` above the running binary's version
+participates; malformed, foreign, oversized, unreadable and differently-fenced
+documents keep the existing refusal, and a future incompatible format must
+bump its numeric version to participate. The hand-off itself is pre-effect
+only: see [installed-binary hand-off](workflow.md#installed-binary-hand-off-oxide122).
+
 **Ranked LRU.** Each pool keeps one monotonic idle-rank sequence. A new actual
 grant and a first held-to-idle release or recovery stamp a fresh rank in the
 same atomic ledger write; holder/grant replay and release/recovery replay do

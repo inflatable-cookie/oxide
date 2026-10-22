@@ -13,6 +13,7 @@ mod cli;
 mod config;
 mod describe;
 mod freshness;
+mod handoff;
 mod identity;
 mod launch;
 mod outputs;
@@ -94,6 +95,10 @@ fn main() -> ExitCode {
     if let Some(code) = launch::hidden() {
         return ExitCode::from(code);
     }
+    // The installer's effect-free capability probe, before any other work.
+    if let Some(code) = handoff::hidden() {
+        return ExitCode::from(code);
+    }
     process::started_ms();
     match run(std::env::args_os().skip(1).collect()) {
         Ok(code) => ExitCode::from(code),
@@ -130,7 +135,19 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
         }
         _ => {}
     }
-    match cli::classify(command) {
+    let class = cli::classify(command);
+    // One pre-effect hand-off check (oxide#122), after help, version, list and
+    // toolchain handling and before any arm opens a store. Plain passthrough,
+    // usage-only `exec` and `status --launch-check` do no work of their own.
+    let no_effect = class == Class::Plain
+        || (class == Class::Exec && !matches!(cli::parse_exec(rest), Ok(Some(_))))
+        || (class == Class::Status && matches!(rest, [flag] if flag == "--launch-check"));
+    if !no_effect {
+        if let Some(code) = handoff::preflight() {
+            return Ok(code);
+        }
+    }
+    match class {
         Class::Plain => Err(exec_cargo(&args)),
         Class::Status => run_status(rest),
         Class::Pool => removable::run(rest),
