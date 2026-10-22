@@ -2569,7 +2569,9 @@ the real external root whose ordinary child outlives it, keeping `run` held
 detach of the owned image while a program runs from the external root,
 stopped by the removal watchdog, then re-attach and redock; the last
 pre-feature Oxide (`8c9b5ae`, staged offline) refusing `check` and a selected
-clean on the fenced pools with the link and root unchanged; a build
+clean on the fenced pools with the link and root unchanged (since oxide#118's
+pool layout it refuses at pool accounting before parsing state; the state
+fence itself is unit-tested); a build
 in ephemeral mode before detach through the committed link; a crafted quarantined writer blocking both
 relink and clean; selected clean refusing after its link turned foreign while
 it waited, and selected and whole clean refusing a replaced or unusable

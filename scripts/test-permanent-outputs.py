@@ -600,7 +600,17 @@ def run(proof: Proof, repo: str) -> None:
     ):
         child = start_child(proof, [pre_feature] + args, app, env)
         code, _, stderr = finish_child(proof, child, label)
-        expect(code != 0 and "Oxide state is invalid" in stderr and "owned_outputs" in stderr, stderr)
+        # With current main's pool layout (oxide#118) the pre-feature binary
+        # refuses the pool at accounting before it parses state; either
+        # refusal keeps it off the owned link. The state-parser fence itself
+        # is covered by store::tests::the_owned_outputs_fence_refuses_a_pre_feature_parser.
+        expect(code != 0, f"{label}: the pre-feature binary did not refuse: {stderr}")
+        expect(
+            ("Oxide state is invalid" in stderr and "owned_outputs" in stderr)
+            or "unknown_accounting" in stderr,
+            f"{label}: unexpected refusal: {stderr}",
+        )
+        print(f"{label}: refused by {'the state fence' if 'owned_outputs' in stderr else 'pool accounting'}", flush=True)
         expect(link_target(link) == external_root, f"{label} moved the link")
         expect(sorted(os.listdir(external_root)) == external_before, f"{label} changed the owned root")
     proof.phase("after the downgrade fence")
