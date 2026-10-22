@@ -506,6 +506,11 @@ impl Default for WaitAccounting {
 
 impl WaitAccounting {
     fn observe(&mut self, wait: &Wait, max_active: usize, now: Instant) {
+        let reason = wait.describe(max_active);
+        self.observe_with_reason(wait, now, &reason);
+    }
+
+    fn observe_with_reason(&mut self, wait: &Wait, now: Instant, reason: &str) {
         let category = wait.category();
         self.observed = true;
         self.account_active_until(now);
@@ -516,10 +521,7 @@ impl WaitAccounting {
             return;
         }
         if self.reason_lines < 8 {
-            eprintln!(
-                "oxide: waiting for {}; Ctrl-C cancels",
-                wait.describe(max_active)
-            );
+            eprintln!("oxide: waiting for {}; Ctrl-C cancels", reason);
             self.reason_lines += 1;
             self.last_announced = Some(category);
         } else {
@@ -1307,7 +1309,11 @@ impl Store {
                     return Ok(Cleaning::Guard(guard));
                 }
                 Ok(None) => {
-                    waits.observe(&Wait::Clean, self.max_active, Instant::now());
+                    waits.observe_with_reason(
+                        &Wait::Clean,
+                        Instant::now(),
+                        "active oxide commands in this checkout",
+                    );
                     std::thread::sleep(WAIT_POLL);
                 }
             }

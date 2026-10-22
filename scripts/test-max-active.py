@@ -107,8 +107,54 @@ def locked_registry_packages() -> list[tuple[str, str]]:
     return packages
 
 
+def locked_git_packages() -> list[tuple[str, str, str, str]]:
+    lock = read_text(os.path.join(REPO, "Cargo.lock"))
+    packages = []
+    for block in lock.split("[[package]]")[1:]:
+        values = {}
+        for line in block.splitlines():
+            match = re.match(r'^(name|version|source) = "([^"]+)"$', line)
+            if match:
+                values[match.group(1)] = match.group(2)
+        source = values.get("source", "")
+        if not source.startswith("git+"):
+            continue
+        url_and_fragment = source[len("git+"):]
+        if "#" not in url_and_fragment:
+            fail(f"locked Git crate {values.get('name', '<unknown>')} has no revision")
+        url, revision = url_and_fragment.rsplit("#", 1)
+        repository_url = url.split("?", 1)[0]
+        repository_name = os.path.basename(repository_url.rstrip("/"))
+        if repository_name.endswith(".git"):
+            repository_name = repository_name[:-4]
+        packages.append((values["name"], values["version"], repository_name, revision))
+    return packages
+
+
+def checkout_contains_package(checkout: str, package: str) -> bool:
+    for current, directories, files in os.walk(checkout):
+        directories[:] = [directory for directory in directories if directory not in (".git", "target", "node_modules")]
+        if "Cargo.toml" not in files:
+            continue
+        manifest = read_text(os.path.join(current, "Cargo.toml"))
+        section = re.search(r"(?ms)^\[package\]\s*(.*?)(?=^\[|\Z)", manifest)
+        if section is None:
+            continue
+        name = re.search(r'(?m)^name\s*=\s*"([^"]+)"\s*$', section.group(1))
+        if name and name.group(1) == package:
+            return True
+    return False
+
+
+def reject_symlinks(root: str) -> None:
+    for current, directories, files in os.walk(root):
+        for name in directories + files:
+            path = os.path.join(current, name)
+            expect(not os.path.islink(path), f"locked Git cache contains a symlink: {path}")
+
+
 def prepare_private_cargo_home(host_home: str, private_home: str) -> None:
-    """Copy only the locked crates and sparse-index entries into scratch."""
+    """Copy only locked registry crates and Git sources into scratch."""
     host_registry = os.path.join(host_home, "registry")
     private_registry = os.path.join(private_home, "registry")
     packages = locked_registry_packages()
@@ -161,6 +207,39 @@ def prepare_private_cargo_home(host_home: str, private_home: str) -> None:
                 shutil.copy2(source, target)
                 artifact_copied = True
         expect(artifact_copied, f"locked crate {package} {version} has no cached source or archive")
+
+    host_git = os.path.join(host_home, "git")
+    private_git = os.path.join(private_home, "git")
+    for package, version, repository_name, revision in locked_git_packages():
+        host_checkouts = os.path.join(host_git, "checkouts")
+        candidates = []
+        for repository_id in sorted(os.listdir(host_checkouts)):
+            if not re.fullmatch(re.escape(repository_name) + r"-[0-9a-f]{16}", repository_id):
+                continue
+            checkout = os.path.join(host_checkouts, repository_id, revision[:7])
+            if os.path.isdir(checkout) and checkout_contains_package(checkout, package):
+                candidates.append((repository_id, checkout))
+        expect(
+            len(candidates) == 1,
+            f"locked Git crate {package} {version} has {len(candidates)} matching cached checkouts",
+        )
+        repository_id, source_checkout = candidates[0]
+        source_db = os.path.join(host_git, "db", repository_id)
+        expect(os.path.isdir(source_db), f"locked Git crate {package} {version} has no cached database")
+        reject_symlinks(source_checkout)
+        reject_symlinks(source_db)
+
+        target_db = os.path.join(private_git, "db", repository_id)
+        target_checkout = os.path.join(private_git, "checkouts", repository_id, revision[:7])
+        make_dir(os.path.dirname(target_db))
+        shutil.copytree(source_db, target_db, dirs_exist_ok=True)
+        make_dir(os.path.dirname(target_checkout))
+        shutil.copytree(source_checkout, target_checkout, dirs_exist_ok=True)
+
+        config_path = os.path.join(target_checkout, ".git", "config")
+        config = read_text(config_path)
+        expect(source_db in config, f"locked Git checkout {package} has an unexpected local origin")
+        write_file(config_path, config.replace(source_db, target_db))
 
 
 def read_text(path: str) -> str:
