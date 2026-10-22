@@ -453,18 +453,15 @@ def git_env(home: Path) -> dict[str, str]:
     }
 
 
-def git_rev_parse(git_dir: Path, spec: str, home: Path) -> str:
-    """Read-only: the object name `spec` resolves to in `git_dir`."""
+def git_rev_parse(proof: "Proof", git_dir: Path, spec: str, home: Path, label: str) -> str:
+    """Read-only: the object name `spec` resolves to in `git_dir`, via Proof.run."""
     git = shutil.which("git")
     if git is None:
         raise SeedRefusal("git is not on the host PATH")
-    result = subprocess.run(
-        [git, "--git-dir", str(git_dir), "rev-parse", "--verify", spec],
-        env=git_env(home), capture_output=True, text=True,
-    )
-    if result.returncode != 0:
+    code, out, _ = proof.run([git, "--git-dir", str(git_dir), "rev-parse", "--verify", spec], git_env(home), label)
+    if code != 0:
         raise SeedRefusal(f"git rev-parse {spec} failed in the private Longhorn database")
-    return result.stdout.strip()
+    return out.strip()
 
 
 def copy_git_tree(source: Path, destination: Path, budget: SeedBudget, rel: str, base: str, files: list[dict]) -> None:
@@ -477,6 +474,8 @@ def copy_git_tree(source: Path, destination: Path, budget: SeedBudget, rel: str,
         if not rel and entry.name in ("config", "hooks"):
             continue
         child = f"{rel}/{entry.name}" if rel else entry.name
+        if child.startswith("objects/info/") and "alternates" in entry.name:
+            raise SeedRefusal(f"longhorn database alternates entry refused: {child}")
         info = os.lstat(source / child)
         if stat.S_ISDIR(info.st_mode):
             (destination / child).mkdir(parents=True, exist_ok=True)
@@ -488,7 +487,7 @@ def copy_git_tree(source: Path, destination: Path, budget: SeedBudget, rel: str,
             raise SeedRefusal(f"longhorn database entry is a symlink or special file: {child}")
 
 
-def seed_git(host_cargo_home: Path, cargo_home: Path, budget: SeedBudget) -> dict:
+def seed_git(proof: "Proof", host_cargo_home: Path, cargo_home: Path, budget: SeedBudget) -> dict:
     """Seed the one locked Longhorn bare database, and verify the locked commit.
 
     Exactly one host database directory must match. It is copied through the
@@ -518,14 +517,14 @@ def seed_git(host_cargo_home: Path, cargo_home: Path, budget: SeedBudget) -> dic
         raise SeedRefusal("seed aggregate would exceed the 256 MiB bound; refused before the write")
     budget.used += len(GIT_CONFIG)
     (destination / "config").write_bytes(GIT_CONFIG)
-    files.append({"path": f"{base}/config", "sha256": hashlib.sha256(GIT_CONFIG).hexdigest()})
-    commit = git_rev_parse(destination, f"{LONGHORN_REV}^{{commit}}", destination)
+    files.append({"path": f"{base}/config", "sha256": hashlib.sha256(GIT_CONFIG).hexdigest(), "generated": True})
+    commit = git_rev_parse(proof, destination, f"{LONGHORN_REV}^{{commit}}", destination, "git-rev-commit")
     if commit != LONGHORN_REV:
         raise SeedRefusal(f"private longhorn database resolves {commit}, not the locked {LONGHORN_REV}")
     return {"source": LONGHORN_SOURCE, "database": name, "rev": LONGHORN_REV, "files": files}
 
 
-def verify_private_checkout(cargo_home: Path, name: str) -> None:
+def verify_private_checkout(proof: "Proof", cargo_home: Path, name: str) -> None:
     """After staging: the checkout Cargo made at the locked rev has that HEAD."""
     checkout = cargo_home / "git" / "checkouts" / name / LONGHORN_REV[:7]
     lstat_real_dir(checkout, "private longhorn checkout")
@@ -533,12 +532,12 @@ def verify_private_checkout(cargo_home: Path, name: str) -> None:
     if not os.path.lexists(git_dir):
         raise SeedRefusal("private checkout has no .git, so its HEAD cannot be verified")
     lstat_real_dir(git_dir, "private checkout git directory")
-    head = git_rev_parse(git_dir, "HEAD", checkout)
+    head = git_rev_parse(proof, git_dir, "HEAD", checkout, "git-rev-checkout")
     if head != LONGHORN_REV:
         raise SeedRefusal(f"private checkout HEAD is {head}, not the locked {LONGHORN_REV}")
 
 
-def seed_from_lock(host_cargo_home: Path, packages: list[dict], git_package: dict, cargo_home: Path, lock_sha256: str) -> dict:
+def seed_from_lock(proof: "Proof", host_cargo_home: Path, packages: list[dict], git_package: dict, cargo_home: Path, lock_sha256: str) -> dict:
     """Copy only what Cargo.lock needs from the one supported crates.io namespace.
 
     Inputs: the namespace config.json, one sparse index entry per package
@@ -576,7 +575,7 @@ def seed_from_lock(host_cargo_home: Path, packages: list[dict], git_package: dic
         check_chain(cache_ns, archive)
         digest = copy_bounded(cache_ns / archive, dest_cache / archive, budget, package["checksum"])
         manifest.append({"path": f"cache/{archive}", "sha256": digest})
-    git = seed_git(host_cargo_home, cargo_home, budget)
+    git = seed_git(proof, host_cargo_home, cargo_home, budget)
     compare_seed(cargo_home, namespace, packages, [entry["path"] for entry in git["files"]])
     return {
         "lock_sha256": lock_sha256,
@@ -639,7 +638,7 @@ def stage(proof: Proof) -> Path:
     lstat_real_dir(host_cargo_home, "host CARGO_HOME")
     cargo_home = proof.root / "cargo-home"
     cargo_home.mkdir()
-    seed = seed_from_lock(host_cargo_home, packages, git_package, cargo_home, lock_sha256)
+    seed = seed_from_lock(proof, host_cargo_home, packages, git_package, cargo_home, lock_sha256)
     (proof.evidence / "seed.json").write_text(json.dumps(seed, indent=2))
     cargo = shutil.which("cargo")
     if cargo is None:
@@ -657,7 +656,7 @@ def stage(proof: Proof) -> Path:
     code, _, err = proof.run([cargo, "build", "--offline", "--locked", "--bin", "oxide"], env, "stage", cwd=REPO)
     if code != 0:
         raise RuntimeError(f"staging failed: {err[-400:]}")
-    verify_private_checkout(cargo_home, seed["git"]["database"])
+    verify_private_checkout(proof, cargo_home, seed["git"]["database"])
     artifact = (proof.root / "target" / "debug" / "oxide").resolve()
     if not artifact.is_file() or proof.root not in artifact.parents:
         raise RuntimeError("the staged artifact is not inside the owned root")
