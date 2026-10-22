@@ -198,8 +198,8 @@ the operating rules.
   - never resets a running clock or enlarges caps silently;
   - doesn't turn uncertainty into release, or allow evading a host-tool
     denial.
-- **Model routing:** Opus High authors and Sol High reviews. Astra is not used
-  for review (Tom, 2026-10-18, "Use Sol").
+- **Model routing:** briefs declare task complexity; Queue selects the author
+  and reviewer models.
 - **Still need Tom's scoped approval:**
   - switching a new consumer project;
   - host installs beyond the planner's receipt-matched `oxide` reinstall;
