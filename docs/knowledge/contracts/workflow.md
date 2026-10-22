@@ -2405,10 +2405,15 @@ migration and consumer adoption remain separate gates.
   step recreates an absent mount point, follows a link, or unlinks by path
   text. Unknown writer custody — a lost slot whose writers were never
   positively closed, in either pool — refuses any relink or clean for that
-  checkout until it is resolved.
+  checkout until it is resolved. Record IDs are per pool, so a command is
+  exempt only from its own record in its own pool; an equal ID in the other
+  pool is another command.
 - **Crash replay.** Only the exact prepared/old generations replay. A live
   prepared sibling is renamed and committed; an already-published prepared
-  link is committed; a preparation that published nothing rolls back to the
+  link is committed — in both cases only after the prepared root passes the
+  full check (marker kind, volume UUID, generation, live registered device,
+  ancestry), so a contradiction stops with the old link, the sibling, both
+  roots and the prepared receipt unchanged; a preparation that published nothing rolls back to the
   old selection and keeps any root it created. The old state is a missing
   target (a first conversion has no committed selection) or the receipt's
   exact old owned link: a link that appeared after the crash, even a dangling
@@ -2428,7 +2433,10 @@ migration and consumer adoption remain separate gates.
   exactly it before Cargo starts. Every reused root is revalidated in full —
   this checkout's marker, kind, volume, creation generation, device and
   ancestry, so a replaced `oxide-outputs` ancestor or a mismatched marker
-  refuses instead of writing onto another disk. If the drive changed while
+  refuses instead of writing onto another disk. The local root must be
+  exactly `<checkout>/.oxide-outputs/local` under a real `.oxide-outputs`
+  directory and resolve to that path: a symlinked ancestor, even on the same
+  device, refuses reuse, establishment and clean. If the drive changed while
   the command waited, the command refuses and asks to be run again rather
   than binding a root its slot was not keyed for. No command is redirected
   mid-run. A checkout that is not converted keeps ephemeral behaviour with a
@@ -2476,8 +2484,10 @@ simultaneous commands that both reach Cargo, so the second-slot rule and a
 non-blocking starter path hold; an active build script blocking an explicit
 relink; a replaced `oxide-outputs` ancestor refused for an unchanged
 destination with no write onto internal disk; crash replay at the prepared,
-sibling and renamed points plus the contradictory-state stop and a crafted
-link that appeared after a crash; a crafted quarantined writer blocking both
+sibling and renamed points plus the contradictory-state stop, a sibling-point
+replay refused before its rename when the registration names another volume,
+and a crafted link that appeared after a crash; a same-device symlinked
+`.oxide-outputs` refused by build and clean with the tree it names unchanged; a crafted quarantined writer blocking both
 relink and clean; selected clean refusing after its link turned foreign while
 it waited, and selected and whole clean refusing a replaced or unusable
 volume while preserving the root, marker and inactive roots; a second

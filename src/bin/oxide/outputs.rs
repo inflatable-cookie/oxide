@@ -1626,6 +1626,7 @@ fn validate_root_device(
     refuse_mount_root(&selected.root)?;
     match (selected.kind, binding) {
         (RootKind::Local, _) => {
+            validate_local_ancestry(checkout, &selected.root)?;
             let checkout_metadata = fs::symlink_metadata(checkout)
                 .map_err(|error| format!("cannot inspect {}: {error}", checkout.display()))?;
             if metadata.dev() != checkout_metadata.dev() {
@@ -1668,6 +1669,38 @@ fn validate_root_device(
                 selected.root.display()
             ))
         }
+    }
+    Ok(())
+}
+
+/// The local root is exactly `<checkout>/.oxide-outputs/local` with a real
+/// `.oxide-outputs` directory and no link anywhere between the checkout and
+/// the leaf: a same-device symlinked ancestor would place outputs (and a
+/// clean's deletions) outside the checkout.
+fn validate_local_ancestry(checkout: &Path, root: &Path) -> Result<(), String> {
+    let outer = checkout.join(LOCAL_DIR);
+    if root != outer.join(LOCAL_ROOT) {
+        return Err(format!(
+            "{} is not this checkout's local root {}",
+            root.display(),
+            outer.join(LOCAL_ROOT).display()
+        ));
+    }
+    let metadata = fs::symlink_metadata(&outer)
+        .map_err(|error| format!("cannot inspect {}: {error}", outer.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!("{} is not a real directory", outer.display()));
+    }
+    let canonical_checkout = fs::canonicalize(checkout)
+        .map_err(|error| format!("cannot resolve {}: {error}", checkout.display()))?;
+    let canonical = fs::canonicalize(root)
+        .map_err(|error| format!("cannot resolve {}: {error}", root.display()))?;
+    if canonical != canonical_checkout.join(LOCAL_DIR).join(LOCAL_ROOT) {
+        return Err(format!(
+            "{} resolves to {}, outside this checkout",
+            root.display(),
+            canonical.display()
+        ));
     }
     Ok(())
 }
@@ -2087,6 +2120,8 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
     let sibling = sibling_link(link, prepared.generation);
     let sibling_read = fs::read_link(&sibling).ok();
     let owned_new = owned_root(&context.workspace, &context.checkout_id, &prepared.to.root).is_ok();
+    let sibling_live = sibling_read.as_deref() == Some(prepared.to.root.as_path());
+    let renamed = target.link_root() == Some(prepared.to.root.as_path());
     // A first conversion has no committed selection, so its only valid old
     // state is a missing target: a link that appeared after the crash (even a
     // dangling one) is not this receipt's and is never renamed over. A
@@ -2098,12 +2133,24 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
         (_, Some(selected)) if target.link_root() == Some(selected.root.as_path()) => true,
         _ => false,
     };
+    // An owned new root is validated in full (marker kind, volume UUID,
+    // generation, live registered device and ancestry) before anything is
+    // committed or renamed: a contradiction keeps the old link, the sibling,
+    // both roots and the prepared receipt exactly as they are.
+    let _binding = if owned_new && (renamed || (sibling_live && old_live)) {
+        Some(
+            validate_prepared(context, &prepared)
+                .map_err(|reason| stop_unknown(context, &prepared, &reason))?,
+        )
+    } else {
+        None
+    };
     // 1. The rename already happened: commit.
-    if owned_new && target.link_root() == Some(prepared.to.root.as_path()) {
+    if owned_new && renamed {
         return finish_commit(context, &receipt, &prepared);
     }
     // 2. The sibling link is live: retry the rename under the barrier.
-    if owned_new && sibling_read.as_deref() == Some(prepared.to.root.as_path()) && old_live {
+    if owned_new && sibling_live && old_live {
         fs::rename(&sibling, link).map_err(|error| {
             format!(
                 "cannot replay the prepared link rename {}: {error}; both roots are kept",
@@ -2144,6 +2191,27 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
     rolled.updated_ms = process::now_ms();
     write_receipt(control, &rolled)?;
     Ok(rolled)
+}
+
+/// The complete check of a prepared destination root, held (with its volume
+/// binding) across the replayed rename and commit.
+fn validate_prepared(context: &Context, prepared: &Prepared) -> Result<Option<Binding>, String> {
+    let to = &prepared.to;
+    let binding = match to.kind {
+        RootKind::External => Some(binding_for(
+            context,
+            to.volume_uuid.as_deref().unwrap_or_default(),
+        )?),
+        RootKind::Local => None,
+    };
+    validate_selected(
+        &context.workspace,
+        &context.checkout_id,
+        to,
+        binding.as_ref(),
+        prepared.generation,
+    )?;
+    Ok(binding)
 }
 
 fn stop_unknown(context: &Context, prepared: &Prepared, reason: &str) -> String {
@@ -2980,6 +3048,97 @@ mod tests {
         )
         .unwrap_err();
         assert!(refused.contains("ahead of the receipt"), "{refused}");
+    }
+
+    /// Replay validates the prepared root in full before it renames: a marker
+    /// ahead of the prepared generation, or one for another volume, stops
+    /// with the target, the sibling, the root and the prepared receipt kept.
+    #[test]
+    fn replay_refuses_a_contradictory_prepared_root_before_renaming() {
+        for contradiction in ["ahead", "volume"] {
+            let fixture = Fixture::new();
+            let context = fixture.context();
+            let spec = fixture.local();
+            let mut to = spec.selected(1);
+            match contradiction {
+                "ahead" => {
+                    ensure_root(&context, &spec, 4).unwrap();
+                }
+                _ => {
+                    ensure_root(&context, &spec, 1).unwrap();
+                    to.volume_uuid = Some("00000000-0000-0000-0000-000000000000".to_owned());
+                }
+            }
+            let prepared = Prepared {
+                generation: 1,
+                to,
+                link: context.link(),
+            };
+            let mut receipt = fixture.receipt();
+            receipt.state = ReceiptState::Prepared;
+            receipt.prepared = Some(prepared.clone());
+            write_receipt(&fixture.control, &receipt).unwrap();
+            let sibling = sibling_link(&prepared.link, 1);
+            symlink(&prepared.to.root, &sibling).unwrap();
+            let refused = replay(&context, receipt.clone()).unwrap_err();
+            assert!(
+                refused.contains("cannot be replayed"),
+                "{contradiction}: {refused}"
+            );
+            assert!(!os_symlink_exists(&context.link()), "{contradiction}");
+            assert_eq!(fs::read_link(&sibling).unwrap(), prepared.to.root);
+            assert!(prepared.to.root.join(MARKER).is_file());
+            let kept = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(kept, receipt, "{contradiction}");
+        }
+    }
+
+    /// A symlinked `.oxide-outputs` on the same device is not the real local
+    /// root: reuse, establishment and clean's device check refuse, and the
+    /// tree it points at is left exactly as it was.
+    #[test]
+    fn a_symlinked_local_ancestor_is_refused_without_mutation() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let spec = fixture.local();
+        let receipt = transition(&context, &fixture.receipt(), &spec).unwrap();
+        let selected = receipt.selected().unwrap().clone();
+        let outer = fixture.checkout.join(LOCAL_DIR);
+        let moved = fixture.root.join("moved-outputs");
+        fs::rename(&outer, &moved).unwrap();
+        symlink(&moved, &outer).unwrap();
+        let listing = |path: &Path| {
+            let mut names: Vec<_> = fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = listing(&moved.join(LOCAL_ROOT));
+
+        match check_root(&context, receipt.generation, &selected) {
+            RootCheck::Contradiction(reason) => {
+                assert!(reason.contains("not a real directory"), "{reason}")
+            }
+            _ => panic!("a symlinked local ancestor must contradict"),
+        }
+        let refused = validate_root_device(&fixture.checkout, &selected, None).unwrap_err();
+        assert!(refused.contains("not a real directory"), "{refused}");
+        assert!(ensure_root(&context, &spec, receipt.generation).is_err());
+        assert_eq!(listing(&moved.join(LOCAL_ROOT)), before);
+        assert_eq!(fs::read_link(&outer).unwrap(), moved);
+
+        // Establishing a new root through a symlinked ancestor writes nothing.
+        let fresh = Fixture::new();
+        let context = fresh.context();
+        let elsewhere = fresh.root.join("elsewhere");
+        fs::create_dir_all(elsewhere.join(LOCAL_ROOT)).unwrap();
+        symlink(&elsewhere, fresh.checkout.join(LOCAL_DIR)).unwrap();
+        assert!(ensure_root(&context, &fresh.local(), 1).is_err());
+        assert!(listing(&elsewhere.join(LOCAL_ROOT)).is_empty());
     }
 
     #[test]

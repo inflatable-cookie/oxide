@@ -855,6 +855,16 @@ def run(proof: Proof, repo: str) -> None:
             expect(link_target(link) == local_root, "the linked crash moved the live link")
             sibling = os.path.join(app, ".target.oxide-new-%d" % prepared["prepared"]["generation"])
             expect(os.path.islink(sibling), f"no prepared sibling at {sibling}")
+            # A registration that no longer names the prepared root's volume
+            # stops the replay before its rename: link, sibling and receipt kept.
+            prepared_bytes = read_bytes(receipt_path(pool, app))
+            set_recorded_uuid(pool, wrong)
+            code, _, stderr = proof.oxide(["outputs", "adopt"], "replay with a wrong UUID refuses", app)
+            expect(code != 0 and "cannot be replayed" in stderr, stderr)
+            expect(link_target(link) == local_root, "the refused replay moved the live link")
+            expect(os.path.islink(sibling), "the refused replay removed the sibling")
+            expect(read_bytes(receipt_path(pool, app)) == prepared_bytes, "the refused replay rewrote the receipt")
+            set_recorded_uuid(pool, good)
         else:
             expect(link_target(link) == external_root, "the renamed crash did not publish the link")
         code, stdout, stderr = proof.oxide(["outputs", "adopt"], f"replay after {point}", app)
@@ -870,6 +880,30 @@ def run(proof: Proof, repo: str) -> None:
     code, stdout, _ = proof.oxide(["outputs", "adopt"], "idempotent adopt", app)
     expect(code == 0 and "already selects" in stdout, stdout)
     proof.phase("after crash replay")
+
+    # 9b. A same-device symlink in place of `.oxide-outputs` is not the real
+    #     checkout-local root: build and clean refuse and the tree it points
+    #     at is unchanged.
+    set_recorded_uuid(pool, wrong)
+    code, _, stderr = proof.oxide(["check"], "local root before the ancestor swap", app)
+    expect(code == 0 and link_target(link) == local_root, stderr)
+    local_outer = os.path.join(app, ".oxide-outputs")
+    moved_outer = os.path.join(root, "moved-local-outputs")
+    os.rename(local_outer, moved_outer)
+    os.symlink(moved_outer, local_outer)
+    moved_local = os.path.join(moved_outer, "local")
+    before = sorted(os.listdir(moved_local))
+    code, _, stderr = proof.oxide(["build", "--bin", "poutputs"], "symlinked local ancestor refuses", app)
+    expect(code != 0 and "not a real directory" in stderr, stderr)
+    code, _, stderr = proof.oxide(["clean"], "clean through a symlinked local ancestor refuses", app)
+    expect(code != 0 and "clean refused" in stderr, stderr)
+    expect(sorted(os.listdir(moved_local)) == before, "the refused commands changed the moved local root")
+    os.remove(local_outer)
+    os.rename(moved_outer, local_outer)
+    set_recorded_uuid(pool, good)
+    code, _, stderr = proof.oxide(["check"], "redock after the ancestor control", app)
+    expect(code == 0 and link_target(link) == external_root, stderr)
+    proof.phase("after the local ancestor control")
 
     # 10. A foreign live link refuses and is left untouched.
     os.remove(os.path.join(app, "target"))

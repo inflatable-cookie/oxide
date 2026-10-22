@@ -1549,10 +1549,15 @@ impl Store {
             },
         };
         let mut writers = false;
-        for (pool, state) in [("this", own_state), ("the other", other_state)] {
+        // Record IDs are per pool, so the caller's own ID is exempt only in
+        // this store's state; an equal ID in the other pool is another command.
+        for (pool, state, exempt) in [
+            ("this", own_state, Some(own)),
+            ("the other", other_state, None),
+        ] {
             let Some(state) = state else { continue };
             for record in &state.records {
-                if record.checkout.as_deref() != Some(checkout) || record.id == own {
+                if record.checkout.as_deref() != Some(checkout) || Some(record.id) == exempt {
                     continue;
                 }
                 if record.phase == Phase::Retired {
@@ -3103,6 +3108,55 @@ mod tests {
             internal.checkout_custody(checkout, 0).unwrap(),
             CheckoutCustody::Clear
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Record IDs are per pool: the caller's own ID exempts only its record in
+    /// its own pool, never an equal ID in the other pool, in either direction
+    /// and for running and quarantined records alike.
+    #[test]
+    fn checkout_custody_exempts_own_id_only_in_its_own_pool() {
+        let (root, internal, removable) = paired_controls("custody-ids");
+        let checkout = Path::new("/checkout/custody-ids");
+        let id_seven = |phase| state_with(vec![custody_record(7, checkout, phase, None)]);
+
+        internal.save(&id_seven(Phase::Acquiring)).unwrap();
+        removable.save(&id_seven(Phase::Running)).unwrap();
+        assert_eq!(
+            internal.checkout_custody(checkout, 7).unwrap(),
+            CheckoutCustody::Writers
+        );
+        assert_eq!(
+            removable.checkout_custody(checkout, 7).unwrap(),
+            CheckoutCustody::Clear
+        );
+
+        removable.save(&id_seven(Phase::Acquiring)).unwrap();
+        internal.save(&id_seven(Phase::Spawning)).unwrap();
+        assert_eq!(
+            removable.checkout_custody(checkout, 7).unwrap(),
+            CheckoutCustody::Writers
+        );
+
+        let quarantined = Lost {
+            slot_id: "9".to_owned(),
+            at_ms: 4,
+            unclosed: Some("an allowed compiler wrapper may still run".to_owned()),
+        };
+        internal
+            .save(&state_with(vec![custody_record(
+                7,
+                checkout,
+                Phase::Retired,
+                Some(quarantined),
+            )]))
+            .unwrap();
+        match removable.checkout_custody(checkout, 7).unwrap() {
+            CheckoutCustody::Unknown(reason) => {
+                assert!(reason.contains("the other pool"), "{reason}")
+            }
+            other => panic!("expected unknown custody, got {other:?}"),
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
