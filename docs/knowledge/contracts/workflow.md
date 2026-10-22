@@ -969,14 +969,21 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   - **Uncertain:** everything else, including first-seen unreadable rows,
     failed re-reads and unconfirmed zombies.
   - **Terminal nonwriter** (allowlisted kernels only): an actual `getsid`
-    `ESRCH` whose snapshot row and FIRST existing confirmation re-read
-    show the complete same (PID, start) with exact `SZOMB` state in both.
-    A terminal row is neither Gone nor Foreign nor a blocking member;
-    tracked attribution is kept and eligibility is recomputed every round
-    with no exemption cache. No extra reads, sleeps or timers; a
-    nonqualifying first read is never salvaged by later reads, and any
-    failed, missing or contradictory observation in the round disqualifies.
-    A successful `getsid` keeps the old member/foreign/tracked paths and
+    `ESRCH` (errno-checked, not any `ProcessLookupError`) whose snapshot
+    row and FIRST existing confirmation read show the same complete
+    `SZOMB` identity (exact non-bool bounded ints, positive PID, exact
+    `SZOMB` state in both) is accepted as terminal, provided every
+    actually performed read in the round (all confirmation reads plus the
+    existing final read, same 20+final bounds, no early short-circuit)
+    shows the same complete `SZOMB` identity with no failure. Gone keeps
+    priority. A terminal row is neither Gone nor Foreign nor a blocking
+    member; tracked attribution is kept and eligibility is recomputed
+    every round with no exemption cache. A nonqualifying first read is
+    never salvaged by later reads; any failed, missing, malformed,
+    identity/state or non-zombie observation disqualifies terminal and
+    taints the round's terminal count as unaccountable, while rows that
+    were never terminal candidates leave an accountable count alone. A
+    successful `getsid` keeps the old member/foreign/tracked paths and
     other session errors can never qualify. In strict mode terminal
     acceptance never fires and every `ESRCH` row keeps the old uncertain
     handling. No live process is excluded by parent, and a replacement
@@ -1012,11 +1019,18 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   (`valid`/`invalid`/`overflow`) and `terminal_nonwriters` (the exact
   non-bool count 0..2^64-1 of this round's terminal-accepted still-present
   `SZOMB` identities, never Gone rows, when valid, else JSON null; a
-  strictly completed round with none is `valid` 0). A snapshot or census
-  failure without a countable set, like any uncertain round, is `invalid`
-  with null and keeps `uncertain`>=1 with `certain` false in the unchanged
-  IPC fields; saturation is `overflow` with null. Output-witness loss
-  never touches these fields and they never change classification.
+  strictly completed round with none is `valid` 0). Unaccountable
+  terminal candidacy (an actual-`ESRCH` row that could not be fully
+  adjudicated), a snapshot or census failure without a countable set, or
+  a malformed count is `invalid` with null; genuine count overflow is
+  `overflow` with null. Uncertainty of unrelated rows (never terminal
+  candidates, e.g. a live row with an injected session failure) does not
+  itself invalidate an accountable count. An `invalid`/`overflow` count
+  always coincides with `uncertain`>=1 and `certain` false in the
+  unchanged IPC fields (forced when necessary); optional diagnostics
+  saturation never drives authoritative counts or classification.
+  Output-witness loss never touches these fields and they never change
+  classification.
   Optional terminal witness rows (PID, start, both qualifying `SZOMB`
   states, prior tracking) share one combined cap with the diagnostics of
   at most 20 rows and 16384 compact bytes; witness loss only ever means
@@ -1109,7 +1123,7 @@ path is printed for the owner.
 
 It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
 `scripts/test_supervisor.py`. The suite runs in order:
-- 77 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 85 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -1133,15 +1147,20 @@ It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
   overflow with an exact omitted count, byte-ceiling trimming and
   serialization failure leaving classifications, counts and faults
   unchanged); mandatory receipt terminal counts (`valid` 0 for a strictly
-  completed round, exact terminal-`SZOMB` count when valid, `invalid`/
-  `overflow` with null and `uncertain`>=1 otherwise, IPC schema unchanged,
-  Gone rows never counted); the exact-kernel allowlist (match, build
-  mismatch, malformed UUID length, wrong UUID value, read error, oversize,
-  version contradiction, version without token) and terminal eligibility
-  (allowlisted zombie accepted with exact witness and kept attribution,
-  strict/live/first-read-failure/final-failure/non-`ESRCH`/replacement
-  never terminal, tracked recompute, combined witness budget keeping the
-  count);
+  completed round or unrelated uncertainty, exact terminal-`SZOMB` count
+  when valid, `invalid`/`overflow` with null and forced `uncertain`>=1 /
+  `certain` false otherwise, IPC schema unchanged, Gone rows never
+  counted, diagnostics saturation never driving the count); the
+  exact-kernel allowlist (match, ASCII form, build mismatch, malformed
+  UUID length, wrong UUID value, read error, oversize, interior-NUL and
+  missing-NUL versions, contradiction, missing token, fixed-reader
+  oversize rejection) and terminal eligibility (allowlisted zombie
+  accepted with exact witness and kept attribution, strict/live/
+  first-read-failure/intermediate-failure/intermediate-live/final-failure/
+  final-live/non-`ESRCH`/non-`ESRCH`-errno/replacement never terminal,
+  all-actually-performed-read tracking without short-circuit, tracked
+  member forcing uncertainty on unaccountable counts, tracked recompute,
+  combined witness budget keeping the count);
 - writers before and after a simulated staging step;
 - 35 real cases with tiny Python fixtures and injected faults:
   - exit 0, owned cleanup, nonzero, exec 127, output saturation;
@@ -1193,7 +1212,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 112 cases;
+- all 120 cases;
 - every real case directory and receipt still present after the
   candidate's cleanup.
 

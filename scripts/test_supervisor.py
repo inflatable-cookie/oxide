@@ -571,6 +571,26 @@ class PureAllowlist(unittest.TestCase):
         self.assertEqual(bounded._decide_terminal_mode(self.reader(values))["reason"],
                          "identity_mismatch")
 
+    def test_version_interior_nul_malformed(self):
+        values = self.exact_triple()
+        values["kern.version"] = b"junk\x00root:xnu-12377.161.14~5/RELEASE_ARM64_T6050\x00"
+        self.assertEqual(bounded._decide_terminal_mode(self.reader(values))["reason"],
+                         "identity_malformed")
+
+    def test_version_missing_nul_malformed(self):
+        values = self.exact_triple()
+        values["kern.version"] = b"root:xnu-12377.161.14~5/RELEASE_ARM64_T6050"
+        self.assertEqual(bounded._decide_terminal_mode(self.reader(values))["reason"],
+                         "identity_malformed")
+
+    def test_fixed_reader_rejects_reported_oversize(self):
+        if sys.platform != "darwin":
+            self.skipTest("macOS sysctl only")
+        reader = bounded._fixed_sysctl_reader()
+        with self.assertRaises(OSError):
+            reader("kern.version", 8)  # true value is 104 bytes: must not slice
+        self.assertEqual(reader("kern.osversion", 64), b"25G83\x00")
+
 
 class PureTerminalCounts(unittest.TestCase):
     """Mandatory receipt terminal_count_status / terminal_nonwriters.
@@ -618,12 +638,16 @@ class PureTerminalCounts(unittest.TestCase):
                          ("invalid", None))
         self.assertNotIn("terminal_witnesses", result)
 
-    def test_live_snapshot_never_terminal(self):
+    def test_live_snapshot_unrelated_valid_zero(self):
+        # A live snapshot was never a terminal candidate: its uncertainty
+        # is unrelated to terminal accounting, so the accountable count
+        # stays valid 0 while the round still blocks.
         table = FakeTable([row(142, start=5)], {142: ProcessLookupError(3, "gone")})
         result = census(table, terminal_allowed=True).round()
         self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
         self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
-                         ("invalid", None))
+                         ("valid", 0))
+        self.assertNotIn("terminal_witnesses", result)
 
     def test_first_read_failure_no_terminal(self):
         def flaky(reads):
@@ -664,12 +688,87 @@ class PureTerminalCounts(unittest.TestCase):
         self.assertEqual((again["terminal_count_status"], again["terminal_nonwriters"]),
                          ("valid", 1))
 
-    def test_non_esrch_never_terminal(self):
+    def test_non_esrch_unrelated_valid_zero(self):
+        # A non-ESRCH failure can never qualify as terminal, but it is
+        # unrelated to terminal accounting: valid 0 with blocking uncertainty.
         table = FakeTable([zombie_row(146, 5)], {146: PermissionError(1, "denied")})
         result = census(table, terminal_allowed=True).round()
         self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
         self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
+                         ("valid", 0))
+        self.assertNotIn("terminal_witnesses", result)
+
+    def test_intermediate_failure_disqualifies(self):
+        # Read 1 matches SZOMB, read 2 fails, final matches: the actually
+        # performed contradiction disqualifies terminal even though the
+        # final read is same-SZOMB.
+        def flaky(reads):
+            if reads == 2:
+                raise OSError(errno.EIO, "injected I/O failure")
+            return zombie_row(148, 5)
+        table = FakeTable([zombie_row(148, 5)], {148: ProcessLookupError(3, "gone")},
+                           reread={148: flaky})
+        result = census(table, terminal_allowed=True).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
                          ("invalid", None))
+        self.assertNotIn("terminal_witnesses", result)
+
+    def test_intermediate_live_disqualifies(self):
+        # An actually performed intermediate live observation of the same
+        # identity contradicts terminal even though every other read matches.
+        def mixed(reads):
+            if reads == 2:
+                return row(149, start=5)
+            return zombie_row(149, 5)
+        table = FakeTable([zombie_row(149, 5)], {149: ProcessLookupError(3, "gone")},
+                           reread={149: mixed})
+        result = census(table, terminal_allowed=True).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
+                         ("invalid", None))
+
+    def test_final_live_disqualifies(self):
+        table = FakeTable([zombie_row(150, 5)], {150: ProcessLookupError(3, "gone")},
+                           reread={150: lambda reads: zombie_row(150, 5) if reads <= 20
+                           else row(150, start=5)})
+        result = census(table, terminal_allowed=True).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
+                         ("invalid", None))
+        self.assertNotIn("terminal_witnesses", result)
+
+    def test_tracked_member_failed_reads_forces_uncertain(self):
+        # Integration: an invalid terminal count forces uncertain>=1 and
+        # certain False through the unchanged IPC fields, even though the
+        # tracked row stays a member.
+        def flaky(reads):
+            if reads == 2:
+                raise OSError(errno.EPERM, "injected failure")
+            return zombie_row(151, 5)
+        table = FakeTable([row(151, start=5)], {151: 100})
+        check = census(table, terminal_allowed=True)
+        self.assertEqual(check.round()["members"], 1)
+        table.rows = [zombie_row(151, 5)]
+        table.sessions = {151: ProcessLookupError(3, "gone")}
+        table.reads, table.rereads = 0, {151: flaky}
+        result = check.round()
+        self.assertEqual(result["members"], 1)  # tracked attribution kept
+        self.assertEqual(result["uncertain"], 1)
+        self.assertFalse(result["certain"])
+        self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
+                         ("invalid", None))
+        self.assertNotIn("terminal_witnesses", result)
+
+    def test_non_esrch_errno_not_gone(self):
+        # Only an actual errno-ESRCH failure takes the Gone branch; any
+        # other ProcessLookupError errno stays on the non-ESRCH path.
+        table = FakeTable([zombie_row(152, 5)], {152: ProcessLookupError(1, "denied")})
+        result = census(table, terminal_allowed=True).round()
+        self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
+        self.assertIn("getsid", result["uncertain_rows"][0]["reason"])
+        self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
+                         ("valid", 0))
 
     def test_replacement_is_gone_not_terminal(self):
         table = FakeTable([zombie_row(147, 5)], {147: ProcessLookupError(3, "gone")},
@@ -693,13 +792,22 @@ class PureTerminalCounts(unittest.TestCase):
         self.assertEqual(len(result["terminal_witnesses"]), 5)  # 15 diag + 15 witness > 20
         self.assertEqual(len(result["diagnostics"]["rows"]), 15)
 
-    def test_uncertain_round_invalid_null(self):
-        table = FakeTable([row(132, start=5)], {132: ProcessLookupError(3, "gone")})
-        result = census(table).round()
+    def test_unaccountable_round_invalid_null(self):
+        # A zombie ESRCH row whose first confirmation read fails cannot be
+        # adjudicated: the terminal count is unaccountable (null) with
+        # blocking uncertainty, serialized as JSON null with its status.
+        def flaky(reads):
+            if reads == 1:
+                raise PermissionError(13, "denied")
+            return zombie_row(132, 5)
+        table = FakeTable([zombie_row(132, start=5)], {132: ProcessLookupError(3, "gone")},
+                           reread={132: flaky})
+        result = census(table, terminal_allowed=True).round()
         self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
         self.assertGreaterEqual(result["uncertain"], 1)
         self.assertEqual(result["terminal_count_status"], "invalid")
         self.assertIsNone(result["terminal_nonwriters"])
+        self.assertNotIn("terminal_witnesses", result)
         blob = json.dumps(result, ensure_ascii=True, separators=(',', ':'))
         self.assertIn('"terminal_nonwriters":null', blob)
 
@@ -715,7 +823,7 @@ class PureTerminalCounts(unittest.TestCase):
         self.assertEqual(bounded._terminal_fields(0, False, False), ("valid", 0))
         self.assertEqual(bounded._terminal_fields(bounded.U64MAX, False, False), ("valid", bounded.U64MAX))
         self.assertEqual(bounded._terminal_fields(bounded.U64MAX + 1, False, False), ("overflow", None))
-        self.assertEqual(bounded._terminal_fields(3, False, False, saturated=True), ("overflow", None))
+        self.assertEqual(bounded._terminal_fields(0, True, False), ("invalid", None))
         self.assertEqual(bounded._terminal_fields(3, True, False), ("invalid", None))
         self.assertEqual(bounded._terminal_fields(-1, False, False), ("invalid", None))
 
@@ -1160,9 +1268,13 @@ class Real(unittest.TestCase):
                                    getsid=injected_getsid, reread=bounded.Kinfo.one,
                                    pause=lambda _seconds: None, terminal_allowed=True)
             result = check.round()
+            # Blocking uncertainty with an accountable count: valid 0, since
+            # a live row with an explicitly injected non-ESRCH failure was
+            # never a terminal candidate.
             self.assertEqual((result["certain"], result["uncertain"]), (False, 1))
             self.assertEqual((result["terminal_count_status"], result["terminal_nonwriters"]),
-                             ("invalid", None))
+                             ("valid", 0))
+            self.assertNotIn("terminal_witnesses", result)
         finally:
             child.kill()
             child.wait(timeout=10)

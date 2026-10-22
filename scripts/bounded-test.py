@@ -399,26 +399,54 @@ def _diag_object(attempted, rows, saturated):
         return None
 
 
-def _terminal_fields(terminal_count, has_uncertain, failed, saturated=False):
+def _same_complete_zombie(ref, cand):
+    """Whether two observations show the same complete SZOMB identity.
+
+    Requires both to be dicts with exact non-bool bounded ints (positive
+    PID, start in range) equal across both, and exact SZOMB state in
+    both. Pure predicate, never raises."""
+    try:
+        if not isinstance(ref, dict) or not isinstance(cand, dict):
+            return False
+        ref_pid, ref_start = ref.get("pid"), ref.get("start")
+        cand_pid, cand_start = cand.get("pid"), cand.get("start")
+        if not (type(ref_pid) is int and 1 <= ref_pid <= U64MAX):
+            return False
+        if not (type(ref_start) is int and 0 <= ref_start <= U64MAX):
+            return False
+        if not (type(cand_pid) is int and 1 <= cand_pid <= U64MAX):
+            return False
+        if not (type(cand_start) is int and 0 <= cand_start <= U64MAX):
+            return False
+        return (ref_pid == cand_pid and ref_start == cand_start
+                and ref.get("zombie") is True and cand.get("zombie") is True)
+    except BaseException:
+        return False
+
+
+def _terminal_fields(terminal_count, unaccountable, failed):
     """Mandatory receipt-only terminal count fields.
 
     Returns (status, value) with status in valid/invalid/overflow and
     value an exact non-bool int 0..U64MAX when valid, else None (JSON
     null). Valid counts this round's positively verified still-present
-    SZOMB identities accepted by the ESRCH-only terminal rule (never Gone
-    rows); a strictly completed round with none is valid 0. Any uncertain
-    row or a failure without a countable set is invalid with null, never
-    a raw bad value, false zero or lower bound; saturation/overflow is
-    likewise null. Invalid/overflow always coincide with uncertain>=1 and
-    certain False in the unchanged IPC fields. Never raises."""
+    SZOMB identities accepted by the terminal rule, never Gone rows.
+    Unaccountable terminal candidacy (an actual-ESRCH row that could not
+    be fully adjudicated as terminal or Gone), a failure without a
+    countable set, or a malformed count is invalid with null, never a raw
+    bad value, false zero or lower bound; genuine count overflow is
+    likewise null. Invalid and overflow always coincide with uncertain>=1
+    and certain False in the unchanged IPC fields (enforced by the
+    caller). Uncertainty of unrelated rows (never terminal candidates)
+    does not itself invalidate an accountable count. Optional
+    diagnostics saturation never feeds this helper and must not change
+    authoritative counts or classification. Never raises."""
     try:
         if failed:
             return ("invalid", None)
-        if saturated:
-            return ("overflow", None)
         if type(terminal_count) is int and terminal_count > U64MAX:
             return ("overflow", None)
-        if has_uncertain:
+        if unaccountable:
             return ("invalid", None)
         if type(terminal_count) is int and 0 <= terminal_count <= U64MAX:
             return ("valid", terminal_count)
@@ -435,6 +463,8 @@ def _fixed_sysctl_reader():
         length = ctypes.c_size_t(size)
         if libc.sysctlbyname(name.encode("ascii"), buf, ctypes.byref(length), None, 0) != 0:
             raise OSError(ctypes.get_errno(), "sysctlbyname " + name)
+        if length.value > size:
+            raise OSError(errno.ENOMEM, "sysctlbyname " + name + " exceeds fixed buffer")
         return bytes(buf.raw[:length.value])
     return read
 
@@ -448,12 +478,14 @@ def _is_oversize(error):
 
 
 def _ascii_nul_text(raw):
-    """Complete ASCII NUL-terminated string body, else None."""
+    """Complete ASCII NUL-terminated string body, else None.
+
+    Exactly one NUL, in terminal position; interior NULs are malformed."""
     try:
         if not raw or raw[-1:] != b"\x00":
             return None
         body = raw[:-1]
-        if not body:
+        if not body or b"\x00" in body:
             return None
         return body.decode("ascii")
     except BaseException:
@@ -486,6 +518,8 @@ def _decide_terminal_mode(reader=None):
                 uuid_text = uuid_raw[:-1].decode("ascii")
             except BaseException:
                 return {"mode": "strict", "reason": "identity_malformed", "evidence": ALLOW_EVIDENCE_ID}
+            if "\x00" in uuid_text:
+                return {"mode": "strict", "reason": "identity_malformed", "evidence": ALLOW_EVIDENCE_ID}
             if uuid_text == ALLOW_KERNEL_UUID_STR:
                 pass
             elif len(uuid_text) == 36:
@@ -510,7 +544,7 @@ def _decide_terminal_mode(reader=None):
         except Exception as error:
             reason = "identity_malformed" if _is_oversize(error) else "identity_read_error"
             return {"mode": "strict", "reason": reason, "evidence": ALLOW_EVIDENCE_ID}
-        if not version_raw or version_raw[-1:] != b"\x00":
+        if not version_raw or version_raw[-1:] != b"\x00" or version_raw.count(b"\x00") != 1:
             return {"mode": "strict", "reason": "identity_malformed", "evidence": ALLOW_EVIDENCE_ID}
         try:
             version_text = version_raw[:-1].decode("ascii")
@@ -591,18 +625,26 @@ class Census:
     (PID, start) identity. A replacement identity is never declared foreign
     or member by inference. A failed read confirms nothing.
 
-    Terminal (allowlisted kernels only): an actual getsid ESRCH whose
-    snapshot row and FIRST existing confirmation read show the complete
-    same (PID, start) with exact SZOMB state in both is accepted as a
-    terminal nonwriter without claiming disappearance. Terminal is neither
-    Gone nor Foreign nor a blocking member; tracked attribution is kept
-    and eligibility is recomputed every round with no exemption cache. No
-    extra census reads, sleeps or timers; a nonqualifying first read is
-    never salvaged by later reads, and any failed, missing or
-    contradictory observation in the round disqualifies terminal. A
-    successful getsid keeps the old member/foreign/tracked paths and other
-    session errors can never qualify. In strict mode terminal acceptance
-    never fires and every ESRCH row keeps the old uncertain handling.
+    Terminal (allowlisted kernels only): an actual getsid ESRCH (errno-
+    checked, not any ProcessLookupError) whose snapshot row and FIRST
+    existing confirmation read show the same complete SZOMB identity
+    (exact non-bool bounded ints, positive PID, exact SZOMB state in
+    both) is accepted as a terminal nonwriter without claiming
+    disappearance, provided every actually performed read in the round
+    (all confirmation reads plus the existing final read, same 20+final
+    bounds, no early short-circuit) shows the same complete SZOMB
+    identity with no failure. Terminal is neither Gone (which keeps
+    priority) nor Foreign nor a blocking member; tracked attribution is
+    kept and eligibility is recomputed every round with no exemption
+    cache. A nonqualifying first read is never salvaged by later reads;
+    any failed, missing, malformed, identity/state or non-zombie
+    observation in the round disqualifies terminal and taints the round's
+    terminal count as unaccountable. Rows that were never terminal
+    candidates (no SZOMB snapshot, non-ESRCH failures) leave an
+    accountable count alone. A successful getsid keeps the old
+    member/foreign/tracked paths and other session errors can never
+    qualify. In strict mode terminal acceptance never fires and every
+    ESRCH row keeps the old uncertain handling.
 
     Everything else (other getsid errors, identity change, failed or
     missing metadata, unconfirmed zombies, a failed snapshot) is uncertain
@@ -638,16 +680,19 @@ class Census:
 
     def confirm_gone_info(self, row):
         """Confirm absence, reporting how. Returns (gone, tries, outcome,
-        error, first_row, first_error).
+        error, first_row, first_error, all_clean).
 
         `gone` follows the existing Gone rule (a successful read lacking the
         identity); `tries` is the bounded 1..20 re-read count; `outcome` is
         one of absent/replaced/matching_exhausted/read_failed; `error` is
         the reread exception or None. `first_row`/`first_error` carry the
         FIRST existing confirmation read (a dict, None when absent, or the
-        exception), reused by the terminal rule with no added reads. Same
-        reads, pauses and budget as confirm_gone."""
-        tries, first_row, first_error = 0, "unset", None
+        exception). `all_clean` reports whether every actually performed
+        non-terminal read showed the same complete SZOMB identity (a later
+        Gone still takes priority and ends the confirmation). The terminal
+        rule reuses all of this with no added reads. Same reads, pauses
+        and budget as confirm_gone; no early short-circuit."""
+        tries, first_row, first_error, all_clean = 0, "unset", None, True
         for attempt in range(CONFIRM_TRIES):
             if attempt:
                 self.pause(CONFIRM_PAUSE)
@@ -657,39 +702,37 @@ class Census:
             except Exception as error:
                 if attempt == 0:
                     first_error = error
-                return (False, tries, "read_failed", error, first_row, first_error)
+                return (False, tries, "read_failed", error, first_row, first_error, False)
             if attempt == 0:
                 first_row, first_error = again, None
             if again is None:
-                return (True, tries, "absent", None, first_row, first_error)
+                return (True, tries, "absent", None, first_row, first_error, all_clean)
             if again["start"] != row["start"]:
-                return (True, tries, "replaced", None, first_row, first_error)
-        return (False, tries, "matching_exhausted", None, first_row, first_error)
+                return (True, tries, "replaced", None, first_row, first_error, all_clean)
+            if not _same_complete_zombie(row, again):
+                all_clean = False
+        return (False, tries, "matching_exhausted", None, first_row, first_error, all_clean)
 
     def confirm_gone(self, row):
         """True only on a successful read that lacks the identity."""
-        gone, _tries, _outcome, _error, _first_row, _first_error = self.confirm_gone_info(row)
+        gone, _t, _o, _e, _fr, _fe, _ac = self.confirm_gone_info(row)
         return gone
 
     def terminal_eligible(self, row, first_row, first_error):
         """Whether an actual-ESRCH row qualifies as terminal nonwriter.
 
         Requires allowlisted mode plus the snapshot row and the FIRST
-        existing confirmation read showing the complete same (PID, start)
-        with exact SZOMB state in both. Pure predicate: no reads, no
-        writes, never raises."""
+        existing confirmation read showing the same complete SZOMB
+        identity (exact non-bool bounded ints, positive PID, exact SZOMB
+        state in both). Pure predicate: no reads, no writes, never
+        raises. Later-read contradictions are tracked separately by the
+        caller; this predicate covers only the snapshot/first-read pair."""
         try:
             if self.terminal_allowed is not True:
                 return False
             if first_error is not None:
                 return False
-            if not isinstance(row, dict) or not isinstance(first_row, dict):
-                return False
-            if _diag_u64(row.get("pid")) is None or _diag_u64(row.get("start")) is None:
-                return False
-            if row.get("pid") != first_row.get("pid") or row.get("start") != first_row.get("start"):
-                return False
-            return row.get("zombie") is True and first_row.get("zombie") is True
+            return _same_complete_zombie(row, first_row)
         except BaseException:
             return False
 
@@ -706,14 +749,21 @@ class Census:
                 del self.tracked[identity]
         members, uncertain = [], []
         diag_attempted, diag_saturated, diag_rows = 0, False, []
-        terminal_count, terminal_witnesses = 0, []
+        terminal_count, terminal_witnesses, terminal_tainted = 0, [], False
         for row in rows:
             identity = (row["pid"], row["start"])
             failure, getsid_error = None, None
             try:
                 session = self.getsid(row["pid"])
             except ProcessLookupError as error:
-                session, failure, getsid_error = None, "gone", error
+                try:
+                    actual_esrch = _ERRNO.__get__(error) == errno.ESRCH
+                except BaseException:
+                    actual_esrch = False
+                if actual_esrch:
+                    session, failure, getsid_error = None, "gone", error
+                else:
+                    session, failure = None, f"getsid: {error}"
             except OSError as error:
                 session, failure = None, f"getsid: {error}"
             if failure == "gone":
@@ -721,7 +771,7 @@ class Census:
                     diag_saturated = True
                 else:
                     diag_attempted += 1
-                gone, tries, confirm_outcome, _confirm_error, first_row, first_error = self.confirm_gone_info(row)
+                gone, tries, confirm_outcome, _cerr, first_row, first_error, all_clean = self.confirm_gone_info(row)
                 if gone:
                     self.tracked.pop(identity, None)
                     try:
@@ -737,6 +787,11 @@ class Census:
                     try:
                         category, number = _diag_classify(error)
                         diag_rows.append(_diag_row(row, tries, confirm_outcome, "read_failed", category, number))
+                    except BaseException:
+                        pass
+                    try:
+                        if row.get("zombie") is True:
+                            terminal_tainted = True
                     except BaseException:
                         pass
                     stable = False
@@ -762,10 +817,22 @@ class Census:
                     except BaseException:
                         pass
                     try:
-                        terminal = (self.terminal_eligible(row, first_row, first_error)
-                                    and isinstance(again, dict) and again.get("zombie") is True)
+                        terminal = (confirm_outcome == "matching_exhausted" and all_clean
+                                    and self.terminal_eligible(row, first_row, first_error)
+                                    and _same_complete_zombie(row, again))
                     except BaseException:
                         terminal = False
+                    if not terminal:
+                        # An actual-ESRCH row with a SZOMB snapshot that is
+                        # neither Gone nor terminal-accepted stays
+                        # unaccounted and taints the terminal count. Rows that
+                        # were never terminal candidates (no SZOMB snapshot)
+                        # leave an accountable count alone.
+                        try:
+                            if row.get("zombie") is True:
+                                terminal_tainted = True
+                        except BaseException:
+                            pass
                     if terminal:
                         try:
                             witness = _terminal_witness_row(row, identity in self.tracked)
@@ -802,13 +869,19 @@ class Census:
                 continue  # positively foreign
             else:
                 uncertain.append(dict(row, reason=failure or "identity changed across getsid"))
-        result = {"certain": not uncertain, "members": len(members), "uncertain": len(uncertain),
-                "member_rows": members[:20], "uncertain_rows": uncertain[:20]}
         try:
-            status, value = _terminal_fields(terminal_count, len(uncertain) > 0, False, diag_saturated)
+            status, value = _terminal_fields(terminal_count, terminal_tainted, False)
         except BaseException:
             status, value = "invalid", None
-        result["terminal_count_status"] = status if status in TERMINAL_STATUS_VALUES else "invalid"
+        if status not in TERMINAL_STATUS_VALUES:
+            status, value = "invalid", None
+        if status in ("invalid", "overflow") and not uncertain:
+            # An unaccountable terminal count must block closure through
+            # the unchanged IPC fields, even if no row was uncertain.
+            uncertain.append({"reason": "terminal count not countable"})
+        result = {"certain": not uncertain, "members": len(members), "uncertain": len(uncertain),
+                "member_rows": members[:20], "uncertain_rows": uncertain[:20]}
+        result["terminal_count_status"] = status
         result["terminal_nonwriters"] = value if (
             status == "valid" and type(value) is int and 0 <= value <= U64MAX) else None
         diag_compact_len, diag_kept = 0, 0
