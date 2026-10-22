@@ -139,11 +139,12 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   project, with least-recently-used idle slots evicted under the byte budget.
 - **Cold slots:** the chosen direction instead of sccache is seeding a cold
   slot by cloning matching dependency units from other slots on the same
-  volume, with Cargo still judging freshness. A design spike comes first.
+  volume, with Cargo still judging freshness. It starts conservative:
+  build scripts whose outputs record absolute paths rerun.
   Oxide bypasses inherited compiler wrappers and doesn't manage sccache.
   Cargo's own cross-workspace cache is the preferred long-term complement.
 - **Approved, not built:**
-  - cold-slot seeding from matching units;
+  - cold-slot seeding from matching units, conservative first;
   - per-slot test scratch;
   - broader submodule-aware cross-worktree reuse beyond the narrow
     two-state coverage in the workflow contract.
