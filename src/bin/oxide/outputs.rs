@@ -924,12 +924,19 @@ fn refuse_existing_target(context: &Context, target: &TargetState) -> String {
     )
 }
 
-/// The facts the automatic first conversion decides on, read before its
-/// barrier. Every field must hold; any other state keeps today's behaviour.
+/// The facts the automatic first conversion decides on. Every field must hold;
+/// any other state keeps today's behaviour.
 #[derive(Debug, Eq, PartialEq)]
 struct AutoFacts {
+    /// This command's intermediate slot came from the removable pool under a
+    /// registration in permanent mode, as selected at its start.
+    selected_permanent: bool,
+    /// The external root the registration in force now selects is the one the
+    /// command's selection captured: same volume UUID and root.
+    same_selection: bool,
     /// The registered permanent volume is usable right now.
     external_usable: bool,
+    /// The registration in force now is in permanent mode.
     permanent: bool,
     /// No owned-output receipt of any state, including `detached`.
     receipt_absent: bool,
@@ -938,27 +945,57 @@ struct AutoFacts {
 }
 
 fn auto_adopts(facts: &AutoFacts) -> bool {
-    facts.external_usable && facts.permanent && facts.receipt_absent && facts.target_absent
+    facts.selected_permanent
+        && facts.same_selection
+        && facts.external_usable
+        && facts.permanent
+        && facts.receipt_absent
+        && facts.target_absent
+}
+
+/// Whether the external root a registration selects is the one a command
+/// captured at its selection (same volume, same root).
+fn selection_matches(captured: &Selected, current: &Selected) -> bool {
+    captured.same_place(current)
 }
 
 /// Automatic first conversion (oxide#121), run once per leased command before
-/// its destination is planned, its key is built or its slot is taken. A
-/// permanent drive selected for this command, a checkout with no receipt of any
-/// state and a positively absent target converts under the same barrier,
-/// fences, admission lock and receipt as `oxide outputs adopt`, with the
-/// missing-target-only transition. Any other state is left to the existing
-/// paths untouched. A metadata error refuses; it is never read as absence.
-pub fn auto_adopt(store: &Store, checkout: &Path, removable: bool) -> Result<(), String> {
-    if !removable {
+/// its destination is planned, its key is built or its slot is taken. The
+/// command's own selection must be a removable permanent one, and the volume
+/// in force now must be the one that selection captured. A checkout with no
+/// receipt of any state and a positively absent target then converts under the
+/// same barrier, fences, admission lock and receipt as `oxide outputs adopt`,
+/// with the missing-target-only transition. Any other state is left to the
+/// existing paths untouched. A metadata error refuses; it is never read as
+/// absence.
+pub fn auto_adopt(
+    store: &Store,
+    checkout: &Path,
+    selection: &removable::Selected,
+) -> Result<(), String> {
+    let selected_permanent = selection.removable && selection.mode == Some(DriveMode::Permanent);
+    let Some(captured_registration) = selection
+        .registration
+        .as_ref()
+        .filter(|_| selected_permanent)
+    else {
         return Ok(());
-    }
+    };
+    let captured = external_spec(captured_registration, checkout).selected(0);
     let context = Context::new(
         Some(store.owner_control().to_path_buf()),
         checkout.to_path_buf(),
     );
-    let registration = usable_external(&context);
+    let current = usable_external(&context);
     let facts = AutoFacts {
-        external_usable: registration.is_ok(),
+        selected_permanent,
+        same_selection: current.as_ref().is_ok_and(|registration| {
+            selection_matches(
+                &captured,
+                &external_spec(registration, checkout).selected(0),
+            )
+        }),
+        external_usable: current.is_ok(),
         permanent: context.mode()? == Some(DriveMode::Permanent),
         receipt_absent: context.receipt()?.is_none(),
         target_absent: context.target()? == TargetState::Missing,
@@ -966,10 +1003,6 @@ pub fn auto_adopt(store: &Store, checkout: &Path, removable: bool) -> Result<(),
     if !auto_adopts(&facts) {
         return Ok(());
     }
-    let Ok(registration) = registration else {
-        return Ok(());
-    };
-    let captured = external_spec(&registration, checkout).selected(0);
     let mut waits = WaitAccounting::default();
     let guard = barrier(store, checkout, &mut waits)?;
     let outcome = (|| {
@@ -982,15 +1015,15 @@ pub fn auto_adopt(store: &Store, checkout: &Path, removable: bool) -> Result<(),
             .ok_or("no internal pool exists, so no removable drive is registered")?;
         let _admission = store::lock_admission(control)?;
         // Every fact is rechecked under the admission lock: a concurrent
-        // creator, receipt or switch of volume or mode makes this a no-op.
+        // creator, receipt, mode or volume switch makes this a no-op.
         if context.receipt()?.is_some() || context.target()? != TargetState::Missing {
             return Ok(None);
         }
-        let Ok(current) = usable_external(&context) else {
+        let Ok(registration) = usable_external(&context) else {
             return Ok(None);
         };
-        let spec = external_spec(&current, checkout);
-        if !spec.selected(0).same_place(&captured) {
+        let spec = external_spec(&registration, checkout);
+        if !selection_matches(&captured, &spec.selected(0)) {
             return Ok(None);
         }
         let receipt = Receipt::first(checkout, &context.checkout_id);
@@ -4018,17 +4051,68 @@ mod tests {
         assert!(!safe_absolute(Path::new("/work/../target")));
     }
 
+    fn all_facts() -> AutoFacts {
+        AutoFacts {
+            selected_permanent: true,
+            same_selection: true,
+            external_usable: true,
+            permanent: true,
+            receipt_absent: true,
+            target_absent: true,
+        }
+    }
+
     #[test]
     fn auto_adoption_needs_every_fact_and_nothing_else() {
-        for bits in 0..16u8 {
+        for bits in 0..64u8 {
             let facts = AutoFacts {
-                external_usable: bits & 1 != 0,
-                permanent: bits & 2 != 0,
-                receipt_absent: bits & 4 != 0,
-                target_absent: bits & 8 != 0,
+                selected_permanent: bits & 1 != 0,
+                same_selection: bits & 2 != 0,
+                external_usable: bits & 4 != 0,
+                permanent: bits & 8 != 0,
+                receipt_absent: bits & 16 != 0,
+                target_absent: bits & 32 != 0,
             };
-            assert_eq!(auto_adopts(&facts), bits == 15, "{facts:?}");
+            assert_eq!(auto_adopts(&facts), bits == 63, "{facts:?}");
         }
+    }
+
+    /// A command whose slot came from the internal pool, or from a registration
+    /// that was ephemeral when it selected, never converts, even when the drive
+    /// is permanent by the time it checks. The all-true facts are the control.
+    #[test]
+    fn an_ephemeral_selection_never_converts_after_a_switch_to_permanent() {
+        let switched = AutoFacts {
+            selected_permanent: false,
+            ..all_facts()
+        };
+        assert!(!auto_adopts(&switched));
+        assert!(auto_adopts(&all_facts()), "positive control");
+    }
+
+    /// A command whose slot came from volume A never converts for volume B,
+    /// even when B is the usable permanent registration now. The same volume
+    /// in force now is the positive control.
+    #[test]
+    fn a_selection_of_one_volume_never_converts_another_registration() {
+        let external = |volume: &str, uuid: &str| Selected {
+            kind: RootKind::External,
+            root: PathBuf::from(format!("/Volumes/{volume}/oxide-outputs/app-0000")),
+            volume_uuid: Some(uuid.to_owned()),
+            generation: 0,
+        };
+        let captured = external("a", "uuid-a");
+        let switched = external("b", "uuid-b");
+        assert!(!selection_matches(&captured, &switched));
+        assert!(!auto_adopts(&AutoFacts {
+            same_selection: selection_matches(&captured, &switched),
+            ..all_facts()
+        }));
+        assert!(selection_matches(&captured, &captured.clone()));
+        assert!(auto_adopts(&AutoFacts {
+            same_selection: selection_matches(&captured, &captured.clone()),
+            ..all_facts()
+        }));
     }
 
     /// A `detached` receipt is a receipt: a missing target beside it is never
@@ -4043,6 +4127,8 @@ mod tests {
         let receipt_absent = context.receipt().unwrap().is_none();
         assert!(!receipt_absent);
         assert!(!auto_adopts(&AutoFacts {
+            selected_permanent: true,
+            same_selection: true,
             external_usable: true,
             permanent: true,
             receipt_absent,

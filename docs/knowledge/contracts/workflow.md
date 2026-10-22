@@ -2595,9 +2595,11 @@ migration and consumer adoption remain separate gates.
   drive mode is still permanent. `status` is read-only.
 - **Automatic first conversion (oxide#121).** A leased command (build, run,
   test, exec) converts a fresh checkout before its destination is keyed and
-  before its slot is taken, when all of these hold: the selected pool is the
-  registered permanent drive (not the internal fallback), the drive is usable
-  now (writable, above its reserve, live UUID and device); the checkout has no
+  before its slot is taken, when all of these hold: the command's selected pool is the
+  registered permanent drive as selected at its start (not the internal
+  fallback; the registration it selected must be permanent, and the volume
+  and root in force now must be that same selection, so a switch is a no-op);
+  the drive is usable now (writable, above its reserve, live UUID and device); the checkout has no
   owned-output receipt of any state; and `<checkout>/target` is positively
   absent (no file, directory or link, dangling links included). It runs the
   adopt barrier, downgrade fence, admission lock, roots, marker and receipt,

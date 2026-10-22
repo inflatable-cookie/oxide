@@ -252,7 +252,7 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     // A fresh checkout on the selected permanent drive converts its target
     // before the destination is planned and keyed (oxide#121). Its barrier is
     // released before this command takes a slot.
-    outputs::auto_adopt(&selected.store, &checkout, selected.removable)?;
+    outputs::auto_adopt(&selected.store, &checkout, &selected)?;
     let store = selected.store;
     let planned =
         outputs::planned_destination(Some(&output_control), &checkout, pool_fallback.as_deref())?;
