@@ -39,7 +39,7 @@ Plan:
    matched exactly on index and cache. Each registry package takes one index
    entry and one .crate archive, with archive bytes checked against the lock
    checksum. Workspace packages are skipped. The one locked Longhorn Git package
-   seeds only its bare database, with a private config, and its full locked
+   seeds only its bare database candidates (1 to 8, one shared aggregate), each with a private config, and its full locked
    commit must resolve before staging; the private checkout's HEAD is checked
    after staging. Other sources, duplicate keys and duplicate packages refuse.
    The host CARGO_HOME and registry roots are checked
@@ -120,12 +120,13 @@ SEED_CHUNK_BYTES = 1024 * 1024
 # The only registry sources the seed serves: crates.io, git index or sparse.
 CRATES_SOURCES = ("registry+https://github.com/rust-lang/crates.io-index", "sparse+https://index.crates.io/")
 # The one locked Git package (oxide#112): exact source, name, version and full
-# commit. Only its bare database is seeded, never a host checkout.
+# commit. Only its bare database candidates are seeded, never a host checkout.
 LONGHORN_SOURCE = "git+https://github.com/inflatable-cookie/longhorn.git?tag=v0.4.1#5caf1e2c763588d6b7b73bbf9c24cc2d83cffe41"
 LONGHORN_NAME = "longhorn-storage-layout"
 LONGHORN_VERSION = "0.4.1"
 LONGHORN_REV = "5caf1e2c763588d6b7b73bbf9c24cc2d83cffe41"
 GIT_DB_RE = re.compile(r"^longhorn-[0-9a-f]{16}$")
+GIT_CANDIDATE_LIMIT = 8
 # Host config, hooks and alternates are never copied. The private config is this.
 GIT_CONFIG = b"[core]\n\trepositoryformatversion = 0\n\tbare = true\n"
 # The one supported crates.io sparse namespace: the name Cargo gives this host's
@@ -487,46 +488,83 @@ def copy_git_tree(source: Path, destination: Path, budget: SeedBudget, rel: str,
             raise SeedRefusal(f"longhorn database entry is a symlink or special file: {child}")
 
 
-def seed_git(proof: "Proof", host_cargo_home: Path, cargo_home: Path, budget: SeedBudget) -> dict:
-    """Seed the one locked Longhorn bare database, and verify the locked commit.
+def git_commit_present(proof: "Proof", git_dir: Path, rev: str, home: Path, label: str) -> bool:
+    """Read-only: whether `rev` resolves to a commit in `git_dir`. Missing is False."""
+    git = shutil.which("git")
+    if git is None:
+        raise SeedRefusal("git is not on the host PATH")
+    code, out, _ = proof.run([git, "--git-dir", str(git_dir), "rev-parse", "--verify", f"{rev}^{{commit}}"], git_env(home), label)
+    return code == 0 and out.strip() == rev
 
-    Exactly one host database directory must match. It is copied through the
-    registry's bounded copier, into the owned Cargo home, with a private config.
-    The full locked commit must resolve in that private copy before staging.
+
+def seed_git(proof: "Proof", host_cargo_home: Path, cargo_home: Path, budget: SeedBudget) -> dict:
+    """Seed every locked-source Longhorn bare database candidate, bounded.
+
+    One to GIT_CANDIDATE_LIMIT candidates are accepted; more refuse before any
+    copy. All candidates share the one aggregate budget, and no charged byte is
+    removed. Each copy has a private config, and each records whether the
+    locked full commit is present. At least one candidate must have it. Cargo
+    chooses its own identifier later; nothing here guesses it.
     """
     host_git = host_cargo_home / "git"
     lstat_real_dir(host_git, "host git root")
     host_db_root = host_git / "db"
     lstat_real_dir(host_db_root, "host git database root")
     names = [name for name in sorted(os.listdir(host_db_root)) if GIT_DB_RE.match(name)]
-    if len(names) != 1:
-        raise SeedRefusal(f"expected exactly one longhorn bare database, found {len(names)}")
-    name = names[0]
-    source = host_db_root / name
-    lstat_real_dir(source, "host longhorn bare database")
-    if not stat.S_ISREG(os.lstat(source / "HEAD").st_mode):
-        raise SeedRefusal("longhorn database HEAD is not a regular file")
-    if os.path.lexists(source / "objects" / "info" / "alternates"):
-        raise SeedRefusal("longhorn database uses alternates; refused")
-    base = f"git/db/{name}"
-    destination = cargo_home / "git" / "db" / name
-    destination.mkdir(parents=True, exist_ok=True)
+    if not 1 <= len(names) <= GIT_CANDIDATE_LIMIT:
+        raise SeedRefusal(f"expected 1 to {GIT_CANDIDATE_LIMIT} longhorn bare databases, found {len(names)}")
+    candidates: list[dict] = []
     files: list[dict] = []
-    copy_git_tree(source, destination, budget, "", base, files)
-    if budget.used + len(GIT_CONFIG) > budget.limit:
-        raise SeedRefusal("seed aggregate would exceed the 256 MiB bound; refused before the write")
-    budget.used += len(GIT_CONFIG)
-    (destination / "config").write_bytes(GIT_CONFIG)
-    files.append({"path": f"{base}/config", "sha256": hashlib.sha256(GIT_CONFIG).hexdigest(), "generated": True})
-    commit = git_rev_parse(proof, destination, f"{LONGHORN_REV}^{{commit}}", destination, "git-rev-commit")
-    if commit != LONGHORN_REV:
-        raise SeedRefusal(f"private longhorn database resolves {commit}, not the locked {LONGHORN_REV}")
-    return {"source": LONGHORN_SOURCE, "database": name, "rev": LONGHORN_REV, "files": files}
+    for index, name in enumerate(names):
+        source = host_db_root / name
+        lstat_real_dir(source, "host longhorn bare database")
+        if not stat.S_ISREG(os.lstat(source / "HEAD").st_mode):
+            raise SeedRefusal(f"longhorn database {name} HEAD is not a regular file")
+        if os.path.lexists(source / "objects" / "info" / "alternates"):
+            raise SeedRefusal(f"longhorn database {name} uses alternates; refused")
+        base = f"git/db/{name}"
+        destination = cargo_home / "git" / "db" / name
+        destination.mkdir(parents=True, exist_ok=True)
+        before = budget.used
+        candidate_files: list[dict] = []
+        copy_git_tree(source, destination, budget, "", base, candidate_files)
+        if budget.used + len(GIT_CONFIG) > budget.limit:
+            raise SeedRefusal("seed aggregate would exceed the 256 MiB bound; refused before the write")
+        budget.used += len(GIT_CONFIG)
+        (destination / "config").write_bytes(GIT_CONFIG)
+        digest = hashlib.sha256(GIT_CONFIG).hexdigest()
+        candidate_files.append({"path": f"{base}/config", "sha256": digest, "generated": True})
+        present = git_commit_present(proof, destination, LONGHORN_REV, destination, f"git-rev-commit-{index}")
+        candidates.append({
+            "database": name,
+            "bytes": budget.used - before,
+            "filecount": len(candidate_files),
+            "commit_present": present,
+            "config_sha256": digest,
+            "generated": True,
+        })
+        files.extend(candidate_files)
+    if not any(candidate["commit_present"] for candidate in candidates):
+        raise SeedRefusal(f"no private longhorn database resolves the locked commit {LONGHORN_REV}")
+    return {"source": LONGHORN_SOURCE, "rev": LONGHORN_REV, "candidates": candidates, "files": files}
 
 
-def verify_private_checkout(proof: "Proof", cargo_home: Path, name: str) -> None:
-    """After staging: the checkout Cargo made at the locked rev has that HEAD."""
-    checkout = cargo_home / "git" / "checkouts" / name / LONGHORN_REV[:7]
+def verify_private_checkout(proof: "Proof", cargo_home: Path, idents: list[str]) -> str:
+    """After staging: exactly one checkout at the locked rev, with the exact HEAD.
+
+    Only the seeded identifiers are considered, and the chosen checkout must be
+    inside the private Cargo home. The returned identifier is Cargo's choice.
+    """
+    checkouts_root = cargo_home / "git" / "checkouts"
+    lstat_real_dir(checkouts_root, "private longhorn checkouts root")
+    found = [
+        name for name in sorted(os.listdir(checkouts_root))
+        if GIT_DB_RE.match(name) and os.path.isdir(checkouts_root / name / LONGHORN_REV[:7])
+    ]
+    if len(found) != 1 or found[0] not in idents:
+        raise SeedRefusal(f"expected exactly one private checkout at {LONGHORN_REV[:7]}, found {found}")
+    ident = found[0]
+    checkout = checkouts_root / ident / LONGHORN_REV[:7]
     lstat_real_dir(checkout, "private longhorn checkout")
     git_dir = checkout / ".git"
     if not os.path.lexists(git_dir):
@@ -535,6 +573,7 @@ def verify_private_checkout(proof: "Proof", cargo_home: Path, name: str) -> None
     head = git_rev_parse(proof, git_dir, "HEAD", checkout, "git-rev-checkout")
     if head != LONGHORN_REV:
         raise SeedRefusal(f"private checkout HEAD is {head}, not the locked {LONGHORN_REV}")
+    return ident
 
 
 def seed_from_lock(proof: "Proof", host_cargo_home: Path, packages: list[dict], git_package: dict, cargo_home: Path, lock_sha256: str) -> dict:
@@ -656,7 +695,9 @@ def stage(proof: Proof) -> Path:
     code, _, err = proof.run([cargo, "build", "--offline", "--locked", "--bin", "oxide"], env, "stage", cwd=REPO)
     if code != 0:
         raise RuntimeError(f"staging failed: {err[-400:]}")
-    verify_private_checkout(proof, cargo_home, seed["git"]["database"])
+    chosen = verify_private_checkout(proof, cargo_home, [c["database"] for c in seed["git"]["candidates"]])
+    seed["git"]["chosen_ident"] = chosen
+    (proof.evidence / "seed.json").write_text(json.dumps(seed, indent=2))
     artifact = (proof.root / "target" / "debug" / "oxide").resolve()
     if not artifact.is_file() or proof.root not in artifact.parents:
         raise RuntimeError("the staged artifact is not inside the owned root")
