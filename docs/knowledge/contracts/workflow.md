@@ -486,6 +486,17 @@ root. A new Cargo release needs this check before it joins the table.
 2. Lease a slot from the host pool. Prefer this checkout's last slot, then any
    idle compatible slot, then a new slot if the per-project cap and budget
    allow. Otherwise wait in order, with a visible "waiting for …" line.
+   Oxide measures monotonic time from the first observed wait reason through
+   each grant, refusal, cancellation or error, and keeps those intervals
+   across freshness retries. Registration and the initial attempt are outside
+   the measurement; work between later observations is attributed to the
+   previous reason. It attributes each interval to the last observed
+   exclusive reason (queue, host limit, checkout, clean, project cap,
+   uncertain slot or capacity); this is an approximate observation, not a
+   root-cause diagnosis. Polling and admission work after an observed wait
+   stays with that reason. Cargo, execution and freshness-gate work are not
+   measured as waits. A changed reason is printed, up to eight reason lines
+   per command followed by one suppression notice.
    **Second-slot rule** (Tom, 2026-10-20, oxide#107): when this checkout's
    slot for the same key is busy (a live command such as a long `oxide exec
    -- tauri dev`, or an interrupted one whose group may still run), a further
@@ -513,6 +524,11 @@ root. A new Cargo release needs this check before it joins the table.
    skips tests.
 6. When the process group exits, record the compile origin, release the lease
    and print one line: profile, strategy, warm/cold, elapsed time, pool use.
+   A command that waited first prints `oxide: waited …; slot ready` after its
+   final freshness gate and cancellation check, before spawning Cargo or the
+   tool. Its summary adds the cumulative measured wait. The existing elapsed
+   time still covers its original interval, including gate and execution
+   work; it is not a compilation-only duration.
 
 ### `oxide exec`: Cargo-wrapping tools
 
@@ -960,19 +976,83 @@ python3 scripts/bounded-test.py [--limit S] [--scratch-budget-mib N] [--evidence
   - **Foreign:** a validated other session that was never a member.
   - **Gone:** `getsid` failed with `ESRCH` and a later successful
     `KERN_PROC_PID` read lacks the identity. A zombie still present is
-    re-read within the round, every 50 ms for at most 1 s. A failed read
-    confirms nothing.
+    re-read within the round, every 50 ms for at most 1 s; when that
+    confirmation does not establish absence, the round's existing final
+    `KERN_PROC_PID` read for the same PID is still checked under the same
+    rule and drops only the old tracked (PID, start) identity. A failed
+    read confirms nothing. A replacement identity is never declared
+    foreign or member by inference.
   - **Uncertain:** everything else, including first-seen unreadable rows,
     failed re-reads and unconfirmed zombies.
+  - **Terminal nonwriter** (allowlisted kernels only): an actual `getsid`
+    `ESRCH` (errno-checked, not any `ProcessLookupError`) whose snapshot
+    row and FIRST existing confirmation read show the same complete
+    `SZOMB` identity (exact non-bool bounded ints, positive PID, exact
+    `SZOMB` state in both) is accepted as terminal, provided every
+    actually performed read in the round (all confirmation reads plus the
+    existing final read, same 20+final bounds, no early short-circuit)
+    shows the same complete `SZOMB` identity with no failure. Gone keeps
+    priority. A terminal row is neither Gone nor Foreign nor a blocking
+    member; tracked attribution is kept and eligibility is recomputed
+    every round with no exemption cache. A nonqualifying first read is
+    never salvaged by later reads; any failed, missing, malformed,
+    identity/state or non-zombie observation disqualifies terminal and,
+    in allowlisted mode, taints the round's terminal count as
+    unaccountable, while rows that were never terminal candidates leave an
+    accountable count alone. A successful `getsid` keeps the old
+    member/foreign/tracked paths and other session errors (including a
+    non-`ESRCH` `errno`) can never qualify. In strict mode terminal
+    acceptance never fires and every `ESRCH` row keeps the old uncertain
+    handling, while the terminal count stays the accountably known valid
+    0. No live process is excluded by parent, and a replacement identity
+    is never declared foreign or member by inference.
 
   An uncertain or failed census after `stopped` latches a fault at once. A
   later certain empty census never clears it or authorizes cleanup.
 
-  Start time is only an identity token, never an exclusion. A zombie of an
-  unrelated parent present after the stop therefore yields a false
-  `UNCLOSED`: it fails closed. During development such zombies appeared
-  transiently and once persisted about 30 s. Owned scratch is removed only
-  after established closure.
+  Start time is only an identity token, never an exclusion. Owned scratch
+  is removed only after established closure.
+
+  Kernel allowlist: once in monitor setup, three fixed-buffer `sysctlbyname`
+  reads (`kern.uuid` 64 B, `kern.osversion` 64 B, `kern.version` 1024 B)
+  decide the frozen mode. Only the exact reviewed build (UUID
+  `8D3E13A0-01FC-381D-9DA3-7F0AF537CB32`, build `25G83`, version token
+  `root:xnu-12377.161.14~5/RELEASE_ARM64_T6050`) enables terminal
+  acceptance; any read failure, oversize, malformed value or mismatch
+  freezes to strict mode. The receipt records the frozen mode, the reason
+  (`allowlisted`/`identity_read_error`/`identity_malformed`/`identity_mismatch`)
+  and the evidence ID. No setting can force terminal acceptance on an
+  unverified kernel, and an OS update returns to strict until reviewed.
+
+  Receipt-only diagnostics summarize `ESRCH` rows (confirm attempts and
+  outcome with the final read result and an enumerated error category).
+  They live only in the monitor's receipt census object, never in the
+  census IPC message, and never change classification, counts, faults,
+  closure, cleanup, reads, time or retry budget. The optional object is
+  compact UTF-8 JSON (`ensure_ascii`, no whitespace) of at most 16384
+  bytes with at most 20 rows and fixed enums only; overflow drops whole
+  rows first with an explicit omitted count, or omits the object.
+
+  Every receipt census object also carries mandatory `terminal_count_status`
+  (`valid`/`invalid`/`overflow`) and `terminal_nonwriters` (the exact
+  non-bool count 0..2^64-1 of this round's terminal-accepted still-present
+  `SZOMB` identities, never Gone rows, when valid, else JSON null; a
+  strictly completed round with none is `valid` 0). Unaccountable
+  terminal candidacy (an actual-`ESRCH` row that could not be fully
+  adjudicated), a snapshot or census failure without a countable set, or
+  a malformed count is `invalid` with null; genuine count overflow is
+  `overflow` with null. Uncertainty of unrelated rows (never terminal
+  candidates, e.g. a live row with an injected session failure) does not
+  itself invalidate an accountable count. An `invalid`/`overflow` count
+  always coincides with `uncertain`>=1 and `certain` false in the
+  unchanged IPC fields (forced when necessary); optional diagnostics
+  saturation never drives authoritative counts or classification.
+  Output-witness loss never touches these fields and they never change
+  classification.
+  Optional terminal witness rows (PID, start, both qualifying `SZOMB`
+  states, prior tracking) share one combined cap with the diagnostics of
+  at most 20 rows and 16384 compact bytes; witness loss only ever means
+  missing qualification evidence.
 - **Faults (latched; none clears).**
   - Monitor: reserve below 22 GiB (20 GiB reserve + 2 GiB margin); no
     reserve reading for 1 s; no completed owned-byte reading for 10 s; owned
@@ -1061,7 +1141,7 @@ path is printed for the owner.
 
 It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
 `scripts/test_supervisor.py`. The suite runs in order:
-- 35 pure cases: guard thresholds, staleness and errors, a future-stamped
+- 88 pure cases: guard thresholds, staleness and errors, a future-stamped
   reading, delayed reserve and scratch publications that do not refresh,
   and a completion after its send stamp; the custodian's setup with every
   filesystem call forbidden; `ready` before `setup`; exit precedence;
@@ -1076,10 +1156,37 @@ It runs `bounded-test.py --limit 280 --scratch-budget-mib 512` around
   `open` and `stat` all forbidden, latching when its record raises, and
   never converting hostile exception text (hostile `__str__`, `__repr__`,
   `__format__`, metaclass `__name__` and `str`-subclass name); refusal to
-  signal an unpinned target;
+  signal an unpinned target; the final-read absence rule (matching
+  exhaustion then a successful final `None`/replacement is gone for
+  tracked and untracked rows, persistent matches and failed or non-`ESRCH`
+  reads still block, an earlier confirmation read failure with a positive
+  final absence is gone, a replacement is never foreign by inference) and
+  bounded receipt diagnostics (fixed enums, 20 maximum-width rows, row
+  overflow with an exact omitted count, byte-ceiling trimming and
+  serialization failure leaving classifications, counts and faults
+  unchanged); mandatory receipt terminal counts (`valid` 0 for a strictly
+  completed round or unrelated uncertainty, exact terminal-`SZOMB` count
+  when valid, `invalid`/`overflow` with null and forced `uncertain`>=1 /
+  `certain` false otherwise, IPC schema unchanged, Gone rows never
+  counted, diagnostics saturation never driving the count); the
+  exact-kernel allowlist (match, ASCII form, build mismatch, malformed
+  UUID length, wrong UUID value, read error, oversize, interior-NUL and
+  missing-NUL versions, contradiction, missing token, deterministic
+  fake-libc fixed-reader success/oversize/error) and terminal eligibility
+  (allowlisted zombie
+  accepted with exact witness and kept attribution, strict/live/
+  first-read-failure/intermediate-failure/intermediate-live/final-failure/
+  final-live/non-`ESRCH`/non-`ESRCH`-errno/replacement never terminal,
+  all-actually-performed-read tracking without short-circuit, tracked
+  member forcing uncertainty on unaccountable counts, tracked recompute,
+  combined witness budget keeping the count);
 - writers before and after a simulated staging step;
-- 33 real cases with tiny Python fixtures and injected faults:
+- 35 real cases with tiny Python fixtures and injected faults:
   - exit 0, owned cleanup, nonzero, exec 127, output saturation;
+  - a held direct-fork zombie child witnessed as the exact (PID, start)
+    terminal nonwriter with `CLOSED` status 0 and no fault, reaped only
+    in `finally`; a live owned child with an explicitly injected session
+    error blocking with terminal `invalid`/null;
   - a group cascading to `closed` at the deadline;
   - a separate-group survivor `UNCLOSED`, never signalled and still alive at
     the verdict, its case directory and receipt outside the outer cleanup;
@@ -1124,7 +1231,7 @@ expiry never counts as closure. The bootstrap requires all of:
 - reserve sampling that began before the gate, with no gap over 1 s;
 - the fixture writers counted;
 - custody at every signal;
-- all 68 cases;
+- all 123 cases;
 - every real case directory and receipt still present after the
   candidate's cleanup.
 
@@ -1382,6 +1489,11 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
   Another command in the same checkout
   and key takes a compatible spare slot or creates one within budget; it waits
   when no safe slot or host capacity is available.
+  Monotonic wait totals continue across freshness retries. Reason changes are
+  reported up to eight times, with one later-change notice; queue-position
+  changes alone do not print another line. The totals use the last observed
+  exclusive reason as an approximate attribution and exclude freshness-gate,
+  Cargo-lock, Cargo and execution time.
 - **Execution.** Cargo runs from the caller's directory as leader of a new
   process group, with `CARGO_BUILD_BUILD_DIR` on the slot and
   `CARGO_TARGET_DIR=<workspace>/target`. SIGINT, SIGTERM and SIGHUP are
@@ -1405,13 +1517,21 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
   ([ledger-only view](local-lease.md#ledger-only-view-for-front-door-membership-oxide110-lead-e4c74399)).
   When the gate refreshed files, or reconciled another checkout's build, it
   appends the count and the outside-Git limit. A refused gate prints its
-  reason on its own line before the cold build.
+  reason on its own line before the cold build. A command that observed a wait
+  also prints a completion line before spawn and appends `waited N.Ns` to the
+  summary; the wait is measured monotonically across reacquisitions, while the
+  existing elapsed value retains its current whole-invocation meaning. If the
+  monotonic measurement becomes unavailable, the diagnostic says so rather
+  than inventing a duration.
 - **`clean`.** Waits until no live or interrupted-but-running command holds a
   slot for this checkout, then blocks new commands in the checkout while it
   runs `cargo clean` against the private target directory and an empty
   private build directory. It then drops the checkout's idle affinity. Slots
   stay intact until evicted, so the next build is cold. Ctrl-C cancels the
-  wait. `cargo clean` runs as a recorded process group and inherits the clean
+  wait. A blocked clean receives a monotonic wait-completion line when its
+  barrier is acquired; whole-target clean summaries include that measured wait
+  when they print a summary. Selected clean has no general summary line.
+  `cargo clean` runs as a recorded process group and inherits the clean
   lock, so if `oxide clean` dies the barrier stays until that lock is free and
   the group is empty.
 - **Crash recovery.** Per [Crash recovery](#crash-recovery), for Oxide's own
@@ -1439,6 +1559,17 @@ on Oxide's own repository. Its result is partial, not a bounded pass.
   interrupted slot names the dead holder's PID and Cargo group) and size:
   allocation counted once per inode, file names and distinct inodes, or
   `partial` past a walk limit; waiting commands, checkouts being cleaned, the
+  recorded lease-ticket waiters (up to the existing 128-ticket bound) with
+  their recorded PID and approximate age from owner-private lockfile metadata
+  (creation time when available, modification time otherwise); unknown ages
+  stay unknown. The lookup reads metadata without opening or mutating the
+  ticket; a missing, symlinked, foreign, unreadable or future timestamp stays
+  unknown. Wall-clock jumps cannot all be detected, and age never affects
+  admission or recovery. These records may be stale and do not establish that
+  a PID is alive. Only lease-ticket waiters are listed: commands waiting at
+  `oxide clean` have no ticket before
+  acquiring the barrier, so they are not listed. The age is approximate
+  wall-clock file age, not the command's measured monotonic wait. Also shows
   newest automatic recoveries, whether the current workspace's `target/`
   holds plain-Cargo `deps/` or `incremental/`, and the Cargo home (see
   [Cargo home hygiene](#cargo-home-hygiene)). It never creates the pool.
@@ -1909,10 +2040,14 @@ oxide#102.
   qualified shared supervisor. It stages `oxide` offline with 1.97.1, checks
   status provenance and precedence, then uses tiny `oxide exec` hold tools to
   show limit 2 waiting for a third command, config limit 3 admitting a third
-  and waiting for a fourth, and a release admitting each waiter. A synthetic
-  unavailable removable registration pairs one active removable record with
-  an internal command; the unit tests exercise both directions of the
-  internal/removable count. No real volume or fixture compilation is used.
+  and waiting for a fourth, and a release admitting each waiter. The focused
+  wait diagnostics extension checks a recorded ticket PID and approximate
+  metadata age, the completion line before the tool marker, the summary wait
+  suffix, absence of wait output for commands that did not wait, and a
+  whole-target clean barrier completion and suffix. A synthetic unavailable
+  removable registration pairs one active removable record with an internal
+  command; the unit tests exercise both directions of the internal/removable
+  count. No real volume or fixture compilation is used.
   The supervisor owns its 300 s deadline, 512 MiB monitored scratch and
   closure; the fixture stops work 30 s before its exported deadline.
 - **Default path.** `~/Library/Caches/oxide/build-pool` on macOS,
