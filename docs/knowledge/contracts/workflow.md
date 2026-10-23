@@ -1666,8 +1666,9 @@ proof never copies the host registry whole.
   local config, includes, hooks and alternates are never read. Candidate
   selection only measures regular-file bytes through the same anchored walk;
   it establishes no commit. Every candidate that fits the remaining aggregate
-  is copied first (host `config` and `hooks` skipped, a known private config
-  generated, `objects/info/alternates` refused), and only then is the locked
+  is copied first (each candidate root's host `config` and `hooks` skipped even
+  when they are symlinks, a known private config generated,
+  `objects/info/alternates` refused), and only then is the locked
   commit read inside the sanitized private copy with system and global config
   disabled, hooks and transports disabled and lazy fetch off. A copied
   candidate that does not carry the commit is rejected and stays charged; an
@@ -1684,11 +1685,14 @@ proof never copies the host registry whole.
   cache write or unbounded directory copy.
 - **Observed fit (2026-10-23, development check, not a native proof).** This
   repository's lock seeds 22 registry packages and three Longhorn bare-database
-  candidates in 0.2 s: the required candidate copies 12.2 MB and resolves the
-  locked commit; a second 13.4 MB candidate is copied and rejected as not
-  carrying it; a 2.0 GiB candidate is measured and not attempted, remaining
-  inside the entry and byte bounds. Total copied bytes are 29.7 MB of the
-  256 MiB seed bound.
+  candidates in 0.6 s: the required candidate copies 12.2 MB and resolves the
+  locked commit; a second 14.4 MB candidate is also copied and resolved it on
+  that run; a 2.0 GiB candidate is measured and not attempted, remaining
+  inside the entry and byte bounds. Total copied bytes are 30.6 MB of the
+  256 MiB seed bound, with 9,627 entries of 100,000; a candidate's host hooks
+  and config are skipped and the private config is regenerated. The shared host
+  cache is mutable, so candidate contents and outcomes can differ between
+  runs; the receipt records each run's own per-candidate records.
 - **Receipts.** A consumer proof records the seeder's SHA-256 in its own
   exact-head receipt together with its own script. Importing the seeder
   transfers no qualification: each proof's evidence stays bound to the exact
@@ -1696,19 +1700,31 @@ proof never copies the host registry whole.
 - **Synthetic cases.** The module's `--self-test ROOT` (also run first by the
   wrapper-bypass native) creates tiny fixtures only under ROOT and covers a
   registry+Git positive, a copied-but-rejected candidate, a measured and
-  unattempted oversized candidate, a wrong commit, a missing candidate, a
-  malformed lock, symlinked inputs and the byte, candidate and entry cap
-  negatives.
+  unattempted oversized candidate, symlinked host config and hooks skipped at a
+  candidate's root, a wrong commit, a missing candidate, a malformed lock,
+  symlinked inputs and the byte, candidate and entry cap negatives.
 - **Consumers.** `test-accounting-vanished.py` (registry), `test-max-active.py`
   (registry and pinned Git), `test-storage-layout.py` (registry and pinned Git),
   `test-oxide-cli.py`'s `--clean-safety` (a one-package cfg-if 1.0.0 lock with
   its known checksum) and `test-pool-describe.py` (the bounded reference) seed
-  through it. `test_build_context_comparison.py` declares registry inputs for
-  its synthetic launcher and never scans the live host cache, so it is not a
-  seeder consumer. Proofs that stage with the host Cargo home offline and copy
-  nothing are not seeders either. Migrating a consumer changes no selector
-  bound: the seeder respects any lower caller budget and never raises one.
-  Their recorded native evidence predates the migration and stays historical.
+  through it. Each consumer keeps its own lower caller budgets; the seeder
+  respects them and never raises another selector's bound, and their recorded
+  native evidence predates the migration and stays historical.
+- **Inventory of the other copied crates.io paths.** `scripts/build_context_comparison.py`
+  is a configured live copier, not a seeder consumer and not migrated here: its
+  `--live` path derives a registry input plan from committed Nucleus #038
+  metadata (not this repository's `Cargo.lock`), copies the plan's declared
+  archives and index files from the hardcoded `/Users/tom/.cargo` roots into an
+  attached scratch image mount with a plain read/write file copy, and is bounded
+  by its own 4,096-file and 512 MiB caps and its absolute deadline. No selector
+  or test executes that path: `effigy build-context:comparison:test` runs
+  synthetic fixtures only, and `--live` needs an admitted resource plan. It
+  verifies digests through its staged-plan checks rather than at the copy, does
+  not use anchored no-follow reads, and is retired-image containment tooling.
+  A future live run must move onto this seeder, or a new scoped record must
+  supersede it; oxide#131 makes no live-execution or source-trust claim for it.
+  Other proofs that stage with the host Cargo home offline and copy nothing are
+  not seeders either.
 
 ### Rollback
 

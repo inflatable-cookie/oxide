@@ -12,9 +12,12 @@ The supervisor owns the absolute `CLOCK_UPTIME_RAW` deadline, the continuous
 child), the monitored 512 MiB scratch budget and cleanup. This script reads
 `OXIDE_TASK_SCRATCH_ROOT`, `OXIDE_PROOF_EVIDENCE` and `OXIDE_PROOF_DEADLINE_NS`
 and refuses without them. It creates no scratch, starts no second clock, takes
-no reserve samples of its own, starts no process session and sends no group
-signal: children run in the supervisor's cooperative session, and a child
-timeout kills only that direct child PID and reports closure unknown. Closure
+no reserve samples or owned-byte readings of its own, starts no process
+session and sends no group signal: children run in the supervisor's
+cooperative session, and a child timeout kills only that direct child PID and
+reports closure unknown. It resolves `cargo`, `rustc` and `git` once from the
+host PATH and gives children those directories plus the system base, because
+its own child environment is otherwise scrubbed. Closure
 is the supervisor's post-leader census, which is the only evidence any of this
 script's children leave none of their own behind. Cargo may start its own
 process groups; neither this script nor the supervisor signals them, and this
@@ -29,9 +32,10 @@ not a measured ceiling for other shapes.
 Cases, in order:
 1. The shared bounded seeder's synthetic suite (`scripts/offline_seed.py`,
    oxide#131): registry+Git positive, a copied-but-rejected candidate, a
-   measured and unattempted oversized candidate, a wrong commit, a missing
-   candidate, a malformed lock, symlinked inputs and the byte/candidate/entry
-   cap negatives, all on tiny fixtures in this proof's own scratch.
+   measured and unattempted oversized candidate, symlinked host config and
+   hooks skipped at a candidate's root, a wrong commit, a missing candidate, a
+   malformed lock, symlinked inputs and the byte/candidate/entry cap
+   negatives, all on tiny fixtures in this proof's own scratch.
 2. Staging: this HEAD's debug `oxide`, built offline from a private CARGO_HOME
    seeded from HEAD's `Cargo.lock` by that same seeder (registry and the one
    pinned Longhorn Git source), with an explicit empty `RUSTC_WRAPPER`. The
@@ -71,7 +75,6 @@ if str(HERE) not in sys.path:
 import offline_seed  # scripts/offline_seed.py, oxide#131; its hash is in the receipt
 
 PROOF_SECONDS = 300
-SCRATCH_LIMIT_BYTES = 512 * 1024 * 1024
 SEED_BYTES = 256 * 1024 * 1024
 STAGING_BYTES = 128 * 1024 * 1024
 FIXTURE_BYTES = 32 * 1024 * 1024
@@ -82,7 +85,6 @@ BUILDER_VERSIONS = ("cargo 1.97.1 (c980f4866 2026-06-30)", "rustc 1.97.1 (8bab26
 # Shutdown margin kept inside the supervisor's own 20 s stop reserve.
 SHUTDOWN_MARGIN_NS = 30 * 1_000_000_000
 NS = 1_000_000_000
-HOST_RESERVE_BYTES = 20 * 1024 * 1024 * 1024
 REPO = HERE.parent
 ROOT_VAR = "OXIDE_TASK_SCRATCH_ROOT"
 TEMP_VARS = (ROOT_VAR, "TMPDIR", "TMP", "TEMP")
@@ -159,8 +161,19 @@ class Proof:
             fail("the supervisor did not provide OXIDE_PROOF_EVIDENCE")
         self.deadline_ns = int(os.environ["OXIDE_PROOF_DEADLINE_NS"]) - SHUTDOWN_MARGIN_NS
         self.started = now_ns()
-        self.phases = []
+        self.phases: list[dict] = []
         self.closure_known = True
+        # Resolve the tools from the host PATH before any child environment
+        # replaces it: this script's children run with a scrubbed PATH.
+        self.tools = {}
+        for tool in ("cargo", "rustc", "git"):
+            found = shutil.which(tool)
+            if found is None:
+                fail(f"{tool} is not on the host PATH")
+            self.tools[tool] = found
+        self.tool_dirs = os.pathsep.join(
+            sorted({os.path.dirname(path) for path in self.tools.values()})
+        )
 
     def remaining(self) -> float:
         left = self.deadline_ns - now_ns()
@@ -181,29 +194,19 @@ class Proof:
         for name in TEMP_VARS:
             env[name] = str(self.root)
         env["RUSTUP_AUTO_INSTALL"] = "0"
-        env["PATH"] = PATH_BASE
+        env["PATH"] = self.tool_dirs + os.pathsep + PATH_BASE
         if extra:
             env.update(extra)
         return env
 
-    def record_phase(self, label: str) -> None:
-        """Report the phase's owned bytes and host reserve; the supervisor
-        enforces both. The reserve is sampled once per phase, not continuously:
-        the supervisor's continuous sampling is the enforcing check."""
-        stats = os.statvfs("/")
-        free = stats.f_bavail * stats.f_frsize
-        owned = owned_bytes(self.root)
-        entry = {"phase": label, "owned": owned, "free": free, "elapsed_s": round(self.elapsed(), 1)}
+    def mark_phase(self, label: str) -> None:
+        """Record when a phase finished. No sampling of any kind happens here:
+        the supervisor owns continuous reserve sampling, monitored owned bytes,
+        the deadline and cleanup, and reports them itself."""
+        entry = {"phase": label, "elapsed_s": round(self.elapsed(), 1)}
         self.phases.append(entry)
         (self.evidence / "phases.json").write_text(json.dumps(self.phases, indent=2))
-        print(
-            f"wrapper-bypass phase {label}: {entry['elapsed_s']} s, owned "
-            f"{owned // (1024 ** 2)} MiB, host reserve {free // (1024 ** 3)} GiB"
-        )
-        if owned > SCRATCH_LIMIT_BYTES:
-            fail(f"owned bytes {owned} at {label} exceed the 512 MiB budget")
-        if free < HOST_RESERVE_BYTES:
-            fail(f"host free space {free} at {label} is below the 20 GiB reserve")
+        print(f"wrapper-bypass phase {label}: {entry['elapsed_s']} s elapsed")
 
     def run(
         self,
@@ -256,7 +259,7 @@ def lines(path: Path) -> list:
 def git(proof: Proof, *args: str) -> str:
     """Read-only Git over this checkout, in the supervisor's session."""
     code, out, err = proof.run(
-        ["git", "-C", str(REPO), *args], label=f"git-{args[0]}", limit=30
+        [proof.tools["git"], "-C", str(REPO), *args], label=f"git-{args[0]}", limit=30
     )
     if code:
         fail(f"git {args[0]} failed: {err[-800:]}")
@@ -277,7 +280,9 @@ def seed_and_stage(proof: Proof) -> tuple[Path, dict]:
     cargo_home = seed_root / "cargo-home"
     cargo_home.mkdir()
     code, lock_text, lock_err = proof.run(
-        ["git", "-C", str(REPO), "show", "HEAD:Cargo.lock"], label="git-show-lock", limit=30
+        [proof.tools["git"], "-C", str(REPO), "show", "HEAD:Cargo.lock"],
+        label="git-show-lock",
+        limit=30,
     )
     if code:
         fail(f"cannot read HEAD's Cargo.lock: {lock_err[-800:]}")
@@ -307,14 +312,20 @@ def seed_and_stage(proof: Proof) -> tuple[Path, dict]:
         }
     )
     versions = tuple(
-        proof.run([tool, "-V"], cwd=REPO, env=env, label=f"stage-{tool}-version", limit=30)[1].strip()
+        proof.run(
+            [proof.tools[tool], "-V"],
+            cwd=REPO,
+            env=env,
+            label=f"stage-{tool}-version",
+            limit=30,
+        )[1].strip()
         for tool in ("cargo", "rustc")
     )
     print(f"wrapper-bypass setup: {versions}")
     if versions != BUILDER_VERSIONS:
         fail(f"builder is not {BUILDER}: {versions}")
     code, _, stderr = proof.run(
-        ["cargo", "build", "--locked", "--offline", "--bin", "oxide"],
+        [proof.tools["cargo"], "build", "--locked", "--offline", "--bin", "oxide"],
         cwd=REPO,
         env=env,
         label="stage-build",
@@ -395,7 +406,7 @@ def prove(proof: Proof, oxide: Path, parent: Path) -> None:
             "CARGO_TERM_COLOR": "never",
             "OXIDE_POOL": str(parent / "pool"),
             "OXIDE_POOL_CAP": "64MiB",
-            "PATH": str(bindir) + os.pathsep + PATH_BASE,
+            "PATH": str(bindir) + os.pathsep + proof.tool_dirs + os.pathsep + PATH_BASE,
             "OXIDE_TASK_SCRATCH_ROOT": tmp,
         }
     )
@@ -437,7 +448,7 @@ def prove(proof: Proof, oxide: Path, parent: Path) -> None:
     # Control: plain Cargo in the same fixture uses the configured wrapper.
     touch()
     code, _, stderr = proof.run(
-        ["cargo", "check"],
+        [proof.tools["cargo"], "check"],
         cwd=app,
         env={**base, "CARGO_TARGET_DIR": str(parent / "plain-target")},
         label="plain-cargo-check",
@@ -556,7 +567,7 @@ def main() -> int:
     )
     print(f"wrapper-bypass scratch: {proof.root}")
     print(f"wrapper-bypass evidence: {proof.evidence}")
-    proof.record_phase("admission")
+    proof.mark_phase("admission")
     helper = {
         name: sha256_file(REPO / "scripts" / name)
         for name in ("bounded-test.py", "offline_seed.py", "test-oxide-wrapper-bypass.py")
@@ -564,15 +575,15 @@ def main() -> int:
     print(f"wrapper-bypass sources: {json.dumps(helper, sort_keys=True)}")
 
     seed_cases(proof)
-    proof.record_phase("seed cases")
+    proof.mark_phase("seed cases")
     oxide, provenance = seed_and_stage(proof)
-    proof.record_phase("staging")
+    proof.mark_phase("staging")
     (proof.evidence / "provenance.json").write_text(json.dumps(provenance, indent=2))
     print(f"wrapper-bypass artifact: {oxide}, sha256 {provenance['artifact_sha256']}")
     parent = proof.root / "proof"
     parent.mkdir(mode=0o700)
     prove(proof, oxide, parent)
-    proof.record_phase("fixtures")
+    proof.mark_phase("fixtures")
     elapsed = proof.elapsed()
     owned = owned_bytes(proof.root)
     receipt = {

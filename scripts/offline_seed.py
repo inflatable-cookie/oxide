@@ -57,9 +57,10 @@ staging.
 
 Run `python3 scripts/offline_seed.py --self-test ROOT` for the synthetic
 cases: registry+git positive, a copied-but-rejected candidate, a measured and
-unattempted oversized candidate, a wrong commit, a missing candidate, a
-malformed lock, symlinked inputs and the byte, candidate and entry cap
-negatives. They create their fixtures only under ROOT and touch no host cache.
+unattempted oversized candidate, symlinked host config and hooks skipped at a
+candidate's root, a wrong commit, a missing candidate, a malformed lock,
+symlinked inputs and the byte, candidate and entry cap negatives. They create
+their fixtures only under ROOT and touch no host cache.
 """
 from __future__ import annotations
 
@@ -600,10 +601,11 @@ def _walk_git(
 ) -> None:
     """Walk one bare database through anchored descriptors, bounded.
 
-    Host `config` and `hooks` are skipped at the top level: the private config
-    is generated. Alternates, symlinks, special entries and foreign devices
-    refuse. Every enumerated entry and every level beyond `limits.depth` is
-    charged to the one seed budget; nothing is listed or walked unbounded.
+    Host `config` and `hooks` are skipped at each candidate's root (`rel` is
+    empty there): the private config is generated and host hooks never run.
+    Alternates, symlinks, special entries and foreign devices refuse. Every
+    enumerated entry and every level beyond `limits.depth` is charged to the
+    one seed budget; nothing is listed or walked unbounded.
     `on_file(host_parts, rel_parts, stat)` decides what happens to a file.
     """
     if depth > budget.limits.depth:
@@ -617,7 +619,7 @@ def _walk_git(
                 names.append(entry.name)
         for name in sorted(names):
             _check_part(name, "git database entry")
-            if not parts and name in ("config", "hooks"):
+            if not rel and name in ("config", "hooks"):
                 continue
             if parts == ("objects", "info") and name in ("alternates", "http-alternates"):
                 raise SeedRefusal(f"Git database alternates entry refused: {'/'.join(parts + (name,))}")
@@ -1104,6 +1106,26 @@ def self_test(root: Path | str) -> list[dict]:
         )
         return refusal
 
+    def host_config_and_hooks(directory: Path) -> str:
+        """Host config and hooks are skipped, even as symlinks, at the root."""
+        host, rev, checksum = _fixture_host(directory)
+        db = host / "git" / "db" / "seedrepo-0123456789abcdef"
+        elsewhere = directory / "elsewhere-config"
+        _write(elsewhere, b"[core]\n\trepositoryformatversion = 99\n")
+        (db / "config").unlink()
+        (db / "config").symlink_to(elsewhere)
+        (db / "hooks").rename(directory / "host-hooks")
+        (db / "hooks").symlink_to(directory / "host-hooks")
+        cargo_home = directory / "cargo-home"
+        seed = seed_cargo_home(host, cargo_home, _lock_text(rev, checksum).encode(), deadline_ns=deadline)
+        private = cargo_home / "git" / "db" / "seedrepo-0123456789abcdef"
+        assert seed["git"]["candidates"][0]["commit_present"] is True
+        assert (private / "config").read_bytes() == GIT_CONFIG, "the host config was not replaced"
+        assert not (private / "hooks").exists(), "host hooks were copied"
+        copied = {entry["path"] for entry in seed["git"]["candidates"][0]["files"]}
+        assert not any("/hooks/" in path for path in copied), copied
+        return "symlinked host config and hooks skipped; private config generated"
+
     def caps(directory: Path) -> str:
         host, rev, checksum = _fixture_host(directory)
         outcomes = []
@@ -1196,6 +1218,7 @@ def self_test(root: Path | str) -> list[dict]:
         return f"oversized candidate measured {skipped[0]['measured_bytes']} bytes and not attempted"
 
     case("registry-git-positive", positive)
+    case("host-config-and-hooks", host_config_and_hooks)
     case("rejected-candidate", rejected_candidate)
     case("oversized-candidate", oversized_candidate)
     case("wrong-commit", wrong_commit)
