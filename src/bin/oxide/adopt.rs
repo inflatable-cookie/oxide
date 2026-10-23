@@ -1,10 +1,13 @@
 //! `oxide init` / `oxide new`: Cargo's command when it applies, then one
-//! marked guidance block in the workspace-root `AGENTS.md` and a readiness
+//! marked guidance block (in the Git work-tree root's `AGENTS.md`, or the
+//! workspace's own outside Git; see [`crate::guidance`]) and a readiness
 //! report. No Oxide config file; `Cargo.toml` changes only as Cargo writes it.
 
+use crate::config::{self, Found};
+use crate::guidance::{self, Placement};
 use crate::identity::{self, Identity};
-use crate::store::{self, Store};
-use crate::{CARGO, MIB};
+use crate::store;
+use crate::CARGO;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -14,12 +17,31 @@ use std::process::Command;
 
 pub const BEGIN: &str = "<!-- oxide:begin -->";
 pub const END: &str = "<!-- oxide:end -->";
+/// Opens the covered-workspace list inside a Git-root block.
+pub const COVERS_OPEN: &str = "<!-- oxide:workspaces:";
+pub const COVERS_CLOSE: &str = "-->";
 
-/// The managed block, markers included. Refreshing replaces it whole.
-pub const BLOCK: &str = "\
-<!-- oxide:begin -->
-## Rust commands: use `oxide`
-
+/// The managed block, markers included. Outside Git it carries no list; a
+/// Git-root block carries one (see [`block`]). Refreshing replaces it whole.
+/// Outside Git, the text is the block Oxide has always written.
+pub fn block(covers: Option<&[String]>) -> String {
+    let mut text = format!("{BEGIN}\n");
+    if let Some(covers) = covers {
+        text.push_str(&format!(
+            "{COVERS_OPEN} {} {COVERS_CLOSE}\n",
+            covers.join(" ")
+        ));
+    }
+    text.push_str("## Rust commands: use `oxide`\n");
+    if let Some(covers) = covers {
+        let listed: Vec<String> = covers.iter().map(|cover| format!("`{cover}`")).collect();
+        text.push_str(&format!(
+            "\nCovers Cargo workspaces {}, relative to this file's folder.\n",
+            listed.join(", ")
+        ));
+    }
+    text.push_str(
+        "
 - Write `oxide` wherever you would write `cargo`: `oxide check`, `oxide test`, `oxide run -- <args>`, `oxide add <crate>`.
 - Profiles: `quick` (default), `--profile debug` for a debugger, `--release`. Oxide places build output, so it refuses `--target-dir`.
 - A tool that runs Cargo itself (Tauri CLI, npm or bun scripts): `oxide exec -- <command>`.
@@ -27,8 +49,17 @@ pub const BLOCK: &str = "\
 - Use `oxide clean`, not `cargo clean`.
 
 Managed by `oxide init`; edits between these markers are replaced.
-<!-- oxide:end -->
-";
+",
+    );
+    text.push_str(END);
+    text.push('\n');
+    text
+}
+
+/// The guidance file name, in the workspace or at the Git root.
+pub const AGENTS: &str = "AGENTS.md";
+/// Bounded read of an `AGENTS.md`; larger files are refused, not rewritten.
+const AGENTS_LIMIT: u64 = 1024 * 1024;
 
 /// `cargo init`/`cargo new` options that take a value.
 const VALUE_OPTIONS: [&str; 7] = [
@@ -42,7 +73,6 @@ const VALUE_OPTIONS: [&str; 7] = [
 ];
 /// Bounded read of an `effigy.toml`; larger files are reported, not scanned.
 const EFFIGY_LIMIT: u64 = 1024 * 1024;
-const AGENTS: &str = "AGENTS.md";
 const GITIGNORE: &str = ".gitignore";
 /// Bounded read of a workspace `.gitignore`.
 const GITIGNORE_LIMIT: u64 = 1024 * 1024;
@@ -150,23 +180,74 @@ fn join_lossy(values: &[OsString]) -> String {
         .join(" ")
 }
 
-/// Write or refresh the block at the workspace root Cargo resolves for this
-/// manifest, then print readiness.
+/// Write or refresh the guidance block for the workspace Cargo resolves for
+/// this manifest, then print readiness. The placement is classified after
+/// Cargo ran, so a repository Cargo just created counts as Git.
 fn adopt(manifest: &Path) -> Result<u8, String> {
     let workspace = identity::locate_workspace(CARGO, Some(manifest)).map_err(|error| {
         format!("{error}\nNo AGENTS.md block was written: Oxide adopts at the workspace root Cargo resolves.")
     })?;
-    let agents = workspace.join(AGENTS);
-    let outcome = write_block(&agents)?;
-    println!("oxide: {outcome} {}", agents.display());
+    let placement = guidance::placement(&workspace).map_err(|error| {
+        format!(
+            "{error}\nNo AGENTS.md block was written: Oxide could not confirm the Git work tree."
+        )
+    })?;
+    let guidance = write_guidance(&workspace, &placement)?;
+    println!("oxide: {} {}", guidance.written, guidance.path.display());
     let ignored = ensure_local_outputs_ignored(&workspace)?;
     println!(
         "oxide: {} {} (the checkout-local fallback output root of permanent drive mode)",
         ignored.describe(),
         workspace.join(GITIGNORE).display()
     );
-    print_readiness(&workspace);
+    print_readiness(&workspace, &placement, &guidance);
     Ok(0)
+}
+
+/// Where the guidance landed and what it covers.
+struct Guidance {
+    path: PathBuf,
+    written: Written,
+    /// Covered workspace paths relative to the Git root; empty outside Git.
+    covers: Vec<String>,
+}
+
+fn write_guidance(workspace: &Path, placement: &Placement) -> Result<Guidance, String> {
+    match placement {
+        Placement::Outside => {
+            let path = workspace.join(AGENTS);
+            let existing = read_for_write(&path, &block(None))?;
+            let written = write_block(&path, existing, &block(None))?;
+            Ok(Guidance {
+                path,
+                written,
+                covers: Vec::new(),
+            })
+        }
+        Placement::Worktree(root) => {
+            let current = guidance::cover_path(root, workspace)?;
+            let path = root.join(AGENTS);
+            // Read, merge and write under one lock on the Git root.
+            let _lock = guidance::lock_root(root)?;
+            let existing = read_for_write(&path, &block(Some(std::slice::from_ref(&current))))?;
+            let text = match &existing {
+                Some(bytes) => block_text(bytes).map_err(|problem| {
+                    format!("{}: {problem}; nothing was written", path.display())
+                })?,
+                None => None,
+            };
+            let manifest = fs::symlink_metadata(root.join("Cargo.toml"))
+                .is_ok_and(|metadata| metadata.file_type().is_file());
+            let covers = guidance::merged_covers(text, manifest, &current)
+                .map_err(|problem| format!("{}: {problem}; nothing was written", path.display()))?;
+            let written = write_block(&path, existing, &block(Some(&covers)))?;
+            Ok(Guidance {
+                path,
+                written,
+                covers,
+            })
+        }
+    }
 }
 
 /// What [`ensure_local_outputs_ignored`] did.
@@ -249,15 +330,43 @@ fn ignores_local_outputs(line: &str) -> bool {
     )
 }
 
-/// The workspace root's `AGENTS.md` holds one ordered Oxide marker pair.
-/// A link or unreadable file is not adoption.
-pub fn is_adopted(workspace: &Path) -> bool {
-    let agents = workspace.join(AGENTS);
-    std::fs::symlink_metadata(&agents).is_ok_and(|metadata| metadata.is_file())
-        && std::fs::read(&agents)
-            .ok()
-            .and_then(|text| find_block(&text).ok().flatten())
-            .is_some()
+/// A regular `AGENTS.md` read within [`AGENTS_LIMIT`]: `None` when absent.
+/// A link, directory or oversize file is an error, never followed.
+pub fn read_bounded(agents: &Path) -> Result<Option<Vec<u8>>, String> {
+    match fs::symlink_metadata(agents) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            if metadata.len() > AGENTS_LIMIT {
+                return Err(format!("is larger than {AGENTS_LIMIT} bytes"));
+            }
+            fs::read(agents)
+                .map(Some)
+                .map_err(|error| format!("cannot read: {error}"))
+        }
+        Ok(_) => Err("is not a regular file (a link or directory)".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot inspect: {error}")),
+    }
+}
+
+/// [`read_bounded`] for a write. A refusal names the file and prints the
+/// block to add by hand, since Oxide will not write through it.
+fn read_for_write(agents: &Path, block: &str) -> Result<Option<Vec<u8>>, String> {
+    read_bounded(agents).map_err(|problem| {
+        format!(
+            "{} {problem}; nothing was written. Add this block by hand:\n{block}",
+            agents.display()
+        )
+    })
+}
+
+/// The text of the marked block in `bytes`, or `None` without markers.
+pub fn block_text(bytes: &[u8]) -> Result<Option<&str>, String> {
+    let Some((start, end)) = find_block(bytes)? else {
+        return Ok(None);
+    };
+    std::str::from_utf8(&bytes[start..end])
+        .map(Some)
+        .map_err(|_| "the Oxide block is not UTF-8".to_owned())
 }
 
 /// What [`write_block`] did.
@@ -280,22 +389,9 @@ impl std::fmt::Display for Written {
     }
 }
 
-fn write_block(agents: &Path) -> Result<Written, String> {
-    let existing = match fs::symlink_metadata(agents) {
-        Ok(metadata) if metadata.file_type().is_file() => Some(
-            fs::read(agents)
-                .map_err(|error| format!("cannot read {}: {error}", agents.display()))?,
-        ),
-        Ok(_) => {
-            return Err(format!(
-                "{} is not a regular file (a link or directory); Oxide does not write through it. Add this block by hand:\n{BLOCK}",
-                agents.display()
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(format!("cannot inspect {}: {error}", agents.display())),
-    };
-    let updated = apply_block(existing.as_deref())
+/// Write `block` into `agents`, whose current bytes the caller has read.
+fn write_block(agents: &Path, existing: Option<Vec<u8>>, block: &str) -> Result<Written, String> {
+    let updated = apply_block(existing.as_deref(), block)
         .map_err(|problem| format!("{}: {problem}; nothing was written", agents.display()))?;
     let outcome = match &existing {
         None => Written::Created,
@@ -309,15 +405,15 @@ fn write_block(agents: &Path) -> Result<Written, String> {
 
 /// The new file contents: the block replaces the one marked span, or is
 /// appended after a blank line. Bytes outside the markers never change.
-fn apply_block(existing: Option<&[u8]>) -> Result<Vec<u8>, String> {
+fn apply_block(existing: Option<&[u8]>, block: &str) -> Result<Vec<u8>, String> {
     let Some(existing) = existing else {
-        return Ok(BLOCK.as_bytes().to_vec());
+        return Ok(block.as_bytes().to_vec());
     };
-    let mut updated = Vec::with_capacity(existing.len() + BLOCK.len() + 2);
+    let mut updated = Vec::with_capacity(existing.len() + block.len() + 2);
     match find_block(existing)? {
         Some((start, end)) => {
             updated.extend_from_slice(&existing[..start]);
-            updated.extend_from_slice(BLOCK.as_bytes());
+            updated.extend_from_slice(block.as_bytes());
             updated.extend_from_slice(&existing[end..]);
         }
         None => {
@@ -330,7 +426,7 @@ fn apply_block(existing: Option<&[u8]>) -> Result<Vec<u8>, String> {
                     updated.push(b'\n');
                 }
             }
-            updated.extend_from_slice(BLOCK.as_bytes());
+            updated.extend_from_slice(block.as_bytes());
         }
     }
     Ok(updated)
@@ -339,7 +435,7 @@ fn apply_block(existing: Option<&[u8]>) -> Result<Vec<u8>, String> {
 /// Byte span of the marked block, from the start of the begin line through
 /// the end line's newline. Markers count only as whole lines; anything but
 /// one ordered pair or none is refused rather than guessed.
-fn find_block(text: &[u8]) -> Result<Option<(usize, usize)>, String> {
+pub fn find_block(text: &[u8]) -> Result<Option<(usize, usize)>, String> {
     let mut begins = Vec::new();
     let mut ends = Vec::new();
     let mut offset = 0;
@@ -390,10 +486,28 @@ fn replace_file(path: &Path, contents: &[u8]) -> Result<(), String> {
     })
 }
 
-/// Toolchain, identity, pool and Effigy selectors. Reports only: nothing here
-/// creates the pool or edits a file.
-fn print_readiness(workspace: &Path) {
+/// Guidance, toolchain, identity, pool and Effigy selectors. Reports only:
+/// nothing here creates the pool, opens its ledger or edits a file.
+fn print_readiness(workspace: &Path, placement: &Placement, guidance: &Guidance) {
     println!("readiness:");
+    println!("  workspace: {}", workspace.display());
+    match placement {
+        Placement::Outside => println!(
+            "  guidance: {} (no Git work tree; this workspace's own AGENTS.md)",
+            guidance.path.display()
+        ),
+        Placement::Worktree(root) => {
+            println!(
+                "  guidance root: {} (Git work tree); guidance: {}",
+                root.display(),
+                guidance.path.display()
+            );
+            println!("  covered paths: {}", guidance.covers.join(", "));
+            if let Some(line) = guidance::retained_report(workspace, root) {
+                println!("  {line}");
+            }
+        }
+    }
     match identity::rustc_version(Some(workspace)) {
         Ok(version) => {
             let release = version.lines().next().unwrap_or("rustc").trim();
@@ -408,36 +522,27 @@ fn print_readiness(workspace: &Path) {
     println!("  identity: {}", Identity::infer(workspace).describe());
     match store::settings() {
         Err(error) => println!("  pool: unknown ({error})"),
-        Ok(settings) => {
-            let path = settings.pool.clone();
-            match Store::open_existing_with(&settings) {
-                Ok(None) => println!(
-                    "  pool: {} not created; the first building oxide command creates it",
-                    path.display()
-                ),
-                Ok(Some(store)) => match store.status() {
-                    Ok(status) => {
-                        // This full status's own whole-payload walk.
-                        let used = status
-                            .payload_unique_allocated_bytes
-                            .map(|used| {
-                                let total = store.budget(status.cap_bytes);
-                                format!("{} of {} MiB used", used / MIB, total / MIB)
-                            })
-                            .unwrap_or_else(|| "use unknown".to_owned());
-                        println!(
-                            "  pool: {}, cap {} MiB, {used}",
-                            path.display(),
-                            status.cap_bytes / MIB
-                        );
-                    }
-                    Err(error) => println!("  pool: {} unreadable ({error})", path.display()),
-                },
-                Err(error) => println!("  pool: {} unreadable ({error})", path.display()),
-            }
-        }
+        Ok(settings) => println!("  pool: {}", pool_state(&settings.pool)),
     }
     report_effigy(workspace);
+}
+
+/// Pool facts from the path alone. Opening a pool takes its lock and
+/// reconciles its ledger, so readiness never does; `oxide status` measures.
+fn pool_state(path: &Path) -> String {
+    match config::inspect(path) {
+        Found::Absent => format!(
+            "{} not created; the first building oxide command creates it",
+            path.display()
+        ),
+        Found::LegacyImage => format!("{} is a retired image pool; not read", path.display()),
+        Found::Directory | Found::Unknown => {
+            format!(
+                "{}, use not measured (readiness reads no pool state)",
+                path.display()
+            )
+        }
+    }
 }
 
 /// Every `effigy.toml` from the workspace root up to the Git top level, with
@@ -563,10 +668,46 @@ mod tests {
         assert!(parse(&args(&["--help"])).help);
     }
 
+    /// The outside-Git block, byte for byte as Oxide has always written it.
+    const OUTSIDE: &str = "\
+<!-- oxide:begin -->
+## Rust commands: use `oxide`
+
+- Write `oxide` wherever you would write `cargo`: `oxide check`, `oxide test`, `oxide run -- <args>`, `oxide add <crate>`.
+- Profiles: `quick` (default), `--profile debug` for a debugger, `--release`. Oxide places build output, so it refuses `--target-dir`.
+- A tool that runs Cargo itself (Tauri CLI, npm or bun scripts): `oxide exec -- <command>`.
+- A `waiting for …` line means another build holds a slot; let it wait. `oxide status` shows the pool, slots and waits.
+- Use `oxide clean`, not `cargo clean`.
+
+Managed by `oxide init`; edits between these markers are replaced.
+<!-- oxide:end -->
+";
+
+    #[test]
+    fn outside_git_block_is_unchanged() {
+        assert_eq!(block(None), OUTSIDE);
+    }
+
+    #[test]
+    fn git_root_block_lists_its_covers_and_round_trips() {
+        let covers = vec![".".to_owned(), "crates/app".to_owned()];
+        let text = block(Some(&covers));
+        assert!(text.starts_with(
+            "<!-- oxide:begin -->\n<!-- oxide:workspaces: . crates/app -->\n## Rust commands"
+        ));
+        assert!(text.contains(
+            "Covers Cargo workspaces `.`, `crates/app`, relative to this file's folder."
+        ));
+        assert_eq!(guidance::parse_covers(&text).unwrap(), Some(covers));
+    }
+
     #[test]
     fn absent_or_empty_files_get_only_the_block() {
-        assert_eq!(apply_block(None).unwrap(), BLOCK.as_bytes());
-        assert_eq!(apply_block(Some(b"")).unwrap(), BLOCK.as_bytes());
+        assert_eq!(apply_block(None, &block(None)).unwrap(), OUTSIDE.as_bytes());
+        assert_eq!(
+            apply_block(Some(b""), &block(None)).unwrap(),
+            OUTSIDE.as_bytes()
+        );
     }
 
     #[test]
@@ -576,8 +717,11 @@ mod tests {
             ("# Notes\n", "\n"),
             ("# Notes\n\n", ""),
         ] {
-            let updated = apply_block(Some(before.as_bytes())).unwrap();
-            assert_eq!(updated, format!("{before}{separator}{BLOCK}").into_bytes());
+            let updated = apply_block(Some(before.as_bytes()), OUTSIDE).unwrap();
+            assert_eq!(
+                updated,
+                format!("{before}{separator}{OUTSIDE}").into_bytes()
+            );
         }
     }
 
@@ -585,19 +729,19 @@ mod tests {
     fn refresh_replaces_only_the_marked_span_and_is_idempotent() {
         let before =
             format!("# Project\r\nkeep me\n{BEGIN}\nstale guidance\n{END}\ntrailing text\n");
-        let updated = apply_block(Some(before.as_bytes())).unwrap();
+        let updated = apply_block(Some(before.as_bytes()), OUTSIDE).unwrap();
         assert_eq!(
             updated,
-            format!("# Project\r\nkeep me\n{BLOCK}trailing text\n").into_bytes()
+            format!("# Project\r\nkeep me\n{OUTSIDE}trailing text\n").into_bytes()
         );
-        assert_eq!(apply_block(Some(&updated)).unwrap(), updated);
-        let first = apply_block(Some(b"intro\n")).unwrap();
-        assert_eq!(apply_block(Some(&first)).unwrap(), first);
+        assert_eq!(apply_block(Some(&updated), OUTSIDE).unwrap(), updated);
+        let first = apply_block(Some(b"intro\n"), OUTSIDE).unwrap();
+        assert_eq!(apply_block(Some(&first), OUTSIDE).unwrap(), first);
         // A final end marker without a newline gains the block's own newline.
         let unterminated = format!("x\n{BEGIN}\nold\n{END}");
         assert_eq!(
-            apply_block(Some(unterminated.as_bytes())).unwrap(),
-            format!("x\n{BLOCK}").into_bytes()
+            apply_block(Some(unterminated.as_bytes()), OUTSIDE).unwrap(),
+            format!("x\n{OUTSIDE}").into_bytes()
         );
     }
 
@@ -607,16 +751,19 @@ mod tests {
             format!("{BEGIN}\nno end\n"),
             format!("no begin\n{END}\n"),
             format!("{END}\n{BEGIN}\n"),
-            format!("{BLOCK}{BLOCK}"),
+            format!("{OUTSIDE}{OUTSIDE}"),
             format!("{BEGIN}\n{BEGIN}\n{END}\n"),
         ] {
-            assert!(apply_block(Some(text.as_bytes())).is_err(), "{text:?}");
+            assert!(
+                apply_block(Some(text.as_bytes()), OUTSIDE).is_err(),
+                "{text:?}"
+            );
         }
         // Markers inside a line are prose, not markers.
         let inline = format!("see `{BEGIN}` in docs\n");
         assert_eq!(
-            apply_block(Some(inline.as_bytes())).unwrap(),
-            format!("{inline}\n{BLOCK}").into_bytes()
+            apply_block(Some(inline.as_bytes()), OUTSIDE).unwrap(),
+            format!("{inline}\n{OUTSIDE}").into_bytes()
         );
     }
 

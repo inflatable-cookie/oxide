@@ -386,6 +386,16 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # different-HEAD, unmerged, unreadable and nested submodules refusing the
 # slot with source bytes and mtimes untouched. No live Effigy checkout, no
 # network or removable volume. Not a benchmark and not full QA.
+# Init guidance placement (oxide#127): under the qualified shared proof
+# supervisor (bounded-test.py SHA-256
+# d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e), stages
+# `oxide` offline with 1.97.1 and proves the Git-root block, covered-path list,
+# adoption, legacy and refusal cases on tiny owned repositories. The native run
+# is held for owner activation. Not a benchmark or an alias for full QA.
+[tasks."rust:init-guidance"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-init-guidance.py"
+
 [tasks."rust:freshness-submodules"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-freshness-submodules.py"

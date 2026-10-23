@@ -801,8 +801,9 @@ must not become required infrastructure for the core experience
    versus plain `cargo clean`. Installing it into an agent skill root is not
    authorized.
 2. **Project guidance block.** `oxide init` writes one marked section in the
-   project's `AGENTS.md`, a few lines long. The block is the opt-in marker; no
-   config file exists.
+   guidance root's `AGENTS.md`, a few lines long: the Git work-tree root inside
+   Git (listing the Cargo workspaces it covers), else the project's own. The
+   block is the opt-in marker; no config file exists.
 3. **Effigy selectors** in Effigy projects call `oxide …`. Effigy stays
    language-neutral.
 
@@ -822,11 +823,14 @@ to an Oxide-adopted Rust project:
 2. If a `Cargo.toml` already exists, skip Cargo. Cargo-only arguments then
    refuse with an explanation instead of being silently ignored.
 3. Resolve the workspace root and write or refresh the marked Oxide block in
-   the root `AGENTS.md`, creating the file if absent. Re-running is
-   idempotent and never touches text outside the markers.
-4. Print readiness: resolved toolchain, inferred project identity, pool state,
-   and any Effigy Rust selectors that still call plain `cargo`. Oxide reports
-   those; it does not edit them.
+   the guidance root's `AGENTS.md`, creating the file if absent. The guidance
+   root is the Git work-tree root when the workspace is inside Git, else the
+   workspace itself (see [placement](#placement-of-the-guidance-block)).
+   Re-running is idempotent and never touches text outside the markers.
+4. Print readiness: the workspace and guidance root, covered paths, any
+   retained older block, resolved toolchain, inferred project identity, pool
+   path (not measured) and any Effigy Rust selectors that still call plain
+   `cargo`. Oxide reports those; it does not edit them.
 
 `oxide new <path>` is `cargo new` followed by steps 3 and 4. Neither command
 creates an Oxide config file or changes `Cargo.toml` beyond what Cargo itself
@@ -841,17 +845,65 @@ Block rules, as implemented:
 - An unchanged block leaves the file untouched. A change is written through a
   sibling temporary file and a rename that keeps the file's permissions. An
   `AGENTS.md` that is a link or directory refuses and prints the block.
-- The location is the workspace root `cargo locate-project --workspace`
-  reports for the target's manifest, so a new member lands the block at its
-  workspace root. When Cargo cannot resolve a workspace, for example a package
+- The workspace is the root `cargo locate-project --workspace` reports for the
+  target's manifest. When Cargo cannot resolve one, for example a package
   inside a workspace that does not list it, Oxide refuses and writes nothing;
   Cargo's own init result stands.
+- Readiness never creates the pool, opens its ledger or edits a file. The
+  pool line names the path and says `use not measured`; `oxide status`
+  measures.
 - With a manifest present, every argument other than the directory refuses as
   Cargo-only. `--help` passes to Cargo.
-- Readiness never creates the pool or edits a file. The Effigy report scans
+- The Effigy report scans
   each `effigy.toml` from the workspace root up to the Git top level, line by
   line, and names lines that run `cargo` as a command word; comments,
   `cargo-*` binaries and `$CARGO` do not count.
+
+### Placement of the guidance block
+
+Placement is classified after Cargo's `init`/`new` has run, so a repository
+Cargo just created counts as Git. Oxide asks `git rev-parse --show-toplevel`
+in the workspace, with a 5 s limit, 64 KiB of stdout, inherited `GIT_*`
+variables cleared and `LC_ALL=C`.
+
+- **Outside Git.** Only a missing `git` or Git's own
+  `fatal: not a git repository` answer (exit 128) counts. The block goes in the
+  workspace's `AGENTS.md`, with no list, as before.
+- **Inside Git.** The work-tree root `T` (canonical) holds the one block in
+  `T/AGENTS.md`. Oxide never creates a block in a nested workspace's
+  `AGENTS.md` when `T` differs from it. The block lists the covered Cargo
+  workspaces, relative to `T`, in one marker line:
+  `<!-- oxide:workspaces: . crates/app -->`. `.` appears only for the root
+  workspace itself. The list is sorted and unique, at most 64 paths of 1024
+  bytes each. Each path is slash-separated components of ASCII letters, digits
+  and `- _ . + @`, with no empty component and no component starting with `.`.
+  Whitespace, controls, backticks and other characters are refused.
+- **Merge.** Init adds the current workspace to an existing valid list. A legacy
+  block with no list covers only `.`, and only when `T/Cargo.toml` is a
+  positively inspected regular file. A duplicate or malformed list, a duplicate
+  block, or unbalanced markers refuses with nothing written.
+- **Lock and writes.** Read, merge and write happen under an advisory `flock`
+  on the opened read-only `T` directory, waited for 10 s without blocking. The
+  file is then replaced atomically and keeps its permissions. The lock
+  serialises cooperating `oxide init`/`new` runs. It does not stop unrelated
+  edits, and no lock file is created or recovered.
+- **Probe failure.** A timeout, a malformed answer, any other Git exit, or an
+  unreadable result refuses before any write. Oxide never writes nested
+  guidance on an uncertain answer.
+- **Older nested blocks.** A workspace's own `AGENTS.md` holding an Oxide block,
+  or malformed markers, is reported with its exact path as retained. Oxide
+  never deletes or rewrites it.
+- **Adoption.** A workspace is adopted when the Git root's list covers it. A
+  legacy root block without a list covers only `T` with a regular `T/Cargo.toml`.
+  A nested legacy block alone is not adoption. `oxide clean --cargo-cache`
+  refuses it, names the path and says to run `oxide init` at the Git root.
+  Outside Git, the workspace's own block still decides adoption. An uncertain
+  probe or an unreadable file is not adoption.
+- **Proof.** `effigy rust:init-guidance` (oxide#127) covers the matrix above on
+  tiny owned repositories under the qualified supervisor. Its native run is held
+  for owner activation, so no native result is claimed here.
+- **Local outputs.** `/.oxide-outputs/` still goes in the workspace's own
+  `.gitignore`, which keeps its Git meaning there.
 
 ### Switching an existing project
 
@@ -1909,7 +1961,9 @@ it never deletes there itself.
     above does not cover `RUSTC_WRAPPER` or `RUSTC`;
   - a Cargo other than 1.97.1 (`cargo -V`), whose trigger and trace text
     were qualified;
-  - a workspace without the Oxide `AGENTS.md` block;
+  - a workspace not listed by the Oxide block that guides it (the Git root's
+    covered list inside Git, else its own `AGENTS.md` outside Git), or a
+    nested legacy block alone;
   - a missing `Cargo.lock`, or one over 16 MiB;
   - any lock source other than crates.io (`registry+https://github.com/rust-lang/crates.io-index`
     or `sparse+https://index.crates.io/`) or a path: SSH and other non-HTTP
