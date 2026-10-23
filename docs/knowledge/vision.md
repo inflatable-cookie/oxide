@@ -91,6 +91,14 @@ An upstream roadmap is never a reason to defer today's relief.
 
 ## Product workflow direction
 
+### Planning discipline
+
+Tom, 2026-10-23: keep concrete work we intend to deliver, rather than an
+indefinite parked backlog. Give each item a delivery path or explicitly decline
+it, preserving the reason and history. Fold duplicate tracking into its owning
+brief or project. Closing an unimplemented item records that disposition; it
+does not claim a fix. New evidence can justify a new decision.
+
 ### Front door
 
 Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
