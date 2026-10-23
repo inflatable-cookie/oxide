@@ -71,6 +71,31 @@ run = "python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 64 -- py
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-accounting-vanished.py"
 
+# Guarded accounting reads and directory boundary samples (oxide#141): one
+# fixed proof under the qualified shared supervisor on private tiny fixtures.
+# A hard-linked 4 MiB pair across two idle whole slots is counted once, so a
+# third project's admission under a 6 MiB budget evicts nothing; the identical
+# layout with two independent copies makes the same admission under the same
+# budget evict exactly one idle whole slot (the non-vacuous control); and an
+# unreadable owned directory inside an idle slot makes the whole-payload walk
+# partial, so the same admission refuses with exactly exit 1 (`main.rs` maps a
+# leased-command error to 1; the retired CLI's 3 is not this exit), naming
+# `unknown_accounting` and `unreadable_entry`, with the exact ledger bytes,
+# every slot-root identity and the planted payload unchanged. `--plan` prints
+# the fixed command, cases, phases, disk allocation, concurrency and limits
+# with no effect; an unknown argument refuses before any subprocess; staging
+# uses the invoking Cargo home offline with target and build in scratch; each
+# fixture pins `RUSTUP_HOME` and 1.97.1 and runs Cargo with one job; a pass
+# writes a uniquely named bounded helper receipt beside the guard's own, which
+# never claims closure. 300 s, 512 MiB monitored scratch, one staged debug
+# binary, no live pool, mounted volume, install or host setting. Tiny fixtures
+# do not establish a large or cold pool's rate; not a benchmark or an alias for
+# full QA. HELD for phase C: this selector is published but no native run is
+# activated here.
+[tasks."rust:accounting-guards"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-accounting-guards.py"
+
 # Fast, read-only default `oxide status` (oxide#128): one fixed proof under the
 # qualified shared supervisor (oxide#109; 300 s absolute, 512 MiB monitored
 # scratch including staging, fixture creation and cleanup). Stages this HEAD's
