@@ -205,6 +205,14 @@ the operating rules.
   closure, and removable media: adds an independent reviewer native session.
 - **Bounds:** wall-clock time and scratch budget. Resource figures are
   reported, not gated.
+- **Mechanical native-evidence gates** (Supervisor, 2026-10-23): every Oxide
+  brief requiring counted native evidence encodes it in Queue before
+  promotion. Use `reviewVerdicts: true` with a `reviewPassGate` subject such
+  as `exact_head_native_evidence`, and/or a `mergeHold` pending that evidence.
+  An owner releases the hold only after verifying the required receipts and
+  their exact source heads. Prose alone is insufficient; a source-only review
+  does not satisfy a required native proof. The brief still names the separate
+  activation, count, time and scratch limits.
 - **Operator acceptance fast path:** Tom can accept a task as-is. It is
   recorded as operator acceptance, never as a review pass. A direct GitHub
   merge needs explicit scoped authorisation.
