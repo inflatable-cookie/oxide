@@ -105,6 +105,16 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   consistently reliable.
 - **Adoption** happens through the `oxide init` agent-docs block, the Oxide
   skill and each project's Effigy selectors.
+- **Diagnostic and adoption direction** (Tom, 2026-10-23): default
+  `oxide status` should be fast and read-only, showing recorded sizes with
+  their age and source, or "not measured". Explicit `status --measure`
+  requests bounded measurement; observation must not reconcile deletions.
+  These diagnostic facts do not decide admission or reopen cached accounting.
+  In a Git repository, `oxide init` should put one managed block in the
+  work-tree root's `AGENTS.md`, listing the Cargo workspaces it covers.
+  Existing nested blocks are reported and retained; outside Git the current
+  workspace-local behavior stays. These are approved correction targets,
+  not claims about the installed binary.
 - **Crash recovery:** Oxide recovers its own interrupted commands. A
   recovery requires a free record lock and matching lease ownership, plus
   either an empty Cargo process group (`ESRCH`) or a recorded pre-launch
