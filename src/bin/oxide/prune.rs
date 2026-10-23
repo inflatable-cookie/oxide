@@ -687,11 +687,12 @@ impl Row {
         {
             return Err("the output registry has an unusable row".to_owned());
         }
-        if self.selected && (self.pending || self.pruning.is_some()) {
-            return Err("the output registry row is both selected and pending".to_owned());
-        }
-        if self.pending && self.pruning.is_some() {
-            return Err("the output registry row is pending and pruning".to_owned());
+        // A prepared transition may name its current root as both the
+        // selected and the proposed reference; that is one row with both
+        // flags, never a contradiction. A pruning row is never selected or
+        // pending, because its blocking intent owns it.
+        if self.pruning.is_some() && (self.selected || self.pending) {
+            return Err("the output registry row is pruning and still referenced".to_owned());
         }
         Ok(())
     }
@@ -794,11 +795,6 @@ pub fn unsettled_for(control: &Path, checkout_id: &str) -> Result<Option<String>
 /// `outputs::write_receipt` while the internal publication lock is held, and
 /// strictly before the changed receipt becomes visible.
 pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
-    // Unit fixtures exercise receipt mechanics without a whole pool; the
-    // registry authority is proved by the focused native proof instead.
-    if cfg!(test) {
-        return Ok(());
-    }
     let mut registry = ready_registry(control)?;
     registry.validate()?;
     let checkout_id = receipt.checkout_id();
@@ -807,8 +803,10 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
     let member = "target";
     let selected = receipt.current();
     let prepared = receipt.prepared_ref();
+    // A prepared transition still selects its committed root until the commit
+    // is durable; a missing reference is never treated as non-selection.
     // Detach and pruned states retain identity but select nothing.
-    let keep_selected = selected.is_some() && receipt.selects();
+    let keep_selected = selected.is_some() && receipt.holds_selection();
     let proposed = prepared.map(|prepared| &prepared.to);
     registry.bump()?;
     let mut matched_selected = false;
@@ -848,6 +846,18 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
                 row.pending = true;
                 matched_pending = true;
             }
+        }
+    }
+    if proposed.is_none() {
+        // The receipt is authoritative for this checkout's placement: a
+        // receipt with no prepared transition cannot still have a pending
+        // reference. This is what clears a rolled-back preparation.
+        for row in registry
+            .rows
+            .iter_mut()
+            .filter(|row| row.checkout_id == checkout_id && row.member == member)
+        {
+            row.pending = false;
         }
     }
     let checkout_volume_uuid = volume_uuid_of(checkout).ok().flatten();
@@ -1245,7 +1255,17 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
         }
     }
     if !completed_roots.is_empty() {
-        registry = ready_registry(&control)?;
+        registry = match ready_registry(&control) {
+            Ok(registry) => registry,
+            Err(reason) => {
+                return Ok(unsettled(
+                    &control,
+                    &format!(
+                        "a replayed intent completed but the registry became unreadable afterwards ({reason})"
+                    ),
+                ))
+            }
+        };
     }
     // Fresh revalidation: the plan's root identity set must match one-to-one,
     // with roots completed by an exact intent replay excluded.
@@ -1304,8 +1324,13 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
             Err(Stop::Refuse(reason)) => {
                 let _ =
                     write_observations(&control, &observation_from(&fresh, &evaluated, outcomes));
-                return Err(format!(
-                    "prune stopped before completing the batch: {reason}; earlier completed roots stay deleted and are listed by the next dry run"
+                // A contradiction can arrive after earlier roots completed;
+                // that is an unsettled batch, never a pre-effect refusal.
+                return Ok(unsettled(
+                    &control,
+                    &format!(
+                        "the batch stopped on a contradiction ({reason}); completed roots stay deleted and any journaled intent stays pending"
+                    ),
                 ));
             }
         }
@@ -1498,9 +1523,8 @@ fn evaluate(
 ) -> Result<Vec<Evaluated>, String> {
     let deadline = Instant::now() + SNAPSHOT_TIME;
     let mut budget = SNAPSHOT_MAX_BYTES;
-    let mut receipts: std::collections::HashMap<String, Option<Receipt>> =
+    let mut receipts: std::collections::HashMap<String, Result<Receipt, String>> =
         std::collections::HashMap::new();
-    let mut roots = std::collections::HashSet::new();
     let mut evaluated = Vec::new();
     let rows: Vec<Row> = registry
         .rows
@@ -1509,26 +1533,50 @@ fn evaluate(
         .cloned()
         .collect();
     if rows.len() > SNAPSHOT_MAX_RECEIPTS {
-        return Err("the registry names more roots than one bounded snapshot reads".to_owned());
+        // A cap is not permission to consider part of the registry.
+        return Ok(rows
+            .into_iter()
+            .map(|row| Evaluated {
+                row,
+                candidate: None,
+                kept: Some(
+                    "the registry exceeds the snapshot receipt cap; the whole batch is kept"
+                        .to_owned(),
+                ),
+                legacy: false,
+            })
+            .collect());
     }
+    let mut snapshot_error: Option<String> = None;
     for row in rows {
-        roots.insert(row.root.clone());
         let entry = receipts.entry(row.checkout_id.clone()).or_insert_with(|| {
-            outputs::read_receipt_for_prune(control, &row.checkout, &row.checkout_id)
-                .ok()
-                .flatten()
+            match outputs::read_receipt_for_prune(control, &row.checkout, &row.checkout_id) {
+                Ok(Some(receipt)) => Ok(receipt),
+                Ok(None) => Err("the receipt is missing".to_owned()),
+                Err(reason) => Err(reason),
+            }
         });
+        let receipt = match entry.as_ref() {
+            Ok(receipt) => Some(receipt),
+            Err(reason) => {
+                snapshot_error.get_or_insert_with(|| reason.clone());
+                None
+            }
+        };
         if Instant::now() > deadline {
-            return Err("the registry snapshot exceeded its time limit".to_owned());
+            snapshot_error.get_or_insert_with(|| "the snapshot exceeded its time limit".to_owned());
         }
-        let receipt = entry.as_ref();
         let mut out = Evaluated {
             row: row.clone(),
             candidate: None,
             kept: None,
             legacy: row.nonce.is_none(),
         };
-        let reason = eligibility(store, control, registry, &row, receipt, list, &mut budget);
+        let reason = if snapshot_error.is_some() {
+            Ok(Some("the registry snapshot is incomplete".to_owned()))
+        } else {
+            eligibility(store, control, registry, &row, receipt, list, &mut budget)
+        };
         match reason {
             Ok(None) => {
                 let facts = match observe_row_root(&row) {
@@ -1572,6 +1620,15 @@ fn evaluate(
             Ok(Some(reason)) | Err(reason) => out.kept = Some(reason),
         }
         evaluated.push(out);
+    }
+    if let Some(reason) = snapshot_error {
+        for entry in &mut evaluated {
+            entry.candidate = None;
+            entry.kept = Some(format!(
+                "the registry snapshot is incomplete ({reason}); the whole batch is kept"
+            ));
+        }
+        return Ok(evaluated);
     }
     // One root may not be selected by two live references.
     let mut counts: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
@@ -1845,10 +1902,16 @@ fn checkout_absence(row: &Row, operator_legacy: bool) -> Result<Absence, String>
         };
         if status != 0 {
             let error = std::io::Error::last_os_error();
-            return Ok(if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(if error.kind() != std::io::ErrorKind::NotFound {
+                Absence::Unknown(error.to_string())
+            } else if last {
+                // Only the actual checkout leaf may be absent by ENOENT.
                 Absence::Absent
             } else {
-                Absence::Unknown(error.to_string())
+                Absence::Unknown(
+                    "an ancestor of the checkout is missing, so the checkout path cannot be proved absent"
+                        .to_owned(),
+                )
             });
         }
         if last {
@@ -2938,20 +3001,35 @@ fn stop_text(stop: Stop) -> String {
 }
 
 /// `oxide outputs resolve-intent <id>`: settle one pending intent only when
-/// both the original and quarantine leaves are positively absent, no other
-/// selection exists and no writer holds the checkout.
+/// both the original and quarantine leaves are positively absent under the
+/// verified volume, the registry is complete, no other selection exists and no
+/// writer holds the checkout. Every check runs before the first effect; the
+/// checkout's clean barrier and binding lock are held from the recheck through
+/// the committed terminal transaction.
 fn resolve_intent(id: &str) -> Result<u8, String> {
     if !hex32(id) {
         return Ok(refused("the intent ID must be 32 lowercase hex characters"));
     }
     let store = paired_store()?;
     let control = store.owner_control().to_path_buf();
-    ensure_ready(&store)?;
-    let registry = ready_registry(&control)?;
+    // Resolution never initializes or migrates anything: a pool without a
+    // ready registry has no intent this verb may act on.
+    let registry = match require_ready(&store, &control) {
+        Ok(registry) => registry,
+        Err(reason) => return Ok(refused(&reason)),
+    };
     let Some(intent) = registry.intent(id).cloned() else {
         return Ok(refused("no pending intent has that ID"));
     };
     if intent.phase == IntentPhase::Deleted {
+        // The recorded transaction is already complete; finish its terminal
+        // receipt if a crash interrupted that step. No root effect occurs.
+        if let Err(reason) = complete_intent(&store, &control, id, "deleted") {
+            return Ok(refused(&format!(
+                "the intent is positively deleted but its terminal receipt did not commit ({})",
+                stop_text(reason)
+            )));
+        }
         eprintln!("oxide: intent {id} is already positively deleted; nothing to resolve");
         return Ok(0);
     }
@@ -2959,61 +3037,187 @@ fn resolve_intent(id: &str) -> Result<u8, String> {
         eprintln!("oxide: intent {id} was already resolved by an operator");
         return Ok(0);
     }
+    // All refusals happen before any effect, including before the barrier.
+    if let Err(reason) = resolve_precheck(&store, &control, &intent, &registry) {
+        return Ok(refused(&reason));
+    }
+    let mut waits = store::WaitAccounting::default();
+    let guard = match store.begin_clean(&intent.identity.checkout, &mut waits) {
+        Ok(store::Cleaning::Guard(guard)) => guard,
+        Ok(store::Cleaning::Interrupted(signal)) => {
+            return Ok(refused(&format!(
+                "interrupted by signal {signal} while waiting for this checkout's commands"
+            )))
+        }
+        Err(reason) => return Ok(refused(&reason)),
+    };
+    let outcome = (|| -> Result<u8, String> {
+        let _binding = store.lock_binding(&intent.identity.checkout)?;
+        let current = require_ready(&store, &control)?;
+        if !current.complete {
+            return Ok(refused(
+                "the registry became sticky-incomplete; the intent stays pending",
+            ));
+        }
+        let Some(record) = current.intent(id) else {
+            return Ok(refused("the intent disappeared from the registry"));
+        };
+        if record.phase != intent.phase || record.identity != intent.identity {
+            return Ok(refused(
+                "the intent changed while its custody was being acquired",
+            ));
+        }
+        if let Err(reason) = resolve_precheck(&store, &control, &intent, &current) {
+            return Ok(refused(&reason));
+        }
+        // First effect: the durable resolution proof.
+        let resolution = serde_json::json!({
+            "version": RESOLUTION_VERSION,
+            "intent": intent.id,
+            "root": intent.identity.root,
+            "checkout": intent.identity.checkout,
+            "member": intent.identity.member,
+            "nonce": intent.identity.nonce,
+            "volume_uuid": intent.identity.volume_uuid,
+            "dev": intent.identity.dev,
+            "ino": intent.identity.ino,
+            "marker_digest": intent.identity.marker_digest,
+            "resolved_ms": process::now_ms(),
+            "binary": std::env::current_exe().map(|path| path.display().to_string()).unwrap_or_default(),
+            "package_version": env!("CARGO_PKG_VERSION"),
+            "registry_revision": current.revision,
+            "coverage": {
+                "registry_rows": current.rows.len(),
+                "complete": current.complete,
+                "source": "internal output registry snapshot",
+            },
+            "checks": {
+                "original_absent": "fstatat(AT_SYMLINK_NOFOLLOW) = ENOENT",
+                "quarantine_absent": "fstatat(AT_SYMLINK_NOFOLLOW) = ENOENT",
+                "no_other_selection": true,
+                "writer_custody": "clear",
+                "volume": "verified UUID, device and mount",
+            }
+        });
+        let directory = registry_dir(&control).join("prune-resolutions");
+        if let Err(reason) = ensure_private_dir(&directory) {
+            return Ok(refused(&format!(
+                "cannot prepare the resolution directory ({reason})"
+            )));
+        }
+        let path = directory.join(format!("{}.json", intent.id));
+        let bytes = match serde_json::to_vec_pretty(&resolution) {
+            Ok(bytes) => bytes,
+            Err(error) => return Ok(refused(&format!("cannot encode the resolution ({error})"))),
+        };
+        let temp = directory.join(format!(".{}.tmp-{}", intent.id, std::process::id()));
+        if let Err(reason) = write_private(&temp, &bytes) {
+            return Ok(refused(&format!(
+                "cannot prepare the resolution proof ({reason})"
+            )));
+        }
+        if let Err(error) = fs::rename(&temp, &path) {
+            let _ = fs::remove_file(&temp);
+            return Ok(refused(&format!(
+                "cannot publish the resolution proof ({error})"
+            )));
+        }
+        if let Err(error) = sync_directory(&directory) {
+            eprintln!(
+                "oxide: resolve-intent unsettled: the resolution proof is published but its directory did not sync ({error}); the intent stays pending"
+            );
+            return Ok(3);
+        }
+        if let Err(reason) = complete_resolution(&store, &control, &intent, "resolved-by-operator")
+        {
+            eprintln!(
+                "oxide: resolve-intent unsettled: {reason}; the resolution proof is published but the terminal transaction did not commit, so the intent stays pending"
+            );
+            return Ok(3);
+        }
+        println!(
+            "outputs resolve-intent: {} resolved by operator (original and quarantine leaves absent); resolution receipt {}",
+            intent.id,
+            path.display()
+        );
+        Ok(0)
+    })();
+    match store.abandon_clean(guard) {
+        Ok(()) => outcome,
+        Err(error) => {
+            eprintln!(
+                "oxide: resolve-intent unsettled: cannot release the checkout barrier ({error}); inspect the clean mark and the registry"
+            );
+            Ok(3)
+        }
+    }
+}
+
+/// Every positive gate resolution needs, in one place so the pre-effect check
+/// and the under-custody recheck are identical.
+fn resolve_precheck(
+    store: &Store,
+    control: &Path,
+    intent: &Intent,
+    registry: &Registry,
+) -> Result<(), String> {
+    if !registry.complete {
+        return Err(
+            "the output registry is sticky-incomplete, so no intent can be resolved".to_owned(),
+        );
+    }
+    if registry.intent(&intent.id).is_none() {
+        return Err("the registry no longer records this intent".to_owned());
+    }
     if registry
         .intents
         .iter()
-        .any(|other| other.id != id && other.identity.root == intent.identity.root)
+        .any(|other| other.id != intent.id && other.identity.root == intent.identity.root)
     {
-        return Ok(refused(
-            "another intent references the same root; settle it first",
-        ));
+        return Err("another intent references the same root; settle it first".to_owned());
     }
-    if registry.rows.iter().any(|row| {
-        row.root == intent.identity.root
-            && row.checkout_id != intent.identity.checkout_id
-            && row.live()
-    }) {
-        return Ok(refused(
-            "another live registry reference still names this root",
-        ));
-    }
-    if registry.rows.iter().any(|row| {
+    let Some(row) = registry.rows.iter().find(|row| {
         row.checkout_id == intent.identity.checkout_id
             && row.member == intent.identity.member
-            && row.root != intent.identity.root
-            && row.selected
+            && row.root == intent.identity.root
+    }) else {
+        return Err("the registry no longer holds this intent's blocking row".to_owned());
+    };
+    if row.pruning.as_deref() != Some(intent.id.as_str()) {
+        return Err("the intent's blocking registry reference changed".to_owned());
+    }
+    if registry.rows.iter().any(|other| {
+        other.root == intent.identity.root
+            && other.checkout_id != intent.identity.checkout_id
+            && other.live()
     }) {
-        return Ok(refused(
-            "the checkout selects another root; the intent stays pending",
-        ));
+        return Err("another live registry reference still names this root".to_owned());
+    }
+    if registry.rows.iter().any(|other| {
+        other.checkout_id == intent.identity.checkout_id
+            && other.member == intent.identity.member
+            && other.root != intent.identity.root
+            && other.selected
+    }) {
+        return Err("the checkout selects another root; the intent stays pending".to_owned());
     }
     let Some(uuid) = intent.identity.volume_uuid.as_deref() else {
-        return Ok(refused(
-            "the intent records no volume UUID, so absence cannot be proven",
-        ));
+        return Err("the intent records no volume UUID, so absence cannot be proven".to_owned());
     };
     let Some(outputs_dir) = intent.identity.root.parent() else {
-        return Ok(refused("the intent root has no parent"));
+        return Err("the intent root has no parent".to_owned());
     };
     let Some(mount) = outputs_dir.parent() else {
-        return Ok(refused("the intent root has no mount"));
+        return Err("the intent root has no mount".to_owned());
     };
-    let binding = match Binding::open(mount, Some(uuid)) {
-        Ok(binding) => binding,
-        Err(error) => {
-            return Ok(refused(&format!(
+    let binding = Binding::open(mount, Some(uuid)).map_err(|error| {
+        format!(
             "the recorded volume is not mounted and matching ({error}); the intent stays pending"
-        )))
-        }
-    };
-    let outputs = match binding.dir_at(binding.fd(), outputs::EXTERNAL_DIR, false) {
-        Ok(outputs) => outputs,
-        Err(error) => {
-            return Ok(refused(&format!(
-                "the outputs directory is not readable ({error}); the intent stays pending"
-            )))
-        }
-    };
+        )
+    })?;
+    let outputs = binding
+        .dir_at(binding.fd(), outputs::EXTERNAL_DIR, false)
+        .map_err(|error| format!("the outputs directory is not readable ({error})"))?;
     let original = intent
         .identity
         .root
@@ -3037,85 +3241,46 @@ fn resolve_intent(id: &str) -> Result<u8, String> {
             )
         };
         if status == 0 {
-            return Ok(refused(&format!(
+            return Err(format!(
                 "the leaf {} is present; both leaves must be positively absent",
                 leaf.to_string_lossy()
-            )));
+            ));
         }
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::NotFound {
-            return Ok(refused(&format!(
+            return Err(format!(
                 "cannot prove {} absent ({error}); the intent stays pending",
                 leaf.to_string_lossy()
-            )));
+            ));
         }
     }
     match store.checkout_custody(&intent.identity.checkout, 0)? {
         CheckoutCustody::Clear => {}
         CheckoutCustody::Writers => {
-            return Ok(refused("an active writer still holds the checkout"))
+            return Err("an active writer still holds the checkout".to_owned())
         }
         CheckoutCustody::Unknown(reason) => {
-            return Ok(refused(&format!("writer custody is unknown ({reason})")))
+            return Err(format!("writer custody is unknown ({reason})"))
         }
     }
-    let resolution = serde_json::json!({
-        "version": RESOLUTION_VERSION,
-        "intent": intent.id,
-        "root": intent.identity.root,
-        "checkout": intent.identity.checkout,
-        "member": intent.identity.member,
-        "nonce": intent.identity.nonce,
-        "volume_uuid": intent.identity.volume_uuid,
-        "dev": intent.identity.dev,
-        "ino": intent.identity.ino,
-        "marker_digest": intent.identity.marker_digest,
-        "resolved_ms": process::now_ms(),
-        "binary": std::env::current_exe().map(|path| path.display().to_string()).unwrap_or_default(),
-        "package_version": env!("CARGO_PKG_VERSION"),
-        "registry_revision": registry.revision,
-        "checks": {
-            "original_absent": "fstatat(AT_SYMLINK_NOFOLLOW) = ENOENT",
-            "quarantine_absent": "fstatat(AT_SYMLINK_NOFOLLOW) = ENOENT",
-            "no_other_selection": true,
-            "writer_custody": "clear",
-            "volume": "verified UUID, device and mount",
-        }
-    });
-    let directory = registry_dir(&control).join("prune-resolutions");
-    ensure_private_dir(&directory)?;
-    let path = directory.join(format!("{}.json", intent.id));
-    let bytes = serde_json::to_vec_pretty(&resolution).map_err(|error| error.to_string())?;
-    let temp = directory.join(format!(".{}.tmp-{}", intent.id, std::process::id()));
-    if let Err(reason) = write_private(&temp, &bytes) {
-        return Ok(refused(&format!(
-            "cannot prepare the resolution proof ({reason})"
-        )));
+    if let Some(holder) = store::active_holders(control, &intent.identity.checkout)?
+        .into_iter()
+        .next()
+    {
+        return Err(format!(
+            "a recorded writer still holds this checkout ({holder})"
+        ));
     }
-    if let Err(error) = fs::rename(&temp, &path) {
-        let _ = fs::remove_file(&temp);
-        return Ok(refused(&format!(
-            "cannot publish the resolution proof ({error})"
-        )));
+    let removable = removable::removable_control(control);
+    if let Some(holder) = store::active_holders(&removable, &intent.identity.checkout)?
+        .into_iter()
+        .next()
+    {
+        return Err(format!(
+            "a recorded writer in the removable pool still holds this checkout ({holder})"
+        ));
     }
-    if let Err(error) = sync_directory(&directory) {
-        eprintln!(
-            "oxide: resolve-intent unsettled: the resolution proof is published but its directory did not sync ({error}); the intent stays pending"
-        );
-        return Ok(3);
-    }
-    if let Err(reason) = complete_resolution(&store, &control, &intent, "resolved-by-operator") {
-        eprintln!(
-            "oxide: resolve-intent unsettled: {reason}; the resolution proof is published but the terminal transaction did not commit, so the intent stays pending"
-        );
-        return Ok(3);
-    }
-    println!(
-        "outputs resolve-intent: {} resolved by operator (original and quarantine leaves absent); resolution receipt {}",
-        intent.id,
-        path.display()
-    );
-    Ok(0)
+    Ok(())
 }
 
 fn complete_resolution(
@@ -3136,16 +3301,20 @@ fn complete_resolution(
             record.resolved_ms = Some(process::now_ms());
             record.updated_ms = process::now_ms();
         }
-        if let Some(row) = registry.rows.iter_mut().find(|row| {
+        let Some(row) = registry.rows.iter_mut().find(|row| {
             row.checkout_id == intent.identity.checkout_id
                 && row.member == intent.identity.member
                 && row.root == intent.identity.root
-        }) {
-            row.selected = false;
-            row.pending = false;
-            row.pruning = None;
-            row.pruned_ms = Some(process::now_ms());
+        }) else {
+            return Err("the intent's blocking registry row disappeared".to_owned());
+        };
+        if row.pruning.as_deref() != Some(intent.id.as_str()) {
+            return Err("the intent's blocking registry reference changed".to_owned());
         }
+        row.selected = false;
+        row.pending = false;
+        row.pruning = None;
+        row.pruned_ms = Some(process::now_ms());
         registry.bump()?;
         write_registry(control, &registry)?;
     }
@@ -3170,6 +3339,43 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
+/// Test-only seeding for the outputs fixtures: a ready, empty registry with a
+/// fresh transaction identity. Product code never creates one this way.
+#[cfg(test)]
+pub(crate) fn seed_test_registry(control: &Path) -> Result<(), String> {
+    if read_registry(control)?.is_some() {
+        return Ok(());
+    }
+    ensure_private_dir(&registry_dir(control))?;
+    let transaction = fresh_nonce()?;
+    match create_or_validate_registry(control, &transaction, true) {
+        Ok(()) => Ok(()),
+        // Another test thread won the exclusive creation.
+        Err(_) if read_registry(control)?.is_some() => Ok(()),
+        Err(reason) => Err(reason),
+    }
+}
+
+/// Test-only view of registry rows: root, selected, pending, pruning.
+#[cfg(test)]
+pub(crate) fn test_rows(
+    control: &Path,
+) -> Result<Vec<(PathBuf, bool, bool, Option<String>)>, String> {
+    let registry = ready_registry(control)?;
+    Ok(registry
+        .rows
+        .iter()
+        .map(|row| {
+            (
+                row.root.clone(),
+                row.selected,
+                row.pending,
+                row.pruning.clone(),
+            )
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -3284,16 +3490,18 @@ mod tests {
     }
 
     #[test]
-    fn a_row_cannot_be_selected_pending_and_pruning_at_once() {
+    fn a_row_can_be_selected_and_pending_but_never_pruning() {
         let root = Fixture::new();
         let mut row = row_for(&root.root);
         assert!(row.validate().is_ok());
+        // A prepared relink of the same root names it in both references.
         row.pending = true;
-        assert!(row.validate().is_err());
-        row.pending = false;
+        assert!(row.validate().is_ok());
         row.pruning = Some("b".repeat(32));
         assert!(row.validate().is_err());
         row.selected = false;
+        assert!(row.validate().is_err());
+        row.pending = false;
         assert!(row.validate().is_ok());
     }
 
@@ -3408,6 +3616,13 @@ mod tests {
             checkout_absence(&row, false).unwrap(),
             Absence::Present
         ));
+        // A missing ancestor is uncertainty, never absence.
+        let mut deep = row_for(&fixture.root);
+        deep.checkout = fixture.root.join("missing-ancestor/checkout");
+        assert!(matches!(
+            checkout_absence(&deep, false).unwrap(),
+            Absence::Unknown(_)
+        ));
         // A symlinked ancestor is never followed.
         let link = fixture.root.join("linked");
         std::os::unix::fs::symlink(&missing, &link).unwrap();
@@ -3469,6 +3684,92 @@ mod tests {
         assert!(same_candidates(&[&first], &[&first]));
         assert!(!same_candidates(&[&first], &[&second]));
         assert!(!same_candidates(&[&first], &[]));
+    }
+
+    #[test]
+    fn a_malformed_receipt_keeps_the_whole_snapshot_batch() {
+        let fixture = Fixture::new();
+        let control = fixture.root.join("control");
+        fs::create_dir(&control).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
+        let outputs = registry_dir(&control);
+        ensure_private_dir(&outputs).unwrap();
+        let mut row = row_for(&fixture.root);
+        row.checkout_id = "d".repeat(64);
+        let receipt_path = outputs::receipt_path_public(&control, &row.checkout_id);
+        fs::write(&receipt_path, b"{not a receipt").unwrap();
+        row.receipt = receipt_path;
+        let registry = Registry {
+            version: REGISTRY_VERSION.to_owned(),
+            revision: 1,
+            complete: true,
+            incomplete: None,
+            created_by: "a".repeat(32),
+            rows: vec![row],
+            intents: Vec::new(),
+        };
+        write_registry(&control, &registry).unwrap();
+        let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
+        let evaluated = evaluate(&store, &control, &registry, None).unwrap();
+        assert!(evaluated.iter().all(|entry| entry.candidate.is_none()));
+        assert!(evaluated.iter().all(|entry| entry
+            .kept
+            .as_deref()
+            .is_some_and(|reason| reason.contains("whole batch"))));
+    }
+
+    #[test]
+    fn resolution_refuses_before_the_volume_without_a_complete_row_bound_snapshot() {
+        let fixture = Fixture::new();
+        let control = fixture.root.join("control");
+        fs::create_dir(&control).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
+        let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
+        let intent = Intent {
+            version: INTENT_VERSION.to_owned(),
+            id: "b".repeat(32),
+            identity: RootIdentity {
+                checkout_id: "d".repeat(64),
+                checkout: fixture.root.join("gone/checkout"),
+                receipt: fixture.root.join("control/outputs/d.json"),
+                member: outputs::MEMBER.to_owned(),
+                root: fixture.root.join("vol/oxide-outputs/app"),
+                root_kind: RootKind::External,
+                volume_uuid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
+                nonce: Some("c".repeat(32)),
+                generation: 1,
+                dev: 1,
+                ino: 2,
+                marker_digest: "e".repeat(64),
+            },
+            phase: IntentPhase::Renamed,
+            quarantine: fixture.root.join("vol/oxide-outputs/.prune-b"),
+            preview_sha256: "f".repeat(64),
+            created_ms: 1,
+            updated_ms: 1,
+            resolved_ms: None,
+        };
+        let mut registry = Registry {
+            version: REGISTRY_VERSION.to_owned(),
+            revision: 1,
+            complete: false,
+            incomplete: Some(Incomplete {
+                reason: "test".to_owned(),
+                since_ms: 1,
+                transaction: "a".repeat(32),
+            }),
+            created_by: "a".repeat(32),
+            rows: Vec::new(),
+            intents: vec![intent.clone()],
+        };
+        let refused = resolve_precheck(&store, &control, &intent, &registry).unwrap_err();
+        assert!(refused.contains("sticky-incomplete"), "{refused}");
+        registry.complete = true;
+        registry.incomplete = None;
+        let refused = resolve_precheck(&store, &control, &intent, &registry).unwrap_err();
+        assert!(refused.contains("blocking row"), "{refused}");
     }
 
     #[test]

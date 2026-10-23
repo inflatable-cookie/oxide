@@ -310,6 +310,12 @@ impl Receipt {
         self.state == ReceiptState::Committed
     }
 
+    /// Whether the selected placement is still live: a committed receipt and
+    /// a prepared transition both keep their committed root selected.
+    pub(crate) fn holds_selection(&self) -> bool {
+        matches!(self.state, ReceiptState::Committed | ReceiptState::Prepared)
+    }
+
     /// The placement's selected root, whether or not the state is committed.
     pub(crate) fn current(&self) -> Option<&Selected> {
         self.link().selected.as_ref()
@@ -3677,6 +3683,9 @@ mod tests {
             let control = root.join("control");
             fs::create_dir(&control).unwrap();
             fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
+            // Receipt writes publish through the registry authority, so every
+            // fixture starts with a ready, empty registry.
+            crate::prune::seed_test_registry(&control).unwrap();
             Self {
                 root,
                 checkout,
@@ -3703,6 +3712,14 @@ mod tests {
                 &identity::digest(&self.checkout.to_string_lossy()),
             )
         }
+    }
+
+    /// A store whose control directory also carries a ready empty registry, so
+    /// tests can exercise the same receipt write-through as production.
+    fn pool_store(root: &Path) -> Store {
+        let store = Store::for_tests(root);
+        crate::prune::seed_test_registry(store.control()).unwrap();
+        store
     }
 
     impl Drop for Fixture {
@@ -4769,7 +4786,7 @@ mod tests {
             generation: 1,
         });
         write_receipt(&fixture.control, &receipt).unwrap();
-        let store = Store::for_tests(&fixture.root.join("pool"));
+        let store = pool_store(&fixture.root.join("pool"));
         match bind_under_binding(&context, &store, 0, &receipt, Some(&expected)) {
             Bind::Refuse(reason) => {
                 assert!(reason.contains("committed receipt selects"), "{reason}")
@@ -4846,9 +4863,9 @@ mod tests {
         let receipt_bytes = fs::read(&path).unwrap();
 
         let managed = oxide_storage::lease::MANAGED_NAME;
-        let removable = Store::for_tests(&fixture.root.join("removable"));
+        let removable = pool_store(&fixture.root.join("removable"));
         removable.quarantine_for_tests(&fixture.checkout);
-        let internal = Store::for_tests(&fixture.root.join("internal"))
+        let internal = pool_store(&fixture.root.join("internal"))
             .with_sibling(&fixture.root.join("removable").join(managed), false);
         let refused = gated_replay(&context, &internal, 0, receipt.clone()).unwrap_err();
         assert!(refused.contains("never confirmed closed"), "{refused}");
@@ -4857,7 +4874,7 @@ mod tests {
         assert!(root.join(MARKER).is_file());
 
         // The control: with clear custody the same state commits.
-        let clear = Store::for_tests(&fixture.root.join("clear"));
+        let clear = pool_store(&fixture.root.join("clear"));
         let replayed = gated_replay(&context, &clear, 0, receipt).unwrap().unwrap();
         assert_eq!(replayed.state, ReceiptState::Committed);
     }
@@ -4990,7 +5007,7 @@ mod tests {
     #[test]
     fn a_receiptless_link_is_never_followed_in_permanent_mode() {
         let fixture = Fixture::new();
-        let store = Store::for_tests(&fixture.root.join("pool"));
+        let store = pool_store(&fixture.root.join("pool"));
         register_at(&fixture, store.owner_control(), DriveMode::Permanent);
         let context = fixture.context();
         let bind = |label: &str| match bind_for_command(&store, &fixture.checkout, 0, None, None) {
@@ -5028,7 +5045,7 @@ mod tests {
     fn a_conversion_while_a_command_waits_refuses_its_unconverted_key() {
         for mode in [DriveMode::Permanent, DriveMode::Ephemeral] {
             let fixture = Fixture::new();
-            let store = Store::for_tests(&fixture.root.join("pool"));
+            let store = pool_store(&fixture.root.join("pool"));
             register_at(&fixture, store.owner_control(), mode);
             let context = Context::new(
                 Some(store.owner_control().to_path_buf()),
@@ -5064,7 +5081,7 @@ mod tests {
     #[test]
     fn a_converted_ephemeral_command_holds_the_binding_mutex() {
         let fixture = Fixture::new();
-        let store = Store::for_tests(&fixture.root.join("pool"));
+        let store = pool_store(&fixture.root.join("pool"));
         register_at(&fixture, store.owner_control(), DriveMode::Ephemeral);
         let context = Context::new(
             Some(store.owner_control().to_path_buf()),
@@ -5083,7 +5100,7 @@ mod tests {
             let root = fixture.root.join("pool");
             let checkout = fixture.checkout.clone();
             std::thread::spawn(move || {
-                let store = Store::for_tests(&root);
+                let store = pool_store(&root);
                 let _lock = store.lock_binding(&checkout).unwrap();
                 acquired.store(true, Ordering::SeqCst);
             })
@@ -5097,6 +5114,63 @@ mod tests {
         drop(binding);
         relinker.join().unwrap();
         assert!(acquired.load(Ordering::SeqCst));
+    }
+
+    /// A receipt write publishes through the registry authority: a committed
+    /// transition has one selected row, and a prepared transition keeps that
+    /// committed root selected while the proposed root is pending.
+    #[test]
+    fn a_receipt_write_publishes_registry_rows_and_prepared_keeps_selection() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let committed =
+            transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
+        let selected = committed.selected().unwrap().clone();
+        let rows = crate::prune::test_rows(&fixture.control).unwrap();
+        assert!(
+            rows.iter().any(|(root, selected_flag, pending, pruning)| {
+                root == &selected.root && *selected_flag && !*pending && pruning.is_none()
+            }),
+            "{rows:?}"
+        );
+        let mut prepared = committed.clone();
+        prepared.state = ReceiptState::Prepared;
+        prepared.link_mut().prepared = Some(Prepared {
+            generation: committed.generation + 1,
+            to: RootSpec::Local {
+                root: fixture.root.join("next-root"),
+            }
+            .selected(committed.generation + 1),
+            link: context.link(),
+        });
+        write_receipt(&fixture.control, &prepared).unwrap();
+        let rows = crate::prune::test_rows(&fixture.control).unwrap();
+        assert!(
+            rows.iter()
+                .any(|(root, selected_flag, _, _)| { root == &selected.root && *selected_flag }),
+            "the prepared transition dropped the committed selection: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|(root, selected_flag, pending, _)| {
+                root == &fixture.root.join("next-root") && !*selected_flag && *pending
+            }),
+            "the proposed root is not pending: {rows:?}"
+        );
+        // A rolled-back preparation clears the pending reference; the
+        // committed root stays selected.
+        let mut rolled = committed.clone();
+        rolled.link_mut().prepared = None;
+        write_receipt(&fixture.control, &rolled).unwrap();
+        let rows = crate::prune::test_rows(&fixture.control).unwrap();
+        assert!(
+            rows.iter().all(|(_, _, pending, _)| !*pending),
+            "a rolled-back preparation left a pending reference: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|(root, selected_flag, _, _)| { root == &selected.root && *selected_flag }),
+            "the rollback dropped the committed selection: {rows:?}"
+        );
     }
 
     #[test]

@@ -3284,7 +3284,12 @@ impl Store {
         // fields and object caps first; an oversized legacy field refuses
         // with the original file untouched.
         let mut fenced = state.clone();
-        let initialized = fenced.outputs_init.is_some() || fenced.owned_outputs.is_some();
+        // The released `oxide.outputs/1` fence is not consent to the version-3
+        // numeric format: a released binary still reads it. Only the version-2
+        // owned-outputs fence or a recorded initialization transaction may
+        // advance the numeric version.
+        let initialized = fenced.outputs_init.is_some()
+            || fenced.owned_outputs.as_deref() == Some(OWNED_OUTPUTS_FENCE);
         fenced.version = if initialized {
             STATE_VERSION
         } else {
@@ -4347,6 +4352,21 @@ mod tests {
         assert_eq!(
             doc["version"].as_u64(),
             Some(u64::from(PREVIOUS_STATE_VERSION))
+        );
+        // A released version-1 owned-outputs fence is not consent to the
+        // version-3 numeric format; only the /2 fence or an init record is.
+        let released = State {
+            owned_outputs: Some(LEGACY_OWNED_OUTPUTS_FENCE.to_owned()),
+            ..State::default()
+        };
+        internal.save(&released).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_slice(&fs::read(internal.control.join("state.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            doc["version"].as_u64(),
+            Some(u64::from(PREVIOUS_STATE_VERSION)),
+            "a released /1 fence advanced the numeric state version"
         );
         let transaction = "a".repeat(32);
         let created = std::cell::Cell::new(0);
