@@ -18,6 +18,7 @@ mod guidance;
 mod handoff;
 mod identity;
 mod launch;
+mod layout;
 mod outputs;
 mod process;
 mod prune;
