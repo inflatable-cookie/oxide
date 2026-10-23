@@ -20,7 +20,7 @@ provider or install):
 
     staging (constrained debug oxide recipe)      288 MiB
     APFS sparse image (payload + quotas)          128 MiB
-    fixtures                                       32 MiB
+    fixtures (incl. ~2.7 MiB old-binary copy)      32 MiB
     evidence                                       32 MiB
     margin                                         32 MiB
     ---------------------------------------------  ------
@@ -39,13 +39,14 @@ detach helper's 5 s refusal margin: about 325 s of the 360 s limit):
     supervisor start offset                         <= 5 s
     staging (constrained debug oxide recipe)       37-60 s
     image attach, registration, first build        10-20 s
+    old-binary verify/copy, probe, two refusals     2-5 s
     cases 01-21 (base 60-120 s + source-fit
       additions: gated writer build, kappa and
       recreated builds, image checkout, 600-entry
       root, extra prune runs, status reads)       95-165 s
     ordinary detach                                 2-10 s
     ---------------------------------------------  --------
-    total                                        149-260 s   (~65 s margin)
+    total                                        151-265 s   (~60 s margin)
 
 No timing fit is claimed. An overrun fails at the deadline (never a timeout
 success); no split, extra session or automatic retry.
@@ -71,6 +72,14 @@ on tiny owned fixtures with exact exit codes and state assertions:
   fence / init (2)
     01 init: adopt publishes state version 3 with oxide.outputs/2 and a ready
        transaction in both controls, and oxide.outputs.registry/1 exists.
+       Older-binary control (root-authorized read-only artifact): the exact
+       installed d246d400 binary and its install receipt are verified (pin,
+       SHA-256 bd52cb42..., size, no-follow regular owned files, metadata
+       stable across the read), copied into owned scratch, and only the copy
+       runs: its capability probe reports control state 2, and its `check`
+       and `outputs adopt` in the fixture both exit nonzero with no handoff,
+       no host path and complete pool, volume-tree and checkout bytes and
+       metadata unchanged.
     02 missing ready registry: dry run exits 2, adopt of another checkout
        refuses, nothing is rebuilt; restoring the exact bytes recovers.
   nonce / reservation / cancel / recreation key (4)
@@ -191,6 +200,19 @@ CASE_ALLOCATION = [
 ]
 
 PLAIN = '[package]\nname = "plain"\nversion = "0.1.0"\nedition = "2021"\n'
+
+# The older-binary fence control (Opus 9a6af8bb, root-authorized READ-ONLY):
+# the exact installed d246d400 binary and its install receipt. They are read
+# with no-follow bounded reads, verified, copied into owned scratch and only
+# the COPY is executed, never against the host pool.
+OLD_BINARY = "/Users/tom/.local/bin/oxide"
+OLD_RECEIPT = "/Users/tom/.local/state/oxide/install/20261023T095314Z-d246d400f5cc.json"
+OLD_PIN = "d246d400f5ccb8e0a601ea6415b93b8346bc2698"
+OLD_SHA = "bd52cb42842c06451b0f8a9bc364ba7de74cfe6f014d33804890c4adbc51fc2b"
+OLD_BINARY_CAP = 8 * 1024 * 1024
+OLD_RECEIPT_CAP = 64 * 1024
+CAPABILITIES_PROBE = "__oxide-build-capabilities"
+HANDOFF_NOTICE = "handing off to the installed binary"
 # A build script that holds Cargo running until its gate releases it
 # (bounded at 60 s), so a writer is positively Running, not pre-launch.
 GATED_BUILD = r"""
@@ -399,6 +421,89 @@ def tree_bytes(root: str) -> dict:
     return digest
 
 
+def read_nofollow(path: str, cap: int) -> tuple[bytes, tuple]:
+    """A bounded no-follow read of one regular file owned by this user;
+    returns the bytes and the (dev, ino, size, mtime_ns) identity."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        facts = os.fstat(fd)
+        expect(stat.S_ISREG(facts.st_mode), f"{path} is not a regular file")
+        expect(facts.st_uid == os.getuid(), f"{path} is not owned by this user")
+        expect(facts.st_size <= cap, f"{path} exceeds its {cap}-byte cap")
+        chunks, left = [], cap + 1
+        while left > 0:
+            chunk = os.read(fd, min(left, 1 << 20))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            left -= len(chunk)
+        data = b"".join(chunks)
+        expect(len(data) == facts.st_size, f"{path} changed size while read")
+        return data, (facts.st_dev, facts.st_ino, facts.st_size, facts.st_mtime_ns)
+    finally:
+        os.close(fd)
+
+
+def copy_old_artifact(root: str) -> str:
+    """Verify the exact receipt and installed binary, copy the binary into
+    owned scratch and return the copy. Any mismatch fails; nothing is
+    reinstalled, skipped or substituted."""
+    receipt_bytes, receipt_id = read_nofollow(OLD_RECEIPT, OLD_RECEIPT_CAP)
+    receipt = json.loads(receipt_bytes)
+    installed = receipt.get("installed", {})
+    expect(receipt.get("pin") == OLD_PIN, f"receipt pin {receipt.get('pin')} is not {OLD_PIN}")
+    expect(installed.get("path") == OLD_BINARY, f"receipt path {installed.get('path')}")
+    expect(installed.get("sha256") == OLD_SHA and receipt.get("built_sha256") == OLD_SHA, "receipt hash mismatch")
+    expect(receipt.get("control_state_version") == 2, f"receipt control state {receipt.get('control_state_version')}")
+    binary, binary_id = read_nofollow(OLD_BINARY, OLD_BINARY_CAP)
+    expect(len(binary) == installed.get("size"), "installed size differs from the receipt")
+    expect(hashlib.sha256(binary).hexdigest() == OLD_SHA, "installed binary hash differs from the pin")
+    for path, before in ((OLD_RECEIPT, receipt_id), (OLD_BINARY, binary_id)):
+        after = os.lstat(path)
+        expect(
+            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) == before,
+            f"{path} changed while it was copied",
+        )
+    copy = os.path.join(root, "old-oxide-d246d400")
+    fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700)
+    try:
+        os.write(fd, binary)
+    finally:
+        os.close(fd)
+    expect(hashlib.sha256(permanent.read_bytes(copy)).hexdigest() == OLD_SHA, "the copy's hash differs")
+    permanent.record(
+        "old-artifact.json",
+        json.dumps(
+            {
+                "source_pin": OLD_PIN,
+                "binary_sha256": OLD_SHA,
+                "binary_size": len(binary),
+                "receipt_path": OLD_RECEIPT,
+                "receipt_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+                "copy": copy,
+            },
+            indent=2,
+        ),
+    )
+    return copy
+
+
+def tree_snapshot(root: str) -> dict:
+    """Complete bounded bytes + metadata of a fixture tree (no atime)."""
+    snapshot = {}
+    for directory, directories, files in os.walk(root):
+        for name in directories + files:
+            path = os.path.join(directory, name)
+            facts = os.lstat(path)
+            entry = (facts.st_mode, facts.st_size, facts.st_mtime_ns, facts.st_ino)
+            if stat.S_ISREG(facts.st_mode):
+                entry += (hashlib.sha256(permanent.read_bytes(path)).hexdigest(),)
+            elif stat.S_ISLNK(facts.st_mode):
+                entry += (os.readlink(path),)
+            snapshot[os.path.relpath(path, root)] = entry
+    return snapshot
+
+
 def marker(root: str) -> dict:
     return permanent.read_json(os.path.join(root, ".oxide-output.json"))
 
@@ -449,6 +554,24 @@ def run(proof, repo: str) -> None:
         expect("ready" in json.dumps(state.get("outputs_init")), f"{control}: {state.get('outputs_init')}")
     registry = world.registry_doc()
     expect(registry["version"] == "oxide.outputs.registry/1" and registry.get("schema") == 1 and registry["complete"], registry)
+    # Older-binary fence control: the exact d246d400 artifact's copy reports
+    # control state 2, then its `check` and `outputs adopt` in this fixture
+    # (private HOME without any install receipt, private CARGO_HOME, pool and
+    # registration) both refuse before any effect.
+    old = copy_old_artifact(proof.root)
+    probe = proof.run([old, CAPABILITIES_PROBE], cwd=alpha, env=proof.env, timeout=30)
+    expect(probe.returncode == 0, f"old capability probe exit {probe.returncode}")
+    expect(json.loads(probe.stdout).get("control_state_version") == 2, f"old probe {probe.stdout!r}")
+    watched = [world.pool, os.path.join(mount, "oxide-outputs"), alpha]
+    before = [tree_snapshot(path) for path in watched]
+    for args in (["check"], ["outputs", "adopt"]):
+        result = proof.run([old, *args], cwd=alpha, env=proof.env, timeout=30)
+        stderr = result.stderr.decode(errors="replace")
+        print(f"----- old binary {args}: exit {result.returncode} -----\n{stderr}", flush=True)
+        expect(result.returncode != 0, f"the older binary's {args} did not refuse")
+        expect(HANDOFF_NOTICE not in stderr, f"the older binary's {args} selected a handoff; STOP")
+        expect(OLD_BINARY not in stderr and "/.local/state/oxide" not in stderr, f"a host path appeared: {stderr}")
+        expect([tree_snapshot(path) for path in watched] == before, f"the older binary's {args} changed fixture state")
 
     case("missing ready registry refuses and is never rebuilt")
     saved = permanent.read_bytes(world.registry)
