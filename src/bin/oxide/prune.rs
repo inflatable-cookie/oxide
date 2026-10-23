@@ -2046,12 +2046,40 @@ fn evaluate(
     let mut receipts: std::collections::HashMap<String, Result<Receipt, String>> =
         std::collections::HashMap::new();
     let mut evaluated = Vec::new();
-    let rows: Vec<Row> = registry
+    // Eligibility and candidate construction are per (checkout, root): every
+    // member of one root under the same checkout is ONE owner, so one
+    // representative (the first sorted member) is evaluated and the full group
+    // is verified again at intent publication. A group carrying a pending or
+    // otherwise unsettled reference is kept, never offered as a candidate.
+    let mut rows: Vec<Row> = registry
         .rows
         .iter()
         .filter(|row| row.live() || row.pruned_ms.is_none())
         .cloned()
         .collect();
+    rows.sort_by(|left, right| {
+        (
+            left.checkout_id.as_str(),
+            left.root.as_path(),
+            left.member.as_str(),
+        )
+            .cmp(&(
+                right.checkout_id.as_str(),
+                right.root.as_path(),
+                right.member.as_str(),
+            ))
+    });
+    let mut grouped: Vec<Row> = Vec::new();
+    let mut group_keys: Vec<(String, PathBuf)> = Vec::new();
+    for row in rows {
+        let key = (row.checkout_id.clone(), row.root.clone());
+        if group_keys.iter().any(|known| known == &key) {
+            continue;
+        }
+        group_keys.push(key);
+        grouped.push(row);
+    }
+    let rows = grouped;
     if rows.len() > SNAPSHOT_MAX_RECEIPTS {
         // A cap is not permission to consider part of the registry.
         return Ok(rows
@@ -4322,6 +4350,11 @@ fn settle_receipt(control: &Path, id: &str, outcome: &str) -> Result<(), String>
     });
     if owns_terminal {
         publish_terminal_receipt(control, &intent, id, outcome)?;
+        // Debug-only proof stop AFTER the expected terminal image digest is
+        // durable and that exact image is published, but BEFORE the intent is
+        // marked settled. The existing `terminal` hook keeps its earlier
+        // pre-settlement meaning.
+        crash_point("terminal-image")?;
     }
     {
         let _guard = store::publication_guard(control)?;

@@ -3125,6 +3125,22 @@ become owned links. Cargo's top-level files (`CACHEDIR.TAG`,
 `.rustc_info.json`), `target/tmp` and tool directories such as `target/doc`
 stay real.
 
+- **Members and destinations.** A converted checkout's `target` is real and
+  each linked member selects its own approved subpath beneath the shared root
+  (`R/debug`, `R/release`, `R/<triple>/debug`, `R/<triple>/release`); the root
+  keeps one immutable nonce, marker and creation generation. `run` maps a
+  Cargo-reported program beneath its own owned member's link only; a real
+  (unlinked) member keeps Cargo's own executable path, so a mixed checkout
+  never runs another member's artifact. An internal-pool fallback slot refuses
+  before Cargo while an external member link is live, and an explicit adopt
+  compares the live link with the desired destination (relinking under custody
+  on a fallback or redock rather than trusting an old receipt match). A profile
+  clean is validated before the legacy whole-target pre-gate, plans each
+  member destination once, and preserves links, root markers and unrelated
+  payloads. Prune eligibility and candidate construction are per
+  `(checkout, root)` with a first-sorted representative, and a debug-only stop
+  after the fixed terminal image is published (before settlement) exercises
+  exact-image replay.
 - **Members.** V1 knows exactly `debug`, `release`, `<triple>/debug` and
   `<triple>/release`. A member has at most two components matching
   `[A-Za-z0-9_.-]+`, is neither `.` nor `..`, and is never absolute or an
@@ -3247,7 +3263,10 @@ stay real.
   outside this task.
 
 **Proof (oxide#133).** `scripts/test-profile-outputs.py` publishes the fixed
-20-case matrix for this design: one private session per side with one owned
+20-case matrix for this design, updated for the corrected distinct member
+destinations (each linked member must select `root/<member>`), the positive
+selected-removable and low-reserve controls, the honest top-level lifecycle and
+the real peer-receipt KEEP: one private session per side with one owned
 128 MiB scratch APFS image, a private `HOME`, `CARGO_HOME` and directory pool,
 a separately staged base `4a70b83` binary and this HEAD's candidate staged
 offline with 1.97.1 from authenticated pinned source, with asserted distinct

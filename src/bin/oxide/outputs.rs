@@ -849,6 +849,57 @@ impl Receipt {
     }
 }
 
+/// Ensure the member's real destination directory exists beneath the root.
+/// The root itself is already validated as a real directory owned by this
+/// checkout; a symlink or other entry at the member path is refused, never
+/// followed.
+fn ensure_member_directory(root: &Path, member: &str) -> Result<PathBuf, String> {
+    let destination = member_destination(root, member);
+    if member == MEMBER {
+        return Ok(destination);
+    }
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            return Ok(destination)
+        }
+        Ok(_) => {
+            return Err(format!(
+                "the output root's member entry {} is not a real directory; it is never followed",
+                destination.display()
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot inspect {}: {error}", destination.display())),
+    }
+    fs::create_dir_all(&destination).map_err(|error| {
+        format!(
+            "cannot create the member directory {}: {error}",
+            destination.display()
+        )
+    })?;
+    let metadata = fs::symlink_metadata(&destination)
+        .map_err(|error| format!("cannot inspect {}: {error}", destination.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "the created member destination {} is not a real directory",
+            destination.display()
+        ));
+    }
+    Ok(destination)
+}
+
+/// The real destination one member's link selects: the approved distinct
+/// subpath beneath the shared root (`R/debug`, `R/release`,
+/// `R/<triple>/debug`, ...). Only the legacy whole-target placement, member
+/// `target`, selects the root directory itself.
+pub(crate) fn member_destination(root: &Path, member: &str) -> PathBuf {
+    if member == MEMBER {
+        root.to_path_buf()
+    } else {
+        root.join(member)
+    }
+}
+
 /// The live link path of one placement member under one checkout.
 fn link_path(checkout: &Path, member: &str) -> PathBuf {
     if member == MEMBER {
@@ -2053,9 +2104,9 @@ fn verify_member_links(dir: &Path, migration: &Migration) -> Result<(), String> 
         }
         let link = fs::read_link(entry.path())
             .map_err(|error| format!("cannot read {}: {error}", entry.path().display()))?;
-        if link != migration.root.root {
+        if link != member_destination(&migration.root.root, &name) {
             return Err(format!(
-                "{} selects {}, not the migrated root",
+                "{} selects {}, not its migrated member destination",
                 entry.path().display(),
                 link.display()
             ));
@@ -2306,12 +2357,14 @@ fn stage_migration(
             )?;
             for member in &migration.members {
                 let link = migration.stage.join(member);
-                symlink(&migration.root.root, &link).map_err(|error| {
-                    format!(
-                        "cannot create the staged member link {}: {error}",
-                        link.display()
-                    )
-                })?;
+                symlink(&member_destination(&migration.root.root, member), &link).map_err(
+                    |error| {
+                        format!(
+                            "cannot create the staged member link {}: {error}",
+                            link.display()
+                        )
+                    },
+                )?;
             }
             sync_directory(&migration.stage)?;
             sync_directory(parent)?;
@@ -2650,9 +2703,9 @@ fn verify_migrated_target(dir: &Path, migration: &Migration) -> Result<(), Strin
         let link = dir.join(member);
         let target = fs::read_link(&link)
             .map_err(|error| format!("cannot read {}: {error}", link.display()))?;
-        if target != migration.root.root {
+        if target != member_destination(&migration.root.root, member) {
             return Err(format!(
-                "{} selects {}, not the migrated root",
+                "{} selects {}, not its migrated member destination",
                 link.display(),
                 target.display()
             ));
@@ -2991,11 +3044,14 @@ fn adopt_profile(context: &Context, receipt: Receipt) -> Result<(Receipt, Select
             TargetState::RealEmpty => {}
             TargetState::Missing => {}
             TargetState::OwnedLink(root)
-                if Some(root.as_path())
-                    == committed.selected_for(member.name()).map(Selected::root) =>
+                if root == member_destination(&desired.root, member.name())
+                    && committed
+                        .selected_for(member.name())
+                        .is_some_and(|selected| selected.same_place(&desired)) =>
             {
-                // Already this receipt's committed link: adoption is
-                // idempotent and writes nothing.
+                // Already the desired destination this adoption would select:
+                // idempotent, nothing is written. A link that still matches an
+                // older receipt but not the desired place is relinked below.
                 continue;
             }
             TargetState::OwnedLink(_) | TargetState::Dangling(_) => {}
@@ -3287,7 +3343,9 @@ fn detach_profile(
         let link = link_path(&context.workspace, placement.member());
         match link_state(&link, &context.workspace, &context.checkout_id)? {
             TargetState::Missing => {}
-            TargetState::OwnedLink(root) if root == selected.root => {
+            TargetState::OwnedLink(root)
+                if root == member_destination(selected.root(), placement.member()) =>
+            {
                 removals.push(link);
             }
             state => {
@@ -3625,7 +3683,9 @@ fn bind_profile_sealed(
         let link = link_path(&context.workspace, &planned.member);
         let state = link_state(&link, &context.workspace, &context.checkout_id)?;
         match (&planned.selected, &state) {
-            (Some(wanted), TargetState::OwnedLink(root)) if root == &wanted.root => {
+            (Some(wanted), TargetState::OwnedLink(root))
+                if root == &member_destination(&wanted.root, &planned.member) =>
+            {
                 check_bound_root(context, receipt.generation, wanted)?;
                 outcome.root.get_or_insert_with(|| wanted.root.clone());
             }
@@ -3856,7 +3916,20 @@ fn bind_profile(
             Err(reason) => return Bind::Refuse(reason),
         };
         match (&planned.selected, &state) {
-            (Some(wanted), TargetState::OwnedLink(root)) if root == &wanted.root => {
+            (Some(wanted), TargetState::OwnedLink(root))
+                if root == &member_destination(&wanted.root, &planned.member) =>
+            {
+                // The legacy #117 rule: an internal-pool fallback slot must
+                // never write through an unsupervised external owned link.
+                if wanted.kind == RootKind::External {
+                    if let Some(reason) = context.pool_fallback.as_deref() {
+                        return Bind::Refuse(format!(
+                            "outputs: this command's intermediate slot fell back to the internal pool ({reason}) while {} selects the external member root {}; the drive's removal is not supervised, so nothing was built. Restore the drive or run `oxide outputs adopt`",
+                            link_path(&context.workspace, &planned.member).display(),
+                            wanted.root.display()
+                        ));
+                    }
+                }
                 if let Err(reason) = check_bound_root(context, receipt.generation, wanted) {
                     return Bind::Refuse(format!(
                         "outputs: {reason}; nothing was changed. Run `oxide outputs adopt` to recheck this checkout's owned outputs"
@@ -4448,6 +4521,37 @@ pub fn refuse_unknown_layout(
     Ok(())
 }
 
+/// The real executable for a Cargo-reported program path, when that program's
+/// member is an owned link into `root`: `target/<member>/<rest>` maps to
+/// `root/<member>/<rest>`. A real (unlinked) member keeps Cargo's own path, so
+/// a mixed checkout never runs another member's artifact.
+pub fn program_target(checkout: &Path, root: &Path, program: &Path) -> Option<PathBuf> {
+    let relative = program.strip_prefix(&checkout.join("target")).ok()?;
+    let mut components = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        });
+    let first = components.next()?;
+    let member = if first == "debug" || first == "release" {
+        first.to_owned()
+    } else {
+        let second = components.next()?;
+        if second != "debug" && second != "release" {
+            return None;
+        }
+        format!("{first}/{second}")
+    };
+    crate::layout::Member::parse(&member).ok()?;
+    let target = fs::read_link(link_path(checkout, &member)).ok()?;
+    if target != member_destination(root, &member) {
+        return None;
+    }
+    let mapped = root.join(relative);
+    mapped.is_file().then_some(mapped)
+}
+
 /// The final-output destination, as a component of a slot's compatibility
 /// identity. Empty for an ephemeral or detached checkout, so those checkouts
 /// keep exactly the slot keys they had before this feature.
@@ -4605,10 +4709,21 @@ fn link_state(link: &Path, checkout: &Path, checkout_id: &str) -> Result<TargetS
     if metadata.file_type().is_symlink() {
         let root = fs::read_link(&target)
             .map_err(|error| format!("cannot read the link {}: {error}", target.display()))?;
-        return Ok(match owned_root(checkout, checkout_id, &root) {
-            Ok(()) => TargetState::OwnedLink(root),
-            Err(_) if fs::symlink_metadata(&root).is_err() => TargetState::Dangling(root),
-            Err(_) => TargetState::Foreign,
+        if owned_root(checkout, checkout_id, &root).is_ok() {
+            return Ok(TargetState::OwnedLink(root));
+        }
+        // A profile member link selects a distinct subpath beneath the owned
+        // root, whose marker lives at the root itself. Ownership is decided by
+        // that root marker, never by following an arbitrary ancestor.
+        if let Some(member_root) = member_root_for_target(&root) {
+            if owned_root(checkout, checkout_id, &member_root).is_ok() {
+                return Ok(TargetState::OwnedLink(root));
+            }
+        }
+        return Ok(if fs::symlink_metadata(&root).is_err() {
+            TargetState::Dangling(root)
+        } else {
+            TargetState::Foreign
         });
     }
     if !metadata.is_dir() {
@@ -4621,6 +4736,30 @@ fn link_state(link: &Path, checkout: &Path, checkout_id: &str) -> Result<TargetS
     } else {
         TargetState::RealNonEmpty
     })
+}
+
+/// The owned root a member destination belongs to: strip a valid v1 member
+/// suffix (`debug`, `release`, `<triple>/debug`, `<triple>/release`) and return
+/// the candidate root. Ownership is still proven by the marker at that root.
+fn member_root_for_target(target: &Path) -> Option<PathBuf> {
+    let name = target.file_name()?.to_str()?;
+    if name != "debug" && name != "release" {
+        return None;
+    }
+    let parent = target.parent()?;
+    // <root>/<profile>
+    if let Ok(member) = crate::layout::Member::parse(name) {
+        if member.name() == name {
+            return Some(parent.to_path_buf());
+        }
+    }
+    // <root>/<triple>/<profile>
+    let triple = parent.file_name()?.to_str()?;
+    let grandparent = parent.parent()?;
+    let member = format!("{triple}/{name}");
+    crate::layout::Member::parse(&member)
+        .ok()
+        .map(|_| grandparent.to_path_buf())
 }
 
 /// A root is owned by this checkout when it is a real directory carrying this
@@ -5118,7 +5257,8 @@ fn transition_at(
             })?;
         }
         (_, Some(selected), Start::Any | Start::Adopt)
-            if target.link_root() == Some(selected.root.as_path()) => {}
+            if target.link_root()
+                == Some(member_destination(selected.root(), member).as_path()) => {}
         (_, _, Start::MissingOnly) => {
             return Err(format!(
                 "outputs: auto-adopt refused: {} is {}; Oxide never moves, adopts or deletes it. Nothing was changed",
@@ -5173,10 +5313,11 @@ fn transition_at(
     crash_point("prepared")?;
 
     ensure_root_with(context, spec, generation, to.nonce())?;
+    ensure_member_directory(&to.root, member)?;
     let sibling = sibling_link(&link, generation);
     match fs::symlink_metadata(&sibling) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            symlink(&to.root, &sibling).map_err(|error| {
+            symlink(&member_destination(&to.root, member), &sibling).map_err(|error| {
                 format!(
                     "cannot create the transition link {}: {error}",
                     sibling.display()
@@ -5186,7 +5327,7 @@ fn transition_at(
         Ok(metadata) if metadata.file_type().is_symlink() => {
             let existing = fs::read_link(&sibling)
                 .map_err(|error| format!("cannot read {}: {error}", sibling.display()))?;
-            if existing != to.root {
+            if existing != member_destination(&to.root, member) {
                 return Err(format!(
                     "outputs: {} exists and selects {}, not {}; both are left as they are",
                     sibling.display(),
@@ -5205,7 +5346,7 @@ fn transition_at(
     }
     let sibling_read = fs::read_link(&sibling)
         .map_err(|error| format!("cannot read {}: {error}", sibling.display()))?;
-    if sibling_read != to.root {
+    if sibling_read != member_destination(&to.root, member) {
         return Err(format!(
             "outputs: {} does not read back as the transition root",
             sibling.display()
@@ -5246,14 +5387,19 @@ fn finish_commit(
         .control()
         .ok_or("no internal pool exists; there is no place for an output receipt")?;
     let link = prepared.link.clone();
+    let member = receipt
+        .placement_for_link(&link)
+        .map(|placement| placement.member.clone())
+        .ok_or("the prepared transition names no placement of this receipt")?;
+    let expected = member_destination(&prepared.to.root, &member);
     let live =
         fs::read_link(&link).map_err(|error| format!("cannot read {}: {error}", link.display()))?;
-    if live != prepared.to.root {
+    if live != expected {
         return Err(format!(
             "outputs: {} selects {}, not the prepared {}; both roots are kept",
             link.display(),
             live.display(),
-            prepared.to.root.display()
+            expected.display()
         ));
     }
     let generation = receipt
@@ -5266,6 +5412,7 @@ fn finish_commit(
         generation,
         prepared.to.nonce(),
     )?;
+    ensure_member_directory(&prepared.to.root, &member)?;
     let selected = prepared
         .to
         .at(prepared.generation)
@@ -5434,6 +5581,7 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
         ));
     }
     let target = link_state(&link, &context.workspace, &context.checkout_id)?;
+    let expected = member_destination(&prepared.to.root, &member);
     let sibling = sibling_link(&link, prepared.generation);
     // The sibling is classified before any replay mutation: positively
     // absent, or exactly the prepared link. Anything else (another kind, a
@@ -5442,7 +5590,7 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
     let sibling_live = match fs::symlink_metadata(&sibling) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Ok(metadata) if metadata.file_type().is_symlink() => match fs::read_link(&sibling) {
-            Ok(read) if read == prepared.to.root => true,
+            Ok(read) if read == expected => true,
             Ok(read) => {
                 return Err(stop_unknown(
                     &prepared,
@@ -5475,7 +5623,7 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
         }
     };
     let owned_new = owned_root(&context.workspace, &context.checkout_id, &prepared.to.root).is_ok();
-    let renamed = target.link_root() == Some(prepared.to.root.as_path());
+    let renamed = target.link_root() == Some(expected.as_path());
     // After the rename the sibling no longer exists: a live sibling beside an
     // already-renamed target is contradictory.
     if renamed && sibling_live {
@@ -5525,10 +5673,10 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
         sync_directory(link.parent().unwrap_or(&context.workspace))?;
         let live = fs::read_link(&link)
             .map_err(|error| format!("cannot read {}: {error}", link.display()))?;
-        if live != prepared.to.root {
+        if live != expected {
             return Err(stop_unknown(
                 &prepared,
-                "the replayed link does not read back as the prepared root",
+                "the replayed link does not read back as the prepared member destination",
             ));
         }
         return finish_commit(context, &receipt, &prepared);
@@ -6371,6 +6519,90 @@ pub fn clean_placement(workspace: &Path) -> Result<Option<CleanPlacement>, Strin
                 .to_owned(),
         ),
         ReceiptState::Committed => {
+            // The profile layout is validated BEFORE the whole-target link
+            // pre-gate: `target` is a real directory there, never the link the
+            // legacy path requires.
+            if receipt.layout() == LayoutKind::Profile {
+                let target = context.target()?;
+                if !matches!(target, TargetState::RealEmpty | TargetState::RealNonEmpty) {
+                    return Err(format!(
+                        "clean refused: {} is {}, not a real profile target directory",
+                        context.link().display(),
+                        target.label()
+                    ));
+                }
+                let mut members = Vec::new();
+                let mut validated: Vec<PathBuf> = Vec::new();
+                for placement in receipt.links() {
+                    let Some(selected) = placement.selected_ref() else {
+                        continue;
+                    };
+                    let link = link_path(workspace, placement.member());
+                    let destination = member_destination(selected.root(), placement.member());
+                    match link_state(&link, workspace, &context.checkout_id)? {
+                        TargetState::OwnedLink(root) if root == destination => {
+                            if !validated.iter().any(|known| known == selected.root()) {
+                                let marker = read_marker(selected.root())?;
+                                check_marker(&marker, workspace, &context.checkout_id)?;
+                                if marker.kind != selected.kind
+                                    || marker.volume_uuid != selected.volume_uuid
+                                {
+                                    return Err(format!(
+                                        "clean refused: {} carries a marker for another root kind or volume",
+                                        selected.root().display()
+                                    ));
+                                }
+                                if marker.generation > receipt.generation {
+                                    return Err(format!(
+                                        "clean refused: {} carries generation {} ahead of the receipt's {}",
+                                        selected.root().display(),
+                                        marker.generation,
+                                        receipt.generation
+                                    ));
+                                }
+                                let binding = match selected.kind {
+                                    RootKind::External => Some(binding_for(&context, selected.volume_uuid.as_deref().unwrap_or_default()).map_err(|reason| {
+                                        format!(
+                                            "clean refused: the registered volume for {} is not usable ({reason})",
+                                            selected.root().display()
+                                        )
+                                    })?),
+                                    RootKind::Local => None,
+                                };
+                                validate_root_device(workspace, selected, binding.as_ref())
+                                    .map_err(|reason| format!("clean refused: {reason}"))?;
+                                validated.push(selected.root().to_path_buf());
+                            }
+                            if !members.iter().any(|(_, known): &(PathBuf, PathBuf)| known == &destination) {
+                                members.push((link, destination));
+                            }
+                        }
+                        TargetState::Missing => {}
+                        state => {
+                            return Err(format!(
+                                "clean refused: {} is {}, not this checkout's owned member link; Oxide never cleans through a foreign link",
+                                link.display(),
+                                state.label()
+                            ))
+                        }
+                    }
+                }
+                let inactive = receipt
+                    .roots
+                    .iter()
+                    .filter(|root| {
+                        !validated.iter().any(|known| known == &root.root) && root.root.is_dir()
+                    })
+                    .map(|root| root.root.clone())
+                    .collect();
+                return Ok(Some(CleanPlacement {
+                    target: context.link(),
+                    keep_root: false,
+                    link: context.link(),
+                    inactive,
+                    members,
+                }));
+            }
             let selected = receipt
                 .selected()
                 .cloned()
@@ -6421,56 +6653,6 @@ pub fn clean_placement(workspace: &Path) -> Result<Option<CleanPlacement>, Strin
                 .filter(|root| root.root != selected.root && root.root.is_dir())
                 .map(|root| root.root.clone())
                 .collect();
-            if receipt.layout() == LayoutKind::Profile {
-                // `target` stays a real directory; each owned member link and
-                // its root marker survive, and the owned payloads live in the
-                // roots.
-                let target = context.target()?;
-                if !matches!(target, TargetState::RealEmpty | TargetState::RealNonEmpty) {
-                    return Err(format!(
-                        "clean refused: {} is {}, not a real profile target directory",
-                        context.link().display(),
-                        target.label()
-                    ));
-                }
-                let mut members = Vec::new();
-                for placement in receipt.links() {
-                    let Some(selected) = placement.selected_ref() else {
-                        continue;
-                    };
-                    let link = link_path(workspace, placement.member());
-                    match link_state(&link, workspace, &context.checkout_id)? {
-                        TargetState::OwnedLink(root) if root == selected.root => {
-                            let marker = read_marker(selected.root())?;
-                            check_marker(&marker, workspace, &context.checkout_id)?;
-                            if marker.generation > receipt.generation {
-                                return Err(format!(
-                                    "clean refused: {} carries generation {} ahead of the receipt's {}",
-                                    selected.root().display(),
-                                    marker.generation,
-                                    receipt.generation
-                                ));
-                            }
-                            members.push((link, selected.root().to_path_buf()));
-                        }
-                        TargetState::Missing => {}
-                        state => {
-                            return Err(format!(
-                                "clean refused: {} is {}, not this checkout's owned member link; Oxide never cleans through a foreign link",
-                                link.display(),
-                                state.label()
-                            ))
-                        }
-                    }
-                }
-                return Ok(Some(CleanPlacement {
-                    target: context.link(),
-                    keep_root: false,
-                    link: context.link(),
-                    inactive,
-                    members,
-                }));
-            }
             Ok(Some(CleanPlacement {
                 target: selected.root,
                 keep_root: true,
@@ -6786,7 +6968,11 @@ mod tests {
         assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
         for member in ["debug", "release"] {
             let link = target.join(member);
-            assert_eq!(fs::read_link(&link).unwrap(), root, "{member}");
+            assert_eq!(
+                fs::read_link(&link).unwrap(),
+                member_destination(&root, member),
+                "{member}"
+            );
             assert_eq!(
                 migrated.selected_for(member).map(Selected::root),
                 Some(root.as_path())
@@ -7000,7 +7186,7 @@ mod tests {
         assert!(debug.file_type().is_symlink());
         assert_eq!(
             fs::read_link(context.link().join("debug")).unwrap(),
-            local.root()
+            member_destination(local.root(), "debug")
         );
         let release = fs::symlink_metadata(context.link().join("release")).unwrap();
         assert!(release.is_dir() && !release.file_type().is_symlink());
@@ -7033,6 +7219,225 @@ mod tests {
             .file_type()
             .is_symlink());
         assert_eq!(readopted.selected().map(Selected::root), Some(local.root()));
+    }
+
+    #[test]
+    fn adoption_relinks_to_the_desired_place_instead_of_trusting_the_old_receipt() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let context = fixture.context();
+        // An older receipt selects an EXTERNAL root whose member links are
+        // live. With no registration the desired place is now the local
+        // fallback, so adoption must relink even though the links still match
+        // the receipt.
+        // A registered permanent drive that is NOT usable now (its mount point
+        // is absent), so the desired place is the local fallback while the old
+        // receipt still selects the external root.
+        let registration = serde_json::json!({
+            "version": 2,
+            "mount_point": fixture.root.join("volume"),
+            "volume_uuid": "11111111-2222-3333-4444-555555555555",
+            "container_uuid": "22222222-3333-4444-5555-666666666666",
+            "reserve_bytes": 16 * 1024 * 1024,
+            "cap_bytes": 64 * 1024 * 1024,
+            "quota_bytes": null,
+            "capacity_bytes": null,
+            "registered_ms": 1,
+            "mode": "permanent"
+        });
+        let registration_path = fixture.control.join("removable.json");
+        fs::write(
+            &registration_path,
+            serde_json::to_vec_pretty(&registration).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&registration_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let external = fixture.root.join("volume/oxide-outputs/checkout-0000");
+        fs::create_dir_all(external.join("debug")).unwrap();
+        fs::create_dir_all(external.join("release")).unwrap();
+        let marker = Marker {
+            version: MARKER_VERSION.to_owned(),
+            checkout: fixture.checkout.clone(),
+            checkout_id: context.checkout_id.clone(),
+            label: "checkout".to_owned(),
+            recipe: RECIPE.to_owned(),
+            kind: RootKind::External,
+            volume_uuid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
+            nonce: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+            checkout_volume_uuid: None,
+            generation: 1,
+            created_ms: 1,
+        };
+        fs::write(
+            external.join(MARKER),
+            serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(fixture.checkout.join("target")).unwrap();
+        for member in ["debug", "release"] {
+            symlink(
+                external.join(member),
+                fixture.checkout.join("target").join(member),
+            )
+            .unwrap();
+        }
+        let mut receipt =
+            Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+        receipt.state = ReceiptState::Committed;
+        receipt.generation = 1;
+        let selected = Selected {
+            kind: RootKind::External,
+            root: external.clone(),
+            volume_uuid: marker.volume_uuid.clone(),
+            nonce: marker.nonce.clone(),
+            generation: 1,
+        };
+        receipt.place_member("debug").selected = Some(selected.clone());
+        receipt.place_member("release").selected = Some(selected);
+        let (adopted, desired, converted) = adopt_profile(&context, receipt.clone()).unwrap();
+        assert!(converted, "a stale external placement was not relinked");
+        assert_eq!(desired.kind, RootKind::Local);
+        for member in ["debug", "release"] {
+            assert_eq!(
+                fs::read_link(fixture.checkout.join("target").join(member)).unwrap(),
+                member_destination(desired.root(), member),
+                "{member}"
+            );
+        }
+        // A second adoption to the same desired place is a no-op.
+        let (again, _, converted) = adopt_profile(&context, adopted.clone()).unwrap();
+        assert!(
+            !converted,
+            "a matching desired placement was relinked again"
+        );
+        assert_eq!(again.generation, adopted.generation);
+    }
+
+    #[test]
+    fn a_member_link_is_owned_only_through_its_root_marker() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let context = fixture.context();
+        let spec = fixture.local();
+        ensure_root(&context, &spec, 1).unwrap();
+        fs::create_dir_all(spec.root().join("debug")).unwrap();
+        fs::create_dir_all(fixture.checkout.join("target")).unwrap();
+        let link = fixture.checkout.join("target/debug");
+        symlink(spec.root().join("debug"), &link).unwrap();
+        assert_eq!(
+            link_state(&link, &fixture.checkout, &context.checkout_id).unwrap(),
+            TargetState::OwnedLink(spec.root().join("debug"))
+        );
+        // A member-looking path whose root carries no marker is foreign: the
+        // classifier never grants ownership by following an ancestor.
+        let foreign = fixture.root.join("foreign/debug");
+        fs::create_dir_all(&foreign).unwrap();
+        let other = fixture.checkout.join("target/release");
+        symlink(&foreign, &other).unwrap();
+        assert_eq!(
+            link_state(&other, &fixture.checkout, &context.checkout_id).unwrap(),
+            TargetState::Foreign
+        );
+    }
+
+    #[test]
+    fn profile_members_select_distinct_destinations_and_run_maps_only_owned_members() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let context = fixture.context();
+        let receipt =
+            Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+        let (_, selected, _) = adopt_profile(&context, receipt).unwrap();
+        let root = selected.root().to_path_buf();
+        // Each member link selects its own approved subpath, never the root.
+        for member in ["debug", "release"] {
+            let link = context.link().join(member);
+            assert_eq!(
+                fs::read_link(&link).unwrap(),
+                member_destination(&root, member),
+                "{member}"
+            );
+            assert!(root.join(member).is_dir(), "{member}: no member directory");
+        }
+        // `run` maps a program beneath its own owned member only.
+        let owned = root.join("debug").join("profileapp");
+        fs::write(&owned, b"program").unwrap();
+        let mapped = program_target(
+            &fixture.checkout,
+            &root,
+            &context.link().join("debug").join("profileapp"),
+        );
+        assert_eq!(mapped.as_deref(), Some(owned.as_path()));
+        // A real member keeps Cargo's path; it never borrows another member's
+        // root.
+        let real = fixture.checkout.join("target/triple/debug/app");
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        fs::write(&real, b"real").unwrap();
+        assert_eq!(
+            program_target(&fixture.checkout, &root, &real),
+            None,
+            "a real member program must keep Cargo's path"
+        );
+        assert!(owned.is_file());
+    }
+
+    #[test]
+    fn a_profile_fallback_slot_refuses_a_live_external_member_before_cargo() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let context = fixture.context();
+        let mut receipt =
+            Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+        let external = Selected {
+            kind: RootKind::External,
+            root: fixture.root.join("volume/oxide-outputs/checkout-0000"),
+            volume_uuid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
+            nonce: Some("99999999999999999999999999999999".to_owned()),
+            generation: 1,
+        };
+        receipt.state = ReceiptState::Committed;
+        receipt.generation = 1;
+        receipt.place_member("debug").selected = Some(external.clone());
+        let plan = Plan {
+            whole_target: false,
+            members: vec![PlannedMember {
+                member: "debug".to_owned(),
+                selected: Some(external.clone()),
+            }],
+        };
+        // A real external root carrying this checkout's marker, with its
+        // member directory; the link is live and matches the keyed external
+        // destination, but the command's slot fell back to the internal pool.
+        fs::create_dir_all(member_destination(&external.root, "debug")).unwrap();
+        let marker = Marker {
+            version: MARKER_VERSION.to_owned(),
+            checkout: fixture.checkout.clone(),
+            checkout_id: context.checkout_id.clone(),
+            label: "checkout".to_owned(),
+            recipe: RECIPE.to_owned(),
+            kind: RootKind::External,
+            volume_uuid: external.volume_uuid.clone(),
+            nonce: external.nonce.clone(),
+            checkout_volume_uuid: None,
+            generation: 1,
+            created_ms: 1,
+        };
+        fs::write(
+            external.root.join(MARKER),
+            serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(fixture.checkout.join("target")).unwrap();
+        let link = fixture.checkout.join("target/debug");
+        symlink(member_destination(&external.root, "debug"), &link).unwrap();
+        let context = context.with_pool_fallback(Some("container mismatch"));
+        let store = pool_store(&fixture.root.join("pool"));
+        match bind_profile(&context, &store, 0, &receipt, Some(&plan)) {
+            Bind::Refuse(reason) => {
+                assert!(
+                    reason.contains("fell back to the internal pool"),
+                    "{reason}"
+                )
+            }
+            Bind::Bound(_) => panic!("an external member link was bound on an internal fallback"),
+            Bind::Wait => panic!("a fallback refusal waited"),
+        }
     }
 
     #[test]
@@ -7147,7 +7552,14 @@ mod tests {
         let lines: Vec<&str> = facts.lines().collect();
         assert_eq!(lines.len(), 2, "{facts}");
         assert!(lines[0].starts_with("outputs-3 "), "{facts}");
-        assert!(!lines[0].contains("outputs-2"), "{facts}");
+        // The token after the namespace is the root nonce, never another
+        // namespace prefix (the fixture path itself contains "outputs-").
+        let tokens: Vec<&str> = lines[0].split_whitespace().collect();
+        assert_eq!(tokens[0], "outputs-3", "{facts}");
+        assert_eq!(
+            tokens[1], "88888888888888888888888888888888",
+            "the second token is not the root nonce: {facts}"
+        );
         assert!(lines[0].ends_with(" debug"), "{facts}");
         assert_eq!(lines[1], "real release");
         // The legacy namespace is exactly the published one, with no profile

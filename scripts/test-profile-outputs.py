@@ -311,9 +311,16 @@ def member_link(checkout: str, member: str) -> str:
     return os.path.join(checkout, "target", member)
 
 
+def member_destination(root: str, member: str) -> str:
+    """The approved distinct destination one linked member selects beneath the
+    shared root; only the legacy whole-target placement selects the root."""
+    return root if member == "target" else os.path.join(root, member)
+
+
 def expect_layout(checkout: str, members: dict) -> None:
     """`target` is a real directory and each named member has the expected
-    placement ("link:<root>" or "real")."""
+    placement ("link:<root>" or "real"). A linked member must select its own
+    destination `root/<member>`, never the shared root itself."""
     target = os.path.join(checkout, "target")
     expect(is_real_dir(target), f"{target} is not a real directory")
     for member, expected in members.items():
@@ -321,8 +328,11 @@ def expect_layout(checkout: str, members: dict) -> None:
         if expected == "real":
             expect(is_real_dir(path), f"{path} is not a real directory")
         else:
-            root = expected[len("link:"):]
-            expect(os.path.islink(path) and os.readlink(path) == root, f"{path} -> {os.readlink(path) if os.path.islink(path) else 'not a link'}, not {root}")
+            root = member_destination(expected[len("link:"):], member)
+            expect(
+                os.path.islink(path) and os.readlink(path) == root,
+                f"{path} -> {os.readlink(path) if os.path.islink(path) else 'not a link'}, not {root}",
+            )
 
 
 def root_of(pool: str, checkout: str) -> str:
@@ -497,6 +507,35 @@ def base_legacy(proof: Proof, base: str, pool: str, checkout: str) -> None:
     )
 
 
+def custody_snapshot(pool: str, checkout: str) -> dict:
+    """Bounded observable state of one checkout's output authority: receipt
+    bytes, member link texts and the root marker's bytes."""
+    receipt_path = receipt_file(pool, checkout)
+    snapshot = {"receipt": perm.sha256_file(receipt_path) if os.path.exists(receipt_path) else "absent"}
+    links = {}
+    for member in ("debug", "release"):
+        link = member_link(checkout, member)
+        if os.path.islink(link):
+            links[member] = os.readlink(link)
+    snapshot["links"] = links
+    marker = os.path.join(root_of(pool, checkout), MARKER) if os.path.exists(receipt_path) else ""
+    snapshot["marker"] = perm.sha256_file(marker) if marker and os.path.exists(marker) else "absent"
+    return snapshot
+
+
+def observed_wait(child, before: dict, pool: str, checkout: str, label: str) -> None:
+    """The waiter must still be running while the writer holds the gate, and
+    it must not change the checkout's output authority while it waits."""
+    deadline = time.monotonic() + min(10, work_left())
+    while time.monotonic() < deadline:
+        expect(child.poll() is None, f"{label}: the waiter exited instead of waiting")
+        expect(
+            custody_snapshot(pool, checkout) == before,
+            f"{label}: the waiter changed the output authority while the writer was gated",
+        )
+        time.sleep(0.1)
+
+
 def adopt(proof: Proof, checkout: str, label: str) -> None:
     code, _, stderr = proof.oxide(["outputs", "adopt"], label, checkout)
     expect(code == 0, f"{label}: adopt exited {code}: {stderr}")
@@ -595,7 +634,7 @@ def run(proof: Proof, repo: str) -> None:
         f"the registered removable pool was not selected: {summary(stderr)}",
     )
     expect(
-        os.readlink(member_link(selected, "debug")) == selected_root,
+        os.readlink(member_link(selected, "debug")) == member_destination(selected_root, "debug"),
         "the member link does not select the registered external root",
     )
     # A SEPARATE deliberate low-reserve control: a reserve above the image's
@@ -710,13 +749,15 @@ def run(proof: Proof, repo: str) -> None:
     env = {**proof.env, "OXIDE_PROFILE_GATE": gate}
     child = perm.start_child(proof, [proof.binary, "build"], first, env)
     wait_started(gate, "02 gated build start")
+    before = custody_snapshot(pool, first)
     second = perm.start_child(proof, [proof.binary, "outputs", "adopt"], first, proof.env)
-    time.sleep(0.4)
-    expect(second.poll() is None, "02: a mutation did not wait for the running writer")
+    observed_wait(second, before, pool, first, "02")
     perm.stop_gate(gate, os.path.join(gate, "release"))
     code, _, _ = perm.finish_child(proof, child, "02 gated build")
     expect(code == 0, f"02: gated build exited {code}")
-    perm.finish_child(proof, second, "02 waited adopt")
+    code, _, _ = perm.finish_child(proof, second, "02 waited adopt")
+    expect(code == 0, "02: the waiting adopt failed")
+    expect(custody_snapshot(pool, first) == before, "02: the waited adopt changed authority")
     expect_layout(first, {"debug": f"link:{root}", "release": f"link:{root}"})
 
     # ----- case 03: test / bench / bench debug / doc mapping --------------
@@ -797,13 +838,25 @@ def run(proof: Proof, repo: str) -> None:
 
     # ----- case 07: exec declarations -------------------------------------
     script = os.path.join(first, "declared.sh")
+    exec_argv = os.path.join(proof.root, "exec-argv")
     with open(script, "w", encoding="utf-8") as handle:
-        handle.write("#!/bin/sh\nexit 0\n")
+        handle.write("#!/bin/sh\nprintf '%s' \"$*\" > \"$OXIDE_EXEC_ARGV\"\nexit 0\n")
     os.chmod(script, 0o755)
+    exec_env = {**proof.env, "OXIDE_EXEC_ARGV": exec_argv}
     code, _, stderr = oxide(proof, ["exec", "--", script], "07 undeclared exec", first)
     expect(code != 0 and "declare" in stderr, f"07: undeclared exec was not refused: {stderr}")
-    code, _, stderr = oxide(proof, ["exec", "--output", "debug", "--", script], "07 declared exec", first)
+    code, _, stderr = perm.oxide_env(
+        proof,
+        ["exec", "--output", "debug", "--", script, "alpha", "beta"],
+        "07 declared exec",
+        first,
+        exec_env,
+    )
     expect(code == 0, f"07: declared exec failed: {stderr}")
+    expect(
+        perm.read_bytes(exec_argv) == b"alpha beta",
+        f"07: the declared tool's argv changed: {perm.read_bytes(exec_argv)!r}",
+    )
     code, _, stderr = oxide(proof, ["exec", "--output", "custom", "--", script], "07 custom exec", first)
     expect(code != 0 and "not an output member" in stderr, f"07: custom declaration was accepted: {stderr}")
     code, _, stderr = oxide(proof, ["exec", "--output", "debug", "--output", "release", "--", script], "07 complete exec", first)
@@ -845,9 +898,12 @@ def run(proof: Proof, repo: str) -> None:
     expect(facts[0]["member"] == "target", "10: legacy member changed")
     code, _, stderr = oxide(proof, ["build"], "10 second", legacy)
     expect(code == 0, f"10: second legacy build failed: {stderr}")
+    first_slot, _ = perm.slot_state(stderr)
     code, _, stderr = oxide(proof, ["build"], "10 warm", legacy)
     expect(code == 0, f"10: warm legacy build failed: {stderr}")
-    expect("warm" in summary(stderr), f"10: legacy build was not warm: {summary(stderr)}")
+    warm_slot, warm_state = perm.slot_state(stderr)
+    expect(warm_state == "warm", f"10: legacy build was not warm: {summary(stderr)}")
+    expect(warm_slot == first_slot, f"10: the warm legacy build changed slot {first_slot} -> {warm_slot}")
     expect(os.path.islink(os.path.join(legacy, "target")), "10: the legacy link changed")
     expect(link_at(os.path.join(legacy, "target")) == legacy_root, "10: the legacy link text changed")
     expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: the legacy receipt was rewritten")
@@ -937,9 +993,9 @@ def run(proof: Proof, repo: str) -> None:
     os.makedirs(gate)
     child = perm.start_child(proof, [proof.binary, "build"], blocked, {**proof.env, "OXIDE_PROFILE_GATE": gate})
     wait_started(gate, "13 writer start")
+    before = custody_snapshot(pool, blocked)
     waiter = perm.start_child(proof, [proof.binary, "outputs", "adopt"], blocked, proof.env)
-    time.sleep(0.4)
-    expect(waiter.poll() is None, "13: migration did not wait for the active writer")
+    observed_wait(waiter, before, pool, blocked, "13")
     expect(
         os.path.islink(os.path.join(blocked, "target")),
         "13: the migration changed the target while a writer ran",
@@ -967,7 +1023,10 @@ def run(proof: Proof, repo: str) -> None:
     # refuses rather than writing to an unsupervised drive.
     code, _, stderr = oxide(proof, ["build"], "14 fallback refusal", fallback)
     expect(code != 0 and "fallback" in stderr.lower(), f"14: fallback build was not refused: {stderr}")
-    expect(os.readlink(member_link(fallback, "debug")) == external, "14: the refusal changed the member link")
+    expect(
+        os.readlink(member_link(fallback, "debug")) == member_destination(external, "debug"),
+        "14: the refusal changed the member link",
+    )
     # An explicit adopt moves every owned member to the checkout-local root
     # under custody, keeping the external root; re-attaching returns them.
     adopt(proof, fallback, "14 fallback adopt")
@@ -998,6 +1057,19 @@ def run(proof: Proof, repo: str) -> None:
     expect(os.path.isdir(root), "15: a root was deleted by detach")
     adopt(proof, first, "15 readopt")
     expect_layout(first, {"debug": f"link:{root_of(pool, first)}"})
+    host = proof.run(["rustc", "-vV"], cwd=first, env=proof.env, timeout=30).stdout.decode()
+    triple = next(line.split(": ", 1)[1] for line in host.splitlines() if line.startswith("host: "))
+    code, _, stderr = oxide(proof, ["build", "--target", triple], "15 triple build", first)
+    expect(code == 0, f"15: host-triple build failed: {stderr}")
+    expect_layout(first, {f"{triple}/debug": f"link:{root_of(pool, first)}"})
+    code, _, stderr = oxide(proof, ["outputs", "detach"], "15 triple detach", first)
+    expect(code == 0, f"15: triple detach failed: {stderr}")
+    expect_layout(first, {"debug": "real", "release": "real", f"{triple}/debug": "real"})
+    adopt(proof, first, "15 triple readopt")
+    expect_layout(
+        first,
+        {"debug": f"link:{root_of(pool, first)}", f"{triple}/debug": f"link:{root_of(pool, first)}"},
+    )
 
     # ----- case 16: whole and selected clean keep links and markers -------
     # The known fixture top-level file is a foreign entry for a whole clean:
@@ -1114,12 +1186,19 @@ def run(proof: Proof, repo: str) -> None:
     code, _, stderr = oxide(proof, ["build"], "18 real build again", cold)
     expect(code == 0, f"18: second real-member build failed: {stderr}")
     expect_layout(cold, {"debug": "real", "release": f"link:{cold_root}"})
+    slots_dir = os.path.join(pool, "payload", "slots")
+    slots_before = sorted(os.listdir(slots_dir))
     shutil.rmtree(os.path.join(cold, "target", "debug"))
     adopt(proof, cold, "18 relink")
     expect_layout(cold, {"debug": f"link:{cold_root}", "release": f"link:{cold_root}"})
     code, _, stderr = oxide(proof, ["build"], "18 linked debug", cold)
     expect(code == 0, f"18: linked build failed: {stderr}")
     expect("cold" in summary(stderr), f"18: linked placement reused the real placement's slot: {summary(stderr)}")
+    slots_after = sorted(os.listdir(slots_dir))
+    expect(
+        set(slots_before).issubset(set(slots_after)),
+        f"18: the real placement's slot was evicted instead of remaining available: {slots_before} -> {slots_after}",
+    )
     facts_linked = perm.plan(proof, cold, "18 linked plan")["members"]
     expect(
         facts_real != facts_linked,
@@ -1129,12 +1208,18 @@ def run(proof: Proof, repo: str) -> None:
     # ----- case 19: the staged state-3 binary refuses state 4 -------------
     snapshot = {member: os.readlink(member_link(migrated, member)) for member in ("debug", "release")}
     receipt_before = perm.sha256_file(perm.receipt_path(pool, migrated))
+    slots_dir = os.path.join(pool, "payload", "slots")
+    slots_before = sorted(os.listdir(slots_dir))
     result = proof.run([base, "build"], cwd=migrated, env=proof.env, timeout=90)
     expect(result.returncode != 0, "19: the state-3 binary did not refuse a state-4 pool")
     print(result.stderr.decode(errors="replace")[-2000:])
     for member, target in snapshot.items():
         expect(os.readlink(member_link(migrated, member)) == target, "19: the refusal changed a member link")
     expect(perm.sha256_file(perm.receipt_path(pool, migrated)) == receipt_before, "19: the refusal rewrote the receipt")
+    expect(
+        sorted(os.listdir(slots_dir)) == slots_before,
+        "19: the refused state-3 run created or changed a slot",
+    )
 
     # ----- case 20: root-group prune keeps another checkout's reference ---
     group = make_checkout(proof, "group")
@@ -1310,15 +1395,15 @@ def run(proof: Proof, repo: str) -> None:
     # Terminal crash image oracle: the intent's expected terminal SHA and
     # FIXED timestamp are durable before publication and the published
     # receipt is exactly that image.
-    env = {**proof.env, "OXIDE_TEST_PRUNE_CRASH": "terminal"}
+    env = {**proof.env, "OXIDE_TEST_PRUNE_CRASH": "terminal-image"}
     code, _, stderr = perm.oxide_env(
         proof,
         ["outputs", "prune", "--plan", plan_path, "--plan-sha256", plan_sha],
-        "20 terminal crash",
+        "20 terminal image crash",
         group,
         env,
     )
-    expect(code != 0, "20: the injected terminal stop did not stop the prune")
+    expect(code != 0, "20: the injected terminal-image stop did not stop the prune")
     registry = perm.read_json(os.path.join(pool, "oxide-managed", "outputs", "registry.json"))
     intent = next((entry for entry in registry.get("intents", []) if entry["identity"]["root"] == gone_root), None)
     expect(intent is not None, "20: the terminal crash lost its intent")

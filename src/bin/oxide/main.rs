@@ -577,10 +577,11 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         (Ok((Some(status), Some(Ok((program, manifest_dir))))), Some(root))
             if run && status.success() && stopped.is_none() =>
         {
-            let program = match program.strip_prefix(key.checkout.join("target")) {
-                Ok(rest) => root.join(rest),
-                Err(_) => program.clone(),
-            };
+            // Only a linked member maps beneath the owned root; a real member
+            // keeps Cargo's own executable path, and the mapped file must be a
+            // real executable before it is run under the held lease.
+            let program = outputs::program_target(&key.checkout, root, &program)
+                .unwrap_or_else(|| program.clone());
             Some((program, manifest_dir.clone()))
         }
         _ => None,
