@@ -145,6 +145,8 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   gets it on its first build, others by explicit adoption. It never moves
   existing output, and ephemeral mode is unchanged
   ([workflow](contracts/workflow.md#final-outputs-on-the-permanent-drive-oxide117)).
+- **Leftover output roots** of checkouts that no longer exist are removed
+  only by an explicit `oxide outputs prune`, never automatically.
 - **Sharing builds:** slots share warm builds across worktrees, up to 8 per
   project, with least-recently-used idle slots evicted under the byte budget.
 - **Cold slots:** the chosen direction instead of sccache is seeding a cold
