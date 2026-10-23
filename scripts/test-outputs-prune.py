@@ -528,18 +528,23 @@ def run(proof, repo: str) -> None:
         os.makedirs(path, mode=0o700)
     proof.env = permanent.proof_env(world.pool, home, cargo_home)
 
-    alpha = world.checkout("alpha")
-    code, _, stderr = world.oxide(["check"], "first build creates the internal pool", alpha)
+    # The pre-registration first build runs in a distinct bootstrap checkout
+    # (its real ephemeral target is expected); alpha is created only after
+    # registration and stays target-free until its own adopt in case 01.
+    bootstrap = world.checkout("bootstrap")
+    code, _, stderr = world.oxide(["check"], "first build creates the internal pool", bootstrap)
     expect(code == 0, stderr)
     world.mount = permanent.attach_image(proof, proof.root, name)
     expect(world.mount == mount, f"mounted at {world.mount}, not {mount}")
     code, stdout, stderr = world.oxide(
         ["pool", "register-removable", mount, "--reserve", "16MiB", "--cap", "64MiB", "--mode", "permanent"],
         "register permanent drive",
-        alpha,
+        bootstrap,
     )
     expect(code == 0 and "registered removable pool" in stdout, stderr)
     good = permanent.real_uuid(world.pool)
+    alpha = world.checkout("alpha")
+    expect(not os.path.lexists(os.path.join(alpha, "target")), "alpha has a target before its adopt")
     proof.phase("after registration")
 
     # ---- fence / init ------------------------------------------------------
