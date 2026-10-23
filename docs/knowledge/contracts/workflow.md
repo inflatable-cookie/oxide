@@ -3274,12 +3274,14 @@ and reattach so the mounted root does not ignore filesystem ownership, and the
 prerequisite is asserted by a bounded read-only mount observation plus the
 product's own registration refusal; no real drive, persistent host ownership
 setting, mount permission or registration safety check is changed. The 128 MiB
-image is registered with a 16 MiB reserve and a 96 MiB admission cap, a positive
+image is registered with a 16 MiB reserve and a 64 MiB admission cap, a positive
 control proves an external root is really selected before any external-root
 oracle, and a separate deliberate low-reserve control temporarily raises the
 private pool's recorded registration reserve to 200 MiB and restores its exact
-bytes to prove the honest local fallback; a benign ordinary target-root file
-makes the top-level preservation control nonvacuous while
+bytes to prove the honest local fallback; a `/target/` parent-ignore control
+proves a directory-only rule refuses the legacy link but accepts profile members;
+a benign ordinary target-root file on its own checkout makes the top-level
+preservation control nonvacuous while
 `CACHEDIR.TAG`/`.rustc_info.json` are asserted real only when present. It has NOT
 run: the
 author and reviewer natives are separately counted owner activations, and this

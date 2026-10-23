@@ -78,12 +78,17 @@ run = "python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 64 -- py
 # `hdiutil attach -owners on` on every attach and reattach, observed with a
 # bounded read-only mount check and the product's own registration refusal for
 # an ignore-ownership mount; no real drive or host setting changes. The 128 MiB
-# image is registered at a 16 MiB reserve / 96 MiB cap, a positive control proves
+# image is registered at a 16 MiB reserve / 64 MiB cap, a positive control proves
 # an external root is really selected before the external oracles, and a
 # separate deliberate low-reserve control raises the recorded registration
 # reserve to 200 MiB and restores its exact bytes to prove the honest local
-# fallback; a benign ordinary target-root file keeps the top-level preservation
-# control nonvacuous, with Cargo's own metadata asserted only when present.
+# fallback; a `/target/` parent-ignore control proves a directory-only rule is
+# refused for the legacy link but accepted for profile members, a benign
+# ordinary target-root file on its own checkout keeps the top-level preservation
+# control nonvacuous, and Cargo's own metadata is asserted only when present.
+# The selected-clean reserve stop uses a positively created directory-budget
+# pool; the removable watchdog is removal-only and is not claimed as a reserve
+# stop.
 # Scratch stays 512 MiB and the detach is ordinary. It
 # stages base 4a70b83 and this HEAD's candidate independently and sequentially
 # from authenticated pinned source, asserts distinct binaries and state-3 /

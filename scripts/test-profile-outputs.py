@@ -28,10 +28,17 @@ private-image fixture option only; no real drive, persistent host setting,
 mount permission or product safety check is changed.
 
 The image is 128 MiB and every normal registration reserves 16 MiB below that
-geometry with a 96 MiB admission cap, so an external root is really selected; a
+geometry with a 64 MiB admission cap, so an external root is really selected; a
 positive control asserts the selected root is under
 `<mount>/oxide-outputs/` with no fallback warning before any external-root
-oracle. A SEPARATE deliberate low-reserve control temporarily raises this
+oracle. The fixture `.gitignore` uses `/target` (valid for a whole-target link
+and as a member parent rule) and a separate `/target/` parent-ignore control
+proves a directory-only rule refuses the legacy link but accepts profile member
+links. The top-level preservation control lives on its own checkout so the
+cleaned checkout carries no foreign entry. The selected-clean reserve stop uses
+a positively created directory-budget pool and a gated delegating fake cargo;
+the removable watchdog is removal-only and is never claimed as a reserve stop.
+A SEPARATE deliberate low-reserve control temporarily raises this
 private pool's recorded registration reserve to 200 MiB (above the image's free
 space), asserts the honest checkout-local fallback and its warning, then
 restores the exact recorded bytes; no second image or pool is created, so
@@ -122,7 +129,7 @@ BASE = "4a70b83"
 STAGE_JOBS = 6
 FIXTURE_JOBS = 2
 # The private image is 128 MiB. Every normal registration reserves well below
-# that geometry (16 MiB) with a 96 MiB admission cap, so the volume is really
+# that geometry (16 MiB) with a 64 MiB admission cap, so the volume is really
 # selected; one SEPARATE deliberate low-reserve control registers another pool
 # above the image's free space to prove the honest internal fallback.
 IMAGE_RESERVE = "16MiB"
@@ -183,8 +190,13 @@ fn main() {
 ''',
     "src/lib.rs": "pub fn value() -> u32 {\n    7\n}\n",
     "src/main.rs": 'fn main() { println!("profile-app {}", profileapp::value()); }\n',
-    ".gitignore": "/target/\n/.oxide-outputs/\n",
+    # The whole-target link conversion needs the exact non-directory path;
+    # `/target` also ignores profile members under the real target directory.
+    ".gitignore": "/target\n/.oxide-outputs/\n",
 }
+# A separate fixture whose parent rule is directory-only: it must refuse a
+# whole-target link but accept a profile member link.
+PARENT_IGNORE_APP = {**APP, ".gitignore": "/target/\n/.oxide-outputs/\n"}
 
 
 def plan_only() -> int:
@@ -217,13 +229,20 @@ def plan_only() -> int:
     print("                  attached with hdiutil -owners on for every attach/reattach,")
     print("                  asserted by a bounded read-only mount observation and the")
     print("                  product registration control; ordinary detach")
-    print("  reserves        normal registration 16 MiB reserve / 96 MiB cap below the")
+    print("  reserves        normal registration 16 MiB reserve / 64 MiB cap below the")
     print("                  128 MiB geometry, with a positive selected-removable control")
     print("                  before external oracles and a separate deliberate 200 MiB")
     print("                  low-reserve control (recorded reserve raised to 200 MiB,")
     print("                  then restored byte-exactly) proving the honest local fallback")
-    print("  top level       a benign ordinary target-root file survives adopt and builds;")
-    print("                  CACHEDIR.TAG/.rustc_info.json asserted real only when present")
+    print("  top level       a benign ordinary target-root file on its OWN checkout")
+    print("                  survives adopt and builds, so the cleaned checkout carries no")
+    print("                  foreign entry; CACHEDIR.TAG/.rustc_info.json asserted real")
+    print("                  only when present")
+    print("  ignore          the fixture uses /target (valid for whole-target links and")
+    print("                  member parents) plus a separate /target/ parent-ignore control")
+    print("  clean           the reserve stop uses a positively created directory-budget")
+    print("                  pool with a gated delegating fake cargo; the removable")
+    print("                  watchdog is removal-only and is not claimed as a reserve stop")
     print("  environment     one private HOME, CARGO_HOME and directory pool per session")
     print("  cases")
     for case in CASES:
@@ -424,12 +443,19 @@ def attach_owned_image(
 def register(proof: Proof, pool: str, mode: str = "permanent") -> None:
     mount = attach_owned_image(proof, "initial attach", "volume.sparseimage")
     code, _, stderr = proof.oxide(
-        ["pool", "register-removable", mount, "--reserve", IMAGE_RESERVE, "--cap", "96MiB", "--mode", mode],
+        ["pool", "register-removable", mount, "--reserve", IMAGE_RESERVE, "--cap", "64MiB", "--mode", mode],
         "register removable",
         proof.root,
     )
     expect(code == 0, f"registration failed: {stderr}")
     expect(os.path.isfile(perm.registration_path(pool)), "no removable registration")
+    registration = perm.read_json(perm.registration_path(pool))
+    expect(registration["reserve_bytes"] == 16 * 1024 * 1024, f"reserve {registration.get('reserve_bytes')}")
+    expect(registration["cap_bytes"] == 64 * 1024 * 1024, f"cap {registration.get('cap_bytes')}")
+    volume = perm.plistlib.loads(
+        proof.run(["/usr/sbin/diskutil", "info", "-plist", mount], timeout=30).stdout
+    )
+    expect(volume.get("VolumeUUID") == registration["volume_uuid"], "registration UUID does not match the mounted volume")
 
 
 def oxide(proof: Proof, args: list, label: str, cwd: str) -> tuple:
@@ -609,18 +635,37 @@ def run(proof: Proof, repo: str) -> None:
         "the low-reserve control did not restore the recorded registration",
     )
 
+    # A separate parent-ignore control: the directory-only `/target/` rule
+    # refuses the automatic whole-target link, while the same rule is a valid
+    # parent ignore for profile members under the real target directory.
+    parent = make_checkout(proof, "parent-ignore", PARENT_IGNORE_APP)
+    code, _, stderr = oxide(proof, ["build"], "parent-ignore auto-adopt", parent)
+    expect(code != 0 and "matches directories only" in stderr, f"the directory-only parent rule did not refuse the whole-target link: {stderr}")
+    expect(not os.path.exists(receipt_file(pool, parent)), "the refused whole-target conversion wrote a receipt")
+    os.makedirs(os.path.join(parent, "target"))
+    adopt(proof, parent, "parent-ignore adopt")
+    expect_layout(parent, {"debug": f"link:{root_of(pool, parent)}"})
+
+    # Nonvacuous top-level preservation on its own checkout, so the cleaned
+    # `first` checkout never carries a foreign entry.
+    top = make_checkout(proof, "top-level")
+    os.makedirs(os.path.join(top, "target"))
+    control_file = os.path.join(top, "target", "oxide-proof-top-level-control")
+    with open(control_file, "wb") as handle:
+        handle.write(b"control")
+    adopt(proof, top, "top-level adopt")
+    code, _, stderr = oxide(proof, ["build"], "top-level build", top)
+    expect(code == 0, f"top-level build failed: {stderr}")
+    expect(os.path.isfile(control_file) and not os.path.islink(control_file), "the ordinary top-level control file was removed or replaced")
+    expect(perm.read_bytes(control_file) == b"control", "the top-level control file changed")
+    expect_layout(top, {"debug": f"link:{root_of(pool, top)}"})
+
     # ----- case 01: a real target with a debug member link -----------------
     first = make_checkout(proof, "first")
     # A real EMPTY target selects the explicit profile adopt: an absent target
     # would let the automatic whole-target first conversion run, and building
     # first would fill target/debug so adoption would keep it real.
     os.makedirs(os.path.join(first, "target"))
-    # A benign ordinary file at the real target root is neither Oxide's nor
-    # Cargo's: it must survive adoption and later builds, so the top-level
-    # preservation contract is nonvacuous.
-    control_file = os.path.join(first, "target", "oxide-proof-top-level-control")
-    with open(control_file, "wb") as handle:
-        handle.write(b"control")
     adopt(proof, first, "01 adopt")
     root = root_of(pool, first)
     expect(root.startswith(os.path.join(proof.mount, "oxide-outputs") + os.sep), f"01: external root {root} is not on the registered volume")
@@ -628,11 +673,6 @@ def run(proof: Proof, repo: str) -> None:
     code, _, stderr = oxide(proof, ["build"], "01 build", first)
     expect(code == 0, f"01: build through the profile layout failed: {stderr}")
     expect_layout(first, {"debug": f"link:{root}", "release": f"link:{root}"})
-    expect(
-        os.path.isfile(control_file) and not os.path.islink(control_file),
-        "01: the ordinary top-level control file was removed or replaced",
-    )
-    expect(perm.read_bytes(control_file) == b"control", "01: the top-level control file changed")
     # Cargo's own top-level metadata may live in the redirected build directory;
     # it is asserted real only when it is present at the target root.
     for name in ("CACHEDIR.TAG", ".rustc_info.json"):
@@ -942,6 +982,11 @@ def run(proof: Proof, repo: str) -> None:
     expect_layout(fallback, {"debug": f"link:{external}", "release": f"link:{external}"})
     expect(os.path.isdir(external), "14: the external root did not return with its volume")
     expect(os.path.isdir(local), "14: the local root was deleted on return")
+    # Positive backend checks only once the volume is mounted again.
+    expect(os.stat(external).st_dev == os.stat(proof.mount).st_dev, "14: the returned root is not on the registered volume")
+    registration = perm.read_json(perm.registration_path(pool))
+    volume = perm.plistlib.loads(proof.run(["/usr/sbin/diskutil", "info", "-plist", proof.mount], timeout=30).stdout)
+    expect(volume.get("VolumeUUID") == registration["volume_uuid"], "14: the mounted volume UUID changed")
 
     # ----- case 15: detach and re-adopt ----------------------------------
     code, _, stderr = oxide(proof, ["outputs", "detach"], "15 detach", first)
@@ -962,9 +1007,15 @@ def run(proof: Proof, repo: str) -> None:
     code, _, stderr = oxide(proof, ["clean", "-p", "profileapp"], "16 selected clean", first)
     expect(code == 0, f"16: selected clean failed: {stderr}")
     expect_layout(first, {"debug": f"link:{root_of(pool, first)}"})
-    # The selected clean runs the existing pool watchdog: an injected
-    # below-reserve reading stops its recorded Cargo group, the group closes
-    # and the command reports it instead of claiming success.
+    # The selected clean runs the existing pool watchdog. The REMOVABLE
+    # watchdog is removal-only (its reserve trigger is disabled), so the
+    # reserve stop is exercised through a positively created directory-budget
+    # pool: a gated fake cargo that delegates `locate-project` and every other
+    # non-clean command to the real cargo starts the recorded group FIRST, then
+    # a below-reserve reading stops it and the stop is reported.
+    dirpool = os.path.join(proof.root, "clean-pool")
+    real_cargo = shutil.which("cargo")
+    expect(real_cargo is not None, "16: no real cargo on PATH for the fake to delegate to")
     binaries = os.path.join(proof.root, "fake-bin")
     os.makedirs(binaries, exist_ok=True)
     gate = os.path.join(proof.root, "clean-gate")
@@ -973,23 +1024,37 @@ def run(proof: Proof, repo: str) -> None:
     with open(fake, "w", encoding="utf-8") as handle:
         handle.write(
             "#!/bin/sh\n"
-            "touch \"$OXIDE_CLEAN_GATE/started\"\n"
-            "n=0\n"
-            "while [ ! -f \"$OXIDE_CLEAN_GATE/release\" ] && [ $n -lt 100 ]; do sleep 0.05; n=$((n+1)); done\n"
-            "exit 0\n"
+            "case \"$1\" in\n"
+            "  clean)\n"
+            "    touch \"$OXIDE_CLEAN_GATE/started\"\n"
+            "    n=0\n"
+            "    while [ ! -f \"$OXIDE_CLEAN_GATE/release\" ] && [ $n -lt 200 ]; do sleep 0.05; n=$((n+1)); done\n"
+            "    exit 0 ;;\n"
+            "  *)\n"
+            "    exec \"" + real_cargo + "\" \"$@\" ;;\n"
+            "esac\n"
         )
     os.chmod(fake, 0o755)
     readings = os.path.join(proof.root, "clean-readings")
     with open(readings, "w", encoding="utf-8") as handle:
-        handle.write(str(22 * perm.MIB * 1024 - 4096))
+        handle.write(str(23 * 1024 * 1024 * 1024))
     env = {
         **proof.env,
+        "OXIDE_POOL": dirpool,
+        "OXIDE_POOL_BACKEND": "directory-budget",
         "PATH": binaries + os.pathsep + proof.env.get("PATH", ""),
         "OXIDE_CLEAN_GATE": gate,
         "OXIDE_TEST_WATCHDOG_READINGS": readings,
     }
-    code, _, stderr = perm.oxide_env(proof, ["clean", "-p", "profileapp"], "16 watched clean", first, env)
-    expect(os.path.exists(os.path.join(gate, "started")), "16: the clean never started its recorded Cargo group")
+    seeded = make_checkout(proof, "clean-pool-fixture")
+    os.makedirs(os.path.join(seeded, "target"))
+    code, _, stderr = perm.oxide_env(proof, ["build"], "16 clean pool seed", seeded, env)
+    expect(code == 0, f"16: creating the directory-budget pool failed: {stderr}")
+    child = perm.start_child(proof, [proof.binary, "clean", "-p", "profileapp"], first, env)
+    perm.wait_for(os.path.join(gate, "started"), "16 watched clean writer start")
+    with open(readings, "w", encoding="utf-8") as handle:
+        handle.write(str(22 * 1024 * 1024 * 1024 - 4096))
+    code, _, stderr = perm.finish_child(proof, child, "16 watched clean")
     expect(code != 0, f"16: a stopped clean claimed success: {stderr}")
     expect(
         any(word in stderr.lower() for word in ("reserve", "watchdog", "stop")),
@@ -1008,8 +1073,13 @@ def run(proof: Proof, repo: str) -> None:
     foreign = os.path.join(malformed, "target", "release")
     os.remove(foreign) if os.path.islink(foreign) else None
     os.symlink("/tmp", foreign)
-    code, _, stderr = oxide(proof, ["build"], "17 foreign link", malformed)
-    expect(code != 0, f"17: a foreign member link was followed: {stderr}")
+    # The command must declare the affected member: a debug build never touches
+    # release, so `build --release` is the refusal that proves it.
+    code, _, stderr = oxide(proof, ["build", "--release"], "17 foreign release link", malformed)
+    expect(code != 0, f"17: a foreign release link was followed: {stderr}")
+    expect(foreign in stderr and "not a link" in stderr or "foreign" in stderr.lower(), f"17: the refusal did not name the affected release member: {stderr}")
+    code, _, stderr = oxide(proof, ["build"], "17 debug still usable", malformed)
+    expect(code == 0, f"17: the unaffected debug member stopped building: {stderr}")
     os.remove(foreign)
 
     # ----- case 18: real and linked placements key different cold slots ----
@@ -1222,7 +1292,6 @@ def run(proof: Proof, repo: str) -> None:
     expect(perm.sha256_file(perm.receipt_path(pool, gone)) == expected, "20: the replay rewrote the terminal image")
     expect(not os.path.exists(gone_root), "20: the root reappeared")
 
-    print("profile-outputs proof: all 20 cases passed", flush=True)
 
 
 def main() -> int:
@@ -1247,11 +1316,14 @@ def main() -> int:
     proof = Proof(root)
     try:
         run(proof, repo)
-    finally:
-        try:
-            proof.detach()
-        except BaseException as error:
-            print(f"cleanup after failure: {error!r}", file=sys.stderr)
+        # Ordinary detach is part of the proof, not best-effort cleanup: a
+        # failed detach fails the run and leaves the mount recorded for the
+        # custodian instead of claiming 20 cases.
+        proof.detach()
+    except BaseException:
+        if proof.mount:
+            print(f"mount {proof.mount} retained for the custodian after failure", file=sys.stderr)
+        raise
     print("profile-outputs proof: 20 cases held", flush=True)
     return 0
 
