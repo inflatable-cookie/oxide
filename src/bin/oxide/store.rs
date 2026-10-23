@@ -1856,7 +1856,7 @@ impl Store {
     pub fn initialize_outputs(
         &self,
         transaction: &str,
-        create: &dyn Fn(&str) -> Result<(), String>,
+        create: &dyn Fn(&str, bool) -> Result<(), String>,
     ) -> Result<bool, String> {
         if !bounded_text(transaction, MAX_INIT_TRANSACTION_BYTES) {
             return Err("the output-registry transaction identity is unusable".to_owned());
@@ -1867,16 +1867,77 @@ impl Store {
         let _internal_admission = internal.admission()?;
         let mut internal_state = internal.load()?;
         let transaction = match internal_state.outputs_init.clone() {
-            Some(OutputsInit::Ready { .. }) => {
-                // The registry must already be present; `create` validates
-                // it without creating or replacing anything.
+            Some(OutputsInit::Ready {
+                transaction: recorded,
+                ..
+            }) => {
                 if internal_state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
                     return Err(
                         "the internal control records a ready output registry without the version-2 fence; refusing"
                             .to_owned(),
                     );
                 }
-                create(transaction)?;
+                // A new or reappearing paired control is fenced and marked
+                // ready under the exact recorded transaction before any
+                // effect; a different or unknown record refuses.
+                let sibling = self
+                    .sibling
+                    .as_ref()
+                    .filter(|sibling| sibling.control != internal_control)
+                    .map(|sibling| (self.view(&sibling.control), sibling.barrier));
+                if let Some((sibling, _barrier)) = &sibling {
+                    sibling.ensure_control()?;
+                    let _admission = sibling.admission()?;
+                    let mut state = sibling.load()?;
+                    match &state.outputs_init {
+                        Some(OutputsInit::Ready { transaction, .. })
+                            if transaction == &recorded => {}
+                        Some(OutputsInit::Ready { .. }) => return Err(
+                            "the paired pool records a different ready output registry; refusing"
+                                .to_owned(),
+                        ),
+                        Some(OutputsInit::Initializing { transaction, .. }) => {
+                            if transaction != &recorded {
+                                return Err(format!(
+                                    "the paired pool records initializer transaction {transaction}, not the recorded {recorded}; refusing"
+                                ));
+                            }
+                            state.outputs_init = Some(OutputsInit::Ready {
+                                transaction: recorded.clone(),
+                                ready_ms: process::now_ms(),
+                            });
+                            state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
+                            sibling.save(&state)?;
+                        }
+                        None => {
+                            if state
+                                .owned_outputs
+                                .as_deref()
+                                .is_some_and(|fence| fence != LEGACY_OWNED_OUTPUTS_FENCE)
+                            {
+                                return Err(
+                                    "the paired pool carries an unknown owned-outputs fence; refusing"
+                                        .to_owned(),
+                                );
+                            }
+                            state.outputs_init = Some(OutputsInit::Ready {
+                                transaction: recorded.clone(),
+                                ready_ms: process::now_ms(),
+                            });
+                            state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
+                            sibling.save(&state)?;
+                        }
+                    }
+                    if state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
+                        return Err(
+                            "the paired pool does not carry the version-2 output fence; refusing"
+                                .to_owned(),
+                        );
+                    }
+                }
+                // The registry must already exist: this path is validation
+                // only and must never create or rebuild it.
+                create(&recorded, false)?;
                 return Ok(true);
             }
             Some(OutputsInit::Initializing { transaction, .. }) => transaction,
@@ -1933,7 +1994,7 @@ impl Store {
                 );
             }
         }
-        create(&transaction)?;
+        create(&transaction, true)?;
         if let Some(OutputsInit::Initializing { .. }) = internal_state.outputs_init {
             internal_state.outputs_init = Some(OutputsInit::Ready {
                 transaction: transaction.clone(),
@@ -3215,12 +3276,20 @@ impl Store {
     }
 
     fn save(&self, state: &State) -> Result<(), String> {
-        // Every Store-controlled mutation writes the permanent version-2
-        // fence. A legacy state is validated against the new field and
-        // object caps first; an oversized legacy field refuses with the
-        // original file untouched.
+        // The numeric version advances only with the owned-outputs forward
+        // fence or its initialization record. An ordinary mutation of a pool
+        // that has not opted into owned outputs stays on the previous
+        // numeric version, so an older binary is not refused merely because a
+        // build ran (oxide#129). A legacy state is validated against the new
+        // fields and object caps first; an oversized legacy field refuses
+        // with the original file untouched.
         let mut fenced = state.clone();
-        fenced.version = STATE_VERSION;
+        let initialized = fenced.outputs_init.is_some() || fenced.owned_outputs.is_some();
+        fenced.version = if initialized {
+            STATE_VERSION
+        } else {
+            PREVIOUS_STATE_VERSION
+        };
         validate_state(&fenced, false)?;
         let bytes = serde_json::to_vec(&fenced).map_err(|error| error.to_string())?;
         if bytes.len() as u64 > MAX_STATE_BYTES {
@@ -4264,6 +4333,48 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// The numeric state version advances only with the owned-outputs fence
+    /// or its initialization record (oxide#129). An ordinary mutation must
+    /// not refuse older binaries that have not opted into owned outputs.
+    #[test]
+    fn the_numeric_state_version_advances_only_with_the_output_fence() {
+        let (root, internal, _removable) = paired_controls("version-gate");
+        let state = internal.load().unwrap();
+        internal.save(&state).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_slice(&fs::read(internal.control.join("state.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            doc["version"].as_u64(),
+            Some(u64::from(PREVIOUS_STATE_VERSION))
+        );
+        let transaction = "a".repeat(32);
+        let created = std::cell::Cell::new(0);
+        internal
+            .initialize_outputs(&transaction, &|_, may_create| {
+                assert!(may_create);
+                created.set(created.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(created.get(), 1);
+        let state = internal.load().unwrap();
+        assert_eq!(state.version, STATE_VERSION);
+        assert!(matches!(
+            state.outputs_init,
+            Some(OutputsInit::Ready { .. })
+        ));
+        assert_eq!(state.owned_outputs.as_deref(), Some(OWNED_OUTPUTS_FENCE));
+        // A ready pool validates the existing registry without creating it.
+        internal
+            .initialize_outputs(&transaction, &|_, may_create| {
+                assert!(!may_create);
+                Ok(())
+            })
+            .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// The checkout clean barrier spans both pools: an internal clean waits
     /// for the checkout's active removable command, and a removable slot
     /// attempt sees a live internal clean under the internal admission lock.
@@ -4762,7 +4873,10 @@ mod tests {
     #[test]
     fn worst_escaped_control_state_roundtrips_through_save_and_load() {
         let (root, store, _removable) = paired_controls("control-escaped");
-        let mut state = State::default();
+        let mut state = State {
+            owned_outputs: Some(OWNED_OUTPUTS_FENCE.to_owned()),
+            ..State::default()
+        };
         for id in 1..=MAX_RECORDS as u64 {
             state.records.push(escaped_record(id));
         }
@@ -4878,7 +4992,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_control_reads_keep_their_limits_and_save_installs_the_fence() {
+    fn legacy_control_reads_keep_their_limits_and_save_keeps_the_previous_version_until_the_fence()
+    {
         let (root, store, _removable) = paired_controls("control-fence");
         let mut legacy = State {
             version: LEGACY_STATE_VERSION,
@@ -4905,13 +5020,26 @@ mod tests {
             bytes,
             "the original state was rewritten"
         );
-        // Within the caps, the same save installs the permanent version-2
-        // fence.
+        // Within the caps, an ordinary save stays on the previous numeric
+        // version so older binaries are not refused before the owned-outputs
+        // fence opts the pool in.
         let mut bounded = legacy.clone();
         bounded.records[0].checkout = Some(PathBuf::from("/checkout"));
         store.save(&bounded).expect("bounded legacy state saves");
         let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["version"], serde_json::json!(PREVIOUS_STATE_VERSION));
+        assert!(stored.get("owned_outputs").is_none());
+        // Only the forward fence (or initialization) advances the numeric
+        // version.
+        store
+            .fence_owned_outputs()
+            .expect("the forward fence saves");
+        let stored: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(stored["version"], serde_json::json!(STATE_VERSION));
+        assert_eq!(
+            stored["owned_outputs"],
+            serde_json::json!(OWNED_OUTPUTS_FENCE)
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

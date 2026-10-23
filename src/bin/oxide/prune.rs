@@ -293,15 +293,27 @@ struct ObservedRoot {
 }
 
 /// `oxide outputs prune ...` / `oxide outputs resolve-intent ...`.
+///
+/// The public contract has no generic failure exit: usage and any refusal
+/// before an effect are exit 2, and an operation whose own transaction is
+/// incomplete reports exit 3. Errors are therefore mapped here instead of
+/// reaching the front door's generic exit 1.
 pub fn run(args: &[std::ffi::OsString]) -> Result<u8, String> {
-    let args: Vec<&str> = args
+    let args: Vec<&str> = match args
         .iter()
         .map(|arg| arg.to_str().ok_or("arguments must be valid UTF-8"))
-        .collect::<Result<_, _>>()?;
-    match args.as_slice() {
+        .collect::<Result<_, _>>()
+    {
+        Ok(args) => args,
+        Err(reason) => {
+            eprintln!("oxide: outputs: {reason}");
+            return Ok(2);
+        }
+    };
+    let result = match args.as_slice() {
         ["prune", "--help" | "-h"] | ["resolve-intent", "--help" | "-h"] => {
             println!("{USAGE}");
-            Ok(0)
+            return Ok(0);
         }
         ["prune", "--dry-run"] => dry_run(None),
         ["prune", "--dry-run", "--operator-list", list] => dry_run(Some(Path::new(list))),
@@ -310,7 +322,19 @@ pub fn run(args: &[std::ffi::OsString]) -> Result<u8, String> {
             real_run(plan, sha, Some(Path::new(list)))
         }
         ["resolve-intent", id] => resolve_intent(id),
-        _ => Err(USAGE.to_owned()),
+        _ => {
+            eprintln!("{USAGE}");
+            return Ok(2);
+        }
+    };
+    match result {
+        Ok(code) => Ok(code),
+        Err(reason) => {
+            eprintln!(
+                "oxide: outputs refused: {reason}; no output root was changed and any pending intent stays pending"
+            );
+            Ok(2)
+        }
     }
 }
 
@@ -367,8 +391,8 @@ pub fn ensure_ready(internal: &Store) -> Result<(), String> {
         Some(store::OutputsInit::Ready { transaction, .. }) => transaction,
         _ => fresh_nonce()?,
     };
-    internal.initialize_outputs(&transaction, &|transaction| {
-        create_or_validate_registry(&control, transaction)
+    internal.initialize_outputs(&transaction, &|transaction, may_create| {
+        create_or_validate_registry(&control, transaction, may_create)
     })?;
     let registry = ready_registry(&control)?;
     registry.validate()?;
@@ -467,7 +491,11 @@ fn seed_registry(control: &Path, registry: &mut Registry) -> Result<(), String> 
     Ok(())
 }
 
-fn create_or_validate_registry(control: &Path, transaction: &str) -> Result<(), String> {
+fn create_or_validate_registry(
+    control: &Path,
+    transaction: &str,
+    may_create: bool,
+) -> Result<(), String> {
     ensure_private_dir(&registry_dir(control))?;
     let path = registry_path(control);
     match fs::symlink_metadata(&path) {
@@ -490,6 +518,14 @@ fn create_or_validate_registry(control: &Path, transaction: &str) -> Result<(), 
             registry.validate()
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if !may_create {
+                // A fenced, ready pool whose registry disappeared is never
+                // rebuilt: mutation refuses and prune keeps every root.
+                return Err(format!(
+                    "{} is missing but the control state records a ready registry; refusing to rebuild it",
+                    path.display()
+                ));
+            }
             let mut registry = Registry {
                 version: REGISTRY_VERSION.to_owned(),
                 revision: 1,
@@ -1213,7 +1249,16 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
     }
     // Fresh revalidation: the plan's root identity set must match one-to-one,
     // with roots completed by an exact intent replay excluded.
-    let evaluated = evaluate(&store, &control, &registry, list.as_ref())?;
+    let evaluated = match evaluate(&store, &control, &registry, list.as_ref()) {
+        Ok(evaluated) => evaluated,
+        Err(reason) if !completed_roots.is_empty() => {
+            return Ok(unsettled(
+                &control,
+                &format!("a replayed intent completed but the fresh snapshot failed ({reason})"),
+            ))
+        }
+        Err(reason) => return Err(reason),
+    };
     let fresh = build_preview(&registry, &evaluated, list.as_ref());
     let plan_set: Vec<&Candidate> = preview
         .candidates
@@ -1236,7 +1281,14 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
         )));
     }
     if fresh.candidates.is_empty() {
-        eprintln!("oxide: no eligible roots; nothing was deleted");
+        if completed_roots.is_empty() {
+            eprintln!("oxide: no eligible roots; nothing was deleted");
+        } else {
+            println!(
+                "outputs prune: completed {} previously journaled root(s); no fresh candidate remains",
+                completed_roots.len()
+            );
+        }
         let _ = write_observations(&control, &observation_from(&fresh, &evaluated, Vec::new()));
         return Ok(0);
     }
@@ -1257,7 +1309,17 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
                 ));
             }
         }
-        registry = ready_registry(&control)?;
+        registry = match ready_registry(&control) {
+            Ok(registry) => registry,
+            Err(reason) => {
+                return Ok(unsettled(
+                    &control,
+                    &format!(
+                        "a root completed but the registry became unreadable afterwards ({reason}); inspect the pending journal before another prune"
+                    ),
+                ))
+            }
+        };
     }
     let _ = write_observations(&control, &observation_from(&fresh, &evaluated, outcomes));
     let deleted = fresh.candidates.len();
@@ -1686,17 +1748,42 @@ enum Absence {
 /// Positive absence of a checkout: every ancestor opens as a real directory
 /// without following a link, and the actual leaf returns ENOENT from
 /// `fstatat(AT_SYMLINK_NOFOLLOW)`. Any other answer is uncertainty.
+/// The path components a checkout walk visits after its start descriptor.
+/// For `/Volumes/<mount>/...` the walk starts at the verified mount root, so
+/// the volume name itself is not visited again; for any other absolute path
+/// it starts at `/`.
+fn checkout_walk(checkout: &Path) -> Result<(bool, Vec<&std::ffi::OsStr>), String> {
+    let components: Vec<_> = checkout.components().collect();
+    // An absolute path is `RootDir` then `Volumes`; the mount root is the
+    // next component and is already the walk's start descriptor.
+    let under_volumes = matches!(
+        components.get(1),
+        Some(std::path::Component::Normal(first)) if first.to_str() == Some("Volumes")
+    );
+    let skip = if under_volumes { 3 } else { 1 };
+    let rest: Vec<&std::ffi::OsStr> = components
+        .iter()
+        .skip(skip)
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(*name),
+            _ => None,
+        })
+        .collect();
+    if rest.is_empty() {
+        return Err("the checkout path has no components below its start".to_owned());
+    }
+    Ok((under_volumes, rest))
+}
+
 fn checkout_absence(row: &Row, operator_legacy: bool) -> Result<Absence, String> {
     use std::os::unix::ffi::OsStrExt;
     let checkout = &row.checkout;
     let components: Vec<_> = checkout.components().collect();
+    let (under_volumes, rest) = match checkout_walk(checkout) {
+        Ok(found) => found,
+        Err(reason) => return Ok(Absence::Unknown(reason)),
+    };
     let mut cursor: OwnedFd = open_root()?;
-    let mut under_volumes = false;
-    if let Some(std::path::Component::Normal(first)) = components.first() {
-        if first.to_str() == Some("Volumes") {
-            under_volumes = true;
-        }
-    }
     if under_volumes {
         // A recorded checkout below /Volumes needs the registered volume's
         // UUID and a live matching mount; a legacy row without one is kept.
@@ -1741,20 +1828,6 @@ fn checkout_absence(row: &Row, operator_legacy: bool) -> Result<Absence, String>
                 "/Users is not on a writable APFS data volume".to_owned(),
             ));
         }
-    }
-    let skip = if under_volumes { 2 } else { 1 };
-    let rest: Vec<&std::ffi::OsStr> = components
-        .iter()
-        .skip(skip)
-        .filter_map(|component| match component {
-            std::path::Component::Normal(name) => Some(*name),
-            _ => None,
-        })
-        .collect();
-    if rest.is_empty() {
-        return Ok(Absence::Unknown(
-            "the checkout path is a volume root".to_owned(),
-        ));
     }
     for (index, name) in rest.iter().enumerate() {
         let last = index + 1 == rest.len();
@@ -3014,10 +3087,29 @@ fn resolve_intent(id: &str) -> Result<u8, String> {
     let path = directory.join(format!("{}.json", intent.id));
     let bytes = serde_json::to_vec_pretty(&resolution).map_err(|error| error.to_string())?;
     let temp = directory.join(format!(".{}.tmp-{}", intent.id, std::process::id()));
-    write_private(&temp, &bytes)?;
-    fs::rename(&temp, &path).map_err(|error| format!("cannot publish the resolution: {error}"))?;
-    sync_directory(&directory)?;
-    complete_resolution(&store, &control, &intent, "resolved-by-operator")?;
+    if let Err(reason) = write_private(&temp, &bytes) {
+        return Ok(refused(&format!(
+            "cannot prepare the resolution proof ({reason})"
+        )));
+    }
+    if let Err(error) = fs::rename(&temp, &path) {
+        let _ = fs::remove_file(&temp);
+        return Ok(refused(&format!(
+            "cannot publish the resolution proof ({error})"
+        )));
+    }
+    if let Err(error) = sync_directory(&directory) {
+        eprintln!(
+            "oxide: resolve-intent unsettled: the resolution proof is published but its directory did not sync ({error}); the intent stays pending"
+        );
+        return Ok(3);
+    }
+    if let Err(reason) = complete_resolution(&store, &control, &intent, "resolved-by-operator") {
+        eprintln!(
+            "oxide: resolve-intent unsettled: {reason}; the resolution proof is published but the terminal transaction did not commit, so the intent stays pending"
+        );
+        return Ok(3);
+    }
     println!(
         "outputs resolve-intent: {} resolved by operator (original and quarantine leaves absent); resolution receipt {}",
         intent.id,
@@ -3244,6 +3336,61 @@ mod tests {
         let list = read_operator_list(&write("ok.json", "[\"/root/a\",\"/root/b\"]")).unwrap();
         assert_eq!(list.roots.len(), 2);
         assert_eq!(list.sha256, sha256_hex(b"[\"/root/a\",\"/root/b\"]"));
+    }
+
+    #[test]
+    fn a_volume_checkout_walk_begins_below_the_verified_mount_root() {
+        // Regression for the review finding: the mount root descriptor is
+        // opened already, so the volume name must not be visited again. A
+        // live checkout previously read as absent and its root was prunable.
+        let (under, rest) = checkout_walk(Path::new("/Volumes/Builds/oxide-outputs/app")).unwrap();
+        assert!(under);
+        assert_eq!(
+            rest,
+            vec![
+                std::ffi::OsStr::new("oxide-outputs"),
+                std::ffi::OsStr::new("app")
+            ]
+        );
+        let (under, rest) = checkout_walk(Path::new("/Users/tom/src/app")).unwrap();
+        assert!(!under);
+        assert_eq!(
+            rest,
+            vec![
+                std::ffi::OsStr::new("Users"),
+                std::ffi::OsStr::new("tom"),
+                std::ffi::OsStr::new("src"),
+                std::ffi::OsStr::new("app")
+            ]
+        );
+        assert!(checkout_walk(Path::new("/Volumes/Builds")).is_err());
+        assert!(checkout_walk(Path::new("/")).is_err());
+    }
+
+    #[test]
+    fn a_ready_registry_is_never_recreated_when_it_is_missing() {
+        let fixture = Fixture::new();
+        let control = fixture.root.join("control");
+        fs::create_dir(&control).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
+        let transaction = "a".repeat(32);
+        let refused = create_or_validate_registry(&control, &transaction, false).unwrap_err();
+        assert!(refused.contains("refusing to rebuild"), "{refused}");
+        assert!(!registry_path(&control).exists());
+        create_or_validate_registry(&control, &transaction, true).unwrap();
+        assert!(registry_path(&control).is_file());
+        // Validation without creation succeeds for the exact transaction.
+        create_or_validate_registry(&control, &transaction, false).unwrap();
+        assert_eq!(ready_registry(&control).unwrap().created_by, "a".repeat(32));
+    }
+
+    #[test]
+    fn usage_and_refusals_use_the_contract_exit_codes() {
+        assert_eq!(
+            run(&[std::ffi::OsString::from("prune"), "bogus".into()]).unwrap(),
+            2
+        );
     }
 
     #[test]
