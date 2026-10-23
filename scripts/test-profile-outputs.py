@@ -796,17 +796,34 @@ def run(proof: Proof, repo: str) -> None:
     os.remove(foreign)
 
     # ----- case 18: real and linked placements key different cold slots ----
+    # A real NONEMPTY debug directory is kept real, so the first keyed build
+    # uses real:debug. The operator then removes that real directory (Oxide
+    # never moves it) and adopts again: the same member becomes a link, so the
+    # next build's key changes and it cannot reuse the real placement's slot.
     cold = make_checkout(proof, "cold")
     os.makedirs(os.path.join(cold, "target", "debug"))
+    with open(os.path.join(cold, "target", "debug", "keep"), "wb") as handle:
+        handle.write(b"keep")
     code, _, stderr = oxide(proof, ["build"], "18 real debug", cold)
     expect(code == 0, f"18: real-member build failed: {stderr}")
-    facts_real = perm.plan(proof, cold, "18 real plan")["members"]
     adopt(proof, cold, "18 adopt")
+    cold_root = root_of(pool, cold)
+    expect_layout(cold, {"debug": "real", "release": f"link:{cold_root}"})
+    facts_real = perm.plan(proof, cold, "18 real plan")["members"]
+    code, _, stderr = oxide(proof, ["build"], "18 real build again", cold)
+    expect(code == 0, f"18: second real-member build failed: {stderr}")
+    expect_layout(cold, {"debug": "real", "release": f"link:{cold_root}"})
+    shutil.rmtree(os.path.join(cold, "target", "debug"))
+    adopt(proof, cold, "18 relink")
+    expect_layout(cold, {"debug": f"link:{cold_root}", "release": f"link:{cold_root}"})
     code, _, stderr = oxide(proof, ["build"], "18 linked debug", cold)
     expect(code == 0, f"18: linked build failed: {stderr}")
-    expect("cold" in summary(stderr), f"18: linked placement reused the real neighbour's slot: {summary(stderr)}")
+    expect("cold" in summary(stderr), f"18: linked placement reused the real placement's slot: {summary(stderr)}")
     facts_linked = perm.plan(proof, cold, "18 linked plan")["members"]
-    expect(facts_real != facts_linked, "18: placement change did not change the planned members")
+    expect(
+        facts_real != facts_linked,
+        f"18: placement change did not change the planned members: {facts_real} vs {facts_linked}",
+    )
 
     # ----- case 19: the staged state-3 binary refuses state 4 -------------
     snapshot = {member: os.readlink(member_link(migrated, member)) for member in ("debug", "release")}
