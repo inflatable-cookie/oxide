@@ -3270,7 +3270,11 @@ stay real.
 20-case matrix for this design, updated for the corrected distinct member
 destinations (each linked member must select `root/<member>`), the positive
 selected-removable and low-reserve controls, the honest top-level lifecycle and
-the real peer-receipt KEEP: one private session per side with one owned
+the real peer-receipt KEEP, the two base-created legacy fixtures prepared under
+one base-compatible registration before any candidate successor-fence effect,
+and a case-11 registry predicate that separates the selected profile group from
+retained legacy history (a history row without a nonce is non-selected history,
+never a live reference): one private session per side with one owned
 128 MiB scratch APFS image, a private `HOME`, `CARGO_HOME` and directory pool,
 a separately staged base `4a70b83` binary and this HEAD's candidate staged
 offline with 1.97.1 from authenticated pinned source, with asserted distinct
@@ -3284,7 +3288,7 @@ and assertions with `--plan`. The root owner's scoped amendment
 publication at 030836f6 is historical and unactivated), with a helper work
 cutoff of about 565 s (its 30 s reserve plus a 5 s refusal margin) inside which
 cleanup and image detach must finish; scratch stays 512 MiB and no runner or
-split-proof change is granted. The published 264-400 s work estimate remains
+split-proof change is granted. The published 300-450 s work estimate remains
 UNMEASURED, not an established fit, and independent source-fit may still
 refuse it. CPU controls support a 6 CPU / 8 GiB planning request: the two
 independent stagings are sequential and each is explicitly bounded to 6 Cargo
@@ -3296,7 +3300,13 @@ APFS fixture image is attached with `hdiutil attach -owners on` on every attach
 and reattach so the mounted root does not ignore filesystem ownership, and the
 prerequisite is asserted by a bounded read-only mount observation plus the
 product's own registration refusal; no real drive, persistent host ownership
-setting, mount permission or registration safety check is changed. The 128 MiB
+setting, mount permission or registration safety check is changed. The image
+backing lives in the qualified guard's own evidence directory beside (not
+inside) its monitored scratch, so the same guard root counts it within the
+512 MiB allocation; an ordinary detach is used on success and after a failure,
+and a failed detach fails the proof and retains the backing with its
+device/UUID/image identity for the custodian. The script is fail-closed on
+arguments (`--plan` and `--self-check` are effect-free, anything else refuses). The 128 MiB
 image is registered with a 16 MiB reserve and a 64 MiB admission cap, a positive
 control proves an external root is really selected before any external-root
 oracle, and a separate deliberate low-reserve control temporarily raises the

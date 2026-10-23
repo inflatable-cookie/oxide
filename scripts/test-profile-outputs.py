@@ -9,7 +9,7 @@ Supervisor delegation) makes this selector/script/plan 600 s TOTAL instead of
 420; the old 420 publication at 030836f6 stays historical and unactivated. The
 helper's work cutoff is about 565 s (its 30 s reserve plus a 5 s refusal
 margin), inside which cleanup and image detach must finish. The published
-264-400 s work estimate is UNMEASURED, not an established fit:
+300-450 s work estimate is UNMEASURED, not an established fit:
 
     python3 scripts/bounded-test.py --limit 600 --scratch-budget-mib 512 \\
         -- python3 scripts/test-profile-outputs.py
@@ -367,6 +367,8 @@ def make_root_one_fixture(pool: str, checkout: str) -> str:
         selected = placement.get("selected")
         if selected:
             selected.pop("nonce", None)
+    for known in doc.get("roots", []):
+        known.pop("nonce", None)
     os.chmod(path, 0o600)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(doc, handle, indent=2)
@@ -435,6 +437,28 @@ def owners_honored(proof: Proof, mount: str, label: str) -> None:
     )
 
 
+def owned_image_dir() -> str:
+    """The private image backing lives in the qualified guard's OWN evidence
+    directory, which it keeps, beside (not inside) its monitored scratch. The
+    same guard root therefore counts the 128 MiB backing inside the published
+    512 MiB allocation, and a retained backing stays monitored for the
+    custodian."""
+    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE", "")
+    scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
+    expect(bool(evidence) and os.path.isdir(evidence), f"OXIDE_PROOF_EVIDENCE {evidence!r} is not a directory")
+    expect(bool(scratch) and os.path.isdir(scratch), f"OXIDE_TASK_SCRATCH_ROOT {scratch!r} is not a directory")
+    common = os.path.commonpath([os.path.realpath(evidence), os.path.dirname(os.path.realpath(scratch))])
+    expect(common == os.path.dirname(os.path.realpath(scratch)), "the evidence directory is not beside the guard scratch")
+    expect(
+        not os.path.realpath(evidence).startswith(os.path.realpath(scratch) + os.sep),
+        "the evidence directory is inside the guard scratch",
+    )
+    directory = os.path.join(evidence, "owned-image")
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    os.chmod(directory, 0o700)
+    return directory
+
+
 def attach_owned_image(
     proof: Proof, label: str, image_name: str = "volume.sparseimage"
 ) -> str:
@@ -444,13 +468,63 @@ def attach_owned_image(
     volume for a control that must not share another registration's payload."""
     mount = perm.attach_image(
         proof,
-        proof.root,
+        owned_image_dir(),
         "ProfileOutputs-" + secrets.token_hex(3),
         owners=True,
         image_name=image_name,
     )
     owners_honored(proof, mount, label)
     return mount
+
+
+def detach_owned_volume(proof: Proof, label: str) -> None:
+    """Ordinary detach of the proof-owned mount, used on success AND after a
+    failure once direct child outcomes are known. A failed detach fails the
+    proof and records the mount/device/UUID/image/ownership; the backing stays
+    in the guard's OWN evidence for the custodian. Backing is removed only
+    after a positive detach confirmation."""
+    mount = proof.mount
+    if not mount:
+        return
+    directory = owned_image_dir()
+    backing = os.path.join(directory, "volume.sparseimage")
+    expect(os.path.lexists(mount), f"{label}: the owned mount {mount} vanished before ordinary detach")
+    result = proof.run(["/usr/bin/hdiutil", "detach", mount], timeout=60)
+    if result.returncode != 0:
+        info = proof.run(["/usr/sbin/diskutil", "info", "-plist", mount], timeout=30)
+        details = {}
+        if info.returncode == 0:
+            try:
+                plist = perm.plistlib.loads(info.stdout)
+                details = {
+                    "device": plist.get("DeviceIdentifier"),
+                    "volume_uuid": plist.get("VolumeUUID"),
+                    "owners": plist.get("Owners"),
+                    "mount_point": plist.get("MountPoint"),
+                }
+            except Exception:
+                details = {"plist": "unreadable"}
+        record = {
+            "label": label,
+            "mount": mount,
+            "detach_exit": result.returncode,
+            "stderr": result.stderr.decode(errors="replace")[:4000],
+            "image": backing,
+            "backing_present": os.path.exists(backing),
+            "details": details,
+        }
+        evidence = os.environ["OXIDE_PROOF_EVIDENCE"]
+        with open(os.path.join(evidence, "detach-failure.json"), "w", encoding="utf-8") as handle:
+            json.dump(record, handle, indent=2)
+            handle.write("\n")
+        fail(f"{label}: ordinary detach of {mount} failed; the backing is retained in the guard evidence")
+    proof.mount = None
+    if os.path.exists(backing):
+        os.remove(backing)
+    try:
+        os.rmdir(directory)
+    except OSError:
+        pass
 
 
 def register(proof: Proof, pool: str, mode: str = "permanent") -> None:
@@ -508,6 +582,61 @@ def base_legacy(proof: Proof, base: str, pool: str, checkout: str) -> None:
     )
 
 
+def validate_migrated_registry(rows: list, root: str, nonce: str, volume_uuid, generation: int) -> None:
+    """Pure registry predicate for a migrated profile group.
+
+    Exactly the debug+release profile rows are live and share the upgraded root
+    nonce and identity; any retained whole-target history row is non-selected,
+    non-pending and never a live reference. A missing or malformed selected
+    nonce, an extra live member or a live legacy row is an explicit failure.
+    """
+    selected = [row for row in rows if row.get("selected")]
+    pending = [row for row in rows if row.get("pending")]
+    live_other = [
+        row
+        for row in rows
+        if row.get("pruning") or row.get("reservation") or row.get("cancelling")
+    ]
+    expect({row.get("member") for row in selected} == {"debug", "release"}, f"11: selected profile rows are {selected}")
+    expect({row.get("member") for row in pending} == set(), f"11: pending registry references remain: {pending}")
+    expect({row.get("member") for row in live_other} == set(), f"11: live pruning/reservation rows remain: {live_other}")
+    for row in selected:
+        expect(row.get("nonce") == nonce, f"11: selected {row.get('member')} row does not carry the upgraded nonce: {row}")
+        expect(row.get("root") == root, f"11: selected {row.get('member')} row names another root: {row}")
+        expect(row.get("volume_uuid") == volume_uuid, f"11: selected {row.get('member')} row names another volume: {row}")
+        expect(row.get("generation") == generation, f"11: selected {row.get('member')} row names another generation: {row}")
+    for row in rows:
+        if row.get("member") == "target":
+            expect(
+                not row.get("selected") and not row.get("pending"),
+                f"11: retained legacy target history is live: {row}",
+            )
+            expect(row.get("root") == root, f"11: legacy history names another root: {row}")
+
+
+def pure_registry_controls() -> None:
+    """No-subprocess self-controls for the case-11 registry predicate."""
+    good = [
+        {"member": "debug", "selected": True, "pending": False, "root": "/r", "nonce": "a" * 32, "volume_uuid": "11111111-2222-3333-4444-555555555555", "generation": 1},
+        {"member": "release", "selected": True, "pending": False, "root": "/r", "nonce": "a" * 32, "volume_uuid": "11111111-2222-3333-4444-555555555555", "generation": 1},
+        {"member": "target", "selected": False, "pending": False, "root": "/r", "generation": 1},
+    ]
+    validate_migrated_registry(good, "/r", "a" * 32, "11111111-2222-3333-4444-555555555555", 1)
+    for broken, why in (
+        ([{**good[0], "nonce": None}, good[1], good[2]], "missing selected nonce"),
+        ([{**good[0], "nonce": "b" * 32}, good[1], good[2]], "mismatched selected nonce"),
+        ([good[0], good[1], {**good[2], "selected": True}], "extra live legacy member"),
+        ([good[0], good[1], {**good[2], "pending": True}], "pending legacy member"),
+        ([good[0], good[1], good[2], {**good[0], "member": "x86_64-unknown-linux-gnu/debug"}], "extra live profile member"),
+    ):
+        try:
+            validate_migrated_registry(broken, "/r", "a" * 32, "11111111-2222-3333-4444-555555555555", 1)
+        except Exception:
+            continue
+        raise AssertionError(f"the registry predicate accepted a {why}")
+    print("pure registry controls: ok", flush=True)
+
+
 def custody_snapshot(pool: str, checkout: str) -> dict:
     """Bounded observable state of one checkout's output authority: receipt
     bytes, member link texts and the root marker's bytes."""
@@ -543,6 +672,7 @@ def adopt(proof: Proof, checkout: str, label: str) -> None:
 
 
 def run(proof: Proof, repo: str) -> None:
+    pure_registry_controls()
     source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
     dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
     expect(not dirty, f"candidate checkout is not clean: {dirty}")
@@ -577,44 +707,6 @@ def run(proof: Proof, repo: str) -> None:
     proof.env["CARGO_BUILD_JOBS"] = str(FIXTURE_JOBS)
     register(proof, pool)
 
-    # ----- case 11: explicit migration of a base-created checkout ---------
-    # The base binary can create its committed whole-target /2 state only
-    # before the primary pool publishes the successor fence, so this case runs
-    # first, on the primary pool and the SAME private image, and the candidate
-    # then migrates it.
-    migrated = make_checkout(proof, "migrate")
-    base_legacy(proof, base, pool, migrated)
-    # The base binary's committed whole-target /2 state is made source-shaped
-    # BEFORE any migration: a root/1 marker and no nonce in the receipt or
-    # registry, so the only path that can reach the profile layout is the
-    # candidate's explicit migrate_layout.
-    migrated_root = make_root_one_fixture(pool, migrated)
-    expect(
-        perm.read_json(perm.receipt_path(pool, migrated))["version"] == "oxide.outputs.transition/2",
-        "11: the source-shaped fixture is not a /2 receipt",
-    )
-    marker_path = os.path.join(migrated_root, MARKER)
-    root_ino = os.stat(migrated_root).st_ino
-    payload = sorted(os.listdir(migrated_root))
-    code, _, stderr = oxide(proof, ["outputs", "adopt"], "11 migrate", migrated)
-    expect(code == 0, f"11: candidate migration failed: {stderr}")
-    expect_layout(migrated, {"debug": f"link:{migrated_root}", "release": f"link:{migrated_root}"})
-    upgraded = perm.read_json(marker_path)
-    expect(upgraded["version"] == "oxide.outputs.root/2", "11: marker not upgraded to root/2")
-    nonce = upgraded["nonce"]
-    expect(len(nonce) == 32, "11: migrated nonce is not 128-bit hex")
-    migrated_receipt = receipt(pool, migrated)
-    expect({p["selected"]["nonce"] for p in migrated_receipt["links"] if p.get("selected")} == {nonce}, "11: members do not share the upgraded nonce")
-    expect(os.stat(migrated_root).st_ino == root_ino, "11: the root inode changed")
-    present = {name for name in os.listdir(migrated_root) if name in payload}
-    expect(present == set(payload), f"11: root payload changed: {present} vs {payload}")
-    expect(not any(name.endswith(".oxide-old-2") for name in os.listdir(migrated_root)), "11: the marker backup was kept")
-    registry = perm.read_json(os.path.join(pool, "oxide-managed", "outputs", "registry.json"))
-    rows = [row for row in registry["rows"] if row["checkout_id"] == perm.hashlib.sha256(migrated.encode()).hexdigest()]
-    expect({row["member"] for row in rows if row["selected"]} == {"debug", "release"}, f"11: registry members {rows}")
-    expect({row["nonce"] for row in rows} == {nonce}, "11: registry nonces do not share the upgraded nonce")
-    expect(migrated_receipt["version"] == "oxide.outputs.transition/3", "11: migrated receipt version")
-
     # Case 10 (base half): a BASE-produced whole-target /2 state and warm slot
     # key created BEFORE this pool publishes the successor fence. The candidate
     # must reuse that exact slot, receipt and link unchanged.
@@ -641,6 +733,68 @@ def run(proof: Proof, repo: str) -> None:
         "uses the whole-target layout" in stderr and "oxide outputs adopt" in stderr,
         f"10: the candidate did not print the one adopt notice: {stderr}",
     )
+
+
+    # ----- case 11: explicit migration of a base-created checkout ---------
+    # The base binary can create its committed whole-target /2 state only
+    # before the primary pool publishes the successor fence, so this case runs
+    # first, on the primary pool and the SAME private image, and the candidate
+    # then migrates it.
+    migrated = make_checkout(proof, "migrate")
+    base_legacy(proof, base, pool, migrated)
+    # The base binary's committed whole-target /2 state is made source-shaped
+    # BEFORE any migration: a root/1 marker and no nonce in the receipt or
+    # registry, so the only path that can reach the profile layout is the
+    # candidate's explicit migrate_layout.
+    migrated_root = make_root_one_fixture(pool, migrated)
+    expect(
+        perm.read_json(perm.receipt_path(pool, migrated))["version"] == "oxide.outputs.transition/2",
+        "11: the source-shaped fixture is not a /2 receipt",
+    )
+    marker_path = os.path.join(migrated_root, MARKER)
+    root_ino = os.stat(migrated_root).st_ino
+    payload = sorted(os.listdir(migrated_root))
+    # Persist the exact bounded PRE-migration registry/receipt/marker bytes in
+    # OWN evidence before the migration and its oracle.
+    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE", "")
+    if evidence:
+        for name, path in (
+            ("registry", os.path.join(pool, "oxide-managed", "outputs", "registry.json")),
+            ("receipt", perm.receipt_path(pool, migrated)),
+            ("marker", marker_path),
+        ):
+            with open(os.path.join(evidence, f"case11-{name}-pre.json"), "wb") as handle:
+                handle.write(perm.read_bytes(path))
+    code, _, stderr = oxide(proof, ["outputs", "adopt"], "11 migrate", migrated)
+    expect(code == 0, f"11: candidate migration failed: {stderr}")
+    expect_layout(migrated, {"debug": f"link:{migrated_root}", "release": f"link:{migrated_root}"})
+    upgraded = perm.read_json(marker_path)
+    expect(upgraded["version"] == "oxide.outputs.root/2", "11: marker not upgraded to root/2")
+    nonce = upgraded["nonce"]
+    expect(len(nonce) == 32, "11: migrated nonce is not 128-bit hex")
+    migrated_receipt = receipt(pool, migrated)
+    expect({p["selected"]["nonce"] for p in migrated_receipt["links"] if p.get("selected")} == {nonce}, "11: members do not share the upgraded nonce")
+    expect(os.stat(migrated_root).st_ino == root_ino, "11: the root inode changed")
+    present = {name for name in os.listdir(migrated_root) if name in payload}
+    expect(present == set(payload), f"11: root payload changed: {present} vs {payload}")
+    expect(not any(name.endswith(".oxide-old-2") for name in os.listdir(migrated_root)), "11: the marker backup was kept")
+    registry_path = os.path.join(pool, "oxide-managed", "outputs", "registry.json")
+    registry = perm.read_json(registry_path)
+    checkout_id = perm.hashlib.sha256(migrated.encode()).hexdigest()
+    rows = [row for row in registry["rows"] if row["checkout_id"] == checkout_id]
+    # Persist the exact bounded registry/receipt/marker bytes into OWN evidence
+    # BEFORE the oracle so a failure leaves the real state for diagnosis.
+    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE", "")
+    if evidence:
+        for name, path in (
+            ("registry", registry_path),
+            ("receipt", perm.receipt_path(pool, migrated)),
+            ("marker", marker_path),
+        ):
+            with open(os.path.join(evidence, f"case11-{name}-post.json"), "wb") as handle:
+                handle.write(perm.read_bytes(path))
+    validate_migrated_registry(rows, migrated_root, nonce, upgraded.get("volume_uuid"), upgraded["generation"])
+    expect(migrated_receipt["version"] == "oxide.outputs.transition/3", "11: migrated receipt version")
 
     # Explicit positive control BEFORE any external-root oracle: the
     # registered removable volume is really selected, so an internal-pool
@@ -1585,9 +1739,19 @@ def run(proof: Proof, repo: str) -> None:
 
 
 
+USAGE = "usage: test-profile-outputs.py [--plan|--self-check]\n--plan prints the fixed allocation and cases; --self-check runs the pure\nregistry predicates only. Neither has filesystem effects."
+
+
 def main() -> int:
-    if "--plan" in sys.argv[1:]:
+    arguments = sys.argv[1:]
+    if arguments == ["--plan"]:
         return plan_only()
+    if arguments == ["--self-check"]:
+        pure_registry_controls()
+        return 0
+    if arguments:
+        print(USAGE, file=sys.stderr)
+        return 2
     if sys.platform != "darwin":
         fail("the profile-outputs proof requires macOS")
     scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
@@ -1607,14 +1771,13 @@ def main() -> int:
     proof = Proof(root)
     try:
         run(proof, repo)
-        # Ordinary detach is part of the proof, not best-effort cleanup: a
-        # failed detach fails the run and leaves the mount recorded for the
-        # custodian instead of claiming 20 cases.
-        proof.detach()
     except BaseException:
-        if proof.mount:
-            print(f"mount {proof.mount} retained for the custodian after failure", file=sys.stderr)
+        try:
+            detach_owned_volume(proof, "failure")
+        except BaseException as error:
+            print(f"ordinary detach after failure also failed: {error!r}", file=sys.stderr)
         raise
+    detach_owned_volume(proof, "success")
     print("profile-outputs proof: 20 cases held", flush=True)
     return 0
 
