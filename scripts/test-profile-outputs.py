@@ -225,6 +225,9 @@ def plan_only() -> int:
     print("                  a few MiB each, inside the fixtures allowance")
     print(f"  staging         candidate {os.environ.get('OXIDE_PROFILE_HEAD', 'this HEAD')} and base {BASE}")
     print("  seed            none: both stagings are plain Cargo offline builds from authenticated pinned source")
+    print("  base order      both base-created legacy states (case 10 warm slot and case 11")
+    print("                  migration) are prepared under ONE base-compatible registration")
+    print("                  before ANY candidate command runs in that pool")
     print("  monitoring      supervisor reserve sampling, census/closure and cleanup; this script runs no clock, timer or harness")
     print("  image           one owned 128 MiB APFS sparse image at a unique /Volumes/<name>,")
     print("                  attached with hdiutil -owners on for every attach/reattach,")
@@ -477,6 +480,45 @@ def attach_owned_image(
     return mount
 
 
+def detach_failure_record(label: str, mount: str, detach_exit: int, stderr: str, image: str, backing_present: bool, details: dict) -> dict:
+    """The bounded record a failed ordinary detach retains: attachment custody
+    must be reported with the mount, device, volume UUID, image path, backing
+    presence and ownership state."""
+    return {
+        "label": label,
+        "mount": mount,
+        "detach_exit": detach_exit,
+        "stderr": stderr[:4000],
+        "image": image,
+        "backing_present": backing_present,
+        "details": {
+            "device": details.get("device"),
+            "volume_uuid": details.get("volume_uuid"),
+            "owners": details.get("owners"),
+            "mount_point": details.get("mount_point"),
+        },
+    }
+
+
+def pure_detach_record_control() -> None:
+    """No-subprocess control for the detach-failure custody record."""
+    record = detach_failure_record(
+        "failure",
+        "/Volumes/ProfileOutputs-proof",
+        -1,
+        "detach refused",
+        "/evidence/owned-image/volume.sparseimage",
+        True,
+        {"device": "/dev/disk99s1", "volume_uuid": "11111111-2222-3333-4444-555555555555", "owners": True, "mount_point": "/Volumes/ProfileOutputs-proof"},
+    )
+    for key in ("mount", "device", "volume_uuid", "image", "backing_present"):
+        reference = record if key in record else record["details"]
+        expect(reference.get(key), f"the detach-failure record does not carry {key}")
+    expect(record["details"].get("owners") is True, "the detach-failure record does not carry ownership")
+    expect(record["backing_present"] is True, "the detach-failure record does not report the retained backing")
+    print("pure detach-failure record control: ok", flush=True)
+
+
 def detach_owned_volume(proof: Proof, label: str) -> None:
     """Ordinary detach of the proof-owned mount, used on success AND after a
     failure once direct child outcomes are known. A failed detach fails the
@@ -504,15 +546,15 @@ def detach_owned_volume(proof: Proof, label: str) -> None:
                 }
             except Exception:
                 details = {"plist": "unreadable"}
-        record = {
-            "label": label,
-            "mount": mount,
-            "detach_exit": result.returncode,
-            "stderr": result.stderr.decode(errors="replace")[:4000],
-            "image": backing,
-            "backing_present": os.path.exists(backing),
-            "details": details,
-        }
+        record = detach_failure_record(
+            label,
+            mount,
+            result.returncode,
+            result.stderr.decode(errors="replace"),
+            backing,
+            os.path.exists(backing),
+            details,
+        )
         evidence = os.environ["OXIDE_PROOF_EVIDENCE"]
         with open(os.path.join(evidence, "detach-failure.json"), "w", encoding="utf-8") as handle:
             json.dump(record, handle, indent=2)
@@ -673,6 +715,7 @@ def adopt(proof: Proof, checkout: str, label: str) -> None:
 
 def run(proof: Proof, repo: str) -> None:
     pure_registry_controls()
+    pure_detach_record_control()
     source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
     dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
     expect(not dirty, f"candidate checkout is not clean: {dirty}")
@@ -708,8 +751,9 @@ def run(proof: Proof, repo: str) -> None:
     register(proof, pool)
 
     # Case 10 (base half): a BASE-produced whole-target /2 state and warm slot
-    # key created BEFORE this pool publishes the successor fence. The candidate
-    # must reuse that exact slot, receipt and link unchanged.
+    # key prepared under the base-compatible registration before ANY candidate
+    # command runs in this pool. The candidate must later reuse that exact
+    # slot, receipt and link unchanged.
     legacy = make_checkout(proof, "legacy")
     result = proof.run([base, "outputs", "adopt"], cwd=legacy, env=proof.env, timeout=120)
     expect(result.returncode == 0, f"10: base whole-target adopt failed: {result.stderr.decode(errors='replace')}")
@@ -723,27 +767,11 @@ def run(proof: Proof, repo: str) -> None:
     result = proof.run([base, "build"], cwd=legacy, env=proof.env, timeout=180)
     expect(result.returncode == 0, f"10: base build failed: {result.stderr.decode(errors='replace')[-2000:]}")
     base_slot, _ = perm.slot_state(result.stderr.decode(errors="replace"))
-    code, _, stderr = oxide(proof, ["build"], "10 candidate warm on base slot", legacy)
-    expect(code == 0, f"10: candidate build on the base legacy slot failed: {stderr}")
-    candidate_slot, candidate_state = perm.slot_state(stderr)
-    expect(candidate_state == "warm", f"10: candidate did not reuse the base key: {summary(stderr)}")
-    expect(candidate_slot == base_slot, f"10: candidate changed the base slot {base_slot} -> {candidate_slot}")
-    expect(os.path.islink(os.path.join(legacy, "target")), "10: the base legacy link changed")
-    expect(link_at(os.path.join(legacy, "target")) == legacy_root, "10: the base legacy link text changed")
-    expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: the base receipt was rewritten")
-    base_links = item(pool, legacy, "links")
-    expect(base_links[0]["member"] == "target", "10: the base placement changed")
-    expect(
-        "uses the whole-target layout" in stderr and "oxide outputs adopt" in stderr,
-        f"10: the candidate did not print the one adopt notice: {stderr}",
-    )
-
-
     # ----- case 11: explicit migration of a base-created checkout ---------
     # The base binary can create its committed whole-target /2 state only
-    # before the primary pool publishes the successor fence, so this case runs
-    # first, on the primary pool and the SAME private image, and the candidate
-    # then migrates it.
+    # before any candidate command runs in this pool, so this base state is
+    # prepared under the SAME base-compatible registration as case 10's, and
+    # the candidate migrates it only after case 10's base warm check.
     migrated = make_checkout(proof, "migrate")
     base_legacy(proof, base, pool, migrated)
     # The base binary's committed whole-target /2 state is made source-shaped
@@ -773,6 +801,26 @@ def run(proof: Proof, repo: str) -> None:
         ):
             with open(os.path.join(evidence, f"case11-{name}-pre.json"), "wb") as handle:
                 handle.write(perm.read_bytes(path))
+
+    # Case 10 (candidate half): only after BOTH base-created legacy states
+    # (this warm-slot checkout and case 11's migration checkout) exist does the
+    # first candidate command run in this pool.
+    code, _, stderr = oxide(proof, ["build"], "10 candidate warm on base slot", legacy)
+    expect(code == 0, f"10: candidate build on the base legacy slot failed: {stderr}")
+    candidate_slot, candidate_state = perm.slot_state(stderr)
+    expect(candidate_state == "warm", f"10: candidate did not reuse the base key: {summary(stderr)}")
+    expect(candidate_slot == base_slot, f"10: candidate changed the base slot {base_slot} -> {candidate_slot}")
+    expect(os.path.islink(os.path.join(legacy, "target")), "10: the base legacy link changed")
+    expect(link_at(os.path.join(legacy, "target")) == legacy_root, "10: the base legacy link text changed")
+    expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: the base receipt was rewritten")
+    base_links = item(pool, legacy, "links")
+    expect(base_links[0]["member"] == "target", "10: the base placement changed")
+    expect(
+        "uses the whole-target layout" in stderr and "oxide outputs adopt" in stderr,
+        f"10: the candidate did not print the one adopt notice: {stderr}",
+    )
+
+    # ----- case 11 (continued): the candidate migration runs only now -----
     code, _, stderr = oxide(proof, ["outputs", "adopt"], "11 migrate", migrated)
     expect(code == 0, f"11: candidate migration failed: {stderr}")
     expect_layout(migrated, {"debug": f"link:{migrated_root}", "release": f"link:{migrated_root}"})
@@ -1811,6 +1859,7 @@ def main() -> int:
         return plan_only()
     if arguments == ["--self-check"]:
         pure_registry_controls()
+        pure_detach_record_control()
         return 0
     if arguments:
         print(USAGE, file=sys.stderr)
