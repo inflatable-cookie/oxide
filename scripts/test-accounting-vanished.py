@@ -19,6 +19,13 @@ import sys
 import time
 from typing import Optional
 
+sys.dont_write_bytecode = True
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import offline_seed
+
 BUILDER = "1.97.1"
 EXPECTED_BRANCH = "ns-ff568299-4433-4c44-bbcb-d046ef2d9d0c"
 EXPECTED_RUNNER_SHA256 = "8e379c93416c6e06b7f06bec7f86dba4fca4c8900b1cc87f1eb6303d39897a9d"
@@ -325,103 +332,30 @@ def stage_oxide(scratch: str) -> str:
 
 
 def seed_private_cargo_home(destination: str) -> None:
-    """Copy only this locked workspace's cached registry inputs into scratch."""
-    host = os.path.realpath(
-        os.environ.get("CARGO_HOME", os.path.expanduser("~/.cargo"))
+    """Seed the private offline CARGO_HOME from this checkout's Cargo.lock.
+
+    The shared bounded seeder (`scripts/offline_seed.py`, oxide#131) copies
+    only the lock's registry and pinned Git inputs, checks every archive
+    against its lock checksum and copies no host `registry/src` tree. Its
+    source hash is in this proof's receipt: importing it transfers no
+    qualification.
+    """
+    lock_bytes = open(os.path.join(REPO, "Cargo.lock"), "rb").read()
+    deadline = int(os.environ["OXIDE_PROOF_DEADLINE_NS"]) - 30 * NS
+    try:
+        seed = offline_seed.seed_cargo_home(
+            os.environ.get("CARGO_HOME") or os.path.expanduser("~/.cargo"),
+            destination,
+            lock_bytes,
+            deadline_ns=deadline,
+        )
+    except offline_seed.SeedRefusal as error:
+        fail(f"bounded offline seed refused: {error}")
+    print(
+        f"private offline Cargo seed: {seed['packages']} registry packages, "
+        f"{len(seed['git']['candidates'])} Git candidates, "
+        f"{seed['aggregate_bytes']} bytes, {seed['entries']} entries"
     )
-    lock = open(os.path.join(REPO, "Cargo.lock"), encoding="utf-8").read()
-    packages: list[tuple[str, str]] = []
-    for block in lock.split("[[package]]")[1:]:
-        name = None
-        version = None
-        registry = False
-        for line in block.splitlines():
-            if line.startswith('name = "'):
-                name = line.split('"')[1]
-            elif line.startswith('version = "'):
-                version = line.split('"')[1]
-            elif line.startswith('source = "registry+'):
-                registry = True
-        if registry and name and version:
-            packages.append((name, version))
-
-    source_root = os.path.join(host, "registry", "src")
-    sources = []
-    for name, version in packages:
-        found = None
-        if os.path.isdir(source_root):
-            for registry in os.listdir(source_root):
-                candidate = os.path.join(source_root, registry, f"{name}-{version}")
-                if os.path.isdir(candidate):
-                    found = (registry, candidate)
-                    break
-        if found is None:
-            fail(f"locked offline source is missing from the host cache: {name}-{version}")
-        sources.append((name, version, found[0], found[1]))
-
-    os.makedirs(destination, mode=0o700, exist_ok=True)
-    index_root = os.path.join(host, "registry", "index")
-    index_registry = None
-    index_score = -1
-    if os.path.isdir(index_root):
-        for registry in os.listdir(index_root):
-            cache = os.path.join(index_root, registry, ".cache")
-            if not os.path.isdir(cache):
-                continue
-            score = sum(
-                os.path.isfile(os.path.join(cache, *index_path(name)))
-                for name, _version in packages
-            )
-            if score > index_score:
-                index_registry, index_score = registry, score
-    if index_registry is None or index_score != len(packages):
-        fail(
-            "the host Cargo cache lacks a complete sparse index for offline staging: "
-            f"{index_score}/{len(packages)} locked registry packages"
-        )
-    print(f"private offline Cargo seed: {len(packages)} locked registry packages")
-    index_source = os.path.join(index_root, index_registry)
-    index_destination = os.path.join(destination, "registry", "index", index_registry)
-    os.makedirs(index_destination, mode=0o700, exist_ok=True)
-    config = os.path.join(index_source, "config.json")
-    if os.path.isfile(config):
-        shutil.copy2(config, os.path.join(index_destination, "config.json"))
-    for name, _version in packages:
-        relative = index_path(name)
-        source = os.path.join(index_source, ".cache", *relative)
-        if os.path.isfile(source):
-            target = os.path.join(index_destination, ".cache", *relative)
-            os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
-            shutil.copy2(source, target)
-
-    for name, version, _registry, source in sources:
-        target = os.path.join(
-            destination, "registry", "src", index_registry, f"{name}-{version}"
-        )
-        shutil.copytree(source, target, dirs_exist_ok=True)
-        archive = os.path.join(
-            host, "registry", "cache", _registry, f"{name}-{version}.crate"
-        )
-        if os.path.isfile(archive):
-            archive_target = os.path.join(
-                destination,
-                "registry",
-                "cache",
-                index_registry,
-                os.path.basename(archive),
-            )
-            os.makedirs(os.path.dirname(archive_target), mode=0o700, exist_ok=True)
-            shutil.copy2(archive, archive_target)
-
-
-def index_path(name: str) -> tuple[str, ...]:
-    if len(name) == 1:
-        return ("1", name)
-    if len(name) == 2:
-        return ("2", name)
-    if len(name) == 3:
-        return ("3", name[0], name)
-    return (name[:2], name[2:4], name)
 
 
 def prepare_pool(
@@ -684,6 +618,7 @@ def main() -> None:
         "src/lease/pool.rs",
         "src/bin/oxide/main.rs",
         "scripts/test-accounting-vanished.py",
+        "scripts/offline_seed.py",
     )
     print(
         "accounting-vanished source: "

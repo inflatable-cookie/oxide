@@ -375,18 +375,22 @@ run = "python3 scripts/test-oxide-cli.py --cargo-matrix 1.98.1"
 admission = "heavy"
 run = "python3 scripts/test-oxide-cli.py --cargo-matrix 1.99.1"
 
-# Rustc wrapper bypass (oxide#099): stages `oxide` offline with 1.97.1, then
-# on tiny std-only fixtures with a private HOME, CARGO_HOME and directory
-# pool proves leased check/build/test/clippy and an external subcommand's
-# `$CARGO` never run a recording fake `build.rustc-wrapper` (config, env and
-# `--config`), plain Cargo does, the workspace wrapper and clippy-driver
-# still run, and the OXIDE_ALLOW_RUSTC_WRAPPER=1 opt-in restores it with its
-# warning. No real sccache, image or download. Plain-Cargo staging has no
-# host-reserve watchdog (reserve checked before and after). Not a benchmark
-# and not full QA.
+# Rustc wrapper bypass (oxide#099) and the shared offline seeder (oxide#131):
+# one fixed script and the whole command under the qualified shared supervisor
+# (oxide#109, 300 s absolute, 512 MiB monitored scratch including seeding,
+# staging, fixtures and cleanup). It runs the seeder's synthetic cases first,
+# seeds HEAD's Cargo.lock into a private offline CARGO_HOME through the shared
+# bounded seeder (registry and the one pinned Longhorn Git source), stages
+# `oxide` offline with 1.97.1 from it, then on tiny std-only fixtures with a
+# private HOME, CARGO_HOME and directory pool proves leased
+# check/build/test/clippy and an external subcommand's `$CARGO` never run a
+# recording fake `build.rustc-wrapper` (config, env and `--config`), plain
+# Cargo does, the workspace wrapper and clippy-driver still run, and the
+# OXIDE_ALLOW_RUSTC_WRAPPER=1 opt-in restores it with its warning. No real
+# sccache, image or download. Not a benchmark and not full QA.
 [tasks."rust:oxide-wrapper-bypass"]
 admission = "heavy"
-run = "python3 scripts/test-oxide-wrapper-bypass.py"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-oxide-wrapper-bypass.py"
 
 # Focused proof for `oxide pool describe --json` (oxide#112). The script's gate
 # RUN_BOUND is True after the apparatus PASS (53ec48e4). It runs inside the

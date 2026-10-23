@@ -16,6 +16,27 @@ The sections on the CLI, image backing, capacity status, exit codes and the
 reviewed handover below are history: Nucleus's installed binary and the
 reviewed handover copies outside this repository are retained, untouched.
 
+### Retired lease-CLI fixture audit (papercut 17674724, closed deprecated)
+
+Papercut `17674724-b4d7-414d-916f-e53d277f5ee8` asked for the retired
+standalone lease CLI fixture's scratch cleanup. Tom approved conditional
+deprecation (Supervisor `083047a8`). The original subject is bound to oxide#064
+/ PR #64 review `6213212075` at source `ecc185bc`:
+`scripts/test-storage-lease-cli.py`'s `scratch_root` (line 32) called an
+external `mktemp`, and `main` (line 439) and `prove_usage` (line 135) each
+called it. Current main `d246d40` has no such script, no
+`rust:storage-lease-cli` selector and no `oxide-storage-lease` binary;
+[retirements](../retired.toml) records exactly that script, selector and
+binary as retired on 2026-10-20. Both adviser inventories found no execution
+route. The retained `src/lease/tests.rs` `Fixture::new` does execute through
+`test rust`, but it is a distinct Rust fixture using `std::env::temp_dir`, not
+the original repeated-`mktemp` path, and it is not declared retired or fixed.
+The suspended `oxide-cli` modes fail before effects; `clean-safety` and
+`launch-check` each allocate one fallback root and preserve failure evidence.
+Disposition: closed as deprecated with this bounded inventory evidence. No
+historical temporary-directory cleanup and no fix claim follows, and no broad
+temporary-file refactor or Rust-fixture cleanup is implied.
+
 Former status: unpublished Oxide-only product command. Same-UID callers take exclusive
 owned slots on a verified APFS payload volume through a short-lived OS lock and
 a durable JSON ledger. There is no resident daemon, HMAC credential, issuer,

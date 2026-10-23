@@ -1,43 +1,96 @@
+#!/usr/bin/env python3
 """Prove that leased `oxide` builds bypass an inherited rustc wrapper (oxide#099).
 
-Stages `oxide` offline with 1.97.1 (an explicit empty RUSTC_WRAPPER, so the
-host's wrapper never runs), then on tiny std-only fixtures with a private
-HOME, CARGO_HOME, scratch directory pool and targets: a fixture Cargo config
-sets `build.rustc-wrapper` to a recording fake wrapper. Plain `cargo check`
-invokes it (control); leased `check`, `build`, `test` and an external
-subcommand's `$CARGO build` never do, nor do environment-only,
-`CARGO_BUILD_RUSTC_WRAPPER` and `--config` wrappers. A recording
-`RUSTC_WORKSPACE_WRAPPER` still runs, `oxide clippy` runs the installed
-clippy-driver, `OXIDE_ALLOW_RUSTC_WRAPPER=1` restores the wrapper with its
-warning, other values are ignored, and summary and `status` lines are
-checked, including a Cargo home holding both `config` and `config.toml`
-(Cargo reads only `config`). No real sccache, image or download. 300 s
-including cleanup, 512 MiB owned scratch. Every child is settled on any
-failure after its spawn.
+Rewritten for oxide#131: this is one fixed script whose whole command is the
+qualified shared proof supervisor (`scripts/bounded-test.py`, oxide#109):
 
-Host reserve: the 20 GiB reserve is sampled at admission and after each
-phase. The fixture builds run under Oxide's own host-reserve watchdog (scratch
-directory pool). Plain-Cargo staging has no existing host-reserve watchdog
-covering it: this script only checks the reserve before and after staging
-(observed staging write 68 MiB). That gap is reported, not filled with a
-bespoke supervisor. Not a benchmark and not full QA.
+    python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- \
+        python3 scripts/test-oxide-wrapper-bypass.py
+
+The supervisor owns the absolute `CLOCK_UPTIME_RAW` deadline, the continuous
+20 GiB host-reserve watchdog (through plain-Cargo staging and every fixture
+child), the monitored 512 MiB scratch budget and cleanup. This script reads
+`OXIDE_TASK_SCRATCH_ROOT`, `OXIDE_PROOF_EVIDENCE` and `OXIDE_PROOF_DEADLINE_NS`
+and refuses without them. It creates no scratch, starts no second clock, takes
+no reserve samples or owned-byte readings of its own, starts no process
+session and sends no group signal: children run in the supervisor's
+cooperative session, and a child timeout kills only that direct child PID and
+reports closure unknown. It resolves `cargo`, `rustc` and `git` once from the
+host PATH and gives children those directories plus the system base, because
+its own child environment is otherwise scrubbed. Closure
+is the supervisor's post-leader census, which is the only evidence any of this
+script's children leave none of their own behind. Cargo may start its own
+process groups; neither this script nor the supervisor signals them, and this
+script makes no separate-group closure claim. A process that leaves the
+session (`setsid`) is outside that census.
+
+Fit: seed 256 MiB, staging 128 MiB, fixtures 32 MiB, evidence 32 MiB, margin
+64 MiB of the one 512 MiB allocation; 45 s seed + 170 s staging ceiling + 55 s
+other work + 30 s cleanup inside 300 s. These are allocations and observations,
+not a measured ceiling for other shapes.
+
+Cases, in order:
+1. The shared bounded seeder's synthetic suite (`scripts/offline_seed.py`,
+   oxide#131): registry+Git positive, a copied-but-rejected candidate, a
+   measured and unattempted oversized candidate, symlinked host config and
+   hooks skipped at a candidate's root, a wrong commit, a missing candidate, a
+   malformed lock, symlinked inputs and the byte/candidate/entry cap
+   negatives, all on tiny fixtures in this proof's own scratch.
+2. Staging: this HEAD's debug `oxide`, built offline from a private CARGO_HOME
+   seeded from HEAD's `Cargo.lock` by that same seeder (registry and the one
+   pinned Longhorn Git source), with an explicit empty `RUSTC_WRAPPER`. The
+   private Longhorn checkout is then required at the locked commit.
+3. On tiny std-only fixtures with a private HOME, CARGO_HOME, scratch
+   directory pool and targets: a fixture Cargo config sets
+   `build.rustc-wrapper` to a recording fake wrapper. Plain `cargo check`
+   invokes it (control); leased `check`, `build`, `test` and an external
+   subcommand's `$CARGO build` never do, nor do environment-only,
+   `CARGO_BUILD_RUSTC_WRAPPER` and `--config` wrappers. A recording
+   `RUSTC_WORKSPACE_WRAPPER` still runs, `oxide clippy` runs the installed
+   clippy-driver, `OXIDE_ALLOW_RUSTC_WRAPPER=1` restores the wrapper with its
+   warning, other values are ignored, and summary and `status` lines are
+   checked, including a Cargo home holding both `config` and `config.toml`
+   (Cargo reads only `config`).
+
+No real sccache, image or download. Every proof child's stdout and stderr are
+kept in the evidence directory. Not a benchmark and not full QA.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shutil
-import signal
 import subprocess
 import sys
 import time
 import traceback
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+import offline_seed  # scripts/offline_seed.py, oxide#131; its hash is in the receipt
 
 PROOF_SECONDS = 300
-SCRATCH_LIMIT_BYTES = 512 * 1024 * 1024
-HOST_RESERVE_BYTES = 20 * 1024 * 1024 * 1024
+SEED_BYTES = 256 * 1024 * 1024
+STAGING_BYTES = 128 * 1024 * 1024
+FIXTURE_BYTES = 32 * 1024 * 1024
+EVIDENCE_BYTES = 32 * 1024 * 1024
+MARGIN_BYTES = 64 * 1024 * 1024
 BUILDER = "1.97.1"
 BUILDER_VERSIONS = ("cargo 1.97.1 (c980f4866 2026-06-30)", "rustc 1.97.1 (8bab26f4f 2026-07-14)")
-STARTED = time.monotonic()
+# Shutdown margin kept inside the supervisor's own 20 s stop reserve.
+SHUTDOWN_MARGIN_NS = 30 * 1_000_000_000
+NS = 1_000_000_000
+REPO = HERE.parent
+ROOT_VAR = "OXIDE_TASK_SCRATCH_ROOT"
+TEMP_VARS = (ROOT_VAR, "TMPDIR", "TMP", "TEMP")
+RUNNER_KEEP = ("OXIDE_PROOF_EVIDENCE", "OXIDE_PROOF_DEADLINE_NS")
+SCRUB_PREFIXES = ("CARGO", "RUSTC", "RUSTFLAGS", "RUSTDOC", "SCCACHE", "OXIDE_")
+PATH_BASE = "/usr/bin:/bin:/usr/sbin:/sbin"
 
 RECORDER = """#!/bin/sh
 # Records one line per rustc invocation, then runs it.
@@ -66,183 +119,340 @@ def fail(message: str) -> None:
     raise RuntimeError(message)
 
 
-def remaining() -> float:
-    left = PROOF_SECONDS - (time.monotonic() - STARTED)
-    if left <= 0:
-        fail(f"proof exceeded {PROOF_SECONDS} s")
-    return left
+def now_ns() -> int:
+    return time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
 
 
-def reserve(path: str, phase: str) -> None:
-    stats = os.statvfs(path)
-    free = stats.f_bavail * stats.f_frsize
-    print(f"wrapper-bypass reserve {phase}: {free // (1024 ** 3)} GiB free")
-    if free < HOST_RESERVE_BYTES:
-        fail(f"host free space {free} is below the 20 GiB reserve at {phase}")
-
-
-def tree_bytes(root: str) -> int:
-    total = 0
-    for current, _, files in os.walk(root, followlinks=False):
-        for name in files:
-            try:
-                total += os.lstat(os.path.join(current, name)).st_blocks * 512
-            except FileNotFoundError:
-                pass
+def owned_bytes(root: Path) -> int:
+    """Allocated bytes under root. A walk error raises: no partial total."""
+    total = os.lstat(root).st_blocks * 512
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_raise):
+        for name in dirnames + filenames:
+            total += os.lstat(os.path.join(dirpath, name)).st_blocks * 512
     return total
 
 
-def run(argv: list, cwd: str, env: dict, limit: float = 90) -> tuple:
-    """One child in its own session. Every failure after the spawn (deadline,
-    timeout, read error, interrupt) settles it before raising: TERM to its
-    process group (Oxide forwards TERM to its Cargo group), then KILL. A group
-    that still exists afterwards is reported as unclosed, never as closed."""
-    timeout = min(limit, remaining())
-    child = subprocess.Popen(
-        argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, errors="replace", start_new_session=True,
-    )
-    try:
-        stdout, stderr = child.communicate(timeout=timeout)
-    except BaseException:
-        settle(child, argv)
-        raise
-    return child.returncode, stdout, stderr
+def _raise(error: OSError) -> None:
+    raise error
 
 
-def group_gone(pgid: int) -> bool | None:
-    try:
-        os.killpg(pgid, 0)
-        return False
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        return None
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def settle(child: subprocess.Popen, argv: list) -> None:
-    """TERM, then KILL, the child's whole process group; each step waits up
-    to 10 s for the group to empty, reaping the leader."""
-    state = None
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(child.pid, sig)
-        except ProcessLookupError:
-            pass
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            child.poll()
-            state = group_gone(child.pid)
-            if state is not False:
-                break
-            time.sleep(0.1)
-        if state is not False:
-            break
-    child.poll()
-    verdict = {True: "settled", False: "UNCLOSED", None: "closure UNKNOWN"}[state]
-    print(f"wrapper-bypass: process group {child.pid} of {argv[:3]} {verdict} after a failure", file=sys.stderr)
-    print("wrapper-bypass: a Cargo group Oxide started is closed only if Oxide forwarded TERM before KILL", file=sys.stderr)
+class Proof:
+    """This proof's own state: the supervisor's root, evidence and deadline."""
+
+    def __init__(self) -> None:
+        if sys.platform != "darwin":
+            fail("the wrapper-bypass proof requires macOS")
+        missing = [name for name in (ROOT_VAR,) + RUNNER_KEEP if not os.environ.get(name)]
+        if missing:
+            fail(f"run under the qualified shared supervisor; missing {', '.join(missing)}")
+        self.root = Path(os.environ[ROOT_VAR])
+        if os.path.realpath(self.root) != str(self.root):
+            fail(f"{ROOT_VAR} must be canonical")
+        if not self.root.is_dir():
+            fail(f"{ROOT_VAR} is not a directory: {self.root}")
+        if any(os.path.realpath(os.environ[name]) != str(self.root) for name in TEMP_VARS[1:]):
+            fail("TMPDIR, TMP and TEMP must all be the supervisor's scratch root")
+        self.evidence = Path(os.environ["OXIDE_PROOF_EVIDENCE"])
+        if not self.evidence.is_dir():
+            fail("the supervisor did not provide OXIDE_PROOF_EVIDENCE")
+        self.deadline_ns = int(os.environ["OXIDE_PROOF_DEADLINE_NS"]) - SHUTDOWN_MARGIN_NS
+        self.started = now_ns()
+        self.phases: list[dict] = []
+        self.closure_known = True
+        # Resolve the tools from the host PATH before any child environment
+        # replaces it: this script's children run with a scrubbed PATH.
+        self.tools = {}
+        for tool in ("cargo", "rustc", "git"):
+            found = shutil.which(tool)
+            if found is None:
+                fail(f"{tool} is not on the host PATH")
+            self.tools[tool] = found
+        self.tool_dirs = os.pathsep.join(
+            sorted({os.path.dirname(path) for path in self.tools.values()})
+        )
+
+    def remaining(self) -> float:
+        left = self.deadline_ns - now_ns()
+        if left <= 0:
+            fail("the supervisor's absolute work cutoff was reached")
+        return left / NS
+
+    def elapsed(self) -> float:
+        return (now_ns() - self.started) / NS
+
+    def env(self, extra: dict | None = None) -> dict:
+        """Scrubbed host environment with the supervisor's temp variables."""
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(SCRUB_PREFIXES) or key in RUNNER_KEEP
+        }
+        for name in TEMP_VARS:
+            env[name] = str(self.root)
+        env["RUSTUP_AUTO_INSTALL"] = "0"
+        env["PATH"] = self.tool_dirs + os.pathsep + PATH_BASE
+        if extra:
+            env.update(extra)
+        return env
+
+    def mark_phase(self, label: str) -> None:
+        """Record when a phase finished. No sampling of any kind happens here:
+        the supervisor owns continuous reserve sampling, monitored owned bytes,
+        the deadline and cleanup, and reports them itself."""
+        entry = {"phase": label, "elapsed_s": round(self.elapsed(), 1)}
+        self.phases.append(entry)
+        (self.evidence / "phases.json").write_text(json.dumps(self.phases, indent=2))
+        print(f"wrapper-bypass phase {label}: {entry['elapsed_s']} s elapsed")
+
+    def run(
+        self,
+        argv: list,
+        *,
+        cwd: Path | str | None = None,
+        env: dict | None = None,
+        label: str,
+        limit: float = 120,
+    ) -> tuple[int, str, str]:
+        """One child in the supervisor's session, logs in the evidence directory.
+
+        No session and no timeout of its own beyond the deadline: a deadline
+        overrun kills only this direct child PID, records closure unknown and
+        fails. A Cargo group is never signalled from here.
+        """
+        out_path = self.evidence / f"{label}.stdout"
+        err_path = self.evidence / f"{label}.stderr"
+        self.remaining()
+        with out_path.open("wb") as out, err_path.open("wb") as err:
+            child = subprocess.Popen(argv, env=env, cwd=cwd, stdout=out, stderr=err)
+            try:
+                code = child.wait(timeout=min(limit, self.remaining()))
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+                self.closure_known = False
+                fail(f"{label}: the supervisor's work cutoff was reached; child closure is unknown")
+        return (
+            code,
+            out_path.read_text(errors="replace"),
+            err_path.read_text(errors="replace"),
+        )
 
 
-def lines(path: str) -> list:
-    if not os.path.exists(path):
-        return []
-    with open(path, encoding="utf-8") as handle:
-        return handle.read().splitlines()
-
-
-def write(path: str, text: str, mode: int = 0o644) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def write(path: Path, text: str, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(text)
     os.chmod(path, mode)
 
 
-def stage(parent: str, repo: str) -> str:
-    env = {name: value for name, value in os.environ.items()
-           if not name.startswith("SCCACHE_") and name not in (
-               "CARGO", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "RUSTC",
-               "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER")}
-    env.update({
-        "RUSTUP_TOOLCHAIN": BUILDER,
-        "RUSTC_WRAPPER": "",
-        "CARGO_TARGET_DIR": os.path.join(parent, "stage-target"),
-        "CARGO_PROFILE_DEV_DEBUG": "0",
-        "CARGO_NET_OFFLINE": "true",
-    })
-    versions = tuple(run([tool, "-V"], repo, env, 30)[1].strip() for tool in ("cargo", "rustc"))
+def lines(path: Path) -> list:
+    if not path.exists():
+        return []
+    with open(path, encoding="utf-8") as handle:
+        return handle.read().splitlines()
+
+
+def git(proof: Proof, *args: str) -> str:
+    """Read-only Git over this checkout, in the supervisor's session."""
+    code, out, err = proof.run(
+        [proof.tools["git"], "-C", str(REPO), *args], label=f"git-{args[0]}", limit=30
+    )
+    if code:
+        fail(f"git {args[0]} failed: {err[-800:]}")
+    return out.strip()
+
+
+def toolchain_channel() -> str:
+    text = (REPO / "rust-toolchain.toml").read_text()
+    marker = 'channel = "'
+    start = text.index(marker) + len(marker)
+    return text[start : text.index('"', start)]
+
+
+def seed_and_stage(proof: Proof) -> tuple[Path, dict]:
+    """Seed HEAD's lock into a private Cargo home, then build this HEAD's oxide."""
+    seed_root = proof.root / "stage"
+    seed_root.mkdir(parents=True, exist_ok=True)
+    cargo_home = seed_root / "cargo-home"
+    cargo_home.mkdir()
+    code, lock_text, lock_err = proof.run(
+        [proof.tools["git"], "-C", str(REPO), "show", "HEAD:Cargo.lock"],
+        label="git-show-lock",
+        limit=30,
+    )
+    if code:
+        fail(f"cannot read HEAD's Cargo.lock: {lock_err[-800:]}")
+    lock_bytes = lock_text.encode()
+    host_cargo_home = os.environ.get("CARGO_HOME") or os.path.join(os.path.expanduser("~"), ".cargo")
+    try:
+        seed = offline_seed.seed_cargo_home(
+            host_cargo_home, cargo_home, lock_bytes, deadline_ns=proof.deadline_ns
+        )
+    except offline_seed.SeedRefusal as error:
+        fail(f"bounded offline seed refused: {error}")
+    (proof.evidence / "seed.json").write_text(json.dumps(seed, indent=2))
+    print(
+        f"wrapper-bypass seed: {seed['packages']} registry packages, "
+        f"{len(seed['git']['candidates'])} Git candidates, {seed['aggregate_bytes']} bytes, "
+        f"{seed['entries']} entries, lock sha256 {seed['lock_sha256'][:12]}"
+    )
+    env = proof.env(
+        {
+            "RUSTUP_TOOLCHAIN": BUILDER,
+            "RUSTC_WRAPPER": "",
+            "CARGO_HOME": str(cargo_home),
+            "CARGO_TARGET_DIR": str(seed_root / "target"),
+            "CARGO_BUILD_BUILD_DIR": str(seed_root / "build"),
+            "CARGO_NET_OFFLINE": "true",
+            "CARGO_PROFILE_DEV_DEBUG": "0",
+        }
+    )
+    versions = tuple(
+        proof.run(
+            [proof.tools[tool], "-V"],
+            cwd=REPO,
+            env=env,
+            label=f"stage-{tool}-version",
+            limit=30,
+        )[1].strip()
+        for tool in ("cargo", "rustc")
+    )
     print(f"wrapper-bypass setup: {versions}")
     if versions != BUILDER_VERSIONS:
         fail(f"builder is not {BUILDER}: {versions}")
-    code, _, stderr = run(["cargo", "build", "--locked", "--offline", "--bin", "oxide"], repo, env, 200)
+    code, _, stderr = proof.run(
+        [proof.tools["cargo"], "build", "--locked", "--offline", "--bin", "oxide"],
+        cwd=REPO,
+        env=env,
+        label="stage-build",
+        limit=180,
+    )
     if code:
         fail(f"staging build failed: {stderr[-2000:]}")
-    oxide = os.path.join(parent, "stage-target", "debug", "oxide")
-    if not os.access(oxide, os.X_OK):
+    git_source = seed["git"]
+    if git_source.get("candidates"):
+        try:
+            chosen = offline_seed.verify_private_checkout(
+                cargo_home,
+                git_source["rev"],
+                [candidate["database"] for candidate in git_source["candidates"]],
+                deadline_ns=proof.deadline_ns,
+            )
+        except offline_seed.SeedRefusal as error:
+            fail(f"private Longhorn checkout is not the locked commit: {error}")
+        git_source["chosen_ident"] = chosen
+        (proof.evidence / "seed.json").write_text(json.dumps(seed, indent=2))
+        print(f"wrapper-bypass private checkout: {chosen} at {git_source['rev'][:12]}")
+    oxide = (seed_root / "target" / "debug" / "oxide").resolve()
+    if not oxide.is_file() or not os.access(oxide, os.X_OK):
         fail("staged oxide is missing")
-    return oxide
+    if not str(oxide).startswith(str(proof.root)):
+        fail("the staged artifact is outside the supervisor's scratch")
+    provenance = {
+        "commit": git(proof, "rev-parse", "HEAD"),
+        "tree": git(proof, "rev-parse", "HEAD^{tree}"),
+        "toolchain": toolchain_channel(),
+        "lock_sha256": seed["lock_sha256"],
+        "artifact_sha256": sha256_file(oxide),
+        "seed_aggregate_bytes": seed["aggregate_bytes"],
+        "seed_entries": seed["entries"],
+    }
+    return oxide, provenance
 
 
-def prove(oxide: str, parent: str) -> None:
-    app = os.path.join(parent, "app")
+def seed_cases(proof: Proof) -> list:
+    """The shared seeder's synthetic cases, in this proof's own scratch."""
+    cases_root = proof.root / "seed-cases"
+    try:
+        records = offline_seed.self_test(cases_root)
+    except Exception as error:
+        fail(f"the shared seeder's synthetic cases failed: {error}")
+    (proof.evidence / "seed-cases.json").write_text(json.dumps(records, indent=2))
+    for record in records:
+        print(f"wrapper-bypass seed case {record['case']}: {record['detail']}")
+    return records
+
+
+def prove(proof: Proof, oxide: Path, parent: Path) -> None:
+    app = parent / "app"
     for relative, text in FIXTURE.items():
-        write(os.path.join(app, relative), text)
-    bindir = os.path.join(parent, "bin")
-    outer_log = os.path.join(parent, "outer.log")
-    workspace_log = os.path.join(parent, "workspace.log")
-    outer = os.path.join(bindir, "fake-wrapper")
-    workspace = os.path.join(bindir, "workspace-wrapper")
-    write(outer, RECORDER.replace("LOG", outer_log), 0o755)
-    write(workspace, RECORDER.replace("LOG", workspace_log), 0o755)
-    write(os.path.join(bindir, "cargo-wrapcheck"), EXTERNAL, 0o755)
-    home = os.path.join(parent, "home")
-    cargo_home = os.path.join(parent, "cargo-home")
-    os.makedirs(home, mode=0o700)
-    config = os.path.join(cargo_home, "config.toml")
+        write(app / relative, text)
+    bindir = parent / "bin"
+    outer_log = parent / "outer.log"
+    workspace_log = parent / "workspace.log"
+    outer = bindir / "fake-wrapper"
+    workspace = bindir / "workspace-wrapper"
+    write(outer, RECORDER.replace("LOG", str(outer_log)), 0o755)
+    write(workspace, RECORDER.replace("LOG", str(workspace_log)), 0o755)
+    write(bindir / "cargo-wrapcheck", EXTERNAL, 0o755)
+    home = parent / "home"
+    cargo_home = parent / "cargo-home"
+    home.mkdir(mode=0o700)
+    config = cargo_home / "config.toml"
     write(config, f'[build]\nrustc-wrapper = "{outer}"\n')
     tmp = os.environ["TMPDIR"]
-    base = {name: value for name, value in os.environ.items()
-            if not (name.startswith(("SCCACHE_", "OXIDE_", "XDG_", "CARGO_"))
-                    or name in ("RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RUSTUP_TOOLCHAIN"))}
-    base.update({
-        "HOME": home,
-        "RUSTUP_HOME": os.environ.get("RUSTUP_HOME") or os.path.join(os.path.expanduser("~"), ".rustup"),
-        "RUSTUP_TOOLCHAIN": BUILDER,
-        "RUSTUP_AUTO_INSTALL": "0",
-        "CARGO_HOME": cargo_home,
-        "CARGO_NET_OFFLINE": "true",
-        "CARGO_TERM_COLOR": "never",
-        "OXIDE_POOL": os.path.join(parent, "pool"),
-        "OXIDE_POOL_CAP": "64MiB",
-        "PATH": bindir + os.pathsep + os.environ.get("PATH", ""),
-        "OXIDE_TASK_SCRATCH_ROOT": tmp, "TMPDIR": tmp, "TMP": tmp, "TEMP": tmp,
-    })
-    main_rs = os.path.join(app, "src", "main.rs")
+    base = proof.env(
+        {
+            "HOME": str(home),
+            "RUSTUP_HOME": os.environ.get("RUSTUP_HOME")
+            or os.path.join(os.path.expanduser("~"), ".rustup"),
+            "RUSTUP_TOOLCHAIN": BUILDER,
+            "CARGO_HOME": str(cargo_home),
+            "CARGO_NET_OFFLINE": "true",
+            "CARGO_TERM_COLOR": "never",
+            "OXIDE_POOL": str(parent / "pool"),
+            "OXIDE_POOL_CAP": "64MiB",
+            "PATH": str(bindir) + os.pathsep + proof.tool_dirs + os.pathsep + PATH_BASE,
+            "OXIDE_TASK_SCRATCH_ROOT": tmp,
+        }
+    )
+    main_rs = app / "src" / "main.rs"
+    counter = {"runs": 0}
 
     def touch() -> None:
         now = time.time() + 2
         os.utime(main_rs, (now, now))
 
-    def leased(args: list, label: str, extra: dict | None = None, wanted_outer: int = 0) -> str:
+    def label(name: str) -> str:
+        counter["runs"] += 1
+        return f"case-{counter['runs']:02d}-{name.replace(' ', '-').replace('/', '-')}"
+
+    def leased(args: list, name: str, extra: dict | None = None, wanted_outer: int = 0) -> str:
+        name_label = label(name)
         touch()
         before = len(lines(outer_log))
-        code, stdout, stderr = run([oxide, *args], app, {**base, **(extra or {})})
+        code, stdout, stderr = proof.run(
+            [str(oxide), *args], cwd=app, env={**base, **(extra or {})}, label=f"{name_label}-command"
+        )
         if code:
-            fail(f"{label}: exit {code}\n{stderr[-3000:]}")
+            fail(f"{name}: exit {code}\n{stderr[-3000:]}")
         if "Checking app" not in stderr and "Compiling app" not in stderr:
-            fail(f"{label}: the fixture crate was not compiled\n{stderr[-2000:]}")
+            fail(f"{name}: the fixture crate was not compiled\n{stderr[-2000:]}")
         calls = len(lines(outer_log)) - before
-        summary = [line for line in stderr.splitlines() if line.startswith("oxide: ") and " profile, " in line]
-        print(f"wrapper-bypass {label}: exit 0, fake wrapper calls {calls}, summary {summary}")
+        summary = [
+            line
+            for line in stderr.splitlines()
+            if line.startswith("oxide: ") and " profile, " in line
+        ]
+        print(f"wrapper-bypass {name}: exit 0, fake wrapper calls {calls}, summary {summary}")
         if (calls == 0) != (wanted_outer == 0):
-            fail(f"{label}: fake wrapper calls {calls}, wanted {'some' if wanted_outer else 'none'}")
+            fail(f"{name}: fake wrapper calls {calls}, wanted {'some' if wanted_outer else 'none'}")
         if len(summary) != 1:
-            fail(f"{label}: expected one summary line, got {summary}")
+            fail(f"{name}: expected one summary line, got {summary}")
         return summary[0] + "\n" + stdout + stderr
 
     # Control: plain Cargo in the same fixture uses the configured wrapper.
     touch()
-    code, _, stderr = run(["cargo", "check"], app, {**base, "CARGO_TARGET_DIR": os.path.join(parent, "plain-target")})
+    code, _, stderr = proof.run(
+        [proof.tools["cargo"], "check"],
+        cwd=app,
+        env={**base, "CARGO_TARGET_DIR": str(parent / "plain-target")},
+        label="plain-cargo-check",
+    )
     plain = len(lines(outer_log))
     print(f"wrapper-bypass plain cargo check: exit {code}, fake wrapper calls {plain}")
     if code or plain == 0:
@@ -256,37 +466,47 @@ def prove(oxide: str, parent: str) -> None:
     text = leased(["wrapcheck"], "external subcommand $CARGO build")
     if "child RUSTC_WRAPPER=[]" not in text or named not in text:
         fail("the external subcommand did not inherit the empty wrapper")
-    no_config = os.path.join(parent, "cargo-home-empty")
-    os.makedirs(no_config)
-    for label, args, extra in (
-        ("RUSTC_WRAPPER only", ["check"], {"RUSTC_WRAPPER": outer}),
-        ("CARGO_BUILD_RUSTC_WRAPPER only", ["check"], {"CARGO_BUILD_RUSTC_WRAPPER": outer}),
+    no_config = parent / "cargo-home-empty"
+    no_config.mkdir()
+    for name, args, extra in (
+        ("RUSTC_WRAPPER only", ["check"], {"RUSTC_WRAPPER": str(outer)}),
+        ("CARGO_BUILD_RUSTC_WRAPPER only", ["check"], {"CARGO_BUILD_RUSTC_WRAPPER": str(outer)}),
         ("--config only", ["check", "--config", f"build.rustc-wrapper='{outer}'"], {}),
     ):
-        text = leased(args, label, {"CARGO_HOME": no_config, **extra})
+        text = leased(args, name, {"CARGO_HOME": str(no_config), **extra})
         if named not in text:
-            fail(f"{label}: the bypassed wrapper was not named")
+            fail(f"{name}: the bypassed wrapper was not named")
     # Both names in one Cargo home: Cargo reads `config` and ignores the
     # `.toml`, whose empty wrapper must not hide the real one.
-    dual = os.path.join(parent, "cargo-home-dual")
-    write(os.path.join(dual, "config.toml"), '[build]\nrustc-wrapper = ""\n')
-    write(os.path.join(dual, "config"), f'[build]\nrustc-wrapper = "{outer}"\n')
-    text = leased(["check"], "dual config files, opt-in", {"CARGO_HOME": dual, "OXIDE_ALLOW_RUSTC_WRAPPER": "1"}, wanted_outer=1)
+    dual = parent / "cargo-home-dual"
+    write(dual / "config.toml", '[build]\nrustc-wrapper = ""\n')
+    write(dual / "config", f'[build]\nrustc-wrapper = "{outer}"\n')
+    text = leased(
+        ["check"],
+        "dual config files, opt-in",
+        {"CARGO_HOME": str(dual), "OXIDE_ALLOW_RUSTC_WRAPPER": "1"},
+        wanted_outer=1,
+    )
     if f"rustc wrapper active: {outer}, unqualified" not in text:
         fail("dual config files: the opt-in summary does not name the active wrapper")
-    text = leased(["check"], "dual config files", {"CARGO_HOME": dual})
+    text = leased(["check"], "dual config files", {"CARGO_HOME": str(dual)})
     if named not in text:
         fail("dual config files: the bypassed wrapper was not named")
-    code, stdout, _ = run([oxide, "status"], app, {**base, "CARGO_HOME": dual})
-    if code or f"rustc wrapper: inherited {outer} (from {os.path.join(dual, 'config')}); bypassed" not in stdout:
+    code, stdout, _ = proof.run(
+        [str(oxide), "status"], cwd=app, env={**base, "CARGO_HOME": str(dual)}, label="status-dual"
+    )
+    wanted_status = (
+        f"rustc wrapper: inherited {outer} (from {dual / 'config'}); bypassed"
+    )
+    if code or wanted_status not in stdout:
         fail(f"dual config files: status is wrong\n{stdout}")
     print("wrapper-bypass dual config files status: names the wrapper from config, not config.toml")
-    text = leased(["check"], "no inherited wrapper", {"CARGO_HOME": no_config})
+    text = leased(["check"], "no inherited wrapper", {"CARGO_HOME": str(no_config)})
     if "rustc wrapper" in text:
         fail("a summary named a wrapper where none is inherited")
 
     before = len(lines(workspace_log))
-    leased(["check"], "workspace wrapper preserved", {"RUSTC_WORKSPACE_WRAPPER": workspace})
+    leased(["check"], "workspace wrapper preserved", {"RUSTC_WORKSPACE_WRAPPER": str(workspace)})
     if len(lines(workspace_log)) == before:
         fail("the recording workspace wrapper did not run")
 
@@ -295,64 +515,90 @@ def prove(oxide: str, parent: str) -> None:
         fail(f"oxide clippy did not run clippy-driver's lints\n{text[-2000:]}")
     print("wrapper-bypass oxide clippy: clippy::needless_return reported by clippy-driver")
 
-    text = leased(["check"], "opt-in OXIDE_ALLOW_RUSTC_WRAPPER=1", {"OXIDE_ALLOW_RUSTC_WRAPPER": "1"}, wanted_outer=1)
+    text = leased(
+        ["check"], "opt-in OXIDE_ALLOW_RUSTC_WRAPPER=1", {"OXIDE_ALLOW_RUSTC_WRAPPER": "1"}, wanted_outer=1
+    )
     if f"rustc wrapper active: {outer}, unqualified" not in text:
         fail("the opt-in summary does not warn that the wrapper is active and unqualified")
-    text = leased(["check"], "OXIDE_ALLOW_RUSTC_WRAPPER=true ignored", {"OXIDE_ALLOW_RUSTC_WRAPPER": "true"})
+    text = leased(
+        ["check"], "OXIDE_ALLOW_RUSTC_WRAPPER=true ignored", {"OXIDE_ALLOW_RUSTC_WRAPPER": "true"}
+    )
     if named not in text or "is not 1, so ignored" not in text:
         fail("a non-1 opt-in value was not reported as ignored")
 
-    code, stdout, _ = run([oxide, "status"], app, base)
+    code, stdout, _ = proof.run([str(oxide), "status"], cwd=app, env=base, label="status-inherited")
     wanted = f"rustc wrapper: inherited {outer} (from {config}); bypassed for oxide builds"
-    print(f"wrapper-bypass status: exit {code}, {[line for line in stdout.splitlines() if 'rustc wrapper' in line]}")
+    print(
+        f"wrapper-bypass status: exit {code}, "
+        f"{[line for line in stdout.splitlines() if 'rustc wrapper' in line]}"
+    )
     if code or wanted not in stdout:
         fail(f"status does not report the inherited wrapper and its state\n{stdout}")
-    code, stdout, _ = run([oxide, "status"], app, {**base, "OXIDE_ALLOW_RUSTC_WRAPPER": "1"})
-    if code or f"rustc wrapper: inherited {outer} (from {config}); kept for oxide builds by OXIDE_ALLOW_RUSTC_WRAPPER=1, unqualified" not in stdout:
+    code, stdout, _ = proof.run(
+        [str(oxide), "status"],
+        cwd=app,
+        env={**base, "OXIDE_ALLOW_RUSTC_WRAPPER": "1"},
+        label="status-opt-in",
+    )
+    if (
+        code
+        or f"rustc wrapper: inherited {outer} (from {config}); kept for oxide builds by OXIDE_ALLOW_RUSTC_WRAPPER=1, unqualified"
+        not in stdout
+    ):
         fail(f"opt-in status is wrong\n{stdout}")
 
     # Plain passthrough is untouched: no lease and no summary.
-    code, stdout, stderr = run([oxide, "pkgid"], app, base)
+    code, stdout, stderr = proof.run([str(oxide), "pkgid"], cwd=app, env=base, label="plain-pkgid")
     if code or "oxide:" in stderr or "app" not in stdout:
         fail(f"plain passthrough changed: exit {code} {stderr}")
-    print(f"wrapper-bypass plain passthrough pkgid: exit 0, no lease; total fake wrapper calls {len(lines(outer_log))}")
+    print(
+        f"wrapper-bypass plain passthrough pkgid: exit 0, no lease; "
+        f"total fake wrapper calls {len(lines(outer_log))}"
+    )
 
 
 def main() -> int:
-    if sys.platform != "darwin":
-        fail("the wrapper-bypass proof requires macOS")
-    reserve("/private/tmp", "admission")
-    made = subprocess.run(["mktemp", "-d", "/private/tmp/oxide-wrapper.XXXXXX"],
-                          capture_output=True, text=True, timeout=30)
-    if made.returncode:
-        fail("mktemp failed")
-    root = os.path.realpath(made.stdout.strip())
-    os.chmod(root, 0o700)
-    os.environ.update({"OXIDE_TASK_SCRATCH_ROOT": root, "TMPDIR": root, "TMP": root, "TEMP": root})
-    parent = os.path.join(root, "proof")
-    os.makedirs(parent, mode=0o700)
-    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    try:
-        oxide = stage(parent, repo)
-        staged = tree_bytes(root)
-        print(f"wrapper-bypass staging: {time.monotonic() - STARTED:.0f} s, {staged // (1024 * 1024)} MiB")
-        if staged > SCRATCH_LIMIT_BYTES:
-            fail(f"staging {staged} exceeds 512 MiB")
-        reserve(root, "after staging")
-        prove(oxide, parent)
-        reserve(root, "after fixtures")
-        owned = tree_bytes(root)
-        print(f"wrapper-bypass owned scratch: {owned // (1024 * 1024)} MiB")
-        if owned > SCRATCH_LIMIT_BYTES:
-            fail(f"owned scratch {owned} exceeds 512 MiB")
-    except Exception:
-        print(f"wrapper-bypass proof retained its owned scratch at {root}", file=sys.stderr)
-        raise
-    shutil.rmtree(root)
-    elapsed = time.monotonic() - STARTED
-    if elapsed > PROOF_SECONDS:
-        fail(f"proof took {elapsed:.0f} s, over {PROOF_SECONDS} s")
-    print(f"oxide wrapper-bypass proof held: {elapsed:.0f} s including cleanup, owned scratch {owned // (1024 * 1024)} MiB, scratch removed")
+    proof = Proof()
+    print(
+        "wrapper-bypass allocation: "
+        f"seed {SEED_BYTES // (1024 ** 2)} MiB, staging {STAGING_BYTES // (1024 ** 2)} MiB, "
+        f"fixtures {FIXTURE_BYTES // (1024 ** 2)} MiB, evidence {EVIDENCE_BYTES // (1024 ** 2)} MiB, "
+        f"margin {MARGIN_BYTES // (1024 ** 2)} MiB of the supervisor's 512 MiB"
+    )
+    print(f"wrapper-bypass scratch: {proof.root}")
+    print(f"wrapper-bypass evidence: {proof.evidence}")
+    proof.mark_phase("admission")
+    helper = {
+        name: sha256_file(REPO / "scripts" / name)
+        for name in ("bounded-test.py", "offline_seed.py", "test-oxide-wrapper-bypass.py")
+    }
+    print(f"wrapper-bypass sources: {json.dumps(helper, sort_keys=True)}")
+
+    seed_cases(proof)
+    proof.mark_phase("seed cases")
+    oxide, provenance = seed_and_stage(proof)
+    proof.mark_phase("staging")
+    (proof.evidence / "provenance.json").write_text(json.dumps(provenance, indent=2))
+    print(f"wrapper-bypass artifact: {oxide}, sha256 {provenance['artifact_sha256']}")
+    parent = proof.root / "proof"
+    parent.mkdir(mode=0o700)
+    prove(proof, oxide, parent)
+    proof.mark_phase("fixtures")
+    elapsed = proof.elapsed()
+    owned = owned_bytes(proof.root)
+    receipt = {
+        "sources": helper,
+        "provenance": provenance,
+        "phases": proof.phases,
+        "closure": "supervisor census only; this script starts no session and signals no group",
+        "elapsed_s": round(elapsed, 1),
+        "owned_bytes": owned,
+    }
+    (proof.evidence / "receipt.json").write_text(json.dumps(receipt, indent=2))
+    print(
+        f"oxide wrapper-bypass proof held: {elapsed:.0f} s of {PROOF_SECONDS} s, owned "
+        f"{owned // (1024 ** 2)} MiB of 512 MiB, closure the supervisor's"
+    )
     return 0
 
 

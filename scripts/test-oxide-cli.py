@@ -71,6 +71,13 @@ import sys
 import time
 import traceback
 
+sys.dont_write_bytecode = True
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import offline_seed  # scripts/offline_seed.py, oxide#131
+
 IMAGE_BYTES = 128 * 1024 * 1024
 SCRATCH_LIMIT_BYTES = 512 * 1024 * 1024
 SOURCE_LIMIT_BYTES = 8 * 1024 * 1024
@@ -2895,30 +2902,39 @@ def tree_state(root: str) -> dict:
 
 
 def seed_cargo_home(home: str) -> None:
-    """Copy cfg-if 1.0.0 and its sparse-index entry from the host Cargo
-    home into the private one; nothing is fetched."""
+    """Seed cfg-if 1.0.0 from the host Cargo home with the shared helper.
+
+    The lock below is this fixture's whole lock: one crates.io package with
+    its known checksum. `scripts/offline_seed.py` (oxide#131) copies the
+    sparse-index entry and the archive through anchored descriptors and
+    checks the archive bytes against that checksum; nothing is fetched and no
+    host `registry/src` tree is copied. The helper's hash is in the seed line:
+    importing it transfers no qualification.
+    """
+    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "offline_seed.py")
+    with open(helper, "rb") as handle:
+        helper_hash = hashlib.sha256(handle.read()).hexdigest()
+    lock = (
+        "version = 4\n\n[[package]]\n"
+        'name = "cfg-if"\nversion = "1.0.0"\n'
+        f'source = "{CRATES_IO_SOURCE}"\n'
+        f'checksum = "{CFG_IF_CHECKSUM}"\n'
+    ).encode()
     host = os.environ.get("CARGO_HOME") or os.path.join(os.path.expanduser("~"), ".cargo")
-    copied = 0
-    for index in sorted(os.listdir(os.path.join(host, "registry", "index"))):
-        crate = os.path.join(host, "registry", "cache", index, "cfg-if-1.0.0.crate")
-        entry = os.path.join(host, "registry", "index", index, ".cache", "cf", "g-", "cfg-if")
-        config = os.path.join(host, "registry", "index", index, "config.json")
-        if not (os.path.isfile(crate) and os.path.isfile(entry)):
-            continue
-        with open(crate, "rb") as handle:
-            digest = hashlib.sha256(handle.read()).hexdigest()
-        if digest != CFG_IF_CHECKSUM:
-            fail(f"host cfg-if 1.0.0 archive sha256 {digest}")
-        for source in (crate, entry, config):
-            if not os.path.isfile(source):
-                continue
-            target = os.path.join(home, os.path.relpath(source, host))
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            shutil.copyfile(source, target)
-            copied += os.path.getsize(source)
-        print(f"clean-safety seed: cfg-if 1.0.0 (sha256 {digest}) and its index entry copied from {index}, {copied} bytes, no download")
-        return
-    fail("the host Cargo home has no cached cfg-if 1.0.0 with its index entry; the proof does not fetch")
+    try:
+        seed = offline_seed.seed_cargo_home(
+            host,
+            home,
+            lock,
+            deadline_ns=time.clock_gettime_ns(time.CLOCK_UPTIME_RAW)
+            + int(min(45, remaining()) * 1_000_000_000),
+        )
+    except offline_seed.SeedRefusal as error:
+        fail(f"the host Cargo home cannot seed cfg-if 1.0.0 offline: {error}")
+    print(
+        f"clean-safety seed: cfg-if 1.0.0 (sha256 {CFG_IF_CHECKSUM}) via scripts/offline_seed.py "
+        f"{helper_hash[:12]}, {seed['aggregate_bytes']} bytes, {seed['entries']} entries, no download"
+    )
 
 
 def prove_whole_clean(call, parent: str, triple: str, real_env: dict) -> None:
