@@ -9,9 +9,16 @@ scratch target, copies the binary out and deletes the target before the
 fixtures. Debug builds carry the walk observer (`OXIDE_TEST_WALK_LOG`), which
 records every accounting/checkout/Cargo-home walk root.
 
-The main fixture is private and holds one ledger-recorded slot with more than
-200,000 zero-byte payload entries (the measured count is printed and
-receipted), a tiny valid directory-pool config/ledger/lock, and
+The fixtures are small private ledgers and pools. Default `oxide status`
+walks nothing (structural: the debug walk log records no root) and reconciles
+nothing (structural: tree and control bytes unchanged, a recorded `Evicting`
+slot intact). `--measure` logs exactly the payload walk and one walk per slot
+(structural, no repeated display walk) and reports its bounded scan; the
+shared cumulative deadline is proved deterministically by the library test
+`measure_walks_share_one_cumulative_deadline` added at 9269. Wall-clock
+timings are sanity observations only, not a large-pool or universal latency
+claim. The first fixture holds one ledger-recorded slot, a
+tiny valid directory-pool config/ledger/lock, and
 a control state with a held command, a waiting ticket, a clean mark and a
 flush. Cases:
 
@@ -60,9 +67,10 @@ BUILDER = "1.97.1"
 EXPECTED_BRANCH = "ns-51242973-65d6-495f-b8f8-c893afbb7d72"
 EXPECTED_RUNNER_SHA256 = "d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e"
 MIB = 1024 * 1024
-# Strictly more than the brief's 200,000-entry matrix; the measured count is
-# printed and receipted, never a formula label.
-ENTRIES = 200_500
+# Small real private fixtures only (brief v3): the walk and reconciliation
+# claims are structural (debug walk log plus debug-only scoped injection), and
+# the wall clock is a sanity observation, not a large-pool latency claim.
+PAYLOAD_FILES = 5
 SHUTDOWN_MARGIN_S = 30
 DEFAULT_STATUS_LIMIT_S = 1.0
 MISSING_FACT = "not measured (no recorded observation)"
@@ -545,13 +553,11 @@ def run_cases(
     for slot in slots:
         private_dir(os.path.join(slot["project"]))
     served = os.path.join(big["slots_root"], "project-aaaa/quick-1/build")
-    created = 0
-    while created < ENTRIES:
-        chunk = min(5_000, ENTRIES - created)
-        for index in range(chunk):
-            open(os.path.join(served, f"{created + index:06d}"), "wb").close()
-        created += chunk
-        work_left()
+    for index in range(PAYLOAD_FILES):
+        with open(os.path.join(served, f"entry-{index:03d}"), "wb") as handle:
+            handle.write(b"payload")
+    with open(os.path.join(served, "blob"), "wb") as handle:
+        handle.write(os.urandom(64 * 1024))
     # A decoy sibling for the legacy `slots/<id>` layout. A status that
     # reconstructed the path would show or measure it.
     decoy = private_dir(os.path.join(big["slots_root"], "1"))
@@ -570,10 +576,9 @@ def run_cases(
         cleans=[{"id": 1, "checkout": checkout}],
     )
     write_private(os.path.join(big["control"], "waiters", "1.lock"), "")
-    measured_entries = entry_count(served)
     expect(
-        measured_entries == ENTRIES and measured_entries > 200_000,
-        f"the fixture holds {measured_entries} entries, not more than 200,000",
+        entry_count(served) == PAYLOAD_FILES + 1,
+        "the fixture has its recorded payload entries",
     )
     walk_log_before = os.path.exists(walk_log)
 
@@ -609,12 +614,14 @@ def run_cases(
         elapsed = elapsed_ns / 1e9
         print(
             f"default status: {elapsed_ns / 1e6:.1f} ms wall, "
-            f"{len(output)} output bytes, measured entries {measured_entries}, "
-            f"load {loadavg()}"
+            f"{len(output)} output bytes, {entry_count(served)} slot entries, "
+            f"load {loadavg()} (sanity only)"
         )
+        # A sanity bound only: the structural no-walk evidence below is the
+        # acceptance claim, not this machine's latency.
         expect(
             elapsed < DEFAULT_STATUS_LIMIT_S,
-            f"default status took {elapsed:.3f}s, not under {DEFAULT_STATUS_LIMIT_S}s",
+            f"default status took {elapsed:.3f}s, not even the 1 s sanity bound",
         )
         expect(before == after, "default status changed pool metadata")
         expect(control_hashes(big) == control_before, "default status changed control bytes")
@@ -651,7 +658,7 @@ def run_cases(
         )
         expect(
             os.path.exists(os.path.join(served, "000000"))
-            and entry_count(served) == measured_entries,
+            and entry_count(served) == PAYLOAD_FILES + 1,
             "the payload fixture was changed",
         )
 
@@ -1024,7 +1031,7 @@ def run_cases(
         "supervisor_sha256": runner_sha,
         "subject_sha256": sha256_file(subject),
         "platform": sys.platform,
-        "entries": measured_entries,
+        "fixture": "small private structural",
         "default_status_limit_s": DEFAULT_STATUS_LIMIT_S,
         "cases": CASES,
         "load_before": load_before,

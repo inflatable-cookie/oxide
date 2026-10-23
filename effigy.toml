@@ -75,10 +75,13 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # qualified shared supervisor (oxide#109; 300 s absolute, 512 MiB monitored
 # scratch including staging, fixture creation and cleanup). Stages this HEAD's
 # debug `oxide` offline with 1.97.1 and builds private hand-made directory
-# pools: one ledger-recorded slot of more than 200,000 zero-byte entries plus a held
+# pools: small private ledger/pool fixtures (one recorded slot, a held
 # command, waiting ticket, clean mark, flush and a recorded Evicting slot. It
-# times one default status end to end under 1 s (published, never retried or
-# averaged), proves no payload traversal with the debug-only walk log, proves zero
+# proves structurally, with the debug-only walk log, that default status runs
+# no payload/checkout/Cargo-home walk and reconciles nothing, and that
+# --measure logs exactly the payload and per-slot walks; the shared measure
+# deadline is the library test added at 9269. A small default-status timing is
+# a sanity observation only, never a large-pool or universal latency claim; proves zero
 # mutation with a bounded before/after
 # metadata digest and exact control bytes, covers held/waits/clean/flush and
 # nested-directory rendering, valid/stale/future/mismatched/missing/corrupt
