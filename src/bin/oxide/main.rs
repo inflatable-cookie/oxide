@@ -1270,7 +1270,15 @@ fn print_pool(
         }
     }
     match &report.measured {
-        Some(pool) => println!("  slot accounting walk: {}", pool.payload_accounting),
+        Some(pool) => {
+            println!("  slot accounting walk: {}", pool.payload_accounting);
+            if pool.coverage != pool.payload_accounting.coverage {
+                println!(
+                    "  pool coverage: {:?} (a recorded deletion is pending reconciliation or a slot walk was incomplete)",
+                    pool.coverage
+                );
+            }
+        }
         None => println!(
             "  slot sizes: recorded observations only; `oxide status --measure` walks the payload and every slot without reconciling"
         ),
@@ -1422,13 +1430,11 @@ fn slot_line(slot: &store::SlotView, state: &str, owner: &str) -> String {
     )
 }
 
-/// Slot allocation from the payload walk; an incomplete walk is a lower
-/// bound and says so.
+/// Slot allocation from the payload walk. The pool's own coverage is used, so
+/// a pending reconciliation or any incomplete slot walk makes the total a
+/// lower bound even when the payload walk itself completed.
 fn slot_use(pool: &PoolStatus) -> String {
-    match (
-        pool.payload_unique_allocated_bytes,
-        pool.payload_accounting.coverage,
-    ) {
+    match (pool.payload_unique_allocated_bytes, pool.coverage) {
         (Some(used), AccountingCoverage::Complete) => {
             format!("{} MiB allocated by slots", used / MIB)
         }

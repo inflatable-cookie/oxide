@@ -979,7 +979,9 @@ def run_cases(
             handle.write(b"z" * 8192)
         ev_ledger = sha256_file(os.path.join(evicting["pool"], "ledger.json"))
         output, _ = run_status(subject, evicting, walk_log, "--measure")
-        expect_line(output, "recorded deletions pending reconciliation: 1", "measure evicting")
+        expect_line(
+            output, "recorded deletions pending reconciliation: slot 1", "measure evicting"
+        )
         expect_line(
             output,
             "slot 1 recorded deletion pending reconciliation (not idle or held)",
