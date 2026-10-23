@@ -189,7 +189,7 @@ fn main() {
 }
 ''',
     "src/lib.rs": "pub fn value() -> u32 {\n    7\n}\n",
-    "src/main.rs": 'fn main() { println!("profile-app {}", profileapp::value()); }\n',
+    "src/main.rs": 'fn main() { println!("profile-app {} {}", profileapp::value(), std::env::current_exe().unwrap().display()); }\n',
     # The whole-target link conversion needs the exact non-directory path;
     # `/target` also ignores profile members under the real target directory.
     ".gitignore": "/target\n/.oxide-outputs/\n",
@@ -714,6 +714,10 @@ def run(proof: Proof, repo: str) -> None:
     result = proof.run([base, "outputs", "adopt"], cwd=legacy, env=proof.env, timeout=120)
     expect(result.returncode == 0, f"10: base whole-target adopt failed: {result.stderr.decode(errors='replace')}")
     legacy_root = root_of(pool, legacy)
+    expect(
+        legacy_root.startswith(os.path.join(proof.mount, "oxide-outputs") + os.sep),
+        f"10: the base legacy root {legacy_root} is not on the registered volume",
+    )
     expect(os.path.islink(os.path.join(legacy, "target")), "10: base did not publish a whole-target link")
     expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: base receipt is not /2")
     result = proof.run([base, "build"], cwd=legacy, env=proof.env, timeout=180)
@@ -747,6 +751,10 @@ def run(proof: Proof, repo: str) -> None:
     # registry, so the only path that can reach the profile layout is the
     # candidate's explicit migrate_layout.
     migrated_root = make_root_one_fixture(pool, migrated)
+    expect(
+        migrated_root.startswith(os.path.join(proof.mount, "oxide-outputs") + os.sep),
+        f"11: the base legacy root {migrated_root} is not on the registered volume",
+    )
     expect(
         perm.read_json(perm.receipt_path(pool, migrated))["version"] == "oxide.outputs.transition/2",
         "11: the source-shaped fixture is not a /2 receipt",
@@ -895,7 +903,17 @@ def run(proof: Proof, repo: str) -> None:
     expect_layout(first, {"debug": f"link:{root}", "release": f"link:{root}"})
     code, _, stderr = oxide(proof, ["build"], "01 build", first)
     expect(code == 0, f"01: build through the profile layout failed: {stderr}")
+    expect("fallback" not in summary(stderr), f"01: external placement unexpectedly fell back: {summary(stderr)}")
     expect_layout(first, {"debug": f"link:{root}", "release": f"link:{root}"})
+    # A real executable control: `run` executes the artifact of its own linked
+    # member, not a global root assumption.
+    code, stdout, stderr = oxide(proof, ["run"], "01 run", first)
+    expect(code == 0, f"01: run failed: {stderr}")
+    expected_exe = member_destination(root, "debug")
+    expect(
+        "profile-app 7 " in stdout and expected_exe in stdout,
+        f"01: run did not execute the debug member artifact {expected_exe}: {stdout}",
+    )
     # Cargo's own top-level metadata may live in the redirected build directory;
     # it is asserted real only when it is present at the target root.
     for name in ("CACHEDIR.TAG", ".rustc_info.json"):
@@ -945,6 +963,7 @@ def run(proof: Proof, repo: str) -> None:
     # ----- case 03: test / bench / bench debug / doc mapping --------------
     code, _, stderr = oxide(proof, ["test"], "03 test", first)
     expect(code == 0, f"03: test failed: {stderr}")
+    expect("fallback" not in summary(stderr), f"03: external placement unexpectedly fell back: {summary(stderr)}")
     code, _, stderr = oxide(proof, ["bench"], "03 bench", first)
     expect(code == 0, f"03: bench failed: {stderr}")
     code, _, stderr = oxide(proof, ["bench", "--profile", "debug"], "03 bench debug", first)
@@ -1103,6 +1122,14 @@ def run(proof: Proof, repo: str) -> None:
             expect(code != 0, "12: the injected P0 stop did not stop adopt")
             stored = perm.read_json(perm.receipt_path(pool, fixture))
             expect(stored["state"] == "prepared", f"12: P0 left state {stored['state']}")
+            expect(
+                stored.get("transition", {}).get("phase") == "prepared",
+                f"12: P0 journal phase is {stored.get('transition')}",
+            )
+            expect(
+                os.path.islink(os.path.join(fixture, "target")),
+                "12: P0 changed the legacy target link",
+            )
             # A P0 replay starts from the journal and commits the profile layout.
             code, _, stderr = oxide(proof, ["outputs", "adopt"], "12 replay p0", fixture)
             expect(code == 0, f"12: replay from p0 failed: {stderr}")
@@ -1133,7 +1160,23 @@ def run(proof: Proof, repo: str) -> None:
         expect(code == 0, f"12: rollback at {boundary} failed: {stderr}")
         expect(os.path.islink(os.path.join(fixture, "target")), f"12: rollback at {boundary} did not restore the old link")
         expect(perm.read_bytes(os.path.join(root, MARKER)) == marker_before, f"12: rollback at {boundary} did not restore the marker")
-        expect(receipt(pool, fixture)["version"] == "oxide.outputs.transition/2", f"12: rollback at {boundary} did not restore /2")
+        restored = receipt(pool, fixture)
+        expect(restored["version"] == "oxide.outputs.transition/2", f"12: rollback at {boundary} did not restore /2")
+        expect(
+            restored["links"][0]["selected"].get("nonce") is None,
+            f"12: rollback at {boundary} restored a nonce into the source-shaped /2 receipt",
+        )
+        registry = perm.read_json(os.path.join(pool, "oxide-managed", "outputs", "registry.json"))
+        fixture_id = perm.hashlib.sha256(fixture.encode()).hexdigest()
+        fixture_rows = [row for row in registry["rows"] if row["checkout_id"] == fixture_id]
+        expect(
+            not any(row["member"] in ("debug", "release") and row.get("selected") for row in fixture_rows),
+            f"12: rollback at {boundary} left profile rows selected: {fixture_rows}",
+        )
+        expect(
+            not any(row.get("pruning") or row.get("pending") for row in fixture_rows),
+            f"12: rollback at {boundary} left a live profile reference: {fixture_rows}",
+        )
         # The rollback retires the journal and reserves nothing.
         expect("transition" not in receipt(pool, fixture), f"12: rollback at {boundary} left a journal")
         # It can be migrated for real afterwards.
@@ -1603,6 +1646,18 @@ def run(proof: Proof, repo: str) -> None:
     )
 
     expect(os.path.isdir(gone_root), "20: the peer-referenced root was removed")
+    kept_reason = next(
+        (
+            entry.get("reason", "")
+            for entry in kept_preview.get("kept", [])
+            if entry.get("root") == gone_root
+        ),
+        "",
+    )
+    expect(
+        "another checkout's live reference" in kept_reason,
+        f"20: the peer KEEP did not carry the other-owner reason: {kept_preview.get('kept')}",
+    )
     with open(registry_path, "wb") as handle:
         handle.write(registry_original)
     os.chmod(registry_path, 0o600)
@@ -1695,9 +1750,17 @@ def run(proof: Proof, repo: str) -> None:
     registry = perm.read_json(os.path.join(pool, "oxide-managed", "outputs", "registry.json"))
     intent = next((entry for entry in registry.get("intents", []) if entry["identity"]["root"] == gone_root), None)
     expect(intent is not None, "20: the terminal crash lost its intent")
+    evidence = os.environ.get("OXIDE_PROOF_EVIDENCE", "")
+    if evidence:
+        with open(os.path.join(evidence, "case20-prune-registry.json"), "wb") as handle:
+            handle.write(perm.read_bytes(os.path.join(pool, "oxide-managed", "outputs", "registry.json")))
     expected = intent.get("expected_terminal_sha")
     fixed_ms = intent.get("terminal_ms")
     expect(intent.get("phase") == "deleted", f"20: terminal phase is {intent.get('phase')}, not deleted")
+    expect(
+        intent.get("receipt_settled") is False,
+        "20: the terminal-image stop fired after intent settlement",
+    )
     expect(expected is not None and fixed_ms is not None, f"20: no fixed terminal image: {intent}")
     published = perm.sha256_file(perm.receipt_path(pool, gone))
     expect(published == expected, "20: the published receipt is not the recorded terminal image")

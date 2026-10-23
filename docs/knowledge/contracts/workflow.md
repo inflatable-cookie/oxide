@@ -3274,7 +3274,9 @@ the real peer-receipt KEEP, the two base-created legacy fixtures prepared under
 one base-compatible registration before any candidate successor-fence effect,
 and a case-11 registry predicate that separates the selected profile group from
 retained legacy history (a history row without a nonce is non-selected history,
-never a live reference): one private session per side with one owned
+never a live reference), a real `run` control that executes the artifact of its
+own linked member, and a specific other-owner KEEP reason in the peer-receipt
+oracle: one private session per side with one owned
 128 MiB scratch APFS image, a private `HOME`, `CARGO_HOME` and directory pool,
 a separately staged base `4a70b83` binary and this HEAD's candidate staged
 offline with 1.97.1 from authenticated pinned source, with asserted distinct
