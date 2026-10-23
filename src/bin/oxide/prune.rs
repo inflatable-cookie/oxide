@@ -1094,10 +1094,13 @@ fn dry_run(operator_list: Option<&Path>) -> Result<u8, String> {
         ));
     }
     let sha = sha256_hex(&bytes);
+    // Exactly these bytes are the plan a real run must present; a newline is
+    // stderr's, never part of the hashed document.
     std::io::stdout()
         .write_all(&bytes)
-        .and_then(|()| std::io::stdout().write_all(b"\n"))
+        .and_then(|()| std::io::stdout().flush())
         .map_err(|error| format!("cannot write the prune preview: {error}"))?;
+    eprintln!();
     eprintln!(
         "oxide: prune preview SHA-256 {sha} ({} candidate root(s), {} kept); nothing was changed. Write these exact bytes to a file and re-run with --plan FILE --plan-sha256 {sha}",
         preview.totals.candidates, preview.totals.kept
@@ -1174,6 +1177,7 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
         let planned = preview.candidates.iter().any(|candidate| {
             candidate.checkout_id == intent.identity.checkout_id
                 && candidate.member == intent.identity.member
+                && candidate.root == intent.identity.root
         }) || intent.phase == IntentPhase::Deleted;
         if !planned {
             return Ok(unsettled(
@@ -1219,6 +1223,14 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
     let fresh_set: Vec<&Candidate> = fresh.candidates.iter().collect();
     if !same_candidates(&plan_set, &fresh_set) {
         let kept = kept_note(&fresh);
+        if !completed_roots.is_empty() {
+            return Ok(unsettled(
+                &control,
+                &format!(
+                    "exact intent replay completed, but the eligible root set no longer matches the plan ({kept}); run a new dry run before another prune"
+                ),
+            ));
+        }
         return Ok(refused(&format!(
             "the eligible root set changed since the preview ({kept}); nothing was changed"
         )));
@@ -2551,6 +2563,33 @@ fn prune_one(
     candidate: &Candidate,
     plan_sha: &str,
 ) -> Result<(), Stop> {
+    // The checkout's bounded clean barrier excludes a concurrent command in
+    // both pools; the binding lock then holds through the prune's effect.
+    let mut waits = store::WaitAccounting::default();
+    let guard = match store
+        .begin_clean(&candidate.checkout, &mut waits)
+        .map_err(Stop::Refuse)?
+    {
+        store::Cleaning::Guard(guard) => guard,
+        store::Cleaning::Interrupted(signal) => {
+            return Err(Stop::Pending(format!(
+                "interrupted by signal {signal} while taking the checkout's clean barrier; nothing was changed"
+            )))
+        }
+    };
+    let outcome = prune_one_barrier(store, control, candidate, plan_sha);
+    store
+        .abandon_clean(guard)
+        .map_err(|error| Stop::Pending(format!("cannot release the clean barrier: {error}")))?;
+    outcome
+}
+
+fn prune_one_barrier(
+    store: &Store,
+    control: &Path,
+    candidate: &Candidate,
+    plan_sha: &str,
+) -> Result<(), Stop> {
     let _binding = store
         .lock_binding(&candidate.checkout)
         .map_err(Stop::Refuse)?;
@@ -2770,14 +2809,53 @@ fn resume_intent(store: &Store, control: &Path, intent: &Intent) -> Result<bool,
         }
         IntentPhase::Resolved => Ok(true),
         IntentPhase::Intent => {
-            // The journal exists but no rename proof does; both an existing
-            // original and a missing quarantine are uncertain, never success.
-            Err(
-                "the intent has no renamed-or-later proof; restore the root or inspect the quarantine before retrying"
-                    .to_owned(),
-            )
+            // No filesystem effect is recorded. If the original root is still
+            // present and unchanged, the journal can be rolled back exactly;
+            // any other state is uncertain and stays pending.
+            let candidate = Candidate {
+                checkout_id: intent.identity.checkout_id.clone(),
+                checkout: intent.identity.checkout.clone(),
+                receipt: intent.identity.receipt.clone(),
+                member: intent.identity.member.clone(),
+                root: intent.identity.root.clone(),
+                root_kind: intent.identity.root_kind,
+                volume_uuid: intent.identity.volume_uuid.clone(),
+                checkout_volume_uuid: None,
+                nonce: intent.identity.nonce.clone(),
+                generation: intent.identity.generation,
+                dev: intent.identity.dev,
+                ino: intent.identity.ino,
+                marker_digest: intent.identity.marker_digest.clone(),
+                logical_bytes: 0,
+                allocated_bytes: 0,
+                accounting_complete: false,
+            };
+            let session = RootSession::open(&candidate)?;
+            session.verify_marker(&candidate)?;
+            rollback_intent(store, control, intent)?;
+            Ok(true)
         }
     }
+}
+
+/// Remove an intent that provably had no filesystem effect and restore the
+/// row's selection, all in one durable revision.
+fn rollback_intent(_store: &Store, control: &Path, intent: &Intent) -> Result<(), String> {
+    let _guard = store::publication_guard(control)?;
+    let mut registry = ready_registry(control)?;
+    let identity = intent.identity.clone();
+    registry.intents.retain(|record| record.id != intent.id);
+    if let Some(row) = registry.rows.iter_mut().find(|row| {
+        row.checkout_id == identity.checkout_id
+            && row.member == identity.member
+            && row.root == identity.root
+    }) {
+        row.selected = true;
+        row.pending = false;
+        row.pruning = None;
+    }
+    registry.bump()?;
+    write_registry(control, &registry)
 }
 
 fn stop_text(stop: Stop) -> String {
