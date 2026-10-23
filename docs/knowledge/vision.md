@@ -146,7 +146,8 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 - **Approved, not built:**
   - owned output links at the profile directory (`target/debug` and the
     like) instead of `target`, so tools that mount `target` keep working;
-  - cold-slot seeding from matching units, conservative first;
+  - cold-slot seeding from matching units, conservative first, with
+    one-use temp workspaces handled as seeded, first-evicted slots;
   - per-slot test scratch;
   - broader submodule-aware cross-worktree reuse beyond the narrow
     two-state coverage in the workflow contract.
@@ -168,6 +169,8 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   next starts a task in it, and every project with a Paseo workspace is
   switching now. Each project's planner owns its change. Projects on Oxide
   are tracked in Queue. Nucleus adoption is off.
+- **Only genuine Cargo uses stay on Cargo:** container or VM guest builds,
+  CI, tools that insist on their own target dir, and tests of Cargo itself.
 
 ### Toolchain support
 
