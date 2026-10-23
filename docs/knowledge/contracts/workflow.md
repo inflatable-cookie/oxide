@@ -2161,8 +2161,9 @@ oxide#102.
   `status` shows the effective one. Builds can still run out of real space:
   the 20 GiB host-reserve watchdog stops the owned group below its 22 GiB
   trigger, and ordinary filesystem errors still fail a build.
-- **Accounting walks (oxide#108).** Admission, reuse, eviction and `status`
-  walk the slots with one set of pool bounds: 2,000,000 entries, depth 64
+- **Accounting walks (oxide#108).** Admission, reuse, eviction and
+  `status --measure` walk the slots with one set of pool bounds; default
+  `oxide status` walks nothing (oxide#128): 2,000,000 entries, depth 64
   (65 for the whole-payload walk, which starts at the payload root; see
   [Finder metadata](#finder-metadata-in-pools)),
   60 s (previously 50,000, 24 and 5 s, which refused Praxis's 76,669-entry

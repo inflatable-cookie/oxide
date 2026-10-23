@@ -57,7 +57,8 @@ USAGE:
     oxide outputs plan|adopt|detach|status
                                          permanent drive: plan, explicitly convert or
                                          detach the owned <checkout>/target link
-    oxide status                         pool, slots, waits, stray output and Cargo home
+    oxide status                         recorded pool, slots and waits; no walk or reconcile
+    oxide status --measure               bounded payload, slot, checkout and Cargo-home walks
     oxide status --launch-check          macOS: time a new executable's first launch
     oxide pool register-removable <mount-point> --reserve <size> --cap <size> [--mode ...]
                                          macOS: register an APFS volume; mode defaults to ephemeral

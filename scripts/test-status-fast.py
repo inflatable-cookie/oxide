@@ -9,8 +9,9 @@ scratch target, copies the binary out and deletes the target before the
 fixtures. Debug builds carry the walk observer (`OXIDE_TEST_WALK_LOG`), which
 records every accounting/checkout/Cargo-home walk root.
 
-The main fixture is private and holds one ledger-recorded slot with 200,002
-zero-byte payload entries, a tiny valid directory-pool config/ledger/lock, and
+The main fixture is private and holds one ledger-recorded slot with more than
+200,000 zero-byte payload entries (the measured count is printed and
+receipted), a tiny valid directory-pool config/ledger/lock, and
 a control state with a held command, a waiting ticket, a clean mark and a
 flush. Cases:
 
@@ -59,7 +60,9 @@ BUILDER = "1.97.1"
 EXPECTED_BRANCH = "ns-51242973-65d6-495f-b8f8-c893afbb7d72"
 EXPECTED_RUNNER_SHA256 = "d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e"
 MIB = 1024 * 1024
-ENTRIES = 200_000
+# Strictly more than the brief's 200,000-entry matrix; the measured count is
+# printed and receipted, never a formula label.
+ENTRIES = 200_500
 SHUTDOWN_MARGIN_S = 30
 DEFAULT_STATUS_LIMIT_S = 1.0
 MISSING_FACT = "not measured (no recorded observation)"
@@ -567,7 +570,11 @@ def run_cases(
         cleans=[{"id": 1, "checkout": checkout}],
     )
     write_private(os.path.join(big["control"], "waiters", "1.lock"), "")
-    expect(entry_count(served) == ENTRIES, "the fixture has the promised entries")
+    measured_entries = entry_count(served)
+    expect(
+        measured_entries == ENTRIES and measured_entries > 200_000,
+        f"the fixture holds {measured_entries} entries, not more than 200,000",
+    )
     walk_log_before = os.path.exists(walk_log)
 
     # A live record lock makes the held slot render as a plain held command
@@ -602,7 +609,7 @@ def run_cases(
         elapsed = elapsed_ns / 1e9
         print(
             f"default status: {elapsed_ns / 1e6:.1f} ms wall, "
-            f"{len(output)} output bytes, entries {ENTRIES + 2}, "
+            f"{len(output)} output bytes, measured entries {measured_entries}, "
             f"load {loadavg()}"
         )
         expect(
@@ -644,7 +651,7 @@ def run_cases(
         )
         expect(
             os.path.exists(os.path.join(served, "000000"))
-            and entry_count(served) == ENTRIES,
+            and entry_count(served) == measured_entries,
             "the payload fixture was changed",
         )
 
@@ -1017,7 +1024,7 @@ def run_cases(
         "supervisor_sha256": runner_sha,
         "subject_sha256": sha256_file(subject),
         "platform": sys.platform,
-        "entries": ENTRIES,
+        "entries": measured_entries,
         "default_status_limit_s": DEFAULT_STATUS_LIMIT_S,
         "cases": CASES,
         "load_before": load_before,
