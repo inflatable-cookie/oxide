@@ -248,6 +248,24 @@ fn exec_stdin() -> Stdio {
     }
 }
 
+/// Debug-only proof pause (oxide#129): with `OXIDE_TEST_PAUSE=<point>:<gate>`
+/// the command writes `<gate>.<point>-<pid>` at `point` and waits (at most
+/// 120 s) until `<gate>` exists. Absent from release builds.
+fn test_pause(point: &str) {
+    #[cfg(debug_assertions)]
+    if let Some(gate) = std::env::var("OXIDE_TEST_PAUSE")
+        .ok()
+        .and_then(|value| value.strip_prefix(&format!("{point}:")).map(str::to_owned))
+    {
+        let _ = std::fs::write(format!("{gate}.{point}-{}", std::process::id()), b"");
+        let deadline = Instant::now() + std::time::Duration::from_secs(120);
+        while !std::path::Path::new(&gate).exists() && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    let _ = point;
+}
+
 fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     let exec = invocation.command == "exec";
     process::install_signal_handlers()?;
@@ -284,6 +302,7 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         &checkout,
         pool_fallback.as_deref(),
     )?;
+    test_pause("reserved");
     let planned =
         outputs::planned_destination(Some(&output_control), &checkout, pool_fallback.as_deref())?;
     let destination = outputs::destination_facts(planned.as_ref());
@@ -347,6 +366,7 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
             return Err(reason);
         }
     };
+    test_pause("bound");
     for warning in &binding.outcome.warnings {
         eprintln!("oxide: WARNING: {warning}");
     }

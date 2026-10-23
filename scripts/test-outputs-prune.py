@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Owned-output prune proof (oxide#129): fixed script and allocation.
+"""Owned-output prune proof (oxide#129): the fixed 21-case native script.
 
-This file publishes the exact native plan required before activation. It is
-NOT run: `RUN_BOUND` is False, so every mode except `--plan` refuses without
-creating, mounting or deleting anything. Activation is a separate owner gate
-(after exact-head review), under the qualified shared supervisor
+Run only as the Effigy heavy task `rust:outputs-prune`, whose whole command is
+`python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 --
+python3 scripts/test-outputs-prune.py` under the qualified shared supervisor
 (`scripts/bounded-test.py`, SHA-256
-d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e):
-300 s absolute, 512 MiB monitored owned scratch, work stopped 30 s before the
-exported deadline, ordinary detach.
+d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e). The
+supervisor owns the 300 s deadline, the 512 MiB monitored scratch, process
+closure and cleanup; work stops 30 s before its exported deadline. Activation
+is a separate counted owner gate for the author and for the Elevated
+reviewer; `--plan` prints the allocation and case list and touches nothing.
 
 Static allocation (one 128 MiB owned APFS sparse image, private HOME,
-CARGO_HOME and directory pools; no real builds, consumer, Windows, provider or
-install):
+CARGO_HOME and directory pool; no real Builds drive, consumer, Windows,
+provider or install):
 
     staging (constrained debug oxide recipe)      288 MiB
     APFS sparse image (payload + quotas)          128 MiB
@@ -22,52 +23,105 @@ install):
     ---------------------------------------------  ------
     total                                         512 MiB
 
-Staging recipe: this HEAD's debug `oxide`, offline 1.97.1, `-j1`, one codegen
-unit, no debug info, stripped/size-optimised (the #122 precedent, 58-64 MiB
-observed, not a measured fit for this proof). Expected staging 37-60 s, 21
-cases 60-120 s, attach/setup 20 s, cleanup 30 s: 147-230 s, UNMEASURED. If the
-fixed script cannot fit, STOP and propose one honest larger bound before
-activation; never split, extend or add a session.
+Staging is the rust:installed-handoff recipe (this HEAD's debug `oxide`,
+plain Cargo offline with 1.97.1, -j1, one codegen unit, no debug info,
+symbols stripped, opt-level s, debug assertions kept so the debug-only
+OXIDE_TEST_PRUNE_CRASH and OXIDE_TEST_PAUSE hooks exist; the staged target is
+deleted after the copy). Expected: staging 37-60 s, cases 60-120 s,
+attach/setup 20 s, cleanup 30 s = 147-230 s, UNMEASURED. If a run does not
+fit, it fails at the deadline (never a timeout success) and one honest larger
+bound is proposed before any further activation; never split or extended.
 
-Case allocation (21 = the original 19-case matrix plus two resolve-intent
-cases):
+Watchdog / reserve call chain exercised by the deletion cases (source, not a
+bespoke harness): prune::prune_one -> Store::begin_clean -> lock_binding ->
+RootSession::open (removable::Binding::open + verify of UUID, device, mount;
+registration reserve) -> RootSession::check (Binding::verify + available
+bytes above the recorded reserve) before the rename and every DELETE_BATCH
+entries inside delete_contents_at; any loss stops further writes and leaves
+the intent pending (exit 3).
 
-  2  forward fence + initialization: internal-first initializing/ready,
-     paired-control fence, exclusive registry creation, missing/unreadable
-     registry refuses mutation and prune keeps; older numeric state refusal.
-  4  nonce/reservation/cancel/recreation key: fresh 128-bit nonce per root
-     creation and recreation, legacy root without a nonce, legacy outputs-1 key
-     distinct from outputs-2, recreated root never claims the old key.
-  3  registry/snapshot/overflow: bounded whole snapshot, malformed/unreadable
-     receipt keeps the batch, sticky-incomplete row cap and prune keeps all,
-     unindexed selection records its receipt transaction.
-  3  eligibility/operator-list/absence: present checkout kept, unreadable or
-     unmounted ancestor kept, operator-list legacy exception (well-formed
-     marker, absent checkout, no selection, closed writers), duplicates and
-     relative paths refuse.
-  2  custody/containment/removal: active writer kept, foreign/symlink root or
-     descendant stops, cross-device stop, marker unlinked last, reserve loss
-     between batches stops with exit 3.
-  4  crash boundaries: after intent, after rename, during delete, after
-     deleted proof; replay only the exact intent; missing proof stays pending.
-  1  completion/diagnostic/logical-allocated: terminal registry + receipt
-     ordering, passive `oxide status` observation, logical/allocated bytes
-     labelled with coverage.
-  2  resolve-intent: (a) both leaves absent, no other selection, no writer
-     publishes `resolved-by-operator` and distinguishes resolved from
-     deleted; (b) present root/quarantine or a held reference refuses with the
-     intent unchanged.
+Cases (21 = the original 19-case matrix plus two resolve-intent cases), each
+on tiny owned fixtures with exact exit codes and state assertions:
 
-Every case is a tiny owned fixture; the proof asserts exit codes 0/2/3,
-byte-for-byte nonmutation for refused and dry-run cases, exact intent/journal
-phases, quarantine/marker state, registry revision movement, and no write
-outside owned scratch. It does not prove a live cleanup, real-drive
-qualification, host installation or product acceptance.
+  fence / init (2)
+    01 init: adopt publishes state version 3 with oxide.outputs/2 and a ready
+       transaction in both controls, and oxide.outputs.registry/1 exists.
+    02 missing ready registry: dry run exits 2, adopt of another checkout
+       refuses, nothing is rebuilt; restoring the exact bytes recovers.
+  nonce / reservation / cancel / recreation key (4)
+    03 root nonce: the external root's v2 marker nonce (32 hex) equals the
+       receipt's selected nonce and the registry row's nonce.
+    04 shared reservation: two paused starters for the same future root share
+       one reserved nonce; both bind it and the created root carries it.
+    05 cancel + stale starter: a paused starter's reservation is cancelled by
+       `outputs cancel-reservation`; the starter refuses before Cargo with
+       "cancelled or replaced"; the root is never created; the row is gone.
+    06 recreation: a pruned checkout re-created at the same path adopts a
+       fresh root nonce different from the deleted root's.
+  registry / snapshot / overflow (3)
+    07 dry run: canonical preview bytes on stdout match the SHA-256 on
+       stderr, schema prune-preview/1, control bytes unchanged.
+    08 malformed receipt: one corrupt receipt keeps the whole batch.
+    09 overflow: a sticky-incomplete registry keeps every root and a new
+       reservation carries an overflow tag naming the registry; the starter
+       binds it with no invented row. Run last: the flag is never cleared.
+  eligibility / operator list / absence (3)
+    10 live checkout kept; a live Detached root kept.
+    11 unreadable ancestor kept (absence unknown); a listed relative path and
+       a duplicate refuse with exit 2.
+    12 receiptless legacy root: listed, its exclusive pruning receipt is
+       created, it is deleted and the receipt ends `pruned`/`deleted`.
+  custody / containment / removal (2)
+    13 active writer: a command bound in a vanished checkout keeps its root.
+    14 symlink: a root replaced by a symlink is kept; a symlink descendant
+       stops deletion (exit 3, link target untouched), and replay after its
+       removal completes (exit 0).
+  crash boundaries (4)
+    15 after intent: exit 3, root in place; replay rolls back and deletes.
+    16 after rename: exit 3, quarantine present; replay completes.
+    17 during delete: exit 3; replay completes.
+    18 after registry terminal: exit 3, receipt not yet pruned; replay
+       settles the receipt.
+  completion / diagnostics / logical-allocated (1)
+    19 completion: deleted root, registry row and intent gone, tombstone,
+       prune-observations recorded, logical/allocated bytes labelled with
+       complete coverage, `oxide status` shows the recorded observation.
+  resolve-intent (2)
+    20 both leaves absent: resolution receipt, `resolved-by-operator`.
+    21 quarantine present: exit 2, intent unchanged; replay then completes.
+
+Not run here: an older binary refusing state version 3 (rust:installed-handoff
+covers the numeric peek), real-drive qualification, live inventory or cleanup.
 """
+
+from __future__ import annotations
 
 import sys
 
-RUN_BOUND = False
+sys.dont_write_bytecode = True
+
+import glob
+import hashlib
+import importlib.util
+import json
+import os
+import secrets
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load(name: str, file: str):
+    spec = importlib.util.spec_from_file_location(name, os.path.join(HERE, file))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 SUPERVISOR = "d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e"
 LIMIT_SECONDS = 300
 SCRATCH_MIB = 512
@@ -92,9 +146,12 @@ CASE_ALLOCATION = [
     ("resolve-intent", 2),
 ]
 
+PLAIN = '[package]\nname = "plain"\nversion = "0.1.0"\nedition = "2021"\n'
+DONE: list[str] = []
+
 
 def plan() -> int:
-    print("oxide#129 owned-output prune proof plan (NOT activated)")
+    print("oxide#129 owned-output prune proof plan")
     print(f"supervisor bounded-test.py sha256 {SUPERVISOR}")
     print(f"wall limit {LIMIT_SECONDS} s; monitored owned scratch {SCRATCH_MIB} MiB")
     print("static allocation:")
@@ -108,19 +165,569 @@ def plan() -> int:
         print(f"  {count:>2}  {label}")
     assert sum(count for _, count in CASE_ALLOCATION) == CASES
     assert total == SCRATCH_MIB
-    print("activation: separate owner gate after exact-head review; this script refuses")
+    print("activation: separate counted owner gate per side; --plan touches nothing")
     return 0
 
 
+# Loaded only for a real run, so `--plan` imports nothing that executes.
+permanent = None
+handoff = None
+expect = fail = None
+
+
+def case(name: str) -> None:
+    DONE.append(name)
+    print(f"===== case {len(DONE):02d}: {name} =====", flush=True)
+
+
+class World:
+    """The fixture: one staged binary, private HOME/CARGO_HOME/pool and one
+    owned scratch volume registered in permanent mode."""
+
+    def __init__(self, proof, root: str):
+        self.proof = proof
+        self.root = root
+        self.pool = os.path.join(root, "pool")
+        self.control = os.path.join(self.pool, "oxide-managed")
+        self.outputs = os.path.join(self.control, "outputs")
+        self.registry = os.path.join(self.outputs, "registry.json")
+        self.gone = os.path.join(root, "gone")
+        self.gate = os.path.join(root, "gate")
+        self.mount = ""
+        os.makedirs(self.gone)
+
+    def oxide(self, args: list, label: str, cwd: str, extra: dict | None = None) -> tuple:
+        env = dict(self.proof.env)
+        env.update(extra or {})
+        return permanent.oxide_env(self.proof, args, label, cwd, env)
+
+    def checkout(self, name: str) -> str:
+        path = os.path.join(self.root, "checkouts", name)
+        os.makedirs(os.path.join(path, "src"))
+        with open(os.path.join(path, "Cargo.toml"), "w", encoding="utf-8") as handle:
+            handle.write(PLAIN)
+        with open(os.path.join(path, "src", "lib.rs"), "w", encoding="utf-8") as handle:
+            handle.write("pub fn v() -> u32 { 1 }\n")
+        self.proof.run(["git", "init", "-q"], cwd=path, timeout=30)
+        with open(os.path.join(path, ".gitignore"), "w", encoding="utf-8") as handle:
+            handle.write("/target\n")
+        return os.path.realpath(path)
+
+    def adopt(self, checkout: str) -> dict:
+        code, _, stderr = self.oxide(["outputs", "adopt"], f"adopt {os.path.basename(checkout)}", checkout)
+        expect(code == 0, f"adopt failed: {stderr}")
+        return self.receipt(checkout)
+
+    def receipt(self, checkout: str) -> dict:
+        return permanent.read_json(permanent.receipt_path(self.pool, checkout))
+
+    def selected(self, checkout: str) -> dict:
+        receipt = self.receipt(checkout)
+        expect(receipt["state"] == "committed", f"{checkout} receipt is {receipt['state']}")
+        return receipt["links"][0]["selected"]
+
+    def vanish(self, checkout: str) -> str:
+        away = os.path.join(self.gone, os.path.basename(checkout) + "-" + secrets.token_hex(3))
+        os.rename(checkout, away)
+        expect(not os.path.lexists(checkout), f"{checkout} still exists")
+        return away
+
+    def restore(self, checkout: str, away: str) -> None:
+        os.rename(away, checkout)
+
+    def registry_doc(self) -> dict:
+        return permanent.read_json(self.registry)
+
+    def dry_run(self, label: str, cwd: str, listed: str | None = None) -> tuple:
+        args = ["outputs", "prune", "--dry-run"] + (["--operator-list", listed] if listed else [])
+        result = self.proof.run([self.proof.binary, *args], cwd=cwd, env=self.proof.env)
+        stdout, stderr = result.stdout, result.stderr.decode(errors="replace")
+        print(f"----- {label}: exit {result.returncode} -----\n{stderr}", flush=True)
+        return result.returncode, stdout, stderr
+
+    def plan_file(self, label: str, cwd: str, listed: str | None = None) -> tuple:
+        code, stdout, stderr = self.dry_run(label, cwd, listed)
+        expect(code == 0, f"{label}: dry run exited {code}: {stderr}")
+        sha = hashlib.sha256(stdout).hexdigest()
+        expect(sha in stderr, f"{label}: stderr does not carry the preview digest")
+        path = os.path.join(self.root, f"plan-{secrets.token_hex(4)}.json")
+        with open(path, "wb") as handle:
+            handle.write(stdout)
+        return path, sha, json.loads(stdout)
+
+    def real_run(self, label: str, cwd: str, plan: str, sha: str, listed: str | None = None, extra: dict | None = None) -> tuple:
+        args = ["outputs", "prune", "--plan", plan, "--plan-sha256", sha]
+        if listed:
+            args += ["--operator-list", listed]
+        return self.oxide(args, label, cwd, extra)
+
+    def candidates(self, preview: dict) -> set:
+        return {candidate["root"] for candidate in preview["candidates"]}
+
+    def kept(self, preview: dict, root: str) -> str:
+        for kept in preview["kept"]:
+            if kept.get("root") == root:
+                return kept["reason"]
+        return ""
+
+    def intents(self) -> list:
+        return self.registry_doc().get("intents", [])
+
+    def quarantines(self) -> list:
+        return sorted(glob.glob(os.path.join(self.mount, "oxide-outputs", ".prune-*")))
+
+    def paused(self, checkout: str, point: str, label: str):
+        """Start `oxide check` paused at a debug-only point; returns the child
+        once it has reached the point."""
+        gate = os.path.join(self.gate, secrets.token_hex(4))
+        os.makedirs(self.gate, exist_ok=True)
+        env = dict(self.proof.env)
+        env["OXIDE_TEST_PAUSE"] = f"{point}:{gate}"
+        child = permanent.start_child(self.proof, [self.proof.binary, "check"], checkout, env)
+        deadline = time.monotonic() + min(60, permanent.work_left())
+        while not glob.glob(f"{gate}.{point}-*"):
+            if child.poll() is not None or time.monotonic() >= deadline:
+                code, out, err = permanent.finish_child(self.proof, child, label)
+                fail(f"{label}: never reached {point} (exit {code}): {err}")
+            time.sleep(0.05)
+        return child, gate
+
+
+def release(gate: str) -> None:
+    with open(gate, "wb") as handle:
+        handle.write(b"go")
+
+
+def tree_bytes(root: str) -> dict:
+    digest = {}
+    for directory, _, files in os.walk(root):
+        for name in files:
+            path = os.path.join(directory, name)
+            if os.path.islink(path):
+                continue
+            with open(path, "rb") as handle:
+                digest[os.path.relpath(path, root)] = hashlib.sha256(handle.read()).hexdigest()
+    return digest
+
+
+def marker(root: str) -> dict:
+    return permanent.read_json(os.path.join(root, ".oxide-output.json"))
+
+
+def run(proof, repo: str) -> None:
+    source = proof.run(["git", "rev-parse", "HEAD"], cwd=repo, timeout=30).stdout.decode().strip()
+    dirty = proof.run(["git", "status", "--porcelain"], cwd=repo, timeout=30).stdout.decode().strip()
+    expect(not dirty, f"candidate checkout is not clean: {dirty}")
+    name = "OxPr" + secrets.token_hex(4)
+    mount = f"/Volumes/{name}"
+    expect(not os.path.lexists(mount), f"{mount} exists before the proof; never touched")
+    print(f"outputs-prune proof {os.getpid()} source {source} mount {mount}", flush=True)
+    proof.phase("start")
+
+    proof.binary = handoff.stage_subject(proof.root)
+    proof.phase("after staging")
+
+    world = World(proof, proof.root)
+    home = os.path.join(proof.root, "home")
+    cargo_home = os.path.join(proof.root, "cargo-home")
+    for path in (home, cargo_home):
+        os.makedirs(path, mode=0o700)
+    proof.env = permanent.proof_env(world.pool, home, cargo_home)
+
+    alpha = world.checkout("alpha")
+    code, _, stderr = world.oxide(["check"], "first build creates the internal pool", alpha)
+    expect(code == 0, stderr)
+    world.mount = permanent.attach_image(proof, proof.root, name)
+    expect(world.mount == mount, f"mounted at {world.mount}, not {mount}")
+    code, stdout, stderr = world.oxide(
+        ["pool", "register-removable", mount, "--reserve", "16MiB", "--cap", "64MiB", "--mode", "permanent"],
+        "register permanent drive",
+        alpha,
+    )
+    expect(code == 0 and "registered removable pool" in stdout, stderr)
+    good = permanent.real_uuid(world.pool)
+    proof.phase("after registration")
+
+    # ---- fence / init ------------------------------------------------------
+    case("init: forward fence and ready registry")
+    world.adopt(alpha)
+    for control in (world.control, os.path.join(world.control, "removable", "oxide-managed")):
+        state_file = os.path.join(control, "state.json")
+        if not os.path.exists(state_file):
+            continue
+        state = permanent.read_json(state_file)
+        expect(state["version"] == 3, f"{control}: state version {state['version']}")
+        expect(state.get("owned_outputs") == "oxide.outputs/2", f"{control}: {state.get('owned_outputs')}")
+        expect("ready" in json.dumps(state.get("outputs_init")), f"{control}: {state.get('outputs_init')}")
+    registry = world.registry_doc()
+    expect(registry["version"] == "oxide.outputs.registry/1" and registry["complete"], registry)
+
+    case("missing ready registry refuses and is never rebuilt")
+    saved = permanent.read_bytes(world.registry)
+    os.rename(world.registry, world.registry + ".aside")
+    code, _, stderr = world.dry_run("dry run without the registry", alpha)
+    expect(code == 2, f"dry run without the registry exited {code}")
+    beta = world.checkout("beta")
+    code, _, stderr = world.oxide(["outputs", "adopt"], "adopt without the registry", beta)
+    expect(code != 0, "adopt succeeded without the registry")
+    expect(not os.path.exists(world.registry), "the registry was rebuilt")
+    os.rename(world.registry + ".aside", world.registry)
+    expect(permanent.read_bytes(world.registry) == saved, "registry bytes changed")
+    proof.phase("after fence cases")
+
+    # ---- nonce / reservation ----------------------------------------------
+    case("root nonce in marker, receipt and registry")
+    selected = world.selected(alpha)
+    root_marker = marker(selected["root"])
+    expect(root_marker["version"] == "oxide.outputs.root/2", root_marker)
+    nonce = root_marker["nonce"]
+    expect(len(nonce) == 32 and all(c in "0123456789abcdef" for c in nonce), nonce)
+    expect(selected.get("nonce") == nonce, f"receipt nonce {selected.get('nonce')} != {nonce}")
+    rows = [row for row in world.registry_doc()["rows"] if row["root"] == selected["root"]]
+    expect(len(rows) == 1 and rows[0]["nonce"] == nonce and rows[0]["selected"], rows)
+
+    case("identical starters share one reserved future-root nonce")
+    world.adopt(beta)
+    permanent.set_recorded_uuid(world.pool, "00000000-0000-0000-0000-000000000000")
+    first, first_gate = world.paused(beta, "reserved", "starter one")
+    second, second_gate = world.paused(beta, "reserved", "starter two")
+    reserved = world.receipt(beta)["links"][0].get("reserved")
+    expect(reserved is not None and len(reserved["nonce"]) == 32, f"no reservation: {reserved}")
+    expect(reserved["kind"] == "local", reserved)
+    release(first_gate)
+    release(second_gate)
+    for child, label in ((first, "starter one"), (second, "starter two")):
+        code, _, stderr = permanent.finish_child(proof, child, label)
+        expect(code == 0, f"{label} failed: {stderr}")
+    local_root = reserved["root"]
+    expect(marker(local_root)["nonce"] == reserved["nonce"], "the created root does not carry the reserved nonce")
+    expect(world.receipt(beta)["links"][0].get("reserved") is None, "the reservation was not consumed")
+    permanent.set_recorded_uuid(world.pool, good)
+
+    case("cancelled reservation: the stale starter refuses before Cargo")
+    gamma = world.checkout("gamma")
+    world.adopt(gamma)
+    permanent.set_recorded_uuid(world.pool, "00000000-0000-0000-0000-000000000000")
+    stale, stale_gate = world.paused(gamma, "reserved", "stale starter")
+    reserved = world.receipt(gamma)["links"][0]["reserved"]
+    code, stdout, stderr = world.oxide(["outputs", "cancel-reservation"], "cancel the reservation", gamma)
+    expect(code == 0 and "cancelled" in stdout, stdout + stderr)
+    expect(world.receipt(gamma)["links"][0].get("reserved") is None, "the receipt kept the reservation")
+    expect(
+        not any(row.get("reservation") == reserved["id"] or row.get("cancelling") for row in world.registry_doc()["rows"]),
+        "the cancelled reservation's row remains",
+    )
+    release(stale_gate)
+    code, _, stderr = permanent.finish_child(proof, stale, "stale starter")
+    expect(code != 0 and "cancelled or replaced" in stderr, f"stale starter exit {code}: {stderr}")
+    expect(not os.path.lexists(reserved["root"]), "the cancelled root was created")
+    permanent.set_recorded_uuid(world.pool, good)
+    proof.phase("after reservation cases")
+
+    # ---- registry / snapshot ----------------------------------------------
+    case("dry run: canonical preview, digest, no mutation")
+    before = tree_bytes(world.control)
+    path, sha, preview = world.plan_file("dry run", alpha)
+    expect(preview["version"] == "oxide.outputs.prune-preview/1", preview["version"])
+    expect(tree_bytes(world.control) == before, "a dry run changed control bytes")
+
+    case("malformed receipt keeps the whole batch")
+    delta = world.checkout("delta")
+    world.adopt(delta)
+    delta_root = world.selected(delta)["root"]
+    delta_away = world.vanish(delta)
+    gamma_receipt = permanent.receipt_path(world.pool, gamma)
+    saved_receipt = permanent.read_bytes(gamma_receipt)
+    with open(gamma_receipt, "wb") as handle:
+        handle.write(b"{corrupt")
+    code, stdout, _ = world.dry_run("dry run with a corrupt receipt", alpha)
+    preview = json.loads(stdout)
+    expect(code == 0 and not preview["candidates"], f"candidates despite a corrupt receipt: {preview['candidates']}")
+    expect("whole batch" in world.kept(preview, delta_root), world.kept(preview, delta_root))
+    with open(gamma_receipt, "wb") as handle:
+        handle.write(saved_receipt)
+
+    # ---- eligibility --------------------------------------------------------
+    case("live checkout and live detached root kept")
+    _, _, preview = world.plan_file("eligibility dry run", alpha)
+    expect(world.candidates(preview) == {delta_root}, f"candidates {world.candidates(preview)}")
+    expect("present" in world.kept(preview, world.selected(alpha)["root"]), "alpha not kept as present")
+    epsilon = world.checkout("epsilon")
+    epsilon_root = world.adopt(epsilon)["links"][0]["selected"]["root"]
+    code, _, stderr = world.oxide(["outputs", "detach"], "detach epsilon", epsilon)
+    expect(code == 0, stderr)
+    epsilon_away = world.vanish(epsilon)
+    _, _, preview = world.plan_file("detached dry run", alpha)
+    expect(epsilon_root not in world.candidates(preview), "a live detached root became a candidate")
+    world.restore(epsilon, epsilon_away)
+
+    case("unreadable ancestor kept; bad operator lists refuse")
+    locked = os.path.join(proof.root, "locked")
+    os.makedirs(locked)
+    eta = os.path.realpath(os.path.join(locked, "eta"))
+    shutil.move(world.checkout("eta-src"), eta)
+    eta_root = world.adopt(eta)["links"][0]["selected"]["root"]
+    shutil.move(eta, os.path.join(world.gone, "eta"))
+    os.chmod(locked, 0)
+    try:
+        _, _, preview = world.plan_file("unreadable ancestor dry run", alpha)
+        expect(eta_root not in world.candidates(preview), "an unreadable ancestor became absence")
+        expect("unknown" in world.kept(preview, eta_root), world.kept(preview, eta_root))
+    finally:
+        os.chmod(locked, 0o700)
+    shutil.move(os.path.join(world.gone, "eta"), eta)
+    for label, body in (("relative", '["relative/root"]'), ("duplicate", json.dumps([delta_root, delta_root]))):
+        listed = os.path.join(proof.root, f"list-{label}.json")
+        with open(listed, "w", encoding="utf-8") as handle:
+            handle.write(body)
+        code, _, _ = world.dry_run(f"{label} operator list", alpha, listed)
+        expect(code == 2, f"{label} operator list exited {code}")
+
+    case("receiptless legacy root: exclusive pruning receipt, deleted")
+    legacy_checkout = os.path.join(proof.root, "never", "legacy-app")
+    os.makedirs(os.path.dirname(legacy_checkout))
+    legacy_id = hashlib.sha256(legacy_checkout.encode()).hexdigest()
+    legacy_root = os.path.join(mount, "oxide-outputs", "legacy-" + legacy_id[:8])
+    os.makedirs(legacy_root)
+    legacy_marker = dict(marker(world.selected(alpha)["root"]))
+    legacy_marker.pop("nonce", None)
+    legacy_marker.update({"version": "oxide.outputs.root/1", "checkout": legacy_checkout, "checkout_id": legacy_id, "generation": 1})
+    with open(os.path.join(legacy_root, ".oxide-output.json"), "w", encoding="utf-8") as handle:
+        json.dump(legacy_marker, handle)
+    with open(os.path.join(legacy_root, "artifact"), "wb") as handle:
+        handle.write(b"x" * 4096)
+    listed = os.path.join(proof.root, "list-legacy.json")
+    with open(listed, "w", encoding="utf-8") as handle:
+        json.dump([legacy_root], handle)
+    plan, sha, preview = world.plan_file("legacy dry run", alpha, listed)
+    expect(legacy_root in world.candidates(preview), f"legacy root not a candidate: {world.kept(preview, legacy_root)}")
+    code, stdout, stderr = world.real_run("legacy real run", alpha, plan, sha, listed)
+    expect(code == 0, f"legacy real run exited {code}: {stderr}")
+    expect(not os.path.lexists(legacy_root), "the legacy root remains")
+    legacy_receipt = permanent.read_json(permanent.receipt_file(world.pool, legacy_checkout))
+    expect(legacy_receipt["state"] == "pruned" and legacy_receipt["pruned"]["outcome"] == "deleted", legacy_receipt)
+    proof.phase("after eligibility cases")
+
+    # ---- custody / containment -------------------------------------------
+    case("active writer keeps a vanished checkout's root")
+    theta = world.checkout("theta")
+    theta_root = world.adopt(theta)["links"][0]["selected"]["root"]
+    writer, writer_gate = world.paused(theta, "bound", "bound writer")
+    theta_away = world.vanish(theta)
+    _, _, preview = world.plan_file("active writer dry run", alpha)
+    expect(theta_root not in world.candidates(preview), "an active writer's root became a candidate")
+    world.restore(theta, theta_away)
+    release(writer_gate)
+    permanent.finish_child(proof, writer, "bound writer")
+
+    case("symlink root kept; symlink descendant stops deletion")
+    iota = world.checkout("iota")
+    iota_root = world.adopt(iota)["links"][0]["selected"]["root"]
+    outside = os.path.join(proof.root, "outside")
+    os.makedirs(outside)
+    with open(os.path.join(outside, "keep"), "wb") as handle:
+        handle.write(b"keep")
+    os.symlink(outside, os.path.join(iota_root, "escape"))
+    world.vanish(iota)
+    plan, sha, preview = world.plan_file("symlink descendant dry run", alpha)
+    expect(iota_root in world.candidates(preview), world.kept(preview, iota_root))
+    expect(delta_root in world.candidates(preview), "delta dropped out")
+    code, _, stderr = world.real_run("symlink descendant real run", alpha, plan, sha)
+    expect(code == 3, f"a symlink descendant did not stop deletion (exit {code})")
+    expect(os.path.exists(os.path.join(outside, "keep")), "the symlink target was touched")
+    quarantined = [path for path in world.quarantines() if os.path.lexists(os.path.join(path, "escape"))]
+    expect(len(quarantined) == 1, f"quarantines {world.quarantines()}")
+    os.unlink(os.path.join(quarantined[0], "escape"))
+    code, _, stderr = world.real_run("replay after the link is removed", alpha, plan, sha)
+    expect(code == 0, f"replay exited {code}: {stderr}")
+    expect(not world.quarantines(), f"quarantine left: {world.quarantines()}")
+    expect(not os.path.lexists(delta_root), "delta remains")
+    kappa = world.checkout("kappa")
+    kappa_root = world.adopt(kappa)["links"][0]["selected"]["root"]
+    kappa_away = world.vanish(kappa)
+    os.rename(kappa_root, kappa_root + ".real")
+    os.symlink(kappa_root + ".real", kappa_root)
+    _, _, preview = world.plan_file("symlink root dry run", alpha)
+    expect(kappa_root not in world.candidates(preview), "a symlink root became a candidate")
+    os.unlink(kappa_root)
+    os.rename(kappa_root + ".real", kappa_root)
+    world.restore(kappa, kappa_away)
+    proof.phase("after custody cases")
+
+    # ---- crash boundaries -------------------------------------------------
+    for point, label in (
+        ("intent", "after intent"),
+        ("renamed", "after rename"),
+        ("deleting", "during delete"),
+        ("terminal", "after registry terminal"),
+    ):
+        case(f"crash {label}: pending, then exact replay")
+        checkout = world.checkout("crash-" + point)
+        root = world.adopt(checkout)["links"][0]["selected"]["root"]
+        world.vanish(checkout)
+        plan, sha, preview = world.plan_file(f"crash {point} dry run", alpha)
+        expect(root in world.candidates(preview), world.kept(preview, root))
+        code, _, stderr = world.real_run(f"crash {point}", alpha, plan, sha, extra={"OXIDE_TEST_PRUNE_CRASH": point})
+        expect(code == 3, f"crash at {point} exited {code}")
+        pending = [intent for intent in world.intents() if intent["identity"]["root"] == root]
+        expect(len(pending) == 1, f"no pending intent after {point}: {world.intents()}")
+        if point == "intent":
+            expect(os.path.isdir(root), "the root moved before its rename")
+        if point == "renamed":
+            expect(not os.path.lexists(root) and world.quarantines(), "no quarantine after the rename")
+        if point == "terminal":
+            expect(not os.path.lexists(root), "the root remains after its registry terminal state")
+            expect(world.receipt(checkout)["state"] == "committed", "the receipt settled before its replay")
+        code, _, stderr = world.real_run(f"replay {point}", alpha, plan, sha)
+        expect(code == 0, f"replay after {point} exited {code}: {stderr}")
+        expect(not os.path.lexists(root) and not world.quarantines(), f"{point}: root or quarantine left")
+        expect(not world.intents(), f"{point}: intents left {world.intents()}")
+    proof.phase("after crash cases")
+
+    # ---- completion / diagnostics ----------------------------------------
+    case("completion: terminal state, tombstone, observations, status")
+    world.vanish(kappa)
+    plan, sha, preview = world.plan_file("completion dry run", alpha)
+    expect(kappa_root in world.candidates(preview), world.kept(preview, kappa_root))
+    for candidate in preview["candidates"]:
+        expect(candidate["accounting_complete"] and candidate["logical_bytes"] >= 0 and candidate["allocated_bytes"] >= 0, candidate)
+    expect(preview["coverage"]["source"] and preview["coverage"]["observed_ms"] > 0, preview["coverage"])
+    code, stdout, stderr = world.real_run("completion real run", alpha, plan, sha)
+    expect(code == 0 and "deleted" in stdout, f"completion exited {code}: {stderr}")
+    expect(not os.path.lexists(kappa_root), "kappa remains")
+    expect(all(row["root"] != kappa_root for row in world.registry_doc()["rows"]), "kappa's row remains")
+    tombstones = permanent.read_json(os.path.join(world.outputs, "tombstones.json"))
+    expect(any(entry["root"] == kappa_root for entry in tombstones["entries"]), "no tombstone for kappa")
+    observations = permanent.read_json(os.path.join(world.outputs, "prune-observations.json"))
+    expect(observations["version"] == "oxide.outputs.prune-observations/1", observations["version"])
+    code, stdout, _ = world.oxide(["status"], "status shows the recorded observation", alpha)
+    expect(code == 0 and "prune" in stdout, stdout)
+
+    case("recreated checkout adopts a fresh root nonce")
+    old_nonce = None
+    for entry in tombstones["entries"]:
+        if entry["root"] == kappa_root:
+            old_nonce = entry.get("nonce")
+    os.makedirs(kappa)
+    shutil.copytree(world.checkout("kappa-src"), kappa, dirs_exist_ok=True)
+    code, _, stderr = world.oxide(["outputs", "adopt"], "re-adopt the recreated checkout", kappa)
+    expect(code == 0, stderr)
+    new_nonce = world.selected(kappa)["nonce"]
+    expect(new_nonce and new_nonce != old_nonce, f"recreated root nonce {new_nonce} reused {old_nonce}")
+    proof.phase("after completion")
+
+    # ---- resolve-intent ---------------------------------------------------
+    case("resolve-intent: both leaves absent")
+    rho = world.checkout("rho")
+    rho_root = world.adopt(rho)["links"][0]["selected"]["root"]
+    world.vanish(rho)
+    plan, sha, _ = world.plan_file("rho dry run", alpha)
+    code, _, _ = world.real_run("rho crash after rename", alpha, plan, sha, extra={"OXIDE_TEST_PRUNE_CRASH": "renamed"})
+    expect(code == 3, f"rho crash exited {code}")
+    [intent] = [intent for intent in world.intents() if intent["identity"]["root"] == rho_root]
+    for quarantine in world.quarantines():
+        shutil.rmtree(quarantine)
+    code, stdout, stderr = world.oxide(["outputs", "resolve-intent", intent["id"]], "resolve rho", alpha)
+    expect(code == 0 and "resolved by operator" in stdout, stdout + stderr)
+    rho_receipt = permanent.read_json(permanent.receipt_file(world.pool, rho))
+    expect(rho_receipt["pruned"]["outcome"] == "resolved-by-operator", rho_receipt)
+    expect(os.path.isfile(os.path.join(world.outputs, "prune-resolutions", intent["id"] + ".json")), "no resolution receipt")
+
+    case("resolve-intent refuses while the quarantine is present")
+    sigma = world.checkout("sigma")
+    sigma_root = world.adopt(sigma)["links"][0]["selected"]["root"]
+    world.vanish(sigma)
+    plan, sha, _ = world.plan_file("sigma dry run", alpha)
+    code, _, _ = world.real_run("sigma crash after rename", alpha, plan, sha, extra={"OXIDE_TEST_PRUNE_CRASH": "renamed"})
+    expect(code == 3, f"sigma crash exited {code}")
+    [intent] = [intent for intent in world.intents() if intent["identity"]["root"] == sigma_root]
+    before = json.dumps(intent, sort_keys=True)
+    code, _, stderr = world.oxide(["outputs", "resolve-intent", intent["id"]], "resolve sigma", alpha)
+    expect(code == 2, f"resolve with a present quarantine exited {code}")
+    [after] = [record for record in world.intents() if record["id"] == intent["id"]]
+    expect(json.dumps(after, sort_keys=True) == before, "a refused resolution changed the intent")
+    code, _, stderr = world.real_run("sigma replay", alpha, plan, sha)
+    expect(code == 0, f"sigma replay exited {code}: {stderr}")
+    proof.phase("after resolve cases")
+
+    # ---- overflow (last: the sticky flag is never cleared) -----------------
+    case("overflow: keep every root; tagged reservation binds with no row")
+    doc = world.registry_doc()
+    doc["complete"] = False
+    doc["incomplete"] = {"reason": "proof overflow", "since_ms": 1, "transaction": doc["created_by"]}
+    doc["revision"] += 1
+    with open(world.registry, "w", encoding="utf-8") as handle:
+        json.dump(doc, handle)
+    os.chmod(world.registry, 0o600)
+    code, stdout, _ = world.dry_run("overflow dry run", alpha)
+    expect(code in (0, 2), f"overflow dry run exited {code}")
+    if code == 0:
+        expect(not json.loads(stdout)["candidates"], "an overflow registry yielded candidates")
+    tau = world.checkout("tau")
+    world.adopt(tau)
+    permanent.set_recorded_uuid(world.pool, "00000000-0000-0000-0000-000000000000")
+    starter, gate = world.paused(tau, "reserved", "overflow starter")
+    reserved = world.receipt(tau)["links"][0]["reserved"]
+    expect(reserved.get("overflow", {}).get("registry") == doc["created_by"], reserved)
+    expect(all(row["root"] != reserved["root"] for row in world.registry_doc()["rows"]), "an overflow row was invented")
+    release(gate)
+    code, _, stderr = permanent.finish_child(proof, starter, "overflow starter")
+    expect(code == 0, f"overflow starter failed: {stderr}")
+    permanent.set_recorded_uuid(world.pool, good)
+    expect(len(DONE) == CASES, f"ran {len(DONE)} cases, not {CASES}")
+
+    proof.detach()
+    proof.phase("after detach")
+
+
 def main(argv: list[str]) -> int:
+    global permanent, handoff, expect, fail
     if argv == ["--plan"]:
         return plan()
-    print(
-        "test-outputs-prune: the fixed native proof is awaiting owner activation; "
-        "only --plan is available",
-        file=sys.stderr,
+    if argv:
+        print(f"test-outputs-prune: unknown arguments {argv!r}", file=sys.stderr)
+        return 2
+    permanent = _load("permanent_outputs", "test-permanent-outputs.py")
+    handoff = _load("installed_handoff", "test-installed-handoff.py")
+    expect, fail = permanent.expect, permanent.fail
+    if sys.platform != "darwin":
+        fail("the outputs-prune proof requires macOS")
+    scratch = os.environ.get("OXIDE_TASK_SCRATCH_ROOT", "")
+    expect(bool(scratch) and os.path.realpath(scratch) == scratch, f"scratch {scratch!r} is not canonical")
+    for name in ("TMPDIR", "TMP", "TEMP"):
+        expect(os.environ.get(name) == scratch, f"{name} differs from the supervisor scratch")
+    expect(
+        os.path.isdir(os.environ.get("OXIDE_PROOF_EVIDENCE", "")) and "OXIDE_PROOF_DEADLINE_NS" in os.environ,
+        "not under the qualified shared proof supervisor",
     )
-    return 2
+    root = tempfile.mkdtemp(prefix="outputs-prune.", dir=scratch)
+    repo = os.path.dirname(HERE)
+    signal.signal(signal.SIGTERM, permanent.terminated)
+    signal.signal(signal.SIGALRM, permanent.overdue)
+    signal.setitimer(signal.ITIMER_REAL, permanent.work_left())
+    proof = permanent.Proof(root)
+    try:
+        run(proof, repo)
+    except BaseException as failure:
+        cleanup = permanent.cleanup_after_failure(proof)
+        permanent.record(
+            "result.txt",
+            f"failed after {len(DONE)} case(s) {DONE}: {failure!r}\n"
+            f"unclosed children: {sorted(proof.unclosed)}\nroot: {root}\ncleanup: {cleanup}\n",
+        )
+        print(f"outputs-prune proof failed; scratch {root} left to the shared supervisor", file=sys.stderr)
+        raise
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+    elapsed = time.monotonic() - permanent.layout.runner.STARTED
+    line = (
+        f"outputs-prune proof held: {len(DONE)} cases, {elapsed:.0f} s script time, peak owned "
+        f"{proof.peak // permanent.MIB} MiB at phase checks, phase-sampled host free minimum "
+        f"{proof.low // permanent.MIB} MiB; one owned 128 MiB scratch image, ordinary detach"
+    )
+    permanent.record("result.txt", f"passed\n{line}\n")
+    print(line)
+    return 0
 
 
 if __name__ == "__main__":

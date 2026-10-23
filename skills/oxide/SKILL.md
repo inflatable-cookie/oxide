@@ -181,6 +181,10 @@ fails, Oxide reports that the wait duration is unavailable.
   reports exit 3 and is settled only with `oxide outputs resolve-intent
   <intent-id>` when both the original and quarantine leaves are positively
   absent. Never prune by hand or delete an `oxide-outputs` directory.
+- A build that needs a new owned root reserves its nonce first; a
+  `cancelled or replaced` refusal means another command or
+  `oxide outputs cancel-reservation` changed that reservation: run the command
+  again.
 - On a pool converted before the version-2 registry, a build's relink refuses
   until `oxide outputs adopt` or `oxide outputs detach` upgrades the format;
   that upgrade waits for no other Oxide command to run in either pool.

@@ -2998,6 +2998,13 @@ fn delete_contents_at(
                 "a quarantined entry is on another device; no further delete".to_owned(),
             ));
         }
+        // A symbolic link inside the quarantine is never followed or removed:
+        // the delete stops and the intent stays pending (exit 3).
+        if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            return Err(Stop::Pending(format!(
+                "the quarantine holds a symbolic link ({name}); deletion stops and the intent stays pending"
+            )));
+        }
         if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
             // SAFETY: the parent descriptor and C string are live for the call.
             let child = unsafe {
@@ -3466,6 +3473,7 @@ fn finish_quarantine(
         deadline: Instant::now() + Duration::from_secs(120),
         entries: 0,
     };
+    crash_point("deleting").map_err(Stop::Pending)?;
     delete_contents(&mut deleter, session.root.as_fd(), true)?;
     update_intent(control, id, IntentPhase::MarkerLast)
         .map_err(|error| Stop::Pending(format!("cannot record marker-last: {error}")))?;
@@ -3514,6 +3522,7 @@ fn complete_intent(_store: &Store, control: &Path, id: &str, outcome: &str) -> R
             write_registry(control, &registry).map_err(Stop::Refuse)?;
         }
     }
+    crash_point("terminal").map_err(Stop::Pending)?;
     settle_receipt(control, id, outcome).map_err(Stop::Pending)
 }
 
