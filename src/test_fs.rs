@@ -110,6 +110,44 @@ pub(crate) fn read_dir(path: &Path) -> io::Result<fs::ReadDir> {
     }
 }
 
+/// `lstat` of the enumerated entry, read relative to the live directory entry
+/// the walker holds. It keeps the same path-keyed injection identity as
+/// [`symlink_metadata`], so one fixture fault serves either read.
+pub(crate) fn entry_metadata(entry: &fs::DirEntry, path: &Path) -> io::Result<fs::Metadata> {
+    match injected_error(Operation::SymlinkMetadata, path) {
+        Some(error) => Err(error),
+        None => entry.metadata(),
+    }
+}
+
+thread_local! {
+    static METADATA_SOURCES: RefCell<Option<Vec<crate::inventory::MetadataSource>>> =
+        const { RefCell::new(None) };
+}
+
+/// Record which source one enumerated entry's metadata read used. This is
+/// test-only accounting of the source selection, not a syscall count or a
+/// performance measurement.
+pub(crate) fn note_metadata_source(source: crate::inventory::MetadataSource) {
+    METADATA_SOURCES.with(|cell| {
+        if let Some(sources) = cell.borrow_mut().as_mut() {
+            sources.push(source);
+        }
+    });
+}
+
+/// Run `body` and return the metadata-source selections it made, in order.
+pub(crate) fn observe_metadata_sources<T>(
+    body: impl FnOnce() -> T,
+) -> (T, Vec<crate::inventory::MetadataSource>) {
+    let outer = METADATA_SOURCES.with(|cell| cell.replace(Some(Vec::new())));
+    let result = body();
+    let sources = METADATA_SOURCES
+        .with(|cell| cell.replace(outer))
+        .unwrap_or_default();
+    (result, sources)
+}
+
 pub(crate) fn symlink_metadata(path: &Path) -> io::Result<fs::Metadata> {
     match injected_error(Operation::SymlinkMetadata, path) {
         Some(error) => Err(error),

@@ -124,7 +124,50 @@ path's inode allocation was freed or is reclaimable: rename, open-unlinked
 files and hardlinks may retain it. A missing root remains a refusal, including
 when the root disappears after it was opened. Iterator errors without an
 associated enumerated path and all other errors keep their existing
-conservative gap categories.
+conservative gap categories. `ENOTDIR` and `ELOOP` are never turned into a
+`vanished` observation, and a pathname sample that finds a different kind or
+inode is `unsupported_metadata`, not `vanished`.
+
+### Per-entry reads and directory boundary samples (oxide#141)
+
+An enumerated regular file or directory is read immediately from the live
+directory entry the walk holds, and that entry is never retained. When the
+absolute path name is shorter than the platform `PATH_MAX` including its
+terminating NUL (`len + 1 <= PATH_MAX`) the read is relative to the already
+open directory; otherwise the walk performs exactly the former full-path
+no-follow operation with its unchanged error handling. `PATH_MAX` is a lookup
+limit here, never a walk bound: the entry, depth, output and elapsed bounds are
+unchanged, a path the platform cannot name still fails the same way
+(`missing_metadata`, hence partial coverage), and no long-path completeness is
+invented. Directories are still read by path name, so this is not general
+long-path support. The selection is a source-level fact; the standard library
+on musl and other targets may still resolve the entry by path internally, so
+no syscall count or wall-clock speed is claimed.
+
+Every directory that is read is sampled twice by path name with no-follow
+metadata: once before its entries are read and once after they were
+enumerated. Each sample must still be the directory observed when it was
+classified, with the root's device and the observed inode. A sample that finds
+another kind or inode is `unsupported_metadata`; another device is
+`mount_boundary`; a root sample keeps the root refusal classes (`root_missing`
+for `NotFound`, `root_unreadable` for other errors, kind or identity change,
+`root_not_directory` for another kind). A non-root `NotFound` is one `vanished`
+observation for that directory. A directory whose sample does not match is
+never read: before the read it is skipped, and after enumeration only the
+children newly queued by that directory are discarded, while older pending
+directories, already observed entries and their bytes are kept and no
+`vanished` event is invented for the discarded children. A slow second sample
+is charged to the same cooperative deadline, so it can only make coverage
+partial. The two samples detect a persistent observed replacement of the
+path name; they do not bind the directory `read_dir` opened, cannot exclude a
+transient swap or inode reuse, and are not an atomic snapshot or containment
+proof.
+
+These samples add two pathname metadata reads per read directory, and the
+pending stack holds one observed inode beside each pending path and depth. The
+memory stays bounded by the depth and entry limits. The extra work is real and
+its net effect against the ancestor path resolution the entry-relative read
+avoids is unmeasured; this is not a performance guarantee.
 
 Unreadable entries, unsupported metadata and finite-bound stops produce a
 partial report, not a panic and not a false exact total. Because unvisited

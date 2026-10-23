@@ -71,6 +71,23 @@ run = "python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 64 -- py
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-accounting-vanished.py"
 
+# Guarded accounting reads and directory boundary samples (oxide#141): one
+# fixed proof under the qualified shared supervisor on private tiny fixtures.
+# A hard-linked 4 MiB pair across two idle whole slots is counted once, so a
+# third project's admission under a 6 MiB budget evicts nothing; the identical
+# layout with two independent copies makes the same admission under the same
+# budget evict exactly one idle whole slot (the non-vacuous control); and an
+# unreadable directory inside an idle slot makes the whole-payload walk partial
+# so the same admission refuses with exit 3, `unknown_accounting` and
+# `unreadable_entry` while changing neither the ledger nor a slot directory.
+# 300 s, 512 MiB monitored scratch, one staged debug binary, no live pool,
+# mounted volume, install or host setting. Tiny fixtures do not establish a
+# large or cold pool's rate; not a benchmark or an alias for full QA. HELD for
+# phase C: this selector is published but no native run is activated here.
+[tasks."rust:accounting-guards"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-accounting-guards.py"
+
 # Fast, read-only default `oxide status` (oxide#128): one fixed proof under the
 # qualified shared supervisor (oxide#109; 300 s absolute, 512 MiB monitored
 # scratch including staging, fixture creation and cleanup). Stages this HEAD's

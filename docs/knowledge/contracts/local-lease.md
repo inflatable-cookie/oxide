@@ -274,7 +274,8 @@ reconciled only for the recorded evicting slot path.
 **Accounting walks (oxide#108).** Every pool accounting walk uses the same
 pool-specific bounds: 2,000,000 entries, depth 64 below the walked root and a
 60 s cooperative deadline. The whole-payload walk starts at the payload root,
-one level above `slots`, so it uses depth 65 and slot contents keep 64
+two levels above the slot content directories (`slots` and a project folder,
+oxide#104), so it uses depth 66 and slot contents keep 64
 ([Finder metadata](workflow.md#finder-metadata-in-pools), oxide#105). They are separate from the inventory tool's
 defaults, which are unchanged. The callers:
 
@@ -285,9 +286,32 @@ defaults, which are unchanged. The callers:
 | The whole-payload walk before each idle eviction in the loop | Must be complete, or the lease refuses |
 | `status --measure`: the whole payload and each slot | Observational; reports coverage, causes and time. Default `oxide status` walks nothing (oxide#128) |
 
+**How one walk reads (oxide#141).** The walk itself is unchanged in scope,
+bounds, policy and refusal classes. Each enumerated regular file or directory
+is read immediately from the live directory entry the walk holds, when its
+absolute path name is shorter than the platform `PATH_MAX` including its
+terminating NUL, and with the former full-path no-follow read when it is not;
+directories are still read by path name, so no long-path completeness is
+claimed. Every directory that is read is also sampled by path name before its
+entries are read and again after they were enumerated, and must still be the
+directory observed when it was classified (kind, root device, observed inode).
+A mismatch is `unsupported_metadata` (another kind or inode), `mount_boundary`
+(another device) or, for a non-root `NotFound`, one `vanished` observation; a
+directory that fails its sample is not read, and after enumeration only its
+newly queued children are discarded while observed entries and bytes are kept.
+`ENOTDIR` and `ELOOP` are never `vanished`. The samples do not bind the
+directory `read_dir` opened and are not an atomic snapshot, and the extra two
+path-name reads per directory cost real time. This removes some redundant
+ancestor path resolution; it is not a measured speed claim and not a guarantee
+that a large or cold pool meets the 60 s deadline, so a walk that reaches the
+deadline still refuses exactly as before. The inventory's own
+[per-entry and boundary-sample rules](storage-inventory.md#per-entry-reads-and-directory-boundary-samples-oxide141)
+own the details. Admission walk counts are unchanged.
+
 A walk that reaches a bound, meets an unreadable entry, missing or unusable
-metadata or a mount boundary, or cannot open its root is incomplete. It
-refuses with reason `unknown_accounting` (exit 3, unchanged), and the error
+metadata, a directory whose path-name identity changed at either of its two
+boundary samples, or a mount boundary, or cannot open its root is incomplete.
+It refuses with reason `unknown_accounting` (exit 3, unchanged), and the error
 names the gap kinds (`entry_limit`, `depth_limit`, `elapsed_deadline`,
 `mount_boundary`, `unreadable_entry`, `missing_metadata`,
 `unsupported_metadata`, `root_missing`, `root_not_directory`,

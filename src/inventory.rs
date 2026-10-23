@@ -325,6 +325,106 @@ impl fmt::Display for InventoryError {
 
 impl std::error::Error for InventoryError {}
 
+/// Which read produced one enumerated entry's metadata: relative to the live
+/// directory entry, or the former full-path no-follow operation for a path the
+/// platform cannot name. This is test-only source accounting of the selection,
+/// not a syscall count and not a performance measurement.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MetadataSource {
+    EntryRelative,
+    FullPath,
+}
+
+/// Where a test-only directory-boundary mutation applies. These controls are
+/// thread-local and exist only in test builds; no product environment hook
+/// exists for them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoundaryPoint {
+    /// The enumerated regular-file or directory read.
+    Entry,
+    /// Before the pathname sample taken before the directory is read.
+    BeforeGuard,
+    /// Before the pathname sample taken after its entries were enumerated.
+    BeforeConfirm,
+}
+
+fn boundary_fault(_path: &Path, _point: BoundaryPoint) -> Option<std::io::Error> {
+    #[cfg(test)]
+    {
+        guard_faults::apply(_path, _point)
+    }
+    #[cfg(not(test))]
+    {
+        None
+    }
+}
+
+/// The platform's `PATH_MAX` including its terminating NUL: a full-path
+/// operation can only name a path shorter than this. It is a filesystem lookup
+/// limit, never a walk bound, and it never widens completeness.
+fn full_path_limit() -> usize {
+    // An unavailable limit takes the conservative former full-path operation.
+    usize::try_from(libc::PATH_MAX).unwrap_or(0)
+}
+
+/// Metadata for one enumerated regular file: the live directory entry when the
+/// path name fits the platform limit, otherwise the former full-path no-follow
+/// operation. Both keep the path-keyed test seam the file read had before.
+fn enumerated_file_metadata(entry: &fs::DirEntry, path: &Path) -> std::io::Result<fs::Metadata> {
+    if let Some(error) = boundary_fault(path, BoundaryPoint::Entry) {
+        return Err(error);
+    }
+    if path.as_os_str().as_bytes().len() < full_path_limit() {
+        entry_relative_metadata(entry, path, true)
+    } else {
+        full_path_metadata(path, true)
+    }
+}
+
+/// Metadata for one enumerated directory. It reads the live directory entry
+/// when the path name fits the platform limit and the former full-path no-follow
+/// operation when it does not. Directory entry reads keep the debug walk hook
+/// and the test-only boundary control, exactly as before.
+fn enumerated_directory_metadata(
+    entry: &fs::DirEntry,
+    path: &Path,
+) -> std::io::Result<fs::Metadata> {
+    if let Some(error) = boundary_fault(path, BoundaryPoint::Entry) {
+        return Err(error);
+    }
+    if path.as_os_str().as_bytes().len() < full_path_limit() {
+        entry_relative_metadata(entry, path, false)
+    } else {
+        full_path_metadata(path, false)
+    }
+}
+
+fn entry_relative_metadata(
+    entry: &fs::DirEntry,
+    path: &Path,
+    injected: bool,
+) -> std::io::Result<fs::Metadata> {
+    #[cfg(test)]
+    crate::test_fs::note_metadata_source(MetadataSource::EntryRelative);
+    if injected {
+        #[cfg(test)]
+        return crate::test_fs::entry_metadata(entry, path);
+    }
+    let _ = path;
+    entry.metadata()
+}
+
+fn full_path_metadata(path: &Path, injected: bool) -> std::io::Result<fs::Metadata> {
+    #[cfg(test)]
+    crate::test_fs::note_metadata_source(MetadataSource::FullPath);
+    if injected {
+        #[cfg(test)]
+        return crate::test_fs::symlink_metadata(path);
+    }
+    fs::symlink_metadata(path)
+}
+
 /// Walk one canonical root with finite bounds and return a report.
 ///
 /// The root is canonicalized once so the operator's explicit path resolves to a
@@ -378,6 +478,22 @@ pub(crate) enum WalkPoint {
     BeforeReadDir,
     BeforeFileType,
     BeforeSymlinkMetadata,
+}
+
+/// One directory still to read, with the identity observed when it was
+/// classified. No `DirEntry`, `ReadDir`, `File` or descriptor is retained.
+struct PendingDirectory {
+    path: PathBuf,
+    depth: usize,
+    inode: u64,
+}
+
+/// Outcome of a directory identity guard. A guard samples the pathname only; it
+/// never binds the opened `ReadDir` to the observed inode.
+enum DirectoryGuard {
+    Matched,
+    Diverged,
+    Refused(InventoryError),
 }
 
 struct Walker<'a> {
@@ -450,13 +566,35 @@ impl<'a> Walker<'a> {
     }
 
     fn run(&mut self) -> Result<(), InventoryError> {
-        let mut stack: Vec<(PathBuf, usize)> = vec![(self.root.to_path_buf(), 0)];
-        while let Some((directory, depth)) = stack.pop() {
+        let mut stack: Vec<PendingDirectory> = vec![PendingDirectory {
+            path: self.root.to_path_buf(),
+            depth: 0,
+            inode: self.root_inode,
+        }];
+        while let Some(pending) = stack.pop() {
+            let PendingDirectory {
+                path: directory,
+                depth,
+                inode,
+            } = pending;
+            let is_root = directory == self.root;
             if self.check_deadline() {
                 return Ok(());
             }
             if self.entries_visited >= self.limits.max_entries {
                 self.gap(GapKind::EntryLimit);
+                return Ok(());
+            }
+            // The pathname must still name the directory observed when it was
+            // classified before that directory is read. This sample detects a
+            // persistent observed replacement of kind, device or inode; it
+            // does not pin the directory `read_dir` opens.
+            match self.guard_directory(&directory, inode, is_root, BoundaryPoint::BeforeGuard) {
+                DirectoryGuard::Matched => {}
+                DirectoryGuard::Diverged => continue,
+                DirectoryGuard::Refused(error) => return Err(error),
+            }
+            if self.check_deadline() {
                 return Ok(());
             }
             let read_dir = self
@@ -491,13 +629,17 @@ impl<'a> Walker<'a> {
                 }
             };
             #[cfg(debug_assertions)]
-            if directory == self.root {
+            if is_root {
                 self.test_hook_remove_after_open(&directory);
             }
             self.directories_visited += 1;
             if depth > self.max_depth_reached {
                 self.max_depth_reached = depth;
             }
+            // Children queued by this directory are exactly the entries above
+            // this pre-enumeration depth; a failed second sample discards only
+            // those and keeps every older pending directory.
+            let pending_before = stack.len();
             for entry in entries {
                 if self.entries_visited >= self.limits.max_entries {
                     self.gap(GapKind::EntryLimit);
@@ -538,13 +680,19 @@ impl<'a> Walker<'a> {
                 } else if file_type.is_dir() {
                     let metadata = self
                         .test_hook_error(&path, WalkPoint::BeforeSymlinkMetadata)
-                        .map_or_else(|| fs::symlink_metadata(&path), Err);
-                    match metadata {
+                        .map_or_else(|| enumerated_directory_metadata(&entry, &path), Err);
+                    let metadata = match metadata {
+                        // A kind that contradicts the enumerated kind is never
+                        // counted, queued or unioned as its replacement.
+                        Ok(metadata) if !metadata.is_dir() => {
+                            self.gap(GapKind::UnsupportedMetadata);
+                            continue;
+                        }
                         Ok(metadata) if metadata.dev() != self.root_device => {
                             self.gap(GapKind::MountBoundary);
                             continue;
                         }
-                        Ok(_) => {}
+                        Ok(metadata) => metadata,
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                             self.vanished += 1;
                             continue;
@@ -553,28 +701,128 @@ impl<'a> Walker<'a> {
                             self.gap(GapKind::MissingMetadata);
                             continue;
                         }
-                    }
+                    };
                     self.directories[index] += 1;
                     if depth + 1 > self.limits.max_depth {
                         self.gap(GapKind::DepthLimit);
                         continue;
                     }
-                    stack.push((path, depth + 1));
+                    stack.push(PendingDirectory {
+                        path,
+                        depth: depth + 1,
+                        inode: metadata.ino(),
+                    });
                 } else if file_type.is_file() {
-                    self.record_file(&path, index);
+                    self.record_file(&entry, &path, index);
                 } else {
                     self.other[index] += 1;
                 }
+            }
+            // A second sample of the same pathname after enumeration. A
+            // mismatch discards this directory's newly queued children only;
+            // observed entries and bytes are kept and no vanished event is
+            // invented for the discarded children.
+            match self.guard_directory(&directory, inode, is_root, BoundaryPoint::BeforeConfirm) {
+                DirectoryGuard::Matched => {}
+                DirectoryGuard::Diverged => stack.truncate(pending_before),
+                DirectoryGuard::Refused(error) => return Err(error),
+            }
+            // Both samples are charged to the same deadline: a slow final guard
+            // cannot finish a complete report after the bound.
+            if self.check_deadline() {
+                return Ok(());
             }
         }
         Ok(())
     }
 
-    fn record_file(&mut self, path: &Path, index: usize) {
+    /// Sample one directory pathname and compare it with the identity observed
+    /// when the directory was classified. Root failures keep the existing
+    /// refusal classes; a non-root mismatch is a partial-coverage observation.
+    fn guard_directory(
+        &mut self,
+        path: &Path,
+        expected_inode: u64,
+        is_root: bool,
+        point: BoundaryPoint,
+    ) -> DirectoryGuard {
+        if let Some(error) = boundary_fault(path, point) {
+            return self.guard_error(path, error, is_root);
+        }
+        // The pathname sample is a plain no-follow read: directory entry faults
+        // keep their existing debug walk hook and the test-only boundary
+        // control rather than the file metadata seam.
+        let metadata = fs::symlink_metadata(path);
+        match metadata {
+            Ok(metadata) => {
+                if !metadata.is_dir() {
+                    if is_root {
+                        return DirectoryGuard::Refused(InventoryError::RootNotDirectory(
+                            path.to_path_buf(),
+                        ));
+                    }
+                    self.gap(GapKind::UnsupportedMetadata);
+                    return DirectoryGuard::Diverged;
+                }
+                if metadata.dev() != self.root_device {
+                    if is_root {
+                        return DirectoryGuard::Refused(InventoryError::RootUnreadable {
+                            root: path.to_path_buf(),
+                            reason: "root device changed during traversal".to_owned(),
+                        });
+                    }
+                    self.gap(GapKind::MountBoundary);
+                    return DirectoryGuard::Diverged;
+                }
+                if metadata.ino() != expected_inode {
+                    if is_root {
+                        return DirectoryGuard::Refused(InventoryError::RootUnreadable {
+                            root: path.to_path_buf(),
+                            reason: "root identity changed during traversal".to_owned(),
+                        });
+                    }
+                    self.gap(GapKind::UnsupportedMetadata);
+                    return DirectoryGuard::Diverged;
+                }
+                DirectoryGuard::Matched
+            }
+            Err(error) => self.guard_error(path, error, is_root),
+        }
+    }
+
+    /// The unchanged error classes for one directory sample. Only a non-root
+    /// `NotFound` is a vanished observation; `ENOTDIR`, `ELOOP` and every other
+    /// error keep their conservative categories.
+    fn guard_error(&mut self, path: &Path, error: std::io::Error, is_root: bool) -> DirectoryGuard {
+        if is_root {
+            return DirectoryGuard::Refused(if error.kind() == std::io::ErrorKind::NotFound {
+                InventoryError::RootMissing(path.to_path_buf())
+            } else {
+                InventoryError::RootUnreadable {
+                    root: path.to_path_buf(),
+                    reason: error.to_string(),
+                }
+            });
+        }
+        if error.kind() == std::io::ErrorKind::NotFound {
+            self.vanished += 1;
+        } else {
+            self.gap(GapKind::MissingMetadata);
+        }
+        DirectoryGuard::Diverged
+    }
+
+    fn record_file(&mut self, entry: &fs::DirEntry, path: &Path, index: usize) {
         let metadata = self
             .test_hook_error(path, WalkPoint::BeforeSymlinkMetadata)
-            .map_or_else(|| fs::symlink_metadata(path), Err);
+            .map_or_else(|| enumerated_file_metadata(entry, path), Err);
         let metadata = match metadata {
+            // A kind that contradicts the enumerated kind is never counted or
+            // unioned as its replacement.
+            Ok(metadata) if !metadata.is_file() => {
+                self.gap(GapKind::UnsupportedMetadata);
+                return;
+            }
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 self.vanished += 1;
@@ -1102,8 +1350,7 @@ fn bound_utf8(text: String, limit: usize) -> Rendered {
 
 /// Debug builds only, absent from release: walk observation and deterministic
 /// mutation fixtures. Production accounting is unchanged unless a debug
-/// fixture explicitly opts in through its bounded scratch environment.
-#[cfg(debug_assertions)]
+/// fixture explicitly opts in through its bounded scratch environment.#[cfg(debug_assertions)]
 pub mod walk_observer {
     use super::WalkPoint;
     use serde::Deserialize;
@@ -1398,10 +1645,135 @@ pub mod walk_observer {
     }
 }
 
+/// Test-only deterministic directory-boundary mutations. They are thread-local
+/// and one-shot per named point, and exist only in test builds: they let a unit
+/// test replace, rename, remove or fail one observed directory between its
+/// classification, its read and its second sample without a race.
+#[cfg(test)]
+mod guard_faults {
+    use super::BoundaryPoint;
+    use std::cell::RefCell;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::path::{Path, PathBuf};
+
+    #[derive(Clone, Debug)]
+    pub(super) enum Fault {
+        Remove,
+        ReplaceWithSymlink(PathBuf),
+        ReplaceWithFile,
+        ReplaceWithDirectory,
+        Fail(i32),
+        Delay(u64),
+    }
+
+    struct Armed {
+        path: PathBuf,
+        point: BoundaryPoint,
+        fault: Fault,
+        fired: bool,
+    }
+
+    thread_local! {
+        static ARMED: RefCell<Option<Armed>> = const { RefCell::new(None) };
+    }
+
+    /// Arm one boundary mutation for `path` and run `body`. The mutation fires
+    /// at most once, at `point`, and the thread's armed state is restored even
+    /// if `body` unwinds.
+    pub(super) fn with_fault<T>(
+        path: &Path,
+        point: BoundaryPoint,
+        fault: Fault,
+        body: impl FnOnce() -> T,
+    ) -> T {
+        let path = fs::canonicalize(path).expect("a boundary fault path must exist");
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ARMED.with(|armed| {
+                    let _ = armed.borrow_mut().take();
+                });
+            }
+        }
+        ARMED.with(|armed| {
+            *armed.borrow_mut() = Some(Armed {
+                path,
+                point,
+                fault,
+                fired: false,
+            });
+        });
+        let _restore = Restore;
+        body()
+    }
+
+    /// Apply the armed fault when it targets this path and point. Filesystem
+    /// mutations act on the fixture and let the walk's own read observe them;
+    /// only an injected error or a bounded delay is returned directly.
+    pub(super) fn apply(path: &Path, point: BoundaryPoint) -> Option<std::io::Error> {
+        let fault = ARMED.with(|armed| {
+            let mut armed = armed.borrow_mut();
+            let armed = armed.as_mut()?;
+            if armed.fired || armed.point != point || armed.path != path {
+                return None;
+            }
+            armed.fired = true;
+            Some(armed.fault.clone())
+        })?;
+        match fault {
+            Fault::Remove => {
+                remove(path);
+                None
+            }
+            Fault::ReplaceWithSymlink(target) => {
+                remove(path);
+                if let Err(error) = symlink(&target, path) {
+                    eprintln!("oxide: test boundary symlink failed: {error}");
+                }
+                None
+            }
+            Fault::ReplaceWithFile => {
+                remove(path);
+                if let Err(error) = fs::write(path, b"replacement") {
+                    eprintln!("oxide: test boundary file failed: {error}");
+                }
+                None
+            }
+            Fault::ReplaceWithDirectory => {
+                remove(path);
+                if let Err(error) = fs::create_dir(path) {
+                    eprintln!("oxide: test boundary directory failed: {error}");
+                }
+                None
+            }
+            Fault::Fail(code) => Some(std::io::Error::from_raw_os_error(code)),
+            Fault::Delay(ms) => {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                None
+            }
+        }
+    }
+
+    fn remove(path: &Path) {
+        let removed = match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(path),
+            Ok(_) => fs::remove_file(path),
+            Err(_) => return,
+        };
+        if let Err(error) = removed {
+            eprintln!("oxide: test boundary removal failed: {error}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::{CString, OsStr, OsString};
     use std::io::Write as _;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{symlink, MetadataExt};
     use std::path::Path as StdPath;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2004,5 +2376,515 @@ mod tests {
             .policy
             .iter()
             .all(|hint| !hint.note.to_lowercase().contains("delet")));
+    }
+
+    fn path_bytes(path: &StdPath) -> usize {
+        path.as_os_str().as_bytes().len()
+    }
+
+    fn component(name: &OsStr) -> CString {
+        CString::new(name.as_bytes()).expect("a fixture component has no NUL byte")
+    }
+
+    fn open_directory(path: &StdPath) -> OwnedFd {
+        let name = CString::new(path.as_os_str().as_bytes()).expect("a fixture path has no NUL");
+        // SAFETY: `name` is a valid NUL-terminated path and the flags need no
+        // further precondition; the descriptor is owned here.
+        let raw = unsafe {
+            libc::open(
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(
+            raw >= 0,
+            "open fixture directory {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `raw` is a fresh descriptor this call owns.
+        unsafe { OwnedFd::from_raw_fd(raw) }
+    }
+
+    fn open_at(parent: &OwnedFd, name: &OsStr) -> OwnedFd {
+        let name = component(name);
+        // SAFETY: a valid NUL-terminated single component with plain flags.
+        let raw = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(
+            raw >= 0,
+            "openat fixture level: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `raw` is a fresh descriptor this call owns.
+        unsafe { OwnedFd::from_raw_fd(raw) }
+    }
+
+    fn mkdir_at(parent: &OwnedFd, name: &OsStr) {
+        let name = component(name);
+        // SAFETY: a valid NUL-terminated single component; the mode is only a
+        // permission mask.
+        let status = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+        assert_eq!(
+            status,
+            0,
+            "mkdirat fixture level: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    fn unlink_at(parent: &OwnedFd, name: &OsStr, flags: i32) {
+        let name = component(name);
+        // SAFETY: a valid NUL-terminated single component below an open parent.
+        let status = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        assert_eq!(
+            status,
+            0,
+            "unlinkat fixture level: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    fn create_file_at(parent: &OwnedFd, name: &OsStr, bytes: usize) {
+        let name = component(name);
+        // SAFETY: a valid NUL-terminated single component with plain flags.
+        let raw = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        assert!(
+            raw >= 0,
+            "openat fixture file: {}",
+            std::io::Error::last_os_error()
+        );
+        let payload = vec![b'x'; bytes];
+        // SAFETY: `raw` is writable and `payload` is a live buffer of that
+        // length.
+        let written = unsafe { libc::write(raw, payload.as_ptr().cast(), payload.len()) };
+        assert_eq!(
+            written as usize,
+            bytes,
+            "write fixture file: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `raw` is owned here and closed exactly once.
+        unsafe { libc::close(raw) };
+    }
+
+    struct OracleMetadata {
+        allocated: u64,
+        size: u64,
+        inode: u64,
+    }
+
+    fn oracle_metadata(parent: &OwnedFd, name: &OsStr) -> OracleMetadata {
+        let name = component(name);
+        // SAFETY: zeroed storage for exactly one `stat`, read no-follow.
+        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        // SAFETY: `name` is a valid single component below `parent` and `stat`
+        // points to writable storage for one value.
+        let status = unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        assert_eq!(
+            status,
+            0,
+            "fstatat fixture file: {}",
+            std::io::Error::last_os_error()
+        );
+        OracleMetadata {
+            allocated: u64::try_from(stat.st_blocks)
+                .unwrap_or_default()
+                .saturating_mul(512),
+            size: u64::try_from(stat.st_size).unwrap_or_default(),
+            inode: stat.st_ino,
+        }
+    }
+
+    /// A chain built only with `openat`/`mkdirat` so a leaf path longer than
+    /// the platform limit can be created and removed without a process-wide
+    /// working directory change. Every level stays nameable by path.
+    struct DeepChain {
+        levels: Vec<OwnedFd>,
+        names: Vec<OsString>,
+        leaf: OsString,
+        leaf_path: PathBuf,
+    }
+
+    impl DeepChain {
+        /// `index` gives each chain its own base directory so two chains never
+        /// share a component name, and the deep levels are unique per chain.
+        fn new(fixture: &Fixture, index: usize, target_bytes: usize) -> Self {
+            let base = fixture.path().join(format!("chain{index}"));
+            fs::create_dir_all(&base).expect("create the deep-chain base");
+            let base_bytes = path_bytes(&base);
+            let mut depth = target_bytes.saturating_sub(base_bytes + 41) / 41;
+            let leaf_bytes = loop {
+                let rest = target_bytes
+                    .checked_sub(base_bytes + 41 * depth + 1)
+                    .expect("the target path is longer than its base");
+                if (1..=200).contains(&rest) {
+                    break rest;
+                }
+                depth += 1;
+            };
+            let mut levels = vec![open_directory(&base)];
+            let mut names = Vec::with_capacity(depth);
+            for _ in 0..depth {
+                let name = OsString::from("\u{e9}".repeat(20));
+                let parent = levels.last().expect("a current level");
+                mkdir_at(parent, &name);
+                let child = open_at(parent, &name);
+                names.push(name);
+                levels.push(child);
+            }
+            let leaf = OsString::from(format!(
+                "{}{}",
+                "\u{e9}".repeat(leaf_bytes / 2),
+                "f".repeat(leaf_bytes % 2)
+            ));
+            create_file_at(levels.last().expect("a deepest level"), &leaf, 4096);
+            let mut leaf_path = base.to_path_buf();
+            for name in &names {
+                leaf_path.push(name);
+            }
+            leaf_path.push(&leaf);
+            assert_eq!(path_bytes(&leaf_path), target_bytes);
+            Self {
+                levels,
+                names,
+                leaf,
+                leaf_path,
+            }
+        }
+
+        fn oracle(&self) -> OracleMetadata {
+            oracle_metadata(self.levels.last().expect("a deepest level"), &self.leaf)
+        }
+    }
+
+    impl Drop for DeepChain {
+        fn drop(&mut self) {
+            let deepest = self.levels.last().expect("a deepest level");
+            unlink_at(deepest, &self.leaf, 0);
+            for index in (0..self.names.len()).rev() {
+                unlink_at(&self.levels[index], &self.names[index], libc::AT_REMOVEDIR);
+            }
+        }
+    }
+
+    fn walk_with_fault(
+        fixture: &Fixture,
+        path: &StdPath,
+        point: BoundaryPoint,
+        fault: guard_faults::Fault,
+    ) -> InventoryReport {
+        guard_faults::with_fault(path, point, fault, || {
+            inventory_directory(fixture.path(), InventoryLimits::default())
+        })
+        .expect("the fixture root is unchanged")
+    }
+
+    #[test]
+    fn enumerated_entry_metadata_uses_the_live_directory_entry() {
+        let fixture = Fixture::new("metadata-source");
+        fixture.file("debug/deps/pkg.rlib", 4096);
+        fixture.file("debug/incremental/session.o", 128);
+        fs::create_dir_all(fixture.path().join("debug/build/out")).unwrap();
+        symlink(
+            fixture.path().join("debug/deps"),
+            fixture.path().join("debug/linkdir"),
+        )
+        .unwrap();
+        let (report, sources) = crate::test_fs::observe_metadata_sources(|| {
+            inventory_directory(fixture.path(), InventoryLimits::default())
+        });
+        let report = report.expect("the fixture root is unchanged");
+        assert!(report.coverage.complete);
+        assert_eq!(report.total.files, 2);
+        assert_eq!(report.total.directories, 5);
+        assert_eq!(report.total.symlinks, 1);
+        assert_eq!(report.total.logical_bytes_by_name, 4224);
+        // A symlink is never read for C1, so only the file and directory
+        // entries were read and each came from its live directory entry.
+        assert!(
+            sources
+                .iter()
+                .all(|source| *source == MetadataSource::EntryRelative),
+            "unexpected metadata source: {sources:?}"
+        );
+        assert_eq!(
+            u64::try_from(sources.len()).unwrap(),
+            report.total.files + report.total.directories
+        );
+    }
+
+    #[test]
+    fn a_path_at_or_past_the_platform_limit_keeps_the_full_path_operation() {
+        let fixture = Fixture::new("path-max");
+        let limit = full_path_limit();
+        let inside = DeepChain::new(&fixture, 0, limit - 1);
+        let oracle = inside.oracle();
+        let at = DeepChain::new(&fixture, 1, limit);
+        let above = DeepChain::new(&fixture, 2, limit + 1);
+        // The fallback performs exactly the former full-path operation: a path
+        // at or past the limit cannot be named by path at all.
+        for chain in [&at, &above] {
+            let error = fs::symlink_metadata(&chain.leaf_path)
+                .expect_err("a path at or past the limit must stay unnameable");
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ENAMETOOLONG),
+                "{}",
+                chain.leaf_path.display()
+            );
+        }
+        let (report, sources) = crate::test_fs::observe_metadata_sources(|| {
+            inventory_directory(fixture.path(), InventoryLimits::default())
+        });
+        let report = report.expect("the fixture root is unchanged");
+        assert!(!report.coverage.complete);
+        assert_eq!(gap(&report, GapKind::MissingMetadata), 2);
+        assert_eq!(report.vanished, 0);
+        assert_eq!(report.total.files, 1);
+        assert_eq!(report.total.distinct_files, 1);
+        assert_eq!(report.total.allocated_bytes, oracle.allocated);
+        assert_eq!(report.total.logical_bytes_by_name, oracle.size);
+        assert!(
+            oracle.inode != 0,
+            "the descriptor oracle did not observe the leaf"
+        );
+        assert_eq!(
+            sources
+                .iter()
+                .filter(|source| **source == MetadataSource::FullPath)
+                .count(),
+            2,
+            "the fallback selection was not used exactly twice: {sources:?}"
+        );
+        assert!(sources
+            .iter()
+            .any(|source| *source == MetadataSource::EntryRelative));
+    }
+
+    #[test]
+    fn replaced_entry_kinds_are_partial_and_never_counted() {
+        let fixture = Fixture::new("entry-kind");
+        let replaced_file = fixture.file("debug/deps/replaced.rlib", 64);
+        let replaced_dir = fixture.path().join("debug/build/replaced");
+        fs::create_dir_all(&replaced_dir).unwrap();
+        fixture.file("debug/incremental/kept.o", 32);
+
+        // A file that is a directory when read is never counted as one.
+        let report = walk_with_fault(
+            &fixture,
+            &replaced_file,
+            BoundaryPoint::Entry,
+            guard_faults::Fault::ReplaceWithDirectory,
+        );
+        assert!(!report.coverage.complete);
+        assert_eq!(gap(&report, GapKind::UnsupportedMetadata), 1);
+        assert_eq!(report.vanished, 0);
+        assert_eq!(report.total.files, 1);
+
+        // A directory that is a symlink when read is never followed or read.
+        let target = fixture.path().join("debug/deps");
+        let report = walk_with_fault(
+            &fixture,
+            &replaced_dir,
+            BoundaryPoint::Entry,
+            guard_faults::Fault::ReplaceWithSymlink(target),
+        );
+        assert_eq!(gap(&report, GapKind::UnsupportedMetadata), 1);
+        assert_eq!(report.vanished, 0);
+        assert_eq!(report.total.files, 1);
+    }
+
+    #[test]
+    fn a_directory_that_changes_at_a_boundary_sample_is_never_read() {
+        // Each case builds its own fixture: the fault mutates the victim.
+        let case =
+            |label: &str, fault: guard_faults::Fault, expected: &dyn Fn(&InventoryReport)| {
+                let fixture = Fixture::new(label);
+                let victim = fixture.path().join("debug/build/victim");
+                fs::create_dir_all(&victim).unwrap();
+                fs::write(victim.join("payload"), vec![b'p'; 512]).unwrap();
+                let kept = fixture.file("debug/deps/kept.rlib", 64);
+                fs::create_dir_all(fixture.path().join("debug/incremental")).unwrap();
+                let kept_allocated = fs::symlink_metadata(&kept).unwrap().blocks() * 512;
+                let report = walk_with_fault(&fixture, &victim, BoundaryPoint::BeforeGuard, fault);
+                assert_eq!(report.total.files, 1, "{label}: only kept was observed");
+                assert_eq!(
+                    report.total.allocated_bytes, kept_allocated,
+                    "{label}: observed bytes were not retained exactly"
+                );
+                expected(&report);
+            };
+
+        // A persistent replacement with another directory is an identity
+        // contradiction, never a read of the replacement.
+        case(
+            "guard-before-directory",
+            guard_faults::Fault::ReplaceWithDirectory,
+            &|report| {
+                assert_eq!(gap(report, GapKind::UnsupportedMetadata), 1);
+                assert_eq!(report.vanished, 0);
+            },
+        );
+        case(
+            "guard-before-file",
+            guard_faults::Fault::ReplaceWithFile,
+            &|report| {
+                assert_eq!(gap(report, GapKind::UnsupportedMetadata), 1);
+                assert_eq!(report.vanished, 0);
+            },
+        );
+        case(
+            "guard-before-symlink",
+            guard_faults::Fault::ReplaceWithSymlink(PathBuf::from("/nonexistent-boundary-target")),
+            &|report| {
+                assert_eq!(gap(report, GapKind::UnsupportedMetadata), 1);
+                assert_eq!(report.vanished, 0);
+            },
+        );
+        // One vanished event for the observed directory, and none for its
+        // never-observed children. A vanished path is not a coverage gap, as
+        // everywhere else in this walk.
+        case(
+            "guard-before-remove",
+            guard_faults::Fault::Remove,
+            &|report| {
+                assert!(report.coverage.complete);
+                assert_eq!(report.vanished, 1);
+            },
+        );
+        // ELOOP and ENOTDIR are never turned into vanished observations.
+        for (label, code) in [
+            ("guard-before-loop", libc::ELOOP),
+            ("guard-before-notdir", libc::ENOTDIR),
+        ] {
+            case(label, guard_faults::Fault::Fail(code), &|report| {
+                assert_eq!(gap(report, GapKind::MissingMetadata), 1);
+                assert_eq!(report.vanished, 0);
+            });
+        }
+    }
+
+    #[test]
+    fn a_directory_replaced_after_enumeration_discards_only_its_new_children() {
+        let fixture = Fixture::new("guard-after");
+        let victim = fixture.path().join("a");
+        fs::create_dir_all(victim.join("sub")).unwrap();
+        fs::write(victim.join("observed"), vec![b'o'; 256]).unwrap();
+        fs::write(victim.join("sub/deep"), vec![b'd'; 256]).unwrap();
+        let sibling = fixture.file("b/kept", 256);
+        let observed_allocated = fs::symlink_metadata(&victim.join("observed"))
+            .unwrap()
+            .blocks()
+            * 512;
+        let sibling_allocated = fs::symlink_metadata(&sibling).unwrap().blocks() * 512;
+
+        let report = walk_with_fault(
+            &fixture,
+            &victim,
+            BoundaryPoint::BeforeConfirm,
+            guard_faults::Fault::ReplaceWithDirectory,
+        );
+        assert!(!report.coverage.complete);
+        assert_eq!(gap(&report, GapKind::UnsupportedMetadata), 1);
+        // Discarded children are never invented as vanished observations.
+        assert_eq!(report.vanished, 0);
+        // The already observed file inside the replaced directory is kept, the
+        // sibling directory queued before it is still read, and the deeper
+        // child queued by the replaced directory is never read.
+        assert_eq!(report.total.files, 2);
+        assert_eq!(
+            report.total.allocated_bytes,
+            observed_allocated + sibling_allocated
+        );
+        assert_eq!(report.total.directories, 3);
+    }
+
+    #[test]
+    fn a_slow_final_directory_sample_cannot_finish_after_the_deadline() {
+        let fixture = Fixture::new("guard-deadline");
+        let directory = fixture.path().join("debug");
+        fixture.file("debug/f.rlib", 1);
+        let limits = InventoryLimits {
+            max_elapsed_ms: 500,
+            ..InventoryLimits::default()
+        };
+        let report = guard_faults::with_fault(
+            &directory,
+            BoundaryPoint::BeforeConfirm,
+            guard_faults::Fault::Delay(600),
+            || inventory_directory(fixture.path(), limits),
+        )
+        .expect("the fixture root is unchanged");
+        // The enumerated file was observed before the second sample, so the
+        // walk reached that sample; the slow sample may not still produce
+        // complete coverage.
+        assert_eq!(report.total.files, 1);
+        assert!(!report.coverage.complete);
+        assert!(gap(&report, GapKind::ElapsedDeadline) >= 1);
+    }
+
+    #[test]
+    fn root_boundary_samples_keep_the_existing_refusals() {
+        let case = |label: &str, fault: guard_faults::Fault| -> InventoryError {
+            let fixture = Fixture::new(label);
+            fixture.file("kept/file", 8);
+            let root = fixture.path().to_path_buf();
+            let result = guard_faults::with_fault(&root, BoundaryPoint::BeforeGuard, fault, || {
+                inventory_directory(&root, InventoryLimits::default())
+            });
+            // Restore a plain directory so the fixture's own drop can clean up
+            // whatever the fault left at the root path.
+            let _ = fs::remove_file(&root);
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).expect("restore the fixture root");
+            result.expect_err("the root boundary refusal is an error")
+        };
+
+        assert!(matches!(
+            case("root-guard-removed", guard_faults::Fault::Remove),
+            InventoryError::RootMissing(_)
+        ));
+        assert!(matches!(
+            case(
+                "root-guard-directory",
+                guard_faults::Fault::ReplaceWithDirectory
+            ),
+            InventoryError::RootUnreadable { .. }
+        ));
+        assert!(matches!(
+            case("root-guard-file", guard_faults::Fault::ReplaceWithFile),
+            InventoryError::RootNotDirectory(_)
+        ));
+        assert!(matches!(
+            case(
+                "root-guard-symlink",
+                guard_faults::Fault::ReplaceWithSymlink(PathBuf::from("/nonexistent-root-target"))
+            ),
+            InventoryError::RootNotDirectory(_)
+        ));
+        assert!(matches!(
+            case("root-guard-denied", guard_faults::Fault::Fail(libc::EACCES)),
+            InventoryError::RootUnreadable { .. }
+        ));
     }
 }
