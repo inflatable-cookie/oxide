@@ -54,24 +54,18 @@ impl Member {
         })
     }
 
-    /// The host profile member a recipe writes: `debug` for `quick` and
-    /// `debug`, `release` for release.
-    pub(crate) fn host(profile: Profile) -> Self {
-        Self {
-            name: profile_member(profile).to_owned(),
-        }
-    }
-
     pub(crate) fn name(&self) -> &str {
         &self.name
     }
 
     /// The member's path under the checkout's real `target` directory.
+    #[cfg(test)]
     pub(crate) fn relative(&self) -> std::path::PathBuf {
         std::path::PathBuf::from(&self.name)
     }
 
     /// Whether this member names an explicit triple.
+    #[cfg(test)]
     pub(crate) fn triple(&self) -> Option<&str> {
         self.name.split_once('/').map(|(triple, _)| triple)
     }
@@ -128,23 +122,6 @@ impl Declaration {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.members.is_empty()
-    }
-
-    pub(crate) fn contains(&self, member: &Member) -> bool {
-        self.members.binary_search(member).is_ok()
-    }
-
-    /// The declared names, for a diagnostic.
-    pub(crate) fn names(&self) -> String {
-        if self.members.is_empty() {
-            "none".to_owned()
-        } else {
-            self.members
-                .iter()
-                .map(Member::name)
-                .collect::<Vec<_>>()
-                .join(", ")
-        }
     }
 }
 

@@ -368,13 +368,6 @@ pub(crate) enum LayoutKind {
 }
 
 impl LayoutKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::WholeTarget => "whole-target",
-            Self::Profile => "profile members",
-        }
-    }
-
     /// The receipt format this layout is published in: a legacy receipt is
     /// never silently rewritten as a successor.
     fn receipt_version(self) -> &'static str {
@@ -527,6 +520,7 @@ impl Receipt {
 
     /// The first placement: the legacy `target` link, or the first profile
     /// member in sorted order. Profile paths address members explicitly.
+    #[allow(dead_code)]
     fn link(&self) -> &LinkPlacement {
         &self.links[0]
     }
@@ -620,6 +614,7 @@ impl Receipt {
     }
 
     /// Whether this receipt places the given profile member.
+    #[allow(dead_code)]
     pub(crate) fn holds_member(&self, member: &str) -> bool {
         self.placement(member).is_some()
     }
@@ -647,6 +642,7 @@ impl Receipt {
     }
 
     /// Drop one member's placement after an explicit detach of that member.
+    #[allow(dead_code)]
     fn forget_member(&mut self, member: &str) {
         self.links.retain(|placement| placement.member != member);
     }
@@ -2903,10 +2899,10 @@ fn adopt_profile(context: &Context, receipt: Receipt) -> Result<(Receipt, Select
 
 fn refuse_existing_target(context: &Context, target: &TargetState) -> String {
     let link = context.link();
-    refuse_existing_target_at(context, target, &link)
+    refuse_existing_target_at(target, &link)
 }
 
-fn refuse_existing_target_at(context: &Context, target: &TargetState, link: &Path) -> String {
+fn refuse_existing_target_at(target: &TargetState, link: &Path) -> String {
     format!(
         "outputs adopt refused: {} is {}; Oxide never moves, adopts or deletes it. Nothing was changed. {}",
         link.display(),
@@ -3959,20 +3955,6 @@ impl Plan {
             .iter()
             .find_map(|member| member.selected.as_ref())
     }
-
-    /// The root one member is planned for, when it is owned.
-    fn selected_for(&self, member: &str) -> Option<&Selected> {
-        self.members
-            .iter()
-            .find(|planned| planned.member == member)
-            .and_then(|planned| planned.selected.as_ref())
-    }
-
-    fn is_real(&self, member: &str) -> bool {
-        self.members
-            .iter()
-            .any(|planned| planned.member == member && planned.selected.is_none())
-    }
 }
 
 /// The root the next command must select, read-only and without any lock: the
@@ -4955,7 +4937,7 @@ fn transition_at(
                 link.display()
             ))
         }
-        _ => return Err(refuse_existing_target_at(context, &target, &link)),
+        _ => return Err(refuse_existing_target_at(&target, &link)),
     }
     // A newly created root gets a fresh random nonce; an existing root keeps
     // the nonce in its marker. A missing root is never re-created with the
@@ -5228,7 +5210,6 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
         .map(|placement| placement.member.clone())
         .ok_or_else(|| {
             stop_unknown(
-                context,
                 &prepared,
                 "its link is not this checkout's target or a profile member of this receipt",
             )
@@ -5253,7 +5234,6 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
     let link = prepared.link.clone();
     if link_path(&context.workspace, &member) != link {
         return Err(stop_unknown(
-            context,
             &prepared,
             "its link is not this checkout's link for that placement",
         ));
@@ -5270,7 +5250,6 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
             Ok(read) if read == prepared.to.root => true,
             Ok(read) => {
                 return Err(stop_unknown(
-                    context,
                     &prepared,
                     &format!(
                         "{} selects {}, not the prepared root {}",
@@ -5282,7 +5261,6 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
             }
             Err(error) => {
                 return Err(stop_unknown(
-                    context,
                     &prepared,
                     &format!("cannot read {}: {error}", sibling.display()),
                 ))
@@ -5290,14 +5268,12 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
         },
         Ok(_) => {
             return Err(stop_unknown(
-                context,
                 &prepared,
                 &format!("{} exists and is not a link", sibling.display()),
             ))
         }
         Err(error) => {
             return Err(stop_unknown(
-                context,
                 &prepared,
                 &format!("cannot inspect {}: {error}", sibling.display()),
             ))
@@ -5309,7 +5285,6 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
     // already-renamed target is contradictory.
     if renamed && sibling_live {
         return Err(stop_unknown(
-            context,
             &prepared,
             "the target already selects the prepared root but the prepared sibling still exists",
         ));
@@ -5332,7 +5307,7 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
     let _binding = if owned_new && (renamed || (sibling_live && old_live)) {
         Some(
             validate_prepared(context, &prepared)
-                .map_err(|reason| stop_unknown(context, &prepared, &reason))?,
+                .map_err(|reason| stop_unknown(&prepared, &reason))?,
         )
     } else {
         None
@@ -5357,7 +5332,6 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
             .map_err(|error| format!("cannot read {}: {error}", link.display()))?;
         if live != prepared.to.root {
             return Err(stop_unknown(
-                context,
                 &prepared,
                 "the replayed link does not read back as the prepared root",
             ));
@@ -5369,14 +5343,12 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
     //    sibling means nothing was published.
     if sibling_live {
         return Err(stop_unknown(
-            context,
             &prepared,
             "the prepared sibling exists but neither its rename nor a rollback is safe",
         ));
     }
     if !old_live {
         return Err(stop_unknown(
-            context,
             &prepared,
             "neither the prepared sibling nor the receipt's old target link is live",
         ));
@@ -5419,7 +5391,7 @@ fn validate_prepared(context: &Context, prepared: &Prepared) -> Result<Option<Bi
     Ok(binding)
 }
 
-fn stop_unknown(context: &Context, prepared: &Prepared, reason: &str) -> String {
+fn stop_unknown(prepared: &Prepared, reason: &str) -> String {
     format!(
         "outputs: the prepared transition to generation {} cannot be replayed: {reason}. Both roots and {} are kept exactly as they are; inspect `oxide outputs status` and the file system before acting",
         prepared.generation,
@@ -5516,23 +5488,6 @@ pub(crate) fn marker_digest(root: &Path) -> Result<String, String> {
 
 /// Record the terminal prune outcome in the checkout's receipt. The registry
 /// terminal state is already durable when this runs.
-pub(crate) fn mark_pruned(
-    control: &Path,
-    checkout: &Path,
-    checkout_id: &str,
-    intent: &str,
-    outcome: &str,
-) -> Result<(), String> {
-    mark_pruned_at(
-        control,
-        checkout,
-        checkout_id,
-        intent,
-        outcome,
-        process::now_ms(),
-    )
-}
-
 /// Publish the receipt's terminal prune image with an exact FIXED timestamp.
 pub(crate) fn mark_pruned_at(
     control: &Path,
@@ -5791,10 +5746,6 @@ fn sync_directory(path: &Path) -> Result<(), String> {
 /// forms are refused even when that is a false negative. Missing Git, a
 /// non-repository, a timeout, a command error and malformed, oversized or
 /// ambiguous output all refuse: unknown is never permission.
-fn refuse_link_git_exposure(context: &Context) -> Result<(), String> {
-    refuse_link_git_exposure_at(context, &context.link().clone(), None)
-}
-
 /// The ignore prerequisite for one link path: the legacy whole-target link
 /// (`suffix` `None`) or one profile member below `target/` (`suffix` is the
 /// member). A profile member is a path inside the real `target` directory, so
@@ -6164,11 +6115,6 @@ impl CleanPlacement {
         &self.members
     }
 
-    /// Whether this placement is the profile layout.
-    pub fn profile(&self) -> bool {
-        !self.members.is_empty()
-    }
-
     /// What the clean keeps, for its report; empty for an ephemeral checkout.
     pub fn preserved_note(&self) -> Option<String> {
         if !self.members.is_empty() {
@@ -6501,6 +6447,10 @@ mod tests {
             .is_none());
     }
 
+    fn context_id(fixture: &Fixture) -> String {
+        identity::digest(&fixture.checkout.to_string_lossy())
+    }
+
     /// A committed profile receipt for `debug` and `release` on one root.
     fn profile_receipt(fixture: &Fixture) -> Receipt {
         let mut receipt = Receipt::first_with(
@@ -6721,7 +6671,7 @@ mod tests {
         let (fixture, legacy) = legacy_checkout();
         let context = fixture.context();
         let root = legacy.selected().unwrap().root().to_path_buf();
-        let mut journal_receipt = publish_migration_journal(
+        let journal_receipt = publish_migration_journal(
             &fixture.control,
             &legacy,
             Migration {
@@ -6924,6 +6874,82 @@ mod tests {
         let back: Receipt = serde_json::from_value(doc).unwrap();
         assert_eq!(back, receipt);
         assert_eq!(back.layout(), LayoutKind::WholeTarget);
+    }
+
+    #[test]
+    fn the_terminal_prune_image_is_fixed_and_replay_accepts_exactly_it() {
+        let fixture = Fixture::new();
+        let mut receipt = profile_receipt(&fixture);
+        write_receipt(&fixture.control, &receipt).unwrap();
+        let id = "e".repeat(32);
+        let first = terminal_receipt_image(
+            &fixture.control,
+            &fixture.checkout,
+            &context_id(&fixture),
+            &id,
+            "deleted",
+            42,
+        )
+        .unwrap();
+        let again = terminal_receipt_image(
+            &fixture.control,
+            &fixture.checkout,
+            &context_id(&fixture),
+            &id,
+            "deleted",
+            42,
+        )
+        .unwrap();
+        assert_eq!(first, again, "the terminal image is not deterministic");
+        mark_pruned_at(
+            &fixture.control,
+            &fixture.checkout,
+            &context_id(&fixture),
+            &id,
+            "deleted",
+            42,
+        )
+        .unwrap();
+        let published = fs::read(receipt_path(&fixture.control, &context_id(&fixture))).unwrap();
+        assert_eq!(
+            published, first,
+            "the published image is not the recorded one"
+        );
+        let terminal: Receipt = serde_json::from_slice(&published).unwrap();
+        assert_eq!(terminal.state, ReceiptState::Pruned);
+        assert_eq!(
+            terminal
+                .pruned
+                .as_ref()
+                .map(|record| (record.intent.as_str(), record.at_ms)),
+            Some((id.as_str(), 42))
+        );
+        // A later replay of the same intent accepts the exact image and does
+        // not rewrite it; a different fixed timestamp is refused.
+        mark_pruned_at(
+            &fixture.control,
+            &fixture.checkout,
+            &context_id(&fixture),
+            &id,
+            "deleted",
+            42,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(receipt_path(&fixture.control, &context_id(&fixture))).unwrap(),
+            first
+        );
+        assert!(terminal_receipt_image(
+            &fixture.control,
+            &fixture.checkout,
+            &context_id(&fixture),
+            &"f".repeat(32),
+            "deleted",
+            43,
+        )
+        .is_err());
+        receipt.state = ReceiptState::Committed;
+        let _ = receipt;
     }
 
     #[test]
@@ -8536,12 +8562,13 @@ mod tests {
             crate::prune::registry_revision(&fixture.control).unwrap(),
         )
         .unwrap();
-        assert!(mark_pruned(
+        assert!(mark_pruned_at(
             &fixture.control,
             &fixture.checkout,
             &checkout_id,
             &first,
-            "deleted"
+            "deleted",
+            5
         )
         .is_err());
         assert!(!discard_pruning_receipt(
@@ -8551,12 +8578,13 @@ mod tests {
             &first
         )
         .unwrap());
-        mark_pruned(
+        mark_pruned_at(
             &fixture.control,
             &fixture.checkout,
             &checkout_id,
             &second,
             "deleted",
+            5,
         )
         .unwrap();
         assert_eq!(
