@@ -64,7 +64,12 @@ pub(crate) const MAX_STATE_BYTES: u64 = 16 * 1024 * 1024;
 /// permanent version-2 fence is actually written.
 const LEGACY_MAX_STATE_BYTES: u64 = 256 * 1024;
 /// Permanent control-state fence for revised Store mutations (oxide#118).
-pub(crate) const STATE_VERSION: u32 = 2;
+/// Version 3 carries the owned-outputs registry initialization transaction
+/// (oxide#129); version 2 remains readable until the forward fence upgrades
+/// it.
+pub(crate) const STATE_VERSION: u32 = 3;
+/// Version 2 (oxide#128) is read with the strict version-3 field bounds.
+const PREVIOUS_STATE_VERSION: u32 = 2;
 const LEGACY_STATE_VERSION: u32 = 1;
 
 /// UTF-8 byte caps for control-state fields (oxide#118).
@@ -92,7 +97,11 @@ const MAX_LOST_OBJECT_BYTES: usize = 8 * 1024;
 const MAX_HOLDER_OBJECT_BYTES: usize = 5 * 1024;
 const MAX_STATE_HEADER_BYTES: usize = 4 * 1024;
 /// The owned-outputs fence value; see [`State::owned_outputs`].
-const OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/1";
+pub(crate) const OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/2";
+/// The version-1 owned-outputs fence is readable until the version-2 fence and
+/// registry initialization transaction replace it (oxide#129).
+const LEGACY_OWNED_OUTPUTS_FENCE: &str = "oxide.outputs/1";
+const MAX_INIT_TRANSACTION_BYTES: usize = 64;
 const MAX_ORIGIN_BYTES: u64 = 8 * 1024 * 1024;
 const ORIGIN_VERSION: u32 = 1;
 const WAIT_POLL: Duration = Duration::from_millis(200);
@@ -285,6 +294,33 @@ struct State {
     /// clean checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     owned_outputs: Option<String>,
+    /// Owned-outputs registry initialization (oxide#129). `Initializing` is
+    /// durable before either control is fenced; `Ready` is published only
+    /// after the registry and its directory are durable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outputs_init: Option<OutputsInit>,
+}
+
+/// The durable initialization record shared by both pools of a pair.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum OutputsInit {
+    Initializing {
+        transaction: String,
+        started_ms: u64,
+    },
+    Ready {
+        transaction: String,
+        ready_ms: u64,
+    },
+}
+
+impl OutputsInit {
+    fn transaction(&self) -> &str {
+        match self {
+            Self::Initializing { transaction, .. } | Self::Ready { transaction, .. } => transaction,
+        }
+    }
 }
 
 impl Default for State {
@@ -299,6 +335,7 @@ impl Default for State {
             recoveries: Vec::new(),
             flushes: Vec::new(),
             owned_outputs: None,
+            outputs_init: None,
         }
     }
 }
@@ -1466,6 +1503,7 @@ impl Store {
 
     /// Full accounting: the whole-payload walk and one walk per slot, for
     /// `oxide status` and readiness only.
+    #[allow(dead_code)]
     pub fn status(&self) -> Result<PoolStatus, String> {
         pool_status(&self.pool).map_err(|error| lease_error("cannot read the pool", &error))
     }
@@ -1758,11 +1796,12 @@ impl Store {
     /// state is replaced atomically and read without its own lock; for the
     /// host-wide limit, a command starting in the other pool at the same
     /// moment may briefly exceed it by one.
+    #[allow(dead_code)]
     /// Publish the owned-outputs downgrade fence in this pool's state and in
     /// its paired pool's (internal first), creating either state when absent
     /// so a pre-feature Oxide cannot start from a fresh unfenced one.
     pub fn fence_owned_outputs(&self) -> Result<(), String> {
-        let mut controls = vec![self.control.clone()];
+        let mut controls = vec![self.owner_control().to_path_buf()];
         controls.extend(self.sibling.as_ref().map(|sibling| sibling.control.clone()));
         for control in controls {
             let store = Store {
@@ -1779,9 +1818,17 @@ impl Store {
             let _admission = store.admission()?;
             let mut state = store.load()?;
             if state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
-                if state.owned_outputs.is_some() {
+                if state.owned_outputs.as_deref() != Some(LEGACY_OWNED_OUTPUTS_FENCE)
+                    && state.owned_outputs.is_some()
+                {
                     return Err(format!(
                         "Oxide state in {} carries an unknown owned-outputs fence; refusing",
+                        store.control.display()
+                    ));
+                }
+                if state.outputs_init.is_some() {
+                    return Err(format!(
+                        "Oxide state in {} already records an output-registry transaction but not the version-2 fence; refusing",
                         store.control.display()
                     ));
                 }
@@ -1790,6 +1837,138 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// The recorded owned-outputs registry transaction, when initialization
+    /// has begun. Read without a lock; callers that mutate recheck it under
+    /// admission.
+    pub fn outputs_initialization(&self) -> Result<Option<OutputsInit>, String> {
+        Ok(self.load()?.outputs_init)
+    }
+
+    /// Run the owned-outputs initialization protocol exactly once
+    /// (oxide#129). The internal control is durable first
+    /// (`initializing` + the version-2 fence), then the paired removable
+    /// control, then `create(transaction)` creates and syncs the registry,
+    /// then both controls record `ready`. A crash resumes only the recorded
+    /// transaction; an unknown or contradicting record refuses before any
+    /// registry effect.
+    pub fn initialize_outputs(
+        &self,
+        transaction: &str,
+        create: &dyn Fn(&str) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        if !bounded_text(transaction, MAX_INIT_TRANSACTION_BYTES) {
+            return Err("the output-registry transaction identity is unusable".to_owned());
+        }
+        let internal_control = self.owner_control().to_path_buf();
+        let internal = self.view(&internal_control);
+        internal.ensure_control()?;
+        let _internal_admission = internal.admission()?;
+        let mut internal_state = internal.load()?;
+        let transaction = match internal_state.outputs_init.clone() {
+            Some(OutputsInit::Ready { .. }) => {
+                // The registry must already be present; `create` validates
+                // it without creating or replacing anything.
+                if internal_state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
+                    return Err(
+                        "the internal control records a ready output registry without the version-2 fence; refusing"
+                            .to_owned(),
+                    );
+                }
+                create(transaction)?;
+                return Ok(true);
+            }
+            Some(OutputsInit::Initializing { transaction, .. }) => transaction,
+            None => {
+                internal_state.outputs_init = Some(OutputsInit::Initializing {
+                    transaction: transaction.to_owned(),
+                    started_ms: process::now_ms(),
+                });
+                internal_state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
+                internal.save(&internal_state)?;
+                transaction.to_owned()
+            }
+        };
+        // Internal-first: the paired removable control is fenced only after
+        // the internal record is durable.
+        let sibling = self
+            .sibling
+            .as_ref()
+            .filter(|sibling| sibling.control != internal_control)
+            .map(|sibling| (self.view(&sibling.control), sibling.barrier));
+        if let Some((sibling, _barrier)) = &sibling {
+            sibling.ensure_control()?;
+            let _admission = sibling.admission()?;
+            let mut state = sibling.load()?;
+            match &state.outputs_init {
+                Some(OutputsInit::Ready { transaction: ready, .. }) if ready == &transaction => {}
+                Some(OutputsInit::Ready { .. }) => {
+                    return Err(
+                        "the paired pool records a different ready output registry; refusing"
+                            .to_owned(),
+                    )
+                }
+                Some(OutputsInit::Initializing { transaction: other, .. })
+                    if other != &transaction =>
+                {
+                    return Err(format!(
+                        "the paired pool records initializer transaction {other}, not {transaction}; refusing"
+                    ))
+                }
+                Some(OutputsInit::Initializing { .. }) => {}
+                None => {
+                    state.outputs_init = Some(OutputsInit::Initializing {
+                        transaction: transaction.clone(),
+                        started_ms: process::now_ms(),
+                    });
+                    state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
+                    sibling.save(&state)?;
+                }
+            }
+            if state.owned_outputs.as_deref() != Some(OWNED_OUTPUTS_FENCE) {
+                return Err(
+                    "the paired pool does not carry the version-2 output fence; refusing"
+                        .to_owned(),
+                );
+            }
+        }
+        create(&transaction)?;
+        if let Some(OutputsInit::Initializing { .. }) = internal_state.outputs_init {
+            internal_state.outputs_init = Some(OutputsInit::Ready {
+                transaction: transaction.clone(),
+                ready_ms: process::now_ms(),
+            });
+            internal.save(&internal_state)?;
+        }
+        if let Some((sibling, _barrier)) = &sibling {
+            let _admission = sibling.admission()?;
+            let mut state = sibling.load()?;
+            if !matches!(
+                &state.outputs_init,
+                Some(OutputsInit::Ready { transaction: ready, .. }) if ready == &transaction
+            ) {
+                state.outputs_init = Some(OutputsInit::Ready {
+                    transaction: transaction.clone(),
+                    ready_ms: process::now_ms(),
+                });
+                sibling.save(&state)?;
+            }
+        }
+        Ok(true)
+    }
+
+    fn view(&self, control: &Path) -> Store {
+        Store {
+            pool: self.pool.clone(),
+            backend: self.backend,
+            payload: self.payload.clone(),
+            control: control.to_path_buf(),
+            budget: self.budget,
+            recorded_budget: self.recorded_budget,
+            max_active: self.max_active,
+            sibling: None,
+        }
     }
 
     /// A store over `root` for other modules' unit tests.
@@ -3020,17 +3199,15 @@ impl Store {
             .map_err(|error| format!("Oxide state is invalid: {error}"))?;
         let legacy = match state.version {
             LEGACY_STATE_VERSION => true,
-            STATE_VERSION => false,
+            PREVIOUS_STATE_VERSION | STATE_VERSION => false,
             _ => return Err("Oxide state has an unsupported version or exceeds a limit".to_owned()),
         };
         if legacy && bytes.len() as u64 > LEGACY_MAX_STATE_BYTES {
             return Err("Oxide state exceeds its byte limit".to_owned());
         }
-        if state
-            .owned_outputs
-            .as_deref()
-            .is_some_and(|fence| fence != OWNED_OUTPUTS_FENCE)
-        {
+        if state.owned_outputs.as_deref().is_some_and(|fence| {
+            fence != OWNED_OUTPUTS_FENCE && fence != LEGACY_OWNED_OUTPUTS_FENCE
+        }) {
             return Err("Oxide state has an unsupported version or exceeds a limit".to_owned());
         }
         validate_state(&state, legacy)?;
@@ -3073,8 +3250,18 @@ impl Store {
 /// document must satisfy every field cap and compact-object ceiling, so the
 /// record-count and byte bounds hold together.
 fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
-    if state.version != STATE_VERSION && !(legacy && state.version == LEGACY_STATE_VERSION) {
+    if !matches!(
+        state.version,
+        LEGACY_STATE_VERSION | PREVIOUS_STATE_VERSION | STATE_VERSION
+    ) {
         return Err("Oxide state has an unsupported version".to_owned());
+    }
+    if state
+        .outputs_init
+        .as_ref()
+        .is_some_and(|init| !bounded_text(init.transaction(), MAX_INIT_TRANSACTION_BYTES))
+    {
+        return Err("Oxide state has an invalid output-registry transaction".to_owned());
     }
     if state.tickets.len() > MAX_TICKETS
         || state.cleans.len() > MAX_CLEANS
@@ -3096,6 +3283,7 @@ fn validate_state(state: &State, legacy: bool) -> Result<(), String> {
         records: Vec::new(),
         recoveries: Vec::new(),
         flushes: Vec::new(),
+        outputs_init: None,
         ..state.clone()
     };
     object_fits(&header, MAX_STATE_HEADER_BYTES, "state header")?;
@@ -3315,6 +3503,53 @@ fn verify_private_dir(path: &Path) -> Result<(), String> {
 /// Take the internal pool's existing admission lock for metadata updates and
 /// command admission. Only the lock file may be created; the control
 /// directory must already exist.
+/// The internal pool's admission lock, made reentrant for this thread so an
+/// owned-output publication can update its registry and its receipt inside one
+/// critical section without taking the same lock twice (oxide#129). Nested
+/// acquisition only succeeds on the thread that already holds it.
+pub(crate) struct PublicationGuard {
+    control: PathBuf,
+    nested: bool,
+    _file: Option<File>,
+}
+
+thread_local! {
+    static HELD_PUBLICATION: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn publication_guard(control: &Path) -> Result<PublicationGuard, String> {
+    let already = HELD_PUBLICATION.with(|held| held.borrow().iter().any(|path| path == control));
+    if already {
+        return Ok(PublicationGuard {
+            control: control.to_path_buf(),
+            nested: true,
+            _file: None,
+        });
+    }
+    let file = lock_admission(control)?;
+    HELD_PUBLICATION.with(|held| held.borrow_mut().push(control.to_path_buf()));
+    Ok(PublicationGuard {
+        control: control.to_path_buf(),
+        nested: false,
+        _file: Some(file),
+    })
+}
+
+impl Drop for PublicationGuard {
+    fn drop(&mut self) {
+        if self.nested {
+            return;
+        }
+        HELD_PUBLICATION.with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some(index) = held.iter().rposition(|path| path == &self.control) {
+                held.remove(index);
+            }
+        });
+    }
+}
+
 pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
     let directory = open_control_directory(control)?
         .ok_or_else(|| format!("{} does not exist", control.display()))?;

@@ -340,7 +340,7 @@ def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) ->
     expect(slot["rank"] == 2 and slot["state"] == "idle", f"release did not stamp the idle rank: {slot}")
     state_path = os.path.join(pool, "oxide-managed", "state.json")
     state = read_json(state_path)
-    expect(state["version"] == 2, f"the first mutation did not install control version 2: {state}")
+    expect(state["version"] == 3, f"the first mutation did not install control version 3: {state}")
     RESULTS.append({"case": "fences-installed", "ledger_policy": 1, "state_version": 2})
 
     # A legacy representation (no fence, rank 0) still reads for status and
@@ -362,7 +362,7 @@ def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) ->
     expect(read_json(state_path)["version"] == 1, "a read-only status migrated the legacy control state")
     run(proof, ["exec", "--", sys.executable, "-c", "pass"], "legacy-first-write", app, env)
     fenced = read_json(ledger_path)
-    expect(fenced.get("capacity_policy") == 1 and read_json(state_path)["version"] == 2,
+    expect(fenced.get("capacity_policy") == 1 and read_json(state_path)["version"] == 3,
            "the first revised mutation did not install both fences")
     RESULTS.append({"case": "legacy-read-no-migration", "fenced_on_mutation": True})
 

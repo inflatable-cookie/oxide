@@ -169,6 +169,16 @@ fails, Oxide reports that the wait duration is unavailable.
   timeout, an error or a bad answer) also refuse, and nothing changes.
   Already-created links, `detach`, `status`, `plan` and ordinary builds are
   unaffected.
+- A root whose checkout is gone is never cleaned automatically. Inspect it
+  with `oxide outputs prune --dry-run`, which prints a bounded preview and its
+  SHA-256 and changes nothing; a real run needs those exact bytes
+  (`--plan FILE --plan-sha256 HEX`) and revalidates every predicate. Roots
+  whose checkout is present, whose selection is not the last live one, whose
+  writer custody is unknown, whose marker or volume does not verify, or which
+  predate the version-2 registry identity are kept. An unfinished intent
+  reports exit 3 and is settled only with `oxide outputs resolve-intent
+  <intent-id>` when both the original and quarantine leaves are positively
+  absent. Never prune by hand or delete an `oxide-outputs` directory.
 - Old version 1 registrations without a mode read as ephemeral and remain
   unchanged until an explicit mode update. An update writes version 2 with a
   required mode. Older Oxide binaries refuse version 2; reinstalling a binary

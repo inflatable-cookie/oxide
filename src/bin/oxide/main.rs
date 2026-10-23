@@ -19,6 +19,7 @@ mod identity;
 mod launch;
 mod outputs;
 mod process;
+mod prune;
 mod removable;
 mod store;
 mod watchdog;
@@ -997,6 +998,9 @@ fn print_pools(
             Section::Internal(note) => {
                 let header = format!("internal pool: {}{note}", internal.pool.display());
                 print_pool(internal, &header, &[], &internal_report, mode)?;
+                for line in crate::prune::status_lines(internal.control()) {
+                    println!("  {line}");
+                }
             }
             Section::NoRemovable => println!("removable pool: none registered"),
             Section::Removable => {
