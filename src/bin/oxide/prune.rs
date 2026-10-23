@@ -907,7 +907,7 @@ fn hex32(value: &str) -> bool {
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
-fn hex64(value: &str) -> bool {
+pub(crate) fn hex64(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()

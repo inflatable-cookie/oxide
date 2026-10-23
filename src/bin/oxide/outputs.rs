@@ -325,13 +325,9 @@ impl Migration {
         if self.root.nonce().is_none() || self.root.nonce().is_some_and(|nonce| nonce.len() != 32) {
             return Err("the layout migration needs one 128-bit root nonce".to_owned());
         }
-        if !crate::prune::is_nonce(&self.prior_receipt_sha)
-            && self.prior_receipt_sha.len() != 64
-            && self
-                .prior_receipt_sha
-                .bytes()
-                .any(|byte| !byte.is_ascii_hexdigit())
-        {
+        // Exactly one lowercase SHA-256 hex digest. A 128-bit root nonce is a
+        // different value type and never satisfies this field.
+        if !is_receipt_digest(&self.prior_receipt_sha) {
             return Err("the layout migration pins an unusable receipt digest".to_owned());
         }
         Ok(())
@@ -2028,6 +2024,14 @@ fn receipt_digest(control: &Path, receipt: &Receipt) -> Result<String, String> {
     file_digest(&receipt_path(control, &receipt.checkout_id))
 }
 
+/// A migration's pinned receipt preimage is exactly one lowercase SHA-256 hex
+/// digest: 64 characters of `0-9a-f`. Empty, wrong-length, non-hex, uppercase
+/// and 32-character nonce values are all unusable, and the nonce test is not a
+/// substitute for the digest test.
+fn is_receipt_digest(value: &str) -> bool {
+    crate::prune::hex64(value)
+}
+
 /// Identity facts a migration step records in the same durable phase write as
 /// the phase itself, so a replay never guesses them.
 #[derive(Default)]
@@ -2265,6 +2269,10 @@ fn replay_migration(
                 .to_owned(),
         );
     }
+    // The journal is revalidated against the receipt it is replayed from, so a
+    // malformed pinned digest (or any other unusable pinned field) refuses here
+    // instead of being acted on.
+    migration.validate(&receipt)?;
     if migration.phase == MigrationPhase::Committed {
         return finish_migration_cleanup(context, control, receipt, &migration);
     }
@@ -3915,6 +3923,40 @@ fn bind_profile(
             Ok(state) => state,
             Err(reason) => return Bind::Refuse(reason),
         };
+        // P4: this checkout's committed receipt still places the member on an
+        // EXTERNAL root, but this command's fresh plan does not (a still-mounted
+        // volume became unusable after the slot was keyed). Relinking,
+        // recreating or linking an absent member under an internal root would be
+        // an automatic external -> local transition behind the owner's back, so
+        // it refuses before Cargo whatever the live link looks like and whether
+        // or not the intermediate slot fell back. Only the explicit
+        // `oxide outputs adopt` may change the recorded place.
+        if let Some(committed) = receipt
+            .links
+            .iter()
+            .find(|placement| placement.member == planned.member && placement.selected.is_some())
+            .and_then(|placement| placement.selected.as_ref())
+        {
+            let planned_external = planned
+                .selected
+                .as_ref()
+                .is_some_and(|wanted| wanted.kind == RootKind::External);
+            if committed.kind == RootKind::External && !planned_external {
+                let now = planned.selected.as_ref().map_or_else(
+                    || "a real profile directory".to_owned(),
+                    |wanted| {
+                        member_destination(&wanted.root, &planned.member)
+                            .display()
+                            .to_string()
+                    },
+                );
+                return Bind::Refuse(format!(
+                    "outputs: {} keeps the external member root {} from this checkout's committed receipt, but this command would place it at {now}; Oxide never moves an owned external output to another pool automatically, so nothing was built. Restore the drive, or run `oxide outputs adopt` to recheck this checkout's owned outputs",
+                    link.display(),
+                    member_destination(&committed.root, &planned.member).display()
+                ));
+            }
+        }
         match (&planned.selected, &state) {
             (Some(wanted), TargetState::OwnedLink(root))
                 if root == &member_destination(&wanted.root, &planned.member) =>
@@ -6695,6 +6737,28 @@ mod tests {
     /// that set it run one at a time.
     static MIGRATION_ENVIRONMENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// P5: the pinned receipt preimage is a SHA-256 digest and nothing else.
+    /// These are pure string-shape assertions and touch no file system.
+    #[test]
+    fn migration_receipt_digest_is_strictly_sha256() {
+        assert!(is_receipt_digest(&"a".repeat(64)));
+        assert!(is_receipt_digest(&"0123456789abcdef".repeat(4)));
+        // Empty and wrong lengths, in both directions.
+        assert!(!is_receipt_digest(""));
+        assert!(!is_receipt_digest(&"a".repeat(63)));
+        assert!(!is_receipt_digest(&"a".repeat(65)));
+        // A 128-bit root nonce is a different value type, not a digest.
+        assert!(!is_receipt_digest(&"a".repeat(32)));
+        assert!(!is_receipt_digest(&"0123456789abcdef".repeat(2)));
+        // 64 characters that are not hex, and uppercase hex.
+        assert!(!is_receipt_digest(&"g".repeat(64)));
+        assert!(!is_receipt_digest(&"A".repeat(64)));
+        assert!(!is_receipt_digest(&"aB".repeat(32)));
+        // Malformed separators or prefixes never stand in for a digest.
+        assert!(!is_receipt_digest(&format!("sha256:{}", "a".repeat(57))));
+        assert!(!is_receipt_digest(&format!("{}\n", "a".repeat(63))));
+    }
+
     struct Fixture {
         root: PathBuf,
         checkout: PathBuf,
@@ -7531,6 +7595,87 @@ mod tests {
             Bind::Bound(_) => panic!("an external member link was bound on an internal fallback"),
             Bind::Wait => panic!("a fallback refusal waited"),
         }
+    }
+
+    /// P4: a still-mounted volume becoming unusable makes the fresh plan stop
+    /// selecting the external root, so the legacy fallback refusal above never
+    /// sees an external destination. Binding must still refuse: relinking the
+    /// live external member to the internal root would be an automatic
+    /// external -> local transition. No fallback slot is present here, so the
+    /// refusal cannot come from the legacy #117 rule, and nothing changes.
+    #[test]
+    fn a_local_plan_never_relinks_a_committed_external_member() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let context = fixture.context();
+        let mut receipt =
+            Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+        let external = Selected {
+            kind: RootKind::External,
+            root: fixture.root.join("volume/oxide-outputs/checkout-0000"),
+            volume_uuid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
+            nonce: Some("99999999999999999999999999999999".to_owned()),
+            generation: 1,
+        };
+        receipt.state = ReceiptState::Committed;
+        receipt.generation = 1;
+        receipt.place_member("debug").selected = Some(external.clone());
+        write_receipt(&fixture.control, &receipt).unwrap();
+        let recorded = fs::read(receipt_path(&fixture.control, &context.checkout_id)).unwrap();
+        // The mounted volume's root is now unusable, so the fresh plan places
+        // the member on the internal fallback instead.
+        let local = Selected {
+            kind: RootKind::Local,
+            root: fixture.checkout.join(".oxide-outputs/local"),
+            volume_uuid: None,
+            nonce: Some("11111111111111111111111111111111".to_owned()),
+            generation: 1,
+        };
+        let plan = Plan {
+            whole_target: false,
+            members: vec![PlannedMember {
+                member: "debug".to_owned(),
+                selected: Some(local.clone()),
+            }],
+        };
+        fs::create_dir_all(fixture.checkout.join("target")).unwrap();
+        let link = fixture.checkout.join("target/debug");
+        let destination = member_destination(&external.root, "debug");
+        symlink(&destination, &link).unwrap();
+        let store = pool_store(&fixture.root.join("pool"));
+        match bind_profile(&context, &store, 0, &receipt, Some(&plan)) {
+            Bind::Refuse(reason) => {
+                assert!(
+                    reason.contains(
+                        "never moves an owned external output to another pool automatically"
+                    ),
+                    "{reason}"
+                );
+                assert!(reason.contains("nothing was built"), "{reason}");
+                assert!(
+                    reason.contains(&destination.display().to_string()),
+                    "{reason}"
+                );
+                assert!(
+                    reason.contains(
+                        &member_destination(&local.root, "debug")
+                            .display()
+                            .to_string()
+                    ),
+                    "{reason}"
+                );
+                assert!(reason.contains("oxide outputs adopt"), "{reason}");
+            }
+            Bind::Bound(_) => panic!("an external member was relinked to the internal pool"),
+            Bind::Wait => panic!("an external-to-local refusal waited"),
+        }
+        // Nothing changed: the link still names the external member and the
+        // committed receipt bytes are exactly what was recorded.
+        assert_eq!(fs::read_link(&link).unwrap(), destination);
+        assert_eq!(
+            fs::read(receipt_path(&fixture.control, &context.checkout_id)).unwrap(),
+            recorded
+        );
+        assert!(!fixture.checkout.join(".oxide-outputs").exists());
     }
 
     #[test]

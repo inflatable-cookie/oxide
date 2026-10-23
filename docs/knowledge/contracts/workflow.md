@@ -3132,7 +3132,12 @@ stay real.
   Cargo-reported program beneath its own owned member's link only; a real
   (unlinked) member keeps Cargo's own executable path, so a mixed checkout
   never runs another member's artifact. An internal-pool fallback slot refuses
-  before Cargo while an external member link is live, and an explicit adopt
+  before Cargo while an external member link is live, and a command whose fresh
+  plan no longer selects a member's committed external root (a still-mounted
+  volume that became unusable after the slot was keyed) refuses before Cargo
+  too, with or without a fallback slot and whatever the live link looks like:
+  an owned external member is never moved to another pool automatically, and
+  only an explicit adopt changes where a member is placed. An explicit adopt
   compares the live link with the desired destination (relinking under custody
   on a fallback or redock rather than trusting an old receipt match). A profile
   clean is validated before the legacy whole-target pre-gate, plans each

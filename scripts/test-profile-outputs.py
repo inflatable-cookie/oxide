@@ -914,16 +914,50 @@ def run(proof: Proof, repo: str) -> None:
         "the low-reserve control did not restore the recorded registration",
     )
 
-    # A separate parent-ignore control: the directory-only `/target/` rule
-    # refuses the automatic whole-target link, while the same rule is a valid
-    # parent ignore for profile members under the real target directory.
+    # A separate parent-ignore control: a directory-only `/target/` rule
+    # cannot cover the published non-directory link, so the automatic
+    # whole-target conversion refuses it. Git decides that question itself and
+    # answers "does not ignore `target`" while the path is still absent (a
+    # trailing-slash rule only matches a directory it can see), so the proof
+    # asserts THIS reachable refusal verbatim rather than a branch that the
+    # absent-target geometry never reaches. The same rule stays a valid parent
+    # ignore for profile members under the real target directory, which is why
+    # the real-empty explicit profile adopt that follows must succeed.
     parent = make_checkout(proof, "parent-ignore", PARENT_IGNORE_APP)
+    parent_target = os.path.join(parent, "target")
     code, _, stderr = oxide(proof, ["build"], "parent-ignore auto-adopt", parent)
-    expect(code != 0 and "matches directories only" in stderr, f"the directory-only parent rule did not refuse the whole-target link: {stderr}")
+    expect(code == 1, f"the uncovariable directory-only rule did not refuse with exit 1: {code}: {stderr}")
+    expect(
+        f"refusing to convert {parent_target} to an owned link" in stderr,
+        f"the refusal did not name the whole-target link it declined: {stderr}",
+    )
+    expect(
+        "Git does not ignore `target`" in stderr,
+        f"the refusal did not report Git's own non-directory answer: {stderr}",
+    )
+    expect(
+        "add `/target` (or `target`), not `target/`" in stderr,
+        f"the refusal did not name the non-directory remedy: {stderr}",
+    )
+    expect("nothing was changed" in stderr, f"the refusal did not report that nothing changed: {stderr}")
+    # No authority change: no receipt, no link, no owned root, no target.
     expect(not os.path.exists(receipt_file(pool, parent)), "the refused whole-target conversion wrote a receipt")
-    os.makedirs(os.path.join(parent, "target"))
+    expect(not os.path.lexists(parent_target), f"the refused conversion left {parent_target} in place")
+    expect(
+        not os.path.lexists(os.path.join(parent, ".oxide-outputs")),
+        "the refused conversion created a checkout-local owned root",
+    )
+    # The same checkout then succeeds through the explicitly requested profile
+    # conversion over a REAL empty target: the directory-only rule is a valid
+    # parent ignore where the member link really sits under a directory.
+    os.makedirs(parent_target)
     adopt(proof, parent, "parent-ignore adopt")
-    expect_layout(parent, {"debug": f"link:{root_of(pool, parent)}"})
+    parent_root = root_of(pool, parent)
+    expect_layout(parent, {"debug": f"link:{parent_root}"})
+    code, _, stderr = oxide(proof, ["build"], "parent-ignore build", parent)
+    expect(code == 0, f"the adopted parent-ignore checkout did not build: {stderr}")
+    expect("fallback" not in summary(stderr), f"parent-ignore: external placement unexpectedly fell back: {summary(stderr)}")
+    expect_layout(parent, {"debug": f"link:{parent_root}"})
 
     # Nonvacuous top-level preservation on its own checkout, so the cleaned
     # `first` checkout never carries a foreign entry.
