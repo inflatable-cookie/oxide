@@ -1834,6 +1834,7 @@ fn reuse_walks_only_its_slot_and_returns_that_measurement() {
             slot_id: first.grant.slot_id.clone(),
             incarnation: first.grant.incarnation.clone(),
             unique_allocated_bytes: expected,
+            dir: None,
         })
     );
 
@@ -2479,4 +2480,201 @@ fn explicit_idle_eviction_checks_rank_headroom_before_deleting() {
         .find(|slot| slot.slot_id == idle.slot_id)
         .expect("idle slot remains a member");
     assert_eq!(slot.state, SlotOccupancy::Idle);
+}
+
+/// Read a pool's control files exactly, for a before/after comparison.
+fn control_bytes(pool: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files = Vec::new();
+    for name in ["config.json", "ledger.json"] {
+        files.push((
+            name.to_owned(),
+            fs::read(pool.join(name)).unwrap_or_default(),
+        ));
+    }
+    files
+}
+
+fn walk_log() -> Option<PathBuf> {
+    std::env::var_os("OXIDE_TEST_WALK_LOG").map(PathBuf::from)
+}
+
+/// A passive snapshot reads membership and a recorded deletion without
+/// taking the pool lock, reconciling it, walking anything or writing. A
+/// mismatched config/ledger pair refuses instead of being repaired.
+#[test]
+fn snapshot_is_read_only_and_does_not_wait_for_the_pool_lock() {
+    let fx = Fixture::new("snapshot");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let leased = lease_injected(request(&pool, &project, &workspace, "holder")).expect("lease");
+    fs::write(leased.env.cargo_build_build_dir.join("blob"), b"bytes").expect("blob");
+    release_injected(&pool, &leased.lease_id).expect("release");
+
+    // Another holder's exclusive pool lock is not something a snapshot may
+    // wait for. The channel timeout proves it returns while the lock is held.
+    let held = super::pool::lock_injected(&pool).expect("lock");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let pool_copy = pool.clone();
+    let log = walk_log();
+    let reader = thread::spawn(move || {
+        let before = control_bytes(&pool_copy);
+        let result = super::pool::snapshot_injected(&pool_copy);
+        let after = control_bytes(&pool_copy);
+        let slot_dirs: Vec<String> = match &result {
+            Ok(snapshot) => snapshot
+                .slots
+                .iter()
+                .map(|slot| slot.dir.clone().unwrap_or_else(|| slot.slot_id.clone()))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        sender
+            .send((result, before, after, slot_dirs))
+            .expect("send");
+    });
+    let (result, before, after, _) = receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("a passive snapshot must not wait for the pool lock");
+    drop(held);
+    reader.join().expect("reader");
+    let snapshot = result.expect("snapshot");
+    assert_eq!(before, after, "a snapshot wrote a control file");
+    assert_eq!(snapshot.slots.len(), 1);
+    assert_eq!(snapshot.slots[0].slot_id, leased.slot_id);
+    assert_eq!(snapshot.slots[0].state, SlotOccupancy::Idle);
+    assert_eq!(snapshot.slots[0].lease_id, None);
+    assert!(snapshot.evicting_slot_ids.is_empty());
+    assert_eq!(snapshot.backend, BUDGET_BACKEND_DIRECTORY_V1);
+    assert_eq!(
+        snapshot.payload,
+        fs::canonicalize(pool.join("payload")).expect("payload")
+    );
+    if let Some(log) = log {
+        let contents = fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !contents.contains(&format!("snapshot-walks-{}", std::process::id())),
+            "the walk log is shared; no snapshot walk is expected here"
+        );
+    }
+
+    // A recorded version that disagrees with the config is unknown, never
+    // silently repaired by a read.
+    super::pool::mismatched_store_id_injected(&pool).expect("mismatch");
+    assert_eq!(
+        super::pool::snapshot_injected(&pool),
+        Err(LeaseError::BackingMismatch)
+    );
+    assert!(status_injected(&pool).is_err());
+}
+
+/// A passive measurement walks the recorded payload and slots but never
+/// reconciles: a recorded `Evicting` slot stays intact, its bytes are walked
+/// and coverage is honestly unknown because nothing finished its deletion.
+#[test]
+fn measure_walks_without_reconciling_a_recorded_deletion() {
+    let fx = Fixture::new("measure");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let leased = lease_injected(request(&pool, &project, &workspace, "holder")).expect("lease");
+    fs::write(
+        leased.env.cargo_build_build_dir.join("blob"),
+        vec![3_u8; 64 * 1024],
+    )
+    .expect("blob");
+    release_injected(&pool, &leased.lease_id).expect("release");
+    let slot = leased.slot_id.parse::<u64>().expect("slot id");
+    super::pool::mark_evicting_for_test(&pool, slot).expect("mark evicting");
+    let ledger_before = fs::read(pool.join("ledger.json")).expect("ledger");
+    let slot_path = pool.join("payload/slots").join(&leased.slot_id);
+    assert!(slot_path.is_dir());
+
+    let measured = super::pool::measure_injected(&pool).expect("measure");
+    assert_eq!(
+        measured.status.coverage,
+        AccountingCoverage::Unknown,
+        "a pending recorded deletion makes coverage unknown"
+    );
+    assert!(
+        measured.status.payload_unique_allocated_bytes.unwrap_or(0) >= 64 * 1024,
+        "the walk covers the pending slot's bytes"
+    );
+    assert_eq!(measured.status.slots.len(), 1);
+    assert_eq!(measured.status.slots[0].state, SlotOccupancy::Abandoned);
+    assert_eq!(
+        measured.snapshot.evicting_slot_ids,
+        vec![leased.slot_id.clone()]
+    );
+    assert!(slot_path.is_dir(), "measure deleted the recorded slot");
+    assert_eq!(
+        fs::read(pool.join("ledger.json")).expect("ledger"),
+        ledger_before,
+        "measure wrote the ledger"
+    );
+
+    // The mutating status reconciles it; the passive measurement must not.
+    let after = status_injected(&pool).expect("status");
+    assert!(after.slots.is_empty(), "status reconciles the deletion");
+    assert!(!slot_path.exists());
+}
+
+/// A measured status and the mutating status agree on a pool with nothing
+/// pending, so the passive path is not a weaker measurement in disguise.
+#[test]
+fn measure_matches_status_for_a_settled_pool() {
+    let fx = Fixture::new("measure-settled");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let leased = lease_injected(request(&pool, &project, &workspace, "holder")).expect("lease");
+    fs::write(
+        leased.env.cargo_build_build_dir.join("blob"),
+        vec![1_u8; 4096],
+    )
+    .expect("blob");
+    release_injected(&pool, &leased.lease_id).expect("release");
+
+    let measured = super::pool::measure_injected(&pool).expect("measure");
+    let walked = status_injected(&pool).expect("status");
+    assert_eq!(measured.status.coverage, walked.coverage);
+    assert_eq!(
+        measured.status.payload_unique_allocated_bytes,
+        walked.payload_unique_allocated_bytes
+    );
+    assert_eq!(
+        measured.status.slots[0].unique_allocated_bytes,
+        walked.slots[0].unique_allocated_bytes
+    );
+}
+
+/// Reuse's measurement carries the exact recorded slot directory, so a
+/// recorded observation binds to that directory and not to an assumed
+/// `slots/<id>` path.
+#[test]
+fn reuse_measurement_names_the_recorded_slot_directory() {
+    let fx = Fixture::new("reuse-dir");
+    let pool = fx.dir("pool");
+    create_injected(&pool, 8 * 1024 * 1024).expect("init");
+    let project = fx.dir("project");
+    let workspace = fx.dir("workspace");
+    let mut first = request(&pool, &project, &workspace, "a");
+    first.layout = Some(SlotLayout {
+        folders: vec!["project-aaaa".to_owned()],
+        same_repository: Vec::new(),
+        profile: "quick".to_owned(),
+    });
+    let leased = lease_injected(first).expect("new slot");
+    release_injected(&pool, &leased.lease_id).expect("release");
+    let reused = managed::lease_measured(request(&pool, &project, &workspace, "b")).expect("reuse");
+    let measured = reused.measured.expect("reuse measures its slot");
+    assert_eq!(measured.slot_id, leased.slot_id);
+    assert_eq!(
+        measured.dir.as_deref(),
+        Some("project-aaaa/quick-1"),
+        "the measurement names the recorded directory"
+    );
 }

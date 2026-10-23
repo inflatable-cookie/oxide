@@ -335,6 +335,48 @@ pub struct LedgerView {
     pub slots: Vec<LedgerSlot>,
 }
 
+/// A pool's recorded identity, ledger membership and recorded payload root,
+/// read with no lock, no reconciliation and no write (oxide#128). Only a
+/// diagnostic: it grants no admission, ownership or deletion authority and
+/// never infers that a recorded deletion can finish.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PassiveSnapshot {
+    pub store_id: String,
+    pub backend: String,
+    pub cap_bytes: u64,
+    /// The payload root the backend records. For a removable pool this is
+    /// the recorded mount point plus payload directory; nothing here proves
+    /// the volume is mounted, writable or that the path resolves.
+    pub payload: PathBuf,
+    /// The recorded volume binding of an `apfs-volume-v1` pool.
+    pub volume: Option<RecordedVolume>,
+    /// Ledger membership in ledger order.
+    pub slots: Vec<LedgerSlot>,
+    /// Slots recorded `Evicting`, in ledger order: a deletion is pending
+    /// reconciliation. They are neither idle nor held, and this snapshot
+    /// never infers that their recorded deletion can finish.
+    pub evicting_slot_ids: Vec<String>,
+}
+
+/// The volume a removable pool's config records. Recorded facts only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordedVolume {
+    pub mount_point: PathBuf,
+    pub volume_uuid: String,
+    pub payload_dir: String,
+}
+
+/// A passive measurement of one pool and the recorded snapshot it read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MeasuredPool {
+    /// Recorded identity and membership, read before the walks.
+    pub snapshot: PassiveSnapshot,
+    /// The bounded walker result. Byte figures are the walker's; `coverage`
+    /// is unknown while any slot is recorded `Evicting`, because this
+    /// measurement reconciles nothing.
+    pub status: PoolStatus,
+}
+
 /// One ledger record: [`SlotStatus`] without its accounting.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LedgerSlot {
@@ -377,6 +419,9 @@ pub struct ReuseMeasurement {
     pub slot_id: String,
     pub incarnation: String,
     pub unique_allocated_bytes: u64,
+    /// The recorded slot directory the walk covered, so a recorded
+    /// observation binds to exactly that directory (oxide#128).
+    pub dir: Option<String>,
 }
 
 /// A grant and, when reuse walked the slot, that measurement.

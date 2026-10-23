@@ -28,7 +28,8 @@ until this foundation works consistently.
 oxide <check|test|clippy|build|run> [--profile <name>] [cargo args] [-- program args]
 oxide <any other cargo command> [args]   # passed to Cargo, with storage where it builds
 oxide exec [--manifest-path <Cargo.toml>] [--profile <name>] -- <command…>  # a tool that calls Cargo itself
-oxide status                             # pool, slots, waits, stray Cargo output, Cargo home
+oxide status                             # recorded pool, slots, waits; no walk, lock or reconcile
+oxide status --measure                   # bounded payload/slot/checkout/Cargo-home walks, still no reconcile
 oxide status --launch-check              # macOS: a new executable's first-launch penalty, advisory
 oxide clean [--dry-run] [--include-foreign]  # remove <workspace>/target and slot affinity
 oxide clean --cargo-cache                # one pass of Cargo's own home cleanup, network refused
@@ -764,14 +765,46 @@ explicit `recover` unless they adopt it.
   A host-wide limit still bounds concurrent Cargo invocations
   ([W-2](#open-decisions)). Queue/Nucleus still decide which tasks run. Oxide
   only orders the Rust work they launch.
-- `oxide status` reuses the read-only [storage inventory](storage-inventory.md).
-  It reports pool and slot use (each slot's file names, distinct inodes and
-  allocation counted once per inode), the Cargo home's allocation, and stray
-  output: a checkout `target/` holding `deps/` or `incremental/` was built by
-  plain Cargo. Finding none reads `none` only under a
-  [verified Cargo release](#cargo-version-matrix); otherwise it reads
-  `unknown`. Reclaiming that space is an explicit command; live cleanup
-  still needs scoped approval. Nothing inside a slot is ever deleted.
+- `oxide status` is diagnostic and read-only (oxide#128). By default it
+  reports recorded facts only: the pool config and ledger, the ledger's
+  recorded slot directories, the control state's holders, waiting tickets,
+  clean marks, latest use and flushes, and the registration's drive mode. It
+  takes no pool lock, creates no lock, reconciles no recorded deletion, runs
+  no accounting walk, invokes no Cargo, `tmutil` or `diskutil`, and writes
+  nothing. A slot's size is a recorded observation from the reuse walk of a
+  previous acquiring command, labelled with its age, source and lease, or
+  `not measured`; recorded facts are never summed into a pool total and never
+  establish free space or admission. A recorded `Evicting` slot is reported
+  as a pending reconciliation, distinct from idle and held, and is left in
+  place. Cargo-home and stray-output lines say not measured.
+- `oxide status --measure` runs the existing bounded walks once: the
+  whole-payload union and each slot's own walk (the same entry, depth and
+  elapsed bounds admission uses), then the checkout stray-output scan and
+  the Cargo home, all under one cumulative 60 s command budget. It shows
+  current bytes and coverage, still without the pool lock, reconciliation or
+  any write, so a recorded deletion stays pending and lowers coverage to
+  unknown. It does not refresh the recorded observations. Both modes reuse
+  the read-only [storage inventory](storage-inventory.md) bounds; each slot's
+  file names, distinct inodes and allocation are counted once per inode. Stray
+  output means a checkout `target/` holding `deps/` or `incremental/` was
+  built by plain Cargo; finding none reads `none` only under a
+  [verified Cargo release](#cargo-version-matrix), otherwise `unknown`.
+  Reclaiming space is an explicit command; live cleanup still needs scoped
+  approval. Nothing inside a slot is ever deleted.
+- Recorded observations live in the auxiliary
+  `<pool>/oxide-managed/status-observations.json` sidecar (schema
+  `oxide.status-observations/1`, at most 256 KiB and 128 retained recent
+  facts). It is diagnostic, not pool, ledger, registration or receipt format:
+  an older binary may ignore it. Each fact binds `store_id`, slot ID,
+  incarnation, the exact recorded directory, wall-clock time, allocated
+  bytes, source and the measuring lease. Only the reuse walk an acquiring
+  command already made is recorded, atomically and with no extra walk;
+  persistence failure changes no admission, ownership or exit status. A
+  missing, unreadable, foreign, corrupt, unknown-version or
+  generation-mismatched sidecar reads as not measured and never falls back
+  to a scan. A same-generation fact stays a historical observation that may
+  have changed since measurement; a future timestamp is an unknown age. The
+  retention cap is at least the slot ceiling and never lowers it.
 - `OXIDE_POOL_CAP` or the config file sets the soft budget for the next
   admission; `oxide clean --cargo-cache` asks
   Cargo for its own home cleanup ([Cargo home hygiene](#cargo-home-hygiene)).
@@ -1475,7 +1508,7 @@ Assessment:
 | Keep | Why |
 | --- | --- |
 | [Local lease](local-lease.md) library: pool, ledger, leases, recovery, eviction | The storage layer of every `oxide` command. Its standalone CLI and the APFS image backing are retired (oxide#102); Nucleus keeps its installed copy until its owner switches. |
-| [Storage inventory](storage-inventory.md) | Backs `oxide status` and stray detection. |
+| [Storage inventory](storage-inventory.md) | Backs `oxide status --measure`, stray detection and admission accounting. |
 | [Stable profiles](stable-cargo-profiles.md) knowledge | Source of the `quick` / `debug` recipes. |
 | Cargo freshness, path-embedding, containment and capacity findings in [qualification readiness](../qualification-readiness.md) | Ground the freshness gate, debug-path limit and crash-recovery design. Kept as evidence; the narrative is condensed. |
 | [Build-context policy](build-context-policy.md) | Candidate input for per-command incremental/debug defaults; stays proposed. |

@@ -27,13 +27,13 @@ use crate::identity::{self, SlotKey};
 use crate::process;
 use crate::watchdog::Watchdog;
 use oxide_storage::lease::managed::{
-    evict_idle_slot, flush_volume, init_budget_pool, lease_measured, ledger_view, recover, release,
-    status as pool_status,
+    evict_idle_slot, flush_volume, init_budget_pool, lease_measured, ledger_view, measure_within,
+    recover, release, snapshot, status as pool_status,
 };
 use oxide_storage::lease::{
-    LeaseError, LeaseRequest, LedgerSlot, LedgerView, PoolStatus, Profile as LeaseProfile,
-    ReuseMeasurement, SlotLayout, SlotOccupancy, SlotStatus, BUDGET_BACKEND_DIRECTORY_V1,
-    MANAGED_NAME, VOLUME_BACKEND_APFS_V1,
+    AccountingScan, LeaseError, LeaseRequest, LedgerSlot, LedgerView, PoolStatus,
+    Profile as LeaseProfile, ReuseMeasurement, SlotLayout, SlotOccupancy,
+    BUDGET_BACKEND_DIRECTORY_V1, MANAGED_NAME, VOLUME_BACKEND_APFS_V1,
 };
 use oxide_storage::volume::Binding;
 use serde::{Deserialize, Serialize};
@@ -375,11 +375,6 @@ pub enum Return {
 
 /// The held lease must be the record's own: its lease ID, or before that was
 /// saved, its unique lease holder string.
-/// The pool slot whose ledger project is `project`.
-fn slots_view<'a>(pool: &'a PoolStatus, project: &Path) -> Option<&'a SlotStatus> {
-    pool.slots.iter().find(|slot| slot.project == project)
-}
-
 fn return_path(record: &Record, slot: &LedgerSlot) -> Return {
     let own = match (&record.lease_id, &record.holder) {
         (Some(lease_id), _) => slot.lease_id.as_ref() == Some(lease_id),
@@ -730,9 +725,191 @@ fn format_duration(duration: Duration) -> Option<String> {
     Some(format!("{}.{:01}s", tenths / 10, tenths % 10))
 }
 
+/// Which accounting one `oxide status` view shows (oxide#128).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Accounting {
+    /// Recorded ledger, control state and auxiliary observations only: no
+    /// pool lock, no reconciliation, no walk and no write.
+    Recorded,
+    /// The existing bounded walks, made without the pool lock, without
+    /// reconciliation and without writing.
+    Measured,
+}
+
+/// How one slot's size is known for this view. Only [`SlotSize::Measured`]
+/// is a current walk; a recorded observation is a historical fact bound to
+/// one slot generation and may have changed since it was taken.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SlotSize {
+    Measured {
+        logical: Option<u64>,
+        unique: Option<u64>,
+        scan: AccountingScan,
+    },
+    Recorded {
+        allocated_bytes: u64,
+        age: RecordedAge,
+        source: ObservationSource,
+        lease_id: Option<String>,
+    },
+    NotMeasured(String),
+}
+
+/// How old a recorded observation is by the wall clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordedAge {
+    /// Seconds before this view's clock reading.
+    Ago(u64),
+    /// The recorded time is ahead of this clock; age unknown.
+    ClockSkew,
+}
+
+impl SlotSize {
+    /// One honest size phrase for a slot line. A recorded fact never reads
+    /// as a current size, and an absent or unreadable one never reads as
+    /// zero.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Measured {
+                logical, unique, ..
+            } => match unique {
+                Some(bytes) => format!(
+                    "{} allocated, {} logical (measured now)",
+                    crate::cargo_home::size(*bytes),
+                    logical.map_or_else(|| "unknown".to_owned(), crate::cargo_home::size)
+                ),
+                None => "size unknown (measured now)".to_owned(),
+            },
+            Self::Recorded {
+                allocated_bytes,
+                age,
+                source,
+                lease_id,
+            } => {
+                let age = match age {
+                    RecordedAge::Ago(seconds) => format!("recorded {} ago", age_text(*seconds)),
+                    RecordedAge::ClockSkew => {
+                        "recorded at a time ahead of this clock, so its age is unknown".to_owned()
+                    }
+                };
+                let lease = lease_id
+                    .as_deref()
+                    .map_or_else(String::new, |lease| format!(" by lease {lease}"));
+                format!(
+                    "{} ({age}; {}{lease}); may have changed since measurement",
+                    crate::cargo_home::size(*allocated_bytes),
+                    source.label()
+                )
+            }
+            Self::NotMeasured(reason) => reason.clone(),
+        }
+    }
+}
+
+/// Compact wall-clock age: seconds, minutes, hours or days.
+pub(crate) fn age_text(seconds: u64) -> String {
+    match seconds {
+        0..=119 => format!("{seconds}s"),
+        120..=7199 => format!("{}m", seconds / 60),
+        7200..=172_799 => format!("{}h", seconds / 3600),
+        _ => format!("{}d", seconds / 86_400),
+    }
+}
+
+/// A recorded observation's provenance. Only the reuse walk the library
+/// already makes during an acquiring command is recorded: nothing fabricates
+/// an admission measurement or adds a walk to obtain one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ObservationSource {
+    LeaseReuse,
+}
+
+impl ObservationSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LeaseReuse => "measured by the reuse walk when leased",
+        }
+    }
+}
+
+/// The diagnostic sidecar's schema. It is not part of the pool, ledger,
+/// registration or receipt formats and grants no accounting authority.
+const OBSERVATIONS_SCHEMA: &str = "oxide.status-observations/1";
+const OBSERVATIONS_NAME: &str = "status-observations.json";
+const OBSERVATIONS_TEMP: &str = "status-observations.json.tmp";
+/// The sidecar's whole-file bound and retained observation count. The count
+/// is at least the pool's slot ceiling, so it never lowers real capacity.
+const MAX_OBSERVATIONS_BYTES: u64 = 256 * 1024;
+const MAX_OBSERVATIONS: usize = 128;
+
+/// One recorded size fact, bound to exactly one slot generation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Observation {
+    store_id: String,
+    slot_id: String,
+    incarnation: String,
+    /// The ledger's recorded slot directory; `None` is the legacy `<id>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dir: Option<String>,
+    measured_at_ms: u64,
+    allocated_bytes: u64,
+    source: ObservationSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lease_id: Option<String>,
+}
+
+impl Observation {
+    fn matches(&self, store_id: &str, slot: &LedgerSlot) -> bool {
+        self.store_id == store_id
+            && self.slot_id == slot.slot_id
+            && self.incarnation == slot.incarnation
+            && self.dir == slot.dir
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let bounded = |value: &str, max: usize| !value.is_empty() && value.len() <= max;
+        if !bounded(&self.store_id, 64)
+            || !bounded(&self.slot_id, 160)
+            || !bounded(&self.incarnation, 64)
+            || self.dir.as_deref().is_some_and(|dir| dir.len() > 200)
+            || self
+                .lease_id
+                .as_deref()
+                .is_some_and(|lease| lease.len() > 160)
+        {
+            return Err("a recorded observation has an out-of-range field".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Observations {
+    schema: String,
+    observations: Vec<Observation>,
+}
+
+impl Default for Observations {
+    fn default() -> Self {
+        Self {
+            schema: OBSERVATIONS_SCHEMA.to_owned(),
+            observations: Vec::new(),
+        }
+    }
+}
+
 /// Pool and slot view for `oxide status`.
 pub struct Report {
-    pub pool: PoolStatus,
+    /// The walks, only in measured mode.
+    pub measured: Option<PoolStatus>,
+    /// The pool's recorded cap, always.
+    pub cap_bytes: u64,
+    /// Slots recorded `Evicting`: a deletion is pending reconciliation, and
+    /// this view neither reports them as idle nor tries to finish them.
+    pub pending_reconciliation: Vec<String>,
     pub flushes: Vec<Flush>,
     pub waiting: usize,
     pub(crate) waiters: Vec<Waiter>,
@@ -741,6 +918,9 @@ pub struct Report {
     pub recoveries: Vec<Recovery>,
     /// This pool's most recently used slot by its use counter.
     pub last_use: Option<LastUse>,
+    /// Why the control state could not be read. Slots, flushes, waits and
+    /// holders then read as unknown, never as empty.
+    pub state_error: Option<String>,
 }
 
 /// An existing lease-ticket record shown by `oxide status`.
@@ -917,6 +1097,9 @@ pub struct SlotView {
     pub retired: Option<String>,
     /// The holding command's label (`exec <program>`), while held.
     pub holder: Option<String>,
+    /// This slot's size for this view: a live walk, a recorded observation
+    /// or an honest not-measured phrase.
+    pub size: SlotSize,
 }
 
 pub struct Interrupted {
@@ -1164,6 +1347,70 @@ impl Store {
                 Ok(Some(control))
             }
         }
+    }
+
+    /// Open an existing internal pool for `oxide status` without its pool
+    /// lock, reconciliation or any write (oxide#128). Refuses a retired,
+    /// foreign or unsafe pool exactly as [`Store::open_existing_with`] does.
+    pub fn open_recorded(settings: &Settings) -> Result<Option<Self>, String> {
+        match config::inspect(&settings.pool) {
+            Found::Absent => Ok(None),
+            Found::LegacyImage => Err(legacy_refusal()),
+            Found::Directory | Found::Unknown => {
+                config::refuse_unsafe_pool_path(&settings.pool)?;
+                Self::open_recorded_at(&settings.pool, settings).map(Some)
+            }
+        }
+    }
+
+    fn open_recorded_at(path: &Path, settings: &Settings) -> Result<Self, String> {
+        let pool =
+            fs::canonicalize(path).map_err(|error| format!("cannot open the pool: {error}"))?;
+        let snapshot =
+            snapshot(&pool).map_err(|error| lease_error("cannot open the pool", &error))?;
+        let backend = Backend::recorded(&snapshot.backend)?;
+        if backend != Backend::DirectoryBudget {
+            return Err(format!(
+                "the pool at {} records {}, not an internal pool",
+                pool.display(),
+                backend.tag()
+            ));
+        }
+        let control = pool.join(MANAGED_NAME);
+        Ok(Self {
+            payload: snapshot.payload,
+            pool,
+            backend,
+            control,
+            budget: Some(admission_budget(settings)),
+            recorded_budget: snapshot.cap_bytes,
+            max_active: settings.active_build_limit.value,
+            sibling: None,
+        })
+    }
+
+    /// Open a recorded removable pool (its config, ledger and control live
+    /// under the internal pool's control directory) without probing the
+    /// volume. `root` is that pool directory.
+    pub fn open_recorded_removable(root: &Path, max_active: usize) -> Result<Self, String> {
+        let snapshot = snapshot(root)
+            .map_err(|error| lease_error("cannot read the removable pool", &error))?;
+        if Backend::recorded(&snapshot.backend)? != Backend::ApfsVolume {
+            return Err(format!(
+                "the removable pool at {} does not record a removable backend",
+                root.display()
+            ));
+        }
+        Ok(Self {
+            payload: snapshot.payload,
+            pool: root.to_path_buf(),
+            backend: Backend::ApfsVolume,
+            control: root.join(MANAGED_NAME),
+            budget: None,
+            recorded_budget: snapshot.cap_bytes,
+            max_active,
+            sibling: None,
+        })
     }
 
     fn open_at(path: &Path, settings: &Settings) -> Result<Self, String> {
@@ -1887,14 +2134,40 @@ impl Store {
         Ok(())
     }
 
-    pub fn report(&self) -> Result<Report, String> {
-        let pool = self.status()?;
-        let state = if self.control.exists() {
-            self.load()?
-        } else {
-            State::default()
+    /// The recorded (or measured) view of this pool for `oxide status`.
+    /// Recorded mode takes no pool lock, reconciles nothing, walks nothing
+    /// and writes nothing: it reads the ledger, the control state and the
+    /// optional diagnostic sidecar. Measured mode reads the same recorded
+    /// facts plus the existing bounded walks, giving `max_elapsed_ms` as this
+    /// pool's share of one cumulative budget, and still reconciles nothing.
+    pub fn report(&self, accounting: Accounting, max_elapsed_ms: u64) -> Result<Report, String> {
+        let (snapshot, measured) = match accounting {
+            Accounting::Recorded => (
+                snapshot(&self.pool)
+                    .map_err(|error| lease_error("cannot read the pool", &error))?,
+                None,
+            ),
+            Accounting::Measured => {
+                let walked = measure_within(&self.pool, max_elapsed_ms)
+                    .map_err(|error| lease_error("cannot measure the pool", &error))?;
+                (walked.snapshot, Some(walked.status))
+            }
         };
-        let slots = pool
+        let (state, state_error) = if self.control.exists() {
+            match self.load() {
+                Ok(state) => (state, None),
+                Err(error) => (State::default(), Some(error)),
+            }
+        } else {
+            (State::default(), None)
+        };
+        let observations = if accounting == Accounting::Measured {
+            Ok(None)
+        } else {
+            read_observations(&self.control)
+        };
+        let now = process::now_ms();
+        let slots = snapshot
             .slots
             .iter()
             .map(|slot| {
@@ -1924,13 +2197,33 @@ impl Store {
                         })
                         .map(|record| Interrupted {
                             holder_pid: record.holder.as_ref().map(|holder| holder.pid),
-                            path: return_path(record, &LedgerSlot::from(slot)),
+                            path: return_path(record, slot),
                         }),
                     retired: record.and_then(|record| record.retired.clone()),
                     holder: record
                         .filter(|_| slot.state == SlotOccupancy::Held)
                         .and_then(|record| record.holder.as_ref())
                         .and_then(|holder| holder.command.clone()),
+                    size: match &measured {
+                        Some(status) => status
+                            .slots
+                            .iter()
+                            .find(|pooled| pooled.slot_id == slot.slot_id)
+                            .map_or_else(
+                                || {
+                                    SlotSize::NotMeasured(
+                                        "size unknown (this slot was not in the measured ledger)"
+                                            .to_owned(),
+                                    )
+                                },
+                                |pooled| SlotSize::Measured {
+                                    logical: pooled.logical_bytes,
+                                    unique: pooled.unique_allocated_bytes,
+                                    scan: pooled.accounting.clone(),
+                                },
+                            ),
+                        None => recorded_size(&observations, &snapshot.store_id, slot, now),
+                    },
                 }
             })
             .collect::<Vec<SlotView>>();
@@ -1940,7 +2233,7 @@ impl Store {
             .filter(|record| record.last_used > 0)
             .filter_map(|record| {
                 let project = self.affinity_dir(record.id);
-                let slot = slots_view(&pool, &project)?;
+                let slot = snapshot.slots.iter().find(|slot| slot.project == project)?;
                 Some((record, slot))
             })
             .max_by_key(|(record, _)| record.last_used)
@@ -1950,18 +2243,20 @@ impl Store {
                 checkout: record.checkout.clone(),
                 at_ms: record.last_used_ms,
             });
-        let now = SystemTime::now();
+        let now_time = SystemTime::now();
         let waiters = state
             .tickets
             .iter()
             .map(|ticket| Waiter {
                 pid: ticket.pid,
-                age: ticket_age(&self.ticket_path(ticket.id), now),
+                age: ticket_age(&self.ticket_path(ticket.id), now_time),
             })
             .collect();
         Ok(Report {
+            measured,
+            cap_bytes: snapshot.cap_bytes,
+            pending_reconciliation: snapshot.evicting_slot_ids,
             last_use,
-            pool,
             flushes: state.flushes,
             waiting: state.tickets.len(),
             waiters,
@@ -1972,6 +2267,7 @@ impl Store {
                 .collect(),
             slots,
             recoveries: state.recoveries,
+            state_error,
         })
     }
 
@@ -2319,6 +2615,22 @@ impl Store {
         };
         state.records[index].lease_id = Some(grant.lease_id.clone());
         self.save(&state)?;
+        // The library's reuse walk is the only complete measurement an
+        // acquiring command already made. Record it as a diagnostic bound to
+        // exactly this slot generation; a failure never changes admission,
+        // ownership or exit status, and no read path ever writes it.
+        if let Some(measured) = measured.as_ref() {
+            let _ = self.record_observation(Observation {
+                store_id: grant.store_id.clone(),
+                slot_id: measured.slot_id.clone(),
+                incarnation: measured.incarnation.clone(),
+                dir: measured.dir.clone(),
+                measured_at_ms: process::now_ms(),
+                allocated_bytes: measured.unique_allocated_bytes,
+                source: ObservationSource::LeaseReuse,
+                lease_id: Some(grant.lease_id.clone()),
+            });
+        }
         let prior = match (grant.reused_slot, recorded) {
             (false, _) => Prior::Fresh,
             (true, Some(origin)) => Prior::Known(origin),
@@ -3072,6 +3384,166 @@ pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
 }
 
 /// Open an owner-only regular control file without following symlinks.
+/// The optional diagnostic sidecar, read without following a link. `None`
+/// means no observations were ever recorded; any other failure is returned
+/// so a caller reports "not measured" instead of falling back to a scan.
+fn read_observations(control: &Path) -> Result<Option<Observations>, String> {
+    let path = control.join(OBSERVATIONS_NAME);
+    let Some(file) = private_file(&path, false)? else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_OBSERVATIONS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read recorded observations: {error}"))?;
+    if bytes.len() as u64 > MAX_OBSERVATIONS_BYTES {
+        return Err("recorded observations exceed their byte limit".to_owned());
+    }
+    let document: Observations = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("recorded observations are invalid: {error}"))?;
+    if document.schema != OBSERVATIONS_SCHEMA {
+        return Err(format!(
+            "recorded observations use schema {:?}, not {OBSERVATIONS_SCHEMA}",
+            document.schema
+        ));
+    }
+    if document.observations.len() > MAX_OBSERVATIONS {
+        return Err("recorded observations exceed their retention bound".to_owned());
+    }
+    for observation in &document.observations {
+        observation.validate()?;
+    }
+    Ok(Some(document))
+}
+
+/// A slot's size phrase from recorded observations, matched to exactly this
+/// ledger record: store identity, slot ID, incarnation and recorded
+/// directory. A different generation is a different slot and reads as not
+/// measured.
+fn recorded_size(
+    observations: &Result<Option<Observations>, String>,
+    store_id: &str,
+    slot: &LedgerSlot,
+    now_ms: u64,
+) -> SlotSize {
+    let document = match observations {
+        Err(error) => {
+            return SlotSize::NotMeasured(format!(
+                "not measured (recorded observations unreadable: {error}); use `oxide status --measure`"
+            ))
+        }
+        Ok(None) => {
+            return SlotSize::NotMeasured(
+                "not measured (no recorded observation); use `oxide status --measure`".to_owned(),
+            )
+        }
+        Ok(Some(document)) => document,
+    };
+    match document
+        .observations
+        .iter()
+        .find(|observation| observation.matches(store_id, slot))
+    {
+        Some(observation) => SlotSize::Recorded {
+            allocated_bytes: observation.allocated_bytes,
+            age: if observation.measured_at_ms > now_ms {
+                RecordedAge::ClockSkew
+            } else {
+                RecordedAge::Ago((now_ms - observation.measured_at_ms) / 1000)
+            },
+            source: observation.source,
+            lease_id: observation.lease_id.clone(),
+        },
+        None => SlotSize::NotMeasured(
+            "not measured (no recorded observation for this slot generation); use `oxide status --measure`"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Retain the most recent observations, at most [`MAX_OBSERVATIONS`], in a
+/// deterministic order. A deterministic tie-break keeps repeated writes of
+/// the same set byte-identical.
+fn retain_newest(observations: &mut Vec<Observation>) {
+    observations.sort_by(|left, right| {
+        (
+            left.measured_at_ms,
+            left.store_id.as_str(),
+            left.slot_id.as_str(),
+            left.incarnation.as_str(),
+            left.dir.as_deref().unwrap_or(""),
+        )
+            .cmp(&(
+                right.measured_at_ms,
+                right.store_id.as_str(),
+                right.slot_id.as_str(),
+                right.incarnation.as_str(),
+                right.dir.as_deref().unwrap_or(""),
+            ))
+    });
+    if observations.len() > MAX_OBSERVATIONS {
+        let excess = observations.len() - MAX_OBSERVATIONS;
+        observations.drain(..excess);
+    }
+}
+
+/// Read the recorded observations, if any, for one pool's status view.
+/// Public so the front door's read path can be exercised without a pool.
+#[cfg(test)]
+pub(crate) fn read_observations_for_tests(
+    control: &Path,
+) -> Result<Option<Vec<Observation>>, String> {
+    Ok(read_observations(control)?.map(|document| document.observations))
+}
+
+impl Store {
+    /// Persist one complete measurement as a diagnostic observation. Never
+    /// called by a read: only an acquiring command that already made the
+    /// reuse walk records it. Failure is diagnostic only, so callers ignore
+    /// it and admission, ownership and exit status never change.
+    fn record_observation(&self, observation: Observation) -> Result<(), String> {
+        if !self.control.is_dir() {
+            return Err("the control directory is absent".to_owned());
+        }
+        let mut document = match read_observations(&self.control)? {
+            Some(document) => document,
+            None => Observations::default(),
+        };
+        document.observations.retain(|existing| {
+            !(existing.store_id == observation.store_id
+                && existing.slot_id == observation.slot_id
+                && existing.incarnation == observation.incarnation
+                && existing.dir == observation.dir)
+        });
+        document.observations.push(observation);
+        retain_newest(&mut document.observations);
+        let mut bytes = serde_json::to_vec(&document).map_err(|error| error.to_string())?;
+        while bytes.len() as u64 > MAX_OBSERVATIONS_BYTES && !document.observations.is_empty() {
+            document.observations.remove(0);
+            bytes = serde_json::to_vec(&document).map_err(|error| error.to_string())?;
+        }
+        if bytes.len() as u64 > MAX_OBSERVATIONS_BYTES {
+            return Err("recorded observations would exceed their byte limit".to_owned());
+        }
+        let temp = self.control.join(OBSERVATIONS_TEMP);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temp)
+            .map_err(|error| format!("cannot write recorded observations: {error}"))?;
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| format!("cannot write recorded observations: {error}"))?;
+        drop(file);
+        fs::rename(&temp, self.control.join(OBSERVATIONS_NAME))
+            .and_then(|()| File::open(&self.control)?.sync_all())
+            .map_err(|error| format!("cannot replace recorded observations: {error}"))
+    }
+}
+
 pub(crate) fn private_file(path: &Path, create: bool) -> Result<Option<File>, String> {
     let mut options = OpenOptions::new();
     options
@@ -3679,7 +4151,7 @@ mod tests {
         store.mark_running(&first, group).unwrap();
         let second = lease(&store, &key, None).expect("a further command leased");
         assert_ne!(second.slot_id, first.slot_id);
-        let report = store.report().unwrap();
+        let report = store.report(Accounting::Recorded, 1).unwrap();
         let shown = |slot: &str| {
             report
                 .slots
@@ -4232,5 +4704,286 @@ mod tests {
         options.write(true).create(true).truncate(true).mode(0o600);
         let mut file = options.open(path).unwrap();
         file.write_all(bytes).unwrap();
+    }
+
+    fn ledger_slot(id: &str, incarnation: &str, dir: Option<&str>) -> LedgerSlot {
+        LedgerSlot {
+            slot_id: id.to_owned(),
+            incarnation: incarnation.to_owned(),
+            state: SlotOccupancy::Idle,
+            project: PathBuf::from("/pool/oxide-managed/affinity/1"),
+            workspace: PathBuf::from("/work/oxide"),
+            profile: LeaseProfile::Dev,
+            holder: None,
+            lease_id: None,
+            dir: dir.map(str::to_owned),
+            rank: 0,
+        }
+    }
+
+    fn observation(slot: &LedgerSlot, at_ms: u64) -> Observation {
+        Observation {
+            store_id: "a".repeat(32),
+            slot_id: slot.slot_id.clone(),
+            incarnation: slot.incarnation.clone(),
+            dir: slot.dir.clone(),
+            measured_at_ms: at_ms,
+            allocated_bytes: 3 * 1024 * 1024,
+            source: ObservationSource::LeaseReuse,
+            lease_id: Some("v1.a.1.1.1".to_owned()),
+        }
+    }
+
+    /// A recorded fact is bound to exactly one slot generation: a different
+    /// incarnation or recorded directory is not a size, and a future clock
+    /// is an unknown age rather than a fresh observation.
+    #[test]
+    fn recorded_sizes_bind_to_one_slot_generation() {
+        let slot = ledger_slot("1", "7", Some("oxide-abcd/quick-1"));
+        let document = Observations {
+            schema: OBSERVATIONS_SCHEMA.to_owned(),
+            observations: vec![observation(&slot, 10_000)],
+        };
+        let recorded = recorded_size(&Ok(Some(document)), &"a".repeat(32), &slot, 15_000);
+        assert_eq!(
+            recorded,
+            SlotSize::Recorded {
+                allocated_bytes: 3 * 1024 * 1024,
+                age: RecordedAge::Ago(5),
+                source: ObservationSource::LeaseReuse,
+                lease_id: Some("v1.a.1.1.1".to_owned()),
+            }
+        );
+        // A different incarnation, directory or store identity is a
+        // different slot: not measured, never a stale size.
+        for other in [
+            ledger_slot("1", "8", Some("oxide-abcd/quick-1")),
+            ledger_slot("1", "7", Some("oxide-abcd/quick-2")),
+            ledger_slot("1", "7", None),
+            ledger_slot("2", "7", Some("oxide-abcd/quick-1")),
+        ] {
+            assert!(
+                matches!(
+                    recorded_size(
+                        &Ok(Some(Observations {
+                            schema: OBSERVATIONS_SCHEMA.to_owned(),
+                            observations: vec![observation(&slot, 10_000)],
+                        })),
+                        &"a".repeat(32),
+                        &other,
+                        15_000
+                    ),
+                    SlotSize::NotMeasured(_)
+                ),
+                "a different slot generation must not inherit a recorded size"
+            );
+        }
+        assert!(matches!(
+            recorded_size(&Ok(None), &"a".repeat(32), &slot, 15_000),
+            SlotSize::NotMeasured(_)
+        ));
+        assert!(matches!(
+            recorded_size(&Err("corrupt".to_owned()), &"a".repeat(32), &slot, 15_000),
+            SlotSize::NotMeasured(_)
+        ));
+        let skew = recorded_size(
+            &Ok(Some(Observations {
+                schema: OBSERVATIONS_SCHEMA.to_owned(),
+                observations: vec![observation(&slot, 20_000)],
+            })),
+            &"a".repeat(32),
+            &slot,
+            15_000,
+        );
+        assert!(matches!(
+            skew,
+            SlotSize::Recorded {
+                age: RecordedAge::ClockSkew,
+                ..
+            }
+        ));
+    }
+
+    /// Retention keeps at most 128 observations, deterministically choosing
+    /// the most recent, so a pool at its slot ceiling still fits.
+    #[test]
+    fn observation_retention_keeps_the_newest_deterministically() {
+        let mut observations: Vec<Observation> = (0..140)
+            .map(|index| {
+                let slot = ledger_slot(&format!("{index}"), "1", None);
+                observation(&slot, 1_000 + index as u64)
+            })
+            .collect();
+        retain_newest(&mut observations);
+        assert_eq!(observations.len(), MAX_OBSERVATIONS);
+        assert_eq!(
+            observations.first().map(|item| item.slot_id.as_str()),
+            Some("12")
+        );
+        assert_eq!(
+            observations.last().map(|item| item.slot_id.as_str()),
+            Some("139")
+        );
+        let mut again: Vec<Observation> = (0..140)
+            .rev()
+            .map(|index| {
+                let slot = ledger_slot(&format!("{index}"), "1", None);
+                observation(&slot, 1_000 + index as u64)
+            })
+            .collect();
+        retain_newest(&mut again);
+        assert_eq!(observations, again, "retention is order independent");
+        assert!(MAX_OBSERVATIONS >= oxide_storage::lease::MAX_SLOTS);
+    }
+
+    /// The sidecar is read strictly: unknown schema, a foreign or unreadable
+    /// document and an over-retention file all refuse, which the view reports
+    /// as not measured instead of scanning.
+    #[test]
+    fn observations_read_strictly_and_never_scan_as_fallback() {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!(
+            "oxide-observations-{}-{}",
+            std::process::id(),
+            process::now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join(OBSERVATIONS_NAME);
+        assert!(read_observations(&root).unwrap().is_none());
+
+        let slot = ledger_slot("1", "1", None);
+        let good = Observations {
+            schema: OBSERVATIONS_SCHEMA.to_owned(),
+            observations: vec![observation(&slot, 5)],
+        };
+        write_private(&path, &serde_json::to_vec(&good).unwrap());
+        assert_eq!(
+            read_observations_for_tests(&root)
+                .unwrap()
+                .map(|items| items.len()),
+            Some(1)
+        );
+
+        write_private(
+            &path,
+            br#"{"schema":"oxide.status-observations/2","observations":[]}"#,
+        );
+        let error = read_observations(&root).unwrap_err();
+        assert!(error.contains("schema"), "{error}");
+
+        write_private(&path, b"not json");
+        assert!(read_observations(&root).unwrap_err().contains("invalid"));
+
+        let over = Observations {
+            schema: OBSERVATIONS_SCHEMA.to_owned(),
+            observations: (0..=MAX_OBSERVATIONS)
+                .map(|index| {
+                    let slot = ledger_slot(&format!("{index}"), "1", None);
+                    observation(&slot, index as u64)
+                })
+                .collect(),
+        };
+        write_private(&path, &serde_json::to_vec(&over).unwrap());
+        assert!(read_observations(&root)
+            .unwrap_err()
+            .contains("retention bound"));
+
+        // A symlink or a world-readable file is foreign, never followed or
+        // trusted.
+        fs::remove_file(&path).unwrap();
+        let target = root.join("elsewhere.json");
+        write_private(&target, &serde_json::to_vec(&good).unwrap());
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(read_observations(&root).is_err());
+        fs::remove_file(&path).unwrap();
+        write_private(&path, &serde_json::to_vec(&good).unwrap());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_observations(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Recording replaces one slot generation's fact, keeps the newest
+    /// bounded set, and never rewrites a document it cannot read.
+    #[test]
+    fn recording_observations_is_bounded_and_never_repairs_a_foreign_file() {
+        let base = std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let root = base.join(format!(
+            "oxide-observation-write-{}-{}",
+            std::process::id(),
+            process::now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Store {
+            control: root.clone(),
+            payload: root.join("payload"),
+            pool: root.clone(),
+            backend: Backend::DirectoryBudget,
+            budget: None,
+            recorded_budget: 1 << 30,
+            max_active: 1,
+            sibling: None,
+        };
+        let slot = ledger_slot("1", "1", Some("oxide-abcd/quick-1"));
+        store
+            .record_observation(observation(&slot, 10))
+            .expect("record");
+        let path = root.join(OBSERVATIONS_NAME);
+        let first = fs::read(&path).unwrap();
+        assert_eq!(
+            read_observations_for_tests(&root)
+                .unwrap()
+                .map(|items| items.len()),
+            Some(1)
+        );
+        // The same generation is replaced, not duplicated, and the write is
+        // byte-stable for the same fact.
+        store
+            .record_observation(observation(&slot, 10))
+            .expect("record");
+        assert_eq!(fs::read(&path).unwrap(), first);
+        let newer = observation(&slot, 20);
+        store.record_observation(newer).expect("record");
+        let document = read_observations_for_tests(&root).unwrap().unwrap();
+        assert_eq!(document.len(), 1);
+        assert_eq!(document[0].measured_at_ms, 20);
+
+        // A file this version cannot read is left exactly as it is.
+        write_private(&path, b"foreign");
+        let foreign = fs::read(&path).unwrap();
+        assert!(store.record_observation(observation(&slot, 30)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), foreign);
+
+        // The worst case the file allows still fits its byte bound: 128
+        // observations with every bounded field at its ceiling.
+        let mut document = Observations {
+            schema: OBSERVATIONS_SCHEMA.to_owned(),
+            observations: Vec::new(),
+        };
+        for index in 0..MAX_OBSERVATIONS {
+            document.observations.push(Observation {
+                store_id: "a".repeat(64),
+                slot_id: format!("{:0>160}", index),
+                incarnation: "1".repeat(64),
+                dir: Some("d".repeat(200)),
+                measured_at_ms: 9_999_999_999_999,
+                allocated_bytes: u64::MAX,
+                source: ObservationSource::LeaseReuse,
+                lease_id: Some("l".repeat(160)),
+            });
+        }
+        let bytes = serde_json::to_vec(&document).unwrap();
+        assert!(
+            bytes.len() as u64 <= MAX_OBSERVATIONS_BYTES,
+            "{} > {}",
+            bytes.len(),
+            MAX_OBSERVATIONS_BYTES
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

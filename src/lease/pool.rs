@@ -6,10 +6,10 @@ use super::{
     is_tolerated_metadata_file, persist_private_file, random_hex, read_private_file,
     remove_tree_owned, unexpected_entry, AccountingCoverage, AccountingGap, AccountingGapKind,
     AccountingScan, LeaseEnvironment, LeaseError, LeaseGrant, Leased, LedgerSlot, LedgerView,
-    PoolStatus, Profile, ReleaseReceipt, ReuseMeasurement, SlotOccupancy, SlotStatus,
-    ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS, ACCOUNTING_MAX_ENTRIES,
-    CAPACITY_POLICY_VERSION, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME, LOCK_NAME, MAX_HOLDER_BYTES,
-    MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, SLOTS_NAME,
+    MeasuredPool, PassiveSnapshot, PoolStatus, Profile, RecordedVolume, ReleaseReceipt,
+    ReuseMeasurement, SlotOccupancy, SlotStatus, ACCOUNTING_MAX_DEPTH, ACCOUNTING_MAX_ELAPSED_MS,
+    ACCOUNTING_MAX_ENTRIES, CAPACITY_POLICY_VERSION, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME,
+    LOCK_NAME, MAX_HOLDER_BYTES, MAX_LEASE_ID_BYTES, MAX_PATH_BYTES, MAX_SLOTS, SLOTS_NAME,
 };
 use super::{BUDGET_BACKEND_DIRECTORY_V1, VOLUME_BACKEND_APFS_V1};
 use crate::inventory::{inventory_directory, GapKind, InventoryError, InventoryLimits};
@@ -232,13 +232,17 @@ impl Payload {
 }
 
 pub(super) struct Pool {
-    _lock: File,
+    /// The exclusive pool lock, held for the life of a mutating open. A
+    /// passive measurement holds none.
+    _lock: Option<File>,
     root: PathBuf,
     config: PoolConfig,
     backing: Payload,
     ledger: Ledger,
     /// Admission budget: the recorded one unless the request overrides it.
     budget: u64,
+    /// Bounds this open's accounting walks use.
+    limits: InventoryLimits,
     reconciliation_blocked: bool,
 }
 
@@ -249,15 +253,16 @@ pub mod managed {
     use super::super::backing::BackingPaths;
     use super::super::{
         canonical_existing_dir, ensure_private_dir, io_error, LeaseError, LeaseGrant, Leased,
-        LedgerView, PoolInfo, PoolStatus, ReleaseReceipt, VolumeDescription,
-        BUDGET_BACKEND_DIRECTORY_V1, CONFIG_NAME, LEASE_VERSION, LEDGER_NAME, MAX_SLOTS,
-        PAYLOAD_NAME, SLOTS_NAME, VOLUME_BACKEND_APFS_V1,
+        LedgerView, MeasuredPool, PassiveSnapshot, PoolInfo, PoolStatus, ReleaseReceipt,
+        VolumeDescription, ACCOUNTING_MAX_ELAPSED_MS, BUDGET_BACKEND_DIRECTORY_V1, CONFIG_NAME,
+        LEASE_VERSION, LEDGER_NAME, MAX_SLOTS, PAYLOAD_NAME, SLOTS_NAME, VOLUME_BACKEND_APFS_V1,
     };
     use super::LeaseRequest;
     use super::{
-        lock_pool, prepare_new_pool, random_hex, read_config, read_ledger,
-        refuse_foreign_pool_entries, write_config, write_ledger, Ledger, Payload, Pool, PoolConfig,
-        SlotPersistState, VolumeConfig,
+        lock_pool, measure_within as measure_walks, open_budget_payload, prepare_new_pool,
+        random_hex, read_config, read_consistent_pair, read_ledger, recorded_volume,
+        refuse_foreign_pool_entries, refuse_retired_image_pool, snapshot_of, write_config,
+        write_ledger, Ledger, Payload, Pool, PoolConfig, SlotPersistState, VolumeConfig,
     };
     use crate::volume::Binding;
     use std::os::fd::AsFd;
@@ -407,13 +412,63 @@ pub mod managed {
     }
 
     pub fn status(pool: &Path) -> Result<PoolStatus, LeaseError> {
-        Pool::open(pool)?.status()
+        Pool::open(pool)?.accounted()
     }
 
     /// Ledger membership without any accounting walk; it refuses exactly
     /// where [`status`] does.
     pub fn ledger_view(pool: &Path) -> Result<LedgerView, LeaseError> {
         Pool::open(pool)?.ledger_view()
+    }
+
+    /// Recorded identity and ledger membership of a pool, read with no lock,
+    /// no reconciliation, no creation and no write (oxide#128). A directory
+    /// pool's recorded payload root must still be the private, owner-only
+    /// directory the backend records; a removable pool's recorded volume is
+    /// reported as recorded and never probed, so an absent volume still
+    /// yields its ledger.
+    ///
+    /// The config and ledger are read atomically each, so one snapshot may
+    /// straddle a concurrent replacement. A mismatched pair is re-read once;
+    /// a second mismatch is [`LeaseError::BackingMismatch`] and is never
+    /// repaired or waited for.
+    pub fn snapshot(pool: &Path) -> Result<PassiveSnapshot, LeaseError> {
+        let root = canonical_existing_dir(pool, true)?;
+        refuse_foreign_pool_entries(&root)?;
+        refuse_retired_image_pool(&root)?;
+        let (config, ledger) = read_consistent_pair(&root)?;
+        let paths = BackingPaths::under(&root);
+        let (payload, volume) = match config.backend.as_str() {
+            BUDGET_BACKEND_DIRECTORY_V1 => (
+                open_budget_payload(&root, &paths, &config)?
+                    .payload_root()
+                    .to_path_buf(),
+                None,
+            ),
+            VOLUME_BACKEND_APFS_V1 => {
+                let volume = recorded_volume(&paths, &config)?;
+                let payload = volume.mount_point.join(&volume.payload_dir);
+                (payload, Some(volume))
+            }
+            _ => return Err(LeaseError::BackingMismatch),
+        };
+        Ok(snapshot_of(&config, &ledger, payload, volume))
+    }
+
+    /// The bounded walker result of a pool, with no lock, no reconciliation
+    /// and no write (oxide#128). A recorded `Evicting` slot is walked as it
+    /// stands and makes coverage unknown, because this measurement never
+    /// finishes its deletion. Uses the existing entry, depth and elapsed
+    /// bounds.
+    pub fn measure(pool: &Path) -> Result<MeasuredPool, LeaseError> {
+        measure_walks(pool, ACCOUNTING_MAX_ELAPSED_MS)
+    }
+
+    /// [`measure`] with a caller's remaining elapsed bound, clamped to the
+    /// existing accounting deadline. One `oxide status --measure` gives each
+    /// pool its share of one cumulative budget.
+    pub fn measure_within(pool: &Path, max_elapsed_ms: u64) -> Result<MeasuredPool, LeaseError> {
+        measure_walks(pool, max_elapsed_ms)
     }
 
     /// Read-only description of an `apfs-volume-v1` pool from its config and
@@ -517,6 +572,30 @@ pub(super) fn status_injected(pool: &Path) -> Result<PoolStatus, LeaseError> {
 }
 
 #[cfg(test)]
+pub(super) fn snapshot_injected(pool: &Path) -> Result<super::PassiveSnapshot, LeaseError> {
+    managed::snapshot(pool)
+}
+
+#[cfg(test)]
+pub(super) fn lock_injected(pool: &Path) -> Result<File, LeaseError> {
+    lock_pool(pool)
+}
+
+/// A ledger whose store identity no longer matches its config, to prove a
+/// passive snapshot refuses a mismatched pair instead of repairing it.
+#[cfg(test)]
+pub(super) fn mismatched_store_id_injected(pool: &Path) -> Result<(), LeaseError> {
+    let mut ledger = read_ledger(pool)?;
+    ledger.store_id = "0".repeat(32);
+    write_ledger(pool, &ledger)
+}
+
+#[cfg(test)]
+pub(super) fn measure_injected(pool: &Path) -> Result<super::MeasuredPool, LeaseError> {
+    managed::measure(pool)
+}
+
+#[cfg(test)]
 pub(super) fn mark_evicting_for_test(pool: &Path, slot_id: u64) -> Result<(), LeaseError> {
     let mut opened = Pool::open(pool)?;
     let slot = opened
@@ -561,16 +640,70 @@ impl Pool {
             }
         }
         let mut pool = Self {
-            _lock: lock,
+            _lock: Some(lock),
             root,
             config,
             backing,
             budget: ledger.cap_bytes,
             ledger,
+            limits: accounting_limits(),
             reconciliation_blocked: false,
         };
         pool.reconcile_evicting()?;
         Ok(pool)
+    }
+
+    /// Open the same verified backing without the pool lock and without
+    /// reconciliation, for [`measure`] only. The recorded payload must still
+    /// be the backend's real, verified payload root, so the walks cover what
+    /// admission would cover; nothing is created or written.
+    fn open_passive(root: &Path, max_elapsed_ms: u64) -> Result<Self, LeaseError> {
+        let root = canonical_existing_dir(root, true)?;
+        refuse_foreign_pool_entries(&root)?;
+        refuse_retired_image_pool(&root)?;
+        let (config, ledger) = read_consistent_pair(&root)?;
+        let paths = BackingPaths::under(&root);
+        let backing = match config.backend.as_str() {
+            BUDGET_BACKEND_DIRECTORY_V1 => open_budget_payload(&root, &paths, &config)?,
+            VOLUME_BACKEND_APFS_V1 => open_volume_payload(&paths, &config)?,
+            _ => return Err(LeaseError::BackingMismatch),
+        };
+        let mut limits = accounting_limits();
+        limits.max_elapsed_ms = max_elapsed_ms.clamp(1, ACCOUNTING_MAX_ELAPSED_MS);
+        let pending = ledger
+            .slots
+            .iter()
+            .any(|slot| slot.state == SlotPersistState::Evicting);
+        Ok(Self {
+            _lock: None,
+            root,
+            config,
+            backing,
+            budget: ledger.cap_bytes,
+            ledger,
+            limits,
+            // Coverage for a measurement made without reconciliation is
+            // unknown while a recorded deletion is pending.
+            reconciliation_blocked: pending,
+        })
+    }
+
+    /// Recorded identity and membership, as this open read them.
+    fn recorded(&self) -> PassiveSnapshot {
+        let volume = match &self.config.volume {
+            Some(volume) => Some(RecordedVolume {
+                mount_point: volume.mount_point.clone(),
+                volume_uuid: volume.volume_uuid.clone(),
+                payload_dir: volume.payload_dir.clone(),
+            }),
+            None => None,
+        };
+        snapshot_of(
+            &self.config,
+            &self.ledger,
+            self.backing.payload_root().to_path_buf(),
+            volume,
+        )
     }
 
     fn persist(&self) -> Result<(), LeaseError> {
@@ -688,6 +821,7 @@ impl Pool {
                 self.validate_idle_slot_scope(idle, incarnation, &project, request.profile)?;
             // Compatible reuse needs this slot's own walk complete.
             let _unique = inventory_sizes(&slot_path).require_complete()?;
+            let dir = self.slot(idle).and_then(|slot| slot.dir.clone());
             // The idle-rank sequence must have headroom before any grant
             // transition; exhaustion refuses without changing the pool.
             self.ensure_capacity_policy()?;
@@ -699,6 +833,7 @@ impl Pool {
                     slot_id: idle.to_string(),
                     incarnation: incarnation.to_string(),
                     unique_allocated_bytes: _unique,
+                    dir,
                 }),
             });
         }
@@ -913,7 +1048,7 @@ impl Pool {
 
     /// Observational: walks the payload and each slot with the same bounds
     /// as admission, and reports each walk's coverage, causes and time.
-    fn status(&self) -> Result<PoolStatus, LeaseError> {
+    fn accounted(&self) -> Result<PoolStatus, LeaseError> {
         let accounted = self.payload_accounting();
         let mut coverage = if self.reconciliation_blocked {
             AccountingCoverage::Unknown
@@ -1263,7 +1398,7 @@ impl Pool {
     /// (`slots` and a project folder) keep slot contents at the depth bound
     /// they had under `slots`.
     fn payload_accounting(&self) -> Sizes {
-        inventory_sizes_deeper(self.backing.payload_root(), 2)
+        inventory_sizes_with(self.backing.payload_root(), 2, self.limits)
     }
 
     /// A slot's path and no-follow root metadata, `None` when missing. A
@@ -1287,16 +1422,136 @@ impl Pool {
             (_, None) => Ok(Sizes {
                 logical: Some(0),
                 unique: Some(0),
-                scan: scan(AccountingCoverage::Complete, Vec::new(), 0, 0),
+                scan: scan_with(
+                    self.limits,
+                    AccountingCoverage::Complete,
+                    Vec::new(),
+                    0,
+                    0,
+                    0,
+                ),
             }),
             (_, Some(metadata)) if metadata.file_type().is_symlink() => Ok(Sizes {
                 logical: None,
                 unique: None,
-                scan: root_failure(AccountingGapKind::RootSymlink, 0),
+                scan: root_failure_with(self.limits, AccountingGapKind::RootSymlink, 0),
             }),
-            (path, Some(_)) => Ok(inventory_sizes(&path)),
+            (path, Some(_)) => Ok(inventory_sizes_with(&path, 0, self.limits)),
         }
     }
+}
+
+/// Read the config and ledger a passive observer reports, validating their
+/// pair. Each file is replaced atomically, so one read may straddle a
+/// concurrent replacement: a mismatched pair is re-read once and a second
+/// mismatch refuses as unknown instead of being repaired or waited for.
+fn read_consistent_pair(root: &Path) -> Result<(PoolConfig, Ledger), LeaseError> {
+    for _ in 0..2 {
+        let config = read_config(root)?;
+        let ledger = read_ledger(root)?;
+        if ledger.version == LEASE_VERSION
+            && ledger.store_id == config.store_id
+            && ledger.cap_bytes == config.cap_bytes
+            && ledger.slots.len() <= MAX_SLOTS
+        {
+            return Ok((config, ledger));
+        }
+    }
+    Err(LeaseError::BackingMismatch)
+}
+
+/// The volume an `apfs-volume-v1` config records, without opening it. The
+/// recorded payload must still name one plain directory below that mount.
+fn recorded_volume(
+    paths: &BackingPaths,
+    config: &PoolConfig,
+) -> Result<RecordedVolume, LeaseError> {
+    let Some(volume) = config.volume.as_ref() else {
+        return Err(LeaseError::BackingMismatch);
+    };
+    if config.version != LEASE_VERSION || config.cap_bytes == 0 || config.image_bytes != 0 {
+        return Err(LeaseError::BackingMismatch);
+    }
+    if paths.image.symlink_metadata().is_ok()
+        || paths.receipt.symlink_metadata().is_ok()
+        || paths.mount.symlink_metadata().is_ok()
+    {
+        return Err(LeaseError::BackingMismatch);
+    }
+    let name = volume.payload_dir.as_str();
+    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+        return Err(LeaseError::BackingMismatch);
+    }
+    Ok(RecordedVolume {
+        mount_point: volume.mount_point.clone(),
+        volume_uuid: volume.volume_uuid.clone(),
+        payload_dir: volume.payload_dir.clone(),
+    })
+}
+
+/// The recorded snapshot of a validated config/ledger pair.
+fn snapshot_of(
+    config: &PoolConfig,
+    ledger: &Ledger,
+    payload: PathBuf,
+    volume: Option<RecordedVolume>,
+) -> PassiveSnapshot {
+    PassiveSnapshot {
+        store_id: config.store_id.clone(),
+        backend: config.backend.clone(),
+        cap_bytes: config.cap_bytes,
+        payload,
+        volume,
+        slots: ledger.slots.iter().map(ledger_slot).collect(),
+        evicting_slot_ids: ledger
+            .slots
+            .iter()
+            .filter(|slot| slot.state == SlotPersistState::Evicting)
+            .map(|slot| slot.id.to_string())
+            .collect(),
+    }
+}
+
+/// The walks of one passive measurement, sharing the caller's remaining
+/// elapsed bound. No lock, reconciliation, creation or write.
+///
+/// A bounded reread afterwards keeps the pairing honest: a concurrent grant,
+/// release or eviction between the read and the walks makes coverage unknown
+/// rather than pairing a walk with a different slot generation. Nothing is
+/// repaired or waited for.
+fn measure_within(pool: &Path, max_elapsed_ms: u64) -> Result<MeasuredPool, LeaseError> {
+    let opened = Pool::open_passive(pool, max_elapsed_ms)?;
+    let snapshot = opened.recorded();
+    let mut status = opened.accounted()?;
+    let stable = match read_consistent_pair(&opened.root) {
+        Ok((config, ledger)) => same_generations(&snapshot, &config, &ledger),
+        Err(_) => false,
+    };
+    if !stable {
+        status.coverage = AccountingCoverage::Unknown;
+        status.full = None;
+    }
+    Ok(MeasuredPool { snapshot, status })
+}
+
+/// Whether a reread still names exactly the generations this measurement
+/// read: same store, backend, cap, and the same slot IDs, incarnations,
+/// recorded directories and occupancy.
+fn same_generations(snapshot: &PassiveSnapshot, config: &PoolConfig, ledger: &Ledger) -> bool {
+    snapshot.store_id == config.store_id
+        && snapshot.backend == config.backend
+        && snapshot.cap_bytes == config.cap_bytes
+        && snapshot.slots.len() == ledger.slots.len()
+        && snapshot
+            .slots
+            .iter()
+            .zip(ledger.slots.iter())
+            .all(|(shown, stored)| {
+                shown.slot_id == stored.id.to_string()
+                    && shown.incarnation == stored.incarnation.to_string()
+                    && shown.dir == stored.dir
+                    && shown.state == occupancy(stored.state)
+            })
 }
 
 /// The budget-only payload is a plain owner-only directory holding `slots`.
@@ -1540,22 +1795,6 @@ fn accounting_limits() -> InventoryLimits {
     }
 }
 
-fn scan(
-    coverage: AccountingCoverage,
-    gaps: Vec<AccountingGap>,
-    entries_visited: u64,
-    elapsed_ms: u64,
-) -> AccountingScan {
-    scan_with(
-        accounting_limits(),
-        coverage,
-        gaps,
-        entries_visited,
-        elapsed_ms,
-        0,
-    )
-}
-
 fn scan_with(
     limits: InventoryLimits,
     coverage: AccountingCoverage,
@@ -1574,10 +1813,6 @@ fn scan_with(
         max_depth: limits.max_depth,
         max_elapsed_ms: limits.max_elapsed_ms,
     }
-}
-
-fn root_failure(kind: AccountingGapKind, elapsed_ms: u64) -> AccountingScan {
-    root_failure_with(accounting_limits(), kind, elapsed_ms)
 }
 
 fn root_failure_with(
@@ -1624,8 +1859,14 @@ fn inventory_sizes(path: &Path) -> Sizes {
 /// root that sits that many levels above the slots; the scan reports the
 /// bounds actually used.
 fn inventory_sizes_deeper(path: &Path, extra_depth: usize) -> Sizes {
+    inventory_sizes_with(path, extra_depth, accounting_limits())
+}
+
+/// [`inventory_sizes_deeper`] with explicit bounds, so one measurement can
+/// share a cumulative deadline across every walk it makes.
+fn inventory_sizes_with(path: &Path, extra_depth: usize, base: InventoryLimits) -> Sizes {
     let started = std::time::Instant::now();
-    let mut limits = accounting_limits();
+    let mut limits = base;
     limits.max_depth = limits.max_depth.saturating_add(extra_depth);
     match inventory_directory(path, limits) {
         Ok(report) => {

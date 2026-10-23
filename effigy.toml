@@ -71,6 +71,26 @@ run = "python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 64 -- py
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-accounting-vanished.py"
 
+# Fast, read-only default `oxide status` (oxide#128): one fixed proof under the
+# qualified shared supervisor (oxide#109; 300 s absolute, 512 MiB monitored
+# scratch including staging, fixture creation and cleanup). Stages this HEAD's
+# debug `oxide` offline with 1.97.1 and builds private hand-made directory
+# pools: one ledger-recorded slot of 200,002 zero-byte entries plus a held
+# command, waiting ticket, clean mark, flush and a recorded Evicting slot. It
+# times one default status end to end under 1 s (published, never retried or
+# averaged), proves no payload traversal with the debug-only walk log and an
+# unreadable nested subtree, proves zero mutation with a bounded before/after
+# metadata digest and exact control bytes, covers held/waits/clean/flush and
+# nested-directory rendering, valid/stale/future/mismatched/missing/corrupt
+# observation facts, no lock creation, a recorded removable pool with an
+# absent volume (no diskutil), and `--measure` on tiny pools for walked bytes,
+# coverage and an untouched recorded deletion. No sparse image, mount, real
+# pool, host install, config, mode or cleanup is involved. Not a benchmark,
+# not a universal filesystem-latency guarantee and not an alias for full QA.
+[tasks."rust:status-fast"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-status-fast.py"
+
 # Final outputs on the permanent drive (oxide#117), under the qualified
 # shared supervisor (oxide#109; 300 s absolute, 512 MiB monitored scratch,
 # ordinary detach). Stages this HEAD's debug `oxide` offline with 1.97.1 and

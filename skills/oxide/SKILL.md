@@ -101,8 +101,22 @@ fails, Oxide reports that the wait duration is unavailable.
 
 ## Status and cleaning
 
-- `oxide status`: pool use, slots (size and file counts), waiting commands,
-  and each recorded lease-ticket PID with an approximate age from the
+- `oxide status` is fast and read-only by default. It reports recorded facts
+  only: pool and slot membership, each slot's recorded directory, holders,
+  waiting commands, clean marks, flushes, the registered drive mode and latest
+  use. A slot size is a recorded observation from an earlier acquiring
+  command, shown with its age, source and lease, or `not measured`; it may have
+  changed since, and recorded sizes are never a current pool total. It takes
+  no pool lock, creates no lock, reconciles and deletes nothing, walks no
+  payload, checkout or Cargo home, and runs no Cargo, `tmutil` or `diskutil`.
+  A slot recorded as being deleted shows as a pending reconciliation, not as
+  idle. Cargo-home and stray-output lines say not measured.
+- `oxide status --measure` runs the bounded whole-payload walk, each slot's own
+  walk, the checkout stray-output scan and the Cargo home once, under one
+  cumulative 60 s budget, and reports current bytes and coverage. It still takes
+  no pool lock, reconciles and writes nothing, and does not refresh the
+  recorded sizes; a recorded deletion stays pending and makes coverage unknown.
+- Each recorded lease-ticket PID comes with an approximate age from the
   owner-private ticket file's creation time (or modification time if creation
   time is unavailable). Missing, symlinked, foreign, unreadable or future
   timestamps remain unknown. The lookup reads metadata without opening or
@@ -111,9 +125,7 @@ fails, Oxide reports that the wait duration is unavailable.
   not prove that a command is still alive. Clean commands waiting for the
   checkout barrier have no ticket yet and are not listed. Ticket age is a
   wall-clock file age, not the measured monotonic wait.
-  Also reports plain-Cargo output in this checkout's `target/` and the Cargo
-  home's size.
-  It never creates the pool.
+  `oxide status` never creates the pool.
 - `oxide pool describe --json` (macOS): the registered drive as stable JSON
   (schema `oxide.pool.describe/1`). Branch on `available`, not on reason
   strings. It reports the registered mode even when the volume is unavailable.
