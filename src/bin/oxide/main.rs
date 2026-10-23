@@ -335,25 +335,37 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         pool_fallback.as_deref(),
     )?;
     test_pause("reserved");
-    let declaration = match layout::classify(
-        &invocation.command,
-        invocation.profile,
-        invocation.explicit_profile,
-        &invocation.targets,
-    ) {
-        Layout::Declared(declaration) => declaration,
-        Layout::Unknown(reason) => {
-            outputs::refuse_unknown_layout(Some(&output_control), &checkout, &reason)?;
-            layout::Declaration::empty()
-        }
-    };
     let declaration = if invocation.command == "exec" {
         // The caller's declaration is the complete set of the tool's profile
         // outputs; an opaque tool that declares none is refused in a profile
         // checkout rather than guessed.
         layout::declared(&invocation.declared_outputs)?
+    } else if !cli::models_profile_outputs(&invocation.command) {
+        // An external or unknown subcommand's output directories are opaque.
+        // A profile checkout refuses it before Cargo rather than assuming its
+        // dev profile.
+        outputs::refuse_unknown_layout(
+            Some(&output_control),
+            &checkout,
+            &format!(
+                "`{}` is not a command whose profile outputs Oxide models",
+                invocation.command
+            ),
+        )?;
+        layout::Declaration::empty()
     } else {
-        declaration
+        match layout::classify(
+            &invocation.command,
+            invocation.profile,
+            invocation.explicit_profile,
+            &invocation.targets,
+        ) {
+            Layout::Declared(declaration) => declaration,
+            Layout::Unknown(reason) => {
+                outputs::refuse_unknown_layout(Some(&output_control), &checkout, &reason)?;
+                layout::Declaration::empty()
+            }
+        }
     };
     let planned = outputs::planned_destination(
         Some(&output_control),

@@ -146,10 +146,19 @@ def plan_only() -> int:
     print(f"  script          {os.path.abspath(__file__)}")
     print(f"  supervisor      scripts/bounded-test.py --limit 420 --scratch-budget-mib 512")
     print(f"  deadline        420 s total; helper work window ~385 s ({SHUTDOWN_MARGIN_S} s margin)")
-    print("  disk            288 MiB staging peak + 128 MiB image + 32 MiB fixtures + 32 MiB evidence + 32 MiB margin")
+    print("  fit             UNMEASURED: no native, trial or setup-only run has been activated")
+    print("  time estimate   two independent offline stagings 37-60 s each at Cargo's default")
+    print("                  parallelism, 20 s setup, 120-200 s cases, 30 s cleanup ->")
+    print("                  264-400 s estimated work; the 30 s margin leaves 385 s")
+    print("  disk            288 MiB staging peak, counted as ONE staging target at a time")
+    print("                  (each is copied out and discarded before the next starts; two")
+    print("                  live targets are NOT assumed), + 128 MiB image backing +")
+    print("                  32 MiB fixtures + 32 MiB evidence + 32 MiB margin = 512 MiB")
+    print("                  real target occupancy: one tiny locked checkout per case,")
+    print("                  a few MiB each, inside the fixtures allowance")
     print(f"  staging         candidate {os.environ.get('OXIDE_PROFILE_HEAD', 'this HEAD')} and base {BASE}")
     print("  seed            none: both stagings are plain Cargo offline builds from authenticated pinned source")
-    print("  monitoring      supervisor reserve sampling, census/closure and cleanup; this script runs no clock or harness")
+    print("  monitoring      supervisor reserve sampling, census/closure and cleanup; this script runs no clock, timer or harness")
     print(f"  image           one owned 128 MiB APFS sparse image at a unique /Volumes/<name>, ordinary detach")
     print("  environment     one private HOME, CARGO_HOME and directory pool per session")
     print("  cases")
@@ -317,6 +326,25 @@ def oxide(proof: Proof, args: list, label: str, cwd: str) -> tuple:
     return proof.oxide(args, label, cwd)
 
 
+def auto_legacy(proof: Proof, checkout: str) -> None:
+    """Create the published whole-target /2 state the way a fresh checkout on
+    the permanent drive gets it: the automatic first conversion."""
+    code, _, stderr = oxide(proof, ["build"], "auto-adopt", checkout)
+    expect(code == 0, f"auto-adopt build failed: {stderr}")
+    expect(os.path.islink(os.path.join(checkout, "target")), "automatic conversion did not publish a whole-target link")
+
+
+def base_legacy(proof: Proof, base: str, pool: str, checkout: str) -> None:
+    """Create a whole-target /2 state with the staged base binary, in a pool
+    that has not published the successor fence."""
+    env = {**proof.env, "OXIDE_POOL": pool}
+    code, _, stderr = perm.oxide_env(proof, ["outputs", "adopt"], "base legacy adopt", checkout, env)
+    expect(code == 0, f"base whole-target adopt failed: {stderr}")
+    expect(os.path.islink(os.path.join(checkout, "target")), "base adopt did not publish a whole-target link")
+    doc = perm.read_json(perm.receipt_path(pool, checkout))
+    expect(doc["version"] == "oxide.outputs.transition/2", f"base receipt {doc['version']}")
+
+
 def adopt(proof: Proof, checkout: str, label: str) -> None:
     code, _, stderr = proof.oxide(["outputs", "adopt"], label, checkout)
     expect(code == 0, f"{label}: adopt exited {code}: {stderr}")
@@ -345,10 +373,13 @@ def run(proof: Proof, repo: str) -> None:
     for directory in (home, cargo_home):
         os.makedirs(directory)
     proof.env = perm.proof_env(pool, home, cargo_home)
-    register(proof, pool, "unused", "unused")
+    register(proof, pool)
 
     # ----- case 01: a real target with a debug member link -----------------
     first = make_checkout(proof, "first")
+    # A real empty target: the automatic first conversion requires an absent
+    # target, so the explicit adopt below is what selects the profile layout.
+    os.makedirs(os.path.join(first, "target"))
     code, _, stderr = oxide(proof, ["build"], "01 build", first)
     expect(code == 0, f"01: build failed: {stderr}")
     adopt(proof, first, "01 adopt")
@@ -418,6 +449,13 @@ def run(proof: Proof, repo: str) -> None:
     code, _, stderr = oxide(proof, ["build", "--target", "targets/spec.json"], "05 linked", unknown)
     expect(code != 0 and "not a plain triple" in stderr, f"05: linked unknown target was not refused: {stderr}")
     expect_layout(unknown, {"debug": f"link:{root_of(pool, unknown)}"})
+    # An external subcommand has opaque output directories: it refuses in the
+    # linked checkout and is not silently treated as the dev profile.
+    code, _, stderr = oxide(proof, ["nextest", "run"], "05 linked external", unknown)
+    expect(code != 0 and "not a command whose profile outputs Oxide models" in stderr, f"05: linked external command was not refused: {stderr}")
+    plain = make_checkout(proof, "unlinked-external")
+    code, _, stderr = oxide(proof, ["nextest", "run"], "05 unlinked external", plain)
+    expect("not a command whose profile outputs Oxide models" not in stderr, f"05: an unlinked checkout refused an external command: {stderr}")
 
     # ----- case 06: opaque custom-profile refusal -------------------------
     code, _, stderr = oxide(proof, ["build", "--profile", "custom"], "06 modelled custom", first)
@@ -441,18 +479,18 @@ def run(proof: Proof, repo: str) -> None:
 
     # ----- case 08: real nonempty kept, empty converted -------------------
     mixed = make_checkout(proof, "mixed")
-    code, _, _ = oxide(proof, ["build"], "08 prebuild", mixed)
-    expect(code == 0, "08: prebuild failed")
     os.makedirs(os.path.join(mixed, "target", "release"), exist_ok=True)
     with open(os.path.join(mixed, "target", "release", "keep"), "wb") as handle:
         handle.write(b"keep")
+    code, _, _ = oxide(proof, ["build"], "08 prebuild", mixed)
+    expect(code == 0, "08: prebuild failed")
     adopt(proof, mixed, "08 adopt")
     expect_layout(mixed, {"debug": f"link:{root_of(pool, mixed)}", "release": "real"})
     expect(perm.read_bytes(os.path.join(mixed, "target", "release", "keep")) == b"keep", "08: real member content changed")
     other = make_checkout(proof, "empty-member")
+    os.makedirs(os.path.join(other, "target", "release"), exist_ok=True)
     code, _, _ = oxide(proof, ["build"], "08 empty prebuild", other)
     expect(code == 0, "08: empty prebuild failed")
-    os.makedirs(os.path.join(other, "target", "release"), exist_ok=True)
     adopt(proof, other, "08 empty adopt")
     expect_layout(other, {"release": f"link:{root_of(pool, other)}"})
 
@@ -464,11 +502,8 @@ def run(proof: Proof, repo: str) -> None:
 
     # ----- case 10: a legacy whole-target checkout is unchanged and warm ---
     legacy = make_checkout(proof, "legacy")
-    code, _, _ = oxide(proof, ["build"], "10 prebuild", legacy)
-    expect(code == 0, "10: prebuild failed")
-    adopt(proof, legacy, "10 base-style adopt")
+    auto_legacy(proof, legacy)
     legacy_root = root_of(pool, legacy)
-    # A whole-target /2 layout, as the base binary creates it.
     expect(os.path.islink(os.path.join(legacy, "target")), "10: legacy target is not a link")
     expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: legacy receipt version changed")
     facts = item(pool, legacy, "links")
@@ -483,13 +518,19 @@ def run(proof: Proof, repo: str) -> None:
     expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: the legacy receipt was rewritten")
 
     # ----- case 11: explicit migration of a base-created checkout ---------
+    # Base-binary whole-target state in its own (not yet successor-fenced)
+    # pool, then the candidate migrates it.
+    pool2 = os.path.join(proof.root, "pool2")
+    code, _, stderr = perm.oxide_env(proof, ["pool", "register-removable", proof.mount, "--reserve", "2GiB", "--cap", "96MiB", "--mode", "permanent"], "register pool2", proof.root, {**proof.env, "OXIDE_POOL": pool2})
+    expect(code == 0, f"11: pool2 registration failed: {stderr}")
     migrated = make_checkout(proof, "migrate")
-    code, _, _ = oxide(proof, ["build"], "11 prebuild", migrated)
-    expect(code == 0, "11: prebuild failed")
-    adopt(proof, migrated, "11 legacy adopt")
+    base_legacy(proof, base, pool2, migrated)
+    migrate_env = {**proof.env, "OXIDE_POOL": pool2}
+    code, _, stderr = perm.oxide_env(proof, ["outputs", "adopt"], "11 migrate", migrated, migrate_env)
+    expect(code == 0, f"11: candidate adopt failed: {stderr}")
     # A source-shaped pre-oxide#129 checkout: a root/1 marker and no nonce in
     # the receipt or registry.
-    migrated_root = make_root_one_fixture(pool, migrated)
+    migrated_root = make_root_one_fixture(pool2, migrated)
     marker_path = os.path.join(migrated_root, MARKER)
     root_ino = os.stat(migrated_root).st_ino
     payload = sorted(os.listdir(migrated_root))
@@ -499,34 +540,90 @@ def run(proof: Proof, repo: str) -> None:
     expect(upgraded["version"] == "oxide.outputs.root/2", "11: marker not upgraded to root/2")
     nonce = upgraded["nonce"]
     expect(len(nonce) == 32, "11: migrated nonce is not 128-bit hex")
-    migrated_receipt = receipt(pool, migrated)
+    migrated_receipt = receipt(pool2, migrated)
     expect({p["selected"]["nonce"] for p in migrated_receipt["links"] if p.get("selected")} == {nonce}, "11: members do not share the upgraded nonce")
     expect(os.stat(migrated_root).st_ino == root_ino, "11: the root inode changed")
     present = {name for name in os.listdir(migrated_root) if name in payload}
     expect(present == set(payload), f"11: root payload changed: {present} vs {payload}")
     expect(not any(name.endswith(".oxide-old-2") for name in os.listdir(migrated_root)), "11: the marker backup was kept")
-    registry = perm.read_json(os.path.join(pool, "oxide-managed", "outputs", "registry.json"))
+    registry = perm.read_json(os.path.join(pool2, "oxide-managed", "outputs", "registry.json"))
     rows = [row for row in registry["rows"] if row["checkout_id"] == perm.hashlib.sha256(migrated.encode()).hexdigest()]
     expect({row["member"] for row in rows if row["selected"]} == {"debug", "release"}, f"11: registry members {rows}")
     expect({row["nonce"] for row in rows} == {nonce}, "11: registry nonces do not share the upgraded nonce")
     expect(migrated_receipt["version"] == "oxide.outputs.transition/3", "11: migrated receipt version")
 
     # ----- case 12: P0-P4 replay, races and exact rollback ----------------
-    rollback = make_checkout(proof, "rollback")
-    code, _, _ = oxide(proof, ["build"], "12 prebuild", rollback)
-    expect(code == 0, "12: prebuild failed")
-    adopt(proof, rollback, "12 legacy adopt")
-    rollback_root = make_root_one_fixture(pool, rollback)
-    old_bytes = perm.read_bytes(os.path.join(rollback_root, MARKER))
-    env = {**proof.env, "OXIDE_TEST_MIGRATION_ROLLBACK": "marker"}
-    code, _, stderr = perm.oxide_env(proof, ["outputs", "adopt"], "12 rollback", rollback, env)
-    expect(code == 0, f"12: rollback adopt failed: {stderr}")
-    expect(os.path.islink(os.path.join(rollback, "target")), "12: rollback did not restore the old link")
-    expect(perm.read_bytes(os.path.join(rollback_root, MARKER)) == old_bytes, "12: rollback did not restore the old marker")
-    expect(receipt(pool, rollback)["version"] == "oxide.outputs.transition/2", "12: rollback did not restore the /2 receipt")
-    # A committed migration is never rolled back: the debug-only rollback
-    # request after the commit leaves the profile layout and member links.
-    adopt(proof, rollback, "12 migrate")
+    # A crash at every pre-commit phase replays to the committed profile
+    # layout; a rollback at the staged and marker boundaries restores the
+    # exact published /2 state.
+    for boundary in ("staged", "marker", "swapped"):
+        fixture = make_checkout(proof, f"replay-{boundary}")
+        auto_legacy(proof, fixture)
+        root = root_of(pool, fixture)
+        marker_before = perm.read_bytes(os.path.join(root, MARKER))
+        if boundary == "marker":
+            make_root_one_fixture(pool, fixture)
+            marker_before = perm.read_bytes(os.path.join(root, MARKER))
+        env = {**proof.env, "OXIDE_TEST_OUTPUTS_CRASH": f"migration-{boundary}"}
+        code, _, _ = perm.oxide_env(proof, ["outputs", "adopt"], f"12 crash {boundary}", fixture, env)
+        expect(code != 0, f"12: the injected {boundary} stop did not stop adopt")
+        stored = perm.read_json(perm.receipt_path(pool, fixture))
+        expect(stored["state"] == "prepared", f"12: {boundary} left state {stored['state']}")
+        # Ordinary commands refuse while the journal is prepared.
+        code, _, stderr = oxide(proof, ["build"], f"12 pending {boundary}", fixture)
+        expect(code != 0, f"12: a build was allowed while the migration was pending")
+        del stderr
+        # A second adopt replays the exact phases and commits.
+        code, _, stderr = oxide(proof, ["outputs", "adopt"], f"12 replay {boundary}", fixture)
+        expect(code == 0, f"12: replay from {boundary} failed: {stderr}")
+        expect_layout(fixture, {"debug": f"link:{root_of(pool, fixture)}"})
+        expect(receipt(pool, fixture)["version"] == "oxide.outputs.transition/3", f"12: {boundary} replay did not commit /3")
+    for boundary in ("staged", "marker"):
+        # A source-shaped root/1 marker makes both boundaries the two sides of
+        # the marker upgrade: staged is before it, marker is after it.
+        fixture = make_checkout(proof, f"rollback-{boundary}")
+        auto_legacy(proof, fixture)
+        root = make_root_one_fixture(pool, fixture)
+        marker_before = perm.read_bytes(os.path.join(root, MARKER))
+        env = {**proof.env, "OXIDE_TEST_MIGRATION_ROLLBACK": boundary}
+        code, _, stderr = perm.oxide_env(proof, ["outputs", "adopt"], f"12 rollback {boundary}", fixture, env)
+        expect(code == 0, f"12: rollback at {boundary} failed: {stderr}")
+        expect(os.path.islink(os.path.join(fixture, "target")), f"12: rollback at {boundary} did not restore the old link")
+        expect(perm.read_bytes(os.path.join(root, MARKER)) == marker_before, f"12: rollback at {boundary} did not restore the marker")
+        expect(receipt(pool, fixture)["version"] == "oxide.outputs.transition/2", f"12: rollback at {boundary} did not restore /2")
+        # The rollback retires the journal and reserves nothing.
+        expect("transition" not in receipt(pool, fixture), f"12: rollback at {boundary} left a journal")
+        # It can be migrated for real afterwards.
+        adopt(proof, fixture, f"12 migrate {boundary}")
+        expect_layout(fixture, {"debug": f"link:{root_of(pool, fixture)}"})
+    # A creator of the target between the backup and the swap is preserved and
+    # leaves the migration pending: no payload is deleted and no creator is
+    # replaced.
+    creator_fixture = make_checkout(proof, "creator-race")
+    auto_legacy(proof, creator_fixture)
+    creator_root = root_of(pool, creator_fixture)
+    env = {**proof.env, "OXIDE_TEST_OUTPUTS_CRASH": "migration-backed-up"}
+    code, _, _ = perm.oxide_env(proof, ["outputs", "adopt"], "12 backup crash", creator_fixture, env)
+    expect(code != 0, "12: the injected backup stop did not stop adopt")
+    creator = os.path.join(creator_fixture, "target")
+    expect(not os.path.lexists(creator), "12: the old link was not moved to its backup")
+    os.makedirs(creator)
+    with open(os.path.join(creator, "creator"), "wb") as handle:
+        handle.write(b"creator")
+    code, _, stderr = oxide(proof, ["outputs", "adopt"], "12 creator race", creator_fixture)
+    expect(code != 0, f"12: the creator race committed: {stderr}")
+    expect(perm.read_bytes(os.path.join(creator, "creator")) == b"creator", "12: the creator was deleted")
+    stored = perm.read_json(perm.receipt_path(pool, creator_fixture))
+    expect(stored["state"] == "prepared", "12: the creator race did not stay pending")
+    os.remove(os.path.join(creator, "creator"))
+    os.rmdir(creator)
+    code, _, stderr = oxide(proof, ["outputs", "adopt"], "12 creator cleared", creator_fixture)
+    expect(code == 0, f"12: adopt after clearing the creator failed: {stderr}")
+    expect_layout(creator_fixture, {"debug": f"link:{creator_root}"})
+    # A committed migration is never rolled back.
+    rollback = make_checkout(proof, "committed")
+    auto_legacy(proof, rollback)
+    adopt(proof, rollback, "12 committed migrate")
     env = {**proof.env, "OXIDE_TEST_MIGRATION_ROLLBACK": "1"}
     code, _, _ = perm.oxide_env(proof, ["outputs", "adopt"], "12 committed", rollback, env)
     expect(code == 0, "12: adopt on a committed profile checkout failed")
@@ -535,9 +632,7 @@ def run(proof: Proof, repo: str) -> None:
 
     # ----- case 13: an active writer blocks migration ---------------------
     blocked = make_checkout(proof, "blocked")
-    code, _, _ = oxide(proof, ["build"], "13 prebuild", blocked)
-    expect(code == 0, "13: prebuild failed")
-    adopt(proof, blocked, "13 legacy adopt")
+    auto_legacy(proof, blocked)
     gate = os.path.join(proof.root, "gate13")
     os.makedirs(gate)
     child = perm.start_child(proof, [proof.binary, "build"], blocked, {**proof.env, "OXIDE_PROFILE_GATE": gate})
@@ -565,11 +660,23 @@ def run(proof: Proof, repo: str) -> None:
     detached = proof.run(["/usr/bin/hdiutil", "detach", proof.mount], timeout=60)
     expect(detached.returncode == 0, "14: ordinary detach failed")
     proof.mount = None
-    code, _, stderr = oxide(proof, ["build"], "14 fallback", fallback)
+    # The internal fallback slot meets an external owned link: the command
+    # refuses rather than writing to an unsupervised drive.
+    code, _, stderr = oxide(proof, ["build"], "14 fallback refusal", fallback)
     expect(code != 0 and "fallback" in stderr.lower(), f"14: fallback build was not refused: {stderr}")
     expect(os.readlink(member_link(fallback, "debug")) == external, "14: the refusal changed the member link")
+    # An explicit adopt moves every owned member to the checkout-local root
+    # under custody, keeping the external root; re-attaching returns them.
+    adopt(proof, fallback, "14 fallback adopt")
+    local = root_of(pool, fallback)
+    expect(local != external, "14: fallback kept the external root")
+    expect_layout(fallback, {"debug": f"link:{local}", "release": f"link:{local}"})
+    expect(os.path.isdir(external), "14: the external root was deleted")
     remount = perm.attach_image(proof, proof.root, "ProfileOutputs-" + secrets.token_hex(3))
     expect(remount is not None, "14: cannot re-attach the image")
+    adopt(proof, fallback, "14 return adopt")
+    expect_layout(fallback, {"debug": f"link:{external}", "release": f"link:{external}"})
+    expect(os.path.isdir(local), "14: the local root was deleted on return")
 
     # ----- case 15: detach and re-adopt ----------------------------------
     code, _, stderr = oxide(proof, ["outputs", "detach"], "15 detach", first)
@@ -590,6 +697,42 @@ def run(proof: Proof, repo: str) -> None:
     code, _, stderr = oxide(proof, ["clean", "-p", "profileapp"], "16 selected clean", first)
     expect(code == 0, f"16: selected clean failed: {stderr}")
     expect_layout(first, {"debug": f"link:{root_of(pool, first)}"})
+    # The selected clean runs the existing pool watchdog: an injected
+    # below-reserve reading stops its recorded Cargo group, the group closes
+    # and the command reports it instead of claiming success.
+    binaries = os.path.join(proof.root, "fake-bin")
+    os.makedirs(binaries, exist_ok=True)
+    gate = os.path.join(proof.root, "clean-gate")
+    os.makedirs(gate, exist_ok=True)
+    fake = os.path.join(binaries, "cargo")
+    with open(fake, "w", encoding="utf-8") as handle:
+        handle.write(
+            "#!/bin/sh\n"
+            "touch \"$OXIDE_CLEAN_GATE/started\"\n"
+            "n=0\n"
+            "while [ ! -f \"$OXIDE_CLEAN_GATE/release\" ] && [ $n -lt 100 ]; do sleep 0.05; n=$((n+1)); done\n"
+            "exit 0\n"
+        )
+    os.chmod(fake, 0o755)
+    readings = os.path.join(proof.root, "clean-readings")
+    with open(readings, "w", encoding="utf-8") as handle:
+        handle.write(str(22 * perm.MIB * 1024 - 4096))
+    env = {
+        **proof.env,
+        "PATH": binaries + os.pathsep + proof.env.get("PATH", ""),
+        "OXIDE_CLEAN_GATE": gate,
+        "OXIDE_TEST_WATCHDOG_READINGS": readings,
+    }
+    code, _, stderr = perm.oxide_env(proof, ["clean", "-p", "profileapp"], "16 watched clean", first, env)
+    expect(os.path.exists(os.path.join(gate, "started")), "16: the clean never started its recorded Cargo group")
+    expect(code != 0, f"16: a stopped clean claimed success: {stderr}")
+    expect(
+        any(word in stderr.lower() for word in ("reserve", "watchdog", "stop")),
+        f"16: the stop was not reported honestly: {stderr}",
+    )
+    expect_layout(first, {"debug": f"link:{root_of(pool, first)}"})
+    with open(os.path.join(gate, "release"), "wb") as handle:
+        handle.write(b"release")
 
     # ----- case 17: refusals ---------------------------------------------
     malformed = make_checkout(proof, "malformed")
@@ -638,14 +781,59 @@ def run(proof: Proof, repo: str) -> None:
     expect(code == 0, f"20: prune dry run failed: {stderr}")
     preview = json.loads(stdout)
     expect(preview["version"] == "oxide.outputs.prune-preview/1", f"20: preview version {preview.get('version')}")
+    # A live checkout's root is KEEP: it is neither a candidate nor removed.
     expect(preview["candidates"] == [], f"20: a live checkout's root is a prune candidate: {preview['candidates']}")
-    # Another checkout's reference keeps the root too: a second checkout links
-    # the same image root but is not pruned while it is live.
-    peer = make_checkout(proof, "group-peer")
-    code, _, _ = oxide(proof, ["build"], "20 peer", peer)
-    expect(code == 0, "20: peer build failed")
     expect(os.path.isdir(group_root), "20: the live root disappeared")
     expect(os.path.isdir(os.path.join(group, "target")), "20: prune removed the target")
+    expect(receipt(pool, group)["links"], "20: the live receipt lost its references")
+    # A positively gone checkout: the checkout directory is moved away, the
+    # receipt and root stay. The dry run then lists its root as a candidate.
+    gone = make_checkout(proof, "gone")
+    code, _, _ = oxide(proof, ["build"], "20 gone build", gone)
+    expect(code == 0, "20: gone build failed")
+    adopt(proof, gone, "20 gone adopt")
+    gone_root = root_of(pool, gone)
+    os.rename(gone, gone + "-moved")
+    code, stdout, stderr = oxide(proof, ["outputs", "prune", "--dry-run"], "20 gone dry", gone)
+    expect(code == 0, f"20: gone prune dry run failed: {stderr}")
+    preview = json.loads(stdout)
+    expect(
+        any(candidate["root"] == gone_root for candidate in preview["candidates"]),
+        f"20: the gone checkout's root is not a candidate: {preview['candidates']}",
+    )
+    plan_path = os.path.join(proof.root, "prune-plan.json")
+    with open(plan_path, "wb") as handle:
+        handle.write(stdout.encode())
+    plan_sha = perm.sha256_file(plan_path)
+    # Terminal crash image oracle: the intent's expected terminal SHA and
+    # FIXED timestamp are durable before publication and the published
+    # receipt is exactly that image.
+    env = {**proof.env, "OXIDE_TEST_PRUNE_CRASH": "terminal"}
+    code, _, stderr = perm.oxide_env(
+        proof,
+        ["outputs", "prune", "--plan", plan_path, "--plan-sha256", plan_sha],
+        "20 terminal crash",
+        gone,
+        env,
+    )
+    expect(code != 0, "20: the injected terminal stop did not stop the prune")
+    registry = perm.read_json(os.path.join(pool, "oxide-managed", "outputs", "registry.json"))
+    intent = next((entry for entry in registry.get("intents", []) if entry["identity"]["root"] == gone_root), None)
+    expect(intent is not None, "20: the terminal crash lost its intent")
+    expected = intent.get("expected_terminal_sha")
+    fixed_ms = intent.get("terminal_ms")
+    expect(expected is not None and fixed_ms is not None, f"20: no fixed terminal image: {intent}")
+    published = perm.sha256_file(perm.receipt_path(pool, gone))
+    expect(published == expected, "20: the published receipt is not the recorded terminal image")
+    expect(not os.path.exists(gone_root), "20: the root survived its terminal deletion")
+    # A replay accepts the exact image and settles the intent without a
+    # rewrite; the fixed timestamp survives.
+    code, _, stderr = oxide(proof, ["outputs", "prune", "--plan", plan_path, "--plan-sha256", plan_sha], "20 settle", gone)
+    expect(code == 0, f"20: settling the terminal image failed: {stderr}")
+    settled = receipt(pool, gone)
+    expect(settled["pruned"]["at_ms"] == fixed_ms, f"20: the terminal timestamp changed: {settled.get('pruned')}")
+    expect(perm.sha256_file(perm.receipt_path(pool, gone)) == expected, "20: the replay rewrote the terminal image")
+    expect(not os.path.exists(gone_root), "20: the root reappeared")
 
     print("profile-outputs proof: all 20 cases passed", flush=True)
 
@@ -664,16 +852,15 @@ def main() -> int:
         and "OXIDE_PROOF_DEADLINE_NS" in os.environ,
         "not under the qualified runner",
     )
+    # No signal handler, timer or harness of this script's own: the qualified
+    # supervisor owns the deadline, reserve sampling, census/closure and
+    # cleanup. Child timeouts only read the deadline it exports.
     root = perm.tempfile.mkdtemp(prefix="profile-outputs.", dir=scratch)
     repo = os.path.dirname(HERE)
-    perm.signal.signal(perm.signal.SIGTERM, layout.terminated)
-    perm.signal.signal(perm.signal.SIGALRM, layout.overdue)
-    perm.signal.setitimer(perm.signal.ITIMER_REAL, work_left())
     proof = Proof(root)
     try:
         run(proof, repo)
     finally:
-        perm.signal.setitimer(perm.signal.ITIMER_REAL, 0)
         try:
             proof.detach()
         except BaseException as error:

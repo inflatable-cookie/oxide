@@ -64,8 +64,12 @@ admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 64 -- python3 scripts/test-installed-handoff.py"
 
 # Owned output links at profile directories (oxide#133): one fixed 20-case
-# script and the whole command of the qualified shared supervisor (420 s,
-# 512 MiB monitored scratch, one owned 128 MiB image, ordinary detach). It
+# script and the whole command of the qualified shared supervisor. The brief's
+# prospective 420 s does not honestly fit the published 264-400 s estimate, so
+# ONE bounded amendment to 600 s total (about 565 s work, same 512 MiB) is
+# requested before any activation and is NOT granted here; the published
+# command keeps the brief's 420 s until the owner rules. 512 MiB monitored
+# scratch, one owned 128 MiB image, ordinary detach. It
 # stages base 4a70b83 and this HEAD's candidate independently and sequentially
 # from authenticated pinned source, asserts distinct binaries and state-3 /
 # state-4 capabilities, and covers the member layout, binding, migration,

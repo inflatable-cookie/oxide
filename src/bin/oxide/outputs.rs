@@ -1977,21 +1977,53 @@ fn receipt_digest(control: &Path, receipt: &Receipt) -> Result<String, String> {
     file_digest(&receipt_path(control, &receipt.checkout_id))
 }
 
-/// Persist the journal with one new phase (durable before its effect).
+/// Identity facts a migration step records in the same durable phase write as
+/// the phase itself, so a replay never guesses them.
+#[derive(Default)]
+struct MigrationPatch {
+    stage: Option<(u64, u64)>,
+    marker_backup: Option<PathBuf>,
+}
+
+/// Persist the journal with one new phase and the identities the step
+/// established (durable before the next effect).
 fn advance_migration(
     control: &Path,
     receipt: &Receipt,
     phase: MigrationPhase,
+    patch: &MigrationPatch,
 ) -> Result<Receipt, String> {
     let mut writing = receipt.clone();
     let Some(transition) = writing.transition.as_mut() else {
         return Err("the receipt lost its migration journal".to_owned());
     };
     transition.phase = phase;
+    if let Some((dev, ino)) = patch.stage {
+        transition.stage_dev = Some(dev);
+        transition.stage_ino = Some(ino);
+    }
+    if let Some(backup) = &patch.marker_backup {
+        transition.marker_backup = Some(backup.clone());
+    }
     transition.updated_ms = process::now_ms();
     writing.updated_ms = process::now_ms();
     write_receipt(control, &writing)?;
     Ok(writing)
+}
+
+/// Verify a staged directory's recorded identity when the journal has one.
+fn verify_stage_identity(dir: &Path, migration: &Migration) -> Result<(), String> {
+    if let (Some(dev), Some(ino)) = (migration.stage_dev, migration.stage_ino) {
+        let meta = fs::symlink_metadata(dir)
+            .map_err(|error| format!("cannot inspect {}: {error}", dir.display()))?;
+        if meta.dev() != dev || meta.ino() != ino {
+            return Err(pending_migration(
+                migration,
+                "the staging directory's identity changed",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Verify the live member link set of one real profile directory: exactly the
@@ -2219,13 +2251,15 @@ fn replay_migration(
         if migration_rollback_requested(migration.phase) {
             return rollback_migration(context, control, current, &migration);
         }
-        let next = match migration.phase {
+        let (next, patch) = match migration.phase {
             MigrationPhase::Prepared => stage_migration(&parent, &migration)?,
             MigrationPhase::Staged if migration.marker_pin.is_some() => {
                 upgrade_marker(context, &migration)?
             }
-            MigrationPhase::Staged | MigrationPhase::MarkerUpgraded => back_up_target(&migration)?,
-            MigrationPhase::BackedUp => swap_in_staging(&migration)?,
+            MigrationPhase::Staged | MigrationPhase::MarkerUpgraded => {
+                (back_up_target(&migration)?, MigrationPatch::default())
+            }
+            MigrationPhase::BackedUp => (swap_in_staging(&migration)?, MigrationPatch::default()),
             MigrationPhase::Swapped => {
                 return commit_migration(context, control, current, &migration);
             }
@@ -2233,7 +2267,7 @@ fn replay_migration(
                 return finish_migration_cleanup(context, control, current, &migration)
             }
         };
-        current = advance_migration(control, &current, next)?;
+        current = advance_migration(control, &current, next, &patch)?;
         crash_point(&format!("migration-{}", migration_phase_label(next)))?;
     }
 }
@@ -2259,7 +2293,10 @@ fn pending_migration(migration: &Migration, reason: &str) -> String {
 
 /// P1: the transaction-owned staging directory with only classified member
 /// links into the same root.
-fn stage_migration(parent: &Path, migration: &Migration) -> Result<MigrationPhase, String> {
+fn stage_migration(
+    parent: &Path,
+    migration: &Migration,
+) -> Result<(MigrationPhase, MigrationPatch), String> {
     match fs::symlink_metadata(&migration.stage) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             fs::create_dir(&migration.stage)
@@ -2291,13 +2328,25 @@ fn stage_migration(parent: &Path, migration: &Migration) -> Result<MigrationPhas
         }
     }
     verify_member_links(&migration.stage, migration)?;
-    Ok(MigrationPhase::Staged)
+    verify_stage_identity(&migration.stage, migration)?;
+    let meta = fs::symlink_metadata(&migration.stage)
+        .map_err(|error| format!("cannot inspect {}: {error}", migration.stage.display()))?;
+    Ok((
+        MigrationPhase::Staged,
+        MigrationPatch {
+            stage: Some((meta.dev(), meta.ino())),
+            marker_backup: None,
+        },
+    ))
 }
 
 /// The root/1 to root/2 marker upgrade, through verified identities. The old
 /// marker is exclusively renamed to a transaction-owned backup and the
 /// successor is published without replacement.
-fn upgrade_marker(context: &Context, migration: &Migration) -> Result<MigrationPhase, String> {
+fn upgrade_marker(
+    context: &Context,
+    migration: &Migration,
+) -> Result<(MigrationPhase, MigrationPatch), String> {
     let pin = migration
         .marker_pin
         .as_ref()
@@ -2305,7 +2354,53 @@ fn upgrade_marker(context: &Context, migration: &Migration) -> Result<MigrationP
     let root = &migration.root.root;
     let marker_path = root.join(MARKER);
     let backup = root.join(format!("{MARKER}.oxide-old-{}", migration.generation));
+    let successor = read_marker(root)
+        .ok()
+        .filter(|marker| marker.nonce() == migration.root.nonce());
     match fs::symlink_metadata(&marker_path) {
+        Ok(meta) if successor.is_some() => {
+            // A crash after the successor was published: the pinned old
+            // marker must be at its backup (or already journaled there).
+            let _ = meta;
+            match fs::symlink_metadata(&backup) {
+                Ok(backup_meta) => {
+                    if backup_meta.dev() != pin.dev || backup_meta.ino() != pin.ino {
+                        return Err(pending_migration(
+                            migration,
+                            "the successor marker is live but its backup is not the pinned marker",
+                        ));
+                    }
+                    if file_digest(&backup)? != pin.sha256 {
+                        return Err(pending_migration(
+                            migration,
+                            "the successor marker's backup bytes changed",
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if migration.marker_backup.as_deref() != Some(backup.as_path()) {
+                        return Err(pending_migration(
+                            migration,
+                            "the successor marker is live and the old marker is gone",
+                        ));
+                    }
+                }
+                Err(error) => {
+                    return Err(pending_migration(
+                        migration,
+                        &format!("cannot inspect the marker backup: {error}"),
+                    ))
+                }
+            }
+            sync_directory(root)?;
+            return Ok((
+                MigrationPhase::MarkerUpgraded,
+                MigrationPatch {
+                    stage: None,
+                    marker_backup: Some(backup),
+                },
+            ));
+        }
         Ok(meta) => {
             if meta.dev() != pin.dev || meta.ino() != pin.ino {
                 return Err(pending_migration(
@@ -2327,9 +2422,9 @@ fn upgrade_marker(context: &Context, migration: &Migration) -> Result<MigrationP
             sync_directory(root)?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // A crash after the rename and before the phase record: the exact
-            // pinned backup is the only acceptable reason for a missing
-            // marker.
+            // A crash after the rename and before the successor was
+            // published: the exact pinned backup is the only acceptable
+            // reason for a missing marker.
             match fs::symlink_metadata(&backup) {
                 Ok(meta) if meta.dev() == pin.dev && meta.ino() == pin.ino => {}
                 _ => {
@@ -2390,7 +2485,13 @@ fn upgrade_marker(context: &Context, migration: &Migration) -> Result<MigrationP
         ));
     }
     sync_directory(root)?;
-    Ok(MigrationPhase::MarkerUpgraded)
+    Ok((
+        MigrationPhase::MarkerUpgraded,
+        MigrationPatch {
+            stage: None,
+            marker_backup: Some(backup),
+        },
+    ))
 }
 
 /// P2: exclusively rename the old whole-target link to its backup.
@@ -2487,7 +2588,7 @@ fn commit_migration(
     receipt: Receipt,
     migration: &Migration,
 ) -> Result<Receipt, String> {
-    verify_member_links(&migration.link, migration)?;
+    verify_migrated_target(&migration.link, migration)?;
     let marker = read_marker(&migration.root.root)?;
     check_marker(&marker, &context.workspace, &context.checkout_id)?;
     if marker.nonce() != migration.root.nonce() {
@@ -2535,14 +2636,40 @@ fn commit_migration(
 
 /// Remove the journaled backups after the commit and then drop the journal.
 /// Only exact recorded identities are removed; a mismatch keeps it pending.
+/// Verify a committed migrated target tolerantly: every recorded member is
+/// still this migration's link into the root, while Cargo's own real top-level
+/// entries (`CACHEDIR.TAG`, `.rustc_info.json`, `tmp`, tool directories) are
+/// Cargo's and are never treated as members.
+fn verify_migrated_target(dir: &Path, migration: &Migration) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(dir)
+        .map_err(|error| format!("cannot inspect {}: {error}", dir.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!("{} is not a real directory", dir.display()));
+    }
+    for member in &migration.members {
+        let link = dir.join(member);
+        let target = fs::read_link(&link)
+            .map_err(|error| format!("cannot read {}: {error}", link.display()))?;
+        if target != migration.root.root {
+            return Err(format!(
+                "{} selects {}, not the migrated root",
+                link.display(),
+                target.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn finish_migration_cleanup(
     context: &Context,
     control: &Path,
     receipt: Receipt,
     migration: &Migration,
 ) -> Result<Receipt, String> {
-    // The committed target must still be the migrated real directory.
-    verify_member_links(&migration.link, migration)?;
+    // The committed target must still be the migrated real directory with its
+    // member links; Cargo's real top-level files are expected and ignored.
+    verify_migrated_target(&migration.link, migration)?;
     match fs::symlink_metadata(&migration.backup) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Ok(meta) => {
@@ -3430,6 +3557,13 @@ fn bind_ephemeral(context: &Context, expected: Option<&Plan>) -> Result<Outcome,
                 .to_owned(),
         ),
         ReceiptState::Committed => {
+            if receipt.layout() == LayoutKind::Profile {
+                // Ephemeral mode never relinks a converted checkout. The
+                // profile layout is validated exactly as keyed: each owned
+                // member link selects the receipt's root and each real member
+                // stays real.
+                return bind_profile_sealed(context, &receipt, expected);
+            }
             let wanted = match expected_selected {
                 Some(expected) => expected.clone(),
                 None => desired_selection(context, &receipt)?
@@ -3464,6 +3598,65 @@ fn bind_ephemeral(context: &Context, expected: Option<&Plan>) -> Result<Outcome,
             )))
         }
     }
+}
+
+/// Ephemeral-mode binding for a converted profile checkout: no member is
+/// created or relinked, so every keyed placement must already be live.
+fn bind_profile_sealed(
+    context: &Context,
+    receipt: &Receipt,
+    expected: Option<&Plan>,
+) -> Result<Outcome, String> {
+    let Some(plan) = expected else {
+        return Err(
+            "outputs: this checkout places outputs at profile members but its slot was keyed with no owned destination; run the command again"
+                .to_owned(),
+        );
+    };
+    if plan.whole_target {
+        return Err(
+            "outputs: this checkout's layout changed to profile members while its slot was keyed for the whole target; nothing was built. Run the command again"
+                .to_owned(),
+        );
+    }
+    let mut outcome = Outcome::default();
+    let mut real = Vec::new();
+    for planned in &plan.members {
+        let link = link_path(&context.workspace, &planned.member);
+        let state = link_state(&link, &context.workspace, &context.checkout_id)?;
+        match (&planned.selected, &state) {
+            (Some(wanted), TargetState::OwnedLink(root)) if root == &wanted.root => {
+                check_bound_root(context, receipt.generation, wanted)?;
+                outcome.root.get_or_insert_with(|| wanted.root.clone());
+            }
+            (None, TargetState::RealEmpty | TargetState::RealNonEmpty) => {
+                real.push(planned.member.clone());
+            }
+            _ => {
+                return Err(format!(
+                    "outputs: {} is {}, not the keyed placement; the drive mode is ephemeral, so Oxide will not relink it. Run `oxide outputs adopt` or `oxide outputs detach`",
+                    link.display(),
+                    state.label()
+                ))
+            }
+        }
+    }
+    if let Some(root) = outcome.root.clone() {
+        outcome.note = Some(format!(
+            "owned outputs {} through profile member links",
+            root.display()
+        ));
+    }
+    if !real.is_empty() {
+        let list = real.join(", ");
+        outcome.warnings.push(format!(
+            "profile outputs: {list} stay real directories and are used locally; only an explicit `oxide outputs adopt` converts an empty one"
+        ));
+        if outcome.note.is_none() {
+            outcome.note = Some(format!("real profile directories kept ({list})"));
+        }
+    }
+    Ok(outcome)
 }
 
 /// The result of one binding attempt under the mutex.
@@ -4268,12 +4461,12 @@ pub fn destination_facts(plan: Option<&Plan>) -> String {
     let Some(plan) = plan else {
         return String::new();
     };
-    if plan.whole_target {
-        return plan.selected().map(selected_facts).unwrap_or_default();
-    }
     plan.members
         .iter()
         .map(|planned| match &planned.selected {
+            Some(selected) if plan.whole_target => {
+                format!("outputs-2 {}", selected_facts(selected))
+            }
             Some(selected) => format!("outputs-3 {} {}", selected_facts(selected), planned.member),
             None => format!("real {}", planned.member),
         })
@@ -4281,10 +4474,12 @@ pub fn destination_facts(plan: Option<&Plan>) -> String {
         .join("\n")
 }
 
-/// One owned root's identity inside a slot key.
+/// One owned root's identity inside a slot key, without the layout's
+/// namespace: a legacy key prefixes `outputs-2`, a profile key `outputs-3` and
+/// the member.
 fn selected_facts(selected: &Selected) -> String {
     format!(
-        "outputs-2 {} {} {} {} g{}",
+        "{} {} {} {} g{}",
         selected.nonce().unwrap_or("-"),
         match selected.kind {
             RootKind::External => "external",
@@ -6293,6 +6488,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    /// The debug-only migration environment is process-global, so the tests
+    /// that set it run one at a time.
+    static MIGRATION_ENVIRONMENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct Fixture {
         root: PathBuf,
@@ -6619,6 +6817,7 @@ mod tests {
 
     #[test]
     fn a_root_one_marker_is_upgraded_once_and_rolled_back_exactly() {
+        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
         let (fixture, legacy) = legacy_checkout();
         let context = fixture.context();
         let root = legacy.selected().unwrap().root().to_path_buf();
@@ -6664,6 +6863,54 @@ mod tests {
         assert!(!root
             .join(format!("{MARKER}.oxide-old-{}", migrated.generation))
             .exists());
+    }
+
+    #[test]
+    fn a_crashed_migration_replays_from_its_recorded_identities() {
+        let _serial = MIGRATION_ENVIRONMENT_LOCK.lock().unwrap();
+        for boundary in ["migration-staged", "migration-marker"] {
+            let (fixture, legacy) = legacy_checkout();
+            let context = fixture.context();
+            make_root_one_marker(&fixture, &legacy);
+            std::env::set_var(CRASH_ENVIRONMENT, boundary);
+            let stopped = migrate_layout(&context, &fixture.control, legacy.clone());
+            std::env::remove_var(CRASH_ENVIRONMENT);
+            assert!(
+                stopped.is_err(),
+                "{boundary}: the injected stop did not stop"
+            );
+            let stored = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+                .unwrap()
+                .unwrap();
+            let journal = stored.transition.clone().unwrap();
+            assert!(
+                journal.stage_dev.is_some() && journal.stage_ino.is_some(),
+                "{boundary}: the journal did not record the staging identity"
+            );
+            if boundary == "migration-marker" {
+                assert!(
+                    journal.marker_backup.is_some(),
+                    "the journal did not record the marker backup"
+                );
+                assert!(!journal.marker_pin.is_none(), "no marker pin");
+            }
+            // A replay commits from the recorded identities only.
+            let done = replay_migration(&context, &fixture.control, stored).unwrap();
+            assert_eq!(done.layout(), LayoutKind::Profile, "{boundary}");
+            assert!(
+                done.transition.is_none(),
+                "{boundary}: the journal was kept"
+            );
+            let target = fixture.checkout.join("target");
+            assert!(fs::symlink_metadata(&target).unwrap().is_dir());
+            assert!(
+                !fixture
+                    .checkout
+                    .join(format!("{BACKUP_PREFIX}{}", done.generation))
+                    .exists(),
+                "{boundary}: the target backup was kept"
+            );
+        }
     }
 
     #[test]
@@ -6874,6 +7121,89 @@ mod tests {
         let back: Receipt = serde_json::from_value(doc).unwrap();
         assert_eq!(back, receipt);
         assert_eq!(back.layout(), LayoutKind::WholeTarget);
+    }
+
+    #[test]
+    fn profile_slot_keys_use_the_outputs_3_namespace_only() {
+        let fixture = Fixture::new();
+        let local = fixture.local();
+        let selected = local
+            .selected(3)
+            .with_nonce(Some("88888888888888888888888888888888".to_owned()));
+        let profile = Plan {
+            whole_target: false,
+            members: vec![
+                PlannedMember {
+                    member: "debug".to_owned(),
+                    selected: Some(selected.clone()),
+                },
+                PlannedMember {
+                    member: "release".to_owned(),
+                    selected: None,
+                },
+            ],
+        };
+        let facts = destination_facts(Some(&profile));
+        let lines: Vec<&str> = facts.lines().collect();
+        assert_eq!(lines.len(), 2, "{facts}");
+        assert!(lines[0].starts_with("outputs-3 "), "{facts}");
+        assert!(!lines[0].contains("outputs-2"), "{facts}");
+        assert!(lines[0].ends_with(" debug"), "{facts}");
+        assert_eq!(lines[1], "real release");
+        // The legacy namespace is exactly the published one, with no profile
+        // suffix or extra token.
+        let legacy = Plan {
+            whole_target: true,
+            members: vec![PlannedMember {
+                member: MEMBER.to_owned(),
+                selected: Some(selected.clone()),
+            }],
+        };
+        let legacy_facts = destination_facts(Some(&legacy));
+        assert!(legacy_facts.starts_with("outputs-2 "), "{legacy_facts}");
+        assert!(!legacy_facts.contains("outputs-3"), "{legacy_facts}");
+        assert_eq!(legacy_facts.lines().count(), 1);
+        assert!(legacy_facts.ends_with("g3"), "{legacy_facts}");
+    }
+
+    #[test]
+    fn ephemeral_mode_binds_a_converted_profile_checkout_without_relinking() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let context = fixture.context();
+        let receipt =
+            Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+        let (receipt, selected, _) = adopt_profile(&context, receipt).unwrap();
+        let declaration = crate::layout::Declaration::new([
+            crate::layout::Member::parse("debug").unwrap(),
+            crate::layout::Member::parse("release").unwrap(),
+        ])
+        .unwrap();
+        let plan = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &declaration,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        // The live member links are exactly what the slot was keyed for.
+        let outcome = bind_profile_sealed(&context, &receipt, Some(&plan)).unwrap();
+        assert_eq!(outcome.root.as_deref(), Some(selected.root()));
+        assert!(outcome.note.is_some());
+        // A member link that selects another root refuses: ephemeral mode
+        // never relinks it.
+        let debug = fixture.checkout.join("target/debug");
+        fs::remove_file(&debug).unwrap();
+        symlink("/tmp", &debug).unwrap();
+        let refused = match bind_profile_sealed(&context, &receipt, Some(&plan)) {
+            Ok(_) => panic!("a foreign member link was bound"),
+            Err(reason) => reason,
+        };
+        assert!(refused.contains("ephemeral"), "{refused}");
+        assert_eq!(
+            fs::read_link(&debug).unwrap(),
+            std::path::PathBuf::from("/tmp")
+        );
     }
 
     #[test]

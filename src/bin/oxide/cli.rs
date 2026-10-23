@@ -55,6 +55,14 @@ fn is_building_builtin(command: &str) -> bool {
     matches!(command, "doc" | "bench" | "rustc" | "rustdoc" | "fix")
 }
 
+/// Whether Oxide models this command's profile outputs. Modelled commands and
+/// the building built-ins do; an external or unknown subcommand's output
+/// directories are opaque, so a profile checkout refuses it unless the caller
+/// declares them with `oxide exec --output`.
+pub(crate) fn models_profile_outputs(command: &str) -> bool {
+    classify(command) == Class::Modelled || is_building_builtin(command)
+}
+
 /// Whether Cargo itself reads this leased command's `--config` arguments.
 /// An external subcommand receives them as its own.
 pub fn reads_config_args(command: &str) -> bool {
@@ -615,6 +623,27 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn only_modelled_commands_and_building_builtins_have_profile_outputs() {
+        for command in [
+            "check", "build", "run", "test", "clippy", "doc", "bench", "rustc", "rustdoc", "fix",
+        ] {
+            assert!(models_profile_outputs(command), "{command}");
+        }
+        // An external or unknown subcommand's output directories are opaque:
+        // a profile checkout must refuse it rather than assume `debug`.
+        for command in [
+            "nextest",
+            "deny",
+            "audit",
+            "outdated",
+            "machete",
+            "custom-tool",
+        ] {
+            assert!(!models_profile_outputs(command), "{command}");
+        }
     }
 
     #[test]

@@ -3256,9 +3256,13 @@ qualified shared supervisor (`scripts/bounded-test.py`, SHA-256
 `d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e`) as
 `bounded-test.py --limit 420 --scratch-budget-mib 512 -- python3
 scripts/test-profile-outputs.py`; the script prints its own phase allocation
-and assertions with `--plan`. It has NOT run: the author and reviewer natives
-are separately counted owner activations, and this task's merge hold requires
-their exact-head receipts.
+and assertions with `--plan`. The published estimate is 264-400 s of work
+against that bound's 385 s helper window, so ONE bounded amendment to 600 s
+total (about 565 s work, the same 512 MiB) is requested before any activation;
+it is not granted here and the published command keeps the brief's 420 s until
+the owner rules. It has NOT run and nothing is measured: the author and
+reviewer natives are separately counted owner activations, and this task's
+merge hold requires their exact-head receipts.
 
 **Proof (oxide#121).** `effigy rust:auto-adopt-outputs` runs
 `scripts/test-permanent-outputs.py auto-adopt`, the focused mode of the same
