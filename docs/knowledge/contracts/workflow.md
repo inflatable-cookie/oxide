@@ -3281,8 +3281,10 @@ private pool's recorded registration reserve to 200 MiB and restores its exact
 bytes to prove the honest local fallback; a `/target/` parent-ignore control
 proves a directory-only rule refuses the legacy link but accepts profile members;
 a benign ordinary target-root file on its own checkout makes the top-level
-preservation control nonvacuous while
-`CACHEDIR.TAG`/`.rustc_info.json` are asserted real only when present. It has NOT
+preservation control nonvacuous (a clean of that checkout must refuse the file
+as foreign and succeed after its removal), a real peer checkout receipt for the
+same root proves another reference keeps it, and `CACHEDIR.TAG`/`.rustc_info.json`
+are asserted real only when present. It has NOT
 run: the
 author and reviewer natives are separately counted owner activations, and this
 task's merge hold requires their exact-head receipts.

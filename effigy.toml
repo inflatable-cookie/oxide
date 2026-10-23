@@ -85,7 +85,10 @@ run = "python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 64 -- py
 # fallback; a `/target/` parent-ignore control proves a directory-only rule is
 # refused for the legacy link but accepted for profile members, a benign
 # ordinary target-root file on its own checkout keeps the top-level preservation
-# control nonvacuous, and Cargo's own metadata is asserted only when present.
+# control nonvacuous (a clean of that checkout must refuse it as foreign and
+# succeed after removal), a real peer checkout receipt for the same root proves
+# another reference keeps it, and Cargo's own metadata is asserted only when
+# present.
 # The selected-clean reserve stop uses a positively created directory-budget
 # pool; the removable watchdog is removal-only and is not claimed as a reserve
 # stop.

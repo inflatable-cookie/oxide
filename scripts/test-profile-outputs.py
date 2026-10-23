@@ -235,11 +235,13 @@ def plan_only() -> int:
     print("                  low-reserve control (recorded reserve raised to 200 MiB,")
     print("                  then restored byte-exactly) proving the honest local fallback")
     print("  top level       a benign ordinary target-root file on its OWN checkout")
-    print("                  survives adopt and builds, so the cleaned checkout carries no")
-    print("                  foreign entry; CACHEDIR.TAG/.rustc_info.json asserted real")
-    print("                  only when present")
+    print("                  survives adopt and builds, then a clean of THAT checkout must")
+    print("                  refuse it as foreign and succeed after removal;")
+    print("                  CACHEDIR.TAG/.rustc_info.json asserted real only when present")
     print("  ignore          the fixture uses /target (valid for whole-target links and")
     print("                  member parents) plus a separate /target/ parent-ignore control")
+    print("  peer keep       a REAL peer checkout receipt for the same root (not a")
+    print("                  synthetic row or a missing receipt) keeps that root")
     print("  clean           the reserve stop uses a positively created directory-budget")
     print("                  pool with a gated delegating fake cargo; the removable")
     print("                  watchdog is removal-only and is not claimed as a reserve stop")
@@ -998,6 +1000,18 @@ def run(proof: Proof, repo: str) -> None:
     expect_layout(first, {"debug": f"link:{root_of(pool, first)}"})
 
     # ----- case 16: whole and selected clean keep links and markers -------
+    # The known fixture top-level file is a foreign entry for a whole clean:
+    # prove the refusal names it, then remove it and prove clean succeeds.
+    top_control = os.path.join(top, "target", "oxide-proof-top-level-control")
+    code, _, stderr = oxide(proof, ["clean", "--dry-run"], "16 top foreign dry", top)
+    expect(code != 0 and "oxide-proof-top-level-control" in stderr, f"16: the known top file did not refuse a clean: {stderr}")
+    expect(os.path.isfile(top_control), "16: the refused clean removed the known top file")
+    os.remove(top_control)
+    code, _, stderr = oxide(proof, ["clean", "--dry-run"], "16 top clean dry", top)
+    expect(code == 0, f"16: clean still refused after the known file was removed: {stderr}")
+    code, _, stderr = oxide(proof, ["clean"], "16 top clean", top)
+    expect(code == 0, f"16: clean failed after the known file was removed: {stderr}")
+    expect_layout(top, {"debug": f"link:{root_of(pool, top)}"})
     code, _, stderr = oxide(proof, ["clean", "--dry-run"], "16 clean dry", first)
     expect(code == 0, f"16: clean dry run failed: {stderr}")
     code, _, stderr = oxide(proof, ["clean"], "16 clean", first)
@@ -1160,12 +1174,42 @@ def run(proof: Proof, repo: str) -> None:
     registry = json.loads(registry_original)
     gone_id = perm.hashlib.sha256(gone.encode()).hexdigest()
     peer = make_checkout(proof, "group-peer")
+    peer_id = perm.hashlib.sha256(peer.encode()).hexdigest()
+    peer_receipt_path = receipt_file(pool, peer)
     rows = [row for row in registry["rows"] if row["checkout_id"] == gone_id]
     expect(bool(rows), "20: the gone checkout has no registry reference")
+    # A real, valid peer receipt for the same root (not a synthetic row and
+    # not a missing receipt): the peer checkout exists, its committed receipt
+    # selects the gone root with the identical recorded identity.
+    peer_receipt = {
+        "version": "oxide.outputs.transition/2",
+        "checkout": peer,
+        "checkout_id": peer_id,
+        "generation": rows[0]["generation"],
+        "state": "committed",
+        "links": [
+            {
+                "member": "target",
+                "selected": {
+                    "kind": rows[0]["root_kind"],
+                    "root": rows[0]["root"],
+                    "volume_uuid": rows[0]["volume_uuid"],
+                    "nonce": rows[0]["nonce"],
+                    "generation": rows[0]["generation"],
+                },
+            }
+        ],
+        "updated_ms": 1,
+    }
+    with open(peer_receipt_path, "w", encoding="utf-8") as handle:
+        json.dump(peer_receipt, handle, indent=2)
+        handle.write("\n")
+    os.chmod(peer_receipt_path, 0o600)
     for row in rows:
         reference = dict(row)
-        reference["checkout_id"] = perm.hashlib.sha256(peer.encode()).hexdigest()
+        reference["checkout_id"] = peer_id
         reference["checkout"] = peer
+        reference["receipt"] = peer_receipt_path
         reference["selected"] = True
         reference["pending"] = False
         reference["pruning"] = None
@@ -1189,6 +1233,7 @@ def run(proof: Proof, repo: str) -> None:
     with open(registry_path, "wb") as handle:
         handle.write(registry_original)
     os.chmod(registry_path, 0o600)
+    os.remove(peer_receipt_path)
     # Guarded rollback: an intent with no filesystem effect restores the
     # row's selection only while the checkout receipt is still the recorded
     # preimage. A changed receipt keeps the root (pending/KEEP).
@@ -1279,6 +1324,7 @@ def run(proof: Proof, repo: str) -> None:
     expect(intent is not None, "20: the terminal crash lost its intent")
     expected = intent.get("expected_terminal_sha")
     fixed_ms = intent.get("terminal_ms")
+    expect(intent.get("phase") == "deleted", f"20: terminal phase is {intent.get('phase')}, not deleted")
     expect(expected is not None and fixed_ms is not None, f"20: no fixed terminal image: {intent}")
     published = perm.sha256_file(perm.receipt_path(pool, gone))
     expect(published == expected, "20: the published receipt is not the recorded terminal image")
