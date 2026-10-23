@@ -7,7 +7,7 @@
 //! port, and reports the outcome Cargo's `gc` trace shows. Routes the proxy
 //! cannot contain refuse before Cargo runs.
 
-use crate::{adopt, freshness, identity, process, CARGO, MIB};
+use crate::{freshness, guidance, identity, process, CARGO, MIB};
 use oxide_storage::inventory::{inventory_directory, InventoryLimits};
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
@@ -625,11 +625,27 @@ pub fn run_cache_clean(args: &[OsString]) -> Result<u8, String> {
         )));
     }
     let workspace = identity::locate_workspace(CARGO, None)?;
-    if !adopt::is_adopted(&workspace) {
-        return Err(refuse(format!(
-            "{} is not adopted; run `oxide init` first",
-            workspace.display()
-        )));
+    match guidance::adoption(&workspace) {
+        guidance::Adoption::Adopted => {}
+        guidance::Adoption::NotAdopted => {
+            return Err(refuse(format!(
+                "{} is not adopted; run `oxide init` first",
+                workspace.display()
+            )))
+        }
+        guidance::Adoption::LegacyNested(path) => {
+            return Err(refuse(format!(
+                "{} holds an older Oxide block that does not list {}; run `oxide init` at the Git root to list it",
+                path.display(),
+                workspace.display()
+            )))
+        }
+        guidance::Adoption::Uncertain(reason) => {
+            return Err(refuse(format!(
+                "cannot confirm that {} is adopted ({reason}); run `oxide init` first",
+                workspace.display()
+            )))
+        }
     }
     let lock = workspace.join("Cargo.lock");
     match std::fs::symlink_metadata(&lock) {

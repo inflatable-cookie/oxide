@@ -184,8 +184,9 @@ fails, Oxide reports that the wait duration is unavailable.
 ## Adoption
 
 `oxide init` (or `oxide new <path>`) makes a Cargo project if needed and
-writes a short guidance block into the workspace-root `AGENTS.md`. Re-running is
-safe. It prints readiness, including Effigy selectors that still call plain
+writes a short guidance block into `AGENTS.md`: the Git work-tree root's when
+the project is inside Git, listing the Cargo workspaces it covers, else the
+project's own. Re-running is safe. It prints readiness, including Effigy selectors that still call plain
 `cargo`. It never edits Effigy files; switching a selector to `oxide` is the
 project's choice.
 

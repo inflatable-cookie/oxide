@@ -13,6 +13,7 @@ mod cli;
 mod config;
 mod describe;
 mod freshness;
+mod guidance;
 mod handoff;
 mod identity;
 mod launch;
@@ -72,8 +73,9 @@ dev profile, so outputs land in target/debug as with plain Cargo; release is the
 project's own. --cargo-profile oxide-quick/oxide-debug still build but are
 deprecated: external tools get the quick recipe without them. Oxide places build output, so --target-dir and --config
 build.build-dir/target-dir are refused. Adoption writes one marked block in the
-workspace-root AGENTS.md and prints readiness; adoption does not create an
-Oxide config file.
+Git work-tree root's AGENTS.md (the workspace's own AGENTS.md outside Git),
+listing the Cargo workspaces it covers, and prints readiness; adoption does not
+create an Oxide config file.
 A whole-target clean refuses entries Cargo does not create in target/ unless
 --include-foreign is given; --dry-run prints every path it would remove.
 OXIDE_POOL selects the pool; OXIDE_MAX_ACTIVE sets the host-wide active-build
