@@ -78,8 +78,8 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # pools: one ledger-recorded slot of 200,002 zero-byte entries plus a held
 # command, waiting ticket, clean mark, flush and a recorded Evicting slot. It
 # times one default status end to end under 1 s (published, never retried or
-# averaged), proves no payload traversal with the debug-only walk log and an
-# unreadable nested subtree, proves zero mutation with a bounded before/after
+# averaged), proves no payload traversal with the debug-only walk log, proves zero
+# mutation with a bounded before/after
 # metadata digest and exact control bytes, covers held/waits/clean/flush and
 # nested-directory rendering, valid/stale/future/mismatched/missing/corrupt
 # observation facts, no lock creation, a recorded removable pool with an

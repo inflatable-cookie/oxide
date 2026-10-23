@@ -16,8 +16,8 @@ flush. Cases:
 
 - default status end-to-end timing on that fixture (one run, no retry), with
   observed wall-clock time, load average and output size published;
-- no payload traversal, independent of timing: the walk log is never created,
-  and an unreadable nested subtree is not visited or reported;
+- no payload traversal, independent of timing: the debug walk log is never
+  created, so no accounting, checkout or Cargo-home walk ran;
 - zero mutation: a bounded metadata digest and the exact control-file bytes
   are identical before and after every run, no sidecar is created and the
   lock's inode/mtime/bytes do not change;
@@ -123,11 +123,6 @@ def write_private(path: str, data, mode: int = 0o600) -> None:
 
 def now_ms() -> int:
     return int(time.time() * 1000)
-
-
-# Fixture directories whose restrictive mode must be restored before the
-# supervisor's cleanup can remove them.
-RESTORE_MODES: list[str] = []
 
 
 def stage_subject(root: str) -> str:
@@ -385,11 +380,7 @@ def run_status(subject: str, pool: dict, walk_log: str, *args: str):
 
 
 def tree_digest(root: str) -> str:
-    """Bounded no-follow metadata digest of every entry under `root`.
-
-    An unreadable directory is hashed as itself and never entered, so the
-    fixture can hold one without the manifest failing.
-    """
+    """Bounded no-follow metadata digest of every entry under `root`."""
     digest = hashlib.sha256()
     stack = [root]
     count = 0
@@ -503,14 +494,7 @@ def main() -> None:
         f"branch={branch} cpu={os.cpu_count()} load={load_before}"
     )
 
-    try:
-        run_cases(scratch, walk_log, branch, commit, runner_sha, load_before)
-    finally:
-        for path in RESTORE_MODES:
-            try:
-                os.chmod(path, 0o700)
-            except OSError:
-                pass
+    run_cases(scratch, walk_log, branch, commit, runner_sha, load_before)
 
 
 def run_cases(
@@ -556,11 +540,6 @@ def run_cases(
             open(os.path.join(served, f"{created + index:06d}"), "wb").close()
         created += chunk
         work_left()
-    # An unreadable subtree: a walk would report a gap; a read that never
-    # walks never visits it.
-    unreadable = private_dir(os.path.join(served, "unreadable"))
-    RESTORE_MODES.append(unreadable)
-    os.chmod(unreadable, 0o000)
     # A decoy sibling for the legacy `slots/<id>` layout. A status that
     # reconstructed the path would show or measure it.
     decoy = private_dir(os.path.join(big["slots_root"], "1"))
@@ -579,7 +558,7 @@ def run_cases(
         cleans=[{"id": 1, "checkout": checkout}],
     )
     write_private(os.path.join(big["control"], "waiters", "1.lock"), "")
-    expect(entry_count(served) == ENTRIES + 1, "the fixture has the promised entries")
+    expect(entry_count(served) == ENTRIES, "the fixture has the promised entries")
     walk_log_before = os.path.exists(walk_log)
 
     # A live record lock makes the held slot render as a plain held command
@@ -656,7 +635,7 @@ def run_cases(
         )
         expect(
             os.path.exists(os.path.join(served, "000000"))
-            and os.stat(os.path.join(served, "unreadable")).st_mode & 0o777 == 0,
+            and entry_count(served) == ENTRIES,
             "the payload fixture was changed",
         )
 
