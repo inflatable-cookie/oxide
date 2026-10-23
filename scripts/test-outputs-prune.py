@@ -104,8 +104,9 @@ on tiny owned fixtures with exact exit codes and state assertions:
   completion / diagnostics / logical-allocated (1)
     19 completion: deleted root, registry row and intent gone, tombstone,
        prune-observations recorded; logical bytes equal an independent
-       by-name oracle and allocated bytes count a hard-linked 64 KiB inode
-       once (complete coverage); `oxide status` shows the observation.
+       by-name oracle and allocated bytes equal an independent unique-inode
+       oracle (a hard-linked 64 KiB inode counted once; complete coverage);
+       `oxide status` shows the observation.
   resolve-intent (2)
     20 both leaves absent: resolution receipt, `resolved-by-operator`.
     21 quarantine present: exit 2, intent unchanged; replay then completes.
@@ -780,8 +781,9 @@ def run(proof, repo: str) -> None:
     [observed] = [candidate for candidate in preview["candidates"] if candidate["root"] == kappa_root]
     expect(observed["accounting_complete"], observed)
     expect(observed["logical_bytes"] == expected_logical, f"logical {observed['logical_bytes']} != oracle {expected_logical}")
-    expect(observed["allocated_bytes"] >= expected_allocated, f"allocated {observed['allocated_bytes']} < oracle {expected_allocated}")
-    expect(observed["allocated_bytes"] < observed["logical_bytes"], "the hard link was allocated twice")
+    # Inventory counts regular files only, allocated once per inode: the
+    # oracle is exact, and the hard-linked inode is not allocated twice.
+    expect(observed["allocated_bytes"] == expected_allocated, f"allocated {observed['allocated_bytes']} != oracle {expected_allocated}")
     expect(preview["coverage"]["source"] and preview["coverage"]["observed_ms"] > 0, preview["coverage"])
     code, stdout, stderr = world.real_run("completion real run", alpha, plan, sha)
     expect(code == 0 and "deleted" in stdout, f"completion exited {code}: {stderr}")
