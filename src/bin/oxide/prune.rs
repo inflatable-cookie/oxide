@@ -674,6 +674,11 @@ pub fn require_registry(control: &Path) -> Result<(), String> {
     }
 }
 
+/// The ready registry's current revision.
+pub fn registry_revision(control: &Path) -> Result<u64, String> {
+    Ok(ready_registry(control)?.revision)
+}
+
 /// The registry that must already be ready. Missing is never "empty".
 fn ready_registry(control: &Path) -> Result<Registry, String> {
     read_registry(control)?.ok_or_else(|| {
@@ -3570,17 +3575,42 @@ fn prune_one_barrier(
         .map_err(Stop::Refuse)?;
         // A receiptless legacy root is protected by its exclusive `pruning`
         // receipt before the intent exists; if the intent is not published
-        // the receipt is discarded again, with no output effect.
-        if candidate.receiptless {
-            outputs::create_pruning_receipt(
+        // the receipt is discarded again, with no output effect. The
+        // receipt publication and the journal run under one internal
+        // publication lock: the receipt is compare-and-set on the recheck's
+        // revision and the journal's expected revision is exactly the one
+        // that own publication produced, so no unrelated change is adopted.
+        let _publication = if candidate.receiptless {
+            Some(store::publication_guard(control).map_err(Stop::Refuse)?)
+        } else {
+            None
+        };
+        let revision = if candidate.receiptless {
+            match outputs::create_pruning_receipt(
                 control,
                 &candidate.checkout,
                 &candidate.checkout_id,
                 &id,
                 &|intent| journaled(control, intent),
+                revision,
             )
-            .map_err(Stop::Refuse)?;
-        }
+            .map_err(Stop::Refuse)?
+            {
+                Some(own) => own,
+                None => {
+                    attempts += 1;
+                    if attempts >= 2 {
+                        return Err(Stop::Refuse(
+                            "the output registry changed twice while this root was rechecked; it is kept"
+                                .to_owned(),
+                        ));
+                    }
+                    continue;
+                }
+            }
+        } else {
+            revision
+        };
         let published = journal_intent(
             store,
             control,
@@ -3599,6 +3629,7 @@ fn prune_one_barrier(
                     ))
                 })?;
         }
+        drop(_publication);
         if published? {
             break;
         }
@@ -5607,6 +5638,102 @@ mod tests {
             Some(PathBuf::from("/Volumes/Builds"))
         );
         assert_eq!(volumes_mount(Path::new("/Volumes")), None);
+    }
+
+    /// A receiptless legacy root's own `pruning` receipt publication yields
+    /// the exact revision the journal then expects, so its own write is not
+    /// a conflict; an unrelated registry change before the publication
+    /// writes nothing, and one between publication and journal still fails
+    /// the journal's compare-and-set, after which the receipt is discarded.
+    #[test]
+    fn a_pruning_receipt_publication_feeds_the_journal_its_own_revision_only() {
+        let fixture = Fixture::new();
+        let control = ready_control(&fixture, Vec::new(), Vec::new());
+        let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
+        let plan = "f".repeat(64);
+        let legacy = |checkout_id: &str, name: &str| {
+            let mut row = row_for(&fixture.root);
+            row.checkout_id = checkout_id.to_owned();
+            row.checkout = fixture.root.join("gone").join(name);
+            row.root = fixture.root.join(format!("vol/oxide-outputs/{name}"));
+            row.nonce = None;
+            let mut candidate = candidate_of(&row);
+            candidate.receiptless = true;
+            candidate
+        };
+        // Own publication, then the journal at exactly that revision.
+        let first = legacy(&"a".repeat(64), "first");
+        let id = fresh_nonce().unwrap();
+        let quarantine = fixture.root.join(format!("{QUARANTINE_PREFIX}{id}"));
+        let own = outputs::create_pruning_receipt(
+            &control,
+            &first.checkout,
+            &first.checkout_id,
+            &id,
+            &|_| false,
+            5,
+        )
+        .unwrap()
+        .expect("the receipt was refused at the recheck's own revision");
+        assert!(own > 5);
+        assert!(matches!(
+            journal_intent(&store, &control, &first, &plan, &id, &quarantine, own),
+            Ok(true)
+        ));
+        assert_eq!(
+            ready_registry(&control).unwrap().intent(&id).unwrap().phase,
+            IntentPhase::Intent
+        );
+
+        // An unrelated change before the publication: nothing is written.
+        let second = legacy(&"b".repeat(64), "second");
+        let stale = ready_registry(&control).unwrap().revision;
+        let mut unrelated = ready_registry(&control).unwrap();
+        unrelated.bump().unwrap();
+        write_registry(&control, &unrelated).unwrap();
+        let id2 = fresh_nonce().unwrap();
+        assert!(outputs::create_pruning_receipt(
+            &control,
+            &second.checkout,
+            &second.checkout_id,
+            &id2,
+            &|_| false,
+            stale
+        )
+        .unwrap()
+        .is_none());
+        assert!(!outputs::receipt_path_public(&control, &second.checkout_id).exists());
+
+        // An unrelated change after the publication: the journal still fails
+        // its compare-and-set, journals nothing and the receipt is discarded.
+        let current = ready_registry(&control).unwrap().revision;
+        let own2 = outputs::create_pruning_receipt(
+            &control,
+            &second.checkout,
+            &second.checkout_id,
+            &id2,
+            &|_| false,
+            current,
+        )
+        .unwrap()
+        .unwrap();
+        let mut unrelated = ready_registry(&control).unwrap();
+        unrelated.bump().unwrap();
+        write_registry(&control, &unrelated).unwrap();
+        let quarantine2 = fixture.root.join(format!("{QUARANTINE_PREFIX}{id2}"));
+        assert!(matches!(
+            journal_intent(&store, &control, &second, &plan, &id2, &quarantine2, own2),
+            Ok(false)
+        ));
+        assert!(ready_registry(&control).unwrap().intent(&id2).is_none());
+        assert!(outputs::discard_pruning_receipt(
+            &control,
+            &second.checkout,
+            &second.checkout_id,
+            &id2
+        )
+        .unwrap());
+        assert!(!outputs::receipt_path_public(&control, &second.checkout_id).exists());
     }
 
     #[test]

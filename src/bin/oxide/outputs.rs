@@ -3486,14 +3486,25 @@ pub(crate) fn mark_pruned(
 /// writer's own interrupted creation (a `pruning` receipt whose intent no
 /// registry journal records), which is rebound to the new intent. Any other
 /// existing receipt refuses. No adoption history is reconstructed.
+///
+/// The publication is compare-and-set on the registry revision: it happens
+/// only while the registry still has `expected_revision` (the revision the
+/// locked recheck read) and returns the exact revision its own publication
+/// produced, read under the same internal publication lock. `Ok(None)`
+/// means an unrelated writer changed the registry first: nothing was
+/// written.
 pub(crate) fn create_pruning_receipt(
     control: &Path,
     checkout: &Path,
     checkout_id: &str,
     intent: &str,
     journaled: &dyn Fn(&str) -> bool,
-) -> Result<(), String> {
+    expected_revision: u64,
+) -> Result<Option<u64>, String> {
     let _guard = store::publication_guard(control)?;
+    if crate::prune::registry_revision(control)? != expected_revision {
+        return Ok(None);
+    }
     let mut receipt = match read_receipt(control, checkout, checkout_id)? {
         None => Receipt::first(checkout, checkout_id),
         Some(existing)
@@ -3520,7 +3531,9 @@ pub(crate) fn create_pruning_receipt(
         at_ms: process::now_ms(),
     });
     receipt.updated_ms = process::now_ms();
-    write_receipt(control, &receipt)
+    write_receipt(control, &receipt)?;
+    // Still under the publication lock: this is exactly our own revision.
+    crate::prune::registry_revision(control).map(Some)
 }
 
 /// Remove this writer's own `pruning` receipt for exactly `intent`, when its
@@ -5717,6 +5730,7 @@ mod tests {
             &checkout_id,
             &first,
             &|_| true,
+            crate::prune::registry_revision(&fixture.control).unwrap(),
         )
         .unwrap();
         let receipt = context.receipt().unwrap().unwrap();
@@ -5731,7 +5745,8 @@ mod tests {
             &fixture.checkout,
             &checkout_id,
             &second,
-            &|_| true
+            &|_| true,
+            crate::prune::registry_revision(&fixture.control).unwrap(),
         )
         .is_err());
         // This writer's own unjournaled creation is rebound to a new intent.
@@ -5741,6 +5756,7 @@ mod tests {
             &checkout_id,
             &second,
             &|_| false,
+            crate::prune::registry_revision(&fixture.control).unwrap(),
         )
         .unwrap();
         assert!(mark_pruned(
@@ -5780,7 +5796,8 @@ mod tests {
             &other.checkout,
             &other_id,
             &first,
-            &|_| false
+            &|_| false,
+            crate::prune::registry_revision(&other.control).unwrap(),
         )
         .is_err());
     }
