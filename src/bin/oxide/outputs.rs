@@ -1963,6 +1963,8 @@ fn migration_members(root: &Path) -> Result<Vec<String>, String> {
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
+        // `file_type` does not follow a symlink, so a linked entry is never
+        // classified as a directory here.
         if !entry
             .file_type()
             .map_err(|error| error.to_string())?
@@ -1972,6 +1974,37 @@ fn migration_members(root: &Path) -> Result<Vec<String>, String> {
         }
         if crate::layout::Member::parse(&name).is_ok() {
             names.push(name);
+            continue;
+        }
+        // One bounded second component: a positively identified plain triple
+        // directory contributes only its own `debug` and `release` profile
+        // directories. No third level and no other profile name is walked, so
+        // a custom profile, a JSON target specification and anything else the
+        // old root holds stay exactly as they are.
+        if !crate::layout::plain_triple(&name) {
+            continue;
+        }
+        for child in fs::read_dir(entry.path())
+            .map_err(|error| format!("cannot read {}: {error}", entry.path().display()))?
+        {
+            let child = child.map_err(|error| error.to_string())?;
+            let Some(leaf) = child.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if leaf != "debug" && leaf != "release" {
+                continue;
+            }
+            if !child
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_dir()
+            {
+                continue;
+            }
+            let member = format!("{name}/{leaf}");
+            if crate::layout::Member::parse(&member).is_ok() {
+                names.push(member);
+            }
         }
     }
     names.sort();
@@ -2082,7 +2115,9 @@ fn verify_stage_identity(dir: &Path, migration: &Migration) -> Result<(), String
 }
 
 /// Verify the live member link set of one real profile directory: exactly the
-/// journal's sorted members, each a symlink into the journal's root.
+/// journal's sorted members, each a symlink into the journal's root. A
+/// `<triple>/<profile>` member lives one level down in its own real triple
+/// directory, which is walked exactly one component deep.
 fn verify_member_links(dir: &Path, migration: &Migration) -> Result<(), String> {
     let metadata = fs::symlink_metadata(dir)
         .map_err(|error| format!("cannot inspect {}: {error}", dir.display()))?;
@@ -2099,23 +2134,55 @@ fn verify_member_links(dir: &Path, migration: &Migration) -> Result<(), String> 
             .to_str()
             .ok_or("the migrated directory holds a non-UTF-8 entry")?
             .to_owned();
-        if !migration.members.contains(&name) {
+        if migration.members.contains(&name) {
+            verify_member_link(&entry.path(), &name, migration)?;
+            found.push(name);
+            continue;
+        }
+        // Only a triple directory that carries recorded members is walked, so
+        // an unrecorded directory refuses instead of being descended into.
+        let nested: Vec<&String> = migration
+            .members
+            .iter()
+            .filter(|member| {
+                member
+                    .split_once('/')
+                    .is_some_and(|(triple, _)| triple == name.as_str())
+            })
+            .collect();
+        if nested.is_empty() {
             return Err(format!(
                 "{} holds {:?}, which this migration did not create",
                 dir.display(),
                 name
             ));
         }
-        let link = fs::read_link(entry.path())
-            .map_err(|error| format!("cannot read {}: {error}", entry.path().display()))?;
-        if link != member_destination(&migration.root.root, &name) {
-            return Err(format!(
-                "{} selects {}, not its migrated member destination",
-                entry.path().display(),
-                link.display()
-            ));
+        let nested_dir = entry.path();
+        let nested_metadata = fs::symlink_metadata(&nested_dir)
+            .map_err(|error| format!("cannot inspect {}: {error}", nested_dir.display()))?;
+        if !nested_metadata.is_dir() || nested_metadata.file_type().is_symlink() {
+            return Err(format!("{} is not a real directory", nested_dir.display()));
         }
-        found.push(name);
+        for child in fs::read_dir(&nested_dir)
+            .map_err(|error| format!("cannot read {}: {error}", nested_dir.display()))?
+        {
+            let child = child.map_err(|error| error.to_string())?;
+            let leaf = child
+                .file_name()
+                .to_str()
+                .ok_or("the migrated directory holds a non-UTF-8 entry")?
+                .to_owned();
+            let member = format!("{name}/{leaf}");
+            if !nested.iter().any(|known| known.as_str() == member) {
+                return Err(format!(
+                    "{} holds {:?}, which this migration did not create",
+                    nested_dir.display(),
+                    leaf
+                ));
+            }
+            verify_member_link(&child.path(), &member, migration)?;
+            found.push(member);
+        }
     }
     found.sort();
     if found != migration.members {
@@ -2124,6 +2191,20 @@ fn verify_member_links(dir: &Path, migration: &Migration) -> Result<(), String> 
             dir.display(),
             found,
             migration.members
+        ));
+    }
+    Ok(())
+}
+
+/// One member entry must be a symlink to that member's own destination.
+fn verify_member_link(path: &Path, member: &str, migration: &Migration) -> Result<(), String> {
+    let link =
+        fs::read_link(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if link != member_destination(&migration.root.root, member) {
+        return Err(format!(
+            "{} selects {}, not its migrated member destination",
+            path.display(),
+            link.display()
         ));
     }
     Ok(())
@@ -2365,6 +2446,34 @@ fn stage_migration(
             )?;
             for member in &migration.members {
                 let link = migration.stage.join(member);
+                // A `<triple>/<profile>` member needs its own real ancestor
+                // directory inside the transaction-owned staging directory.
+                if let Some(parent) = link.parent() {
+                    if parent != migration.stage.as_path() {
+                        // The first member of a triple creates its directory;
+                        // the second one legitimately finds it already there.
+                        match fs::create_dir(parent) {
+                            Ok(()) => {
+                                fs::set_permissions(
+                                    parent,
+                                    fs::Permissions::from_mode(0o755),
+                                )
+                                .map_err(|error| {
+                                    format!(
+                                        "cannot set permissions on the staged member directory: {error}"
+                                    )
+                                })?;
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                            Err(error) => {
+                                return Err(format!(
+                                    "cannot create the staged member directory {}: {error}",
+                                    parent.display()
+                                ))
+                            }
+                        }
+                    }
+                }
                 symlink(&member_destination(&migration.root.root, member), &link).map_err(
                     |error| {
                         format!(
@@ -6995,6 +7104,114 @@ mod tests {
         assert!(refused.contains("declares none"), "{refused}");
     }
 
+    /// P5: the members an explicit migration links are discovered with one
+    /// bounded second component. Only a positively identified plain triple
+    /// contributes its own `debug`/`release` directories; a linked triple
+    /// directory, a JSON target specification, a custom profile and any other
+    /// root entry are never classified as members.
+    #[test]
+    fn migration_members_discover_only_bounded_triple_pairs() {
+        let fixture = Fixture::new();
+        let root = fixture.root.join("volume/oxide-outputs/checkout-0000");
+        for directory in [
+            "debug",
+            "release",
+            "aarch64-apple-darwin/debug",
+            "aarch64-apple-darwin/release",
+            // A custom profile under a real triple is not a v1 member.
+            "aarch64-apple-darwin/bench",
+            // Three components are outside the bounded traversal.
+            "aarch64-apple-darwin/debug/incremental",
+            // A JSON target specification is not a plain triple.
+            "x86_64-unknown-linux-gnu.json/debug",
+            // A profile name no v1 layout links.
+            "custom-profile",
+        ] {
+            fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        // A plain triple that is a SYMLINK is not positively identified: it is
+        // never descended into.
+        fs::create_dir_all(fixture.root.join("elsewhere/riscv64-unknown-elf/debug")).unwrap();
+        symlink(
+            fixture.root.join("elsewhere"),
+            root.join("riscv64-unknown-elf"),
+        )
+        .unwrap();
+        fs::write(root.join("CACHEDIR.TAG"), b"signature").unwrap();
+        assert_eq!(
+            migration_members(&root).unwrap(),
+            vec![
+                "aarch64-apple-darwin/debug".to_owned(),
+                "aarch64-apple-darwin/release".to_owned(),
+                "debug".to_owned(),
+                "release".to_owned(),
+            ]
+        );
+    }
+
+    /// P5: the same discovery end to end. A migrated root that already holds a
+    /// plain triple's profile directories gets those pairs linked one level
+    /// down under a REAL triple directory, while every other root entry is
+    /// left exactly where it was.
+    #[test]
+    fn a_migration_links_discovered_triple_pairs_one_level_down() {
+        let (fixture, legacy) = legacy_checkout();
+        let context = fixture.context();
+        let root = legacy.selected().unwrap().root().to_path_buf();
+        let triple = "aarch64-apple-darwin";
+        for profile in ["debug", "release"] {
+            fs::create_dir_all(root.join(triple).join(profile)).unwrap();
+        }
+        // Root entries that are not v1 profile pairs stay untouched.
+        fs::write(root.join(triple).join("keep-me"), b"peer").unwrap();
+        fs::create_dir_all(root.join("doc")).unwrap();
+        let (migrated, _, converted) =
+            migrate_layout(&context, &fixture.control, legacy.clone()).unwrap();
+        assert!(converted);
+        let target = context.link();
+        let metadata = fs::symlink_metadata(&target).unwrap();
+        assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+        let members = vec![
+            "debug".to_owned(),
+            "release".to_owned(),
+            format!("{triple}/debug"),
+            format!("{triple}/release"),
+        ];
+        for member in &members {
+            assert_eq!(
+                fs::read_link(target.join(member)).unwrap(),
+                member_destination(&root, member),
+                "{member}"
+            );
+            assert_eq!(
+                migrated.selected_for(member).map(Selected::root),
+                Some(root.as_path()),
+                "{member}"
+            );
+        }
+        // The triple directory is real, and the pair sits inside it.
+        let triple_dir = target.join(triple);
+        let nested = fs::symlink_metadata(&triple_dir).unwrap();
+        assert!(nested.is_dir() && !nested.file_type().is_symlink());
+        // The root keeps every entry this migration does not own, and those
+        // entries are never copied into the new real target.
+        assert_eq!(
+            fs::read(root.join(triple).join("keep-me")).unwrap(),
+            b"peer"
+        );
+        assert!(root.join("doc").is_dir());
+        assert!(!triple_dir.join("keep-me").exists());
+        // The journaled staging and backup are gone and a replay is a no-op.
+        assert!(!fixture
+            .checkout
+            .join(format!("{STAGE_PREFIX}{}", migrated.generation))
+            .exists());
+        assert_eq!(
+            replay_migration(&context, &fixture.control, migrated.clone()).unwrap(),
+            migrated
+        );
+    }
+
     /// A committed whole-target checkout in a Git work tree that ignores
     /// `target/`, with a root that carries its marker.
     fn legacy_checkout() -> (Fixture, Receipt) {
@@ -7810,8 +8027,17 @@ mod tests {
             }],
         };
         let legacy_facts = destination_facts(Some(&legacy));
-        assert!(legacy_facts.starts_with("outputs-2 "), "{legacy_facts}");
-        assert!(!legacy_facts.contains("outputs-3"), "{legacy_facts}");
+        // The namespace is the FIRST TOKEN only. The fixture path itself can
+        // contain "outputs-3" (its random temporary suffix), so a substring
+        // test is wrong: only a leading namespace token is a namespace.
+        let legacy_tokens: Vec<&str> = legacy_facts.split_whitespace().collect();
+        assert_eq!(legacy_tokens[0], "outputs-2", "{legacy_facts}");
+        assert!(
+            !legacy_facts
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some("outputs-3")),
+            "{legacy_facts}"
+        );
         assert_eq!(legacy_facts.lines().count(), 1);
         assert!(legacy_facts.ends_with("g3"), "{legacy_facts}");
     }

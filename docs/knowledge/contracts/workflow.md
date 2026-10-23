@@ -3221,7 +3221,13 @@ stay real.
   exact target-link text/dev/ino, the parent identity and — for a root/1
   marker — the marker's dev/ino/SHA plus ONE freshly reserved root nonce. P1
   creates the transaction's staging directory with only classified member
-  links into the same root and records its identity. The root/1 marker is
+  links into the same root and records its identity. The classified set is the
+  host `debug`/`release` pair plus, one bounded component down, the `debug` and
+  `release` directories of each positively identified plain triple directory
+  in the old root; a linked triple directory, a JSON target specification, a
+  custom profile, a third component and every other entry are never
+  classified, and each `<triple>` becomes a real ancestor directory in the new
+  target holding only its own owned member links. The root/1 marker is
   exclusively renamed to a transaction backup and the root/2 successor is
   published without replacement, preserving owner, recipe, kind, volume and
   the original root-creation generation. P2 exclusively renames the old target
