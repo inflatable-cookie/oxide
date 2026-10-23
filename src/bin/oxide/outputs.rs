@@ -86,6 +86,11 @@ const MAX_ROOTS: usize = 8;
 const MAX_HOLDERS: usize = 16;
 /// Debug-only crash injection, naming a write-ahead point.
 const CRASH_ENVIRONMENT: &str = "OXIDE_TEST_OUTPUTS_CRASH";
+/// Debug-only rollback oracle for an uncommitted layout migration.
+const ROLLBACK_ENVIRONMENT: &str = "OXIDE_TEST_MIGRATION_ROLLBACK";
+/// Siblings of `<checkout>/target` that a layout migration owns.
+const STAGE_PREFIX: &str = ".target.oxide-new-";
+const BACKUP_PREFIX: &str = ".target.oxide-old-";
 /// One bounded Git probe's time limit.
 const GIT_PROBE_TIME: Duration = Duration::from_secs(5);
 /// Byte cap for one Git probe's stdout.
@@ -220,6 +225,119 @@ pub(crate) struct Prepared {
     link: PathBuf,
 }
 
+/// Where one explicit whole-target-to-profile migration stands. Every phase is
+/// durable before its effect; a replay advances only exact recorded
+/// identities and leaves anything ambiguous pending.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MigrationPhase {
+    /// P0: the journal and pinned old state are durable. No target effect yet.
+    Prepared,
+    /// P1: `.target.oxide-new-<g>` exists with exactly the member links.
+    Staged,
+    /// The root's legacy marker was replaced by its root/2 successor.
+    MarkerUpgraded,
+    /// P2: the old target link is at its `.target.oxide-old-<g>` backup.
+    BackedUp,
+    /// P3: the staging directory is the new real `target`.
+    Swapped,
+    /// P4: the receipt, root marker and member references are committed.
+    Committed,
+}
+
+/// The migration journal of one explicit `oxide outputs adopt`. It pins the
+/// exact old target link, parent, marker and receipt so no step ever acts on
+/// anything it did not positively classify.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Migration {
+    /// The receipt generation this migration commits at.
+    generation: u64,
+    phase: MigrationPhase,
+    /// The root the migration keeps; for a root/1 marker this carries the ONE
+    /// freshly reserved nonce every proposed member shares.
+    root: Selected,
+    /// The sorted v1 member names the new layout links.
+    members: Vec<String>,
+    link: PathBuf,
+    link_text: PathBuf,
+    link_dev: u64,
+    link_ino: u64,
+    parent_dev: u64,
+    parent_ino: u64,
+    stage: PathBuf,
+    backup: PathBuf,
+    /// Exact staging-directory identity, recorded when P1 is durable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stage_dev: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stage_ino: Option<u64>,
+    /// A root/1 marker being upgraded: its pinned identity and backup leaf.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    marker_pin: Option<MarkerPin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    marker_backup: Option<PathBuf>,
+    /// The receipt bytes this migration started from.
+    prior_receipt_sha: String,
+    /// The registry revision the journal was published at.
+    registry_revision: u64,
+    created_ms: u64,
+    updated_ms: u64,
+}
+
+/// An old root marker's exact identity, so a rollback restores those bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarkerPin {
+    dev: u64,
+    ino: u64,
+    sha256: String,
+}
+
+impl Migration {
+    fn validate(&self, receipt: &Receipt) -> Result<(), String> {
+        let expected = match self.phase {
+            MigrationPhase::Committed => receipt.generation,
+            _ => receipt.generation.saturating_add(1),
+        };
+        if self.generation != expected || self.generation == 0 {
+            return Err("the layout migration names an unusable generation".to_owned());
+        }
+        if self.link != receipt.checkout.join("target")
+            || !safe_absolute(&self.root.root)
+            || !safe_absolute(&self.stage)
+            || !safe_absolute(&self.backup)
+        {
+            return Err("the layout migration names an unusable path".to_owned());
+        }
+        let mut names = self.members.clone();
+        names.sort();
+        names.dedup();
+        if names != self.members || names.is_empty() {
+            return Err("the layout migration names an unusable member set".to_owned());
+        }
+        for member in &names {
+            crate::layout::Member::parse(member)
+                .map_err(|reason| format!("a migrated member is unusable: {reason}"))?;
+        }
+        crate::layout::validate_set(&names, crate::layout::MAX_RECEIPT_MEMBERS)
+            .map_err(|reason| format!("the migrated member set is unusable: {reason}"))?;
+        if self.root.nonce().is_none() || self.root.nonce().is_some_and(|nonce| nonce.len() != 32) {
+            return Err("the layout migration needs one 128-bit root nonce".to_owned());
+        }
+        if !crate::prune::is_nonce(&self.prior_receipt_sha)
+            && self.prior_receipt_sha.len() != 64
+            && self
+                .prior_receipt_sha
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit())
+        {
+            return Err("the layout migration pins an unusable receipt digest".to_owned());
+        }
+        Ok(())
+    }
+}
+
 /// Receipt state. `Prepared` is the only state a crash can leave behind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -293,6 +411,9 @@ pub(crate) struct Receipt {
     /// The terminal outcome of an explicit prune, when this receipt was
     /// pruned or resolved.
     pruned: Option<PruneRecord>,
+    /// The durable journal of an explicit whole-target-to-profile migration.
+    /// Present from P0 until its committed cleanup finishes.
+    transition: Option<Migration>,
     updated_ms: u64,
 }
 
@@ -399,6 +520,7 @@ impl Receipt {
             reserved: None,
             roots: Vec::new(),
             pruned: None,
+            transition: None,
             updated_ms: process::now_ms(),
         }
     }
@@ -530,9 +652,15 @@ impl Receipt {
     }
 
     fn validate(&self, checkout: &Path, checkout_id: &str) -> Result<(), String> {
-        if self.version != self.layout.receipt_version()
-            || (self.version != RECEIPT_VERSION && self.version != PROFILE_RECEIPT_VERSION)
-        {
+        let format_ok = match (self.version.as_str(), self.layout) {
+            (RECEIPT_VERSION, LayoutKind::WholeTarget) => true,
+            (PROFILE_RECEIPT_VERSION, LayoutKind::Profile) => true,
+            // A migration journal is published in the successor format before
+            // its commit; its placement is still the legacy whole target.
+            (PROFILE_RECEIPT_VERSION, LayoutKind::WholeTarget) => self.transition.is_some(),
+            _ => false,
+        };
+        if !format_ok {
             return Err(format!(
                 "the owned-output receipt has an unsupported version {:?}",
                 self.version
@@ -634,6 +762,32 @@ impl Receipt {
                     .to_owned(),
             );
         }
+        if let Some(transition) = &self.transition {
+            if self.version != PROFILE_RECEIPT_VERSION {
+                return Err(
+                    "a layout migration journal needs the successor receipt format".to_owned(),
+                );
+            }
+            match transition.phase {
+                MigrationPhase::Committed => {
+                    if self.layout != LayoutKind::Profile {
+                        return Err(
+                            "a committed layout migration must select the profile layout"
+                                .to_owned(),
+                        );
+                    }
+                }
+                _ => {
+                    if self.layout != LayoutKind::WholeTarget {
+                        return Err(
+                            "a pending layout migration keeps the whole-target placement"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+            transition.validate(self)?;
+        }
         if let Some(prepared) = prepared {
             if prepared.generation != self.generation.saturating_add(1)
                 || prepared.generation == 0
@@ -664,12 +818,22 @@ impl Receipt {
             }
             ReceiptState::Pruned => prepared.is_none(),
             ReceiptState::Pruning => prepared.is_none() && self.pruned.is_some(),
-            ReceiptState::Prepared => {
-                prepared.is_some()
-                    && self.links.iter().all(|placement| {
-                        placement.selected.is_some() || placement.prepared.is_some()
-                    })
-            }
+            ReceiptState::Prepared => match &self.transition {
+                Some(transition) => {
+                    transition.validate(self)?;
+                    prepared.is_none()
+                        && self
+                            .links
+                            .iter()
+                            .all(|placement| placement.prepared.is_none())
+                }
+                None => {
+                    prepared.is_some()
+                        && self.links.iter().all(|placement| {
+                            placement.selected.is_some() || placement.prepared.is_some()
+                        })
+                }
+            },
         };
         if !consistent {
             return Err(
@@ -712,6 +876,8 @@ impl Serialize for Receipt {
             state: ReceiptState,
             #[serde(skip_serializing_if = "Option::is_none")]
             layout: Option<LayoutKind>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            transition: Option<&'a Migration>,
             links: Vec<PlacementDoc<'a>>,
             #[serde(skip_serializing_if = "Option::is_none")]
             reserved: Option<&'a Reservation>,
@@ -733,7 +899,7 @@ impl Serialize for Receipt {
             #[serde(skip_serializing_if = "Option::is_none")]
             reserved: Option<&'a Reservation>,
         }
-        let legacy = self.layout == LayoutKind::WholeTarget;
+        let legacy = self.version == RECEIPT_VERSION;
         let links = self
             .links
             .iter()
@@ -751,6 +917,7 @@ impl Serialize for Receipt {
             generation: self.generation,
             state: self.state,
             layout: (!legacy).then_some(self.layout),
+            transition: (!legacy).then_some(self.transition.as_ref()).flatten(),
             links,
             reserved: (!legacy).then_some(self.reserved.as_ref()).flatten(),
             roots: &self.roots,
@@ -788,6 +955,8 @@ impl<'de> Deserialize<'de> for Receipt {
             #[serde(default)]
             layout: Option<LayoutKind>,
             #[serde(default)]
+            transition: Option<Migration>,
+            #[serde(default)]
             links: Vec<PlacementDoc>,
             #[serde(default)]
             reserved: Option<Reservation>,
@@ -810,9 +979,9 @@ impl<'de> Deserialize<'de> for Receipt {
             .collect();
         let (version, layout, links) = match doc.version.as_str() {
             RECEIPT_VERSION => {
-                if doc.layout.is_some() {
+                if doc.layout.is_some() || doc.transition.is_some() {
                     return Err(serde::de::Error::custom(
-                        "a version-2 receipt carries no successor layout",
+                        "a version-2 receipt carries no successor layout or migration",
                     ));
                 }
                 let links = if legacy {
@@ -849,11 +1018,17 @@ impl<'de> Deserialize<'de> for Receipt {
                         "a version-3 receipt carries placements, not top-level references",
                     ));
                 }
-                if doc.layout != Some(LayoutKind::Profile) {
-                    return Err(serde::de::Error::custom(
-                        "a version-3 receipt must declare its layout",
-                    ));
-                }
+                let layout = match doc.layout {
+                    Some(LayoutKind::Profile) => LayoutKind::Profile,
+                    Some(LayoutKind::WholeTarget) if doc.transition.is_some() => {
+                        LayoutKind::WholeTarget
+                    }
+                    _ => {
+                        return Err(serde::de::Error::custom(
+                            "a version-3 receipt must declare its layout",
+                        ))
+                    }
+                };
                 if doc
                     .links
                     .iter()
@@ -872,11 +1047,7 @@ impl<'de> Deserialize<'de> for Receipt {
                         prepared: placement.prepared,
                     })
                     .collect();
-                (
-                    PROFILE_RECEIPT_VERSION.to_owned(),
-                    LayoutKind::Profile,
-                    links,
-                )
+                (PROFILE_RECEIPT_VERSION.to_owned(), layout, links)
             }
             other => {
                 return Err(serde::de::Error::custom(format!(
@@ -907,6 +1078,7 @@ impl<'de> Deserialize<'de> for Receipt {
             reserved,
             roots: doc.roots,
             pruned: doc.pruned,
+            transition: doc.transition,
             updated_ms: doc.updated_ms,
         })
     }
@@ -1619,6 +1791,15 @@ fn adopt_command() -> Result<u8, String> {
         }
         let _admission = store::publication_guard(&control)?;
         let stored = read_receipt(&control, &context.workspace, &context.checkout_id)?;
+        if let Some(receipt) = stored.as_ref() {
+            if receipt.transition.is_some() {
+                let replayed = replay_migration(&context, &control, receipt.clone())?;
+                if let Some(selected) = replayed.selected().cloned() {
+                    let converted = replayed.transition.is_none();
+                    return Ok((replayed, selected, converted));
+                }
+            }
+        }
         let fresh = stored.is_none();
         let receipt = match stored {
             // Only the explicit first conversion selects the profile layout.
@@ -1632,8 +1813,13 @@ fn adopt_command() -> Result<u8, String> {
             ),
             Some(receipt) => replay(&context, receipt)?,
         };
-        if fresh || receipt.layout() == LayoutKind::Profile {
+        if receipt.layout() == LayoutKind::Profile || fresh {
             adopt_profile(&context, receipt)
+        } else if receipt.state == ReceiptState::Committed
+            && context.mode()? == Some(DriveMode::Permanent)
+            && matches!(context.target()?, TargetState::OwnedLink(_))
+        {
+            migrate_layout(&context, &control, receipt)
         } else {
             adopt_under_barrier(&context, receipt)
         }
@@ -1720,6 +1906,891 @@ fn adopt_under_barrier(
         }
         _ => Err(refuse_existing_target(context, &target)),
     }
+}
+
+/// The v1 members a migration links: the host debug/release pair, plus every
+/// other v1-form directory the old whole-target root already holds. Nothing is
+/// invented and no other directory is classified.
+fn migration_members(root: &Path) -> Result<Vec<String>, String> {
+    let mut names = vec!["debug".to_owned(), "release".to_owned()];
+    for entry in fs::read_dir(root)
+        .map_err(|error| format!("cannot read the output root {}: {error}", root.display()))?
+    {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
+            continue;
+        }
+        if crate::layout::Member::parse(&name).is_ok() {
+            names.push(name);
+        }
+    }
+    names.sort();
+    names.dedup();
+    crate::layout::validate_set(&names, crate::layout::MAX_RECEIPT_MEMBERS)?;
+    Ok(names)
+}
+
+/// Debug-only: `OXIDE_TEST_MIGRATION_ROLLBACK=1` asks `adopt` to restore the
+/// exact pre-migration state instead of continuing. Absent from release
+/// builds.
+fn migration_rollback_requested(phase: MigrationPhase) -> bool {
+    #[cfg(debug_assertions)]
+    {
+        let Some(value) = std::env::var(ROLLBACK_ENVIRONMENT).ok() else {
+            return false;
+        };
+        // `1` rolls back at the first durable phase; a phase name rolls back
+        // exactly when the journal reaches it, so both marker boundaries and
+        // the pre-P4 target are exercisable.
+        return value == "1"
+            || (value == "marker" && phase == MigrationPhase::MarkerUpgraded)
+            || (value == "staged" && phase == MigrationPhase::Staged)
+            || (value == "swapped" && phase == MigrationPhase::Swapped);
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = phase;
+        false
+    }
+}
+
+/// SHA-256 of one file's exact bytes.
+fn file_digest(path: &Path) -> Result<String, String> {
+    let bytes =
+        fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&bytes);
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    Ok(hex)
+}
+
+/// SHA-256 of the receipt file's exact bytes, pinned before P0.
+fn receipt_digest(control: &Path, receipt: &Receipt) -> Result<String, String> {
+    file_digest(&receipt_path(control, &receipt.checkout_id))
+}
+
+/// Persist the journal with one new phase (durable before its effect).
+fn advance_migration(
+    control: &Path,
+    receipt: &Receipt,
+    phase: MigrationPhase,
+) -> Result<Receipt, String> {
+    let mut writing = receipt.clone();
+    let Some(transition) = writing.transition.as_mut() else {
+        return Err("the receipt lost its migration journal".to_owned());
+    };
+    transition.phase = phase;
+    transition.updated_ms = process::now_ms();
+    writing.updated_ms = process::now_ms();
+    write_receipt(control, &writing)?;
+    Ok(writing)
+}
+
+/// Verify the live member link set of one real profile directory: exactly the
+/// journal's sorted members, each a symlink into the journal's root.
+fn verify_member_links(dir: &Path, migration: &Migration) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(dir)
+        .map_err(|error| format!("cannot inspect {}: {error}", dir.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!("{} is not a real directory", dir.display()));
+    }
+    let mut found = Vec::new();
+    for entry in
+        fs::read_dir(dir).map_err(|error| format!("cannot read {}: {error}", dir.display()))?
+    {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .ok_or("the migrated directory holds a non-UTF-8 entry")?
+            .to_owned();
+        if !migration.members.contains(&name) {
+            return Err(format!(
+                "{} holds {:?}, which this migration did not create",
+                dir.display(),
+                name
+            ));
+        }
+        let link = fs::read_link(entry.path())
+            .map_err(|error| format!("cannot read {}: {error}", entry.path().display()))?;
+        if link != migration.root.root {
+            return Err(format!(
+                "{} selects {}, not the migrated root",
+                entry.path().display(),
+                link.display()
+            ));
+        }
+        found.push(name);
+    }
+    found.sort();
+    if found != migration.members {
+        return Err(format!(
+            "{} holds members {:?}, not the recorded {:?}",
+            dir.display(),
+            found,
+            migration.members
+        ));
+    }
+    Ok(())
+}
+
+/// `oxide outputs adopt` on a committed whole-target checkout: the explicit
+/// P0-P4 migration to profile member links. macOS only; Linux is compile-only.
+fn migrate_layout(
+    context: &Context,
+    control: &Path,
+    receipt: Receipt,
+) -> Result<(Receipt, Selected, bool), String> {
+    if !cfg!(target_os = "macos") {
+        return Err(
+            "outputs adopt: migrating a whole-target checkout to profile members needs the macOS removable backend; Linux remains compile-only"
+                .to_owned(),
+        );
+    }
+    let target = context.target()?;
+    let selected = receipt
+        .selected()
+        .cloned()
+        .ok_or("the receipt selects no root; there is nothing to migrate")?;
+    match &target {
+        TargetState::OwnedLink(root) if root == &selected.root => {}
+        _ => {
+            return Err(format!(
+                "outputs adopt (migration) refused: {} is {}, not this checkout's owned whole-target link; nothing was changed",
+                context.link().display(),
+                target.label()
+            ))
+        }
+    }
+    let link = context.link();
+    let link_meta = fs::symlink_metadata(&link)
+        .map_err(|error| format!("cannot inspect {}: {error}", link.display()))?;
+    if !link_meta.file_type().is_symlink() {
+        return Err("the owned whole-target link is not a symlink; nothing was changed".to_owned());
+    }
+    let link_text =
+        fs::read_link(&link).map_err(|error| format!("cannot read {}: {error}", link.display()))?;
+    if link_text != selected.root {
+        return Err(format!(
+            "outputs adopt (migration) refused: {} selects {}, not the recorded {}; nothing was changed",
+            link.display(),
+            link_text.display(),
+            selected.root.display()
+        ));
+    }
+    let parent = context.workspace.clone();
+    let parent_meta = fs::symlink_metadata(&parent)
+        .map_err(|error| format!("cannot inspect {}: {error}", parent.display()))?;
+    let generation = receipt
+        .generation
+        .checked_add(1)
+        .ok_or("the output generation sequence is exhausted")?;
+    // The marker: an existing root/2 marker keeps its nonce; a root/1 marker
+    // gets ONE freshly reserved nonce in this journal before any marker effect.
+    let marker = read_marker(&selected.root)?;
+    check_marker(&marker, &context.workspace, &context.checkout_id)?;
+    let root = match marker.nonce() {
+        Some(nonce) => selected.clone().with_nonce(Some(nonce.to_owned())),
+        None => selected
+            .clone()
+            .with_nonce(Some(crate::prune::fresh_nonce()?)),
+    };
+    let marker_pin = if marker.is_legacy() {
+        let path = selected.root.join(MARKER);
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot inspect the owner marker: {error}"))?;
+        Some(MarkerPin {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            sha256: file_digest(&path)?,
+        })
+    } else {
+        None
+    };
+    let migration = Migration {
+        generation,
+        phase: MigrationPhase::Prepared,
+        root,
+        members: migration_members(&selected.root)?,
+        link: link.clone(),
+        link_text,
+        link_dev: link_meta.dev(),
+        link_ino: link_meta.ino(),
+        parent_dev: parent_meta.dev(),
+        parent_ino: parent_meta.ino(),
+        stage: parent.join(format!("{STAGE_PREFIX}{generation}")),
+        backup: parent.join(format!("{BACKUP_PREFIX}{generation}")),
+        stage_dev: None,
+        stage_ino: None,
+        marker_pin,
+        marker_backup: None,
+        prior_receipt_sha: receipt_digest(control, &receipt)?,
+        registry_revision: crate::prune::registry_revision(control)?,
+        created_ms: process::now_ms(),
+        updated_ms: process::now_ms(),
+    };
+    migration.validate(&receipt)?;
+    // P0: the durable journal in the successor format. The whole-target
+    // placement stays selected, so its key is unchanged until P4.
+    let writing = publish_migration_journal(control, &receipt, migration)?;
+    crash_point("migration-p0")?;
+    let done = replay_migration(context, control, writing)?;
+    let selected = done
+        .selected()
+        .cloned()
+        .ok_or("the migration committed no root")?;
+    Ok((done, selected, true))
+}
+
+/// Publish the P0 journal durably. Ordinary commands refuse while it is
+/// pending; nothing on the file system has changed yet.
+fn publish_migration_journal(
+    control: &Path,
+    receipt: &Receipt,
+    migration: Migration,
+) -> Result<Receipt, String> {
+    let mut writing = receipt.clone();
+    writing.version = PROFILE_RECEIPT_VERSION.to_owned();
+    writing.state = ReceiptState::Prepared;
+    writing.transition = Some(migration);
+    writing.updated_ms = process::now_ms();
+    write_receipt(control, &writing)?;
+    Ok(writing)
+}
+
+/// Advance or finish an explicit layout migration from its durable journal.
+/// Only exact recorded identities are acted on; anything else stays pending.
+fn replay_migration(
+    context: &Context,
+    control: &Path,
+    receipt: Receipt,
+) -> Result<Receipt, String> {
+    let Some(migration) = receipt.transition.clone() else {
+        return Ok(receipt);
+    };
+    if !cfg!(target_os = "macos") {
+        return Err(
+            "outputs: a layout migration is pending and needs the macOS removable backend"
+                .to_owned(),
+        );
+    }
+    if migration.phase == MigrationPhase::Committed {
+        return finish_migration_cleanup(context, control, receipt, &migration);
+    }
+    if migration_rollback_requested(migration.phase) {
+        return rollback_migration(context, control, receipt, &migration);
+    }
+    // Every step rechecks the exact identities the journal pinned before it
+    // acts; a contradicting observation is a pending migration, never a guess.
+    let parent = context.workspace.clone();
+    let parent_meta = fs::symlink_metadata(&parent)
+        .map_err(|error| format!("cannot inspect {}: {error}", parent.display()))?;
+    if parent_meta.dev() != migration.parent_dev || parent_meta.ino() != migration.parent_ino {
+        return Err(pending_migration(
+            &migration,
+            "the checkout directory identity changed",
+        ));
+    }
+    // The pre-P0 receipt digest is an audit pin. Check that the live receipt is
+    // this exact journal, not a different transition that reused the name.
+    match &receipt.transition {
+        Some(live) if live == &migration => {}
+        _ => {
+            return Err(pending_migration(
+                &migration,
+                "the live receipt is not this journal",
+            ))
+        }
+    }
+    let mut current = receipt;
+    loop {
+        let migration = current
+            .transition
+            .clone()
+            .ok_or("the migration journal disappeared")?;
+        if migration_rollback_requested(migration.phase) {
+            return rollback_migration(context, control, current, &migration);
+        }
+        let next = match migration.phase {
+            MigrationPhase::Prepared => stage_migration(&parent, &migration)?,
+            MigrationPhase::Staged if migration.marker_pin.is_some() => {
+                upgrade_marker(context, &migration)?
+            }
+            MigrationPhase::Staged | MigrationPhase::MarkerUpgraded => back_up_target(&migration)?,
+            MigrationPhase::BackedUp => swap_in_staging(&migration)?,
+            MigrationPhase::Swapped => {
+                return commit_migration(context, control, current, &migration);
+            }
+            MigrationPhase::Committed => {
+                return finish_migration_cleanup(context, control, current, &migration)
+            }
+        };
+        current = advance_migration(control, &current, next)?;
+        crash_point(&format!("migration-{}", migration_phase_label(next)))?;
+    }
+}
+
+fn migration_phase_label(phase: MigrationPhase) -> &'static str {
+    match phase {
+        MigrationPhase::Prepared => "prepared",
+        MigrationPhase::Staged => "staged",
+        MigrationPhase::MarkerUpgraded => "marker",
+        MigrationPhase::BackedUp => "backed-up",
+        MigrationPhase::Swapped => "swapped",
+        MigrationPhase::Committed => "committed",
+    }
+}
+
+fn pending_migration(migration: &Migration, reason: &str) -> String {
+    format!(
+        "outputs: the layout migration at phase {:?} cannot proceed: {reason}. The journal, {}, the backup and both layouts are kept exactly as they are",
+        migration.phase,
+        migration.link.display()
+    )
+}
+
+/// P1: the transaction-owned staging directory with only classified member
+/// links into the same root.
+fn stage_migration(parent: &Path, migration: &Migration) -> Result<MigrationPhase, String> {
+    match fs::symlink_metadata(&migration.stage) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&migration.stage)
+                .map_err(|error| format!("cannot create {}: {error}", migration.stage.display()))?;
+            fs::set_permissions(&migration.stage, fs::Permissions::from_mode(0o755)).map_err(
+                |error| format!("cannot set permissions on the staging directory: {error}"),
+            )?;
+            for member in &migration.members {
+                let link = migration.stage.join(member);
+                symlink(&migration.root.root, &link).map_err(|error| {
+                    format!(
+                        "cannot create the staged member link {}: {error}",
+                        link.display()
+                    )
+                })?;
+            }
+            sync_directory(&migration.stage)?;
+            sync_directory(parent)?;
+        }
+        Ok(_) => {
+            // A crash after the links but before the phase record.
+            verify_member_links(&migration.stage, migration)?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect {}: {error}",
+                migration.stage.display()
+            ))
+        }
+    }
+    verify_member_links(&migration.stage, migration)?;
+    Ok(MigrationPhase::Staged)
+}
+
+/// The root/1 to root/2 marker upgrade, through verified identities. The old
+/// marker is exclusively renamed to a transaction-owned backup and the
+/// successor is published without replacement.
+fn upgrade_marker(context: &Context, migration: &Migration) -> Result<MigrationPhase, String> {
+    let pin = migration
+        .marker_pin
+        .as_ref()
+        .ok_or("the migration has no marker pin")?;
+    let root = &migration.root.root;
+    let marker_path = root.join(MARKER);
+    let backup = root.join(format!("{MARKER}.oxide-old-{}", migration.generation));
+    match fs::symlink_metadata(&marker_path) {
+        Ok(meta) => {
+            if meta.dev() != pin.dev || meta.ino() != pin.ino {
+                return Err(pending_migration(
+                    migration,
+                    "the root marker's identity changed",
+                ));
+            }
+            if file_digest(&marker_path)? != pin.sha256 {
+                return Err(pending_migration(
+                    migration,
+                    "the root marker's bytes changed",
+                ));
+            }
+            rename_no_replace(&marker_path, &backup).map_err(|error| {
+                format!(
+                    "cannot move the legacy owner marker to its backup: {error}; nothing was replaced"
+                )
+            })?;
+            sync_directory(root)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A crash after the rename and before the phase record: the exact
+            // pinned backup is the only acceptable reason for a missing
+            // marker.
+            match fs::symlink_metadata(&backup) {
+                Ok(meta) if meta.dev() == pin.dev && meta.ino() == pin.ino => {}
+                _ => {
+                    return Err(pending_migration(
+                        migration,
+                        "the old root marker and its backup are both absent",
+                    ))
+                }
+            }
+        }
+        Err(error) => {
+            return Err(pending_migration(
+                migration,
+                &format!("cannot inspect the root marker: {error}"),
+            ))
+        }
+    }
+    // Publish the root/2 marker without replacement, preserving owner,
+    // recipe, kind, volume and the ORIGINAL root-creation generation.
+    let current = match read_marker(root) {
+        Ok(current) => current,
+        Err(_) => {
+            // The marker path is empty because this step renamed the old one
+            // away; publish the successor now.
+            let bytes = fs::read(&backup).map_err(|error| {
+                pending_migration(
+                    migration,
+                    &format!("cannot read the old marker backup: {error}"),
+                )
+            })?;
+            let before: Marker = serde_json::from_slice(&bytes).map_err(|error| {
+                pending_migration(
+                    migration,
+                    &format!("the old marker backup is invalid: {error}"),
+                )
+            })?;
+            let spec = spec_for(&migration.root);
+            let binding = match migration.root.kind {
+                RootKind::External => Some(binding_for(
+                    context,
+                    migration.root.volume_uuid.as_deref().unwrap_or_default(),
+                )?),
+                RootKind::Local => None,
+            };
+            create_marker(
+                context,
+                &spec,
+                before.generation,
+                binding.as_ref(),
+                migration.root.nonce(),
+            )?
+        }
+    };
+    if current.nonce() != migration.root.nonce() {
+        return Err(pending_migration(
+            migration,
+            "the root carries another nonce than the reserved one",
+        ));
+    }
+    sync_directory(root)?;
+    Ok(MigrationPhase::MarkerUpgraded)
+}
+
+/// P2: exclusively rename the old whole-target link to its backup.
+fn back_up_target(migration: &Migration) -> Result<MigrationPhase, String> {
+    match fs::symlink_metadata(&migration.backup) {
+        Ok(_) => {
+            // Already renamed by an earlier attempt.
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let link_meta = fs::symlink_metadata(&migration.link).map_err(|error| {
+                pending_migration(
+                    migration,
+                    &format!("cannot inspect the target link: {error}"),
+                )
+            })?;
+            if !link_meta.file_type().is_symlink()
+                || link_meta.dev() != migration.link_dev
+                || link_meta.ino() != migration.link_ino
+            {
+                return Err(pending_migration(
+                    migration,
+                    "the target link is no longer the pinned symlink",
+                ));
+            }
+            let text = fs::read_link(&migration.link).map_err(|error| {
+                pending_migration(migration, &format!("cannot read the target link: {error}"))
+            })?;
+            if text != migration.link_text {
+                return Err(pending_migration(migration, "the target link text changed"));
+            }
+            rename_no_replace(&migration.link, &migration.backup).map_err(|error| {
+                format!(
+                    "cannot move the old target link to its backup: {error}; nothing else was changed"
+                )
+            })?;
+            if let Some(parent) = migration.link.parent() {
+                sync_directory(parent)?;
+            }
+        }
+        Err(error) => {
+            return Err(pending_migration(
+                migration,
+                &format!("cannot inspect the backup: {error}"),
+            ))
+        }
+    }
+    Ok(MigrationPhase::BackedUp)
+}
+
+/// P3: exclusively rename the staging directory onto `target`. A creator that
+/// appeared in between is preserved and leaves the migration pending.
+fn swap_in_staging(migration: &Migration) -> Result<MigrationPhase, String> {
+    match fs::symlink_metadata(&migration.link) {
+        Ok(_) => {
+            // A creator (or an earlier replay) is at the target. It is only
+            // acceptable when it is exactly the staged member set.
+            if verify_member_links(&migration.link, migration).is_ok()
+                && fs::symlink_metadata(&migration.stage).is_err()
+            {
+                return Ok(MigrationPhase::Swapped);
+            }
+            return Err(pending_migration(
+                migration,
+                "the target is occupied by something this migration did not create",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(pending_migration(
+                migration,
+                &format!("cannot inspect the target: {error}"),
+            ))
+        }
+    }
+    verify_member_links(&migration.stage, migration)?;
+    rename_no_replace(&migration.stage, &migration.link).map_err(|error| {
+        format!(
+            "cannot publish the migrated target {}: {error}; the old link is kept at its backup",
+            migration.link.display()
+        )
+    })?;
+    if let Some(parent) = migration.link.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(MigrationPhase::Swapped)
+}
+
+/// P4: the COMMIT point. The committed target is verified as a real directory
+/// with exactly the member links; the receipt, root marker and member
+/// references are committed and are never rolled back afterwards.
+fn commit_migration(
+    context: &Context,
+    control: &Path,
+    receipt: Receipt,
+    migration: &Migration,
+) -> Result<Receipt, String> {
+    verify_member_links(&migration.link, migration)?;
+    let marker = read_marker(&migration.root.root)?;
+    check_marker(&marker, &context.workspace, &context.checkout_id)?;
+    if marker.nonce() != migration.root.nonce() {
+        return Err(pending_migration(
+            migration,
+            "the root does not carry the migrated nonce",
+        ));
+    }
+    if marker.generation > receipt.generation.saturating_add(1) {
+        return Err(pending_migration(
+            migration,
+            "the root marker is ahead of the receipt",
+        ));
+    }
+    let selected = migration
+        .root
+        .clone()
+        .at(marker.generation)
+        .with_nonce(marker.nonce().map(str::to_owned));
+    let mut committed = receipt.clone();
+    committed.version = PROFILE_RECEIPT_VERSION.to_owned();
+    committed.layout = LayoutKind::Profile;
+    committed.state = ReceiptState::Committed;
+    committed.generation = migration.generation;
+    committed.links = migration
+        .members
+        .iter()
+        .map(|member| LinkPlacement {
+            member: member.clone(),
+            selected: Some(selected.clone()),
+            prepared: None,
+        })
+        .collect();
+    committed.roots.retain(|known| known.root != selected.root);
+    committed.roots.push(selected.clone());
+    let mut journal = migration.clone();
+    journal.phase = MigrationPhase::Committed;
+    journal.updated_ms = process::now_ms();
+    committed.transition = Some(journal);
+    committed.updated_ms = process::now_ms();
+    write_receipt(control, &committed)?;
+    crash_point("migration-p4")?;
+    finish_migration_cleanup(context, control, committed, migration)
+}
+
+/// Remove the journaled backups after the commit and then drop the journal.
+/// Only exact recorded identities are removed; a mismatch keeps it pending.
+fn finish_migration_cleanup(
+    context: &Context,
+    control: &Path,
+    receipt: Receipt,
+    migration: &Migration,
+) -> Result<Receipt, String> {
+    // The committed target must still be the migrated real directory.
+    verify_member_links(&migration.link, migration)?;
+    match fs::symlink_metadata(&migration.backup) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(meta) => {
+            if !meta.file_type().is_symlink()
+                || meta.dev() != migration.link_dev
+                || meta.ino() != migration.link_ino
+            {
+                return Err(pending_migration(
+                    migration,
+                    "the backup is not the pinned old link",
+                ));
+            }
+            let text = fs::read_link(&migration.backup)
+                .map_err(|error| format!("cannot read the backup link: {error}"))?;
+            if text != migration.link_text {
+                return Err(pending_migration(migration, "the backup link text changed"));
+            }
+            fs::remove_file(&migration.backup)
+                .map_err(|error| format!("cannot remove the migration backup: {error}"))?;
+            if let Some(parent) = migration.link.parent() {
+                sync_directory(parent)?;
+            }
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect the migration backup {}: {error}",
+                migration.backup.display()
+            ))
+        }
+    }
+    if let Some(backup) = &migration.marker_backup {
+        remove_marker_backup(&migration.root.root, backup, migration)?;
+    } else if let Some(pin) = &migration.marker_pin {
+        // A crash may have left the marker backup without its journal record.
+        let candidate = migration
+            .root
+            .root
+            .join(format!("{MARKER}.oxide-old-{}", migration.generation));
+        remove_marker_backup(&migration.root.root, &candidate, migration)?;
+        let _ = pin;
+    }
+    let mut finished = receipt.clone();
+    finished.transition = None;
+    finished.updated_ms = process::now_ms();
+    if receipt.transition.is_some() {
+        write_receipt(control, &finished)?;
+    }
+    let _ = context;
+    Ok(finished)
+}
+
+fn remove_marker_backup(root: &Path, backup: &Path, migration: &Migration) -> Result<(), String> {
+    let pin = migration
+        .marker_pin
+        .as_ref()
+        .ok_or("the migration has no marker pin")?;
+    match fs::symlink_metadata(backup) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(meta) => {
+            if meta.dev() != pin.dev || meta.ino() != pin.ino {
+                return Err(pending_migration(
+                    migration,
+                    "the marker backup is not the pinned marker",
+                ));
+            }
+            if file_digest(backup)? != pin.sha256 {
+                return Err(pending_migration(
+                    migration,
+                    "the marker backup's bytes changed",
+                ));
+            }
+            fs::remove_file(backup)
+                .map_err(|error| format!("cannot remove the marker backup: {error}"))?;
+            sync_directory(root)
+        }
+        Err(error) => Err(format!("cannot inspect the marker backup: {error}")),
+    }
+}
+
+/// Restore the exact pre-migration state for an uncommitted journal (the
+/// debug-only rollback oracle). The old marker is restored from its pinned
+/// backup, the old target link returns, and the receipt returns to its
+/// published /2 form; the reserved nonce was never published, so it retires
+/// with the journal.
+fn rollback_migration(
+    context: &Context,
+    control: &Path,
+    receipt: Receipt,
+    migration: &Migration,
+) -> Result<Receipt, String> {
+    // A committed target is never rolled back.
+    if migration.phase == MigrationPhase::Committed {
+        return Err("a committed layout migration is never rolled back".to_owned());
+    }
+    // 1. If the staging directory was swapped in, remove exactly it.
+    match fs::symlink_metadata(&migration.link) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                // The old link is still (or again) in place.
+            } else if verify_member_links(&migration.link, migration).is_ok() {
+                for member in &migration.members {
+                    let link = migration.link.join(member);
+                    fs::remove_file(&link).map_err(|error| {
+                        format!("cannot remove the migrated member link: {error}")
+                    })?;
+                }
+                fs::remove_dir(&migration.link).map_err(|error| {
+                    format!(
+                        "cannot remove the migrated target directory {}: {error}",
+                        migration.link.display()
+                    )
+                })?;
+            } else {
+                return Err(pending_migration(
+                    migration,
+                    "the target is neither the old link nor the migrated directory",
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot inspect the target: {error}")),
+    }
+    // 2. The backup link goes back to the target.
+    match fs::symlink_metadata(&migration.backup) {
+        Ok(meta) => {
+            if !meta.file_type().is_symlink()
+                || meta.dev() != migration.link_dev
+                || meta.ino() != migration.link_ino
+            {
+                return Err(pending_migration(
+                    migration,
+                    "the backup is not the pinned old link",
+                ));
+            }
+            if fs::symlink_metadata(&migration.link).is_ok() {
+                return Err(pending_migration(
+                    migration,
+                    "the target appeared again while rolling back",
+                ));
+            }
+            rename_no_replace(&migration.backup, &migration.link)
+                .map_err(|error| format!("cannot restore the old target link: {error}"))?;
+            if let Some(parent) = migration.link.parent() {
+                sync_directory(parent)?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot inspect the backup: {error}")),
+    }
+    // 3. The old marker returns from its pinned backup.
+    if let Some(backup) = migration.marker_backup.clone().or_else(|| {
+        migration.marker_pin.as_ref().map(|_| {
+            migration
+                .root
+                .root
+                .join(format!("{MARKER}.oxide-old-{}", migration.generation))
+        })
+    }) {
+        let pin = migration
+            .marker_pin
+            .as_ref()
+            .ok_or("the migration has no marker pin")?;
+        if let Ok(meta) = fs::symlink_metadata(&backup) {
+            if meta.dev() != pin.dev || meta.ino() != pin.ino || file_digest(&backup)? != pin.sha256
+            {
+                return Err(pending_migration(
+                    migration,
+                    "the marker backup is not the pinned marker",
+                ));
+            }
+            let marker_path = migration.root.root.join(MARKER);
+            if fs::symlink_metadata(&marker_path).is_ok() {
+                let current = read_marker(&migration.root.root)
+                    .map_err(|reason| pending_migration(migration, &reason))?;
+                if current.nonce() != migration.root.nonce() {
+                    return Err(pending_migration(
+                        migration,
+                        "the live marker is not the prepared successor",
+                    ));
+                }
+                fs::remove_file(&marker_path).map_err(|error| {
+                    format!("cannot remove the prepared marker before rollback: {error}")
+                })?;
+            }
+            rename_no_replace(&backup, &marker_path)
+                .map_err(|error| format!("cannot restore the old marker: {error}"))?;
+            sync_directory(&migration.root.root)?;
+        } else {
+            // No backup: either the marker was never touched (still root/1) or
+            // it is unknowable.
+            match read_marker(&migration.root.root) {
+                Ok(marker) if marker.is_legacy() => {}
+                _ => {
+                    return Err(pending_migration(
+                        migration,
+                        "the old marker and its backup are both absent",
+                    ))
+                }
+            }
+        }
+    }
+    // 4. The staging directory is removed only when it is exactly the
+    //    journal's member links.
+    if fs::symlink_metadata(&migration.stage).is_ok() {
+        verify_member_links(&migration.stage, migration)?;
+        for member in &migration.members {
+            fs::remove_file(migration.stage.join(member))
+                .map_err(|error| format!("cannot remove a staged member link: {error}"))?;
+        }
+        fs::remove_dir(&migration.stage)
+            .map_err(|error| format!("cannot remove the staging directory: {error}"))?;
+        sync_directory(&context.workspace)?;
+    }
+    // 5. The receipt returns to its published /2 form with the whole-target
+    //    placement selected and no journal.
+    let mut restored = receipt.clone();
+    restored.version = RECEIPT_VERSION.to_owned();
+    restored.layout = LayoutKind::WholeTarget;
+    restored.state = ReceiptState::Committed;
+    restored.transition = None;
+    let link_text = migration.link_text.clone();
+    let root = migration.root.clone().with_nonce(
+        read_marker(&migration.root.root)
+            .ok()
+            .and_then(|marker| marker.nonce),
+    );
+    let _ = link_text;
+    if restored.links.is_empty() {
+        restored.links.push(LinkPlacement {
+            member: MEMBER.to_owned(),
+            selected: Some(root),
+            prepared: None,
+        });
+    } else {
+        restored.links.truncate(1);
+        restored.links[0] = LinkPlacement {
+            member: MEMBER.to_owned(),
+            selected: Some(root),
+            prepared: None,
+        };
+    }
+    restored.updated_ms = process::now_ms();
+    write_receipt(control, &restored)?;
+    Ok(restored)
 }
 
 /// `oxide outputs adopt` for the bound profile layout: `target` stays a real
@@ -4135,6 +5206,12 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
     if receipt.state == ReceiptState::Pruning {
         return Err("outputs: a listed legacy root of this checkout is being pruned; nothing changes until `oxide outputs prune` replays it or `oxide outputs resolve-intent` settles it".to_owned());
     }
+    if receipt.transition.is_some() {
+        return Err(
+            "outputs: an explicit layout migration is pending; `oxide outputs adopt` replays its exact recorded phases and every other command refuses until it commits or rolls back"
+                .to_owned(),
+        );
+    }
     if receipt.state != ReceiptState::Prepared {
         return Ok(receipt);
     }
@@ -5343,6 +6420,203 @@ mod tests {
         )
         .unwrap_err();
         assert!(refused.contains("declares none"), "{refused}");
+    }
+
+    /// A committed whole-target checkout in a Git work tree that ignores
+    /// `target/`, with a root that carries its marker.
+    fn legacy_checkout() -> (Fixture, Receipt) {
+        let fixture = Fixture::in_tree("", "/target\n/.oxide-outputs/\n");
+        let context = fixture.context();
+        let receipt =
+            transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
+        (fixture, receipt)
+    }
+
+    /// Rewrite the root marker as a source-shaped root/1 document: no nonce,
+    /// no checkout volume, same owner, recipe, kind and generation.
+    fn make_root_one_marker(fixture: &Fixture, receipt: &Receipt) {
+        let root = receipt.selected().unwrap().root();
+        let marker = read_marker(root).unwrap();
+        let legacy = Marker {
+            version: LEGACY_MARKER_VERSION.to_owned(),
+            checkout: marker.checkout,
+            checkout_id: marker.checkout_id,
+            label: marker.label,
+            recipe: marker.recipe,
+            kind: marker.kind,
+            volume_uuid: marker.volume_uuid,
+            nonce: None,
+            checkout_volume_uuid: None,
+            generation: marker.generation,
+            created_ms: marker.created_ms,
+        };
+        fs::write(
+            root.join(MARKER),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+        let _ = fixture;
+    }
+
+    #[test]
+    fn an_explicit_migration_publishes_profile_links_and_resumes() {
+        let (fixture, legacy) = legacy_checkout();
+        let context = fixture.context();
+        let root = legacy.selected().unwrap().root().to_path_buf();
+        let nonce = read_marker(&root).unwrap().nonce().unwrap().to_owned();
+        let (migrated, selected, converted) =
+            migrate_layout(&context, &fixture.control, legacy.clone()).unwrap();
+        assert!(converted);
+        assert_eq!(migrated.layout(), LayoutKind::Profile);
+        assert_eq!(migrated.generation, legacy.generation + 1);
+        assert_eq!(migrated.state, ReceiptState::Committed);
+        assert_eq!(selected.root(), root.as_path());
+        assert_eq!(selected.nonce(), Some(nonce.as_str()));
+        assert!(migrated.transition.is_none());
+        // The target is a real directory whose only entries are the member
+        // links into the same root.
+        let target = context.link();
+        let metadata = fs::symlink_metadata(&target).unwrap();
+        assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+        for member in ["debug", "release"] {
+            let link = target.join(member);
+            assert_eq!(fs::read_link(&link).unwrap(), root, "{member}");
+            assert_eq!(
+                migrated.selected_for(member).map(Selected::root),
+                Some(root.as_path())
+            );
+        }
+        // The journaled backups and staging directory are gone.
+        assert!(!fixture
+            .checkout
+            .join(format!("{BACKUP_PREFIX}{}", migrated.generation))
+            .exists());
+        assert!(!fixture
+            .checkout
+            .join(format!("{STAGE_PREFIX}{}", migrated.generation))
+            .exists());
+        // Replaying the committed migration is a no-op.
+        let again = replay_migration(&context, &fixture.control, migrated.clone()).unwrap();
+        assert_eq!(again, migrated);
+        // A legacy starter keyed for the whole target refuses after migration.
+        let mut facts =
+            crate::layout::Declaration::new([crate::layout::Member::parse("debug").unwrap()])
+                .unwrap();
+        assert!(facts.members().len() == 1);
+        facts = crate::layout::Declaration::empty();
+        assert!(
+            planned_destination(Some(&fixture.control), &fixture.checkout, &facts, None).is_err()
+        );
+    }
+
+    #[test]
+    fn a_root_one_marker_is_upgraded_once_and_rolled_back_exactly() {
+        let (fixture, legacy) = legacy_checkout();
+        let context = fixture.context();
+        let root = legacy.selected().unwrap().root().to_path_buf();
+        make_root_one_marker(&fixture, &legacy);
+        let old_bytes = fs::read(root.join(MARKER)).unwrap();
+        let old_digest = file_digest(&root.join(MARKER)).unwrap();
+        // A pre-P4 rollback at the marker boundary restores the exact old
+        // marker, the old whole-target link and the /2 receipt.
+        std::env::set_var(ROLLBACK_ENVIRONMENT, "marker");
+        let (restored, selected, _) =
+            migrate_layout(&context, &fixture.control, legacy.clone()).unwrap();
+        std::env::remove_var(ROLLBACK_ENVIRONMENT);
+        assert_eq!(restored.layout(), LayoutKind::WholeTarget);
+        assert_eq!(restored.version, RECEIPT_VERSION);
+        assert!(restored.transition.is_none());
+        assert_eq!(restored.generation, legacy.generation);
+        assert_eq!(selected.root(), root.as_path());
+        assert_eq!(selected.nonce(), None, "the reserved nonce retires");
+        assert_eq!(fs::read(root.join(MARKER)).unwrap(), old_bytes);
+        assert_eq!(file_digest(&root.join(MARKER)).unwrap(), old_digest);
+        let target = context.link();
+        let metadata = fs::symlink_metadata(&target).unwrap();
+        assert!(metadata.file_type().is_symlink());
+        assert_eq!(fs::read_link(&target).unwrap(), root);
+        assert!(!target.join("debug").exists());
+        assert!(!fixture
+            .checkout
+            .join(format!("{BACKUP_PREFIX}{}", legacy.generation + 1))
+            .exists());
+        assert!(!fixture
+            .checkout
+            .join(format!("{STAGE_PREFIX}{}", legacy.generation + 1))
+            .exists());
+        // Now migrate for real: one fresh nonce, shared by every member, and
+        // the root marker becomes root/2 while keeping its creation generation.
+        let legacy_generation = legacy.generation;
+        let (migrated, _, _) = migrate_layout(&context, &fixture.control, legacy).unwrap();
+        let marker = read_marker(&root).unwrap();
+        assert_eq!(marker.version, MARKER_VERSION);
+        assert_eq!(marker.nonce(), migrated.selected().unwrap().nonce());
+        assert!(marker.nonce().is_some());
+        assert_eq!(marker.generation, legacy_generation);
+        assert!(!root
+            .join(format!("{MARKER}.oxide-old-{}", migrated.generation))
+            .exists());
+    }
+
+    #[test]
+    fn a_migration_waits_for_a_creator_of_the_target() {
+        let (fixture, legacy) = legacy_checkout();
+        let context = fixture.context();
+        let root = legacy.selected().unwrap().root().to_path_buf();
+        let mut journal_receipt = publish_migration_journal(
+            &fixture.control,
+            &legacy,
+            Migration {
+                generation: legacy.generation + 1,
+                phase: MigrationPhase::Prepared,
+                root: legacy.selected().unwrap().clone(),
+                members: vec!["debug".to_owned(), "release".to_owned()],
+                link: context.link(),
+                link_text: root.clone(),
+                link_dev: fs::symlink_metadata(context.link()).unwrap().dev(),
+                link_ino: fs::symlink_metadata(context.link()).unwrap().ino(),
+                parent_dev: fs::symlink_metadata(&fixture.checkout).unwrap().dev(),
+                parent_ino: fs::symlink_metadata(&fixture.checkout).unwrap().ino(),
+                stage: fixture
+                    .checkout
+                    .join(format!("{STAGE_PREFIX}{}", legacy.generation + 1)),
+                backup: fixture
+                    .checkout
+                    .join(format!("{BACKUP_PREFIX}{}", legacy.generation + 1)),
+                stage_dev: None,
+                stage_ino: None,
+                marker_pin: None,
+                marker_backup: None,
+                prior_receipt_sha: receipt_digest(&fixture.control, &legacy).unwrap(),
+                registry_revision: crate::prune::registry_revision(&fixture.control).unwrap(),
+                created_ms: 1,
+                updated_ms: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(journal_receipt.state, ReceiptState::Prepared);
+        // A creator appears where the staging directory would be published.
+        let stage = journal_receipt.transition.clone().unwrap().stage;
+        fs::create_dir(&stage).unwrap();
+        fs::write(stage.join("creator"), b"x").unwrap();
+        let refused =
+            replay_migration(&context, &fixture.control, journal_receipt.clone()).unwrap_err();
+        assert!(
+            refused.contains("cannot proceed") || refused.contains("did not create"),
+            "{refused}"
+        );
+        // The old target link, the creator and the journal are all kept.
+        assert!(fs::symlink_metadata(context.link())
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(stage.join("creator")).unwrap(), b"x");
+        let stored = read_receipt(&fixture.control, &fixture.checkout, &context.checkout_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, ReceiptState::Prepared);
+        // Every other command refuses while the journal is pending.
+        assert!(replay(&context, journal_receipt).is_err());
     }
 
     #[test]
