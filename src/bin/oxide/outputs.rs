@@ -408,7 +408,9 @@ impl Receipt {
     }
 
     pub(crate) fn placement(&self, member: &str) -> Option<&LinkPlacement> {
-        self.links.iter().find(|placement| placement.member == member)
+        self.links
+            .iter()
+            .find(|placement| placement.member == member)
     }
 
     /// The placement a prepared transition belongs to, by its recorded link.
@@ -456,12 +458,15 @@ impl Receipt {
     /// roots (per-member fallback), so member-specific paths use
     /// [`Receipt::selected_for`].
     pub(crate) fn current(&self) -> Option<&Selected> {
-        self.links.iter().find_map(|placement| placement.selected.as_ref())
+        self.links
+            .iter()
+            .find_map(|placement| placement.selected.as_ref())
     }
 
     /// The root one member's placement selects.
     pub(crate) fn selected_for(&self, member: &str) -> Option<&Selected> {
-        self.placement(member).and_then(|placement| placement.selected.as_ref())
+        self.placement(member)
+            .and_then(|placement| placement.selected.as_ref())
     }
 
     pub(crate) fn prepared_ref(&self) -> Option<&Prepared> {
@@ -555,7 +560,7 @@ impl Receipt {
                 sorted.dedup();
                 if sorted != names {
                     return Err(
-                        "the profile placements are not unique and sorted by member".to_owned(),
+                        "the profile placements are not unique and sorted by member".to_owned()
                     );
                 }
                 crate::layout::validate_set(&sorted, crate::layout::MAX_RECEIPT_MEMBERS)
@@ -603,7 +608,13 @@ impl Receipt {
             }
         }
         let prepared = self.prepared_ref();
-        if self.links.iter().filter(|placement| placement.prepared.is_some()).count() > 1 {
+        if self
+            .links
+            .iter()
+            .filter(|placement| placement.prepared.is_some())
+            .count()
+            > 1
+        {
             return Err(
                 "the owned-output receipt prepares more than one placement; it is not followed"
                     .to_owned(),
@@ -625,11 +636,17 @@ impl Receipt {
             ReceiptState::Committed => {
                 prepared.is_none()
                     && !self.links.is_empty()
-                    && self.links.iter().all(|placement| placement.selected.is_some())
+                    && self
+                        .links
+                        .iter()
+                        .all(|placement| placement.selected.is_some())
             }
             ReceiptState::Detached => {
                 prepared.is_none()
-                    && self.links.iter().all(|placement| placement.selected.is_none())
+                    && self
+                        .links
+                        .iter()
+                        .all(|placement| placement.selected.is_none())
             }
             ReceiptState::Pruned => prepared.is_none(),
             ReceiptState::Pruning => prepared.is_none() && self.pruned.is_some(),
@@ -823,7 +840,11 @@ impl<'de> Deserialize<'de> for Receipt {
                         "a version-3 receipt must declare its layout",
                     ));
                 }
-                if doc.links.iter().any(|placement| placement.reserved.is_some()) {
+                if doc
+                    .links
+                    .iter()
+                    .any(|placement| placement.reserved.is_some())
+                {
                     return Err(serde::de::Error::custom(
                         "a version-3 reservation is root-level, not per placement",
                     ));
@@ -837,11 +858,15 @@ impl<'de> Deserialize<'de> for Receipt {
                         prepared: placement.prepared,
                     })
                     .collect();
-                (PROFILE_RECEIPT_VERSION.to_owned(), LayoutKind::Profile, links)
+                (
+                    PROFILE_RECEIPT_VERSION.to_owned(),
+                    LayoutKind::Profile,
+                    links,
+                )
             }
             other => {
                 return Err(serde::de::Error::custom(format!(
-                    "unsupported owned-output receipt version {other:?}"
+                    "unsupported version {other:?} of the owned-output receipt"
                 )))
             }
         };
@@ -2005,10 +2030,7 @@ fn gated_replay(
 /// starts. If the checkout was converted (or detached) while the command
 /// waited for admission, the slot's key no longer describes where Cargo
 /// would write: refuse before Cargo so the next attempt keys afresh.
-fn keyed_state_matches(
-    receipt: Option<&Receipt>,
-    expected: Option<&Plan>,
-) -> Result<(), String> {
+fn keyed_state_matches(receipt: Option<&Receipt>, expected: Option<&Plan>) -> Result<(), String> {
     let converted = receipt.is_some_and(|receipt| receipt.state != ReceiptState::Detached);
     if converted == expected.is_some() {
         return Ok(());
@@ -2587,7 +2609,9 @@ pub struct Plan {
 
 impl Plan {
     fn selected(&self) -> Option<&Selected> {
-        self.members.iter().find_map(|member| member.selected.as_ref())
+        self.members
+            .iter()
+            .find_map(|member| member.selected.as_ref())
     }
 
     /// The root one member is planned for, when it is owned.
@@ -2626,12 +2650,14 @@ pub fn planned_destination(
     };
     match receipt.layout() {
         LayoutKind::WholeTarget => {
-            let selected = desired_selection(&context, &receipt)?;
+            let Some(selected) = desired_selection(&context, &receipt)? else {
+                return Ok(None);
+            };
             Ok(Some(Plan {
                 whole_target: true,
                 members: vec![PlannedMember {
                     member: MEMBER.to_owned(),
-                    selected,
+                    selected: Some(selected),
                 }],
             }))
         }
@@ -2648,10 +2674,8 @@ pub fn planned_destination(
                     &context.workspace,
                     &context.checkout_id,
                 )?;
-                let keeps_real = matches!(
-                    state,
-                    TargetState::RealEmpty | TargetState::RealNonEmpty
-                );
+                let keeps_real =
+                    matches!(state, TargetState::RealEmpty | TargetState::RealNonEmpty);
                 if !keeps_real && !matches!(state, TargetState::Missing) {
                     // An owned or foreign link: the owned root (or the desired
                     // one) is planned; a foreign link refuses here, before the
@@ -2922,11 +2946,7 @@ pub fn destination_facts(plan: Option<&Plan>) -> String {
     plan.members
         .iter()
         .map(|planned| match &planned.selected {
-            Some(selected) => format!(
-                "outputs-3 {} {}",
-                selected_facts(selected),
-                planned.member
-            ),
+            Some(selected) => format!("outputs-3 {} {}", selected_facts(selected), planned.member),
             None => format!("real {}", planned.member),
         })
         .collect::<Vec<_>>()
@@ -3541,20 +3561,15 @@ fn transition_at(
     // does, through `Start::Adopt`.
     let target = link_state(&link, &context.workspace, &context.checkout_id)?;
     let committed = receipt.selected_for(member);
-    let converts_empty = target == TargetState::RealEmpty
-        && (!profile_member || start == Start::Adopt);
+    let converts_empty =
+        target == TargetState::RealEmpty && (!profile_member || start == Start::Adopt);
     // A first conversion publishes an owned link, so Git must ignore that
     // exact path first — before the prepared receipt, the root or either link
     // exists. Later generations keep their committed link's eligibility and
     // are not re-guarded.
-    let first_link = committed.is_none()
-        && (target == TargetState::Missing || converts_empty);
+    let first_link = committed.is_none() && (target == TargetState::Missing || converts_empty);
     if first_link {
-        refuse_link_git_exposure_at(
-            context,
-            &link,
-            profile_member.then_some(member),
-        )?;
+        refuse_link_git_exposure_at(context, &link, profile_member.then_some(member))?;
     }
     // The publish below replaces nothing when the link was absent (or an empty
     // directory was just removed): a creator that appears in between is kept.
@@ -3861,7 +3876,7 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
             stop_unknown(
                 context,
                 &prepared,
-                "its link belongs to no placement of this receipt",
+                "its link is not this checkout's target or a profile member of this receipt",
             )
         })?;
     let committed_here = receipt.selected_for(&member).is_some();
@@ -4485,9 +4500,8 @@ fn git_link_path(context: &Context, suffix: Option<&str>) -> Result<(PathBuf, St
     parts.push("target".to_owned());
     if let Some(suffix) = suffix {
         for component in suffix.split('/') {
-            if !crate::layout::Member::parse(suffix).is_ok_and(|member| {
-                member.name() == suffix
-            }) || component.is_empty()
+            if !crate::layout::Member::parse(suffix).is_ok_and(|member| member.name() == suffix)
+                || component.is_empty()
             {
                 return Err("the profile member is not a plain relative path".to_owned());
             }
@@ -4982,9 +4996,10 @@ mod tests {
             &identity::digest(&fixture.checkout.to_string_lossy()),
             LayoutKind::Profile,
         );
-        let selected = fixture.local().selected(1).with_nonce(Some(
-            "22222222222222222222222222222222".to_owned(),
-        ));
+        let selected = fixture
+            .local()
+            .selected(1)
+            .with_nonce(Some("22222222222222222222222222222222".to_owned()));
         receipt.state = ReceiptState::Committed;
         receipt.generation = 1;
         receipt.place_member("debug").selected = Some(selected.clone());
@@ -5002,10 +5017,12 @@ mod tests {
         );
         receipt.state = ReceiptState::Committed;
         receipt.generation = 1;
-        receipt.place_member("debug").selected =
-            Some(fixture.local().selected(1).with_nonce(Some(
-                "77777777777777777777777777777777".to_owned(),
-            )));
+        receipt.place_member("debug").selected = Some(
+            fixture
+                .local()
+                .selected(1)
+                .with_nonce(Some("77777777777777777777777777777777".to_owned())),
+        );
         write_receipt(&fixture.control, &receipt).unwrap();
         // `release` is a real, nonempty profile directory: it stays local.
         fs::create_dir(fixture.checkout.join("target")).unwrap();
@@ -5127,14 +5144,21 @@ mod tests {
         receipt.links.reverse();
         assert!(receipt.validate(&fixture.checkout, &id).is_err());
         let mut receipt = profile_receipt(&fixture);
-        receipt.place_member("debug");
-        receipt.place_member("debug");
+        let duplicate = receipt.links[0].clone();
+        receipt.links.insert(1, duplicate);
         assert!(receipt.validate(&fixture.checkout, &id).is_err());
         let mut receipt = profile_receipt(&fixture);
         receipt.place_member("debug/debug");
         assert!(receipt.validate(&fixture.checkout, &id).is_err());
         let mut receipt = profile_receipt(&fixture);
-        receipt.place_member("../../escape");
+        receipt.links.push(LinkPlacement {
+            member: "../../escape".to_owned(),
+            selected: None,
+            prepared: None,
+        });
+        receipt
+            .links
+            .sort_by(|left, right| left.member.cmp(&right.member));
         assert!(receipt.validate(&fixture.checkout, &id).is_err());
     }
 
@@ -5686,10 +5710,9 @@ mod tests {
         assert_eq!(destination_facts(None), "");
         let receipt =
             transition(&context, &fixture.receipt(), &fixture.local(), Start::Any).unwrap();
-        let planned =
-            planned_destination(Some(&fixture.control), &fixture.checkout, &empty, None)
-                .unwrap()
-                .unwrap();
+        let planned = planned_destination(Some(&fixture.control), &fixture.checkout, &empty, None)
+            .unwrap()
+            .unwrap();
         let selected = planned.selected().unwrap();
         assert_eq!(selected.kind, RootKind::Local);
         assert_eq!(selected.root, fixture.local().root());
@@ -5700,10 +5723,9 @@ mod tests {
         // a warm slot survives a relink.
         let again = transition(&context, &receipt, &fixture.local(), Start::Any).unwrap();
         assert_eq!(again.generation, 2);
-        let planned =
-            planned_destination(Some(&fixture.control), &fixture.checkout, &empty, None)
-                .unwrap()
-                .unwrap();
+        let planned = planned_destination(Some(&fixture.control), &fixture.checkout, &empty, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(destination_facts(Some(&planned)), first);
     }
 
@@ -6103,9 +6125,14 @@ mod tests {
         let fixture = Fixture::new();
         register(&fixture, DriveMode::Ephemeral);
         let (_, external) = committed_external(&fixture);
-        let planned = planned_destination(Some(&fixture.control), &fixture.checkout, &crate::layout::Declaration::empty(), None)
-            .unwrap()
-            .unwrap();
+        let planned = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &crate::layout::Declaration::empty(),
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(planned.selected().unwrap().kind, RootKind::External);
         assert_eq!(planned.selected().unwrap().root, external);
         // With the intermediate slot on the internal pool, the external root
@@ -6131,7 +6158,13 @@ mod tests {
         receipt.state = ReceiptState::Detached;
         receipt.link_mut().selected = None;
         write_receipt(&fixture.control, &receipt).unwrap();
-        let planned = planned_destination(Some(&fixture.control), &fixture.checkout, &crate::layout::Declaration::empty(), None).unwrap();
+        let planned = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &crate::layout::Declaration::empty(),
+            None,
+        )
+        .unwrap();
         assert!(planned.is_none(), "{planned:?}");
         let mut facts = all_facts();
         facts.receipt_absent = false;
@@ -6978,9 +7011,14 @@ mod tests {
             Start::MissingOnly,
         )
         .unwrap();
-        let planned = planned_destination(Some(&fixture.control), &fixture.checkout, &crate::layout::Declaration::empty(), None)
-            .unwrap()
-            .unwrap();
+        let planned = planned_destination(
+            Some(&fixture.control),
+            &fixture.checkout,
+            &crate::layout::Declaration::empty(),
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(planned.selected(), committed.selected());
     }
 

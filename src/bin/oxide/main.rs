@@ -29,9 +29,9 @@ mod watchdog;
 mod wrapper;
 
 use cli::{Class, Invocation, Profile, LEGACY_PROFILE_ENVIRONMENT};
-use layout::Layout;
 use freshness::{Gate, Refusal};
 use identity::{RunPick, SlotKey};
+use layout::Layout;
 use oxide_storage::inventory::{inventory_directory, Category, InventoryLimits};
 use oxide_storage::lease::{AccountingCoverage, PoolStatus, ReuseMeasurement, SlotOccupancy};
 use std::ffi::OsString;

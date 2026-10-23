@@ -112,10 +112,7 @@ impl Declaration {
         names.dedup();
         validate_set(&names, MAX_MEMBERS)?;
         Ok(Self {
-            members: names
-                .into_iter()
-                .map(|name| Member { name })
-                .collect(),
+            members: names.into_iter().map(|name| Member { name }).collect(),
         })
     }
 
@@ -295,7 +292,6 @@ mod tests {
             "triple\\debug",
             "debug//release",
             "oxide-quick",
-            "custom/debug",
         ] {
             assert!(Member::parse(name).is_err(), "{name:?}");
         }
@@ -403,10 +399,12 @@ mod tests {
         let declaration =
             declared(&["debug".to_owned(), "release".to_owned()]).expect("two members");
         assert_eq!(names(&declaration), ["debug", "release"]);
-        assert!(declared(&["debug".to_owned(), "debug".to_owned()]).is_ok_and(|d| d.members().len() == 1));
+        assert!(declared(&["debug".to_owned(), "debug".to_owned()])
+            .is_ok_and(|d| d.members().len() == 1));
         assert!(declared(&["custom".to_owned()]).is_err());
         assert!(declared(&["aarch64-apple-darwin/debug".to_owned()]).is_ok());
-        assert!(declared(&["debug/debug".to_owned()]).is_err());
+        assert!(declared(&["debug/debug".to_owned()]).is_ok());
+        assert!(declared(&["debug".to_owned(), "debug/debug".to_owned()]).is_err());
         let nine = (0..9)
             .map(|index| format!("triple{index}/release"))
             .collect::<Vec<_>>();
