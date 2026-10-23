@@ -400,13 +400,15 @@ def run(proof: Proof, repo: str) -> None:
 
     # ----- case 01: a real target with a debug member link -----------------
     first = make_checkout(proof, "first")
-    # A real empty target: the automatic first conversion requires an absent
-    # target, so the explicit adopt below is what selects the profile layout.
+    # A real EMPTY target selects the explicit profile adopt: an absent target
+    # would let the automatic whole-target first conversion run, and building
+    # first would fill target/debug so adoption would keep it real.
     os.makedirs(os.path.join(first, "target"))
-    code, _, stderr = oxide(proof, ["build"], "01 build", first)
-    expect(code == 0, f"01: build failed: {stderr}")
     adopt(proof, first, "01 adopt")
     root = root_of(pool, first)
+    expect_layout(first, {"debug": f"link:{root}", "release": f"link:{root}"})
+    code, _, stderr = oxide(proof, ["build"], "01 build", first)
+    expect(code == 0, f"01: build through the profile layout failed: {stderr}")
     expect_layout(first, {"debug": f"link:{root}", "release": f"link:{root}"})
     for name in ("CACHEDIR.TAG", ".rustc_info.json"):
         path = os.path.join(first, "target", name)
@@ -486,6 +488,11 @@ def run(proof: Proof, repo: str) -> None:
     plain = make_checkout(proof, "unlinked-external")
     code, _, stderr = oxide(proof, ["nextest", "run"], "05 unlinked external", plain)
     expect("not a command whose profile outputs Oxide models" not in stderr, f"05: an unlinked checkout refused an external command: {stderr}")
+    # A failed unknown-target build may have left a partial target; the adopt
+    # below must start from a positively empty real target so its member links
+    # are what the assertions see.
+    shutil.rmtree(os.path.join(unknown, "target"), ignore_errors=True)
+    os.makedirs(os.path.join(unknown, "target"))
 
     # ----- case 06: opaque custom-profile refusal -------------------------
     code, _, stderr = oxide(proof, ["build", "--profile", "custom"], "06 modelled custom", first)
@@ -509,20 +516,23 @@ def run(proof: Proof, repo: str) -> None:
 
     # ----- case 08: real nonempty kept, empty converted -------------------
     mixed = make_checkout(proof, "mixed")
+    # A real NONEMPTY release member must be kept; debug is absent, so the
+    # explicit adopt links it. No build runs before adoption: a pre-build would
+    # also fill target/debug and both members would stay real.
     os.makedirs(os.path.join(mixed, "target", "release"), exist_ok=True)
     with open(os.path.join(mixed, "target", "release", "keep"), "wb") as handle:
         handle.write(b"keep")
-    code, _, _ = oxide(proof, ["build"], "08 prebuild", mixed)
-    expect(code == 0, "08: prebuild failed")
     adopt(proof, mixed, "08 adopt")
     expect_layout(mixed, {"debug": f"link:{root_of(pool, mixed)}", "release": "real"})
     expect(perm.read_bytes(os.path.join(mixed, "target", "release", "keep")) == b"keep", "08: real member content changed")
+    code, _, stderr = oxide(proof, ["build"], "08 build", mixed)
+    expect(code == 0, f"08: build with a kept real member failed: {stderr}")
+    expect_layout(mixed, {"debug": f"link:{root_of(pool, mixed)}", "release": "real"})
     other = make_checkout(proof, "empty-member")
+    # An empty release directory is converted only by this explicit adopt.
     os.makedirs(os.path.join(other, "target", "release"), exist_ok=True)
-    code, _, _ = oxide(proof, ["build"], "08 empty prebuild", other)
-    expect(code == 0, "08: empty prebuild failed")
     adopt(proof, other, "08 empty adopt")
-    expect_layout(other, {"release": f"link:{root_of(pool, other)}"})
+    expect_layout(other, {"debug": f"link:{root_of(pool, other)}", "release": f"link:{root_of(pool, other)}"})
 
     # ----- case 09: container-style preflight sees a real target ----------
     expect(is_real_dir(os.path.join(first, "target")), "09: target is not a real directory for a container preflight")
