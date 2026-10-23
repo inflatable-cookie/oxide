@@ -80,7 +80,8 @@ run = "python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 64 -- py
 # an ignore-ownership mount; no real drive or host setting changes. The 128 MiB
 # image is registered at a 16 MiB reserve / 96 MiB cap, a positive control proves
 # an external root is really selected before the external oracles, and a
-# separate deliberate 200 MiB low-reserve control proves the honest local
+# separate deliberate low-reserve control raises the recorded registration
+# reserve to 200 MiB and restores its exact bytes to prove the honest local
 # fallback; a benign ordinary target-root file keeps the top-level preservation
 # control nonvacuous, with Cargo's own metadata asserted only when present.
 # Scratch stays 512 MiB and the detach is ordinary. It

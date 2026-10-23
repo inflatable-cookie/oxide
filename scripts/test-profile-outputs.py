@@ -31,10 +31,11 @@ The image is 128 MiB and every normal registration reserves 16 MiB below that
 geometry with a 96 MiB admission cap, so an external root is really selected; a
 positive control asserts the selected root is under
 `<mount>/oxide-outputs/` with no fallback warning before any external-root
-oracle. A SEPARATE deliberate low-reserve control registers another pool at a
-200 MiB reserve (above the image's free space) and asserts the honest
-checkout-local fallback and its warning, so fallback can never masquerade as
-external placement. Top-level preservation is nonvacuous: a benign ordinary
+oracle. A SEPARATE deliberate low-reserve control temporarily raises this
+private pool's recorded registration reserve to 200 MiB (above the image's free
+space), asserts the honest checkout-local fallback and its warning, then
+restores the exact recorded bytes; no second image or pool is created, so
+fallback can never masquerade as external placement. Top-level preservation is nonvacuous: a benign ordinary
 file created at the real target root before adoption must still exist, be a
 real regular file and be unchanged after adoption and builds, while Cargo's own
 `CACHEDIR.TAG`/`.rustc_info.json` are asserted real only when present.
@@ -125,7 +126,7 @@ FIXTURE_JOBS = 2
 # selected; one SEPARATE deliberate low-reserve control registers another pool
 # above the image's free space to prove the honest internal fallback.
 IMAGE_RESERVE = "16MiB"
-LOW_RESERVE_CONTROL = "200MiB"
+LOW_RESERVE_MIB = 200
 SHUTDOWN_MARGIN_S = 30
 MARKER = ".oxide-output.json"
 CAPABILITIES = "__oxide-build-capabilities"
@@ -219,7 +220,8 @@ def plan_only() -> int:
     print("  reserves        normal registration 16 MiB reserve / 96 MiB cap below the")
     print("                  128 MiB geometry, with a positive selected-removable control")
     print("                  before external oracles and a separate deliberate 200 MiB")
-    print("                  low-reserve control proving the honest local fallback")
+    print("                  low-reserve control (recorded reserve raised to 200 MiB,")
+    print("                  then restored byte-exactly) proving the honest local fallback")
     print("  top level       a benign ordinary target-root file survives adopt and builds;")
     print("                  CACHEDIR.TAG/.rustc_info.json asserted real only when present")
     print("  environment     one private HOME, CARGO_HOME and directory pool per session")
@@ -269,8 +271,15 @@ def is_real_dir(path: str) -> bool:
     return os.path.isdir(path) and not os.path.islink(path)
 
 
+def receipt_file(pool: str, checkout: str) -> str:
+    """The receipt path keyed by the canonical checkout digest, WITHOUT
+    asserting that it exists (used for positive absence checks)."""
+    key = perm.hashlib.sha256(checkout.encode()).hexdigest()
+    return os.path.join(pool, "oxide-managed", "outputs", key + ".json")
+
+
 def receipt(pool: str, checkout: str) -> dict:
-    return perm.read_json(perm.receipt_path(pool, checkout))
+    return perm.read_json(receipt_file(pool, checkout))
 
 
 def item(pool: str, checkout: str, key: str):
@@ -394,22 +403,26 @@ def owners_honored(proof: Proof, mount: str, label: str) -> None:
     )
 
 
-def attach_owned_image(proof: Proof, label: str) -> str:
+def attach_owned_image(
+    proof: Proof, label: str, image_name: str = "volume.sparseimage"
+) -> str:
     """Attach this proof's private image with filesystem owners ON, then
     positively observe the mount state. Every attach and reattach in this
-    proof goes through here."""
+    proof goes through here. A distinct `image_name` gives an isolated owned
+    volume for a control that must not share another registration's payload."""
     mount = perm.attach_image(
         proof,
         proof.root,
         "ProfileOutputs-" + secrets.token_hex(3),
         owners=True,
+        image_name=image_name,
     )
     owners_honored(proof, mount, label)
     return mount
 
 
 def register(proof: Proof, pool: str, mode: str = "permanent") -> None:
-    mount = attach_owned_image(proof, "initial attach")
+    mount = attach_owned_image(proof, "initial attach", "volume.sparseimage")
     code, _, stderr = proof.oxide(
         ["pool", "register-removable", mount, "--reserve", IMAGE_RESERVE, "--cap", "96MiB", "--mode", mode],
         "register removable",
@@ -495,6 +508,45 @@ def run(proof: Proof, repo: str) -> None:
     # proof peaks at 6 concurrent Cargo jobs.
     proof.env["CARGO_BUILD_JOBS"] = str(FIXTURE_JOBS)
     register(proof, pool)
+
+    # ----- case 11: explicit migration of a base-created checkout ---------
+    # The base binary can create its committed whole-target /2 state only
+    # before the primary pool publishes the successor fence, so this case runs
+    # first, on the primary pool and the SAME private image, and the candidate
+    # then migrates it.
+    migrated = make_checkout(proof, "migrate")
+    base_legacy(proof, base, pool, migrated)
+    # The base binary's committed whole-target /2 state is made source-shaped
+    # BEFORE any migration: a root/1 marker and no nonce in the receipt or
+    # registry, so the only path that can reach the profile layout is the
+    # candidate's explicit migrate_layout.
+    migrated_root = make_root_one_fixture(pool, migrated)
+    expect(
+        perm.read_json(perm.receipt_path(pool, migrated))["version"] == "oxide.outputs.transition/2",
+        "11: the source-shaped fixture is not a /2 receipt",
+    )
+    marker_path = os.path.join(migrated_root, MARKER)
+    root_ino = os.stat(migrated_root).st_ino
+    payload = sorted(os.listdir(migrated_root))
+    code, _, stderr = oxide(proof, ["outputs", "adopt"], "11 migrate", migrated)
+    expect(code == 0, f"11: candidate migration failed: {stderr}")
+    expect_layout(migrated, {"debug": f"link:{migrated_root}", "release": f"link:{migrated_root}"})
+    upgraded = perm.read_json(marker_path)
+    expect(upgraded["version"] == "oxide.outputs.root/2", "11: marker not upgraded to root/2")
+    nonce = upgraded["nonce"]
+    expect(len(nonce) == 32, "11: migrated nonce is not 128-bit hex")
+    migrated_receipt = receipt(pool, migrated)
+    expect({p["selected"]["nonce"] for p in migrated_receipt["links"] if p.get("selected")} == {nonce}, "11: members do not share the upgraded nonce")
+    expect(os.stat(migrated_root).st_ino == root_ino, "11: the root inode changed")
+    present = {name for name in os.listdir(migrated_root) if name in payload}
+    expect(present == set(payload), f"11: root payload changed: {present} vs {payload}")
+    expect(not any(name.endswith(".oxide-old-2") for name in os.listdir(migrated_root)), "11: the marker backup was kept")
+    registry = perm.read_json(os.path.join(pool, "oxide-managed", "outputs", "registry.json"))
+    rows = [row for row in registry["rows"] if row["checkout_id"] == perm.hashlib.sha256(migrated.encode()).hexdigest()]
+    expect({row["member"] for row in rows if row["selected"]} == {"debug", "release"}, f"11: registry members {rows}")
+    expect({row["nonce"] for row in rows} == {nonce}, "11: registry nonces do not share the upgraded nonce")
+    expect(migrated_receipt["version"] == "oxide.outputs.transition/3", "11: migrated receipt version")
+
     # Explicit positive control BEFORE any external-root oracle: the
     # registered removable volume is really selected, so an internal-pool
     # fallback can never masquerade as external-placement evidence.
@@ -521,30 +573,40 @@ def run(proof: Proof, repo: str) -> None:
     # A SEPARATE deliberate low-reserve control: a reserve above the image's
     # free space must fall back to the internal pool with an honest warning and
     # must not claim an external placement.
-    low_pool = os.path.join(proof.root, "pool-low-reserve")
-    low_env = {**proof.env, "OXIDE_POOL": low_pool}
-    code, _, stderr = perm.oxide_env(
-        proof,
-        ["pool", "register-removable", proof.mount, "--reserve", LOW_RESERVE_CONTROL, "--cap", "32MiB", "--mode", "permanent"],
-        "register low-reserve control",
-        proof.root,
-        low_env,
-    )
-    expect(code == 0, f"low-reserve registration failed: {stderr}")
+    # A SEPARATE deliberate low-reserve control: the private pool's recorded
+    # registration reserve is temporarily raised above the image's free space,
+    # then its exact bytes are restored. No second image or pool is created and
+    # no real drive or host setting is touched.
+    registration_file = perm.registration_path(pool)
+    original_registration = perm.read_bytes(registration_file)
+    registration = json.loads(original_registration)
+    registration["reserve_bytes"] = LOW_RESERVE_MIB * 1024 * 1024
+    with open(registration_file, "w", encoding="utf-8") as handle:
+        json.dump(registration, handle, indent=2)
+        handle.write("\n")
+    os.chmod(registration_file, 0o600)
     low = make_checkout(proof, "low-reserve")
     os.makedirs(os.path.join(low, "target"))
-    code, _, stderr = perm.oxide_env(proof, ["outputs", "adopt"], "low-reserve adopt", low, low_env)
+    code, _, stderr = oxide(proof, ["outputs", "adopt"], "low-reserve adopt", low)
     expect(code == 0, f"low-reserve adopt failed: {stderr}")
-    low_root = root_of(low_pool, low)
+    low_root = root_of(pool, low)
     expect(
         low_root.startswith(low + os.sep + ".oxide-outputs" + os.sep),
         f"the low-reserve control selected {low_root} instead of the checkout-local fallback",
     )
-    code, _, stderr = perm.oxide_env(proof, ["build"], "low-reserve build", low, low_env)
+    code, _, stderr = oxide(proof, ["build"], "low-reserve build", low)
     expect(code == 0, f"low-reserve build failed: {stderr}")
     expect(
         "not above the" in stderr and "reserve" in stderr,
         f"the low-reserve control did not report its fallback honestly: {stderr}",
+    )
+    # Restore the exact recorded registration bytes this fixture changed.
+    with open(registration_file, "wb") as handle:
+        handle.write(original_registration)
+    os.chmod(registration_file, 0o600)
+    expect(
+        perm.read_bytes(registration_file) == original_registration,
+        "the low-reserve control did not restore the recorded registration",
     )
 
     # ----- case 01: a real target with a debug member link -----------------
@@ -645,7 +707,7 @@ def run(proof: Proof, repo: str) -> None:
     code, _, stderr = oxide(proof, ["build", "--target", "targets/spec.json"], "05 unlinked", unknown)
     expect("not a plain triple" not in stderr, f"05: unlinked checkout refused a JSON target: {stderr}")
     expect(
-        not os.path.exists(perm.receipt_path(pool, unknown)),
+        not os.path.exists(receipt_file(pool, unknown)),
         "05: an unlinked unknown-target build wrote an output receipt",
     )
     # A failed unknown-target build may leave a partial target; start the
@@ -683,6 +745,10 @@ def run(proof: Proof, repo: str) -> None:
     # ----- case 06: opaque custom-profile refusal -------------------------
     code, _, stderr = oxide(proof, ["build", "--profile", "custom"], "06 modelled custom", first)
     expect(code != 0 and "not an Oxide profile" in stderr, f"06: modelled custom profile was not refused: {stderr}")
+    # Case 05's unlinked run wrote the marker; clear it first so this absence
+    # check is about case 06's refusal, not leftover state.
+    if os.path.exists(external_marker):
+        os.remove(external_marker)
     code, _, stderr = perm.oxide_env(proof, ["nextest", "--profile", "custom"], "06 opaque custom", first, fake_env)
     expect(code != 0, f"06: an opaque tool's custom profile was accepted: {stderr}")
     expect(not os.path.exists(external_marker), "06: the opaque tool ran in a linked checkout")
@@ -743,46 +809,6 @@ def run(proof: Proof, repo: str) -> None:
     expect(os.path.islink(os.path.join(legacy, "target")), "10: the legacy link changed")
     expect(link_at(os.path.join(legacy, "target")) == legacy_root, "10: the legacy link text changed")
     expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: the legacy receipt was rewritten")
-
-    # ----- case 11: explicit migration of a base-created checkout ---------
-    # Base-binary whole-target state in its own (not yet successor-fenced)
-    # pool, then the candidate migrates it.
-    pool2 = os.path.join(proof.root, "pool2")
-    code, _, stderr = perm.oxide_env(proof, ["pool", "register-removable", proof.mount, "--reserve", IMAGE_RESERVE, "--cap", "96MiB", "--mode", "permanent"], "register pool2", proof.root, {**proof.env, "OXIDE_POOL": pool2})
-    expect(code == 0, f"11: pool2 registration failed: {stderr}")
-    migrated = make_checkout(proof, "migrate")
-    base_legacy(proof, base, pool2, migrated)
-    # The base binary's committed whole-target /2 state is made source-shaped
-    # BEFORE any migration: a root/1 marker and no nonce in the receipt or
-    # registry, so the only path that can reach the profile layout is the
-    # candidate's explicit migrate_layout.
-    migrated_root = make_root_one_fixture(pool2, migrated)
-    expect(
-        perm.read_json(perm.receipt_path(pool2, migrated))["version"] == "oxide.outputs.transition/2",
-        "11: the source-shaped fixture is not a /2 receipt",
-    )
-    marker_path = os.path.join(migrated_root, MARKER)
-    root_ino = os.stat(migrated_root).st_ino
-    payload = sorted(os.listdir(migrated_root))
-    migrate_env = {**proof.env, "OXIDE_POOL": pool2}
-    code, _, stderr = perm.oxide_env(proof, ["outputs", "adopt"], "11 migrate", migrated, migrate_env)
-    expect(code == 0, f"11: candidate migration in pool2 failed: {stderr}")
-    expect_layout(migrated, {"debug": f"link:{migrated_root}", "release": f"link:{migrated_root}"})
-    upgraded = perm.read_json(marker_path)
-    expect(upgraded["version"] == "oxide.outputs.root/2", "11: marker not upgraded to root/2")
-    nonce = upgraded["nonce"]
-    expect(len(nonce) == 32, "11: migrated nonce is not 128-bit hex")
-    migrated_receipt = receipt(pool2, migrated)
-    expect({p["selected"]["nonce"] for p in migrated_receipt["links"] if p.get("selected")} == {nonce}, "11: members do not share the upgraded nonce")
-    expect(os.stat(migrated_root).st_ino == root_ino, "11: the root inode changed")
-    present = {name for name in os.listdir(migrated_root) if name in payload}
-    expect(present == set(payload), f"11: root payload changed: {present} vs {payload}")
-    expect(not any(name.endswith(".oxide-old-2") for name in os.listdir(migrated_root)), "11: the marker backup was kept")
-    registry = perm.read_json(os.path.join(pool2, "oxide-managed", "outputs", "registry.json"))
-    rows = [row for row in registry["rows"] if row["checkout_id"] == perm.hashlib.sha256(migrated.encode()).hexdigest()]
-    expect({row["member"] for row in rows if row["selected"]} == {"debug", "release"}, f"11: registry members {rows}")
-    expect({row["nonce"] for row in rows} == {nonce}, "11: registry nonces do not share the upgraded nonce")
-    expect(migrated_receipt["version"] == "oxide.outputs.transition/3", "11: migrated receipt version")
 
     # ----- case 12: P0-P4 replay, races and exact rollback ----------------
     # A crash at every pre-commit phase replays to the committed profile
@@ -906,11 +932,15 @@ def run(proof: Proof, repo: str) -> None:
     local = root_of(pool, fallback)
     expect(local != external, "14: fallback kept the external root")
     expect_layout(fallback, {"debug": f"link:{local}", "release": f"link:{local}"})
-    expect(os.path.isdir(external), "14: the external root was deleted")
+    expect(
+        not os.path.exists(external),
+        "14: the external root is reachable while its volume is unmounted",
+    )
     remount = attach_owned_image(proof, "fallback return attach")
     expect(remount is not None, "14: cannot re-attach the image")
     adopt(proof, fallback, "14 return adopt")
     expect_layout(fallback, {"debug": f"link:{external}", "release": f"link:{external}"})
+    expect(os.path.isdir(external), "14: the external root did not return with its volume")
     expect(os.path.isdir(local), "14: the local root was deleted on return")
 
     # ----- case 15: detach and re-adopt ----------------------------------
@@ -1014,14 +1044,13 @@ def run(proof: Proof, repo: str) -> None:
 
     # ----- case 19: the staged state-3 binary refuses state 4 -------------
     snapshot = {member: os.readlink(member_link(migrated, member)) for member in ("debug", "release")}
-    receipt_before = perm.sha256_file(perm.receipt_path(pool2, migrated))
-    pool2_env = {**proof.env, "OXIDE_POOL": pool2}
-    result = proof.run([base, "build"], cwd=migrated, env=pool2_env, timeout=90)
+    receipt_before = perm.sha256_file(perm.receipt_path(pool, migrated))
+    result = proof.run([base, "build"], cwd=migrated, env=proof.env, timeout=90)
     expect(result.returncode != 0, "19: the state-3 binary did not refuse a state-4 pool")
     print(result.stderr.decode(errors="replace")[-2000:])
     for member, target in snapshot.items():
         expect(os.readlink(member_link(migrated, member)) == target, "19: the refusal changed a member link")
-    expect(perm.sha256_file(perm.receipt_path(pool2, migrated)) == receipt_before, "19: the refusal rewrote the receipt")
+    expect(perm.sha256_file(perm.receipt_path(pool, migrated)) == receipt_before, "19: the refusal rewrote the receipt")
 
     # ----- case 20: root-group prune keeps another checkout's reference ---
     group = make_checkout(proof, "group")

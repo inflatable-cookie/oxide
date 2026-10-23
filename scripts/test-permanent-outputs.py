@@ -330,12 +330,15 @@ def plan(proof: Proof, cwd: str, label: str) -> dict:
     return report
 
 
-def attach_image(proof: Proof, root: str, name: str, owners: bool = False) -> str:
+def attach_image(
+    proof: Proof, root: str, name: str, owners: bool = False, image_name: str = "volume.sparseimage"
+) -> str:
     """Attach this proof's OWNED sparse image. `owners` is an optional
     `hdiutil attach -owners on` request used only by a proof that needs
-    filesystem ownership honored on its private image; the default keeps every
-    existing selector's command and behaviour unchanged."""
-    image = os.path.join(root, "volume.sparseimage")
+    filesystem ownership honored on its private image; `image_name` selects a
+    distinct owned image file when a proof needs a second isolated volume. Both
+    defaults keep every existing selector's command and behaviour unchanged."""
+    image = os.path.join(root, image_name)
     if not os.path.exists(image):
         created = proof.run(
             ["/usr/bin/hdiutil", "create", "-size", "128m", "-fs", "APFS", "-volname", name]
