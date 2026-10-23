@@ -27,6 +27,18 @@ own `pool register-removable` refusal for an ignore-ownership mount. This is a
 private-image fixture option only; no real drive, persistent host setting,
 mount permission or product safety check is changed.
 
+The image is 128 MiB and every normal registration reserves 16 MiB below that
+geometry with a 96 MiB admission cap, so an external root is really selected; a
+positive control asserts the selected root is under
+`<mount>/oxide-outputs/` with no fallback warning before any external-root
+oracle. A SEPARATE deliberate low-reserve control registers another pool at a
+200 MiB reserve (above the image's free space) and asserts the honest
+checkout-local fallback and its warning, so fallback can never masquerade as
+external placement. Top-level preservation is nonvacuous: a benign ordinary
+file created at the real target root before adoption must still exist, be a
+real regular file and be unchanged after adoption and builds, while Cargo's own
+`CACHEDIR.TAG`/`.rustc_info.json` are asserted real only when present.
+
 CPU controls for a 6 CPU / 8 GiB planning request: the two independent
 stagings are SEQUENTIAL and each is explicitly bounded to 6 Cargo jobs; fixture
 Cargo children are bounded to 2 jobs each and at most two gated writers overlap
@@ -108,6 +120,12 @@ BASE = "4a70b83"
 # exceeds 6 concurrent Cargo jobs.
 STAGE_JOBS = 6
 FIXTURE_JOBS = 2
+# The private image is 128 MiB. Every normal registration reserves well below
+# that geometry (16 MiB) with a 96 MiB admission cap, so the volume is really
+# selected; one SEPARATE deliberate low-reserve control registers another pool
+# above the image's free space to prove the honest internal fallback.
+IMAGE_RESERVE = "16MiB"
+LOW_RESERVE_CONTROL = "200MiB"
 SHUTDOWN_MARGIN_S = 30
 MARKER = ".oxide-output.json"
 CAPABILITIES = "__oxide-build-capabilities"
@@ -198,6 +216,12 @@ def plan_only() -> int:
     print("                  attached with hdiutil -owners on for every attach/reattach,")
     print("                  asserted by a bounded read-only mount observation and the")
     print("                  product registration control; ordinary detach")
+    print("  reserves        normal registration 16 MiB reserve / 96 MiB cap below the")
+    print("                  128 MiB geometry, with a positive selected-removable control")
+    print("                  before external oracles and a separate deliberate 200 MiB")
+    print("                  low-reserve control proving the honest local fallback")
+    print("  top level       a benign ordinary target-root file survives adopt and builds;")
+    print("                  CACHEDIR.TAG/.rustc_info.json asserted real only when present")
     print("  environment     one private HOME, CARGO_HOME and directory pool per session")
     print("  cases")
     for case in CASES:
@@ -387,7 +411,7 @@ def attach_owned_image(proof: Proof, label: str) -> str:
 def register(proof: Proof, pool: str, mode: str = "permanent") -> None:
     mount = attach_owned_image(proof, "initial attach")
     code, _, stderr = proof.oxide(
-        ["pool", "register-removable", mount, "--reserve", "2GiB", "--cap", "96MiB", "--mode", mode],
+        ["pool", "register-removable", mount, "--reserve", IMAGE_RESERVE, "--cap", "96MiB", "--mode", mode],
         "register removable",
         proof.root,
     )
@@ -471,6 +495,57 @@ def run(proof: Proof, repo: str) -> None:
     # proof peaks at 6 concurrent Cargo jobs.
     proof.env["CARGO_BUILD_JOBS"] = str(FIXTURE_JOBS)
     register(proof, pool)
+    # Explicit positive control BEFORE any external-root oracle: the
+    # registered removable volume is really selected, so an internal-pool
+    # fallback can never masquerade as external-placement evidence.
+    expect(proof.mount is not None, "the private image is not mounted")
+    expect(os.path.isfile(perm.registration_path(pool)), "no removable registration")
+    selected = make_checkout(proof, "selected-removable")
+    os.makedirs(os.path.join(selected, "target"))
+    adopt(proof, selected, "selected-removable adopt")
+    selected_root = root_of(pool, selected)
+    expect(
+        selected_root.startswith(os.path.join(proof.mount, "oxide-outputs") + os.sep),
+        f"the selected root {selected_root} is not under {proof.mount}/oxide-outputs",
+    )
+    code, _, stderr = oxide(proof, ["build"], "selected-removable build", selected)
+    expect(code == 0, f"selected-removable build failed: {stderr}")
+    expect(
+        "fallback" not in summary(stderr),
+        f"the registered removable pool was not selected: {summary(stderr)}",
+    )
+    expect(
+        os.readlink(member_link(selected, "debug")) == selected_root,
+        "the member link does not select the registered external root",
+    )
+    # A SEPARATE deliberate low-reserve control: a reserve above the image's
+    # free space must fall back to the internal pool with an honest warning and
+    # must not claim an external placement.
+    low_pool = os.path.join(proof.root, "pool-low-reserve")
+    low_env = {**proof.env, "OXIDE_POOL": low_pool}
+    code, _, stderr = perm.oxide_env(
+        proof,
+        ["pool", "register-removable", proof.mount, "--reserve", LOW_RESERVE_CONTROL, "--cap", "32MiB", "--mode", "permanent"],
+        "register low-reserve control",
+        proof.root,
+        low_env,
+    )
+    expect(code == 0, f"low-reserve registration failed: {stderr}")
+    low = make_checkout(proof, "low-reserve")
+    os.makedirs(os.path.join(low, "target"))
+    code, _, stderr = perm.oxide_env(proof, ["outputs", "adopt"], "low-reserve adopt", low, low_env)
+    expect(code == 0, f"low-reserve adopt failed: {stderr}")
+    low_root = root_of(low_pool, low)
+    expect(
+        low_root.startswith(low + os.sep + ".oxide-outputs" + os.sep),
+        f"the low-reserve control selected {low_root} instead of the checkout-local fallback",
+    )
+    code, _, stderr = perm.oxide_env(proof, ["build"], "low-reserve build", low, low_env)
+    expect(code == 0, f"low-reserve build failed: {stderr}")
+    expect(
+        "not above the" in stderr and "reserve" in stderr,
+        f"the low-reserve control did not report its fallback honestly: {stderr}",
+    )
 
     # ----- case 01: a real target with a debug member link -----------------
     first = make_checkout(proof, "first")
@@ -478,15 +553,33 @@ def run(proof: Proof, repo: str) -> None:
     # would let the automatic whole-target first conversion run, and building
     # first would fill target/debug so adoption would keep it real.
     os.makedirs(os.path.join(first, "target"))
+    # A benign ordinary file at the real target root is neither Oxide's nor
+    # Cargo's: it must survive adoption and later builds, so the top-level
+    # preservation contract is nonvacuous.
+    control_file = os.path.join(first, "target", "oxide-proof-top-level-control")
+    with open(control_file, "wb") as handle:
+        handle.write(b"control")
     adopt(proof, first, "01 adopt")
     root = root_of(pool, first)
+    expect(root.startswith(os.path.join(proof.mount, "oxide-outputs") + os.sep), f"01: external root {root} is not on the registered volume")
     expect_layout(first, {"debug": f"link:{root}", "release": f"link:{root}"})
     code, _, stderr = oxide(proof, ["build"], "01 build", first)
     expect(code == 0, f"01: build through the profile layout failed: {stderr}")
     expect_layout(first, {"debug": f"link:{root}", "release": f"link:{root}"})
+    expect(
+        os.path.isfile(control_file) and not os.path.islink(control_file),
+        "01: the ordinary top-level control file was removed or replaced",
+    )
+    expect(perm.read_bytes(control_file) == b"control", "01: the top-level control file changed")
+    # Cargo's own top-level metadata may live in the redirected build directory;
+    # it is asserted real only when it is present at the target root.
     for name in ("CACHEDIR.TAG", ".rustc_info.json"):
         path = os.path.join(first, "target", name)
-        expect(os.path.exists(path) and not os.path.islink(path), f"01: {path} is not real")
+        if os.path.exists(path):
+            expect(
+                os.path.isfile(path) and not os.path.islink(path),
+                f"01: {path} is not a real regular file",
+            )
     report = perm.plan(proof, first, "01 plan")
     expect(report["layout"] == "profile", f"01: plan layout {report['layout']}")
     members = {entry["member"]: entry["state"] for entry in report["members"]}
@@ -551,28 +644,48 @@ def run(proof: Proof, repo: str) -> None:
     unknown = make_checkout(proof, "unknown-target")
     code, _, stderr = oxide(proof, ["build", "--target", "targets/spec.json"], "05 unlinked", unknown)
     expect("not a plain triple" not in stderr, f"05: unlinked checkout refused a JSON target: {stderr}")
+    expect(
+        not os.path.exists(perm.receipt_path(pool, unknown)),
+        "05: an unlinked unknown-target build wrote an output receipt",
+    )
+    # A failed unknown-target build may leave a partial target; start the
+    # adopt from a positively empty real target so only the member links are
+    # what the assertions see.
+    shutil.rmtree(os.path.join(unknown, "target"), ignore_errors=True)
+    os.makedirs(os.path.join(unknown, "target"))
     adopt(proof, unknown, "05 adopt")
     code, _, stderr = oxide(proof, ["build", "--target", "targets/spec.json"], "05 linked", unknown)
     expect(code != 0 and "not a plain triple" in stderr, f"05: linked unknown target was not refused: {stderr}")
     expect_layout(unknown, {"debug": f"link:{root_of(pool, unknown)}"})
     # An external subcommand has opaque output directories: it refuses in the
     # linked checkout and is not silently treated as the dev profile.
-    code, _, stderr = oxide(proof, ["nextest", "run"], "05 linked external", unknown)
+    fake_bin = os.path.join(proof.root, "fake-bin")
+    os.makedirs(fake_bin, exist_ok=True)
+    external_marker = os.path.join(proof.root, "external-tool-ran")
+    fake = os.path.join(fake_bin, "nextest")
+    with open(fake, "w", encoding="utf-8") as handle:
+        handle.write(
+            "#!/bin/sh\nprintf 'ran %s' \"$*\" > \"$OXIDE_FAKE_EXTERNAL_MARKER\"\nexit 0\n"
+        )
+    os.chmod(fake, 0o755)
+    fake_env = {
+        **proof.env,
+        "PATH": fake_bin + os.pathsep + proof.env.get("PATH", ""),
+        "OXIDE_FAKE_EXTERNAL_MARKER": external_marker,
+    }
+    code, _, stderr = perm.oxide_env(proof, ["nextest", "run"], "05 linked external", unknown, fake_env)
     expect(code != 0 and "not a command whose profile outputs Oxide models" in stderr, f"05: linked external command was not refused: {stderr}")
+    expect(not os.path.exists(external_marker), "05: the external tool ran in a linked checkout")
     plain = make_checkout(proof, "unlinked-external")
-    code, _, stderr = oxide(proof, ["nextest", "run"], "05 unlinked external", plain)
-    expect("not a command whose profile outputs Oxide models" not in stderr, f"05: an unlinked checkout refused an external command: {stderr}")
-    # A failed unknown-target build may have left a partial target; the adopt
-    # below must start from a positively empty real target so its member links
-    # are what the assertions see.
-    shutil.rmtree(os.path.join(unknown, "target"), ignore_errors=True)
-    os.makedirs(os.path.join(unknown, "target"))
-
+    code, _, stderr = perm.oxide_env(proof, ["nextest", "run"], "05 unlinked external", plain, fake_env)
+    expect(code == 0, f"05: the positive fake external tool did not run in an unlinked checkout: {stderr}")
+    expect(os.path.isfile(external_marker), "05: the positive fake external tool did not record its run")
     # ----- case 06: opaque custom-profile refusal -------------------------
     code, _, stderr = oxide(proof, ["build", "--profile", "custom"], "06 modelled custom", first)
     expect(code != 0 and "not an Oxide profile" in stderr, f"06: modelled custom profile was not refused: {stderr}")
-    code, _, stderr = oxide(proof, ["nextest", "--profile", "custom"], "06 opaque custom", first)
+    code, _, stderr = perm.oxide_env(proof, ["nextest", "--profile", "custom"], "06 opaque custom", first, fake_env)
     expect(code != 0, f"06: an opaque tool's custom profile was accepted: {stderr}")
+    expect(not os.path.exists(external_marker), "06: the opaque tool ran in a linked checkout")
 
     # ----- case 07: exec declarations -------------------------------------
     script = os.path.join(first, "declared.sh")
@@ -635,7 +748,7 @@ def run(proof: Proof, repo: str) -> None:
     # Base-binary whole-target state in its own (not yet successor-fenced)
     # pool, then the candidate migrates it.
     pool2 = os.path.join(proof.root, "pool2")
-    code, _, stderr = perm.oxide_env(proof, ["pool", "register-removable", proof.mount, "--reserve", "2GiB", "--cap", "96MiB", "--mode", "permanent"], "register pool2", proof.root, {**proof.env, "OXIDE_POOL": pool2})
+    code, _, stderr = perm.oxide_env(proof, ["pool", "register-removable", proof.mount, "--reserve", IMAGE_RESERVE, "--cap", "96MiB", "--mode", "permanent"], "register pool2", proof.root, {**proof.env, "OXIDE_POOL": pool2})
     expect(code == 0, f"11: pool2 registration failed: {stderr}")
     migrated = make_checkout(proof, "migrate")
     base_legacy(proof, base, pool2, migrated)
