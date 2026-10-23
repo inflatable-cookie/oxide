@@ -856,7 +856,7 @@ def run_cases(
             "default status touched the recorded Evicting slot",
         )
         expect(
-            os.path.exists(os.path.join(served, "000000"))
+            os.path.exists(os.path.join(served, "entry-000"))
             and entry_count(served) == PAYLOAD_FILES + 1,
             "the payload fixture was changed",
         )
@@ -1242,7 +1242,7 @@ def run_cases(
         "load_before": load_before,
         "load_after": loadavg(),
         "limitations": [
-            "one non-contended author run; not a universal filesystem-latency guarantee",
+            "one author run; not a universal filesystem-latency guarantee",
             "fixture pools are hand-built and private; no real or live pool was read",
             "no installed binary, real drive, consumer or host state was touched",
         ],
