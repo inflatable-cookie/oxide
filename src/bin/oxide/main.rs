@@ -20,6 +20,7 @@ mod identity;
 mod launch;
 mod outputs;
 mod process;
+mod prune;
 mod removable;
 mod store;
 mod version;
@@ -265,6 +266,36 @@ fn exec_stdin() -> Stdio {
     }
 }
 
+/// Debug-only proof pause (oxide#129): with `OXIDE_TEST_PAUSE=<point>:<gate>`
+/// the command writes `<gate>.<point>-<pid>` at `point` and waits (at most
+/// 120 s) until `<gate>` exists. Absent from release builds.
+fn test_pause(point: &str) {
+    test_pause_with(point, "");
+}
+
+/// [`test_pause`] whose marker file holds `detail` (for `keyed`, the
+/// destination facts the slot key captured, including the root nonce).
+fn test_pause_with(point: &str, detail: &str) {
+    #[cfg(debug_assertions)]
+    if let Some(gate) = std::env::var("OXIDE_TEST_PAUSE")
+        .ok()
+        .and_then(|value| value.strip_prefix(&format!("{point}:")).map(str::to_owned))
+    {
+        // Published atomically: the content is complete before the marker
+        // name (which the proof globs for) exists.
+        let marker = format!("{gate}.{point}-{}", std::process::id());
+        let staged = format!("{gate}.staging-{point}-{}", std::process::id());
+        if std::fs::write(&staged, detail.as_bytes()).is_ok() {
+            let _ = std::fs::rename(&staged, &marker);
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(120);
+        while !std::path::Path::new(&gate).exists() && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    let _ = (point, detail);
+}
+
 fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     let exec = invocation.command == "exec";
     process::install_signal_handlers()?;
@@ -292,6 +323,16 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     // released before this command takes a slot.
     outputs::auto_adopt(&selected.store, &checkout, &selected)?;
     let store = selected.store;
+    // A future owned root gets its durable random nonce reserved before the
+    // destination is planned and keyed (oxide#129); the binding lock is
+    // released again before this command waits for a slot.
+    outputs::reserve(
+        &store,
+        Some(&output_control),
+        &checkout,
+        pool_fallback.as_deref(),
+    )?;
+    test_pause("reserved");
     let planned =
         outputs::planned_destination(Some(&output_control), &checkout, pool_fallback.as_deref())?;
     let destination = outputs::destination_facts(planned.as_ref());
@@ -301,6 +342,7 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         invocation.target.as_deref(),
         &destination,
     )?;
+    test_pause_with("keyed", &destination);
     if !selected.removable {
         if selection_mode == Some(removable::DriveMode::Permanent) {
             if let Some(reason) = fallback_reason.as_deref() {
@@ -355,6 +397,7 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
             return Err(reason);
         }
     };
+    test_pause("bound");
     for warning in &binding.outcome.warnings {
         eprintln!("oxide: WARNING: {warning}");
     }
@@ -1030,6 +1073,9 @@ fn print_pools(
             Section::Internal(note) => {
                 let header = format!("internal pool: {}{note}", internal.pool.display());
                 print_pool(internal, &header, &[], &internal_report, mode)?;
+                for line in crate::prune::status_lines(internal.control()) {
+                    println!("  {line}");
+                }
             }
             Section::NoRemovable => println!("removable pool: none registered"),
             Section::Removable => {

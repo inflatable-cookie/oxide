@@ -340,7 +340,7 @@ def prove_fences_and_exhaustion(proof: Proof, app: str, pool: str, env: dict) ->
     expect(slot["rank"] == 2 and slot["state"] == "idle", f"release did not stamp the idle rank: {slot}")
     state_path = os.path.join(pool, "oxide-managed", "state.json")
     state = read_json(state_path)
-    expect(state["version"] == 2, f"the first mutation did not install control version 2: {state}")
+    expect(state["version"] == 2, f"the first mutation did not keep the previous control version before the owned-outputs fence: {state}")
     RESULTS.append({"case": "fences-installed", "ledger_policy": 1, "state_version": 2})
 
     # A legacy representation (no fence, rank 0) still reads for status and

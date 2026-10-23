@@ -45,7 +45,7 @@ import time
 MIB = 1024 * 1024
 NOTICE = "oxide: handing off to the installed binary (state is newer than this one).\n"
 REFUSAL = "oxide: oxide was upgraded during this command; re-run.\n"
-STATE_VERSION = 2
+STATE_VERSION = 3
 REGISTRATION_VERSION = 2
 CAPABILITIES_PROBE = "__oxide-build-capabilities"
 SHUTDOWN_MARGIN_S = 20

@@ -591,11 +591,11 @@ def run(proof: Proof, repo: str) -> None:
     expect(external_root.startswith(mount + "/oxide-outputs/"), external_root)
     expect(os.path.isfile(os.path.join(external_root, MARKER)), "the root has no marker")
     marker = read_json(os.path.join(external_root, MARKER))
-    expect(marker["version"] == "oxide.outputs.root/1", marker)
+    expect(marker["version"] == "oxide.outputs.root/2", marker)
     expect(marker["checkout"] == app and marker["kind"] == "external", marker)
     receipt = read_json(receipt_path(pool, app))
     expect(
-        receipt["version"] == "oxide.outputs.transition/1"
+        receipt["version"] == "oxide.outputs.transition/2"
         and receipt["state"] == "committed"
         and receipt["checkout"] == app,
         receipt,
@@ -617,7 +617,7 @@ def run(proof: Proof, repo: str) -> None:
     expect(sha256_file(pre_feature) != sha256_file(proof.binary), "the pre-feature binary is the candidate")
     for state_dir in (os.path.join(pool, "oxide-managed"), os.path.join(pool, "oxide-managed", "removable", "oxide-managed")):
         fenced = read_json(os.path.join(state_dir, "state.json"))
-        expect(fenced.get("owned_outputs") == "oxide.outputs/1", f"{state_dir} is not fenced: {fenced}")
+        expect(fenced.get("owned_outputs") == "oxide.outputs/2", f"{state_dir} is not fenced: {fenced}")
     external_before = sorted(os.listdir(external_root))
     for args, label in (
         (["check"], "pre-feature check refuses the fenced pool"),

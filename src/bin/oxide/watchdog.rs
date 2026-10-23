@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 /// Safety margin above the protected reserve.
 pub const MARGIN_BYTES: u64 = 2 * GIB;
-const INTERVAL: Duration = Duration::from_secs(1);
+pub(crate) const INTERVAL: Duration = Duration::from_secs(1);
 /// TERM to KILL.
 const GRACE: Duration = Duration::from_secs(2);
 /// KILL to giving up on positive closure: the slot then stays held.
