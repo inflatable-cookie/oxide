@@ -367,7 +367,6 @@ pub fn observe_parent(parent: &Path) -> Result<ParentFacts, String> {
 /// Structural facts about a mounted volume's root directory, observed once
 /// through the volume binding's own descriptor (oxide#130).
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(clippy::struct_excessive_bools)]
 pub struct RootFacts {
     /// `fstat` on the descriptor says a real directory.
     pub real_directory: bool,

@@ -819,9 +819,11 @@ explicit `recover` unless they adopt it.
   After a pool-creation reserve refusal, and after a host-reserve stop once
   every writer in Cargo's group has positively closed, Oxide runs its own
   executing artifact as the hidden `oxide __oxide-capacity-probe
-  <absolute-path>` child: a separate process group, 2 s cumulative including
-  killing and reaping, at most 8 KiB of combined stdout and stderr, and one
-  typed JSON answer. The child reads CoreFoundation URL resource values
+  <absolute-path>` child: a separate process group, one 2 s budget taken
+  before the spawn and shared by the answer, a bounded KILL, its positive reap
+  and the pipe drain (the reap reserve is carved out of that budget, never
+  added to it), at most 8 KiB of combined stdout and stderr, and one typed
+  JSON answer. The child reads CoreFoundation URL resource values
   (`CFURLCopyResourcePropertyForKey` with the public
   `NSURLVolumeAvailableCapacityForImportantUsageKey` and
   `NSURLVolumeAvailableCapacityForOpportunisticUsageKey` keys) and reports
@@ -1228,8 +1230,9 @@ identity lines.
   sentinel `CARGO_TARGET_DIR` intact; and creation-refusal and reserve-stop
   capacity diagnostics in typed, unknown-value, error-class, timeout,
   oversized and real positive-control forms, with the raw refusal and the
-  20 GiB decision unchanged and no pool created. The recorded author run
-  passed 50/50 cases in 24 s with an 81.9 MiB owned peak. It is not a
+  20 GiB decision unchanged and no pool created. The recorded author runs
+  passed 50/50 cases (24 s at an 81.9 MiB owned peak, then 22 s at 89.9 MiB
+  after the shared-budget correction). It is not a
   benchmark or an alias for full QA.
 
 ### Shared proof supervisor

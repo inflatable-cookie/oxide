@@ -4,8 +4,9 @@
 //! diagnostics). After a pool-creation reserve refusal, or after a
 //! host-reserve stop when every writer in Cargo's group has closed, Oxide may
 //! ask macOS for its own purgeable/reclaimable estimates. The probe is a
-//! separate process of the same executing artifact, with a 2-second cumulative
-//! bound that includes killing and reaping it, and 8 KiB of combined output.
+//! separate process of the same executing artifact, inside one 2-second budget
+//! that also covers a bounded KILL, its positive reap and the pipe drain, and
+//! with 8 KiB of combined output.
 //!
 //! The figures are informational. They overlap each other, they are not
 //! guaranteed free space, nothing is purged, and no decision reads them: the
@@ -22,11 +23,14 @@ use std::time::{Duration, Instant};
 
 /// The hidden probe child, dispatched before any other work in `main`.
 pub const PROBE: &str = "__oxide-capacity-probe";
-/// Total budget for the child, including bounded termination and reaping.
+/// One budget for the whole probe: the child's answer, a bounded KILL, its
+/// positive reap and the pipe drain all fit inside this window.
 const LIMIT: Duration = Duration::from_secs(2);
+/// Held back from [`LIMIT`] so a KILL and its positive reap cannot overrun it.
+const TERMINATION_RESERVE: Duration = Duration::from_millis(250);
 /// Combined stdout and stderr bound.
 const OUTPUT_CAP: usize = 8 * 1024;
-/// Reserved answer size; the parent rejects anything longer than [`OUTPUT_CAP`].
+/// How often the wait loop observes the child.
 const POLL: Duration = Duration::from_millis(10);
 
 /// The child. Prints one typed JSON answer, or an explicit error class.
@@ -186,6 +190,11 @@ fn diagnose_command(command: &mut Command) -> String {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // One absolute budget, taken before the spawn, so the child's answer, a
+    // KILL, its positive reap and the pipe drain all share it. Nothing below
+    // adds a window of its own; each phase is given what is left.
+    let deadline = Instant::now() + LIMIT;
+    let answer_by = deadline - TERMINATION_RESERVE;
     // The probe is its own process group, so a bounded stop reaches exactly
     // what this run started and nothing else.
     let mut group = match process::start_group(command) {
@@ -193,11 +202,11 @@ fn diagnose_command(command: &mut Command) -> String {
         Err(error) => return unknown_line(&format!("the read-only probe did not start ({error})")),
     };
     let Some(stdout) = group.child.stdout.take() else {
-        kill_and_reap(&mut group);
+        kill_and_reap(&mut group, deadline);
         return unknown_line("the probe's output could not be read");
     };
     let Some(stderr) = group.child.stderr.take() else {
-        kill_and_reap(&mut group);
+        kill_and_reap(&mut group, deadline);
         return unknown_line("the probe's output could not be read");
     };
     let (sender, answers) = std::sync::mpsc::channel();
@@ -211,9 +220,8 @@ fn diagnose_command(command: &mut Command) -> String {
         let (bytes, overflow) = read_bounded(stderr);
         let _ = stderr_sender.send((false, bytes, overflow));
     });
-    let deadline = Instant::now() + LIMIT;
     let mut status = None;
-    while Instant::now() < deadline {
+    while Instant::now() < answer_by {
         match group.child.try_wait() {
             Ok(Some(exit)) => {
                 status = Some(exit);
@@ -221,24 +229,30 @@ fn diagnose_command(command: &mut Command) -> String {
             }
             Ok(None) => std::thread::sleep(POLL),
             Err(error) => {
-                kill_and_reap(&mut group);
+                kill_and_reap(&mut group, deadline);
                 return unknown_line(&format!("the probe could not be observed ({error})"));
             }
         }
     }
     if status.is_none() {
-        kill_and_reap(&mut group);
-        return unknown_line("the probe did not answer within 2 s; it was killed and reaped");
+        let reaped = kill_and_reap(&mut group, deadline);
+        return unknown_line(if reaped {
+            "the probe did not answer within 2 s; it was killed and reaped inside that bound"
+        } else {
+            "the probe did not answer within 2 s and was not positively reaped inside that bound"
+        });
     }
     // The leader is reaped. Both pipes normally reach end-of-file at once; a
-    // remaining writer is read only inside a fixed bound rather than waited on.
-    let close_deadline = Instant::now() + Duration::from_millis(250);
+    // remaining writer is read only with what is left of the same budget.
     let mut pipes = Vec::new();
     while pipes.len() < 2 {
-        let left = close_deadline.saturating_duration_since(Instant::now());
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return unknown_line("the probe's output did not close inside its 2 s bound");
+        }
         match answers.recv_timeout(left) {
             Ok(answer) => pipes.push(answer),
-            Err(_) => return unknown_line("the probe's output did not close after it exited"),
+            Err(_) => return unknown_line("the probe's output did not close inside its 2 s bound"),
         }
     }
     let overflow = pipes.iter().any(|(_, _, overflow)| *overflow);
@@ -263,7 +277,10 @@ fn unknown_line(reason: &str) -> String {
     format!("capacity diagnostics: unknown ({reason}); the raw reserve decision is unchanged")
 }
 
-fn kill_and_reap(group: &mut process::Group) {
+/// KILL the probe's group and positively reap its leader, using only what is
+/// left of the caller's [`LIMIT`] budget. Returns whether the leader was
+/// reaped; a false answer is reported as unknown, never as a clean stop.
+fn kill_and_reap(group: &mut process::Group, deadline: Instant) -> bool {
     if group.id > 1 {
         // SAFETY: a negative PID addresses the process group this run
         // created; the probe is its only member.
@@ -271,17 +288,14 @@ fn kill_and_reap(group: &mut process::Group) {
             libc::kill(-group.id, libc::SIGKILL);
         }
     }
-    // Positive reaping, inside the same 2-second budget: SIGKILL on our own
-    // child returns promptly, and a bounded wait never leaves a zombie for
-    // the caller's turn.
-    let deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < deadline {
         match group.child.try_wait() {
-            Ok(Some(_)) => return,
+            Ok(Some(_)) => return true,
             Ok(None) => std::thread::sleep(POLL),
-            Err(_) => return,
+            Err(_) => return false,
         }
     }
+    false
 }
 
 /// Read one pipe up to the combined bound, reporting an overflow instead of
@@ -581,7 +595,15 @@ mod tests {
                     assert_eq!(answer.important, None, "{bytes}");
                     assert_eq!(answer.opportunistic, None, "{bytes}");
                 }
-                Err(_) => {}
+                Err(class) => assert!(
+                    matches!(
+                        class,
+                        "a capacity figure was not a non-negative integer"
+                            | "the probe printed no valid answer"
+                            | "the probe printed no answer object"
+                    ),
+                    "{bytes}: {class}"
+                ),
             }
         }
         for (class, expected) in [
@@ -663,17 +685,35 @@ mod tests {
 
     /// The parent's bounds: a hang is killed and reaped inside the 2-second
     /// budget, a flood is capped, a typed answer is rendered, and an explicit
-    /// class stays unknown.
+    /// class stays unknown. The elapsed checks are the contract: the wait, the
+    /// KILL, its reap and the drain all fit inside one [`LIMIT`].
     #[test]
     fn the_probe_is_bounded_and_reported() {
         let started = Instant::now();
         let line = diagnose_command(&mut script("sleep 60"));
+        let timeout_elapsed = started.elapsed();
         assert!(
             line.contains("did not answer within 2 s")
+                && line.contains("killed and reaped inside that bound")
                 && line.contains("the raw reserve decision is unchanged"),
             "{line}"
         );
-        assert!(started.elapsed() < Duration::from_secs(4), "{started:?}");
+        assert!(
+            timeout_elapsed <= LIMIT + Duration::from_millis(150),
+            "the timeout path took {timeout_elapsed:?}, past its {LIMIT:?} budget"
+        );
+        // An answer that arrives just inside the answer window still renders,
+        // and the drain that follows stays inside the same budget.
+        let started = Instant::now();
+        let line = diagnose_command(&mut script(
+            "sleep 1.4; printf '{\"important_usage_bytes\":1073741824,\"opportunistic_usage_bytes\":null}'",
+        ));
+        let answer_elapsed = started.elapsed();
+        assert!(line.contains("important use 1.0 GiB"), "{line}");
+        assert!(
+            answer_elapsed <= LIMIT + Duration::from_millis(150),
+            "the slow-answer path took {answer_elapsed:?}, past its {LIMIT:?} budget"
+        );
         let line = diagnose_command(&mut script("printf '%020000d' 0"));
         assert!(line.contains("output exceeded its 8 KiB bound"), "{line}");
         let line = diagnose_command(&mut script(
