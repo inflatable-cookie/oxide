@@ -312,6 +312,7 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         invocation.target.as_deref(),
         &destination,
     )?;
+    test_pause("keyed");
     if !selected.removable {
         if selection_mode == Some(removable::DriveMode::Permanent) {
             if let Some(reason) = fallback_reason.as_deref() {

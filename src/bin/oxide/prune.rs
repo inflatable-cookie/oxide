@@ -40,6 +40,8 @@ pub const INTENT_VERSION: &str = "oxide.outputs.prune-intent/1";
 pub const RESOLUTION_VERSION: &str = "oxide.outputs.prune-resolution/1";
 
 const REGISTRY_FILE: &str = "registry.json";
+/// The registry's frozen numeric format.
+const REGISTRY_SCHEMA: u32 = 1;
 const OBSERVATIONS_FILE: &str = "prune-observations.json";
 /// The diagnostic tombstone ring (oxide#129): settled prune outcomes only,
 /// oldest first, compactable. Never a safety journal or a live cap.
@@ -80,6 +82,9 @@ registry still selects with no active writer and a validated owner marker.";
 #[serde(deny_unknown_fields)]
 struct Registry {
     version: String,
+    /// The frozen numeric registry format, 1 (shared with `version`).
+    #[serde(default)]
+    schema: u32,
     /// Advanced before every changed receipt, selection or root effect.
     revision: u64,
     complete: bool,
@@ -217,6 +222,15 @@ struct Intent {
     /// unfinished: its receipt step is replayed, never assumed.
     #[serde(default)]
     receipt_settled: bool,
+    /// Whether the registry row was a live selection when the intent was
+    /// journaled (a released root is not); an intent-phase rollback
+    /// restores exactly this.
+    #[serde(default = "selected_by_default")]
+    was_selected: bool,
+}
+
+fn selected_by_default() -> bool {
+    true
 }
 
 /// The bounded preview document. Its canonical bytes are the plan a real run
@@ -563,6 +577,7 @@ fn create_or_validate_registry(
             }
             let mut registry = Registry {
                 version: REGISTRY_VERSION.to_owned(),
+                schema: REGISTRY_SCHEMA,
                 revision: 1,
                 complete: true,
                 incomplete: None,
@@ -671,7 +686,7 @@ fn ready_registry(control: &Path) -> Result<Registry, String> {
 
 impl Registry {
     fn validate(&self) -> Result<(), String> {
-        if self.version != REGISTRY_VERSION {
+        if self.version != REGISTRY_VERSION || self.schema != REGISTRY_SCHEMA {
             return Err(format!(
                 "the output registry has an unsupported version {:?}",
                 self.version
@@ -1278,6 +1293,11 @@ fn row_identity(selected: &Selected) -> Result<(Option<u64>, Option<u64>, Option
     }
     let digest = outputs::marker_digest(selected.root()).ok();
     Ok((Some(metadata.dev()), Some(metadata.ino()), digest))
+}
+
+/// The checkout's volume UUID for a new marker (shared root/2 field).
+pub fn checkout_volume_uuid(checkout: &Path) -> Option<String> {
+    volume_uuid_of(checkout).ok().flatten()
 }
 
 fn volume_uuid_of(path: &Path) -> Result<Option<String>, String> {
@@ -2076,13 +2096,15 @@ fn eligibility(
             "a prepared transition still references this root".to_owned(),
         ));
     }
-    if !row.selected {
-        return Ok(Some("the registry does not select this root".to_owned()));
+    if row.reservation.is_some() || row.cancelling.is_some() {
+        return Ok(Some(
+            "a root reservation still references this root".to_owned(),
+        ));
     }
-    if registry
-        .live_rows()
-        .any(|other| other.root == row.root && !std::ptr::eq(other, row))
-    {
+    if registry.live_rows().any(|other| {
+        other.root == row.root
+            && !(other.checkout_id == row.checkout_id && other.member == row.member)
+    }) {
         return Ok(Some(
             "another live reference also names this root".to_owned(),
         ));
@@ -2092,22 +2114,35 @@ fn eligibility(
             "the checkout's receipt is missing or unreadable".to_owned(),
         ));
     };
-    if !receipt.selects() {
-        return Ok(Some(
-            "the checkout's receipt is detached, pruning or prepared".to_owned(),
-        ));
+    if outputs::receipt_is_pruning(receipt) {
+        return Ok(Some("the checkout's receipt is pruning".to_owned()));
     }
-    let Some(selected) = receipt.current() else {
-        return Ok(Some("the checkout's receipt selects nothing".to_owned()));
-    };
-    if selected.root() != row.root
-        || selected.nonce() != row.nonce.as_deref()
-        || selected.generation() != row.generation
-        || selected.kind() != row.root_kind
-    {
-        return Ok(Some(
-            "the registry row does not match the checkout's committed receipt".to_owned(),
-        ));
+    // The checkout's receipt either still selects this exact root, or no
+    // longer references it as current (a released root: relinked away or
+    // detached, kept in history). A registry selection the receipt does not
+    // make is a contradiction and keeps the root.
+    match receipt.current() {
+        Some(selected) if selected.root() == row.root => {
+            if !receipt.selects() {
+                return Ok(Some(
+                    "the checkout's receipt is not committed for this root".to_owned(),
+                ));
+            }
+            if selected.nonce() != row.nonce.as_deref()
+                || selected.generation() != row.generation
+                || selected.kind() != row.root_kind
+            {
+                return Ok(Some(
+                    "the registry row does not match the checkout's committed receipt".to_owned(),
+                ));
+            }
+        }
+        _ if row.selected => {
+            return Ok(Some(
+                "the registry selects this root but the checkout's receipt does not".to_owned(),
+            ))
+        }
+        _ => {}
     }
     if receipt.prepared_ref().is_some() {
         return Ok(Some("the checkout has a prepared transition".to_owned()));
@@ -2290,7 +2325,19 @@ fn checkout_absence(row: &Row, operator_legacy: bool) -> Result<Absence, String>
         }
         // SAFETY: `opened` is a newly owned descriptor.
         cursor = unsafe { OwnedFd::from_raw_fd(opened) };
-    } else if operator_legacy {
+    } else if !operator_legacy {
+        // A registered checkout outside /Volumes still needs its recorded
+        // volume: the nearest existing ancestor must be on that APFS/HFS
+        // volume; network, autofs or unknown file systems are kept.
+        let Some(uuid) = row.checkout_volume_uuid.as_deref() else {
+            return Ok(Absence::Unknown(
+                "the checkout has no recorded volume UUID".to_owned(),
+            ));
+        };
+        if let Err(reason) = on_recorded_volume(checkout, uuid) {
+            return Ok(Absence::Unknown(reason));
+        }
+    } else {
         // The explicit legacy exception allows only a positively mounted,
         // readable APFS data-volume ancestry below /Users.
         // The explicit legacy exception is volume-based: the nearest existing
@@ -2374,14 +2421,12 @@ fn checkout_absence(row: &Row, operator_legacy: bool) -> Result<Absence, String>
     Ok(Absence::Unknown("the checkout walk ended early".to_owned()))
 }
 
-/// The legacy operator-list exception's volume proof: the nearest existing
-/// ancestor of `checkout` (found without following its leaf) is a directory
-/// on the same device and APFS volume UUID as `/System/Volumes/Data`.
-fn on_boot_data_volume(checkout: &Path) -> Result<(), String> {
+/// The nearest existing ancestor of `checkout`, found without following it.
+fn nearest_ancestor(checkout: &Path) -> Result<&Path, String> {
     let mut ancestor = checkout.parent();
     while let Some(candidate) = ancestor {
         match fs::symlink_metadata(candidate) {
-            Ok(metadata) if metadata.is_dir() => break,
+            Ok(metadata) if metadata.is_dir() => return Ok(candidate),
             Ok(_) => {
                 return Err(format!(
                     "the nearest existing ancestor {} is not a directory",
@@ -2394,7 +2439,36 @@ fn on_boot_data_volume(checkout: &Path) -> Result<(), String> {
             Err(error) => return Err(format!("the checkout's ancestry is unreadable ({error})")),
         }
     }
-    let ancestor = ancestor.ok_or("the checkout has no existing ancestor")?;
+    Err("the checkout has no existing ancestor".to_owned())
+}
+
+/// A registered checkout's volume proof: its nearest existing ancestor is on
+/// a local APFS or HFS volume with the recorded UUID.
+fn on_recorded_volume(checkout: &Path, uuid: &str) -> Result<(), String> {
+    let ancestor = nearest_ancestor(checkout)?;
+    let facts = oxide_storage::volume::observe_path(ancestor)
+        .map_err(|error| format!("{} is unverifiable ({error})", ancestor.display()))?;
+    if !matches!(facts.fstype.as_str(), "apfs" | "hfs") {
+        return Err(format!(
+            "{} is on a {} file system, not a verified local volume",
+            ancestor.display(),
+            facts.fstype
+        ));
+    }
+    if facts.uuid.as_deref() != Some(uuid) {
+        return Err(format!(
+            "{} is not on the checkout's recorded volume",
+            ancestor.display()
+        ));
+    }
+    Ok(())
+}
+
+/// The legacy operator-list exception's volume proof: the nearest existing
+/// ancestor of `checkout` (found without following its leaf) is a directory
+/// on the same device and APFS volume UUID as `/System/Volumes/Data`.
+fn on_boot_data_volume(checkout: &Path) -> Result<(), String> {
+    let ancestor = nearest_ancestor(checkout)?;
     let data = oxide_storage::volume::observe_path(Path::new("/System/Volumes/Data"))
         .map_err(|error| format!("the boot Data volume is unverifiable ({error})"))?;
     let here = oxide_storage::volume::observe_path(ancestor)
@@ -2462,6 +2536,45 @@ fn injected_eacces(directory: &Path) -> bool {
 
 #[cfg(not(debug_assertions))]
 fn injected_eacces(_directory: &Path) -> bool {
+    false
+}
+
+/// Debug builds only: with `OXIDE_TEST_PRUNE_LOW_RESERVE_AT=<n>` under the
+/// shared proof supervisor's deadline, the n-th volume/reserve check of this
+/// process (1 = before the rename, later ones between delete batches) reads
+/// zero free space, so a proof drives the real reserve stop. Each firing is
+/// recorded in the evidence directory.
+#[cfg(debug_assertions)]
+fn injected_low_reserve() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CHECKS: AtomicU64 = AtomicU64::new(0);
+    let Some(at) = std::env::var("OXIDE_TEST_PRUNE_LOW_RESERVE_AT")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return false;
+    };
+    let armed = std::env::var("OXIDE_PROOF_DEADLINE_NS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some();
+    let count = CHECKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if !armed || count != at {
+        return false;
+    }
+    if let Some(evidence) = std::env::var_os("OXIDE_PROOF_EVIDENCE") {
+        let _ = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(Path::new(&evidence).join("prune-low-reserve-fired"))
+            .and_then(|mut file| writeln!(file, "check {count}"));
+    }
+    true
+}
+
+#[cfg(not(debug_assertions))]
+fn injected_low_reserve() -> bool {
     false
 }
 
@@ -2882,13 +2995,23 @@ impl RootSession {
                 "the registered volume is no longer verified ({error})"
             ))
         })?;
-        if let Some(available) = facts.available_bytes {
-            if available <= self.registration.reserve_bytes {
-                return Err(Stop::Pending(format!(
-                    "the registered volume's free space {available} bytes is at or below the recorded {} byte reserve",
-                    self.registration.reserve_bytes
-                )));
-            }
+        // Unknown free space is not above the reserve: stop.
+        let available = if injected_low_reserve() {
+            Some(0)
+        } else {
+            facts.available_bytes
+        };
+        let Some(available) = available else {
+            return Err(Stop::Pending(
+                "the registered volume's free space is unknown, so its reserve cannot be proved"
+                    .to_owned(),
+            ));
+        };
+        if available <= self.registration.reserve_bytes {
+            return Err(Stop::Pending(format!(
+                "the registered volume's free space {available} bytes is at or below the recorded {} byte reserve",
+                self.registration.reserve_bytes
+            )));
         }
         Ok(())
     }
@@ -3044,6 +3167,9 @@ struct Deleter<'a> {
     session: &'a RootSession,
     deadline: Instant,
     entries: u64,
+    /// The last volume and reserve check: rechecked every `DELETE_BATCH`
+    /// entries and at least at the existing watchdog cadence.
+    checked: Instant,
 }
 
 fn delete_contents(deleter: &mut Deleter, dir: BorrowedFd, top: bool) -> Result<(), Stop> {
@@ -3156,8 +3282,11 @@ fn delete_contents_at(
             }
         }
         deleter.entries += 1;
-        if deleter.entries % DELETE_BATCH == 0 {
+        if deleter.entries % DELETE_BATCH == 0
+            || deleter.checked.elapsed() >= crate::watchdog::INTERVAL
+        {
             deleter.session.check()?;
+            deleter.checked = Instant::now();
         }
     }
     Ok(())
@@ -3465,6 +3594,7 @@ fn journal_intent(
             "the registry became incomplete before the intent".to_owned(),
         ));
     }
+    let mut was_selected = false;
     if candidate.receiptless {
         // A temporary pruning row, within the live caps; never a selection.
         if registry.rows.iter().any(|row| row.root == candidate.root) {
@@ -3509,11 +3639,16 @@ fn journal_intent(
                     && row.root == candidate.root
             })
             .ok_or_else(|| Stop::Refuse("the registry row disappeared".to_owned()))?;
-        if !row.selected || row.pending || row.pruning.is_some() {
+        if row.pending
+            || row.pruning.is_some()
+            || row.reservation.is_some()
+            || row.cancelling.is_some()
+        {
             return Err(Stop::Refuse(
-                "the registry row is no longer an eligible selection".to_owned(),
+                "the registry row is no longer an eligible root".to_owned(),
             ));
         }
+        was_selected = row.selected;
         row.selected = false;
         row.pruning = Some(id.to_owned());
     }
@@ -3554,6 +3689,7 @@ fn journal_intent(
         updated_ms: process::now_ms(),
         resolved_ms: None,
         receipt_settled: false,
+        was_selected,
     });
     registry.bump().map_err(Stop::Refuse)?;
     // A failed publication may still have landed: the journal is then an
@@ -3579,6 +3715,7 @@ fn finish_quarantine(
         session,
         deadline: Instant::now() + Duration::from_secs(120),
         entries: 0,
+        checked: Instant::now(),
     };
     crash_point("deleting").map_err(Stop::Pending)?;
     delete_contents(&mut deleter, session.root.as_fd(), true)?;
@@ -3645,13 +3782,28 @@ fn settle_receipt(control: &Path, id: &str, outcome: &str) -> Result<(), String>
     if intent.receipt_settled {
         return Ok(());
     }
-    outputs::mark_pruned(
+    // A released root is history in its receipt: the receipt's own current
+    // selection (if any) is never rewritten for it.
+    let receipt = outputs::read_receipt_for_prune(
         control,
         &intent.identity.checkout,
         &intent.identity.checkout_id,
-        id,
-        outcome,
     )?;
+    let owns_terminal = receipt.as_ref().is_some_and(|receipt| {
+        outputs::receipt_is_pruning(receipt)
+            || receipt
+                .current()
+                .is_some_and(|selected| selected.root() == intent.identity.root)
+    });
+    if owns_terminal {
+        outputs::mark_pruned(
+            control,
+            &intent.identity.checkout,
+            &intent.identity.checkout_id,
+            id,
+            outcome,
+        )?;
+    }
     {
         let _guard = store::publication_guard(control)?;
         let mut registry = ready_registry(control)?;
@@ -3931,7 +4083,7 @@ fn rollback_intent(_store: &Store, control: &Path, intent: &Intent) -> Result<()
                 !(matches(row) && row.pruning.as_deref() == Some(intent.id.as_str()))
             });
         } else if let Some(row) = registry.rows.iter_mut().find(|row| matches(row)) {
-            row.selected = true;
+            row.selected = intent.was_selected;
             row.pending = false;
             row.pruning = None;
         }
@@ -4087,8 +4239,11 @@ fn receiptless_candidate(
     use std::os::unix::fs::MetadataExt;
     row.checkout_id = marker.checkout_id().to_owned();
     row.checkout = marker.checkout().to_path_buf();
-    if !hex64(&row.checkout_id) {
-        return Err("the listed root's marker names an unusable checkout identity".to_owned());
+    if row.checkout_id != crate::identity::digest(&row.checkout.to_string_lossy()) {
+        return Err(
+            "the listed root's marker checkout identity is not the digest of its checkout path"
+                .to_owned(),
+        );
     }
     row.receipt = outputs::receipt_path_public(control, &row.checkout_id);
     row.volume_uuid = Some(registration.volume_uuid.clone());
@@ -4647,6 +4802,7 @@ mod tests {
     fn a_preview_is_canonical_and_its_digest_binds_the_exact_bytes() {
         let registry = Registry {
             version: REGISTRY_VERSION.to_owned(),
+            schema: REGISTRY_SCHEMA,
             revision: 7,
             complete: true,
             incomplete: None,
@@ -4671,6 +4827,7 @@ mod tests {
     fn the_registry_refuses_unknown_schemas_and_contradictory_incompleteness() {
         let mut registry = Registry {
             version: "oxide.outputs.registry/9".to_owned(),
+            schema: REGISTRY_SCHEMA,
             revision: 1,
             complete: true,
             incomplete: None,
@@ -4842,9 +4999,22 @@ mod tests {
         let missing = fixture.root.join("missing-checkout");
         let mut row = row_for(&fixture.root);
         row.checkout = missing.clone();
+        // Without a recorded checkout volume, absence is never proved.
+        assert!(matches!(
+            checkout_absence(&row, false).unwrap(),
+            Absence::Unknown(_)
+        ));
+        row.checkout_volume_uuid = checkout_volume_uuid(&fixture.root);
         assert!(matches!(
             checkout_absence(&row, false).unwrap(),
             Absence::Absent
+        ));
+        // A different recorded volume keeps it.
+        let mut other = row.clone();
+        other.checkout_volume_uuid = Some("00000000-0000-0000-0000-000000000000".to_owned());
+        assert!(matches!(
+            checkout_absence(&other, false).unwrap(),
+            Absence::Unknown(_)
         ));
         fs::create_dir_all(&missing).unwrap();
         assert!(matches!(
@@ -4938,6 +5108,7 @@ mod tests {
         row.receipt = receipt_path;
         let registry = Registry {
             version: REGISTRY_VERSION.to_owned(),
+            schema: REGISTRY_SCHEMA,
             revision: 1,
             complete: true,
             incomplete: None,
@@ -4988,9 +5159,11 @@ mod tests {
             updated_ms: 1,
             resolved_ms: None,
             receipt_settled: false,
+            was_selected: true,
         };
         let mut registry = Registry {
             version: REGISTRY_VERSION.to_owned(),
+            schema: REGISTRY_SCHEMA,
             revision: 1,
             complete: false,
             incomplete: Some(Incomplete {
@@ -5019,6 +5192,7 @@ mod tests {
         ensure_private_dir(&registry_dir(&control)).unwrap();
         let registry = Registry {
             version: REGISTRY_VERSION.to_owned(),
+            schema: REGISTRY_SCHEMA,
             revision: 5,
             complete: true,
             incomplete: None,
@@ -5133,6 +5307,7 @@ mod tests {
             updated_ms: 1,
             resolved_ms: None,
             receipt_settled: false,
+            was_selected: true,
         };
         let checkout_id = row.checkout_id.clone();
         let control = ready_control(&fixture, vec![row], vec![intent.clone()]);
@@ -5249,6 +5424,51 @@ mod tests {
         let fixture = Fixture::new();
         on_boot_data_volume(&fixture.root.join("gone/deeper/checkout")).unwrap();
         assert!(!injected_eacces(&fixture.root));
+    }
+
+    /// A row evaluated from the snapshot is a clone: it must not count as
+    /// "another live reference" to its own root, while a second checkout's
+    /// live row naming the same root still keeps it.
+    #[test]
+    fn a_cloned_row_is_not_another_reference_to_its_own_root() {
+        let fixture = Fixture::new();
+        let row = row_for(&fixture.root);
+        let control = ready_control(&fixture, vec![row.clone()], Vec::new());
+        let registry = ready_registry(&control).unwrap();
+        let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
+        let mut budget = SNAPSHOT_MAX_BYTES;
+        let reason = eligibility(
+            &store,
+            &control,
+            &registry,
+            &row,
+            None,
+            None,
+            &mut budget,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!reason.contains("another live reference"), "{reason}");
+        let mut other = row.clone();
+        other.checkout_id = "e".repeat(64);
+        let control2 = fixture.root.join("second");
+        fs::create_dir(&control2).unwrap();
+        let mut both = registry.clone();
+        both.rows.push(other);
+        let reason = eligibility(
+            &store,
+            &control,
+            &both,
+            &row,
+            None,
+            None,
+            &mut budget,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(reason.contains("another live reference"), "{reason}");
     }
 
     #[test]

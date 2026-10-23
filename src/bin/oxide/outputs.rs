@@ -551,6 +551,10 @@ pub(crate) struct Marker {
     /// marker always carries one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     nonce: Option<String>,
+    /// The APFS volume UUID of the checkout when the root was created
+    /// (shared `oxide.outputs.root/2`); absent in version-1 markers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkout_volume_uuid: Option<String>,
     /// The generation the root was created at; never rewritten.
     generation: u64,
     created_ms: u64,
@@ -2141,6 +2145,13 @@ pub fn reserve(
     if context.receipt()?.is_none() || crate::prune::require_registry(control).is_err() {
         return Ok(());
     }
+    // A recreated checkout never reserves or binds while a prune intent for
+    // it is unsettled.
+    if let Some(intent) = crate::prune::unsettled_for(control, &context.checkout_id)? {
+        return Err(format!(
+            "outputs: prune intent {intent} is unsettled for this checkout; nothing is built until the exact intent completes or `oxide outputs resolve-intent {intent}` settles it"
+        ));
+    }
     let _binding = store.lock_binding(checkout)?;
     // Overflow publication needs at most one retry: the first attempt
     // durably records sticky incompleteness and the second tags the receipt.
@@ -2805,6 +2816,7 @@ fn create_marker(
         kind: selected.kind,
         volume_uuid: selected.volume_uuid.clone(),
         nonce: selected.nonce.clone(),
+        checkout_volume_uuid: crate::prune::checkout_volume_uuid(&context.workspace),
         generation,
         created_ms: process::now_ms(),
     };
@@ -4247,6 +4259,7 @@ mod tests {
                 kind: RootKind::Local,
                 volume_uuid: None,
                 nonce: Some("11111111111111111111111111111111".to_owned()),
+                checkout_volume_uuid: None,
                 generation: 1,
                 created_ms: 1,
             })
