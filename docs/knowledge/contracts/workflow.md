@@ -689,12 +689,24 @@ changes Cargo config, the sccache server or its cache.
   `config.toml` when both exist). An unreadable file or an `include` reports the name
   as unknown, never as none; the bypass does not depend on the name.
 - **Proof:** `effigy rust:oxide-wrapper-bypass`, on fixtures with a recording
-  fake wrapper only. Evidence is in the oxide#099 PR. The selector is unqualified
-  test tooling: timeout cleanup can leave Cargo's separate process group running.
-  Its plain-Cargo staging has no host-reserve watchdog; the reserve is checked
-  before and after. The final dual-config and corrected-cleanup cases have no
-  native run. Tom's acceptance of the product source with these disclosed gaps
-  does not qualify the apparatus or supply that missing evidence.
+  fake wrapper only. The oxide#099 evidence is in its PR and stays historical.
+  oxide#131 moved the selector onto the qualified shared supervisor as one
+  fixed script: `bounded-test.py --limit 300 --scratch-budget-mib 512` owns
+  the absolute deadline, the continuous 20 GiB reserve watchdog through
+  plain-Cargo staging and every fixture child, the 512 MiB monitored scratch
+  and cleanup. The script keeps no clock, scratch or sampler of its own,
+  starts no session and sends no group signal; a child deadline kill touches
+  only that direct child PID and reports closure unknown. Closure is the
+  supervisor's post-leader session census. Cargo may start its own process
+  groups, so no separate-Cargo-group closure is claimed and a `setsid` escape
+  is outside the census. Staging seeds HEAD's `Cargo.lock` into a private
+  offline `CARGO_HOME` with the [shared seeder](#bounded-offline-lock-seeder)
+  and then verifies the private Longhorn checkout at the locked commit; the
+  same fixed script first runs that seeder's synthetic cases. The final
+  dual-config case is now exercised in source, but no native run of this
+  script under the supervisor exists: native activation is separately gated
+  (#131), and Tom's acceptance of the product source does not qualify the
+  apparatus or substitute for that run.
 
 The [qualified cross-worktree result](project-adoption.md#focused-cross-worktree-result)
 supports this shape for one workflow: a different-path checkout on a shared
@@ -1629,6 +1641,75 @@ one. Pool-scale's own `mktemp` scratch lies outside the supervisor's owned
 bytes.
 `scripts/bounded_runner.py` (oxide#097) stays separate and unqualified.
 
+### Bounded offline lock seeder
+
+`scripts/offline_seed.py` (oxide#131) is the one seeder for proof fixtures that
+need a private, offline `CARGO_HOME` without a download. It takes one
+`Cargo.lock` and the host Cargo home and copies only the lock's inputs, so a
+proof never copies the host registry whole.
+
+- **Selection.** One supported crates.io sparse namespace
+  (`index.crates.io-1949cf8c6b5b557f`), matched on index and cache: the
+  namespace `config.json`, one sparse-index `.cache` entry per locked registry
+  package and one `.crate` archive per package whose bytes must equal the lock
+  checksum. Workspace and path packages are skipped. One pinned Git source
+  (exact URL, name, version and full 40-hex commit) seeds its bare database
+  candidates; more than one Git source, another registry source, a duplicate
+  or malformed lock entry, or an unsafe name, version, checksum or revision
+  refuses.
+- **Anchored reads.** One opened host root; every source component is opened
+  descriptor-relative with `O_NOFOLLOW` on the root's device, so a symlink,
+  special file, foreign device or missing component refuses. Each copied file
+  is checked before and after its bytes are read (identity, size, mtime and
+  ctime) and its name is reopened afterwards, so a changed source refuses.
+- **Git without host Git.** No Git ever runs on a host repository, so its
+  local config, includes, hooks and alternates are never read. Candidate
+  selection only measures regular-file bytes through the same anchored walk;
+  it establishes no commit. Every candidate that fits the remaining aggregate
+  is copied first (host `config` and `hooks` skipped, a known private config
+  generated, `objects/info/alternates` refused), and only then is the locked
+  commit read inside the sanitized private copy with system and global config
+  disabled, hooks and transports disabled and lazy fetch off. A copied
+  candidate that does not carry the commit is rejected and stays charged; an
+  oversized candidate is not attempted, its entries stay charged, and its
+  record says so. The seed refuses when no attempted candidate resolves the
+  commit.
+- **Bounds, charged across the whole seed.** 256 MiB of copied bytes checked
+  before each write; at most 8 Git candidates; at most 100,000 enumerated
+  entries and depth 64; at most 1 MiB for one manifest read and 8 MiB of
+  manifest reads; at most 64 KiB of Git output and 10 s for one Git command;
+  at most 45 s of seed work and never past the caller's exported absolute
+  deadline. No byte, entry or metadata charge is reset per attempt, copied
+  bytes are never removed, there is no network, authentication, fetch, host
+  cache write or unbounded directory copy.
+- **Observed fit (2026-10-23, development check, not a native proof).** This
+  repository's lock seeds 22 registry packages and three Longhorn bare-database
+  candidates in 0.2 s: the required candidate copies 12.2 MB and resolves the
+  locked commit; a second 13.4 MB candidate is copied and rejected as not
+  carrying it; a 2.0 GiB candidate is measured and not attempted, remaining
+  inside the entry and byte bounds. Total copied bytes are 29.7 MB of the
+  256 MiB seed bound.
+- **Receipts.** A consumer proof records the seeder's SHA-256 in its own
+  exact-head receipt together with its own script. Importing the seeder
+  transfers no qualification: each proof's evidence stays bound to the exact
+  sources it ran.
+- **Synthetic cases.** The module's `--self-test ROOT` (also run first by the
+  wrapper-bypass native) creates tiny fixtures only under ROOT and covers a
+  registry+Git positive, a copied-but-rejected candidate, a measured and
+  unattempted oversized candidate, a wrong commit, a missing candidate, a
+  malformed lock, symlinked inputs and the byte, candidate and entry cap
+  negatives.
+- **Consumers.** `test-accounting-vanished.py` (registry), `test-max-active.py`
+  (registry and pinned Git), `test-storage-layout.py` (registry and pinned Git),
+  `test-oxide-cli.py`'s `--clean-safety` (a one-package cfg-if 1.0.0 lock with
+  its known checksum) and `test-pool-describe.py` (the bounded reference) seed
+  through it. `test_build_context_comparison.py` declares registry inputs for
+  its synthetic launcher and never scans the live host cache, so it is not a
+  seeder consumer. Proofs that stage with the host Cargo home offline and copy
+  nothing are not seeders either. Migrating a consumer changes no selector
+  bound: the seeder respects any lower caller budget and never raises one.
+  Their recorded native evidence predates the migration and stays historical.
+
 ### Rollback
 
 Do not rehearse these steps; they remove the dogfood artifacts.
@@ -2176,8 +2257,9 @@ it never deletes there itself.
   an outside symlink to a pool directory inside the target, the
   `--include-foreign` clean, its dry run and a `--release` clean all refuse
   with the slot sentinel and tree unchanged. A fresh private
-  `CARGO_HOME` is seeded by copying `cfg-if` 1.0.0 and its sparse-index
-  entry from the host cache (checksum checked, nothing fetched); there each
+  `CARGO_HOME` is seeded by the [shared seeder](#bounded-offline-lock-seeder)
+  from a one-package lock for `cfg-if` 1.0.0 (checksum checked, nothing
+  fetched); there each
   risky key refuses by name (`source`, `registries`, both credential-provider
   keys, quoted-dotted `net.git-fetch-with-cli`, `include`; one in the Cargo
   home, a `build.rustc-wrapper` in an ancestor's `.cargo/config`), with no
@@ -3072,7 +3154,7 @@ benchmark, real-drive qualification or an alias for full QA.
 
 ### `oxide pool describe --json`
 
-The stable, read-only interface other tools use to find the registered Builds drive. Oxide#112 implements it. The recorded fixed native proof passed at `ade4d51` under the qualified runner `d89115f1` (run `7bca5d80c0242754ec72b928a86f84b4`), including the `reserve_bytes` assertions. That source predates describe's registration-v2/mode integration and does not validate the integrated source. Earlier passes at `1f9607c1` (run `5711ac9a89310c08052f3929e9198a20`), `034f9ac4` under the qualified #109 runner (run `580419035311c3a1ee3061c0a7a95ed6`), and `89aa9b2e` remain historical; the last two predate the host commit prefilter. Output on stdout, schema version 1:
+The stable, read-only interface other tools use to find the registered Builds drive. Oxide#112 implements it. The recorded fixed native proof passed at `ade4d51` under the qualified runner `d89115f1` (run `7bca5d80c0242754ec72b928a86f84b4`), including the `reserve_bytes` assertions. That source predates describe's registration-v2/mode integration and does not validate the integrated source. Earlier passes at `1f9607c1` (run `5711ac9a89310c08052f3929e9198a20`), `034f9ac4` under the qualified #109 runner (run `580419035311c3a1ee3061c0a7a95ed6`), and `89aa9b2e` remain historical; the last two predate the host commit check that the [shared seeder](#bounded-offline-lock-seeder) later removed, and their evidence stays historical. Output on stdout, schema version 1:
 
 ```json
 {
@@ -3113,7 +3195,7 @@ The stable, read-only interface other tools use to find the registered Builds dr
 - **A snapshot.** The data is a point-in-time observation. Before writing, consumers still apply their own gate: the volume UUID, the mount root, and a device different from both `/` and `/System/Volumes/Data`.
 - **Exit codes:** 0 whenever the description was produced, whether or not a drive is registered or available. Non-zero only when Oxide itself fails (for example, settings cannot be read), with the reason on stderr.
 - **Compatibility:** fields may be added in schema 1. Removing or renaming a field needs `oxide.pool.describe/2`.
-- **Proof.** Library tests read a private config and ledger fixture, including a pending record, and check the directory tree is unchanged afterwards. Refusals (other backends, mismatched store IDs, missing files) leave the tree unchanged. Unit tests use the existing thread-local permission-denied seam on both control files to verify that non-missing metadata failures propagate as I/O errors, rather than missing files, without changing the fixture. CLI unit tests cover legacy v1 and both v2 modes, malformed and unsupported registrations, byte/metadata/directory nonmutation, the RFC 3339 timestamp, null and unknown-registration JSON with escaping, reason tags, bounded reads and their output cap. Not yet proven: a real or tiny APFS volume. The fixed proof `rust:pool-describe` (`scripts/test-pool-describe.py`) passed at `ade4d51` (run `7bca5d80c0242754ec72b928a86f84b4`), and earlier at `1f9607c1` and `034f9ac4`. It covers four CLI case meanings, each with nonmutation: no registration, an unknown registration, an absent volume, and the usage refusal without `--json`. The absent-volume fixture now checks legacy v1 plus v2 ephemeral and permanent; the recorded native passes predate that extension. It runs inside the qualified shared runner (#109, `scripts/bounded-test.py` SHA-256 `d89115f1…`) with a 300 s limit and a 512 MiB monitored budget. Offline staging does not copy the host registry whole. The one locked Longhorn Git source seeds its bare database candidates (one to eight `longhorn-<16 hex>` directories, refused above eight), bounded by the same 256 MiB aggregate, each with a private config. A read-only prefilter checks the full locked commit in each host candidate before any copy, and only commit-bearing candidates are copied. Each private copy must resolve the locked commit again, and a refusal keeps the per-candidate record and charged bytes. After staging, exactly one checkout at the locked rev must exist, with exactly the full locked HEAD; Cargo chooses its identifier. The seed is selected from HEAD's `Cargo.lock`: one supported crates.io namespace, matched on index and cache, with at most 256 MiB aggregate of lock-selected cached inputs. Seed preflight plus copy is not one no-follow operation; that race is disclosed. It does not cover `available: true`, the volume-dependent refusals, pending reconciliation through the CLI, or live diskutil bounds. Those gaps are listed in the script.
+- **Proof.** Library tests read a private config and ledger fixture, including a pending record, and check the directory tree is unchanged afterwards. Refusals (other backends, mismatched store IDs, missing files) leave the tree unchanged. Unit tests use the existing thread-local permission-denied seam on both control files to verify that non-missing metadata failures propagate as I/O errors, rather than missing files, without changing the fixture. CLI unit tests cover legacy v1 and both v2 modes, malformed and unsupported registrations, byte/metadata/directory nonmutation, the RFC 3339 timestamp, null and unknown-registration JSON with escaping, reason tags, bounded reads and their output cap. Not yet proven: a real or tiny APFS volume. The fixed proof `rust:pool-describe` (`scripts/test-pool-describe.py`) passed at `ade4d51` (run `7bca5d80c0242754ec72b928a86f84b4`), and earlier at `1f9607c1` and `034f9ac4`. It covers four CLI case meanings, each with nonmutation: no registration, an unknown registration, an absent volume, and the usage refusal without `--json`. The absent-volume fixture now checks legacy v1 plus v2 ephemeral and permanent; the recorded native passes predate that extension. It runs inside the qualified shared runner (#109, `scripts/bounded-test.py` SHA-256 `d89115f1…`) with a 300 s limit and a 512 MiB monitored budget. Offline staging does not copy the host registry whole. The seed is selected from HEAD's `Cargo.lock` by the [shared seeder](#bounded-offline-lock-seeder): one supported crates.io namespace matched on index and cache, and the one locked Longhorn Git source's bare database candidates, bounded by the same 256 MiB aggregate. No Git runs on a host repository. Candidate selection only measures bytes; each candidate that fits is copied first through anchored no-follow descriptors with its host config and hooks skipped, a known private config generated and alternates refused, and only then must its private copy resolve the locked commit. A copied candidate that does not carry the commit is rejected and stays charged, an oversized one is not attempted, and a refusal keeps the per-candidate record. After staging, exactly one checkout at the locked rev must exist, with exactly the full locked HEAD; Cargo chooses its identifier. The seeder's record and hash are in the script's receipt, and the recorded native passes predate this migration. It does not cover `available: true`, the volume-dependent refusals, pending reconciliation through the CLI, or live diskutil bounds. Those gaps are listed in the script.
 
 ## Adaptive sccache location (proposed)
 

@@ -20,6 +20,11 @@ import time
 
 sys.dont_write_bytecode = True
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import offline_seed  # scripts/offline_seed.py, oxide#131; its hash is in the receipt
+
 BUILDER = "1.97.1"
 SHUTDOWN_MARGIN_S = 30
 MAX_ACTIVE_RUNNER_SHA256 = "8e379c93416c6e06b7f06bec7f86dba4fca4c8900b1cc87f1eb6303d39897a9d"
@@ -82,164 +87,30 @@ def write_evidence(name: str, contents: str) -> None:
     os.chmod(path, 0o600)
 
 
-def sparse_index_path(name: str) -> str:
-    name = name.lower()
-    if len(name) == 1:
-        return os.path.join("1", name)
-    if len(name) == 2:
-        return os.path.join("2", name)
-    if len(name) == 3:
-        return os.path.join("3", name[0], name)
-    return os.path.join(name[:2], name[2:4], name)
+def seed_private_cargo_home(host_home: str, private_home: str) -> None:
+    """Seed the lock's registry and pinned Git inputs with the shared helper.
 
-
-def locked_registry_packages() -> list[tuple[str, str]]:
-    lock = read_text(os.path.join(REPO, "Cargo.lock"))
-    packages = []
-    for block in lock.split("[[package]]")[1:]:
-        values = {}
-        for line in block.splitlines():
-            match = re.match(r'^(name|version|source) = "([^"]+)"$', line)
-            if match:
-                values[match.group(1)] = match.group(2)
-        if values.get("source", "").startswith("registry+"):
-            packages.append((values["name"], values["version"]))
-    return packages
-
-
-def locked_git_packages() -> list[tuple[str, str, str, str]]:
-    lock = read_text(os.path.join(REPO, "Cargo.lock"))
-    packages = []
-    for block in lock.split("[[package]]")[1:]:
-        values = {}
-        for line in block.splitlines():
-            match = re.match(r'^(name|version|source) = "([^"]+)"$', line)
-            if match:
-                values[match.group(1)] = match.group(2)
-        source = values.get("source", "")
-        if not source.startswith("git+"):
-            continue
-        url_and_fragment = source[len("git+"):]
-        if "#" not in url_and_fragment:
-            fail(f"locked Git crate {values.get('name', '<unknown>')} has no revision")
-        url, revision = url_and_fragment.rsplit("#", 1)
-        repository_url = url.split("?", 1)[0]
-        repository_name = os.path.basename(repository_url.rstrip("/"))
-        if repository_name.endswith(".git"):
-            repository_name = repository_name[:-4]
-        packages.append((values["name"], values["version"], repository_name, revision))
-    return packages
-
-
-def checkout_contains_package(checkout: str, package: str) -> bool:
-    for current, directories, files in os.walk(checkout):
-        directories[:] = [directory for directory in directories if directory not in (".git", "target", "node_modules")]
-        if "Cargo.toml" not in files:
-            continue
-        manifest = read_text(os.path.join(current, "Cargo.toml"))
-        section = re.search(r"(?ms)^\[package\]\s*(.*?)(?=^\[|\Z)", manifest)
-        if section is None:
-            continue
-        name = re.search(r'(?m)^name\s*=\s*"([^"]+)"\s*$', section.group(1))
-        if name and name.group(1) == package:
-            return True
-    return False
-
-
-def reject_symlinks(root: str) -> None:
-    for current, directories, files in os.walk(root):
-        for name in directories + files:
-            path = os.path.join(current, name)
-            expect(not os.path.islink(path), f"locked Git cache contains a symlink: {path}")
-
-
-def prepare_private_cargo_home(host_home: str, private_home: str) -> None:
-    """Copy only locked registry crates and Git sources into scratch."""
-    host_registry = os.path.join(host_home, "registry")
-    private_registry = os.path.join(private_home, "registry")
-    packages = locked_registry_packages()
-    index_roots = [
-        name for name in os.listdir(os.path.join(host_registry, "index"))
-        if os.path.isdir(os.path.join(host_registry, "index", name))
-    ]
-    source_roots = [
-        name for name in os.listdir(os.path.join(host_registry, "src"))
-        if os.path.isdir(os.path.join(host_registry, "src", name))
-    ]
-    cache_roots = [
-        name for name in os.listdir(os.path.join(host_registry, "cache"))
-        if os.path.isdir(os.path.join(host_registry, "cache", name))
-    ]
-    expect(index_roots and source_roots and cache_roots, "host Cargo registry cache is incomplete")
-
-    for name in index_roots:
-        source = os.path.join(host_registry, "index", name, "config.json")
-        if os.path.isfile(source):
-            target = os.path.join(private_registry, "index", name, "config.json")
-            make_dir(os.path.dirname(target))
-            shutil.copy2(source, target)
-
-    for package, version in packages:
-        index_copied = False
-        for name in index_roots:
-            entry = sparse_index_path(package)
-            source = os.path.join(host_registry, "index", name, ".cache", entry)
-            if os.path.isfile(source):
-                target = os.path.join(private_registry, "index", name, ".cache", entry)
-                make_dir(os.path.dirname(target))
-                shutil.copy2(source, target)
-                index_copied = True
-        expect(index_copied, f"locked crate {package} {version} has no cached sparse-index entry")
-
-        artifact_copied = False
-        for name in source_roots:
-            source = os.path.join(host_registry, "src", name, f"{package}-{version}")
-            if os.path.isdir(source):
-                target = os.path.join(private_registry, "src", name, f"{package}-{version}")
-                make_dir(os.path.dirname(target))
-                shutil.copytree(source, target, dirs_exist_ok=True)
-                artifact_copied = True
-        for name in cache_roots:
-            source = os.path.join(host_registry, "cache", name, f"{package}-{version}.crate")
-            if os.path.isfile(source):
-                target = os.path.join(private_registry, "cache", name, f"{package}-{version}.crate")
-                make_dir(os.path.dirname(target))
-                shutil.copy2(source, target)
-                artifact_copied = True
-        expect(artifact_copied, f"locked crate {package} {version} has no cached source or archive")
-
-    host_git = os.path.join(host_home, "git")
-    private_git = os.path.join(private_home, "git")
-    for package, version, repository_name, revision in locked_git_packages():
-        host_checkouts = os.path.join(host_git, "checkouts")
-        candidates = []
-        for repository_id in sorted(os.listdir(host_checkouts)):
-            if not re.fullmatch(re.escape(repository_name) + r"-[0-9a-f]{16}", repository_id):
-                continue
-            checkout = os.path.join(host_checkouts, repository_id, revision[:7])
-            if os.path.isdir(checkout) and checkout_contains_package(checkout, package):
-                candidates.append((repository_id, checkout))
-        expect(
-            len(candidates) == 1,
-            f"locked Git crate {package} {version} has {len(candidates)} matching cached checkouts",
+    `scripts/offline_seed.py` (oxide#131) copies every candidate first through
+    anchored descriptors, generates its own private Git config, refuses host
+    alternates, symlinks and changed sources, charges rejected candidates and
+    verifies the locked commit only inside the private copy. Its hash is part
+    of this script's source set: importing it transfers no qualification.
+    """
+    lock_bytes = open(os.path.join(REPO, "Cargo.lock"), "rb").read()
+    try:
+        seed = offline_seed.seed_cargo_home(
+            host_home,
+            private_home,
+            lock_bytes,
+            deadline_ns=DEADLINE_NS - int(SHUTDOWN_MARGIN_S * 1e9),
         )
-        repository_id, source_checkout = candidates[0]
-        source_db = os.path.join(host_git, "db", repository_id)
-        expect(os.path.isdir(source_db), f"locked Git crate {package} {version} has no cached database")
-        reject_symlinks(source_checkout)
-        reject_symlinks(source_db)
-
-        target_db = os.path.join(private_git, "db", repository_id)
-        target_checkout = os.path.join(private_git, "checkouts", repository_id, revision[:7])
-        make_dir(os.path.dirname(target_db))
-        shutil.copytree(source_db, target_db, dirs_exist_ok=True)
-        make_dir(os.path.dirname(target_checkout))
-        shutil.copytree(source_checkout, target_checkout, dirs_exist_ok=True)
-
-        config_path = os.path.join(target_checkout, ".git", "config")
-        config = read_text(config_path)
-        expect(source_db in config, f"locked Git checkout {package} has an unexpected local origin")
-        write_file(config_path, config.replace(source_db, target_db))
+    except offline_seed.SeedRefusal as error:
+        fail(f"bounded offline seed refused: {error}")
+    print(
+        f"private offline Cargo seed: {seed['packages']} registry packages, "
+        f"{len(seed['git']['candidates'])} Git candidates, "
+        f"{seed['aggregate_bytes']} bytes, {seed['entries']} entries"
+    )
 
 
 def read_text(path: str) -> str:
@@ -293,7 +164,7 @@ def clear_owned_environment() -> dict[str, str]:
     cargo_home = os.path.join(ROOT, "cargo-home")
     make_dir(home)
     make_dir(cargo_home)
-    prepare_private_cargo_home(host_cargo_home, cargo_home)
+    seed_private_cargo_home(host_cargo_home, cargo_home)
     env.update(
         {
             "HOME": home,
@@ -661,6 +532,11 @@ def main() -> None:
         "source_commit": source,
         "source_tree": tree,
         "binary_sha256": RESULTS[0].get("binary_sha256"),
+        "helper_sha256": {
+            "scripts/offline_seed.py": hashlib.sha256(
+                open(os.path.join(REPO, "scripts", "offline_seed.py"), "rb").read()
+            ).hexdigest()
+        },
         "runner_sha256": runner_hash,
         "result": "pass",
         "cases": RESULTS,
