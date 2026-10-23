@@ -62,6 +62,10 @@ pub const MARKER: &str = ".oxide-output.json";
 pub const GITIGNORE_LINE: &str = "/.oxide-outputs/";
 
 const RECEIPT_VERSION: &str = "oxide.outputs.transition/2";
+/// The bound successor receipt (oxide#133): `target` stays a real directory
+/// and each positively identified profile member is an owned link. A legacy
+/// receipt is never written in this form without an explicit migration.
+const PROFILE_RECEIPT_VERSION: &str = "oxide.outputs.transition/3";
 /// Version-1 receipts are read as legacy and upgraded on the next write,
 /// only behind the version-2 forward fence (oxide#129).
 const LEGACY_RECEIPT_VERSION: &str = "oxide.outputs.transition/1";
@@ -232,8 +236,39 @@ enum ReceiptState {
     Pruning,
 }
 
+/// How a receipt places this checkout's final outputs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LayoutKind {
+    /// oxide#117/#129: `<checkout>/target` is one owned link to the root.
+    /// Legacy receipts keep exactly this format and destination key until an
+    /// explicit `oxide outputs adopt` migrates them.
+    WholeTarget,
+    /// The bound profile layout: `<checkout>/target` stays a real directory
+    /// and each profile member is an owned link into the root.
+    Profile,
+}
+
+impl LayoutKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::WholeTarget => "whole-target",
+            Self::Profile => "profile members",
+        }
+    }
+
+    /// The receipt format this layout is published in: a legacy receipt is
+    /// never silently rewritten as a successor.
+    fn receipt_version(self) -> &'static str {
+        match self {
+            Self::WholeTarget => RECEIPT_VERSION,
+            Self::Profile => PROFILE_RECEIPT_VERSION,
+        }
+    }
+}
+
 /// The checkout's owned-output receipt, keyed by canonical checkout.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Receipt {
     version: String,
     checkout: PathBuf,
@@ -241,15 +276,22 @@ pub(crate) struct Receipt {
     /// Last committed generation; zero before the first conversion.
     generation: u64,
     state: ReceiptState,
-    /// Exactly one placement, `target`, in this tranche (oxide#129). Roots
-    /// hold immutable nonces; placements only reference them.
+    layout: LayoutKind,
+    /// The owned placements of this layout: exactly one `target` placement
+    /// for a legacy receipt, one per positively identified profile member for
+    /// the bound profile layout. Roots hold immutable nonces; placements only
+    /// reference them.
     links: Vec<LinkPlacement>,
+    /// A durable random nonce reserved for a future root before a command's
+    /// slot is keyed (oxide#129). Reservations are root-level: every member
+    /// of this checkout shares one future root and its nonce. Commands that
+    /// want the identical future root share it; it is consumed by the commit
+    /// that creates the root or removed only by the cancellation journal.
+    reserved: Option<Reservation>,
     /// Bounded history of roots this checkout has selected, newest last.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     roots: Vec<Selected>,
     /// The terminal outcome of an explicit prune, when this receipt was
     /// pruned or resolved.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pruned: Option<PruneRecord>,
     updated_ms: u64,
 }
@@ -272,12 +314,6 @@ struct LinkPlacement {
     selected: Option<Selected>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prepared: Option<Prepared>,
-    /// A durable random nonce reserved for a future root before a command's
-    /// slot is keyed (oxide#129). Commands that want the identical future
-    /// root share it; it is consumed by the commit that creates the root or
-    /// removed only by the cancellation journal.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    reserved: Option<Reservation>,
 }
 
 /// A reserved future root: its transaction ID, root nonce and the exact
@@ -323,31 +359,77 @@ impl Reservation {
 }
 
 impl Receipt {
+    /// A receipt for a checkout that has never converted: the legacy
+    /// whole-target layout, selected by nothing.
     fn first(checkout: &Path, checkout_id: &str) -> Self {
+        Self::first_with(checkout, checkout_id, LayoutKind::WholeTarget)
+    }
+
+    fn first_with(checkout: &Path, checkout_id: &str, layout: LayoutKind) -> Self {
+        let links = match layout {
+            LayoutKind::WholeTarget => vec![LinkPlacement {
+                member: MEMBER.to_owned(),
+                selected: None,
+                prepared: None,
+            }],
+            LayoutKind::Profile => Vec::new(),
+        };
         Self {
-            version: RECEIPT_VERSION.to_owned(),
+            version: layout.receipt_version().to_owned(),
             checkout: checkout.to_path_buf(),
             checkout_id: checkout_id.to_owned(),
             generation: 0,
             state: ReceiptState::Detached,
-            links: vec![LinkPlacement {
-                member: MEMBER.to_owned(),
-                selected: None,
-                prepared: None,
-                reserved: None,
-            }],
+            layout,
+            links,
+            reserved: None,
             roots: Vec::new(),
             pruned: None,
             updated_ms: process::now_ms(),
         }
     }
 
+    /// The first placement: the legacy `target` link, or the first profile
+    /// member in sorted order. Profile paths address members explicitly.
     fn link(&self) -> &LinkPlacement {
         &self.links[0]
     }
 
     fn link_mut(&mut self) -> &mut LinkPlacement {
         &mut self.links[0]
+    }
+
+    pub(crate) fn layout(&self) -> LayoutKind {
+        self.layout
+    }
+
+    pub(crate) fn links(&self) -> &[LinkPlacement] {
+        &self.links
+    }
+
+    pub(crate) fn placement(&self, member: &str) -> Option<&LinkPlacement> {
+        self.links.iter().find(|placement| placement.member == member)
+    }
+
+    /// The placement a prepared transition belongs to, by its recorded link.
+    /// The link path is authoritative, so a replay never depends on a file's
+    /// contents to find its own transition.
+    fn placement_for_link(&self, link: &Path) -> Option<&LinkPlacement> {
+        self.links
+            .iter()
+            .find(|placement| self.link_path(&placement.member).as_path() == link)
+    }
+
+    fn placement_for_link_mut(&mut self, link: &Path) -> Option<&mut LinkPlacement> {
+        let checkout = self.checkout.clone();
+        self.links
+            .iter_mut()
+            .find(|placement| link_path(&checkout, placement.member.as_str()).as_path() == link)
+    }
+
+    /// The live link path of one placement member.
+    fn link_path(&self, member: &str) -> PathBuf {
+        link_path(&self.checkout, member)
     }
 
     pub(crate) fn checkout(&self) -> &Path {
@@ -369,21 +451,69 @@ impl Receipt {
         matches!(self.state, ReceiptState::Committed | ReceiptState::Prepared)
     }
 
-    /// The placement's selected root, whether or not the state is committed.
+    /// The layout's representative selected root, whether or not the state is
+    /// committed. A profile layout may let two members select different
+    /// roots (per-member fallback), so member-specific paths use
+    /// [`Receipt::selected_for`].
     pub(crate) fn current(&self) -> Option<&Selected> {
-        self.link().selected.as_ref()
+        self.links.iter().find_map(|placement| placement.selected.as_ref())
+    }
+
+    /// The root one member's placement selects.
+    pub(crate) fn selected_for(&self, member: &str) -> Option<&Selected> {
+        self.placement(member).and_then(|placement| placement.selected.as_ref())
     }
 
     pub(crate) fn prepared_ref(&self) -> Option<&Prepared> {
-        self.link().prepared.as_ref()
+        self.links
+            .iter()
+            .find_map(|placement| placement.prepared.as_ref())
     }
 
     pub(crate) fn reserved(&self) -> Option<&Reservation> {
-        self.link().reserved.as_ref()
+        self.reserved.as_ref()
+    }
+
+    fn reserved_mut(&mut self) -> &mut Option<Reservation> {
+        &mut self.reserved
+    }
+
+    /// Whether this receipt places the given profile member.
+    pub(crate) fn holds_member(&self, member: &str) -> bool {
+        self.placement(member).is_some()
+    }
+
+    /// Add a placement for one profile member, keeping members sorted.
+    fn place_member(&mut self, member: &str) -> &mut LinkPlacement {
+        let position = self
+            .links
+            .iter()
+            .position(|placement| placement.member == member)
+            .unwrap_or_else(|| {
+                self.links.push(LinkPlacement {
+                    member: member.to_owned(),
+                    selected: None,
+                    prepared: None,
+                });
+                self.links
+                    .sort_by(|left, right| left.member.cmp(&right.member));
+                self.links
+                    .iter()
+                    .position(|placement| placement.member == member)
+                    .unwrap_or(0)
+            });
+        &mut self.links[position]
+    }
+
+    /// Drop one member's placement after an explicit detach of that member.
+    fn forget_member(&mut self, member: &str) {
+        self.links.retain(|placement| placement.member != member);
     }
 
     fn validate(&self, checkout: &Path, checkout_id: &str) -> Result<(), String> {
-        if self.version != RECEIPT_VERSION {
+        if self.version != self.layout.receipt_version()
+            || (self.version != RECEIPT_VERSION && self.version != PROFILE_RECEIPT_VERSION)
+        {
             return Err(format!(
                 "the owned-output receipt has an unsupported version {:?}",
                 self.version
@@ -398,22 +528,54 @@ impl Receipt {
         if self.roots.len() > MAX_ROOTS {
             return Err("the owned-output receipt holds too many roots".to_owned());
         }
-        if self.links.len() != 1 || self.links[0].member != MEMBER {
-            return Err(
-                "the owned-output receipt must hold exactly one `target` placement".to_owned(),
-            );
-        }
-        let selected = self.link().selected.as_ref();
-        let prepared = self.link().prepared.as_ref();
-        if let Some(selected) = selected {
-            if !safe_absolute(&selected.root) || selected.generation > self.generation {
-                return Err(
-                    "the owned-output receipt selects an unusable root or generation".to_owned(),
-                );
+        match self.layout {
+            LayoutKind::WholeTarget => {
+                if self.links.len() != 1 || self.links[0].member != MEMBER {
+                    return Err(
+                        "a whole-target owned-output receipt must hold exactly one `target` placement"
+                            .to_owned(),
+                    );
+                }
             }
-            if let Some(nonce) = selected.nonce() {
-                if nonce.len() != 32 {
-                    return Err("the owned-output receipt has an unusable root nonce".to_owned());
+            LayoutKind::Profile => {
+                if self.links.is_empty() || self.links.len() > crate::layout::MAX_RECEIPT_MEMBERS {
+                    return Err(
+                        "a profile owned-output receipt holds an unsupported number of members"
+                            .to_owned(),
+                    );
+                }
+                let mut names = Vec::with_capacity(self.links.len());
+                for placement in &self.links {
+                    crate::layout::Member::parse(&placement.member)
+                        .map_err(|reason| format!("a profile placement is unusable: {reason}"))?;
+                    names.push(placement.member.clone());
+                }
+                let mut sorted = names.clone();
+                sorted.sort();
+                sorted.dedup();
+                if sorted != names {
+                    return Err(
+                        "the profile placements are not unique and sorted by member".to_owned(),
+                    );
+                }
+                crate::layout::validate_set(&sorted, crate::layout::MAX_RECEIPT_MEMBERS)
+                    .map_err(|reason| format!("the profile placements are unusable: {reason}"))?;
+            }
+        }
+        for placement in &self.links {
+            if let Some(selected) = placement.selected.as_ref() {
+                if !safe_absolute(&selected.root) || selected.generation > self.generation {
+                    return Err(
+                        "the owned-output receipt selects an unusable root or generation"
+                            .to_owned(),
+                    );
+                }
+                if let Some(nonce) = selected.nonce() {
+                    if nonce.len() != 32 {
+                        return Err(
+                            "the owned-output receipt has an unusable root nonce".to_owned()
+                        );
+                    }
                 }
             }
         }
@@ -440,22 +602,49 @@ impl Receipt {
                 );
             }
         }
-        match (self.state, selected, prepared) {
-            (ReceiptState::Committed, Some(_), None) => {}
-            (ReceiptState::Detached, None, None) => {}
-            (ReceiptState::Pruned, _, None) => {}
-            (ReceiptState::Pruning, None, None) if self.pruned.is_some() => {}
-            (ReceiptState::Prepared, _, Some(prepared))
-                if prepared.generation == self.generation.saturating_add(1)
-                    && prepared.generation > 0
-                    && prepared.link == checkout.join("target")
-                    && safe_absolute(&prepared.to.root) => {}
-            _ => {
+        let prepared = self.prepared_ref();
+        if self.links.iter().filter(|placement| placement.prepared.is_some()).count() > 1 {
+            return Err(
+                "the owned-output receipt prepares more than one placement; it is not followed"
+                    .to_owned(),
+            );
+        }
+        if let Some(prepared) = prepared {
+            if prepared.generation != self.generation.saturating_add(1)
+                || prepared.generation == 0
+                || !safe_absolute(&prepared.to.root)
+                || self.placement_for_link(&prepared.link).is_none()
+            {
                 return Err(
-                    "the owned-output receipt is internally inconsistent; it is not followed"
+                    "the owned-output receipt prepares an unusable transition; it is not followed"
                         .to_owned(),
-                )
+                );
             }
+        }
+        let consistent = match self.state {
+            ReceiptState::Committed => {
+                prepared.is_none()
+                    && !self.links.is_empty()
+                    && self.links.iter().all(|placement| placement.selected.is_some())
+            }
+            ReceiptState::Detached => {
+                prepared.is_none()
+                    && self.links.iter().all(|placement| placement.selected.is_none())
+            }
+            ReceiptState::Pruned => prepared.is_none(),
+            ReceiptState::Pruning => prepared.is_none() && self.pruned.is_some(),
+            ReceiptState::Prepared => {
+                prepared.is_some()
+                    && self.links.iter().all(|placement| {
+                        placement.selected.is_some() || placement.prepared.is_some()
+                    })
+            }
+        };
+        if !consistent {
+            return Err(
+                "the owned-output receipt is internally inconsistent; it is not followed"
+                    .to_owned(),
+            );
         }
         Ok(())
     }
@@ -469,11 +658,94 @@ impl Receipt {
     }
 }
 
+/// The live link path of one placement member under one checkout.
+fn link_path(checkout: &Path, member: &str) -> PathBuf {
+    if member == MEMBER {
+        checkout.join("target")
+    } else {
+        checkout.join("target").join(member)
+    }
+}
+
+impl Serialize for Receipt {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct Doc<'a> {
+            version: &'a str,
+            checkout: &'a Path,
+            checkout_id: &'a str,
+            generation: u64,
+            state: ReceiptState,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            layout: Option<LayoutKind>,
+            links: Vec<PlacementDoc<'a>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            reserved: Option<&'a Reservation>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            roots: &'a Vec<Selected>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            pruned: Option<&'a PruneRecord>,
+            updated_ms: u64,
+        }
+        #[derive(Serialize)]
+        struct PlacementDoc<'a> {
+            member: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            selected: Option<&'a Selected>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            prepared: Option<&'a Prepared>,
+            /// A legacy receipt keeps its reservation inside its one
+            /// placement, byte for byte as published.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            reserved: Option<&'a Reservation>,
+        }
+        let legacy = self.layout == LayoutKind::WholeTarget;
+        let links = self
+            .links
+            .iter()
+            .map(|placement| PlacementDoc {
+                member: &placement.member,
+                selected: placement.selected.as_ref(),
+                prepared: placement.prepared.as_ref(),
+                reserved: legacy.then_some(self.reserved.as_ref()).flatten(),
+            })
+            .collect();
+        Doc {
+            version: &self.version,
+            checkout: &self.checkout,
+            checkout_id: &self.checkout_id,
+            generation: self.generation,
+            state: self.state,
+            layout: (!legacy).then_some(self.layout),
+            links,
+            reserved: (!legacy).then_some(self.reserved.as_ref()).flatten(),
+            roots: &self.roots,
+            pruned: self.pruned.as_ref(),
+            updated_ms: self.updated_ms,
+        }
+        .serialize(serializer)
+    }
+}
+
 impl<'de> Deserialize<'de> for Receipt {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PlacementDoc {
+            member: String,
+            #[serde(default)]
+            selected: Option<Selected>,
+            #[serde(default)]
+            prepared: Option<Prepared>,
+            #[serde(default)]
+            reserved: Option<Reservation>,
+        }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Doc {
@@ -483,7 +755,11 @@ impl<'de> Deserialize<'de> for Receipt {
             generation: u64,
             state: ReceiptState,
             #[serde(default)]
-            links: Vec<LinkPlacement>,
+            layout: Option<LayoutKind>,
+            #[serde(default)]
+            links: Vec<PlacementDoc>,
+            #[serde(default)]
+            reserved: Option<Reservation>,
             #[serde(default)]
             selected: Option<Selected>,
             #[serde(default)]
@@ -495,39 +771,101 @@ impl<'de> Deserialize<'de> for Receipt {
             updated_ms: u64,
         }
         let doc = Doc::deserialize(deserializer)?;
-        let version = match doc.version.as_str() {
-            RECEIPT_VERSION => RECEIPT_VERSION.to_owned(),
-            LEGACY_RECEIPT_VERSION => RECEIPT_VERSION.to_owned(),
-            other => other.to_owned(),
-        };
         let legacy = doc.version == LEGACY_RECEIPT_VERSION;
-        let links = if legacy {
-            if !doc.links.is_empty() {
-                return Err(serde::de::Error::custom(
-                    "a version-1 receipt cannot carry placements",
-                ));
+        let legacy_reservations: Vec<Reservation> = doc
+            .links
+            .iter()
+            .filter_map(|placement| placement.reserved.clone())
+            .collect();
+        let (version, layout, links) = match doc.version.as_str() {
+            RECEIPT_VERSION => {
+                if doc.layout.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "a version-2 receipt carries no successor layout",
+                    ));
+                }
+                let links = if legacy {
+                    if !doc.links.is_empty() {
+                        return Err(serde::de::Error::custom(
+                            "a version-1 receipt cannot carry placements",
+                        ));
+                    }
+                    vec![LinkPlacement {
+                        member: MEMBER.to_owned(),
+                        selected: doc.selected,
+                        prepared: doc.prepared,
+                    }]
+                } else {
+                    if doc.selected.is_some() || doc.prepared.is_some() {
+                        return Err(serde::de::Error::custom(
+                            "a version-2 receipt carries placements, not top-level references",
+                        ));
+                    }
+                    doc.links
+                        .into_iter()
+                        .map(|placement| LinkPlacement {
+                            member: placement.member,
+                            selected: placement.selected,
+                            prepared: placement.prepared,
+                        })
+                        .collect()
+                };
+                (RECEIPT_VERSION.to_owned(), LayoutKind::WholeTarget, links)
             }
-            vec![LinkPlacement {
-                member: MEMBER.to_owned(),
-                selected: doc.selected,
-                prepared: doc.prepared,
-                reserved: None,
-            }]
-        } else {
-            if doc.selected.is_some() || doc.prepared.is_some() {
-                return Err(serde::de::Error::custom(
-                    "a version-2 receipt carries placements, not top-level references",
-                ));
+            PROFILE_RECEIPT_VERSION => {
+                if doc.selected.is_some() || doc.prepared.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "a version-3 receipt carries placements, not top-level references",
+                    ));
+                }
+                if doc.layout != Some(LayoutKind::Profile) {
+                    return Err(serde::de::Error::custom(
+                        "a version-3 receipt must declare its layout",
+                    ));
+                }
+                if doc.links.iter().any(|placement| placement.reserved.is_some()) {
+                    return Err(serde::de::Error::custom(
+                        "a version-3 reservation is root-level, not per placement",
+                    ));
+                }
+                let links = doc
+                    .links
+                    .into_iter()
+                    .map(|placement| LinkPlacement {
+                        member: placement.member,
+                        selected: placement.selected,
+                        prepared: placement.prepared,
+                    })
+                    .collect();
+                (PROFILE_RECEIPT_VERSION.to_owned(), LayoutKind::Profile, links)
             }
-            doc.links
+            other => {
+                return Err(serde::de::Error::custom(format!(
+                    "unsupported owned-output receipt version {other:?}"
+                )))
+            }
         };
+        // A legacy receipt keeps a reservation inside its placement; the
+        // in-memory form holds one root-level reservation.
+        let mut reserved = doc.reserved;
+        if legacy_reservations.len() > 1 || (reserved.is_some() && !legacy_reservations.is_empty())
+        {
+            return Err(serde::de::Error::custom(
+                "an owned-output receipt carries more than one reservation",
+            ));
+        }
+        if let Some(placement) = legacy_reservations.into_iter().next() {
+            reserved = Some(placement);
+        }
         Ok(Receipt {
             version,
             checkout: doc.checkout,
             checkout_id: doc.checkout_id,
             generation: doc.generation,
             state: doc.state,
+            layout,
             links,
+            reserved,
             roots: doc.roots,
             pruned: doc.pruned,
             updated_ms: doc.updated_ms,
@@ -2188,7 +2526,7 @@ pub fn reserve(
         let id = crate::prune::fresh_nonce()?;
         let nonce = crate::prune::fresh_nonce()?;
         let overflow = crate::prune::overflow_tag(control, &id, &nonce)?;
-        receipt.link_mut().reserved = Some(Reservation {
+        *receipt.reserved_mut() = Some(Reservation {
             id,
             nonce,
             kind: wanted.kind,
@@ -2243,7 +2581,7 @@ fn cancel_reservation(
         }
     }
     crate::prune::begin_cancel(control, &context.checkout_id, &reserved)?;
-    receipt.link_mut().reserved = None;
+    *receipt.reserved_mut() = None;
     receipt.updated_ms = process::now_ms();
     write_receipt(control, receipt)?;
     crate::prune::finish_cancel(control, &context.checkout_id, &reserved)
@@ -3055,7 +3393,7 @@ fn finish_commit(
     if committed.reserved().is_some_and(|reserved| {
         reserved.root == selected.root && Some(reserved.nonce.as_str()) == selected.nonce()
     }) {
-        committed.link_mut().reserved = None;
+        *committed.reserved_mut() = None;
     }
     remember_root(&mut committed, selected);
     committed.updated_ms = process::now_ms();
@@ -3524,7 +3862,7 @@ pub(crate) fn create_pruning_receipt(
     receipt.state = ReceiptState::Pruning;
     receipt.link_mut().selected = None;
     receipt.link_mut().prepared = None;
-    receipt.link_mut().reserved = None;
+    *receipt.reserved_mut() = None;
     receipt.pruned = Some(PruneRecord {
         intent: intent.to_owned(),
         outcome: "pruning".to_owned(),
@@ -4229,6 +4567,135 @@ mod tests {
         assert!(read_receipt(&fixture.control, &other.checkout, &other_id)
             .unwrap()
             .is_none());
+    }
+
+    /// A committed profile receipt for `debug` and `release` on one root.
+    fn profile_receipt(fixture: &Fixture) -> Receipt {
+        let mut receipt = Receipt::first_with(
+            &fixture.checkout,
+            &identity::digest(&fixture.checkout.to_string_lossy()),
+            LayoutKind::Profile,
+        );
+        let selected = fixture.local().selected(1).with_nonce(Some(
+            "22222222222222222222222222222222".to_owned(),
+        ));
+        receipt.state = ReceiptState::Committed;
+        receipt.generation = 1;
+        receipt.place_member("debug").selected = Some(selected.clone());
+        receipt.place_member("release").selected = Some(selected);
+        receipt
+    }
+
+    #[test]
+    fn a_profile_receipt_round_trips_in_its_own_version() {
+        let fixture = Fixture::new();
+        let mut receipt = profile_receipt(&fixture);
+        receipt.reserved = None;
+        let bytes = serde_json::to_vec(&receipt).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(doc["version"], PROFILE_RECEIPT_VERSION);
+        assert_eq!(doc["layout"], "profile");
+        assert_eq!(doc["links"][0]["member"], "debug");
+        assert_eq!(doc["links"][1]["member"], "release");
+        let back: Receipt = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, receipt);
+        assert_eq!(back.layout(), LayoutKind::Profile);
+        assert_eq!(
+            back.selected_for("debug").map(Selected::root),
+            Some(fixture.local().root())
+        );
+        // A version-3 receipt without its layout, or with a per-placement
+        // reservation, is refused rather than guessed.
+        let mut missing = doc.clone();
+        missing.as_object_mut().unwrap().remove("layout");
+        assert!(serde_json::from_value::<Receipt>(missing).is_err());
+        let mut misplaced = doc;
+        misplaced["links"][0]["reserved"] = serde_json::json!({
+            "id": "33333333333333333333333333333333",
+            "nonce": "44444444444444444444444444444444",
+            "kind": "local",
+            "root": "/nowhere",
+            "generation": 2,
+            "created_ms": 1,
+        });
+        assert!(serde_json::from_value::<Receipt>(misplaced).is_err());
+    }
+
+    #[test]
+    fn a_legacy_receipt_keeps_its_published_shape_and_reservation() {
+        let fixture = Fixture::new();
+        let mut receipt = Receipt::first(
+            &fixture.checkout,
+            &identity::digest(&fixture.checkout.to_string_lossy()),
+        );
+        receipt.state = ReceiptState::Committed;
+        receipt.generation = 1;
+        receipt.link_mut().selected = Some(fixture.local().selected(1));
+        receipt.reserved = Some(Reservation {
+            id: "55555555555555555555555555555555".to_owned(),
+            nonce: "66666666666666666666666666666666".to_owned(),
+            kind: RootKind::Local,
+            root: fixture.local().root().to_path_buf(),
+            volume_uuid: None,
+            generation: 2,
+            created_ms: 1,
+            overflow: None,
+        });
+        let doc = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(doc["version"], RECEIPT_VERSION);
+        assert!(doc.get("layout").is_none());
+        assert!(doc.get("reserved").is_none());
+        assert_eq!(
+            doc["links"][0]["reserved"]["id"],
+            "55555555555555555555555555555555"
+        );
+        let back: Receipt = serde_json::from_value(doc).unwrap();
+        assert_eq!(back, receipt);
+        assert_eq!(back.layout(), LayoutKind::WholeTarget);
+    }
+
+    #[test]
+    fn a_profile_receipt_refuses_unsorted_overlapping_or_foreign_members() {
+        let fixture = Fixture::new();
+        let id = identity::digest(&fixture.checkout.to_string_lossy());
+        let mut receipt = profile_receipt(&fixture);
+        receipt.links.reverse();
+        assert!(receipt.validate(&fixture.checkout, &id).is_err());
+        let mut receipt = profile_receipt(&fixture);
+        receipt.place_member("debug");
+        receipt.place_member("debug");
+        assert!(receipt.validate(&fixture.checkout, &id).is_err());
+        let mut receipt = profile_receipt(&fixture);
+        receipt.place_member("debug/debug");
+        assert!(receipt.validate(&fixture.checkout, &id).is_err());
+        let mut receipt = profile_receipt(&fixture);
+        receipt.place_member("../../escape");
+        assert!(receipt.validate(&fixture.checkout, &id).is_err());
+    }
+
+    #[test]
+    fn a_prepared_profile_placement_keeps_the_others_committed() {
+        let fixture = Fixture::new();
+        let id = identity::digest(&fixture.checkout.to_string_lossy());
+        let mut receipt = profile_receipt(&fixture);
+        let link = link_path(&fixture.checkout, "release");
+        receipt.generation = 1;
+        receipt.state = ReceiptState::Prepared;
+        receipt.place_member("release").prepared = Some(Prepared {
+            generation: 2,
+            to: fixture.local().selected(2),
+            link: link.clone(),
+        });
+        receipt.validate(&fixture.checkout, &id).unwrap();
+        assert_eq!(receipt.prepared_ref().map(|p| p.link.clone()), Some(link));
+        // A prepared transition on a link no placement owns is unusable.
+        let mut orphan = receipt.clone();
+        orphan.place_member("release").prepared = Some(Prepared {
+            generation: 2,
+            to: fixture.local().selected(2),
+            link: fixture.checkout.join("target/elsewhere"),
+        });
+        assert!(orphan.validate(&fixture.checkout, &id).is_err());
     }
 
     #[test]
@@ -5658,7 +6125,7 @@ mod tests {
         };
         let mut reserved = fixture.receipt();
         let reservation = reservation_for(&future, 1);
-        reserved.link_mut().reserved = Some(reservation.clone());
+        *reserved.reserved_mut() = Some(reservation.clone());
         write_receipt(&fixture.control, &reserved).unwrap();
         crate::prune::validate_reservation(&fixture.control, &reservation).unwrap();
         let rows = crate::prune::test_rows(&fixture.control).unwrap();
@@ -5688,7 +6155,7 @@ mod tests {
         let later = fixture.root.join("later-root");
         let mut held = created.clone();
         let unused = reservation_for(&later, created.generation + 1);
-        held.link_mut().reserved = Some(unused.clone());
+        *held.reserved_mut() = Some(unused.clone());
         write_receipt(&fixture.control, &held).unwrap();
         let store = Store::for_tests(&fixture.root.join("pool"));
         cancel_reservation(&store, &fixture.control, &context, &mut held).unwrap();
@@ -5706,9 +6173,9 @@ mod tests {
         // Dropping a live reservation without its journal is refused.
         let mut dropped = held.clone();
         let orphan = reservation_for(&later, created.generation + 1);
-        dropped.link_mut().reserved = Some(orphan);
+        *dropped.reserved_mut() = Some(orphan);
         write_receipt(&fixture.control, &dropped).unwrap();
-        dropped.link_mut().reserved = None;
+        *dropped.reserved_mut() = None;
         let refused = write_receipt(&fixture.control, &dropped).unwrap_err();
         assert!(refused.contains("cancellation journal"), "{refused}");
     }

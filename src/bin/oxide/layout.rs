@@ -110,20 +110,7 @@ impl Declaration {
         let mut names: Vec<String> = members.into_iter().map(|member| member.name).collect();
         names.sort();
         names.dedup();
-        if names.len() > MAX_MEMBERS {
-            return Err(format!(
-                "one command may write at most {MAX_MEMBERS} profile output members; it selected {}",
-                names.len()
-            ));
-        }
-        for pair in names.windows(2) {
-            if prefix_of(&pair[0], &pair[1]) {
-                return Err(format!(
-                    "the output members {:?} and {:?} overlap; declare only the deeper one",
-                    pair[0], pair[1]
-                ));
-            }
-        }
+        validate_set(&names, MAX_MEMBERS)?;
         Ok(Self {
             members: names
                 .into_iter()
@@ -162,6 +149,26 @@ impl Declaration {
                 .join(", ")
         }
     }
+}
+
+/// Validate one set of member names against the total cap and the
+/// prefix-free rule. Names are already sorted and duplicate-free.
+pub(crate) fn validate_set(names: &[String], cap: usize) -> Result<(), String> {
+    if names.len() > cap {
+        return Err(format!(
+            "one command may write at most {cap} profile output members; it selected {}",
+            names.len()
+        ));
+    }
+    for pair in names.windows(2) {
+        if prefix_of(&pair[0], &pair[1]) {
+            return Err(format!(
+                "the output members {:?} and {:?} overlap; declare only the deeper one",
+                pair[0], pair[1]
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Whether `longer` is `shorter` plus one more path component.
