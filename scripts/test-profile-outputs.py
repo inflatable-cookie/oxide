@@ -405,9 +405,16 @@ def run(proof: Proof, repo: str) -> None:
     expect(item(pool, first, "version") == "oxide.outputs.transition/3", "01: receipt version")
     registry = perm.read_json(os.path.join(pool, "oxide-managed", "outputs", "registry.json"))
     expect(registry["schema"] == 2, f"01: registry schema {registry['schema']}")
+    first_members = sorted(
+        {
+            row["member"]
+            for row in registry["rows"]
+            if row["checkout_id"] == perm.hashlib.sha256(first.encode()).hexdigest()
+        }
+    )
     expect(
-        sorted({row["member"] for row in registry["rows"] if row["checkout_id"] == perm.hashlib.sha256(first.encode()).hexdigest()}),
-        ["debug", "release"],
+        first_members == ["debug", "release"],
+        f"01: registry members are {first_members}, not the debug/release pair",
     )
 
     # ----- case 02: a member mutation waits for a gated writer ------------
@@ -534,16 +541,21 @@ def run(proof: Proof, repo: str) -> None:
     expect(code == 0, f"11: pool2 registration failed: {stderr}")
     migrated = make_checkout(proof, "migrate")
     base_legacy(proof, base, pool2, migrated)
-    migrate_env = {**proof.env, "OXIDE_POOL": pool2}
-    code, _, stderr = perm.oxide_env(proof, ["outputs", "adopt"], "11 migrate", migrated, migrate_env)
-    expect(code == 0, f"11: candidate adopt failed: {stderr}")
-    # A source-shaped pre-oxide#129 checkout: a root/1 marker and no nonce in
-    # the receipt or registry.
+    # The base binary's committed whole-target /2 state is made source-shaped
+    # BEFORE any migration: a root/1 marker and no nonce in the receipt or
+    # registry, so the only path that can reach the profile layout is the
+    # candidate's explicit migrate_layout.
     migrated_root = make_root_one_fixture(pool2, migrated)
+    expect(
+        perm.read_json(perm.receipt_path(pool2, migrated))["version"] == "oxide.outputs.transition/2",
+        "11: the source-shaped fixture is not a /2 receipt",
+    )
     marker_path = os.path.join(migrated_root, MARKER)
     root_ino = os.stat(migrated_root).st_ino
     payload = sorted(os.listdir(migrated_root))
-    adopt(proof, migrated, "11 migrate")
+    migrate_env = {**proof.env, "OXIDE_POOL": pool2}
+    code, _, stderr = perm.oxide_env(proof, ["outputs", "adopt"], "11 migrate", migrated, migrate_env)
+    expect(code == 0, f"11: candidate migration in pool2 failed: {stderr}")
     expect_layout(migrated, {"debug": f"link:{migrated_root}", "release": f"link:{migrated_root}"})
     upgraded = perm.read_json(marker_path)
     expect(upgraded["version"] == "oxide.outputs.root/2", "11: marker not upgraded to root/2")
@@ -771,13 +783,14 @@ def run(proof: Proof, repo: str) -> None:
 
     # ----- case 19: the staged state-3 binary refuses state 4 -------------
     snapshot = {member: os.readlink(member_link(migrated, member)) for member in ("debug", "release")}
-    receipt_before = perm.sha256_file(perm.receipt_path(pool, migrated))
-    result = proof.run([base, "build"], cwd=migrated, env=proof.env, timeout=90)
+    receipt_before = perm.sha256_file(perm.receipt_path(pool2, migrated))
+    pool2_env = {**proof.env, "OXIDE_POOL": pool2}
+    result = proof.run([base, "build"], cwd=migrated, env=pool2_env, timeout=90)
     expect(result.returncode != 0, "19: the state-3 binary did not refuse a state-4 pool")
     print(result.stderr.decode(errors="replace")[-2000:])
     for member, target in snapshot.items():
         expect(os.readlink(member_link(migrated, member)) == target, "19: the refusal changed a member link")
-    expect(perm.sha256_file(perm.receipt_path(pool, migrated)) == receipt_before, "19: the refusal rewrote the receipt")
+    expect(perm.sha256_file(perm.receipt_path(pool2, migrated)) == receipt_before, "19: the refusal rewrote the receipt")
 
     # ----- case 20: root-group prune keeps another checkout's reference ---
     group = make_checkout(proof, "group")
@@ -803,17 +816,122 @@ def run(proof: Proof, repo: str) -> None:
     adopt(proof, gone, "20 gone adopt")
     gone_root = root_of(pool, gone)
     os.rename(gone, gone + "-moved")
-    code, stdout, stderr = oxide(proof, ["outputs", "prune", "--dry-run"], "20 gone dry", gone)
+    code, stdout, stderr = oxide(proof, ["outputs", "prune", "--dry-run"], "20 gone dry", group)
     expect(code == 0, f"20: gone prune dry run failed: {stderr}")
     preview = json.loads(stdout)
     expect(
         any(candidate["root"] == gone_root for candidate in preview["candidates"]),
         f"20: the gone checkout's root is not a candidate: {preview['candidates']}",
     )
+    # Another checkout's reference keeps the root: a peer reference for the
+    # same root turns the candidate set empty (KEEP) while it is live.
+    registry_path = os.path.join(pool, "oxide-managed", "outputs", "registry.json")
+    registry_original = perm.read_bytes(registry_path)
+    registry = json.loads(registry_original)
+    gone_id = perm.hashlib.sha256(gone.encode()).hexdigest()
+    peer = make_checkout(proof, "group-peer")
+    rows = [row for row in registry["rows"] if row["checkout_id"] == gone_id]
+    expect(bool(rows), "20: the gone checkout has no registry reference")
+    for row in rows:
+        reference = dict(row)
+        reference["checkout_id"] = perm.hashlib.sha256(peer.encode()).hexdigest()
+        reference["checkout"] = peer
+        reference["selected"] = True
+        reference["pending"] = False
+        reference["pruning"] = None
+        reference["pruned_ms"] = None
+        reference["reservation"] = None
+        reference["cancelling"] = None
+        registry["rows"].append(reference)
+    registry["revision"] = registry["revision"] + 1
+    with open(registry_path, "w", encoding="utf-8") as handle:
+        json.dump(registry, handle, indent=2)
+        handle.write("\n")
+    os.chmod(registry_path, 0o600)
+    code, stdout, stderr = oxide(proof, ["outputs", "prune", "--dry-run"], "20 peer keep", group)
+    expect(code == 0, f"20: the peer-reference dry run failed: {stderr}")
+    kept_preview = json.loads(stdout)
+    expect(
+        not any(candidate["root"] == gone_root for candidate in kept_preview["candidates"]),
+        f"20: another checkout's reference did not keep the root: {kept_preview['candidates']}",
+    )
+    expect(os.path.isdir(gone_root), "20: the peer-referenced root was removed")
+    with open(registry_path, "wb") as handle:
+        handle.write(registry_original)
+    os.chmod(registry_path, 0o600)
+    # Guarded rollback: an intent with no filesystem effect restores the
+    # row's selection only while the checkout receipt is still the recorded
+    # preimage. A changed receipt keeps the root (pending/KEEP).
+    code, stdout, stderr = oxide(proof, ["outputs", "prune", "--dry-run"], "20 rollback plan", group)
+    expect(code == 0, f"20: the rollback dry run failed: {stderr}")
+    rollback_plan = os.path.join(proof.root, "prune-rollback.json")
+    with open(rollback_plan, "wb") as handle:
+        handle.write(stdout.encode())
+    rollback_sha = perm.sha256_file(rollback_plan)
+    env = {**proof.env, "OXIDE_TEST_PRUNE_CRASH": "intent"}
+    code, _, stderr = perm.oxide_env(
+        proof,
+        ["outputs", "prune", "--plan", rollback_plan, "--plan-sha256", rollback_sha],
+        "20 intent crash",
+        group,
+        env,
+    )
+    expect(code != 0, "20: the injected intent stop did not stop the prune")
+    expect(os.path.isdir(gone_root), "20: the intent crash removed the root")
+    receipt_path = perm.receipt_path(pool, gone)
+    original_receipt = perm.read_bytes(receipt_path)
+    with open(receipt_path, "wb") as handle:
+        handle.write(original_receipt + b"\n")
+    os.chmod(receipt_path, 0o600)
+    code, _, _ = oxide(
+        proof,
+        ["outputs", "prune", "--plan", rollback_plan, "--plan-sha256", rollback_sha],
+        "20 guarded rollback",
+        group,
+    )
+    expect(code != 0, "20: a rollback with a changed receipt reported success")
+    expect(os.path.isdir(gone_root), "20: the changed-receipt rollback removed the root")
+    with open(receipt_path, "wb") as handle:
+        handle.write(original_receipt)
+    os.chmod(receipt_path, 0o600)
+    code, _, stderr = oxide(
+        proof,
+        ["outputs", "prune", "--plan", rollback_plan, "--plan-sha256", rollback_sha],
+        "20 rollback replay",
+        group,
+    )
+    if code != 0:
+        # A settled rollback may stop after restoring the row; one identical
+        # replay then performs the planned deletion. A kept root is not a
+        # settled rollback.
+        expect(os.path.isdir(gone_root), f"20: the restored rollback failed and removed the root: {stderr}")
+        code, _, stderr = oxide(
+            proof,
+            ["outputs", "prune", "--plan", rollback_plan, "--plan-sha256", rollback_sha],
+            "20 rollback replay 2",
+            group,
+        )
+    expect(code == 0, f"20: the restored rollback did not settle: {stderr}")
+    expect(not os.path.exists(gone_root), "20: the rolled-back root survived its deletion")
+    # A second gone checkout carries the terminal crash image oracle.
+    terminal = make_checkout(proof, "terminal")
+    code, _, _ = oxide(proof, ["build"], "20 terminal build", terminal)
+    expect(code == 0, "20: terminal build failed")
+    adopt(proof, terminal, "20 terminal adopt")
+    terminal_root = root_of(pool, terminal)
+    os.rename(terminal, terminal + "-moved")
+    code, stdout, stderr = oxide(proof, ["outputs", "prune", "--dry-run"], "20 terminal dry", group)
+    expect(code == 0, f"20: terminal dry run failed: {stderr}")
+    expect(
+        any(candidate["root"] == terminal_root for candidate in json.loads(stdout)["candidates"]),
+        "20: the terminal root is not a candidate",
+    )
     plan_path = os.path.join(proof.root, "prune-plan.json")
     with open(plan_path, "wb") as handle:
         handle.write(stdout.encode())
     plan_sha = perm.sha256_file(plan_path)
+    gone = terminal
+    gone_root = terminal_root
     # Terminal crash image oracle: the intent's expected terminal SHA and
     # FIXED timestamp are durable before publication and the published
     # receipt is exactly that image.
@@ -822,7 +940,7 @@ def run(proof: Proof, repo: str) -> None:
         proof,
         ["outputs", "prune", "--plan", plan_path, "--plan-sha256", plan_sha],
         "20 terminal crash",
-        gone,
+        group,
         env,
     )
     expect(code != 0, "20: the injected terminal stop did not stop the prune")
@@ -837,7 +955,7 @@ def run(proof: Proof, repo: str) -> None:
     expect(not os.path.exists(gone_root), "20: the root survived its terminal deletion")
     # A replay accepts the exact image and settles the intent without a
     # rewrite; the fixed timestamp survives.
-    code, _, stderr = oxide(proof, ["outputs", "prune", "--plan", plan_path, "--plan-sha256", plan_sha], "20 settle", gone)
+    code, _, stderr = oxide(proof, ["outputs", "prune", "--plan", plan_path, "--plan-sha256", plan_sha], "20 settle", group)
     expect(code == 0, f"20: settling the terminal image failed: {stderr}")
     settled = receipt(pool, gone)
     expect(settled["pruned"]["at_ms"] == fixed_ms, f"20: the terminal timestamp changed: {settled.get('pruned')}")

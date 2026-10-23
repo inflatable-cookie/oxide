@@ -145,6 +145,17 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   gets it on its first build, others by explicit adoption. It never moves
   existing output, and ephemeral mode is unchanged
   ([workflow](contracts/workflow.md#final-outputs-on-the-permanent-drive-oxide117)).
+- **Owned links at profile directories** (approved direction, oxide#133): a
+  converted checkout keeps `target` itself a real directory and owns only the
+  positively identified members `debug`, `release`, `<triple>/debug` and
+  `<triple>/release`, so tools that mount `target` keep working. Existing
+  whole-target checkouts are migrated only by an explicit `oxide outputs
+  adopt` under a durable journal, a real nonempty profile directory is never
+  moved or converted, and an undeclared opaque tool refuses instead of
+  guessing. The reviewed implementation is not merged or active: the
+  whole-target behaviour above stays the published default until that reviewed
+  change lands, and its native qualification remains a separate counted gate
+  ([workflow](contracts/workflow.md#owned-output-members-at-profile-directories-oxide133)).
 - **Leftover output roots** of checkouts that no longer exist are removed
   only by an explicit `oxide outputs prune`, never automatically.
 - **Sharing builds:** slots share warm builds across worktrees, up to 8 per
@@ -156,8 +167,6 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   Oxide bypasses inherited compiler wrappers and doesn't manage sccache.
   Cargo's own cross-workspace cache is the preferred long-term complement.
 - **Approved, not built:**
-  - owned output links at the profile directory (`target/debug` and the
-    like) instead of `target`, so tools that mount `target` keep working;
   - cold-slot seeding from matching units, conservative first, with
     one-use temp workspaces handled as seeded, first-evicted slots;
   - per-slot test scratch;
