@@ -67,10 +67,15 @@ on tiny owned fixtures with exact exit codes and state assertions:
        binds it with no invented row. Run last: the flag is never cleared.
   eligibility / operator list / absence (3)
     10 live checkout kept; a live Detached root kept.
-    11 unreadable ancestor kept (absence unknown); a listed relative path and
-       a duplicate refuse with exit 2.
-    12 receiptless legacy root: listed, its exclusive pruning receipt is
-       created, it is deleted and the receipt ends `pruned`/`deleted`.
+    11 unreadable ancestor kept: a debug-only EACCES (OXIDE_TEST_PRUNE_EACCES,
+       bound to the supervisor's scratch/evidence layout) keeps the root, its
+       firing is recorded in evidence, and the same fixture without injection
+       is a genuine-absence candidate; no real unreadable directory exists.
+       A listed relative path and a duplicate refuse with exit 2.
+    12 receiptless legacy roots: the one whose checkout is on the boot Data
+       volume (device + APFS UUID proof) gets its exclusive pruning receipt
+       and is deleted (receipt `pruned`/`deleted`); the one whose checkout is
+       on the attached scratch image is kept.
   custody / containment / removal (2)
     13 active writer: a command bound in a vanished checkout keeps its root.
     14 symlink: a root replaced by a symlink is kept; a symlink descendant
@@ -238,15 +243,17 @@ class World:
     def registry_doc(self) -> dict:
         return permanent.read_json(self.registry)
 
-    def dry_run(self, label: str, cwd: str, listed: str | None = None) -> tuple:
+    def dry_run(self, label: str, cwd: str, listed: str | None = None, extra: dict | None = None) -> tuple:
         args = ["outputs", "prune", "--dry-run"] + (["--operator-list", listed] if listed else [])
-        result = self.proof.run([self.proof.binary, *args], cwd=cwd, env=self.proof.env)
+        env = dict(self.proof.env)
+        env.update(extra or {})
+        result = self.proof.run([self.proof.binary, *args], cwd=cwd, env=env)
         stdout, stderr = result.stdout, result.stderr.decode(errors="replace")
         print(f"----- {label}: exit {result.returncode} -----\n{stderr}", flush=True)
         return result.returncode, stdout, stderr
 
-    def plan_file(self, label: str, cwd: str, listed: str | None = None) -> tuple:
-        code, stdout, stderr = self.dry_run(label, cwd, listed)
+    def plan_file(self, label: str, cwd: str, listed: str | None = None, extra: dict | None = None) -> tuple:
+        code, stdout, stderr = self.dry_run(label, cwd, listed, extra)
         expect(code == 0, f"{label}: dry run exited {code}: {stderr}")
         sha = hashlib.sha256(stdout).hexdigest()
         expect(sha in stderr, f"{label}: stderr does not carry the preview digest")
@@ -461,21 +468,26 @@ def run(proof, repo: str) -> None:
     expect(epsilon_root not in world.candidates(preview), "a live detached root became a candidate")
     world.restore(epsilon, epsilon_away)
 
-    case("unreadable ancestor kept; bad operator lists refuse")
-    locked = os.path.join(proof.root, "locked")
+    case("injected EACCES ancestor kept; genuine absence is a candidate; bad lists refuse")
+    # No real unreadable directory: a debug-only EACCES is injected inside the
+    # supervisor-owned scratch, its firing is recorded in the evidence
+    # directory, and the same fixture without injection is genuine absence.
+    locked = os.path.realpath(os.path.join(proof.root, "locked"))
     os.makedirs(locked)
-    eta = os.path.realpath(os.path.join(locked, "eta"))
+    eta = os.path.join(locked, "eta")
     shutil.move(world.checkout("eta-src"), eta)
     eta_root = world.adopt(eta)["links"][0]["selected"]["root"]
-    shutil.move(eta, os.path.join(world.gone, "eta"))
-    os.chmod(locked, 0)
-    try:
-        _, _, preview = world.plan_file("unreadable ancestor dry run", alpha)
-        expect(eta_root not in world.candidates(preview), "an unreadable ancestor became absence")
-        expect("unknown" in world.kept(preview, eta_root), world.kept(preview, eta_root))
-    finally:
-        os.chmod(locked, 0o700)
-    shutil.move(os.path.join(world.gone, "eta"), eta)
+    eta_away = world.vanish(eta)
+    fired = os.path.join(os.environ["OXIDE_PROOF_EVIDENCE"], "prune-eacces-fired")
+    expect(not os.path.exists(fired), "the EACCES marker exists before injection")
+    _, _, preview = world.plan_file("injected EACCES dry run", alpha, extra={"OXIDE_TEST_PRUNE_EACCES": locked})
+    expect(eta_root not in world.candidates(preview), "an injected unreadable ancestor became absence")
+    reason = world.kept(preview, eta_root)
+    expect("unknown" in reason and "Permission denied" in reason, reason)
+    expect(os.path.isfile(fired) and locked in permanent.read_bytes(fired).decode(), "the EACCES injection did not fire")
+    _, _, preview = world.plan_file("genuine absence control dry run", alpha)
+    expect(eta_root in world.candidates(preview), f"genuine absence not a candidate: {world.kept(preview, eta_root)}")
+    world.restore(eta, eta_away)
     for label, body in (("relative", '["relative/root"]'), ("duplicate", json.dumps([delta_root, delta_root]))):
         listed = os.path.join(proof.root, f"list-{label}.json")
         with open(listed, "w", encoding="utf-8") as handle:
@@ -496,14 +508,27 @@ def run(proof, repo: str) -> None:
         json.dump(legacy_marker, handle)
     with open(os.path.join(legacy_root, "artifact"), "wb") as handle:
         handle.write(b"x" * 4096)
+    # A second legacy root whose recorded checkout is on the separately
+    # attached scratch image (not the boot Data volume): kept.
+    image_checkout = os.path.join(mount, "never", "image-app")
+    image_id = hashlib.sha256(image_checkout.encode()).hexdigest()
+    image_root = os.path.join(mount, "oxide-outputs", "legacy-" + image_id[:8])
+    os.makedirs(image_root)
+    image_marker = dict(legacy_marker)
+    image_marker.update({"checkout": image_checkout, "checkout_id": image_id})
+    with open(os.path.join(image_root, ".oxide-output.json"), "w", encoding="utf-8") as handle:
+        json.dump(image_marker, handle)
     listed = os.path.join(proof.root, "list-legacy.json")
     with open(listed, "w", encoding="utf-8") as handle:
-        json.dump([legacy_root], handle)
+        json.dump([legacy_root, image_root], handle)
     plan, sha, preview = world.plan_file("legacy dry run", alpha, listed)
     expect(legacy_root in world.candidates(preview), f"legacy root not a candidate: {world.kept(preview, legacy_root)}")
+    expect(image_root not in world.candidates(preview), "a legacy root of an image checkout became a candidate")
+    expect("volume" in world.kept(preview, image_root), world.kept(preview, image_root))
     code, stdout, stderr = world.real_run("legacy real run", alpha, plan, sha, listed)
     expect(code == 0, f"legacy real run exited {code}: {stderr}")
     expect(not os.path.lexists(legacy_root), "the legacy root remains")
+    expect(os.path.isdir(image_root), "the kept image-checkout legacy root was deleted")
     legacy_receipt = permanent.read_json(permanent.receipt_file(world.pool, legacy_checkout))
     expect(legacy_receipt["state"] == "pruned" and legacy_receipt["pruned"]["outcome"] == "deleted", legacy_receipt)
     proof.phase("after eligibility cases")

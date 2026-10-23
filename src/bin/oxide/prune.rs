@@ -2293,32 +2293,47 @@ fn checkout_absence(row: &Row, operator_legacy: bool) -> Result<Absence, String>
     } else if operator_legacy {
         // The explicit legacy exception allows only a positively mounted,
         // readable APFS data-volume ancestry below /Users.
-        let facts = match oxide_storage::volume::observe_path(Path::new("/Users")) {
-            Ok(facts) => facts,
-            Err(error) => return Ok(Absence::Unknown(format!("/Users is unreadable ({error})"))),
-        };
-        if facts.fstype != "apfs" || facts.read_only || facts.uuid.is_none() {
-            return Ok(Absence::Unknown(
-                "/Users is not on a writable APFS data volume".to_owned(),
-            ));
+        // The explicit legacy exception is volume-based: the nearest existing
+        // ancestor must be on the same device and APFS volume UUID as the
+        // boot Data volume. Any other or unverifiable volume is kept.
+        if let Err(reason) = on_boot_data_volume(checkout) {
+            return Ok(Absence::Unknown(reason));
         }
     }
+    // The directory each walk step reads, for the debug-only EACCES fixture.
+    let mut walked = if under_volumes {
+        match components.get(1) {
+            Some(std::path::Component::Normal(volume)) => Path::new("/Volumes").join(volume),
+            _ => PathBuf::from("/Volumes"),
+        }
+    } else {
+        PathBuf::from("/")
+    };
     for (index, name) in rest.iter().enumerate() {
         let last = index + 1 == rest.len();
         let name = std::ffi::CString::new(name.as_bytes())
             .map_err(|_| "the checkout path contains a NUL".to_owned())?;
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        let injected = injected_eacces(&walked);
         // SAFETY: the descriptor and C string are live for the call.
-        let status = unsafe {
-            libc::fstatat(
-                cursor.as_raw_fd(),
-                name.as_ptr(),
-                &mut stat,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
+        let status = if injected {
+            -1
+        } else {
+            unsafe {
+                libc::fstatat(
+                    cursor.as_raw_fd(),
+                    name.as_ptr(),
+                    &mut stat,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            }
         };
         if status != 0 {
-            let error = std::io::Error::last_os_error();
+            let error = if injected {
+                std::io::Error::from_raw_os_error(libc::EACCES)
+            } else {
+                std::io::Error::last_os_error()
+            };
             return Ok(if error.kind() != std::io::ErrorKind::NotFound {
                 Absence::Unknown(error.to_string())
             } else if last {
@@ -2354,8 +2369,100 @@ fn checkout_absence(row: &Row, operator_legacy: bool) -> Result<Absence, String>
         }
         // SAFETY: `next` is a newly owned descriptor.
         cursor = unsafe { OwnedFd::from_raw_fd(next) };
+        walked.push(std::ffi::OsStr::from_bytes(name.as_bytes()));
     }
     Ok(Absence::Unknown("the checkout walk ended early".to_owned()))
+}
+
+/// The legacy operator-list exception's volume proof: the nearest existing
+/// ancestor of `checkout` (found without following its leaf) is a directory
+/// on the same device and APFS volume UUID as `/System/Volumes/Data`.
+fn on_boot_data_volume(checkout: &Path) -> Result<(), String> {
+    let mut ancestor = checkout.parent();
+    while let Some(candidate) = ancestor {
+        match fs::symlink_metadata(candidate) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => {
+                return Err(format!(
+                    "the nearest existing ancestor {} is not a directory",
+                    candidate.display()
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = candidate.parent();
+            }
+            Err(error) => return Err(format!("the checkout's ancestry is unreadable ({error})")),
+        }
+    }
+    let ancestor = ancestor.ok_or("the checkout has no existing ancestor")?;
+    let data = oxide_storage::volume::observe_path(Path::new("/System/Volumes/Data"))
+        .map_err(|error| format!("the boot Data volume is unverifiable ({error})"))?;
+    let here = oxide_storage::volume::observe_path(ancestor)
+        .map_err(|error| format!("{} is unverifiable ({error})", ancestor.display()))?;
+    if data.fstype != "apfs" || data.uuid.is_none() {
+        return Err("the boot Data volume is not a verified APFS volume".to_owned());
+    }
+    if here.fstype != "apfs" || here.dev != data.dev || here.uuid != data.uuid {
+        return Err(format!(
+            "{} is not on the boot Data volume (device and APFS volume UUID differ)",
+            ancestor.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Debug builds only: inject EACCES when the checkout walk reads inside the
+/// directory named by `OXIDE_TEST_PRUNE_EACCES`, so a proof drives an
+/// unreadable ancestor without a real unreadable directory. Bound like the
+/// walk-mutation fixture: only under the shared proof supervisor (a
+/// deadline, canonical scratch below /private/tmp, evidence nested in or a
+/// sibling `evidence/` of it) and only for a canonical path inside that
+/// scratch. Each firing appends the path to `prune-eacces-fired` in the
+/// evidence directory, so a proof can show the injection fired.
+#[cfg(debug_assertions)]
+fn injected_eacces(directory: &Path) -> bool {
+    let Ok(target) = std::env::var("OXIDE_TEST_PRUNE_EACCES") else {
+        return false;
+    };
+    let armed = (|| -> Option<PathBuf> {
+        std::env::var("OXIDE_PROOF_DEADLINE_NS")
+            .ok()?
+            .parse::<u64>()
+            .ok()?;
+        let scratch = fs::canonicalize(std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")?).ok()?;
+        let evidence = fs::canonicalize(std::env::var_os("OXIDE_PROOF_EVIDENCE")?).ok()?;
+        let nested = evidence.starts_with(&scratch);
+        let sibling = scratch.file_name() == Some(std::ffi::OsStr::new("scratch"))
+            && evidence.file_name() == Some(std::ffi::OsStr::new("evidence"))
+            && scratch.parent() == evidence.parent();
+        if !scratch.starts_with("/private/tmp") || !(nested || sibling) {
+            return None;
+        }
+        let target = PathBuf::from(&target);
+        let canonical = fs::canonicalize(&target).ok()?;
+        if canonical != target || canonical == scratch || !canonical.starts_with(&scratch) {
+            return None;
+        }
+        Some(evidence)
+    })();
+    let Some(evidence) = armed else {
+        return false;
+    };
+    if directory != Path::new(&target) {
+        return false;
+    }
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(evidence.join("prune-eacces-fired"))
+        .and_then(|mut file| writeln!(file, "{target}"));
+    true
+}
+
+#[cfg(not(debug_assertions))]
+fn injected_eacces(_directory: &Path) -> bool {
+    false
 }
 
 fn open_root() -> Result<OwnedFd, String> {
@@ -5130,6 +5237,18 @@ mod tests {
         let bytes = fs::read(registry_dir(&control).join(TOMBSTONES_FILE)).unwrap();
         let read: Tombstones = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(read.entries.len(), 1);
+    }
+
+    /// The legacy exception is volume-based: a checkout whose nearest
+    /// existing ancestor is on the boot Data volume qualifies (scratch under
+    /// /private/tmp is), and a missing ancestry chain is walked up, never
+    /// followed. The EACCES fixture is inert without its proof environment.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn legacy_eligibility_is_proved_by_the_boot_data_volume() {
+        let fixture = Fixture::new();
+        on_boot_data_volume(&fixture.root.join("gone/deeper/checkout")).unwrap();
+        assert!(!injected_eacces(&fixture.root));
     }
 
     #[test]
