@@ -164,7 +164,10 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 - **The fallback to Cargo is Effigy's,** through a generic per-program
   fallback that Effigy owns and documents. It replaces per-selector `:cargo`
   escapes and project-side CI switches. Oxide ships no CI shim.
-- **Projects on Oxide** are tracked in Queue. Nucleus adoption is off.
+- **Projects switch by standing rule:** a Rust project switches when Queue
+  next starts a task in it, and every project with a Paseo workspace is
+  switching now. Each project's planner owns its change. Projects on Oxide
+  are tracked in Queue. Nucleus adoption is off.
 
 ### Toolchain support
 
@@ -212,7 +215,6 @@ the operating rules.
 - **Model routing:** briefs declare task complexity; Queue selects the author
   and reviewer models.
 - **Still need Tom's scoped approval:**
-  - switching a new consumer project;
   - host installs beyond the planner's receipt-matched `oxide` reinstall;
   - releases, tags and workflow changes;
   - settings or scheduler changes;
