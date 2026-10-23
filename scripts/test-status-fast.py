@@ -776,7 +776,9 @@ def run_cases(
         write_private(
             os.path.join(rem["control"], "removable.json"), json.dumps(registration)
         )
-        rem_pool = private_dir(os.path.join(rem["control"], "pool"))
+        # The removable pool root is `<internal control>/removable`; its own
+        # control directory is `<root>/oxide-managed`.
+        rem_pool = private_dir(os.path.join(rem["control"], "removable"))
         rem_control = private_dir(os.path.join(rem_pool, "oxide-managed"))
         rem_store = hashlib.sha256(rem_pool.encode()).hexdigest()[:32]
         rem_workspace = private_dir(os.path.join(rem_root, "rem-checkout"))
