@@ -386,25 +386,20 @@ def tree_digest(root: str) -> str:
     count = 0
     while stack:
         current = stack.pop()
-        try:
-            names = sorted(os.listdir(current))
-        except PermissionError:
-            digest.update(f"denied {os.path.relpath(current, root)}\n".encode())
-            continue
-        for name in names:
-            path = os.path.join(current, name)
-            relative = os.path.relpath(path, root)
-            item = os.lstat(path)
+        with os.scandir(current) as entries:
+            listed = sorted(entries, key=lambda entry: entry.name)
+        for entry in listed:
+            item = entry.stat(follow_symlinks=False)
             count += 1
             digest.update(
-                f"{relative}\0{stat.S_IFMT(item.st_mode)}\0{item.st_mode:o}\0"
-                f"{item.st_size}\0{item.st_mtime_ns}\0{item.st_ino}\0"
-                f"{item.st_nlink}\n".encode()
+                f"{os.path.relpath(entry.path, root)}\0{stat.S_IFMT(item.st_mode)}\0"
+                f"{item.st_mode:o}\0{item.st_size}\0{item.st_mtime_ns}\0"
+                f"{item.st_ino}\0{item.st_nlink}\n".encode()
             )
             if stat.S_ISDIR(item.st_mode):
-                stack.append(path)
+                stack.append(entry.path)
             elif stat.S_ISREG(item.st_mode) and item.st_size <= 64 * 1024:
-                with open(path, "rb") as handle:
+                with open(entry.path, "rb") as handle:
                     digest.update(handle.read())
     digest.update(f"entries {count}\n".encode())
     return digest.hexdigest()
@@ -658,7 +653,7 @@ def run_cases(
         now = now_ms()
         matrix = [
             ("valid", [observation(slot, big["store_id"], at_ms=now - 42_000)], "recorded 42s ago"),
-            ("stale", [observation(slot, 1, at_ms=now - 3 * 3600_000)], "recorded 3h ago"),
+            ("stale", [observation(slot, big["store_id"], at_ms=now - 3 * 3600_000)], "recorded 3h ago"),
             (
                 "incarnation-mismatch",
                 [
