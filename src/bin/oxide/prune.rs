@@ -5044,6 +5044,85 @@ mod tests {
         .settled());
     }
 
+    /// After durable overflow, a tagged reservation is valid against the
+    /// exact sticky-incomplete registry without any row; another registry or
+    /// a begun cancellation refuses, and finishing the cancellation clears
+    /// only its journal entry. A complete registry refuses an overflow tag.
+    #[test]
+    fn overflow_reservations_bind_by_tag_and_cancel_without_a_row() {
+        let fixture = Fixture::new();
+        let control = ready_control(&fixture, Vec::new(), Vec::new());
+        let mut registry = ready_registry(&control).unwrap();
+        let id = fresh_nonce().unwrap();
+        let nonce = fresh_nonce().unwrap();
+        assert!(overflow_tag(&control, &id, &nonce).unwrap().is_none());
+        mark_incomplete(&mut registry, "test overflow").unwrap();
+        write_registry(&control, &registry).unwrap();
+        let tag = overflow_tag(&control, &id, &nonce).unwrap().unwrap();
+        assert_eq!(tag.registry, registry.created_by);
+        let reserved = outputs::Reservation {
+            id: id.clone(),
+            nonce,
+            kind: RootKind::External,
+            root: fixture.root.join("vol/oxide-outputs/app"),
+            volume_uuid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
+            generation: 1,
+            created_ms: 1,
+            overflow: Some(tag.clone()),
+        };
+        validate_reservation(&control, &reserved).unwrap();
+        // An unrelated revision advance does not refuse it.
+        let mut later = ready_registry(&control).unwrap();
+        later.bump().unwrap();
+        write_registry(&control, &later).unwrap();
+        validate_reservation(&control, &reserved).unwrap();
+        let mut foreign = reserved.clone();
+        foreign.overflow.as_mut().unwrap().registry = "f".repeat(32);
+        assert!(validate_reservation(&control, &foreign).is_err());
+        let checkout_id = "a".repeat(64);
+        begin_cancel(&control, &checkout_id, &reserved).unwrap();
+        assert!(validate_reservation(&control, &reserved).is_err());
+        assert!(ready_registry(&control).unwrap().rows.is_empty());
+        finish_cancel(&control, &checkout_id, &reserved).unwrap();
+        assert!(ready_registry(&control)
+            .unwrap()
+            .cancelled_overflow
+            .is_empty());
+    }
+
+    /// The tombstone ring is diagnostics: oldest entries compact first to the
+    /// entry and byte caps, and a corrupt ring is replaced, never trusted.
+    #[test]
+    fn the_tombstone_ring_compacts_oldest_first_within_its_caps() {
+        let fixture = Fixture::new();
+        let control = ready_control(&fixture, Vec::new(), Vec::new());
+        let entry = |n: usize| Tombstone {
+            intent: format!("{n:032x}"),
+            checkout_id: "a".repeat(64),
+            root: PathBuf::from("/vol/oxide-outputs/app"),
+            nonce: None,
+            outcome: "deleted".to_owned(),
+            at_ms: n as u64,
+        };
+        let mut ring = Tombstones {
+            version: TOMBSTONES_VERSION.to_owned(),
+            entries: (0..MAX_TOMBSTONES + 10).map(entry).collect(),
+        };
+        compact_tombstones(&mut ring).unwrap();
+        assert!(ring.entries.len() <= MAX_TOMBSTONES);
+        assert!(serde_json::to_vec(&ring).unwrap().len() <= MAX_TOMBSTONE_BYTES);
+        assert_eq!(
+            ring.entries.last().unwrap().at_ms,
+            (MAX_TOMBSTONES + 9) as u64
+        );
+        assert!(ring.entries.first().unwrap().at_ms >= 10);
+        fs::write(registry_dir(&control).join(TOMBSTONES_FILE), b"{corrupt").unwrap();
+        append_tombstone(&control, entry(1)).unwrap();
+        let bytes = fs::read(registry_dir(&control).join(TOMBSTONES_FILE)).unwrap();
+        let read: Tombstones = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(read.entries.len(), 1);
+    }
+
     #[test]
     fn status_reads_only_a_bounded_recorded_observation() {
         let fixture = Fixture::new();

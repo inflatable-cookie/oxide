@@ -5606,6 +5606,172 @@ mod tests {
         );
     }
 
+    fn reservation_for(root: &Path, generation: u64) -> Reservation {
+        Reservation {
+            id: crate::prune::fresh_nonce().unwrap(),
+            nonce: crate::prune::fresh_nonce().unwrap(),
+            kind: RootKind::Local,
+            root: root.to_path_buf(),
+            volume_uuid: None,
+            generation,
+            created_ms: 1,
+            overflow: None,
+        }
+    }
+
+    /// A future root's nonce is reserved durably (receipt plus pending
+    /// registry row), the transition that creates the root uses exactly that
+    /// nonce and consumes the reservation, and cancellation runs through its
+    /// journal so a stale starter holding the old nonce refuses.
+    #[test]
+    fn a_reserved_root_nonce_is_created_exactly_and_cancels_through_its_journal() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let RootSpec::Local { root: future } = fixture.local() else {
+            panic!("the fixture's local spec is not local");
+        };
+        let mut reserved = fixture.receipt();
+        let reservation = reservation_for(&future, 1);
+        reserved.link_mut().reserved = Some(reservation.clone());
+        write_receipt(&fixture.control, &reserved).unwrap();
+        crate::prune::validate_reservation(&fixture.control, &reservation).unwrap();
+        let rows = crate::prune::test_rows(&fixture.control).unwrap();
+        assert!(
+            rows.iter()
+                .any(|(root, selected, pending, _)| root == &future && !*selected && *pending),
+            "{rows:?}"
+        );
+        let wanted = fixture
+            .local()
+            .selected(1)
+            .with_nonce(Some(reservation.nonce.clone()));
+        reservation_matches(&context, &reserved, &wanted).unwrap();
+        let created = transition(&context, &reserved, &fixture.local(), Start::Any).unwrap();
+        assert_eq!(
+            read_marker(&future).unwrap().nonce,
+            Some(reservation.nonce.clone())
+        );
+        assert!(
+            created.reserved().is_none(),
+            "the commit kept its consumed reservation"
+        );
+        assert!(crate::prune::validate_reservation(&fixture.control, &reservation).is_err());
+
+        // A second, unused reservation is cancelled through its journal; its
+        // stale starter refuses and the abandoned row is gone.
+        let later = fixture.root.join("later-root");
+        let mut held = created.clone();
+        let unused = reservation_for(&later, created.generation + 1);
+        held.link_mut().reserved = Some(unused.clone());
+        write_receipt(&fixture.control, &held).unwrap();
+        let store = Store::for_tests(&fixture.root.join("pool"));
+        cancel_reservation(&store, &fixture.control, &context, &mut held).unwrap();
+        assert!(held.reserved().is_none());
+        assert!(crate::prune::validate_reservation(&fixture.control, &unused).is_err());
+        let stale = RootSpec::Local {
+            root: later.clone(),
+        }
+        .selected(created.generation + 1)
+        .with_nonce(Some(unused.nonce.clone()));
+        let refused = reservation_matches(&context, &held, &stale).unwrap_err();
+        assert!(refused.contains("cancelled or replaced"), "{refused}");
+        let rows = crate::prune::test_rows(&fixture.control).unwrap();
+        assert!(rows.iter().all(|(root, ..)| root != &later), "{rows:?}");
+        // Dropping a live reservation without its journal is refused.
+        let mut dropped = held.clone();
+        let orphan = reservation_for(&later, created.generation + 1);
+        dropped.link_mut().reserved = Some(orphan);
+        write_receipt(&fixture.control, &dropped).unwrap();
+        dropped.link_mut().reserved = None;
+        let refused = write_receipt(&fixture.control, &dropped).unwrap_err();
+        assert!(refused.contains("cancellation journal"), "{refused}");
+    }
+
+    /// A receiptless legacy root's checkout gets an exclusive `pruning`
+    /// receipt: every replay/bind path refuses it, an existing receipt
+    /// refuses the creator, only this writer's unjournaled creation is
+    /// rebound, and the terminal receipt needs the same intent.
+    #[test]
+    fn a_pruning_receipt_is_exclusive_and_refuses_every_binding_path() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let checkout_id = identity::digest(&fixture.checkout.to_string_lossy());
+        crate::prune::seed_test_registry(&fixture.control).unwrap();
+        let first = crate::prune::fresh_nonce().unwrap();
+        create_pruning_receipt(
+            &fixture.control,
+            &fixture.checkout,
+            &checkout_id,
+            &first,
+            &|_| true,
+        )
+        .unwrap();
+        let receipt = context.receipt().unwrap().unwrap();
+        assert!(receipt_is_pruning(&receipt));
+        assert!(replay(&context, receipt.clone())
+            .unwrap_err()
+            .contains("being pruned"));
+        // Journaled: another creation refuses.
+        let second = crate::prune::fresh_nonce().unwrap();
+        assert!(create_pruning_receipt(
+            &fixture.control,
+            &fixture.checkout,
+            &checkout_id,
+            &second,
+            &|_| true
+        )
+        .is_err());
+        // This writer's own unjournaled creation is rebound to a new intent.
+        create_pruning_receipt(
+            &fixture.control,
+            &fixture.checkout,
+            &checkout_id,
+            &second,
+            &|_| false,
+        )
+        .unwrap();
+        assert!(mark_pruned(
+            &fixture.control,
+            &fixture.checkout,
+            &checkout_id,
+            &first,
+            "deleted"
+        )
+        .is_err());
+        assert!(!discard_pruning_receipt(
+            &fixture.control,
+            &fixture.checkout,
+            &checkout_id,
+            &first
+        )
+        .unwrap());
+        mark_pruned(
+            &fixture.control,
+            &fixture.checkout,
+            &checkout_id,
+            &second,
+            "deleted",
+        )
+        .unwrap();
+        assert_eq!(
+            context.receipt().unwrap().unwrap().state,
+            ReceiptState::Pruned
+        );
+        // A committed receipt is never replaced by the creator.
+        let other = Fixture::new();
+        let other_context = other.context();
+        transition(&other_context, &other.receipt(), &other.local(), Start::Any).unwrap();
+        let other_id = identity::digest(&other.checkout.to_string_lossy());
+        assert!(create_pruning_receipt(
+            &other.control,
+            &other.checkout,
+            &other_id,
+            &first,
+            &|_| false
+        )
+        .is_err());
+    }
+
     #[test]
     fn paths_in_receipts_are_absolute() {
         assert!(safe_absolute(Path::new("/work/app/target")));
