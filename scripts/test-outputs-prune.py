@@ -687,6 +687,7 @@ def run(proof, repo: str) -> None:
     code, _, stderr = world.oxide(["check"], "kappa build before prune", kappa)
     expect(code == 0, stderr)
     kappa_slot, _ = permanent.slot_state(stderr)
+    kappa_pool = "removable pool:" if "removable" in permanent.summary(stderr) else "internal pool:"
     kappa_away = world.vanish(kappa)
     os.rename(kappa_root, kappa_root + ".real")
     os.symlink(kappa_root + ".real", kappa_root)
@@ -716,11 +717,12 @@ def run(proof, repo: str) -> None:
     expect(tree_bytes(lam_root) == before and not world.intents(), "a refused reserve changed the root or journaled")
     expect(os.path.isfile(fired), "the low-reserve injection did not fire")
     os.unlink(fired)
-    code, _, stderr = world.real_run("low reserve mid-batch", alpha, plan, sha, extra={"OXIDE_TEST_PRUNE_LOW_RESERVE_AT": "3"})
+    code, _, stderr = world.real_run("low reserve mid-batch", alpha, plan, sha, extra={"OXIDE_TEST_PRUNE_LOW_RESERVE_AFTER_ENTRIES": "1"})
     expect(code == 3 and "reserve" in stderr, f"low reserve mid-batch exited {code}")
     expect(os.path.isfile(fired) and world.intents() and world.quarantines(), "no pending mid-batch stop")
-    # Checks 1 (pre-rename) and 2 (before the first delete) passed; check 3
-    # fired between batches: some entries were deleted, none after the stop.
+    expect("entries:" in permanent.read_bytes(fired).decode(), "the entry-count injection did not fire")
+    # The entry-count trigger fires at the first check after one entry was
+    # actually deleted: some entries are gone, none after the stop.
     remaining = sum(len(files) for _, _, files in os.walk(world.quarantines()[0]))
     expect(0 < remaining < 601, f"the reserve stop was not mid-batch ({remaining} entries left)")
     code, _, stderr = world.real_run("replay after the reserve stop", alpha, plan, sha)
@@ -806,10 +808,13 @@ def run(proof, repo: str) -> None:
     # cold, different slot below proves key separation, not eviction.
     code, stdout, _ = world.oxide(["status"], "old kappa slot still idle", alpha)
     expect(code == 0, "status failed")
-    expect(
-        any(line.split()[:3] == ["slot", kappa_slot, "idle"] for line in stdout.splitlines()),
-        f"the old kappa slot {kappa_slot} is not present and idle before the recreated build",
-    )
+    section, idle = None, False
+    for line in stdout.splitlines():
+        if line.startswith(("internal pool:", "removable pool:")):
+            section = line.split(":")[0] + ":"
+        elif section == kappa_pool and line.split()[:3] == ["slot", kappa_slot, "idle"] and kappa in line:
+            idle = True
+    expect(idle, f"the old kappa slot {kappa_slot} ({kappa_pool} {kappa}) is not present and idle before the recreated build")
     new_nonce = world.selected(kappa)["nonce"]
     expect(new_nonce and new_nonce != old_nonce, f"recreated root nonce {new_nonce} reused {old_nonce}")
     code, _, stderr = world.oxide(["check"], "recreated root build", kappa)

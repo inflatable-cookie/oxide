@@ -2503,19 +2503,8 @@ fn injected_eacces(directory: &Path) -> bool {
         return false;
     };
     let armed = (|| -> Option<PathBuf> {
-        std::env::var("OXIDE_PROOF_DEADLINE_NS")
-            .ok()?
-            .parse::<u64>()
-            .ok()?;
+        let evidence = proof_evidence()?;
         let scratch = fs::canonicalize(std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")?).ok()?;
-        let evidence = fs::canonicalize(std::env::var_os("OXIDE_PROOF_EVIDENCE")?).ok()?;
-        let nested = evidence.starts_with(&scratch);
-        let sibling = scratch.file_name() == Some(std::ffi::OsStr::new("scratch"))
-            && evidence.file_name() == Some(std::ffi::OsStr::new("evidence"))
-            && scratch.parent() == evidence.parent();
-        if !scratch.starts_with("/private/tmp") || !(nested || sibling) {
-            return None;
-        }
         let target = PathBuf::from(&target);
         let canonical = fs::canonicalize(&target).ok()?;
         if canonical != target || canonical == scratch || !canonical.starts_with(&scratch) {
@@ -2543,42 +2532,73 @@ fn injected_eacces(_directory: &Path) -> bool {
     false
 }
 
-/// Debug builds only: with `OXIDE_TEST_PRUNE_LOW_RESERVE_AT=<n>` under the
-/// shared proof supervisor's deadline, the n-th volume/reserve check of this
-/// process (1 = before the rename, later ones between delete batches) reads
-/// zero free space, so a proof drives the real reserve stop. Each firing is
-/// recorded in the evidence directory.
+/// The evidence directory of an armed debug proof fixture: only under the
+/// shared proof supervisor (a deadline, canonical scratch below
+/// /private/tmp, evidence nested in it or its `evidence/` sibling).
 #[cfg(debug_assertions)]
-fn injected_low_reserve() -> bool {
-    use std::sync::atomic::{AtomicU64, Ordering};
+fn proof_evidence() -> Option<PathBuf> {
+    std::env::var("OXIDE_PROOF_DEADLINE_NS")
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    let scratch = fs::canonicalize(std::env::var_os("OXIDE_TASK_SCRATCH_ROOT")?).ok()?;
+    let evidence = fs::canonicalize(std::env::var_os("OXIDE_PROOF_EVIDENCE")?).ok()?;
+    let nested = evidence.starts_with(&scratch);
+    let sibling = scratch.file_name() == Some(std::ffi::OsStr::new("scratch"))
+        && evidence.file_name() == Some(std::ffi::OsStr::new("evidence"))
+        && scratch.parent() == evidence.parent();
+    if !scratch.starts_with("/private/tmp") || !(nested || sibling) {
+        return None;
+    }
+    Some(evidence)
+}
+
+/// Debug builds only, under [`proof_evidence`]: a low-reserve reading for
+/// one prune worker check, in exactly one of two modes (both set disarms
+/// both; malformed or zero values disarm):
+/// - `OXIDE_TEST_PRUNE_LOW_RESERVE_AT=<n>`: the n-th check of this process
+///   (1 = the check before the rename);
+/// - `OXIDE_TEST_PRUNE_LOW_RESERVE_AFTER_ENTRIES=<n>`: the first check made
+///   once at least n quarantined entries were actually deleted.
+/// It fires once, records itself in the evidence directory and changes no
+/// production reserve policy.
+#[cfg(debug_assertions)]
+fn injected_low_reserve(deleted: u64) -> bool {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     static CHECKS: AtomicU64 = AtomicU64::new(0);
-    let Some(at) = std::env::var("OXIDE_TEST_PRUNE_LOW_RESERVE_AT")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-    else {
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    let positive = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.parse::<u64>().ok().filter(|n| *n > 0))
+    };
+    let count = CHECKS.fetch_add(1, Ordering::Relaxed) + 1;
+    let (mode, fire) = match (
+        positive("OXIDE_TEST_PRUNE_LOW_RESERVE_AT"),
+        positive("OXIDE_TEST_PRUNE_LOW_RESERVE_AFTER_ENTRIES"),
+    ) {
+        (Some(Some(at)), None) => ("check", count == at),
+        (None, Some(Some(after))) => ("entries", deleted >= after),
+        _ => return false,
+    };
+    if !fire || FIRED.load(Ordering::Relaxed) {
+        return false;
+    }
+    let Some(evidence) = proof_evidence() else {
         return false;
     };
-    let armed = std::env::var("OXIDE_PROOF_DEADLINE_NS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .is_some();
-    let count = CHECKS.fetch_add(1, Ordering::Relaxed) + 1;
-    if !armed || count != at {
-        return false;
-    }
-    if let Some(evidence) = std::env::var_os("OXIDE_PROOF_EVIDENCE") {
-        let _ = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(Path::new(&evidence).join("prune-low-reserve-fired"))
-            .and_then(|mut file| writeln!(file, "check {count}"));
-    }
+    FIRED.store(true, Ordering::Relaxed);
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(evidence.join("prune-low-reserve-fired"))
+        .and_then(|mut file| writeln!(file, "{mode}: check {count}, {deleted} entries deleted"));
     true
 }
 
 #[cfg(not(debug_assertions))]
-fn injected_low_reserve() -> bool {
+fn injected_low_reserve(_deleted: u64) -> bool {
     false
 }
 
@@ -2996,7 +3016,7 @@ impl RootSession {
     /// The prune worker's own monitoring: the registered volume's identity
     /// and reserve, and the host reserve of the internal control volume
     /// (where every journal write lands). Unknown readings stop.
-    fn check(&self, control: &Path) -> Result<(), Stop> {
+    fn check(&self, control: &Path, deleted: u64) -> Result<(), Stop> {
         let host = oxide_storage::volume::observe_path(control).map_err(|error| {
             Stop::Pending(format!(
                 "the internal control volume cannot be read ({error}); no further writes"
@@ -3022,7 +3042,7 @@ impl RootSession {
             ))
         })?;
         // Unknown free space is not above the reserve: stop.
-        let available = if injected_low_reserve() {
+        let available = if injected_low_reserve(deleted) {
             Some(0)
         } else {
             facts.available_bytes
@@ -3201,7 +3221,7 @@ struct Deleter<'a> {
 
 impl Deleter<'_> {
     fn check(&mut self) -> Result<(), Stop> {
-        self.session.check(self.control)?;
+        self.session.check(self.control, self.entries)?;
         self.checked = Instant::now();
         Ok(())
     }
@@ -3513,7 +3533,7 @@ fn prune_one_barrier(
     let (session, id, quarantine) = (|| {
         let session = RootSession::open(candidate).map_err(Stop::Refuse)?;
         session.verify_marker(candidate).map_err(Stop::Refuse)?;
-        session.check(control)?;
+        session.check(control, 0)?;
         // The locked recheck keeps the operator-list legacy classification
         // the preview validated: a receiptless root, or a listed registry
         // row without a v2 identity, takes the boot Data volume rule.
