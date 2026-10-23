@@ -384,14 +384,16 @@ fn paired_store() -> Result<Store, String> {
 }
 
 /// Ensure the shared forward format and the registry exist exactly once.
-/// Called under the caller's checkout barrier and before its admission lock.
-pub fn ensure_ready(internal: &Store) -> Result<(), String> {
+/// Called under the caller's checkout barrier for `checkout` and before its
+/// admission lock; initialization refuses unless every writer in both pools
+/// is positively closed (that barrier excepted).
+pub fn ensure_ready(internal: &Store, checkout: &Path) -> Result<(), String> {
     let control = internal.owner_control().to_path_buf();
     let transaction = match internal.outputs_initialization()? {
         Some(store::OutputsInit::Ready { transaction, .. }) => transaction,
         _ => fresh_nonce()?,
     };
-    internal.initialize_outputs(&transaction, &|transaction, may_create| {
+    internal.initialize_outputs(&transaction, Some(checkout), &|transaction, may_create| {
         create_or_validate_registry(&control, transaction, may_create)
     })?;
     let registry = ready_registry(&control)?;
@@ -609,6 +611,20 @@ fn require_ready(store: &Store, control: &Path) -> Result<Registry, String> {
     ready_registry(control)
 }
 
+/// Refuse an output transition or replay before its first effect unless the
+/// registry is ready (oxide#129). A pool adopted before the shared output
+/// format has none; a command holding a slot cannot initialize it (its own
+/// record is an open writer), so the refusal names the explicit upgrade.
+pub fn require_registry(control: &Path) -> Result<(), String> {
+    match read_registry(control)? {
+        Some(registry) => registry.validate(),
+        None => Err(format!(
+            "outputs: the output registry {} is missing, so no owned-output receipt is written and the link, receipt and roots are unchanged. A pool from before the shared output format is upgraded by `oxide outputs adopt` (or `oxide outputs detach`) in this checkout once no other Oxide command runs in either pool",
+            registry_path(control).display()
+        )),
+    }
+}
+
 /// The registry that must already be ready. Missing is never "empty".
 fn ready_registry(control: &Path) -> Result<Registry, String> {
     read_registry(control)?.ok_or_else(|| {
@@ -795,6 +811,7 @@ pub fn unsettled_for(control: &Path, checkout_id: &str) -> Result<Option<String>
 /// `outputs::write_receipt` while the internal publication lock is held, and
 /// strictly before the changed receipt becomes visible.
 pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
+    require_registry(control)?;
     let mut registry = ready_registry(control)?;
     registry.validate()?;
     let checkout_id = receipt.checkout_id();
@@ -1216,9 +1233,13 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
         ));
     }
     // An unfinished intent is resumed only for its exact recorded
-    // transaction; anything it cannot prove stays pending (exit 3).
+    // transaction; anything it cannot prove stays pending (exit 3). An
+    // intent-phase journal with no filesystem effect is rolled back to its
+    // pre-intent selection, which is not a completion: its root stays in
+    // the plan and is re-evaluated below like any other candidate.
     let pending: Vec<Intent> = registry.unfinished_intents().cloned().collect();
     let mut completed_roots = Vec::new();
+    let mut rolled_back = 0usize;
     for intent in &pending {
         let planned = preview.candidates.iter().any(|candidate| {
             candidate.checkout_id == intent.identity.checkout_id
@@ -1236,16 +1257,8 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
             ));
         }
         match resume_intent(&store, &control, intent) {
-            Ok(true) => completed_roots.push(intent.identity.root.clone()),
-            Ok(false) => {
-                return Ok(unsettled(
-                    &control,
-                    &format!(
-                        "prune intent {} cannot be proven complete; inspect its quarantine and resolve it explicitly",
-                        intent.id
-                    ),
-                ))
-            }
+            Ok(Resumed::Completed) => completed_roots.push(intent.identity.root.clone()),
+            Ok(Resumed::RolledBack) => rolled_back += 1,
             Err(reason) => {
                 return Ok(unsettled(
                     &control,
@@ -1254,14 +1267,19 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
             }
         }
     }
-    if !completed_roots.is_empty() {
+    if rolled_back > 0 {
+        eprintln!(
+            "oxide: prune rolled back {rolled_back} journaled intent(s) that had no filesystem effect; their roots are re-evaluated"
+        );
+    }
+    if !completed_roots.is_empty() || rolled_back > 0 {
         registry = match ready_registry(&control) {
             Ok(registry) => registry,
             Err(reason) => {
                 return Ok(unsettled(
                     &control,
                     &format!(
-                        "a replayed intent completed but the registry became unreadable afterwards ({reason})"
+                        "a replayed intent settled but the registry became unreadable afterwards ({reason})"
                     ),
                 ))
             }
@@ -1272,9 +1290,9 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
     let evaluated = match evaluate(&store, &control, &registry, list.as_ref()) {
         Ok(evaluated) => evaluated,
         Err(reason) if !completed_roots.is_empty() => {
-            return Ok(unsettled(
-                &control,
-                &format!("a replayed intent completed but the fresh snapshot failed ({reason})"),
+            return Ok(partial(
+                &completed_roots,
+                &format!("the fresh snapshot failed ({reason}), so every other root is kept"),
             ))
         }
         Err(reason) => return Err(reason),
@@ -1289,15 +1307,15 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
     if !same_candidates(&plan_set, &fresh_set) {
         let kept = kept_note(&fresh);
         if !completed_roots.is_empty() {
-            return Ok(unsettled(
-                &control,
+            return Ok(partial(
+                &completed_roots,
                 &format!(
-                    "exact intent replay completed, but the eligible root set no longer matches the plan ({kept}); run a new dry run before another prune"
+                    "the eligible root set no longer matches the plan, so every other root is kept ({kept}); run a new dry run before another prune"
                 ),
             ));
         }
         return Ok(refused(&format!(
-            "the eligible root set changed since the preview ({kept}); nothing was changed"
+            "the eligible root set changed since the preview ({kept}); no output root was changed"
         )));
     }
     if fresh.candidates.is_empty() {
@@ -1309,60 +1327,89 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
                 completed_roots.len()
             );
         }
-        let _ = write_observations(&control, &observation_from(&fresh, &evaluated, Vec::new()));
+        let _ = write_observations(
+            &control,
+            &observation_from(&fresh, &evaluated, Vec::new(), None),
+        );
         return Ok(0);
     }
     let mut outcomes: Vec<(Candidate, Option<String>)> = Vec::new();
+    // A per-root refusal before its intent keeps that root unchanged and
+    // the batch continues; only a journaled intent stops it.
+    let mut refusals: Vec<(PathBuf, String)> = Vec::new();
     for candidate in &fresh.candidates {
         match prune_one(&store, &control, candidate, sha) {
             Ok(()) => outcomes.push((candidate.clone(), None)),
             Err(Stop::Pending(reason)) => {
-                let _ =
-                    write_observations(&control, &observation_from(&fresh, &evaluated, outcomes));
+                let _ = write_observations(
+                    &control,
+                    &observation_from(&fresh, &evaluated, outcomes, Some(&candidate.root)),
+                );
                 return Ok(unsettled(&control, &reason));
             }
-            Err(Stop::Refuse(reason)) => {
-                let _ =
-                    write_observations(&control, &observation_from(&fresh, &evaluated, outcomes));
-                // A contradiction can arrive after earlier roots completed;
-                // that is an unsettled batch, never a pre-effect refusal.
-                return Ok(unsettled(
-                    &control,
-                    &format!(
-                        "the batch stopped on a contradiction ({reason}); completed roots stay deleted and any journaled intent stays pending"
-                    ),
-                ));
-            }
+            Err(Stop::Refuse(reason)) => refusals.push((candidate.root.clone(), reason)),
         }
-        registry = match ready_registry(&control) {
-            Ok(registry) => registry,
-            Err(reason) => {
-                return Ok(unsettled(
-                    &control,
-                    &format!(
-                        "a root completed but the registry became unreadable afterwards ({reason}); inspect the pending journal before another prune"
-                    ),
-                ))
-            }
-        };
     }
-    let _ = write_observations(&control, &observation_from(&fresh, &evaluated, outcomes));
-    let deleted = fresh.candidates.len();
-    println!(
-        "outputs prune: deleted {deleted} root(s) whose checkout was positively absent; registry revision {}",
-        registry.revision
+    let deleted: Vec<PathBuf> = outcomes
+        .iter()
+        .map(|(candidate, _)| candidate.root.clone())
+        .collect();
+    let _ = write_observations(
+        &control,
+        &observation_from(&fresh, &evaluated, outcomes, None),
     );
+    if deleted.is_empty() && completed_roots.is_empty() {
+        for (root, reason) in &refusals {
+            eprintln!("oxide: prune kept {}: {reason}", root.display());
+        }
+        return Ok(refused(
+            "every candidate root was kept by a fresh check before its intent; no output root was changed",
+        ));
+    }
+    let revision = ready_registry(&control)
+        .map(|registry| registry.revision.to_string())
+        .unwrap_or_else(|reason| format!("unreadable ({reason})"));
+    for root in completed_roots.iter().chain(&deleted) {
+        println!("outputs prune: deleted {}", root.display());
+    }
+    println!(
+        "outputs prune: deleted {} root(s) whose checkout was positively absent ({} by exact intent replay); registry revision {revision}",
+        completed_roots.len() + deleted.len(),
+        completed_roots.len()
+    );
+    for (root, reason) in &refusals {
+        println!(
+            "outputs prune: kept {} (refused before its intent: {reason})",
+            root.display()
+        );
+    }
     for kept in &fresh.kept {
         println!(
-            "outputs prune: kept {}{}",
+            "outputs prune: kept {} ({})",
             kept.root
                 .as_ref()
                 .map(|root| root.display().to_string())
                 .unwrap_or_else(|| "root".to_owned()),
-            format!(" ({})", kept.reason)
+            kept.reason
         );
     }
     Ok(0)
+}
+
+/// Exit 0 for a batch that completed some roots and kept the rest with no
+/// unfinished intent: the exact partial completion is listed.
+fn partial(completed: &[PathBuf], kept: &str) -> u8 {
+    for root in completed {
+        println!(
+            "outputs prune: deleted {} (exact intent replay)",
+            root.display()
+        );
+    }
+    println!(
+        "outputs prune: partial completion: {} root(s) deleted; {kept}",
+        completed.len()
+    );
+    0
 }
 
 fn same_candidates(plan: &[&Candidate], fresh: &[&Candidate]) -> bool {
@@ -2183,6 +2230,7 @@ fn observation_from(
     preview: &Preview,
     evaluated: &[Evaluated],
     completed: Vec<(Candidate, Option<String>)>,
+    pending: Option<&Path>,
 ) -> Observations {
     let mut roots: Vec<ObservedRoot> = completed
         .iter()
@@ -2200,9 +2248,10 @@ fn observation_from(
         if roots.iter().any(|root| root.root == entry.row.root) {
             continue;
         }
-        let (outcome, intent) = match &entry.candidate {
-            Some(_) => ("pending".to_owned(), None),
-            None => ("kept".to_owned(), None),
+        let (outcome, intent) = if pending == Some(entry.row.root.as_path()) {
+            ("pending".to_owned(), None)
+        } else {
+            ("kept".to_owned(), None)
         };
         roots.push(ObservedRoot {
             checkout_id: entry.row.checkout_id.clone(),
@@ -2236,10 +2285,22 @@ fn observation_from(
 }
 
 enum Stop {
-    /// Leave the intent pending and exit 3.
+    /// A journaled intent is unfinished or its outcome is contradictory:
+    /// leave it pending, stop the batch and exit 3.
     Pending(String),
-    /// Stop the batch with an error (no silent continuation).
+    /// Refused before this root's intent was journaled: nothing about the
+    /// root changed, so it is kept with the reason and the batch continues.
     Refuse(String),
+}
+
+/// Any stop before a root's intent is journaled keeps the root unchanged.
+fn before_journal(stop: Stop) -> Stop {
+    Stop::Refuse(stop_text(stop))
+}
+
+/// Any stop after a root's intent is journaled leaves that intent pending.
+fn after_journal(stop: Stop) -> Stop {
+    Stop::Pending(stop_text(stop))
 }
 
 /// One verified external root, opened through the registered volume.
@@ -2446,8 +2507,13 @@ impl RootSession {
         let root = binding.dir_at(outputs.as_fd(), leaf, false)?;
         let facts = fstat_fd(&root)?;
         let dev = u64::try_from(facts.st_dev).unwrap_or(u64::MAX);
-        if dev != identity.dev {
-            return Err("the quarantine is on another device".to_owned());
+        // The rename kept the root's inode: anything else under the
+        // intent's quarantine name is not the recorded root.
+        if dev != identity.dev || facts.st_ino != identity.ino {
+            return Err(
+                "the quarantine is not the recorded root (device or inode differs); it is kept"
+                    .to_owned(),
+            );
         }
         Ok(Self {
             binding,
@@ -2708,7 +2774,7 @@ fn prune_one(
     {
         store::Cleaning::Guard(guard) => guard,
         store::Cleaning::Interrupted(signal) => {
-            return Err(Stop::Pending(format!(
+            return Err(Stop::Refuse(format!(
                 "interrupted by signal {signal} while taking the checkout's clean barrier; nothing was changed"
             )))
         }
@@ -2729,25 +2795,42 @@ fn prune_one_barrier(
     let _binding = store
         .lock_binding(&candidate.checkout)
         .map_err(Stop::Refuse)?;
-    let session = RootSession::open(candidate).map_err(Stop::Refuse)?;
-    session.verify_marker(candidate).map_err(Stop::Refuse)?;
-    session.check()?;
-    match checkout_absence_for_candidate(candidate, false) {
-        Ok(Absence::Absent) => {}
-        Ok(Absence::Present) => {
-            return Err(Stop::Refuse(
-                "the checkout reappeared before the prune".to_owned(),
-            ))
+    // Everything up to the journal is a per-root refusal: the root, its
+    // registry row and every receipt are unchanged.
+    let (session, id, quarantine) = (|| {
+        let session = RootSession::open(candidate).map_err(Stop::Refuse)?;
+        session.verify_marker(candidate).map_err(Stop::Refuse)?;
+        session.check()?;
+        match checkout_absence_for_candidate(candidate, false) {
+            Ok(Absence::Absent) => {}
+            Ok(Absence::Present) => {
+                return Err(Stop::Refuse(
+                    "the checkout reappeared before the prune".to_owned(),
+                ))
+            }
+            Ok(Absence::Unknown(reason)) | Err(reason) => return Err(Stop::Refuse(reason)),
         }
-        Ok(Absence::Unknown(reason)) | Err(reason) => return Err(Stop::Pending(reason)),
-    }
-    let id = fresh_nonce().map_err(Stop::Refuse)?;
-    let quarantine = candidate
-        .root
-        .parent()
-        .ok_or_else(|| Stop::Refuse("the root has no parent".to_owned()))?
-        .join(format!("{QUARANTINE_PREFIX}{id}"));
+        let id = fresh_nonce().map_err(Stop::Refuse)?;
+        let quarantine = candidate
+            .root
+            .parent()
+            .ok_or_else(|| Stop::Refuse("the root has no parent".to_owned()))?
+            .join(format!("{QUARANTINE_PREFIX}{id}"));
+        Ok((session, id, quarantine))
+    })()
+    .map_err(before_journal)?;
     journal_intent(store, control, candidate, plan_sha, &id, &quarantine)?;
+    prune_journaled(store, control, &session, &id).map_err(after_journal)
+}
+
+/// The effects after a durable intent; every stop leaves the intent pending.
+fn prune_journaled(
+    store: &Store,
+    control: &Path,
+    session: &RootSession,
+    id: &str,
+) -> Result<(), Stop> {
+    let id = id.to_owned();
     crash_point("intent").map_err(Stop::Pending)?;
     session.quarantine(&id).map_err(Stop::Pending)?;
     if let Err(error) = update_intent(control, &id, IntentPhase::Renamed) {
@@ -2761,7 +2844,7 @@ fn prune_one_barrier(
             "deletion cannot begin without its journal phase: {error}"
         ))
     })?;
-    finish_quarantine(store, control, &session, &id)
+    finish_quarantine(store, control, session, &id)
 }
 
 fn journal_intent(
@@ -2834,7 +2917,14 @@ fn journal_intent(
         resolved_ms: None,
     });
     registry.bump().map_err(Stop::Refuse)?;
-    write_registry(control, &registry).map_err(Stop::Refuse)
+    // A failed publication may still have landed: the journal is then an
+    // unfinished intent with no filesystem effect, which the next run rolls
+    // back exactly. It is never reported as a pre-effect refusal.
+    write_registry(control, &registry).map_err(|error| {
+        Stop::Pending(format!(
+            "the prune intent's publication did not complete ({error}); a journaled intent may be pending"
+        ))
+    })
 }
 
 /// Delete the verified quarantine, publish deletion proof, then the registry
@@ -2921,29 +3011,28 @@ fn checkout_absence_for_candidate(candidate: &Candidate, legacy: bool) -> Result
     checkout_absence(&row, legacy)
 }
 
+/// What resuming one unfinished intent settled.
+enum Resumed {
+    /// The root is deleted and its terminal state committed.
+    Completed,
+    /// An intent-phase journal with no filesystem effect was removed and the
+    /// row's selection restored; nothing was deleted.
+    RolledBack,
+}
+
 /// Resume an unfinished delete transaction for exactly the recorded intent.
-/// Returns `Ok(true)` when it completed; `Ok(false)` when the phase cannot be
-/// proven and the intent must stay pending.
-fn resume_intent(store: &Store, control: &Path, intent: &Intent) -> Result<bool, String> {
+fn resume_intent(store: &Store, control: &Path, intent: &Intent) -> Result<Resumed, String> {
     match intent.phase {
         IntentPhase::Deleted => {
             complete_intent(store, control, &intent.id, "deleted").map_err(stop_text)?;
-            Ok(true)
+            Ok(Resumed::Completed)
         }
         IntentPhase::Renamed | IntentPhase::Deleting | IntentPhase::MarkerLast => {
-            let leaf = intent
-                .quarantine
-                .file_name()
-                .ok_or("the intent quarantine has no leaf")?
-                .to_string_lossy()
-                .into_owned();
-            let session = RootSession::open_quarantine(&intent.identity, &leaf)?;
-            update_intent(control, &intent.id, IntentPhase::Deleting)
-                .map_err(|error| format!("cannot record the resumed delete phase: {error}"))?;
-            finish_quarantine(store, control, &session, &intent.id).map_err(stop_text)?;
-            Ok(true)
+            let session =
+                RootSession::open_quarantine(&intent.identity, &quarantine_leaf(intent)?)?;
+            resume_quarantine(store, control, intent, &session)
         }
-        IntentPhase::Resolved => Ok(true),
+        IntentPhase::Resolved => Ok(Resumed::Completed),
         IntentPhase::Intent => {
             // No filesystem effect is recorded. If the original root is still
             // present and unchanged, the journal can be rolled back exactly;
@@ -2966,12 +3055,53 @@ fn resume_intent(store: &Store, control: &Path, intent: &Intent) -> Result<bool,
                 allocated_bytes: 0,
                 accounting_complete: false,
             };
-            let session = RootSession::open(&candidate)?;
+            let session = match RootSession::open(&candidate) {
+                Ok(session) => session,
+                Err(original) => {
+                    // A crash between the exclusive rename and its journal
+                    // phase leaves the root under the intent's own random
+                    // quarantine leaf. Only that exact device and inode,
+                    // with the recorded marker, resumes deletion.
+                    let session = RootSession::open_quarantine(
+                        &intent.identity,
+                        &quarantine_leaf(intent)?,
+                    )
+                    .map_err(|quarantine| {
+                        format!("the root is not at its path ({original}) or in its quarantine ({quarantine})")
+                    })?;
+                    session.verify_marker(&candidate)?;
+                    update_intent(control, &intent.id, IntentPhase::Renamed).map_err(|error| {
+                        format!("cannot record the observed quarantine rename: {error}")
+                    })?;
+                    return resume_quarantine(store, control, intent, &session);
+                }
+            };
             session.verify_marker(&candidate)?;
             rollback_intent(store, control, intent)?;
-            Ok(true)
+            Ok(Resumed::RolledBack)
         }
     }
+}
+
+fn quarantine_leaf(intent: &Intent) -> Result<String, String> {
+    Ok(intent
+        .quarantine
+        .file_name()
+        .ok_or("the intent quarantine has no leaf")?
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn resume_quarantine(
+    store: &Store,
+    control: &Path,
+    intent: &Intent,
+    session: &RootSession,
+) -> Result<Resumed, String> {
+    update_intent(control, &intent.id, IntentPhase::Deleting)
+        .map_err(|error| format!("cannot record the resumed delete phase: {error}"))?;
+    finish_quarantine(store, control, session, &intent.id).map_err(stop_text)?;
+    Ok(Resumed::Completed)
 }
 
 /// Remove an intent that provably had no filesystem effect and restore the
@@ -3591,6 +3721,35 @@ mod tests {
         // Validation without creation succeeds for the exact transaction.
         create_or_validate_registry(&control, &transaction, false).unwrap();
         assert_eq!(ready_registry(&control).unwrap().created_by, "a".repeat(32));
+    }
+
+    /// A pool adopted before the shared format has no registry: a command's
+    /// transition or replay refuses before any effect and names the explicit
+    /// upgrade, and a receipt write never creates the registry.
+    #[test]
+    fn a_pre_fence_pool_refuses_receipt_writes_with_the_upgrade_named() {
+        let fixture = Fixture::new();
+        let control = fixture.root.join("control");
+        fs::create_dir(&control).unwrap();
+        let refused = require_registry(&control).unwrap_err();
+        assert!(refused.contains("oxide outputs adopt"), "{refused}");
+        assert!(refused.contains("unchanged"), "{refused}");
+        assert!(!registry_path(&control).exists());
+    }
+
+    /// Per-root stops before the journal keep the root (exit 0 or 2 for the
+    /// batch); stops after it leave the intent pending (exit 3).
+    #[test]
+    fn stops_before_the_journal_are_refusals_and_after_it_pending() {
+        assert!(matches!(
+            before_journal(Stop::Pending("volume".to_owned())),
+            Stop::Refuse(reason) if reason == "volume"
+        ));
+        assert!(matches!(
+            after_journal(Stop::Refuse("marker".to_owned())),
+            Stop::Pending(reason) if reason == "marker"
+        ));
+        assert_eq!(partial(&[PathBuf::from("/r")], "kept"), 0);
     }
 
     #[test]

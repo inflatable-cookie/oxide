@@ -1082,13 +1082,17 @@ fn adopt_command() -> Result<u8, String> {
     }
     let outcome = (|| {
         refuse_unknown_custody(&internal, &context.workspace, "relink")?;
-        // Fence a pre-feature Oxide out of both pools before any link can be
-        // published; a target adopt refuses outright changes nothing.
-        if !matches!(
-            context.target()?,
-            TargetState::RealNonEmpty | TargetState::Foreign
-        ) {
-            crate::prune::ensure_ready(&internal)?;
+        // Fence a pre-feature Oxide out of both pools before any link or
+        // receipt can be published: an existing receipt may need a replay
+        // write. A target adopt refuses outright with no receipt changes
+        // nothing, so it initializes nothing.
+        if read_receipt(&control, &context.workspace, &context.checkout_id)?.is_some()
+            || !matches!(
+                context.target()?,
+                TargetState::RealNonEmpty | TargetState::Foreign
+            )
+        {
+            crate::prune::ensure_ready(&internal, &context.workspace)?;
         }
         let _admission = store::publication_guard(&control)?;
         let receipt = match read_receipt(&control, &context.workspace, &context.checkout_id)? {
@@ -1282,7 +1286,7 @@ pub fn auto_adopt(
         refuse_unknown_custody(store, checkout, "auto-adopt")?;
         // Fence a pre-feature Oxide out of both pools before any link can be
         // published, as an explicit adopt does for a missing target.
-        crate::prune::ensure_ready(store)?;
+        crate::prune::ensure_ready(store, checkout)?;
         let control = context
             .control()
             .ok_or("no internal pool exists, so no removable drive is registered")?;
@@ -1334,6 +1338,12 @@ fn detach_command() -> Result<u8, String> {
     let guard = barrier(&internal, &context.workspace, &mut waits)?;
     let outcome = (|| {
         refuse_unknown_custody(&internal, &context.workspace, "detach")?;
+        // A pool adopted before the shared output format upgrades behind
+        // the forward fence before its first receipt write (a no-op once
+        // ready); a missing receipt changes nothing.
+        if read_receipt(&control, &context.workspace, &context.checkout_id)?.is_some() {
+            crate::prune::ensure_ready(&internal, &context.workspace)?;
+        }
         let _admission = store::publication_guard(&control)?;
         let receipt = read_receipt(&control, &context.workspace, &context.checkout_id)?
             .ok_or("this checkout has no owned-output receipt; nothing to detach")?;
@@ -2541,6 +2551,7 @@ fn transition(
     let control = context
         .control()
         .ok_or("no internal pool exists; there is no place for an output receipt")?;
+    crate::prune::require_registry(control)?;
     let link = context.link();
     let generation = receipt
         .generation
@@ -2822,6 +2833,9 @@ fn replay(context: &Context, receipt: Receipt) -> Result<Receipt, String> {
     let control = context
         .control()
         .ok_or("no internal pool exists; there is no place for an output receipt")?;
+    // Every replay write records into the registry: refuse before the first
+    // effect when it is not ready.
+    crate::prune::require_registry(control)?;
     // The receipt's link is validated to be this checkout's own target; the
     // rename destination is derived from the checkout, never from the file.
     let link = &context.link();

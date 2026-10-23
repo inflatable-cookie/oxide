@@ -1791,15 +1791,11 @@ impl Store {
         self.load().ok()?.flushes.pop()
     }
 
-    /// Pair this store with the other pool's control directory. `barrier`
-    /// is set for the removable store (see [`Sibling`]). The other pool's
-    /// state is replaced atomically and read without its own lock; for the
-    /// host-wide limit, a command starting in the other pool at the same
-    /// moment may briefly exceed it by one.
-    #[allow(dead_code)]
     /// Publish the owned-outputs downgrade fence in this pool's state and in
     /// its paired pool's (internal first), creating either state when absent
-    /// so a pre-feature Oxide cannot start from a fresh unfenced one.
+    /// so a pre-feature Oxide cannot start from a fresh unfenced one. Test
+    /// fixtures only: production initialization is [`Store::initialize_outputs`].
+    #[cfg(test)]
     pub fn fence_owned_outputs(&self) -> Result<(), String> {
         let mut controls = vec![self.owner_control().to_path_buf()];
         controls.extend(self.sibling.as_ref().map(|sibling| sibling.control.clone()));
@@ -1853,9 +1849,18 @@ impl Store {
     /// then both controls record `ready`. A crash resumes only the recorded
     /// transaction; an unknown or contradicting record refuses before any
     /// registry effect.
+    ///
+    /// Initialization (and resuming an `initializing` record) first requires
+    /// positive pool-wide writer closure under both admission locks, held
+    /// together: no active or held command record and no lost slot with
+    /// unclosed writers in either pool, and no clean barrier except the
+    /// caller's own `own_checkout`. An older binary's in-flight command is a
+    /// record in the same state, so it must close before the fence is
+    /// published.
     pub fn initialize_outputs(
         &self,
         transaction: &str,
+        own_checkout: Option<&Path>,
         create: &dyn Fn(&str, bool) -> Result<(), String>,
     ) -> Result<bool, String> {
         if !bounded_text(transaction, MAX_INIT_TRANSACTION_BYTES) {
@@ -1866,6 +1871,7 @@ impl Store {
         internal.ensure_control()?;
         let _internal_admission = internal.admission()?;
         let mut internal_state = internal.load()?;
+        let mut fresh = false;
         let transaction = match internal_state.outputs_init.clone() {
             Some(OutputsInit::Ready {
                 transaction: recorded,
@@ -1902,6 +1908,7 @@ impl Store {
                                     "the paired pool records initializer transaction {transaction}, not the recorded {recorded}; refusing"
                                 ));
                             }
+                            writers_closed(&state, "the paired", own_checkout)?;
                             state.outputs_init = Some(OutputsInit::Ready {
                                 transaction: recorded.clone(),
                                 ready_ms: process::now_ms(),
@@ -1920,6 +1927,9 @@ impl Store {
                                         .to_owned(),
                                 );
                             }
+                            // A new or reappearing control is fenced only
+                            // with its own writers positively closed.
+                            writers_closed(&state, "the paired", own_checkout)?;
                             state.outputs_init = Some(OutputsInit::Ready {
                                 transaction: recorded.clone(),
                                 ready_ms: process::now_ms(),
@@ -1942,25 +1952,36 @@ impl Store {
             }
             Some(OutputsInit::Initializing { transaction, .. }) => transaction,
             None => {
-                internal_state.outputs_init = Some(OutputsInit::Initializing {
-                    transaction: transaction.to_owned(),
-                    started_ms: process::now_ms(),
-                });
-                internal_state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
-                internal.save(&internal_state)?;
+                fresh = true;
                 transaction.to_owned()
             }
         };
-        // Internal-first: the paired removable control is fenced only after
-        // the internal record is durable.
+        // Both admission locks are held together (internal first) from the
+        // closure check through both `initializing` records.
         let sibling = self
             .sibling
             .as_ref()
             .filter(|sibling| sibling.control != internal_control)
             .map(|sibling| (self.view(&sibling.control), sibling.barrier));
+        let mut sibling_admission = None;
         if let Some((sibling, _barrier)) = &sibling {
             sibling.ensure_control()?;
-            let _admission = sibling.admission()?;
+            sibling_admission = Some(sibling.admission()?);
+            writers_closed(&sibling.load()?, "the paired", own_checkout)?;
+        }
+        writers_closed(&internal_state, "the internal", own_checkout)?;
+        if fresh {
+            internal_state.outputs_init = Some(OutputsInit::Initializing {
+                transaction: transaction.clone(),
+                started_ms: process::now_ms(),
+            });
+            internal_state.owned_outputs = Some(OWNED_OUTPUTS_FENCE.to_owned());
+            internal.save(&internal_state)?;
+        }
+        // Internal-first: the paired removable control is fenced only after
+        // the internal record is durable.
+        if let Some((sibling, _barrier)) = &sibling {
+            let _admission = sibling_admission.take();
             let mut state = sibling.load()?;
             match &state.outputs_init {
                 Some(OutputsInit::Ready { transaction: ready, .. }) if ready == &transaction => {}
@@ -2080,6 +2101,11 @@ impl Store {
         self.save(&state).unwrap();
     }
 
+    /// Pair this store with the other pool's control directory. `barrier`
+    /// is set for the removable store (see [`Sibling`]). The other pool's
+    /// state is replaced atomically and read without its own lock; for the
+    /// host-wide limit, a command starting in the other pool at the same
+    /// moment may briefly exceed it by one.
     pub fn with_sibling(mut self, control: &Path, barrier: bool) -> Self {
         self.sibling = Some(Sibling {
             control: control.to_path_buf(),
@@ -3624,6 +3650,40 @@ impl Drop for PublicationGuard {
     }
 }
 
+/// Positive writer closure in one pool's state for owned-outputs
+/// initialization (see [`Store::initialize_outputs`]). Anything that is not
+/// positively idle, closed or the caller's own barrier refuses.
+fn writers_closed(state: &State, pool: &str, own_checkout: Option<&Path>) -> Result<(), String> {
+    for record in &state.records {
+        if record.active() {
+            return Err(format!(
+                "{pool} pool holds an active command record (record {}); the shared output format is initialized only after every command in both pools closes",
+                record.id
+            ));
+        }
+        if let Some(why) = record
+            .lost
+            .as_ref()
+            .and_then(|lost| lost.unclosed.as_deref())
+        {
+            return Err(format!(
+                "{pool} pool has a lost slot whose writers were never confirmed closed ({why}); the shared output format is not initialized until that is resolved"
+            ));
+        }
+    }
+    if let Some(clean) = state
+        .cleans
+        .iter()
+        .find(|clean| Some(clean.checkout.as_path()) != own_checkout)
+    {
+        return Err(format!(
+            "{pool} pool holds a clean barrier for {}; the shared output format is initialized only after it closes",
+            clean.checkout.display()
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn lock_admission(control: &Path) -> Result<File, String> {
     let directory = open_control_directory(control)?
         .ok_or_else(|| format!("{} does not exist", control.display()))?;
@@ -4371,7 +4431,7 @@ mod tests {
         let transaction = "a".repeat(32);
         let created = std::cell::Cell::new(0);
         internal
-            .initialize_outputs(&transaction, &|_, may_create| {
+            .initialize_outputs(&transaction, None, &|_, may_create| {
                 assert!(may_create);
                 created.set(created.get() + 1);
                 Ok(())
@@ -4387,11 +4447,85 @@ mod tests {
         assert_eq!(state.owned_outputs.as_deref(), Some(OWNED_OUTPUTS_FENCE));
         // A ready pool validates the existing registry without creating it.
         internal
-            .initialize_outputs(&transaction, &|_, may_create| {
+            .initialize_outputs(&transaction, None, &|_, may_create| {
                 assert!(!may_create);
                 Ok(())
             })
             .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Owned-outputs initialization requires positive writer closure in both
+    /// pools under both admission locks: an active record (an older binary's
+    /// in-flight command included), a lost slot with unclosed writers or
+    /// another checkout's clean barrier refuses with nothing written, while
+    /// the initializing checkout's own barrier is allowed.
+    #[test]
+    fn output_initialization_requires_closed_writers_in_both_pools() {
+        let (root, internal, removable) = paired_controls("init-closure");
+        let own = Path::new("/own");
+        let transaction = "b".repeat(32);
+        let refuses = |internal: &Store, label: &str| {
+            let created = std::cell::Cell::new(false);
+            let error = internal
+                .initialize_outputs(&transaction, Some(own), &|_, _| {
+                    created.set(true);
+                    Ok(())
+                })
+                .unwrap_err();
+            assert!(!created.get(), "{label}: the registry was created");
+            assert!(internal.load().unwrap().outputs_init.is_none(), "{label}");
+            assert!(internal.load().unwrap().owned_outputs.is_none(), "{label}");
+            assert!(removable.load().unwrap().outputs_init.is_none(), "{label}");
+            error
+        };
+        let mut active = State::default();
+        active
+            .records
+            .push(record(Phase::Running, Some(i32::MAX), Some("v1.a.1.1.1")));
+        removable.save(&active).unwrap();
+        assert!(refuses(&internal, "active removable record").contains("active command record"));
+        removable.save(&State::default()).unwrap();
+        let mut lost = State::default();
+        let mut retired = record(Phase::Retired, None, None);
+        retired.lost = Some(Lost {
+            slot_id: "1".to_owned(),
+            at_ms: 1,
+            unclosed: Some("never confirmed".to_owned()),
+        });
+        lost.records.push(retired);
+        internal.save(&lost).unwrap();
+        assert!(refuses(&internal, "unclosed lost slot").contains("never confirmed closed"));
+        let mut other_clean = State::default();
+        other_clean.cleans.push(Clean {
+            id: 1,
+            checkout: PathBuf::from("/other"),
+            process_group: None,
+        });
+        internal.save(&other_clean).unwrap();
+        assert!(refuses(&internal, "other clean barrier").contains("/other"));
+        let mut own_clean = State::default();
+        own_clean.cleans.push(Clean {
+            id: 1,
+            checkout: own.to_path_buf(),
+            process_group: None,
+        });
+        internal.save(&own_clean).unwrap();
+        removable.save(&own_clean).unwrap();
+        internal
+            .initialize_outputs(&transaction, Some(own), &|_, may_create| {
+                assert!(may_create);
+                Ok(())
+            })
+            .unwrap();
+        for side in [&internal, &removable] {
+            let state = side.load().unwrap();
+            assert!(matches!(
+                state.outputs_init,
+                Some(OutputsInit::Ready { .. })
+            ));
+            assert_eq!(state.owned_outputs.as_deref(), Some(OWNED_OUTPUTS_FENCE));
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

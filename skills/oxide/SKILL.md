@@ -175,10 +175,15 @@ fails, Oxide reports that the wait duration is unavailable.
   (`--plan FILE --plan-sha256 HEX`) and revalidates every predicate. Roots
   whose checkout is present, whose selection is not the last live one, whose
   writer custody is unknown, whose marker or volume does not verify, or which
-  predate the version-2 registry identity are kept. An unfinished intent
+  predate the version-2 registry identity are kept. A root refused by a
+  fresh check before its intent is kept and the run continues: exit 0 lists
+  what was deleted and kept, exit 2 means nothing changed. An unfinished intent
   reports exit 3 and is settled only with `oxide outputs resolve-intent
   <intent-id>` when both the original and quarantine leaves are positively
   absent. Never prune by hand or delete an `oxide-outputs` directory.
+- On a pool converted before the version-2 registry, a build's relink refuses
+  until `oxide outputs adopt` or `oxide outputs detach` upgrades the format;
+  that upgrade waits for no other Oxide command to run in either pool.
 - Old version 1 registrations without a mode read as ephemeral and remain
   unchanged until an explicit mode update. An update writes version 2 with a
   required mode. Older Oxide binaries refuse version 2; reinstalling a binary
