@@ -80,7 +80,10 @@ def digest(path: str) -> str:
 
 
 def manifest(directory: str, name: str) -> None:
+    # A target is required: without one, `cargo locate-project` refuses the
+    # manifest before oxide reaches the guidance step.
     write(os.path.join(directory, "Cargo.toml"), MANIFEST.format(name=name))
+    write(os.path.join(directory, "src", "lib.rs"), "pub fn value() -> u32 {\n    7\n}\n")
 
 
 def git(directory: str) -> None:

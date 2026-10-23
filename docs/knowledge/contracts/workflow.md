@@ -1961,7 +1961,9 @@ it never deletes there itself.
     above does not cover `RUSTC_WRAPPER` or `RUSTC`;
   - a Cargo other than 1.97.1 (`cargo -V`), whose trigger and trace text
     were qualified;
-  - a workspace without the Oxide `AGENTS.md` block;
+  - a workspace not listed by the Oxide block that guides it (the Git root's
+    covered list inside Git, else its own `AGENTS.md` outside Git), or a
+    nested legacy block alone;
   - a missing `Cargo.lock`, or one over 16 MiB;
   - any lock source other than crates.io (`registry+https://github.com/rust-lang/crates.io-index`
     or `sparse+https://index.crates.io/`) or a path: SSH and other non-HTTP
