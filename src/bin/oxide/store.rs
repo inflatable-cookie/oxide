@@ -1065,6 +1065,18 @@ pub fn recorded_lost(control: &Path) -> Result<Vec<(String, Option<PathBuf>, Str
 /// means no cooperative Oxide command holds the checkout right now, never
 /// that no external writer exists.
 pub fn active_holders(control: &Path, checkout: &Path) -> Result<Vec<String>, String> {
+    holders(control, checkout, true)
+}
+
+/// [`active_holders`] without clean barriers, for a caller that itself holds
+/// this checkout's clean barrier: `begin_clean` admits one barrier per
+/// checkout across both pools, so any recorded barrier is the caller's own.
+/// Command records are still reported.
+pub fn active_records(control: &Path, checkout: &Path) -> Result<Vec<String>, String> {
+    holders(control, checkout, false)
+}
+
+fn holders(control: &Path, checkout: &Path, cleans: bool) -> Result<Vec<String>, String> {
     let path = control.join("state.json");
     let Some(file) = private_file(&path, false)? else {
         return Ok(Vec::new());
@@ -1094,7 +1106,7 @@ pub fn active_holders(control: &Path, checkout: &Path) -> Result<Vec<String>, St
             .map_or_else(|| "unknown".to_owned(), |holder| holder.pid.to_string());
         holders.push(format!("oxide pid {pid}: {name}"));
     }
-    for clean in &state.cleans {
+    for clean in state.cleans.iter().filter(|_| cleans) {
         if clean.checkout == checkout {
             holders.push("oxide clean barrier".to_owned());
         }
@@ -4526,6 +4538,37 @@ mod tests {
             ));
             assert_eq!(state.owned_outputs.as_deref(), Some(OWNED_OUTPUTS_FENCE));
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A holder of a checkout's clean barrier excludes only barriers when it
+    /// rechecks writers: command records are still reported.
+    #[test]
+    fn active_records_omit_barriers_but_keep_commands() {
+        let (root, internal, _removable) = paired_controls("active-records");
+        let checkout = Path::new("/checkout");
+        let mut state = State::default();
+        state.cleans.push(Clean {
+            id: 1,
+            checkout: checkout.to_path_buf(),
+            process_group: None,
+        });
+        internal.save(&state).unwrap();
+        assert_eq!(
+            active_holders(&internal.control, checkout).unwrap(),
+            vec!["oxide clean barrier".to_owned()]
+        );
+        assert!(active_records(&internal.control, checkout)
+            .unwrap()
+            .is_empty());
+        let mut running = record(Phase::Running, Some(i32::MAX), Some("v1.a.1.1.1"));
+        running.checkout = Some(checkout.to_path_buf());
+        state.records.push(running);
+        internal.save(&state).unwrap();
+        assert_eq!(
+            active_records(&internal.control, checkout).unwrap().len(),
+            1
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

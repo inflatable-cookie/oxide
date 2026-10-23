@@ -190,6 +190,11 @@ struct Intent {
     updated_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resolved_ms: Option<u64>,
+    /// The checkout receipt's terminal state committed after the registry
+    /// terminal state. A `deleted` or `resolved` intent without it is still
+    /// unfinished: its receipt step is replayed, never assumed.
+    #[serde(default)]
+    receipt_settled: bool,
 }
 
 /// The bounded preview document. Its canonical bytes are the plan a real run
@@ -686,9 +691,7 @@ impl Registry {
     }
 
     fn unfinished_intents(&self) -> impl Iterator<Item = &Intent> {
-        self.intents
-            .iter()
-            .filter(|intent| !matches!(intent.phase, IntentPhase::Deleted | IntentPhase::Resolved))
+        self.intents.iter().filter(|intent| !intent.settled())
     }
 }
 
@@ -715,6 +718,12 @@ impl Row {
 }
 
 impl Intent {
+    /// Settled only once both the registry terminal state and the checkout
+    /// receipt's terminal state committed.
+    fn settled(&self) -> bool {
+        matches!(self.phase, IntentPhase::Deleted | IntentPhase::Resolved) && self.receipt_settled
+    }
+
     fn validate(&self) -> Result<(), String> {
         if self.version != INTENT_VERSION
             || !hex32(&self.id)
@@ -1245,7 +1254,7 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
             candidate.checkout_id == intent.identity.checkout_id
                 && candidate.member == intent.identity.member
                 && candidate.root == intent.identity.root
-        }) || intent.phase == IntentPhase::Deleted;
+        }) || matches!(intent.phase, IntentPhase::Deleted | IntentPhase::Resolved);
         if !planned {
             return Ok(unsettled(
                 &control,
@@ -1256,9 +1265,14 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
                 ),
             ));
         }
-        match resume_intent(&store, &control, intent) {
+        // Every replay effect (rollback, deletion, terminal receipt) runs
+        // under the checkout's clean barrier and binding lock.
+        match under_checkout_barrier(&store, &intent.identity.checkout, || {
+            resume_intent(&store, &control, intent)
+        }) {
             Ok(Resumed::Completed) => completed_roots.push(intent.identity.root.clone()),
             Ok(Resumed::RolledBack) => rolled_back += 1,
+            Ok(Resumed::Settled) => {}
             Err(reason) => {
                 return Ok(unsettled(
                     &control,
@@ -1338,7 +1352,7 @@ fn real_run(plan: &str, sha: &str, operator_list: Option<&Path>) -> Result<u8, S
     // the batch continues; only a journaled intent stops it.
     let mut refusals: Vec<(PathBuf, String)> = Vec::new();
     for candidate in &fresh.candidates {
-        match prune_one(&store, &control, candidate, sha) {
+        match prune_one(&store, &control, candidate, sha, list.as_ref()) {
             Ok(()) => outcomes.push((candidate.clone(), None)),
             Err(Stop::Pending(reason)) => {
                 let _ = write_observations(
@@ -1622,7 +1636,16 @@ fn evaluate(
         let reason = if snapshot_error.is_some() {
             Ok(Some("the registry snapshot is incomplete".to_owned()))
         } else {
-            eligibility(store, control, registry, &row, receipt, list, &mut budget)
+            eligibility(
+                store,
+                control,
+                registry,
+                &row,
+                receipt,
+                list,
+                &mut budget,
+                false,
+            )
         };
         match reason {
             Ok(None) => {
@@ -1700,6 +1723,7 @@ fn evaluate(
 /// The eligibility predicates for one row. `Ok(None)` means every predicate
 /// holds; `Ok(Some(reason))` is an explicit keep; `Err` keeps the root and
 /// refuses the batch where the snapshot itself is untrustworthy.
+#[allow(clippy::too_many_arguments)]
 fn eligibility(
     store: &Store,
     control: &Path,
@@ -1708,6 +1732,7 @@ fn eligibility(
     receipt: Option<&Receipt>,
     list: Option<&OperatorList>,
     budget: &mut u64,
+    under_barrier: bool,
 ) -> Result<Option<String>, String> {
     if !registry.complete {
         return Ok(Some(
@@ -1791,7 +1816,17 @@ fn eligibility(
             return Ok(Some(format!("checkout absence is unknown ({reason})")))
         }
     }
-    // Writer custody across both pools, and library ledger holders.
+    // Writer custody across both pools, and library ledger holders. A
+    // caller holding the checkout's barrier excludes only its own barrier.
+    if under_barrier {
+        if let Err(reason) = custody_clear_under_barrier(store, control, &row.checkout) {
+            return Ok(Some(reason));
+        }
+        if *budget > 0 {
+            *budget = budget.saturating_sub(row.root.to_string_lossy().len() as u64);
+        }
+        return Ok(None);
+    }
     match store.checkout_custody(&row.checkout, 0)? {
         CheckoutCustody::Clear => {}
         CheckoutCustody::Writers => {
@@ -1808,12 +1843,20 @@ fn eligibility(
             "a recorded writer still holds this checkout ({holder})"
         )));
     }
+    // An unreadable removable state is not closure: the root is kept.
     let removable = removable::removable_control(control);
-    if let Ok(holders) = store::active_holders(&removable, &row.checkout) {
-        if let Some(holder) = holders.into_iter().next() {
+    match store::active_holders(&removable, &row.checkout) {
+        Ok(holders) => {
+            if let Some(holder) = holders.into_iter().next() {
+                return Ok(Some(format!(
+                    "a recorded writer in the removable pool still holds this checkout ({holder})"
+                )));
+            }
+        }
+        Err(reason) => {
             return Ok(Some(format!(
-                "a recorded writer in the removable pool still holds this checkout ({holder})"
-            )));
+                "the removable pool's writer records are unreadable ({reason})"
+            )))
         }
     }
     if *budget > 0 {
@@ -2732,6 +2775,8 @@ fn unlink_marker(root: &OwnedFd) -> Result<(), String> {
 }
 
 fn update_intent(control: &Path, id: &str, phase: IntentPhase) -> Result<(), String> {
+    // Every registry writer holds the internal publication lock.
+    let _guard = store::publication_guard(control)?;
     let mut registry = ready_registry(control)?;
     let Some(intent) = registry.intents.iter_mut().find(|intent| intent.id == id) else {
         return Err(format!("prune intent {id} disappeared"));
@@ -2764,6 +2809,7 @@ fn prune_one(
     control: &Path,
     candidate: &Candidate,
     plan_sha: &str,
+    list: Option<&OperatorList>,
 ) -> Result<(), Stop> {
     // The checkout's bounded clean barrier excludes a concurrent command in
     // both pools; the binding lock then holds through the prune's effect.
@@ -2779,7 +2825,7 @@ fn prune_one(
             )))
         }
     };
-    let outcome = prune_one_barrier(store, control, candidate, plan_sha);
+    let outcome = prune_one_barrier(store, control, candidate, plan_sha, list);
     store
         .abandon_clean(guard)
         .map_err(|error| Stop::Pending(format!("cannot release the clean barrier: {error}")))?;
@@ -2791,6 +2837,7 @@ fn prune_one_barrier(
     control: &Path,
     candidate: &Candidate,
     plan_sha: &str,
+    list: Option<&OperatorList>,
 ) -> Result<(), Stop> {
     let _binding = store
         .lock_binding(&candidate.checkout)
@@ -2819,8 +2866,87 @@ fn prune_one_barrier(
         Ok((session, id, quarantine))
     })()
     .map_err(before_journal)?;
-    journal_intent(store, control, candidate, plan_sha, &id, &quarantine)?;
+    // The locked full reread of this root's authority, then a revision
+    // compare-and-set at the journal write. A revision change in between
+    // gets one bounded reread; a second change keeps the root.
+    let mut attempts = 0;
+    loop {
+        let revision = recheck_candidate(store, control, candidate, list).map_err(Stop::Refuse)?;
+        if journal_intent(
+            store,
+            control,
+            candidate,
+            plan_sha,
+            &id,
+            &quarantine,
+            revision,
+        )? {
+            break;
+        }
+        attempts += 1;
+        if attempts >= 2 {
+            return Err(Stop::Refuse(
+                "the output registry changed twice while this root was rechecked; it is kept"
+                    .to_owned(),
+            ));
+        }
+    }
     prune_journaled(store, control, &session, &id).map_err(after_journal)
+}
+
+/// Under the checkout's barrier and binding lock: reread the ready registry
+/// and this root's receipt and re-run every eligibility predicate for its
+/// row, with the root's recorded identity unchanged. Returns the registry
+/// revision this proof read.
+fn recheck_candidate(
+    store: &Store,
+    control: &Path,
+    candidate: &Candidate,
+    list: Option<&OperatorList>,
+) -> Result<u64, String> {
+    let registry = ready_registry(control)?;
+    registry.validate()?;
+    if !registry.complete {
+        return Err("the registry became sticky-incomplete".to_owned());
+    }
+    let row = registry
+        .rows
+        .iter()
+        .find(|row| {
+            row.checkout_id == candidate.checkout_id
+                && row.member == candidate.member
+                && row.root == candidate.root
+        })
+        .cloned()
+        .ok_or("the root's registry row disappeared")?;
+    if row.nonce != candidate.nonce || row.generation != candidate.generation {
+        return Err("the root's recorded nonce or generation changed".to_owned());
+    }
+    let receipt = outputs::read_receipt_for_prune(control, &row.checkout, &row.checkout_id)?
+        .ok_or("the root's receipt is missing")?;
+    let mut budget = SNAPSHOT_MAX_BYTES;
+    if let Some(reason) = eligibility(
+        store,
+        control,
+        &registry,
+        &row,
+        Some(&receipt),
+        list,
+        &mut budget,
+        true,
+    )? {
+        return Err(reason);
+    }
+    match observe_row_root(&row)? {
+        RootState::Present(facts)
+            if facts.dev == candidate.dev
+                && facts.ino == candidate.ino
+                && facts.marker_digest == candidate.marker_digest => {}
+        RootState::Present(_) => return Err("the root's identity changed".to_owned()),
+        RootState::Absent => return Err("the root is already absent".to_owned()),
+        RootState::Unknown(reason) => return Err(reason),
+    }
+    Ok(registry.revision)
 }
 
 /// The effects after a durable intent; every stop leaves the intent pending.
@@ -2847,6 +2973,9 @@ fn prune_journaled(
     finish_quarantine(store, control, session, &id)
 }
 
+/// Publish the durable intent under internal admission. `Ok(false)` means the
+/// registry revision is no longer the one the locked recheck read: nothing
+/// was written.
 fn journal_intent(
     _store: &Store,
     control: &Path,
@@ -2854,10 +2983,14 @@ fn journal_intent(
     plan_sha: &str,
     id: &str,
     quarantine: &Path,
-) -> Result<(), Stop> {
+    expected_revision: u64,
+) -> Result<bool, Stop> {
     let _guard = store::publication_guard(control).map_err(Stop::Refuse)?;
     let mut registry = ready_registry(control).map_err(Stop::Refuse)?;
     registry.validate().map_err(Stop::Refuse)?;
+    if registry.revision != expected_revision {
+        return Ok(false);
+    }
     if !registry.complete {
         return Err(Stop::Refuse(
             "the registry became incomplete before the intent".to_owned(),
@@ -2883,7 +3016,7 @@ fn journal_intent(
         let completed = registry
             .intents
             .iter()
-            .position(|intent| matches!(intent.phase, IntentPhase::Deleted | IntentPhase::Resolved))
+            .position(Intent::settled)
             .ok_or_else(|| {
                 Stop::Refuse(
                     "the unfinished prune intent limit is reached; settle an intent first"
@@ -2915,6 +3048,7 @@ fn journal_intent(
         created_ms: process::now_ms(),
         updated_ms: process::now_ms(),
         resolved_ms: None,
+        receipt_settled: false,
     });
     registry.bump().map_err(Stop::Refuse)?;
     // A failed publication may still have landed: the journal is then an
@@ -2924,7 +3058,8 @@ fn journal_intent(
         Stop::Pending(format!(
             "the prune intent's publication did not complete ({error}); a journaled intent may be pending"
         ))
-    })
+    })?;
+    Ok(true)
 }
 
 /// Delete the verified quarantine, publish deletion proof, then the registry
@@ -2959,32 +3094,66 @@ fn finish_quarantine(
 }
 
 fn complete_intent(_store: &Store, control: &Path, id: &str, outcome: &str) -> Result<(), Stop> {
-    let (checkout, checkout_id) = {
+    {
         let _guard = store::publication_guard(control).map_err(Stop::Refuse)?;
         let mut registry = ready_registry(control).map_err(Stop::Refuse)?;
         let identity = registry
             .intent(id)
             .map(|intent| intent.identity.clone())
             .ok_or_else(|| Stop::Refuse("the prune intent disappeared".to_owned()))?;
-        if let Some(intent) = registry.intents.iter_mut().find(|intent| intent.id == id) {
-            intent.phase = IntentPhase::Deleted;
-            intent.updated_ms = process::now_ms();
+        let terminal = registry
+            .intent(id)
+            .is_some_and(|intent| intent.phase == IntentPhase::Deleted);
+        if !terminal {
+            if let Some(intent) = registry.intents.iter_mut().find(|intent| intent.id == id) {
+                intent.phase = IntentPhase::Deleted;
+                intent.updated_ms = process::now_ms();
+            }
+            if let Some(row) = registry.rows.iter_mut().find(|row| {
+                row.checkout_id == identity.checkout_id
+                    && row.member == identity.member
+                    && row.root == identity.root
+            }) {
+                row.selected = false;
+                row.pending = false;
+                row.pruning = None;
+                row.pruned_ms = Some(process::now_ms());
+            }
+            registry.bump().map_err(Stop::Refuse)?;
+            write_registry(control, &registry).map_err(Stop::Refuse)?;
         }
-        if let Some(row) = registry.rows.iter_mut().find(|row| {
-            row.checkout_id == identity.checkout_id
-                && row.member == identity.member
-                && row.root == identity.root
-        }) {
-            row.selected = false;
-            row.pending = false;
-            row.pruning = None;
-            row.pruned_ms = Some(process::now_ms());
-        }
-        registry.bump().map_err(Stop::Refuse)?;
-        write_registry(control, &registry).map_err(Stop::Refuse)?;
-        (identity.checkout, identity.checkout_id)
+    }
+    settle_receipt(control, id, outcome).map_err(Stop::Pending)
+}
+
+/// After the registry terminal state is durable: commit the checkout
+/// receipt's terminal state (idempotent for the same intent), then record
+/// that it committed. Until that record, the intent stays unfinished and
+/// this step is replayed.
+fn settle_receipt(control: &Path, id: &str, outcome: &str) -> Result<(), String> {
+    let intent = ready_registry(control)?
+        .intent(id)
+        .cloned()
+        .ok_or_else(|| format!("prune intent {id} disappeared"))?;
+    if intent.receipt_settled {
+        return Ok(());
+    }
+    outputs::mark_pruned(
+        control,
+        &intent.identity.checkout,
+        &intent.identity.checkout_id,
+        id,
+        outcome,
+    )?;
+    let _guard = store::publication_guard(control)?;
+    let mut registry = ready_registry(control)?;
+    let Some(record) = registry.intents.iter_mut().find(|record| record.id == id) else {
+        return Err(format!("prune intent {id} disappeared"));
     };
-    outputs::mark_pruned(control, &checkout, &checkout_id, id, outcome).map_err(Stop::Pending)
+    record.receipt_settled = true;
+    record.updated_ms = process::now_ms();
+    registry.bump()?;
+    write_registry(control, &registry)
 }
 
 fn checkout_absence_for_candidate(candidate: &Candidate, legacy: bool) -> Result<Absence, String> {
@@ -3018,6 +3187,37 @@ enum Resumed {
     /// An intent-phase journal with no filesystem effect was removed and the
     /// row's selection restored; nothing was deleted.
     RolledBack,
+    /// An operator resolution's terminal receipt committed; no root effect.
+    Settled,
+}
+
+/// Run `work` under `checkout`'s bounded clean barrier and binding lock, the
+/// same custody a fresh prune takes for each root.
+fn under_checkout_barrier<T>(
+    store: &Store,
+    checkout: &Path,
+    work: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let mut waits = store::WaitAccounting::default();
+    let guard = match store.begin_clean(checkout, &mut waits)? {
+        store::Cleaning::Guard(guard) => guard,
+        store::Cleaning::Interrupted(signal) => {
+            return Err(format!(
+                "interrupted by signal {signal} while taking the checkout's clean barrier"
+            ))
+        }
+    };
+    let outcome = (|| {
+        let _binding = store.lock_binding(checkout)?;
+        work()
+    })();
+    match store.abandon_clean(guard) {
+        Ok(()) => outcome,
+        Err(error) => Err(match outcome {
+            Ok(_) => format!("cannot release the clean barrier: {error}"),
+            Err(reason) => format!("{reason}; cannot release the clean barrier: {error}"),
+        }),
+    }
 }
 
 /// Resume an unfinished delete transaction for exactly the recorded intent.
@@ -3032,7 +3232,10 @@ fn resume_intent(store: &Store, control: &Path, intent: &Intent) -> Result<Resum
                 RootSession::open_quarantine(&intent.identity, &quarantine_leaf(intent)?)?;
             resume_quarantine(store, control, intent, &session)
         }
-        IntentPhase::Resolved => Ok(Resumed::Completed),
+        IntentPhase::Resolved => {
+            settle_receipt(control, &intent.id, RESOLVED_OUTCOME)?;
+            Ok(Resumed::Settled)
+        }
         IntentPhase::Intent => {
             // No filesystem effect is recorded. If the original root is still
             // present and unchanged, the journal can be rolled back exactly;
@@ -3136,6 +3339,8 @@ fn stop_text(stop: Stop) -> String {
 /// writer holds the checkout. Every check runs before the first effect; the
 /// checkout's clean barrier and binding lock are held from the recheck through
 /// the committed terminal transaction.
+const RESOLVED_OUTCOME: &str = "resolved-by-operator";
+
 fn resolve_intent(id: &str) -> Result<u8, String> {
     if !hex32(id) {
         return Ok(refused("the intent ID must be 32 lowercase hex characters"));
@@ -3151,20 +3356,36 @@ fn resolve_intent(id: &str) -> Result<u8, String> {
     let Some(intent) = registry.intent(id).cloned() else {
         return Ok(refused("no pending intent has that ID"));
     };
-    if intent.phase == IntentPhase::Deleted {
-        // The recorded transaction is already complete; finish its terminal
-        // receipt if a crash interrupted that step. No root effect occurs.
-        if let Err(reason) = complete_intent(&store, &control, id, "deleted") {
-            return Ok(refused(&format!(
-                "the intent is positively deleted but its terminal receipt did not commit ({})",
-                stop_text(reason)
-            )));
+    if matches!(intent.phase, IntentPhase::Deleted | IntentPhase::Resolved) {
+        let deleted = intent.phase == IntentPhase::Deleted;
+        if intent.receipt_settled {
+            eprintln!(
+                "oxide: intent {id} is already {}; nothing to resolve",
+                if deleted {
+                    "positively deleted"
+                } else {
+                    "resolved by an operator"
+                }
+            );
+            return Ok(0);
         }
-        eprintln!("oxide: intent {id} is already positively deleted; nothing to resolve");
-        return Ok(0);
-    }
-    if intent.phase == IntentPhase::Resolved {
-        eprintln!("oxide: intent {id} was already resolved by an operator");
+        // The registry terminal state committed but the checkout receipt's
+        // did not: finish exactly that step under the checkout's custody. No
+        // root effect occurs.
+        let finished = under_checkout_barrier(&store, &intent.identity.checkout, || {
+            settle_receipt(
+                &control,
+                id,
+                if deleted { "deleted" } else { RESOLVED_OUTCOME },
+            )
+        });
+        if let Err(reason) = finished {
+            eprintln!(
+                "oxide: resolve-intent unsettled: intent {id}'s registry terminal state committed but its checkout receipt did not ({reason}); it stays pending"
+            );
+            return Ok(3);
+        }
+        eprintln!("oxide: intent {id}'s terminal receipt committed; nothing else to resolve");
         return Ok(0);
     }
     // All refusals happen before any effect, including before the barrier.
@@ -3258,8 +3479,7 @@ fn resolve_intent(id: &str) -> Result<u8, String> {
             );
             return Ok(3);
         }
-        if let Err(reason) = complete_resolution(&store, &control, &intent, "resolved-by-operator")
-        {
+        if let Err(reason) = complete_resolution(&store, &control, &intent, RESOLVED_OUTCOME) {
             eprintln!(
                 "oxide: resolve-intent unsettled: {reason}; the resolution proof is published but the terminal transaction did not commit, so the intent stays pending"
             );
@@ -3384,7 +3604,20 @@ fn resolve_precheck(
             ));
         }
     }
-    match store.checkout_custody(&intent.identity.checkout, 0)? {
+    custody_clear_under_barrier(store, control, &intent.identity.checkout)
+}
+
+/// Writer closure for a checkout whose clean barrier and binding lock the
+/// caller holds: cooperative custody in both pools is clear and neither
+/// pool's state records an active command for it. The caller's own barrier
+/// is the only one `begin_clean` admits, so barriers are not counted. An
+/// unreadable state in either pool is not closure.
+fn custody_clear_under_barrier(
+    store: &Store,
+    control: &Path,
+    checkout: &Path,
+) -> Result<(), String> {
+    match store.checkout_custody(checkout, 0)? {
         CheckoutCustody::Clear => {}
         CheckoutCustody::Writers => {
             return Err("an active writer still holds the checkout".to_owned())
@@ -3393,16 +3626,13 @@ fn resolve_precheck(
             return Err(format!("writer custody is unknown ({reason})"))
         }
     }
-    if let Some(holder) = store::active_holders(control, &intent.identity.checkout)?
-        .into_iter()
-        .next()
-    {
+    if let Some(holder) = store::active_records(control, checkout)?.into_iter().next() {
         return Err(format!(
             "a recorded writer still holds this checkout ({holder})"
         ));
     }
     let removable = removable::removable_control(control);
-    if let Some(holder) = store::active_holders(&removable, &intent.identity.checkout)?
+    if let Some(holder) = store::active_records(&removable, checkout)?
         .into_iter()
         .next()
     {
@@ -3448,13 +3678,7 @@ fn complete_resolution(
         registry.bump()?;
         write_registry(control, &registry)?;
     }
-    outputs::mark_pruned(
-        control,
-        &intent.identity.checkout,
-        &intent.identity.checkout_id,
-        &intent.id,
-        outcome,
-    )
+    settle_receipt(control, &intent.id, outcome)
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -3909,6 +4133,7 @@ mod tests {
             created_ms: 1,
             updated_ms: 1,
             resolved_ms: None,
+            receipt_settled: false,
         };
         let mut registry = Registry {
             version: REGISTRY_VERSION.to_owned(),
@@ -3929,6 +4154,153 @@ mod tests {
         registry.incomplete = None;
         let refused = resolve_precheck(&store, &control, &intent, &registry).unwrap_err();
         assert!(refused.contains("blocking row"), "{refused}");
+    }
+
+    fn ready_control(fixture: &Fixture, rows: Vec<Row>, intents: Vec<Intent>) -> PathBuf {
+        let control = fixture.root.join("control");
+        fs::create_dir(&control).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o700)).unwrap();
+        ensure_private_dir(&registry_dir(&control)).unwrap();
+        let registry = Registry {
+            version: REGISTRY_VERSION.to_owned(),
+            revision: 5,
+            complete: true,
+            incomplete: None,
+            created_by: "a".repeat(32),
+            rows,
+            intents,
+        };
+        write_registry(&control, &registry).unwrap();
+        control
+    }
+
+    fn candidate_of(row: &Row) -> Candidate {
+        Candidate {
+            checkout_id: row.checkout_id.clone(),
+            checkout: row.checkout.clone(),
+            receipt: row.receipt.clone(),
+            member: row.member.clone(),
+            root: row.root.clone(),
+            root_kind: row.root_kind,
+            volume_uuid: row.volume_uuid.clone(),
+            checkout_volume_uuid: None,
+            nonce: row.nonce.clone(),
+            generation: row.generation,
+            dev: 1,
+            ino: 2,
+            marker_digest: "c".repeat(64),
+            logical_bytes: 0,
+            allocated_bytes: 0,
+            accounting_complete: true,
+        }
+    }
+
+    /// The journal is a compare-and-set on the revision the locked recheck
+    /// read, and every intent phase write waits for the internal publication
+    /// lock like every other registry writer.
+    #[test]
+    fn the_journal_is_revision_checked_and_phase_writes_hold_the_publication_lock() {
+        let fixture = Fixture::new();
+        let row = row_for(&fixture.root);
+        let candidate = candidate_of(&row);
+        let control = ready_control(&fixture, vec![row], Vec::new());
+        let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
+        let id = "e".repeat(32);
+        let quarantine = fixture.root.join(format!("{QUARANTINE_PREFIX}{id}"));
+        let plan = "f".repeat(64);
+        assert!(matches!(
+            journal_intent(&store, &control, &candidate, &plan, &id, &quarantine, 4),
+            Ok(false)
+        ));
+        let unchanged = ready_registry(&control).unwrap();
+        assert_eq!(unchanged.revision, 5);
+        assert!(unchanged.intents.is_empty() && unchanged.rows[0].selected);
+        assert!(matches!(
+            journal_intent(&store, &control, &candidate, &plan, &id, &quarantine, 5),
+            Ok(true)
+        ));
+        let journaled = ready_registry(&control).unwrap();
+        assert_eq!(journaled.revision, 6);
+        assert_eq!(journaled.intent(&id).unwrap().phase, IntentPhase::Intent);
+        assert_eq!(journaled.rows[0].pruning.as_deref(), Some(id.as_str()));
+        let guard = store::publication_guard(&control).unwrap();
+        let writer = {
+            let (control, id) = (control.clone(), id.clone());
+            std::thread::spawn(move || update_intent(&control, &id, IntentPhase::Renamed))
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            ready_registry(&control).unwrap().intent(&id).unwrap().phase,
+            IntentPhase::Intent,
+            "a phase write ran while the publication lock was held"
+        );
+        drop(guard);
+        writer.join().unwrap().unwrap();
+        assert_eq!(
+            ready_registry(&control).unwrap().intent(&id).unwrap().phase,
+            IntentPhase::Renamed
+        );
+    }
+
+    /// A deleted or resolved intent whose checkout receipt has not committed
+    /// its terminal state is still unfinished, so prune, adopt and
+    /// resolve-intent all replay that step instead of treating it as settled.
+    #[test]
+    fn a_terminal_intent_stays_unfinished_until_its_receipt_settles() {
+        let fixture = Fixture::new();
+        let mut row = row_for(&fixture.root);
+        row.selected = false;
+        row.pruned_ms = Some(1);
+        let intent = Intent {
+            version: INTENT_VERSION.to_owned(),
+            id: "b".repeat(32),
+            identity: RootIdentity {
+                checkout_id: row.checkout_id.clone(),
+                checkout: row.checkout.clone(),
+                receipt: row.receipt.clone(),
+                member: row.member.clone(),
+                root: row.root.clone(),
+                root_kind: RootKind::External,
+                volume_uuid: row.volume_uuid.clone(),
+                nonce: row.nonce.clone(),
+                generation: 1,
+                dev: 1,
+                ino: 2,
+                marker_digest: "c".repeat(64),
+            },
+            phase: IntentPhase::Deleted,
+            quarantine: fixture.root.join(".prune-b"),
+            preview_sha256: "f".repeat(64),
+            created_ms: 1,
+            updated_ms: 1,
+            resolved_ms: None,
+            receipt_settled: false,
+        };
+        let checkout_id = row.checkout_id.clone();
+        let control = ready_control(&fixture, vec![row], vec![intent.clone()]);
+        assert_eq!(
+            unsettled_for(&control, &checkout_id).unwrap(),
+            Some(intent.id.clone())
+        );
+        for phase in [IntentPhase::Deleted, IntentPhase::Resolved] {
+            let unsettled = Intent {
+                phase,
+                ..intent.clone()
+            };
+            assert!(!unsettled.settled());
+            assert!(Intent {
+                receipt_settled: true,
+                ..unsettled
+            }
+            .settled());
+        }
+        assert!(!Intent {
+            phase: IntentPhase::Renamed,
+            receipt_settled: true,
+            ..intent
+        }
+        .settled());
     }
 
     #[test]
