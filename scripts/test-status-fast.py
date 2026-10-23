@@ -90,6 +90,7 @@ def expect(condition: bool, message: str) -> None:
 
 
 PHASE_STARTED = time.perf_counter()
+LAST_STDERR = ""
 
 
 def say(message: str) -> None:
@@ -404,6 +405,8 @@ def run_status(
         timeout=timeout if timeout is not None else work_left(),
     )
     elapsed_ns = time.perf_counter_ns() - started
+    global LAST_STDERR
+    LAST_STDERR = result.stderr
     if result.returncode != 0:
         fail(
             f"status {args} exit {result.returncode}: {result.stderr[-2000:]}"
@@ -646,11 +649,166 @@ def run_cases(
         expect(holder.stdout is not None, "holder helper has no pipe")
         expect(holder.stdout.readline().strip() == "held", "holder could not lock")
 
+        # The observer is established by a positive control before any
+        # zero-root claim, and the log is cleared between checks.
+        case("observer-control")
+        control_root = private_dir(os.path.join(scratch, "observer"))
+        control_checkout = private_dir(os.path.join(control_root, "checkout"))
+        control = build_pool(
+            control_root,
+            [
+                slot_record(
+                    1,
+                    1,
+                    "idle",
+                    os.path.join(control_root, "pool", "oxide-managed", "affinity", "1"),
+                    control_checkout,
+                    directory="observer-aaaa/quick-1",
+                )
+            ],
+        )
+        private_dir(control["ledger"]["slots"][0]["project"])
+        write_state(control, [control_record(1, control_checkout)])
+        with open(os.path.join(control["slots_root"], "observer-aaaa/quick-1/build/blob"), "wb") as handle:
+            handle.write(os.urandom(4096))
+        clear_walk_log(walk_log)
+        run_status(subject, control, walk_log, "--measure")
+        control_roots = walk_roots(walk_log)
+        expect(
+            control_roots
+            == [
+                os.path.realpath(control["payload"]),
+                os.path.realpath(os.path.join(control["slots_root"], "observer-aaaa/quick-1")),
+            ],
+            f"the positive observer control logged {control_roots}",
+        )
+        reject_walk_warnings(LAST_STDERR, "observer control")
+        say(f"observer control: {len(control_roots)} walk roots")
+        clear_walk_log(walk_log)
+
+        # EACCES tripwire and positive control. Default never reaches the
+        # walker or the hook; --measure does and reports partial coverage.
+        case("eacces-tripwire")
+        denied_root = private_dir(os.path.join(scratch, "denied"))
+        denied_checkout = private_dir(os.path.join(denied_root, "checkout"))
+        denied = build_pool(
+            denied_root,
+            [
+                slot_record(
+                    1,
+                    2,
+                    "idle",
+                    os.path.join(denied_root, "pool", "oxide-managed", "affinity", "1"),
+                    denied_checkout,
+                    directory="denied-aaaa/quick-1",
+                )
+            ],
+        )
+        private_dir(denied["ledger"]["slots"][0]["project"])
+        write_state(denied, [control_record(1, denied_checkout)])
+        child = private_dir(os.path.join(denied["slots_root"], "denied-aaaa/quick-1/child"))
+        with open(os.path.join(child, "entry"), "wb") as handle:
+            handle.write(b"child")
+        denied_spec = mutation(
+            [{"path": os.path.realpath(child), "action": "permission_denied_before_read_dir"}]
+        )
+        clear_walk_log(walk_log)
+        denied_before = tree_digest(denied["pool"])
+        output, _ = run_status(subject, denied, walk_log, extra=denied_spec)
+        expect(walk_roots(walk_log) == [], "default status walked under an enabled denial hook")
+        expect(tree_digest(denied["pool"]) == denied_before, "the denial tripwire changed the pool")
+        reject_line(output, "unreadable", "the denial tripwire reached default output")
+        reject_walk_warnings(LAST_STDERR, "denial tripwire")
+        output, _ = run_status(subject, denied, walk_log, "--measure", extra=denied_spec)
+        expect(
+            "unreadable_entry" in output or "partial" in output,
+            f"the enabled denial produced no partial coverage:\n{output}",
+        )
+        expect(walk_roots(walk_log), "the enabled denial produced no walk")
+        say("eacces: default zero walks; --measure partial coverage")
+
+        # ONE 61 s delay at the payload root drives the real 60 s measure
+        # deadline. Its phase allocation is checked here.
+        case("measure-deadline")
+        expect(
+            work_left() >= 76.0,
+            f"only {work_left():.1f} s left before the work cutoff; need >=76 s for the 61 s case",
+        )
+        deadline_root = private_dir(os.path.join(scratch, "deadline"))
+        deadline_checkout = private_dir(os.path.join(deadline_root, "checkout"))
+        deadline = build_pool(
+            deadline_root,
+            [
+                slot_record(
+                    1,
+                    3,
+                    "idle",
+                    os.path.join(deadline_root, "pool", "oxide-managed", "affinity", "1"),
+                    deadline_checkout,
+                    directory="deadline-aaaa/quick-1",
+                ),
+                slot_record(
+                    2,
+                    1,
+                    "evicting",
+                    os.path.join(deadline_root, "pool", "oxide-managed", "affinity", "2"),
+                    deadline_checkout,
+                    directory="deadline-aaaa/quick-2",
+                ),
+            ],
+        )
+        for slot in deadline["ledger"]["slots"]:
+            private_dir(slot["project"])
+        write_state(
+            deadline,
+            [control_record(1, deadline_checkout), control_record(2, deadline_checkout)],
+        )
+        with open(os.path.join(deadline["slots_root"], "deadline-aaaa/quick-1/build/entry"), "wb") as handle:
+            handle.write(b"entry")
+        pending = os.path.join(deadline["slots_root"], "deadline-aaaa/quick-2/pending")
+        with open(pending, "wb") as handle:
+            handle.write(b"pending")
+        deadline_spec = mutation(
+            [
+                {
+                    "path": os.path.realpath(deadline["payload"]),
+                    "action": "delay_before_read_dir",
+                    "delay_ms": 61_000,
+                }
+            ]
+        )
+        clear_walk_log(walk_log)
+        ledger_hash = sha256_file(os.path.join(deadline["pool"], "ledger.json"))
+        pending_hash = sha256_file(pending)
+        output, elapsed_ns = run_status(
+            subject, deadline, walk_log, "--measure", extra=deadline_spec, timeout=75.0
+        )
+        markers = LAST_STDERR.count("oxide: debug walk delay 61000 ms")
+        expect(markers == 1, f"the delay marker fired {markers} times, not once")
+        expect(
+            os.path.realpath(deadline["payload"]) in walk_roots(walk_log),
+            f"the payload walk is missing from {walk_roots(walk_log)}",
+        )
+        expect("elapsed_deadline" in output, f"no elapsed-deadline gap:\n{output}")
+        expect(
+            "partial" in output or "at least" in output,
+            f"no partial coverage after the deadline:\n{output}",
+        )
+        expect(
+            sha256_file(os.path.join(deadline["pool"], "ledger.json")) == ledger_hash,
+            "the deadline measurement wrote the ledger",
+        )
+        expect(sha256_file(pending) == pending_hash, "the deadline measurement touched the pending slot")
+        say(f"measure deadline: {elapsed_ns / 1e9:.1f} s, one delay marker, partial coverage")
+
         case("default-status-fast")
         before = tree_digest(big["pool"])
         control_before = control_hashes(big)
         cheap_before = cheap_state(big)
+        clear_walk_log(walk_log)
         output, elapsed_ns = run_status(subject, big, walk_log)
+        expect(walk_roots(walk_log) == [], "default status walked something")
+        reject_walk_warnings(LAST_STDERR, "default status")
         after = tree_digest(big["pool"])
         elapsed = elapsed_ns / 1e9
         print(
@@ -736,7 +894,9 @@ def run_cases(
             write_observations(big, facts)
             sidecar = os.path.join(big["control"], "status-observations.json")
             before_bytes = open(sidecar, "rb").read()
+            clear_walk_log(walk_log)
             output, _ = run_status(subject, big, walk_log)
+            expect(walk_roots(walk_log) == [], f"fact {name}: default status walked")
             expect_line(output, needle, f"fact {name}")
             if name == "valid":
                 expect_line(output, "measured by the reuse walk when leased", "fact valid source")
@@ -788,7 +948,9 @@ def run_cases(
         )
         private_dir(nolock["ledger"]["slots"][0]["project"])
         write_state(nolock, [control_record(1, nolock_root + "/checkout")])
+        clear_walk_log(walk_log)
         output, _ = run_status(subject, nolock, walk_log)
+        expect(walk_roots(walk_log) == [], "the no-lock default status walked")
         expect(
             not os.path.exists(os.path.join(nolock["pool"], "lock")),
             "default status created a pool lock",
@@ -913,8 +1075,10 @@ def run_cases(
             ),
         )
         before = tree_digest(rem["pool"])
+        clear_walk_log(walk_log)
         output, elapsed_ns = run_status(subject, rem, walk_log)
-        print(f"removable recorded status: {elapsed_ns / 1e6:.1f} ms wall")
+        expect(walk_roots(walk_log) == [], "the removable recorded status walked")
+        say(f"removable recorded status: {elapsed_ns / 1e6:.1f} ms wall")
         expect(tree_digest(rem["pool"]) == before, "removable recorded status changed the pool")
         expect_line(output, "mode: permanent", "drive mode")
         expect_line(output, "no volume is present at /Volumes/OxideStatusProofAbsent", "offline selection")
