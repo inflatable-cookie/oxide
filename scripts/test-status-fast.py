@@ -988,7 +988,7 @@ def run_cases(
             "measure evicting slot label",
         )
         expect_line(output, "at least", "unknown coverage is a lower bound")
-        expect_line(output, "unknown", "measure reports unknown coverage")
+        expect_line(output, "pool coverage: Unknown", "measure reports unknown coverage")
         expect_line(output, "slots 2", "measure keeps every recorded slot")
         expect(
             os.path.exists(os.path.join(ev_slot, "pending")),
