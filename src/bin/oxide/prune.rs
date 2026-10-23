@@ -33,7 +33,11 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-pub const REGISTRY_VERSION: &str = "oxide.outputs.registry/1";
+pub const REGISTRY_VERSION: &str = "oxide.outputs.registry/2";
+/// Schema 1 named only a whole `target` placement; schema 2 names one
+/// reference per profile member and is read from a version-1 document without
+/// changing its meaning.
+const LEGACY_REGISTRY_VERSION: &str = "oxide.outputs.registry/1";
 pub const OBSERVATIONS_VERSION: &str = "oxide.outputs.prune-observations/1";
 pub const PREVIEW_VERSION: &str = "oxide.outputs.prune-preview/1";
 pub const INTENT_VERSION: &str = "oxide.outputs.prune-intent/1";
@@ -41,7 +45,9 @@ pub const RESOLUTION_VERSION: &str = "oxide.outputs.prune-resolution/1";
 
 const REGISTRY_FILE: &str = "registry.json";
 /// The registry's frozen numeric format.
-const REGISTRY_SCHEMA: u32 = 1;
+const REGISTRY_SCHEMA: u32 = 2;
+/// A version-1 registry predates profile member references.
+const LEGACY_REGISTRY_SCHEMA: u32 = 1;
 const OBSERVATIONS_FILE: &str = "prune-observations.json";
 /// The diagnostic tombstone ring (oxide#129): settled prune outcomes only,
 /// oldest first, compactable. Never a safety journal or a live cap.
@@ -494,47 +500,53 @@ fn seed_registry(control: &Path, registry: &mut Registry) -> Result<(), String> 
                 Ok(None) => continue,
                 Err(error) => return Err(error),
             };
-        let member = outputs::MEMBER;
         let checkout_volume_uuid = volume_uuid_of(&stub.checkout).ok().flatten();
-        for (selected, is_selected) in receipt
-            .current()
-            .map(|selected| (selected, true))
-            .into_iter()
-            .chain(receipt.prepared_ref().map(|prepared| (&prepared.to, false)))
-        {
-            if registry.rows.iter().any(|row| {
-                row.checkout_id == stub.checkout_id
-                    && row.member == member
-                    && row.root == selected.root()
-            }) {
-                continue;
+        for placement in receipt.links() {
+            let member = placement.member();
+            for (selected, is_selected) in placement
+                .selected_ref()
+                .map(|selected| (selected, true))
+                .into_iter()
+                .chain(
+                    placement
+                        .prepared_ref()
+                        .map(|prepared| (&prepared.to, false)),
+                )
+            {
+                if registry.rows.iter().any(|row| {
+                    row.checkout_id == stub.checkout_id
+                        && row.member == member
+                        && row.root == selected.root()
+                }) {
+                    continue;
+                }
+                if registry.rows.len() >= MAX_ROWS {
+                    return Err("the receipt seed reached the registry row limit".to_owned());
+                }
+                let identity = row_identity(selected)?;
+                registry.rows.push(Row {
+                    checkout_id: stub.checkout_id.clone(),
+                    checkout: stub.checkout.clone(),
+                    checkout_volume_uuid: checkout_volume_uuid.clone(),
+                    receipt: outputs::receipt_path_public(control, &stub.checkout_id),
+                    member: member.to_owned(),
+                    root: selected.root().to_path_buf(),
+                    root_kind: selected.kind(),
+                    volume_uuid: selected.volume_uuid().map(str::to_owned),
+                    recipe: outputs::RECIPE_PUBLIC.to_owned(),
+                    nonce: selected.nonce().map(str::to_owned),
+                    generation: selected.generation(),
+                    root_dev: identity.0,
+                    root_ino: identity.1,
+                    marker_digest: identity.2,
+                    selected: is_selected,
+                    pending: !is_selected,
+                    pruning: None,
+                    pruned_ms: None,
+                    reservation: None,
+                    cancelling: None,
+                });
             }
-            if registry.rows.len() >= MAX_ROWS {
-                return Err("the receipt seed reached the registry row limit".to_owned());
-            }
-            let identity = row_identity(selected)?;
-            registry.rows.push(Row {
-                checkout_id: stub.checkout_id.clone(),
-                checkout: stub.checkout.clone(),
-                checkout_volume_uuid: checkout_volume_uuid.clone(),
-                receipt: outputs::receipt_path_public(control, &stub.checkout_id),
-                member: member.to_owned(),
-                root: selected.root().to_path_buf(),
-                root_kind: selected.kind(),
-                volume_uuid: selected.volume_uuid().map(str::to_owned),
-                recipe: outputs::RECIPE_PUBLIC.to_owned(),
-                nonce: selected.nonce().map(str::to_owned),
-                generation: selected.generation(),
-                root_dev: identity.0,
-                root_ino: identity.1,
-                marker_digest: identity.2,
-                selected: is_selected,
-                pending: !is_selected,
-                pruning: None,
-                pruned_ms: None,
-                reservation: None,
-                cancelling: None,
-            });
         }
     }
     Ok(())
@@ -691,12 +703,19 @@ fn ready_registry(control: &Path) -> Result<Registry, String> {
 
 impl Registry {
     fn validate(&self) -> Result<(), String> {
-        if self.version != REGISTRY_VERSION || self.schema != REGISTRY_SCHEMA {
-            return Err(format!(
-                "the output registry has an unsupported version {:?}",
-                self.version
-            ));
-        }
+        let schema = match self.version.as_str() {
+            REGISTRY_VERSION if self.schema == REGISTRY_SCHEMA => REGISTRY_SCHEMA,
+            LEGACY_REGISTRY_VERSION if self.schema == LEGACY_REGISTRY_SCHEMA => {
+                LEGACY_REGISTRY_SCHEMA
+            }
+            _ => {
+                return Err(format!(
+                    "the output registry has an unsupported version {:?}",
+                    self.version
+                ))
+            }
+        };
+        let _ = schema;
         if self.revision == 0 {
             return Err("the output registry has no revision".to_owned());
         }
@@ -868,22 +887,70 @@ pub fn unsettled_for(control: &Path, checkout_id: &str) -> Result<Option<String>
 /// Publish one receipt's live references into the registry. Called from
 /// `outputs::write_receipt` while the internal publication lock is held, and
 /// strictly before the changed receipt becomes visible.
+///
+/// One row is kept per (checkout, member, root) reference. A legacy receipt's
+/// one `target` placement keeps the schema-1 meaning exactly; a profile
+/// receipt publishes one reference per positively identified member and
+/// upgrades the document to schema 2, which only happens after the caller's
+/// forward fence.
 pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
     require_registry(control)?;
     let mut registry = ready_registry(control)?;
     registry.validate()?;
+    if receipt.layout() == outputs::LayoutKind::Profile {
+        registry.version = REGISTRY_VERSION.to_owned();
+        registry.schema = REGISTRY_SCHEMA;
+    }
+    let checkout_id = receipt.checkout_id().to_owned();
+    let receipt_path = outputs::receipt_path_public(control, &checkout_id);
+    let checkout_volume_uuid = volume_uuid_of(receipt.checkout()).ok().flatten();
+    registry.bump()?;
+    for placement in receipt.links() {
+        note_placement(
+            &mut registry,
+            receipt,
+            placement,
+            &receipt_path,
+            checkout_volume_uuid.clone(),
+        )?;
+    }
+    // Members this receipt no longer places keep their identity as history but
+    // are neither selected nor pending; a blocking prune intent still owns its
+    // row.
+    let members: Vec<String> = receipt
+        .links()
+        .iter()
+        .map(|placement| placement.member().to_owned())
+        .collect();
+    for row in registry
+        .rows
+        .iter_mut()
+        .filter(|row| row.checkout_id == checkout_id && !members.contains(&row.member))
+    {
+        row.selected = false;
+        row.pending = false;
+    }
+    note_reservation(&mut registry, receipt, &receipt_path, checkout_volume_uuid)?;
+    write_registry(control, &registry)
+}
+
+/// Publish one placement's selected and proposed references.
+fn note_placement(
+    registry: &mut Registry,
+    receipt: &Receipt,
+    placement: &outputs::LinkPlacement,
+    receipt_path: &Path,
+    checkout_volume_uuid: Option<String>,
+) -> Result<(), String> {
     let checkout_id = receipt.checkout_id();
     let checkout = receipt.checkout();
-    let receipt_path = outputs::receipt_path_public(control, checkout_id);
-    let member = "target";
-    let selected = receipt.current();
-    let prepared = receipt.prepared_ref();
+    let member = placement.member();
+    let selected = placement.selected_ref();
+    let proposed = placement.prepared_ref().map(|prepared| &prepared.to);
     // A prepared transition still selects its committed root until the commit
     // is durable; a missing reference is never treated as non-selection.
     // Detach and pruned states retain identity but select nothing.
     let keep_selected = selected.is_some() && receipt.holds_selection();
-    let proposed = prepared.map(|prepared| &prepared.to);
-    registry.bump()?;
     let mut matched_selected = false;
     let mut matched_pending = false;
     for row in registry
@@ -924,9 +991,9 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
         }
     }
     if proposed.is_none() {
-        // The receipt is authoritative for this checkout's placement: a
-        // receipt with no prepared transition cannot still have a pending
-        // reference. This is what clears a rolled-back preparation.
+        // The receipt is authoritative for this placement: a placement with
+        // no prepared transition cannot still have a pending reference. This
+        // is what clears a rolled-back preparation.
         for row in registry
             .rows
             .iter_mut()
@@ -935,18 +1002,17 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
             row.pending = false;
         }
     }
-    let checkout_volume_uuid = volume_uuid_of(checkout).ok().flatten();
     if let Some(selected) = selected {
         if (keep_selected && !matched_selected) || (proposed.is_some() && !matched_pending) {
             let identity = row_identity(selected)?;
             if registry.rows.len() >= MAX_ROWS {
-                mark_incomplete(&mut registry, "the registry row limit was reached")?;
+                mark_incomplete(registry, "the registry row limit was reached")?;
             } else {
                 let row = Row {
                     checkout_id: checkout_id.to_owned(),
                     checkout: checkout.to_path_buf(),
                     checkout_volume_uuid: checkout_volume_uuid.clone(),
-                    receipt: receipt_path.clone(),
+                    receipt: receipt_path.to_path_buf(),
                     member: member.to_owned(),
                     root: selected.root().to_path_buf(),
                     root_kind: selected.kind(),
@@ -971,14 +1037,14 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
     if let Some(proposed) = proposed {
         if !matched_pending {
             if registry.rows.len() >= MAX_ROWS {
-                mark_incomplete(&mut registry, "the registry row limit was reached")?;
+                mark_incomplete(registry, "the registry row limit was reached")?;
             } else {
                 let identity = row_identity(proposed)?;
                 registry.rows.push(Row {
                     checkout_id: checkout_id.to_owned(),
                     checkout: checkout.to_path_buf(),
                     checkout_volume_uuid: checkout_volume_uuid.clone(),
-                    receipt: receipt_path.clone(),
+                    receipt: receipt_path.to_path_buf(),
                     member: member.to_owned(),
                     root: proposed.root().to_path_buf(),
                     root_kind: proposed.kind(),
@@ -999,8 +1065,7 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
             }
         }
     }
-    note_reservation(&mut registry, receipt, &receipt_path, checkout_volume_uuid)?;
-    write_registry(control, &registry)
+    Ok(())
 }
 
 /// The marker a reservation write returns after it durably published sticky
@@ -1033,7 +1098,15 @@ fn note_reservation(
     checkout_volume_uuid: Option<String>,
 ) -> Result<(), String> {
     let checkout_id = receipt.checkout_id();
-    let member = outputs::MEMBER;
+    // A reservation is root-level: every member of this checkout shares the
+    // pending reference. New rows name the first sorted member (the legacy
+    // `target` for a whole-target receipt).
+    let member = receipt
+        .links()
+        .first()
+        .map(|placement| placement.member().to_owned())
+        .unwrap_or_else(|| outputs::MEMBER.to_owned());
+    let member = member.as_str();
     let reserved = receipt.reserved();
     let current_id = reserved.map(|reserved| reserved.id.as_str());
     let selected_root = receipt
@@ -1045,7 +1118,7 @@ fn note_reservation(
     for row in registry
         .rows
         .iter_mut()
-        .filter(|row| row.checkout_id == checkout_id && row.member == member)
+        .filter(|row| row.checkout_id == checkout_id)
     {
         let Some(id) = row.reservation.clone() else {
             continue;
@@ -1084,9 +1157,11 @@ fn note_reservation(
         }
         return Ok(());
     }
-    if let Some(row) = registry.rows.iter_mut().find(|row| {
-        row.checkout_id == checkout_id && row.member == member && row.root == reserved.root
-    }) {
+    if let Some(row) = registry
+        .rows
+        .iter_mut()
+        .find(|row| row.checkout_id == checkout_id && row.root == reserved.root)
+    {
         if row.cancelling.is_some() {
             return Err(format!(
                 "reservation {} is being cancelled; refusing to republish it",

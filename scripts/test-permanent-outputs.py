@@ -323,7 +323,8 @@ def plan(proof: Proof, cwd: str, label: str) -> dict:
     code, stdout, stderr = proof.oxide(["outputs", "plan"], label, cwd)
     expect(code == 0, f"{label}: plan exited {code}: {stderr}")
     report = json.loads(stdout)
-    expect(report["version"] == "oxide.outputs.plan/1", f"{label}: {report}")
+    expect(report["version"] == "oxide.outputs.plan/2", f"{label}: {report}")
+    expect(report["layout"] in ("whole-target", "profile", "none"), f"{label}: {report}")
     expect(report["data_move"] is False, f"{label}: plan claims a data move: {report}")
     expect(len(stdout) < 64 * 1024, f"{label}: plan exceeds its byte bound")
     return report
