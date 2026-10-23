@@ -2989,7 +2989,29 @@ impl RootSession {
     }
 
     /// Recheck the volume and its reserve between bounded work batches.
-    fn check(&self) -> Result<(), Stop> {
+    /// The prune worker's own monitoring: the registered volume's identity
+    /// and reserve, and the host reserve of the internal control volume
+    /// (where every journal write lands). Unknown readings stop.
+    fn check(&self, control: &Path) -> Result<(), Stop> {
+        let host = oxide_storage::volume::observe_path(control).map_err(|error| {
+            Stop::Pending(format!(
+                "the internal control volume cannot be read ({error}); no further writes"
+            ))
+        })?;
+        match host.available_bytes {
+            Some(free) if free >= store::HOST_RESERVE_BYTES => {}
+            Some(free) => {
+                return Err(Stop::Pending(format!(
+                "host free space {free} bytes is below the {} byte host reserve; no further writes",
+                store::HOST_RESERVE_BYTES
+            )))
+            }
+            None => {
+                return Err(Stop::Pending(
+                    "host free space is unknown, so the host reserve cannot be proved".to_owned(),
+                ))
+            }
+        }
         let facts = self.binding.verify().map_err(|error| {
             Stop::Pending(format!(
                 "the registered volume is no longer verified ({error})"
@@ -3165,11 +3187,28 @@ fn sync_fd(fd: &OwnedFd) -> Result<(), String> {
 /// One bounded delete pass over a verified quarantine directory.
 struct Deleter<'a> {
     session: &'a RootSession,
+    control: &'a Path,
     deadline: Instant,
     entries: u64,
     /// The last volume and reserve check: rechecked every `DELETE_BATCH`
     /// entries and at least at the existing watchdog cadence.
     checked: Instant,
+}
+
+impl Deleter<'_> {
+    fn check(&mut self) -> Result<(), Stop> {
+        self.session.check(self.control)?;
+        self.checked = Instant::now();
+        Ok(())
+    }
+
+    /// Recheck at least every watchdog interval during any bounded work.
+    fn check_due(&mut self) -> Result<(), Stop> {
+        if self.checked.elapsed() >= crate::watchdog::INTERVAL {
+            self.check()?;
+        }
+        Ok(())
+    }
 }
 
 fn delete_contents(deleter: &mut Deleter, dir: BorrowedFd, top: bool) -> Result<(), Stop> {
@@ -3187,7 +3226,9 @@ fn delete_contents_at(
             "the quarantine is deeper than the bounded traversal allows; it is kept".to_owned(),
         ));
     }
-    let mut names = list_directory(dir).map_err(Stop::Refuse)?;
+    // Enumeration is bounded work too: the cadence check runs before it.
+    deleter.check_due()?;
+    let mut names = list_directory(dir).map_err(Stop::Pending)?;
     if names.len() > 200_000 {
         return Err(Stop::Pending(
             "one quarantined directory holds more entries than one bounded batch; it is kept"
@@ -3282,11 +3323,10 @@ fn delete_contents_at(
             }
         }
         deleter.entries += 1;
-        if deleter.entries % DELETE_BATCH == 0
-            || deleter.checked.elapsed() >= crate::watchdog::INTERVAL
-        {
-            deleter.session.check()?;
-            deleter.checked = Instant::now();
+        if deleter.entries % DELETE_BATCH == 0 {
+            deleter.check()?;
+        } else {
+            deleter.check_due()?;
         }
     }
     Ok(())
@@ -3417,7 +3457,7 @@ fn prune_one_barrier(
     let (session, id, quarantine) = (|| {
         let session = RootSession::open(candidate).map_err(Stop::Refuse)?;
         session.verify_marker(candidate).map_err(Stop::Refuse)?;
-        session.check()?;
+        session.check(control)?;
         match checkout_absence_for_candidate(candidate, false) {
             Ok(Absence::Absent) => {}
             Ok(Absence::Present) => {
@@ -3713,12 +3753,17 @@ fn finish_quarantine(
 ) -> Result<(), Stop> {
     let mut deleter = Deleter {
         session,
+        control,
         deadline: Instant::now() + Duration::from_secs(120),
         entries: 0,
         checked: Instant::now(),
     };
     crash_point("deleting").map_err(Stop::Pending)?;
+    // Every deletion, fresh or resumed, starts with a check before its
+    // first write, and the marker-last write is checked too.
+    deleter.check()?;
     delete_contents(&mut deleter, session.root.as_fd(), true)?;
+    deleter.check()?;
     update_intent(control, id, IntentPhase::MarkerLast)
         .map_err(|error| Stop::Pending(format!("cannot record marker-last: {error}")))?;
     unlink_marker(&session.root).map_err(Stop::Refuse)?;

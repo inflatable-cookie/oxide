@@ -54,7 +54,8 @@ on tiny owned fixtures with exact exit codes and state assertions:
   nonce / reservation / cancel / recreation key (4)
     03 root nonce: the external root's v2 marker nonce (32 hex) equals the
        receipt's selected nonce and the registry row's nonce.
-    04 shared reservation: two starters paused after slot keying share
+    04 shared reservation: two starters paused after slot keying (their
+       captured destination keys compared before release) share
        one reserved nonce; both bind it and the created root carries it.
     05 cancel + stale starter: a starter paused after keying has its reservation cancelled by
        `outputs cancel-reservation`; the starter refuses before Cargo with
@@ -89,7 +90,8 @@ on tiny owned fixtures with exact exit codes and state assertions:
        symlink descendant stops deletion (exit 3, target untouched) and
        replay completes; an injected low reserve at the pre-rename check
        refuses (exit 2, root bytes unchanged, nothing journaled); one between
-       delete batches of a 600-entry root stops (exit 3) and replay completes.
+       delete batches of a 600-entry root stops (exit 3) with some but not
+       all entries deleted, and replay completes.
   crash boundaries (4)
     15 after intent: exit 3, root in place; replay rolls back and deletes.
     16 after rename: exit 3, quarantine present; a recreated checkout's
@@ -99,8 +101,9 @@ on tiny owned fixtures with exact exit codes and state assertions:
        settles the receipt.
   completion / diagnostics / logical-allocated (1)
     19 completion: deleted root, registry row and intent gone, tombstone,
-       prune-observations recorded, logical/allocated bytes labelled with
-       complete coverage, `oxide status` shows the recorded observation.
+       prune-observations recorded; logical bytes equal an independent
+       by-name oracle and allocated bytes count a hard-linked 64 KiB inode
+       once (complete coverage); `oxide status` shows the observation.
   resolve-intent (2)
     20 both leaves absent: resolution receipt, `resolved-by-operator`.
     21 quarantine present: exit 2, intent unchanged; replay then completes.
@@ -123,6 +126,7 @@ import os
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import time
@@ -324,6 +328,28 @@ class World:
         return child, gate
 
 
+def keyed_destination(gate: str) -> str:
+    """The destination facts a starter's slot key captured (keyed pause)."""
+    [marker_file] = glob.glob(f"{gate}.keyed-*")
+    return permanent.read_bytes(marker_file).decode()
+
+
+def accounting_oracle(root: str) -> tuple[int, int]:
+    """Independent expectation: regular files' sizes by name, and allocated
+    blocks of each regular-file inode counted once (hard links once)."""
+    logical, allocated, seen = 0, 0, set()
+    for directory, _, files in os.walk(root):
+        for name in files:
+            facts = os.lstat(os.path.join(directory, name))
+            if not stat.S_ISREG(facts.st_mode):
+                continue
+            logical += facts.st_size
+            if (facts.st_dev, facts.st_ino) not in seen:
+                seen.add((facts.st_dev, facts.st_ino))
+                allocated += facts.st_blocks * 512
+    return logical, allocated
+
+
 def release(gate: str) -> None:
     with open(gate, "wb") as handle:
         handle.write(b"go")
@@ -424,6 +450,9 @@ def run(proof, repo: str) -> None:
     reserved = world.receipt(beta)["links"][0].get("reserved")
     expect(reserved is not None and len(reserved["nonce"]) == 32, f"no reservation: {reserved}")
     expect(reserved["kind"] == "local", reserved)
+    # Both starters keyed the same reserved nonce, before either proceeds.
+    first_key, second_key = keyed_destination(first_gate), keyed_destination(second_gate)
+    expect(first_key == second_key and reserved["nonce"] in first_key, f"keys {first_key!r} / {second_key!r}")
     release(first_gate)
     release(second_gate)
     for child, label in ((first, "starter one"), (second, "starter two")):
@@ -440,6 +469,7 @@ def run(proof, repo: str) -> None:
     permanent.set_recorded_uuid(world.pool, "00000000-0000-0000-0000-000000000000")
     stale, stale_gate = world.paused(gamma, "keyed", "stale starter")
     reserved = world.receipt(gamma)["links"][0]["reserved"]
+    expect(reserved["nonce"] in keyed_destination(stale_gate), "the stale starter did not key the reserved nonce")
     code, stdout, stderr = world.oxide(["outputs", "cancel-reservation"], "cancel the reservation", gamma)
     expect(code == 0 and "cancelled" in stdout, stdout + stderr)
     expect(world.receipt(gamma)["links"][0].get("reserved") is None, "the receipt kept the reservation")
@@ -665,9 +695,13 @@ def run(proof, repo: str) -> None:
     expect(tree_bytes(lam_root) == before and not world.intents(), "a refused reserve changed the root or journaled")
     expect(os.path.isfile(fired), "the low-reserve injection did not fire")
     os.unlink(fired)
-    code, _, stderr = world.real_run("low reserve mid-batch", alpha, plan, sha, extra={"OXIDE_TEST_PRUNE_LOW_RESERVE_AT": "2"})
+    code, _, stderr = world.real_run("low reserve mid-batch", alpha, plan, sha, extra={"OXIDE_TEST_PRUNE_LOW_RESERVE_AT": "3"})
     expect(code == 3 and "reserve" in stderr, f"low reserve mid-batch exited {code}")
     expect(os.path.isfile(fired) and world.intents() and world.quarantines(), "no pending mid-batch stop")
+    # Checks 1 (pre-rename) and 2 (before the first delete) passed; check 3
+    # fired between batches: some entries were deleted, none after the stop.
+    remaining = sum(len(files) for _, _, files in os.walk(world.quarantines()[0]))
+    expect(0 < remaining < 601, f"the reserve stop was not mid-batch ({remaining} entries left)")
     code, _, stderr = world.real_run("replay after the reserve stop", alpha, plan, sha)
     expect(code == 0 and not world.quarantines() and not world.intents(), f"reserve replay exited {code}: {stderr}")
     proof.phase("after custody cases")
@@ -714,11 +748,20 @@ def run(proof, repo: str) -> None:
 
     # ---- completion / diagnostics ----------------------------------------
     case("completion: terminal state, tombstone, observations, status")
+    # Hard-link control: one 64 KiB inode under two names counts twice by
+    # name and once allocated.
+    with open(os.path.join(kappa_root, "payload"), "wb") as handle:
+        handle.write(os.urandom(64 * 1024))
+    os.link(os.path.join(kappa_root, "payload"), os.path.join(kappa_root, "payload-link"))
+    expected_logical, expected_allocated = accounting_oracle(kappa_root)
     world.vanish(kappa)
     plan, sha, preview = world.plan_file("completion dry run", alpha)
     expect(kappa_root in world.candidates(preview), world.kept(preview, kappa_root))
-    for candidate in preview["candidates"]:
-        expect(candidate["accounting_complete"] and candidate["logical_bytes"] >= 0 and candidate["allocated_bytes"] >= 0, candidate)
+    [observed] = [candidate for candidate in preview["candidates"] if candidate["root"] == kappa_root]
+    expect(observed["accounting_complete"], observed)
+    expect(observed["logical_bytes"] == expected_logical, f"logical {observed['logical_bytes']} != oracle {expected_logical}")
+    expect(observed["allocated_bytes"] >= expected_allocated, f"allocated {observed['allocated_bytes']} < oracle {expected_allocated}")
+    expect(observed["allocated_bytes"] < observed["logical_bytes"], "the hard link was allocated twice")
     expect(preview["coverage"]["source"] and preview["coverage"]["observed_ms"] > 0, preview["coverage"])
     code, stdout, stderr = world.real_run("completion real run", alpha, plan, sha)
     expect(code == 0 and "deleted" in stdout, f"completion exited {code}: {stderr}")

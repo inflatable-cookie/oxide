@@ -252,18 +252,27 @@ fn exec_stdin() -> Stdio {
 /// the command writes `<gate>.<point>-<pid>` at `point` and waits (at most
 /// 120 s) until `<gate>` exists. Absent from release builds.
 fn test_pause(point: &str) {
+    test_pause_with(point, "");
+}
+
+/// [`test_pause`] whose marker file holds `detail` (for `keyed`, the
+/// destination facts the slot key captured, including the root nonce).
+fn test_pause_with(point: &str, detail: &str) {
     #[cfg(debug_assertions)]
     if let Some(gate) = std::env::var("OXIDE_TEST_PAUSE")
         .ok()
         .and_then(|value| value.strip_prefix(&format!("{point}:")).map(str::to_owned))
     {
-        let _ = std::fs::write(format!("{gate}.{point}-{}", std::process::id()), b"");
+        let _ = std::fs::write(
+            format!("{gate}.{point}-{}", std::process::id()),
+            detail.as_bytes(),
+        );
         let deadline = Instant::now() + std::time::Duration::from_secs(120);
         while !std::path::Path::new(&gate).exists() && Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
-    let _ = point;
+    let _ = (point, detail);
 }
 
 fn run_invocation(invocation: Invocation) -> Result<u8, String> {
@@ -312,7 +321,7 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         invocation.target.as_deref(),
         &destination,
     )?;
-    test_pause("keyed");
+    test_pause_with("keyed", &destination);
     if !selected.removable {
         if selection_mode == Some(removable::DriveMode::Permanent) {
             if let Some(reason) = fallback_reason.as_deref() {
