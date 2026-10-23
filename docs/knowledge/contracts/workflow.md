@@ -3263,9 +3263,14 @@ cutoff of about 565 s (its 30 s reserve plus a 5 s refusal margin) inside which
 cleanup and image detach must finish; scratch stays 512 MiB and no runner or
 split-proof change is granted. The published 264-400 s work estimate remains
 UNMEASURED, not an established fit, and independent source-fit may still
-refuse it. It has NOT run: the author and reviewer natives are separately
-counted owner activations, and this task's merge hold requires their exact-head
-receipts.
+refuse it. CPU controls support a 6 CPU / 8 GiB planning request: the two
+independent stagings are sequential and each is explicitly bounded to 6 Cargo
+jobs, fixture Cargo children are bounded to 2 jobs with at most two gated
+writers overlapping, and the shared staging helper takes that bound explicitly
+after sanitizing inherited `CARGO_BUILD_*` (its default is unchanged for other
+selectors), so the proof peaks at 6 concurrent Cargo jobs. It has NOT run: the
+author and reviewer natives are separately counted owner activations, and this
+task's merge hold requires their exact-head receipts.
 
 **Proof (oxide#121).** `effigy rust:auto-adopt-outputs` runs
 `scripts/test-permanent-outputs.py auto-adopt`, the focused mode of the same

@@ -93,11 +93,15 @@ FIXTURE = runner.FIXTURE
 CANDIDATE_MARKER = b"selected for the next build: internal pool (no removable volume registered)"
 
 
-def stage_at(proof: Proof, source: str, label: str) -> str:
+def stage_at(proof: Proof, source: str, label: str, jobs: int | None = None) -> str:
     """Build `oxide` from `source` into its own fresh target and build
     directories under the owned scratch, never shared with another source
     tree: one shared target let Cargo reuse the base binary for the
-    candidate in the first session (identical SHA-256 46db66ce...)."""
+    candidate in the first session (identical SHA-256 46db66ce...).
+
+    `jobs` is an OPTIONAL explicit Cargo job bound applied after the
+    inherited-environment sanitization (which removes `CARGO_BUILD_*`); the
+    default `None` keeps every existing selector's behaviour unchanged."""
     stage_root = os.path.join(proof.root, f"stage-{label}")
     os.makedirs(stage_root)
     env = dict(os.environ)
@@ -117,12 +121,22 @@ def stage_at(proof: Proof, source: str, label: str) -> str:
             "CARGO_INCREMENTAL": "0",
         }
     )
-    result = proof.run(
-        ["cargo", "build", "--locked", "--offline", "--bin", "oxide", "--message-format=json-render-diagnostics"],
-        cwd=source,
-        env=env,
-        timeout=200,
-    )
+    command = [
+        "cargo",
+        "build",
+        "--locked",
+        "--offline",
+        "--bin",
+        "oxide",
+        "--message-format=json-render-diagnostics",
+    ]
+    if jobs is not None:
+        expect(isinstance(jobs, int) and jobs > 0, f"{label}: unusable staging job bound {jobs!r}")
+        # Explicit after sanitization: an inherited CARGO_BUILD_JOBS was
+        # removed above, so the bound cannot come from the environment.
+        env["CARGO_BUILD_JOBS"] = str(jobs)
+        command.extend(["--jobs", str(jobs)])
+    result = proof.run(command, cwd=source, env=env, timeout=200)
     print(result.stderr.decode(errors="replace")[-4000:])
     expect(result.returncode == 0, f"{label} staging exit {result.returncode}")
     built = None

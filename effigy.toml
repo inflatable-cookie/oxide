@@ -69,8 +69,13 @@ run = "python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 64 -- py
 # instead of 420; the old 420 s publication at 030836f6 stays historical and
 # unactivated. The helper work cutoff is about 565 s (30 s reserve plus a 5 s
 # refusal margin), inside which cleanup and image detach must finish. The
-# published 264-400 s work estimate is UNMEASURED. Scratch stays 512 MiB with
-# one owned 128 MiB image and an ordinary detach. It
+# published estimate is UNMEASURED. CPU controls support a 6 CPU / 8 GiB
+# planning request: the two independent stagings are sequential and each is
+# explicitly bounded to 6 Cargo jobs, fixture Cargo children to 2 jobs with at
+# most two gated writers overlapping, so the proof peaks at 6 concurrent Cargo
+# jobs; the shared staging helper takes that bound explicitly and keeps its
+# default for other selectors. Scratch stays 512 MiB with one owned 128 MiB
+# image and an ordinary detach. It
 # stages base 4a70b83 and this HEAD's candidate independently and sequentially
 # from authenticated pinned source, asserts distinct binaries and state-3 /
 # state-4 capabilities, and covers the member layout, binding, migration,

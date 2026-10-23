@@ -21,9 +21,19 @@ scratch of its own. Every write stays inside the supervisor-owned scratch
 APFS sparse image at a unique `/Volumes/<name>` and uses one private `HOME`,
 `CARGO_HOME`, directory pool and fixture tree per session.
 
+CPU controls for a 6 CPU / 8 GiB planning request: the two independent
+stagings are SEQUENTIAL and each is explicitly bounded to 6 Cargo jobs; fixture
+Cargo children are bounded to 2 jobs each and at most two gated writers overlap
+(2 x 2 = 4), so the whole proof peaks at 6 concurrent Cargo jobs. No inherited
+CARGO_BUILD_JOBS is trusted: the shared staging helper sanitizes it first and
+takes an explicit optional job bound (its default stays unchanged for other
+selectors).
+
 Staging (an unmeasured estimate, not a gate): two independent configs from
-authenticated pinned source, this HEAD's candidate (~37-60 s) and base
-`4a70b83` (~37-60 s); the script discards each staging target after copying
+authenticated pinned source, this HEAD's candidate (~45-80 s at 6 jobs) and
+base `4a70b83` (~45-80 s at 6 jobs); each target is copied out and discarded
+before the next staging starts, so only one staging target exists at a time.
+The script discards each staging target after copying
 its binary into the owned `bin/` directory so both never exceed the allocation:
 288 MiB staging peak + 128 MiB image backing + 32 MiB fixtures + 32 MiB
 evidence + 32 MiB margin = 512 MiB monitored.
@@ -86,6 +96,12 @@ expect, fail, summary, MIB = perm.expect, perm.fail, perm.summary, perm.MIB
 
 BUILDER = "1.97.1"
 BASE = "4a70b83"
+# Explicit CPU controls (planning request 6 CPU / 8 GiB): each independent
+# staging is sequential with at most 6 Cargo jobs; fixture children are
+# bounded to 2 jobs each and at most two gated writers overlap, so no moment
+# exceeds 6 concurrent Cargo jobs.
+STAGE_JOBS = 6
+FIXTURE_JOBS = 2
 SHUTDOWN_MARGIN_S = 30
 MARKER = ".oxide-output.json"
 CAPABILITIES = "__oxide-build-capabilities"
@@ -152,10 +168,14 @@ def plan_only() -> int:
     print("  supervisor      scripts/bounded-test.py --limit 600 --scratch-budget-mib 512")
     print(f"  deadline        600 s total (scoped brief amendment); helper work cutoff ~565 s")
     print("                  = 30 s helper reserve + 5 s refusal margin; cleanup/detach inside it")
-    print("  fit             UNMEASURED: 264-400 s estimated work; no native, trial or")
-    print("                  setup-only run has been activated, so the estimate is not a fit")
-    print("  time estimate   two independent offline stagings 37-60 s each at Cargo's default")
-    print("                  parallelism, 20 s setup, 120-200 s cases, 30 s cleanup")
+    print("  fit             UNMEASURED: 275-410 s estimated work inside the ~565 s cutoff;")
+    print("                  no native, trial or setup-only run has been activated, so the")
+    print("                  estimate is not an established fit")
+    print("  cpu             planning request 6 CPU / 8 GiB: two SEQUENTIAL stagings at")
+    print("                  STAGE_JOBS=6 each, fixture children at FIXTURE_JOBS=2 with at")
+    print("                  most two gated writers (2 x 2 = 4); peak 6 Cargo jobs")
+    print("  time estimate   two sequential 6-job stagings ~45-80 s each, 20 s setup,")
+    print("                  120-200 s cases, 30 s cleanup -> 275-410 s estimated work")
     print("  history         the 420 s publication at 030836f6 is historical and unactivated")
     print("  amendment       GRANTED scoped bound: 600 s total (root owner 2026-10-23T16:10Z),")
     print("                  512 MiB unchanged; no disk increase, runner change or native start")
@@ -380,10 +400,13 @@ def run(proof: Proof, repo: str) -> None:
     print(f"profile-outputs proof {os.getpid()} source {source}", flush=True)
     # Independent sequential staging from authenticated pinned source, each in
     # its own target, copied out and then discarded.
+    # Explicit CPU controls for a 6 CPU / 8 GiB planning request. The two
+    # stages are sequential and each is bounded to 6 Cargo jobs (passed
+    # explicitly to the shared helper, which sanitizes CARGO_BUILD_* first).
     base_src = source_at(proof, repo, BASE, "base")
-    base = layout.stage_at(proof, base_src, "base")
+    base = layout.stage_at(proof, base_src, "base", jobs=STAGE_JOBS)
     shutil.rmtree(base_src)
-    candidate = layout.stage_at(proof, repo, "candidate")
+    candidate = layout.stage_at(proof, repo, "candidate", jobs=STAGE_JOBS)
     expect(perm.sha256_file(base) != perm.sha256_file(candidate), "base and candidate binaries are identical")
     expect(capabilities(base) == 3, f"base binary is not a state-3 binary")
     expect(capabilities(candidate) == 4, "candidate binary is not a state-4 binary")
@@ -396,6 +419,13 @@ def run(proof: Proof, repo: str) -> None:
     for directory in (home, cargo_home):
         os.makedirs(directory)
     proof.env = perm.proof_env(pool, home, cargo_home)
+    # Every fixture Cargo child (oxide build/test/bench/doc/check/metadata)
+    # inherits this bound. At most two gated fixture writers run at once, so
+    # the fixture peak is 2 x FIXTURE_JOBS = 4 jobs; staging is sequential and
+    # peaked earlier at STAGE_JOBS = 6. The fake clean `cargo` compiles
+    # nothing, and one `cargo metadata` process does not compile, so the whole
+    # proof peaks at 6 concurrent Cargo jobs.
+    proof.env["CARGO_BUILD_JOBS"] = str(FIXTURE_JOBS)
     register(proof, pool)
 
     # ----- case 01: a real target with a debug member link -----------------
