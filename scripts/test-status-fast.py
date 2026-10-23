@@ -89,9 +89,16 @@ def expect(condition: bool, message: str) -> None:
         fail(message)
 
 
+PHASE_STARTED = time.perf_counter()
+
+
+def say(message: str) -> None:
+    print(f"[{time.perf_counter() - PHASE_STARTED:7.1f}s] {message}", flush=True)
+
+
 def case(name: str) -> None:
     CASES.append(name)
-    print(f"case {name}")
+    say(f"case {name}")
 
 
 def work_left() -> float:
@@ -371,8 +378,22 @@ def fixture_env(pool: dict, walk_log: str) -> dict:
     return env
 
 
-def run_status(subject: str, pool: dict, walk_log: str, *args: str):
+def run_status(
+    subject: str,
+    pool: dict,
+    walk_log: str,
+    *args: str,
+    extra: Optional[dict] = None,
+    timeout: Optional[float] = None,
+):
     env = fixture_env(pool, walk_log)
+    # The debug walk hook is enabled only by the guard's own variables; pass
+    # them through unchanged so an enabled injection is never vacuous.
+    for name in ("OXIDE_PROOF_DEADLINE_NS", "OXIDE_TASK_SCRATCH_ROOT", "OXIDE_PROOF_EVIDENCE"):
+        if name in os.environ:
+            env[name] = os.environ[name]
+    if extra:
+        env.update(extra)
     started = time.perf_counter_ns()
     result = subprocess.run(
         [subject, "status", *args],
@@ -380,7 +401,7 @@ def run_status(subject: str, pool: dict, walk_log: str, *args: str):
         cwd=pool["root"],
         capture_output=True,
         text=True,
-        timeout=work_left(),
+        timeout=timeout if timeout is not None else work_left(),
     )
     elapsed_ns = time.perf_counter_ns() - started
     if result.returncode != 0:
@@ -388,6 +409,26 @@ def run_status(subject: str, pool: dict, walk_log: str, *args: str):
             f"status {args} exit {result.returncode}: {result.stderr[-2000:]}"
         )
     return result.stdout, elapsed_ns
+
+
+def walk_roots(walk_log: str) -> list[str]:
+    if not os.path.exists(walk_log):
+        return []
+    return [line for line in open(walk_log, encoding="utf-8").read().splitlines() if line]
+
+
+def clear_walk_log(walk_log: str) -> None:
+    if os.path.exists(walk_log):
+        os.unlink(walk_log)
+
+
+def mutation(actions: list[dict]) -> dict:
+    return {"OXIDE_TEST_WALK_MUTATIONS": json.dumps(actions)}
+
+
+def reject_walk_warnings(stderr: str, label: str) -> None:
+    if "walk log" in stderr and "not written" in stderr:
+        fail(f"{label}: the observer could not write its walk log: {stderr[-800:]}")
 
 
 def tree_digest(root: str) -> str:

@@ -374,7 +374,7 @@ struct InodeRecord {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WalkPoint {
+pub(crate) enum WalkPoint {
     BeforeReadDir,
     BeforeFileType,
     BeforeSymlinkMetadata,
@@ -1136,6 +1136,10 @@ pub mod walk_observer {
         RemoveAfterRootOpen,
         PermissionDeniedBeforeReadDir,
         PermissionDeniedBeforeSymlinkMetadata,
+        /// Test-only slowness, so a proof can drive a real walk deadline:
+        /// one total delay of 1..=65,000 ms, marked fired before it sleeps
+        /// and reported by a debug marker. Release builds have no hook.
+        DelayBeforeReadDir,
     }
 
     #[derive(Deserialize)]
@@ -1143,20 +1147,23 @@ pub mod walk_observer {
     struct MutationSpec {
         path: PathBuf,
         action: Action,
+        #[serde(default)]
+        delay_ms: Option<u64>,
     }
 
     struct Mutation {
         path: PathBuf,
         action: Action,
+        delay_ms: Option<u64>,
         fired: bool,
     }
 
-    pub(super) struct WalkHook {
+    pub(crate) struct WalkHook {
         mutations: Vec<Mutation>,
     }
 
     impl WalkHook {
-        pub(super) fn from_environment() -> Option<Self> {
+        pub(crate) fn from_environment() -> Option<Self> {
             #[cfg(test)]
             let test_value = TEST_MUTATIONS.with(|cell| cell.borrow().clone());
             #[cfg(not(test))]
@@ -1207,7 +1214,25 @@ pub mod walk_observer {
             };
             let scratch = std::fs::canonicalize(scratch).ok()?;
             let mut mutations = Vec::with_capacity(specs.len());
+            let mut aggregate = 0_u64;
             for spec in specs {
+                // A delay belongs only to the delay action, is bounded per
+                // specification and in aggregate, and anything malformed
+                // refuses the whole injection before any walk runs.
+                match (spec.action, spec.delay_ms) {
+                    (Action::DelayBeforeReadDir, Some(delay @ 1..=65_000)) => {
+                        aggregate = aggregate
+                            .checked_add(delay)
+                            .filter(|total| *total <= 65_000)
+                            .unwrap_or(65_001);
+                        if aggregate > 65_000 {
+                            return None;
+                        }
+                    }
+                    (Action::DelayBeforeReadDir, _) => return None,
+                    (_, Some(_)) => return None,
+                    (_, None) => {}
+                }
                 let candidate = if test_value.is_some() {
                     std::fs::canonicalize(&spec.path).ok()?
                 } else {
@@ -1223,13 +1248,14 @@ pub mod walk_observer {
                 mutations.push(Mutation {
                     path: canonical,
                     action: spec.action,
+                    delay_ms: spec.delay_ms,
                     fired: false,
                 });
             }
             Some(Self { mutations })
         }
 
-        pub(super) fn before(&mut self, path: &Path, point: WalkPoint) -> Option<std::io::Error> {
+        pub(crate) fn before(&mut self, path: &Path, point: WalkPoint) -> Option<std::io::Error> {
             let mutation = self.mutations.iter_mut().find(|mutation| {
                 !mutation.fired
                     && mutation.path == path
@@ -1249,6 +1275,7 @@ pub mod walk_observer {
                                 Action::PermissionDeniedBeforeSymlinkMetadata,
                                 WalkPoint::BeforeSymlinkMetadata
                             )
+                            | (Action::DelayBeforeReadDir, WalkPoint::BeforeReadDir)
                     )
             })?;
             mutation.fired = true;
@@ -1269,6 +1296,12 @@ pub mod walk_observer {
                     })
                 }
                 Action::RemoveAfterRootOpen => None,
+                Action::DelayBeforeReadDir => {
+                    let delay = mutation.delay_ms.unwrap_or(0);
+                    eprintln!("oxide: debug walk delay {delay} ms");
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    None
+                }
             }
         }
 
@@ -1331,6 +1364,12 @@ pub mod walk_observer {
             .with(|cell| cell.replace(outer))
             .unwrap_or_default();
         (result, walked)
+    }
+
+    /// Test-only: whether the current thread's injection is accepted.
+    #[cfg(test)]
+    pub(crate) fn injection_accepted() -> bool {
+        WalkHook::from_environment().is_some()
     }
 
     pub(super) fn record(root: &Path) {
@@ -1437,6 +1476,78 @@ mod tests {
         body: impl FnOnce() -> T,
     ) -> T {
         walk_observer::with_mutations(scratch_root, value.to_string(), body)
+    }
+
+    /// The debug-only delay action is strictly bounded, scoped, one-shot and
+    /// can drive a real walk deadline. It never exists outside debug builds.
+    #[test]
+    fn debug_delay_injection_is_bounded_scoped_one_shot_and_reaches_the_deadline() {
+        let fixture = Fixture::new("delay");
+        fixture.file("debug/deps/pkg.rlib", 10);
+        let root = fixture.path().to_path_buf();
+        let delayed = root.join("debug");
+        let spec = |path: &StdPath, cost: u64| {
+            serde_json::json!([{ "path": path, "action": "delay_before_read_dir", "delay_ms": cost }])
+        };
+        for value in [
+            serde_json::json!([{ "path": delayed, "action": "delay_before_read_dir" }]),
+            spec(&delayed, 0),
+            spec(&delayed, 65_001),
+            serde_json::json!([{ "path": delayed, "action": "remove_before_read_dir", "delay_ms": 5 }]),
+            // The injection must be strictly below the canonical scratch root.
+            spec(&root, 5),
+            serde_json::json!([
+                { "path": delayed, "action": "delay_before_read_dir", "delay_ms": 40_000 },
+                { "path": root.join("other"), "action": "delay_before_read_dir", "delay_ms": 30_000 }
+            ]),
+        ] {
+            let accepted = with_walk_mutations(&root, value.clone(), || {
+                walk_observer::injection_accepted()
+            });
+            assert!(!accepted, "injection was accepted: {value}");
+        }
+        let accepted = with_walk_mutations(&root, spec(&delayed, 60), || {
+            walk_observer::injection_accepted()
+        });
+        assert!(accepted, "a bounded delay injection was refused");
+
+        // One-shot: the first matching call waits, a second does not.
+        let mut hook = with_walk_mutations(&root, spec(&delayed, 60), || {
+            walk_observer::WalkHook::from_environment()
+        })
+        .expect("an accepted hook");
+        let first = std::time::Instant::now();
+        assert!(hook
+            .before(&delayed, super::WalkPoint::BeforeReadDir)
+            .is_none());
+        let waited = first.elapsed();
+        let second = std::time::Instant::now();
+        assert!(hook
+            .before(&delayed, super::WalkPoint::BeforeReadDir)
+            .is_none());
+        assert!(waited >= std::time::Duration::from_millis(40), "{waited:?}");
+        assert!(
+            second.elapsed() < std::time::Duration::from_millis(40),
+            "the injection fired twice: {:?}",
+            second.elapsed()
+        );
+
+        // A delay longer than the walk's own bound produces a real
+        // elapsed-deadline gap, not a fabricated one.
+        let limits = InventoryLimits {
+            max_elapsed_ms: 40,
+            ..InventoryLimits::default()
+        };
+        let report = with_walk_mutations(&root, spec(&delayed, 200), || {
+            inventory_directory(&root, limits)
+        })
+        .expect("walk under the delay");
+        assert!(!report.coverage.complete);
+        assert!(report
+            .coverage
+            .gaps
+            .iter()
+            .any(|gap| gap.kind == GapKind::ElapsedDeadline));
     }
 
     #[test]
