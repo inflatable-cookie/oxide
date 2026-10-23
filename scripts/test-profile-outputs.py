@@ -614,6 +614,33 @@ def run(proof: Proof, repo: str) -> None:
     expect({row["nonce"] for row in rows} == {nonce}, "11: registry nonces do not share the upgraded nonce")
     expect(migrated_receipt["version"] == "oxide.outputs.transition/3", "11: migrated receipt version")
 
+    # Case 10 (base half): a BASE-produced whole-target /2 state and warm slot
+    # key created BEFORE this pool publishes the successor fence. The candidate
+    # must reuse that exact slot, receipt and link unchanged.
+    legacy = make_checkout(proof, "legacy")
+    result = proof.run([base, "outputs", "adopt"], cwd=legacy, env=proof.env, timeout=120)
+    expect(result.returncode == 0, f"10: base whole-target adopt failed: {result.stderr.decode(errors='replace')}")
+    legacy_root = root_of(pool, legacy)
+    expect(os.path.islink(os.path.join(legacy, "target")), "10: base did not publish a whole-target link")
+    expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: base receipt is not /2")
+    result = proof.run([base, "build"], cwd=legacy, env=proof.env, timeout=180)
+    expect(result.returncode == 0, f"10: base build failed: {result.stderr.decode(errors='replace')[-2000:]}")
+    base_slot, _ = perm.slot_state(result.stderr.decode(errors="replace"))
+    code, _, stderr = oxide(proof, ["build"], "10 candidate warm on base slot", legacy)
+    expect(code == 0, f"10: candidate build on the base legacy slot failed: {stderr}")
+    candidate_slot, candidate_state = perm.slot_state(stderr)
+    expect(candidate_state == "warm", f"10: candidate did not reuse the base key: {summary(stderr)}")
+    expect(candidate_slot == base_slot, f"10: candidate changed the base slot {base_slot} -> {candidate_slot}")
+    expect(os.path.islink(os.path.join(legacy, "target")), "10: the base legacy link changed")
+    expect(link_at(os.path.join(legacy, "target")) == legacy_root, "10: the base legacy link text changed")
+    expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: the base receipt was rewritten")
+    base_links = item(pool, legacy, "links")
+    expect(base_links[0]["member"] == "target", "10: the base placement changed")
+    expect(
+        "uses the whole-target layout" in stderr and "oxide outputs adopt" in stderr,
+        f"10: the candidate did not print the one adopt notice: {stderr}",
+    )
+
     # Explicit positive control BEFORE any external-root oracle: the
     # registered removable volume is really selected, so an internal-pool
     # fallback can never masquerade as external-placement evidence.
@@ -888,22 +915,15 @@ def run(proof: Proof, repo: str) -> None:
     result = proof.run(["cargo", "metadata", "--format-version", "1", "--no-deps"], cwd=first, env=env, timeout=60)
     expect(result.returncode == 0, "09: metadata through the real target failed")
 
-    # ----- case 10: a legacy whole-target checkout is unchanged and warm ---
-    legacy = make_checkout(proof, "legacy")
-    auto_legacy(proof, legacy)
-    legacy_root = root_of(pool, legacy)
-    expect(os.path.islink(os.path.join(legacy, "target")), "10: legacy target is not a link")
-    expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: legacy receipt version changed")
-    facts = item(pool, legacy, "links")
-    expect(facts[0]["member"] == "target", "10: legacy member changed")
-    code, _, stderr = oxide(proof, ["build"], "10 second", legacy)
-    expect(code == 0, f"10: second legacy build failed: {stderr}")
-    first_slot, _ = perm.slot_state(stderr)
-    code, _, stderr = oxide(proof, ["build"], "10 warm", legacy)
-    expect(code == 0, f"10: warm legacy build failed: {stderr}")
+    # ----- case 10: legacy whole-target state stays unchanged under state 4 ---
+    # The pool now carries the successor fence (case 11); the base-produced /2
+    # checkout must still build warm with the same slot, key, receipt and link.
+    expect(fence_in(pool) == STATE4_FENCE, f"10: the pool is not state 4: {fence_in(pool)}")
+    code, _, stderr = oxide(proof, ["build"], "10 warm under state4", legacy)
+    expect(code == 0, f"10: legacy build under state4 failed: {stderr}")
     warm_slot, warm_state = perm.slot_state(stderr)
-    expect(warm_state == "warm", f"10: legacy build was not warm: {summary(stderr)}")
-    expect(warm_slot == first_slot, f"10: the warm legacy build changed slot {first_slot} -> {warm_slot}")
+    expect(warm_state == "warm", f"10: legacy build was not warm under state4: {summary(stderr)}")
+    expect(warm_slot == base_slot, f"10: legacy slot changed under state4 {base_slot} -> {warm_slot}")
     expect(os.path.islink(os.path.join(legacy, "target")), "10: the legacy link changed")
     expect(link_at(os.path.join(legacy, "target")) == legacy_root, "10: the legacy link text changed")
     expect(item(pool, legacy, "version") == "oxide.outputs.transition/2", "10: the legacy receipt was rewritten")
