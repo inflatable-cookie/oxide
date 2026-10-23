@@ -74,8 +74,11 @@ run = "python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 64 -- py
 # explicitly bounded to 6 Cargo jobs, fixture Cargo children to 2 jobs with at
 # most two gated writers overlapping, so the proof peaks at 6 concurrent Cargo
 # jobs; the shared staging helper takes that bound explicitly and keeps its
-# default for other selectors. Scratch stays 512 MiB with one owned 128 MiB
-# image and an ordinary detach. It
+# default for other selectors. Its private 128 MiB image is attached with
+# `hdiutil attach -owners on` on every attach and reattach, observed with a
+# bounded read-only mount check and the product's own registration refusal for
+# an ignore-ownership mount; no real drive or host setting changes. Scratch
+# stays 512 MiB and the detach is ordinary. It
 # stages base 4a70b83 and this HEAD's candidate independently and sequentially
 # from authenticated pinned source, asserts distinct binaries and state-3 /
 # state-4 capabilities, and covers the member layout, binding, migration,

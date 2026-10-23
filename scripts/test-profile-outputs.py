@@ -18,8 +18,14 @@ This script is a whole fixed script with no supervision, clock, signal or
 scratch of its own. Every write stays inside the supervisor-owned scratch
 (`OXIDE_TASK_SCRATCH_ROOT`, also `TMPDIR`/`TMP`/`TEMP`); evidence goes to
 `OXIDE_PROOF_EVIDENCE`. It models the removable drive as ONE owned 128 MiB
-APFS sparse image at a unique `/Volumes/<name>` and uses one private `HOME`,
-`CARGO_HOME`, directory pool and fixture tree per session.
+APFS sparse image at a unique `/Volumes/<name>`, attached with
+`hdiutil attach -owners on` on EVERY attach and reattach, and uses one private
+`HOME`, `CARGO_HOME`, directory pool and fixture tree per session. The fixture
+prerequisite is published and asserted twice: a bounded read-only `/sbin/mount`
+observation that the mounted root does not carry `noowners`, and the product's
+own `pool register-removable` refusal for an ignore-ownership mount. This is a
+private-image fixture option only; no real drive, persistent host setting,
+mount permission or product safety check is changed.
 
 CPU controls for a 6 CPU / 8 GiB planning request: the two independent
 stagings are SEQUENTIAL and each is explicitly bounded to 6 Cargo jobs; fixture
@@ -188,7 +194,10 @@ def plan_only() -> int:
     print(f"  staging         candidate {os.environ.get('OXIDE_PROFILE_HEAD', 'this HEAD')} and base {BASE}")
     print("  seed            none: both stagings are plain Cargo offline builds from authenticated pinned source")
     print("  monitoring      supervisor reserve sampling, census/closure and cleanup; this script runs no clock, timer or harness")
-    print(f"  image           one owned 128 MiB APFS sparse image at a unique /Volumes/<name>, ordinary detach")
+    print("  image           one owned 128 MiB APFS sparse image at a unique /Volumes/<name>,")
+    print("                  attached with hdiutil -owners on for every attach/reattach,")
+    print("                  asserted by a bounded read-only mount observation and the")
+    print("                  product registration control; ordinary detach")
     print("  environment     one private HOME, CARGO_HOME and directory pool per session")
     print("  cases")
     for case in CASES:
@@ -340,8 +349,43 @@ def make_checkout(proof: Proof, name: str, files: dict | None = None) -> str:
     return os.path.realpath(workspace)
 
 
+def owners_honored(proof: Proof, mount: str, label: str) -> None:
+    """Bounded read-only observation that the private image's mounted root does
+    not carry the ignore-ownership flag. The product registration below is the
+    second control: it refuses an ignore-ownership mount."""
+    result = proof.run(["/sbin/mount"], timeout=30)
+    expect(result.returncode == 0, f"{label}: mount listing failed: {result.stderr!r}")
+    line = next(
+        (
+            entry
+            for entry in result.stdout.decode(errors="replace").splitlines()
+            if f" on {mount} " in entry
+        ),
+        None,
+    )
+    expect(line is not None, f"{label}: {mount} is not in the mount listing")
+    expect(
+        "noowners" not in line,
+        f"{label}: {mount} was mounted with owners ignored (MNT_IGNORE_OWNERSHIP): {line}",
+    )
+
+
+def attach_owned_image(proof: Proof, label: str) -> str:
+    """Attach this proof's private image with filesystem owners ON, then
+    positively observe the mount state. Every attach and reattach in this
+    proof goes through here."""
+    mount = perm.attach_image(
+        proof,
+        proof.root,
+        "ProfileOutputs-" + secrets.token_hex(3),
+        owners=True,
+    )
+    owners_honored(proof, mount, label)
+    return mount
+
+
 def register(proof: Proof, pool: str, mode: str = "permanent") -> None:
-    mount = perm.attach_image(proof, proof.root, "ProfileOutputs-" + secrets.token_hex(3))
+    mount = attach_owned_image(proof, "initial attach")
     code, _, stderr = proof.oxide(
         ["pool", "register-removable", mount, "--reserve", "2GiB", "--cap", "96MiB", "--mode", mode],
         "register removable",
@@ -750,7 +794,7 @@ def run(proof: Proof, repo: str) -> None:
     expect(local != external, "14: fallback kept the external root")
     expect_layout(fallback, {"debug": f"link:{local}", "release": f"link:{local}"})
     expect(os.path.isdir(external), "14: the external root was deleted")
-    remount = perm.attach_image(proof, proof.root, "ProfileOutputs-" + secrets.token_hex(3))
+    remount = attach_owned_image(proof, "fallback return attach")
     expect(remount is not None, "14: cannot re-attach the image")
     adopt(proof, fallback, "14 return adopt")
     expect_layout(fallback, {"debug": f"link:{external}", "release": f"link:{external}"})

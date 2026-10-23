@@ -330,7 +330,11 @@ def plan(proof: Proof, cwd: str, label: str) -> dict:
     return report
 
 
-def attach_image(proof: Proof, root: str, name: str) -> str:
+def attach_image(proof: Proof, root: str, name: str, owners: bool = False) -> str:
+    """Attach this proof's OWNED sparse image. `owners` is an optional
+    `hdiutil attach -owners on` request used only by a proof that needs
+    filesystem ownership honored on its private image; the default keeps every
+    existing selector's command and behaviour unchanged."""
     image = os.path.join(root, "volume.sparseimage")
     if not os.path.exists(image):
         created = proof.run(
@@ -339,7 +343,11 @@ def attach_image(proof: Proof, root: str, name: str) -> str:
             timeout=60,
         )
         expect(created.returncode == 0, f"image creation failed: {created.stderr!r}")
-    attached = proof.run(["/usr/bin/hdiutil", "attach", "-nobrowse", "-plist", image], timeout=60)
+    attach_command = ["/usr/bin/hdiutil", "attach", "-nobrowse", "-plist"]
+    if owners:
+        attach_command.extend(["-owners", "on"])
+    attach_command.append(image)
+    attached = proof.run(attach_command, timeout=60)
     expect(
         attached.returncode == 0,
         f"attach failed; attachment unresolved, evidence kept: {attached.stderr!r}",

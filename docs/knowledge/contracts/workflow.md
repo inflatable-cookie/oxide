@@ -3268,7 +3268,13 @@ independent stagings are sequential and each is explicitly bounded to 6 Cargo
 jobs, fixture Cargo children are bounded to 2 jobs with at most two gated
 writers overlapping, and the shared staging helper takes that bound explicitly
 after sanitizing inherited `CARGO_BUILD_*` (its default is unchanged for other
-selectors), so the proof peaks at 6 concurrent Cargo jobs. It has NOT run: the
+selectors), so the proof peaks at 6 concurrent Cargo jobs. Its private 128 MiB
+APFS fixture image is attached with `hdiutil attach -owners on` on every attach
+and reattach so the mounted root does not ignore filesystem ownership, and the
+prerequisite is asserted by a bounded read-only mount observation plus the
+product's own registration refusal; no real drive, persistent host ownership
+setting, mount permission or registration safety check is changed. It has NOT
+run: the
 author and reviewer natives are separately counted owner activations, and this
 task's merge hold requires their exact-head receipts.
 
