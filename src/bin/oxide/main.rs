@@ -263,10 +263,13 @@ fn test_pause_with(point: &str, detail: &str) {
         .ok()
         .and_then(|value| value.strip_prefix(&format!("{point}:")).map(str::to_owned))
     {
-        let _ = std::fs::write(
-            format!("{gate}.{point}-{}", std::process::id()),
-            detail.as_bytes(),
-        );
+        // Published atomically: the content is complete before the marker
+        // name (which the proof globs for) exists.
+        let marker = format!("{gate}.{point}-{}", std::process::id());
+        let staged = format!("{gate}.staging-{point}-{}", std::process::id());
+        if std::fs::write(&staged, detail.as_bytes()).is_ok() {
+            let _ = std::fs::rename(&staged, &marker);
+        }
         let deadline = Instant::now() + std::time::Duration::from_secs(120);
         while !std::path::Path::new(&gate).exists() && Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(50));

@@ -2284,10 +2284,18 @@ fn checkout_walk(checkout: &Path) -> Result<(bool, Vec<&std::ffi::OsStr>), Strin
     Ok((under_volumes, rest))
 }
 
+/// The mount root of a `/Volumes/<mount>/...` checkout: `RootDir`,
+/// `Volumes`, then the mount name (component 2).
+fn volumes_mount(checkout: &Path) -> Option<PathBuf> {
+    match checkout.components().nth(2) {
+        Some(std::path::Component::Normal(volume)) => Some(Path::new("/Volumes").join(volume)),
+        _ => None,
+    }
+}
+
 fn checkout_absence(row: &Row, operator_legacy: bool) -> Result<Absence, String> {
     use std::os::unix::ffi::OsStrExt;
     let checkout = &row.checkout;
-    let components: Vec<_> = checkout.components().collect();
     let (under_volumes, rest) = match checkout_walk(checkout) {
         Ok(found) => found,
         Err(reason) => return Ok(Absence::Unknown(reason)),
@@ -2301,12 +2309,11 @@ fn checkout_absence(row: &Row, operator_legacy: bool) -> Result<Absence, String>
                 "a /Volumes checkout has no recorded volume UUID".to_owned(),
             ));
         };
-        let Some(std::path::Component::Normal(volume)) = components.get(1) else {
+        let Some(mount) = volumes_mount(checkout) else {
             return Ok(Absence::Unknown(
                 "the /Volumes path is malformed".to_owned(),
             ));
         };
-        let mount = Path::new("/Volumes").join(volume);
         let binding = match Binding::open(&mount, Some(uuid)) {
             Ok(binding) => binding,
             Err(error) => {
@@ -2349,10 +2356,7 @@ fn checkout_absence(row: &Row, operator_legacy: bool) -> Result<Absence, String>
     }
     // The directory each walk step reads, for the debug-only EACCES fixture.
     let mut walked = if under_volumes {
-        match components.get(1) {
-            Some(std::path::Component::Normal(volume)) => Path::new("/Volumes").join(volume),
-            _ => PathBuf::from("/Volumes"),
-        }
+        volumes_mount(checkout).unwrap_or_else(|| PathBuf::from("/Volumes"))
     } else {
         PathBuf::from("/")
     };
@@ -3226,16 +3230,12 @@ fn delete_contents_at(
             "the quarantine is deeper than the bounded traversal allows; it is kept".to_owned(),
         ));
     }
-    // Enumeration is bounded work too: the cadence check runs before it.
+    // Enumeration is bounded work too: polled while names accumulate, capped,
+    // and checked again after sorting, before this directory's first write.
     deleter.check_due()?;
-    let mut names = list_directory(dir).map_err(Stop::Pending)?;
-    if names.len() > 200_000 {
-        return Err(Stop::Pending(
-            "one quarantined directory holds more entries than one bounded batch; it is kept"
-                .to_owned(),
-        ));
-    }
+    let mut names = list_directory_checked(dir, deleter)?;
     names.sort();
+    deleter.check()?;
     for name in names {
         if top && name == outputs::MARKER {
             continue;
@@ -3330,6 +3330,62 @@ fn delete_contents_at(
         }
     }
     Ok(())
+}
+
+/// Most names one quarantined directory may hold in one bounded pass.
+const MAX_DIRECTORY_NAMES: usize = 200_000;
+
+/// `list_directory` for deletion: the deleter's cadence check runs every
+/// `DELETE_BATCH` names, and more than `MAX_DIRECTORY_NAMES` stops with the
+/// intent pending. One `readdir` call itself is not interrupted.
+fn list_directory_checked(dir: BorrowedFd, deleter: &mut Deleter) -> Result<Vec<String>, Stop> {
+    // SAFETY: `dup` returns a new descriptor.
+    let dup = unsafe { libc::dup(dir.as_raw_fd()) };
+    if dup < 0 {
+        return Err(Stop::Pending(format!(
+            "cannot read a quarantined directory ({})",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: `dup` is a live descriptor that `fdopendir` takes ownership of.
+    let stream = unsafe { libc::fdopendir(dup) };
+    if stream.is_null() {
+        // SAFETY: the duplicate is still owned here.
+        unsafe { libc::close(dup) };
+        return Err(Stop::Pending(format!(
+            "cannot read a quarantined directory ({})",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut names = Vec::new();
+    let outcome = loop {
+        // SAFETY: `stream` is a live directory stream.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break Ok(());
+        }
+        // SAFETY: `d_name` is a live NUL-terminated array for this entry.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let name = name.to_string_lossy().into_owned();
+        if name == "." || name == ".." {
+            continue;
+        }
+        names.push(name);
+        if names.len() > MAX_DIRECTORY_NAMES {
+            break Err(Stop::Pending(
+                "one quarantined directory holds more entries than one bounded pass; it is kept"
+                    .to_owned(),
+            ));
+        }
+        if names.len() % DELETE_BATCH as usize == 0 {
+            if let Err(stop) = deleter.check_due() {
+                break Err(stop);
+            }
+        }
+    };
+    // SAFETY: `stream` is live and closed once.
+    unsafe { libc::closedir(stream) };
+    outcome.map(|()| names)
 }
 
 fn list_directory(dir: BorrowedFd) -> Result<Vec<String>, String> {
@@ -3458,7 +3514,12 @@ fn prune_one_barrier(
         let session = RootSession::open(candidate).map_err(Stop::Refuse)?;
         session.verify_marker(candidate).map_err(Stop::Refuse)?;
         session.check(control)?;
-        match checkout_absence_for_candidate(candidate, false) {
+        // The locked recheck keeps the operator-list legacy classification
+        // the preview validated: a receiptless root, or a listed registry
+        // row without a v2 identity, takes the boot Data volume rule.
+        let listed = list.is_some_and(|list| list.roots.iter().any(|root| root == &candidate.root));
+        let legacy = candidate.receiptless || (listed && candidate.nonce.is_none());
+        match checkout_absence_for_candidate(candidate, legacy) {
             Ok(Absence::Absent) => {}
             Ok(Absence::Present) => {
                 return Err(Stop::Refuse(
@@ -3775,6 +3836,7 @@ fn finish_quarantine(
             "the quarantine gained content after its marker was removed".to_owned(),
         ));
     }
+    deleter.check()?;
     session
         .remove_quarantine(&format!("{QUARANTINE_PREFIX}{id}"))
         .map_err(Stop::Pending)?;
@@ -5514,6 +5576,17 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(reason.contains("another live reference"), "{reason}");
+    }
+
+    /// A registered `/Volumes` checkout's mount is `/Volumes/<name>`
+    /// (component 2), never `/Volumes/Volumes`.
+    #[test]
+    fn a_volumes_checkout_names_its_own_mount() {
+        assert_eq!(
+            volumes_mount(Path::new("/Volumes/Builds/work/app")),
+            Some(PathBuf::from("/Volumes/Builds"))
+        );
+        assert_eq!(volumes_mount(Path::new("/Volumes")), None);
     }
 
     #[test]

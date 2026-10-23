@@ -72,7 +72,9 @@ on tiny owned fixtures with exact exit codes and state assertions:
        binds it with no invented row. Run last: the flag is never cleared.
   eligibility / operator list / absence (3)
     10 live checkout kept; a live (present) detached checkout's root kept;
-       the same released root is a candidate once its checkout is gone.
+       the same released root is a candidate once its checkout is gone; a
+       registered checkout on the attached image is a candidate when gone
+       (absence through the verified mount and recorded UUID).
     11 unreadable ancestor kept: a debug-only EACCES (OXIDE_TEST_PRUNE_EACCES,
        bound to the supervisor's scratch/evidence layout) keeps the root, its
        firing is recorded in evidence, and the same fixture without injection
@@ -234,8 +236,8 @@ class World:
         env.update(extra or {})
         return permanent.oxide_env(self.proof, args, label, cwd, env)
 
-    def checkout(self, name: str) -> str:
-        path = os.path.join(self.root, "checkouts", name)
+    def checkout(self, name: str, base: str | None = None) -> str:
+        path = os.path.join(base or self.root, "checkouts", name)
         os.makedirs(os.path.join(path, "src"))
         with open(os.path.join(path, "Cargo.toml"), "w", encoding="utf-8") as handle:
             handle.write(PLAIN)
@@ -260,7 +262,12 @@ class World:
         return receipt["links"][0]["selected"]
 
     def vanish(self, checkout: str) -> str:
-        away = os.path.join(self.gone, os.path.basename(checkout) + "-" + secrets.token_hex(3))
+        # A rename never crosses devices: an image checkout moves within it.
+        base = self.gone
+        if self.mount and checkout.startswith(self.mount + "/"):
+            base = os.path.join(self.mount, "gone")
+            os.makedirs(base, exist_ok=True)
+        away = os.path.join(base, os.path.basename(checkout) + "-" + secrets.token_hex(3))
         os.rename(checkout, away)
         expect(not os.path.lexists(checkout), f"{checkout} still exists")
         return away
@@ -528,6 +535,15 @@ def run(proof, repo: str) -> None:
     expect(epsilon_root in world.candidates(preview), f"a released vanished root was kept: {world.kept(preview, epsilon_root)}")
     world.restore(epsilon, epsilon_away)
 
+    # A registered checkout on the attached image: absence is proved through
+    # the verified mount and its recorded volume UUID (the /Volumes branch).
+    omega = world.checkout("omega", base=mount)
+    omega_root = world.adopt(omega)["links"][0]["selected"]["root"]
+    omega_away = world.vanish(omega)
+    _, _, preview = world.plan_file("registered image checkout dry run", alpha)
+    expect(omega_root in world.candidates(preview), f"a registered /Volumes checkout was kept: {world.kept(preview, omega_root)}")
+    world.restore(omega, omega_away)
+
     case("injected EACCES ancestor kept; genuine absence is a candidate; bad lists refuse")
     # No real unreadable directory: a debug-only EACCES is injected inside the
     # supervisor-owned scratch, its firing is recorded in the evidence
@@ -598,6 +614,9 @@ def run(proof, repo: str) -> None:
     listed = os.path.join(proof.root, "list-legacy.json")
     with open(listed, "w", encoding="utf-8") as handle:
         json.dump([legacy_root, image_root, foreign_root, forged_root], handle)
+    # Delta (an ordinary eligible root) is present for this run so only the
+    # listed legacy roots are candidates; it vanishes again afterwards.
+    world.restore(delta, delta_away)
     plan, sha, preview = world.plan_file("legacy dry run", alpha, listed)
     expect(legacy_root in world.candidates(preview), f"legacy root not a candidate: {world.kept(preview, legacy_root)}")
     expect(image_root not in world.candidates(preview), "a legacy root of an image checkout became a candidate")
@@ -608,6 +627,7 @@ def run(proof, repo: str) -> None:
     expect(code == 0, f"legacy real run exited {code}: {stderr}")
     expect(not os.path.lexists(legacy_root), "the legacy root remains")
     expect(os.path.isdir(image_root), "the kept image-checkout legacy root was deleted")
+    delta_away = world.vanish(delta)
     for root, digest in kept_before.items():
         expect(tree_bytes(root) == digest, f"kept listed root {root} changed")
     legacy_receipt = permanent.read_json(permanent.receipt_file(world.pool, legacy_checkout))
@@ -780,6 +800,14 @@ def run(proof, repo: str) -> None:
     shutil.copytree(world.checkout("kappa-src"), kappa, dirs_exist_ok=True)
     code, _, stderr = world.oxide(["outputs", "adopt"], "re-adopt the recreated checkout", kappa)
     expect(code == 0, stderr)
+    # The old root's slot is still present and idle (read-only status), so a
+    # cold, different slot below proves key separation, not eviction.
+    code, stdout, _ = world.oxide(["status"], "old kappa slot still idle", alpha)
+    expect(code == 0, "status failed")
+    expect(
+        any(line.split()[:3] == ["slot", kappa_slot, "idle"] for line in stdout.splitlines()),
+        f"the old kappa slot {kappa_slot} is not present and idle before the recreated build",
+    )
     new_nonce = world.selected(kappa)["nonce"]
     expect(new_nonce and new_nonce != old_nonce, f"recreated root nonce {new_nonce} reused {old_nonce}")
     code, _, stderr = world.oxide(["check"], "recreated root build", kappa)
