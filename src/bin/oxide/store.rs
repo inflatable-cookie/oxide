@@ -3204,6 +3204,24 @@ fn object_fits<T: Serialize>(value: &T, max: usize, what: &str) -> Result<(), St
     Ok(())
 }
 
+/// Caller-available bytes of the filesystem holding the new pool's parent.
+/// Debug builds accept a scoped injected reading so the fixture proof reaches
+/// the refusal path, capacity diagnostic included, without consuming the
+/// host's free space; release builds always sample the filesystem.
+fn free_bytes_for_creation(parent: &Path) -> Option<u64> {
+    #[cfg(debug_assertions)]
+    if let Some(injected) = std::env::var("OXIDE_TEST_POOL_FREE_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        return Some(injected);
+    }
+    statfs(parent).and_then(|sample| {
+        let block = u64::try_from(sample.f_bsize).ok()?;
+        sample.f_bavail.checked_mul(block)
+    })
+}
+
 fn create_pool(path: &Path, budget: u64) -> Result<(), String> {
     let parent = path.parent().ok_or("the pool path has no parent")?;
     let name = path
@@ -3211,17 +3229,20 @@ fn create_pool(path: &Path, budget: u64) -> Result<(), String> {
         .ok_or("the pool path has no final component")?;
     create_parents(parent)?;
     let parent = fs::canonicalize(parent).map_err(|error| error.to_string())?;
-    let available = statfs(&parent)
-        .and_then(|sample| {
-            let block = u64::try_from(sample.f_bsize).ok()?;
-            sample.f_bavail.checked_mul(block)
-        })
+    let available = free_bytes_for_creation(&parent)
         .ok_or("cannot sample host free space for pool creation")?;
     if available < HOST_RESERVE_BYTES {
-        return Err(format!(
+        let mut message = format!(
             "refusing to create the pool: host free space {} MiB is below the 20 GiB reserve",
             available / (1024 * 1024)
-        ));
+        );
+        // Read-only, bounded macOS figures for the same filesystem, after the
+        // refusal is decided: they never change the 20 GiB decision.
+        if let Some(note) = crate::capacity::diagnose(&parent) {
+            message.push('\n');
+            message.push_str(&note);
+        }
+        return Err(message);
     }
     let pool = parent.join(name);
     let backend = Backend::DirectoryBudget;

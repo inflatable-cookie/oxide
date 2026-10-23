@@ -11,6 +11,12 @@ The receipt records the pinned build's own `control_state_version` and
 `registration_version` capabilities, read by an effect-free probe of the
 built binary (oxide#122). A build that cannot report them is refused before
 anything is installed, so no receipt wrongly claims a hand-off target.
+
+Every build is stamped with the authenticated source pin and a fresh
+128-bit installer instance (oxide#130), so `oxide --version` can name the
+source it came from and prove the running binary is this receipt's. The
+stamp is verified in the built binary before installation; a receipt without
+one could not be authenticated.
 """
 import argparse
 import datetime
@@ -30,6 +36,9 @@ DESTINATION = HOME / ".local/bin/oxide"
 RECEIPTS = HOME / ".local/state/oxide/install"
 BUILD = ["cargo", "build", "--release", "--locked", "--offline", "--bin", "oxide"]
 CAPABILITIES_ARGUMENT = "__oxide-build-capabilities"
+IDENTITY_ARGUMENT = "__oxide-build-identity"
+BUILD_PIN_VARIABLE = "OXIDE_BUILD_PIN"
+BUILD_INSTANCE_VARIABLE = "OXIDE_BUILD_INSTANCE"
 REPOSITORY = Path(__file__).resolve().parent.parent
 REMOTE_MAIN = "refs/heads/main"
 
@@ -155,7 +164,26 @@ def preflight(replace):
     return previous, expected
 
 
-def build(pin, staging):
+def new_instance():
+    """A fresh 128-bit lowercase-hex nonce for exactly this build."""
+    return secrets.token_hex(16)
+
+
+def build_environment(staging, pin, instance):
+    """The build's environment: private target, authenticated pin, fresh instance.
+
+    Inherited `CARGO_TARGET_*` names are dropped so the build cannot write to
+    a caller's storage. The stamp names are read by `option_env!`, which
+    Cargo tracks, so a changed stamp recompiles the binary.
+    """
+    environment = {k: v for k, v in os.environ.items() if not k.startswith("CARGO_TARGET_")}
+    environment["CARGO_TARGET_DIR"] = str(staging / "target")
+    environment[BUILD_PIN_VARIABLE] = pin
+    environment[BUILD_INSTANCE_VARIABLE] = instance
+    return environment
+
+
+def build(pin, instance, staging):
     source = staging / "source"
     source.mkdir()
     archive = subprocess.Popen(
@@ -164,8 +192,7 @@ def build(pin, staging):
     subprocess.run(["tar", "-x", "-C", str(source)], stdin=archive.stdout, check=True)
     if archive.wait() != 0:
         raise Refusal("git archive failed")
-    environment = {k: v for k, v in os.environ.items() if not k.startswith("CARGO_TARGET_")}
-    environment["CARGO_TARGET_DIR"] = str(staging / "target")
+    environment = build_environment(staging, pin, instance)
     versions = {
         tool: subprocess.run(
             [tool, "-vV" if tool == "rustc" else "-V"],
@@ -201,6 +228,47 @@ def state_capabilities(built):
             raise Refusal(f"the built oxide reported no valid {name}")
         values[name] = value
     return values
+
+
+def build_identity(built, pin, instance):
+    """The stamp the built binary actually carries, or a refusal.
+
+    This runs the built binary's own effect-free probe, so a build that missed
+    its stamp or kept a stale one can never be installed with a receipt that
+    claims it.
+    """
+    try:
+        result = subprocess.run(
+            [str(built), IDENTITY_ARGUMENT], check=True, capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise Refusal(f"the built oxide cannot report its build identity: {error}")
+    try:
+        reported = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise Refusal(f"the built oxide printed no build identity JSON: {error}")
+    if not isinstance(reported, dict):
+        raise Refusal("the built oxide printed no build identity object")
+    for name, expected in (("build_pin", pin), ("build_instance", instance)):
+        if reported.get(name) != expected:
+            raise Refusal(f"the built oxide's {name} does not match this build")
+    return reported
+
+
+def write_receipt(receipt, started, pin):
+    """Write one new receipt owner-only; earlier receipts are left untouched."""
+    RECEIPTS.mkdir(parents=True, exist_ok=True)
+    info = os.lstat(RECEIPTS)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise Refusal(f"{RECEIPTS} is not a real directory owned by this user")
+    name = f"{started.strftime('%Y%m%dT%H%M%SZ')}-{pin[:12]}.json"
+    descriptor = os.open(
+        RECEIPTS / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+    )
+    with os.fdopen(descriptor, "w") as file:
+        json.dump(receipt, file, indent=2)
+        file.write("\n")
+    return RECEIPTS / name
 
 
 def install(built, expected):
@@ -271,8 +339,10 @@ def main():
             return 0
         staging = Path(tempfile.mkdtemp(prefix="oxide-install.", dir="/private/tmp"))
         print(f"staging {staging}")
-        built, versions = build(pin, staging)
+        instance = new_instance()
+        built, versions = build(pin, instance, staging)
         capabilities = state_capabilities(built)
+        build_identity(built, pin, instance)
         built_hash, installed = install(built, expected)
     except (Refusal, subprocess.CalledProcessError, OSError) as error:
         print(f"oxide:install refused: {error}", file=sys.stderr)
@@ -287,6 +357,7 @@ def main():
         "build": " ".join(BUILD),
         "toolchain": versions,
         "built_sha256": built_hash,
+        "build_instance": instance,
         "control_state_version": capabilities["control_state_version"],
         "registration_version": capabilities["registration_version"],
         "installed": installed,
@@ -294,19 +365,15 @@ def main():
             "receipt": previous[0].name, "sha256": previous[1]["installed"]["sha256"],
         },
     }
-    RECEIPTS.mkdir(parents=True, exist_ok=True)
-    info = os.lstat(RECEIPTS)
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
-        print(f"oxide:install installed but cannot write a receipt: {RECEIPTS} is not a real owned directory", file=sys.stderr)
+    try:
+        path = write_receipt(receipt, started, pin)
+    except Refusal as error:
+        print(f"oxide:install installed but cannot write a receipt: {error}", file=sys.stderr)
         print(json.dumps(receipt, indent=2))
         return 1
-    name = f"{started.strftime('%Y%m%dT%H%M%SZ')}-{pin[:12]}.json"
-    with open(RECEIPTS / name, "x") as file:
-        json.dump(receipt, file, indent=2)
-        file.write("\n")
     shutil.rmtree(staging)
     print(json.dumps(receipt, indent=2))
-    print(f"receipt {RECEIPTS / name}")
+    print(f"receipt {path}")
     return 0
 
 

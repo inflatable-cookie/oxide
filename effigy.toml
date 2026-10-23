@@ -422,6 +422,24 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-init-guidance.py"
 
+# Everyday CLI polish (oxide#130): one fixed author native proof under the
+# qualified shared supervisor (300 s absolute, 512 MiB monitored scratch
+# including staging and cleanup), with no image, mount, real registration,
+# install, network or host state. It stages this HEAD's debug `oxide` offline
+# with 1.97.1 twice from one target directory (unstamped, then stamped with
+# this HEAD's pin and a synthetic instance) and runs one CLI matrix with a
+# recording, refusing fake `cargo`: `--version`/`-V` identity, honest pin and
+# receipt provenance (verified, stale, missing, replaced, non-private),
+# `--list` pass-through, init readiness `:cargo` acknowledgement against
+# actionable warnings and a malformed manifest, exact `deny`/`audit`/
+# `outdated`/`machete` forwarding with no pool, and bounded capacity
+# diagnostics on a creation refusal and a reserve stop (typed, unknown, error,
+# timeout, oversized and a real positive control). Not a benchmark and not an
+# alias for full QA.
+[tasks."rust:everyday-cli"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-everyday-cli.py"
+
 [tasks."rust:freshness-submodules"]
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-freshness-submodules.py"

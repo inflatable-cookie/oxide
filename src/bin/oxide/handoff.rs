@@ -45,9 +45,9 @@ const REFUSAL_LINE: &str = "oxide: oxide was upgraded during this command; re-ru
 const NOTICE: &str = "oxide: handing off to the installed binary (state is newer than this one).";
 /// Control files this check may read.
 const STATE_FILE: &str = "state.json";
-const RECEIPT_MAX_BYTES: u64 = 64 * 1024;
-const RECEIPT_MAX_ENTRIES: usize = 4096;
-const CANDIDATE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const RECEIPT_MAX_BYTES: u64 = 64 * 1024;
+pub(crate) const RECEIPT_MAX_ENTRIES: usize = 4096;
+pub(crate) const CANDIDATE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// `main` answers the installer's capability probe before any other work.
 pub fn hidden() -> Option<u8> {
@@ -144,8 +144,9 @@ fn peek_version(path: &Path, cap: u64, current: u32) -> Option<u32> {
 }
 
 /// A private, user-owned regular control file, opened without following a
-/// final symlink.
-fn open_control_file(path: &Path, cap: u64) -> Result<File, String> {
+/// final symlink. `version`'s identity line reads install receipts with the
+/// same rule.
+pub(crate) fn open_control_file(path: &Path, cap: u64) -> Result<File, String> {
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -326,38 +327,8 @@ fn exec(prepared: &Prepared) -> std::io::Error {
 /// fields a hand-off needs. Only `*.json` files are considered; the
 /// directory is read whole under a fixed entry bound.
 fn newest_receipt(home: &Path, destination: &Path) -> Result<Receipt, Refusal> {
-    let directory = home.join(".local/state/oxide/install");
-    let metadata =
-        fs::symlink_metadata(&directory).map_err(|_| Refusal("no install receipt directory"))?;
-    // SAFETY: geteuid has no preconditions.
-    let uid = unsafe { libc::geteuid() };
-    if !metadata.is_dir() || metadata.uid() != uid {
-        return Err(Refusal(
-            "the receipt directory is not an owned real directory",
-        ));
-    }
-    let mut names = Vec::new();
-    let entries = fs::read_dir(&directory).map_err(|_| Refusal("cannot read receipts"))?;
-    for (index, entry) in entries.enumerate() {
-        if index >= RECEIPT_MAX_ENTRIES {
-            return Err(Refusal("too many receipt directory entries"));
-        }
-        let entry = entry.map_err(|_| Refusal("cannot read receipts"))?;
-        let name = entry.file_name();
-        if name.to_string_lossy().ends_with(".json") {
-            names.push(name);
-        }
-    }
-    names.sort();
-    let name = names.last().ok_or(Refusal("no install receipt"))?;
-    let file = open_receipt(&directory.join(name))?;
-    let mut bytes = Vec::new();
-    file.take(RECEIPT_MAX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| Refusal("cannot read the newest receipt"))?;
-    if bytes.len() as u64 > RECEIPT_MAX_BYTES {
-        return Err(Refusal("the newest receipt exceeds its byte limit"));
-    }
+    let (_, bytes, _) =
+        newest_receipt_bytes(home).map_err(|_| Refusal("the receipt could not be read"))?;
     let value: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| Refusal("the newest receipt is invalid"))?;
     let installed = value
@@ -398,23 +369,56 @@ fn newest_receipt(home: &Path, destination: &Path) -> Result<Receipt, Refusal> {
     })
 }
 
-fn open_receipt(path: &Path) -> Result<File, Refusal> {
+/// The newest receipt's file name, exact bytes and whether it is owner-only.
+/// One owned real directory under a fixed entry bound and one bounded,
+/// no-follow, owned regular file: the rule the hand-off has always applied to
+/// receipts an older installer left at 0644. `version`'s identity line reads
+/// the same bytes, so its receipt digest is over exactly what was parsed, and
+/// it alone requires the private mode a new receipt gets.
+pub(crate) fn newest_receipt_bytes(home: &Path) -> Result<(String, Vec<u8>, bool), String> {
+    let directory = home.join(".local/state/oxide/install");
+    let metadata =
+        fs::symlink_metadata(&directory).map_err(|_| "no install receipt directory".to_owned())?;
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_dir() || metadata.uid() != uid {
+        return Err("the receipt directory is not an owned real directory".to_owned());
+    }
+    let mut names = Vec::new();
+    let entries = fs::read_dir(&directory).map_err(|_| "cannot read receipts".to_owned())?;
+    for (index, entry) in entries.enumerate() {
+        if index >= RECEIPT_MAX_ENTRIES {
+            return Err("too many receipt directory entries".to_owned());
+        }
+        let entry = entry.map_err(|_| "cannot read receipts".to_owned())?;
+        let name = entry.file_name();
+        if name.to_string_lossy().ends_with(".json") {
+            names.push(name);
+        }
+    }
+    names.sort();
+    let name = names.last().ok_or("no install receipt".to_owned())?;
+    let path = directory.join(name);
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|_| Refusal("cannot open the newest receipt"))?;
+        .open(&path)
+        .map_err(|_| "cannot open the newest receipt".to_owned())?;
     let metadata = file
         .metadata()
-        .map_err(|_| Refusal("cannot inspect the newest receipt"))?;
-    // SAFETY: geteuid has no preconditions.
-    let uid = unsafe { libc::geteuid() };
+        .map_err(|_| "cannot inspect the newest receipt".to_owned())?;
     if !metadata.is_file() || metadata.uid() != uid || metadata.size() > RECEIPT_MAX_BYTES {
-        return Err(Refusal(
-            "the newest receipt is not a bounded owned regular file",
-        ));
+        return Err("the newest receipt is not a bounded owned regular file".to_owned());
     }
-    Ok(file)
+    let private = metadata.mode() & 0o077 == 0;
+    let mut bytes = Vec::new();
+    file.take(RECEIPT_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "cannot read the newest receipt".to_owned())?;
+    if bytes.len() as u64 > RECEIPT_MAX_BYTES {
+        return Err("the newest receipt exceeds its byte limit".to_owned());
+    }
+    Ok((name.to_string_lossy().into_owned(), bytes, private))
 }
 
 /// A `u32` capability field. A receipt without one cannot prove what the
@@ -499,6 +503,13 @@ fn only_candidate_on_path(path: &OsStr, identity: (u64, u64)) -> Result<(), Refu
 
 /// SHA-256 of the opened descriptor, bounded before the whole file is read.
 fn digest(file: &File) -> Result<String, Refusal> {
+    digest_bounded(file, CANDIDATE_MAX_BYTES)
+        .map_err(|_| Refusal("the candidate exceeds its byte limit"))
+}
+
+/// SHA-256 of an opened descriptor, counting only up to `cap` bytes. The
+/// same reader serves the hand-off and `version`'s installed-binary digest.
+pub(crate) fn digest_bounded(file: &File, cap: u64) -> Result<String, String> {
     let mut hasher = Sha256::new();
     let mut reader = file;
     let mut buffer = vec![0_u8; 64 * 1024];
@@ -506,13 +517,13 @@ fn digest(file: &File) -> Result<String, Refusal> {
     loop {
         let read = reader
             .read(&mut buffer)
-            .map_err(|_| Refusal("the candidate cannot be read"))?;
+            .map_err(|_| "the file cannot be read".to_owned())?;
         if read == 0 {
             break;
         }
         total += read as u64;
-        if total > CANDIDATE_MAX_BYTES {
-            return Err(Refusal("the candidate exceeds its byte limit"));
+        if total > cap {
+            return Err("the file exceeds its byte limit".to_owned());
         }
         hasher.update(&buffer[..read]);
     }

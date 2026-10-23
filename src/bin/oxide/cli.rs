@@ -42,6 +42,10 @@ pub fn classify(command: &str) -> Class {
         | "install" | "uninstall" | "publish" | "login" | "logout" | "owner" | "yank"
         | "vendor" | "fetch" | "generate-lockfile" | "locate-project" | "pkgid" | "version"
         | "help" | "report" | "config" | "package" | "verify-project" => Class::Plain,
+        // Dependency scanners and security tools (oxide#130): they forward to
+        // the caller's Cargo unchanged, with no lease, pool setup, adoption or
+        // build recipe. An unknown external command is still leased.
+        "deny" | "audit" | "outdated" | "machete" => Class::Plain,
         _ => Class::Building,
     }
 }
@@ -560,6 +564,14 @@ mod tests {
         }
         for command in ["fmt", "tree", "metadata", "version", "fetch"] {
             assert_eq!(classify(command), Class::Plain, "{command}");
+        }
+        // The four scanner tools forward unchanged; unknown external
+        // commands stay leased.
+        for command in ["deny", "audit", "outdated", "machete"] {
+            assert_eq!(classify(command), Class::Plain, "{command}");
+        }
+        for command in ["nextest", "llvm-cov", "watch", "expand"] {
+            assert_eq!(classify(command), Class::Building, "{command}");
         }
         assert_eq!(classify("clean"), Class::Clean);
         assert_eq!(classify("status"), Class::Status);
