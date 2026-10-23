@@ -63,6 +63,19 @@ default = false
 admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 120 --scratch-budget-mib 64 -- python3 scripts/test-installed-handoff.py"
 
+# Owned output links at profile directories (oxide#133): one fixed 20-case
+# script and the whole command of the qualified shared supervisor (420 s,
+# 512 MiB monitored scratch, one owned 128 MiB image, ordinary detach). It
+# stages base 4a70b83 and this HEAD's candidate independently and sequentially
+# from authenticated pinned source, asserts distinct binaries and state-3 /
+# state-4 capabilities, and covers the member layout, binding, migration,
+# clean, refusals and the root-group prune. It has not run: each side's run is
+# a separately counted owner activation, and the merge hold requires the exact
+# head author and reviewer native receipts.
+[tasks."rust:profile-outputs"]
+admission = "heavy"
+run = "python3 scripts/bounded-test.py --limit 420 --scratch-budget-mib 512 -- python3 scripts/test-profile-outputs.py"
+
 # Enumerated paths that disappear during accounting (oxide#113): the
 # qualified session supervisor bounds one fixed native proof covering the
 # debug-only walk hook, status/refusal diagnostics, whole-slot eviction and

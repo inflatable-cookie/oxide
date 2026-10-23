@@ -3117,6 +3117,149 @@ refused when Git would track it; and `detach` restoring a real directory in
 ephemeral mode (permanent mode: oxide#124). Not a benchmark, real-drive
 qualification or an alias for full QA.
 
+### Owned output members at profile directories (oxide#133)
+
+The bound v1 successor to the whole-target placement. `<checkout>/target`
+itself stays a **real directory**; only positively identified profile members
+become owned links. Cargo's top-level files (`CACHEDIR.TAG`,
+`.rustc_info.json`), `target/tmp` and tool directories such as `target/doc`
+stay real.
+
+- **Members.** V1 knows exactly `debug`, `release`, `<triple>/debug` and
+  `<triple>/release`. A member has at most two components matching
+  `[A-Za-z0-9_.-]+`, is neither `.` nor `..`, and is never absolute or an
+  escape; members are unique and prefix-free, at most eight per command and 32
+  per receipt. Existing real nonempty member directories are never moved or
+  converted (they are used locally with a notice), a real empty member
+  directory converts only under an explicit `oxide outputs adopt`, and a
+  foreign link refuses. Every first link also checks the actual Git
+  ignore/tracked state of `target/<member>`; a winning parent `target/` ignore
+  is allowed, unknown answers refuse.
+- **Classification and declarations.** `check`, `build`, `run`, `test`,
+  `clippy`, `rustc` and `fix` with `quick`/`debug` map to `debug`, `--release`
+  to `release`. Plain `bench` maps to `release` (Cargo's release-based bench
+  profile) while `bench --profile quick|debug` follows `dev` and maps to
+  `debug`. `doc`/`rustdoc` compile the selected profile's units and are
+  classified the same way, while `target/doc` stays a real tool directory.
+  Every `--target`/`--target=` before `--` is parsed, deduplicated and expands
+  the selected member; more than eight total refuses. Only plain triples are
+  modelled: a JSON target specification, `CARGO_BUILD_TARGET`, `--config
+  build.target` and a configured `build.target` are unknown, and the existing
+  refusal for a modelled `--profile` other than quick/debug/release is
+  unchanged. `oxide exec --output <member>` is repeatable and COMPLETE: the
+  caller declares the tool's entire profile-output set, only the four member
+  forms are accepted, the same validation and eight-total cap apply, and the
+  tool's argv after `--` is untouched. A tool that supplies its own `--target`
+  needs the matching `<triple>/…` declaration in that project's selector; this
+  task changes no consumer selector. A profile checkout with any owned member
+  link refuses a command that declares none before Cargo, naming `oxide exec
+  --output` and `oxide outputs detach`; an unlinked checkout runs it locally as
+  before. Legacy whole-target checkouts keep today's behaviour until explicit
+  migration.
+- **Custody, keys and binding.** Every create, relink, fallback return,
+  detach, clean, migration and replay waits for all checkout writers under the
+  existing barrier, binding mutex and positive cross-pool closure; an unknown
+  writer is never downgraded to clear. The order is: classify; durably reserve
+  a root nonce if needed; plan the sorted destination set; resolve the slot
+  key; release pre-lease custody locks; acquire the lease; then under binding
+  validate the exact surviving reservation, layout and every keyed destination
+  while excluding only this command's own record. Linked profile keys render
+  one `outputs-3 <nonce> <kind> <root> <volume> g<generation> <member>` line
+  per owned member and `real <member>` for a real directory, so a linked and a
+  real member never share a warm slot; legacy whole-target keys stay exactly
+  `outputs-2`. Adding a member to a root preserves the root's nonce; a
+  reservation is root-level and may not be cancelled while another member's
+  consumer owns it. A command whose slot was keyed before the layout changed
+  refuses before Cargo without an automatic retry.
+- **Explicit profile adoption.** `oxide outputs adopt` on a checkout with no
+  receipt selects the profile layout: it creates the real `target`, links the
+  host `debug`/`release` pair (and every member the receipt already places)
+  into one root under the member ignore check, keeps a real nonempty member
+  with a notice, is idempotent, and refuses a legacy whole-target link
+  untouched. `oxide outputs detach` restores real empty member directories,
+  keeps every root and marker, and leaves the receipt detached.
+- **Explicit migration and marker upgrade.** `oxide outputs adopt` on a
+  committed whole-target receipt is the only path that rewrites a legacy
+  placement. It is macOS-only (Linux remains compile-only), runs under the
+  clean barrier, binding mutex and publication custody with all writers
+  closed, and uses exclusive renames; no payload is moved or copied. P0
+  publishes a durable prepared journal pinning the prior receipt digest, the
+  exact target-link text/dev/ino, the parent identity and — for a root/1
+  marker — the marker's dev/ino/SHA plus ONE freshly reserved root nonce. P1
+  creates the transaction's staging directory with only classified member
+  links into the same root and records its identity. The root/1 marker is
+  exclusively renamed to a transaction backup and the root/2 successor is
+  published without replacement, preserving owner, recipe, kind, volume and
+  the original root-creation generation. P2 exclusively renames the old target
+  link to its recorded backup and P3 exclusively publishes the staging
+  directory as the real target; a creator of `target` is preserved and leaves
+  the transaction pending. P4 verifies the final real directory and exact
+  member link set and commits the receipt, root/2 nonce and outputs-3 member
+  references — the COMMIT point, never rolled back. Journaled backups are
+  removed only under their pinned identities before the journal is dropped.
+  Replay advances only exact recorded identities, including a crash before a
+  phase record; ambiguous identity, a foreign creator, a lost volume, a
+  missing required backup or an unrecognised phase stays pending. A pre-P4
+  rollback restores the exact old marker from its pinned backup, the old
+  target link and the published /2 receipt, and retires the reserved nonce;
+  the debug-only `OXIDE_TEST_MIGRATION_ROLLBACK` hook and
+  `OXIDE_TEST_OUTPUTS_CRASH=migration-<phase>` crashes exist only in debug
+  builds.
+- **Formats and upgrade.** State version 4 carries the successor fence
+  `owned_outputs: "oxide.outputs/3"`; receipts are
+  `oxide.outputs.transition/3` (layout profile, one placement per member,
+  root-level reservation), the registry is `oxide.outputs.registry/2` schema 2
+  with one reference per member, and the plan is `oxide.outputs.plan/2`. The
+  published `/2` receipt shape, whole-target link, `outputs-2` destination
+  key and in-placement reservation are never redefined; a legacy registry
+  reference keeps member `target` and a schema-1 document reads unchanged.
+  Root/2 marker shape and existing root nonces are unchanged. The fence is
+  published internal-first, then in the paired removable control, only after
+  complete bounded authority reads and positive writer closure across both
+  pools; a missing, inaccessible, corrupt or sticky-incomplete authority
+  refuses and is never rebuilt. A `/2`-fenced pool keeps numeric state version
+  3 so a state-3 binary still runs it; state 4 is forward-only after the
+  successor fence. Status reports the layout and each member's live state, and
+  each leased command on a legacy checkout prints ONE notice naming
+  `oxide outputs adopt`.
+- **Multi-member prune and clean.** All verified members of one root under the
+  same checkout identity form ONE owner; another checkout's reference keeps the
+  root. A prune intent atomically marks every row of the (checkout, root)
+  group and durably records the prior receipt SHA and the complete sorted group
+  (member, generation, nonce, device/inode, marker digest and selection
+  flags). Replay verifies that exact group and the receipt BEFORE recomputing
+  each row's selection; a missing, corrupt or changed receipt, a missing or
+  extra row, a contradictory identity or a pending reference keeps the root
+  (pending/KEEP). The receipt's terminal image digest and its FIXED timestamp
+  are durable before publication, and a replay accepts only the recorded
+  preimage or that exact image. `RootIdentity.member` is only the first sorted
+  representative, never the transaction scope. A whole clean plans the
+  checkout target with every owned member link preserved and each owned member
+  root's payload with its marker kept, never follows a generic link, and
+  removes only its plan; a selected clean runs the pool watchdog and the
+  watched leader/group-closure APIs, and the removable watchdog watches volume
+  removal only — not a continuous free-space reserve.
+- **Limits.** Migration, external roots and drive handling are macOS-only;
+  Linux is compile-only. A profile-layout migration of a checkout whose root
+  marker is root/1 reserves its new nonce in the migration journal (never via
+  the unused-root cancellation journal). Automatic custom-profile linking,
+  consumer adoption, live prune, host installation and release actions are
+  outside this task.
+
+**Proof (oxide#133).** `scripts/test-profile-outputs.py` publishes the fixed
+20-case matrix for this design: one private session per side with one owned
+128 MiB scratch APFS image, a private `HOME`, `CARGO_HOME` and directory pool,
+a separately staged base `4a70b83` binary and this HEAD's candidate staged
+offline with 1.97.1 from authenticated pinned source, with asserted distinct
+binary hashes and state-3/state-4 capability probes. It runs under the
+qualified shared supervisor (`scripts/bounded-test.py`, SHA-256
+`d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e`) as
+`bounded-test.py --limit 420 --scratch-budget-mib 512 -- python3
+scripts/test-profile-outputs.py`; the script prints its own phase allocation
+and assertions with `--plan`. It has NOT run: the author and reviewer natives
+are separately counted owner activations, and this task's merge hold requires
+their exact-head receipts.
+
 **Proof (oxide#121).** `effigy rust:auto-adopt-outputs` runs
 `scripts/test-permanent-outputs.py auto-adopt`, the focused mode of the same
 fixture, as the whole command of the qualified shared supervisor (300 s,

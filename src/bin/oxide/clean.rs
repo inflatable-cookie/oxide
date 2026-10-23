@@ -239,7 +239,12 @@ type Protected = Option<(u64, u64)>;
 /// `keep_root` is set for a permanent drive's owned output root: the root
 /// directory and its ownership marker are preserved, and only the entries
 /// Cargo (or a foreign entry) created inside it are planned.
-fn plan(target: &Path, pool: Protected, keep_root: bool) -> Result<Option<Plan>, String> {
+fn plan(
+    target: &Path,
+    pool: Protected,
+    keep_root: bool,
+    preserve: &[PathBuf],
+) -> Result<Option<Plan>, String> {
     let refuse_pool = |path: &Path, metadata: &Metadata| {
         if pool == Some((metadata.dev(), metadata.ino())) {
             Err(format!(
@@ -297,6 +302,13 @@ fn plan(target: &Path, pool: Protected, keep_root: bool) -> Result<Option<Plan>,
                     "{} is on another filesystem; Oxide does not clean across a mount",
                     path.display()
                 ));
+            }
+            if preserve.iter().any(|kept| kept == &path) {
+                // An owned profile member link is Oxide's placement, never
+                // Cargo's content: a whole clean keeps it and cleans the
+                // root's payload instead.
+                plan.preserved.push(path);
+                continue;
             }
             if keep_root && depth == 0 && entry.file_name() == outputs::MARKER {
                 // The root's ownership marker is Oxide's, not Cargo's, and it
@@ -414,9 +426,10 @@ fn checked_plan(
     pool: Protected,
     include_foreign: bool,
     keep_root: bool,
+    preserve: &[PathBuf],
 ) -> Result<Option<Plan>, String> {
-    let plan =
-        plan(target, pool, keep_root).map_err(|reason| format!("clean refused: {reason}"))?;
+    let plan = plan(target, pool, keep_root, preserve)
+        .map_err(|reason| format!("clean refused: {reason}"))?;
     match plan {
         Some(plan) if !plan.foreign.is_empty() && !include_foreign => {
             Err(refuse_foreign(target, &plan))
@@ -463,6 +476,8 @@ fn run_whole(
 ) -> Result<u8, String> {
     // A permanent drive's owned link resolves through its receipt to the
     // selected real root; everything else keeps the real `<workspace>/target`.
+    // In the profile layout `target` is real and every owned member link is
+    // kept while its root's payload is cleaned instead.
     let placement = outputs::clean_placement(workspace)?;
     let target = placement.as_ref().map_or_else(
         || workspace.join("target"),
@@ -471,36 +486,67 @@ fn run_whole(
     let keep_root = placement
         .as_ref()
         .is_some_and(outputs::CleanPlacement::keep_root);
-    let pool = protect_pool(&target, &settings.pool)?;
+    let preserve: Vec<PathBuf> = placement
+        .as_ref()
+        .map(|place| {
+            place
+                .members()
+                .iter()
+                .map(|(link, _)| link.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let member_roots: Vec<PathBuf> = placement
+        .as_ref()
+        .map(|place| {
+            place
+                .members()
+                .iter()
+                .map(|(_, root)| root.clone())
+                .collect()
+        })
+        .unwrap_or_default();
     // Refusal precedes waiting, deletion and any affinity change.
-    let first = checked_plan(&target, pool, include_foreign, keep_root)?;
+    let planned = whole_plans(
+        &target,
+        &member_roots,
+        &preserve,
+        keep_root,
+        include_foreign,
+        settings,
+    )?;
     let kept = placement
         .as_ref()
         .and_then(outputs::CleanPlacement::preserved_note);
     if dry_run {
-        let Some(plan) = first else {
+        if planned.is_empty() {
             eprintln!(
                 "oxide: dry run: {} does not exist; nothing would be removed",
                 target.display()
             );
             return Ok(0);
-        };
-        for planned in &plan.entries {
-            println!("{}", planned.path.display());
         }
-        let foreign = if plan.foreign.is_empty() {
+        let mut entries = 0;
+        for (root, plan) in &planned {
+            for path in &plan.entries {
+                println!("{}", path.path.display());
+            }
+            entries += plan.entries.len();
+            let _ = root;
+        }
+        let foreign = if planned.iter().all(|(_, plan)| plan.foreign.is_empty()) {
             String::new()
         } else {
-            format!(
-                ", including foreign entries (--include-foreign): {}",
-                names(&plan.foreign)
-            )
+            ", including foreign entries (--include-foreign)".to_owned()
         };
         let kept = kept.map(|kept| format!("; {kept}")).unwrap_or_default();
         eprintln!(
-            "oxide: dry run: a clean would remove the {} paths listed ({}){foreign}{kept}; nothing was removed. A clean also drops this checkout's slot affinity; slots stay",
-            plan.entries.len(),
-            summary(&plan)
+            "oxide: dry run: a clean would remove the {entries} paths listed ({}{foreign}){kept}; nothing was removed. A clean also drops this checkout's slot affinity; slots stay",
+            planned
+                .iter()
+                .map(|(root, plan)| format!("{}: {}", root.display(), summary(plan)))
+                .collect::<Vec<_>>()
+                .join("; ")
         );
         return Ok(0);
     }
@@ -515,7 +561,7 @@ fn run_whole(
         None => None,
     };
     // Plan again under the clean barrier: what is removed is what this plan
-    // lists, from the root the receipt selects now.
+    // lists, from the roots the receipt selects now.
     let outcome = refuse_unknown_custody_opt(&store, workspace)
         .and_then(|()| outputs::clean_placement(workspace))
         .and_then(|placement| {
@@ -526,23 +572,52 @@ fn run_whole(
             let keep_root = placement
                 .as_ref()
                 .is_some_and(outputs::CleanPlacement::keep_root);
-            let pool = protect_pool(&target, &settings.pool)?;
-            checked_plan(&target, pool, include_foreign, keep_root).and_then(|plan| match plan {
-                None => Ok(None),
-                Some(plan) => remove(&plan).map(|()| Some((target.clone(), plan))),
-            })
+            let preserve: Vec<PathBuf> = placement
+                .as_ref()
+                .map(|place| {
+                    place
+                        .members()
+                        .iter()
+                        .map(|(link, _)| link.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let member_roots: Vec<PathBuf> = placement
+                .as_ref()
+                .map(|place| {
+                    place
+                        .members()
+                        .iter()
+                        .map(|(_, root)| root.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let planned = whole_plans(
+                &target,
+                &member_roots,
+                &preserve,
+                keep_root,
+                include_foreign,
+                settings,
+            )?;
+            let mut removed = Vec::new();
+            for (root, plan) in planned {
+                remove(&plan)?;
+                removed.push((root, plan));
+            }
+            Ok(removed)
         });
-    let plan = match (outcome, &store, guard) {
-        (Ok(plan), Some(store), Some(guard)) => {
+    let planned = match (outcome, &store, guard) {
+        (Ok(planned), Some(store), Some(guard)) => {
             let detached = store.finish_clean(guard, workspace)?;
             if detached > 0 {
                 eprintln!(
                     "oxide: dropped this checkout's slot affinity; {detached} slot(s) kept until evicted"
                 );
             }
-            plan
+            planned
         }
-        (Ok(plan), _, _) => plan,
+        (Ok(planned), _, _) => planned,
         (Err(reason), Some(store), Some(guard)) => {
             store.abandon_clean(guard)?;
             return Err(reason);
@@ -556,28 +631,52 @@ fn run_whole(
         .as_ref()
         .and_then(outputs::CleanPlacement::preserved_note);
     let kept = kept.map(|kept| format!("; {kept}")).unwrap_or_default();
-    match plan {
-        None => eprintln!(
+    if planned.is_empty() {
+        eprintln!(
             "oxide: {} does not exist; nothing removed{wait}{kept}",
             target.display(),
-        ),
-        Some((target, plan)) => {
-            let foreign = if plan.foreign.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    ", including foreign entries (--include-foreign): {}",
-                    names(&plan.foreign)
-                )
-            };
-            eprintln!(
-                "oxide: removed {} ({}){foreign}{wait}{kept}",
-                target.display(),
-                summary(&plan)
-            );
-        }
+        );
+    } else {
+        let foreign = if planned.iter().all(|(_, plan)| plan.foreign.is_empty()) {
+            String::new()
+        } else {
+            ", including foreign entries (--include-foreign)".to_owned()
+        };
+        eprintln!(
+            "oxide: removed {}{foreign}{wait}{kept}",
+            planned
+                .iter()
+                .map(|(root, plan)| format!("{} ({})", root.display(), summary(plan)))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
     }
     Ok(0)
+}
+
+/// The complete plan of one whole clean before any effect: the checkout's own
+/// target (with every owned member link preserved) and each owned member
+/// root's payload with the root marker kept.
+fn whole_plans(
+    target: &Path,
+    member_roots: &[PathBuf],
+    preserve: &[PathBuf],
+    keep_root: bool,
+    include_foreign: bool,
+    settings: &Settings,
+) -> Result<Vec<(PathBuf, Plan)>, String> {
+    let mut planned = Vec::new();
+    let pool = protect_pool(target, &settings.pool)?;
+    if let Some(plan) = checked_plan(target, pool, include_foreign, keep_root, preserve)? {
+        planned.push((target.to_path_buf(), plan));
+    }
+    for root in member_roots {
+        let pool = protect_pool(root, &settings.pool)?;
+        if let Some(plan) = checked_plan(root, pool, include_foreign, true, &[])? {
+            planned.push((root.clone(), plan));
+        }
+    }
+    Ok(planned)
 }
 
 /// `cargo clean` with a package, profile or doc selection, against the
@@ -625,14 +724,57 @@ fn run_selected(args: &[OsString], workspace: &Path, settings: &Settings) -> Res
     if let Some(guard) = &guard {
         guard.share_with_children()?;
     }
+    // The selected clean runs the same supervision as a leased build: the
+    // pool's watchdog is polled while the recorded group runs and closure is
+    // positively witnessed before the barrier lifts. The removable watchdog
+    // watches for volume removal only; it is not a continuous free-space
+    // sampler.
+    let mut watchdog = store.as_ref().and_then(Store::watchdog);
     let status = process::spawn_group(&mut cargo).and_then(|mut group| {
         let recorded = match (&store, &guard) {
             (Some(store), Some(guard)) => store.clean_running(guard, group.id),
             _ => Ok(()),
         };
-        let status = process::wait_leader(&mut group);
-        process::wait_group_empty(group.id);
-        recorded.and(status)
+        let status = match watchdog.as_mut() {
+            Some(watchdog) => {
+                process::wait_leader_watched(&mut group, watchdog).map(|status| status)
+            }
+            None => process::wait_leader(&mut group).map(Some),
+        };
+        let closed = match watchdog.as_mut() {
+            Some(watchdog) => process::wait_group_empty_watched(group.id, watchdog),
+            None => {
+                process::wait_group_empty(group.id);
+                Some(std::time::Instant::now())
+            }
+        };
+        if let Some(watchdog) = watchdog.as_ref().filter(|watchdog| watchdog.stopped()) {
+            crate::report_stop(
+                watchdog,
+                group.id,
+                closed,
+                &store
+                    .as_ref()
+                    .map_or_else(|| std::path::PathBuf::new(), |store| store.payload.clone()),
+            );
+        }
+        if closed.is_none() {
+            return Err(format!(
+                "could not confirm the Cargo clean group {} closed after a watchdog stop",
+                group.id
+            ));
+        }
+        let status = match status {
+            Ok(Some(status)) => status,
+            Ok(None) => {
+                return Err(format!(
+                    "the Cargo clean group {} was stopped by the pool watchdog",
+                    group.id
+                ))
+            }
+            Err(reason) => return Err(reason),
+        };
+        recorded.map(|()| status)
     });
     let _ = std::fs::remove_dir(scratch.join("build"));
     let _ = std::fs::remove_dir(&scratch);
@@ -756,7 +898,7 @@ mod tests {
         let root = scratch("classify");
         let target = root.join("target");
         cargo_target(&target);
-        let clean = plan(&target, None, false).unwrap().unwrap();
+        let clean = plan(&target, None, false, &[]).unwrap().unwrap();
         assert!(clean.foreign.is_empty(), "{:?}", clean.foreign);
         assert_eq!(clean.entries[0].path, target);
         // A plausible name without Cargo's lock is not a profile directory;
@@ -769,7 +911,7 @@ mod tests {
         std::fs::create_dir_all(target.join("aarch64-apple-darwin/release")).unwrap();
         std::fs::write(target.join("aarch64-apple-darwin/release/.cargo-lock"), "").unwrap();
         std::fs::write(target.join("aarch64-apple-darwin/extra"), "").unwrap();
-        let mixed = plan(&target, None, false).unwrap().unwrap();
+        let mixed = plan(&target, None, false, &[]).unwrap().unwrap();
         assert_eq!(
             mixed.foreign,
             os(&[
@@ -798,10 +940,12 @@ mod tests {
         std::fs::write(outside.join("sentinel"), "keep").unwrap();
         std::fs::create_dir_all(target.join("handover/nested")).unwrap();
         symlink(&outside, target.join("handover/nested/escape")).unwrap();
-        assert!(checked_plan(&target, None, false, false)
+        assert!(checked_plan(&target, None, false, false, &[])
             .unwrap_err()
             .contains("handover"));
-        let plan = checked_plan(&target, None, true, false).unwrap().unwrap();
+        let plan = checked_plan(&target, None, true, false, &[])
+            .unwrap()
+            .unwrap();
         assert!(plan
             .entries
             .iter()
@@ -817,7 +961,9 @@ mod tests {
         let root = scratch("late");
         let target = root.join("target");
         cargo_target(&target);
-        let plan = checked_plan(&target, None, false, false).unwrap().unwrap();
+        let plan = checked_plan(&target, None, false, false, &[])
+            .unwrap()
+            .unwrap();
         std::fs::write(target.join("doc/late"), "new").unwrap();
         let left = remove(&plan).unwrap_err();
         assert!(left.contains("not in the plan"), "{left}");
@@ -837,11 +983,11 @@ mod tests {
         let alias = std::fs::metadata(root.join("pool-alias")).unwrap();
         let identity = Some((alias.dev(), alias.ino()));
         for include_foreign in [false, true] {
-            let refused = checked_plan(&target, identity, include_foreign, false).unwrap_err();
+            let refused = checked_plan(&target, identity, include_foreign, false, &[]).unwrap_err();
             assert!(refused.contains("is the Oxide pool"), "{refused}");
         }
         let whole = std::fs::metadata(&target).unwrap();
-        assert!(plan(&target, Some((whole.dev(), whole.ino())), false)
+        assert!(plan(&target, Some((whole.dev(), whole.ino())), false, &[])
             .unwrap_err()
             .contains("is the Oxide pool"));
         assert_eq!(std::fs::read(pool.join("sentinel")).unwrap(), b"slot");
@@ -854,7 +1000,9 @@ mod tests {
         let owned = root.join("owned");
         cargo_target(&owned);
         std::fs::write(owned.join(crate::outputs::MARKER), b"{}").unwrap();
-        let plan = checked_plan(&owned, None, false, true).unwrap().unwrap();
+        let plan = checked_plan(&owned, None, false, true, &[])
+            .unwrap()
+            .unwrap();
         assert!(plan.foreign.is_empty(), "{:?}", plan.foreign);
         assert!(plan
             .entries
@@ -873,10 +1021,12 @@ mod tests {
         let root = scratch("link");
         std::fs::create_dir(root.join("real")).unwrap();
         symlink(root.join("real"), root.join("target")).unwrap();
-        assert!(plan(&root.join("target"), None, false)
+        assert!(plan(&root.join("target"), None, false, &[])
             .unwrap_err()
             .contains("symlink"));
-        assert!(plan(&root.join("absent"), None, false).unwrap().is_none());
+        assert!(plan(&root.join("absent"), None, false, &[])
+            .unwrap()
+            .is_none());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

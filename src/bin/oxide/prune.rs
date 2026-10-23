@@ -228,11 +228,45 @@ struct Intent {
     /// unfinished: its receipt step is replayed, never assumed.
     #[serde(default)]
     receipt_settled: bool,
-    /// Whether the registry row was a live selection when the intent was
-    /// journaled (a released root is not); an intent-phase rollback
-    /// restores exactly this.
+    /// Whether the representative registry row was a live selection when the
+    /// intent was journaled. Only a group member's own flag is restored from
+    /// [`Intent::group`]; this field is diagnostic for the representative.
     #[serde(default = "selected_by_default")]
     was_selected: bool,
+    /// The checkout receipt's exact bytes at intent publication. A replay or
+    /// rollback acts only while the live receipt still matches this preimage.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    prior_receipt_sha: String,
+    /// Every verified reference of this (checkout, root) group, sorted by
+    /// member. The group — never a single row — is the transaction scope.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    group: Vec<GroupRow>,
+    /// Persisted before the terminal receipt publication: the exact terminal
+    /// image digest and its FIXED timestamp. A replay accepts only the
+    /// recorded preimage or this exact image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_terminal_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_ms: Option<u64>,
+}
+
+/// One reference of an intent's (checkout, root) group: its member, immutable
+/// root-creation generation, nonce and recorded identity, and the selection
+/// flag the rollback restores.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GroupRow {
+    member: String,
+    generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nonce: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root_dev: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root_ino: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    marker_digest: Option<String>,
+    selected: bool,
 }
 
 fn selected_by_default() -> bool {
@@ -802,6 +836,26 @@ impl Intent {
             || !hex64(&self.preview_sha256)
         {
             return Err("the output registry has an unusable prune intent".to_owned());
+        }
+        if !self.prior_receipt_sha.is_empty() && !hex64(&self.prior_receipt_sha) {
+            return Err("the output registry has an unusable intent preimage".to_owned());
+        }
+        if let Some(sha) = &self.expected_terminal_sha {
+            if !hex64(sha) || self.terminal_ms.is_none() {
+                return Err("the output registry has an unusable terminal image".to_owned());
+            }
+        }
+        let mut names: Vec<&str> = self.group.iter().map(|row| row.member.as_str()).collect();
+        let sorted = names.clone();
+        names.sort_unstable();
+        names.dedup();
+        if names != sorted {
+            return Err("the prune intent group is not sorted and unique".to_owned());
+        }
+        for row in &self.group {
+            if !text(&row.member) {
+                return Err("the prune intent group has an unusable member".to_owned());
+            }
         }
         Ok(())
     }
@@ -3798,6 +3852,127 @@ fn prune_journaled(
     finish_quarantine(store, control, session, &id)
 }
 
+/// Every registry row that references one (checkout, root) group, sorted by
+/// member. The group, never one row, is the transaction scope.
+fn group_rows<'a>(registry: &'a Registry, checkout_id: &str, root: &Path) -> Vec<&'a Row> {
+    let mut rows: Vec<&Row> = registry
+        .rows
+        .iter()
+        .filter(|row| row.checkout_id == checkout_id && row.root == root)
+        .collect();
+    rows.sort_by(|left, right| left.member.cmp(&right.member));
+    rows
+}
+
+/// The verified group of one candidate root: all references share the root's
+/// immutable identity, none is pending or already owned by another
+/// transaction. Anything else refuses.
+fn verified_group(registry: &Registry, candidate: &Candidate) -> Result<Vec<GroupRow>, String> {
+    let rows = group_rows(registry, &candidate.checkout_id, &candidate.root);
+    if rows.is_empty() {
+        return Err("no registry row references the candidate root".to_owned());
+    }
+    let first = rows[0];
+    for row in &rows {
+        if row.pending
+            || row.pruning.is_some()
+            || row.reservation.is_some()
+            || row.cancelling.is_some()
+        {
+            return Err(format!(
+                "the registry reference {} is not an eligible part of this root's group",
+                row.member
+            ));
+        }
+        if row.nonce != first.nonce
+            || row.generation != first.generation
+            || row.root_dev != first.root_dev
+            || row.root_ino != first.root_ino
+            || row.marker_digest != first.marker_digest
+            || row.root_kind != first.root_kind
+            || row.volume_uuid != first.volume_uuid
+        {
+            return Err("the root's registry references disagree about its identity".to_owned());
+        }
+    }
+    if first.nonce != candidate.nonce
+        || first.root_dev != Some(candidate.dev)
+        || first.root_ino != Some(candidate.ino)
+        || first.marker_digest.as_deref() != Some(candidate.marker_digest.as_str())
+    {
+        return Err("the root's registry identity changed since the plan".to_owned());
+    }
+    Ok(rows
+        .iter()
+        .map(|row| GroupRow {
+            member: row.member.clone(),
+            generation: row.generation,
+            nonce: row.nonce.clone(),
+            root_dev: row.root_dev,
+            root_ino: row.root_ino,
+            marker_digest: row.marker_digest.clone(),
+            selected: row.selected,
+        })
+        .collect())
+}
+
+/// The checkout receipt's exact bytes, for the intent's preimage pin.
+fn receipt_preimage(control: &Path, checkout_id: &str) -> Result<String, String> {
+    let path = outputs::receipt_path_public(control, checkout_id);
+    let bytes =
+        fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Verify, before any selection flag is recomputed, that the checkout receipt
+/// is the recorded preimage and that its owned references to this root are
+/// exactly the recorded group (same members, generations and nonce), with no
+/// prepared transition.
+fn verify_group_receipt(
+    control: &Path,
+    checkout: &Path,
+    checkout_id: &str,
+    root: &Path,
+    group: &[GroupRow],
+) -> Result<(), String> {
+    let receipt = outputs::read_receipt_for_prune(control, checkout, checkout_id)?
+        .ok_or_else(|| "the checkout's receipt disappeared".to_owned())?;
+    if receipt.prepared_ref().is_some() {
+        return Err("the checkout receipt has a pending transition".to_owned());
+    }
+    let mut receipt_members: Vec<&str> = receipt
+        .links()
+        .iter()
+        .filter(|placement| {
+            placement
+                .selected_ref()
+                .is_some_and(|selected| selected.root() == root)
+        })
+        .map(outputs::LinkPlacement::member)
+        .collect();
+    receipt_members.sort_unstable();
+    let mut group_members: Vec<&str> = group.iter().map(|row| row.member.as_str()).collect();
+    group_members.sort_unstable();
+    if receipt_members != group_members {
+        return Err("the checkout receipt's references do not match the recorded group".to_owned());
+    }
+    for row in group {
+        let selected = receipt
+            .selected_for(&row.member)
+            .ok_or_else(|| "the receipt lost a group member".to_owned())?;
+        if selected.root() != root
+            || selected.generation() != row.generation
+            || selected.nonce() != row.nonce.as_deref()
+        {
+            return Err(format!(
+                "the receipt's reference for {} disagrees with the recorded group",
+                row.member
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Publish the durable intent under internal admission. `Ok(false)` means the
 /// registry revision is no longer the one the locked recheck read: nothing
 /// was written.
@@ -3822,6 +3997,8 @@ fn journal_intent(
         ));
     }
     let mut was_selected = false;
+    let mut group = Vec::new();
+    let mut prior_receipt_sha = String::new();
     if candidate.receiptless {
         // A temporary pruning row, within the live caps; never a selection.
         if registry.rows.iter().any(|row| row.root == candidate.root) {
@@ -3857,27 +4034,29 @@ fn journal_intent(
             cancelling: None,
         });
     } else {
-        let row = registry
+        let verified = verified_group(&registry, candidate).map_err(Stop::Refuse)?;
+        prior_receipt_sha =
+            receipt_preimage(control, &candidate.checkout_id).map_err(Stop::Refuse)?;
+        verify_group_receipt(
+            control,
+            &candidate.checkout,
+            &candidate.checkout_id,
+            &candidate.root,
+            &verified,
+        )
+        .map_err(Stop::Refuse)?;
+        was_selected = verified.iter().any(|row| row.selected);
+        // Atomically mark ALL of the group's rows: one root, one owner.
+        for row in registry
             .rows
             .iter_mut()
-            .find(|row| {
-                row.checkout_id == candidate.checkout_id
-                    && row.member == candidate.member
-                    && row.root == candidate.root
-            })
-            .ok_or_else(|| Stop::Refuse("the registry row disappeared".to_owned()))?;
-        if row.pending
-            || row.pruning.is_some()
-            || row.reservation.is_some()
-            || row.cancelling.is_some()
+            .filter(|row| row.checkout_id == candidate.checkout_id && row.root == candidate.root)
         {
-            return Err(Stop::Refuse(
-                "the registry row is no longer an eligible root".to_owned(),
-            ));
+            row.selected = false;
+            row.pending = false;
+            row.pruning = Some(id.to_owned());
         }
-        was_selected = row.selected;
-        row.selected = false;
-        row.pruning = Some(id.to_owned());
+        group = verified;
     }
     while registry.intents.len() >= MAX_INTENTS {
         let completed = registry
@@ -3917,6 +4096,10 @@ fn journal_intent(
         resolved_ms: None,
         receipt_settled: false,
         was_selected,
+        prior_receipt_sha,
+        group,
+        expected_terminal_sha: None,
+        terminal_ms: None,
     });
     registry.bump().map_err(Stop::Refuse)?;
     // A failed publication may still have landed: the journal is then an
@@ -3985,15 +4168,20 @@ fn complete_intent(_store: &Store, control: &Path, id: &str, outcome: &str) -> R
                 intent.phase = IntentPhase::Deleted;
                 intent.updated_ms = process::now_ms();
             }
-            if let Some(row) = registry.rows.iter_mut().find(|row| {
+            let now = process::now_ms();
+            let group: Vec<String> = registry
+                .intent(id)
+                .map(|intent| intent.group.iter().map(|row| row.member.clone()).collect())
+                .unwrap_or_default();
+            for row in registry.rows.iter_mut().filter(|row| {
                 row.checkout_id == identity.checkout_id
-                    && row.member == identity.member
                     && row.root == identity.root
+                    && (group.is_empty() || group.contains(&row.member))
             }) {
                 row.selected = false;
                 row.pending = false;
                 row.pruning = None;
-                row.pruned_ms = Some(process::now_ms());
+                row.pruned_ms = Some(now);
             }
             registry.bump().map_err(Stop::Refuse)?;
             write_registry(control, &registry).map_err(Stop::Refuse)?;
@@ -4001,6 +4189,110 @@ fn complete_intent(_store: &Store, control: &Path, id: &str, outcome: &str) -> R
     }
     crash_point("terminal").map_err(Stop::Pending)?;
     settle_receipt(control, id, outcome).map_err(Stop::Pending)
+}
+
+/// Publish the checkout receipt's terminal image with its FIXED recorded
+/// timestamp. The expected image digest is durable before the publication;
+/// a replay accepts only the recorded preimage or that exact image.
+fn publish_terminal_receipt(
+    control: &Path,
+    intent: &Intent,
+    id: &str,
+    outcome: &str,
+) -> Result<(), String> {
+    let path = outputs::receipt_path_public(control, &intent.identity.checkout_id);
+    let read_digest = |path: &Path| -> Result<String, String> {
+        let bytes = fs::read(path).map_err(|error| {
+            format!(
+                "cannot read the checkout receipt {}: {error}",
+                path.display()
+            )
+        })?;
+        Ok(sha256_hex(&bytes))
+    };
+    match (&intent.expected_terminal_sha, intent.terminal_ms) {
+        (Some(expected), Some(at_ms)) => {
+            let live = read_digest(&path)?;
+            if &live == expected {
+                return Ok(());
+            }
+            if !intent.prior_receipt_sha.is_empty() && live == intent.prior_receipt_sha {
+                outputs::mark_pruned_at(
+                    control,
+                    &intent.identity.checkout,
+                    &intent.identity.checkout_id,
+                    id,
+                    outcome,
+                    at_ms,
+                )?;
+                let after = read_digest(&path)?;
+                if &after != expected {
+                    return Err(format!(
+                        "the terminal receipt image for intent {id} is not the recorded one; it is kept pending"
+                    ));
+                }
+                return Ok(());
+            }
+            Err(format!(
+                "the checkout receipt is neither the recorded preimage nor the recorded terminal image for intent {id}; it is kept pending"
+            ))
+        }
+        _ => {
+            let live = read_digest(&path)?;
+            if !intent.prior_receipt_sha.is_empty() && live != intent.prior_receipt_sha {
+                return Err(format!(
+                    "the checkout receipt changed since prune intent {id}; nothing was published"
+                ));
+            }
+            let at_ms = process::now_ms();
+            let image = outputs::terminal_receipt_image(
+                control,
+                &intent.identity.checkout,
+                &intent.identity.checkout_id,
+                id,
+                outcome,
+                at_ms,
+            )?;
+            let expected = sha256_hex(&image);
+            // Durable before publication: the fixed timestamp and the exact
+            // expected image. Another writer's record wins; we then publish
+            // exactly that image.
+            let (expected, at_ms) = {
+                let _guard = store::publication_guard(control)?;
+                let mut registry = ready_registry(control)?;
+                let Some(record) = registry.intents.iter_mut().find(|record| record.id == id)
+                else {
+                    return Err(format!("prune intent {id} disappeared"));
+                };
+                match (&record.expected_terminal_sha, record.terminal_ms) {
+                    (Some(sha), Some(ms)) => (sha.clone(), ms),
+                    _ => {
+                        record.expected_terminal_sha = Some(expected.clone());
+                        record.terminal_ms = Some(at_ms);
+                        record.updated_ms = process::now_ms();
+                        registry.bump()?;
+                        write_registry(control, &registry)?;
+                        (expected, at_ms)
+                    }
+                }
+            };
+            outputs::mark_pruned_at(
+                control,
+                &intent.identity.checkout,
+                &intent.identity.checkout_id,
+                id,
+                outcome,
+                at_ms,
+            )?;
+            let after = read_digest(&path)?;
+            if after != expected {
+                return Err(format!(
+                    "the terminal receipt image for intent {id} is not the recorded one; it is kept pending"
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 /// After the registry terminal state is durable: commit the checkout
@@ -4029,13 +4321,7 @@ fn settle_receipt(control: &Path, id: &str, outcome: &str) -> Result<(), String>
                 .is_some_and(|selected| selected.root() == intent.identity.root)
     });
     if owns_terminal {
-        outputs::mark_pruned(
-            control,
-            &intent.identity.checkout,
-            &intent.identity.checkout_id,
-            id,
-            outcome,
-        )?;
+        publish_terminal_receipt(control, &intent, id, outcome)?;
     }
     {
         let _guard = store::publication_guard(control)?;
@@ -4054,7 +4340,6 @@ fn settle_receipt(control: &Path, id: &str, outcome: &str) -> Result<(), String>
         registry.intents.retain(|record| record.id != id);
         registry.rows.retain(|row| {
             !(row.checkout_id == record.identity.checkout_id
-                && row.member == record.identity.member
                 && row.root == record.identity.root
                 && row.pruned_ms.is_some()
                 && !row.live())
@@ -4315,10 +4600,54 @@ fn rollback_intent(_store: &Store, control: &Path, intent: &Intent) -> Result<()
             registry.rows.retain(|row| {
                 !(matches(row) && row.pruning.as_deref() == Some(intent.id.as_str()))
             });
-        } else if let Some(row) = registry.rows.iter_mut().find(|row| matches(row)) {
-            row.selected = intent.was_selected;
-            row.pending = false;
-            row.pruning = None;
+        } else {
+            // The group and the receipt must still be exactly what the intent
+            // recorded; anything else keeps the root (pending3/KEEP).
+            if !intent.prior_receipt_sha.is_empty()
+                && receipt_preimage(control, &identity.checkout_id)? != intent.prior_receipt_sha
+            {
+                return Err(
+                    "the checkout receipt changed since the prune intent; the root is kept"
+                        .to_owned(),
+                );
+            }
+            let live: Vec<&Row> = registry.rows.iter().filter(|row| matches(row)).collect();
+            if live.len() != intent.group.len() {
+                return Err(
+                    "the root's registry references changed since the prune intent; the root is kept"
+                        .to_owned(),
+                );
+            }
+            for recorded in &intent.group {
+                let Some(row) = live.iter().find(|row| row.member == recorded.member) else {
+                    return Err("a recorded group member disappeared; the root is kept".to_owned());
+                };
+                if row.nonce != recorded.nonce
+                    || row.generation != recorded.generation
+                    || row.root_dev != recorded.root_dev
+                    || row.root_ino != recorded.root_ino
+                    || row.marker_digest != recorded.marker_digest
+                    || row.selected
+                    || row.pending
+                    || row.pruning.as_deref() != Some(intent.id.as_str())
+                {
+                    return Err(format!(
+                        "the registry reference for {} changed since the prune intent; the root is kept",
+                        recorded.member
+                    ));
+                }
+            }
+            for recorded in &intent.group {
+                if let Some(row) = registry
+                    .rows
+                    .iter_mut()
+                    .find(|row| matches(row) && row.member == recorded.member)
+                {
+                    row.selected = recorded.selected;
+                    row.pending = false;
+                    row.pruning = None;
+                }
+            }
         }
         registry.bump()?;
         write_registry(control, &registry)?;
@@ -4897,20 +5226,33 @@ fn complete_resolution(
             record.resolved_ms = Some(process::now_ms());
             record.updated_ms = process::now_ms();
         }
-        let Some(row) = registry.rows.iter_mut().find(|row| {
-            row.checkout_id == intent.identity.checkout_id
-                && row.member == intent.identity.member
-                && row.root == intent.identity.root
-        }) else {
-            return Err("the intent's blocking registry row disappeared".to_owned());
+        let blocking: Vec<usize> = registry
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                row.checkout_id == intent.identity.checkout_id
+                    && row.root == intent.identity.root
+                    && row.pruning.as_deref() == Some(intent.id.as_str())
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let expected = if intent.group.is_empty() {
+            1
+        } else {
+            intent.group.len()
         };
-        if row.pruning.as_deref() != Some(intent.id.as_str()) {
-            return Err("the intent's blocking registry reference changed".to_owned());
+        if blocking.len() != expected {
+            return Err("the intent's blocking registry references changed".to_owned());
         }
-        row.selected = false;
-        row.pending = false;
-        row.pruning = None;
-        row.pruned_ms = Some(process::now_ms());
+        let now = process::now_ms();
+        for index in blocking {
+            let row = &mut registry.rows[index];
+            row.selected = false;
+            row.pending = false;
+            row.pruning = None;
+            row.pruned_ms = Some(now);
+        }
         registry.bump()?;
         write_registry(control, &registry)?;
     }
@@ -5020,6 +5362,115 @@ mod tests {
             reservation: None,
             cancelling: None,
         }
+    }
+
+    /// Two references of one root under the same checkout form one group; the
+    /// registry durably keeps the sorted group, its preimage pin and the
+    /// expected terminal image, and refuses a group that is not sorted.
+    #[test]
+    fn a_root_group_is_sorted_durable_and_validated() {
+        let fixture = Fixture::new();
+        let mut debug = row_for(&fixture.root);
+        debug.member = "debug".to_owned();
+        let mut release = debug.clone();
+        release.member = "release".to_owned();
+        release.selected = false;
+        let registry = Registry {
+            version: REGISTRY_VERSION.to_owned(),
+            schema: REGISTRY_SCHEMA,
+            revision: 1,
+            complete: true,
+            incomplete: None,
+            created_by: "a".repeat(32),
+            rows: vec![release.clone(), debug.clone()],
+            intents: Vec::new(),
+            cancelled_overflow: Vec::new(),
+        };
+        let rows = group_rows(&registry, &debug.checkout_id, &debug.root);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.member.as_str())
+                .collect::<Vec<_>>(),
+            ["debug", "release"]
+        );
+        registry.validate().unwrap();
+        let root = debug.root.clone();
+        let group: Vec<GroupRow> = rows
+            .iter()
+            .map(|row| GroupRow {
+                member: row.member.clone(),
+                generation: row.generation,
+                nonce: row.nonce.clone(),
+                root_dev: row.root_dev,
+                root_ino: row.root_ino,
+                marker_digest: row.marker_digest.clone(),
+                selected: row.selected,
+            })
+            .collect();
+        let intent = Intent {
+            version: INTENT_VERSION.to_owned(),
+            id: "d".repeat(32),
+            identity: RootIdentity {
+                checkout_id: debug.checkout_id.clone(),
+                checkout: debug.checkout.clone(),
+                receipt: debug.receipt.clone(),
+                member: "debug".to_owned(),
+                root: root.clone(),
+                root_kind: debug.root_kind,
+                volume_uuid: debug.volume_uuid.clone(),
+                nonce: debug.nonce.clone(),
+                generation: debug.generation,
+                dev: debug.root_dev.unwrap(),
+                ino: debug.root_ino.unwrap(),
+                marker_digest: debug.marker_digest.clone().unwrap(),
+            },
+            phase: IntentPhase::Intent,
+            quarantine: root.join(".prune-intent"),
+            preview_sha256: "e".repeat(64),
+            created_ms: 1,
+            updated_ms: 1,
+            resolved_ms: None,
+            receipt_settled: false,
+            was_selected: true,
+            prior_receipt_sha: "f".repeat(64),
+            group: group.clone(),
+            expected_terminal_sha: None,
+            terminal_ms: None,
+        };
+        intent.validate().unwrap();
+        let mut registry = Registry {
+            version: REGISTRY_VERSION.to_owned(),
+            schema: REGISTRY_SCHEMA,
+            revision: 2,
+            complete: true,
+            incomplete: None,
+            created_by: "a".repeat(32),
+            rows: vec![debug, release],
+            intents: vec![intent.clone()],
+            cancelled_overflow: Vec::new(),
+        };
+        write_registry(&fixture.root, &registry).unwrap();
+        let loaded = read_registry(&fixture.root).unwrap().unwrap();
+        assert_eq!(loaded.intents[0].group, group);
+        assert_eq!(loaded.intents[0].prior_receipt_sha, "f".repeat(64));
+        // An unsorted or duplicated group is refused.
+        let mut unsorted = registry.intents[0].clone();
+        unsorted.group.reverse();
+        assert!(unsorted.validate().is_err());
+        let mut terminal = registry.intents[0].clone();
+        terminal.expected_terminal_sha = Some("1".repeat(64));
+        assert!(
+            terminal.validate().is_err(),
+            "a terminal image needs its fixed timestamp"
+        );
+        terminal.terminal_ms = Some(7);
+        terminal.validate().unwrap();
+        // The fixed terminal image only accepts a recorded preimage or itself.
+        terminal.prior_receipt_sha = String::new();
+        registry.intents = vec![terminal];
+        write_registry(&fixture.root, &registry).unwrap();
+        let loaded = read_registry(&fixture.root).unwrap().unwrap();
+        assert_eq!(loaded.intents[0].terminal_ms, Some(7));
     }
 
     #[test]
@@ -5393,6 +5844,10 @@ mod tests {
             resolved_ms: None,
             receipt_settled: false,
             was_selected: true,
+            prior_receipt_sha: String::new(),
+            group: Vec::new(),
+            expected_terminal_sha: None,
+            terminal_ms: None,
         };
         let mut registry = Registry {
             version: REGISTRY_VERSION.to_owned(),
@@ -5468,7 +5923,38 @@ mod tests {
         let fixture = Fixture::new();
         let row = row_for(&fixture.root);
         let candidate = candidate_of(&row);
-        let control = ready_control(&fixture, vec![row], Vec::new());
+        let control = ready_control(&fixture, vec![row.clone()], Vec::new());
+        // The intent pins the checkout receipt's exact bytes and verifies its
+        // references against the group, so a committed receipt must exist.
+        let receipt_path = outputs::receipt_path_public(&control, &row.checkout_id);
+        fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
+        fs::write(
+            &receipt_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": "oxide.outputs.transition/2",
+                "checkout": row.checkout.to_string_lossy(),
+                "checkout_id": row.checkout_id,
+                "generation": 1,
+                "state": "committed",
+                "links": [{
+                    "member": "target",
+                    "selected": {
+                        "kind": "external",
+                        "root": row.root.to_string_lossy(),
+                        "volume_uuid": row.volume_uuid,
+                        "nonce": row.nonce,
+                        "generation": 1
+                    }
+                }],
+                "updated_ms": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
         let id = "e".repeat(32);
         let quarantine = fixture.root.join(format!("{QUARANTINE_PREFIX}{id}"));
@@ -5480,10 +5966,11 @@ mod tests {
         let unchanged = ready_registry(&control).unwrap();
         assert_eq!(unchanged.revision, 5);
         assert!(unchanged.intents.is_empty() && unchanged.rows[0].selected);
-        assert!(matches!(
-            journal_intent(&store, &control, &candidate, &plan, &id, &quarantine, 5),
-            Ok(true)
-        ));
+        match journal_intent(&store, &control, &candidate, &plan, &id, &quarantine, 5) {
+            Ok(true) => {}
+            Ok(false) => panic!("the journal did not publish (revision changed)"),
+            Err(stop) => panic!("the journal refused: {}", stop_text(stop)),
+        }
         let journaled = ready_registry(&control).unwrap();
         assert_eq!(journaled.revision, 6);
         assert_eq!(journaled.intent(&id).unwrap().phase, IntentPhase::Intent);
@@ -5541,6 +6028,10 @@ mod tests {
             resolved_ms: None,
             receipt_settled: false,
             was_selected: true,
+            prior_receipt_sha: String::new(),
+            group: Vec::new(),
+            expected_terminal_sha: None,
+            terminal_ms: None,
         };
         let checkout_id = row.checkout_id.clone();
         let control = ready_control(&fixture, vec![row], vec![intent.clone()]);

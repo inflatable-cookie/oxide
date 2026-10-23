@@ -5523,15 +5523,68 @@ pub(crate) fn mark_pruned(
     intent: &str,
     outcome: &str,
 ) -> Result<(), String> {
-    let mut receipt = read_receipt(control, checkout, checkout_id)?
+    mark_pruned_at(
+        control,
+        checkout,
+        checkout_id,
+        intent,
+        outcome,
+        process::now_ms(),
+    )
+}
+
+/// Publish the receipt's terminal prune image with an exact FIXED timestamp.
+pub(crate) fn mark_pruned_at(
+    control: &Path,
+    checkout: &Path,
+    checkout_id: &str,
+    intent: &str,
+    outcome: &str,
+    at_ms: u64,
+) -> Result<(), String> {
+    let receipt = read_receipt(control, checkout, checkout_id)?
         .ok_or_else(|| "the checkout's receipt disappeared before its prune receipt".to_owned())?;
+    let terminal = pruned_receipt(receipt, intent, outcome, at_ms)?;
+    if terminal.pruned.as_ref().is_none() {
+        // Already the terminal image for this exact intent: nothing to write.
+        return Ok(());
+    }
+    write_receipt(control, &terminal)
+}
+
+/// The exact terminal receipt image for one prune intent, with its fixed
+/// timestamp. The caller persists its digest before publishing it.
+pub(crate) fn terminal_receipt_image(
+    control: &Path,
+    checkout: &Path,
+    checkout_id: &str,
+    intent: &str,
+    outcome: &str,
+    at_ms: u64,
+) -> Result<Vec<u8>, String> {
+    let receipt = read_receipt(control, checkout, checkout_id)?
+        .ok_or_else(|| "the checkout's receipt disappeared before its prune receipt".to_owned())?;
+    let terminal = pruned_receipt(receipt, intent, outcome, at_ms)?;
+    serde_json::to_vec_pretty(&terminal)
+        .map_err(|error| format!("cannot encode the terminal receipt image: {error}"))
+}
+
+/// Apply the terminal prune state to one receipt, clearing every owned
+/// placement of the deleted root and preserving all other placements,
+/// selections and history.
+fn pruned_receipt(
+    mut receipt: Receipt,
+    intent: &str,
+    outcome: &str,
+    at_ms: u64,
+) -> Result<Receipt, String> {
     if receipt.state == ReceiptState::Pruned {
         if receipt
             .pruned
             .as_ref()
             .is_some_and(|record| record.intent == intent)
         {
-            return Ok(());
+            return Ok(receipt);
         }
         return Err("the receipt records a different prune intent".to_owned());
     }
@@ -5543,16 +5596,46 @@ pub(crate) fn mark_pruned(
     {
         return Err("the pruning receipt records a different prune intent".to_owned());
     }
-    receipt.state = ReceiptState::Pruned;
-    receipt.link_mut().selected = None;
-    receipt.link_mut().prepared = None;
+    if receipt.state == ReceiptState::Prepared {
+        return Err(
+            "the receipt has a pending transition; a prune terminal image refuses".to_owned(),
+        );
+    }
+    match receipt.current().map(|selected| selected.root.clone()) {
+        Some(root) => {
+            // Clear only the deleted root's placements; another root's
+            // selection and unrelated history stay exactly as they are.
+            for placement in &mut receipt.links {
+                if placement
+                    .selected
+                    .as_ref()
+                    .is_some_and(|selected| selected.root == root)
+                {
+                    placement.selected = None;
+                    placement.prepared = None;
+                }
+            }
+            if receipt
+                .links
+                .iter()
+                .all(|placement| placement.selected.is_none())
+            {
+                receipt.state = ReceiptState::Pruned;
+            }
+        }
+        None => {
+            // A receiptless legacy root's pruning receipt selects nothing; its
+            // terminal image is still this intent's evidence.
+            receipt.state = ReceiptState::Pruned;
+        }
+    }
     receipt.pruned = Some(PruneRecord {
         intent: intent.to_owned(),
         outcome: outcome.to_owned(),
-        at_ms: process::now_ms(),
+        at_ms,
     });
-    receipt.updated_ms = process::now_ms();
-    write_receipt(control, &receipt)
+    receipt.updated_ms = at_ms;
+    Ok(receipt)
 }
 
 /// Exclusively create the `pruning` receipt that protects an operator-listed
@@ -6062,6 +6145,9 @@ pub struct CleanPlacement {
     keep_root: bool,
     link: PathBuf,
     inactive: Vec<PathBuf>,
+    /// The bound profile layout: every owned member link must survive a
+    /// whole clean, and its real root's payload is what gets cleaned.
+    members: Vec<(PathBuf, PathBuf)>,
 }
 
 impl CleanPlacement {
@@ -6073,8 +6159,29 @@ impl CleanPlacement {
         self.keep_root
     }
 
+    /// Owned member links and their real roots, for the profile layout.
+    pub fn members(&self) -> &[(PathBuf, PathBuf)] {
+        &self.members
+    }
+
+    /// Whether this placement is the profile layout.
+    pub fn profile(&self) -> bool {
+        !self.members.is_empty()
+    }
+
     /// What the clean keeps, for its report; empty for an ephemeral checkout.
     pub fn preserved_note(&self) -> Option<String> {
+        if !self.members.is_empty() {
+            return Some(format!(
+                "{} profile member link(s) and their ownership marker are kept; each owned member root's payload is cleaned instead: {}",
+                self.members.len(),
+                self.members
+                    .iter()
+                    .map(|(link, root)| format!("{} -> {}", link.display(), root.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         if !self.keep_root {
             return None;
         }
@@ -6173,11 +6280,62 @@ pub fn clean_placement(workspace: &Path) -> Result<Option<CleanPlacement>, Strin
                 .filter(|root| root.root != selected.root && root.root.is_dir())
                 .map(|root| root.root.clone())
                 .collect();
+            if receipt.layout() == LayoutKind::Profile {
+                // `target` stays a real directory; each owned member link and
+                // its root marker survive, and the owned payloads live in the
+                // roots.
+                let target = context.target()?;
+                if !matches!(target, TargetState::RealEmpty | TargetState::RealNonEmpty) {
+                    return Err(format!(
+                        "clean refused: {} is {}, not a real profile target directory",
+                        context.link().display(),
+                        target.label()
+                    ));
+                }
+                let mut members = Vec::new();
+                for placement in receipt.links() {
+                    let Some(selected) = placement.selected_ref() else {
+                        continue;
+                    };
+                    let link = link_path(workspace, placement.member());
+                    match link_state(&link, workspace, &context.checkout_id)? {
+                        TargetState::OwnedLink(root) if root == selected.root => {
+                            let marker = read_marker(selected.root())?;
+                            check_marker(&marker, workspace, &context.checkout_id)?;
+                            if marker.generation > receipt.generation {
+                                return Err(format!(
+                                    "clean refused: {} carries generation {} ahead of the receipt's {}",
+                                    selected.root().display(),
+                                    marker.generation,
+                                    receipt.generation
+                                ));
+                            }
+                            members.push((link, selected.root().to_path_buf()));
+                        }
+                        TargetState::Missing => {}
+                        state => {
+                            return Err(format!(
+                                "clean refused: {} is {}, not this checkout's owned member link; Oxide never cleans through a foreign link",
+                                link.display(),
+                                state.label()
+                            ))
+                        }
+                    }
+                }
+                return Ok(Some(CleanPlacement {
+                    target: context.link(),
+                    keep_root: false,
+                    link: context.link(),
+                    inactive,
+                    members,
+                }));
+            }
             Ok(Some(CleanPlacement {
                 target: selected.root,
                 keep_root: true,
                 link: context.link(),
                 inactive,
+                members: Vec::new(),
             }))
         }
     }
