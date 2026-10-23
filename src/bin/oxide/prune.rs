@@ -87,6 +87,11 @@ struct Registry {
     /// reconstructed, and they count toward the live caps.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     intents: Vec<Intent>,
+    /// Overflow reservations whose cancellation began but whose receipt has
+    /// not yet committed without them. A safety journal: binding refuses any
+    /// listed reservation; never compacted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cancelled_overflow: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -131,11 +136,22 @@ struct Row {
     pruning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pruned_ms: Option<u64>,
+    /// The receipt reservation transaction that created this pending row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reservation: Option<String>,
+    /// Set durably before an unused reservation's receipt drops it; binding
+    /// refuses the reservation from then on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cancelling: Option<String>,
 }
 
 impl Row {
     fn live(&self) -> bool {
-        self.selected || self.pending || self.pruning.is_some()
+        self.selected
+            || self.pending
+            || self.pruning.is_some()
+            || self.reservation.is_some()
+            || self.cancelling.is_some()
     }
 }
 
@@ -492,6 +508,8 @@ fn seed_registry(control: &Path, registry: &mut Registry) -> Result<(), String> 
                 pending: !is_selected,
                 pruning: None,
                 pruned_ms: None,
+                reservation: None,
+                cancelling: None,
             });
         }
     }
@@ -541,6 +559,7 @@ fn create_or_validate_registry(
                 created_by: transaction.to_owned(),
                 rows: Vec::new(),
                 intents: Vec::new(),
+                cancelled_overflow: Vec::new(),
             };
             // Seed live references from the bounded committed receipts this
             // control directory already holds. Never from markers, and never
@@ -912,6 +931,8 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
                     pending: false,
                     pruning: None,
                     pruned_ms: None,
+                    reservation: None,
+                    cancelling: None,
                 };
                 registry.rows.push(row);
             }
@@ -926,7 +947,7 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
                 registry.rows.push(Row {
                     checkout_id: checkout_id.to_owned(),
                     checkout: checkout.to_path_buf(),
-                    checkout_volume_uuid,
+                    checkout_volume_uuid: checkout_volume_uuid.clone(),
                     receipt: receipt_path.clone(),
                     member: member.to_owned(),
                     root: proposed.root().to_path_buf(),
@@ -942,10 +963,284 @@ pub fn note_receipt(control: &Path, receipt: &Receipt) -> Result<(), String> {
                     pending: true,
                     pruning: None,
                     pruned_ms: None,
+                    reservation: None,
+                    cancelling: None,
                 });
             }
         }
     }
+    note_reservation(&mut registry, receipt, &receipt_path, checkout_volume_uuid)?;
+    write_registry(control, &registry)
+}
+
+/// The marker a reservation write returns after it durably published sticky
+/// incompleteness: the caller retries once with an overflow tag.
+pub const OVERFLOW_RETRY: &str =
+    "the output registry reached its row limit and is now sticky-incomplete";
+
+/// Most overflow cancellations in flight at once.
+const MAX_CANCELLED_OVERFLOW: usize = 64;
+
+/// Whether `value` is a 128-bit lowercase-hex nonce.
+pub fn is_nonce(value: &str) -> bool {
+    hex32(value)
+}
+
+fn overflow_key(checkout_id: &str, id: &str) -> String {
+    format!("{checkout_id}/{id}")
+}
+
+/// Publish a receipt's reservation reference. An indexed reservation is a
+/// pending row carrying its transaction and nonce; an overflow reservation
+/// adds no row and is valid only against the durably sticky-incomplete
+/// registry it names. A reservation whose cancellation began is never
+/// republished, and a dropped reservation without its cancellation journal
+/// is refused rather than read as non-selection.
+fn note_reservation(
+    registry: &mut Registry,
+    receipt: &Receipt,
+    receipt_path: &Path,
+    checkout_volume_uuid: Option<String>,
+) -> Result<(), String> {
+    let checkout_id = receipt.checkout_id();
+    let member = outputs::MEMBER;
+    let reserved = receipt.reserved();
+    let current_id = reserved.map(|reserved| reserved.id.as_str());
+    let selected_root = receipt
+        .current()
+        .map(|selected| selected.root().to_path_buf());
+    let proposed_root = receipt
+        .prepared_ref()
+        .map(|prepared| prepared.to.root().to_path_buf());
+    for row in registry
+        .rows
+        .iter_mut()
+        .filter(|row| row.checkout_id == checkout_id && row.member == member)
+    {
+        let Some(id) = row.reservation.clone() else {
+            continue;
+        };
+        if Some(id.as_str()) == current_id || row.cancelling.is_some() {
+            continue;
+        }
+        // Consumed: the commit (or the prepared transition) now references
+        // the reserved root itself.
+        if Some(&row.root) == selected_root.as_ref() || Some(&row.root) == proposed_root.as_ref() {
+            row.reservation = None;
+            continue;
+        }
+        return Err(format!(
+            "the receipt drops reservation {id} without its cancellation journal; refusing"
+        ));
+    }
+    let Some(reserved) = reserved else {
+        return Ok(());
+    };
+    if let Some(tag) = &reserved.overflow {
+        if registry.complete || tag.registry != registry.created_by {
+            return Err(
+                "an overflow reservation needs the durably sticky-incomplete registry it names; refusing"
+                    .to_owned(),
+            );
+        }
+        if registry
+            .cancelled_overflow
+            .contains(&overflow_key(checkout_id, &reserved.id))
+        {
+            return Err(format!(
+                "reservation {} is being cancelled; refusing to republish it",
+                reserved.id
+            ));
+        }
+        return Ok(());
+    }
+    if let Some(row) = registry.rows.iter_mut().find(|row| {
+        row.checkout_id == checkout_id && row.member == member && row.root == reserved.root
+    }) {
+        if row.cancelling.is_some() {
+            return Err(format!(
+                "reservation {} is being cancelled; refusing to republish it",
+                reserved.id
+            ));
+        }
+        row.reservation = Some(reserved.id.clone());
+        if !row.selected {
+            row.pending = true;
+            row.nonce = Some(reserved.nonce.clone());
+            row.generation = reserved.generation;
+        }
+        return Ok(());
+    }
+    if !registry.complete || registry.rows.len() >= MAX_ROWS {
+        mark_incomplete(registry, "the registry row limit was reached")?;
+        return Err(format!(
+            "{OVERFLOW_RETRY}; reserve again with an overflow tag"
+        ));
+    }
+    registry.rows.push(Row {
+        checkout_id: checkout_id.to_owned(),
+        checkout: receipt.checkout().to_path_buf(),
+        checkout_volume_uuid,
+        receipt: receipt_path.to_path_buf(),
+        member: member.to_owned(),
+        root: reserved.root.clone(),
+        root_kind: reserved.kind,
+        volume_uuid: reserved.volume_uuid.clone(),
+        recipe: outputs::RECIPE_PUBLIC.to_owned(),
+        nonce: Some(reserved.nonce.clone()),
+        generation: reserved.generation,
+        root_dev: None,
+        root_ino: None,
+        marker_digest: None,
+        selected: false,
+        pending: true,
+        pruning: None,
+        pruned_ms: None,
+        reservation: Some(reserved.id.clone()),
+        cancelling: None,
+    });
+    Ok(())
+}
+
+/// The overflow tag for a new reservation: `Some` only once the registry is
+/// durably sticky-incomplete. Its revision is provenance only.
+pub fn overflow_tag(
+    control: &Path,
+    id: &str,
+    nonce: &str,
+) -> Result<Option<outputs::OverflowTag>, String> {
+    let registry = ready_registry(control)?;
+    registry.validate()?;
+    if registry.complete {
+        return Ok(None);
+    }
+    Ok(Some(outputs::OverflowTag {
+        registry: registry.created_by.clone(),
+        transaction: id.to_owned(),
+        nonce: nonce.to_owned(),
+        revision: registry.revision,
+    }))
+}
+
+/// Binding validation of an exact surviving reservation. Indexed: its row
+/// carries the same transaction, nonce and root and no cancellation. Overflow:
+/// the same registry identity is still sticky-incomplete and no cancellation
+/// of this transaction began. An unrelated revision advance never refuses.
+pub fn validate_reservation(control: &Path, reserved: &outputs::Reservation) -> Result<(), String> {
+    let registry = ready_registry(control)?;
+    registry.validate()?;
+    if let Some(tag) = &reserved.overflow {
+        if registry.complete || tag.registry != registry.created_by {
+            return Err("its overflow tag names another registry state".to_owned());
+        }
+        if registry
+            .cancelled_overflow
+            .iter()
+            .any(|key| key.ends_with(&format!("/{}", reserved.id)))
+        {
+            return Err("its cancellation began".to_owned());
+        }
+        return Ok(());
+    }
+    match registry
+        .rows
+        .iter()
+        .find(|row| row.reservation.as_deref() == Some(reserved.id.as_str()))
+    {
+        Some(row) if row.cancelling.is_some() => Err("its cancellation began".to_owned()),
+        Some(row)
+            if row.nonce.as_deref() == Some(reserved.nonce.as_str())
+                && row.root == reserved.root =>
+        {
+            Ok(())
+        }
+        Some(_) => Err("its registry row names another nonce or root".to_owned()),
+        None => Err("no registry row backs it".to_owned()),
+    }
+}
+
+/// First cancellation step, durable before the receipt drops the
+/// reservation: the authority is invalidated and the revision advances.
+/// Idempotent for the exact same transaction.
+pub fn begin_cancel(
+    control: &Path,
+    checkout_id: &str,
+    reserved: &outputs::Reservation,
+) -> Result<(), String> {
+    let _guard = store::publication_guard(control)?;
+    let mut registry = ready_registry(control)?;
+    registry.validate()?;
+    if reserved.overflow.is_some() {
+        let key = overflow_key(checkout_id, &reserved.id);
+        if !registry.cancelled_overflow.contains(&key) {
+            if registry.cancelled_overflow.len() >= MAX_CANCELLED_OVERFLOW {
+                return Err(
+                    "too many overflow reservation cancellations are unfinished; refusing"
+                        .to_owned(),
+                );
+            }
+            registry.cancelled_overflow.push(key);
+        }
+    } else {
+        let Some(row) = registry
+            .rows
+            .iter_mut()
+            .find(|row| row.reservation.as_deref() == Some(reserved.id.as_str()))
+        else {
+            return Err(format!(
+                "reservation {} has no registry row; it is kept",
+                reserved.id
+            ));
+        };
+        row.cancelling = Some(reserved.id.clone());
+        row.pending = false;
+    }
+    registry.bump()?;
+    write_registry(control, &registry)
+}
+
+/// Last cancellation step, after the receipt committed without the
+/// reservation: remove the abandoned row (or overflow journal entry).
+pub fn finish_cancel(
+    control: &Path,
+    checkout_id: &str,
+    reserved: &outputs::Reservation,
+) -> Result<(), String> {
+    let _guard = store::publication_guard(control)?;
+    let mut registry = ready_registry(control)?;
+    registry.validate()?;
+    let key = overflow_key(checkout_id, &reserved.id);
+    registry.cancelled_overflow.retain(|entry| entry != &key);
+    registry
+        .rows
+        .retain(|row| row.cancelling.as_deref() != Some(reserved.id.as_str()));
+    registry.bump()?;
+    write_registry(control, &registry)
+}
+
+/// Replay of interrupted cancellations for one checkout whose receipt no
+/// longer holds the reservation: finish exactly the recorded transactions.
+pub fn finish_dropped_cancels(
+    control: &Path,
+    checkout_id: &str,
+    current: Option<&str>,
+) -> Result<(), String> {
+    let _guard = store::publication_guard(control)?;
+    let mut registry = ready_registry(control)?;
+    let before = (registry.rows.len(), registry.cancelled_overflow.len());
+    registry.rows.retain(|row| {
+        row.checkout_id != checkout_id
+            || row.cancelling.is_none()
+            || row.cancelling.as_deref() == current
+    });
+    registry.cancelled_overflow.retain(|key| {
+        !key.starts_with(&format!("{checkout_id}/"))
+            || current.is_some_and(|id| key.ends_with(&format!("/{id}")))
+    });
+    if (registry.rows.len(), registry.cancelled_overflow.len()) == before {
+        return Ok(());
+    }
+    registry.bump()?;
     write_registry(control, &registry)
 }
 
@@ -3176,6 +3471,8 @@ fn checkout_absence_for_candidate(candidate: &Candidate, legacy: bool) -> Result
         pending: false,
         pruning: None,
         pruned_ms: None,
+        reservation: None,
+        cancelling: None,
     };
     checkout_absence(&row, legacy)
 }
@@ -3781,6 +4078,8 @@ mod tests {
             pending: false,
             pruning: None,
             pruned_ms: None,
+            reservation: None,
+            cancelling: None,
         }
     }
 
@@ -3803,6 +4102,7 @@ mod tests {
             created_by: "a".repeat(32),
             rows: Vec::new(),
             intents: Vec::new(),
+            cancelled_overflow: Vec::new(),
         };
         let preview = build_preview(&registry, &[], None);
         let first = serde_json::to_vec(&preview).unwrap();
@@ -3826,6 +4126,7 @@ mod tests {
             created_by: "a".repeat(32),
             rows: Vec::new(),
             intents: Vec::new(),
+            cancelled_overflow: Vec::new(),
         };
         assert!(registry.validate().is_err());
         registry.version = REGISTRY_VERSION.to_owned();
@@ -4091,6 +4392,7 @@ mod tests {
             created_by: "a".repeat(32),
             rows: vec![row],
             intents: Vec::new(),
+            cancelled_overflow: Vec::new(),
         };
         write_registry(&control, &registry).unwrap();
         let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
@@ -4147,6 +4449,7 @@ mod tests {
             created_by: "a".repeat(32),
             rows: Vec::new(),
             intents: vec![intent.clone()],
+            cancelled_overflow: Vec::new(),
         };
         let refused = resolve_precheck(&store, &control, &intent, &registry).unwrap_err();
         assert!(refused.contains("sticky-incomplete"), "{refused}");
@@ -4170,6 +4473,7 @@ mod tests {
             created_by: "a".repeat(32),
             rows,
             intents,
+            cancelled_overflow: Vec::new(),
         };
         write_registry(&control, &registry).unwrap();
         control

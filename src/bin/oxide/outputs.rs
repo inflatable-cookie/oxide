@@ -268,6 +268,54 @@ struct LinkPlacement {
     selected: Option<Selected>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prepared: Option<Prepared>,
+    /// A durable random nonce reserved for a future root before a command's
+    /// slot is keyed (oxide#129). Commands that want the identical future
+    /// root share it; it is consumed by the commit that creates the root or
+    /// removed only by the cancellation journal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reserved: Option<Reservation>,
+}
+
+/// A reserved future root: its transaction ID, root nonce and the exact
+/// destination it was reserved for.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Reservation {
+    pub(crate) id: String,
+    pub(crate) nonce: String,
+    pub(crate) kind: RootKind,
+    pub(crate) root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) volume_uuid: Option<String>,
+    pub(crate) generation: u64,
+    pub(crate) created_ms: u64,
+    /// Present only when the registry was already durably sticky-incomplete:
+    /// the reservation is backed by this receipt transaction, never by an
+    /// invented registry row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) overflow: Option<OverflowTag>,
+}
+
+/// The explicit overflow binding of an unindexed reservation: the registry
+/// identity, the reservation transaction and nonce, and the global revision
+/// it was made at (provenance, not a freshness requirement).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OverflowTag {
+    pub(crate) registry: String,
+    pub(crate) transaction: String,
+    pub(crate) nonce: String,
+    pub(crate) revision: u64,
+}
+
+impl Reservation {
+    /// Whether this reservation is for exactly `wanted`'s future root.
+    fn is_for(&self, wanted: &Selected) -> bool {
+        self.kind == wanted.kind
+            && self.root == wanted.root
+            && self.volume_uuid == wanted.volume_uuid
+            && self.generation == wanted.generation
+    }
 }
 
 impl Receipt {
@@ -282,6 +330,7 @@ impl Receipt {
                 member: MEMBER.to_owned(),
                 selected: None,
                 prepared: None,
+                reserved: None,
             }],
             roots: Vec::new(),
             pruned: None,
@@ -325,6 +374,10 @@ impl Receipt {
         self.link().prepared.as_ref()
     }
 
+    pub(crate) fn reserved(&self) -> Option<&Reservation> {
+        self.link().reserved.as_ref()
+    }
+
     fn validate(&self, checkout: &Path, checkout_id: &str) -> Result<(), String> {
         if self.version != RECEIPT_VERSION {
             return Err(format!(
@@ -358,6 +411,19 @@ impl Receipt {
                 if nonce.len() != 32 {
                     return Err("the owned-output receipt has an unusable root nonce".to_owned());
                 }
+            }
+        }
+        if let Some(reserved) = self.reserved() {
+            let tagged = reserved
+                .overflow
+                .as_ref()
+                .is_none_or(|tag| tag.transaction == reserved.id && tag.nonce == reserved.nonce);
+            if !crate::prune::is_nonce(&reserved.id)
+                || !crate::prune::is_nonce(&reserved.nonce)
+                || !safe_absolute(&reserved.root)
+                || !tagged
+            {
+                return Err("the owned-output receipt has an unusable reservation".to_owned());
             }
         }
         for root in &self.roots {
@@ -440,6 +506,7 @@ impl<'de> Deserialize<'de> for Receipt {
                 member: MEMBER.to_owned(),
                 selected: doc.selected,
                 prepared: doc.prepared,
+                reserved: None,
             }]
         } else {
             if doc.selected.is_some() || doc.prepared.is_some() {
@@ -664,6 +731,7 @@ pub fn run(args: &[OsString]) -> Result<u8, String> {
         ),
         ["adopt"] => adopt_command(),
         ["detach"] => detach_command(),
+        ["cancel-reservation"] => cancel_command(),
         ["status"] => status_command(),
         ["-h" | "--help"] | [] => {
             println!("{USAGE}");
@@ -1344,6 +1412,15 @@ fn detach_command() -> Result<u8, String> {
         if read_receipt(&control, &context.workspace, &context.checkout_id)?.is_some() {
             crate::prune::ensure_ready(&internal, &context.workspace)?;
         }
+        // Detach selects nothing, so an unused reservation is cancelled
+        // through its journal first, before the admission lock.
+        if let Some(mut reserved) =
+            read_receipt(&control, &context.workspace, &context.checkout_id)?
+                .filter(|receipt| receipt.reserved().is_some())
+        {
+            let _binding = internal.lock_binding(&context.workspace)?;
+            cancel_reservation(&internal, &control, &context, &mut reserved)?;
+        }
         let _admission = store::publication_guard(&control)?;
         let receipt = read_receipt(&control, &context.workspace, &context.checkout_id)?
             .ok_or("this checkout has no owned-output receipt; nothing to detach")?;
@@ -1750,7 +1827,14 @@ fn bind_under_binding(
             return Bind::Bound(bound_outcome(&usable, &wanted, false));
         }
         RootCheck::Valid => {}
-        RootCheck::Missing => {}
+        RootCheck::Missing => {
+            // A future root binds only the exact surviving reservation its
+            // slot was keyed with: a cancelled, replaced or absent one
+            // refuses before Cargo, with no automatic retry.
+            if let Err(reason) = reservation_matches(context, receipt, &wanted) {
+                return Bind::Refuse(reason);
+            }
+        }
         RootCheck::Contradiction(reason) => {
             return Bind::Refuse(format!(
                 "outputs: {reason}; nothing was changed. Run `oxide outputs adopt` to recheck this checkout's owned outputs"
@@ -1808,6 +1892,39 @@ fn bind_under_binding(
             }
         }
     }
+}
+
+/// The keyed future root's reservation must survive exactly: the receipt's
+/// reservation is for this root and generation with the keyed nonce, and the
+/// registry row (or, after durable overflow, the receipt's overflow tag)
+/// still backs it with no cancellation recorded.
+fn reservation_matches(
+    context: &Context,
+    receipt: &Receipt,
+    wanted: &Selected,
+) -> Result<(), String> {
+    let control = context
+        .control()
+        .ok_or("no internal pool exists; there is no place for an output receipt")?;
+    crate::prune::require_registry(control)?;
+    let stale = || {
+        format!(
+            "outputs: this command's slot was keyed for root nonce {} of {}, but that reservation was cancelled or replaced; nothing was built. Run the command again",
+            wanted.nonce().unwrap_or("(none)"),
+            wanted.root.display()
+        )
+    };
+    let Some(nonce) = wanted.nonce() else {
+        return Err(stale());
+    };
+    let Some(reserved) = receipt
+        .reserved()
+        .filter(|reserved| reserved.is_for(wanted) && reserved.nonce == nonce)
+    else {
+        return Err(stale());
+    };
+    crate::prune::validate_reservation(control, reserved)
+        .map_err(|reason| format!("{} ({reason})", stale()))
 }
 
 /// Whether a root can be used as the keyed destination right now.
@@ -1881,6 +1998,12 @@ fn check_bound_root(
         receipt_generation,
     )?;
     let marker = read_marker(root)?;
+    if wanted.nonce.is_some() && marker.nonce != wanted.nonce {
+        return Err(format!(
+            "{} carries another root nonce than the keyed one; run the command again",
+            root.display()
+        ));
+    }
     if marker.generation != wanted.generation {
         return Err(format!(
             "{} was created at generation {}, not the keyed {}; run the command again",
@@ -1964,8 +2087,171 @@ fn desired_selection(context: &Context, receipt: &Receipt) -> Result<Option<Sele
     };
     let marker = read_marker(spec.root()).ok();
     let generation = marker.as_ref().map_or(next, |marker| marker.generation);
-    let nonce = marker.and_then(|marker| marker.nonce);
-    Ok(Some(spec.selected(generation).with_nonce(nonce)))
+    let wanted = spec.selected(generation);
+    // An existing root keys its own marker nonce; a future root keys the
+    // nonce reserved for exactly it, never a missing root's old nonce.
+    let nonce = match marker {
+        Some(marker) => marker.nonce,
+        None => receipt
+            .reserved()
+            .filter(|reserved| reserved.is_for(&wanted))
+            .map(|reserved| reserved.nonce.clone()),
+    };
+    Ok(Some(wanted.with_nonce(nonce)))
+}
+
+/// Reserve the nonce of this command's future root before its slot is keyed
+/// (oxide#129). Runs after automatic adoption and before
+/// `planned_destination`/`SlotKey::resolve_in`, under the checkout's binding
+/// lock (held only here, never across the lease wait) and, through
+/// `write_receipt`, the internal publication lock. An existing root, an
+/// identical uncancelled reservation, a pool without a ready registry (whose
+/// transition refuses later and names the upgrade) or a checkout with no
+/// committed receipt reserves nothing.
+pub fn reserve(
+    store: &Store,
+    control: Option<&Path>,
+    checkout: &Path,
+    pool_fallback: Option<&str>,
+) -> Result<(), String> {
+    let Some(control) = control else {
+        return Ok(());
+    };
+    let context = Context::new(Some(control.to_path_buf()), checkout.to_path_buf())
+        .with_pool_fallback(pool_fallback);
+    if context.receipt()?.is_none() || crate::prune::require_registry(control).is_err() {
+        return Ok(());
+    }
+    let _binding = store.lock_binding(checkout)?;
+    // Overflow publication needs at most one retry: the first attempt
+    // durably records sticky incompleteness and the second tags the receipt.
+    for _ in 0..2 {
+        let Some(mut receipt) = context.receipt()? else {
+            return Ok(());
+        };
+        // Finish any exact cancellation a crash interrupted after its
+        // receipt committed.
+        crate::prune::finish_dropped_cancels(
+            control,
+            &context.checkout_id,
+            receipt.reserved().map(|reserved| reserved.id.as_str()),
+        )?;
+        if receipt.state != ReceiptState::Committed {
+            return Ok(());
+        }
+        let Some(wanted) = desired_selection(&context, &receipt)? else {
+            return Ok(());
+        };
+        if read_marker(&wanted.root).is_ok() {
+            return Ok(());
+        }
+        if let Some(reserved) = receipt.reserved().cloned() {
+            if reserved.is_for(&wanted)
+                && crate::prune::validate_reservation(control, &reserved).is_ok()
+            {
+                return Ok(());
+            }
+            // A different or invalidated reservation is cancelled through
+            // its journal before a new one is made.
+            cancel_reservation(store, control, &context, &mut receipt)?;
+        }
+        let id = crate::prune::fresh_nonce()?;
+        let nonce = crate::prune::fresh_nonce()?;
+        let overflow = crate::prune::overflow_tag(control, &id, &nonce)?;
+        receipt.link_mut().reserved = Some(Reservation {
+            id,
+            nonce,
+            kind: wanted.kind,
+            root: wanted.root.clone(),
+            volume_uuid: wanted.volume_uuid.clone(),
+            generation: wanted.generation,
+            created_ms: process::now_ms(),
+            overflow,
+        });
+        receipt.updated_ms = process::now_ms();
+        match write_receipt(control, &receipt) {
+            Ok(()) => return Ok(()),
+            Err(reason) if reason.contains(crate::prune::OVERFLOW_RETRY) => continue,
+            Err(reason) => return Err(reason),
+        }
+    }
+    Err("outputs: the output registry overflowed twice while reserving a root nonce; nothing was built. Run the command again".to_owned())
+}
+
+/// Cancel this checkout's unused reservation (oxide#129). Only under the
+/// binding lock with every writer positively clear, the reserved root absent
+/// (no marker, no entry) and no prune intent for the checkout. The durable
+/// cancellation record invalidates its authority first, then the receipt
+/// commits without it, then the abandoned registry row is removed. A stale
+/// starter holding the old nonce refuses at binding; the nonce is never
+/// reused.
+fn cancel_reservation(
+    store: &Store,
+    control: &Path,
+    context: &Context,
+    receipt: &mut Receipt,
+) -> Result<(), String> {
+    let Some(reserved) = receipt.reserved().cloned() else {
+        return Ok(());
+    };
+    if crate::prune::unsettled_for(control, &context.checkout_id)?.is_some() {
+        return Err("outputs: a prune intent is unsettled for this checkout, so its root reservation is kept; nothing was built".to_owned());
+    }
+    match fs::symlink_metadata(&reserved.root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => {
+            return Err(format!(
+                "outputs: the reserved root {} exists or cannot be inspected, so its reservation is kept; nothing was built",
+                reserved.root.display()
+            ))
+        }
+    }
+    match store.checkout_custody(&context.workspace, 0)? {
+        CheckoutCustody::Clear => {}
+        _ => {
+            return Err("outputs: this checkout's root reservation changed while another command may hold it; nothing was built. Run the command again once other commands in this checkout finish".to_owned())
+        }
+    }
+    crate::prune::begin_cancel(control, &context.checkout_id, &reserved)?;
+    receipt.link_mut().reserved = None;
+    receipt.updated_ms = process::now_ms();
+    write_receipt(control, receipt)?;
+    crate::prune::finish_cancel(control, &context.checkout_id, &reserved)
+}
+
+/// `oxide outputs cancel-reservation`: the explicit cancellation of this
+/// checkout's unused reservation, under its clean barrier and binding lock.
+fn cancel_command() -> Result<u8, String> {
+    let context = Context::open()?;
+    let Some(control) = context.control().map(Path::to_path_buf) else {
+        return Err("no internal pool exists; there is no owned output state".to_owned());
+    };
+    let Some(internal) = output_store()? else {
+        return Err("no internal pool exists; there is no owned output state".to_owned());
+    };
+    process::install_signal_handlers()?;
+    let mut waits = WaitAccounting::default();
+    let guard = barrier(&internal, &context.workspace, &mut waits)?;
+    let outcome = (|| -> Result<Option<Reservation>, String> {
+        let _binding = internal.lock_binding(&context.workspace)?;
+        let mut receipt = read_receipt(&control, &context.workspace, &context.checkout_id)?
+            .ok_or("this checkout has no owned-output receipt; nothing to cancel")?;
+        let Some(reserved) = receipt.reserved().cloned() else {
+            return Ok(None);
+        };
+        cancel_reservation(&internal, &control, &context, &mut receipt)?;
+        Ok(Some(reserved))
+    })();
+    release_barrier(&internal, guard)?;
+    match outcome? {
+        Some(reserved) => println!(
+            "outputs: cancelled the unused reservation {} for {}; its nonce is never reused",
+            reserved.id,
+            reserved.root.display()
+        ),
+        None => println!("outputs: this checkout holds no root reservation"),
+    }
+    Ok(0)
 }
 
 /// The generation a destination root has, or will be created at: its marker's
@@ -2601,10 +2887,23 @@ fn transition(
     let existing_nonce = read_marker(spec.root())
         .ok()
         .and_then(|marker| marker.nonce);
+    // A future root takes the nonce reserved for exactly it, after the
+    // reservation is validated against the registry (or its overflow tag);
+    // only an explicit adoption without a keyed slot draws a fresh one.
+    let reserved = receipt
+        .reserved()
+        .filter(|reserved| reserved.is_for(&spec.selected(generation)))
+        .cloned();
     let nonce = match existing_nonce {
         Some(nonce) => Some(nonce),
         None if read_marker(spec.root()).is_ok() => None,
-        None => Some(crate::prune::fresh_nonce()?),
+        None => match &reserved {
+            Some(reserved) => {
+                crate::prune::validate_reservation(control, reserved)?;
+                Some(reserved.nonce.clone())
+            }
+            None => Some(crate::prune::fresh_nonce()?),
+        },
     };
     let to = spec.selected(generation).with_nonce(nonce);
     // Write-ahead: prepared first, then the destination root, then the
@@ -2721,6 +3020,12 @@ fn finish_commit(
     committed.generation = prepared.generation;
     committed.link_mut().selected = Some(selected.clone());
     committed.link_mut().prepared = None;
+    // The commit that creates the reserved root consumes its reservation.
+    if committed.reserved().is_some_and(|reserved| {
+        reserved.root == selected.root && Some(reserved.nonce.as_str()) == selected.nonce()
+    }) {
+        committed.link_mut().reserved = None;
+    }
     remember_root(&mut committed, selected);
     committed.updated_ms = process::now_ms();
     write_receipt(control, &committed)?;

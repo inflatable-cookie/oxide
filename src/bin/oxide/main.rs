@@ -275,6 +275,15 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     // released before this command takes a slot.
     outputs::auto_adopt(&selected.store, &checkout, &selected)?;
     let store = selected.store;
+    // A future owned root gets its durable random nonce reserved before the
+    // destination is planned and keyed (oxide#129); the binding lock is
+    // released again before this command waits for a slot.
+    outputs::reserve(
+        &store,
+        Some(&output_control),
+        &checkout,
+        pool_fallback.as_deref(),
+    )?;
     let planned =
         outputs::planned_destination(Some(&output_control), &checkout, pool_fallback.as_deref())?;
     let destination = outputs::destination_facts(planned.as_ref());
