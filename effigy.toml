@@ -80,7 +80,10 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # proves structurally, with the debug-only walk log, that default status runs
 # no payload/checkout/Cargo-home walk and reconciles nothing, and that
 # --measure logs exactly the payload and per-slot walks; the shared measure
-# deadline is the library test added at 9269. A small default-status timing is
+# deadline is the library test added at 9269; a debug-only scoped 61 s delay at
+# the payload root drives the real 60 s budget to a partial elapsed-deadline
+# result and a scoped denial proves default never reaches the hook. A small
+# default-status timing is
 # a sanity observation only, never a large-pool or universal latency claim; proves zero
 # mutation with a bounded before/after
 # metadata digest and exact control bytes, covers held/waits/clean/flush and
