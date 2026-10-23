@@ -1486,9 +1486,7 @@ mod tests {
         fixture.file("debug/deps/pkg.rlib", 10);
         let root = fixture.path().to_path_buf();
         let delayed = root.join("debug");
-        let spec = |path: &StdPath, cost: u64| {
-            serde_json::json!([{ "path": path, "action": "delay_before_read_dir", "delay_ms": cost }])
-        };
+        let spec = |path: &StdPath, cost: u64| serde_json::json!([{ "path": path, "action": "delay_before_read_dir", "delay_ms": cost }]);
         for value in [
             serde_json::json!([{ "path": delayed, "action": "delay_before_read_dir" }]),
             spec(&delayed, 0),
@@ -1501,9 +1499,8 @@ mod tests {
                 { "path": root.join("other"), "action": "delay_before_read_dir", "delay_ms": 30_000 }
             ]),
         ] {
-            let accepted = with_walk_mutations(&root, value.clone(), || {
-                walk_observer::injection_accepted()
-            });
+            let accepted =
+                with_walk_mutations(&root, value.clone(), || walk_observer::injection_accepted());
             assert!(!accepted, "injection was accepted: {value}");
         }
         let accepted = with_walk_mutations(&root, spec(&delayed, 60), || {
