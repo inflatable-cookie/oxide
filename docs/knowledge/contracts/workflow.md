@@ -2422,12 +2422,21 @@ oxide#102.
 - **Accounting walks (oxide#108).** Admission, reuse, eviction and
   `status --measure` walk the slots with one set of pool bounds; default
   `oxide status` walks nothing (oxide#128): 2,000,000 entries, depth 64
-  (65 for the whole-payload walk, which starts at the payload root; see
+  (66 for the whole-payload walk, which starts at the payload root and stays
+  two levels above the slot content directories; see
   [Finder metadata](#finder-metadata-in-pools)),
   60 s (previously 50,000, 24 and 5 s, which refused Praxis's 76,669-entry
   and Farmyard's 60,657-entry pools). Reusing an idle slot needs that slot's
   own walk complete; a new slot needs the whole-payload walk complete before
-  and after eviction. An incomplete walk refuses with `unknown_accounting`
+  and after eviction. A walk reads each enumerated file or directory from its
+  live directory entry when the path name is shorter than the platform
+  `PATH_MAX` (and by path name when it is not), and samples each read
+  directory's path-name identity before and after its entries
+  ([per-entry reads and boundary samples](storage-inventory.md#per-entry-reads-and-directory-boundary-samples-oxide141),
+  oxide#141). That correction changes no bound, walk count, policy or refusal
+  class, and it is not a measured speed claim or a guarantee that a large or
+  cold pool meets the deadline. An incomplete walk refuses with
+  `unknown_accounting`
   and names its cause (`entry_limit`, `depth_limit`, `elapsed_deadline`,
   `unreadable_entry`, `missing_metadata`, a mount boundary or a root
   failure), entries visited, elapsed time and bounds; its bytes are never

@@ -91,6 +91,14 @@ An upstream roadmap is never a reason to defer today's relief.
 
 ## Product workflow direction
 
+### Planning discipline
+
+Tom, 2026-10-23: keep concrete work we intend to deliver, rather than an
+indefinite parked backlog. Give each item a delivery path or explicitly decline
+it, preserving the reason and history. Fold duplicate tracking into its owning
+brief or project. Closing an unimplemented item records that disposition; it
+does not claim a fix. New evidence can justify a new decision.
+
 ### Front door
 
 Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
@@ -123,6 +131,13 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
   with Oxide storage (#107). When a checkout's slot is busy, a further command
   in that checkout takes a compatible spare slot. Whether Tauri honours
   build-dir is still unverified.
+- **Command time budgets** (Tom, 2026-10-23): approved direction is separate
+  finite admission and child-execution budgets, with a typed child-start
+  boundary. Independent design review precedes implementation. Compilation,
+  Cargo locks and nested admissions consume the execution budget once it
+  starts; nested calls never pause or reset an outer budget. Preserve signal
+  forwarding and conservative group closure. Consumer adoption and installation
+  remain separate gates; this is not an installed capability.
 - **Paused:** the unchanged-source `oxide run` fast path. Its plan is preserved
   in #089's closed task and its committee contract.
 - **Deferred:** remote builds. The executor seam stays local-only.
@@ -174,7 +189,7 @@ Tom, 2026-10-18. Oxide is an explicit build service, not an interceptor.
 
   Details live in their Queue leads and, once built, in the
   [workflow contract](contracts/workflow.md).
-- **Parked:** cached slot accounting.
+- **Declined:** cached slot accounting; revisit only on new evidence.
 
 ### Adoption pattern
 
