@@ -2,12 +2,15 @@
 """Owned-output prune proof (oxide#129): the fixed 21-case native script.
 
 Run only as the Effigy heavy task `rust:outputs-prune`, whose whole command is
-`python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 --
+`python3 scripts/bounded-test.py --limit 360 --scratch-budget-mib 512 --
 python3 scripts/test-outputs-prune.py` under the qualified shared supervisor
 (`scripts/bounded-test.py`, SHA-256
 d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e). The
-supervisor owns the 300 s deadline, the 512 MiB monitored scratch, process
-closure and cleanup; work stops 30 s before its exported deadline. Activation
+supervisor owns the 360 s deadline (root-approved one larger bound before
+any activation; the historical 300 s estimate is retained), the 512 MiB
+monitored scratch, process closure and cleanup; work stops 30 s before its
+exported deadline, and every case start and the ordinary detach check the
+remaining work window first. Activation
 is a separate counted owner gate for the author and for the Elevated
 reviewer; `--plan` prints the allocation and case list and touches nothing.
 
@@ -27,21 +30,40 @@ Staging is the rust:installed-handoff recipe (this HEAD's debug `oxide`,
 plain Cargo offline with 1.97.1, -j1, one codegen unit, no debug info,
 symbols stripped, opt-level s, debug assertions kept so the debug-only
 OXIDE_TEST_PRUNE_CRASH and OXIDE_TEST_PAUSE hooks exist; the staged target is
-deleted after the copy). Expected: staging 37-60 s, cases 60-120 s,
-attach/setup 20 s, cleanup 30 s = 147-230 s before the source-fit
-additions (a gated build-script fixture, two extra fixture builds, one
-600-entry root and three extra prune runs, estimated +15-30 s): 162-260 s,
-UNMEASURED. If a run does not
-fit, it fails at the deadline (never a timeout success) and one honest larger
-bound is proposed before any further activation; never split or extended.
+deleted after the copy).
 
-Watchdog / reserve call chain exercised by the deletion cases (source, not a
-bespoke harness): prune::prune_one -> Store::begin_clean -> lock_binding ->
-RootSession::open (removable::Binding::open + verify of UUID, device, mount;
-registration reserve) -> RootSession::check (Binding::verify + available
-bytes above the recorded reserve) before the rename and every DELETE_BATCH
-entries inside delete_contents_at; any loss stops further writes and leaves
-the intent pending (exit 3).
+Static time allocation, UNMEASURED (a successful run must finish everything,
+including the ordinary detach, by the exported deadline minus 30 s, with the
+detach helper's 5 s refusal margin: about 325 s of the 360 s limit):
+
+    supervisor start offset                         <= 5 s
+    staging (constrained debug oxide recipe)       37-60 s
+    image attach, registration, first build        10-20 s
+    cases 01-21 (base 60-120 s + source-fit
+      additions: gated writer build, kappa and
+      recreated builds, image checkout, 600-entry
+      root, extra prune runs, status reads)       95-165 s
+    ordinary detach                                 2-10 s
+    ---------------------------------------------  --------
+    total                                        149-260 s   (~65 s margin)
+
+No timing fit is claimed. An overrun fails at the deadline (never a timeout
+success); no split, extra session or automatic retry.
+
+Prune-worker monitoring call chain exercised by the deletion cases (product
+source, not a bespoke harness): prune::prune_one -> Store::begin_clean ->
+lock_binding -> recheck_candidate/recheck_receiptless -> RootSession::open
+(removable::Binding::open + UUID, device, mount; registration) ->
+RootSession::check(control, deleted) [internal control volume host reserve,
+Binding::verify, registered reserve; unknown readings stop] before the
+rename -> journal_intent -> rename -> finish_quarantine: Deleter::check
+before the first and after the last delete and before the quarantine leaf
+removal, Deleter::check after each directory's names are sorted,
+check_due (>= 1 s, watchdog INTERVAL) before each enumeration, every 512
+names while listing and after each unlink, and a forced check every 512
+deleted entries. Any stop leaves the intent pending (exit 3). The debug-only
+injections OXIDE_TEST_PRUNE_LOW_RESERVE_AT / _AFTER_ENTRIES drive the
+pre-rename refusal and the mid-batch stop.
 
 Cases (21 = the original 19-case matrix plus two resolve-intent cases), each
 on tiny owned fixtures with exact exit codes and state assertions:
@@ -145,7 +167,7 @@ def _load(name: str, file: str):
 
 
 SUPERVISOR = "d89115f1ca03587e1d9134efa153cc9c94860d2904f52e2a11bc8c8fbe21f25e"
-LIMIT_SECONDS = 300
+LIMIT_SECONDS = 360
 SCRATCH_MIB = 512
 CASES = 21
 
@@ -212,6 +234,8 @@ expect = fail = None
 
 
 def case(name: str) -> None:
+    # Every case starts inside the exported work window (fails otherwise).
+    permanent.work_left()
     DONE.append(name)
     print(f"===== case {len(DONE):02d}: {name} =====", flush=True)
 
@@ -883,6 +907,8 @@ def run(proof, repo: str) -> None:
     permanent.set_recorded_uuid(world.pool, good)
     expect(len(DONE) == CASES, f"ran {len(DONE)} cases, not {CASES}")
 
+    # The ordinary detach also runs inside the work window.
+    permanent.work_left()
     proof.detach()
     proof.phase("after detach")
 

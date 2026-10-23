@@ -155,7 +155,7 @@ admission = "heavy"
 run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-permanent-outputs.py ignore-safety"
 
 # Owned-output prune (oxide#129): one fixed 21-case native proof under the
-# qualified shared supervisor (300 s, 512 MiB monitored scratch, 30 s work
+# qualified shared supervisor (360 s, 512 MiB monitored scratch, 30 s work
 # shutdown margin, one owned 128 MiB scratch image, ordinary detach). Fence and
 # initialization, root nonces, shared and cancelled reservations, snapshot,
 # overflow, eligibility, receiptless legacy roots, custody, containment, four
@@ -163,7 +163,7 @@ run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- p
 # is a separately counted owner activation; `--plan` alone touches nothing.
 [tasks."rust:outputs-prune"]
 admission = "heavy"
-run = "python3 scripts/bounded-test.py --limit 300 --scratch-budget-mib 512 -- python3 scripts/test-outputs-prune.py"
+run = "python3 scripts/bounded-test.py --limit 360 --scratch-budget-mib 512 -- python3 scripts/test-outputs-prune.py"
 
 # Removable drive modes (oxide#116): under the qualified shared supervisor,
 # stages oxide offline and exercises versioned registration metadata,
