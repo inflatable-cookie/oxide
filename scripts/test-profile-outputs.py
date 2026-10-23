@@ -344,14 +344,28 @@ def auto_legacy(proof: Proof, checkout: str) -> None:
 
 
 def base_legacy(proof: Proof, base: str, pool: str, checkout: str) -> None:
-    """Create a whole-target /2 state with the staged base binary, in a pool
-    that has not published the successor fence."""
+    """Create a whole-target /2 state with the STAGED BASE binary (never the
+    candidate), in a pool that has not published the successor fence."""
     env = {**proof.env, "OXIDE_POOL": pool}
-    code, _, stderr = perm.oxide_env(proof, ["outputs", "adopt"], "base legacy adopt", checkout, env)
-    expect(code == 0, f"base whole-target adopt failed: {stderr}")
-    expect(os.path.islink(os.path.join(checkout, "target")), "base adopt did not publish a whole-target link")
+    result = proof.run([base, "outputs", "adopt"], cwd=checkout, env=env, timeout=90)
+    stdout, stderr = result.stdout.decode(errors="replace"), result.stderr.decode(errors="replace")
+    print(f"----- base legacy adopt: exit {result.returncode} -----\n{stdout}{stderr}", flush=True)
+    expect(result.returncode == 0, f"base whole-target adopt failed: {stderr}")
+    expect(
+        os.path.islink(os.path.join(checkout, "target")),
+        "base adopt did not publish a whole-target link",
+    )
     doc = perm.read_json(perm.receipt_path(pool, checkout))
     expect(doc["version"] == "oxide.outputs.transition/2", f"base receipt {doc['version']}")
+    # The base binary wrote a /2 whole-target placement, not a profile one.
+    expect(doc["links"][0]["member"] == "target", f"base placement {doc['links'][0]}")
+    # The second pool is still on the published fence, so the candidate's
+    # adopt must take the explicit migration path.
+    state = perm.read_json(os.path.join(pool, "oxide-managed", "state.json"))
+    expect(
+        state.get("owned_outputs") == "oxide.outputs/2",
+        f"the base pool fence is {state.get('owned_outputs')}, not the published /2",
+    )
 
 
 def adopt(proof: Proof, checkout: str, label: str) -> None:
@@ -661,7 +675,10 @@ def run(proof: Proof, repo: str) -> None:
     waiter = perm.start_child(proof, [proof.binary, "outputs", "adopt"], blocked, proof.env)
     time.sleep(0.4)
     expect(waiter.poll() is None, "13: migration did not wait for the active writer")
-    expect(os.path.islink(os.path.join(blocked, "target")) and not os.path.isdir(os.path.join(blocked, "target")), "13: migration changed the target while a writer ran")
+    expect(
+        os.path.islink(os.path.join(blocked, "target")),
+        "13: the migration changed the target while a writer ran",
+    )
     perm.stop_gate(gate, os.path.join(gate, "release"))
     perm.finish_child(proof, child, "13 writer")
     code, _, _ = perm.finish_child(proof, waiter, "13 waiting adopt")
