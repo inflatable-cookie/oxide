@@ -29,6 +29,7 @@ mod watchdog;
 mod wrapper;
 
 use cli::{Class, Invocation, Profile, LEGACY_PROFILE_ENVIRONMENT};
+use layout::Layout;
 use freshness::{Gate, Refusal};
 use identity::{RunPick, SlotKey};
 use oxide_storage::inventory::{inventory_directory, Category, InventoryLimits};
@@ -334,8 +335,32 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
         pool_fallback.as_deref(),
     )?;
     test_pause("reserved");
-    let planned =
-        outputs::planned_destination(Some(&output_control), &checkout, pool_fallback.as_deref())?;
+    let declaration = match layout::classify(
+        &invocation.command,
+        invocation.profile,
+        invocation.explicit_profile,
+        &invocation.targets,
+    ) {
+        Layout::Declared(declaration) => declaration,
+        Layout::Unknown(reason) => {
+            outputs::refuse_unknown_layout(Some(&output_control), &checkout, &reason)?;
+            layout::Declaration::empty()
+        }
+    };
+    let declaration = if invocation.command == "exec" {
+        // The caller's declaration is the complete set of the tool's profile
+        // outputs; an opaque tool that declares none is refused in a profile
+        // checkout rather than guessed.
+        layout::declared(&invocation.declared_outputs)?
+    } else {
+        declaration
+    };
+    let planned = outputs::planned_destination(
+        Some(&output_control),
+        &checkout,
+        &declaration,
+        pool_fallback.as_deref(),
+    )?;
     let destination = outputs::destination_facts(planned.as_ref());
     let key = SlotKey::resolve_in(
         &checkout,
