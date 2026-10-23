@@ -865,7 +865,16 @@ def run_cases(
         expect_line(output, "no volume is present at /Volumes/OxideStatusProofAbsent", "offline selection")
         expect_line(output, "flush before releasing slot 2: 3.2 ms", "flush rendering")
         expect_line(output, "project foo-1234", "recorded removable slot label")
-        expect_line(output, "fallback while the removable volume is absent", "internal fallback note")
+        # With no volume present the internal pool is the recorded selection.
+        expect_line(
+            output,
+            f"internal pool: {os.path.realpath(rem['pool'])} (selected for the next build)",
+            "internal selection note",
+        )
+        expect(
+            output.index("internal pool: ") < output.index("removable pool: "),
+            "the recorded selection is not listed first",
+        )
         expect_line(output, "volume now: not checked by status", "no volume probe")
         expect(
             re.search(r"volume now: \d", output) is None,
