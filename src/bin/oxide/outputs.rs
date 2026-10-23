@@ -3944,9 +3944,24 @@ fn bind_profile(
                 needed.push((planned.member.clone(), wanted.clone()));
                 owned_root.get_or_insert_with(|| wanted.root.clone());
             }
-            (Some(wanted), TargetState::OwnedLink(_) | TargetState::Dangling(_)) => {
+            (Some(wanted), TargetState::OwnedLink(_)) => {
                 needed.push((planned.member.clone(), wanted.clone()));
                 owned_root.get_or_insert_with(|| wanted.root.clone());
+            }
+            (Some(wanted), TargetState::Dangling(_)) => {
+                // Never transition automatically through a dangling link.
+                // With an internal-pool fallback slot this is the #117 refusal;
+                // otherwise the owner must run the explicit adopt.
+                let fallback = context
+                    .pool_fallback
+                    .as_deref()
+                    .map(|reason| format!("; this command's intermediate slot fell back to the internal pool ({reason})"))
+                    .unwrap_or_default();
+                return Bind::Refuse(format!(
+                    "outputs: {} selects the member root {} which is not available now{fallback}; nothing was built. Run `oxide outputs adopt` to recheck this checkout's owned outputs",
+                    link.display(),
+                    wanted.root.display()
+                ));
             }
             (Some(_), _) => {
                 return Bind::Refuse(format!(
@@ -4717,7 +4732,13 @@ fn link_state(link: &Path, checkout: &Path, checkout_id: &str) -> Result<TargetS
         // that root marker, never by following an arbitrary ancestor.
         if let Some(member_root) = member_root_for_target(&root) {
             if owned_root(checkout, checkout_id, &member_root).is_ok() {
-                return Ok(TargetState::OwnedLink(root));
+                // The root is ours; the member destination is only an owned
+                // link while it actually exists.
+                return Ok(if fs::symlink_metadata(&root).is_ok() {
+                    TargetState::OwnedLink(root)
+                } else {
+                    TargetState::Dangling(root)
+                });
             }
         }
         return Ok(if fs::symlink_metadata(&root).is_err() {
@@ -7376,6 +7397,78 @@ mod tests {
             "a real member program must keep Cargo's path"
         );
         assert!(owned.is_file());
+    }
+
+    #[test]
+    fn a_dangling_member_link_never_transitions_automatically() {
+        let fixture = Fixture::in_tree("", "/target/\n/.oxide-outputs/\n");
+        let context = fixture.context();
+        let external = Selected {
+            kind: RootKind::External,
+            root: fixture.root.join("volume/oxide-outputs/checkout-0000"),
+            volume_uuid: Some("11111111-2222-3333-4444-555555555555".to_owned()),
+            nonce: Some("99999999999999999999999999999999".to_owned()),
+            generation: 1,
+        };
+        // The external ROOT exists and carries this checkout's marker, but the
+        // member directory it should contain does not: the member link dangles.
+        fs::create_dir_all(&external.root).unwrap();
+        let marker = Marker {
+            version: MARKER_VERSION.to_owned(),
+            checkout: fixture.checkout.clone(),
+            checkout_id: context.checkout_id.clone(),
+            label: "checkout".to_owned(),
+            recipe: RECIPE.to_owned(),
+            kind: RootKind::External,
+            volume_uuid: external.volume_uuid.clone(),
+            nonce: external.nonce.clone(),
+            checkout_volume_uuid: None,
+            generation: 1,
+            created_ms: 1,
+        };
+        fs::write(
+            external.root.join(MARKER),
+            serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(fixture.checkout.join("target")).unwrap();
+        let link = fixture.checkout.join("target/debug");
+        let dangling = member_destination(&external.root, "debug");
+        symlink(&dangling, &link).unwrap();
+        let mut receipt =
+            Receipt::first_with(&fixture.checkout, &context.checkout_id, LayoutKind::Profile);
+        receipt.state = ReceiptState::Committed;
+        receipt.generation = 1;
+        receipt.place_member("debug").selected = Some(external.clone());
+        let plan = Plan {
+            whole_target: false,
+            members: vec![PlannedMember {
+                member: "debug".to_owned(),
+                selected: Some(external.clone()),
+            }],
+        };
+        let store = pool_store(&fixture.root.join("pool"));
+        // With an internal fallback slot the refusal names the fallback.
+        let fallback = Context::new(Some(fixture.control.clone()), fixture.checkout.clone())
+            .with_pool_fallback(Some("container mismatch"));
+        let refused = match bind_profile(&fallback, &store, 0, &receipt, Some(&plan)) {
+            Bind::Refuse(reason) => reason,
+            Bind::Bound(_) => panic!("a dangling member link was bound"),
+            Bind::Wait => panic!("a dangling refusal waited"),
+        };
+        assert!(refused.contains("not available"), "{refused}");
+        assert!(refused.contains("fell back"), "{refused}");
+        assert!(refused.contains("oxide outputs adopt"), "{refused}");
+        // Without a fallback it still refuses rather than auto-transitioning.
+        let refused = match bind_profile(&context, &store, 0, &receipt, Some(&plan)) {
+            Bind::Refuse(reason) => reason,
+            Bind::Bound(_) => panic!("a dangling member link was bound without a fallback"),
+            Bind::Wait => panic!("a dangling refusal waited"),
+        };
+        assert!(refused.contains("not available"), "{refused}");
+        // The link and the receipt are untouched.
+        assert_eq!(fs::read_link(&link).unwrap(), dangling);
+        write_receipt(&fixture.control, &receipt).unwrap();
     }
 
     #[test]

@@ -2263,12 +2263,15 @@ fn eligibility(
             "a root reservation still references this root".to_owned(),
         ));
     }
-    if registry.live_rows().any(|other| {
-        other.root == row.root
-            && !(other.checkout_id == row.checkout_id && other.member == row.member)
-    }) {
+    // One root under one checkout is ONE owner: its own sibling members are
+    // the same reference group, not another live reference. Only a reference
+    // from a DIFFERENT checkout keeps the root.
+    if registry
+        .live_rows()
+        .any(|other| other.root == row.root && other.checkout_id != row.checkout_id)
+    {
         return Ok(Some(
-            "another live reference also names this root".to_owned(),
+            "another checkout's live reference also names this root".to_owned(),
         ));
     }
     let Some(receipt) = receipt else {
@@ -6033,6 +6036,96 @@ mod tests {
         );
     }
 
+    /// Eligibility follows the (checkout, root) owner group: sibling members
+    /// of the gone checkout do not keep each other, while a reference from a
+    /// DIFFERENT checkout still keeps the root.
+    #[test]
+    fn eligibility_keeps_a_root_for_another_checkout_but_not_for_sibling_members() {
+        let fixture = Fixture::new();
+        let mut debug = row_for(&fixture.root);
+        debug.member = "debug".to_owned();
+        debug.root_kind = RootKind::Local;
+        debug.volume_uuid = None;
+        debug.checkout = fixture.root.join("gone");
+        debug.receipt = fixture.root.join("receipt.json");
+        let mut release = debug.clone();
+        release.member = "release".to_owned();
+        release.selected = false;
+        let rows = vec![debug.clone(), release.clone()];
+        let control = ready_control(&fixture, rows.clone(), Vec::new());
+        let registry = ready_registry(&control).unwrap();
+        let receipt_path = outputs::receipt_path_public(&control, &debug.checkout_id);
+        fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
+        fs::write(
+            &receipt_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": "oxide.outputs.transition/2",
+                "checkout": debug.checkout.to_string_lossy(),
+                "checkout_id": debug.checkout_id,
+                "generation": 1,
+                "state": "committed",
+                "links": [{
+                    "member": "target",
+                    "selected": {
+                        "kind": "local",
+                        "root": debug.root.to_string_lossy(),
+                        "nonce": debug.nonce,
+                        "generation": 1
+                    }
+                }],
+                "updated_ms": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let receipt =
+            outputs::read_receipt_for_prune(&control, &debug.checkout, &debug.checkout_id).unwrap();
+        let store = crate::store::Store::for_tests(&fixture.root.join("pool"));
+        let mut budget = SNAPSHOT_MAX_BYTES;
+        let reason = eligibility(
+            &store,
+            &control,
+            &registry,
+            &debug,
+            receipt.as_ref(),
+            None,
+            &mut budget,
+            false,
+        )
+        .unwrap();
+        assert!(
+            reason.as_deref() != Some("another checkout's live reference also names this root"),
+            "a sibling member kept its own root: {reason:?}"
+        );
+        // A reference from another checkout keeps the shared root.
+        let mut other = debug.clone();
+        other.checkout_id = "b".repeat(64);
+        other.checkout = fixture.root.join("other-gone");
+        let mut with_other = ready_registry(&control).unwrap();
+        with_other.rows.push(other);
+        let reason = eligibility(
+            &store,
+            &control,
+            &with_other,
+            &debug,
+            receipt.as_ref(),
+            None,
+            &mut budget,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            reason.as_deref(),
+            Some("another checkout's live reference also names this root"),
+            "another checkout's reference did not keep the root"
+        );
+        let _ = registry;
+    }
+
     /// Two members of one root under the same checkout are ONE owner: the
     /// intent marks and journals the complete group, and rollback restores
     /// every row only while the pinned receipt preimage is unchanged.
@@ -6349,7 +6442,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(!reason.contains("another live reference"), "{reason}");
+        assert!(
+            !reason.contains("another checkout's live reference"),
+            "a same-owner row kept its own root: {reason}"
+        );
         let mut other = row.clone();
         other.checkout_id = "e".repeat(64);
         let control2 = fixture.root.join("second");
@@ -6368,7 +6464,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(reason.contains("another live reference"), "{reason}");
+        assert!(
+            reason.contains("another checkout's live reference"),
+            "another checkout's reference did not keep the root: {reason}"
+        );
     }
 
     /// A registered `/Volumes` checkout's mount is `/Volumes/<name>`

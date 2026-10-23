@@ -3138,7 +3138,11 @@ stay real.
   clean is validated before the legacy whole-target pre-gate, plans each
   member destination once, and preserves links, root markers and unrelated
   payloads. Prune eligibility and candidate construction are per
-  `(checkout, root)` with a first-sorted representative, and a debug-only stop
+  `(checkout, root)` with a first-sorted representative: a root under one
+  checkout is ONE owner, so its own sibling members never keep each other,
+  while a reference from a different checkout does keep the root. A dangling
+  member link never transitions automatically (a command on an internal
+  fallback names the fallback and `oxide outputs adopt`), and a debug-only stop
   after the fixed terminal image is published (before settlement) exercises
   exact-image replay.
 - **Members.** V1 knows exactly `debug`, `release`, `<triple>/debug` and

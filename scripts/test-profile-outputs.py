@@ -205,14 +205,15 @@ def plan_only() -> int:
     print("  supervisor      scripts/bounded-test.py --limit 600 --scratch-budget-mib 512")
     print(f"  deadline        600 s total (scoped brief amendment); helper work cutoff ~565 s")
     print("                  = 30 s helper reserve + 5 s refusal margin; cleanup/detach inside it")
-    print("  fit             UNMEASURED: 275-410 s estimated work inside the ~565 s cutoff;")
+    print("  fit             UNMEASURED: 300-450 s estimated work inside the ~565 s cutoff;")
     print("                  no native, trial or setup-only run has been activated, so the")
     print("                  estimate is not an established fit")
     print("  cpu             planning request 6 CPU / 8 GiB: two SEQUENTIAL stagings at")
     print("                  STAGE_JOBS=6 each, fixture children at FIXTURE_JOBS=2 with at")
     print("                  most two gated writers (2 x 2 = 4); peak 6 Cargo jobs")
-    print("  time estimate   two sequential 6-job stagings ~45-80 s each, 20 s setup,")
-    print("                  120-200 s cases, 30 s cleanup -> 275-410 s estimated work")
+    print("  time estimate   two sequential 6-job stagings ~45-80 s each, 25 s setup,")
+    print("                  150-240 s cases (base control, p0/parent races, unknown")
+    print("                  custody, prune oracles), 30 s cleanup -> 300-450 s estimated work")
     print("  history         the 420 s publication at 030836f6 is historical and unactivated")
     print("  amendment       GRANTED scoped bound: 600 s total (root owner 2026-10-23T16:10Z),")
     print("                  512 MiB unchanged; no disk increase, runner change or native start")
@@ -932,7 +933,7 @@ def run(proof: Proof, repo: str) -> None:
     # A crash at every pre-commit phase replays to the committed profile
     # layout; a rollback at the staged and marker boundaries restores the
     # exact published /2 state.
-    for boundary in ("staged", "marker", "swapped"):
+    for boundary in ("p0", "staged", "marker", "swapped"):
         fixture = make_checkout(proof, f"replay-{boundary}")
         auto_legacy(proof, fixture)
         root = root_of(pool, fixture)
@@ -941,6 +942,18 @@ def run(proof: Proof, repo: str) -> None:
             make_root_one_fixture(pool, fixture)
             marker_before = perm.read_bytes(os.path.join(root, MARKER))
         env = {**proof.env, "OXIDE_TEST_OUTPUTS_CRASH": f"migration-{boundary}"}
+        if boundary == "p0":
+            # The P0 crash point is named "prepared" by the journal phase.
+            env["OXIDE_TEST_OUTPUTS_CRASH"] = "migration-p0"
+            code, _, _ = perm.oxide_env(proof, ["outputs", "adopt"], "12 crash p0", fixture, env)
+            expect(code != 0, "12: the injected P0 stop did not stop adopt")
+            stored = perm.read_json(perm.receipt_path(pool, fixture))
+            expect(stored["state"] == "prepared", f"12: P0 left state {stored['state']}")
+            # A P0 replay starts from the journal and commits the profile layout.
+            code, _, stderr = oxide(proof, ["outputs", "adopt"], "12 replay p0", fixture)
+            expect(code == 0, f"12: replay from p0 failed: {stderr}")
+            expect_layout(fixture, {"debug": f"link:{root_of(pool, fixture)}"})
+            continue
         code, _, _ = perm.oxide_env(proof, ["outputs", "adopt"], f"12 crash {boundary}", fixture, env)
         expect(code != 0, f"12: the injected {boundary} stop did not stop adopt")
         stored = perm.read_json(perm.receipt_path(pool, fixture))
@@ -996,6 +1009,28 @@ def run(proof: Proof, repo: str) -> None:
     code, _, stderr = oxide(proof, ["outputs", "adopt"], "12 creator cleared", creator_fixture)
     expect(code == 0, f"12: adopt after clearing the creator failed: {stderr}")
     expect_layout(creator_fixture, {"debug": f"link:{creator_root}"})
+    # A replaced checkout directory (same path, new inode) is an identity
+    # change: the journal stays pending with no effects until the exact pinned
+    # identity returns.
+    parent_race = make_checkout(proof, "parent-race")
+    auto_legacy(proof, parent_race)
+    env = {**proof.env, "OXIDE_TEST_OUTPUTS_CRASH": "migration-staged"}
+    code, _, _ = perm.oxide_env(proof, ["outputs", "adopt"], "12 parent crash", parent_race, env)
+    expect(code != 0, "12: the parent-race crash did not stop adopt")
+    os.rename(parent_race, parent_race + "-old")
+    shutil.copytree(parent_race + "-old", parent_race, symlinks=True)
+    code, _, stderr = oxide(proof, ["outputs", "adopt"], "12 parent race", parent_race)
+    expect(code != 0 and "identity" in stderr, f"12: a replaced checkout identity was replayed: {stderr}")
+    expect(
+        perm.read_json(perm.receipt_path(pool, parent_race))["state"] == "prepared",
+        "12: the parent race did not stay pending",
+    )
+    shutil.rmtree(parent_race)
+    os.rename(parent_race + "-old", parent_race)
+    code, _, stderr = oxide(proof, ["outputs", "adopt"], "12 parent restored", parent_race)
+    expect(code == 0, f"12: adopt after restoring the checkout identity failed: {stderr}")
+    expect_layout(parent_race, {"debug": f"link:{root_of(pool, parent_race)}"})
+
     # A crash after the P4 commit keeps the committed real target and the
     # cleanup journal; a replay finishes cleanup and never rolls back.
     p4 = make_checkout(proof, "p4-cleanup")
@@ -1048,7 +1083,8 @@ def run(proof: Proof, repo: str) -> None:
         "13: the migration changed the target while a writer ran",
     )
     perm.stop_gate(gate, os.path.join(gate, "release"))
-    perm.finish_child(proof, child, "13 writer")
+    code, _, _ = perm.finish_child(proof, child, "13 writer")
+    expect(code == 0, f"13: the gated writer exited {code}")
     code, _, _ = perm.finish_child(proof, waiter, "13 waiting adopt")
     expect(code == 0, "13: the waiting adopt failed")
     expect_layout(blocked, {"debug": f"link:{root_of(pool, blocked)}"})
@@ -1214,6 +1250,33 @@ def run(proof: Proof, repo: str) -> None:
     code, _, stderr = oxide(proof, ["build"], "17 debug still usable", malformed)
     expect(code == 0, f"17: the unaffected debug member stopped building: {stderr}")
     os.remove(foreign)
+    # Actual unknown custody: a retired record whose writers were never
+    # positively closed must make adopt refuse with every byte unchanged.
+    custody = make_checkout(proof, "unknown-custody")
+    os.makedirs(os.path.join(custody, "target"))
+    adopt(proof, custody, "17 custody adopt")
+    state_path = os.path.join(pool, "oxide-managed", "state.json")
+    original_state = perm.read_bytes(state_path)
+    state = json.loads(original_state)
+    template = next(record for record in state["records"] if record.get("checkout"))
+    stolen = dict(template)
+    stolen["id"] = max(record["id"] for record in state["records"]) + 1
+    stolen["checkout"] = custody
+    stolen["phase"] = "retired"
+    stolen["retired"] = "proof fixture"
+    stolen["lost"] = {"slot_id": "proof-lost", "at_ms": 1, "unclosed": "proof fixture: writers never confirmed closed"}
+    state["records"].append(stolen)
+    with open(state_path, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2)
+        handle.write("\n")
+    os.chmod(state_path, 0o600)
+    before = custody_snapshot(pool, custody)
+    code, _, stderr = oxide(proof, ["outputs", "adopt"], "17 unknown custody", custody)
+    expect(code != 0 and "lost with writers" in stderr, f"17: unknown custody was not refused: {stderr}")
+    expect(custody_snapshot(pool, custody) == before, "17: the unknown-custody refusal changed authority")
+    with open(state_path, "wb") as handle:
+        handle.write(original_state)
+    os.chmod(state_path, 0o600)
 
     # ----- case 18: real and linked placements key different cold slots ----
     # A real NONEMPTY debug directory is kept real, so the first keyed build
@@ -1257,9 +1320,31 @@ def run(proof: Proof, repo: str) -> None:
     receipt_before = perm.sha256_file(perm.receipt_path(pool, migrated))
     slots_dir = os.path.join(pool, "payload", "slots")
     slots_before = sorted(os.listdir(slots_dir))
-    result = proof.run([base, "build"], cwd=migrated, env=proof.env, timeout=90)
-    expect(result.returncode != 0, "19: the state-3 binary did not refuse a state-4 pool")
-    print(result.stderr.decode(errors="replace")[-2000:])
+    # Working base control immediately before the refusal: the same base
+    # binary serves a fresh private pool normally.
+    control = proof.run([base, "--version"], cwd=migrated, env=proof.env, timeout=60)
+    expect(control.returncode == 0, f"19: the working base control failed: {control.stderr.decode(errors='replace')}")
+    # Case 10 already records the base binary producing and warming a /2 pool
+    # before the candidate fence; this control proves the same staged binary
+    # still runs immediately before its forward-fence refusal.
+    # Zero Cargo calls: a recording fake cargo refuses and records any call.
+    recorder_bin = os.path.join(proof.root, "record-bin")
+    os.makedirs(recorder_bin, exist_ok=True)
+    cargo_marker = os.path.join(proof.root, "cargo-was-called")
+    recorder = os.path.join(recorder_bin, "cargo")
+    with open(recorder, "w", encoding="utf-8") as handle:
+        handle.write("#!/bin/sh\nprintf '%s' \"$*\" >> \"" + cargo_marker + "\"\nexit 99\n")
+    os.chmod(recorder, 0o755)
+    refusal_env = {**proof.env, "PATH": recorder_bin + os.pathsep + proof.env.get("PATH", "")}
+    result = proof.run([base, "build"], cwd=migrated, env=refusal_env, timeout=90)
+    expect(result.returncode == 75, f"19: the state-3 refusal exit is {result.returncode}, not 75")
+    refusal_text = result.stderr.decode(errors="replace")
+    expect(
+        "oxide was upgraded during this command; re-run." in refusal_text,
+        f"19: the forward-fence refusal text changed: {refusal_text}",
+    )
+    expect(not os.path.exists(cargo_marker), "19: the refused state-3 binary called Cargo")
+    print(refusal_text[-2000:])
     for member, target in snapshot.items():
         expect(os.readlink(member_link(migrated, member)) == target, "19: the refusal changed a member link")
     expect(perm.sha256_file(perm.receipt_path(pool, migrated)) == receipt_before, "19: the refusal rewrote the receipt")
