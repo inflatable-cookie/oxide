@@ -16,7 +16,8 @@ oxide check
 oxide test -p core -- --nocapture
 oxide run -- --port 8080
 oxide add serde        # non-building commands are plain Cargo
-oxide nextest run      # external subcommands work too
+oxide deny check       # deny/audit/outdated/machete forward unchanged, no lease
+oxide nextest run      # other external subcommands are leased
 oxide exec -- npm run tauri build   # a tool that runs Cargo itself
 ```
 
@@ -45,6 +46,14 @@ External tools get the quick recipe with no flag: `oxide nextest run`.
 `--cargo-profile oxide-quick` is deprecated and builds into
 `target/oxide-quick/`. A tool's `--cargo-profile debug` is Cargo's own
 profile, not Oxide's `--profile debug`.
+
+## Version
+
+`oxide --version` (or `-V`) prints this build's package identity, its source
+pin — ``unknown`` for a build the installer did not stamp — and whether it is
+the installer's verified binary (with the receipt's digest kept separate from
+the binary's), then Cargo's own version. `oxide --list` passes straight to
+Cargo.
 
 ## What Oxide prints
 
@@ -199,8 +208,10 @@ fails, Oxide reports that the wait duration is unavailable.
 writes a short guidance block into `AGENTS.md`: the Git work-tree root's when
 the project is inside Git, listing the Cargo workspaces it covers, else the
 project's own. Re-running is safe. It prints readiness, including Effigy selectors that still call plain
-`cargo`. It never edits Effigy files; switching a selector to `oxide` is the
-project's choice.
+`cargo`. A `:cargo` task or a `-cargo` test suite that calls plain `cargo` is
+acknowledged once per run as an intentional escape; any other selector that
+calls plain `cargo` is an actionable warning. It never edits Effigy files and
+remembers nothing; switching a selector to `oxide` is the project's choice.
 
 When switching selectors:
 - **Escapes:** keep a `:cargo` escape beside each main one.

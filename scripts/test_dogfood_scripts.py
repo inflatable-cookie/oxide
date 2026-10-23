@@ -9,11 +9,13 @@ inside one fresh mktemp directory. Aggregate budget is 60 seconds.
 """
 from __future__ import annotations
 
+import datetime
 import hashlib
 import importlib.util
 import json
 import os
 import signal
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -144,6 +146,55 @@ class InstallerTests(unittest.TestCase):
                 installer.state_capabilities(self.capability_binary(output))
         with self.assertRaises(installer.Refusal):
             installer.state_capabilities(self.capability_binary('{"control_state_version": 2, "registration_version": 2}', code=1))
+
+    def test_a_build_is_stamped_with_the_pin_and_a_fresh_instance(self):
+        pin, instance = "a" * 40, installer.new_instance()
+        self.assertRegex(instance, r"^[0-9a-f]{32}$")
+        self.assertEqual(instance, instance.lower())
+        self.assertEqual(len({installer.new_instance() for _ in range(8)}), 8)
+        os.environ["CARGO_TARGET_DIR"] = "/inherited"
+        try:
+            environment = installer.build_environment(self.home / "staging", pin, instance)
+        finally:
+            del os.environ["CARGO_TARGET_DIR"]
+        self.assertEqual(environment["OXIDE_BUILD_PIN"], pin)
+        self.assertEqual(environment["OXIDE_BUILD_INSTANCE"], instance)
+        self.assertEqual(environment["CARGO_TARGET_DIR"], str(self.home / "staging/target"))
+        self.assertEqual(
+            [name for name in environment if name.startswith("CARGO_TARGET_")],
+            ["CARGO_TARGET_DIR"],
+        )
+
+    def test_build_identity_must_match_the_supplied_stamp(self):
+        pin, instance = "a" * 40, "b" * 32
+        matching = json.dumps({"build_pin": pin, "build_instance": instance})
+        self.assertEqual(
+            installer.build_identity(self.capability_binary(matching), pin, instance)["build_pin"],
+            pin,
+        )
+        for output, code in (
+            (json.dumps({"build_pin": pin}), 0),
+            (json.dumps({"build_instance": instance}), 0),
+            (json.dumps({"build_pin": "c" * 40, "build_instance": instance}), 0),
+            (json.dumps({"build_pin": pin, "build_instance": "c" * 32}), 0),
+            (json.dumps({"build_pin": None, "build_instance": None}), 0),
+            (json.dumps([pin, instance]), 0),
+            ("not json", 0),
+            (matching, 1),
+        ):
+            with self.assertRaises(installer.Refusal):
+                installer.build_identity(self.capability_binary(output, code=code), pin, instance)
+
+    def test_a_new_receipt_is_owner_only_and_names_its_instance(self):
+        started = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+        receipt = {"pin": "a" * 40, "build_instance": "b" * 32, "installed": {"path": "x"}}
+        path = installer.write_receipt(receipt, started, "a" * 40)
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        self.assertEqual(json.loads(path.read_text())["build_instance"], "b" * 32)
+        self.assertEqual(path.name, "20260101T000000Z-aaaaaaaaaaaa.json")
+        # An existing receipt is never overwritten.
+        with self.assertRaises(FileExistsError):
+            installer.write_receipt(receipt, started, "a" * 40)
 
     def test_replace_refuses_an_unmatched_or_linked_destination(self):
         self.receipt(b"old oxide")

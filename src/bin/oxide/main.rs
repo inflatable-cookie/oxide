@@ -7,6 +7,7 @@
 //! only through the freshness gate. Plain `cargo` behavior is untouched.
 
 mod adopt;
+mod capacity;
 mod cargo_home;
 mod clean;
 mod cli;
@@ -21,6 +22,7 @@ mod outputs;
 mod process;
 mod removable;
 mod store;
+mod version;
 mod watchdog;
 mod wrapper;
 
@@ -102,6 +104,15 @@ fn main() -> ExitCode {
     if let Some(code) = handoff::hidden() {
         return ExitCode::from(code);
     }
+    // The installer's effect-free build-identity probe (oxide#130).
+    if let Some(code) = version::hidden() {
+        return ExitCode::from(code);
+    }
+    // The bounded read-only capacity probe child (oxide#130), before any
+    // other work: the parent runs it only for a capacity refusal.
+    if let Some(code) = capacity::hidden() {
+        return ExitCode::from(code);
+    }
     process::started_ms();
     match run(std::env::args_os().skip(1).collect()) {
         Ok(code) => ExitCode::from(code),
@@ -124,7 +135,14 @@ fn run(args: Vec<OsString>) -> Result<u8, String> {
             print!("{USAGE}");
             return Ok(0);
         }
-        "-V" | "--version" | "--list" => return Err(exec_cargo(&args)),
+        "-V" | "--version" => {
+            // Oxide's own identity first, then Cargo's version and exit status
+            // exactly as the caller's Cargo gives them. `--list` stays a
+            // direct pass to Cargo with no identity lines.
+            version::print_identity();
+            return Err(exec_cargo(&args));
+        }
+        "--list" => return Err(exec_cargo(&args)),
         _ if command.starts_with('+') => {
             return Err(
                 "toolchain overrides are refused: Oxide uses the toolchain rustup resolves for the project"
@@ -436,7 +454,7 @@ fn run_invocation(invocation: Invocation) -> Result<u8, String> {
     };
     let stopped = watchdog.as_ref().filter(|watchdog| watchdog.stopped());
     if let Some(watchdog) = stopped {
-        eprintln!("{}", watchdog.report(group.id, closed));
+        report_stop(watchdog, group.id, closed, &store.payload);
     }
     if closed.is_none() {
         if stopped.is_some_and(Watchdog::removal) {
@@ -616,7 +634,7 @@ fn run_owned_program(
     drop(foreground);
     let stopped = watchdog.as_ref().filter(|watchdog| watchdog.stopped());
     if let Some(watchdog) = stopped {
-        eprintln!("{}", watchdog.report(group.id, closed));
+        report_stop(watchdog, group.id, closed, &store.payload);
     }
     if closed.is_none() {
         store.quarantine_lost(
@@ -628,6 +646,21 @@ fn run_owned_program(
     store.release(held, origin)?;
     let code = status.map_or(1, process::exit_code);
     Ok(if stopped.is_some() { code.max(1) } else { code })
+}
+
+/// One reserve-stop line, then a read-only capacity diagnostic for the same
+/// filesystem once the stopped group has positively closed (oxide#130). An
+/// unconfirmed closure, and a removable volume's own removal stop, probe
+/// nothing: the diagnostic runs after writers are closed, never during
+/// polling.
+fn report_stop(watchdog: &Watchdog, group: i32, closed: Option<Instant>, payload: &Path) {
+    eprintln!("{}", watchdog.report(group, closed));
+    if closed.is_none() || watchdog.removal() {
+        return;
+    }
+    if let Some(note) = capacity::diagnose(payload) {
+        eprintln!("{note}");
+    }
 }
 
 /// Why the leased child did not start.

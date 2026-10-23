@@ -546,7 +546,8 @@ fn pool_state(path: &Path) -> String {
 }
 
 /// Every `effigy.toml` from the workspace root up to the Git top level, with
-/// the lines that still call plain `cargo`. Effigy files are never edited.
+/// the selectors that still call plain `cargo`. Effigy files are never
+/// edited.
 fn report_effigy(workspace: &Path) {
     let top = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
@@ -557,11 +558,12 @@ fn report_effigy(workspace: &Path) {
         .and_then(|output| fs::canonicalize(String::from_utf8_lossy(&output.stdout).trim()).ok())
         .filter(|top| workspace.starts_with(top));
     let mut found = false;
+    let mut acknowledged: Vec<String> = Vec::new();
     for directory in workspace.ancestors() {
         let file = directory.join("effigy.toml");
         if fs::symlink_metadata(&file).is_ok_and(|metadata| metadata.is_file()) {
             found = true;
-            report_effigy_file(&file);
+            acknowledged.extend(report_effigy_file(&file));
         }
         if top.as_deref().is_none_or(|top| directory == top) {
             break;
@@ -569,10 +571,34 @@ fn report_effigy(workspace: &Path) {
     }
     if !found {
         println!("  effigy: no effigy.toml");
+        return;
+    }
+    // Intentional escapes are acknowledged once for this run, never stored
+    // and never silenced selector by selector.
+    if !acknowledged.is_empty() {
+        acknowledged.sort();
+        let shown: Vec<&str> = acknowledged.iter().take(8).map(String::as_str).collect();
+        let rest = acknowledged.len().saturating_sub(shown.len());
+        let more = if rest > 0 {
+            format!(" and {rest} more")
+        } else {
+            String::new()
+        };
+        println!(
+            "  effigy: acknowledged once for this run: {} intentional plain-cargo escape selector(s) (`:cargo` tasks, `-cargo` suites): {}{more}",
+            acknowledged.len(),
+            shown.join(", ")
+        );
     }
 }
 
-fn report_effigy_file(file: &Path) {
+/// One file's selectors, read from parsed TOML so only executable routes
+/// count: a `:cargo` task or `-cargo` suite that runs plain `cargo` is an
+/// acknowledged escape, any other executable selector that does is an
+/// actionable warning. Comments and dependency references are not routes.
+/// A file that is not parseable TOML stays honest: its calling lines are
+/// reported unclassified rather than guessed into a group.
+fn report_effigy_file(file: &Path) -> Vec<String> {
     let text = match fs::metadata(file) {
         Ok(metadata) if metadata.len() > EFFIGY_LIMIT => {
             println!(
@@ -580,35 +606,139 @@ fn report_effigy_file(file: &Path) {
                 file.display(),
                 EFFIGY_LIMIT / 1024
             );
-            return;
+            return Vec::new();
         }
         Ok(_) => match fs::read(file) {
             Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(error) => {
                 println!("  effigy: {} unreadable ({error})", file.display());
-                return;
+                return Vec::new();
             }
         },
         Err(error) => {
             println!("  effigy: {} unreadable ({error})", file.display());
-            return;
+            return Vec::new();
         }
     };
-    let lines = plain_cargo_lines(&text);
-    if lines.is_empty() {
-        println!(
-            "  effigy: {} has no selectors calling plain cargo",
-            file.display()
-        );
-        return;
+    match classify_effigy(&text) {
+        Ok(scan) => {
+            if scan.warnings.is_empty() {
+                println!(
+                    "  effigy: {} has no actionable selectors calling plain cargo",
+                    file.display()
+                );
+            } else {
+                println!(
+                    "  effigy: {} still calls plain cargo (reported, not edited; use `oxide`):",
+                    file.display()
+                );
+                for warning in &scan.warnings {
+                    let shown: String = warning.command.chars().take(120).collect();
+                    println!("    {}: {shown}", warning.selector);
+                }
+            }
+            scan.acknowledged
+        }
+        Err(reason) => {
+            println!(
+                "  effigy: {} is not parseable as TOML ({reason}); plain cargo calls are reported unclassified:",
+                file.display()
+            );
+            for (number, line) in plain_cargo_lines(&text) {
+                let shown: String = line.chars().take(120).collect();
+                println!("    line {number}: {shown}");
+            }
+            Vec::new()
+        }
     }
-    println!(
-        "  effigy: {} still calls plain cargo (reported, not edited; use `oxide`):",
-        file.display()
-    );
-    for (number, line) in lines {
-        let shown: String = line.chars().take(120).collect();
-        println!("    line {number}: {shown}");
+}
+
+/// Plain-Cargo selectors of one parsed `effigy.toml`.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct EffigyScan {
+    /// Intentional escape selector names (`:cargo` tasks, `-cargo` suites).
+    acknowledged: Vec<String>,
+    /// Actionable selectors that still call plain `cargo`.
+    warnings: Vec<Warning>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct Warning {
+    selector: String,
+    command: String,
+}
+
+/// Parse the file and classify its executable plain-Cargo routes. Only the
+/// command a selector runs counts: a task's string value, a task's or suite's
+/// `run` string or list. Comments, `depends`-style references and any shape
+/// this reader does not understand contribute nothing.
+fn classify_effigy(text: &str) -> Result<EffigyScan, String> {
+    let value: serde_json::Value = basic_toml::from_str(text).map_err(|error| error.to_string())?;
+    let Some(root) = value.as_object() else {
+        return Err("not a TOML table".to_owned());
+    };
+    let mut scan = EffigyScan::default();
+    if let Some(tasks) = root.get("tasks") {
+        let tasks = tasks
+            .as_object()
+            .ok_or("`tasks` is not a table of selectors")?;
+        for (name, entry) in tasks {
+            for command in executable_commands(entry) {
+                if !calls_cargo(&command) {
+                    continue;
+                }
+                if name.ends_with(":cargo") {
+                    scan.acknowledged.push(format!("tasks.{name}"));
+                } else {
+                    scan.warnings.push(Warning {
+                        selector: format!("tasks.{name}"),
+                        command,
+                    });
+                }
+            }
+        }
+    }
+    if let Some(suites) = root
+        .get("test")
+        .and_then(|test| test.get("suites"))
+        .filter(|suites| !suites.is_null())
+    {
+        let suites = suites
+            .as_object()
+            .ok_or("`test.suites` is not a table of suites")?;
+        for (name, entry) in suites {
+            for command in executable_commands(entry) {
+                if !calls_cargo(&command) {
+                    continue;
+                }
+                if name.ends_with("-cargo") || name.ends_with(":cargo") {
+                    scan.acknowledged.push(format!("test.suites.{name}"));
+                } else {
+                    scan.warnings.push(Warning {
+                        selector: format!("test.suites.{name}"),
+                        command,
+                    });
+                }
+            }
+        }
+    }
+    Ok(scan)
+}
+
+/// The command strings one selector's value runs.
+fn executable_commands(entry: &serde_json::Value) -> Vec<String> {
+    match entry {
+        serde_json::Value::String(command) => vec![command.clone()],
+        serde_json::Value::Array(commands) => commands
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        serde_json::Value::Object(object) => match object.get("run") {
+            Some(run) => executable_commands(run),
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
     }
 }
 
@@ -789,5 +919,64 @@ run = "python3 scripts/bounded-test.py cargo test --workspace"
                 ),
             ]
         );
+    }
+
+    /// Intentional escapes are grouped once and kept apart from the
+    /// actionable selectors. Only executable routes count: comments and
+    /// dependency references are not plain-Cargo calls.
+    #[test]
+    fn effigy_classification_separates_acknowledged_escapes() {
+        let text = r#"[tasks]
+"rust:compile:cargo" = "cargo check --workspace --locked"
+"rust:compile" = "oxide check --workspace --locked"
+"legacy" = "cargo build"
+"nextest" = "cargo-nextest run"
+"env" = "$CARGO build"
+# "commented" = "cargo test"
+"batch" = { run = ["cargo fmt --all", "oxide test"], admission = "heavy" }
+"with-dep" = { run = "oxide test", depends = ["rust:compile:cargo"] }
+[test.suites.rust-cargo]
+run = "cargo test --workspace"
+[test.suites."rust:cargo"]
+run = "cargo metadata"
+[test.suites.rust]
+run = "python3 scripts/bounded-test.py cargo test --workspace"
+"#;
+        let scan = classify_effigy(text).unwrap();
+        assert_eq!(
+            scan.acknowledged,
+            vec![
+                "tasks.rust:compile:cargo".to_owned(),
+                "test.suites.rust-cargo".to_owned(),
+                "test.suites.rust:cargo".to_owned()
+            ]
+        );
+        let mut warnings: Vec<(String, String)> = scan
+            .warnings
+            .into_iter()
+            .map(|warning| (warning.selector, warning.command))
+            .collect();
+        warnings.sort();
+        assert_eq!(
+            warnings,
+            vec![
+                ("tasks.batch".to_owned(), "cargo fmt --all".to_owned()),
+                ("tasks.legacy".to_owned(), "cargo build".to_owned()),
+                (
+                    "test.suites.rust".to_owned(),
+                    "python3 scripts/bounded-test.py cargo test --workspace".to_owned()
+                ),
+            ]
+        );
+        // A file with no plain-Cargo route reports nothing at all.
+        let scan = classify_effigy("[tasks]\n\"a:b\" = \"oxide test\"\n").unwrap();
+        assert_eq!(scan, EffigyScan::default());
+        // Malformed or wrongly shaped files stay unclassified instead of
+        // being guessed into either group.
+        assert!(classify_effigy("[tasks\n").is_err());
+        assert!(classify_effigy("not a table").is_err());
+        assert!(classify_effigy("[tasks]\nx = 3\n").is_ok());
+        assert!(classify_effigy("[tasks]\nx = [1, 2]\n").is_ok());
+        assert!(classify_effigy("[test]\nsuites = 3\n").is_err());
     }
 }

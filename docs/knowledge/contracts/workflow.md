@@ -43,7 +43,7 @@ Commands fall into four classes:
 | --- | --- | --- |
 | Modelled | `check`, `test`, `clippy`, `build`, `run` | Profile-aware, leased, strategy-selected (see [profiles](#profiles-and-strategies)). |
 | Building passthrough | Other built-ins that compile (`doc`, `bench`, `rustc`, `rustdoc`, `fix`) and every unknown or external subcommand (`nextest`, `llvm-cov`, `miri`) | Passed to Cargo unchanged, under a lease with storage and profile definitions injected. Unknown commands are treated as building, which is the conservative choice. |
-| Plain passthrough | Non-building built-ins (`fmt`, `tree`, `metadata`, `add`, `remove`, `update`, `info`, `search`, `install`, `publish`, `login`, `vendor`, `fetch`, `generate-lockfile`, `locate-project`, `pkgid`, `version`, `help`) | Run as plain Cargo; no lease. |
+| Plain passthrough | Non-building built-ins (`fmt`, `tree`, `metadata`, `add`, `remove`, `update`, `info`, `search`, `install`, `publish`, `login`, `vendor`, `fetch`, `generate-lockfile`, `locate-project`, `pkgid`, `version`, `help`) and the four scanner tools `deny`, `audit`, `outdated`, `machete` | Run as plain Cargo; no lease. |
 | Extended built-ins | `init`, `new`, `clean` | Cargo's command plus Oxide's step (see [adoption](#adoption-oxide-init)). `clean` removes the checkout's private outputs and slot affinity and never deletes a shared slot: a 2026-10-18 probe showed plain `cargo clean` also deletes the injected build directory. A whole-target clean is Oxide's own plan ([clean](#clean)). |
 | Oxide-owned | `status`, `pool`, `exec` | Oxide semantics. `exec` runs a tool that calls Cargo itself under a lease ([below](#oxide-exec-cargo-wrapping-tools)); it shadows an external `cargo-exec` subcommand, which stays reachable as plain `cargo exec`. |
 
@@ -62,6 +62,13 @@ Commands fall into four classes:
   default profile; `release` becomes `--release` (see [profiles](#profiles-and-strategies)).
   External tools receive arguments untouched and build with the quick recipe
   through the inherited `dev` settings, with no profile flag.
+- `deny`, `audit`, `outdated` and `machete` are exact passthrough (oxide#130):
+  Oxide replaces itself with the caller's Cargo, which receives the original
+  arguments unchanged, in the caller's working directory, with the caller's
+  environment, standard streams, signals and exit status. No slot is leased,
+  no pool is created or measured, no adoption, guidance or build-recipe
+  injection runs, and the front-door hand-off check is skipped. Every other
+  unknown or external subcommand stays leased, as above.
 
 ## Profiles and strategies
 
@@ -808,6 +815,26 @@ explicit `recover` unless they adopt it.
   to a scan. A same-generation fact stays a historical observation that may
   have changed since measurement; a future timestamp is an unknown age. The
   retention cap is at least the slot ceiling and never lowers it.
+- Capacity refusals may add bounded, read-only macOS figures (oxide#130).
+  After a pool-creation reserve refusal, and after a host-reserve stop once
+  every writer in Cargo's group has positively closed, Oxide runs its own
+  executing artifact as the hidden `oxide __oxide-capacity-probe
+  <absolute-path>` child: a separate process group, one 2 s budget taken
+  before the spawn and shared by the answer, a bounded KILL, its positive reap
+  and the pipe drain (the reap reserve is carved out of that budget, never
+  added to it), at most 8 KiB of combined stdout and stderr, and one typed
+  JSON answer. The child reads CoreFoundation URL resource values
+  (`CFURLCopyResourcePropertyForKey` with the public
+  `NSURLVolumeAvailableCapacityForImportantUsageKey` and
+  `NSURLVolumeAvailableCapacityForOpportunisticUsageKey` keys) and reports
+  each as optional bytes or `unknown`. An explicit error class, a timeout, an
+  oversized or malformed answer, and an absent, negative or wrongly typed
+  value are all `unknown`. The figures overlap and are not guaranteed free
+  space: the line is labelled informational, nothing is purged, no user-data
+  deletion is suggested, and no decision reads it. The raw 20 GiB start,
+  abort and reserve decisions are unchanged; no probe runs on plain `oxide
+  status`, on a watchdog sample, during polling, or without confirmed writer
+  closure. Linux keeps its raw refusal text.
 - `OXIDE_POOL_CAP` or the config file sets the soft budget for the next
   admission; `oxide clean --cargo-cache` asks
   Cargo for its own home cleanup ([Cargo home hygiene](#cargo-home-hygiene)).
@@ -890,10 +917,20 @@ Block rules, as implemented:
   measures.
 - With a manifest present, every argument other than the directory refuses as
   Cargo-only. `--help` passes to Cargo.
-- The Effigy report scans
-  each `effigy.toml` from the workspace root up to the Git top level, line by
-  line, and names lines that run `cargo` as a command word; comments,
-  `cargo-*` binaries and `$CARGO` do not count.
+- The Effigy report parses each `effigy.toml` from the workspace root up to
+  the Git top level (bounded by the same 1 MiB file cap) and classifies its
+  executable plain-Cargo routes (oxide#130). A selector counts only through
+  the command it runs: a `[tasks]` string value, a task's or suite's `run`
+  string or list. A `[tasks]` key ending `:cargo`, or a `[test.suites]` name
+  ending `-cargo` or `:cargo`, that runs plain `cargo` is an intentional
+  escape and is acknowledged once per invocation, grouped by name and
+  separately from the warnings. Every other executable selector that runs
+  plain `cargo` stays an actionable warning with the selector name and
+  command. Comments, `depends`-style references, `cargo-*` binaries and
+  `$CARGO` never count, nothing is edited, and no acknowledgement is
+  persisted. A file that is not parseable TOML, or whose `tasks` or suites
+  shape cannot be read, is reported honestly as unclassified with its
+  calling lines instead of being placed in either group.
 
 ### Placement of the guidance block
 
@@ -1134,6 +1171,69 @@ necessary.
   a final-release error after effects that never executes anything. It never
   touches the real `~/.local/bin/oxide`, a real install receipt or a live pool,
   and is not a benchmark or an alias for full QA.
+
+### Version identity (oxide#130)
+
+`oxide --version` and `oxide -V` first print this build's identity on stdout and
+flush it, then hand the unchanged arguments to the caller's Cargo, exactly as
+the old direct pass did. Identity write and flush errors (a closed pipe above
+all) are ignored and Cargo still runs: Cargo keeps stdout, stderr, signals and
+the exit status, and an `exec` failure keeps the existing `oxide: could not
+start Cargo:` message and exit 1. `oxide --list` stays a direct pass with no
+identity lines.
+
+- **Identity.** One line names the package (`oxide 0.1.0 (package
+  oxide-storage)`), then a build line and a provenance line. Where Oxide
+  cannot authenticate, it says `unknown` rather than naming the current
+  checkout's HEAD: no `git`, pool, workspace or network discovery runs here.
+- **Stamp.** The installer authenticates the source pin as it does now, then
+  generates a fresh 128-bit lowercase-hex instance before the build and
+  supplies `OXIDE_BUILD_PIN` and `OXIDE_BUILD_INSTANCE` to it. `option_env!`
+  embeds them, and Cargo's dep-info tracks both names, so a changed stamp
+  recompiles. A build without a well-formed 40-hex pin and 32-hex instance
+  says `source pin unknown (this build carries no installer stamp)` and
+  `provenance: unknown`.
+- **Verified provenance.** With a well-formed stamp, the newest receipt under
+  this `HOME` (`~/.local/state/oxide/install/*.json`, the hand-off's bounded
+  no-follow reader: at most 4096 directory entries, 64 KiB per receipt) must
+  be owner-only, carry the same `pin` and `build_instance`, and its
+  `installed` facts must name the canonical running executable: path equal
+  after canonicalising both, a stable private owned regular file, and a size
+  and SHA-256 (bounded to 64 MiB) equal to the receipt's. The binary digest is
+  reported as `installed binary sha256`, and the receipt digest — SHA-256 over
+  exactly the receipt bytes that were parsed — as `receipt sha256`, always as
+  separate labels. The matching instance closes the same-pin replacement gap:
+  a runtime path and hash alone cannot authenticate an older executing image
+  after replacement.
+- **Unverified.** A missing, stale, foreign, malformed, oversized,
+  non-owner-only or mismatched receipt, another instance, a symlinked
+  destination, a copy elsewhere, or a hash or size mismatch is
+  `provenance: unverified (<reason>)`. Historical receipts keep their bytes
+  and permissions; an older receipt without an instance simply never
+  verifies. The installer writes new receipts with `0600`.
+- **Proof.** `effigy rust:everyday-cli` (heavy) is one fixed script and whole
+  command under the qualified shared proof supervisor: 300 s including
+  staging and cleanup, 512 MiB monitored scratch, 30 s shutdown margin, no
+  image, mount, real registration, install, network or host state. Inside
+  its scratch it stages this HEAD's debug `oxide` twice from one target
+  (unstamped, then stamped with this HEAD's pin and a synthetic instance;
+  measured ~10 s of staging at ~82 MiB peak owned) and runs one CLI matrix
+  with a recording, refusing fake `cargo`: `--version`/`-V` identity order,
+  honest unknown pin, exit code, arguments, working directory, environment and
+  stream pass-through; `--list`; verified provenance with separate digests;
+  same-pin replacement, unstamped replacement, another instance, non-private
+  receipt and missing receipt as `unverified`/`unknown`; readiness escape
+  acknowledgement once per run against actionable warnings, a comment that is
+  not a route, per-invocation (not persisted) acknowledgement, an unedited
+  manifest and a malformed manifest reported unclassified; exact
+  `deny`/`audit`/`outdated`/`machete` forwarding with no pool and the caller's
+  sentinel `CARGO_TARGET_DIR` intact; and creation-refusal and reserve-stop
+  capacity diagnostics in typed, unknown-value, error-class, timeout,
+  oversized and real positive-control forms, with the raw refusal and the
+  20 GiB decision unchanged and no pool created. The recorded author runs
+  passed 50/50 cases (24 s at an 81.9 MiB owned peak, then 22 s at 89.9 MiB
+  after the shared-budget correction). It is not a
+  benchmark or an alias for full QA.
 
 ### Shared proof supervisor
 
@@ -2590,6 +2690,7 @@ Tom approved an early host trial on 2026-10-20. His `Builds` volume (`A6AC3ED7-3
   - a path of exactly `/Volumes/<name>`: nested paths, `..`, hidden names, prefix look-alikes and custom mount parents refuse;
   - `/Volumes` passing the structural mount-parent rule, at registration and at every selection: the caller is not root; `/Volumes` is a real directory (not a symlink) whose path and opened descriptor agree; it is owned by root with no group or other write and no setuid, setgid or sticky bit; `acl_get_fd_np(ACL_TYPE_EXTENDED)` positively reports no extended ACL entry (`ENOENT`, or an ACL with no entry), any other result refuses; and it has no file flag except `UF_HIDDEN` (`sys/stat.h`, a GUI display hint the standard `/Volumes` carries). Every violation is reported. A denied combined `faccessat(W_OK)` is not used, since it does not prove that a specific right such as `add_subdirectory` is denied;
   - the name opened with `O_NOFOLLOW | O_DIRECTORY` (a symlink alias refuses), whose descriptor's `fstatfs` `f_mntonname` names exactly that path, whose `st_dev` differs from `/Volumes`'s, `f_fstypename` `apfs`, not `MNT_RDONLY`, not `MNT_ROOTFS`, and writable by the user;
+  - the mounted root itself, through that volume descriptor, before any media write (oxide#130): a real directory owned by the calling user, with no group or other write, no setuid, setgid or sticky bit, positively no extended ACL entry, no file flag except `UF_HIDDEN`, and mount flags without `MNT_IGNORE_OWNERSHIP`. The check runs after the binding opens and again immediately before the payload directory is created. A violation refuses before registering and names the manual fix on the drive itself (`chmod go-w` as the volume's owner, or erase and reformat); Oxide never changes the drive's ownership or mode. A volume registered before this rule is not re-judged by it;
   - `diskutil info -plist` agreeing on the volume UUID (the kernel's `ATTR_VOL_UUID`), mount point and APFS, with a container other than the one holding `/System/Volumes/Data`;
   - `diskutil apfs list -plist <container>` listing the volume with no APFS role: a Backup (Time Machine) role, and every other role, refuses.
   It records mount point, volume UUID, container UUID, reserve, cap, the volume's capacity and APFS quota (`CapacityQuota`, none when 0) at registration. A second registration refuses, and so does a registration left under a previous pool's control root ([oxide#102](#budget-only-default-pool-and-user-configuration)). The payload directory is created empty through the volume's descriptor.
@@ -2604,7 +2705,7 @@ Tom approved an early host trial on 2026-10-20. His `Builds` volume (`A6AC3ED7-3
 
 Sources: `fstatfs(2)` / `sys/mount.h`; `getattrlist(2)` / `sys/attr.h` (`ATTR_VOL_UUID`); `faccessat(2)` with `AT_EACCESS` (volume writability only); `acl_get_fd_np(3)`, `acl_get_entry(3)`, `acl_free(3)` / `sys/acl.h`; `UF_HIDDEN` / `sys/stat.h`; `fsync_volume_np(3)` / `unistd.h` (macOS 10.8+: `SYNC_VOLUME_FULLSYNC` writes data and metadata to the disk hardware, `SYNC_VOLUME_WAIT` waits; returns a non-zero error code on failure); `diskutil(8)`. Observed on macOS 26.6: `fgetattrlist(ATTR_VOL_UUID)` on a non-root directory's descriptor answers the containing volume's UUID despite the man page's `EINVAL` rule, so the UUID is never treated as proof of a mount root.
 
-**Proof.** `effigy rust:oxide-removable-pool` stages `oxide` offline with 1.97.1 and models the drive as one separately attached 128 MiB APFS sparse image in owned scratch, mounted by `hdiutil` at a unique `/Volumes/<name>`, over a budget-only internal directory pool. One fresh canonical directory inside the counted scratch is `OXIDE_TASK_SCRATCH_ROOT`, `TMPDIR`, `TMP` and `TEMP` for the runner and every child from before staging. A session guardian (`scripts/bounded_runner.py`) owns the bounds from admission: a sticky first fault; host free space sampled every 250 ms against the 20 GiB reserve (a failed sample, dead sampler or sample older than 1 s faults); owned bytes walked at least every 2 s within 1 s (scratch, staging, targets, temp, logs, control and image backing, plus each positively identified mount by its used blocks; an attach in progress counts at the image's whole 128 MiB, a mount being detached at its last used bytes; on `ENOENT` the partial total is discarded and the walk restarts once inside the same second, and a second disappearance, any other error or a sample older than 4 s faults); both output streams drained and counted against 32 MiB as they arrive; work stops at 240 s and teardown must finish by 300 s. Every child goes through its one spawn path in its own session; a fault, deadline, exception, SIGTERM or SIGINT closes that session (TERM, then KILL, then a fresh observation), and a session not positively closed stays unclosed and blocks every detach. A child counts as closed only when its leader has exited and been reaped and a fresh observation finds its session and groups empty; a missing exit status, or a cleanup step that times out, is a failure that goes through closure. Every walk observation, including the final one and each mount observation, is checked against the same 1 s deadline before a total is published; a late walk faults and never refreshes the sample time. Every closure wait, process observation, drain and settlement uses only what is left of the original 300 s; when positive settlement cannot fit, the session stays unclosed and resources are kept. After a fault only cleanup runs: positive closure, then ordinary detach, never clearing the fault or starting experimental work. On success the scratch is removed by a bounded cleanup step while the reserve and deadline monitors stay live, with owned bytes explicitly held at the last complete total during removal. The 512 MiB figure is a monitored cap checked by complete samples, not an instantaneous ceiling: overshoot between samples is possible, and any sample over it fails the proof. Before staging, the same session runs a deterministic synthetic suite (`scripts/bounded_runner_cases.py`) under the real guardian: reserve breach, error, dead and stale sampler; storage excess, error, staleness, deadline and the `ENOENT` whole-walk retry; pipe pressure, output excess and an open pipe after exit; a fault and a cancellation during a running child; TERM-to-KILL escalation; a failed process observation settled by the outer guardian; stand-ins for an unresolved attachment, a failed ordinary detach and cleanup after the deadline; a late final `lstat`, `scandir`, mount `stat`, `ismount` and `statvfs`, and a second walk attempt past the deadline; a cleanup leader that closes its streams but stays alive; and deadline expiry during closure, drain, settlement and a cleanup step. Synthetic results are apparatus checks, not product acceptance. It covers: unregistered behaviour unchanged; the mount-parent rule accepting the real `/Volumes` (read only) and refusing an owned scratch directory first for its owner alone, then by name for one `chmod +a "<account name> allow add_subdirectory"` entry (debug builds expose `oxide pool debug-check-parent <dir>` for this); refusals (missing, zero and overflowing reserve, custom parent, nested path, absent volume, the `Macintosh HD` symlink alias, read-only attach, prefix look-alike, second registration); registration matching `diskutil`'s UUID with only `slots` on the volume; selection present (cold then warm, flush cost recorded), below its reserve and absent after an ordinary detach (no mount point recreated); an injected flush failure (debug builds only) retiring a held slot that the next build does not reuse; warmth kept across detach and re-attach; status. Unit tests cover the stale-directory and descriptor-swap cases with real kernel metadata, injected device change, Backup and other roles at registration and selection (container mismatch and the boot/data container too), and size parsing. A Backup-role volume, a mismatched device under the registered name and a stale `/Volumes/<name>` cannot be created unprivileged, so they are unit-tested only. 300 s, 512 MiB owned bytes including the mounted payload, ordinary detach only. Not a benchmark or real-drive qualification. The removable-pool runner and rust:oxide-removable-pool selector are unqualified test tooling; defects are fixed as found. Observed in the author's passing run at an earlier head (2026-10-20, before the review corrections): flushes of 8.9 ms and 8.8 ms after cold checks and 0.0 ms (display precision) after a no-op warm repeat, on a scratch sparse image backed by the internal SSD. These are not the real drive's flush cost.
+**Proof.** `effigy rust:oxide-removable-pool` stages `oxide` offline with 1.97.1 and models the drive as one separately attached 128 MiB APFS sparse image in owned scratch, mounted by `hdiutil` at a unique `/Volumes/<name>`, over a budget-only internal directory pool. One fresh canonical directory inside the counted scratch is `OXIDE_TASK_SCRATCH_ROOT`, `TMPDIR`, `TMP` and `TEMP` for the runner and every child from before staging. A session guardian (`scripts/bounded_runner.py`) owns the bounds from admission: a sticky first fault; host free space sampled every 250 ms against the 20 GiB reserve (a failed sample, dead sampler or sample older than 1 s faults); owned bytes walked at least every 2 s within 1 s (scratch, staging, targets, temp, logs, control and image backing, plus each positively identified mount by its used blocks; an attach in progress counts at the image's whole 128 MiB, a mount being detached at its last used bytes; on `ENOENT` the partial total is discarded and the walk restarts once inside the same second, and a second disappearance, any other error or a sample older than 4 s faults); both output streams drained and counted against 32 MiB as they arrive; work stops at 240 s and teardown must finish by 300 s. Every child goes through its one spawn path in its own session; a fault, deadline, exception, SIGTERM or SIGINT closes that session (TERM, then KILL, then a fresh observation), and a session not positively closed stays unclosed and blocks every detach. A child counts as closed only when its leader has exited and been reaped and a fresh observation finds its session and groups empty; a missing exit status, or a cleanup step that times out, is a failure that goes through closure. Every walk observation, including the final one and each mount observation, is checked against the same 1 s deadline before a total is published; a late walk faults and never refreshes the sample time. Every closure wait, process observation, drain and settlement uses only what is left of the original 300 s; when positive settlement cannot fit, the session stays unclosed and resources are kept. After a fault only cleanup runs: positive closure, then ordinary detach, never clearing the fault or starting experimental work. On success the scratch is removed by a bounded cleanup step while the reserve and deadline monitors stay live, with owned bytes explicitly held at the last complete total during removal. The 512 MiB figure is a monitored cap checked by complete samples, not an instantaneous ceiling: overshoot between samples is possible, and any sample over it fails the proof. Before staging, the same session runs a deterministic synthetic suite (`scripts/bounded_runner_cases.py`) under the real guardian: reserve breach, error, dead and stale sampler; storage excess, error, staleness, deadline and the `ENOENT` whole-walk retry; pipe pressure, output excess and an open pipe after exit; a fault and a cancellation during a running child; TERM-to-KILL escalation; a failed process observation settled by the outer guardian; stand-ins for an unresolved attachment, a failed ordinary detach and cleanup after the deadline; a late final `lstat`, `scandir`, mount `stat`, `ismount` and `statvfs`, and a second walk attempt past the deadline; a cleanup leader that closes its streams but stays alive; and deadline expiry during closure, drain, settlement and a cleanup step. Synthetic results are apparatus checks, not product acceptance. It covers: unregistered behaviour unchanged; the mount-parent rule accepting the real `/Volumes` (read only) and refusing an owned scratch directory first for its owner alone, then by name for one `chmod +a "<account name> allow add_subdirectory"` entry (debug builds expose `oxide pool debug-check-parent <dir>` for this); refusals (missing, zero and overflowing reserve, custom parent, nested path, absent volume, the `Macintosh HD` symlink alias, read-only attach, prefix look-alike, second registration); registration matching `diskutil`'s UUID with only `slots` on the volume; selection present (cold then warm, flush cost recorded), below its reserve and absent after an ordinary detach (no mount point recreated); an injected flush failure (debug builds only) retiring a held slot that the next build does not reuse; warmth kept across detach and re-attach; status. Unit tests cover the stale-directory and descriptor-swap cases with real kernel metadata, injected device change, Backup and other roles at registration and selection (container mismatch and the boot/data container too), and size parsing. The mount-root rule is unit-tested with real descriptor facts for an owned scratch directory (accepted at `0700`, refused after `0770`) and injected facts for every refusal reason, since a group-writable drive root or `MNT_IGNORE_OWNERSHIP` mount cannot be created unprivileged; `rust:everyday-cli` proves no mount case and touches no volume. A Backup-role volume, a mismatched device under the registered name and a stale `/Volumes/<name>` cannot be created unprivileged, so they are unit-tested only. 300 s, 512 MiB owned bytes including the mounted payload, ordinary detach only. Not a benchmark or real-drive qualification. The removable-pool runner and rust:oxide-removable-pool selector are unqualified test tooling; defects are fixed as found. Observed in the author's passing run at an earlier head (2026-10-20, before the review corrections): flushes of 8.9 ms and 8.8 ms after cold checks and 0.0 ms (display precision) after a no-op warm repeat, on a scratch sparse image backed by the internal SSD. These are not the real drive's flush cost.
 
 ### Implemented: part 2, surprise removal (oxide#098)
 

@@ -253,8 +253,11 @@ fn register(mount: &Path, reserve: u64, cap: u64, mode: DriveMode) -> Result<u8,
     if !cfg!(target_os = "macos") {
         return Err("the removable apfs-volume-v1 backend is macOS-only".to_owned());
     }
-    // Every check before the first write.
+    // Every check before the first write. The mounted root's own ownership
+    // and mode are part of that: a group- or other-writable drive root lets
+    // another process redirect the pool's payload.
     let binding = Binding::open(mount, None)?;
+    volume::refuse_unclosed_root(&binding)?;
     if !volume::writable(binding.mount_point())? {
         return Err(format!("{} is not writable", mount.display()));
     }
@@ -274,6 +277,9 @@ fn register(mount: &Path, reserve: u64, cap: u64, mode: DriveMode) -> Result<u8,
             internal.pool.display()
         ));
     }
+    // Revalidate the root immediately before the first media write: the
+    // registration is refused, not repaired, if it changed.
+    volume::refuse_unclosed_root(&binding)?;
     let facts = binding.verify()?;
     init_volume_pool(&control.join(POOL_DIR), &binding, PAYLOAD_DIR, cap)
         .map_err(|error| format!("cannot create the removable pool: {error}"))?;

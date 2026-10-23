@@ -358,10 +358,125 @@ pub fn observe_parent(parent: &Path) -> Result<ParentFacts, String> {
         uid: stat.st_uid,
         mode: u32::from(stat.st_mode),
         flags: file_flags(&stat),
-        acl: extended_acl(&fd),
+        acl: extended_acl(fd.as_fd_ref()),
         // SAFETY: geteuid has no preconditions.
         euid: unsafe { libc::geteuid() },
     })
+}
+
+/// Structural facts about a mounted volume's root directory, observed once
+/// through the volume binding's own descriptor (oxide#130).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RootFacts {
+    /// `fstat` on the descriptor says a real directory.
+    pub real_directory: bool,
+    pub uid: u32,
+    pub mode: u32,
+    pub flags: u32,
+    pub acl: Acl,
+    /// The caller's effective UID.
+    pub euid: u32,
+    /// `Some(true)` when `fstatfs` reports `MNT_IGNORE_OWNERSHIP`; `None`
+    /// when the mount flags could not be read.
+    pub ignore_ownership: Option<bool>,
+}
+
+/// The mount-root rule, applied once before a removable volume is registered
+/// and once more before its first media write: the root is a real directory
+/// owned by the caller, with no group or other write, no setuid/setgid/sticky
+/// bit, positively no extended ACL entries, no file flag except `UF_HIDDEN`,
+/// and mount flags without `MNT_IGNORE_OWNERSHIP`. Every violation is
+/// reported together with the manual fix; Oxide never changes the drive's
+/// ownership or mode itself.
+pub fn judge_root(mount: &Path, facts: &RootFacts) -> Result<(), String> {
+    let mut reasons = Vec::new();
+    if facts.euid == 0 {
+        reasons.push("the caller runs as root, so the root's ownership proves nothing".to_owned());
+    }
+    if !facts.real_directory {
+        reasons.push("the mount root is not a real directory".to_owned());
+    }
+    if facts.uid != facts.euid {
+        reasons.push(format!(
+            "it is owned by UID {}, not the caller's UID {}",
+            facts.uid, facts.euid
+        ));
+    }
+    if facts.mode & 0o022 != 0 {
+        reasons.push(format!(
+            "mode {:o} allows group or other write",
+            facts.mode & 0o7777
+        ));
+    }
+    if facts.mode & 0o7000 != 0 {
+        reasons.push(format!(
+            "mode {:o} has setuid, setgid or sticky bits",
+            facts.mode & 0o7777
+        ));
+    }
+    match &facts.acl {
+        Acl::None => {}
+        Acl::Entries(count) => reasons.push(format!("it has {count} extended ACL entries")),
+        Acl::Unknown(error) => reasons.push(format!("its extended ACL is unknown ({error})")),
+    }
+    if facts.flags & !UF_HIDDEN != 0 {
+        reasons.push(format!(
+            "it has file flags {:#x} beyond UF_HIDDEN",
+            facts.flags
+        ));
+    }
+    match facts.ignore_ownership {
+        Some(false) => {}
+        Some(true) => reasons.push(
+            "its mount flags include MNT_IGNORE_OWNERSHIP, so this user's ownership does not apply"
+                .to_owned(),
+        ),
+        None => reasons.push("its mount flags are unknown".to_owned()),
+    }
+    if reasons.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to register {}: the mounted root is not provably closed to this user: {}. Fix it on the drive itself, for example `chmod go-w` as the volume's owner or erase and reformat it, then register again; Oxide never changes the mount root",
+        mount.display(),
+        reasons.join("; ")
+    ))
+}
+
+/// Observe the bound volume's root through its held descriptor and apply
+/// [`judge_root`]. Nothing is written.
+pub fn refuse_unclosed_root(binding: &Binding) -> Result<(), String> {
+    judge_root(binding.mount_point(), &observe_root(binding.fd())?)
+}
+
+pub fn observe_root(fd: BorrowedFd<'_>) -> Result<RootFacts, String> {
+    let stat = fstat(fd)?;
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    Ok(RootFacts {
+        real_directory: u32::from(stat.st_mode) & libc::S_IFMT as u32 == libc::S_IFDIR as u32,
+        uid: stat.st_uid,
+        mode: u32::from(stat.st_mode),
+        flags: file_flags(&stat),
+        acl: extended_acl(fd),
+        euid,
+        ignore_ownership: mount_ignore_ownership(fd),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn mount_ignore_ownership(fd: BorrowedFd<'_>) -> Option<bool> {
+    // SAFETY: zeroed statfs is valid output storage; the descriptor is open.
+    let mut sample: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(fd.as_raw_fd(), &mut sample) } != 0 {
+        return None;
+    }
+    Some(sample.f_flags & libc::MNT_IGNORE_OWNERSHIP as u32 != 0)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mount_ignore_ownership(_fd: BorrowedFd<'_>) -> Option<bool> {
+    None
 }
 
 #[cfg(target_os = "macos")]
@@ -375,7 +490,7 @@ fn file_flags(_stat: &libc::stat) -> u32 {
 }
 
 #[cfg(target_os = "macos")]
-fn extended_acl(fd: &OwnedFd) -> Acl {
+fn extended_acl(fd: BorrowedFd<'_>) -> Acl {
     // sys/acl.h
     const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
     const ACL_FIRST_ENTRY: libc::c_int = 0;
@@ -419,7 +534,7 @@ fn extended_acl(fd: &OwnedFd) -> Acl {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn extended_acl(_fd: &OwnedFd) -> Acl {
+fn extended_acl(_fd: BorrowedFd<'_>) -> Acl {
     Acl::Unknown("extended ACLs are read on macOS only".to_owned())
 }
 
@@ -788,6 +903,99 @@ mod tests {
         assert!(dir_at(fd.as_fd_ref(), "link", false).is_err());
         assert!(dir_at(fd.as_fd_ref(), "..", true).is_err());
         assert!(dir_at(fd.as_fd_ref(), "a/b", true).is_err());
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    fn standard_root() -> RootFacts {
+        RootFacts {
+            real_directory: true,
+            uid: 501,
+            mode: 0o40700,
+            flags: 0,
+            acl: Acl::None,
+            euid: 501,
+            ignore_ownership: Some(false),
+        }
+    }
+
+    #[test]
+    fn root_rule_is_structural_and_names_the_manual_fix() {
+        let mount = Path::new("/Volumes/OxideBuild");
+        assert!(judge_root(mount, &standard_root()).is_ok());
+        let mut open_root = standard_root();
+        open_root.mode = 0o40755;
+        open_root.flags = UF_HIDDEN;
+        assert!(judge_root(mount, &open_root).is_ok());
+        let cases: Vec<(fn(&mut RootFacts), &str)> = vec![
+            (|facts| facts.euid = 0, "runs as root"),
+            (|facts| facts.real_directory = false, "not a real directory"),
+            (|facts| facts.uid = 502, "owned by UID 502"),
+            (|facts| facts.mode = 0o40720, "group or other write"),
+            (|facts| facts.mode = 0o40702, "group or other write"),
+            (|facts| facts.mode = 0o41700, "sticky"),
+            (|facts| facts.mode = 0o42700, "sticky"),
+            (|facts| facts.mode = 0o44700, "setuid"),
+            (|facts| facts.acl = Acl::Entries(1), "extended ACL entries"),
+            (
+                |facts| facts.acl = Acl::Unknown("EINVAL".to_owned()),
+                "extended ACL is unknown",
+            ),
+            (
+                |facts| facts.flags = UF_HIDDEN | 0x0002_0000,
+                "beyond UF_HIDDEN",
+            ),
+            (
+                |facts| facts.ignore_ownership = Some(true),
+                "MNT_IGNORE_OWNERSHIP",
+            ),
+            (
+                |facts| facts.ignore_ownership = None,
+                "mount flags are unknown",
+            ),
+        ];
+        for (change, reason) in cases {
+            let mut facts = standard_root();
+            change(&mut facts);
+            let error = judge_root(mount, &facts).unwrap_err();
+            assert!(error.contains(reason), "{reason}: {error}");
+            assert!(
+                error.contains("chmod go-w") && error.contains("never changes the mount root"),
+                "{error}"
+            );
+        }
+        // Every violation is reported, so one check cannot hide another.
+        let mut both = standard_root();
+        both.uid = 502;
+        both.acl = Acl::Entries(2);
+        let error = judge_root(mount, &both).unwrap_err();
+        assert!(
+            error.contains("owned by UID 502") && error.contains("2 extended ACL entries"),
+            "{error}"
+        );
+    }
+
+    /// Real descriptor facts for a scratch directory this user owns: the
+    /// rule accepts an owner-only root and refuses a group-writable one.
+    /// No volume, image or media write is involved.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_caller_owned_private_root_passes_and_a_writable_one_refuses() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = scratch("root");
+        let root = parent.join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let fd = open_dir(None, &root).unwrap();
+        let facts = observe_root(fd.as_fd_ref()).unwrap();
+        assert_eq!(facts.uid, facts.euid);
+        assert_eq!(facts.acl, Acl::None);
+        assert_eq!(facts.ignore_ownership, Some(false));
+        assert!(facts.real_directory);
+        assert!(judge_root(&root, &facts).is_ok(), "{facts:?}");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let facts = observe_root(fd.as_fd_ref()).unwrap();
+        let error = judge_root(&root, &facts).unwrap_err();
+        assert!(error.contains("group or other write"), "{error}");
         std::fs::remove_dir_all(parent).unwrap();
     }
 
